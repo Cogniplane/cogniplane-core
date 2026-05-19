@@ -1,0 +1,67 @@
+name: CLA Assistant
+
+# Gates every public PR on a signed Contributor License Agreement (CLA.md).
+# The dual-license model (AGPL-3.0 + commercial) only holds when every
+# contribution is licensed to Cogniplane under terms that allow re-licensing —
+# without per-contributor consent, even a small typo fix would create code
+# we couldn't include in the commercial license.
+#
+# Implementation: contributor-assistant/github-action runs in this repo and
+# stores signatures in a separate repo (`Cogniplane/cla-signatures`) so
+# signature commits don't pollute this repo's history and can be audited
+# independently. Signatures persist across PRs from the same GitHub account.
+#
+# Required setup before this workflow can run successfully:
+#   1. Create the empty `Cogniplane/cla-signatures` repo (private or public).
+#   2. Generate a fine-scoped PAT with contents:read+write on that repo.
+#   3. Save the PAT as the `CLA_SIGNATURE_PAT` secret in this repo.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, closed]
+
+# pull_request_target gives this workflow repo write permissions even when
+# the PR comes from a fork — required so the bot can comment on the PR and
+# add the `cla-signed` label.
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla-check:
+    runs-on: ubuntu-24.04
+    # Only run when a contributor types `I have read the CLA Document and I
+    # hereby sign the CLA` (the action's signature trigger phrase) OR on
+    # any PR event so the bot can post the initial signature request.
+    if: |
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null) ||
+      github.event_name == 'pull_request_target'
+    steps:
+      - name: CLA Assistant
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURE_PAT }}
+        with:
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/Cogniplane/cogniplane-core/blob/main/CLA.md
+          branch: main
+          # `mathd1` is the maintainer's personal GitHub username so the bot
+          # doesn't prompt the maintainer to sign their own CLA. Replace with
+          # `cogniplane-bot` (or similar) once a dedicated maintainer-bot
+          # identity is provisioned. The handle is already public via commit
+          # history and the COPYRIGHT file, so listing it here is not a leak.
+          allowlist: dependabot[bot],mathd1,renovate[bot]
+          remote-organization-name: Cogniplane
+          remote-repository-name: cla-signatures
+          custom-notsigned-prcomment: >
+            Thank you for your pull request! Before we can merge it, please sign
+            the [Cogniplane Individual Contributor License Agreement](https://github.com/Cogniplane/cogniplane-core/blob/main/CLA.md).
+            Reply with the following comment to sign:
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-allsigned-prcomment: 'All contributors have signed the CLA. ✓'
+          lock-pullrequest-aftermerge: false

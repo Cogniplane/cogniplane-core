@@ -1,0 +1,42 @@
+{
+  "name": "@cogniplane/backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp src/services/runtime/AGENTS.md.template dist/services/runtime/AGENTS.md.template",
+    "db:migrate": "tsx src/scripts/migrate.ts",
+    "db:seed-dev": "tsx src/scripts/seed-dev-data.ts",
+    "dev": "tsx watch src/server.ts",
+    "lint": "eslint src --ext .ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.138",
+    "@aws-sdk/client-s3": "^3.1045.0",
+    "@aws-sdk/lib-storage": "^3.1045.0",
+    "@cogniplane/shared-types": "workspace:*",
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "11.2.0",
+    "@fastify/multipart": "10.0.0",
+    "@workos-inc/node": "^9.2.0",
+    "cron-parser": "^5.5.0",
+    "e2b": "^2.19.5",
+    "fastify": "5.8.5",
+    "file-type": "^22.0.1",
+    "ioredis": "^5.10.1",
+    "jose": "^6.2.3",
+    "jszip": "^3.10.1",
+    "pg": "8.20.0",
+    "tar": "^7.5.15",
+    "undici": "^8.2.0",
+    "yaml": "^2.9.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/pg": "8.20.0",
+    "tsx": "4.21.0"
+  }
+}

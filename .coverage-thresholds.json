@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Coverage thresholds source of truth. apps/backend/vitest.config.ts reads this file at startup so Vitest enforces in-process; out-of-process CI tooling can enforce against the same numbers. Baseline note: the previous floor (86.25 / 80.15 / 80.03) was measured by `tsx --test --experimental-test-coverage` and overstated coverage because that tool only counted files actually loaded by tests. After the 2026-05-09 round of targeted tests (mappers, resolvers, breakers, claude/SDK helpers, RBAC, cron, response serialization, workspace artifact capture, pii-rule edge cases) the v8 measurement is 74.96/67.20/74.96 (lines/branches/functions). Thresholds set ~2 points below measurement to give the suite headroom for unrelated edits; ratchet upward as gaps close.",
+  "thresholds": {
+    "lines": 73,
+    "branches": 65,
+    "functions": 73
+  },
+  "enforcement": {
+    "command": "pnpm --filter @cogniplane/backend exec vitest run --coverage",
+    "blockPRCreation": true,
+    "blockTaskCompletion": true,
+    "description": "Out-of-process CI tooling that consumes this file should check coverage against these thresholds before allowing a task or PR to land. Vitest also enforces these thresholds in-process via apps/backend/vitest.config.ts."
+  }
+}

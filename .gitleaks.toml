@@ -1,0 +1,47 @@
+# Gitleaks configuration — extends defaults with project-specific allowlists.
+#
+# Default rules from gitleaks ship as-is; this file ONLY adds allowlists for
+# known false positives in test fixtures and documentation. Do NOT add real
+# secrets here — rotate them and remove them from history instead.
+#
+# Verify with: gitleaks detect --log-opts='--all' --no-banner
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives in test fixtures and security documentation"
+
+# AWS documentation example access keys (publicly known; not real credentials).
+# Used in apps/backend/src/services/redact-secrets.test.ts to verify the
+# redactSecrets() function correctly redacts AWS-shaped tokens.
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''ASIAIOSFODNN7EXAMPLE''',
+]
+
+# Files that are inherently full of "fake secrets" used as test inputs or
+# documentation examples. Listed by exact path; anything matching here is
+# fully exempt from gitleaks rules.
+paths = [
+  # Tests for the secret-redaction function — must contain things that LOOK
+  # like secrets so the redaction can be verified.
+  '''apps/backend/src/services/redact-secrets\.test\.ts''',
+
+  # Test fixtures that hardcode well-known test values (encryption keys for
+  # round-trip tests, signing secrets that must exceed N chars, etc.).
+  '''apps/backend/src/services/tenant-org-settings-store\.test\.ts''',
+  '''apps/backend/src/lib/mcp-proxy-signature\.test\.ts''',
+  '''apps/backend/src/services/integrations/integration-registry-service\.test\.ts''',
+  # Same file at its historical pre-refactor path, kept for history scans.
+  '''apps/backend/src/services/integration-registry-service\.test\.ts''',
+]
+
+# Stopwords that gitleaks should treat as non-secret regardless of where they
+# appear. Use these only for placeholder strings that are unambiguously fake
+# AND too widespread to enumerate with `paths`.
+stopwords = [
+  "EXAMPLE",
+  "abc123",
+  "test-secret",
+]

@@ -1,0 +1,126 @@
+# Cogniplane Core — single-host self-host stack.
+#
+# This file is intended for OSS self-hosters who want to run the full platform
+# on one machine via `docker compose up`. It boots Postgres + Redis + the
+# backend + the frontend with sensible defaults (AUTH_MODE=dev-headers,
+# RUNTIME_BACKEND=local, no E2B sandbox isolation).
+#
+# Required env vars (export before `docker compose up`, or put in a .env file):
+#   ANTHROPIC_API_KEY  — to use the Claude runtime (otherwise hidden in UI)
+#   OPENAI_API_KEY     — to use the Codex runtime (otherwise hidden in UI)
+# At least one is required for any agent turn to work.
+#
+# After bring-up:
+#   Frontend: http://localhost:3000
+#   Backend:  http://localhost:3001
+#
+# Production caveats:
+#   - dev-headers mode reads X-User-Id from the request — never expose this
+#     stack to the internet without first switching AUTH_MODE=workos.
+#   - RUNTIME_BACKEND=local executes Codex in the backend container with no
+#     sandbox isolation. Trusted internal users only. Switch to
+#     RUNTIME_BACKEND=e2b (and CLAUDE_RUNTIME_BACKEND=e2b) for real isolation.
+#   - See docs/docker-deploy.md for the full walkthrough.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: cogniplane-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:17
+    container_name: cogniplane-postgres
+    environment:
+      POSTGRES_DB: cogniplane
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cogniplane"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      # These pins are checked by the codex-release drift test
+      # (apps/backend/src/codex-release.test.ts) — bumping them requires
+      # rebuilding the E2B template too. See docs/self-hosting.md.
+      args:
+        CODEX_NPM_VERSION: 0.130.0
+    container_name: cogniplane-backend
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    volumes:
+      - runtime-workspaces:/runtime-workspaces
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 3001
+      API_ORIGIN: http://localhost:3000
+      AUTH_MODE: dev-headers
+      DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
+      MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/cogniplane
+      APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
+      LOCAL_DEV_USER_ID: local-dev-user
+      CODEX_VERSION: 0.130.0
+      RUNTIME_BACKEND: local
+      CLAUDE_RUNTIME_BACKEND: local
+      RUNTIME_WORKSPACE_ROOT: /runtime-workspaces
+      REDIS_URL: redis://redis:6379
+      # Provider keys are optional but the backend's Zod schema rejects
+      # empty strings. Use `${VAR:?}` to fail fast if explicitly set empty,
+      # or omit. Compose forwards these from the host env / .env file when
+      # they are non-empty; when unset they're not added to the container.
+      ANTHROPIC_API_KEY:
+      OPENAI_API_KEY:
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are baked at build time. The defaults work for
+        # local docker-compose on the same host. To deploy under a different
+        # hostname, override these args (and rebuild) and set API_ORIGIN on
+        # the backend to match.
+        NEXT_PUBLIC_API_URL: http://localhost:3001
+        NEXT_PUBLIC_DEV_USER_ID: local-dev-user
+        NEXT_PUBLIC_DEV_TENANT_ID: local-dev-tenant
+    container_name: cogniplane-frontend
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  redis-data:
+  postgres-data:
+  runtime-workspaces:

@@ -1,0 +1,11 @@
+{
+  // Internal monorepo package. Dev consumers (tsx, Next.js) read TS source via
+  // tsconfig path mapping; production `node dist/server.js` reads the compiled
+  // JS that this build emits to `./dist`.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,57 @@
+name: CI
+
+# Lint, typecheck, and unit tests for every PR and every push to main.
+# License compatibility is gated separately by license-check.yml.
+# CLA signing is gated separately by cla.yml.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      # shared-types and frontend: full type check.
+      # backend: --noCheck (parse + import resolution only) — full type checking
+      # requires more RAM than free GitHub runners provide; the private CI is the
+      # authoritative type-safety gate for the backend.
+      - name: Typecheck (shared-types + frontend)
+        run: pnpm --filter @cogniplane/shared-types --filter @cogniplane/frontend --workspace-concurrency=1 typecheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Typecheck (backend — imports + syntax)
+        run: pnpm --filter @cogniplane/backend exec tsc -p tsconfig.json --noEmit --noCheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=2048
+
+      - name: Tests
+        run: pnpm test:all

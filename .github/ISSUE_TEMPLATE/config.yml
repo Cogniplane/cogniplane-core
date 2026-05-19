@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Cogniplane/cogniplane-core/security/advisories/new
+    about: Report security issues privately. Do NOT open a public issue. See SECURITY.md.
+  - name: Commercial licensing
+    url: mailto:licensing@cogniplane.ai
+    about: Questions about the dual-license offer or commercial use. See COMMERCIAL.md.
+  - name: General questions
+    url: https://github.com/Cogniplane/cogniplane-core/discussions
+    about: Use GitHub Discussions for usage questions and design discussion.

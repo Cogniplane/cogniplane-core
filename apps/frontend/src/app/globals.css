@@ -1,0 +1,183 @@
+/* ============================================================
+   EDITORIAL INTELLIGENCE — Design Token System
+   Tokens live in @theme so Tailwind v4 generates utility classes
+   (bg-surface, text-on-surface, rounded-lg, …). Dark mode swaps
+   the underlying --color-* values via [data-theme="dark"]; the
+   @custom-variant maps Tailwind's `dark:` modifier to that
+   selector for components that need explicit overrides.
+   ============================================================ */
+
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme {
+  --color-background:              #f7f9fb;
+  --color-surface:                 #f7f9fb;
+  --color-surface-container-low:   #f0f4f7;
+  --color-surface-container:       #e8eff3;
+  --color-surface-container-high:  #e1e9ee;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-bright:          #ffffff;
+
+  --color-primary:                 #0f172a;
+  --color-primary-mid:             #565e74;
+  --color-on-primary:               #f7f7ff;
+  --color-primary-container:       #dae2fd;
+  --color-on-primary-container:    #4a5167;
+
+  --color-secondary:               #506076;
+  --color-secondary-container:     #d3e4fe;
+  --color-on-secondary-container:  #435368;
+
+  --color-on-surface:              #2a3439;
+  --color-on-surface-variant:      #566166;
+  --color-on-surface-faint:        #8a9ba8;
+
+  --color-outline-variant:         rgba(169, 180, 185, 0.15);
+  --color-outline:                 #717c82;
+
+  --color-success:                 #1a7a4a;
+  --color-success-surface:         rgba(26, 122, 74, 0.1);
+  --color-danger:                  #9f403d;
+  --color-danger-surface:          rgba(159, 64, 61, 0.1);
+  --color-warning:                 #7a5c00;
+  --color-warning-surface:         rgba(255, 207, 112, 0.18);
+
+  --color-accent:                  #d6dfe5;
+  --color-accent-soft:             rgba(61, 90, 153, 0.1);
+
+  /* Brand-blue text/pill color. Distinct from --color-accent, which is
+     reserved for shadcn's hover-surface semantics (Menu/Select/Dropdown).
+     Use text-info / bg-info-surface for "info" pills, "blue" status, and
+     non-hover brand-blue text. */
+  --color-info:                    #3d5a99;
+  --color-info-surface:            rgba(61, 90, 153, 0.1);
+
+  /* shadcn/ui token aliases — let the generated primitives reference
+     names like `bg-primary-foreground`, `bg-destructive`, etc. without
+     us hand-editing every CVA variant. Map them to our editorial tokens. */
+  --color-foreground:              #2a3439;
+  --color-muted:                   #e8eff3;
+  --color-muted-foreground:        #566166;
+  --color-card:                    #ffffff;
+  --color-card-foreground:         #2a3439;
+  --color-popover:                 #ffffff;
+  --color-popover-foreground:      #2a3439;
+  --color-primary-foreground:      #f7f7ff;
+  --color-secondary-foreground:    #435368;
+  --color-accent-foreground:       #2a3439;
+  --color-destructive:             #9f403d;
+  --color-destructive-foreground:  #ffffff;
+  --color-border:                  rgba(169, 180, 185, 0.15);
+  --color-input:                   rgba(169, 180, 185, 0.15);
+  --color-ring:                    #3d5a99;
+
+  --shadow-sm: 0 2px 8px rgba(42, 52, 57, 0.06);
+  --shadow-md: 0 4px 24px rgba(42, 52, 57, 0.08);
+  --shadow-lg: 0 8px 40px rgba(42, 52, 57, 0.10);
+
+  --radius-sm:   0.25rem;
+  --radius-md:   0.5rem;
+  --radius-lg:   0.75rem;
+  --radius-xl:   1rem;
+  --radius-full: 9999px;
+}
+
+[data-theme="dark"] {
+  --color-background:              #10141b;
+  --color-surface:                 #151b23;
+  --color-surface-container-low:   #1a212b;
+  --color-surface-container:       #24303c;
+  --color-surface-container-high:  #2d3946;
+  --color-surface-container-lowest: #202834;
+  --color-surface-bright:          #364252;
+
+  --color-primary:                 #e6edf6;
+  --color-primary-mid:             #b6c3d3;
+  --color-on-primary:              #0f141b;
+  --color-primary-container:       #334356;
+  --color-on-primary-container:    #f1f5fb;
+
+  --color-secondary:               #9aa9bb;
+  --color-secondary-container:     #2a3644;
+  --color-on-secondary-container:  #d7e0ea;
+
+  --color-on-surface:              #e2e9f3;
+  --color-on-surface-variant:      #b1bccb;
+  --color-on-surface-faint:        #8996a8;
+
+  --color-outline-variant:         rgba(177, 188, 203, 0.16);
+  --color-outline:                 #627186;
+
+  --color-success:                 #61d48c;
+  --color-success-surface:         rgba(97, 212, 140, 0.14);
+  --color-danger:                  #ff8f87;
+  --color-danger-surface:          rgba(255, 143, 135, 0.12);
+  --color-warning:                 #f1c86a;
+  --color-warning-surface:         rgba(241, 200, 106, 0.16);
+
+  --color-accent:                  #2d3946;
+  --color-accent-soft:             rgba(140, 184, 255, 0.16);
+
+  --color-info:                    #8cb8ff;
+  --color-info-surface:            rgba(140, 184, 255, 0.16);
+
+  /* shadcn dark-mode aliases */
+  --color-foreground:              #e2e9f3;
+  --color-muted:                   #24303c;
+  --color-muted-foreground:        #b1bccb;
+  --color-card:                    #1a212b;
+  --color-card-foreground:         #e2e9f3;
+  --color-popover:                 #1a212b;
+  --color-popover-foreground:      #e2e9f3;
+  --color-primary-foreground:      #0f141b;
+  --color-secondary-foreground:    #d7e0ea;
+  --color-accent-foreground:       #e2e9f3;
+  --color-destructive:             #ff8f87;
+  --color-destructive-foreground:  #0f141b;
+  --color-border:                  rgba(177, 188, 203, 0.16);
+  --color-input:                   rgba(177, 188, 203, 0.16);
+  --color-ring:                    #8cb8ff;
+
+  --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.16);
+  --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.24);
+}
+
+/* ============================================================
+   BASE RESET
+   ============================================================ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--color-on-surface);
+  background: var(--color-background);
+  font-family: var(--font-body), "Inter", "Segoe UI", sans-serif;
+  font-size: 1rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-headline), "Manrope", sans-serif;
+  letter-spacing: -0.02em;
+}
+
+a {
+  color: inherit;
+}
+
+textarea, input, select {
+  font: inherit;
+  color: inherit;
+}

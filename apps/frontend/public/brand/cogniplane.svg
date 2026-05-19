@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title desc">
+  <title id="title">Cogniplane Safe Terminal logo</title>
+  <desc id="desc">An open teal terminal frame with glowing blue bracket and caret glyphs on a transparent background.</desc>
+
+  <defs>
+    <linearGradient id="frame-gradient" x1="28" y1="28" x2="164" y2="164" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2c9ba0" />
+      <stop offset="1" stop-color="#358f91" />
+    </linearGradient>
+
+    <linearGradient id="terminal-gradient" x1="61" y1="64" x2="134" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f8fbff" />
+      <stop offset="0.44" stop-color="#a9ccff" />
+      <stop offset="1" stop-color="#6da4ff" />
+    </linearGradient>
+
+    <filter id="terminal-glow" x="-55%" y="-55%" width="210%" height="210%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="blur" />
+      <feColorMatrix
+        in="blur"
+        result="blue-glow"
+        type="matrix"
+        values="0 0 0 0 0.19
+                0 0 0 0 0.43
+                0 0 0 0 1
+                0 0 0 0.85 0"
+      />
+      <feMerge>
+        <feMergeNode in="blue-glow" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <path
+    d="M 30 30 H 88 V 52 H 52 V 140 H 140 V 52 H 116 V 30 H 162 V 162 H 30 Z"
+    fill="url(#frame-gradient)"
+  />
+  <g filter="url(#terminal-glow)">
+    <path d="M 61 64 H 84 V 77 H 74 V 115 H 84 V 128 H 61 Z" fill="url(#terminal-gradient)" stroke="#5f9dff" stroke-width="1.5" />
+    <rect x="96" y="115" width="38" height="13" fill="url(#terminal-gradient)" stroke="#5f9dff" stroke-width="1.5" />
+  </g>
+</svg>

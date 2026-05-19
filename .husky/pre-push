@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Husky pre-push hook — fast local sanity check.
+#
+# Only lint runs here. Typecheck and the backend test suite + coverage
+# live in .github/workflows/ci.yml so we don't block pushes on minute-long
+# checks. ESLint over the workspace is fast enough (~10s) to catch the
+# obviously-broken stuff before it lands on a remote branch.
+#
+# To skip this hook for a single push: `git push --no-verify`.
+# To disable globally: `git config core.hooksPath /dev/null` (not recommended).
+set -e
+
+echo "▶ Pre-push: lint"
+if command -v pnpm &>/dev/null; then
+  pnpm lint
+else
+  npm run lint
+fi
+echo "▶ Pre-push checks passed."

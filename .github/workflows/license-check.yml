@@ -1,0 +1,44 @@
+name: License Check
+
+# The dual-license model (AGPL-3.0 + commercial) only holds when every
+# transitive production dependency is AGPL-compatible. This workflow gates
+# every PR and every push to main on `pnpm license:check`.
+#
+# Implementation: see scripts/license-check.ts (sources data from
+# `pnpm licenses list --prod --json`; pnpm's content-addressed node_modules
+# layout breaks license-checker / license-checker-rseidelsohn).
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  license-check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run license check
+        run: pnpm license:check

@@ -1,0 +1,185 @@
+# Agent operating guide
+
+This file describes your sandbox, the tools available to you, and the rules
+you must follow. Read it before starting any task.
+
+## Sandbox constraints
+
+- **Sandbox mode:** `{{sandboxMode}}` — writes are confined to this workspace
+- **Network mode:** `{{networkMode}}` — outbound network access is restricted
+- **Shell commands:** {{shellCommandsNote}}
+- **Approval policy:** `{{approvalPolicy}}`
+{{shellApprovalWarning}}
+
+## Workspace layout
+
+Your working directory is the root of this workspace. All file operations
+must stay inside it. The following paths are framework-managed — do not
+modify or delete them:
+
+| Path | Purpose |
+|------|---------|
+| `codex.toml` | MCP server configuration (auto-generated) |
+| `.codex/skills/` | Skill definitions loaded at startup |
+| `.framework/runtime-manifest.json` | Session metadata snapshot |
+| `artifacts/` | Session artifacts synced from user uploads (read-only) |
+| `AGENTS.md` | This file |
+
+Write any files you produce directly in the workspace root or in
+subdirectories you create. Prefer descriptive names.
+
+## Available runtimes and tools
+
+The following are pre-installed in the sandbox and available for use:
+
+| Tool | Command | Notes |
+|------|---------|-------|
+| Node.js 24 | `node` | JavaScript/TypeScript runtime |
+| npm / pnpm | `npm`, `pnpm` | Node package managers |
+| Bun | `bun`, `bunx` | Fast JS/TS runtime — runs `.ts` files directly |
+| Python 3 | `python`, `python3` | Aliased to the same binary |
+| uv | `uv`, `uvx` | Fast Python package/project manager (preferred over pip) |
+| pip | `pip3` | Python package installer |
+| Python venv | `python3 -m venv` | Isolated Python environments |
+| SQLite | `sqlite3` | Serverless SQL database |
+| Bash | `bash` | Default shell for scripts |
+| make | `make` | Build tool / task runner |
+| Git | `git` | Version control |
+| GitHub CLI | `gh` | Interact with GitHub repos, PRs, issues |
+| jq | `jq` | JSON processor |
+| ripgrep | `rg` | Fast file content search |
+| curl | `curl` | HTTP client |
+| wget | `wget` | File downloader |
+| unzip | `unzip` | Archive extraction |
+| tar | `tar` | Archive extraction |
+
+**Not pre-installed:** `php`, `ruby`, `go`, `java`, `aws`, `az`, `gcloud` — see below for how to install them on demand.
+
+## Installing additional tools
+
+The sandbox runs as a non-root user so `apt` is not available. Use the
+following user-space methods instead.
+
+> **Important:** installed tools are stored in the home directory, which is
+> reset between runtime sessions. If the runtime restarts mid-conversation,
+> reinstall any tools your task depends on before continuing.
+
+### Python packages
+
+Prefer `uv` — it is faster and manages its own isolated environments:
+
+```bash
+# run a script with auto-installed dependencies (no setup needed):
+uv run --with <package> script.py
+
+# create a project venv and add dependencies:
+uv init && uv add <package> && uv run script.py
+
+# one-off tool execution without installing globally:
+uvx <tool>   # e.g. uvx ruff check .
+```
+
+Fall back to `pip3` only if a package is not compatible with `uv`:
+
+```bash
+pip3 install --user <package>
+```
+
+### TypeScript / JavaScript
+
+Prefer `bun` for running TypeScript directly without a compile step:
+
+```bash
+bun run script.ts
+bun add <package>        # installs into local node_modules
+bunx <package>           # one-off execution
+```
+
+Use `node` / `npm` / `pnpm` when a project's tooling requires it.
+
+### Node packages
+
+```bash
+# local to the workspace (preferred):
+npm install <package>
+# global to the user:
+npm install -g --prefix ~/.npm-global <package>
+export PATH="$HOME/.npm-global/bin:$PATH"
+```
+
+### AWS CLI
+
+```bash
+ARCH=$(uname -m)
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --install-dir ~/aws-cli --bin-dir ~/bin
+aws --version
+```
+
+### Azure CLI
+
+```bash
+uv tool install azure-cli
+az --version
+```
+
+Note: this installs ~180 packages and takes 1–2 minutes even with `uv`.
+
+### Google Cloud CLI (gcloud)
+
+```bash
+ARCH=$(uname -m); [ "$ARCH" = "aarch64" ] && ARCH="arm"
+curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-${ARCH}.tar.gz" \
+  | tar -xz -C ~/
+~/google-cloud-sdk/install.sh --quiet --path-update false
+export PATH="$HOME/google-cloud-sdk/bin:$PATH"
+gcloud --version
+```
+
+### Self-contained binaries (kubectl, terraform, etc.)
+
+```bash
+curl -fsSL <download-url> -o ~/bin/<tool> && chmod +x ~/bin/<tool>
+```
+
+`~/bin` is already on PATH. No `export` needed.
+
+## Available MCP tools
+
+{{mcpServersSection}}
+
+## Active skills
+
+{{skillsSection}}
+
+{{artifactRule}}
+## Behaviour guidelines
+
+- Do not narrate your step-by-step investigation, tool checks, or internal
+  reasoning to the user. Think privately and reply only with the answer, or a
+  short explanation of the blocker and the next useful action.
+- Produce output files in the workspace. Use the framework artifact tools
+  (if enabled) to surface them to the user rather than printing large
+  content inline.
+- When the user references an uploaded file, check the `artifacts/` directory
+  first. Session uploads are synced there automatically and can be read
+  directly (PDFs, images, CSVs, etc.). Do not re-download or re-fetch them.
+- When a user asks about data in an external system such as SharePoint,
+  OneDrive, GitHub, or another MCP-backed source, use the relevant MCP tools
+  when available. Do not search the local workspace as a substitute for those
+  external systems.
+- For exact file requests in SharePoint or OneDrive, prefer listing the
+  relevant folder first and matching by filename. If the user says the file is
+  in OneDrive root, list the OneDrive root before falling back to search.
+- Do not use `list_mcp_resources` or `list_mcp_resource_templates` to inspect
+  the session servers declared in `codex.toml`. Those helpers do not describe
+  the managed tools available through this runtime. Read `AGENTS.md` and call
+  the documented tools directly.
+- If a task requires a capability not listed above, tell the user clearly
+  instead of attempting workarounds.
+- Do not read or write outside the workspace directory.
+- Do not attempt to contact external services unless a skill explicitly
+  instructs you to use a configured MCP tool for that purpose.
+
+_Generated for session `{{sessionId}}`_

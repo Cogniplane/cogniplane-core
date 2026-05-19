@@ -1,0 +1,201 @@
+import { test, expect } from "vitest";
+
+import type { Pool } from "../../lib/db.js";
+
+import { PiiScanRunStore } from "./pii-scan-run-store.js";
+
+class CaptureDatabase {
+  lastQuery: { text: string; values: unknown[] } | null = null;
+  insertReturn: Record<string, unknown> | null = null;
+  updateReturn: Record<string, unknown> | null = null;
+  selectReturn: Record<string, unknown>[] = [];
+
+  async connect() {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    return {
+      async query(text: string, values: unknown[] = []) {
+        return self._query(text, values);
+      },
+      async release() {}
+    };
+  }
+
+  _query(text: string, values: unknown[] = []) {
+    if (
+      text === "BEGIN" ||
+      text === "COMMIT" ||
+      text === "ROLLBACK" ||
+      text.startsWith("SELECT set_config")
+    ) {
+      return { rows: [], rowCount: 0 };
+    }
+    this.lastQuery = { text, values };
+    if (text.trim().startsWith("INSERT INTO pii_scan_runs")) {
+      return { rows: this.insertReturn ? [this.insertReturn] : [], rowCount: 1 };
+    }
+    if (text.trim().startsWith("UPDATE pii_scan_runs")) {
+      return { rows: this.updateReturn ? [this.updateReturn] : [], rowCount: this.updateReturn ? 1 : 0 };
+    }
+    if (text.trim().startsWith("SELECT")) {
+      return { rows: this.selectReturn, rowCount: this.selectReturn.length };
+    }
+    throw new Error(`Unexpected query: ${text}`);
+  }
+
+  async query(text: string, values: unknown[] = []) {
+    return this._query(text, values);
+  }
+}
+
+function sampleRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const now = new Date().toISOString();
+  return {
+    tenant_id: "tenant-1",
+    scan_run_id: "scan-1",
+    subject_type: "message",
+    subject_id: "msg-1",
+    source_session_id: "session-1",
+    source_user_id: "user-1",
+    mode: "block",
+    provider_type: "openrouter",
+    provider_model: "google/gemini-2.5-flash",
+    status: "pending",
+    findings_json: [],
+    summary_text: null,
+    action_taken: null,
+    error_message: null,
+    created_at: now,
+    updated_at: now,
+    completed_at: null,
+    ...overrides
+  };
+}
+
+test("PiiScanRunStore.create inserts with defaults and returns mapped record", async () => {
+  const db = new CaptureDatabase();
+  db.insertReturn = sampleRow();
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const record = await store.create({
+    tenantId: "tenant-1",
+    scanRunId: "scan-1",
+    subjectType: "message",
+    subjectId: "msg-1",
+    sourceSessionId: "session-1",
+    sourceUserId: "user-1",
+    mode: "block",
+    providerType: "openrouter",
+    providerModel: "google/gemini-2.5-flash"
+  });
+
+  expect(db.lastQuery).toBeTruthy();
+  expect(db.lastQuery.text.includes("INSERT INTO pii_scan_runs")).toBeTruthy();
+  expect(db.lastQuery.values[0]).toBe("tenant-1");
+  expect(db.lastQuery.values[1]).toBe("scan-1");
+  expect(db.lastQuery.values[2]).toBe("message");
+  expect(db.lastQuery.values[9]).toBe("pending");
+  expect(db.lastQuery.values[10]).toBe("[]");
+  expect(record.scanRunId).toBe("scan-1");
+  expect(record.status).toBe("pending");
+  expect(record.findings).toEqual([]);
+});
+
+test("PiiScanRunStore.create serializes findings_json", async () => {
+  const db = new CaptureDatabase();
+  db.insertReturn = sampleRow({
+    status: "completed",
+    findings_json: [
+      { entityType: "email", value: "x@y.com", start: 0, end: 7, confidence: "high" }
+    ]
+  });
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  await store.create({
+    tenantId: "tenant-1",
+    subjectType: "message",
+    subjectId: "msg-1",
+    mode: "detect",
+    status: "completed",
+    findings: [
+      { entityType: "email", value: "x@y.com", start: 0, end: 7, confidence: "high" }
+    ]
+  });
+
+  expect(db.lastQuery).toBeTruthy();
+  const findingsParam = db.lastQuery.values[10];
+  const parsed = JSON.parse(String(findingsParam));
+  expect(parsed.length).toBe(1);
+  expect(parsed[0].entityType).toBe("email");
+});
+
+test("PiiScanRunStore.update builds patch SQL with only provided fields", async () => {
+  const db = new CaptureDatabase();
+  db.updateReturn = sampleRow({ status: "completed", summary_text: "ok", action_taken: "report" });
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const updated = await store.update("tenant-1", "scan-1", {
+    status: "completed",
+    summaryText: "ok",
+    actionTaken: "report",
+    completedAt: new Date("2026-04-17T00:00:00Z")
+  });
+
+  expect(db.lastQuery).toBeTruthy();
+  expect(db.lastQuery.text.includes("UPDATE pii_scan_runs")).toBeTruthy();
+  expect(db.lastQuery.text.includes("status = $1")).toBeTruthy();
+  expect(db.lastQuery.text.includes("summary_text = $2")).toBeTruthy();
+  expect(db.lastQuery.text.includes("action_taken = $3")).toBeTruthy();
+  expect(db.lastQuery.text.includes("completed_at = $4")).toBeTruthy();
+  expect(db.lastQuery.text.includes("updated_at = NOW()")).toBeTruthy();
+  expect(db.lastQuery.values[0]).toBe("completed");
+  expect(db.lastQuery.values[1]).toBe("ok");
+  expect(db.lastQuery.values[4]).toBe("tenant-1");
+  expect(db.lastQuery.values[5]).toBe("scan-1");
+  expect(updated).toBeTruthy();
+  expect(updated?.status).toBe("completed");
+});
+
+test("PiiScanRunStore.update returns null when row missing", async () => {
+  const db = new CaptureDatabase();
+  db.updateReturn = null;
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const updated = await store.update("tenant-1", "missing", { status: "failed" });
+  expect(updated).toBe(null);
+});
+
+test("PiiScanRunStore.getById returns mapped record", async () => {
+  const db = new CaptureDatabase();
+  db.selectReturn = [sampleRow({ status: "completed" })];
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const record = await store.getById("tenant-1", "scan-1");
+  expect(record).toBeTruthy();
+  expect(record?.scanRunId).toBe("scan-1");
+  expect(record?.status).toBe("completed");
+});
+
+test("PiiScanRunStore.listForSubject queries by subject tuple", async () => {
+  const db = new CaptureDatabase();
+  db.selectReturn = [sampleRow(), sampleRow({ scan_run_id: "scan-2" })];
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const rows = await store.listForSubject("tenant-1", "message", "msg-1", 10);
+
+  expect(db.lastQuery).toBeTruthy();
+  expect(db.lastQuery.text.includes("FROM pii_scan_runs")).toBeTruthy();
+  expect(db.lastQuery.values[0]).toBe("tenant-1");
+  expect(db.lastQuery.values[1]).toBe("message");
+  expect(db.lastQuery.values[2]).toBe("msg-1");
+  expect(db.lastQuery.values[3]).toBe(10);
+  expect(rows.length).toBe(2);
+});
+
+test("mapRow preserves canonical action_taken values", async () => {
+  const db = new CaptureDatabase();
+  db.selectReturn = [sampleRow({ action_taken: "report" })];
+  const store = new PiiScanRunStore(db as unknown as Pool);
+  const record = await store.getById("tenant-1", "scan-1");
+  expect(record?.actionTaken).toBe("report");
+});
