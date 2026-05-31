@@ -40,25 +40,9 @@ import {
   SKILL_FILE_PREVIEW_LIMIT_BYTES,
   readSkillRevisionFile
 } from "../../services/skills/skill-revision-file-reader.js";
-import {
-  launchSkillImprovementSession,
-  type SkillImprovementLauncherDeps,
-  SkillImprovementRuntimeNotAllowedError,
-  SkillImprovementSkillNotEditableError,
-  SkillImprovementSkillNotFoundError
-} from "../../services/skills/skill-improvement-launcher.js";
-import type { SkillImprovementSessionStore } from "../../services/skills/skill-improvement-session-store.js";
-
 const skillIdParamsSchema = z.object({ skillId: adminIdSchema });
 const skillRevisionFileQuerySchema = z.object({
   path: z.string().min(1).max(1024)
-});
-
-const launchImprovementBodySchema = z.object({
-  sessionCount: z.number().int().min(0).max(200).optional(),
-  provider: z.enum(["codex", "claude-code"]).nullable().optional(),
-  model: z.string().min(1).max(200).nullable().optional(),
-  effort: z.string().min(1).max(50).nullable().optional()
 });
 
 function respondSkillConfigError(reply: FastifyReply, error: unknown, fallback: string) {
@@ -82,10 +66,6 @@ export async function registerAdminSkillRoutes(
     tenantSettings?: {
       getMarketplaceManifestUrl(tenantId: string): Promise<string | null>;
     };
-    // Optional so existing tests that don't exercise the improver path keep
-    // compiling. The route returns 503 when absent.
-    skillImprovementLauncher?: SkillImprovementLauncherDeps;
-    skillImprovementSessions?: SkillImprovementSessionStore;
     // Optional: when present, the skill list is decorated with adoption
     // counts (last 30 days) per skill. Failures are swallowed — counts are
     // decorative. Tests that don't supply it just get skills with no counts.
@@ -461,95 +441,4 @@ export async function registerAdminSkillRoutes(
     }
   }));
 
-  app.post("/admin/skills/:skillId/improve", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
-    if (!paramsResult.ok) return paramsResult.response;
-
-    const bodyResult = parseAdminBody(reply, launchImprovementBodySchema, request.body ?? {});
-    if (!bodyResult.ok) return bodyResult.response;
-
-    if (!stores.skillImprovementLauncher) {
-      reply.code(503);
-      return apiError(
-        "skill_improvement_unavailable",
-        "Skill improvement is not configured for this deployment."
-      );
-    }
-
-    try {
-      const result = await launchSkillImprovementSession(stores.skillImprovementLauncher, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        skillId: paramsResult.value.skillId,
-        sessionLimit: bodyResult.value.sessionCount ?? 50,
-        provider: bodyResult.value.provider ?? null,
-        model: bodyResult.value.model ?? null,
-        effort: bodyResult.value.effort ?? null
-      });
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.skill.improvement_launched",
-        payload: {
-          skillId: paramsResult.value.skillId,
-          sessionId: result.sessionId,
-          artifactId: result.artifactId,
-          includedSessionCount: result.includedSessionCount,
-          excludedSessionCount: result.excludedSessionCount,
-          truncatedToolResultCount: result.truncatedToolResultCount,
-          sessionLimit: bodyResult.value.sessionCount ?? 50,
-          provider: bodyResult.value.provider ?? null,
-          model: bodyResult.value.model ?? null,
-          effort: bodyResult.value.effort ?? null
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
-
-      reply.code(201);
-      return {
-        sessionId: result.sessionId,
-        artifactId: result.artifactId,
-        includedSessionCount: result.includedSessionCount,
-        excludedSessionCount: result.excludedSessionCount,
-        truncatedToolResultCount: result.truncatedToolResultCount
-      };
-    } catch (error) {
-      if (error instanceof SkillImprovementSkillNotFoundError) {
-        return respondAdminNotFound(reply, "skill_not_found");
-      }
-      if (error instanceof SkillImprovementSkillNotEditableError) {
-        reply.code(400);
-        return apiError("skill_not_editable", getErrorMessage(error, "Skill cannot be improved."));
-      }
-      if (error instanceof SkillImprovementRuntimeNotAllowedError) {
-        reply.code(400);
-        return apiError(
-          "skill_improvement_runtime_not_allowed",
-          getErrorMessage(error, "Requested runtime selection is not allowed for this tenant.")
-        );
-      }
-      return respondSkillConfigError(reply, error, "Skill improvement launch failed.");
-    }
-  }));
-
-  app.get(
-    "/admin/skills/:skillId/improvement-sessions",
-    withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
-      if (!paramsResult.ok) return paramsResult.response;
-
-      const store = stores.skillImprovementSessions;
-      if (!store) {
-        return { sessions: [] };
-      }
-
-      const sessions = await store.listForSkill(
-        request.auth.tenantId,
-        paramsResult.value.skillId
-      );
-      return { sessions };
-    })
-  );
 }

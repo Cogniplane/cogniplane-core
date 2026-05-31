@@ -1,13 +1,10 @@
 import { describe, expect, test } from "vitest";
 
 import {
-  computeBarLayout,
-  computeYTicks,
   fmtAxisShort,
   fmtCost,
   fmtTokens,
-  formatBarLabel,
-  shouldShowBarLabel
+  formatBarLabel
 } from "./token-usage-chart-primitives.logic";
 
 describe("fmtTokens", () => {
@@ -66,48 +63,5 @@ describe("formatBarLabel", () => {
   test("invalid month falls through to truncation path", () => {
     // 10-char input → 8-char tail (drops year prefix).
     expect(formatBarLabel("2026-13-01")).toBe("26-13-01");
-  });
-});
-
-describe("computeYTicks", () => {
-  test("emits 5 ticks at 25% steps", () => {
-    expect(computeYTicks(100)).toEqual([0, 25, 50, 75, 100]);
-  });
-
-  test("forces yMax>=1 to keep axis valid for empty series", () => {
-    expect(computeYTicks(0)).toEqual([0, 0, 1, 1, 1]);
-  });
-});
-
-describe("computeBarLayout", () => {
-  test("splits chart width across groups", () => {
-    const layout = computeBarLayout(600, 4);
-    expect(layout.barGroupW).toBe(150);
-    expect(layout.barW).toBe(150 * 0.35);
-    expect(layout.gap).toBeGreaterThanOrEqual(2);
-  });
-
-  test("clamps to small minimums on tiny inputs", () => {
-    const layout = computeBarLayout(10, 50);
-    expect(layout.barW).toBeGreaterThanOrEqual(3);
-    expect(layout.gap).toBeGreaterThanOrEqual(2);
-  });
-
-  test("zero buckets returns the full chart width", () => {
-    const layout = computeBarLayout(600, 0);
-    expect(layout.barGroupW).toBe(600);
-  });
-});
-
-describe("shouldShowBarLabel", () => {
-  test("short series shows every label", () => {
-    expect(shouldShowBarLabel(7, 8)).toBe(true);
-  });
-
-  test("long series strides labels", () => {
-    // 30 buckets → stride 3 → indexes 0,3,6,... show
-    expect(shouldShowBarLabel(0, 30)).toBe(true);
-    expect(shouldShowBarLabel(1, 30)).toBe(false);
-    expect(shouldShowBarLabel(3, 30)).toBe(true);
   });
 });

@@ -282,6 +282,34 @@ test("transformText falls back to original input text when transformedText is mi
   expect(result.transformedText).toBe("leave me alone");
 });
 
+test("transformText throws when transformedText is missing but findings are present", async () => {
+  // The model reported PII but gave us no redacted text. Falling back to the
+  // raw input would forward unredacted PII while claiming a transform — instead
+  // we fail so the service fails closed.
+  const fetchImpl = buildFakeFetch({
+    responsePayload: {
+      choices: [
+        {
+          message: {
+            content: JSON.stringify({
+              // no transformedText returned
+              findings: [
+                { entityType: "email", value: "a@b.co", start: 0, end: 6, confidence: "high" }
+              ]
+            })
+          }
+        }
+      ]
+    }
+  });
+  const provider = buildProvider(fetchImpl);
+  const error = await provider
+    .transformText({ text: "a@b.co", entityTypes: ["email"] })
+    .catch((e: unknown) => e);
+  expect(error instanceof OpenRouterPiiProviderError).toBeTruthy();
+  expect((error as OpenRouterPiiProviderError).code).toBe("transform_missing_output");
+});
+
 test("transformText honors per-call model override", async () => {
   const captured: CapturedRequest[] = [];
   const fetchImpl = buildFakeFetch({

@@ -140,8 +140,8 @@ test("resolveSessionToolIds returns reads + writes when both enabled", async () 
 
   const ids = await service.resolveSessionToolIds("tenant-1", "user-1");
   expect(ids.length).toBe(6);
-  expect(ids.includes("notion_search")).toBeTruthy();
-  expect(ids.includes("notion_create_page")).toBeTruthy();
+  expect(ids.includes("notion_search")).toBe(true);
+  expect(ids.includes("notion_create_page")).toBe(true);
 });
 
 test("resolveSessionToolIds skips integrations without a user connection", async () => {
@@ -175,8 +175,8 @@ test("resolveSessionToolIds combines multiple integrations and deduplicates", as
   const service = new IntegrationRegistryService(buildConfig(), store, probes);
 
   const ids = await service.resolveSessionToolIds("tenant-1", "user-1");
-  expect(ids.includes("notion_search")).toBeTruthy();
-  expect(ids.includes("github_write_file")).toBeTruthy();
+  expect(ids.includes("notion_search")).toBe(true);
+  expect(ids.includes("github_write_file")).toBe(true);
   // No duplicates.
   expect(new Set(ids).size).toBe(ids.length);
 });
@@ -218,7 +218,7 @@ test("getIntegrationsForAdmin reports platform unconfigured when env vars are mi
   const views = await service.getIntegrationsForAdmin("tenant-1");
   const notion = views.find((v) => v.id === "notion")!;
   expect(notion.platformConfigured).toBe(false);
-  expect(notion.platformConfigMessage?.includes("NOTION_OAUTH_CLIENT_ID")).toBeTruthy();
+  expect(notion.platformConfigMessage?.includes("NOTION_OAUTH_CLIENT_ID")).toBe(true);
 });
 
 test("getIntegrationsForAdmin hasConfig is true only when all required fields are present for oauth_app", async () => {
@@ -325,9 +325,9 @@ test("resolveSessionToolIds with sharepoint reads-only excludes sharepoint_impor
   const service = new IntegrationRegistryService(buildConfig(), store, probes);
 
   const ids = await service.resolveSessionToolIds("tenant-1", "user-1");
-  expect(ids.includes("sharepoint_search")).toBeTruthy();
-  expect(!ids.includes("sharepoint_import_file_to_session")).toBeTruthy();
-  expect(!ids.includes("sharepoint_upload_file")).toBeTruthy();
+  expect(ids.includes("sharepoint_search")).toBe(true);
+  expect(ids.includes("sharepoint_import_file_to_session")).toBe(false);
+  expect(ids.includes("sharepoint_upload_file")).toBe(false);
 });
 
 test("resolveSessionToolIds with sharepoint writes enabled includes sharepoint_import_file_to_session", async () => {
@@ -342,6 +342,6 @@ test("resolveSessionToolIds with sharepoint writes enabled includes sharepoint_i
   const service = new IntegrationRegistryService(buildConfig(), store, probes);
 
   const ids = await service.resolveSessionToolIds("tenant-1", "user-1");
-  expect(ids.includes("sharepoint_import_file_to_session")).toBeTruthy();
-  expect(ids.includes("sharepoint_upload_file")).toBeTruthy();
+  expect(ids.includes("sharepoint_import_file_to_session")).toBe(true);
+  expect(ids.includes("sharepoint_upload_file")).toBe(true);
 });

@@ -8,6 +8,16 @@
     "threadId"
   ],
   "properties": {
+    "additionalContext": {
+      "description": "Optional client-provided context fragments keyed by an opaque source identifier.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/definitions/AdditionalContextEntry"
+      }
+    },
     "expectedTurnId": {
       "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
       "type": "string"
@@ -33,6 +43,28 @@
     }
   },
   "definitions": {
+    "AdditionalContextEntry": {
+      "type": "object",
+      "required": [
+        "kind",
+        "value"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/AdditionalContextKind"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "AdditionalContextKind": {
+      "type": "string",
+      "enum": [
+        "untrusted",
+        "application"
+      ]
+    },
     "ByteRange": {
       "type": "object",
       "required": [
@@ -51,6 +83,15 @@
           "minimum": 0.0
         }
       }
+    },
+    "ImageDetail": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "low",
+        "high",
+        "original"
+      ]
     },
     "TextElement": {
       "type": "object",
@@ -112,6 +153,17 @@
             "url"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -132,6 +184,17 @@
             "type"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },

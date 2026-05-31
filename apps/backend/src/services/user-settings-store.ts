@@ -43,6 +43,7 @@ export type ScheduledJobRecord = {
   input: Record<string, unknown>;
   settingsSnapshot: Record<string, unknown>;
   enabled: boolean;
+  consecutiveFailures: number;
   lastRunAt: string | null;
   nextRunAt: string | null;
   createdAt: string;
@@ -81,6 +82,7 @@ function mapScheduledJob(row: Record<string, unknown>): ScheduledJobRecord {
     input: toRecord(row.input_json),
     settingsSnapshot: toRecord(row.settings_snapshot_json),
     enabled: Boolean(row.enabled),
+    consecutiveFailures: Number(row.consecutive_failures ?? 0),
     lastRunAt: row.last_run_at ? new Date(String(row.last_run_at)).toISOString() : null,
     nextRunAt: row.next_run_at ? new Date(String(row.next_run_at)).toISOString() : null,
     createdAt: new Date(String(row.created_at)).toISOString(),
@@ -166,6 +168,28 @@ export class UserSettingsStore {
       );
 
       return result.rows.map((row) => mapScheduledJob(row));
+    });
+  }
+
+  /**
+   * Count a user's ENABLED scheduled jobs. Used by the active-job cap at
+   * creation time: only enabled jobs fire recurring synthetic turns, so
+   * disabled/parked jobs (invalid cron, poison-disabled) must not count against
+   * the limit — otherwise a user could be wedged out of creating new jobs by
+   * dead rows that no longer do anything.
+   */
+  async countActiveScheduledJobs(tenantId: string, userId: string): Promise<number> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          SELECT COUNT(*) AS count
+          FROM scheduled_jobs
+          WHERE tenant_id = $1 AND user_id = $2 AND enabled = TRUE
+        `,
+        [tenantId, userId]
+      );
+
+      return Number(result.rows[0]?.count ?? 0);
     });
   }
 
@@ -313,24 +337,82 @@ export class UserSettingsStore {
     return result.rows.map((row) => mapScheduledJob(row));
   }
 
-  async claimJob(jobId: string, nextRunAt: string | null): Promise<ScheduledJobRecord | null> {
+  /**
+   * Claim a due job for execution. Runs on the RLS-bypassing scheduler pool
+   * (the worker has no per-request tenant scope), so the `tenant_id` predicate
+   * is the *only* thing isolating one tenant's jobs from another — it must
+   * always be present and must come from the job row the worker already read,
+   * never from caller-supplied input.
+   */
+  async claimJob(
+    tenantId: string,
+    jobId: string,
+    nextRunAt: string | null
+  ): Promise<ScheduledJobRecord | null> {
     const result = await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
         SET
           last_run_at = NOW(),
-          next_run_at = $2,
+          next_run_at = $3,
           updated_at = NOW()
-        WHERE job_id = $1
+        WHERE tenant_id = $1
+          AND job_id = $2
           AND enabled = TRUE
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
         RETURNING *
       `,
-      [jobId, nextRunAt]
+      [tenantId, jobId, nextRunAt]
     );
 
     return result.rows[0] ? mapScheduledJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Record the outcome of a finished run against the job's poison counter.
+   * On success the counter resets to 0; on failure it increments. Returns the
+   * new `consecutive_failures` value so the scheduler can decide whether to
+   * auto-disable. Runs on the RLS-bypassing scheduler pool (same as claimJob)
+   * since the worker has no per-request tenant scope, so the `tenant_id`
+   * predicate is the sole isolation guarantee and must always be present.
+   */
+  async recordJobRunOutcome(
+    tenantId: string,
+    jobId: string,
+    succeeded: boolean
+  ): Promise<number> {
+    const result = await this.schedulerDb.query(
+      `
+        UPDATE scheduled_jobs
+        SET
+          consecutive_failures = CASE WHEN $3 THEN 0 ELSE consecutive_failures + 1 END,
+          updated_at = NOW()
+        WHERE tenant_id = $1 AND job_id = $2
+        RETURNING consecutive_failures
+      `,
+      [tenantId, jobId, succeeded]
+    );
+
+    return result.rows[0] ? Number(result.rows[0].consecutive_failures ?? 0) : 0;
+  }
+
+  /**
+   * Disable a job (enabled = FALSE, next_run_at = NULL) so it permanently
+   * leaves the due-job query. Used for poison jobs (invalid cron or repeated
+   * failures). Idempotent; runs on the RLS-bypassing scheduler pool, so the
+   * `tenant_id` predicate is the sole isolation guarantee and must always be
+   * present.
+   */
+  async disableJob(tenantId: string, jobId: string): Promise<void> {
+    await this.schedulerDb.query(
+      `
+        UPDATE scheduled_jobs
+        SET enabled = FALSE, next_run_at = NULL, updated_at = NOW()
+        WHERE tenant_id = $1 AND job_id = $2
+      `,
+      [tenantId, jobId]
+    );
   }
 
   async createJobRun(input: {

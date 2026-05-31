@@ -13,7 +13,7 @@ import { captureWorkspaceArtifacts } from "../artifacts/workspace-artifact-captu
 import type {
   JsonRpcNotification,
   JsonRpcRequest
-} from "./codex-runtime-process.js";
+} from "./codex-jsonrpc.js";
 import type { ActiveTurnState, RuntimeState } from "./runtime-types.js";
 import { CodexSessionLifecycle } from "./codex-session-lifecycle.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
@@ -58,7 +58,19 @@ export class CodexTurnOrchestrator {
         },
         "Codex notification"
       );
-      this.handleNotification(runtime, notification);
+      try {
+        this.handleNotification(runtime, notification);
+      } catch (err) {
+        // A throw inside notification mapping/dispatch must NOT escape into the
+        // process event emitter — the SSE consumer is blocked in `for await`
+        // and would hang forever (pinning the active-turn slot) with no terminal
+        // frame. Surface it as a turn failure so the consumer unblocks.
+        this.deps.logger.error(
+          { err, sessionId: runtime.sessionId, method: notification.method },
+          "runtime notification handler threw"
+        );
+        this.failActiveTurn(runtime, getErrorMessage(err, "Runtime notification handler failed"));
+      }
     });
 
     runtime.process.onRequest((request) => {
@@ -67,6 +79,11 @@ export class CodexTurnOrchestrator {
           { err, sessionId: runtime.sessionId, method: request.method, requestId: request.id },
           "runtime request handler failed"
         );
+        // The request handler is how approvals (and other runtime-initiated
+        // requests) are serviced; if it fails, a turn blocked awaiting that
+        // response would hang. Fail the active turn so the consumer unblocks
+        // instead of waiting on a response that will never come.
+        this.failActiveTurn(runtime, getErrorMessage(err, "Runtime request handler failed"));
       });
     });
 
@@ -250,12 +267,25 @@ export class CodexTurnOrchestrator {
 
     runtime.healthStatus = "error";
     runtime.lifecycleMetadata = { ...runtime.lifecycleMetadata, lastError: message };
-    activeTurn.queue.push({
-      type: "response.failed",
-      responseId: activeTurn.responseId ?? uuidv7(),
-      message
-    });
-    activeTurn.queue.end();
+    // Normal path: deliver a terminal `response.failed` frame, then close the
+    // queue so the consumer's `for await` returns cleanly. If pushing/closing
+    // itself throws (an unexpected internal error), fall back to rejecting the
+    // queue via setError so a consumer blocked in `next()` is still unblocked
+    // rather than hung — never leave the turn slot pinned.
+    try {
+      activeTurn.queue.push({
+        type: "response.failed",
+        responseId: activeTurn.responseId ?? uuidv7(),
+        message
+      });
+      activeTurn.queue.end();
+    } catch (err) {
+      this.deps.logger.error(
+        { err, sessionId: runtime.sessionId },
+        "failActiveTurn could not deliver terminal frame; rejecting queue"
+      );
+      activeTurn.queue.setError(err instanceof Error ? err : new Error(message));
+    }
     runtime.activeTurn = null;
   }
 

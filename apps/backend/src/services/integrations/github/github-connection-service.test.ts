@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import { createTestConfig } from "../../../test-helpers/test-config.js";
+import { createFakeFetch } from "../../../test-helpers/fake-fetch.js";
 import { InMemoryAuditEventStore } from "../../../test-helpers/in-memory-audit-events.js";
 
 import {
@@ -76,7 +77,7 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
   const store = new InMemoryGithubConnectionStore();
   const auditEvents = new InMemoryAuditEventStore();
   const invalidatedUsers: Array<{ tenantId: string; userId: string; integrationId: string }> = [];
-  const service = new GithubConnectionService(config, {} as never, store, auditEvents, {
+  const service = new GithubConnectionService(config, store, auditEvents, {
     async invalidateRuntimesForIntegration(tenantId: string, userId: string, integrationId: string) {
       invalidatedUsers.push({ tenantId, userId, integrationId });
       return [];
@@ -90,11 +91,7 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
   const authState = new URL(authorizeUrl).searchParams.get("state");
   expect(authState).toBeTruthy();
 
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input) => {
-    const url =
-      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-
+  const fake = createFakeFetch((url) => {
     if (url === "https://github.com/login/oauth/access_token") {
       return new Response(
         JSON.stringify({
@@ -131,7 +128,7 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
     }
 
     throw new Error(`Unexpected fetch URL: ${url}`);
-  };
+  });
 
   try {
     const authRedirect = await service.completeAuthorization({
@@ -156,14 +153,14 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
     expect(runtimeCredentials.login).toBe("octocat");
     expect(store.markUsedCount).toBe(1);
   } finally {
-    globalThis.fetch = originalFetch;
+    fake.restore();
   }
 });
 
 test("getRuntimeCredentials returns null when no user connection exists", async () => {
   const config = createOAuthConfig();
   const store = new InMemoryGithubConnectionStore();
-  const service = new GithubConnectionService(config, {} as never, store, new InMemoryAuditEventStore());
+  const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
 
   const credentials = await service.getRuntimeCredentials("tenant-1", "user-1");
   expect(credentials).toBe(null);
@@ -192,28 +189,29 @@ test("getRuntimeCredentials returns null when token expired and refresh fails", 
     updatedAt: new Date().toISOString()
   };
 
-  const service = new GithubConnectionService(config, {} as never, store, new InMemoryAuditEventStore());
+  const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
 
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error: "bad_refresh_token" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" }
-    });
+  const fake = createFakeFetch(
+    () =>
+      new Response(JSON.stringify({ error: "bad_refresh_token" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" }
+      })
+  );
 
   try {
     const credentials = await service.getRuntimeCredentials("tenant-1", "user-1");
     expect(credentials).toBe(null);
     expect(store.markUsedCount).toBe(0);
   } finally {
-    globalThis.fetch = originalFetch;
+    fake.restore();
   }
 });
 
 test("getAuthorizationUrl throws when GitHub OAuth is not configured", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const store = new InMemoryGithubConnectionStore();
-  const service = new GithubConnectionService(config, {} as never, store, new InMemoryAuditEventStore());
+  const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
 
   await expect(() => service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })).rejects.toThrow(GithubConnectionNotConfiguredError);
 });
@@ -221,7 +219,7 @@ test("getAuthorizationUrl throws when GitHub OAuth is not configured", async () 
 test("hasConnection returns false when GitHub OAuth is not configured", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const store = new InMemoryGithubConnectionStore();
-  const service = new GithubConnectionService(config, {} as never, store);
+  const service = new GithubConnectionService(config, store);
 
   expect(await service.hasConnection("tenant-1", "user-1")).toBe(false);
 });
@@ -248,7 +246,7 @@ test("hasConnection returns true when a non-expired user record exists", async (
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  const service = new GithubConnectionService(config, {} as never, store);
+  const service = new GithubConnectionService(config, store);
 
   expect(await service.hasConnection("tenant-1", "user-1")).toBe(true);
 });
@@ -275,7 +273,7 @@ test("hasConnection returns false when token expired and no refresh available", 
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
-  const service = new GithubConnectionService(config, {} as never, store);
+  const service = new GithubConnectionService(config, store);
 
   expect(await service.hasConnection("tenant-1", "user-1")).toBe(false);
 });

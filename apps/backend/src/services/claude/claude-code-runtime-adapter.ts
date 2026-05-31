@@ -1,5 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { rm } from "node:fs/promises";
 
 import type { FastifyBaseLogger } from "fastify";
 
@@ -18,7 +17,6 @@ import { executeClaudeTurn } from "./claude-turn-executor.js";
 import {
   buildClaudeContentBlocks,
   buildClaudeSdkOptions,
-  resolveWorkspacePath,
   resolveSandboxWorkspacePath
 } from "./claude-sdk-helpers.js";
 import type { ClaudeCodeE2bOptions, ClaudeMcpServerEntry, ClaudeSessionState } from "./claude-types.js";
@@ -27,7 +25,7 @@ import type { ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { IntegrationRegistryService } from "../integrations/integration-registry-service.js";
-import { cancelPendingApprovals } from "../runtime/approval-cleanup.js";
+import { cancelPendingApprovals, expireApprovalById } from "../runtime/approval-cleanup.js";
 import type { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
 import type { RuntimeSessionStore } from "../runtime/runtime-session-store.js";
 
@@ -43,9 +41,8 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
   private readonly activeTurns = new Set<string>();
   /**
    * Maps approvalId → sessionId for pending E2B approvals. The in-sandbox
-   * harness owns the SDK's `canUseTool` Promise, so the backend's
-   * `ClaudeApprovalHandler` is bypassed in e2b mode — approval resolution
-   * must route through this map to reach the correct sandbox instead.
+   * harness owns the SDK's `canUseTool` Promise, so approval resolution must
+   * route through this map to reach the correct sandbox.
    */
   private readonly e2bPendingApprovals = new Map<string, string>();
 
@@ -75,10 +72,6 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     private readonly integrationRegistry?: IntegrationRegistryService,
     private readonly activationTracker?: ActivationTracker
   ) {}
-
-  private get mode(): "local" | "e2b" {
-    return this.config.CLAUDE_RUNTIME_BACKEND === "e2b" && this.e2bOptions ? "e2b" : "local";
-  }
 
   hasActiveTurn(sessionId: string): boolean {
     return this.activeTurns.has(sessionId);
@@ -113,10 +106,7 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     // fresh createSession path instead.
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.abortController.signal.aborted) {
-      const sandboxStillUsable =
-        existing.mode === "local" ||
-        (existing.e2bProcess !== null && existing.e2bProcess.isAlive());
-      if (sandboxStillUsable) {
+      if (existing.e2bProcess.isAlive()) {
         return {
           sessionId,
           runtimeId: existing.runtimeId,
@@ -124,8 +114,8 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
         };
       }
 
-      // e2b session with a dead sandbox: tear it down before recreating so
-      // runtime_sessions, approvalHandler, and any stale approvals are cleaned up.
+      // Dead sandbox: tear it down before recreating so runtime_sessions and
+      // any stale approvals are cleaned up.
       this.log.warn(
         { sessionId, runtimeId: existing.runtimeId },
         "Claude E2B sandbox is no longer alive; recreating the session"
@@ -142,7 +132,14 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
       integrationRegistry: this.integrationRegistry,
       activationTracker: this.activationTracker,
       managedToolCatalog: this.managedToolCatalog,
-      stores: this.stores
+      stores: this.stores,
+      // e2b-only: the in-sandbox harness owns the SDK's `canUseTool` Promise, so
+      // an unanswered approval can only be swept by a backend timer. The process
+      // arms a per-approval TTL that (a) sends the harness a deny so the turn
+      // unblocks and (b) calls this back so the DB row + audit mirror Codex.
+      approvalRequestTtlMs: this.config.APPROVAL_REQUEST_TTL_MS,
+      onApprovalExpired: (approvalId) =>
+        this.handleE2bApprovalExpired({ tenantId, sessionId, userId, approvalId })
     });
     this.sessions.set(sessionId, state);
 
@@ -184,10 +181,7 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
 
   async readRuntimeFile(sessionId: string, filePath: string): Promise<Uint8Array> {
     const state = this.requireSessionState(sessionId);
-    if (state.mode === "e2b" && state.e2bProcess) {
-      return state.e2bProcess.readFile(resolveSandboxWorkspacePath(state.workspacePath, filePath));
-    }
-    return readFile(resolveWorkspacePath(state.workspacePath, filePath));
+    return state.e2bProcess.readFile(resolveSandboxWorkspacePath(state.workspacePath, filePath));
   }
 
   async writeRuntimeFile(
@@ -196,28 +190,16 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     data: Uint8Array | ArrayBuffer | string
   ): Promise<string> {
     const state = this.requireSessionState(sessionId);
-    if (state.mode === "e2b" && state.e2bProcess) {
-      const sandboxPath = resolveSandboxWorkspacePath(state.workspacePath, filePath);
-      await state.e2bProcess.writeFile(sandboxPath, data);
-      return sandboxPath;
-    }
-    const resolvedPath = resolveWorkspacePath(state.workspacePath, filePath);
-    await mkdir(path.dirname(resolvedPath), { recursive: true });
-    const payload: string | Uint8Array =
-      typeof data === "string"
-        ? data
-        : data instanceof Uint8Array
-          ? data
-          : new Uint8Array(data);
-    await writeFile(resolvedPath, payload);
-    return resolvedPath;
+    const sandboxPath = resolveSandboxWorkspacePath(state.workspacePath, filePath);
+    await state.e2bProcess.writeFile(sandboxPath, data);
+    return sandboxPath;
   }
 
   // Stop button — interrupt the in-flight turn for `sessionId` while leaving
-  // the session warm. The shared `state.activeTurnInterrupt` ref points at
-  // either iterator.interrupt() (local) or the sandbox interrupt-frame send
-  // (e2b); either way the SDK eventually emits a result(subtype="interrupt")
-  // which the event mapper turns into response.completed{interrupted:true}.
+  // the session warm. The shared `state.activeTurnInterrupt` ref sends the
+  // sandbox an interrupt frame; the SDK eventually emits a result(subtype=
+  // "interrupt") which the event mapper turns into response.completed{
+  // interrupted:true}.
   async interruptTurn(input: {
     tenantId: string;
     sessionId: string;
@@ -235,21 +217,18 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
       await interrupt();
     } catch (err) {
       this.log.warn(
-        { err, sessionId: input.sessionId, mode: state.mode },
-        "Claude iterator.interrupt() failed; expecting SDK to surface the result anyway"
+        { err, sessionId: input.sessionId },
+        "Claude interrupt() failed; expecting SDK to surface the result anyway"
       );
     }
     // Drop any approvals that were still pending at interrupt time so the UI
     // doesn't keep showing an approve/reject prompt for a stopped turn and a
     // late decision can't resolve into a turn that no longer exists.
-    //   - local mode: cancel deferred canUseTool promises (deny → SDK moves on)
-    //     by clearing the in-process handler once.
-    //   - e2b mode: drop the per-approval entry in `e2bPendingApprovals` so
-    //     `resolveApproval` can't try to forward a decision over a
-    //     torn-down sandbox bridge (handled inside onCancelLocal below).
-    //   - both modes: expire the DB rows + emit `approval.expired` audit
-    //     events via the shared cleanup helper.
-    state.approvalHandler.clearAll();
+    //   - drop the per-approval entry in `e2bPendingApprovals` so
+    //     `resolveApproval` can't try to forward a decision over a torn-down
+    //     sandbox bridge (handled inside onCancelLocal below).
+    //   - expire the DB rows + emit `approval.expired` audit events via the
+    //     shared cleanup helper.
     if (this.stores?.approvals && this.stores?.auditEvents) {
       void cancelPendingApprovals({
         tenantId: input.tenantId,
@@ -284,7 +263,6 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     if (!state) return;
 
     state.abortController.abort();
-    state.approvalHandler.clearAll();
 
     // Drop any e2b approvals outstanding for this session; the sandbox will be
     // killed right after and the deferred Promises would never resolve otherwise.
@@ -292,11 +270,9 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
       if (sid === input.sessionId) this.e2bPendingApprovals.delete(approvalId);
     }
 
-    if (state.e2bProcess) {
-      await state.e2bProcess.terminate().catch((err) => {
-        this.log.warn({ err, sessionId: input.sessionId }, "Failed to terminate E2B Claude sandbox");
-      });
-    }
+    await state.e2bProcess.terminate().catch((err) => {
+      this.log.warn({ err, sessionId: input.sessionId }, "Failed to terminate E2B Claude sandbox");
+    });
 
     // Release the runtime's IP pin so the slot is reclaimable immediately
     // instead of waiting on the 24-hour TTL. The runtimeId from the dead
@@ -320,17 +296,14 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
       }
     }
 
-    // In e2b mode the backend only has the local staging dir; the sandbox path
+    // The backend only has the local staging dir; the sandbox workspace path
     // does not exist on the backend filesystem.
-    const cleanupTarget = state.mode === "e2b" ? state.localStagingPath : state.workspacePath;
-    if (cleanupTarget) {
-      rm(cleanupTarget, { recursive: true, force: true }).catch((err: unknown) => {
-        this.log.warn(
-          { err, sessionId: input.sessionId, cleanupTarget },
-          "failed to clean up Claude workspace dir"
-        );
-      });
-    }
+    rm(state.localStagingPath, { recursive: true, force: true }).catch((err: unknown) => {
+      this.log.warn(
+        { err, sessionId: input.sessionId, cleanupTarget: state.localStagingPath },
+        "failed to clean up Claude workspace staging dir"
+      );
+    });
 
     this.sessions.delete(input.sessionId);
   }
@@ -367,6 +340,42 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     return targets.map((state) => state.sessionId);
   }
 
+  /**
+   * Backend sweep for an e2b approval that aged out. The process has already
+   * sent the harness a deny (so the SDK turn unblocks); here we move the DB row
+   * off `pending` and write the `approval.expired` audit row so the Claude e2b
+   * path matches Codex's `scheduleApprovalExpiry`. Drops the in-memory entry so
+   * a late `resolveApproval` can't try to forward to a settled prompt. Fired
+   * from a timer — never throws into the caller.
+   */
+  private handleE2bApprovalExpired(input: {
+    tenantId: string;
+    sessionId: string;
+    userId: string;
+    approvalId: string;
+  }): void {
+    const { tenantId, sessionId, userId, approvalId } = input;
+    if (!this.stores?.approvals || !this.stores?.auditEvents) {
+      // No approvals/audit wiring (opt-out test fixtures): just release memory.
+      this.e2bPendingApprovals.delete(approvalId);
+      return;
+    }
+    void expireApprovalById({
+      tenantId,
+      sessionId,
+      userId,
+      approvalId,
+      reason: "ttl_expired",
+      approvals: this.stores.approvals,
+      auditEvents: this.stores.auditEvents,
+      logger: this.log,
+      onCancelLocal: (id) => {
+        this.e2bPendingApprovals.delete(id);
+        return undefined;
+      }
+    });
+  }
+
   async resolveApproval(input: {
     tenantId: string;
     approvalId: string;
@@ -374,45 +383,89 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
   }): Promise<"resolved" | "missing"> {
-    const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
+    const { tenantId, approvalId, userId, decision } = input;
+    const decisionStatus = decision === "approve" ? "approve" : "reject";
 
-    // In e2b mode the approval Promise lives inside the sandbox harness. Look
-    // up the owning session and forward the decision over stdin. The SDK
-    // inside the sandbox then resumes the canUseTool handler.
+    // Deliver to the owning live runtime FIRST, and confirm it was actually
+    // received, BEFORE settling the shared DB row. Two correctness reasons:
+    //  1. Cross-adapter: the production route tries adapters in order (Codex,
+    //     then Claude) until one returns "resolved". Forwarding first means a
+    //     non-owning adapter returns "missing" WITHOUT flipping the row, so the
+    //     real owner (tried next) can still resolve it.
+    //  2. e2b: forwarding is async (a stdin frame to the sandbox). Awaiting it
+    //     means we never report a decision as resolved (DB approved/rejected +
+    //     audit) while the sandbox never actually received it (dead sandbox /
+    //     failed write) — in that case the row stays pending for the TTL sweep.
+    const forwarded = await this.forwardApprovalDecision(approvalId, tenantId, userId, decision);
+    if (!forwarded) return "missing";
+
+    if (this.stores?.approvals) {
+      // Atomic once-only guard: ApprovalStore.resolve flips pending→settled a
+      // single time. A concurrent double-click, a retried POST, or a row already
+      // settled by the TTL sweep returns null — we already delivered to the
+      // runtime, so still report "resolved" but skip a duplicate audit row.
+      const approval = await this.stores.approvals.resolve(
+        tenantId,
+        approvalId,
+        userId,
+        decisionStatus
+      );
+      if (approval) {
+        await this.stores.auditEvents?.create({
+          tenantId,
+          sessionId: approval.sessionId,
+          userId: approval.userId,
+          approvalId: approval.approvalId,
+          type: decision === "approve" ? "approval.approved" : "approval.rejected",
+          payload: { itemId: approval.itemId, kind: approval.kind }
+        });
+      }
+    }
+    return "resolved";
+  }
+
+  /**
+   * Routes an approval decision to the sandbox harness that owns the pending
+   * `canUseTool` Promise. Resolves to true when a matching pending approval was
+   * found AND the decision was delivered (the stdin write to the sandbox
+   * succeeded), false otherwise. Does NOT touch the DB or audit trail; the
+   * caller owns that.
+   */
+  private async forwardApprovalDecision(
+    approvalId: string,
+    tenantId: string,
+    userId: string,
+    decision: RuntimeApprovalDecision
+  ): Promise<boolean> {
+    // The approval Promise lives inside the sandbox harness. Look up the owning
+    // session and forward the decision over stdin. The SDK inside the sandbox
+    // then resumes the canUseTool handler.
     const e2bSessionId = this.e2bPendingApprovals.get(approvalId);
-    if (e2bSessionId) {
-      const state = this.sessions.get(e2bSessionId);
-      if (!state || state.tenantId !== tenantId || state.userId !== userId) {
-        return "missing";
-      }
-      this.e2bPendingApprovals.delete(approvalId);
-      if (state.e2bProcess) {
-        void state.e2bProcess
-          .sendApprovalResponse(approvalId, decision === "approve" ? "approve" : "reject")
-          .catch((err) => {
-            this.log.warn(
-              { err, approvalId, sessionId: e2bSessionId },
-              "Failed to forward approval to E2B sandbox"
-            );
-          });
-        return "resolved";
-      }
-      return "missing";
+    if (!e2bSessionId) {
+      return false;
     }
-
-    // Local mode: approval lives in the in-process ClaudeApprovalHandler.
-    // Only search sessions belonging to the requesting tenant and user.
-    for (const [, state] of this.sessions) {
-      if (
-        state.mode === "local" &&
-        state.tenantId === tenantId &&
-        state.userId === userId &&
-        state.approvalHandler.resolveApproval(approvalId, decision, rememberForTurn)
-      ) {
-        return "resolved";
-      }
+    const state = this.sessions.get(e2bSessionId);
+    if (!state || state.tenantId !== tenantId || state.userId !== userId) {
+      return false;
     }
-    return "missing";
+    // Drop the pending entry synchronously (before the await) so a concurrent
+    // double-click can't forward twice. If the stdin write then fails, the
+    // decision was NOT delivered — report false so the caller leaves the DB
+    // row pending for the TTL sweep instead of falsely auditing it settled.
+    this.e2bPendingApprovals.delete(approvalId);
+    try {
+      await state.e2bProcess.sendApprovalResponse(
+        approvalId,
+        decision === "approve" ? "approve" : "reject"
+      );
+      return true;
+    } catch (err) {
+      this.log.warn(
+        { err, approvalId, sessionId: e2bSessionId },
+        "Failed to forward approval to E2B sandbox"
+      );
+      return false;
+    }
   }
 
   private requireSessionState(sessionId: string): ClaudeSessionState {

@@ -143,7 +143,7 @@ describe("UserSettingsStore – scheduler methods", () => {
         return { rows: [], rowCount: 0 };
       });
 
-      const result = await store.claimJob("job-1", "2026-03-19T09:00:00.000Z");
+      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z");
 
       expect(result).toBeTruthy();
       expect(result!.jobId).toBe("job-1");
@@ -153,20 +153,24 @@ describe("UserSettingsStore – scheduler methods", () => {
     it("returns null when the job was already claimed (no rows)", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      const result = await store.claimJob("job-1", "2026-03-19T09:00:00.000Z");
+      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z");
 
       expect(result).toBe(null);
     });
 
-    it("passes jobId and nextRunAt as parameters", async () => {
+    it("scopes the RLS-bypassing claim to tenantId and passes jobId + nextRunAt", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      await store.claimJob("job-42", "2026-03-20T00:00:00.000Z");
+      await store.claimJob("tenant-42", "job-42", "2026-03-20T00:00:00.000Z");
 
       const call = db.calls[0];
       expect(call).toBeTruthy();
-      expect(call.params[0]).toBe("job-42");
-      expect(call.params[1]).toBe("2026-03-20T00:00:00.000Z");
+      // tenant_id MUST be the first predicate — it is the only isolation
+      // guarantee on the BYPASSRLS scheduler pool.
+      expect(call.sql).toContain("tenant_id = $1");
+      expect(call.params[0]).toBe("tenant-42");
+      expect(call.params[1]).toBe("job-42");
+      expect(call.params[2]).toBe("2026-03-20T00:00:00.000Z");
     });
   });
 

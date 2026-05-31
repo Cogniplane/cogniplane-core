@@ -101,7 +101,7 @@
       "enum": [
         "read",
         "write",
-        "none"
+        "deny"
       ]
     },
     "FileSystemPath": {

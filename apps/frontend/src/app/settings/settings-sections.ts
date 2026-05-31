@@ -37,27 +37,6 @@ export function listSettingsLiveSections(): readonly SettingsLiveSection[] {
   return [...CORE_LIVE_SECTIONS, ...overlaySections];
 }
 
-export const SETTINGS_PLANNED_SECTIONS = [
-  {
-    id: "skills",
-    label: "Skill selection",
-    description: "Pick personal default skills without stepping outside the admin-managed envelope."
-  },
-  {
-    id: "mcp",
-    label: "MCP selection",
-    description: "Choose from approved MCP surfaces when user-level routing becomes available."
-  },
-  {
-    id: "model",
-    label: "Model override",
-    description: "Store user-level model preferences while preserving platform guardrails and auditability."
-  }
-] as const;
-
 export function listSettingsNavigationItems(): readonly NavigationItem[] {
-  return [
-    ...listSettingsLiveSections().map((s) => ({ id: s.id, label: s.label, tone: "live" as const })),
-    ...SETTINGS_PLANNED_SECTIONS.map((s) => ({ id: s.id, label: s.label, tone: "planned" as const }))
-  ];
+  return listSettingsLiveSections().map((s) => ({ id: s.id, label: s.label }));
 }

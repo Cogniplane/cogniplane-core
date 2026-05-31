@@ -1,7 +1,7 @@
 import { test, expect } from "vitest";
 
 import type { Pool } from "../lib/db.js";
-import { ActivationTracker, resolveSkillsForToolCall } from "./activation-tracker.js";
+import { ActivationTracker } from "./activation-tracker.js";
 
 type CapturedQuery = { text: string; values: unknown[] };
 
@@ -224,19 +224,4 @@ test("countMcpServerActivations filters by mcp_server resource type", async () =
   expect(counts.size).toBe(2);
   expect(counts.get("managed-session-context")).toEqual({ invokedSessions: 5, materializedSessions: 12 });
   expect(counts.get("managed-write-artifact")).toEqual({ invokedSessions: 0, materializedSessions: 8 });
-});
-
-test("resolveSkillsForToolCall returns all skills declaring the tool", () => {
-  const skills = [
-    { id: "write-artifact-skill", associatedToolIds: ["write_artifact"] },
-    { id: "skill-improver", associatedToolIds: ["write_artifact"] },
-    { id: "doc-analysis", associatedToolIds: ["read_text_artifact"] },
-    { id: "no-tools" }
-  ];
-  expect(resolveSkillsForToolCall("write_artifact", skills)).toEqual([
-        "write-artifact-skill",
-        "skill-improver"
-      ]);
-  expect(resolveSkillsForToolCall("read_text_artifact", skills)).toEqual(["doc-analysis"]);
-  expect(resolveSkillsForToolCall("session_context", skills)).toEqual([]);
 });

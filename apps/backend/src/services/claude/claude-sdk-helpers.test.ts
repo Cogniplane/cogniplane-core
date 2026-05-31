@@ -6,12 +6,12 @@ import { test, expect, describe, afterEach } from "vitest";
 
 import { phase4RuntimePolicy } from "../../test-helpers/phase4-runtime-policy.js";
 import {
-  CLAUDE_SDK_ENV_DENY_SUBSTRINGS,
   buildClaudeContentBlocks,
   buildClaudePromptStream,
   buildClaudeSdkEnv,
   buildClaudeSdkOptions,
   inferImageMediaType,
+  isClaudeSdkEnvAllowed,
   isInitMessage,
   resolveSandboxWorkspacePath,
   resolveWorkspacePath
@@ -127,32 +127,105 @@ describe("buildClaudeSdkEnv", () => {
     Object.assign(process.env, ORIGINAL_ENV);
   });
 
-  test("strips every secret pattern in the deny list", () => {
-    process.env.JWT_SECRET = "super-secret";
-    process.env.WORKOS_CLIENT_ID = "client";
-    process.env.WORKOS_CLIENT_SECRET = "secret";
-    process.env.GITHUB_OAUTH_CLIENT_SECRET = "github";
-    process.env.PII_OPENROUTER_API_KEY = "pii";
-    process.env.E2B_API_KEY = "e2b";
-    process.env.ARTIFACT_BUCKET_ACCESS_KEY_ID = "akid";
-    process.env.ARTIFACT_BUCKET_SECRET_ACCESS_KEY = "ask";
-    process.env.ARTIFACT_BUCKET_SESSION_TOKEN = "token";
-    process.env.OPENAI_API_KEY = "openai";
-    process.env.REDIS_URL = "redis://x";
-    process.env.DATABASE_URL = "postgres://x";
-    process.env.MIGRATION_DATABASE_URL = "postgres://migrate";
-    process.env.DATA_ENCRYPTION_SECRET = "enc";
-    process.env.HARMLESS = "kept";
+  // Every secret-bearing env var the backend reads (mirrors config.ts). The
+  // allowlist is fail-closed, so this list does not need to be exhaustive for
+  // the security property to hold — but it documents the concrete keys we know
+  // carry secrets, including NOTION_OAUTH_CLIENT_SECRET, which the previous
+  // denylist leaked to the agent. The marker value lets us assert by VALUE
+  // (not just key name) that nothing secret survives.
+  const SECRET_CONFIG_KEYS = [
+    "DATABASE_URL",
+    "MIGRATION_DATABASE_URL",
+    "JWT_SECRET",
+    "DATA_ENCRYPTION_SECRET",
+    "WORKOS_API_KEY",
+    "WORKOS_CLIENT_ID",
+    "WORKOS_CLIENT_SECRET",
+    "GITHUB_OAUTH_CLIENT_ID",
+    "GITHUB_OAUTH_CLIENT_SECRET",
+    "NOTION_OAUTH_CLIENT_ID",
+    "NOTION_OAUTH_CLIENT_SECRET",
+    "PII_OPENROUTER_API_KEY",
+    "PII_RETENTION_KEK",
+    "E2B_API_KEY",
+    "ARTIFACT_BUCKET_ACCESS_KEY_ID",
+    "ARTIFACT_BUCKET_SECRET_ACCESS_KEY",
+    "ARTIFACT_BUCKET_SESSION_TOKEN",
+    "OPENAI_API_KEY",
+    "REDIS_URL",
+    // Anthropic credential-bearing vars: a bearer/OAuth token and a header bag
+    // that can carry `Authorization:`. Auth is set explicitly (rt_* proxy token
+    // or fallback key), so these must never be inherited into the sandbox.
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS"
+  ];
+
+  test("no secret-bearing config key survives the allowlist", () => {
+    const SECRET_MARKER = "SECRET-MUST-NOT-LEAK";
+    for (const key of SECRET_CONFIG_KEYS) {
+      process.env[key] = SECRET_MARKER;
+    }
+    // A var the agent legitimately needs must still pass through.
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.HARMLESS_NON_ALLOWED = "kept?";
 
     const env = buildClaudeSdkEnv("test-key");
 
-    expect(env.HARMLESS).toBe("kept");
+    // Belt: no secret key name leaks.
+    for (const key of SECRET_CONFIG_KEYS) {
+      expect(env[key], `secret key "${key}" leaked into SDK env`).toBeUndefined();
+    }
+    // Suspenders: the marker value does not appear under ANY key (catches a
+    // secret that slipped through under an alias or prefix match).
+    for (const [key, value] of Object.entries(env)) {
+      expect(value, `marker leaked via key "${key}"`).not.toBe(SECRET_MARKER);
+    }
+    // Allowlisted essentials survive.
+    expect(env.PATH).toBe("/usr/bin:/bin");
     expect(env.ANTHROPIC_API_KEY).toBe("test-key");
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
-    for (const denied of CLAUDE_SDK_ENV_DENY_SUBSTRINGS) {
-      const stripped = Object.keys(env).every((k) => !k.includes(denied));
-      expect(stripped, `expected no env key to contain "${denied}"`).toBe(true);
-    }
+    // A non-allowlisted, non-secret var is also dropped (fail-closed default).
+    expect(env.HARMLESS_NON_ALLOWED).toBeUndefined();
+  });
+
+  test("inherited ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL are not passed through implicitly", () => {
+    // These are set explicitly by buildClaudeSdkEnv (proxy token or fallback),
+    // never inherited from the backend process — so an inherited backend key
+    // must not survive the filter on its own.
+    process.env.ANTHROPIC_API_KEY = "inherited-backend-key";
+    process.env.ANTHROPIC_BASE_URL = "https://inherited.example";
+
+    // null key + no proxy → ANTHROPIC_API_KEY is deleted, base URL not echoed.
+    const env = buildClaudeSdkEnv(null);
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+  });
+
+  test("allowlist keeps SDK / proxy / OS essentials and drops everything else", () => {
+    process.env.HTTPS_PROXY = "http://proxy.corp:8080";
+    process.env.NODE_EXTRA_CA_CERTS = "/etc/ssl/corp.pem";
+    process.env.CLAUDE_CODE_USE_BEDROCK = "1";
+    process.env.HOME = "/home/agent";
+    process.env.SOME_RANDOM_BACKEND_VAR = "nope";
+
+    const env = buildClaudeSdkEnv("k");
+
+    expect(env.HTTPS_PROXY).toBe("http://proxy.corp:8080");
+    expect(env.NODE_EXTRA_CA_CERTS).toBe("/etc/ssl/corp.pem");
+    expect(env.CLAUDE_CODE_USE_BEDROCK).toBe("1");
+    expect(env.HOME).toBe("/home/agent");
+    expect(env.SOME_RANDOM_BACKEND_VAR).toBeUndefined();
+  });
+
+  test("isClaudeSdkEnvAllowed: exact names, prefixes, and rejections", () => {
+    expect(isClaudeSdkEnvAllowed("PATH")).toBe(true);
+    expect(isClaudeSdkEnvAllowed("HTTPS_PROXY")).toBe(true);
+    expect(isClaudeSdkEnvAllowed("CLAUDE_CODE_ANYTHING_NEW")).toBe(true);
+    expect(isClaudeSdkEnvAllowed("LC_ALL")).toBe(true);
+    expect(isClaudeSdkEnvAllowed("NOTION_OAUTH_CLIENT_SECRET")).toBe(false);
+    expect(isClaudeSdkEnvAllowed("DATABASE_URL")).toBe(false);
+    // ANTHROPIC_API_KEY is set explicitly, not inherited — not on the allowlist.
+    expect(isClaudeSdkEnvAllowed("ANTHROPIC_API_KEY")).toBe(false);
   });
 
   test("deletes inherited ANTHROPIC_API_KEY when null is passed", () => {

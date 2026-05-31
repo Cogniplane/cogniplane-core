@@ -17,10 +17,8 @@ import { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "./pii/pii-scan-run-store.js";
 import { ActiveTurnsRegistry } from "./active-turns-registry.js";
 import { RuntimeSessionStore } from "./runtime/runtime-session-store.js";
-import { SessionJudgmentStore } from "./session-judgment-store.js";
 import { SessionRuntimeOverrideStore } from "./session-runtime-override-store.js";
 import { SessionStore } from "./session-store.js";
-import { SkillImprovementSessionStore } from "./skills/skill-improvement-session-store.js";
 import { SkillConfigStore } from "./skills/skill-config-store.js";
 import { SkillRevisionStore } from "./skills/skill-revision-store.js";
 import { ToolEventStore } from "./tool-event-store.js";
@@ -42,8 +40,6 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
   const mcpServers = new McpServerStore(db);
   const tenantSettings = new TenantSettingsStore(db);
   const sessionRuntimeOverrides = new SessionRuntimeOverrideStore(db);
-  const skillImprovementSessions = new SkillImprovementSessionStore(db);
-  const sessionJudgments = new SessionJudgmentStore(db, schedulerDb);
   const userSettings = new UserSettingsStore(db, schedulerDb);
   const tenantMembers = new TenantMemberStore(db);
   const githubConnections = new GithubConnectionStore(db);
@@ -70,8 +66,6 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
     mcpServers,
     tenantSettings,
     sessionRuntimeOverrides,
-    skillImprovementSessions,
-    sessionJudgments,
     userSettings,
     tenantMembers,
     githubConnections,

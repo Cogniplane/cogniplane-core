@@ -14,6 +14,16 @@ import type { ArtifactRecord } from "./artifact-store.js";
 
 const execFile = promisify(execFileCallback);
 
+/**
+ * Narrow shape of the promisified `execFile` used for PDF rasterization.
+ * Injectable so tests can drive the pdftoppm-failure path deterministically
+ * without depending on host poppler-utils (mirrors the `extractPdfText` seam).
+ */
+export type ExecFile = (
+  file: string,
+  args: string[]
+) => Promise<{ stdout: string; stderr: string }>;
+
 async function readStreamAsBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) {
@@ -35,6 +45,7 @@ export class ArtifactProcessor {
       logger: Pick<FastifyBaseLogger, "warn" | "error">;
       storage: ArtifactStorage;
       extractPdfText?: (pdfBuffer: Buffer) => Promise<string>;
+      execFile?: ExecFile;
     }
   ) {}
 
@@ -118,9 +129,11 @@ export class ArtifactProcessor {
     const inputPath = path.join(tempDir, "input.pdf");
     const outputPrefix = path.join(tempDir, "page");
 
+    const runExecFile = this.deps.execFile ?? execFile;
+
     try {
       await writeFile(inputPath, pdfBuffer);
-      await execFile("pdftoppm", [
+      await runExecFile("pdftoppm", [
         "-png",
         "-r",
         "144",

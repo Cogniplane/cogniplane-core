@@ -9,7 +9,7 @@ import type { AppConfig } from "../../config.js";
 import type { RuntimeManifest, RuntimeManifestSkillEntry } from "../../domain/runtime-manifest.js";
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
 import type { SkillBundleStorage } from "../skills/skill-bundle-storage.js";
-import { generateRuntimeToken, runtimeTokenExpiry, type RuntimeTokenClaims } from "../auth/runtime-token.js";
+import { generateRuntimeToken, runtimeTokenExpiry, type RuntimeTokenMintClaims } from "../auth/runtime-token.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 
 export type WorkspaceArtifacts = {
@@ -190,7 +190,7 @@ export async function createRuntimeWorkspace(
   // codex.toml or a sandbox snapshot is captured. The TTL needs to outlive
   // the longest realistic continuous session because the token is not
   // refreshed mid-runtime — only a fresh bootstrap mints a new one.
-  const runtimeTokenClaims: RuntimeTokenClaims = {
+  const runtimeTokenClaims: RuntimeTokenMintClaims = {
     sid: input.sessionId,
     tid: input.tenantId,
     uid: input.userId,

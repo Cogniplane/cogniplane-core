@@ -124,27 +124,6 @@ export const SkillMarketplaceResponseSchema = z.object({
 }).passthrough();
 export type SkillMarketplaceResponse = z.infer<typeof SkillMarketplaceResponseSchema>;
 
-export const SkillImprovementSessionSummarySchema = z.object({
-  tenantId: z.string(),
-  sessionId: z.string(),
-  skillId: z.string(),
-  corpusArtifactId: z.string().nullable(),
-  sessionLimit: z.number(),
-  model: z.string().nullable(),
-  effort: z.string().nullable(),
-  createdBy: z.string(),
-  createdAt: IsoDateSchema
-}).passthrough();
-export type SkillImprovementSessionSummary = z.infer<typeof SkillImprovementSessionSummarySchema>;
-
-export const LaunchSkillImprovementResponseSchema = z.object({
-  sessionId: z.string(),
-  artifactId: z.string().nullable(),
-  includedSessionCount: z.number(),
-  truncatedToolResultCount: z.number()
-}).passthrough();
-export type LaunchSkillImprovementResponse = z.infer<typeof LaunchSkillImprovementResponseSchema>;
-
 // Skill import endpoints (zip / github / inline) all return the same shape:
 // the upserted skill row plus the newly-created revision row.
 export const SkillImportResponseSchema = z.object({
@@ -172,67 +151,3 @@ export const SkillRevisionFileResponseSchema = z.object({
   limitBytes: z.number()
 }).passthrough();
 export type SkillRevisionFileResponse = z.infer<typeof SkillRevisionFileResponseSchema>;
-
-export const SkillImprovementSessionsListResponseSchema = z.object({
-  sessions: z.array(SkillImprovementSessionSummarySchema)
-}).passthrough();
-export type SkillImprovementSessionsListResponse = z.infer<typeof SkillImprovementSessionsListResponseSchema>;
-
-// ── Skill judge admin ────────────────────────────────────────────────────────
-
-export const SkillJudgeProviderIdSchema = z.enum(["anthropic", "openai"]);
-export type SkillJudgeProviderId = z.infer<typeof SkillJudgeProviderIdSchema>;
-
-export const SkillJudgeModeSchema = z.enum(["sync", "batch"]);
-export type SkillJudgeMode = z.infer<typeof SkillJudgeModeSchema>;
-
-export const SkillJudgeSettingsSchema = z.object({
-  skillJudgeEnabled: z.boolean(),
-  skillJudgeProvider: SkillJudgeProviderIdSchema.nullable(),
-  skillJudgeModel: z.string().nullable(),
-  skillJudgeMode: SkillJudgeModeSchema
-}).passthrough();
-export type SkillJudgeSettings = z.infer<typeof SkillJudgeSettingsSchema>;
-
-export const SkillJudgeModelOptionSchema = z.object({
-  id: z.string(),
-  label: z.string(),
-  provider: SkillJudgeProviderIdSchema,
-  isDefault: z.boolean().optional(),
-  hint: z.string().optional()
-}).passthrough();
-export type SkillJudgeModelOption = z.infer<typeof SkillJudgeModelOptionSchema>;
-
-export const SkillJudgePlatformInfoSchema = z.object({
-  workerEnabled: z.boolean(),
-  pollIntervalMs: z.number(),
-  inactiveBeforeMs: z.number(),
-  maxSessionsPerTick: z.number()
-}).passthrough();
-export type SkillJudgePlatformInfo = z.infer<typeof SkillJudgePlatformInfoSchema>;
-
-export const SkillJudgeStatsSchema = z.object({
-  eligibleNow: z.number(),
-  syncRunning: z.number(),
-  batchPending: z.number(),
-  oldestBatchSubmittedAt: z.string().nullable(),
-  recentFailures: z.array(z.object({
-    sessionId: z.string(),
-    error: z.string().nullable(),
-    completedAt: z.string().nullable()
-  }).passthrough())
-}).passthrough();
-export type SkillJudgeStats = z.infer<typeof SkillJudgeStatsSchema>;
-
-export const SkillJudgeResponseSchema = z.object({
-  settings: SkillJudgeSettingsSchema,
-  availableModels: z.array(SkillJudgeModelOptionSchema),
-  platform: SkillJudgePlatformInfoSchema,
-  stats: SkillJudgeStatsSchema
-}).passthrough();
-export type SkillJudgeResponse = z.infer<typeof SkillJudgeResponseSchema>;
-
-export const SkillJudgeSettingsEnvelopeSchema = z.object({
-  settings: SkillJudgeSettingsSchema
-}).passthrough();
-export type SkillJudgeSettingsEnvelope = z.infer<typeof SkillJudgeSettingsEnvelopeSchema>;

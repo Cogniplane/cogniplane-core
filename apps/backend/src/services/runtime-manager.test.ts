@@ -6,7 +6,7 @@ import { test, expect, onTestFinished } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 
 import codexRelease from "../codex-release.json" with { type: "json" };
-import { CodexRuntimeProcessStartError } from "./runtime/codex-runtime-process.js";
+import { CodexRuntimeProcessStartError } from "./runtime/codex-jsonrpc.js";
 import type { DynamicConfigService } from "./dynamic-config-service.js";
 import { CodexRuntimeManager, resolveInsideSandbox } from "./runtime-manager.js";
 import type { ApprovalRecord } from "./auth/approval-store.js";
@@ -33,7 +33,6 @@ class FakeRuntimeProcess {
   readonly requestLog: Array<{ method: string; params: Record<string, unknown> }> = [];
   readonly notificationLog: Array<{ method: string; params?: Record<string, unknown> }> = [];
   readonly responseLog: Array<{ id: number | string; result?: unknown; error?: unknown }> = [];
-  socketReadyState: number = WebSocket.OPEN;
   alive = true;
   skillListResponse: unknown = {
     data: [
@@ -52,6 +51,11 @@ class FakeRuntimeProcess {
     ]
   };
 
+  // When set, `turn/start` records into requestLog immediately but blocks on
+  // this gate before returning a turnId. Lets a test reproduce the window where
+  // the active turn exists with a still-null responseId (a fast Stop click).
+  turnStartGate: Promise<void> | null = null;
+
   private readonly notificationListeners = new Set<(notification: JsonRpcNotification) => void>();
   private readonly requestListeners = new Set<(request: JsonRpcRequest) => void>();
   private readonly closeListeners = new Set<() => void>();
@@ -63,6 +67,10 @@ class FakeRuntimeProcess {
 
   async sendRequest<T>(method: string, params: Record<string, unknown>): Promise<T> {
     this.requestLog.push({ method, params });
+
+    if (method === "turn/start" && this.turnStartGate) {
+      await this.turnStartGate;
+    }
 
     if (method === "initialize") {
       return {} as T;
@@ -92,6 +100,10 @@ class FakeRuntimeProcess {
       return {} as T;
     }
 
+    if (method === "turn/interrupt") {
+      return {} as T;
+    }
+
     throw new Error(`Unexpected request method in test: ${method}`);
   }
 
@@ -113,12 +125,15 @@ class FakeRuntimeProcess {
     });
   }
 
-  closeSocket(): void {
-    this.socketReadyState = WebSocket.CLOSED;
-  }
-
   terminate(): void {
+    if (!this.alive) return;
     this.alive = false;
+    for (const listener of this.closeListeners) {
+      listener();
+    }
+    for (const listener of this.exitListeners) {
+      listener(null, null);
+    }
   }
 
   rejectPendingRequests(): void {}
@@ -250,6 +265,10 @@ class NoopApprovalStore {
 
 class RecordingApprovalStore {
   readonly created: ApprovalRecord[] = [];
+  // Number of times resolve() was called. The cross-provider guard test relies
+  // on this staying at 0: the Codex manager must bail out (returning "missing")
+  // before touching a row it does not own.
+  resolveCount = 0;
 
   async create(input: Omit<ApprovalRecord, "createdAt" | "updatedAt" | "resolvedAt"> & { tenantId: string }): Promise<ApprovalRecord> {
     const record: ApprovalRecord = {
@@ -262,17 +281,40 @@ class RecordingApprovalStore {
     return record;
   }
 
+  // cancelPendingApprovals enumerates pending rows via this method. Mirror the
+  // real store's contract: only rows that are still `pending` (not yet expired
+  // or resolved) for the given tenant/session/user are returned.
+  async listPending(tenantId: string, sessionId: string, userId: string): Promise<ApprovalRecord[]> {
+    return this.created.filter(
+      (a) =>
+        a.tenantId === tenantId &&
+        a.sessionId === sessionId &&
+        a.userId === userId &&
+        !this.expired.includes(a.approvalId) &&
+        a.status === "pending"
+    );
+  }
+
   async resolve(
     _tenantId: string,
     approvalId: string,
     userId: string,
     decision: "approve" | "reject"
   ): Promise<ApprovalRecord> {
+    this.resolveCount += 1;
     const existing = this.created.find(
       (approval) => approval.approvalId === approvalId && approval.userId === userId
     );
 
-    expect(existing).toBeTruthy();
+    // Guard misuse at the fake's boundary rather than asserting inside it: the
+    // store contract is that resolve() only ever runs against a previously
+    // created approval. Throwing (instead of expect()) keeps `existing`
+    // narrowed to a defined ApprovalRecord, so the spread below is type-safe.
+    if (!existing) {
+      throw new Error(
+        `RecordingApprovalStore.resolve called for unknown approval ${approvalId} / user ${userId}`
+      );
+    }
 
     return {
       ...existing,
@@ -465,6 +507,44 @@ async function collectEvents(iterable: AsyncIterable<unknown>) {
   return result;
 }
 
+// Consume the turn stream into `events` while exposing a promise that resolves
+// the moment the first event matching `predicate` is observed. Used by the
+// interrupt tests to wait deterministically until `response.created` has been
+// emitted — i.e. the turn's responseId is assigned — before calling
+// interruptTurn (which refuses while the turnId is still null). Avoids racing
+// the orchestrator's post-`turn/start` microtask.
+function collectEventsUntil(
+  iterable: AsyncIterable<unknown>,
+  predicate: (event: unknown) => boolean
+): { events: unknown[]; done: Promise<unknown[]>; reached: Promise<void> } {
+  const events: unknown[] = [];
+  let signalReached: () => void = () => {};
+  const reached = new Promise<void>((resolve) => {
+    signalReached = resolve;
+  });
+
+  const done = (async () => {
+    for await (const item of iterable) {
+      events.push(item);
+      if (predicate(item)) {
+        signalReached();
+      }
+    }
+    signalReached();
+    return events;
+  })();
+
+  return { events, done, reached };
+}
+
+function isResponseCreated(event: unknown): boolean {
+  return (
+    typeof event === "object" &&
+    event !== null &&
+    (event as { type?: string }).type === "response.created"
+  );
+}
+
 async function waitFor(assertion: () => void, timeoutMs = 1_000): Promise<void> {
   const startedAt = Date.now();
 
@@ -564,7 +644,18 @@ test("initializes the pinned protocol and starts a thread before the session bec
           hash: runtimeConfig.runtimePolicy.hash
         }
       });
-  expect(process.requestLog.map((entry) => entry.method)).toEqual(["initialize", "thread/start", "skills/config/write", "skills/list"]);
+  // Assert the handshake by relative ordering + presence, not an exact array.
+  // The contract is "initialize before thread/start before skills config write
+  // before skills list" — a benign extra probe (e.g. a capability check) the
+  // app-server may add later should not fail this test.
+  const handshakeMethods = process.requestLog.map((entry) => entry.method);
+  expect(handshakeMethods).toContain("initialize");
+  expect(handshakeMethods).toContain("thread/start");
+  expect(handshakeMethods).toContain("skills/config/write");
+  expect(handshakeMethods).toContain("skills/list");
+  expect(handshakeMethods.indexOf("initialize")).toBeLessThan(handshakeMethods.indexOf("thread/start"));
+  expect(handshakeMethods.indexOf("thread/start")).toBeLessThan(handshakeMethods.indexOf("skills/config/write"));
+  expect(handshakeMethods.indexOf("skills/config/write")).toBeLessThan(handshakeMethods.indexOf("skills/list"));
   expect(process.notificationLog.length).toBe(1);
   expect(process.notificationLog[0].method).toBe("initialized");
   expect(runtimeSessions.upserts.length).toBe(2);
@@ -572,7 +663,8 @@ test("initializes the pinned protocol and starts a thread before the session bec
   expect(runtimeSessions.upserts[1].status).toBe("active");
   expect(runtimeSessions.upserts[1].healthStatus).toBe("healthy");
   expect(manager.getHealthSnapshot().activeRuntimeCount).toEqual(1);
-  expect((process.requestLog[1].params as { approvalPolicy?: string }).approvalPolicy).toBe("on-request");
+  const threadStartRequest = process.requestLog.find((entry) => entry.method === "thread/start");
+  expect((threadStartRequest?.params as { approvalPolicy?: string }).approvalPolicy).toBe("on-request");
   expect((runtimeSessions.upserts[1].lifecycleMetadata as { discoveredSkillNames?: string[] })
           .discoveredSkillNames?.[0]).toBe("pdf-processing");
 });
@@ -697,7 +789,11 @@ test("bootstraps github git credentials into the runtime workspace when a user c
   expect(helperScript).toMatch(/x-access-token/);
 });
 
-test("falls back to the backend OPENAI_API_KEY when no tenant API key is configured", async () => {
+// The sandbox never receives the real OpenAI key: when ANY key (tenant or
+// backend) is configured, the sandbox env's OPENAI_API_KEY is the session's
+// short-lived rt_* runtime token, and Codex is pointed at the /llm/openai
+// proxy which swaps it for the real key on the backend.
+test("passes the rt_* runtime token (not the real key) when a backend key is configured", async () => {
   const runtimeSessions = new InMemoryRuntimeSessionStore();
   const runtimeProcess = new FakeRuntimeProcess();
   let capturedEnv: Record<string, string> | undefined;
@@ -726,10 +822,11 @@ test("falls back to the backend OPENAI_API_KEY when no tenant API key is configu
     userId: "test-user"
   });
 
-  expect(capturedEnv?.OPENAI_API_KEY).toBe("backend-openai-key");
+  expect(capturedEnv?.OPENAI_API_KEY).toBe(workspaceArtifacts.runtimeToken);
+  expect(capturedEnv?.OPENAI_API_KEY).not.toBe("backend-openai-key");
 });
 
-test("prefers the tenant API key over the backend OPENAI_API_KEY", async () => {
+test("passes the rt_* runtime token when a tenant key is configured", async () => {
   const runtimeSessions = new InMemoryRuntimeSessionStore();
   const runtimeProcess = new FakeRuntimeProcess();
   let capturedEnv: Record<string, string> | undefined;
@@ -758,7 +855,8 @@ test("prefers the tenant API key over the backend OPENAI_API_KEY", async () => {
     userId: "test-user"
   });
 
-  expect(capturedEnv?.OPENAI_API_KEY).toBe("tenant-openai-key");
+  expect(capturedEnv?.OPENAI_API_KEY).toBe(workspaceArtifacts.runtimeToken);
+  expect(capturedEnv?.OPENAI_API_KEY).not.toBe("tenant-openai-key");
 });
 
 test("maps turn start and streaming notifications into framework response events", async () => {
@@ -1578,6 +1676,375 @@ test("invalidateIntegrationRuntimesForTenant ignores other tenants", async () =>
   expect(invalidated).toEqual(["session-a"]);
   // Tenant-b runtime survived.
   expect(processes[1].alive).toBe(true);
+
+  await manager.close();
+});
+
+test("interruptTurn: stops the active turn, emits a terminal interrupted frame, and issues exactly one turn/interrupt", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Long-running thing",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+
+  // The turn must be fully started (turnId assigned via response.created) before
+  // interruptTurn will act — otherwise it refuses (see the "before turn/start"
+  // test below).
+  await collected.reached;
+
+  const outcome = await manager.interruptTurn({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const events = await collected.done;
+
+  expect(outcome).toBe("interrupted");
+  // Terminal frame carries the interrupted flag so the writer persists partial
+  // output under the "interrupted" status.
+  expect(events.at(-1)).toEqual({
+    type: "response.completed",
+    responseId: "turn-1",
+    interrupted: true
+  });
+  // Exactly one turn/interrupt — no double-send, no retry storm.
+  const interruptRequests = process.requestLog.filter((entry) => entry.method === "turn/interrupt");
+  expect(interruptRequests.length).toBe(1);
+  expect(interruptRequests[0].params).toMatchObject({ threadId: "thread-1", turnId: "turn-1" });
+  // The runtime process stays alive so the user can immediately send a follow-up.
+  expect(process.alive).toBe(true);
+
+  await manager.close();
+});
+
+test("interruptTurn: refuses to interrupt before turn/start assigns a turnId — no turn/interrupt issued", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+
+  // Gate turn/start so the active turn exists (queued by runMessage) but its
+  // responseId is still null when interruptTurn runs. This reproduces a fast
+  // Stop click that lands before Codex returns a turnId.
+  let releaseTurnStart: (() => void) | null = null;
+  process.turnStartGate = new Promise<void>((resolve) => {
+    releaseTurnStart = resolve;
+  });
+
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Race the Stop button",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+
+  // Wait until turn/start is in-flight (gated) so the active turn exists with a
+  // null responseId. turn/start is recorded into requestLog *before* the gate
+  // awaits, so seeing it here guarantees the gated, responseId-less window.
+  await waitFor(() => {
+    expect(process.requestLog.some((entry) => entry.method === "turn/start")).toBeTruthy();
+  });
+
+  const outcome = await manager.interruptTurn({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  expect(outcome).toBe("no_active_turn");
+  // No turn/interrupt was sent — interrupting here would orphan the running turn.
+  expect(process.requestLog.some((entry) => entry.method === "turn/interrupt")).toBe(false);
+
+  // Let the gated turn proceed and complete so the stream terminates cleanly.
+  releaseTurnStart?.();
+  await collected.reached;
+  process.emitNotification({
+    method: "turn/completed",
+    params: { turn: { status: "completed" } }
+  });
+  await collected.done;
+
+  await manager.close();
+});
+
+test("interruptTurn: clears a still-pending approval — rejects it to the runtime and drops the DB row", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const approvals = new RecordingApprovalStore();
+  const auditEvents = new InMemoryAuditEventStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals,
+    auditEvents,
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Do a thing that needs approval",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+
+  await collected.reached;
+
+  process.emitRequest({
+    id: 77,
+    method: "execCommandApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "call-77",
+      approvalId: "approval-77",
+      command: ["rm", "-rf", "/tmp/x"],
+      cwd: "/tmp",
+      reason: "interrupt-while-pending"
+    }
+  });
+
+  await waitFor(() => {
+    expect(approvals.created.length).toBe(1);
+  });
+
+  const outcome = await manager.interruptTurn({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+  expect(outcome).toBe("interrupted");
+
+  // cancelPendingApprovals is fire-and-forget: wait for its observable effects.
+  // 1. The runtime is unblocked with a reject ("denied" for the compat method).
+  // 2. The DB row is expired (dropped from pending).
+  await waitFor(() => {
+    expect(
+      process.responseLog.some(
+        (entry) => entry.id === 77 && (entry.result as { decision?: string } | undefined)?.decision === "denied"
+      )
+    ).toBeTruthy();
+    expect(approvals.expired).toContain("approval-77");
+  });
+
+  // The pending row is gone, so resolving it now reports "missing" — proof the
+  // in-memory entry and timer were cleared, not just the DB row.
+  const lateResolve = await manager.resolveApproval({
+    tenantId: "test-tenant",
+    approvalId: "approval-77",
+    userId: "test-user",
+    decision: "approve"
+  });
+  expect(lateResolve).toBe("missing");
+
+  const events = await collected.done;
+  expect(events.at(-1)).toEqual({
+    type: "response.completed",
+    responseId: "turn-1",
+    interrupted: true
+  });
+
+  await manager.close();
+});
+
+test("resolveApproval: returns 'missing' without touching the row when no in-memory runtime owns it (Claude-owned guard)", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const approvals = new RecordingApprovalStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals,
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  // This approval id was never registered with any Codex runtime (it belongs to
+  // a Claude runtime in production). The Codex manager must NOT flip the shared
+  // DB row — the production route tries the Claude resolver next.
+  const outcome = await manager.resolveApproval({
+    tenantId: "test-tenant",
+    approvalId: "claude-owned-approval",
+    userId: "test-user",
+    decision: "approve"
+  });
+
+  expect(outcome).toBe("missing");
+  expect(approvals.resolveCount).toBe(0);
+
+  await manager.close();
+});
+
+test("resolveApproval: rememberForTurn auto-approves the next same-kind request with no new approval row", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const approvals = new RecordingApprovalStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals,
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const eventsPromise = collectEvents(
+    manager.runMessage(session, {
+      prompt: "Run two shell commands",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    })
+  );
+
+  await waitFor(() => {
+    expect(process.requestLog.some((entry) => entry.method === "turn/start")).toBeTruthy();
+  });
+
+  // First command-execution approval — surfaced to the user.
+  process.emitRequest({
+    id: 10,
+    method: "execCommandApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "call-10",
+      approvalId: "approval-10",
+      command: ["ls"],
+      cwd: "/tmp",
+      reason: "first"
+    }
+  });
+
+  await waitFor(() => {
+    expect(approvals.created.length).toBe(1);
+  });
+
+  const firstOutcome = await manager.resolveApproval({
+    tenantId: "test-tenant",
+    approvalId: "approval-10",
+    userId: "test-user",
+    decision: "approve",
+    rememberForTurn: true
+  });
+  expect(firstOutcome).toBe("resolved");
+
+  // Second command-execution approval (same kind). Because rememberForTurn
+  // recorded the kind, it must auto-approve WITHOUT creating a second DB row.
+  process.emitRequest({
+    id: 11,
+    method: "execCommandApproval",
+    params: {
+      conversationId: "thread-1",
+      callId: "call-11",
+      approvalId: "approval-11",
+      command: ["pwd"],
+      cwd: "/tmp",
+      reason: "second"
+    }
+  });
+
+  // Observable signal: the runtime is auto-approved (compat method → "approved")
+  // for request id 11, and no new approval row was created.
+  await waitFor(() => {
+    expect(
+      process.responseLog.some(
+        (entry) => entry.id === 11 && (entry.result as { decision?: string } | undefined)?.decision === "approved"
+      )
+    ).toBeTruthy();
+  });
+  expect(approvals.created.length).toBe(1);
+  expect(approvals.created.some((row) => row.approvalId === "approval-11")).toBe(false);
+
+  process.emitNotification({
+    method: "turn/completed",
+    params: { turn: { status: "completed" } }
+  });
+  await eventsPromise;
 
   await manager.close();
 });

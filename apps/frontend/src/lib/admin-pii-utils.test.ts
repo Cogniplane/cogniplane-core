@@ -1,10 +1,8 @@
 import { test, expect } from "vitest";
 import {
   breakerStatePillClass,
-  buildDonutSegments,
   buildMetricsQuery,
   buildSegmentTooltip,
-  buildTimeSeriesGeometry,
   computeDelta,
   entityColor,
   formatBucketLabel,
@@ -18,21 +16,6 @@ import {
   writePersistedBoolean
 } from "./admin-pii-utils";
 import type { PiiActivityTimeSeriesPoint } from "@cogniplane/shared-types";
-
-function bucket(
-  iso: string,
-  fields: Partial<Omit<PiiActivityTimeSeriesPoint, "bucket">> = {}
-): PiiActivityTimeSeriesPoint {
-  return {
-    bucket: iso,
-    allow: 0,
-    report: 0,
-    block: 0,
-    transform: 0,
-    failed: 0,
-    ...fields
-  };
-}
 
 // ─── buildMetricsQuery ──────────────────────────────────────────────────────
 
@@ -198,138 +181,6 @@ test("PiiActivityMetrics never carries a 'value' field on findings", () => {
   const sampleConfRecord: Record<string, unknown> = sample.byConfidence[0]!;
   expect("value" in sampleAsRecord).toBe(false);
   expect("value" in sampleConfRecord).toBe(false);
-});
-
-// ─── buildTimeSeriesGeometry ────────────────────────────────────────────────
-
-test("buildTimeSeriesGeometry: empty series returns empty bars + yMax 0", () => {
-  const geo = buildTimeSeriesGeometry([]);
-  expect(geo.bars).toEqual([]);
-  expect(geo.yMax).toBe(0);
-  expect(geo.yTicks).toEqual([0]);
-});
-
-test("buildTimeSeriesGeometry: single bucket renders one bar with correct segments", () => {
-  const geo = buildTimeSeriesGeometry([
-    bucket("2026-04-30T00:00:00Z", { allow: 5, block: 3, failed: 2 })
-  ]);
-  expect(geo.bars.length).toBe(1);
-  expect(geo.yMax).toBe(10);
-  const segments = geo.bars[0]!.segments;
-  // Only non-zero actions emit segments.
-  expect(segments.map((s) => s.action)).toEqual(["allow", "block", "failed"]);
-  // Stack order is fixed: allow (5/10=50%) then block (30%) then failed (20%).
-  expect(segments[0]!.yStartPct).toBe(0);
-  expect(segments[0]!.hPct).toBe(50);
-  expect(segments[1]!.yStartPct).toBe(50);
-  expect(segments[1]!.hPct).toBe(30);
-  expect(segments[2]!.yStartPct).toBe(80);
-  expect(segments[2]!.hPct).toBe(20);
-  // Tooltip strings carry both count and percentage.
-  expect(segments[0]!.label).toBe("allow: 5 (50%)");
-});
-
-test("buildTimeSeriesGeometry: 7-bucket span — bars don't overlap, sum to ≤100% width", () => {
-  const series = Array.from({ length: 7 }, (_, i) =>
-    bucket(`2026-04-${20 + i}T00:00:00Z`, { allow: i + 1 })
-  );
-  const geo = buildTimeSeriesGeometry(series);
-  expect(geo.bars.length).toBe(7);
-  // Each bar's right edge < next bar's left edge.
-  for (let i = 0; i < geo.bars.length - 1; i += 1) {
-    const a = geo.bars[i]!;
-    const b = geo.bars[i + 1]!;
-    const aRight = a.xPct + a.widthPct / 2;
-    const bLeft = b.xPct - b.widthPct / 2;
-    expect(aRight < bLeft).toBeTruthy();
-  }
-  // yMax tracks the largest single-bucket total (bucket 7 has allow=7).
-  expect(geo.yMax).toBe(7);
-});
-
-test("buildTimeSeriesGeometry: 30-bucket span fits without overlap", () => {
-  const series = Array.from({ length: 30 }, (_, i) =>
-    bucket(`2026-04-01T${String(i % 24).padStart(2, "0")}:00:00Z`, { allow: 1 })
-  );
-  const geo = buildTimeSeriesGeometry(series);
-  expect(geo.bars.length).toBe(30);
-  // First bar's left edge >= 0; last bar's right edge <= 100.
-  const first = geo.bars[0]!;
-  const last = geo.bars[29]!;
-  expect(first.xPct - first.widthPct / 2 >= 0).toBeTruthy();
-  expect(last.xPct + last.widthPct / 2 <= 100).toBeTruthy();
-});
-
-test("buildTimeSeriesGeometry: yTicks span 0 to yMax in five steps", () => {
-  const geo = buildTimeSeriesGeometry([
-    bucket("a", { allow: 100 }),
-    bucket("b", { allow: 200 })
-  ]);
-  expect(geo.yMax).toBe(200);
-  // yMax * [0, 0.25, 0.5, 0.75, 1] rounded.
-  expect(geo.yTicks).toEqual([0, 50, 100, 150, 200]);
-});
-
-// ─── buildDonutSegments ─────────────────────────────────────────────────────
-
-test("buildDonutSegments: empty input returns empty array", () => {
-  expect(buildDonutSegments([])).toEqual([]);
-  // Filter zero-counts too — they produce no visible arc.
-  expect(buildDonutSegments([{ entityType: "email", count: 0 }])).toEqual([]);
-});
-
-test("buildDonutSegments: single 100% segment marks isFullCircle (no degenerate arc)", () => {
-  // SVG arcs from x0,y0 to x1,y1 where the points coincide render nothing.
-  // The renderer must use <circle> instead — isFullCircle flags this.
-  const out = buildDonutSegments([{ entityType: "email", count: 5 }]);
-  expect(out.length).toBe(1);
-  expect(out[0]!.isFullCircle).toBe(true);
-  expect(out[0]!.percentage).toBe(100);
-  expect(out[0]!.pathD).toBe("");
-});
-
-test("buildDonutSegments: three even segments sum to 360° with correct percentages", () => {
-  const out = buildDonutSegments([
-    { entityType: "email", count: 1 },
-    { entityType: "phone", count: 1 },
-    { entityType: "address", count: 1 }
-  ]);
-  expect(out.length).toBe(3);
-  expect(out.map((s) => s.percentage)).toEqual([33.3, 33.3, 33.3]);
-  // Each path is non-empty and starts with 'M 50 50'.
-  for (const seg of out) {
-    expect(seg.pathD).toMatch(/^M 50 50/);
-    expect(seg.isFullCircle).toBe(false);
-  }
-});
-
-test("buildDonutSegments: skewed 90/5/5 produces a large-arc (>180°) plus two thin arcs", () => {
-  // The 90% segment exceeds 180° so its arc must use largeArcFlag=1.
-  // Encoded in the path's '0 1 1' / '0 1 0' triplet (rx ry x-axis-rot
-  // large-arc sweep). We assert by substring search rather than parsing
-  // the path.
-  const out = buildDonutSegments([
-    { entityType: "email", count: 90 },
-    { entityType: "phone", count: 5 },
-    { entityType: "address", count: 5 }
-  ]);
-  expect(out.length).toBe(3);
-  // Sorted desc by count, so [0] is email at 90%.
-  expect(out[0]!.entityType).toBe("email");
-  expect(out[0]!.percentage).toBe(90);
-  // Large-arc flag (1) appears in email's path; the small arcs use 0.
-  expect(out[0]!.pathD).toMatch(/A 40 40 0 1 1/);
-  expect(out[1]!.pathD).toMatch(/A 40 40 0 0 1/);
-});
-
-test("buildDonutSegments: sort order is deterministic (count desc, then alpha)", () => {
-  // Two ties at count=3: address before phone alphabetically.
-  const out = buildDonutSegments([
-    { entityType: "phone", count: 3 },
-    { entityType: "email", count: 5 },
-    { entityType: "address", count: 3 }
-  ]);
-  expect(out.map((s) => s.entityType)).toEqual(["email", "address", "phone"]);
 });
 
 // ─── entityColor ────────────────────────────────────────────────────────────

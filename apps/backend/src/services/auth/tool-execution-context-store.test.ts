@@ -2,7 +2,7 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../../lib/db.js";
 
-import { ToolExecutionContextStore } from "./tool-execution-context-store.js";
+import { ToolContextUnavailableError, ToolExecutionContextStore } from "./tool-execution-context-store.js";
 
 type StoredContextRow = {
   tool_context_id: string;
@@ -131,5 +131,13 @@ test("ToolExecutionContextStore treats expired contexts as missing", async () =>
   db.advanceBy(51);
 
   expect(await store.get("test-tenant", created.toolContextId)).toBe(null);
-  await expect(store.require("test-tenant", created.toolContextId)).rejects.toThrow(/was not found or expired/);
+  // Assert the typed contract (code + error class), not the prose message, so
+  // wording changes don't break the test and callers can branch on `.code`.
+  const error = await store
+    .require("test-tenant", created.toolContextId)
+    .then(() => null)
+    .catch((caught) => caught);
+  expect(error).toBeInstanceOf(ToolContextUnavailableError);
+  expect((error as ToolContextUnavailableError).code).toBe("TOOL_CONTEXT_UNAVAILABLE");
+  expect((error as ToolContextUnavailableError).toolContextId).toBe(created.toolContextId);
 });

@@ -108,7 +108,12 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
   constructor(private readonly rootPath: string) {}
 
   async storeBundle(input: StoreBundleInput): Promise<StoreBundleResult> {
-    const bundlePath = path.join(this.rootPath, input.bundleName, input.contentHash);
+    // Namespace by tenantId so two tenants importing the same bundleName +
+    // contentHash do not share an on-disk path. Cleanup reference-counts per
+    // tenant, so a shared path would let one tenant's cleanup rm a bundle
+    // another tenant still uses. Mirrors the bucket backend's
+    // `skills/<tenantId>/...` layout.
+    const bundlePath = path.join(this.rootPath, input.tenantId, input.bundleName, input.contentHash);
     if (await pathExists(bundlePath)) {
       return { storageUri: `file://${bundlePath}` };
     }
@@ -332,66 +337,18 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
 }
 
 /**
- * Routes bundle operations to the right backend based on the persisted
- * `storageUri` scheme. A deployment that flips `SKILL_BUNDLE_STORAGE_BACKEND`
- * from `local` to `bucket` (or rolls back) must keep honoring revisions
- * imported under the previous backend, so read/delete paths dispatch by URI
- * rather than by env. Writes always use the configured primary backend.
+ * Returns the single storage backend selected by `SKILL_BUNDLE_STORAGE_BACKEND`.
+ *
+ * There is no cross-backend routing: each backend validates the persisted
+ * `storageUri` scheme (`parseFileUri` / `parseS3Uri`) and throws a clear error
+ * if it is handed the other scheme. Switching a tenant from `local` → `bucket`
+ * is a deliberate re-upload (see CLAUDE.md "skill bundle storage"), so live
+ * URIs always match the configured backend — a stray cross-scheme URI is an
+ * operator error that should surface loudly, not be silently re-routed.
  */
-export class CompositeSkillBundleStorage implements SkillBundleStorage {
-  readonly backend: "local" | "bucket";
-
-  constructor(
-    private readonly deps: {
-      primary: SkillBundleStorage;
-      local: LocalSkillBundleStorage;
-      bucket?: BucketSkillBundleStorage;
-    }
-  ) {
-    this.backend = deps.primary.backend;
-  }
-
-  private routeForUri(storageUri: string): SkillBundleStorage {
-    if (storageUri.startsWith("file://")) {
-      return this.deps.local;
-    }
-    if (storageUri.startsWith("s3://")) {
-      if (!this.deps.bucket) {
-        throw new Error(
-          `Skill bundle storage URI ${storageUri} requires the bucket backend, ` +
-            `but SKILL_BUNDLE_STORAGE_BACKEND is not configured for bucket mode.`
-        );
-      }
-      return this.deps.bucket;
-    }
-    throw new Error(`Unsupported skill bundle storage URI scheme: ${storageUri}`);
-  }
-
-  async storeBundle(input: StoreBundleInput): Promise<StoreBundleResult> {
-    return this.deps.primary.storeBundle(input);
-  }
-
-  async installBundle(input: InstallBundleInput): Promise<void> {
-    return this.routeForUri(input.storageUri).installBundle(input);
-  }
-
-  async materializeBundle(storageUri: string): Promise<{ localPath: string }> {
-    return this.routeForUri(storageUri).materializeBundle(storageUri);
-  }
-
-  async deleteBundle(storageUri: string): Promise<void> {
-    return this.routeForUri(storageUri).deleteBundle(storageUri);
-  }
-}
-
 export function createSkillBundleStorage(config: AppConfig): SkillBundleStorage {
-  const local = new LocalSkillBundleStorage(config.SKILL_BUNDLE_STORAGE_ROOT);
-
   if (config.SKILL_BUNDLE_STORAGE_BACKEND === "local") {
-    // No bucket configured — only file:// URIs are reachable. A rollback from
-    // bucket mode will surface a clear error on s3:// revisions instead of
-    // silently returning stale cache or ENOENT.
-    return new CompositeSkillBundleStorage({ primary: local, local });
+    return new LocalSkillBundleStorage(config.SKILL_BUNDLE_STORAGE_ROOT);
   }
 
   const client = new S3Client({
@@ -407,14 +364,12 @@ export function createSkillBundleStorage(config: AppConfig): SkillBundleStorage 
       : undefined
   });
 
-  const bucket = new BucketSkillBundleStorage({
+  return new BucketSkillBundleStorage({
     client,
     bucketName: config.SKILL_BUNDLE_BUCKET_NAME as string,
     keyPrefix: config.SKILL_BUNDLE_BUCKET_PREFIX,
     cacheRoot: config.SKILL_BUNDLE_CACHE_ROOT
   });
-
-  return new CompositeSkillBundleStorage({ primary: bucket, local, bucket });
 }
 
 export function defaultSkillBundleCacheRoot(): string {

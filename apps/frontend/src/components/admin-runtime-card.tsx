@@ -79,14 +79,6 @@ export function AdminRuntimeCard(props: {
             <p className={SECTION_LABEL}>Backend configuration</p>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <span className={CHIP}>
-                Codex backend:{" "}
-                <strong className="ml-1 font-semibold">{props.runtimeConfig.codexBackend}</strong>
-              </span>
-              <span className={CHIP}>
-                Claude backend:{" "}
-                <strong className="ml-1 font-semibold">{props.runtimeConfig.claudeBackend}</strong>
-              </span>
-              <span className={CHIP}>
                 E2B template:{" "}
                 <code className="ml-1 font-mono text-[0.7rem]">
                   {props.runtimeConfig.e2bTemplateId || "—"}

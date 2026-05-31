@@ -25,6 +25,30 @@ describe("isPrivateOrReservedHost", () => {
     expect(isPrivateOrReservedHost("1.1.1.1")).toBe(false);
     expect(isPrivateOrReservedHost("2606:4700:4700::1111")).toBe(false);
   });
+
+  it("blocks IPv4-mapped IPv6 literals by classifying the embedded quad", () => {
+    expect(isPrivateOrReservedHost("::ffff:127.0.0.1")).toBe(true);
+    expect(isPrivateOrReservedHost("::ffff:169.254.169.254")).toBe(true);
+    expect(isPrivateOrReservedHost("::ffff:10.0.0.1")).toBe(true);
+    // Bracketed form (as it would appear in a URL hostname).
+    expect(isPrivateOrReservedHost("[::ffff:169.254.169.254]")).toBe(true);
+    // Hex-form IPv4-mapped (::ffff:7f00:1 == ::ffff:127.0.0.1).
+    expect(isPrivateOrReservedHost("::ffff:7f00:1")).toBe(true);
+    // Public IPv4 mapped through ::ffff: stays allowed.
+    expect(isPrivateOrReservedHost("::ffff:8.8.8.8")).toBe(false);
+  });
+
+  it("blocks expanded / alternate IPv6 loopback forms", () => {
+    expect(isPrivateOrReservedHost("0:0:0:0:0:0:0:1")).toBe(true);
+    expect(isPrivateOrReservedHost("0000:0000:0000:0000:0000:0000:0000:0001")).toBe(true);
+    expect(isPrivateOrReservedHost("0:0:0:0:0:0:0:0")).toBe(true);
+  });
+
+  it("blocks the NAT64 well-known prefix 64:ff9b::/96", () => {
+    expect(isPrivateOrReservedHost("64:ff9b::7f00:1")).toBe(true);
+    expect(isPrivateOrReservedHost("64:ff9b::8.8.8.8")).toBe(true);
+    expect(isPrivateOrReservedHost("64:ff9b::169.254.169.254")).toBe(true);
+  });
 });
 
 describe("ssrfSafeLookup", () => {

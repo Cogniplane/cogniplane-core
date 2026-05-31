@@ -82,6 +82,16 @@
   --radius-lg:   0.75rem;
   --radius-xl:   1rem;
   --radius-full: 9999px;
+
+  /* Categorical chart palette (light). Drawn from the editorial token set so
+     dashboard charts read as part of the app theme rather than a bolted-on
+     library palette. Referenced by shadcn <ChartContainer> via each chart's
+     `chartConfig[series].color = "var(--chart-N)"`. */
+  --chart-1: #3d5a99; /* info blue   */
+  --chart-2: #1a7a4a; /* success     */
+  --chart-3: #7a5c00; /* warning     */
+  --chart-4: #9f403d; /* danger      */
+  --chart-5: #566166; /* neutral ink */
 }
 
 [data-theme="dark"] {
@@ -143,6 +153,14 @@
   --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.16);
   --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.2);
   --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.24);
+
+  /* Categorical chart palette (dark) — brighter variants of the same hues so
+     contrast holds on the dark surfaces. */
+  --chart-1: #8cb8ff; /* info blue   */
+  --chart-2: #61d48c; /* success     */
+  --chart-3: #f1c86a; /* warning     */
+  --chart-4: #ff8f87; /* danger      */
+  --chart-5: #b1bccb; /* neutral ink */
 }
 
 /* ============================================================

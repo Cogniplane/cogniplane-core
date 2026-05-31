@@ -1,6 +1,7 @@
 import { test, afterEach, beforeEach, expect } from "vitest";
 
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
+import { createFakeFetch, type FakeFetch } from "../../test-helpers/fake-fetch.js";
 import { createGithubTools, GITHUB_TOOL_CATALOG } from "./github-tools.js";
 
 const fakeContext: ToolExecutionContext = {
@@ -39,31 +40,39 @@ const writeTool = tools.find((t) => t.name === "github_write_file");
 const prTool = tools.find((t) => t.name === "github_create_pr");
 expect(readTool && writeTool && prTool).toBeTruthy();
 
-let capturedUrl: string | null = null;
-const originalFetch = globalThis.fetch;
+let fake: FakeFetch | null = null;
+
+// The URL of the last fetch the tool issued, or null when validation rejected
+// before any fetch (the only observable signal that the canonical URL was
+// constructed vs. short-circuited).
+function capturedUrl(): string | null {
+  const calls = fake?.calls ?? [];
+  return calls.length > 0 ? calls[calls.length - 1]!.url : null;
+}
 
 function installFakeFetch(responseBody: Record<string, unknown> = {}, ok = true, status = 200) {
-  globalThis.fetch = (async (input: string | URL | Request) => {
-    capturedUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    return {
-      ok,
-      status,
-      async json() {
-        return responseBody;
-      },
-      async text() {
-        return JSON.stringify(responseBody);
-      }
-    } as unknown as Response;
-  }) as typeof globalThis.fetch;
+  fake = createFakeFetch(
+    () =>
+      ({
+        ok,
+        status,
+        async json() {
+          return responseBody;
+        },
+        async text() {
+          return JSON.stringify(responseBody);
+        }
+      }) as unknown as Response
+  );
 }
 
 beforeEach(() => {
-  capturedUrl = null;
+  fake = null;
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
+  fake?.restore();
+  fake = null;
 });
 
 // ── github_read_file ─────────────────────────────────────────────────────────
@@ -75,7 +84,7 @@ test("github_read_file rejects malformed repo with extra path segments", async (
     arguments: { repo: "owner/repo/contents/secret", path: "README.md" }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid repo/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 test("github_read_file rejects repo containing query string", async () => {
@@ -85,7 +94,7 @@ test("github_read_file rejects repo containing query string", async () => {
     arguments: { repo: "owner/repo?ref=evil", path: "README.md" }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid repo/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 test("github_read_file rejects path containing '..' segments", async () => {
@@ -95,7 +104,7 @@ test("github_read_file rejects path containing '..' segments", async () => {
     arguments: { repo: "owner/repo", path: "docs/../../etc/secret" }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid path/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 test("github_read_file encodes path segments containing reserved characters", async () => {
@@ -104,8 +113,8 @@ test("github_read_file encodes path segments containing reserved characters", as
     context: fakeContext,
     arguments: { repo: "owner/repo", path: "dir/file with space.txt" }
   });
-  expect(capturedUrl).toBeTruthy();
-  expect(capturedUrl!).toMatch(/\/contents\/dir\/file%20with%20space\.txt$/);
+  expect(capturedUrl()).toBeTruthy();
+  expect(capturedUrl()!).toMatch(/\/contents\/dir\/file%20with%20space\.txt$/);
 });
 
 test("github_read_file constructs the canonical URL on valid input", async () => {
@@ -114,7 +123,7 @@ test("github_read_file constructs the canonical URL on valid input", async () =>
     context: fakeContext,
     arguments: { repo: "octocat/Hello-World", path: "src/index.ts", ref: "main" }
   });
-  expect(capturedUrl).toBe("https://api.github.com/repos/octocat/Hello-World/contents/src/index.ts?ref=main");
+  expect(capturedUrl()).toBe("https://api.github.com/repos/octocat/Hello-World/contents/src/index.ts?ref=main");
 });
 
 // ── github_write_file ────────────────────────────────────────────────────────
@@ -132,7 +141,7 @@ test("github_write_file rejects malformed repo", async () => {
     }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid repo/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 test("github_write_file rejects path with '..' segments", async () => {
@@ -148,7 +157,7 @@ test("github_write_file rejects path with '..' segments", async () => {
     }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid path/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 // ── github_create_pr ─────────────────────────────────────────────────────────
@@ -165,7 +174,7 @@ test("github_create_pr rejects malformed repo", async () => {
     }
   });
   expect(String(result.error ?? "")).toMatch(/Invalid repo/i);
-  expect(capturedUrl).toBe(null);
+  expect(capturedUrl()).toBe(null);
 });
 
 test("github_create_pr constructs canonical URL on valid input", async () => {
@@ -174,7 +183,7 @@ test("github_create_pr constructs canonical URL on valid input", async () => {
     context: fakeContext,
     arguments: { repo: "octocat/Hello-World", title: "t", head: "h", base: "b" }
   });
-  expect(capturedUrl).toBe("https://api.github.com/repos/octocat/Hello-World/pulls");
+  expect(capturedUrl()).toBe("https://api.github.com/repos/octocat/Hello-World/pulls");
 });
 
 // ── catalog sanity ───────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ export const DEFAULT_TENANT_TOOL_IDS = [
   "session_context",
   "list_artifacts",
   "read_text_artifact",
+  "read_skill_corpus",
   "write_artifact"
 ];
 
@@ -26,9 +27,6 @@ function normalizeRuntimeProviders(value: unknown): RuntimeProvider[] {
   return providers;
 }
 
-export type SkillJudgeProviderId = "anthropic" | "openai";
-export type SkillJudgeMode = "sync" | "batch";
-
 export type TenantSettingsRecord = {
   tenantId: string;
   /** Default runtime provider — derived from `enabledRuntimeProviders[0]`. */
@@ -44,23 +42,10 @@ export type TenantSettingsRecord = {
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
-  skillJudgeEnabled: boolean;
-  skillJudgeProvider: SkillJudgeProviderId | null;
-  skillJudgeModel: string | null;
-  skillJudgeMode: SkillJudgeMode;
   version: number;
   configHash: string;
   updatedAt: string;
 };
-
-function parseSkillJudgeProvider(value: unknown): SkillJudgeProviderId | null {
-  if (value === "anthropic" || value === "openai") return value;
-  return null;
-}
-
-function parseSkillJudgeMode(value: unknown): SkillJudgeMode {
-  return value === "batch" ? "batch" : "sync";
-}
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -85,10 +70,6 @@ function mapRow(row: Record<string, unknown>): TenantSettingsRecord {
     developerInstructions: row.developer_instructions ? String(row.developer_instructions) : null,
     enabledToolIds: toStringArray(row.enabled_tool_ids),
     enabledMcpServerIds: toStringArray(row.enabled_mcp_server_ids),
-    skillJudgeEnabled: Boolean(row.skill_judge_enabled),
-    skillJudgeProvider: parseSkillJudgeProvider(row.skill_judge_provider),
-    skillJudgeModel: row.skill_judge_model ? String(row.skill_judge_model) : null,
-    skillJudgeMode: parseSkillJudgeMode(row.skill_judge_mode),
     version: Number(row.version),
     configHash: String(row.config_hash),
     updatedAt: new Date(String(row.updated_at)).toISOString()
@@ -111,10 +92,6 @@ export type TenantSettingsInput = {
   developerInstructions?: string | null;
   enabledToolIds?: string[];
   enabledMcpServerIds?: string[];
-  skillJudgeEnabled?: boolean;
-  skillJudgeProvider?: SkillJudgeProviderId | null;
-  skillJudgeModel?: string | null;
-  skillJudgeMode?: SkillJudgeMode;
 };
 
 function hasOwn(input: TenantSettingsInput, key: keyof TenantSettingsInput): boolean {
@@ -132,11 +109,7 @@ export function buildDefaultTenantSettingsInput(): Required<TenantSettingsInput>
     autoApproveReadOnlyTools: true,
     developerInstructions: null,
     enabledToolIds: [...DEFAULT_TENANT_TOOL_IDS],
-    enabledMcpServerIds: [...DEFAULT_TENANT_MCP_SERVER_IDS],
-    skillJudgeEnabled: false,
-    skillJudgeProvider: null,
-    skillJudgeModel: null,
-    skillJudgeMode: "sync"
+    enabledMcpServerIds: [...DEFAULT_TENANT_MCP_SERVER_IDS]
   };
 }
 
@@ -190,21 +163,6 @@ export class TenantSettingsStore {
     const resolvedMcpIds = hasOwn(input, "enabledMcpServerIds")
       ? (input.enabledMcpServerIds ?? defaults.enabledMcpServerIds)
       : (existing?.enabledMcpServerIds ?? defaults.enabledMcpServerIds);
-    const resolvedJudgeEnabled = hasOwn(input, "skillJudgeEnabled")
-      ? (input.skillJudgeEnabled ?? defaults.skillJudgeEnabled)
-      : (existing?.skillJudgeEnabled ?? defaults.skillJudgeEnabled);
-    const resolvedJudgeProvider = hasOwn(input, "skillJudgeProvider")
-      ? (input.skillJudgeProvider ?? null)
-      : (existing?.skillJudgeProvider ?? defaults.skillJudgeProvider);
-    const resolvedJudgeModel = hasOwn(input, "skillJudgeModel")
-      ? (input.skillJudgeModel ?? null)
-      : (existing?.skillJudgeModel ?? defaults.skillJudgeModel);
-    const resolvedJudgeMode = hasOwn(input, "skillJudgeMode")
-      ? (input.skillJudgeMode ?? defaults.skillJudgeMode)
-      : (existing?.skillJudgeMode ?? defaults.skillJudgeMode);
-    if (resolvedJudgeEnabled && (!resolvedJudgeProvider || !resolvedJudgeModel)) {
-      throw new Error("Skill judge cannot be enabled without a provider and model.");
-    }
 
     const configHash = computeConfigHash({
       tenantId,
@@ -217,11 +175,7 @@ export class TenantSettingsStore {
       autoApproveReadOnlyTools: resolvedReadOnly,
       developerInstructions: resolvedInstructions,
       enabledToolIds: resolvedToolIds,
-      enabledMcpServerIds: resolvedMcpIds,
-      skillJudgeEnabled: resolvedJudgeEnabled,
-      skillJudgeProvider: resolvedJudgeProvider,
-      skillJudgeModel: resolvedJudgeModel,
-      skillJudgeMode: resolvedJudgeMode
+      enabledMcpServerIds: resolvedMcpIds
     });
 
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -239,15 +193,11 @@ export class TenantSettingsStore {
             developer_instructions,
             enabled_tool_ids,
             enabled_mcp_server_ids,
-            skill_judge_enabled,
-            skill_judge_provider,
-            skill_judge_model,
-            skill_judge_mode,
             version,
             config_hash,
             updated_at
           )
-          VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15, 1, $16, NOW())
+          VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, 1, $12, NOW())
           ON CONFLICT (tenant_id) DO UPDATE SET
             enabled_runtime_providers = EXCLUDED.enabled_runtime_providers,
             show_effort_selector = EXCLUDED.show_effort_selector,
@@ -259,10 +209,6 @@ export class TenantSettingsStore {
             developer_instructions = EXCLUDED.developer_instructions,
             enabled_tool_ids = EXCLUDED.enabled_tool_ids,
             enabled_mcp_server_ids = EXCLUDED.enabled_mcp_server_ids,
-            skill_judge_enabled = EXCLUDED.skill_judge_enabled,
-            skill_judge_provider = EXCLUDED.skill_judge_provider,
-            skill_judge_model = EXCLUDED.skill_judge_model,
-            skill_judge_mode = EXCLUDED.skill_judge_mode,
             version = tenant_settings.version + 1,
             config_hash = EXCLUDED.config_hash,
             updated_at = NOW()
@@ -280,10 +226,6 @@ export class TenantSettingsStore {
           resolvedInstructions,
           JSON.stringify(resolvedToolIds),
           JSON.stringify(resolvedMcpIds),
-          resolvedJudgeEnabled,
-          resolvedJudgeProvider,
-          resolvedJudgeModel,
-          resolvedJudgeMode,
           configHash
         ]
       );

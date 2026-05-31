@@ -106,7 +106,44 @@ export class PiiProtectionService {
     return record ?? DEFAULT_PII_PROTECTION;
   }
 
+  /**
+   * Enforce the configured `timeoutMs` budget across the WHOLE evaluation —
+   * policy lookup, rule detection, the provider round-trip, and redaction — not
+   * just an individual HTTP call. `evaluateText`/`evaluateArtifact` run on the
+   * critical `POST /messages` path (block/transform are synchronous there), so a
+   * hung policy lookup or a provider that ignores its own per-request timeout
+   * must never block the turn indefinitely. On timeout we REJECT (fail-closed):
+   * the caller treats a thrown PII error as "do not forward the text", which is
+   * the safe outcome for block/transform and a hard stop for sync detect.
+   */
+  private async withTimeout<T>(op: string, run: () => Promise<T>): Promise<T> {
+    const budget = this.options.timeoutMs;
+    if (!budget || budget <= 0) {
+      return run();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new PiiProtectionServiceError(
+            "pii_timeout",
+            `PII ${op} exceeded the ${budget}ms timeout budget`
+          )
+        );
+      }, budget);
+    });
+    try {
+      return await Promise.race([run(), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async evaluateText(input: PiiServiceEvaluateTextInput): Promise<PiiDecision> {
+    return this.withTimeout("text evaluation", () => this.evaluateTextUnbounded(input));
+  }
+
+  private async evaluateTextUnbounded(input: PiiServiceEvaluateTextInput): Promise<PiiDecision> {
     const settings = await this.getActiveSettings(input.tenantId);
 
     if (!isEffectivelyEnabled(settings)) {
@@ -180,10 +217,25 @@ export class PiiProtectionService {
       return { action: "allow", reason: "no_findings" };
     }
 
-    // Belt-and-suspenders: if the provider missed any deterministic match that
-    // the rule detector already found, scrub it ourselves before returning. We
-    // can't trust the model to always redact the exact spans we anchored.
-    const scrubbedText = enforceRuleRedactions(transformResult.transformedText, ruleResult.findings);
+    // Belt-and-suspenders: never trust the model to have redacted the spans it
+    // (or the rule detector) flagged. Scrub against the FULL merged finding set
+    // — rule hits AND LLM-only types (person_name/address) — so a model that
+    // returns its findings but leaves the values in `transformedText` can't
+    // leak PII downstream.
+    const scrubbedText = enforceRedactions(transformResult.transformedText, mergedFindings);
+
+    // Fail closed: if any flagged value still appears verbatim in the output
+    // (e.g. overlapping spans the scrub couldn't fully resolve), refuse to
+    // return a "transformed" decision rather than persist/forward raw PII.
+    const leaked = mergedFindings.find(
+      (finding) => finding.value && scrubbedText.includes(finding.value)
+    );
+    if (leaked) {
+      throw new PiiProtectionServiceError(
+        "pii_transform_incomplete",
+        `transform output still contains a '${leaked.entityType}' value after redaction`
+      );
+    }
 
     return {
       action: "transform",
@@ -195,6 +247,10 @@ export class PiiProtectionService {
   }
 
   async evaluateArtifact(input: PiiServiceEvaluateArtifactInput): Promise<PiiDecision> {
+    return this.withTimeout("artifact evaluation", () => this.evaluateArtifactUnbounded(input));
+  }
+
+  private async evaluateArtifactUnbounded(input: PiiServiceEvaluateArtifactInput): Promise<PiiDecision> {
     const settings = await this.getActiveSettings(input.tenantId);
 
     if (!isEffectivelyEnabled(settings) || !isScopeEnabled(settings, input.subject)) {
@@ -269,20 +325,6 @@ export class PiiProtectionService {
       providerType,
       providerModel
     };
-  }
-
-  /**
-   * Decides whether a request should be executed synchronously (provider call
-   * in the hot path) or asynchronously (enqueue a scan job). Phase 1:
-   * - `block` and `transform` are sync (fail-closed within the timeout budget).
-   * - `detect` is async for uploads/microsoft, sync for chat prompts so the
-   *   scan run id can be attached to the message before the runtime turn begins.
-   */
-  resolveExecutionPath(settings: PiiProtectionSettings, subject: PiiSubject): "sync" | "async" {
-    if (!isEffectivelyEnabled(settings)) return "sync";
-    if (settings.mode === "block" || settings.mode === "transform") return "sync";
-    if (subject.kind === "chat_prompt") return "sync";
-    return "async";
   }
 
   private async runDetectWithOptionalProvider(args: {
@@ -558,9 +600,13 @@ function resolveProviderModel(settings: PiiProtectionSettings): string | undefin
   return model;
 }
 
-function enforceRuleRedactions(transformedText: string, ruleFindings: PiiFinding[]): string {
+function enforceRedactions(transformedText: string, findings: PiiFinding[]): string {
+  // Replace longer values first so that a value which is a substring of another
+  // finding's value doesn't leave a partial match behind (e.g. a name embedded
+  // in an address).
+  const ordered = [...findings].sort((a, b) => b.value.length - a.value.length);
   let scrubbed = transformedText;
-  for (const finding of ruleFindings) {
+  for (const finding of ordered) {
     if (!finding.value) continue;
     if (!scrubbed.includes(finding.value)) continue;
     scrubbed = scrubbed.split(finding.value).join(`[REDACTED:${finding.entityType}]`);

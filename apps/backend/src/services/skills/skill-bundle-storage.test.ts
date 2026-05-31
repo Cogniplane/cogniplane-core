@@ -8,7 +8,6 @@ import * as tar from "tar";
 
 import {
   BucketSkillBundleStorage,
-  CompositeSkillBundleStorage,
   LocalSkillBundleStorage
 } from "./skill-bundle-storage.js";
 import {
@@ -31,9 +30,13 @@ async function streamToBuffer(body: unknown): Promise<Buffer> {
 }
 
 function createFakeS3Client(objects: Map<string, Buffer>) {
+  // `getObjectCount` is the observable signal a cache-hit test needs: a real
+  // download issues a GetObject, a cache hit does not.
   return {
+    getObjectCount: 0,
     async send(command: unknown) {
       if (command instanceof GetObjectCommand) {
+        this.getObjectCount += 1;
         const stored = objects.get(`${command.input.Bucket}/${command.input.Key}`);
         if (!stored) throw new Error("Missing object");
         return { Body: Readable.from([stored]), ContentLength: stored.length };
@@ -125,7 +128,42 @@ test("local skill bundle storage caches and installs a bundle directory", async 
   expect(storedAgain.storageUri).toBe(stored.storageUri);
 
   const materialized = await storage.materializeBundle(stored.storageUri);
-  expect(materialized.localPath.endsWith(path.join("pdf-processing", "abc123"))).toBeTruthy();
+  // Local path is namespaced by tenantId so per-tenant cleanup cannot rm a
+  // bundle another tenant still uses.
+  expect(materialized.localPath.endsWith(path.join("t1", "pdf-processing", "abc123"))).toBeTruthy();
+});
+
+test("local skill bundle storage isolates identical bundles across tenants", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-tenant-iso-"));
+  const sourcePath = path.join(root, "source-bundle");
+  const cacheRoot = path.join(root, "cache");
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "---\nname: shared\ndescription: Test\n---\n");
+  onTestFinished(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const shared = {
+    skillId: "shared",
+    revisionNumber: 1,
+    bundleName: "shared",
+    contentHash: "samehash",
+    sourcePath
+  };
+
+  const tenantA = await storage.storeBundle({ tenantId: "tenant-a", ...shared });
+  const tenantB = await storage.storeBundle({ tenantId: "tenant-b", ...shared });
+
+  // Same bundleName + contentHash, different tenant → distinct on-disk paths.
+  expect(tenantA.storageUri).not.toBe(tenantB.storageUri);
+
+  // Tenant A's cleanup must leave tenant B's bundle intact.
+  await storage.deleteBundle(tenantA.storageUri);
+  const survivor = await storage.materializeBundle(tenantB.storageUri);
+  const body = await readFile(path.join(survivor.localPath, "SKILL.md"), "utf8");
+  expect(body.includes("shared")).toBe(true);
 });
 
 test("bucket skill bundle storage uploads a tarball and extracts on materialize", async () => {
@@ -178,12 +216,13 @@ test("bucket skill bundle storage uploads a tarball and extracts on materialize"
   expect(installedScript.includes("echo hi")).toBe(true);
 
   // Second materialize should be a cache hit — no extra GetObject needed.
-  const sendsBefore = objects.size;
+  const getObjectsBefore = client.getObjectCount;
   const second = await storage.materializeBundle(stored.storageUri);
   // Cache path is namespaced by bucket so renames do not collide.
   expect(second.localPath.includes(path.join("skill-bucket", "skills", "tenant-a"))).toBeTruthy();
-  // Same number of objects after: the cache was used, not re-downloaded.
-  expect(objects.size).toBe(sendsBefore);
+  // No new GetObject issued: the content-addressed cache was reused rather than
+  // re-downloaded from S3.
+  expect(client.getObjectCount).toBe(getObjectsBefore);
 
   await storage.deleteBundle(stored.storageUri);
   expect(objects.size).toBe(0);
@@ -331,53 +370,6 @@ test("bucket skill bundle storage applies the configured key prefix", async () =
   });
   expect(stored.storageUri).toBe("s3://my-bucket/env/demo/skills/t1/s1/7-h.tar.gz");
   expect(objects.has("my-bucket/env/demo/skills/t1/s1/7-h.tar.gz")).toBeTruthy();
-
-  await rm(tmpRoot, { recursive: true, force: true });
-});
-
-test("composite storage honors pre-existing file:// URIs after the primary is bucket", async () => {
-  // Simulates the rollout: a revision imported under local backend stays on
-  // disk, and its file:// URI must keep working after the process flips to
-  // bucket mode.
-  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-composite-"));
-  onTestFinished(async () => {
-        await rm(root, { recursive: true, force: true });
-      });
-
-  const legacyBundleRoot = path.join(root, "legacy", "my-skill", "hash-legacy");
-  await mkdir(legacyBundleRoot, { recursive: true });
-  await writeFile(path.join(legacyBundleRoot, "SKILL.md"), "---\nname: legacy\n---\n");
-
-  const local = new LocalSkillBundleStorage(path.join(root, "legacy"));
-  const bucketObjects = new Map<string, Buffer>();
-  const bucket = new BucketSkillBundleStorage({
-    client: createFakeS3Client(bucketObjects),
-    bucketName: "new-bucket",
-    keyPrefix: "",
-    cacheRoot: path.join(root, "cache"),
-    uploader: createFakeUploader(bucketObjects)
-  });
-  const composite = new CompositeSkillBundleStorage({ primary: bucket, local, bucket });
-
-  const legacyUri = `file://${legacyBundleRoot}`;
-  const materialized = await composite.materializeBundle(legacyUri);
-  expect(materialized.localPath).toBe(legacyBundleRoot);
-
-  const installPath = path.join(root, "install", "my-skill");
-  await composite.installBundle({ storageUri: legacyUri, destinationPath: installPath });
-  const installed = await readFile(path.join(installPath, "SKILL.md"), "utf8");
-  expect(installed.includes("legacy")).toBe(true);
-
-  // Delete should also route to the local backend, not throw about URI scheme.
-  await composite.deleteBundle(legacyUri);
-});
-
-test("composite storage rejects s3:// URIs when no bucket backend is configured", async () => {
-  const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-composite-local-"));
-  const local = new LocalSkillBundleStorage(path.join(tmpRoot, "cache"));
-  const composite = new CompositeSkillBundleStorage({ primary: local, local });
-
-  await expect(composite.materializeBundle("s3://some-bucket/some/key.tar.gz")).rejects.toThrow(/requires the bucket backend/);
 
   await rm(tmpRoot, { recursive: true, force: true });
 });

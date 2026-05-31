@@ -78,3 +78,44 @@ test("next() returns done=true on a queue that ends with empty buffer", async ()
   const result = await q.next();
   expect(result.done).toBe(true);
 });
+
+test("setError() rejects a consumer currently blocked in next()", async () => {
+  const q = new AsyncQueue<number>();
+  const pending = q.next();
+  const boom = new Error("producer failed");
+  q.setError(boom);
+  await expect(pending).rejects.toBe(boom);
+});
+
+test("setError() makes all subsequent next() calls throw", async () => {
+  const q = new AsyncQueue<number>();
+  const boom = new Error("producer failed");
+  q.setError(boom);
+  await expect(q.next()).rejects.toBe(boom);
+  await expect(q.next()).rejects.toBe(boom);
+});
+
+test("setError() unblocks a for-await consumer instead of hanging", async () => {
+  const q = new AsyncQueue<number>();
+  const boom = new Error("producer failed");
+  const consumed: number[] = [];
+  const consumer = (async () => {
+    for await (const v of q) {
+      consumed.push(v);
+    }
+  })();
+  q.push(1);
+  // Let the consumer pick up the buffered value and block on the next read.
+  await Promise.resolve();
+  q.setError(boom);
+  await expect(consumer).rejects.toBe(boom);
+});
+
+test("setError() is terminal: first error wins, end()/push() are no-ops after", () => {
+  const q = new AsyncQueue<number>();
+  const first = new Error("first");
+  q.setError(first);
+  q.setError(new Error("second"));
+  q.end();
+  expect(q.push(99)).toBe(false);
+});

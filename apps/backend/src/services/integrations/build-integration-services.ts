@@ -1,5 +1,5 @@
 import type { AppConfig } from "../../config.js";
-import type { Pool } from "../../lib/db.js";
+import type { RequestLimitsInterface } from "../request-limits.js";
 import type { RuntimeInvalidator } from "./contracts.js";
 import { GithubConnectionService } from "./github/github-connection-service.js";
 import { IntegrationRegistryService } from "./integration-registry-service.js";
@@ -13,14 +13,15 @@ import type { Stores } from "../build-stores.js";
 
 export function buildIntegrationServices(
   config: AppConfig,
-  db: Pool,
   stores: Stores,
   // Lazy getter that returns the live `RuntimeInvalidator` once it's been
   // constructed. Called only inside async OAuth/disconnect paths, never at
   // module load — so the runtime manager can be wired *after* this builder
   // runs without any setter dance. Throws if invoked before the runtime
   // manager exists, which would indicate a wiring bug.
-  resolveRuntimeInvalidator: () => RuntimeInvalidator
+  resolveRuntimeInvalidator: () => RuntimeInvalidator,
+  // Rate limiter applied (per-IP) to the unauthenticated OAuth callback routes.
+  limits?: RequestLimitsInterface
 ) {
   const runtimeInvalidator: RuntimeInvalidator = {
     invalidateRuntimesForIntegration(tenantId, userId, integrationId) {
@@ -34,7 +35,6 @@ export function buildIntegrationServices(
 
   const githubConnectionService = new GithubConnectionService(
     config,
-    db,
     stores.githubConnections,
     stores.auditEvents,
     runtimeInvalidator
@@ -63,7 +63,8 @@ export function buildIntegrationServices(
     oauth: {
       notion: notionConnectionService,
       github: githubConnectionService
-    }
+    },
+    limits
   });
 
   const integrationRegistry = new IntegrationRegistryService(config, stores.integrationStates);

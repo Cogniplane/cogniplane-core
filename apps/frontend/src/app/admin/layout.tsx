@@ -26,10 +26,6 @@ const ADMIN_SECTION_TITLES: Record<string, { title: string; subtitle: string }> 
     subtitle: "Enable third-party services for your tenant. Users connect their own accounts after you toggle an integration on."
   },
   capabilities: { title: "Agent settings", subtitle: "Tune tools, approvals, and guardrails per profile." },
-  "skill-judge": {
-    title: "Skill judge",
-    subtitle: "Configure the LLM that classifies whether skills were actually invoked in past sessions."
-  },
   runtime: { title: "Runtime rollout", subtitle: "Control provider selection and runtime configuration." },
   users: { title: "Users", subtitle: "Members, roles, and access management." },
   sessions: { title: "Sessions", subtitle: "Review and investigate chat sessions across the tenant." },

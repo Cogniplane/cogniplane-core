@@ -347,7 +347,8 @@ test("DynamicConfigService imports zip bundles from nested archive wrappers", as
 
   expect(imported.skill.skillId).toBe("pdf-processing");
   expect(capturedImports.length).toBe(1);
-  expect(capturedImports[0]!.bundleStorageUri).toMatch(/^file:\/\/.*\/cache\/pdf-processing\//);
+  // Bundle paths are now tenant-scoped: <root>/cache/<tenantId>/<bundleName>/...
+  expect(capturedImports[0]!.bundleStorageUri).toMatch(/^file:\/\/.*\/cache\/[^/]+\/pdf-processing\//);
 });
 
 test("DynamicConfigService rejects inline edits of inherited (system) skills from a tenant", async () => {

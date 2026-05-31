@@ -27,6 +27,11 @@ export type ClaudeEventMapperState = {
   // content_block index → tool_use_id, so input_json_delta / content_block_stop
   // (which carry an index, not an id) can find their pending tool call.
   indexToToolUseId: Map<number, string>;
+  // Last `error` seen on an assistant message (SDKAssistantMessageError, e.g.
+  // "model_not_found"). The terminal result message carries only a generic
+  // `errors[]` / subtype, so we stash the typed assistant error here to turn it
+  // into an actionable failure message in mapResult.
+  assistantError: string | null;
 };
 
 export function createClaudeEventMapperState(responseId: string): ClaudeEventMapperState {
@@ -35,7 +40,8 @@ export function createClaudeEventMapperState(responseId: string): ClaudeEventMap
     lastToolUseId: null,
     assistantTextStreamed: false,
     pendingToolCalls: new Map(),
-    indexToToolUseId: new Map()
+    indexToToolUseId: new Map(),
+    assistantError: null
   };
 }
 
@@ -80,6 +86,14 @@ function mapLooseMessage(
     // ── 7. assistant message complete ────────────────────────────────
     case "assistant": {
       const events: RuntimeEvent[] = [];
+
+      // Capture the typed assistant error (e.g. "model_not_found") so the
+      // terminal result mapper can render an actionable message. Since 0.3.144
+      // the SDK reports model_not_found here when the selected model is
+      // unavailable, instead of a generic invalid_request.
+      if (typeof message.error === "string") {
+        state.assistantError = message.error;
+      }
 
       // Snapshot text fallback: only emit when stream_event/text_delta did NOT
       // already deliver this message's text. With includePartialMessages, the
@@ -373,13 +387,39 @@ function mapResult(
     ];
   }
 
-  // Any error subtype (error_max_turns, error_tool, etc.)
+  // A configured model that doesn't exist / isn't available surfaces as
+  // error="model_not_found" on the assistant message (SDK 0.3.144+). Turn it
+  // into a tenant-actionable config error instead of an opaque API failure —
+  // the model is set per-tenant (CLAUDE_CODE_MODEL / per-turn override), so a
+  // bad value is a configuration mistake, not an outage.
+  if (state.assistantError === "model_not_found") {
+    return [
+      doneEvent,
+      {
+        type: "response.failed",
+        responseId: state.responseId,
+        message:
+          "The configured Claude model is not available (model_not_found). " +
+          "Check the tenant's model setting."
+      }
+    ];
+  }
+
+  // Any other error subtype (error_during_execution, error_max_turns, …).
+  // SDKResultError carries `errors: string[]`; older/loose shapes use
+  // `error`/`message`. Prefer the typed assistant error when present.
+  const errorsArray = Array.isArray(message.errors)
+    ? (message.errors as unknown[]).filter((e): e is string => typeof e === "string")
+    : [];
   const errorMessage =
-    typeof message.error === "string"
-      ? message.error
-      : typeof message.message === "string"
-        ? message.message
-        : subtype ?? "Unknown error";
+    state.assistantError ??
+    (errorsArray.length > 0
+      ? errorsArray.join("; ")
+      : typeof message.error === "string"
+        ? message.error
+        : typeof message.message === "string"
+          ? message.message
+          : subtype ?? "Unknown error");
 
   return [
     doneEvent,

@@ -18,13 +18,7 @@ import type { AppConfig } from "../../config.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import type { SandboxTurnFrame } from "../runtime/sandbox-agent-protocol.js";
 import type { ClaudeSessionState } from "./claude-types.js";
-import {
-  buildClaudeContentBlocks,
-  buildClaudePromptStream,
-  buildClaudeSdkEnv,
-  buildClaudeSdkOptions,
-  isInitMessage
-} from "./claude-sdk-helpers.js";
+import { buildClaudeContentBlocks, isInitMessage } from "./claude-sdk-helpers.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
 
 type TurnInput = {
@@ -43,7 +37,7 @@ export type ClaudeTurnContext = {
   activeTurns: Set<string>;
   e2bPendingApprovals: Map<string, string>;
   stores: { approvals?: ApprovalStore } | undefined;
-  config: Pick<AppConfig, "CLAUDE_CODE_MODEL">;
+  config: Pick<AppConfig, "CLAUDE_CODE_MODEL" | "APPROVAL_REQUEST_TTL_MS">;
   log: FastifyBaseLogger;
   managedToolCatalog: ManagedToolCatalog;
 };
@@ -86,7 +80,11 @@ export async function* executeClaudeTurn(
           summary: JSON.stringify(event.toolInput),
           status: "pending",
           decision: null,
-          requestPayload: event.toolInput
+          requestPayload: event.toolInput,
+          // DB-level deadline mirroring the in-process TTL on canUseTool, so a
+          // sandbox/process death before that timer fires still lets the startup
+          // sweep recover this row instead of leaving it pending forever.
+          expiresAt: new Date(Date.now() + config.APPROVAL_REQUEST_TTL_MS).toISOString()
         });
       } catch (err) {
         log.warn({ err, approvalId: event.approvalId }, "Failed to persist Claude approval to store");
@@ -106,50 +104,29 @@ export async function* executeClaudeTurn(
     });
   };
 
-  // Local-mode approval routing must be wired before the background task
-  // starts — onApprovalRequired fires synchronously inside canUseTool.
-  if (state.mode === "local") {
-    state.approvalHandler.clearAutoApprovedKindsForTurn();
-    state.approvalHandler.onApprovalRequired(dispatchApprovalEvent);
-    state.approvalHandler.setToolContextId(input.toolContextId ?? null);
-  }
-
   const runTask = (async () => {
     try {
-      if (state.mode === "e2b" && state.e2bProcess) {
-        await runE2bTurn({
-          state,
-          eventQueue,
-          responseId,
-          mapperState,
-          turnId: responseId,
-          turn: input,
-          dispatchApprovalEvent,
-          e2bPendingApprovals,
-          config,
-          log,
-          session,
-          managedToolCatalog: ctx.managedToolCatalog
-        });
-      } else {
-        await runLocalTurn({
-          state,
-          eventQueue,
-          responseId,
-          mapperState,
-          turn: input,
-          config,
-          log,
-          session
-        });
-      }
+      await runE2bTurn({
+        state,
+        eventQueue,
+        responseId,
+        mapperState,
+        turnId: responseId,
+        turn: input,
+        dispatchApprovalEvent,
+        e2bPendingApprovals,
+        config,
+        log,
+        session,
+        managedToolCatalog: ctx.managedToolCatalog
+      });
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const aborted = state.abortController.signal.aborted;
       if (aborted) {
         log.info({ sessionId: session.sessionId }, "Claude session aborted");
       } else {
-        log.error({ err, sessionId: session.sessionId, mode: state.mode }, "Claude turn failed");
+        log.error({ err, sessionId: session.sessionId }, "Claude turn failed");
       }
       eventQueue.push({
         type: "response.failed",
@@ -170,161 +147,6 @@ export async function* executeClaudeTurn(
   await runTask;
 }
 
-async function runLocalTurn(ctx: {
-  state: ClaudeSessionState;
-  eventQueue: AsyncQueue<RuntimeEvent>;
-  responseId: string;
-  mapperState: ReturnType<typeof createClaudeEventMapperState>;
-  turn: TurnInput;
-  config: Pick<AppConfig, "CLAUDE_CODE_MODEL">;
-  log: FastifyBaseLogger;
-  session: RuntimeSessionRef;
-}): Promise<void> {
-  const { state, eventQueue, responseId, mapperState, turn, config, log, session } = ctx;
-  const sdk = await import("@anthropic-ai/claude-agent-sdk");
-  const { runtimePolicy } = state.configBundle;
-
-  // approvalPolicy "never" means auto-allow all, but we still route every call
-  // through canUseTool so toolContextId can be injected into MCP requests.
-  state.approvalHandler.setBypass(runtimePolicy.approvalPolicy === "never");
-
-  const env = buildClaudeSdkEnv(state.anthropicApiKey, {
-    runtimeToken: state.runtimeToken,
-    baseUrl: state.proxyBaseUrl
-  });
-  const mcpServersConfig: Record<
-    string,
-    { type: "http"; url: string; headers: Record<string, string> }
-  > = {};
-  for (const server of state.mcpServerEntries) {
-    mcpServersConfig[server.id] = {
-      type: "http",
-      url: server.url,
-      headers: { Authorization: `Bearer ${state.runtimeToken}` }
-    };
-  }
-
-  const model = turn.model ?? config.CLAUDE_CODE_MODEL;
-  const hasEffort = Boolean(turn.effort);
-
-  // Wire the per-turn canUseTool handler into the delegating ref so the
-  // pre-warmed subprocess (if any) routes tool calls correctly.
-  state.warmCanUseToolRef.current = (toolName, toolInput, toolOpts) =>
-    state.approvalHandler.canUseTool(toolName, toolInput, toolOpts);
-
-  // Consume the pre-warmed subprocess on the first turn when it matches.
-  const warmResult = state.warmState ? await state.warmState : null;
-  state.warmState = null;
-
-  const useWarm =
-    warmResult !== null &&
-    !state.claudeSessionId && // only first turn — warm subprocess has no session to resume
-    model === warmResult.model &&
-    !hasEffort; // effort changes the subprocess config; fall back if specified
-
-  if (!useWarm && warmResult) {
-    warmResult.query.close();
-  }
-
-  const options = buildClaudeSdkOptions({
-    model,
-    effort: turn.effort,
-    developerInstructions: runtimePolicy.developerInstructions,
-    mcpServersConfig,
-    workspacePath: state.workspacePath,
-    env,
-    // allowedTools is intentionally NOT set: it's an auto-approve allowlist in
-    // the SDK, not an availability filter. All tool calls must land in canUseTool
-    // so toolContextId can be injected before the MCP gateway sees them.
-    canUseTool: (toolName, toolInput, toolOpts) =>
-      state.approvalHandler.canUseTool(toolName, toolInput, toolOpts)
-  });
-
-  const promptStream = buildClaudePromptStream({
-    prompt: turn.prompt,
-    userInputs: turn.userInputs,
-    runtimePolicy,
-    toolContextId: turn.toolContextId,
-    // Prefer the provider-native session id when available; fall back to our
-    // internal id for the first turn. The SDK uses this to resume conversation memory.
-    sessionId: state.claudeSessionId ?? session.sessionId
-  });
-
-  // `resume` and `continue` are mutually exclusive in the SDK — always use
-  // the explicit session id when we have one; `continue: true` picks up
-  // whatever was last used in cwd, which isn't meaningful here.
-  const iterator = useWarm
-    ? warmResult!.query.query(promptStream)
-    : sdk.query({
-        prompt: promptStream,
-        options: state.claudeSessionId ? { ...options, resume: state.claudeSessionId } : options
-      });
-
-  // Expose the SDK iterator's interrupt() so the runtime adapter's interruptTurn
-  // (Stop button) can short-circuit the in-flight model call without tearing
-  // down the warm session. Cleared in the surrounding finally so a stale ref
-  // can't fire on a later turn.
-  state.activeTurnInterrupt.current = () => iterator.interrupt();
-
-  void iterator.mcpServerStatus
-    ?.()
-    .then((mcpStatus) => {
-      log.info(
-        {
-          sessionId: session.sessionId,
-          runtimeId: state.runtimeId,
-          expectedMcpServerIds: Object.keys(mcpServersConfig),
-          mcpServerStatus: mcpStatus
-        },
-        "Claude SDK mcpServerStatus"
-      );
-    })
-    .catch((err) => {
-      log.warn({ err, sessionId: session.sessionId }, "Claude SDK mcpServerStatus failed");
-    });
-
-  // Terminal events are deferred until the iterator finishes without throwing —
-  // an SDK throw always takes precedence over a prior success event.
-  let deferredTerminal: RuntimeEvent | null = null;
-
-  for await (const message of iterator) {
-    if (isInitMessage(message)) {
-      log.info(
-        {
-          sessionId: session.sessionId,
-          runtimeId: state.runtimeId,
-          model: message.model,
-          permissionMode: message.permissionMode,
-          toolCount: message.tools.length,
-          tools: message.tools,
-          mcpToolNames: message.tools.filter((name) => name.startsWith("mcp__")),
-          mcpServers: message.mcp_servers,
-          slashCommands: message.slash_commands,
-          skills: message.skills,
-          cwd: message.cwd,
-          claudeCodeVersion: message.claude_code_version
-        },
-        "Claude SDK system/init tool surface"
-      );
-    }
-
-    const events = mapClaudeEvent(mapperState, message as ClaudeMessageInput);
-    for (const evt of events) {
-      if (evt.type === "response.completed" || evt.type === "response.failed") {
-        deferredTerminal = evt;
-      } else {
-        eventQueue.push(evt);
-      }
-    }
-
-    if (message.session_id && !state.claudeSessionId) {
-      state.claudeSessionId = message.session_id;
-    }
-  }
-
-  eventQueue.push(deferredTerminal ?? { type: "response.completed", responseId });
-}
-
 async function runE2bTurn(ctx: {
   state: ClaudeSessionState;
   eventQueue: AsyncQueue<RuntimeEvent>;
@@ -339,7 +161,7 @@ async function runE2bTurn(ctx: {
     kind: RuntimeApprovalKind;
   }) => Promise<void>;
   e2bPendingApprovals: Map<string, string>;
-  config: Pick<AppConfig, "CLAUDE_CODE_MODEL">;
+  config: Pick<AppConfig, "CLAUDE_CODE_MODEL" | "APPROVAL_REQUEST_TTL_MS">;
   log: FastifyBaseLogger;
   session: RuntimeSessionRef;
   managedToolCatalog: ManagedToolCatalog;
@@ -376,7 +198,10 @@ async function runE2bTurn(ctx: {
     enabledToolIds: runtimePolicy.enabledToolIds,
     bypass: runtimePolicy.approvalPolicy === "never",
     autoApproveReadOnly: runtimePolicy.autoApproveReadOnlyTools,
-    readOnlyManagedToolNames: ctx.managedToolCatalog.listReadOnlyIds()
+    readOnlyManagedToolNames: ctx.managedToolCatalog.listReadOnlyIds(),
+    // Keep the harness deny-by-default timer in lockstep with the backend's
+    // DB-expiry sweep so a closed tab can't hang the in-sandbox SDK turn.
+    approvalTtlMs: config.APPROVAL_REQUEST_TTL_MS
   };
 
   // Terminal events are deferred until onComplete fires — same reasoning as

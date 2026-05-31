@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import { createTestConfig } from "../../../test-helpers/test-config.js";
+import { createFakeFetch } from "../../../test-helpers/fake-fetch.js";
 import { InMemoryAuditEventStore } from "../../../test-helpers/in-memory-audit-events.js";
 
 import {
@@ -121,10 +122,7 @@ test("completeAuthorization exchanges code and stores connection", async () => {
   const authUrl = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
   const validStateJwt = new URL(authUrl).searchParams.get("state")!;
 
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-
+  const fake = createFakeFetch((url, init) => {
     if (url === "https://api.notion.com/v1/oauth/token") {
       // Verify Basic auth header is present
       const headers = new Headers(init?.headers as HeadersInit | undefined);
@@ -156,7 +154,7 @@ test("completeAuthorization exchanges code and stores connection", async () => {
     }
 
     throw new Error(`Unexpected fetch URL: ${url}`);
-  };
+  });
 
   try {
     const redirectUrl = await service.completeAuthorization({
@@ -176,7 +174,7 @@ test("completeAuthorization exchanges code and stores connection", async () => {
             { tenantId: "tenant-1", userId: "user-1", integrationId: "notion" }
           ]);
   } finally {
-    globalThis.fetch = originalFetch;
+    fake.restore();
   }
 });
 
@@ -207,12 +205,13 @@ test("completeAuthorization fails when token endpoint returns error", async () =
   const authUrl = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
   const validStateJwt = new URL(authUrl).searchParams.get("state")!;
 
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(JSON.stringify({ error: "invalid_grant", error_description: "code expired" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" }
-    });
+  const fake = createFakeFetch(
+    () =>
+      new Response(JSON.stringify({ error: "invalid_grant", error_description: "code expired" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      })
+  );
 
   try {
     const redirectUrl = await service.completeAuthorization({
@@ -223,7 +222,7 @@ test("completeAuthorization fails when token endpoint returns error", async () =
     expect(redirectUrl).toMatch(/code\+expired|code%20expired/);
     expect(store.record).toBe(null);
   } finally {
-    globalThis.fetch = originalFetch;
+    fake.restore();
   }
 });
 

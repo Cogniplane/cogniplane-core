@@ -8,13 +8,64 @@ import {
   buildE2bCodexFactories,
   buildSandboxCodexConfig,
   collectLocalWorkspaceFiles,
+  createLineBufferedStdoutHandler,
   extractMcpServersToml,
   E2bRuntimeProcess,
-  E2B_WORKSPACE_BASE
+  E2B_WORKSPACE_BASE,
+  startE2bStdioHarness
 } from "./e2b-runtime-process.js";
+import type { E2bSandboxLike, E2bStdioHarnessExitResult } from "./e2b-runtime-process.js";
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import { phase4RuntimePolicy } from "../../test-helpers/phase4-runtime-policy.js";
+
+test("createLineBufferedStdoutHandler emits complete lines and buffers the trailing fragment", () => {
+  const lines: string[] = [];
+  const handler = createLineBufferedStdoutHandler((line) => lines.push(line));
+  handler("a\nb\nc"); // "c" has no newline yet
+  expect(lines).toEqual(["a", "b"]);
+  handler("-rest\n");
+  expect(lines).toEqual(["a", "b", "c-rest"]);
+});
+
+test("createLineBufferedStdoutHandler drops a newline-less flood once it crosses the cap", () => {
+  const lines: string[] = [];
+  let overflowBytes = 0;
+  const handler = createLineBufferedStdoutHandler((line) => lines.push(line), {
+    maxLineBytes: 10,
+    onOverflow: (n) => {
+      overflowBytes = n;
+    }
+  });
+
+  // No newline ever — the trailing buffer must not grow without bound.
+  handler("x".repeat(8));
+  expect(overflowBytes).toBe(0); // under cap, still buffered
+  handler("x".repeat(8)); // now 16 > 10 → dropped
+  expect(overflowBytes).toBe(16);
+  expect(lines).toEqual([]);
+
+  // After the drop, a subsequent complete line still flows.
+  handler("hi\n");
+  expect(lines).toEqual(["hi"]);
+});
+
+test("createLineBufferedStdoutHandler drops a complete but over-limit line before onLine", () => {
+  const lines: string[] = [];
+  let overflowBytes = 0;
+  const handler = createLineBufferedStdoutHandler((line) => lines.push(line), {
+    maxLineBytes: 10,
+    onOverflow: (n) => {
+      overflowBytes = n;
+    }
+  });
+
+  // A single newline-TERMINATED frame that already exceeds the cap must not be
+  // handed to onLine (it would otherwise reach JSON.parse for the Codex path).
+  handler("x".repeat(20) + "\nok\n");
+  expect(overflowBytes).toBe(20);
+  expect(lines).toEqual(["ok"]);
+});
 
 test("collectLocalWorkspaceFiles collects files recursively", async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "e2b-test-"));
@@ -83,7 +134,6 @@ test("buildCodexStdioCommand starts app-server with the documented default trans
 
 test("buildE2bCodexFactories workspace factory remaps paths to sandbox", async () => {
   const config = createTestConfig({
-    RUNTIME_BACKEND: "e2b" as const,
     E2B_API_KEY: "e2b_test_key",
     E2B_TEMPLATE_ID: "test-template",
     E2B_SANDBOX_TIMEOUT_MS: 60_000,
@@ -120,7 +170,6 @@ test("buildE2bCodexFactories workspace factory remaps paths to sandbox", async (
 
 test("buildE2bCodexFactories processFactory throws when localWorkspacePath is missing", async () => {
   const config = createTestConfig({
-    RUNTIME_BACKEND: "e2b" as const,
     E2B_API_KEY: "e2b_test_key",
     E2B_TEMPLATE_ID: "test-template",
     E2B_SANDBOX_TIMEOUT_MS: 60_000,
@@ -144,7 +193,6 @@ test("buildE2bCodexFactories processFactory throws when localWorkspacePath is mi
 
 test("buildE2bCodexFactories processFactory uses the explicit staging path and cleans it up on success", async () => {
   const config = createTestConfig({
-    RUNTIME_BACKEND: "e2b" as const,
     E2B_API_KEY: "e2b_test_key",
     E2B_TEMPLATE_ID: "test-template",
     E2B_SANDBOX_TIMEOUT_MS: 60_000,
@@ -154,25 +202,13 @@ test("buildE2bCodexFactories processFactory uses the explicit staging path and c
   const localWorkspacePath = await mkdtemp(path.join(os.tmpdir(), "e2b-factory-success-"));
   await writeFile(path.join(localWorkspacePath, "codex.toml"), "");
 
-  const { processFactory } = buildE2bCodexFactories(config);
-  const fakeProcess = { pid: 1234 };
-  let capturedInput: Record<string, unknown> | null = null;
-  const originalStart = E2bRuntimeProcess.start;
-  Object.defineProperty(E2bRuntimeProcess, "start", {
-    configurable: true,
-    writable: true,
-    value: async (input: Record<string, unknown>) => {
-      capturedInput = input;
-      return fakeProcess;
-    }
-  });
-  onTestFinished(() => {
-        Object.defineProperty(E2bRuntimeProcess, "start", {
-          configurable: true,
-          writable: true,
-          value: originalStart
-        });
-      });
+  const fakeProcess = { pid: 1234 } as unknown as E2bRuntimeProcess;
+  let capturedInput: Parameters<typeof E2bRuntimeProcess.start>[0] | null = null;
+  const startProcess: typeof E2bRuntimeProcess.start = async (startInput) => {
+    capturedInput = startInput;
+    return fakeProcess;
+  };
+  const { processFactory } = buildE2bCodexFactories(config, { startProcess });
 
   const process = await processFactory({
     binaryPath: "codex",
@@ -199,7 +235,6 @@ test("buildE2bCodexFactories processFactory uses the explicit staging path and c
 
 test("buildE2bCodexFactories processFactory cleans up the staging path on failure", async () => {
   const config = createTestConfig({
-    RUNTIME_BACKEND: "e2b" as const,
     E2B_API_KEY: "e2b_test_key",
     E2B_TEMPLATE_ID: "test-template",
     E2B_SANDBOX_TIMEOUT_MS: 60_000,
@@ -209,22 +244,10 @@ test("buildE2bCodexFactories processFactory cleans up the staging path on failur
   const localWorkspacePath = await mkdtemp(path.join(os.tmpdir(), "e2b-factory-failure-"));
   await writeFile(path.join(localWorkspacePath, "codex.toml"), "");
 
-  const { processFactory } = buildE2bCodexFactories(config);
-  const originalStart = E2bRuntimeProcess.start;
-  Object.defineProperty(E2bRuntimeProcess, "start", {
-    configurable: true,
-    writable: true,
-    value: async () => {
-      throw new Error("sandbox start failed");
-    }
-  });
-  onTestFinished(() => {
-        Object.defineProperty(E2bRuntimeProcess, "start", {
-          configurable: true,
-          writable: true,
-          value: originalStart
-        });
-      });
+  const startProcess: typeof E2bRuntimeProcess.start = async () => {
+    throw new Error("sandbox start failed");
+  };
+  const { processFactory } = buildE2bCodexFactories(config, { startProcess });
 
   await expect(() =>
         processFactory({
@@ -319,6 +342,63 @@ test("buildSandboxCodexConfig includes mcpServersToml when provided", () => {
   expect(config).toMatch(/\[mcp_servers\.managed-session-context\]/);
   expect(config).toMatch(/url = "https:\/\/api\.example\.com\/mcp\/managed-session-context"/);
   expect(config).toMatch(/Authorization = "Bearer rt_secret"/);
+});
+
+test("startE2bStdioHarness exit watcher fires onExit when CommandHandle.wait() rejects", async () => {
+  const exitResults: E2bStdioHarnessExitResult[] = [];
+
+  // Empty staging dir so uploadWorkspaceFiles is a no-op (it still readdir()s).
+  const emptyWorkspace = await mkdtemp(path.join(os.tmpdir(), "e2b-harness-exit-"));
+  onTestFinished(() => rm(emptyWorkspace, { recursive: true, force: true }));
+
+  const handle = {
+    pid: 4321,
+    wait: () => Promise.reject(new Error("sandbox was killed")),
+    kill: async () => true
+  };
+
+  const fakeSandbox: E2bSandboxLike = {
+    sandboxId: "sbx-killed",
+    files: {
+      write: async () => {},
+      read: async () => new Uint8Array()
+    },
+    commands: {
+      run: async () => handle as never,
+      sendStdin: async () => {},
+      list: async () => []
+    },
+    kill: async () => {}
+  };
+
+  const fakeSandboxClass = {
+    create: async () => fakeSandbox
+  };
+
+  await startE2bStdioHarness({
+    logger: createSilentLogger(),
+    sessionId: "session-killed",
+    runtimeId: "runtime-killed",
+    e2bApiKey: "e2b_test_key",
+    e2bTemplateId: "test-template",
+    e2bSandboxTimeoutMs: 60_000,
+    localWorkspacePath: emptyWorkspace,
+    sandboxWorkspacePath: "/home/user/workspace/session-killed",
+    command: "codex app-server --listen stdio://",
+    stderrLogLabel: "Codex runtime (E2B)",
+    onStdoutLine: () => {},
+    onExit: (result) => exitResults.push(result),
+    loadSandboxClass: async () => fakeSandboxClass as never
+  });
+
+  // The exit watcher's reject branch runs on a microtask after wait() rejects.
+  for (let attempt = 0; attempt < 50 && exitResults.length === 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  expect(exitResults.length).toBe(1);
+  expect(exitResults[0].exitCode).toBeUndefined();
+  expect(exitResults[0].error).toMatch(/sandbox was killed/);
 });
 
 async function waitForPathRemoval(targetPath: string): Promise<void> {

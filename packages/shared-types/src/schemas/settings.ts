@@ -106,7 +106,6 @@ export type UserSettingsSectionsResponse = z.infer<typeof UserSettingsSectionsRe
 export type NavigationItem = {
   id: string;
   label: string;
-  tone: "live" | "planned";
   count?: number;
 };
 

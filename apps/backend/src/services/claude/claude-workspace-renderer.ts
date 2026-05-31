@@ -3,6 +3,14 @@ import path from "node:path";
 
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 
+// Skill ids are validated at import time by `adminIdSchema`
+// (/^[a-z0-9][a-z0-9-_]*$/), so they never contain path separators. We
+// re-assert that here before using the id as a filename segment — the command
+// file is written under `.claude/commands/`, and a `../`-bearing value would
+// escape that directory. The display name (`skill.name`) is NOT path-safe and
+// must never be used to build a filesystem path.
+const skillFileNamePattern = /^[a-z0-9][a-z0-9-_]*$/;
+
 export type ClaudeWorkspaceInput = {
   workspacePath: string;
   developerInstructions: string | null;
@@ -142,8 +150,14 @@ export async function renderClaudeWorkspace(input: ClaudeWorkspaceInput): Promis
     const commandsPath = path.join(workspacePath, ".claude", "commands");
     await mkdir(commandsPath, { recursive: true, mode: 0o700 });
     for (const skill of input.skills) {
+      // Use the validated skill id (not the free-form display name) as the
+      // filename so a malicious/inline skillName like `../../foo` cannot escape
+      // `commandsPath`. Mirrors the Codex renderer, which keys skill dirs on id.
+      if (!skillFileNamePattern.test(skill.id)) {
+        throw new Error(`Invalid skill id for workspace command file: ${skill.id}`);
+      }
       await writeFile(
-        path.join(commandsPath, `${skill.name}.md`),
+        path.join(commandsPath, `${skill.id}.md`),
         skill.instructions,
         { mode: 0o600 }
       );

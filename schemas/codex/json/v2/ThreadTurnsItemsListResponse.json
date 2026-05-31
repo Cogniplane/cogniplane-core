@@ -312,6 +312,15 @@
         }
       }
     },
+    "ImageDetail": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "low",
+        "high",
+        "original"
+      ]
+    },
     "McpToolCallError": {
       "type": "object",
       "required": [
@@ -829,6 +838,12 @@
                 "null"
               ]
             },
+            "pluginId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "result": {
               "anyOf": [
                 {
@@ -1211,6 +1226,17 @@
             "url"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -1231,6 +1257,17 @@
             "type"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },

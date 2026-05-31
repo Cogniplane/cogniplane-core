@@ -1,5 +1,7 @@
 import type { FastifyInstance } from "fastify";
 
+import type { RequestLimitsInterface } from "../../request-limits.js";
+import { enforceOAuthCallbackRateLimit } from "../oauth-callback-rate-limit.js";
 import type { GithubConnectionService } from "./github-connection-service.js";
 
 export const GITHUB_OAUTH_CALLBACK_PATHS = [
@@ -9,9 +11,11 @@ export const GITHUB_OAUTH_CALLBACK_PATHS = [
 
 export function registerGithubOAuthRoutes(
   app: FastifyInstance,
-  connections: GithubConnectionService
+  connections: GithubConnectionService,
+  limits?: RequestLimitsInterface
 ): void {
   app.get("/auth/github/user/callback", async (request, reply) => {
+    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
     const query = request.query as { code?: string; state?: string };
     const redirectUrl = await connections.completeAuthorization({
       code: query.code ?? null,

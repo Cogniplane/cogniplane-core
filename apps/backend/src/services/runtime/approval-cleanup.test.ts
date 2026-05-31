@@ -1,7 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 import { test, expect } from "vitest";
 
-import { cancelPendingApprovals } from "./approval-cleanup.js";
+import { cancelPendingApprovals, expireApprovalById } from "./approval-cleanup.js";
 
 type FakeApproval = { approvalId: string };
 
@@ -178,6 +178,89 @@ test("onCancelLocal throwing on one approval does not abort cleanup of subsequen
     reason: "turn_interrupted"
   });
   expect(logger._warnings).toHaveLength(1);
+});
+
+test("expireApprovalById: ttl sweep expires the single row, drops in-memory state, and audits with reason ttl_expired", async () => {
+  const approvals = makeApprovalsFake({ pending: [{ approvalId: "a-1" }, { approvalId: "a-2" }] });
+  const audit = makeAuditFake();
+  const dropped: string[] = [];
+
+  await expireApprovalById({
+    tenantId: "t",
+    sessionId: "s",
+    userId: "u",
+    approvalId: "a-1",
+    reason: "ttl_expired",
+    approvals,
+    auditEvents: audit,
+    logger: makeLogger(),
+    onCancelLocal: (id) => {
+      dropped.push(id);
+      return undefined;
+    }
+  });
+
+  // Only the aged-out row is touched — siblings are left alone.
+  expect(approvals.expireCalls).toEqual(["a-1"]);
+  expect(dropped).toEqual(["a-1"]);
+  expect(audit.calls).toHaveLength(1);
+  expect(audit.calls[0]).toMatchObject({
+    tenantId: "t",
+    sessionId: "s",
+    userId: "u",
+    approvalId: "a-1",
+    type: "approval.expired",
+    payload: { reason: "ttl_expired" }
+  });
+});
+
+test("expireApprovalById: decision-raced row (expire returns null) skips audit but still released memory", async () => {
+  const approvals = makeApprovalsFake({
+    pending: [{ approvalId: "a-1" }],
+    expireResults: { "a-1": null }
+  });
+  const audit = makeAuditFake();
+  const dropped: string[] = [];
+
+  await expireApprovalById({
+    tenantId: "t",
+    sessionId: "s",
+    userId: "u",
+    approvalId: "a-1",
+    reason: "ttl_expired",
+    approvals,
+    auditEvents: audit,
+    logger: makeLogger(),
+    onCancelLocal: (id) => { dropped.push(id); }
+  });
+
+  expect(dropped).toEqual(["a-1"]);
+  expect(approvals.expireCalls).toEqual(["a-1"]);
+  expect(audit.calls).toEqual([]);
+});
+
+test("expireApprovalById: expire throwing is logged, never rejects", async () => {
+  const approvals = makeApprovalsFake({
+    pending: [{ approvalId: "a-1" }],
+    expireThrows: new Set(["a-1"])
+  });
+  const audit = makeAuditFake();
+  const logger = makeLogger();
+
+  await expireApprovalById({
+    tenantId: "t",
+    sessionId: "s",
+    userId: "u",
+    approvalId: "a-1",
+    reason: "ttl_expired",
+    approvals,
+    auditEvents: audit,
+    logger,
+    onCancelLocal: () => undefined
+  });
+
+  expect(audit.calls).toEqual([]);
+  expect(logger._errors).toHaveLength(1);
 });
 
 test("listPending failure logs and returns; no expire, no audit", async () => {

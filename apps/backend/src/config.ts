@@ -67,11 +67,6 @@ const envSchema = z.object({
   // rt_* token's session-scoped HMAC claims; both must pass.
   E2B_EGRESS_CIDRS: z.string().trim().default(""),
   CLAUDE_CODE_MODEL: z.string().trim().min(1).default("claude-sonnet-4-6"),
-  // Where the Claude Agent SDK runs. `local` keeps the SDK in-process on the
-  // backend (quickest for local dev and regional fallback). `e2b` launches
-  // the bundled sandbox-agent harness inside the shared agent-runtime
-  // template, giving Claude the same sandbox isolation Codex has.
-  CLAUDE_RUNTIME_BACKEND: z.enum(["local", "e2b"]).default("local"),
   CLAUDE_AGENT_SDK_VERSION: z.string().trim().min(1).default(codexRelease.claudeAgentSdkVersion),
   OPENAI_API_KEY: z.string().trim().min(1).optional(),
   SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-4-5-20251001"),
@@ -98,8 +93,8 @@ const envSchema = z.object({
   // would require tearing down and rebuilding the runtime mid-session.
   // Idle timeout (RUNTIME_IDLE_TIMEOUT_MS, default 5 min) tears Codex down on
   // inactivity, but a session with a turn every few minutes can stay alive
-  // indefinitely. Local Claude (CLAUDE_RUNTIME_BACKEND=local) has no sandbox
-  // hard cap; e2b mode is bounded by E2B_SANDBOX_TIMEOUT_MS (default 30 min).
+  // indefinitely. The sandbox lifetime is bounded by E2B_SANDBOX_TIMEOUT_MS
+  // (default 30 min).
   //
   // 24 hours is the floor that comfortably exceeds long debugging sessions
   // while still being 7x tighter than the previous 7-day default. Tighten to
@@ -124,6 +119,12 @@ const envSchema = z.object({
   ARTIFACT_BUCKET_SECRET_ACCESS_KEY: z.string().trim().min(1).optional(),
   ARTIFACT_BUCKET_SESSION_TOKEN: z.string().trim().min(1).optional(),
   ARTIFACT_MAX_UPLOAD_BYTES: z.coerce.number().int().positive().default(25 * 1024 * 1024),
+  // HTTP-layer cap on non-multipart request bodies (JSON/raw). This is the
+  // outer guard that bounds memory for an oversized POST before any field-level
+  // schema runs. Generous enough for the largest legitimate JSON turn while
+  // still rejecting body-bomb DoS. File uploads bypass this via the multipart
+  // plugin's own `fileSize` limit (ARTIFACT_MAX_UPLOAD_BYTES).
+  MAX_REQUEST_BODY_BYTES: z.coerce.number().int().positive().default(2 * 1024 * 1024),
   ARTIFACT_DOWNLOAD_TTL_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   SKILL_BUNDLE_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
   SKILL_MARKETPLACE_MANIFEST_URL: z.string().url().optional(),
@@ -134,26 +135,44 @@ const envSchema = z.object({
   SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(50),
   MESSAGE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   MESSAGE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
+  ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // Artifact creation from a message (POST /messages/:id/artifact).
+  ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(30),
+  ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(150),
+  // Scheduled-job creation (POST /me/scheduled-jobs) — each job later runs as a
+  // synthetic turn that does NOT draw down the interactive turn quota, so it is
+  // throttled at creation time here.
+  SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(10),
+  SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(50),
+  // Hard cap on the number of scheduled jobs a single user may have at once
+  // (each one fires recurring synthetic turns), independent of the per-window
+  // creation rate limit. 0 disables the cap.
+  SCHEDULED_JOB_MAX_ACTIVE_PER_USER: z.coerce.number().int().min(0).default(50),
+  // OAuth callback verification (GitHub/Notion). The callbacks are
+  // unauthenticated, so the limit is keyed per source IP (used as both the user
+  // and tenant subject) to throttle probing of forged state values.
+  OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
   SCHEDULER_ENABLED: booleanFromEnvSchema.default(true),
   SCHEDULER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   SCHEDULER_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
   SCHEDULER_JOB_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
-  // Tier 3 LLM judge worker.
-  // Off by default at the platform level — per-tenant judge config in
-  // `tenant_settings` is the second gate. Set the platform flag, set tenant
-  // skill_judge_provider/skill_judge_model, and the worker will start judging
-  // that tenant's eligible sessions on the next tick.
-  SKILL_JUDGE_WORKER_ENABLED: booleanFromEnvSchema.default(false),
-  SKILL_JUDGE_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60 * 60_000),
-  SKILL_JUDGE_INACTIVE_BEFORE_MS: z.coerce.number().int().positive().default(30 * 60_000),
-  SKILL_JUDGE_MAX_SESSIONS_PER_TICK: z.coerce.number().int().positive().default(5),
-  // How long a sync row can stay in `running` before the worker reaps it
-  // back to `failed`. Sync providers should resolve in seconds; anything
-  // older than this is an orphan from a crash/kill mid-tick. Batch rows
-  // (`submitted`) are exempt — they have their own poll loop.
-  SKILL_JUDGE_RUNNING_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60_000),
+  // Poison-job guard: a job is auto-disabled once this many consecutive runs
+  // fail (reset to 0 on any success), so a perpetually-failing cron can't
+  // re-fire every tick forever. This is part of the scheduler's own resource
+  // budget — scheduled turns deliberately do NOT draw down a user's interactive
+  // rate-limit/turn-quota; the scheduler is governed by its concurrency cap and
+  // this poison guard instead.
+  SCHEDULER_MAX_CONSECUTIVE_FAILURES: z.coerce.number().int().positive().default(5),
+  // Max queued `pii_scan_jobs` drained in parallel per worker tick. Independent
+  // of SCHEDULER_MAX_CONCURRENT_JOBS so PII async scans and cron jobs don't
+  // share a single budget. The worker's PII drain runs whenever the async PII
+  // path is wired, even when SCHEDULER_ENABLED=false.
+  PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
   AUTH_MODE: z.enum(["workos", "dev-headers"]).default("dev-headers"),
   DATA_ENCRYPTION_SECRET: z.string().min(32).default(DEFAULT_DATA_ENCRYPTION_SECRET),
   WORKOS_API_KEY: z.string().trim().min(1).optional(),
@@ -173,7 +192,6 @@ const envSchema = z.object({
   // without invalidating tokens already in flight.
   JWT_KEY_ID: z.string().trim().min(1).default("default"),
   REDIS_URL: z.string().url().optional(),
-  RUNTIME_BACKEND: z.enum(["local", "e2b"]).default("local"),
   E2B_API_KEY: z.string().trim().min(1).optional(),
   E2B_TEMPLATE_ID: z.string().trim().min(1).default(codexRelease.e2bTemplateId),
   E2B_SANDBOX_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
@@ -271,6 +289,33 @@ function resolveStoragePath(
   return nodeEnv !== "production" && insideProject ? defaultPath : resolved;
 }
 
+// All-or-nothing validation for a built-in OAuth provider: if any of the three
+// credentials is set, all three must be. Throws with the per-field env-var name.
+function validateOAuthProvider(
+  label: string,
+  envPrefix: string,
+  clientId: string | undefined,
+  clientSecret: string | undefined,
+  redirectUri: string | undefined
+): void {
+  const configured = [clientId, clientSecret, redirectUri].some(Boolean);
+  if (!configured) {
+    return;
+  }
+  const fields: Array<[string, string | undefined]> = [
+    ["CLIENT_ID", clientId],
+    ["CLIENT_SECRET", clientSecret],
+    ["REDIRECT_URI", redirectUri]
+  ];
+  for (const [suffix, value] of fields) {
+    if (!value) {
+      throw new Error(
+        `${envPrefix}_OAUTH_${suffix} is required when ${label} OAuth is configured.`
+      );
+    }
+  }
+}
+
 export function loadConfig(
   source: NodeJS.ProcessEnv = process.env,
   logger: ConfigLogger = defaultConfigLogger
@@ -339,12 +384,35 @@ export function loadConfig(
   // dev-headers mode trusts X-User-Id / X-Tenant-Id from request headers, which
   // lets any caller impersonate any user or tenant. It is intended for local
   // development only and must never be active in production.
-  if (source.NODE_ENV === "production" && parsed.AUTH_MODE !== "workos") {
+  //
+  // FAIL-CLOSED on unrecognized environments: the previous guard did an exact
+  // `=== "production"` match, so any *other* value — "prod", "Production",
+  // "staging", a typo — silently left dev-headers active, a fail-open
+  // misconfiguration exposing full cross-tenant impersonation. The guard now
+  // keys on an allowlist of recognized non-production environments. Unset
+  // NODE_ENV is treated as development (the Node convention, and what `make dev`
+  // / the test runner rely on), but any non-empty value that is NOT a recognized
+  // dev/test value is treated as production and requires workos auth.
+  const RECOGNIZED_NON_PROD_ENVS = new Set(["development", "dev", "test", ""]);
+  const nodeEnv = typeof source.NODE_ENV === "string" ? source.NODE_ENV.trim().toLowerCase() : "";
+  const isRecognizedNonProd = RECOGNIZED_NON_PROD_ENVS.has(nodeEnv);
+  if (!isRecognizedNonProd && parsed.AUTH_MODE !== "workos") {
     throw new Error(
-      `AUTH_MODE=${parsed.AUTH_MODE} is not permitted when NODE_ENV=production. ` +
-        "Set AUTH_MODE=workos for production deployments."
+      `AUTH_MODE=${parsed.AUTH_MODE} is only permitted when NODE_ENV is unset or one of ` +
+        `[development, dev, test] (got NODE_ENV=${JSON.stringify(source.NODE_ENV)}). ` +
+        "Any other value — including typos like 'prod' or 'Production' — is treated as production " +
+        "and requires AUTH_MODE=workos."
     );
   }
+
+  // Make the effective auth posture visible at boot so an operator can confirm
+  // it at a glance rather than inferring it from request behavior.
+  logger.warn(
+    { authMode: parsed.AUTH_MODE, nodeEnv: source.NODE_ENV ?? "(unset)", devHeadersTrusted: parsed.AUTH_MODE !== "workos" },
+    parsed.AUTH_MODE === "workos"
+      ? "Auth mode: workos (JWT). Request headers are NOT trusted for identity."
+      : "Auth mode: dev-headers. X-User-Id / X-Tenant-Id request headers are TRUSTED for identity — DEV ONLY."
+  );
 
   if (parsed.AUTH_MODE !== "workos" && parsed.JWT_SECRET === DEFAULT_JWT_SECRET) {
     logger.warn(
@@ -364,82 +432,50 @@ export function loadConfig(
     );
   }
 
-  const githubOAuthConfigured = [
+  validateOAuthProvider(
+    "GitHub",
+    "GITHUB",
     parsed.GITHUB_OAUTH_CLIENT_ID,
     parsed.GITHUB_OAUTH_CLIENT_SECRET,
     parsed.GITHUB_OAUTH_REDIRECT_URI
-  ].some(Boolean);
-  if (githubOAuthConfigured) {
-    if (!parsed.GITHUB_OAUTH_CLIENT_ID) {
-      throw new Error("GITHUB_OAUTH_CLIENT_ID is required when GitHub OAuth is configured.");
-    }
-    if (!parsed.GITHUB_OAUTH_CLIENT_SECRET) {
-      throw new Error("GITHUB_OAUTH_CLIENT_SECRET is required when GitHub OAuth is configured.");
-    }
-    if (!parsed.GITHUB_OAUTH_REDIRECT_URI) {
-      throw new Error("GITHUB_OAUTH_REDIRECT_URI is required when GitHub OAuth is configured.");
-    }
-  }
-
-  const notionOAuthConfigured = [
+  );
+  validateOAuthProvider(
+    "Notion",
+    "NOTION",
     parsed.NOTION_OAUTH_CLIENT_ID,
     parsed.NOTION_OAUTH_CLIENT_SECRET,
     parsed.NOTION_OAUTH_REDIRECT_URI
-  ].some(Boolean);
-  if (notionOAuthConfigured) {
-    if (!parsed.NOTION_OAUTH_CLIENT_ID) {
-      throw new Error("NOTION_OAUTH_CLIENT_ID is required when Notion OAuth is configured.");
-    }
-    if (!parsed.NOTION_OAUTH_CLIENT_SECRET) {
-      throw new Error("NOTION_OAUTH_CLIENT_SECRET is required when Notion OAuth is configured.");
-    }
-    if (!parsed.NOTION_OAUTH_REDIRECT_URI) {
-      throw new Error("NOTION_OAUTH_REDIRECT_URI is required when Notion OAuth is configured.");
-    }
-  }
+  );
 
   // Set E2B_TEMPLATE_ID via env after running `make e2b-build-codex`. The
   // default in codex-release.json is the placeholder string `replace-with-
   // your-template-id` — booting against E2B with the placeholder would fail
   // opaquely in `Sandbox.create()`, so we surface a clearer error here.
+  // Both runtimes run exclusively inside E2B sandboxes — there is no in-process
+  // local execution mode. E2B is therefore required at boot, unconditionally.
   const e2bTemplateIdLooksUnset =
     !parsed.E2B_TEMPLATE_ID || parsed.E2B_TEMPLATE_ID === "replace-with-your-template-id";
 
-  if (parsed.RUNTIME_BACKEND === "e2b") {
-    if (!parsed.E2B_API_KEY) {
-      throw new Error("E2B_API_KEY is required when RUNTIME_BACKEND=e2b.");
-    }
-    if (e2bTemplateIdLooksUnset) {
-      throw new Error(
-        "E2B_TEMPLATE_ID is not configured for RUNTIME_BACKEND=e2b. " +
-          "Run `make e2b-build-codex` to build a template in your own E2B account, " +
-          "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
-          "apps/backend/src/codex-release.json so the default picks it up)."
-      );
-    }
-    const gatewayUrl = parsed.RUNTIME_GATEWAY_BASE_URL.toLowerCase();
-    if (gatewayUrl.includes("127.0.0.1") || gatewayUrl.includes("localhost")) {
-      logger.warn(
-        { gatewayUrl: parsed.RUNTIME_GATEWAY_BASE_URL, runtimeBackend: parsed.RUNTIME_BACKEND },
-        "RUNTIME_GATEWAY_BASE_URL points to localhost while RUNTIME_BACKEND=e2b. " +
-          "E2B sandboxes cannot reach localhost — MCP tool calls from the agent will fail. " +
-          "Use a tunnel (ngrok, cloudflared) or a public URL for full functionality."
-      );
-    }
+  if (!parsed.E2B_API_KEY) {
+    throw new Error(
+      "E2B_API_KEY is required: both the Codex and Claude runtimes run inside E2B sandboxes."
+    );
   }
-
-  if (parsed.CLAUDE_RUNTIME_BACKEND === "e2b") {
-    if (!parsed.E2B_API_KEY) {
-      throw new Error("E2B_API_KEY is required when CLAUDE_RUNTIME_BACKEND=e2b.");
-    }
-    if (e2bTemplateIdLooksUnset) {
-      throw new Error(
-        "E2B_TEMPLATE_ID is not configured for CLAUDE_RUNTIME_BACKEND=e2b. " +
-          "Run `make e2b-build-codex` to build a template in your own E2B account, " +
-          "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
-          "apps/backend/src/codex-release.json so the default picks it up)."
-      );
-    }
+  if (e2bTemplateIdLooksUnset) {
+    throw new Error(
+      "E2B_TEMPLATE_ID is not configured. " +
+        "Run `make e2b-build-codex` to build a template in your own E2B account, " +
+        "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
+        "apps/backend/src/codex-release.json so the default picks it up)."
+    );
+  }
+  const gatewayUrl = parsed.RUNTIME_GATEWAY_BASE_URL.toLowerCase();
+  if (gatewayUrl.includes("127.0.0.1") || gatewayUrl.includes("localhost")) {
+    logger.warn(
+      { gatewayUrl: parsed.RUNTIME_GATEWAY_BASE_URL },
+      "RUNTIME_GATEWAY_BASE_URL points to localhost, but E2B sandboxes cannot reach localhost — " +
+        "MCP tool calls from the agent will fail. Use a tunnel (ngrok, cloudflared) or a public URL."
+    );
   }
 
   if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_OPENROUTER_API_KEY) {

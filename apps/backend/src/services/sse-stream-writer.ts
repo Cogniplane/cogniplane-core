@@ -53,6 +53,17 @@ export type StreamAssistantReplyInput = {
       }
     ): AsyncIterable<RuntimeEvent>;
     writeRuntimeFile?: (sessionId: string, filePath: string, data: Uint8Array | ArrayBuffer | string) => Promise<string>;
+    /**
+     * Cancel the in-flight runtime turn for this session while keeping the
+     * session warm. Called when the SSE client disconnects mid-stream so the
+     * runtime stops generating (avoids billable tokens + DB writes for output
+     * nobody will see). Optional: adapters without a turn-interrupt path omit it.
+     */
+    interruptTurn?: (input: {
+      tenantId: string;
+      sessionId: string;
+      userId: string;
+    }) => Promise<"interrupted" | "no_active_turn">;
   };
   tenantId: string;
   sessionId: string;
@@ -122,7 +133,7 @@ type TurnContext = {
   userId: string;
   modelName: string;
   assistantMessageId: string;
-  reply: FastifyReply;
+  writer: SseWriter;
   messages: StreamAssistantReplyInput["messages"];
   sourceArtifactNames: string[] | undefined;
   streamingContent: {
@@ -143,6 +154,83 @@ type TurnContext = {
   /** Bundles identity for tool-output deltas. */
   appendToolResultOutput: (toolResultId: string, delta: string) => Promise<void>;
 };
+
+// ---------------------------------------------------------------------------
+// SSE writer with backpressure + disconnect handling
+// ---------------------------------------------------------------------------
+
+// Minimal slice of `http.ServerResponse` we rely on. Declared structurally so
+// the test fake doesn't have to satisfy the full Node typing.
+type RawSseResponse = {
+  write(chunk: string): boolean;
+  end(): void;
+  once?(event: "drain", listener: () => void): unknown;
+  on?(event: "close", listener: () => void): unknown;
+  writableEnded?: boolean;
+  destroyed?: boolean;
+};
+
+/**
+ * Wraps `reply.raw` to (a) respect TCP backpressure — when `write()` returns
+ * `false` the socket buffer is full, so we await `drain` before queueing more
+ * frames instead of growing an unbounded in-memory buffer — and (b) stop
+ * writing entirely once the client disconnects. `closed` flips on the socket
+ * `close` event; callers check it (via `isClosed`) to short-circuit further
+ * work and to cancel the runtime turn.
+ */
+class SseWriter {
+  private closed = false;
+  private readonly onCloseCallbacks: Array<() => void> = [];
+
+  constructor(private readonly raw: RawSseResponse) {
+    raw.on?.("close", () => {
+      if (this.closed) return;
+      this.closed = true;
+      for (const cb of this.onCloseCallbacks) {
+        cb();
+      }
+    });
+  }
+
+  get isClosed(): boolean {
+    return this.closed || this.raw.writableEnded === true || this.raw.destroyed === true;
+  }
+
+  onClose(cb: () => void): void {
+    if (this.closed) {
+      cb();
+      return;
+    }
+    this.onCloseCallbacks.push(cb);
+  }
+
+  // Fire-and-forget write that still honours backpressure. Returns a promise
+  // that resolves once the frame is buffered and (if the socket was full) the
+  // drain has occurred. Resolves immediately when the client is gone so the
+  // turn loop can unwind instead of hanging on a drain that will never fire.
+  async write(frame: string): Promise<void> {
+    if (this.isClosed) return;
+    const ok = this.raw.write(frame);
+    if (ok || !this.raw.once) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      this.raw.once!("drain", finish);
+      // The socket may close while we're parked waiting for drain — unblock so
+      // the loop can observe `isClosed` and stop.
+      this.onClose(finish);
+    });
+  }
+
+  end(): void {
+    if (this.raw.writableEnded === true) return;
+    this.raw.end();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Artifact provenance
@@ -174,7 +262,7 @@ async function appendArtifactProvenance(ctx: TurnContext, responseId: string): P
   ctx.provenanceAppended = true;
 
   await ctx.persistAssistantStatus("streaming", ctx.streamingContent.assistant);
-  ctx.reply.raw.write(
+  await ctx.writer.write(
     sseFrame("response.output_text.delta", {
       type: "response.output_text.delta",
       response_id: responseId,
@@ -336,7 +424,7 @@ async function persistEvent(
 async function handleStreamEvent(ctx: TurnContext, event: RuntimeEvent): Promise<boolean> {
   const { break: shouldBreak } = await persistEvent(ctx, event);
   const frame = runtimeEventToSSEFrame(event, ctx.assistantMessageId);
-  ctx.reply.raw.write(sseFrame(frame.event, frame.data));
+  await ctx.writer.write(sseFrame(frame.event, frame.data));
   return shouldBreak;
 }
 
@@ -411,7 +499,46 @@ async function runRuntimeTurn(
     ctx.assistantMessageId,
     input.modelName
   );
+
+  // Client disconnect mid-stream: cancel the runtime turn so it stops
+  // generating (no more billable tokens, no more DB writes for output nobody
+  // will ever see). The runtime stays warm — `interruptTurn` only stops the
+  // turn, not the session. Fire-and-forget; the for-await loop below also
+  // observes `writer.isClosed` and unwinds.
+  let interruptedByDisconnect = false;
+  // Set once the turn reaches a terminal state. A normal completion calls
+  // `writer.end()`, which also makes Node emit `close` — without this guard the
+  // close handler would fire `interruptTurn` (session-scoped!) and could cancel
+  // a follow-up turn the user already started on the same session. Only a close
+  // that arrives WHILE the turn is still streaming is a real client disconnect.
+  let turnSettled = false;
+  ctx.writer.onClose(() => {
+    if (interruptedByDisconnect || turnSettled) return;
+    interruptedByDisconnect = true;
+    void Promise.resolve(
+      input.runtimeManager.interruptTurn?.({
+        tenantId: input.tenantId,
+        sessionId: input.sessionId,
+        userId: input.userId
+      })
+    ).catch((err) => {
+      input.logger?.warn(
+        { err, sessionId: input.sessionId },
+        "failed to cancel runtime turn after client disconnect"
+      );
+    });
+  });
+
   try {
+    let abandoned = false;
+    // Early-disconnect guard: the client can drop during session / tool-context
+    // setup above, i.e. before any runtime turn exists for `onClose` to
+    // interrupt (its `interruptTurn` would no-op). Don't start billable
+    // generation for a connection that is already gone — fall straight through
+    // to the abandoned-turn handling below.
+    if (ctx.writer.isClosed) {
+      abandoned = true;
+    } else {
     for await (const event of input.runtimeManager.runMessage(runtimeSession, {
       prompt: input.prompt,
       runtimePolicyId: runtimeSession.runtimePolicy.id,
@@ -422,12 +549,32 @@ async function runRuntimeTurn(
       onBeforeTurn,
       get userInputs() { return turnState.userInputs; }
     })) {
+      // Stop draining the runtime once the browser is gone — the interrupt
+      // fired above will land a terminal frame on the runtime side; here we
+      // just stop persisting/writing for a connection no one is reading.
+      if (ctx.writer.isClosed) {
+        abandoned = true;
+        break;
+      }
       const shouldBreak = await handleStreamEvent(ctx, event);
       if (shouldBreak) {
         break;
       }
     }
+    }
+    if (abandoned && !ctx.completed) {
+      // Client disconnected mid-turn. Persist whatever streamed so far under
+      // "interrupted" so the row doesn't linger in "streaming" forever, and
+      // mark the turn terminal so the outer `finally` doesn't try to emit a
+      // (dropped) synthetic frame to the dead socket.
+      ctx.completed = true;
+      await ctx.persistAssistantStatus("interrupted", ctx.streamingContent.assistant);
+      await persistStreamingAuxContent(ctx);
+    }
   } finally {
+    // The turn has reached a terminal state: any subsequent `close` (e.g. from
+    // our own `writer.end()`) must NOT be treated as a client disconnect.
+    turnSettled = true;
     input.activeTurnMessageMap.clear(input.sessionId, runtimeSession.runtimeId);
     if (turnState.cleanup.length) {
       await Promise.allSettled(turnState.cleanup.map((fn) => fn()));
@@ -440,8 +587,10 @@ async function runRuntimeTurn(
 // ---------------------------------------------------------------------------
 
 export async function streamAssistantReply(input: StreamAssistantReplyInput): Promise<void> {
+  const writer = new SseWriter(input.reply.raw as unknown as RawSseResponse);
+
   if (input.userMessageReplacement) {
-    input.reply.raw.write(
+    await writer.write(
       sseFrame("runtime.user_message_replaced", {
         type: "runtime.user_message_replaced",
         message_id: input.userMessageReplacement.messageId,
@@ -466,7 +615,7 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
     userId: input.userId,
     modelName: input.modelName,
     assistantMessageId: assistant.messageId,
-    reply: input.reply,
+    writer,
     messages: input.messages,
     sourceArtifactNames: input.sourceArtifactNames,
     streamingContent: {
@@ -515,25 +664,37 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
       { err: error, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
       "runtime turn failed"
     );
-    await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
-    await persistStreamingAuxContent(ctx);
-    input.reply.raw.write(
+    // Emit the terminal failure frame BEFORE persistence. If
+    // `persistAssistantStatus` throws (e.g. the DB is unreachable, which is a
+    // plausible cause of the runtime failure in the first place), the client
+    // must still receive a terminal frame instead of hanging on an open stream
+    // forever. The frame is independent of the DB write.
+    await writer.write(
       sseFrame("response.failed", {
         type: "response.failed",
         response: { id: ctx.latestResponseId, status: "failed" },
         error: { message }
       })
     );
+    try {
+      await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
+      await persistStreamingAuxContent(ctx);
+    } catch (persistError) {
+      input.logger?.error(
+        { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
+        "failed to persist runtime turn failure"
+      );
+    }
   } finally {
     if (!ctx.completed) {
-      input.reply.raw.write(
+      await writer.write(
         sseFrame("response.completed", {
           type: "response.completed",
           response: { id: ctx.latestResponseId, status: "failed" }
         })
       );
     }
-    input.reply.raw.end();
+    writer.end();
     input.activeTurns?.clear(input.sessionId);
   }
 }

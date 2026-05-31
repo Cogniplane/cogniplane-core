@@ -1,6 +1,7 @@
 import { test, expect } from "vitest";
 
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
+import { createFakeFetch } from "../../test-helpers/fake-fetch.js";
 
 import { createNotionTools, markdownToNotionBlocks, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 
@@ -56,11 +57,8 @@ function findTool(name: string) {
 }
 
 function stubFetch(handler: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) {
-  const original = globalThis.fetch;
-  globalThis.fetch = handler as typeof globalThis.fetch;
-  return () => {
-    globalThis.fetch = original;
-  };
+  const fake = createFakeFetch((_url, init, input) => handler(input, init));
+  return () => fake.restore();
 }
 
 test("NOTION_TOOL_CATALOG declares 6 tools with consistent readOnly flags", () => {

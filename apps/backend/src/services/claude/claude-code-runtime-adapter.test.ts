@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, it, expect } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import { rm, mkdir } from "node:fs/promises";
@@ -10,11 +10,50 @@ import { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "../managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "../managed-tools/register-builtin-managed-tools.js";
 import { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
+import { E2bClaudeRuntimeProcess } from "../runtime/e2b-claude-runtime-process.js";
 
 function makeTestManagedToolCatalog(): ManagedToolCatalog {
   const catalog = new ManagedToolCatalog();
   registerBuiltinManagedTools(catalog, new ManagedToolFactoryRegistry());
   return catalog;
+}
+
+/**
+ * Minimal stand-in for E2bClaudeRuntimeProcess. Covers every method the
+ * adapter + bootstrap invoke on `state.e2bProcess`:
+ *   - bootstrap: sendWarmup
+ *   - createSession reuse / abort: isAlive, terminate
+ *   - readRuntimeFile / writeRuntimeFile: readFile, writeFile (round-trips
+ *     content keyed by sandbox path so the read-back assertion holds)
+ *   - resolveApproval (e2b path): sendApprovalResponse (a vi.fn so tests can
+ *     assert the forwarded decision)
+ * A fresh instance is minted per E2bClaudeRuntimeProcess.start() call so
+ * sessions don't share file state.
+ */
+function makeFakeE2bProcess() {
+  const files = new Map<string, Uint8Array>();
+  return {
+    isAlive: () => true,
+    terminate: vi.fn(async () => {}),
+    sendWarmup: vi.fn(async () => {}),
+    sendApprovalResponse: vi.fn(async () => {}),
+    readFile: async (sandboxPath: string): Promise<Uint8Array> => {
+      const stored = files.get(sandboxPath);
+      if (!stored) throw new Error(`no such file: ${sandboxPath}`);
+      return stored;
+    },
+    writeFile: async (sandboxPath: string, data: string | Uint8Array | ArrayBuffer): Promise<void> => {
+      let bytes: Uint8Array;
+      if (typeof data === "string") {
+        bytes = new TextEncoder().encode(data);
+      } else if (data instanceof Uint8Array) {
+        bytes = data;
+      } else {
+        bytes = new Uint8Array(data);
+      }
+      files.set(sandboxPath, bytes);
+    }
+  };
 }
 
 const testWorkspaceRoot = path.join(os.tmpdir(), `claude-adapter-test-${Date.now()}`);
@@ -23,6 +62,11 @@ const testConfig = createTestConfig({
   RUNTIME_WORKSPACE_ROOT: testWorkspaceRoot,
   ANTHROPIC_API_KEY: "sk-ant-test-key"
 });
+
+// E2B is the only Claude backend, so every adapter needs real e2bOptions and a
+// stubbed sandbox start (see beforeEach) to construct sessions without spawning
+// a real sandbox.
+const testE2bOptions = { apiKey: "e2b-test-key", templateId: "tpl-test", sandboxTimeoutMs: 1_800_000 };
 
 const fakeDynamicConfig = {
   async compileRuntimeConfig() {
@@ -58,16 +102,39 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     await mkdir(testWorkspaceRoot, { recursive: true });
   });
 
+  beforeEach(() => {
+    // Stub the static sandbox bootstrap so createSession never spawns a real
+    // E2B sandbox. A fresh fake per call keeps file/approval state isolated.
+    vi.spyOn(E2bClaudeRuntimeProcess, "start").mockImplementation(
+      async () => makeFakeE2bProcess() as unknown as E2bClaudeRuntimeProcess
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   const fakeApprovalStore = {
     async create() {
       return {} as import("./approval-store.js").ApprovalRecord;
+    },
+    // No matching pending row by default — the atomic guard returns null, so
+    // resolveApproval surfaces "missing" without touching the live runtime.
+    async resolve() {
+      return null;
     }
   };
 
   beforeEach(() => {
-    adapter = new ClaudeCodeRuntimeAdapter(testConfig, fakeDynamicConfig, fakeLog, makeTestManagedToolCatalog(), {
-      approvals: fakeApprovalStore
-    });
+    adapter = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: fakeApprovalStore },
+      undefined,
+      testE2bOptions
+    );
   });
 
   afterAll(async () => {
@@ -107,7 +174,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       fakeDynamicConfig,
       fakeLog,
       makeTestManagedToolCatalog(),
-      { approvals: fakeApprovalStore, egressIpPins }
+      { approvals: fakeApprovalStore, egressIpPins },
+      undefined,
+      testE2bOptions
     );
     const ref = await adapterWithPins.createSession({
       tenantId: "test-tenant",
@@ -234,27 +303,6 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     ).toBe("missing");
   });
 
-  it("createSession ignores the global E2B backend flag and still initializes the SDK path", async () => {
-    const e2bConfig = createTestConfig({
-      RUNTIME_WORKSPACE_ROOT: testWorkspaceRoot,
-      ANTHROPIC_API_KEY: "sk-ant-test-key",
-      RUNTIME_BACKEND: "e2b",
-      E2B_API_KEY: "e2b-test-key"
-    });
-    const e2bAdapter = new ClaudeCodeRuntimeAdapter(e2bConfig, fakeDynamicConfig, fakeLog, makeTestManagedToolCatalog(), {
-      approvals: fakeApprovalStore
-    });
-
-    const ref = await e2bAdapter.createSession({
-      tenantId: "test-tenant",
-      sessionId: "sess-e2b-ignored",
-      userId: "user-1"
-    });
-
-    expect(ref.sessionId).toBe("sess-e2b-ignored");
-    expect(ref.runtimeId.startsWith("claude-")).toBeTruthy();
-  });
-
   it("hasSession/hasRuntime/hasActiveTurn report state for known sessions", async () => {
     const ref = await adapter.createSession({
       tenantId: "test-tenant",
@@ -327,7 +375,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       fakeDynamicConfig,
       fakeLog,
       makeTestManagedToolCatalog(),
-      { approvals: richApprovals as never, auditEvents: auditEvents as never }
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
     );
 
     await wired.createSession({ tenantId: "tenant-x", sessionId: "sess-x", userId: "user-x" });
@@ -362,21 +412,246 @@ describe("ClaudeCodeRuntimeAdapter", () => {
   });
 
   it("resolveApproval returns 'missing' when sandbox-bound approval has wrong tenant/user", async () => {
-    // Inject a fake e2bPendingApprovals entry without a real sandbox: we can't
-    // build one without spawning E2B, but we can verify the tenant/user gate
-    // by manipulating the public API: create a session, then call
-    // resolveApproval with an approvalId that the adapter doesn't know about.
-    // The local-mode code path in resolveApproval iterates sessions and
-    // returns "missing" because there's no matching approval.
+    // Seed a pending e2b approval owned by tenant-a/u, then attempt to resolve
+    // it as a different user. forwardApprovalDecision's tenant/user gate must
+    // reject without flipping the DB row or forwarding to the sandbox.
     await adapter.createSession({ tenantId: "tenant-a", sessionId: "s", userId: "u" });
+    (adapter as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+      "appr-mismatch",
+      "s"
+    );
     expect(
       await adapter.resolveApproval({
-        approvalId: "unknown-approval",
+        approvalId: "appr-mismatch",
         tenantId: "tenant-a",
-        userId: "u",
+        userId: "someone-else",
         decision: "approve"
       })
     ).toBe("missing");
+  });
+
+  it("resolveApproval flips the DB row, forwards the decision to the sandbox, and emits an audit event", async () => {
+    type ResolveArgs = { tenantId: string; approvalId: string; userId: string; decision: string };
+    const resolveCalls: ResolveArgs[] = [];
+    const auditCalls: Array<Record<string, unknown>> = [];
+
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async resolve(tenantId: string, approvalId: string, userId: string, decision: string) {
+        resolveCalls.push({ tenantId, approvalId, userId, decision });
+        return {
+          approvalId,
+          sessionId: "sess-approve",
+          userId,
+          itemId: "item-9",
+          kind: "command_execution"
+        } as unknown as import("./approval-store.js").ApprovalRecord;
+      }
+    };
+    const auditEvents = {
+      async create(input: Record<string, unknown>) {
+        auditCalls.push(input);
+      }
+    };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-approve", userId: "user-1" });
+
+    // Seed a pending e2b approval mapping approvalId → sessionId. The real
+    // canUseTool Promise lives inside the sandbox harness, so the adapter
+    // forwards the decision over the bridge (state.e2bProcess.sendApprovalResponse).
+    const approvalId = "appr-1";
+    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+      approvalId,
+      "sess-approve"
+    );
+    const sandboxProcess = (wired as unknown as {
+      sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
+    }).sessions.get("sess-approve")!.e2bProcess;
+
+    const result = await wired.resolveApproval({
+      approvalId,
+      tenantId: "tenant-a",
+      userId: "user-1",
+      decision: "approve"
+    });
+
+    expect(result).toBe("resolved");
+    // DB row flipped exactly once, with the decision threaded through.
+    expect(resolveCalls).toEqual([
+      { tenantId: "tenant-a", approvalId, userId: "user-1", decision: "approve" }
+    ]);
+    // Audit event mirrors the Codex payload shape.
+    expect(auditCalls).toHaveLength(1);
+    expect(auditCalls[0]).toMatchObject({
+      tenantId: "tenant-a",
+      sessionId: "sess-approve",
+      userId: "user-1",
+      approvalId,
+      type: "approval.approved",
+      payload: { itemId: "item-9", kind: "command_execution" }
+    });
+    // The decision was forwarded to the in-sandbox harness as "approve".
+    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(approvalId, "approve");
+  });
+
+  it("resolveApproval emits approval.rejected and forwards a reject to the sandbox", async () => {
+    const auditCalls: Array<Record<string, unknown>> = [];
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async resolve(_t: string, approvalId: string, userId: string) {
+        return {
+          approvalId,
+          sessionId: "sess-reject",
+          userId,
+          itemId: "item-r",
+          kind: "file_change"
+        } as unknown as import("./approval-store.js").ApprovalRecord;
+      }
+    };
+    const auditEvents = {
+      async create(input: Record<string, unknown>) {
+        auditCalls.push(input);
+      }
+    };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-reject", userId: "user-1" });
+
+    const approvalId = "appr-r";
+    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+      approvalId,
+      "sess-reject"
+    );
+    const sandboxProcess = (wired as unknown as {
+      sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
+    }).sessions.get("sess-reject")!.e2bProcess;
+
+    const result = await wired.resolveApproval({
+      approvalId,
+      tenantId: "tenant-a",
+      userId: "user-1",
+      decision: "reject"
+    });
+
+    expect(result).toBe("resolved");
+    expect(auditCalls).toHaveLength(1);
+    expect(auditCalls[0]).toMatchObject({
+      type: "approval.rejected",
+      payload: { itemId: "item-r", kind: "file_change" }
+    });
+    // The decision was forwarded to the in-sandbox harness as "reject".
+    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(approvalId, "reject");
+  });
+
+  it("resolveApproval returns 'missing' without auditing when the DB row is not pending", async () => {
+    const auditCalls: unknown[] = [];
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      // Atomic guard found no pending row (already resolved / expired / unknown).
+      async resolve() {
+        return null;
+      }
+    };
+    const auditEvents = {
+      async create(input: unknown) {
+        auditCalls.push(input);
+      }
+    };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-dbl", userId: "user-1" });
+
+    // Seed the pending entry so forwarding succeeds and we reach the DB guard;
+    // resolve() returns null (row already settled) so no audit row is written.
+    const approvalId = "already-settled";
+    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+      approvalId,
+      "sess-dbl"
+    );
+
+    expect(
+      await wired.resolveApproval({
+        approvalId,
+        tenantId: "tenant-a",
+        userId: "user-1",
+        decision: "approve"
+      })
+    ).toBe("resolved");
+    expect(auditCalls).toHaveLength(0);
+  });
+
+  it("resolveApproval does NOT flip the DB row for an approval it doesn't own (so the owning adapter can)", async () => {
+    // Regression guard for the multi-adapter route (Codex tried before Claude):
+    // a non-owning adapter must not settle another provider's approval row.
+    const resolveCalls: unknown[] = [];
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async resolve(...args: unknown[]) {
+        resolveCalls.push(args);
+        return null;
+      }
+    };
+    const auditEvents = { async create() {} };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+    // A live session exists, but no pending approval with this id belongs to it
+    // (e2bPendingApprovals has no entry), so forwardApprovalDecision returns
+    // false and resolveApproval bails before touching the DB row.
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-unowned", userId: "user-1" });
+
+    const result = await wired.resolveApproval({
+      approvalId: "owned-by-another-provider",
+      tenantId: "tenant-a",
+      userId: "user-1",
+      decision: "approve"
+    });
+
+    expect(result).toBe("missing");
+    // The DB row was never touched — the owning adapter, tried next, still sees
+    // it as pending and can resolve it.
+    expect(resolveCalls).toHaveLength(0);
   });
 
   it("buildClaudeSdkOptions enables partial messages so tool-use events reach the UI", async () => {

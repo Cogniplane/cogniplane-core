@@ -1,9 +1,18 @@
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { MessageStore } from "../message-store.js";
+import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type { PiiScanArtifactInput } from "./pii-provider.js";
 import type { PiiScanSubjectReader } from "./pii-scan-job-handler.js";
 import { withTenantScope, type Pool } from "../../lib/db.js";
+
+/**
+ * Hard cap on bytes buffered from artifact storage during a PII scan read.
+ * Matches the `PiiProtectionService` default (`artifactMaxBytes`) so the
+ * stream read fails fast — before the whole object lands in memory — instead
+ * of OOMing on a multi-GB upload and only then hitting the service-level cap.
+ */
+const ARTIFACT_READ_MAX_BYTES = 5 * 1024 * 1024;
 
 export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
   constructor(
@@ -12,6 +21,8 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
       messages: MessageStore;
       artifacts: ArtifactStore;
       storage: ArtifactStorage;
+      /** Overrides the default 5 MiB read cap. */
+      maxBytes?: number;
     }
   ) {}
 
@@ -39,6 +50,7 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
     if (!artifact) return null;
 
     const storage = this.deps.storage;
+    const maxBytes = this.deps.maxBytes ?? ARTIFACT_READ_MAX_BYTES;
     // `entityTypes` on the input is part of the provider contract but the
     // protection service resolves the effective list from tenant settings —
     // this array is a placeholder to satisfy the type.
@@ -49,8 +61,23 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
       async readContent() {
         const handle = await storage.openReadStream(artifact.storageKey);
         const chunks: Buffer[] = [];
+        let total = 0;
         for await (const chunk of handle.stream) {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += buf.length;
+          // Enforce the cap while reading so a huge object can't be fully
+          // buffered into memory before the service-level check runs.
+          if (total > maxBytes) {
+            const destroyable = handle.stream as { destroy?: () => void };
+            if (typeof destroyable.destroy === "function") {
+              destroyable.destroy();
+            }
+            throw new PiiProtectionServiceError(
+              "file_too_large",
+              `Artifact exceeds the ${maxBytes}-byte PII scan cap`
+            );
+          }
+          chunks.push(buf);
         }
         return Buffer.concat(chunks).toString("utf8");
       }

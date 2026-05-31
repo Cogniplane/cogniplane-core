@@ -1,22 +1,13 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import path from "node:path";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import type { FastifyBaseLogger } from "fastify";
 
-import { extractMcpServersToml } from "./e2b-runtime-process.js";
-
 import type { AppConfig } from "../../config.js";
-import { CodexRuntimeProcess } from "./codex-runtime-process.js";
 import { CodexSkillDiscoveryService } from "./codex-skill-discovery-service.js";
 import type { GithubConnectionService } from "../integrations/github/github-connection-service.js";
 import type { IntegrationRegistryService } from "../integrations/integration-registry-service.js";
 import { prepareGithubWorkspace } from "./runtime-github-bootstrap.js";
-import {
-  createRuntimeWorkspace,
-  type WorkspaceArtifacts
-} from "./runtime-workspace.js";
+import type { WorkspaceArtifacts } from "./runtime-workspace.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import type { SkillBundleStorage } from "../skills/skill-bundle-storage.js";
 import type { ActivationTracker } from "../activation-tracker.js";
@@ -40,8 +31,10 @@ export class CodexWorkspaceBootstrap {
       getTenantApiKey?: (tenantId: string) => Promise<string | null>;
       githubConnections?: GithubConnectionService;
       integrationRegistry?: IntegrationRegistryService;
-      processFactory?: RuntimeProcessFactory;
-      workspaceFactory?: RuntimeWorkspaceFactory;
+      // Required: both runtimes run inside E2B. The sandbox-backed factories
+      // are always supplied by build-runtime-adapters.
+      processFactory: RuntimeProcessFactory;
+      workspaceFactory: RuntimeWorkspaceFactory;
       skillDiscovery?: CodexSkillDiscoveryService;
       skillBundleStorage: SkillBundleStorage;
       managedToolCatalog: ManagedToolCatalog;
@@ -151,7 +144,7 @@ export class CodexWorkspaceBootstrap {
     startedAt: string;
   }> {
     const { tenantId, sessionId, userId, runtimeConfig } = input;
-    const workspaceFactory = this.deps.workspaceFactory ?? createRuntimeWorkspace;
+    const workspaceFactory = this.deps.workspaceFactory;
 
     const runtimeId = uuidv7();
     const [workspace, tenantApiKey] = await Promise.all([
@@ -174,19 +167,13 @@ export class CodexWorkspaceBootstrap {
       tenantApiKey?.trim() ||
       this.config.OPENAI_API_KEY?.trim() ||
       null;
-    // In e2b mode the sandbox never holds the real OpenAI key. The env's
-    // OPENAI_API_KEY is the session's short-lived rt_* runtime token; Codex
-    // is configured (via [model_providers.cogniplane_proxy] in
-    // ~/.codex/config.toml) to call /llm/openai on the backend, which swaps
-    // the rt_* for the real key. Local mode keeps the real key in env so
-    // Codex talks to api.openai.com directly.
-    const useOpenaiProxy = this.config.RUNTIME_BACKEND === "e2b" && Boolean(runtimeApiKey);
-    let processEnv: Record<string, string> | undefined;
-    if (useOpenaiProxy) {
-      processEnv = { OPENAI_API_KEY: workspace.runtimeToken };
-    } else if (runtimeApiKey) {
-      processEnv = { OPENAI_API_KEY: runtimeApiKey };
-    }
+    // The sandbox never holds the real OpenAI key. The env's OPENAI_API_KEY is
+    // the session's short-lived rt_* runtime token; Codex is configured (via
+    // [model_providers.cogniplane_proxy] in ~/.codex/config.toml) to call
+    // /llm/openai on the backend, which swaps the rt_* for the real key.
+    let processEnv: Record<string, string> | undefined = runtimeApiKey
+      ? { OPENAI_API_KEY: workspace.runtimeToken }
+      : undefined;
 
     if (this.deps.githubConnections) {
       const githubBootstrapWorkspacePath = workspace.localWorkspacePath ?? workspace.workspacePath;
@@ -251,19 +238,7 @@ export class CodexWorkspaceBootstrap {
   }): Promise<RuntimeState> {
     const { tenantId, sessionId, userId, runtimeId, workspace, runtimeConfig, processEnv, startedAt } =
       input;
-    const processFactory = this.deps.processFactory ?? CodexRuntimeProcess.start;
-
-    // Codex CLI ignores project-local config (including [mcp_servers.*]) for
-    // any cwd that isn't trusted, and recent versions only honor [mcp_servers.*]
-    // from the global ~/.codex/config.toml. We patch the global config to (a)
-    // trust the per-session workspace and (b) mirror its [mcp_servers.*] blocks.
-    // E2B mode handles this inside buildSandboxCodexConfig; this is the local-mode equivalent.
-    await ensureLocalCodexGlobalConfig({
-      workspacePath: workspace.workspacePath,
-      workspaceCodexTomlPath: workspace.codexTomlPath,
-      sessionId,
-      logger: this.deps.logger
-    });
+    const processFactory = this.deps.processFactory;
 
     const process = await processFactory({
       binaryPath: this.config.CODEX_BINARY_PATH,
@@ -323,8 +298,7 @@ export class CodexWorkspaceBootstrap {
       ...(runtimeConfig.runtimePolicy.developerInstructions
         ? { developerInstructions: runtimeConfig.runtimePolicy.developerInstructions }
         : {}),
-      experimentalRawEvents: false,
-      persistExtendedHistory: false
+      experimentalRawEvents: false
     })) as { thread?: { id: string } };
 
     await this.verifySkillDiscovery(runtime, skillDiscovery);
@@ -389,82 +363,5 @@ export class CodexWorkspaceBootstrap {
       discoveredSkillNames: result.discoveredSkillNames,
       skillDiscoveryErrors: result.skillDiscoveryErrors
     };
-  }
-}
-
-async function ensureLocalCodexGlobalConfig(input: {
-  workspacePath: string;
-  workspaceCodexTomlPath: string;
-  sessionId: string;
-  logger: FastifyBaseLogger;
-}): Promise<void> {
-  const { workspacePath, workspaceCodexTomlPath, sessionId, logger } = input;
-  const codexHome = process.env.CODEX_HOME ?? path.join(homedir(), ".codex");
-  const configPath = path.join(codexHome, "config.toml");
-
-  let existing = "";
-  try {
-    existing = await readFile(configPath, "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException)?.code;
-    if (code !== "ENOENT") {
-      logger.warn(
-        { err: error, configPath },
-        "Could not read Codex config.toml; spawning without injected config."
-      );
-      return;
-    }
-  }
-
-  const trustHeader = `[projects."${workspacePath}"]`;
-  let next = existing;
-
-  if (!next.includes(trustHeader)) {
-    const trim = next.endsWith("\n") || next.length === 0 ? "" : "\n";
-    next = `${next}${trim}\n${trustHeader}\ntrust_level = "trusted"\n`;
-  }
-
-  let mcpServersToml = "";
-  try {
-    const workspaceToml = await readFile(workspaceCodexTomlPath, "utf8");
-    mcpServersToml = extractMcpServersToml(workspaceToml);
-  } catch (error) {
-    logger.warn(
-      { err: error, workspaceCodexTomlPath },
-      "Could not read workspace codex.toml; managed MCP servers will be unavailable."
-    );
-  }
-
-  // Strip every prior managed-MCP block (any session). MCP server names like
-  // `managed-session-context` are not session-scoped at the TOML level, so
-  // leaving stale blocks behind from other sessions produces a duplicate-key
-  // error when Codex parses the file. Only one block — the current session's —
-  // should ever be present.
-  const begin = `# >>> cogniplane-managed-mcp:${sessionId}`;
-  const end = `# <<< cogniplane-managed-mcp:${sessionId}`;
-  const anyBlockPattern = /\n?# >>> cogniplane-managed-mcp:[^\n]*\n[\s\S]*?# <<< cogniplane-managed-mcp:[^\n]*\n?/g;
-  next = next.replace(anyBlockPattern, "\n");
-
-  if (mcpServersToml) {
-    const trim = next.endsWith("\n") || next.length === 0 ? "" : "\n";
-    next = `${next}${trim}\n${begin}\n${mcpServersToml}\n${end}\n`;
-  }
-
-  if (next === existing) {
-    return;
-  }
-
-  try {
-    await mkdir(codexHome, { recursive: true });
-    await writeFile(configPath, next, { mode: 0o600 });
-    logger.info(
-      { workspacePath, configPath, mcpServers: mcpServersToml.length > 0 },
-      "Updated Codex global config (project trust + managed MCP servers)"
-    );
-  } catch (error) {
-    logger.warn(
-      { err: error, configPath, workspacePath },
-      "Failed to update Codex global config; spawning anyway."
-    );
   }
 }

@@ -137,12 +137,31 @@ export class OpenRouterPiiProvider implements PiiProvider {
       model
     );
 
-    const transformedText =
-      typeof raw.transformedText === "string" ? raw.transformedText : input.text;
+    const findings = normalizeFindings(raw.findings, input.text, input.entityTypes);
+
+    // A missing `transformedText` is only safe when the model also reported no
+    // findings — then "no change" genuinely means "nothing to redact". If the
+    // model flagged PII but gave us no redacted text, falling back to the raw
+    // input would forward unredacted PII while claiming a transform happened.
+    // Fail the call so the service fails closed instead.
+    if (typeof raw.transformedText !== "string") {
+      if (findings.length > 0) {
+        throw new OpenRouterPiiProviderError(
+          "transform_missing_output",
+          "OpenRouter reported findings but returned no transformedText"
+        );
+      }
+      return {
+        transformedText: input.text,
+        findings,
+        providerType: this.type,
+        providerModel: model
+      };
+    }
 
     return {
-      transformedText,
-      findings: normalizeFindings(raw.findings, input.text, input.entityTypes),
+      transformedText: raw.transformedText,
+      findings,
       providerType: this.type,
       providerModel: model
     };

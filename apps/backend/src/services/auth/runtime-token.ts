@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 /**
  * Session-scoped runtime tokens allow the Codex CLI (running inside an E2B
@@ -6,7 +6,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  * backend's MCP gateway without holding a real user JWT.
  *
  * Token format: `rt_<payload>.<signature>`
- *   payload = base64url(JSON.stringify({ sid, tid, uid, rid, exp? }))
+ *   payload = base64url(JSON.stringify({ jti, sid, tid, uid, rid, exp? }))
  *   signature = HMAC-SHA256(payload, secret)
  *
  * The token is generated once per runtime session and embedded as an
@@ -14,9 +14,17 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  *
  * Production callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`
  * to bound the leak window if a workspace file or sandbox snapshot is
- * captured. Default TTL is 1 hour; operators can shorten via the env var.
- * Verification still tolerates absence so older in-flight tokens keep
- * working through a deploy.
+ * captured. Default TTL is 24 hours (see RUNTIME_TOKEN_TTL_MS in config.ts for
+ * the rationale: the token is minted once and must outlive the longest realistic
+ * session); operators can shorten via the env var. Verification still tolerates
+ * absence of `exp` so older in-flight tokens keep working through a deploy.
+ *
+ * Every minted token carries a unique `jti` (token id). On its own the token is
+ * still a bearer credential valid until `exp`, but `jti` gives each token a
+ * stable identity so a caller can (a) correlate it in audit logs and (b) check
+ * it against a revocation deny-list — see `verifyRuntimeToken`'s optional
+ * `isRevoked` hook — to get an immediate kill switch for a leaked token instead
+ * of waiting out the full TTL.
  */
 
 const TOKEN_PREFIX = "rt_";
@@ -45,6 +53,8 @@ export function runtimeTokenExpiry(ttlMs: number, now: Date = new Date()): strin
 }
 
 export type RuntimeTokenClaims = {
+  /** Unique token id — enables revocation + audit correlation. */
+  jti: string;
   /** Session ID */
   sid: string;
   /** Tenant ID */
@@ -57,15 +67,19 @@ export type RuntimeTokenClaims = {
   exp?: string;
 };
 
+/** Claims a caller supplies at mint time. `jti` is auto-generated if omitted. */
+export type RuntimeTokenMintClaims = Omit<RuntimeTokenClaims, "jti"> & { jti?: string };
+
 function hmac(data: string, secret: string): string {
   return createHmac(ALGORITHM, secret).update(data).digest("base64url");
 }
 
 export function generateRuntimeToken(
-  claims: RuntimeTokenClaims,
+  claims: RuntimeTokenMintClaims,
   secret: string
 ): string {
-  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const fullClaims: RuntimeTokenClaims = { jti: claims.jti ?? randomUUID(), ...claims };
+  const payload = Buffer.from(JSON.stringify(fullClaims)).toString("base64url");
   const signature = hmac(payload, secret);
   return `${TOKEN_PREFIX}${payload}.${signature}`;
 }
@@ -73,10 +87,12 @@ export function generateRuntimeToken(
 // Verification result. `expired` is distinguished from `invalid` so callers
 // can log/respond differently — an expired token is operationally normal at
 // the end of a long session, while `invalid` means malformed, tampered, or
-// signed under a rotated secret.
+// signed under a rotated secret. `revoked` means the signature/expiry are fine
+// but the token's `jti` is on the deny-list (an explicit kill switch).
 export type RuntimeTokenVerification =
   | { kind: "valid"; claims: RuntimeTokenClaims }
   | { kind: "expired" }
+  | { kind: "revoked"; claims: RuntimeTokenClaims }
   | { kind: "invalid" };
 
 export function verifyRuntimeToken(
@@ -136,8 +152,29 @@ export function verifyRuntimeToken(
 }
 
 /**
- * Returns the bearer token value for use in an Authorization header.
+ * Verify a token AND check its `jti` against a revocation deny-list. Kept
+ * separate from the synchronous `verifyRuntimeToken` so the hot HMAC/expiry
+ * path stays sync and dependency-free; callers that have a revocation store
+ * (e.g. Redis) wire it here to get an immediate kill switch. Fail-closed: an
+ * `isRevoked` that throws is treated as revoked rather than letting a token
+ * through during a revocation-store outage.
  */
-export function runtimeTokenBearer(token: string): string {
-  return `Bearer ${token}`;
+export async function verifyRuntimeTokenWithRevocation(
+  token: string,
+  secret: string,
+  isRevoked: (jti: string) => Promise<boolean>
+): Promise<RuntimeTokenVerification> {
+  const result = verifyRuntimeToken(token, secret);
+  if (result.kind !== "valid") {
+    return result;
+  }
+  try {
+    if (await isRevoked(result.claims.jti)) {
+      return { kind: "revoked", claims: result.claims };
+    }
+  } catch {
+    // Fail-closed: if we cannot confirm the token is NOT revoked, deny it.
+    return { kind: "revoked", claims: result.claims };
+  }
+  return result;
 }

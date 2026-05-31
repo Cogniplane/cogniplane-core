@@ -165,5 +165,13 @@ test("skill marketplace service reports manifest validation failures as catalog 
   const catalog = await service.getCatalog();
 
   expect(catalog.status).toBe("error");
-  expect(catalog.error ?? "").toMatch(/description|name|subdirectory/);
+  expect(catalog.skills).toEqual([]);
+  // The manifest entry omits `name`, `description`, and `subdirectory`; every
+  // omitted required field must surface in the catalog error so the operator
+  // can see all of them, not just whichever one validation happens to report
+  // first.
+  const error = catalog.error ?? "";
+  expect(error).toContain("name");
+  expect(error).toContain("description");
+  expect(error).toContain("subdirectory");
 });

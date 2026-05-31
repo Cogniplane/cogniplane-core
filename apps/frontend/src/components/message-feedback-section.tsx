@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  type ColumnDef,
+  type SortingState,
+  flexRender,
+  getCoreRowModel,
+  getSortedRowModel,
+  useReactTable
+} from "@tanstack/react-table";
+import { ChevronDown, ChevronUp, ChevronsUpDown } from "lucide-react";
 
 import { fetchMessageFeedback, type MessageFeedbackStats } from "../lib/message-feedback-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
@@ -154,27 +163,99 @@ function StatCard(props: { label: string; value: string; detail: string }) {
   );
 }
 
-function FeedbackTable(props: {
-  rows: Array<{ key: string; label: string; thumbsUp: number; thumbsDown: number; rate: number | null }>;
-  firstColLabel: string;
-}) {
+type FeedbackRow = {
+  key: string;
+  label: string;
+  thumbsUp: number;
+  thumbsDown: number;
+  rate: number | null;
+};
+
+function FeedbackTable(props: { rows: FeedbackRow[]; firstColLabel: string }) {
+  const [sorting, setSorting] = useState<SortingState>([]);
+
+  const columns = useMemo<ColumnDef<FeedbackRow>[]>(
+    () => [
+      {
+        accessorKey: "label",
+        header: props.firstColLabel,
+        cell: (ctx) => ctx.getValue<string>()
+      },
+      {
+        accessorKey: "thumbsUp",
+        header: "Up",
+        cell: (ctx) => <span className="text-accent">{ctx.getValue<number>()}</span>
+      },
+      {
+        accessorKey: "thumbsDown",
+        header: "Down",
+        cell: (ctx) => <span className="text-danger">{ctx.getValue<number>()}</span>
+      },
+      {
+        accessorKey: "rate",
+        header: "Rate",
+        // null rates sort last regardless of direction.
+        sortUndefined: "last",
+        cell: (ctx) => {
+          const v = ctx.getValue<number | null>();
+          return v != null ? `${v}%` : "—";
+        }
+      }
+    ],
+    [props.firstColLabel]
+  );
+
+  // TanStack Table returns functions React Compiler can't memoize, so it skips
+  // compiling this component. That's expected and harmless here — the table is
+  // small and re-renders are cheap. Silence the known-incompatibility warning.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const table = useReactTable({
+    data: props.rows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    getRowId: (row) => row.key,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel()
+  });
+
   return (
     <table className="w-full border-collapse text-sm">
       <thead>
-        <tr className="text-left text-on-surface-faint">
-          <th className="pr-3 pb-1 font-medium">{props.firstColLabel}</th>
-          <th className="pr-3 pb-1 font-medium">Up</th>
-          <th className="pr-3 pb-1 font-medium">Down</th>
-          <th className="pb-1 font-medium">Rate</th>
-        </tr>
+        {table.getHeaderGroups().map((hg) => (
+          <tr key={hg.id} className="text-left text-on-surface-faint">
+            {hg.headers.map((header) => {
+              const sorted = header.column.getIsSorted();
+              return (
+                <th key={header.id} className="pr-3 pb-1 font-medium">
+                  <button
+                    type="button"
+                    onClick={header.column.getToggleSortingHandler()}
+                    className="inline-flex items-center gap-1 hover:text-on-surface"
+                  >
+                    {flexRender(header.column.columnDef.header, header.getContext())}
+                    {sorted === "asc" ? (
+                      <ChevronUp className="size-3" aria-hidden="true" />
+                    ) : sorted === "desc" ? (
+                      <ChevronDown className="size-3" aria-hidden="true" />
+                    ) : (
+                      <ChevronsUpDown className="size-3 opacity-40" aria-hidden="true" />
+                    )}
+                  </button>
+                </th>
+              );
+            })}
+          </tr>
+        ))}
       </thead>
       <tbody>
-        {props.rows.map((row) => (
-          <tr key={row.key} className="border-t border-outline-variant">
-            <td className="pr-3 py-1.5">{row.label}</td>
-            <td className="pr-3 py-1.5 text-accent">{row.thumbsUp}</td>
-            <td className="pr-3 py-1.5 text-danger">{row.thumbsDown}</td>
-            <td className="py-1.5">{row.rate != null ? `${row.rate}%` : "—"}</td>
+        {table.getRowModel().rows.map((row) => (
+          <tr key={row.id} className="border-t border-outline-variant">
+            {row.getVisibleCells().map((cell) => (
+              <td key={cell.id} className="pr-3 py-1.5">
+                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+              </td>
+            ))}
           </tr>
         ))}
       </tbody>

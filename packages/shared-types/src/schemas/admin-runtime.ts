@@ -53,8 +53,6 @@ export const RuntimeRolloutResponseSchema = z.object({
 export type RuntimeRolloutResponse = z.infer<typeof RuntimeRolloutResponseSchema>;
 
 export const AdminRuntimeConfigSchema = z.object({
-  codexBackend: z.enum(["local", "e2b"]),
-  claudeBackend: z.enum(["local", "e2b"]),
   e2bTemplateId: z.string(),
   codexModel: z.string(),
   claudeModel: z.string(),

@@ -2,7 +2,11 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../lib/db.js";
 
-import { MessageStore } from "./message-store.js";
+import {
+  MAX_MESSAGE_CONTENT_LENGTH,
+  MAX_TOOL_RESULT_TEXT_LENGTH,
+  MessageStore
+} from "./message-store.js";
 
 class CaptureMessageDatabase {
   lastValues: unknown[] | null = null;
@@ -129,13 +133,71 @@ test("MessageStore.upsertToolResult normalizes nullable tool fields for persiste
   });
 
   expect(db.lastValues).toBeTruthy();
-  expect(db.lastValues[9]).toBe("");
-  expect(db.lastValues[10]).toBe("");
-  expect(db.lastValues[11]).toBe("");
-  expect(db.lastValues[12]).toBe("");
+  // The NOT-NULL coercion (null input → "" persisted, to satisfy the NOT NULL
+  // text columns) is ONLY observable in the bound values: the RETURNING row
+  // round-trips "" back through mapToolResult, which re-maps empty strings to
+  // null — so the returned record below can't distinguish "coerced to ''" from
+  // "passed through as null". The bind is the sole signal, hence positional
+  // peeks here. [9] = cwd, [10] = server_name.
+  expect(db.lastValues![9]).toBe("");
+  expect(db.lastValues![10]).toBe("");
+  // The mapped record surfaces the nullable fields as null (the observable
+  // contract callers actually see).
   expect(result.server).toBe(null);
   expect(result.toolName).toBe(null);
   expect(result.cwd).toBe(null);
+});
+
+test("MessageStore.upsertToolResult truncates oversized tool output before persistence", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const huge = "x".repeat(MAX_TOOL_RESULT_TEXT_LENGTH + 5000);
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "command",
+    title: "Shell command",
+    status: "completed",
+    command: "cat huge.log",
+    cwd: null,
+    server: null,
+    toolName: null,
+    input: "",
+    output: huge,
+    exitCode: 0,
+    durationMs: 1
+  });
+
+  // The fake's RETURNING echoes the persisted output_text, so the mapped
+  // record's `output` is what actually reached storage.
+  // Capped at MAX + the truncation marker, never the full GB-scale payload.
+  expect(result.output.length).toBeLessThan(huge.length);
+  expect(result.output.startsWith("x".repeat(MAX_TOOL_RESULT_TEXT_LENGTH))).toBe(true);
+  expect(result.output).toContain("truncated");
+});
+
+test("MessageStore.create truncates oversized content before persistence", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const huge = "y".repeat(MAX_MESSAGE_CONTENT_LENGTH + 5000);
+  const record = await store.create({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    role: "assistant",
+    status: "completed",
+    content: huge
+  });
+
+  // The fake's RETURNING echoes the persisted content_text, so the mapped
+  // record's `content` is what actually reached storage.
+  expect(record.content.length).toBeLessThan(huge.length);
+  expect(record.content).toContain("truncated");
 });
 
 test("MessageStore.create persists detail_json with PII metadata and system role", async () => {
@@ -154,19 +216,19 @@ test("MessageStore.create persists detail_json with PII metadata and system role
     }
   });
 
-  expect(db.lastValues).toBeTruthy();
-  const persistedDetail = JSON.parse(String(db.lastValues[7]));
-  expect(persistedDetail.pii.status).toBe("blocked");
-  expect(persistedDetail.pii.blockReason).toBe("email");
+  // The fake's RETURNING echoes the persisted detail_json, so the mapped
+  // record is the observable proof that PII metadata + the system role round-
+  // trip through create() — no need to peek the raw bound JSON.
   expect(record.role).toBe("system");
   expect(record.detail.pii?.status).toBe("blocked");
+  expect(record.detail.pii?.blockReason).toBe("email");
 });
 
 test("MessageStore.create defaults detail_json to an empty object", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
 
-  await store.create({
+  const record = await store.create({
     tenantId: "test-tenant",
     sessionId: "session-1",
     userId: "user-1",
@@ -175,8 +237,10 @@ test("MessageStore.create defaults detail_json to an empty object", async () => 
     content: "hi"
   });
 
-  expect(db.lastValues).toBeTruthy();
-  expect(String(db.lastValues[7])).toBe("{}");
+  // Omitting `detail` yields an empty object on the returned record — the
+  // fake derives detail_json from what create() bound, so the mapped record
+  // is the observable proof of the default.
+  expect(record.detail).toEqual({});
 });
 
 test("MessageStore.setPiiDetail issues a jsonb_set merge under detail_json.pii", async () => {
@@ -185,10 +249,12 @@ test("MessageStore.setPiiDetail issues a jsonb_set merge under detail_json.pii",
 
   await store.setPiiDetail("test-tenant", "msg-1", { status: "transformed", transformed: true });
 
+  // setPiiDetail returns void, so the bound values are the ONLY observable
+  // signal that the tenant/message scope and the merged patch reach the query.
   expect(db.lastValues).toBeTruthy();
-  expect(db.lastValues[0]).toBe("test-tenant");
-  expect(db.lastValues[1]).toBe("msg-1");
-  const patch = JSON.parse(String(db.lastValues[2]));
+  expect(db.lastValues).toContain("test-tenant");
+  expect(db.lastValues).toContain("msg-1");
+  const patch = JSON.parse(String(db.lastValues![2]));
   expect(patch.status).toBe("transformed");
   expect(patch.transformed).toBe(true);
 });

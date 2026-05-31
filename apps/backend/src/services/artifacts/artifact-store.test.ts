@@ -4,12 +4,6 @@ import type { Pool } from "../../lib/db.js";
 
 import { ArtifactStore } from "./artifact-store.js";
 
-test("ArtifactStore.update rejects empty patches", async () => {
-  const store = new ArtifactStore({} as Pool);
-
-  await expect(store.update("test-tenant", "artifact-1", {})).rejects.toThrow(/requires at least one field to update/);
-});
-
 class CaptureDatabase {
   lastQuery: { text: string; values: unknown[] } | null = null;
 
@@ -42,7 +36,7 @@ class CaptureDatabase {
   }
 }
 
-test("ArtifactStore.setPiiDetail issues jsonb_set merge under detail_json.pii", async () => {
+test("ArtifactStore.setPiiDetail binds the full PII detail as the JSON patch, scoped to tenant + artifact", async () => {
   const db = new CaptureDatabase();
   const store = new ArtifactStore(db as unknown as Pool);
 
@@ -54,31 +48,33 @@ test("ArtifactStore.setPiiDetail issues jsonb_set merge under detail_json.pii", 
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("UPDATE artifacts")).toBeTruthy();
-  expect(db.lastQuery.text.includes("jsonb_set")).toBeTruthy();
-  expect(db.lastQuery.text.includes("'{pii}'")).toBeTruthy();
+  // Bound contract: $1 tenant, $2 artifact, $3 the serialized PII patch.
   expect(db.lastQuery.values[0]).toBe("test-tenant");
   expect(db.lastQuery.values[1]).toBe("artifact-1");
   const patch = JSON.parse(String(db.lastQuery.values[2]));
-  expect(patch.status).toBe("scanned");
-  expect(patch.modeApplied).toBe("detect");
-  expect(patch.scanRunId).toBe("scan-123");
-  expect(patch.findingsCount).toBe(2);
+  expect(patch).toEqual({
+    status: "scanned",
+    modeApplied: "detect",
+    scanRunId: "scan-123",
+    findingsCount: 2
+  });
 });
 
-test("ArtifactStore.setPiiDetail sends only the partial patch, preserving server-side merge semantics", async () => {
+test("ArtifactStore.setPiiDetail sends only the caller's partial fields as the patch (server-side merge owns the rest)", async () => {
   const db = new CaptureDatabase();
   const store = new ArtifactStore(db as unknown as Pool);
 
   await store.setPiiDetail("test-tenant", "artifact-1", { status: "transformed" });
 
   expect(db.lastQuery).toBeTruthy();
+  // Only the field the caller passed is sent — the merge semantics live in the
+  // DB, so the patch must not be padded with undefined keys that would clobber
+  // previously-stored PII detail.
   const patch = JSON.parse(String(db.lastQuery.values[2]));
-  expect(Object.keys(patch)).toEqual(["status"]);
-  expect(db.lastQuery.text.includes("COALESCE(detail_json->'pii', '{}'::jsonb) || $3::jsonb")).toBeTruthy();
+  expect(patch).toEqual({ status: "transformed" });
 });
 
-test("ArtifactStore.consumeDownloadToken issues an UPDATE that gates on consumed_at IS NULL and matches the requester identity in SQL", async () => {
+test("ArtifactStore.consumeDownloadToken binds [token, tenant, user, callerIsAdmin] and gates on token expiry", async () => {
   const db = new CaptureDatabase();
   const store = new ArtifactStore({} as Pool, db as unknown as Pool);
 
@@ -90,11 +86,36 @@ test("ArtifactStore.consumeDownloadToken issues an UPDATE that gates on consumed
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("UPDATE artifact_download_tokens")).toBeTruthy();
-  expect(db.lastQuery.text.includes("SET consumed_at = NOW()")).toBeTruthy();
-  expect(db.lastQuery.text.includes("download.consumed_at IS NULL")).toBeTruthy();
-  expect(db.lastQuery.text.includes("download.tenant_id = $2")).toBeTruthy();
-  expect(db.lastQuery.text.includes("$4::boolean OR download.user_id = $3")).toBeTruthy();
-  expect(db.lastQuery.text.includes("RETURNING")).toBeTruthy();
+  // The exact bound contract is the observable signal a store-level fake can't
+  // reproduce, so we pin it: token, tenant, user, callerIsAdmin (in order).
   expect(db.lastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  // Structural invariant with no fake equivalent: consume must reject expired
+  // tokens in SQL so an expired token is never burned (the route surfaces
+  // expiry as a repeatable 410). The expiry predicate is the ONLY way to assert
+  // this against a query-capturing fake.
+  expect(db.lastQuery.text.includes("expires_at > NOW()")).toBe(true);
+});
+
+test("ArtifactStore.peekDownloadToken is read-only and omits the expiry filter so the route can answer 410", async () => {
+  const db = new CaptureDatabase();
+  const store = new ArtifactStore({} as Pool, db as unknown as Pool);
+
+  await store.peekDownloadToken({
+    token: "tok-123",
+    requesterTenantId: "test-tenant",
+    requesterUserId: "user-1",
+    callerIsAdmin: false
+  });
+
+  expect(db.lastQuery).toBeTruthy();
+  expect(db.lastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  // Structural invariants with no DB-backed equivalent in a fake:
+  // 1. Peek must NOT mutate the row — a failed storage read later cannot have
+  //    already burned the token. The absence of an UPDATE / consumed_at write
+  //    is the only observable proof against a query-capturing fake.
+  expect(db.lastQuery.text.includes("UPDATE")).toBe(false);
+  expect(db.lastQuery.text.includes("consumed_at = NOW()")).toBe(false);
+  // 2. Peek deliberately omits the expiry filter (which consume includes) so an
+  //    expired-but-unconsumed token still resolves and the route can answer 410.
+  expect(db.lastQuery.text.includes("expires_at > NOW()")).toBe(false);
 });

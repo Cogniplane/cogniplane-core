@@ -1,8 +1,7 @@
-// OpenAI API proxy for sandboxed Codex runtimes
-// (RUNTIME_BACKEND=e2b). The Codex CLI inside the sandbox holds only a
-// session-scoped rt_* runtime token (written to ~/.codex/auth.json by
-// `codex login --with-api-key`); this route swaps it for the real
-// OPENAI_API_KEY and forwards to api.openai.com.
+// OpenAI API proxy for the sandboxed Codex runtime. The Codex CLI inside the
+// E2B sandbox holds only a session-scoped rt_* runtime token (written to
+// ~/.codex/auth.json by `codex login --with-api-key`); this route swaps it for
+// the real OPENAI_API_KEY and forwards to api.openai.com.
 //
 // Provider quirks captured here:
 //   - Codex uses the OpenAI SDK convention: `Authorization: Bearer <key>`.

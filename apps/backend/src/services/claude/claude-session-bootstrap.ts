@@ -5,7 +5,6 @@ import { uuidv7 } from "../../lib/uuid.js";
 import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "../../config.js";
-import { ClaudeApprovalHandler } from "./claude-code-approval-handler.js";
 import { renderClaudeWorkspace } from "./claude-workspace-renderer.js";
 import { E2bClaudeRuntimeProcess } from "../runtime/e2b-claude-runtime-process.js";
 import { E2B_WORKSPACE_BASE } from "../runtime/e2b-runtime-process.js";
@@ -13,7 +12,7 @@ import type { RuntimeConfigBundle } from "../admin-config-records.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "../auth/runtime-token.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import type { ClaudeCodeE2bOptions, ClaudeMcpServerEntry, ClaudeSessionState } from "./claude-types.js";
-import { buildClaudeSdkEnv, buildClaudeSdkOptions } from "./claude-sdk-helpers.js";
+import { buildClaudeSdkEnv } from "./claude-sdk-helpers.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type { ActivationTracker } from "../activation-tracker.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
@@ -33,6 +32,13 @@ export async function bootstrapClaudeSession(
     activationTracker?: ActivationTracker;
     managedToolCatalog: ManagedToolCatalog;
     stores?: { approvals?: ApprovalStore; runtimeSessions?: RuntimeSessionStore };
+    /** e2b only: wall-clock TTL for a pending in-sandbox approval. */
+    approvalRequestTtlMs?: number;
+    /**
+     * e2b only: called once when the process's per-approval TTL fires. The
+     * adapter expires the DB row + writes the `approval.expired` audit event.
+     */
+    onApprovalExpired?: (approvalId: string) => void;
   }
 ): Promise<ClaudeSessionState> {
   const { tenantId, sessionId, userId } = input;
@@ -68,18 +74,12 @@ export async function bootstrapClaudeSession(
 
   const { runtimePolicy } = configBundle;
 
-  const approvalHandler = new ClaudeApprovalHandler();
-  approvalHandler.setAutoApproveReadOnly(runtimePolicy.autoApproveReadOnlyTools);
-  approvalHandler.setReadOnlyManagedToolNames(managedToolCatalog.listReadOnlyIds());
-  approvalHandler.setApprovalTtlMs(config.APPROVAL_REQUEST_TTL_MS);
+  if (!e2bOptions) throw new Error("Claude runtime requires e2bOptions (E2B is the only backend).");
+
   const abortController = new AbortController();
 
   const tenantAnthropicKey = getTenantApiKey ? await getTenantApiKey(tenantId) : null;
   const anthropicApiKey = tenantAnthropicKey?.trim() || config.ANTHROPIC_API_KEY || null;
-
-  const mode: "local" | "e2b" = config.CLAUDE_RUNTIME_BACKEND === "e2b" && e2bOptions ? "e2b" : "local";
-
-  // ── Common setup (independent of mode) ──────────────────────────────────────
 
   const runtimeToken = generateRuntimeToken(
     {
@@ -93,10 +93,10 @@ export async function bootstrapClaudeSession(
   );
 
   const gatewayBase = config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "");
-  // The SDK calls the backend's /llm/anthropic proxy in both local and e2b
-  // mode so token usage + cost get captured uniformly via activeTurnMessageMap.
-  // The real ANTHROPIC_API_KEY never leaves the backend; the SDK only ever
-  // sees the session's short-lived rt_* runtime token.
+  // The SDK (inside the sandbox) calls the backend's /llm/anthropic proxy so
+  // token usage + cost get captured uniformly via activeTurnMessageMap. The
+  // real ANTHROPIC_API_KEY never leaves the backend; the SDK only ever sees
+  // the session's short-lived rt_* runtime token.
   const proxyBaseUrl = `${gatewayBase}/llm/anthropic`;
 
   const sessionBase = {
@@ -105,25 +105,17 @@ export async function bootstrapClaudeSession(
     userId,
     runtimeId,
     configBundle,
-    approvalHandler,
     abortController,
     claudeSessionId: null,
     anthropicApiKey,
-    proxyBaseUrl,
-    mode
+    proxyBaseUrl
   };
   const mcpServerEntries: ClaudeMcpServerEntry[] = configBundle.mcpServers.map((server) => {
     const url = new URL(server.routePath, gatewayBase + "/");
     return { id: server.id, url: url.toString() };
   });
 
-  // Mutable ref for the per-turn canUseTool handler. Passed into the startup()
-  // warmup options as a stable closure so the subprocess never needs rebuilding.
-  const warmCanUseToolRef: { current: NonNullable<import("@anthropic-ai/claude-agent-sdk").Options["canUseTool"]> | null } = {
-    current: null
-  };
-
-  const renderWorkspace = async (workspacePath: string, source: "local" | "e2b-staging") => {
+  const renderWorkspace = async (workspacePath: string, source: "e2b-staging") => {
     await renderClaudeWorkspace({
       workspacePath,
       developerInstructions: runtimePolicy.developerInstructions,
@@ -140,117 +132,63 @@ export async function bootstrapClaudeSession(
     await logClaudeWorkspaceDiagnostics(log, { workspacePath, sessionId, runtimeId, source });
   };
 
-  // ── Mode-specific workspace setup ────────────────────────────────────────────
+  // ── Workspace setup (E2B sandbox) ────────────────────────────────────────────
 
-  let state: ClaudeSessionState;
+  const sandboxWorkspacePath = path.posix.join(E2B_WORKSPACE_BASE, sessionId);
+  const localStagingPath = path.join(
+    config.RUNTIME_WORKSPACE_ROOT,
+    `claude-e2b-staging-${runtimeId}`
+  );
+  await mkdir(localStagingPath, { recursive: true });
+  await renderWorkspace(localStagingPath, "e2b-staging");
 
-  if (mode === "e2b") {
-    const sandboxWorkspacePath = path.posix.join(E2B_WORKSPACE_BASE, sessionId);
-    const localStagingPath = path.join(
-      config.RUNTIME_WORKSPACE_ROOT,
-      `claude-e2b-staging-${runtimeId}`
-    );
-    await mkdir(localStagingPath, { recursive: true });
-    await renderWorkspace(localStagingPath, "e2b-staging");
+  // RUNTIME_GATEWAY_BASE_URL must be reachable from the sandbox — same
+  // requirement the MCP gateway already imposes.
+  const sandboxEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(
+    buildClaudeSdkEnv(anthropicApiKey, { runtimeToken, baseUrl: proxyBaseUrl })
+  )) {
+    if (typeof value === "string") sandboxEnv[key] = value;
+  }
 
-    if (!e2bOptions) throw new Error("e2b mode requires e2bOptions to be set");
-    // RUNTIME_GATEWAY_BASE_URL must be reachable from the sandbox — same
-    // requirement the MCP gateway already imposes.
-    const sandboxEnv: Record<string, string> = {};
-    for (const [key, value] of Object.entries(
-      buildClaudeSdkEnv(anthropicApiKey, { runtimeToken, baseUrl: proxyBaseUrl })
-    )) {
-      if (typeof value === "string") sandboxEnv[key] = value;
-    }
+  const e2bProcess = await E2bClaudeRuntimeProcess.start({
+    e2bApiKey: e2bOptions.apiKey,
+    e2bTemplateId: e2bOptions.templateId,
+    e2bSandboxTimeoutMs: e2bOptions.sandboxTimeoutMs,
+    workspacePath: sandboxWorkspacePath,
+    localWorkspacePath: localStagingPath,
+    env: sandboxEnv,
+    logger: log,
+    sessionId,
+    runtimeId,
+    approvalRequestTtlMs: ctx.approvalRequestTtlMs,
+    onApprovalExpired: ctx.onApprovalExpired
+  });
 
-    const e2bProcess = await E2bClaudeRuntimeProcess.start({
-      e2bApiKey: e2bOptions.apiKey,
-      e2bTemplateId: e2bOptions.templateId,
-      e2bSandboxTimeoutMs: e2bOptions.sandboxTimeoutMs,
-      workspacePath: sandboxWorkspacePath,
-      localWorkspacePath: localStagingPath,
-      env: sandboxEnv,
-      logger: log,
-      sessionId,
-      runtimeId
+  e2bProcess
+    .sendWarmup({
+      type: "warmup",
+      model: config.CLAUDE_CODE_MODEL,
+      developerInstructions: runtimePolicy.developerInstructions,
+      mcpServers: mcpServerEntries.map((e) => ({
+        id: e.id,
+        url: e.url,
+        authorization: `Bearer ${runtimeToken}`
+      }))
+    })
+    .catch((err: unknown) => {
+      log.warn({ err, sessionId }, "Failed to send E2B warmup frame; first turn will cold-start");
     });
 
-    e2bProcess
-      .sendWarmup({
-        type: "warmup",
-        model: config.CLAUDE_CODE_MODEL,
-        developerInstructions: runtimePolicy.developerInstructions,
-        mcpServers: mcpServerEntries.map((e) => ({
-          id: e.id,
-          url: e.url,
-          authorization: `Bearer ${runtimeToken}`
-        }))
-      })
-      .catch((err: unknown) => {
-        log.warn({ err, sessionId }, "Failed to send E2B warmup frame; first turn will cold-start");
-      });
-
-    state = {
-      ...sessionBase,
-      workspacePath: sandboxWorkspacePath,
-      localStagingPath,
-      runtimeToken,
-      mcpServerEntries,
-      e2bProcess,
-      warmCanUseToolRef,
-      warmState: null,
-      activeTurnInterrupt: { current: null }
-    };
-  } else {
-    const workspacePath = path.join(config.RUNTIME_WORKSPACE_ROOT, runtimeId);
-    await mkdir(workspacePath, { recursive: true });
-    await renderWorkspace(workspacePath, "local");
-
-    const mcpServersConfig: Record<string, { type: "http"; url: string; headers: Record<string, string> }> = {};
-    for (const server of mcpServerEntries) {
-      mcpServersConfig[server.id] = {
-        type: "http",
-        url: server.url,
-        headers: { Authorization: `Bearer ${runtimeToken}` }
-      };
-    }
-
-    const warmState = import("@anthropic-ai/claude-agent-sdk")
-      .then(async (sdk) => {
-        const wq = await sdk.startup({
-          options: buildClaudeSdkOptions({
-            model: config.CLAUDE_CODE_MODEL,
-            developerInstructions: runtimePolicy.developerInstructions,
-            mcpServersConfig,
-            workspacePath,
-            env: buildClaudeSdkEnv(anthropicApiKey, { runtimeToken, baseUrl: proxyBaseUrl }),
-            canUseTool: (toolName, toolInput, opts) => {
-              const fn = warmCanUseToolRef.current;
-              return fn
-                ? fn(toolName, toolInput, opts)
-                : Promise.resolve({ behavior: "deny" as const, message: "No active turn" });
-            }
-          })
-        });
-        return { query: wq, model: config.CLAUDE_CODE_MODEL };
-      })
-      .catch((err: unknown) => {
-        log.warn({ err, sessionId }, "Claude SDK startup() pre-warm failed; first turn will cold-start");
-        return null;
-      });
-
-    state = {
-      ...sessionBase,
-      workspacePath,
-      localStagingPath: null,
-      runtimeToken,
-      mcpServerEntries,
-      e2bProcess: null,
-      warmCanUseToolRef,
-      warmState,
-      activeTurnInterrupt: { current: null }
-    };
-  }
+  const state: ClaudeSessionState = {
+    ...sessionBase,
+    workspacePath: sandboxWorkspacePath,
+    localStagingPath,
+    runtimeToken,
+    mcpServerEntries,
+    e2bProcess,
+    activeTurnInterrupt: { current: null }
+  };
 
   const { workspacePath } = state;
 
@@ -295,7 +233,7 @@ export async function bootstrapClaudeSession(
         lastActiveAt: now,
         startedAt: now,
         terminatedAt: null,
-        lifecycleMetadata: { provider: "claude-code", mode: state.mode },
+        lifecycleMetadata: { provider: "claude-code", mode: "e2b" },
         status: "active"
       });
     } catch (err) {
@@ -312,7 +250,7 @@ async function logClaudeWorkspaceDiagnostics(
     workspacePath: string;
     sessionId: string;
     runtimeId: string;
-    source: "local" | "e2b-staging";
+    source: "e2b-staging";
   }
 ): Promise<void> {
   try {

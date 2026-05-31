@@ -1,6 +1,6 @@
 {
-  "codexVersion": "0.130.0",
+  "codexVersion": "0.135.0",
   "schemaVersion": "v2",
   "e2bTemplateId": "replace-with-your-template-id",
-  "claudeAgentSdkVersion": "0.2.138"
+  "claudeAgentSdkVersion": "0.3.156"
 }

@@ -10,7 +10,6 @@ import {
   AdminUserEnvelopeSchema,
   AdminUsersListResponseSchema,
   DownloadHandleEnvelopeSchema,
-  LaunchSkillImprovementResponseSchema,
   PiiActivityMetricsSchema,
   PiiJobsStatsResponseSchema,
   PiiProviderStatusSchema,
@@ -20,9 +19,6 @@ import {
   RuntimeRolloutResponseSchema,
   RuntimeSessionsListResponseSchema,
   SkillImportResponseSchema,
-  SkillImprovementSessionsListResponseSchema,
-  SkillJudgeResponseSchema,
-  SkillJudgeSettingsEnvelopeSchema,
   SkillMarketplaceResponseSchema,
   SkillRevisionFileResponseSchema,
   SkillRevisionsListResponseSchema,
@@ -47,7 +43,6 @@ import type {
   AdminSkill,
   AdminUser,
   ApprovalPolicy,
-  LaunchSkillImprovementResponse,
   PiiActivityMetrics,
   PiiJobsStatsResponse,
   PiiProtectionSettings,
@@ -59,10 +54,7 @@ import type {
   PiiTopResponse,
   RuntimeOpenAiDiagnostic,
   RuntimeSessionSummary,
-  SkillImprovementSessionSummary,
   SkillImportResponse,
-  SkillJudgeResponse,
-  SkillJudgeSettings,
   SkillMarketplaceCatalog,
   SkillRevision,
   SkillRevisionFilePreview,
@@ -72,13 +64,6 @@ import type {
 
 export type {
   AdminManagedTool,
-  SkillJudgeMode,
-  SkillJudgeModelOption,
-  SkillJudgePlatformInfo,
-  SkillJudgeProviderId,
-  SkillJudgeResponse,
-  SkillJudgeSettings,
-  SkillJudgeStats,
   SkillRevisionFilePreview
 } from "@cogniplane/shared-types";
 
@@ -510,51 +495,6 @@ export async function deleteTenantMicrosoftConfig(): Promise<void> {
   await request<void>("/tenant/settings/microsoft", {
     method: "DELETE"
   });
-}
-
-export async function launchSkillImprovementSession(input: {
-  skillId: string;
-  sessionCount?: number;
-  provider?: "codex" | "claude-code" | null;
-  model?: string | null;
-  effort?: string | null;
-}): Promise<LaunchSkillImprovementResponse> {
-  const { skillId, ...body } = input;
-  const raw = await request<unknown>(`/admin/skills/${skillId}/improve`, {
-    method: "POST",
-    body: JSON.stringify(body)
-  });
-  return parseResponse(
-    LaunchSkillImprovementResponseSchema,
-    raw,
-    "POST /admin/skills/:id/improve"
-  );
-}
-
-export async function listSkillImprovementSessions(
-  skillId: string
-): Promise<SkillImprovementSessionSummary[]> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/improvement-sessions`);
-  return parseResponse(
-    SkillImprovementSessionsListResponseSchema,
-    raw,
-    "GET /admin/skills/:id/improvement-sessions"
-  ).sessions;
-}
-
-// ─── Skill judge admin ───────────────────────────────────────────────────────
-
-export async function getSkillJudgeAdmin(): Promise<SkillJudgeResponse> {
-  const raw = await request<unknown>("/admin/skill-judge");
-  return parseResponse(SkillJudgeResponseSchema, raw, "GET /admin/skill-judge");
-}
-
-export async function updateSkillJudgeAdmin(input: SkillJudgeSettings) {
-  const raw = await request<unknown>("/admin/skill-judge", {
-    method: "PUT",
-    body: JSON.stringify(input)
-  });
-  return parseResponse(SkillJudgeSettingsEnvelopeSchema, raw, "PUT /admin/skill-judge");
 }
 
 // ─── PII admin metrics ──────────────────────────────────────────────────────

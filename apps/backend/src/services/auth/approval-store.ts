@@ -5,6 +5,7 @@ export type ApprovalKind = "command_execution" | "file_change" | "permissions";
 
 export type ApprovalRecord = {
   approvalId: string;
+  tenantId: string;
   sessionId: string;
   userId: string;
   runtimeId: string;
@@ -21,11 +22,13 @@ export type ApprovalRecord = {
   createdAt: string;
   updatedAt: string;
   resolvedAt: string | null;
+  expiresAt: string;
 };
 
 function mapApproval(row: Record<string, unknown>): ApprovalRecord {
   return {
     approvalId: String(row.approval_id),
+    tenantId: String(row.tenant_id),
     sessionId: String(row.session_id),
     userId: String(row.user_id),
     runtimeId: String(row.runtime_id),
@@ -48,7 +51,8 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
         : {},
     createdAt: new Date(String(row.created_at)).toISOString(),
     updatedAt: new Date(String(row.updated_at)).toISOString(),
-    resolvedAt: row.resolved_at ? new Date(String(row.resolved_at)).toISOString() : null
+    resolvedAt: row.resolved_at ? new Date(String(row.resolved_at)).toISOString() : null,
+    expiresAt: new Date(String(row.expires_at)).toISOString()
   };
 }
 
@@ -74,9 +78,10 @@ export class ApprovalStore {
             summary,
             status,
             decision,
-            request_payload
+            request_payload,
+            expires_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)
           RETURNING *
         `,
         [
@@ -94,7 +99,8 @@ export class ApprovalStore {
           input.summary,
           input.status,
           input.decision,
-          JSON.stringify(input.requestPayload)
+          JSON.stringify(input.requestPayload),
+          input.expiresAt
         ]
       );
 
@@ -115,22 +121,6 @@ export class ApprovalStore {
       );
 
       return result.rows.map(mapApproval);
-    });
-  }
-
-  async getOwned(tenantId: string, approvalId: string, userId: string): Promise<ApprovalRecord | null> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const result = await client.query(
-        `
-          SELECT *
-          FROM approvals
-          WHERE tenant_id = $1 AND approval_id = $2 AND user_id = $3
-          LIMIT 1
-        `,
-        [tenantId, approvalId, userId]
-      );
-
-      return result.rows[0] ? mapApproval(result.rows[0]) : null;
     });
   }
 
@@ -170,5 +160,38 @@ export class ApprovalStore {
 
       return result.rows[0] ? mapApproval(result.rows[0]) : null;
     });
+  }
+
+  /**
+   * DB-level backstop for the in-process TTL timers: atomically move every
+   * `pending` approval whose `expires_at` deadline has passed to `expired` and
+   * return the affected rows so the caller can write `approval.expired` audit
+   * events. Runs across ALL tenants in one statement, so it MUST be given the
+   * privileged (BYPASSRLS) pool — RLS would otherwise scope it to whatever
+   * tenant context happens to be set. This recovers rows orphaned when a crash
+   * or restart killed the in-memory timer before it could fire.
+   *
+   * `limit` bounds the batch so a large backlog can't lock the table or balloon
+   * the audit write; the caller loops until a sweep returns fewer than `limit`.
+   */
+  async sweepExpired(limit = 500): Promise<ApprovalRecord[]> {
+    const result = await this.db.query(
+      `
+        UPDATE approvals
+        SET status = 'expired', resolved_at = NOW(), updated_at = NOW()
+        WHERE approval_id IN (
+          SELECT approval_id
+          FROM approvals
+          WHERE status = 'pending' AND expires_at <= NOW()
+          ORDER BY expires_at ASC
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+      `,
+      [limit]
+    );
+
+    return result.rows.map(mapApproval);
   }
 }

@@ -24,19 +24,16 @@ export const AUDIT_EVENT_TYPES = [
   "admin.mcp_server.disabled",
   "admin.mcp_server.published",
   "admin.mcp_server.unpublished",
-  // Admin — runtime / skill / skill-judge / tenant settings / users.
+  // Admin — runtime / skill / tenant settings / users.
   "admin.runtime_rollout.executed",
   "admin.skill.activated",
   "admin.skill.cleanup.completed",
   "admin.skill.disabled",
   "admin.skill.imported",
-  "admin.skill.improvement_launched",
   "admin.skill.published",
   "admin.skill.reviewed",
   "admin.skill.rollback",
   "admin.skill.unpublished",
-  "admin.skill_judge.executed",
-  "admin.skill_judge.updated",
   "admin.tenant_settings.updated",
   "admin.user.beta_tester_updated",
 
@@ -70,6 +67,7 @@ export const AUDIT_EVENT_TYPES = [
   // Scheduler.
   "scheduler.job.run.completed",
   "scheduler.job.run.failed",
+  "scheduler.job.disabled",
 
   // Tenant-level integration toggles (admin-driven).
   "tenant.integration.config_cleared",

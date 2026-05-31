@@ -42,8 +42,8 @@ test("toIsoFromNow: positive seconds → ISO string in the future", () => {
   const iso = toIsoFromNow(60);
   expect(iso).toBeTruthy();
   const t = new Date(iso!).getTime();
-  expect(t >= before + 60_000 - 100).toBeTruthy();
-  expect(t <= before + 60_000 + 1_000).toBeTruthy();
+  expect(t >= before + 60_000 - 100).toBe(true);
+  expect(t <= before + 60_000 + 1_000).toBe(true);
 });
 
 // shouldRefreshToken

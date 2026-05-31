@@ -1,9 +1,7 @@
 "use client";
 import {
   ModelsListResponseSchema,
-  SessionImprovementContextSchema,
-  type ModelsListResponse,
-  type SessionImprovementContext as SessionImprovementContextType
+  type ModelsListResponse
 } from "@cogniplane/shared-types";
 
 import { parseResponse } from "./validate-response";
@@ -140,20 +138,6 @@ export async function buildErrorMessage(response: Response): Promise<string> {
   return message;
 }
 
-export type SessionImprovementContext = SessionImprovementContextType;
-
-export async function fetchSessionImprovementContext(
-  sessionId: string
-): Promise<SessionImprovementContext | null> {
-  try {
-    const raw = await request<unknown>(
-      `/sessions/${encodeURIComponent(sessionId)}/improvement-context`
-    );
-    return parseResponse(SessionImprovementContextSchema, raw, "GET /sessions/:id/improvement-context");
-  } catch {
-    return null;
-  }
-}
 
 export async function fetchModels(): Promise<ModelsListResponse> {
   const raw = await request<unknown>("/models");

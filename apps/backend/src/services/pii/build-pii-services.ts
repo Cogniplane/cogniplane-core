@@ -59,7 +59,10 @@ export function buildPiiServices(input: {
     db,
     messages: stores.messages,
     artifacts: stores.artifacts,
-    storage: artifactStorage
+    storage: artifactStorage,
+    // Same source as the service-level cap, so the stream-time guard never
+    // rejects an artifact the configured policy would otherwise allow.
+    maxBytes: config.PII_ARTIFACT_MAX_BYTES
   });
 
   const findingEncryptor = config.PII_RETENTION_KEK

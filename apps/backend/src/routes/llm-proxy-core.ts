@@ -1,7 +1,6 @@
 // Provider-agnostic LLM proxy core.
 //
-// Sandboxed runtimes (CLAUDE_RUNTIME_BACKEND=e2b for Anthropic,
-// RUNTIME_BACKEND=e2b for Codex/OpenAI) hold only a session-scoped rt_*
+// Both runtimes run inside E2B sandboxes that hold only a session-scoped rt_*
 // runtime token. The real ANTHROPIC_API_KEY / OPENAI_API_KEY never leaves
 // the backend; this proxy verifies the rt_*, looks up the real key, and
 // forwards the request upstream while streaming the response back.

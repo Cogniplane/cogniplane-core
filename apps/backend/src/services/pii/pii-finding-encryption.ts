@@ -11,6 +11,9 @@ const IV_BYTES = 12;
 const KEY_BYTES = 32;
 const AUTH_TAG_BYTES = 16;
 const HKDF_INFO = "pii-finding-v1";
+// Empty salt — HKDF (RFC 5869 §2.2) treats an absent salt as HashLen zero bytes.
+// Tenant domain separation is carried in the `info` parameter, not the salt.
+const EMPTY_SALT = Buffer.alloc(0);
 
 export interface PiiFindingEncryptor {
   encryptValue(plain: string, tenantId: string): string;
@@ -96,8 +99,17 @@ export class Aes256GcmFindingEncryptor implements PiiFindingEncryptor {
   }
 
   private deriveDek(tenantId: string): Buffer {
-    const salt = Buffer.from(tenantId, "utf8");
-    const dek = hkdfSync("sha256", this.kek, salt, Buffer.from(HKDF_INFO, "utf8"), KEY_BYTES);
+    // Per RFC 5869, HKDF's `salt` is meant to be an unpredictable (ideally
+    // random) value, while *domain separation* between derived keys is the job
+    // of the `info` parameter. The tenantId is a known, low-entropy identifier,
+    // so binding it through `info` rather than `salt` is the correct construction
+    // — it still derives a distinct DEK per tenant (blast-radius containment)
+    // without misusing a public value as the salt. We pass an empty salt, which
+    // HKDF defines as a string of HashLen zero bytes (standard when no shared
+    // random salt is available). No prod ciphertext exists yet, so changing the
+    // derivation in place is safe.
+    const info = Buffer.from(`${HKDF_INFO}:${tenantId}`, "utf8");
+    const dek = hkdfSync("sha256", this.kek, EMPTY_SALT, info, KEY_BYTES);
     return Buffer.from(dek);
   }
 }

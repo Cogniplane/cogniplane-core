@@ -5,9 +5,9 @@
 //
 // Per-turn `toolContextId` resolution has three fallbacks — args, URL query
 // param, and session-scoped lookup via the runtime token's `sid` claim.
-// Each runtime hits a different path: Codex injects the id into args, the
-// Claude SDK in local mode passes it as a query param, and the in-sandbox
-// Claude harness can only rely on the session-scoped lookup. All three
+// Different runtimes hit different paths: Codex injects the id into args; the
+// in-sandbox Claude harness relies on the session-scoped lookup. The URL
+// query-param path is a defensive fallback some transports use. All three
 // must keep working — don't collapse them into one path.
 
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
@@ -18,7 +18,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { signProxyHeaders } from "../lib/mcp-proxy-signature.js";
 import { ssrfSafeAgent } from "../lib/url-validation.js";
-import { verifyRuntimeToken } from "../services/auth/runtime-token.js";
+import { verifyRuntimeToken, type RuntimeTokenClaims } from "../services/auth/runtime-token.js";
 
 import type { ActivationTracker } from "../services/activation-tracker.js";
 import {
@@ -87,6 +87,7 @@ export function buildMcpRouteStores(
   }
 ) {
   return {
+    db: deps.db,
     dynamicConfig: deps.dynamicConfig,
     sessions: deps.sessions,
     messages: deps.messages,
@@ -96,6 +97,7 @@ export function buildMcpRouteStores(
     toolContexts: deps.toolContexts,
     githubConnections: deps.githubConnectionService,
     notionConnections: deps.notionConnectionService,
+    piiProtection: deps.piiProtection,
     managedToolFactoryRegistry: deps.managedToolFactoryRegistry,
     readRuntimeFile: extras.readRuntimeFile,
     writeRuntimeFile: extras.writeRuntimeFile,
@@ -108,6 +110,8 @@ export type McpRouteStores = ReturnType<typeof buildMcpRouteStores>;
 
 export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteStores): Promise<void> {
   const managedTools = stores.managedToolFactoryRegistry.createDefinitions({
+    db: stores.db,
+    dynamicConfig: stores.dynamicConfig,
     sessions: stores.sessions,
     messages: stores.messages,
     artifacts: stores.artifacts,
@@ -115,6 +119,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     auditEvents: stores.auditEvents,
     githubConnections: stores.githubConnections,
     notionConnections: stores.notionConnections,
+    piiProtection: stores.piiProtection,
     readRuntimeFile: stores.readRuntimeFile,
     writeRuntimeFile: stores.writeRuntimeFile
   });
@@ -179,11 +184,17 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     // authenticated this request — we re-verify it here rather than threading
     // the claim through request.auth so the rest of the API surface stays
     // unchanged.
-    const sessionIdFromRuntimeToken = resolveSessionIdFromRuntimeToken(
+    //
+    // The full claims (sid + uid) are also used to BIND an arg/URL-supplied
+    // toolContextId to the caller: a same-tenant attacker must not be able to
+    // substitute another user's or session's context id into a tool call (see
+    // assertContextBoundToCaller in the tool-call handlers).
+    const runtimeTokenClaims = resolveRuntimeTokenClaims(
       request.headers.authorization,
       request.url,
       stores.runtimeTokenSecret
     );
+    const sessionIdFromRuntimeToken = runtimeTokenClaims?.sid ?? null;
 
     request.log.debug(
       {
@@ -225,6 +236,8 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           toolContexts: stores.toolContexts,
           urlToolContextId,
           sessionIdFromRuntimeToken,
+          runtimeTokenClaims,
+          requestHeaders: request.headers,
           activationTracker: stores.activationTracker,
           dataEncryptionSecret: app.config.DATA_ENCRYPTION_SECRET,
           logger: request.log
@@ -296,13 +309,36 @@ async function handleToolsList(input: {
     // `mcp__managed-session-context__*` entries in system/init).
     // `outputSchema` is optional per MCP spec; callers get the same
     // structured data via the `content` array on tool calls.
+    // `annotations.readOnlyHint` is the standard MCP tool annotation (distinct
+    // from the `outputSchema` field warned about above — annotations do not
+    // trip the SDK's tools/list validation drop). Codex 0.134.0+ runs tools
+    // that advertise `readOnlyHint: true` concurrently instead of serially, so
+    // a read-heavy turn (session_context / list_artifacts / read_text_artifact)
+    // fans those reads out in parallel.
     return ok(rpc.id, {
       tools: managedToolsForRequest!.map((tool) => ({
         name: tool.name,
         description: tool.description,
-        inputSchema: tool.inputSchema
+        inputSchema: tool.inputSchema,
+        annotations: { readOnlyHint: tool.readOnly }
       }))
     });
+  }
+
+  // Proxy mode: apply the same enabledMcpServers policy check the managed
+  // path enforces. If the active turn's runtime policy forbids this server,
+  // advertise no tools rather than forwarding to the upstream — `tools/list`
+  // is probed by every SDK at startup, so we return an empty list instead of
+  // throwing (mirrors getVisibleManagedTools). Tool *calls* are still gated by
+  // requireMcpServerAllowed in handleForwardedToolCall.
+  if (sessionIdFromRuntimeToken) {
+    const context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
+    if (context) {
+      const runtimePolicy = getRuntimePolicySnapshot(context);
+      if (!runtimePolicy.enabledMcpServers.includes(server.id)) {
+        return ok(rpc.id, { tools: [] });
+      }
+    }
   }
 
   return forwardRpc(server.upstreamUrl, rpc, {
@@ -318,6 +354,8 @@ async function handleToolsCall(input: {
   toolContexts: ToolExecutionContextStore;
   urlToolContextId: string | null;
   sessionIdFromRuntimeToken: string | null;
+  runtimeTokenClaims: RuntimeTokenClaims | null;
+  requestHeaders: Record<string, string | string[] | undefined>;
   activationTracker?: ActivationTracker;
   dataEncryptionSecret: string;
   logger: Pick<FastifyBaseLogger, "debug">;
@@ -330,6 +368,8 @@ async function handleToolsCall(input: {
     toolContexts,
     urlToolContextId,
     sessionIdFromRuntimeToken,
+    runtimeTokenClaims,
+    requestHeaders,
     activationTracker,
     dataEncryptionSecret,
     logger
@@ -363,16 +403,18 @@ async function handleToolsCall(input: {
           managedTools,
           toolContexts,
           urlToolContextId,
-          sessionIdFromRuntimeToken
+          sessionIdFromRuntimeToken,
+          runtimeTokenClaims
         )
       : await handleForwardedToolCall(
           rpc,
           tenantId,
-          server.id,
+          server,
           toolContexts,
-          server.upstreamUrl,
           urlToolContextId,
           sessionIdFromRuntimeToken,
+          runtimeTokenClaims,
+          requestHeaders,
           dataEncryptionSecret
         );
 
@@ -431,6 +473,75 @@ async function recordToolCallTelemetry(input: {
   }
 }
 
+/**
+ * Resolves the per-turn tool-execution context for a tool call and binds it to
+ * the runtime token's identity.
+ *
+ * Resolution order:
+ *   1. toolContextId in the RPC args (primary path — Codex, Claude SDK).
+ *   2. toolContextId in the MCP URL query string.
+ *   3. Active session fallback — look up the latest non-expired context for the
+ *      sessionId carried by the runtime token. Resilience path when a runtime
+ *      omits the argument.
+ *
+ * SECURITY (paths 1 and 2): an arg/URL-supplied toolContextId is otherwise
+ * resolved by TENANT only, which would let a same-tenant attacker substitute
+ * another user's or session's context id into a tool call — for proxy mode that
+ * means the gateway would sign identity headers for the substituted identity.
+ * We therefore assert that the resolved context belongs to the runtime token's
+ * sid + uid. Path 3 is inherently bound: it looks up by the token's sid.
+ *
+ * Binding only applies when a runtime token is present. In production the
+ * `/mcp/` path is reachable only with a valid `rt_*` token (the auth middleware
+ * 401s otherwise), so an attacker cannot drop the token to skip the check.
+ * When no token is present the caller was authenticated some other way
+ * (dev-headers) and is already trusted at tenant scope.
+ */
+async function resolveBoundToolContext(input: {
+  rpc: z.infer<typeof rpcRequestSchema>;
+  tenantId: string;
+  args: Record<string, unknown>;
+  urlToolContextId: string | null;
+  sessionIdFromRuntimeToken: string | null;
+  runtimeTokenClaims: RuntimeTokenClaims | null;
+  toolContexts: ToolExecutionContextStore;
+}): Promise<{ context: ToolExecutionContext } | { error: RpcResponse }> {
+  const { rpc, tenantId, args, urlToolContextId, sessionIdFromRuntimeToken, runtimeTokenClaims, toolContexts } = input;
+  const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
+
+  let context: ToolExecutionContext | null = null;
+  let suppliedByCaller = false;
+
+  try {
+    if (argToolContextId) {
+      context = await toolContexts.require(tenantId, argToolContextId);
+      suppliedByCaller = true;
+    } else if (urlToolContextId) {
+      context = await toolContexts.require(tenantId, urlToolContextId);
+      suppliedByCaller = true;
+    } else if (sessionIdFromRuntimeToken) {
+      context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
+    }
+  } catch (error) {
+    return { error: failure(rpc.id, -32000, getErrorMessage(error, "Tool context lookup failed.")) };
+  }
+
+  if (!context) {
+    return { error: failure(rpc.id, -32602, "toolContextId is required.") };
+  }
+
+  // Bind a caller-supplied context id to the authenticated runtime token so a
+  // same-tenant caller cannot substitute another user's/session's context.
+  // Only enforced when a runtime token is present (see docstring).
+  if (suppliedByCaller && runtimeTokenClaims) {
+    if (context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid) {
+      return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
+    }
+  }
+
+  return { context };
+}
+
 async function handleManagedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
@@ -438,7 +549,8 @@ async function handleManagedToolCall(
   managedTools: ManagedToolDefinition[],
   toolContexts: ToolExecutionContextStore,
   urlToolContextId: string | null,
-  sessionIdFromRuntimeToken: string | null
+  sessionIdFromRuntimeToken: string | null,
+  runtimeTokenClaims: RuntimeTokenClaims | null
 ): Promise<RpcResponse> {
   const params = rpc.params ?? {};
   const toolName = String(params.name ?? "");
@@ -452,30 +564,19 @@ async function handleManagedToolCall(
     return failure(rpc.id, -32601, `Unknown managed tool ${toolName}.`);
   }
 
-  // Resolution order for the tool context:
-  //   1. toolContextId in the RPC args (primary path — Codex, Claude SDK).
-  //   2. toolContextId in the MCP URL query string.
-  //   3. Active session fallback — look up the latest non-expired context
-  //      for the sessionId carried by the runtime token. This remains as a
-  //      compatibility and resilience path when a runtime omits the argument.
-  const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
-  let context: ToolExecutionContext | null = null;
-
-  try {
-    if (argToolContextId) {
-      context = await toolContexts.require(tenantId, argToolContextId);
-    } else if (urlToolContextId) {
-      context = await toolContexts.require(tenantId, urlToolContextId);
-    } else if (sessionIdFromRuntimeToken) {
-      context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
-    }
-  } catch (error) {
-    return failure(rpc.id, -32000, getErrorMessage(error, "Tool context lookup failed."));
+  const resolved = await resolveBoundToolContext({
+    rpc,
+    tenantId,
+    args,
+    urlToolContextId,
+    sessionIdFromRuntimeToken,
+    runtimeTokenClaims,
+    toolContexts
+  });
+  if ("error" in resolved) {
+    return resolved.error;
   }
-
-  if (!context) {
-    return failure(rpc.id, -32602, "toolContextId is required.");
-  }
+  const context = resolved.context;
 
   // Stamp the resolved context id into the args so handlers that expect it
   // (and downstream auditing) see a consistent value.
@@ -589,14 +690,15 @@ function enforceManagedToolPolicy(
 async function handleForwardedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
-  serverId: string,
+  server: McpServerRegistration,
   toolContexts: ToolExecutionContextStore,
-  upstreamUrl: string | null,
   urlToolContextId: string | null,
   sessionIdFromRuntimeToken: string | null,
+  runtimeTokenClaims: RuntimeTokenClaims | null,
+  requestHeaders: Record<string, string | string[] | undefined>,
   dataEncryptionSecret: string
 ): Promise<RpcResponse> {
-  if (!upstreamUrl) {
+  if (!server.upstreamUrl) {
     return failure(rpc.id, -32601, "Trusted MCP upstream is not configured.");
   }
 
@@ -605,31 +707,26 @@ async function handleForwardedToolCall(
     params.arguments && typeof params.arguments === "object"
       ? ({ ...(params.arguments as Record<string, unknown>) } satisfies Record<string, unknown>)
       : {};
-  const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
 
-  // Same resolution order as the managed path — see handleManagedToolCall.
-  let context: ToolExecutionContext | null = null;
-  try {
-    if (argToolContextId) {
-      context = await toolContexts.require(tenantId, argToolContextId);
-    } else if (urlToolContextId) {
-      context = await toolContexts.require(tenantId, urlToolContextId);
-    } else if (sessionIdFromRuntimeToken) {
-      context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
-    }
-  } catch (error) {
-    return failure(rpc.id, -32000, getErrorMessage(error, "Tool context lookup failed."));
+  const resolved = await resolveBoundToolContext({
+    rpc,
+    tenantId,
+    args,
+    urlToolContextId,
+    sessionIdFromRuntimeToken,
+    runtimeTokenClaims,
+    toolContexts
+  });
+  if ("error" in resolved) {
+    return resolved.error;
   }
+  const context = resolved.context;
 
-  if (!context) {
-    return failure(rpc.id, -32602, "toolContextId is required.");
-  }
-
-  requireMcpServerAllowed(serverId, context);
+  requireMcpServerAllowed(server.id, context);
   delete args.toolContextId;
 
   return forwardRpc(
-    upstreamUrl,
+    server.upstreamUrl,
     {
       ...rpc,
       params: {
@@ -637,13 +734,61 @@ async function handleForwardedToolCall(
         arguments: args
       }
     },
-    signProxyHeaders({
-      userId: context.userId,
-      sessionId: context.sessionId,
-      runtimeId: context.runtimeId,
-      secret: dataEncryptionSecret
-    })
+    {
+      ...selectAllowlistedHeaders(requestHeaders, server.headersAllowlist),
+      ...signProxyHeaders({
+        userId: context.userId,
+        sessionId: context.sessionId,
+        runtimeId: context.runtimeId,
+        secret: dataEncryptionSecret
+      })
+    }
   );
+}
+
+/**
+ * Picks the incoming request headers named in the MCP server's
+ * `headersAllowlist` so they can be forwarded to the proxy upstream. Header
+ * names are matched case-insensitively (Fastify lower-cases incoming header
+ * keys). Two classes of header are reserved and dropped regardless of the
+ * allowlist:
+ *   - The framework's own signed identity headers (`X-Framework-*`), which are
+ *     set separately and take priority so a caller can never spoof them.
+ *   - Inbound credential headers. The request that reaches `/mcp` carries the
+ *     gateway runtime token (`Authorization: Bearer rt_*`) plus any session
+ *     cookies; reflecting those to a third-party proxy upstream would hand it a
+ *     gateway credential it could replay against `/mcp` until expiry. These are
+ *     NEVER forwardable, even if an admin lists them in `headersAllowlist`.
+ */
+export function selectAllowlistedHeaders(
+  requestHeaders: Record<string, string | string[] | undefined>,
+  allowlist: string[]
+): Record<string, string> {
+  const reservedLower = new Set(
+    [
+      "x-framework-user-id",
+      "x-framework-session-id",
+      "x-framework-runtime-id",
+      "x-framework-timestamp",
+      "x-framework-signature",
+      // Inbound credentials — must never leak to a proxy upstream.
+      "authorization",
+      "proxy-authorization",
+      "cookie",
+      "x-api-key"
+    ]
+  );
+  const selected: Record<string, string> = {};
+  for (const name of allowlist) {
+    const lower = name.toLowerCase();
+    if (reservedLower.has(lower)) continue;
+    const value = requestHeaders[lower];
+    const resolved = Array.isArray(value) ? value[0] : value;
+    if (typeof resolved === "string") {
+      selected[name] = resolved;
+    }
+  }
+  return selected;
 }
 
 async function forwardRpc(
@@ -677,18 +822,20 @@ async function forwardRpc(
 }
 
 /**
- * Extracts the sessionId claim from a runtime token (rt_*) on the incoming
- * request, checking the Authorization header then the `?token=` query param.
+ * Extracts the full claims from a runtime token (rt_*) on the incoming request,
+ * checking the Authorization header then the `?token=` query param.
  *
  * The auth middleware already verified this token before the handler ran;
- * re-verifying here keeps the claim extraction localised to MCP routes
- * instead of widening `request.auth` for every endpoint.
+ * re-verifying here keeps the claim extraction localised to MCP routes instead
+ * of widening `request.auth` for every endpoint. Callers use `sid` for the
+ * session-scoped context fallback/telemetry and `sid` + `uid` to bind a
+ * caller-supplied toolContextId to the authenticated identity.
  */
-function resolveSessionIdFromRuntimeToken(
+function resolveRuntimeTokenClaims(
   authHeader: string | string[] | undefined,
   requestUrl: string,
   secret: string
-): string | null {
+): RuntimeTokenClaims | null {
   const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
   let token: string | null = null;
 
@@ -708,5 +855,5 @@ function resolveSessionIdFromRuntimeToken(
 
   if (!token) return null;
   const result = verifyRuntimeToken(token, secret);
-  return result.kind === "valid" ? result.claims.sid : null;
+  return result.kind === "valid" ? result.claims : null;
 }

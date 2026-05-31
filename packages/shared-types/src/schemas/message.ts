@@ -77,9 +77,16 @@ export type ApprovalsListResponse = z.infer<typeof ApprovalsListResponseSchema>;
 // field is narrowed to the AVAILABLE_MODELS allowlist at the route layer);
 // the wire shape stays here.
 
+// Hard cap on a single user turn's prompt text. This bounds per-request DB
+// storage and downstream token cost before quota/rate-limit enforcement even
+// runs. 100k chars (~25k tokens) is far above any legitimate hand-typed turn
+// while still rejecting paste-bomb / DoS inputs. The HTTP-layer `bodyLimit`
+// (app.ts) is the coarse outer guard; this is the precise field-level one.
+export const MAX_MESSAGE_TEXT_LENGTH = 100_000;
+
 export const MessagePostRequestSchema = z.object({
   sessionId: z.string().uuid(),
-  text: z.string().trim().min(1),
+  text: z.string().trim().min(1).max(MAX_MESSAGE_TEXT_LENGTH),
   artifactIds: z.array(z.string().uuid()).max(10).optional(),
   model: z.string().optional(),
   effort: z.enum(EFFORT_LEVELS).optional()
@@ -134,38 +141,33 @@ export type MessageFeedbackResponse = z.infer<typeof MessageFeedbackResponseSche
 
 // ── Token usage analytics ────────────────────────────────────────────────────
 
-export const TokenUsageDayPointSchema = z.object({
-  date: z.string(),
+const TokenUsageMetricsShape = {
   inputTokens: z.number(),
   outputTokens: z.number(),
   totalTokens: z.number(),
   costUsd: z.number()
+};
+
+export const TokenUsageDayPointSchema = z.object({
+  date: z.string(),
+  ...TokenUsageMetricsShape
 }).passthrough();
 export type TokenUsageDayPoint = z.infer<typeof TokenUsageDayPointSchema>;
 
 export const TokenUsageUserBreakdownSchema = z.object({
   userId: z.string(),
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  totalTokens: z.number(),
-  costUsd: z.number()
+  ...TokenUsageMetricsShape
 }).passthrough();
 export type TokenUsageUserBreakdown = z.infer<typeof TokenUsageUserBreakdownSchema>;
 
 export const TokenUsageModelBreakdownSchema = z.object({
   modelName: z.string(),
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  totalTokens: z.number(),
-  costUsd: z.number()
+  ...TokenUsageMetricsShape
 }).passthrough();
 export type TokenUsageModelBreakdown = z.infer<typeof TokenUsageModelBreakdownSchema>;
 
 export const TokenUsageTotalsSchema = z.object({
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  totalTokens: z.number(),
-  costUsd: z.number(),
+  ...TokenUsageMetricsShape,
   messageCount: z.number()
 }).passthrough();
 export type TokenUsageTotals = z.infer<typeof TokenUsageTotalsSchema>;

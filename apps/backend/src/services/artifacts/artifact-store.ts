@@ -113,6 +113,38 @@ const ARTIFACT_COLUMNS = `
   updated_at
 `.trim();
 
+// Columns projected by both the peek and consume download-token queries.
+const DOWNLOAD_TOKEN_COLUMNS = `
+  download.token,
+  download.tenant_id,
+  download.artifact_id,
+  download.session_id,
+  download.user_id,
+  download.storage_backend,
+  download.storage_key,
+  download.file_name,
+  download.content_type,
+  download.expires_at,
+  download.created_at
+`.trim();
+
+// Identity + artifact-state gating shared by peek and consume so the two
+// paths can never diverge. Placeholders: $1 token, $2 tenant, $3 user, $4
+// callerIsAdmin. Deliberately does NOT filter on `expires_at` — expiry is
+// surfaced to the caller as a distinct 410 rather than collapsed into a 404,
+// and an expired token must never be consumed (so the 410 stays repeatable).
+const DOWNLOAD_TOKEN_GATING = `
+  download.token = $1
+  AND download.tenant_id = $2
+  AND ($4::boolean OR download.user_id = $3)
+  AND download.consumed_at IS NULL
+  AND artifact.tenant_id   = download.tenant_id
+  AND artifact.artifact_id = download.artifact_id
+  AND artifact.user_id     = download.user_id
+  AND artifact.status     <> 'deleted'
+  AND (artifact.artifact_type = 'upload' OR artifact.status = 'ready')
+`.trim();
+
 function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRecord {
   return {
     token: String(row.token),
@@ -269,44 +301,22 @@ export class ArtifactStore {
     });
   }
 
+  // Status is the only mutable column here; `detail_json` is owned exclusively
+  // by setPiiDetail() (which merges, rather than clobbering, the JSONB).
   async update(
     tenantId: string,
     artifactId: string,
-    input: {
-      status?: ArtifactRecord["status"];
-      detail?: ArtifactDetail;
-    }
+    input: { status: ArtifactRecord["status"] }
   ): Promise<ArtifactRecord | null> {
-    const assignments: string[] = [];
-    const values: unknown[] = [];
-
-    if (input.status !== undefined) {
-      values.push(input.status);
-      assignments.push(`status = $${values.length}`);
-    }
-
-    if (input.detail !== undefined) {
-      values.push(JSON.stringify(input.detail));
-      assignments.push(`detail_json = $${values.length}::jsonb`);
-    }
-
-    if (!assignments.length) {
-      throw new Error("ArtifactStore.update requires at least one field to update.");
-    }
-
-    values.push(tenantId);
-    values.push(artifactId);
     return withTenantScope(this.db, tenantId, async (client) => {
       const updatedArtifact = await client.query(
         `
           UPDATE artifacts
-          SET
-            ${assignments.join(", ")},
-            updated_at = NOW()
-          WHERE tenant_id = $${values.length - 1} AND artifact_id = $${values.length}
+          SET status = $3, updated_at = NOW()
+          WHERE tenant_id = $1 AND artifact_id = $2
           RETURNING ${ARTIFACT_COLUMNS}
         `,
-        values
+        [tenantId, artifactId, input.status]
       );
       return updatedArtifact.rows[0] ? mapArtifact(updatedArtifact.rows[0]) : null;
     });
@@ -412,16 +422,48 @@ export class ArtifactStore {
     });
   }
 
+  // Non-consuming lookup used by GET /downloads/:token to validate the token
+  // and open the storage stream BEFORE committing the single-use consume.
+  // This keeps a transient storage read failure from permanently burning the
+  // token (the consume only happens once the stream is in hand), and lets the
+  // route distinguish expired-but-unconsumed (→ 410, repeatable) from
+  // not-found (→ 404). Returns null on the same conditions as consume:
+  // unknown token, wrong tenant/user, already-consumed, or unreadable artifact.
+  // Does NOT filter on expiry — an expired token still resolves here so the
+  // route can answer 410.
+  //
+  // Caller-identity gating happens in SQL so an unauthorized request can never
+  // observe a peer's token. When `callerIsAdmin` is true the user-equality
+  // check is skipped — admin-minted tokens (POST /admin/artifacts/:id/download-token)
+  // carry the artifact OWNER's user_id, not the admin's, because the
+  // persistence layer joins on (tenant_id, artifact_id, user_id).
+  async peekDownloadToken(input: {
+    token: string;
+    requesterTenantId: string;
+    requesterUserId: string;
+    callerIsAdmin: boolean;
+  }): Promise<ArtifactDownloadTokenRecord | null> {
+    const tokenRows = await this.privilegedDb.query(
+      `
+        SELECT ${DOWNLOAD_TOKEN_COLUMNS}
+          FROM artifact_download_tokens AS download
+          JOIN artifacts AS artifact
+            ON artifact.tenant_id = download.tenant_id
+         WHERE ${DOWNLOAD_TOKEN_GATING}
+      `,
+      [input.token, input.requesterTenantId, input.requesterUserId, input.callerIsAdmin]
+    );
+    return tokenRows.rows[0] ? mapDownloadToken(tokenRows.rows[0]) : null;
+  }
+
   // Single-use: flips `consumed_at` atomically so a leaked token cannot be
   // replayed for the full TTL. The first call wins and returns the row;
-  // subsequent calls match no rows and return null.
+  // subsequent calls match no rows and return null. The `expires_at > NOW()`
+  // predicate means an expired token is never consumed — the route surfaces
+  // expiry via peek (→ 410) before reaching here.
   //
-  // Caller-identity gating happens in SQL so an unauthorized request never
-  // burns the token (which would let any same-tenant user DoS the legitimate
-  // owner). When `callerIsAdmin` is true the user-equality check is skipped
-  // — admin-minted tokens (POST /admin/artifacts/:id/download-token) carry
-  // the artifact OWNER's user_id, not the admin's, because the persistence
-  // layer joins on (tenant_id, artifact_id, user_id).
+  // Caller-identity gating is identical to `peekDownloadToken`; see that
+  // method for why an unauthorized request never burns the token.
   async consumeDownloadToken(input: {
     token: string;
     requesterTenantId: string;
@@ -433,27 +475,9 @@ export class ArtifactStore {
         UPDATE artifact_download_tokens AS download
            SET consumed_at = NOW()
           FROM artifacts AS artifact
-         WHERE download.token = $1
-           AND download.tenant_id = $2
-           AND ($4::boolean OR download.user_id = $3)
-           AND download.consumed_at IS NULL
-           AND artifact.tenant_id   = download.tenant_id
-           AND artifact.artifact_id = download.artifact_id
-           AND artifact.user_id     = download.user_id
-           AND artifact.status     <> 'deleted'
-           AND (artifact.artifact_type = 'upload' OR artifact.status = 'ready')
-        RETURNING
-          download.token,
-          download.tenant_id,
-          download.artifact_id,
-          download.session_id,
-          download.user_id,
-          download.storage_backend,
-          download.storage_key,
-          download.file_name,
-          download.content_type,
-          download.expires_at,
-          download.created_at
+         WHERE ${DOWNLOAD_TOKEN_GATING}
+           AND download.expires_at > NOW()
+        RETURNING ${DOWNLOAD_TOKEN_COLUMNS}
       `,
       [input.token, input.requesterTenantId, input.requesterUserId, input.callerIsAdmin]
     );

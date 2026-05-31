@@ -53,6 +53,30 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
     }
   }
 
+  /**
+   * Signal that the producer failed. Any consumer currently blocked in `next()`
+   * (i.e. `for await`-ing an empty queue) is rejected immediately, and all
+   * subsequent `next()` calls throw the same error. Without this, a producer
+   * that throws — e.g. a runtime request handler hitting a DB error — leaves the
+   * consumer waiting forever, hanging the turn and pinning its active-turn slot.
+   *
+   * Idempotent and terminal: the first error wins, and the queue is closed so no
+   * further values can be pushed. Any values already buffered are discarded in
+   * favor of surfacing the failure (the turn is already broken).
+   */
+  setError(error: Error): void {
+    if (this.closed || this.error) {
+      return;
+    }
+
+    this.error = error;
+    this.closed = true;
+    while (this.waiters.length) {
+      const waiter = this.waiters.shift();
+      waiter?.reject(error);
+    }
+  }
+
   async next(): Promise<IteratorResult<T>> {
     if (this.error) {
       throw this.error;

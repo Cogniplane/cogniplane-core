@@ -7,6 +7,16 @@
     "threadId"
   ],
   "properties": {
+    "additionalContext": {
+      "description": "Optional client-provided context fragments keyed by an opaque source identifier.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/definitions/AdditionalContextEntry"
+      }
+    },
     "approvalPolicy": {
       "description": "Override the approval policy for this turn and subsequent turns.",
       "anyOf": [
@@ -85,14 +95,10 @@
       "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
     },
     "permissions": {
-      "description": "Select a named permissions profile for this turn and subsequent turns. Cannot be combined with `sandboxPolicy`. Use bounded `modifications` for supported turn adjustments instead of replacing the full permissions profile.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/PermissionProfileSelectionParams"
-        },
-        {
-          "type": "null"
-        }
+      "description": "Select a named permissions profile id for this turn and subsequent turns. Cannot be combined with `sandboxPolicy`.",
+      "type": [
+        "string",
+        "null"
       ]
     },
     "personality": {
@@ -113,6 +119,16 @@
         "null"
       ],
       "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "runtimeWorkspaceRoots": {
+      "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Relative paths are resolved against the effective cwd for the turn.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
         "type": "string"
       }
     },
@@ -153,6 +169,28 @@
     "AbsolutePathBuf": {
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
+    },
+    "AdditionalContextEntry": {
+      "type": "object",
+      "required": [
+        "kind",
+        "value"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/AdditionalContextKind"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "AdditionalContextKind": {
+      "type": "string",
+      "enum": [
+        "untrusted",
+        "application"
+      ]
     },
     "ApprovalsReviewer": {
       "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
@@ -248,6 +286,15 @@
         }
       }
     },
+    "ImageDetail": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "low",
+        "high",
+        "original"
+      ]
+    },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
       "type": "string",
@@ -261,65 +308,6 @@
       "enum": [
         "restricted",
         "enabled"
-      ]
-    },
-    "PermissionProfileModificationParams": {
-      "oneOf": [
-        {
-          "description": "Additional concrete directory that should be writable.",
-          "type": "object",
-          "required": [
-            "path",
-            "type"
-          ],
-          "properties": {
-            "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "additionalWritableRoot"
-              ],
-              "title": "AdditionalWritableRootPermissionProfileModificationParamsType"
-            }
-          },
-          "title": "AdditionalWritableRootPermissionProfileModificationParams"
-        }
-      ]
-    },
-    "PermissionProfileSelectionParams": {
-      "oneOf": [
-        {
-          "description": "Select a named built-in or user-defined profile and optionally apply bounded modifications that Codex knows how to validate.",
-          "type": "object",
-          "required": [
-            "id",
-            "type"
-          ],
-          "properties": {
-            "id": {
-              "type": "string"
-            },
-            "modifications": {
-              "type": [
-                "array",
-                "null"
-              ],
-              "items": {
-                "$ref": "#/definitions/PermissionProfileModificationParams"
-              }
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "profile"
-              ],
-              "title": "ProfilePermissionProfileSelectionParamsType"
-            }
-          },
-          "title": "ProfilePermissionProfileSelectionParams"
-        }
       ]
     },
     "Personality": {
@@ -564,6 +552,17 @@
             "url"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -584,6 +583,17 @@
             "type"
           ],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },

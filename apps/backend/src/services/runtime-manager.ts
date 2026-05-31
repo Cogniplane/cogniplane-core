@@ -90,8 +90,10 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       getTenantApiKey?: (tenantId: string) => Promise<string | null>;
       githubConnections?: GithubConnectionService;
       integrationRegistry?: IntegrationRegistryService;
-      processFactory?: RuntimeProcessFactory;
-      workspaceFactory?: RuntimeWorkspaceFactory;
+      // Required: both runtimes run inside E2B; build-runtime-adapters always
+      // supplies the sandbox-backed factories (tests inject fakes).
+      processFactory: RuntimeProcessFactory;
+      workspaceFactory: RuntimeWorkspaceFactory;
       skillDiscovery?: CodexSkillDiscoveryService;
       skillBundleStorage: SkillBundleStorage;
       managedToolCatalog: ManagedToolCatalog;
@@ -103,7 +105,28 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       deps.config,
       deps.runtimeSessions,
       deps.logger,
-      deps.egressIpPins
+      deps.egressIpPins,
+      // Expire any still-pending approvals when a runtime is torn down by any
+      // path (idle/crash/socket-close/invalidation). Without this, a teardown
+      // mid-approval orphans `status='pending'` rows: the UI keeps showing a
+      // dead approve/reject prompt and a late decision 404s into a gone turn.
+      // interruptTurn already does this for the explicit-interrupt path; this
+      // closes the implicit-teardown gap. Runs before the in-memory map is
+      // cleared so onCancelLocal can still read it.
+      (runtime) =>
+        cancelPendingApprovals({
+          tenantId: runtime.tenantId,
+          sessionId: runtime.sessionId,
+          userId: runtime.userId,
+          reason: "runtime_terminated",
+          approvals: this.deps.approvals,
+          auditEvents: this.deps.auditEvents,
+          logger: this.deps.logger,
+          onCancelLocal: (approvalId) => {
+            const pending = runtime.pendingApprovals.get(approvalId);
+            return pending ? { itemId: pending.itemId, kind: pending.kind } : undefined;
+          }
+        })
     );
 
     this.turnOrchestrator = new CodexTurnOrchestrator(
@@ -260,6 +283,23 @@ export class CodexRuntimeManager implements RuntimeAdapter {
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
   }): Promise<"resolved" | "missing"> {
+    // Find the owning runtime in memory BEFORE mutating the shared `approvals`
+    // row. The production route consults this manager first for EVERY approval
+    // (Codex and Claude alike); flipping the DB row here for an approval owned
+    // by another provider would settle it and strand the real owner (its
+    // resolveApproval, tried next, would see a null row and never deliver the
+    // decision to its runtime). approvalIds are globally unique, so scanning by
+    // id is safe; the tenant/user gate is still enforced by `approvals.resolve`.
+    let runtime: RuntimeState | undefined;
+    for (const candidate of this.lifecycle.runtimes.values()) {
+      if (candidate.pendingApprovals.has(input.approvalId)) {
+        runtime = candidate;
+        break;
+      }
+    }
+    const pending = runtime?.pendingApprovals.get(input.approvalId);
+    if (!runtime || !pending) return "missing";
+
     const approval = await this.deps.approvals.resolve(
       input.tenantId,
       input.approvalId,
@@ -267,10 +307,6 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       input.decision
     );
     if (!approval) return "missing";
-
-    const runtime = this.lifecycle.runtimes.get(approval.sessionId);
-    const pending = runtime?.pendingApprovals.get(input.approvalId);
-    if (!runtime || !pending) return "missing";
 
     await this.deps.auditEvents.create({
       tenantId: input.tenantId,
@@ -450,7 +486,7 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       hasActiveTurn: Boolean(runtime.activeTurn),
       processId: runtime.process.pid,
       port: runtime.process.port,
-      socketState: this.lifecycle.describeSocketState(runtime.process.socketReadyState)
+      isAlive: runtime.process.isAlive()
     }));
 
     return {

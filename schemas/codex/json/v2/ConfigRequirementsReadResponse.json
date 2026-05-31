@@ -75,9 +75,32 @@
         }
       ]
     },
+    "ComputerUseRequirements": {
+      "type": "object",
+      "properties": {
+        "allowLockedComputerUse": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "ConfigRequirements": {
       "type": "object",
       "properties": {
+        "allowAppshots": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allowManagedHooksOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "allowedApprovalPolicies": {
           "type": [
             "array",
@@ -94,6 +117,15 @@
           ],
           "items": {
             "$ref": "#/definitions/ApprovalsReviewer"
+          }
+        },
+        "allowedPermissions": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
           }
         },
         "allowedSandboxModes": {
@@ -113,6 +145,16 @@
           "items": {
             "$ref": "#/definitions/WebSearchMode"
           }
+        },
+        "computerUse": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ComputerUseRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "enforceResidency": {
           "anyOf": [
@@ -170,6 +212,12 @@
             },
             "command": {
               "type": "string"
+            },
+            "commandWindows": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "statusMessage": {
               "type": [
@@ -259,6 +307,8 @@
         "PreToolUse",
         "SessionStart",
         "Stop",
+        "SubagentStart",
+        "SubagentStop",
         "UserPromptSubmit"
       ],
       "properties": {
@@ -299,6 +349,18 @@
           }
         },
         "Stop": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          }
+        },
+        "SubagentStart": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          }
+        },
+        "SubagentStop": {
           "type": "array",
           "items": {
             "$ref": "#/definitions/ConfiguredHookMatcherGroup"

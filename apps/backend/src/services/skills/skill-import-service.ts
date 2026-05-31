@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 
 import JSZip from "jszip";
+import { fetch as undiciFetch } from "undici";
 import YAML from "yaml";
 
 import type { AppConfig } from "../../config.js";
+import { isPrivateOrReservedHost, ssrfSafeAgent } from "../../lib/url-validation.js";
 import type {
   AdminSkillRecord,
   AdminSkillRevisionRecord
@@ -241,18 +243,99 @@ function normalizeRelativeSubdirectory(value: string | null | undefined): string
   return normalized;
 }
 
+export const MAX_GITHUB_REDIRECTS = 5;
+
+/**
+ * SSRF-safe fetch for admin-triggered GitHub imports. The default dispatcher
+ * (`ssrfSafeAgent`) pins every outbound connection to a DNS-validated public IP,
+ * closing the rebinding TOCTOU window. On top of that, redirects are followed
+ * manually so each `Location` target is re-validated (scheme + private/reserved
+ * host) before we connect — GitHub's zipball endpoint 302s to a presigned
+ * codeload/S3 URL, and a compromised/malicious upstream could redirect into the
+ * internal network. Must use undici's fetch directly: Node's global fetch
+ * ignores the `dispatcher` option as of undici v8.
+ */
+function assertFetchableHttpsUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("GitHub import target is not a valid URL.");
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error("GitHub import target must use the https:// scheme.");
+  }
+  if (isPrivateOrReservedHost(parsed.hostname)) {
+    throw new Error("GitHub import target resolves to a private or reserved address.");
+  }
+  return parsed;
+}
+
+export async function ssrfSafeGithubFetch(
+  fetchFn: typeof fetch,
+  url: string,
+  init: RequestInit,
+  // Low-level fetch used inside the manual-redirect loop. Defaults to undici's
+  // fetch (Node's global fetch ignores the `dispatcher` option). Injectable
+  // only so tests can drive the real redirect/SSRF machinery with a fake — the
+  // production call sites omit this argument, so behavior is unchanged.
+  lowLevelFetch: typeof fetch = undiciFetch as unknown as typeof fetch
+): Promise<Response> {
+  // A caller-supplied fetchFn (used only in tests) bypasses the dispatcher and
+  // manual-redirect machinery, since the test harness controls every response.
+  // The production path always uses undici + ssrfSafeAgent.
+  if (fetchFn !== lowLevelFetch) {
+    return fetchFn(url, init);
+  }
+
+  let currentUrl = assertFetchableHttpsUrl(url).toString();
+  const headers = { ...(init.headers as Record<string, string> | undefined) };
+
+  for (let hop = 0; hop <= MAX_GITHUB_REDIRECTS; hop += 1) {
+    const response = (await lowLevelFetch(currentUrl, {
+      ...init,
+      headers,
+      redirect: "manual",
+      dispatcher: ssrfSafeAgent
+    } as never)) as unknown as Response;
+
+    if (response.status < 300 || response.status >= 400) {
+      return response;
+    }
+
+    const location = response.headers.get("location");
+    if (!location) {
+      return response;
+    }
+    // Resolve relative redirects against the current URL, then re-validate.
+    const next = assertFetchableHttpsUrl(new URL(location, currentUrl).toString());
+    // Drop the Authorization header on cross-origin redirects so a token bound
+    // to api.github.com is never replayed to a redirect-controlled host.
+    if (next.origin !== new URL(currentUrl).origin) {
+      delete headers.Authorization;
+    }
+    currentUrl = next.toString();
+  }
+
+  throw new Error("GitHub import exceeded the maximum number of redirects.");
+}
+
 async function resolveGitHubDefaultBranch(
   source: ReturnType<typeof parseGitHubSkillSource>,
   fetchFn: typeof fetch,
   githubToken?: string
 ): Promise<string> {
-  const response = await fetchFn(`https://api.github.com/repos/${source.owner}/${source.repo}`, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "cogniplane-core",
-      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {})
+  const response = await ssrfSafeGithubFetch(
+    fetchFn,
+    `https://api.github.com/repos/${source.owner}/${source.repo}`,
+    {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "cogniplane-core",
+        ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {})
+      }
     }
-  });
+  );
 
   if (!response.ok) {
     throw new Error(`Unable to resolve default branch for ${source.owner}/${source.repo}.`);
@@ -496,7 +579,7 @@ export async function importSkillBundleFromGithub(input: {
   githubToken?: string;
   fetchFn?: typeof fetch;
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
-  const fetchFn = input.fetchFn ?? fetch;
+  const fetchFn = input.fetchFn ?? (undiciFetch as unknown as typeof fetch);
   const source = parseGitHubSkillSource({
     githubUrl: input.githubUrl,
     ref: input.ref,
@@ -504,7 +587,7 @@ export async function importSkillBundleFromGithub(input: {
   });
   const resolvedRef = source.ref ?? (await resolveGitHubDefaultBranch(source, fetchFn, input.githubToken));
   const archiveUrl = buildGitHubZipballUrl(source, resolvedRef);
-  const response = await fetchFn(archiveUrl, {
+  const response = await ssrfSafeGithubFetch(fetchFn, archiveUrl, {
     headers: {
       Accept: "application/vnd.github+json",
       "User-Agent": "cogniplane-core",

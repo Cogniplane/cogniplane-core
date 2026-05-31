@@ -151,8 +151,8 @@ export function TokenUsageSection() {
             ) : (
               <BarChart
                 data={dailyBars}
-                primaryColor="var(--color-accent)"
-                secondaryColor="var(--color-success)"
+                primaryColor="var(--chart-1)"
+                secondaryColor="var(--chart-2)"
                 primaryLabel="Input tokens"
                 secondaryLabel="Output tokens"
               />
@@ -172,10 +172,10 @@ export function TokenUsageSection() {
                   totalTokens: u.totalTokens,
                   costUsd: u.costUsd
                 }))}
-                barColor="var(--color-accent)"
+                barColor="var(--chart-1)"
                 chartBars={userBars}
-                chartPrimaryColor="var(--color-accent)"
-                chartSecondaryColor="var(--color-success)"
+                chartPrimaryColor="var(--chart-1)"
+                chartSecondaryColor="var(--chart-2)"
               />
             )
           ) : null}
@@ -193,10 +193,10 @@ export function TokenUsageSection() {
                   totalTokens: m.totalTokens,
                   costUsd: m.costUsd
                 }))}
-                barColor="var(--color-warning)"
+                barColor="var(--chart-3)"
                 chartBars={modelBars}
-                chartPrimaryColor="var(--color-warning)"
-                chartSecondaryColor="var(--color-success)"
+                chartPrimaryColor="var(--chart-3)"
+                chartSecondaryColor="var(--chart-2)"
               />
             )
           ) : null}

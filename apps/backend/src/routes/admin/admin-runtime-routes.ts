@@ -68,10 +68,6 @@ export async function registerAdminRuntimeRoutes(
   // the UI needs them.
   app.get("/admin/runtime-config", withAdmin(app, async () => {
     return serialize(AdminRuntimeConfigSchema, {
-      // Codex always runs in E2B when RUNTIME_BACKEND=e2b; local otherwise.
-      codexBackend: app.config.RUNTIME_BACKEND,
-      // Claude uses its own flag since the two providers are independent.
-      claudeBackend: app.config.CLAUDE_RUNTIME_BACKEND,
       e2bTemplateId: app.config.E2B_TEMPLATE_ID,
       codexModel: app.config.CODEX_MODEL,
       claudeModel: app.config.CLAUDE_CODE_MODEL,

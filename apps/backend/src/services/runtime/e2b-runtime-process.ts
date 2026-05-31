@@ -6,10 +6,12 @@ import type { FastifyBaseLogger } from "fastify";
 import type { AppConfig } from "../../config.js";
 
 import type {
+  JsonRpcFailure,
   JsonRpcNotification,
-  JsonRpcRequest
-} from "./codex-runtime-process.js";
-import { CodexRuntimeProcessStartError } from "./codex-runtime-process.js";
+  JsonRpcRequest,
+  JsonRpcSuccess
+} from "./codex-jsonrpc.js";
+import { CodexRuntimeProcessStartError } from "./codex-jsonrpc.js";
 import {
   buildCodexStdioCommand,
   buildSandboxCodexConfig,
@@ -18,18 +20,14 @@ import {
 import { createRuntimeWorkspace } from "./runtime-workspace.js";
 import type { RuntimeProcessFactory, RuntimeWorkspaceFactory } from "./runtime-types.js";
 
-type JsonRpcSuccess = {
-  id: number | string;
-  result: unknown;
-};
-
-type JsonRpcFailure = {
-  id: number | string;
-  error: {
-    code: number;
-    message: string;
-  };
-};
+/**
+ * Hard cap on a single newline-delimited stdout line from an in-sandbox harness
+ * (Codex app-server or the Claude sandbox-agent). A pathological / corrupted
+ * stream without `\n` would otherwise grow the line buffer without bound. Shared
+ * by the buffer's append-path guard here and the per-line guard in the Claude
+ * process so both runtimes use the same limit.
+ */
+export const MAX_STDOUT_LINE_BYTES = 8 * 1024 * 1024;
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -304,10 +302,6 @@ export class E2bRuntimeProcess {
     return null;
   }
 
-  get socketReadyState(): number {
-    return this.alive ? WebSocket.OPEN : WebSocket.CLOSED;
-  }
-
   isAlive(): boolean {
     return this.alive;
   }
@@ -361,15 +355,16 @@ export class E2bRuntimeProcess {
     await this.sandbox.files.write([{ path: filePath, data: payload }]);
   }
 
-  closeSocket(): void {
+  terminate(): void {
+    // Idempotent: a second terminate() (e.g. lifecycle shutdown racing an exit
+    // watcher) must not re-fire listeners or re-kill the sandbox.
+    if (!this.alive) return;
     this.alive = false;
+    // Fire close listeners first so the turn orchestrator sees the stream end
+    // before the sandbox is torn down, then kill, then signal exit.
     for (const listener of this.closeListeners) {
       listener();
     }
-  }
-
-  terminate(): void {
-    this.alive = false;
     void this.sandbox.kill().catch((err: unknown) => {
       this.logger?.warn(
         { err, sandboxId: this.sandbox.sandboxId },
@@ -448,7 +443,10 @@ function remapEnvPathsToSandbox(
  * `createRuntimeWorkspace`; the process factory uploads them to the sandbox,
  * starts codex, and cleans up the staging dir.
  */
-function buildE2bCodexFactories(config: AppConfig): {
+function buildE2bCodexFactories(
+  config: AppConfig,
+  { startProcess = E2bRuntimeProcess.start }: { startProcess?: typeof E2bRuntimeProcess.start } = {}
+): {
   processFactory: RuntimeProcessFactory;
   workspaceFactory: RuntimeWorkspaceFactory;
 } {
@@ -479,7 +477,7 @@ function buildE2bCodexFactories(config: AppConfig): {
     try {
       // start() awaits the full file upload to the sandbox before returning,
       // so the local staging directory is safe to remove in the finally block.
-      return await E2bRuntimeProcess.start({
+      return await startProcess({
         binaryPath: input.binaryPath,
         cwd: input.cwd,
         logger: input.logger,
@@ -677,7 +675,15 @@ async function startE2bStdioHarness(input: E2bStdioHarnessInput): Promise<E2bStd
       cwd: input.sandboxWorkspacePath,
       envs: input.env ?? {},
       timeoutMs: 0,
-      onStdout: createLineBufferedStdoutHandler(input.onStdoutLine),
+      onStdout: createLineBufferedStdoutHandler(input.onStdoutLine, {
+        maxLineBytes: MAX_STDOUT_LINE_BYTES,
+        onOverflow: (droppedBytes) => {
+          input.logger.error(
+            { sessionId: input.sessionId, runtimeId: input.runtimeId, droppedBytes, max: MAX_STDOUT_LINE_BYTES },
+            "sandbox stdout: dropping oversized newline-less buffer"
+          );
+        }
+      }),
       onStderr: (data: string) => {
         const trimmed = data.trim();
         if (trimmed) {
@@ -741,14 +747,32 @@ async function uploadWorkspaceFiles(
  * only. The last incomplete trailing fragment stays in the buffer until
  * the next chunk arrives.
  */
-function createLineBufferedStdoutHandler(onLine: (line: string) => void): (data: string) => void {
+export function createLineBufferedStdoutHandler(
+  onLine: (line: string) => void,
+  options?: { maxLineBytes?: number; onOverflow?: (droppedBytes: number) => void }
+): (data: string) => void {
   let stdoutBuffer = "";
+  const maxLineBytes = options?.maxLineBytes;
   return (data: string) => {
     stdoutBuffer += data;
     const lines = stdoutBuffer.split("\n");
     stdoutBuffer = lines.pop() ?? "";
+    // Bound the trailing (not-yet-terminated) fragment so a newline-less flood
+    // can't grow the buffer without limit before a complete line ever forms.
+    if (maxLineBytes !== undefined && stdoutBuffer.length > maxLineBytes) {
+      options?.onOverflow?.(stdoutBuffer.length);
+      stdoutBuffer = "";
+    }
     for (const line of lines) {
-      if (line) onLine(line);
+      if (!line) continue;
+      // Also drop a COMPLETE but over-limit line before handing it to onLine —
+      // otherwise a single newline-terminated huge frame would reach the
+      // consumer (e.g. Codex's JSON.parse), bypassing the memory/CPU guard.
+      if (maxLineBytes !== undefined && line.length > maxLineBytes) {
+        options?.onOverflow?.(line.length);
+        continue;
+      }
+      onLine(line);
     }
   };
 }
@@ -757,7 +781,8 @@ function createLineBufferedStdoutHandler(onLine: (line: string) => void): (data:
  * Attach an exit watcher to the background command handle. Fires
  * `input.onExit` exactly once with the harness exit result, plus an
  * informational log line. If the sandbox is killed externally the wait
- * promise rejects — we log and swallow, since the sandbox is gone anyway.
+ * promise rejects — we still fire `input.onExit` so the process is marked
+ * dead (otherwise `isAlive()` stays true after a killed sandbox).
  */
 function attachExitWatcher(
   handle: { pid: number },
@@ -791,6 +816,10 @@ function attachExitWatcher(
         { sandboxId: sandbox.sandboxId, sessionId: input.sessionId, error: String(err) },
         "E2B CommandHandle.wait() rejected (sandbox may have been killed)"
       );
+      // The wait() rejection means the process/sandbox is gone. Mark the
+      // process dead so isAlive() flips to false and pending requests are
+      // rejected — otherwise a killed sandbox leaves the runtime looking alive.
+      input.onExit({ exitCode: undefined, error: err instanceof Error ? err.message : String(err) });
     }
   );
 }

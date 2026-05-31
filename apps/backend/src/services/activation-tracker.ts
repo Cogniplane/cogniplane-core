@@ -81,15 +81,16 @@ export class ActivationTracker {
    * skill that has at least one row in the window — skills with no activity
    * are absent from the map (callers default to zero).
    *
-   * Both numbers are *distinct sessions*, not raw event counts. Tier 1
-   * telemetry writes one `materialized` row per turn the skill is offered;
-   * counting raw rows would inflate a skill that just sat through a long
-   * conversation. Distinct sessions matches the question the admin is
-   * actually asking ("in how many sessions was this skill used").
+   * Both numbers are *distinct sessions*, not raw event counts. Telemetry
+   * writes one `materialized` row per turn the skill is offered; counting raw
+   * rows would inflate a skill that just sat through a long conversation.
+   * Distinct sessions matches the question the admin is actually asking ("in
+   * how many sessions was this skill used").
    *
-   * `invoked` rows can come from two sources — Tier 1 (tool call matched
-   * `metadata.associatedToolIds`) and Tier 3 (judge said yes). We don't
-   * distinguish them here: both are evidence the skill was actually used.
+   * An `invoked` row is written when a tool call routed through the MCP gateway
+   * matches a skill's `metadata.associatedToolIds`. It's a weak signal (the
+   * agent may have called the tool without following the skill's instructions),
+   * but it's the evidence we have that the skill was actually used.
    */
   async countSkillActivations(
     tenantId: string,
@@ -259,19 +260,3 @@ export class ActivationTracker {
   }
 }
 
-/**
- * Resolve which skills should be credited with an `invoked` event for a tool
- * call. A skill is credited when its active revision declares the tool in
- * `metadata.associatedToolIds`. Multiple skills can match — the caller emits
- * one `invoked` row per match. This is a weak signal (the agent may have
- * called the tool without following the skill's instructions); Tier 3 LLM
- * judgment is the strong signal.
- */
-export function resolveSkillsForToolCall(
-  toolId: string,
-  skills: Array<{ id: string; associatedToolIds?: string[] }>
-): string[] {
-  return skills
-    .filter((skill) => (skill.associatedToolIds ?? []).includes(toolId))
-    .map((skill) => skill.id);
-}

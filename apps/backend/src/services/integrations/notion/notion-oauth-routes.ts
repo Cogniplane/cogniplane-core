@@ -1,14 +1,18 @@
 import type { FastifyInstance } from "fastify";
 
+import type { RequestLimitsInterface } from "../../request-limits.js";
+import { enforceOAuthCallbackRateLimit } from "../oauth-callback-rate-limit.js";
 import type { NotionConnectionService } from "./notion-connection-service.js";
 
 export const NOTION_OAUTH_CALLBACK_PATHS = ["/integrations/notion/callback"] as const;
 
 export function registerNotionOAuthRoutes(
   app: FastifyInstance,
-  connections: NotionConnectionService
+  connections: NotionConnectionService,
+  limits?: RequestLimitsInterface
 ): void {
   app.get("/integrations/notion/callback", async (request, reply) => {
+    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
     const query = request.query as {
       code?: string;
       state?: string;

@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import type { RuntimeEvent } from "../runtime-contracts.js";
 import { ActiveTurnMessageMap } from "./active-turn-message-map.js";
@@ -8,17 +8,51 @@ import { streamAssistantReply } from "./sse-stream-writer.js";
 // Minimal fakes
 // ---------------------------------------------------------------------------
 
-function makeRawResponse() {
+function makeRawResponse(opts: { backpressureAfter?: number } = {}) {
   const written: string[] = [];
   let ended = false;
+  let writableEnded = false;
+  const closeListeners: Array<() => void> = [];
+  const drainListeners: Array<() => void> = [];
+  let writeCount = 0;
   return {
     raw: {
       write(chunk: string) {
         written.push(chunk);
+        writeCount += 1;
+        // Simulate a full socket buffer once we cross the threshold: `write`
+        // returns false and the caller must await `drain`.
+        if (opts.backpressureAfter !== undefined && writeCount > opts.backpressureAfter) {
+          return false;
+        }
+        return true;
+      },
+      once(event: "drain", listener: () => void) {
+        if (event === "drain") drainListeners.push(listener);
+      },
+      on(event: "close", listener: () => void) {
+        if (event === "close") closeListeners.push(listener);
       },
       end() {
         ended = true;
-      }
+        writableEnded = true;
+      },
+      get writableEnded() {
+        return writableEnded;
+      },
+      destroyed: false
+    },
+    // Test hooks ---------------------------------------------------------
+    emitClose() {
+      for (const cb of [...closeListeners]) cb();
+    },
+    flushDrain() {
+      const listeners = [...drainListeners];
+      drainListeners.length = 0;
+      for (const cb of listeners) cb();
+    },
+    get drainPending() {
+      return drainListeners.length > 0;
     },
     get written() {
       return written;
@@ -173,6 +207,37 @@ function makeRuntimeManager(events: RuntimeEvent[]) {
     async *runMessage() {
       for (const event of events) {
         yield event;
+      }
+    }
+  };
+}
+
+// Runtime manager whose runMessage waits on an external "gate" promise between
+// each event, so the test can drive the stream one step at a time (e.g. emit a
+// client disconnect after the first event). Also records interruptTurn calls.
+function makeControllableRuntimeManager(events: RuntimeEvent[]) {
+  const interruptCalls: Array<{ sessionId: string }> = [];
+  let release: (() => void) | null = null;
+  const base = makeRuntimeManager([]);
+  return {
+    interruptCalls,
+    advance() {
+      release?.();
+      release = null;
+    },
+    manager: {
+      ...base,
+      async *runMessage() {
+        for (const event of events) {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          yield event;
+        }
+      },
+      async interruptTurn(input: { tenantId: string; sessionId: string; userId: string }) {
+        interruptCalls.push({ sessionId: input.sessionId });
+        return "interrupted" as const;
       }
     }
   };
@@ -471,18 +536,171 @@ test("streamAssistantReply redacts secrets from persisted tool input/output and 
   expect(!/Bearer\s+(?!\[REDACTED\])\S+/.test(deltaText)).toBeTruthy();
 });
 
-test("streamAssistantReply completes without cleanup callbacks", async () => {
+test("streamAssistantReply cancels the runtime turn and stops writing when the client disconnects mid-stream", async () => {
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  const events: RuntimeEvent[] = [
+    { type: "response.created", responseId: "r1" },
+    { type: "response.output_text.delta", responseId: "r1", delta: "partial" },
+    { type: "response.output_text.delta", responseId: "r1", delta: " more" },
+    { type: "response.completed", responseId: "r1" }
+  ];
+  const controllable = makeControllableRuntimeManager(events);
+
+  const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).runtimeManager = controllable.manager;
+  (input as Record<string, unknown>).messages = messages;
+
+  const done = streamAssistantReply(input);
+
+  // Drive the first event through, then simulate the browser hanging up.
+  controllable.advance(); // response.created
+  await Promise.resolve();
+  await Promise.resolve();
+  const writesBeforeClose = reply.written.length;
+
+  reply.emitClose();
+  // Allow further events; the loop must short-circuit on isClosed instead of
+  // streaming them out.
+  controllable.advance();
+  await Promise.resolve();
+  controllable.advance();
+  await Promise.resolve();
+  controllable.advance();
+  await done;
+
+  // interruptTurn fired exactly once for this session.
+  expect(controllable.interruptCalls.length).toBe(1);
+  expect(controllable.interruptCalls[0]?.sessionId).toBe("session-1");
+
+  // No frames were written after the disconnect.
+  expect(reply.written.length).toBe(writesBeforeClose);
+
+  // The row is left in a clean terminal state, not stuck "streaming".
+  const lastPersist = messages.contentLog[messages.contentLog.length - 1];
+  expect(lastPersist?.status).toBe("interrupted");
+});
+
+test("streamAssistantReply does not interrupt the runtime when the stream closes after normal completion", async () => {
+  // Normal completion calls writer.end(), and Node emits `close` for a finished
+  // response too. That close must NOT be treated as a client disconnect — a
+  // session-scoped interruptTurn could otherwise cancel a follow-up turn.
   const reply = makeRawResponse();
   const events: RuntimeEvent[] = [
     { type: "response.created", responseId: "r1" },
+    { type: "response.output_text.delta", responseId: "r1", delta: "done" },
+    { type: "response.completed", responseId: "r1" }
+  ];
+  const interruptCalls: Array<{ sessionId: string }> = [];
+  const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).runtimeManager = {
+    ...makeRuntimeManager(events),
+    async interruptTurn(i: { sessionId: string }) {
+      interruptCalls.push({ sessionId: i.sessionId });
+      return "interrupted" as const;
+    }
+  };
+
+  // Run to a normal completion.
+  await streamAssistantReply(input);
+
+  // The socket close now fires, exactly as Node does after writer.end().
+  reply.emitClose();
+  await Promise.resolve();
+
+  // The post-completion close must not have triggered an interrupt.
+  expect(interruptCalls.length).toBe(0);
+});
+
+test("streamAssistantReply does not start the runtime turn if the client disconnected during setup", async () => {
+  // The browser hangs up while the session / tool context are still being set
+  // up — before any runtime turn exists for the disconnect handler to interrupt.
+  // The turn must NOT start (no billable generation for a gone client).
+  const reply = makeRawResponse();
+  reply.raw.destroyed = true;
+  const messages = makeMessages();
+
+  let runMessageCalled = false;
+  const manager = {
+    ...makeRuntimeManager([]),
+    runMessage() {
+      runMessageCalled = true;
+      return (async function* () {})();
+    }
+  };
+
+  const input = makeInput(reply, []) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).runtimeManager = manager;
+  (input as Record<string, unknown>).messages = messages;
+
+  await streamAssistantReply(input);
+
+  expect(runMessageCalled).toBe(false);
+  // The assistant row is settled (not left "streaming") so it doesn't linger.
+  const lastPersist = messages.contentLog[messages.contentLog.length - 1];
+  expect(lastPersist?.status).toBe("interrupted");
+});
+
+test("streamAssistantReply awaits drain when the socket signals backpressure", async () => {
+  // First write succeeds; every subsequent write returns false (socket full),
+  // so the writer must park on `drain` before queueing the next frame.
+  const reply = makeRawResponse({ backpressureAfter: 1 });
+  const events: RuntimeEvent[] = [
+    { type: "response.created", responseId: "r1" },
+    { type: "response.output_text.delta", responseId: "r1", delta: "a" },
     { type: "response.completed", responseId: "r1" }
   ];
 
-  await streamAssistantReply(
-    makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0]
-  );
+  const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
 
-  // Cleanup is now handled internally by runRuntimeTurn for artifact processing.
-  // This test verifies the stream completes cleanly without external cleanup callbacks.
-  expect(true).toBeTruthy();
+  let resolved = false;
+  const done = streamAssistantReply(input).then(() => {
+    resolved = true;
+  });
+
+  // Let the microtasks run; the stream must park waiting for drain before it
+  // can complete (the second frame's `write()` returns false).
+  for (let i = 0; i < 50 && !reply.drainPending; i += 1) await Promise.resolve();
+  expect(resolved).toBe(false);
+  expect(reply.drainPending).toBe(true);
+
+  // Release drains until the stream completes.
+  for (let i = 0; i < 10 && !resolved; i += 1) {
+    reply.flushDrain();
+    for (let j = 0; j < 5; j += 1) await Promise.resolve();
+  }
+  await done;
+  expect(resolved).toBe(true);
+  expect(reply.ended).toBeTruthy();
+});
+
+test("streamAssistantReply emits the terminal failure frame even when persistence throws", async () => {
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  // Runtime throws (rejecting the for-await), then the error-path persist also
+  // throws. The client must still get response.failed + the stream must end.
+  messages.updateContent = vi.fn(async () => {
+    throw new Error("db unreachable");
+  }) as unknown as typeof messages.updateContent;
+
+  const runtimeManager = {
+    ...makeRuntimeManager([]),
+    async *runMessage() {
+      throw new Error("runtime exploded");
+      // `yield` is required for this to be a generator (require-yield); it is
+      // intentionally never reached because the throw above models a runtime
+      // that fails before producing any event.
+      yield undefined as never;
+    }
+  };
+
+  const input = makeInput(reply, []) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).messages = messages;
+  (input as Record<string, unknown>).runtimeManager = runtimeManager;
+
+  await streamAssistantReply(input);
+
+  const sseEvents = reply.events();
+  expect(sseEvents.some((e) => e.event === "response.failed")).toBeTruthy();
+  expect(reply.ended).toBeTruthy();
 });

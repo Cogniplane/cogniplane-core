@@ -1,9 +1,14 @@
 import type { Redis } from "ioredis";
 
-import type { AppConfig } from "../config.js";
-import type { LimitExceededErrorPayload, RequestLimitsInterface } from "./request-limits.js";
+import {
+  buildLimitsConfig,
+  rateLimitMessage,
+  type LimitExceededErrorPayload,
+  type LimitResource,
+  type RequestLimitsConfigKeys,
+  type RequestLimitsInterface
+} from "./request-limits.js";
 
-type LimitResource = "session_create" | "message_turn";
 type LimitScope = "user" | "tenant";
 
 type RateLimitConfig = {
@@ -35,37 +40,8 @@ export class RedisRequestLimits implements RequestLimitsInterface {
     }
   ) {}
 
-  static fromAppConfig(redis: Redis, config: Pick<
-    AppConfig,
-    | "RATE_LIMIT_WINDOW_MS"
-    | "SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW"
-    | "SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
-    | "MESSAGE_LIMIT_PER_USER_PER_WINDOW"
-    | "MESSAGE_LIMIT_PER_TENANT_PER_WINDOW"
-    | "TURN_QUOTA_PER_USER_PER_DAY"
-    | "TURN_QUOTA_PER_TENANT_PER_DAY"
-  >): RedisRequestLimits {
-    return new RedisRequestLimits(redis, {
-      rateLimit: {
-        windowMs: config.RATE_LIMIT_WINDOW_MS,
-        limits: {
-          session_create: {
-            user: config.SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW,
-            tenant: config.SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW
-          },
-          message_turn: {
-            user: config.MESSAGE_LIMIT_PER_USER_PER_WINDOW,
-            tenant: config.MESSAGE_LIMIT_PER_TENANT_PER_WINDOW
-          }
-        }
-      },
-      quota: {
-        dailyTurnQuota: {
-          user: config.TURN_QUOTA_PER_USER_PER_DAY,
-          tenant: config.TURN_QUOTA_PER_TENANT_PER_DAY
-        }
-      }
-    });
+  static fromAppConfig(redis: Redis, config: RequestLimitsConfigKeys): RedisRequestLimits {
+    return new RedisRequestLimits(redis, buildLimitsConfig(config));
   }
 
   async consumeRateLimit(input: {
@@ -107,9 +83,7 @@ export class RedisRequestLimits implements RequestLimitsInterface {
           limit,
           retryAfterMs,
           resetAt: new Date(Date.now() + retryAfterMs).toISOString(),
-          message: `${scope === "user" ? "User" : "Tenant"} ${
-            input.resource === "session_create" ? "session creation" : "message"
-          } rate limit exceeded.`
+          message: rateLimitMessage(input.resource, scope)
         };
       }
     }

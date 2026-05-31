@@ -47,6 +47,24 @@ function stubProvider(overrides: Partial<PiiProvider> = {}): PiiProvider {
 
 const CHAT: PiiSubject = { kind: "chat_prompt" };
 
+test("evaluateText fails closed (throws pii_timeout) when the provider hangs past the budget", async () => {
+  const hangingProvider = stubProvider({
+    // Never resolves — simulates a provider that ignores its own per-request
+    // timeout, or a policy lookup wedged on a slow DB.
+    detectText: () => new Promise(() => {})
+  });
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "block" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: hangingProvider,
+    timeoutMs: 25
+  });
+
+  await expect(
+    service.evaluateText({ tenantId: "t1", text: "call me at name John Smith", subject: CHAT })
+  ).rejects.toMatchObject({ code: "pii_timeout" });
+});
+
 test("evaluateText allows when PII protection is disabled", async () => {
   const service = new PiiProtectionService({
     policyReader: stubReader(buildSettings({ enabled: false })),
@@ -206,6 +224,66 @@ test("transform mode scrubs rule-detected PII that the provider missed", async (
     expect(decision.findings.length).toBe(1);
     expect(decision.findings[0]?.entityType).toBe("email");
   }
+});
+
+test("transform mode scrubs LLM-only findings the model left in the output", async () => {
+  // The model reports a person_name finding but returns transformedText that
+  // still contains the raw name. The service must scrub it against the merged
+  // finding set before returning — the rule detector never sees person_name.
+  const provider = stubProvider({
+    transformText: async ({ text }) => ({
+      transformedText: text, // name NOT redacted by the model
+      findings: [
+        { entityType: "person_name", value: "Alice Smith", start: 0, end: 11, confidence: "high" }
+      ],
+      providerType: "stub",
+      providerModel: "m"
+    })
+  });
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "transform" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider,
+    timeoutMs: 5000
+  });
+  const decision = await service.evaluateText({
+    tenantId: "t1",
+    text: "Alice Smith called",
+    subject: CHAT
+  });
+  expect(decision.action).toBe("transform");
+  if (decision.action === "transform") {
+    expect(decision.transformedText).toBe("[REDACTED:person_name] called");
+    expect(decision.transformedText.includes("Alice Smith")).toBe(false);
+    expect(decision.findings.some((f) => f.entityType === "person_name")).toBeTruthy();
+  }
+});
+
+test("transform mode fails closed when a flagged value still leaks after scrubbing", async () => {
+  // Pathological provider: the flagged value ("REDACTED") is a substring of the
+  // placeholder the scrub inserts, so it can never be fully removed. Rather than
+  // return text that still contains the flagged value, the service fails closed.
+  const provider = stubProvider({
+    transformText: async () => ({
+      transformedText: "name is REDACTED today",
+      findings: [
+        { entityType: "person_name", value: "REDACTED", start: 8, end: 16, confidence: "high" }
+      ],
+      providerType: "stub",
+      providerModel: "m"
+    })
+  });
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "transform" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider,
+    timeoutMs: 5000
+  });
+  const error = await service
+    .evaluateText({ tenantId: "t1", text: "name is REDACTED today", subject: CHAT })
+    .catch((e: unknown) => e);
+  expect(error instanceof PiiProtectionServiceError).toBeTruthy();
+  expect((error as PiiProtectionServiceError).code).toBe("pii_transform_incomplete");
 });
 
 test("tenant-configured provider model overrides the provider default", async () => {
@@ -510,24 +588,6 @@ test("evaluateArtifact merges rule and provider findings", async () => {
     expect(decision.findings.some((f) => f.entityType === "person_name")).toBeTruthy();
     expect(decision.providerType).toBe("stub");
   }
-});
-
-test("resolveExecutionPath maps policy + subject to sync/async", () => {
-  const service = new PiiProtectionService({
-    policyReader: stubReader(null),
-    ruleDetector: new RuleBasedPiiDetector(),
-    timeoutMs: 5000
-  });
-  const detect = buildSettings({ enabled: true, mode: "detect" });
-  const block = buildSettings({ enabled: true, mode: "block" });
-  const transform = buildSettings({ enabled: true, mode: "transform" });
-  const off = buildSettings({ enabled: false });
-
-  expect(service.resolveExecutionPath(detect, { kind: "chat_prompt" })).toBe("sync");
-  expect(service.resolveExecutionPath(detect, { kind: "upload" })).toBe("async");
-  expect(service.resolveExecutionPath(block, { kind: "upload" })).toBe("sync");
-  expect(service.resolveExecutionPath(transform, { kind: "microsoft_import" })).toBe("sync");
-  expect(service.resolveExecutionPath(off, { kind: "chat_prompt" })).toBe("sync");
 });
 
 test("rawRetention='never' strips finding values before returning the decision", async () => {

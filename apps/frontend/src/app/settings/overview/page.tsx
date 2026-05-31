@@ -2,7 +2,6 @@
 
 import { useSettingsOverviewData } from "../../../hooks/use-settings-overview-data";
 import { SettingsOverviewSection } from "../../../components/settings-overview-section";
-import { SettingsModuleRoadmap } from "../../../components/settings-module-roadmap";
 import { listSettingsLiveSections } from "../settings-sections";
 
 export default function SettingsOverviewPage() {
@@ -26,10 +25,5 @@ export default function SettingsOverviewPage() {
     }
   ];
 
-  return (
-    <>
-      <SettingsOverviewSection error={error} overviewStats={overviewStats} />
-      <SettingsModuleRoadmap scheduledJobCount={scheduledJobsCount} />
-    </>
-  );
+  return <SettingsOverviewSection error={error} overviewStats={overviewStats} />;
 }

@@ -213,6 +213,96 @@ test("E2bClaudeRuntimeProcess forwards approval_request and sends approval_respo
   }
 });
 
+test("turn_complete reconciles an unresolved approval by firing onApprovalExpired", async () => {
+  const staging = await makeStagingDir("claude-e2b-reconcile");
+  try {
+    const { sandbox, callbacks } = createFakeSandbox();
+    const expired: string[] = [];
+
+    const proc = await E2bClaudeRuntimeProcess.start({
+      e2bApiKey: "k",
+      e2bTemplateId: "tpl",
+      e2bSandboxTimeoutMs: 60000,
+      workspacePath: "/home/user/workspace/sess-1",
+      localWorkspacePath: staging,
+      logger: silentLog,
+      sessionId: "sess-1",
+      runtimeId: "claude-1",
+      // Long TTL so the backend deny timer cannot fire on its own during the
+      // test — the reconciliation must come from turn_complete, not the timer.
+      approvalRequestTtlMs: 600_000,
+      onApprovalExpired: (id) => expired.push(id),
+      loadSandboxClass: async () => ({ create: async () => sandbox })
+    });
+
+    const runPromise = proc.runTurn(turnFrame("t-r"), {
+      onSdkMessage: () => {},
+      onApprovalRequest: () => {
+        // User never decides; the harness self-denies and finishes the turn.
+      },
+      onComplete: () => {},
+      onFail: (err) => expect.fail(`unexpected fail: ${err}`)
+    });
+
+    callbacks.onStdout?.(
+      '{"type":"approval_request","approvalId":"a-9","toolName":"Write","toolInput":{},"kind":"file_change"}\n'
+    );
+    callbacks.onStdout?.('{"type":"turn_complete","turnId":"t-r","claudeSessionId":null}\n');
+
+    await runPromise;
+
+    // The still-pending approval was reconciled so its DB row can be expired,
+    // rather than its timer being silently dropped (which would strand it).
+    expect(expired).toEqual(["a-9"]);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+});
+
+test("turn_complete does NOT expire an approval the user already resolved", async () => {
+  const staging = await makeStagingDir("claude-e2b-resolved");
+  try {
+    const { sandbox, callbacks } = createFakeSandbox();
+    const expired: string[] = [];
+
+    const proc = await E2bClaudeRuntimeProcess.start({
+      e2bApiKey: "k",
+      e2bTemplateId: "tpl",
+      e2bSandboxTimeoutMs: 60000,
+      workspacePath: "/home/user/workspace/sess-1",
+      localWorkspacePath: staging,
+      logger: silentLog,
+      sessionId: "sess-1",
+      runtimeId: "claude-1",
+      approvalRequestTtlMs: 600_000,
+      onApprovalExpired: (id) => expired.push(id),
+      loadSandboxClass: async () => ({ create: async () => sandbox })
+    });
+
+    const runPromise = proc.runTurn(turnFrame("t-ok"), {
+      onSdkMessage: () => {},
+      onApprovalRequest: (frame) => {
+        void proc.sendApprovalResponse(frame.approvalId, "approve");
+      },
+      onComplete: () => {},
+      onFail: (err) => expect.fail(`unexpected fail: ${err}`)
+    });
+
+    callbacks.onStdout?.(
+      '{"type":"approval_request","approvalId":"a-ok","toolName":"Write","toolInput":{},"kind":"file_change"}\n'
+    );
+    callbacks.onStdout?.('{"type":"turn_complete","turnId":"t-ok","claudeSessionId":null}\n');
+
+    await runPromise;
+
+    // The user's decision cleared the timer in sendApprovalResponse, so turn end
+    // must not also expire it.
+    expect(expired).toEqual([]);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+});
+
 test("E2bClaudeRuntimeProcess turn_failed surfaces to onFail and rejects runTurn", async () => {
   const staging = await makeStagingDir("claude-e2b-fail");
   try {

@@ -86,6 +86,43 @@ describe("claude workspace renderer", () => {
     expect(skillFile.includes("Call write_artifact tool.")).toBeTruthy();
   });
 
+  test("names the command file from the validated skill id, not the display name", async () => {
+    await renderClaudeWorkspace({
+      workspacePath,
+      developerInstructions: null,
+      skills: [
+        // Display name carries spaces/casing; only the id is filesystem-safe.
+        { id: "pdf-skill", name: "PDF Processing", instructions: "Parse PDFs." }
+      ],
+      mcpServers: [],
+      enabledToolIds: [],
+      runtimeToken: "rt_test",
+      managedToolCatalog: sharedManagedToolCatalog
+    });
+
+    const skillFile = await readFile(
+      path.join(workspacePath, ".claude", "commands", "pdf-skill.md"),
+      "utf-8"
+    );
+    expect(skillFile.includes("Parse PDFs.")).toBeTruthy();
+  });
+
+  test("rejects a skill id that could escape the commands directory", async () => {
+    await expect(
+      renderClaudeWorkspace({
+        workspacePath,
+        developerInstructions: null,
+        skills: [
+          { id: "../../etc/evil", name: "Evil", instructions: "pwned" }
+        ],
+        mcpServers: [],
+        enabledToolIds: [],
+        runtimeToken: "rt_test",
+        managedToolCatalog: sharedManagedToolCatalog
+      })
+    ).rejects.toThrow(/Invalid skill id/);
+  });
+
   test("skips developer instructions section in CLAUDE.md when null", async () => {
     await renderClaudeWorkspace({
       workspacePath,

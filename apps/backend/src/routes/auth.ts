@@ -1,11 +1,12 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { WorkOS } from "@workos-inc/node";
 
 import { uuidv7 } from "../lib/uuid.js";
 
 import type { AppConfig } from "../config.js";
+import { isCorsOriginAllowed } from "../lib/cors.js";
 import type { Pool } from "../lib/db.js";
 import { withTransaction } from "../lib/db.js";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../lib/jwt.js";
@@ -46,6 +47,56 @@ export function resolveTenantMembershipRole(input: {
   }
 
   return input.workosRoleSlug === "admin" ? "admin" : "member";
+}
+
+/**
+ * CSRF guard for the cookie-only state-changing auth routes (`/auth/refresh`,
+ * `/auth/logout`). The refresh cookie is `SameSite=None` (the frontend and
+ * backend live on different domains), so the browser attaches it to cross-site
+ * requests — meaning a malicious page could trigger a forced logout or an
+ * unwanted token rotation. CORS stops the attacker from *reading* the response,
+ * but not from *sending* the request, so these side-effects would still run.
+ *
+ * We reject any request whose `Origin` (or, as a fallback, `Referer`) header is
+ * present but does not match the configured frontend origin. Requests with
+ * neither header (non-browser / server-to-server callers) are allowed: a
+ * cross-site page in a modern browser cannot suppress both headers on a
+ * credentialed POST, so their absence means the request did not originate from a
+ * forged browser context.
+ *
+ * Returns `true` when the request passed the check (or no check applied) and
+ * `false` after it has written a 403 response.
+ */
+export function passesCsrfOriginCheck(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  allowedOrigin: string
+): boolean {
+  const origin = request.headers.origin;
+  if (origin) {
+    if (isCorsOriginAllowed(origin, allowedOrigin)) {
+      return true;
+    }
+    reply.code(403).send({ error: "csrf_origin_mismatch" });
+    return false;
+  }
+
+  const referer = request.headers.referer;
+  if (referer) {
+    let refererOrigin: string | undefined;
+    try {
+      refererOrigin = new URL(referer).origin;
+    } catch {
+      refererOrigin = undefined;
+    }
+    if (refererOrigin && isCorsOriginAllowed(refererOrigin, allowedOrigin)) {
+      return true;
+    }
+    reply.code(403).send({ error: "csrf_origin_mismatch" });
+    return false;
+  }
+
+  return true;
 }
 
 function requireRefreshTokenStore(app: FastifyInstance) {
@@ -287,6 +338,10 @@ export async function registerAuthRoutes(
     });
 
     app.post("/auth/refresh", async (request, reply) => {
+      if (!passesCsrfOriginCheck(request, reply, config.API_ORIGIN)) {
+        return reply;
+      }
+
       const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
       if (!refreshToken) {
         return reply.code(401).send({ error: "missing_refresh_token" });
@@ -391,6 +446,10 @@ export async function registerAuthRoutes(
     });
 
     app.post("/auth/logout", async (request, reply) => {
+      if (!passesCsrfOriginCheck(request, reply, config.API_ORIGIN)) {
+        return reply;
+      }
+
       const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
 
       // Revoke the entire refresh-token family so any rotated jti from the

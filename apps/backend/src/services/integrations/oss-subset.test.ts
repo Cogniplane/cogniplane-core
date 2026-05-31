@@ -118,11 +118,11 @@ const ossSubsetSetup = test("OSS subset (no SharePoint): registers only GitHub +
 
   // Managed tool catalog has no sharepoint_* tools.
   const toolIds = catalog.listIds();
-  expect(toolIds.includes("github_read_file")).toBeTruthy();
-  expect(toolIds.includes("notion_search")).toBeTruthy();
-  expect(toolIds.includes("session_context")).toBeTruthy();
-  expect(toolIds.includes("write_artifact")).toBeTruthy();
-  expect(!toolIds.some((id) => id.startsWith("sharepoint_"))).toBeTruthy();
+  expect(toolIds.includes("github_read_file")).toBe(true);
+  expect(toolIds.includes("notion_search")).toBe(true);
+  expect(toolIds.includes("session_context")).toBe(true);
+  expect(toolIds.includes("write_artifact")).toBe(true);
+  expect(toolIds.some((id) => id.startsWith("sharepoint_"))).toBe(false);
 
   // Service produces an admin view that lists exactly the registered
   // descriptors and resolves session tool ids correctly.
@@ -157,10 +157,10 @@ const ossSubsetSetup = test("OSS subset (no SharePoint): registers only GitHub +
   expect(adminView.map((v) => v.id).sort()).toEqual(["github", "notion"]);
 
   const sessionToolIds = await service.resolveSessionToolIds("t1", "u1");
-  expect(sessionToolIds.includes("github_read_file")).toBeTruthy();
-  expect(sessionToolIds.includes("notion_search")).toBeTruthy();
-  expect(sessionToolIds.includes("notion_create_page")).toBeTruthy();
-  expect(!sessionToolIds.some((id) => id.startsWith("sharepoint_"))).toBeTruthy();
+  expect(sessionToolIds.includes("github_read_file")).toBe(true);
+  expect(sessionToolIds.includes("notion_search")).toBe(true);
+  expect(sessionToolIds.includes("notion_create_page")).toBe(true);
+  expect(sessionToolIds.some((id) => id.startsWith("sharepoint_"))).toBe(false);
 
   // The factory builds tool definitions for every registered factory.
   // Plug in cheap stubs for the per-provider connection deps — the
@@ -183,11 +183,11 @@ const ossSubsetSetup = test("OSS subset (no SharePoint): registers only GitHub +
     notionConnections: fakeConnections as never
   });
   const toolNames = tools.map((t) => t.name);
-  expect(toolNames.includes("github_read_file")).toBeTruthy();
-  expect(toolNames.includes("notion_search")).toBeTruthy();
-  expect(toolNames.includes("session_context")).toBeTruthy();
-  expect(toolNames.includes("write_artifact")).toBeTruthy();
-  expect(!toolNames.some((n) => n.startsWith("sharepoint_"))).toBeTruthy();
+  expect(toolNames.includes("github_read_file")).toBe(true);
+  expect(toolNames.includes("notion_search")).toBe(true);
+  expect(toolNames.includes("session_context")).toBe(true);
+  expect(toolNames.includes("write_artifact")).toBe(true);
+  expect(toolNames.some((n) => n.startsWith("sharepoint_"))).toBe(false);
 });
 
 void ossSubsetSetup;

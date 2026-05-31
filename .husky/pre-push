@@ -10,6 +10,13 @@
 # To disable globally: `git config core.hooksPath /dev/null` (not recommended).
 set -e
 
+if command -v gitleaks &>/dev/null; then
+  echo "▶ Pre-push: gitleaks"
+  gitleaks detect --no-banner --redact --config .gitleaks.toml
+else
+  echo "▶ Pre-push: gitleaks not installed — skipping (install with: brew install gitleaks)"
+fi
+
 echo "▶ Pre-push: lint"
 if command -v pnpm &>/dev/null; then
   pnpm lint

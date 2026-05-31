@@ -3,6 +3,7 @@ import { type ManagedToolFactoryRegistry } from "./factory.js";
 import { createGithubTools, GITHUB_TOOL_CATALOG } from "./github-tools.js";
 import { createNotionTools, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
+import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
 import { createWriteArtifactTool, WRITE_ARTIFACT_CATALOG } from "./write-artifact.js";
 
 type RawCatalogEntry = { name: string; description: string; readOnly: boolean };
@@ -32,6 +33,7 @@ export function registerBuiltinManagedTools(
   // tenantConfigurable=true: managed tools governed by the tenant Agent
   // settings picker (session_context, list_artifacts, write_artifact, ...).
   catalog.register(asCatalogEntries(SESSION_TOOL_CATALOG, true));
+  catalog.register(asCatalogEntries(SKILL_CORPUS_TOOL_CATALOG, true));
   catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true));
 
   // tenantConfigurable=false: integration-owned tools, gated by the
@@ -40,6 +42,7 @@ export function registerBuiltinManagedTools(
   catalog.register(asCatalogEntries(NOTION_TOOL_CATALOG, false));
 
   factoryRegistry.register("session", createSessionTools);
+  factoryRegistry.register("skill-corpus", createSkillCorpusTool);
   factoryRegistry.register("github", createGithubTools);
   factoryRegistry.register("notion", createNotionTools);
   factoryRegistry.register("write-artifact", createWriteArtifactTool);

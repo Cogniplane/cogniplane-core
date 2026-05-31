@@ -3,6 +3,7 @@ import { test, afterEach, expect } from "vitest";
 
 import type { AvailableModel } from "../domain/models.js";
 import type { RuntimeAdapter } from "../runtime-contracts.js";
+import { createFakeFetch, type FakeFetch } from "../test-helpers/fake-fetch.js";
 
 import {
   enrichClaudeModelsFromAnthropic,
@@ -14,9 +15,10 @@ import { createAnthropicCapabilitiesCache } from "./models-anthropic-cache.js";
 
 const stubAdapter = { hasActiveTurn: () => false } as unknown as RuntimeAdapter;
 
-const ORIGINAL_FETCH = globalThis.fetch;
+let fake: FakeFetch | null = null;
 afterEach(() => {
-  globalThis.fetch = ORIGINAL_FETCH;
+  fake?.restore();
+  fake = null;
 });
 
 function makeStores(overrides: Partial<ModelRouteStores> = {}): ModelRouteStores {
@@ -271,39 +273,38 @@ test("enrichClaudeModelsFromAnthropic: returns models unchanged when API key emp
 });
 
 test("enrichClaudeModelsFromAnthropic: returns unchanged when Anthropic API responds non-2xx", async () => {
-  globalThis.fetch = (async () => new Response("err", { status: 500 })) as typeof fetch;
+  fake = createFakeFetch(() => new Response("err", { status: 500 }));
   const stores = makeStores({ getAnthropicApiKey: async () => "k" });
   const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
   expect(result).toEqual([claudeModel]);
 });
 
 test("enrichClaudeModelsFromAnthropic: returns unchanged when fetch rejects (timeout/network)", async () => {
-  globalThis.fetch = (async () => {
+  fake = createFakeFetch(() => {
     throw new Error("net");
-  }) as typeof fetch;
+  });
   const stores = makeStores({ getAnthropicApiKey: async () => "k" });
   const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
   expect(result).toEqual([claudeModel]);
 });
 
 test("enrichClaudeModelsFromAnthropic: cache reuses the upstream result on a second call within TTL", async () => {
-  let fetchCalls = 0;
-  globalThis.fetch = (async () => {
-    fetchCalls += 1;
-    return new Response(
-      JSON.stringify({
-        data: [
-          {
-            id: "claude-sonnet",
-            capabilities: {
-              effort: { supported: true, high: { supported: true } }
+  fake = createFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: "claude-sonnet",
+              capabilities: {
+                effort: { supported: true, high: { supported: true } }
+              }
             }
-          }
-        ]
-      }),
-      { status: 200 }
-    );
-  }) as typeof fetch;
+          ]
+        }),
+        { status: 200 }
+      )
+  );
 
   const cache = createAnthropicCapabilitiesCache({
     successTtlMs: 60_000,
@@ -317,7 +318,7 @@ test("enrichClaudeModelsFromAnthropic: cache reuses the upstream result on a sec
   const first = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
   const second = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
 
-  expect(fetchCalls).toBe(1);
+  expect(fake.calls.length).toBe(1);
   expect(first[0].supportedEfforts).toEqual(["high"]);
   expect(second[0].supportedEfforts).toEqual(["high"]);
 });

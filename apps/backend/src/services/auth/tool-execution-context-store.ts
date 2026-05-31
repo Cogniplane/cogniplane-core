@@ -2,6 +2,21 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
+/**
+ * Thrown when a `require`/`requireOwned` lookup finds no live tool context
+ * (missing row, wrong tenant, wrong owner, or expired TTL). Carries a stable
+ * machine-readable `code` so callers and tests can branch on the contract
+ * instead of matching prose in the message.
+ */
+export class ToolContextUnavailableError extends Error {
+  readonly code = "TOOL_CONTEXT_UNAVAILABLE" as const;
+
+  constructor(public readonly toolContextId: string) {
+    super(`Tool context ${toolContextId} was not found or expired.`);
+    this.name = "ToolContextUnavailableError";
+  }
+}
+
 export type ToolExecutionContext = {
   toolContextId: string;
   tenantId: string;
@@ -142,7 +157,7 @@ export class ToolExecutionContextStore {
   async require(tenantId: string, toolContextId: string): Promise<ToolExecutionContext> {
     const context = await this.get(tenantId, toolContextId);
     if (!context) {
-      throw new Error(`Tool context ${toolContextId} was not found or expired.`);
+      throw new ToolContextUnavailableError(toolContextId);
     }
 
     return context;
@@ -151,7 +166,7 @@ export class ToolExecutionContextStore {
   async requireOwned(tenantId: string, toolContextId: string, userId: string): Promise<ToolExecutionContext> {
     const context = await this.getOwned(tenantId, toolContextId, userId);
     if (!context) {
-      throw new Error(`Tool context ${toolContextId} was not found or expired.`);
+      throw new ToolContextUnavailableError(toolContextId);
     }
 
     return context;

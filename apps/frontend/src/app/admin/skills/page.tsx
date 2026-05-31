@@ -19,9 +19,7 @@ export default function AdminSkillsPage() {
     handlePublish,
     handleUnpublish,
     handleDisable,
-    handleSaveManifestUrl,
-    handleLaunchImprovement,
-    handleListImprovementSessions
+    handleSaveManifestUrl
   } = useAdminSkillsData();
 
   return (
@@ -48,8 +46,6 @@ export default function AdminSkillsPage() {
         onListRevisions={handleListRevisions}
         onActivateRevision={handleActivateRevision}
         onSaveManifestUrl={handleSaveManifestUrl}
-        onLaunchImprovement={handleLaunchImprovement}
-        onListImprovementSessions={handleListImprovementSessions}
       />
     </section>
   );

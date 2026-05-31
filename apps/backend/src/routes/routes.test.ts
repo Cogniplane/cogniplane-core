@@ -1432,6 +1432,7 @@ test("POST /messages accepts optional model override", async () => {
   });
 
   expect(msgResponse.statusCode).toBe(200);
+  expect(runtimeManager.runMessageInputs.at(-1)?.model).toBe("gpt-5.2");
 });
 
 test("POST /messages forwards an effort override when the model supports it", async () => {

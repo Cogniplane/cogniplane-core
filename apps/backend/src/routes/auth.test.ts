@@ -197,8 +197,9 @@ describe("GET /auth/login", () => {
 
     const stateCookie = parseSetCookie(res.headers["set-cookie"], "cogniplane_oauth_state");
     expect(stateCookie).not.toBeNull();
-    // The base64url-encoded random state is 43 chars (32 bytes → ~43 b64url chars).
-    expect(stateCookie!.value.length).toBeGreaterThan(20);
+    // The state is `randomBytes(32).toString("base64url")`: exactly 43
+    // unpadded base64url chars from the [A-Za-z0-9_-] alphabet.
+    expect(stateCookie!.value).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(stateCookie!.attrs.httponly).toBe(true);
     expect(stateCookie!.attrs.secure).toBe(true);
     expect(String(stateCookie!.attrs.samesite).toLowerCase()).toBe("none");
@@ -307,7 +308,7 @@ describe("POST /auth/callback", () => {
         rows: [{ user_id: "user-uuid-1" }],
         rowCount: 1
       }))
-      .onQuery(/COUNT\(\*\) AS cnt FROM tenant_memberships/, () => ({
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({
         // 0 = first member → owner promotion
         rows: [{ cnt: "0" }],
         rowCount: 1
@@ -358,7 +359,7 @@ describe("POST /auth/callback", () => {
     harness.pool
       .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
-      .onQuery(/COUNT\(\*\) AS cnt/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
       .onQuery(/SELECT role FROM tenant_memberships/, () => ({
         rows: [{ role: "owner" }],
         rowCount: 1
@@ -383,7 +384,7 @@ describe("POST /auth/callback", () => {
     harness.pool
       .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
-      .onQuery(/COUNT\(\*\) AS cnt/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
       .onQuery(/SELECT role FROM tenant_memberships/, () => ({
         rows: [{ role: "member" }],
         rowCount: 1
@@ -588,6 +589,74 @@ describe("POST /auth/refresh", () => {
     expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({ error: "invalid_refresh_token" });
   });
+
+  test("rejects a cross-site Origin before touching the refresh token (403)", async () => {
+    const familyId = "fid-csrf";
+    const jti = "jti-csrf";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, {
+      sub: "user-csrf",
+      tid: "tenant-csrf",
+      jti,
+      fid: familyId
+    });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      headers: { origin: "https://evil.example" },
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "csrf_origin_mismatch" });
+    // The jti must NOT have been consumed — the guard runs first.
+    expect(harness.redis.store.has(`refresh_jti:${jti}`)).toBe(true);
+  });
+
+  test("rejects a cross-site Referer when no Origin is sent (403)", async () => {
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      headers: { referer: "https://evil.example/attack" },
+      cookies: { cogniplane_refresh: "anything" }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "csrf_origin_mismatch" });
+  });
+
+  test("allows a same-origin Origin matching API_ORIGIN", async () => {
+    const familyId = "fid-same-origin";
+    const oldJti = "jti-same-origin";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, {
+      sub: "user-1",
+      tid: "tenant-1",
+      jti: oldJti,
+      fid: familyId
+    });
+    await issueRefreshJti(harness.redis, { jti: oldJti, familyId, ttlSeconds: 60 });
+
+    harness.pool
+      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
+        rows: [{ role: "admin" }],
+        rowCount: 1
+      }))
+      .onQuery(/SELECT email FROM users/, () => ({
+        rows: [{ email: "alice@example.com" }],
+        rowCount: 1
+      }));
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      headers: { origin: "http://localhost:3000" },
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { accessToken: string }).accessToken.length).toBeGreaterThan(0);
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -628,6 +697,30 @@ describe("POST /auth/logout", () => {
     const res = await harness.app.inject({ method: "POST", url: "/auth/logout" });
     expect(res.statusCode).toBe(200);
     expect(harness.redis.store.size).toBe(0);
+  });
+
+  test("rejects a cross-site Origin before revoking the family (403)", async () => {
+    const familyId = "fid-logout-csrf";
+    const jti = "jti-logout-csrf";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, {
+      sub: "user-l",
+      tid: "tenant-l",
+      jti,
+      fid: familyId
+    });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/logout",
+      headers: { origin: "https://evil.example" },
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "csrf_origin_mismatch" });
+    // The family must still be active — a forged logout cannot revoke it.
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
   });
 });
 

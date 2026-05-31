@@ -2,8 +2,7 @@
 
 import { useAdminOverviewData } from "../../../hooks/use-admin-overview-data";
 import { AdminOverviewSection } from "../../../components/admin-overview-section";
-import { AdminModuleRoadmap } from "../../../components/admin-module-roadmap";
-import { ADMIN_PLANNED_SECTIONS } from "../admin-sections";
+import { ADMIN_LIVE_SECTIONS } from "../admin-sections";
 
 export default function AdminOverviewPage() {
   const {
@@ -16,8 +15,8 @@ export default function AdminOverviewPage() {
   const overviewStats = [
     {
       label: "Live modules",
-      value: "6",
-      detail: "Skills, MCP, agent settings, runtime rollout, users, and token usage"
+      value: String(ADMIN_LIVE_SECTIONS.length),
+      detail: "Admin sections available in the control plane"
     },
     {
       label: "Enabled skills",
@@ -28,22 +27,8 @@ export default function AdminOverviewPage() {
       label: "MCP servers",
       value: String(mcpServersCount),
       detail: "Registered in the gateway"
-    },
-    {
-      label: "Planned modules",
-      value: String(ADMIN_PLANNED_SECTIONS.length),
-      detail: "Dashboard, tracing, and cost controls queued next"
     }
   ];
 
-  return (
-    <>
-      <AdminOverviewSection error={error} overviewStats={overviewStats} />
-      <AdminModuleRoadmap
-        skillsCount={skillsCount}
-        mcpServersCount={mcpServersCount}
-        plannedModules={ADMIN_PLANNED_SECTIONS}
-      />
-    </>
-  );
+  return <AdminOverviewSection error={error} overviewStats={overviewStats} />;
 }

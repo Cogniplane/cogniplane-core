@@ -2,7 +2,6 @@ import { SignJWT, jwtVerify } from "jose";
 
 import type { AppConfig } from "../../../config.js";
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
-import type { Pool } from "../../../lib/db.js";
 import type { AuditEventStore } from "../../audit-event-store.js";
 import {
   exchangeUserAuthorizationCode,
@@ -89,7 +88,6 @@ function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSumm
 export class GithubConnectionService {
   constructor(
     private readonly config: AppConfig,
-    private readonly _db: Pool,
     private readonly store: GithubConnectionStore,
     private readonly auditEvents?: AuditEventStore,
     private readonly runtimeManager?: RuntimeInvalidator

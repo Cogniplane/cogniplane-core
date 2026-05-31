@@ -141,9 +141,10 @@ WHERE tenant_id = 'system'
   AND active_revision_id IS NULL;
 
 -- ─── Built-in skill: skill-improver ───────────────────────────────────────
--- Drives improver sessions launched from the admin skills page. Per-session
--- runtime overrides narrow the active skill list to just this one + the
--- corpus artifact when the admin starts a session.
+-- Activated in any normal session. When the admin asks to improve a skill,
+-- this skill instructs the agent to call the `read_skill_corpus` managed tool
+-- (which assembles a redacted corpus of past sessions where the target skill
+-- was used) and propose a revised SKILL.md.
 
 INSERT INTO admin_skills (
   tenant_id, skill_id, skill_name, description,
@@ -172,18 +173,17 @@ SELECT
   jsonb_build_object(
     'skillName', 'Skill Improver',
     'description', 'Analyzes a corpus of past sessions where a skill was used and proposes a revised SKILL.md.',
-    'associatedToolIds', jsonb_build_array('write_artifact'),
+    'associatedToolIds', jsonb_build_array('read_skill_corpus', 'write_artifact'),
     'instructions', $instructions$## Skill Improver
 
 You help the admin improve a single SKILL.md by analyzing how the skill has
-actually been used in past sessions. The session has been pre-loaded with one
-markdown artifact named `skill-improvement-corpus-<skill>-<timestamp>.md`
-that contains redacted excerpts from real sessions where the skill was
-invoked, plus the current SKILL.md content.
+actually been used in past sessions.
 
 ### Workflow
 
-1. **Read the corpus artifact first.** Use `read_text_artifact` to load it.
+1. **Read the corpus first.** Call the `read_skill_corpus` tool with the
+   target skill's `skillId`. It returns a redacted markdown corpus of recent
+   sessions where the skill was offered or used, plus the current SKILL.md.
    Do not propose changes before you have read it. If the corpus is empty or
    very small, say so and ask the admin what they want to focus on instead
    of guessing.
@@ -210,13 +210,11 @@ invoked, plus the current SKILL.md content.
 
 5. **When the admin approves the direction**, write the final improved
    SKILL.md as an artifact via `write_artifact`. Use the filename
-   `SKILL.md`. The admin will copy the contents into the inline skill
-   editor, which creates a new revision through the normal pipeline.
+   `SKILL.md`. The admin copies the contents into the inline skill editor,
+   which creates a new revision through the normal pipeline.
 
 ### Constraints
 
-- This session is restricted to read-only corpus tools and `write_artifact`.
-  You cannot run shell commands, fetch URLs, or call other MCP servers.
 - Never invent evidence. If the corpus does not support a claim, say so.
 - Keep the proposed SKILL.md focused. Removing instructions that no longer
   match observed behavior is as valuable as adding new ones.

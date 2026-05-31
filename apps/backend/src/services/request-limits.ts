@@ -1,8 +1,96 @@
 import type { AppConfig } from "../config.js";
 
-type LimitResource = "session_create" | "message_turn";
+export type LimitResource =
+  | "session_create"
+  | "message_turn"
+  | "artifact_upload"
+  | "artifact_create"
+  | "scheduled_job_create"
+  | "oauth_callback";
 type LimitScope = "user" | "tenant";
 type LimitType = "rate_limit" | "usage_quota";
+
+// Human label for a resource, used in the `message` of a limit-exceeded payload.
+// Centralized so both the in-memory and Redis implementations stay in sync as
+// new resources are added.
+const RESOURCE_LABELS: Record<LimitResource, string> = {
+  session_create: "session creation",
+  message_turn: "message",
+  artifact_upload: "artifact upload",
+  artifact_create: "artifact creation",
+  scheduled_job_create: "scheduled job creation",
+  oauth_callback: "OAuth callback"
+};
+
+export function rateLimitMessage(resource: LimitResource, scope: LimitScope): string {
+  return `${scope === "user" ? "User" : "Tenant"} ${RESOURCE_LABELS[resource]} rate limit exceeded.`;
+}
+
+// Config keys the rate-limit knobs are read from — shared by both fromAppConfig
+// implementations so the two stay structurally identical.
+export type RequestLimitsConfigKeys = Pick<
+  AppConfig,
+  | "RATE_LIMIT_WINDOW_MS"
+  | "SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW"
+  | "SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "MESSAGE_LIMIT_PER_USER_PER_WINDOW"
+  | "MESSAGE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW"
+  | "ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW"
+  | "ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW"
+  | "ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW"
+  | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
+  | "OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW"
+  | "TURN_QUOTA_PER_USER_PER_DAY"
+  | "TURN_QUOTA_PER_TENANT_PER_DAY"
+>;
+
+// Build the shared rate-limit + quota config from app config. Used by both the
+// in-memory and Redis stores so a new resource is added in exactly one place.
+export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
+  rateLimit: { windowMs: number; limits: Record<LimitResource, Record<LimitScope, number>> };
+  quota: { dailyTurnQuota: Record<LimitScope, number> };
+} {
+  return {
+    rateLimit: {
+      windowMs: config.RATE_LIMIT_WINDOW_MS,
+      limits: {
+        session_create: {
+          user: config.SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        message_turn: {
+          user: config.MESSAGE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.MESSAGE_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        artifact_upload: {
+          user: config.ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        artifact_create: {
+          user: config.ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        scheduled_job_create: {
+          user: config.SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        oauth_callback: {
+          user: config.OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW
+        }
+      }
+    },
+    quota: {
+      dailyTurnQuota: {
+        user: config.TURN_QUOTA_PER_USER_PER_DAY,
+        tenant: config.TURN_QUOTA_PER_TENANT_PER_DAY
+      }
+    }
+  };
+}
 
 type RateLimitConfig = {
   windowMs: number;
@@ -70,39 +158,8 @@ export class RequestLimits implements RequestLimitsInterface {
     }
   ) {}
 
-  static fromAppConfig(
-    config: Pick<
-      AppConfig,
-      | "RATE_LIMIT_WINDOW_MS"
-      | "SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW"
-      | "SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
-      | "MESSAGE_LIMIT_PER_USER_PER_WINDOW"
-      | "MESSAGE_LIMIT_PER_TENANT_PER_WINDOW"
-      | "TURN_QUOTA_PER_USER_PER_DAY"
-      | "TURN_QUOTA_PER_TENANT_PER_DAY"
-    >
-  ): RequestLimits {
-    return new RequestLimits({
-      rateLimit: {
-        windowMs: config.RATE_LIMIT_WINDOW_MS,
-        limits: {
-          session_create: {
-            user: config.SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW,
-            tenant: config.SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW
-          },
-          message_turn: {
-            user: config.MESSAGE_LIMIT_PER_USER_PER_WINDOW,
-            tenant: config.MESSAGE_LIMIT_PER_TENANT_PER_WINDOW
-          }
-        }
-      },
-      quota: {
-        dailyTurnQuota: {
-          user: config.TURN_QUOTA_PER_USER_PER_DAY,
-          tenant: config.TURN_QUOTA_PER_TENANT_PER_DAY
-        }
-      }
-    });
+  static fromAppConfig(config: RequestLimitsConfigKeys): RequestLimits {
+    return new RequestLimits(buildLimitsConfig(config));
   }
 
   consumeRateLimit(input: {
@@ -147,9 +204,7 @@ export class RequestLimits implements RequestLimitsInterface {
           limit,
           retryAfterMs: Math.max(0, entry.resetAtMs - now),
           resetAt: new Date(entry.resetAtMs).toISOString(),
-          message: `${
-            scope === "user" ? "User" : "Tenant"
-          } ${input.resource === "session_create" ? "session creation" : "message"} rate limit exceeded.`
+          message: rateLimitMessage(input.resource, scope)
         });
       }
     }

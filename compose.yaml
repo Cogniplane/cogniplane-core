@@ -61,7 +61,7 @@ services:
       # (apps/backend/src/codex-release.test.ts) — bumping them requires
       # rebuilding the E2B template too. See docs/self-hosting.md.
       args:
-        CODEX_NPM_VERSION: 0.130.0
+        CODEX_NPM_VERSION: 0.135.0
     container_name: cogniplane-backend
     security_opt:
       - no-new-privileges:true
@@ -83,7 +83,7 @@ services:
       MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/cogniplane
       APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
       LOCAL_DEV_USER_ID: local-dev-user
-      CODEX_VERSION: 0.130.0
+      CODEX_VERSION: 0.135.0
       RUNTIME_BACKEND: local
       CLAUDE_RUNTIME_BACKEND: local
       RUNTIME_WORKSPACE_ROOT: /runtime-workspaces

@@ -229,6 +229,213 @@ test("tenant role updates still allow changing a non-owner member", async () => 
 });
 
 // ---------------------------------------------------------------------------
+// Member-management routes share this fake DB. It serves the membership
+// SELECT (driven by `targetRole`) and records whether the role-UPDATE or the
+// member-DELETE was ever issued — those negative "no write happened" flags are
+// the load-bearing privilege-escalation assertions. `deleteValues` captures
+// the bind values of the DELETE so we can assert membership identity by value
+// (tenantId + targetUserId) without depending on positional bind order.
+// ---------------------------------------------------------------------------
+
+function makeMembersDb(targetRole: string | null) {
+  const tracked = {
+    deleteCalled: false,
+    updateCalled: false,
+    deleteValues: null as unknown[] | null,
+    updateValues: null as unknown[] | null
+  };
+  const client = {
+    async query(text: string, values: unknown[]) {
+      if (
+        text === "BEGIN" ||
+        text === "COMMIT" ||
+        text === "ROLLBACK" ||
+        text.includes("set_config")
+      ) {
+        return { rows: [] };
+      }
+      if (text.includes("SELECT role FROM tenant_memberships")) {
+        return { rows: targetRole === null ? [] : [{ role: targetRole }] };
+      }
+      if (text.includes("UPDATE tenant_memberships SET role")) {
+        tracked.updateCalled = true;
+        tracked.updateValues = values;
+        return { rows: [{ tenant_id: values[1], user_id: values[2], role: values[0] }] };
+      }
+      if (text.includes("DELETE FROM tenant_memberships")) {
+        tracked.deleteCalled = true;
+        tracked.deleteValues = values;
+        return { rows: [] };
+      }
+      throw new Error(`Unexpected query: ${text}`);
+    },
+    release() {}
+  };
+  const db = {
+    async connect() {
+      return client;
+    }
+  };
+  return { db, tracked };
+}
+
+function makeMembersApp(role: string, userId: string) {
+  const app = Fastify();
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId,
+      tenantId: "tenant-1",
+      role,
+      isAdmin: role === "admin"
+    };
+  });
+  return app;
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /tenant/members/:userId
+// ---------------------------------------------------------------------------
+
+test("DELETE member: removing yourself returns 400 cannot_remove_self and never issues a DELETE", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/admin-user" });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({ error: "cannot_remove_self" });
+  // Self-removal is rejected before opening a tenant-scoped transaction.
+  expect(tracked.deleteCalled).toBe(false);
+});
+
+test("DELETE member: removing an owner returns 403 cannot_remove_owner and never issues a DELETE", async () => {
+  const { db, tracked } = makeMembersDb("owner");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/other-owner" });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toEqual({ error: "cannot_remove_owner" });
+  expect(tracked.deleteCalled).toBe(false);
+});
+
+test("DELETE member: unknown member returns 404 member_not_found and never issues a DELETE", async () => {
+  const { db, tracked } = makeMembersDb(null);
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/ghost-user" });
+
+  expect(response.statusCode).toBe(404);
+  expect(response.json()).toEqual({ error: "member_not_found" });
+  expect(tracked.deleteCalled).toBe(false);
+});
+
+test("DELETE member: happy path returns 200 and fires DELETE scoped to tenant + target user", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/member-user" });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual({ ok: true });
+  expect(tracked.deleteCalled).toBe(true);
+  // Assert by value membership so the test does not couple to bind ordering:
+  // the DELETE must be scoped to this tenant AND this target user.
+  expect(tracked.deleteValues).toContain("tenant-1");
+  expect(tracked.deleteValues).toContain("member-user");
+});
+
+// ---------------------------------------------------------------------------
+// PUT /tenant/members/:userId/role  (privilege guards)
+// ---------------------------------------------------------------------------
+
+test("PUT member role: invalid role value returns 400 invalid_role and never issues an UPDATE", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/member-user/role",
+    payload: { role: "superuser" }
+  });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({ error: "invalid_role" });
+  expect(tracked.updateCalled).toBe(false);
+});
+
+test("SECURITY REGRESSION: PUT member role — a non-owner admin cannot assign owner; rejected 403 before any DB write", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  // Actor is an admin, NOT an owner — escalating a member to owner is forbidden.
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/member-user/role",
+    payload: { role: "owner" }
+  });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toEqual({ error: "only_owner_can_assign_owner" });
+  // The guard must short-circuit before the membership lookup OR the UPDATE.
+  expect(tracked.updateCalled).toBe(false);
+});
+
+test("PUT member role: changing your own role returns 400 cannot_change_own_role and never issues an UPDATE", async () => {
+  const { db, tracked } = makeMembersDb("owner");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/owner-user/role",
+    payload: { role: "admin" }
+  });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({ error: "cannot_change_own_role" });
+  expect(tracked.updateCalled).toBe(false);
+});
+
+test("PUT member role: unknown member returns 404 member_not_found and never issues an UPDATE", async () => {
+  const { db, tracked } = makeMembersDb(null);
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/ghost-user/role",
+    payload: { role: "admin" }
+  });
+
+  expect(response.statusCode).toBe(404);
+  expect(response.json()).toEqual({ error: "member_not_found" });
+  expect(tracked.updateCalled).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
 // PUT /tenant/settings/marketplace
 // ---------------------------------------------------------------------------
 

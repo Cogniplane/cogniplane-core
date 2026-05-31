@@ -195,6 +195,53 @@ function ensureNonNullText(value: string | null | undefined): string {
   return value ?? "";
 }
 
+// Persisted-text caps. Tool output in particular comes from an untrusted source
+// — a misbehaving or malicious tool can emit GB-scale stdout — and is stored in
+// full, so an upper bound on what reaches the DB is the only thing protecting
+// storage and later read/serialize cost. Assistant content/reasoning/plan are
+// model-produced and effectively bounded by context, but capped here too as
+// defense in depth. These are storage limits, not correctness limits: we keep
+// the head of the text (where the signal usually is) and append a marker.
+export const MAX_TOOL_RESULT_TEXT_LENGTH = 1_000_000;
+export const MAX_MESSAGE_CONTENT_LENGTH = 1_000_000;
+
+// Single source of truth for the columns returned by message and tool-result
+// mutations — keeps the RETURNING clauses (and the shape mapMessage /
+// mapToolResult expect) in sync across the create/update/upsert/append queries.
+const MESSAGE_RETURNING_COLUMNS = `id, message_id, session_id, user_id, role, status, content_text,
+                    reasoning_content, plan_content,
+                    input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+                    model_name, cost_usd, feedback_rating, feedback_notes, feedback_given_at,
+                    detail_json,
+                    created_at, updated_at`;
+
+const TOOL_RESULT_RETURNING_COLUMNS = `id,
+          tool_result_id,
+          message_id,
+          session_id,
+          user_id,
+          kind,
+          title,
+          status,
+          command_text,
+          cwd,
+          server_name,
+          tool_name,
+          input_text,
+          output_text,
+          exit_code,
+          duration_ms,
+          created_at,
+          updated_at`;
+
+function truncateForStorage(value: string, max: number): string {
+  if (value.length <= max) {
+    return value;
+  }
+  const marker = `\n\n[… truncated ${value.length - max} characters for storage]`;
+  return value.slice(0, max) + marker;
+}
+
 export class MessageStore {
   constructor(private readonly db: Pool) {}
 
@@ -290,12 +337,7 @@ export class MessageStore {
         `
           INSERT INTO messages (message_id, tenant_id, session_id, user_id, role, status, content_text, detail_json)
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-          RETURNING id, message_id, session_id, user_id, role, status, content_text,
-                    reasoning_content, plan_content,
-                    input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                    model_name, cost_usd, feedback_rating, feedback_notes, feedback_given_at,
-                    detail_json,
-                    created_at, updated_at
+          RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
         [
           messageId,
@@ -304,7 +346,7 @@ export class MessageStore {
           input.userId,
           input.role,
           input.status,
-          input.content,
+          truncateForStorage(input.content, MAX_MESSAGE_CONTENT_LENGTH),
           JSON.stringify(input.detail ?? {})
         ]
       );
@@ -356,14 +398,9 @@ export class MessageStore {
           UPDATE messages
           SET status = $4, content_text = $5, updated_at = NOW()
           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
-          RETURNING id, message_id, session_id, user_id, role, status, content_text,
-                    reasoning_content, plan_content,
-                    input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-                    model_name, cost_usd, feedback_rating, feedback_notes, feedback_given_at,
-                    detail_json,
-                    created_at, updated_at
+          RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
-        [tenantId, messageId, userId, status, content]
+        [tenantId, messageId, userId, status, truncateForStorage(content, MAX_MESSAGE_CONTENT_LENGTH)]
       );
 
       return updatedMessage.rows[0]
@@ -400,8 +437,12 @@ export class MessageStore {
           tenantId,
           messageId,
           userId,
-          content.reasoningContent ?? null,
-          content.planContent ?? null
+          content.reasoningContent === undefined
+            ? null
+            : truncateForStorage(content.reasoningContent, MAX_MESSAGE_CONTENT_LENGTH),
+          content.planContent === undefined
+            ? null
+            : truncateForStorage(content.planContent, MAX_MESSAGE_CONTENT_LENGTH)
         ]
       );
     });
@@ -526,24 +567,7 @@ export class MessageStore {
           duration_ms = EXCLUDED.duration_ms,
           updated_at = NOW()
         RETURNING
-          id,
-          tool_result_id,
-          message_id,
-          session_id,
-          user_id,
-          kind,
-          title,
-          status,
-          command_text,
-          cwd,
-          server_name,
-          tool_name,
-          input_text,
-          output_text,
-          exit_code,
-          duration_ms,
-          created_at,
-          updated_at
+          ${TOOL_RESULT_RETURNING_COLUMNS}
       `,
       [
         input.tenantId,
@@ -558,8 +582,8 @@ export class MessageStore {
         ensureNonNullText(input.cwd),
         ensureNonNullText(input.server),
         ensureNonNullText(input.toolName),
-        ensureNonNullText(input.input),
-        ensureNonNullText(input.output),
+        truncateForStorage(ensureNonNullText(input.input), MAX_TOOL_RESULT_TEXT_LENGTH),
+        truncateForStorage(ensureNonNullText(input.output), MAX_TOOL_RESULT_TEXT_LENGTH),
         input.exitCode,
         input.durationMs
       ]
@@ -600,24 +624,7 @@ export class MessageStore {
           SET output_text = output_text || $4, updated_at = NOW()
           WHERE tenant_id = $1 AND tool_result_id = $2 AND user_id = $3
           RETURNING
-            id,
-            tool_result_id,
-            message_id,
-            session_id,
-            user_id,
-            kind,
-            title,
-            status,
-            command_text,
-            cwd,
-            server_name,
-            tool_name,
-            input_text,
-            output_text,
-            exit_code,
-            duration_ms,
-            created_at,
-            updated_at
+            ${TOOL_RESULT_RETURNING_COLUMNS}
         `,
         [tenantId, toolResultId, userId, delta]
       );

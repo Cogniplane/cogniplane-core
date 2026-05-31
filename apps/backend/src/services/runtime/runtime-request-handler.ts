@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
-import type { JsonRpcRequest } from "./codex-runtime-process.js";
+import type { JsonRpcRequest } from "./codex-jsonrpc.js";
 import {
   buildApprovalRequest,
   type PendingApprovalRecord,
@@ -86,7 +86,10 @@ export async function handleRuntimeRequest(input: {
     summary: approval.summary,
     status: "pending",
     decision: null,
-    requestPayload: approval.requestPayload
+    requestPayload: approval.requestPayload,
+    // DB-level deadline mirroring the in-process TTL timer above, so a crash
+    // before the timer fires still lets the startup sweep recover this row.
+    expiresAt: new Date(Date.now() + input.approvalTtlMs).toISOString()
   });
 
   await input.auditEvents.create({

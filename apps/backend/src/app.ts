@@ -1,14 +1,11 @@
 import Fastify from "fastify";
+import type { FastifyError, FastifyReply, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
-import {
-  buildAppDependencies,
-  buildSchedulerWorker,
-  buildSessionJudgeWorker
-} from "./app-dependencies.js";
+import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
 import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
@@ -21,11 +18,47 @@ import { registerAuthRoutes } from "./routes/auth.js";
 import { registerTenantRoutes } from "./routes/tenant.js";
 import { TenantMemberStore } from "./services/tenant-member-store.js";
 import { TenantOrgSettingsStore } from "./services/tenant-org-settings-store.js";
+import { ApprovalStore } from "./services/auth/approval-store.js";
 import { Pool } from "pg";
+
+/**
+ * Map unhandled errors to a safe envelope so internal Error messages and stack
+ * traces never reach clients. Validation errors (Fastify schema, status 400)
+ * and any error a route deliberately set a 4xx status on are passed through
+ * verbatim — those are part of the API contract. Everything else (status >= 500
+ * or unset) is logged in full server-side and returned as an opaque 500.
+ */
+export function handleAppError(
+  error: FastifyError,
+  request: FastifyRequest,
+  reply: FastifyReply
+): void {
+  const statusCode = error.statusCode ?? 500;
+  if (statusCode >= 400 && statusCode < 500) {
+    // Client errors (validation, bad input, explicit 4xx) are safe to surface.
+    reply.code(statusCode).send({
+      error: error.code ?? "bad_request",
+      message: error.message
+    });
+    return;
+  }
+  // Server errors: log the real cause, return an opaque body.
+  request.log.error({ err: error }, "unhandled request error");
+  reply.code(statusCode >= 500 ? statusCode : 500).send({
+    error: "internal_error",
+    message: "An unexpected error occurred."
+  });
+}
 
 export async function buildApp() {
   const config = loadConfig();
   const app = Fastify({
+    // Defense-in-depth HTTP-layer cap on JSON/raw request bodies. Field-level
+    // schemas (e.g. MessagePostRequestSchema.text) enforce tighter per-field
+    // limits, but those only run *after* the whole body is buffered, so a global
+    // cap is what actually bounds memory for an oversized POST. File uploads use
+    // the multipart plugin's own `fileSize` limit and are unaffected by this.
+    bodyLimit: config.MAX_REQUEST_BODY_BYTES,
     logger: {
       // Redact runtime tokens (and similar) that callers embed as query
       // parameters on MCP URLs. Fastify's automatic request-completion log
@@ -45,6 +78,8 @@ export async function buildApp() {
     }
   });
 
+  app.setErrorHandler(handleAppError);
+
   app.decorate("config", config);
   app.decorate("db", createDatabase(config));
   app.decorate("redis", getRedis(config, app.log));
@@ -57,6 +92,40 @@ export async function buildApp() {
 
   // Fail fast if Postgres is unavailable so the app does not boot into a half-working state.
   await app.db.query("SELECT 1");
+
+  // The privileged pool is, by definition, the RLS-bypassing superuser pool:
+  // background work that must read across tenants (scheduler claiming due jobs,
+  // PII scan jobs) and getDownloadToken depend on it. If
+  // MIGRATION_DATABASE_URL is unset, privilegedDb silently falls back to the
+  // RLS-bound app_user pool, and those cross-tenant queries return zero rows
+  // with no error — a near-invisible failure. Verify the pool's contract at boot
+  // so the misconfiguration surfaces immediately rather than as mysteriously
+  // empty job queues in production. Fail-closed on two axes:
+  //   1. If a distinct privileged pool exists, it MUST actually bypass RLS —
+  //      asserted unconditionally, never gated on feature flags, so a flag
+  //      flipping on later can't be the first thing to reveal a broken pool.
+  //   2. If no distinct pool exists (fell back to app.db) but a feature needs
+  //      cross-tenant reads, that's fatal — boot would silently return no rows.
+  const privilegedNeedsBypassRls =
+    config.SCHEDULER_ENABLED || config.PII_PROVIDER_ENABLED || config.AUTH_MODE === "workos";
+  if (privilegedDb !== app.db) {
+    const { rows } = await privilegedDb.query<{ bypassrls: boolean }>(
+      "SELECT rolbypassrls AS bypassrls FROM pg_roles WHERE rolname = current_user"
+    );
+    if (!rows[0]?.bypassrls) {
+      throw new Error(
+        "Privileged database pool must use a role with BYPASSRLS (e.g. a superuser). " +
+          "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
+          "Without it, scheduler/PII cross-tenant queries silently return zero rows under RLS."
+      );
+    }
+  } else if (privilegedNeedsBypassRls) {
+    throw new Error(
+      "Scheduler/PII/workos are enabled but no distinct privileged (BYPASSRLS) database pool is configured. " +
+        "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
+        "Without it, cross-tenant background queries silently return zero rows under RLS."
+    );
+  }
 
   await registerSecurityHeaders(app);
 
@@ -112,17 +181,7 @@ export async function buildApp() {
     auditEvents: deps.auditEvents
   });
 
-  const sessionJudgeWorker = buildSessionJudgeWorker(config, {
-    sessionJudgments: deps.sessionJudgments,
-    messages: deps.messages,
-    dynamicConfig: deps.dynamicConfig,
-    activations: deps.activationTracker,
-    logger: app.log,
-    getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey
-  });
-
-  await registerAppRoutes(app, deps, { sessionJudgeWorker: sessionJudgeWorker ?? undefined });
+  await registerAppRoutes(app, deps);
 
   const schedulerWorker = buildSchedulerWorker(config, {
     userSettings: deps.userSettings,
@@ -144,7 +203,14 @@ export async function buildApp() {
     runtimeAdapters: deps.runtimeAdapters,
     privilegedDb,
     schedulerWorker,
-    sessionJudgeWorker
+    // Cross-tenant stale-approval recovery needs a BYPASSRLS pool; reuse the
+    // privileged pool (asserted to bypass RLS above) so the sweep can see every
+    // tenant's rows in one statement.
+    staleApprovalSweeper: {
+      approvals: new ApprovalStore(privilegedDb),
+      auditEvents: deps.auditEvents,
+      logger: app.log
+    }
   });
 
   return app;

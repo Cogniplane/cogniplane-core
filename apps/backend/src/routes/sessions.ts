@@ -3,7 +3,6 @@ import { z } from "zod";
 
 import {
   SessionEnvelopeSchema,
-  SessionImprovementContextSchema,
   SessionMessagesResponseSchema,
   SessionsListResponseSchema
 } from "@cogniplane/shared-types";
@@ -36,9 +35,7 @@ export function buildSessionRouteStores(deps: AppDependencies) {
     limits: deps.limits,
     activeTurns: deps.activeTurns,
     runtimeAdapters: deps.runtimeAdapters,
-    auditEvents: deps.auditEvents,
-    skillImprovementSessions: deps.skillImprovementSessions,
-    skillConfig: deps.skills
+    auditEvents: deps.auditEvents
   };
 }
 
@@ -54,9 +51,9 @@ export async function registerSessionRoutes(
 
     // `?purposes=` controls which session purposes are returned.
     //   omitted     → only `purpose = 'normal'` (the chat sidebar default;
-    //                 keeps improver runs out of the regular list).
+    //                 keeps non-chat runs like scheduled jobs out of the list).
     //   all         → every active session.
-    //   csv list    → exact set, e.g. `?purposes=normal,skill_improvement`.
+    //   csv list    → exact set, e.g. `?purposes=normal,scheduled`.
     const queryResult = parseRequestInput(reply, listSessionsQuerySchema, request.query ?? {});
     if (!queryResult.ok) {
       return queryResult.response;
@@ -257,44 +254,6 @@ export async function registerSessionRoutes(
     return serialize(SessionMessagesResponseSchema, {
       session,
       messages: await stores.messages.listBySession(tenantId, sessionId, userId)
-    });
-  });
-
-  app.get("/sessions/:sessionId/improvement-context", async (request, reply) => {
-    const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
-    if (!paramsResult.ok) {
-      return paramsResult.response;
-    }
-
-    const { userId, tenantId } = request.auth;
-    const { sessionId } = paramsResult.value;
-    const session = await stores.sessions.getOwned(tenantId, sessionId, userId);
-
-    if (!session || session.status !== "active") {
-      reply.code(404);
-      return notFoundError("session_not_found");
-    }
-    if (session.purpose !== "skill_improvement") {
-      reply.code(404);
-      return notFoundError("not_an_improvement_session");
-    }
-
-    const link = stores.skillImprovementSessions
-      ? await stores.skillImprovementSessions.get(tenantId, sessionId)
-      : null;
-    if (!link) {
-      reply.code(404);
-      return notFoundError("improvement_link_missing");
-    }
-
-    const skill = stores.skillConfig
-      ? await stores.skillConfig.getSkill(tenantId, link.skillId)
-      : null;
-
-    return serialize(SessionImprovementContextSchema, {
-      skillId: link.skillId,
-      skillName: skill?.skillName ?? null,
-      corpusArtifactId: link.corpusArtifactId
     });
   });
 }

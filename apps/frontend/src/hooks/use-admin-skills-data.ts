@@ -10,9 +10,7 @@ import {
   importAdminSkillGithub,
   importAdminSkillInline,
   importAdminSkillZip,
-  launchSkillImprovementSession,
   listAdminSkills,
-  listSkillImprovementSessions,
   listSkillRevisions,
   publishAdminSkill,
   unpublishAdminSkill,
@@ -21,8 +19,6 @@ import {
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import type {
-  LaunchSkillImprovementResponse,
-  SkillImprovementSessionSummary,
   SkillMarketplaceEntry,
   SkillRevision
 } from "@cogniplane/shared-types";
@@ -105,22 +101,6 @@ export function useAdminSkillsData() {
     }
   });
 
-  const improveLaunchMutation = useMutation({
-    mutationFn: launchSkillImprovementSession,
-    onSuccess: async (_result, variables) => {
-      // Refresh the per-skill history so the new session shows up
-      // immediately in the inline list on the card.
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.admin.skillImprovementSessions(variables.skillId)
-      });
-      // Refetch the session list so the chat shell's first-load restore
-      // sees the brand-new improver session and selects it (otherwise the
-      // restore falls back to sessions[0] and the kickoff effect never
-      // matches the staged sessionId).
-      await queryClient.refetchQueries({ queryKey: queryKeys.sessions.list() });
-    }
-  });
-
   let busyKey: string | null = null;
   if (zipImportMutation.isPending) busyKey = "skill-import-zip";
   else if (githubImportMutation.isPending) busyKey = "skill-import-github";
@@ -136,8 +116,6 @@ export function useAdminSkillsData() {
   else if (disableMutation.isPending && disableMutation.variables)
     busyKey = `disable-skill-${disableMutation.variables}`;
   else if (manifestMutation.isPending) busyKey = "skill-marketplace-manifest-url";
-  else if (improveLaunchMutation.isPending && improveLaunchMutation.variables)
-    busyKey = `improve-skill-${improveLaunchMutation.variables.skillId}`;
 
   const pendingMutation =
     zipImportMutation.error ??
@@ -148,8 +126,7 @@ export function useAdminSkillsData() {
     publishMutation.error ??
     unpublishMutation.error ??
     disableMutation.error ??
-    manifestMutation.error ??
-    improveLaunchMutation.error;
+    manifestMutation.error;
 
   const errorFallback = zipImportMutation.error
     ? "Failed to import zip skill bundle."
@@ -169,9 +146,7 @@ export function useAdminSkillsData() {
                 ? "Failed to disable skill."
                 : manifestMutation.error
                   ? "Failed to save marketplace manifest URL."
-                  : improveLaunchMutation.error
-                    ? "Failed to launch the improver session."
-                    : "Failed to load skills.";
+                  : "Failed to load skills.";
   const loadError = skillsQuery.error ?? marketplaceQuery.error ?? tenantQuery.error;
   const currentError = pendingMutation ?? loadError;
 
@@ -217,20 +192,6 @@ export function useAdminSkillsData() {
     handleDisable: (skillId: string) => disableMutation.mutate(skillId),
     handleSaveManifestUrl: async (url: string | null): Promise<void> => {
       await manifestMutation.mutateAsync(url);
-    },
-    handleLaunchImprovement: async (input: {
-      skillId: string;
-      sessionCount: number;
-      provider?: "codex" | "claude-code" | null;
-      model?: string | null;
-      effort?: string | null;
-    }): Promise<LaunchSkillImprovementResponse> => {
-      return improveLaunchMutation.mutateAsync(input);
-    },
-    handleListImprovementSessions: async (
-      skillId: string
-    ): Promise<SkillImprovementSessionSummary[]> => {
-      return listSkillImprovementSessions(skillId);
     }
   };
 }

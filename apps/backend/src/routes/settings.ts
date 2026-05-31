@@ -16,13 +16,12 @@ import { uuidv7 } from "../lib/uuid.js";
 
 import { computeNextCronRunAt } from "../lib/cron.js";
 import { ensureUser, withTenantScope } from "../lib/db.js";
-import { getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
+import { apiError, getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
 import { jobIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import type { AuditEventStore } from "../services/audit-event-store.js";
 import { GithubConnectionNotConfiguredError } from "../services/integrations/github/github-connection-service.js";
 import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
 import { NotionConnectionNotConfiguredError } from "../services/integrations/notion/notion-connection-service.js";
@@ -67,48 +66,6 @@ function buildInvalidScheduledJobConfigError(error: unknown) {
       message: getErrorMessage(error, "Invalid scheduled job configuration.")
     }
   ]);
-}
-
-async function createScheduledJobAuditEvent(
-  auditEvents: AuditEventStore,
-  input: {
-    tenantId: string;
-    userId: string;
-    type: "user.scheduled_job.created" | "user.scheduled_job.updated";
-    job: {
-      jobId: string;
-      jobName: string;
-      enabled: boolean;
-      nextRunAt: string | null;
-    };
-  }
-) {
-  await auditEvents.create({
-    tenantId: input.tenantId,
-    sessionId: null,
-    userId: input.userId,
-    type: input.type,
-    payload: buildScheduledJobAuditPayload(input.job)
-  });
-}
-
-async function createScheduledJobDeletedAuditEvent(
-  auditEvents: AuditEventStore,
-  input: {
-    tenantId: string;
-    userId: string;
-    jobId: string;
-  }
-) {
-  await auditEvents.create({
-    tenantId: input.tenantId,
-    sessionId: null,
-    userId: input.userId,
-    type: "user.scheduled_job.deleted",
-    payload: {
-      jobId: input.jobId
-    }
-  });
 }
 
 async function buildScheduledJobPersistenceInput(
@@ -170,7 +127,8 @@ export function buildSettingsRouteStores(deps: AppDependencies, extras: { config
     notionConnections: deps.notionConnectionService,
     config: extras.config,
     integrationStates: deps.integrationStates,
-    integrationRegistry: deps.integrationRegistry
+    integrationRegistry: deps.integrationRegistry,
+    limits: deps.limits
   };
 }
 
@@ -343,6 +301,23 @@ export async function registerSettingsRoutes(
   app.post("/me/scheduled-jobs", async (request, reply) => {
     const { userId, tenantId } = request.auth;
     await ensureUser(app.db, userId);
+
+    // Scheduled jobs run as recurring synthetic turns that deliberately do NOT
+    // draw down the interactive turn quota, so they are throttled here at
+    // creation with a per-window rate limit. (The total-active-job cap is
+    // enforced further down, after the body is parsed, since it only applies to
+    // jobs that will actually be enabled.)
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "scheduled_job_create",
+      userId,
+      tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     const persistenceInputResult = await resolveScheduledJobPersistenceInput(
       reply,
       stores.settings,
@@ -354,16 +329,33 @@ export async function registerSettingsRoutes(
       return persistenceInputResult.response;
     }
 
+    // Total-active-job cap: only ENABLED jobs fire turns, so a request creating a
+    // disabled job must NOT be blocked even when the user is already at the cap.
+    // Enforced after body parse so we know whether this creation is enabled.
+    const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
+    if (maxActive > 0 && persistenceInputResult.value.enabled) {
+      const activeCount = await stores.settings.countActiveScheduledJobs(tenantId, userId);
+      if (activeCount >= maxActive) {
+        reply.code(409);
+        return apiError(
+          "scheduled_job_limit_reached",
+          `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before creating a new one.`
+        );
+      }
+    }
+
     const job = await stores.settings.createScheduledJob({
       jobId: uuidv7(),
       ...persistenceInputResult.value
     });
 
-    await createScheduledJobAuditEvent(stores.auditEvents, {
+    // sessionId: null — this is a non-interactive (route-driven) audit event.
+    await stores.auditEvents.create({
       tenantId,
+      sessionId: null,
       userId,
       type: "user.scheduled_job.created",
-      job
+      payload: buildScheduledJobAuditPayload(job)
     });
 
     reply.code(201);
@@ -399,11 +391,13 @@ export async function registerSettingsRoutes(
       return notFoundError("scheduled_job_not_found");
     }
 
-    await createScheduledJobAuditEvent(stores.auditEvents, {
+    // sessionId: null — this is a non-interactive (route-driven) audit event.
+    await stores.auditEvents.create({
       tenantId,
+      sessionId: null,
       userId,
       type: "user.scheduled_job.updated",
-      job
+      payload: buildScheduledJobAuditPayload(job)
     });
 
     return serialize(ScheduledJobEnvelopeSchema, { scheduledJob: job });
@@ -442,10 +436,13 @@ export async function registerSettingsRoutes(
       return notFoundError("scheduled_job_not_found");
     }
 
-    await createScheduledJobDeletedAuditEvent(stores.auditEvents, {
+    // sessionId: null — this is a non-interactive (route-driven) audit event.
+    await stores.auditEvents.create({
       tenantId,
+      sessionId: null,
       userId,
-      jobId: paramsResult.value.jobId
+      type: "user.scheduled_job.deleted",
+      payload: { jobId: paramsResult.value.jobId }
     });
 
     reply.code(204);

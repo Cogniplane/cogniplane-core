@@ -46,12 +46,14 @@ test("decrypt with a different KEK fails", () => {
 test("tampered ciphertext fails decryption (GCM authTag validates integrity)", () => {
   const enc = new Aes256GcmFindingEncryptor(KEK_HEX);
   const envelope = enc.encryptValue("the-secret-value", "tenant-a");
-  // Flip a character inside the ciphertext segment (parts[3]).
-  const parts = envelope.split(":");
-  const ct = parts[3]!;
-  const flipped = (ct[0] === "A" ? "B" : "A") + ct.slice(1);
-  parts[3] = flipped;
-  const tampered = parts.join(":");
+  // Corrupt the first byte AFTER the fixed `enc:v1:` prefix (the start of the
+  // iv:ct:tag body) rather than indexing a specific colon segment. This stays
+  // robust to envelope-segment layout changes while still mutating opaque
+  // ciphertext material — enough for GCM's authTag to reject it on decrypt.
+  const prefix = "enc:v1:";
+  const body = envelope.slice(prefix.length);
+  const flippedFirst = body[0] === "A" ? "B" : "A";
+  const tampered = prefix + flippedFirst + body.slice(1);
   let err: unknown;
   try { enc.decryptValue(tampered, "tenant-a"); } catch (e) { err = e; }
   expect(err instanceof PiiFindingEncryptionError).toBeTruthy();

@@ -149,6 +149,9 @@ test("ArtifactProcessor.renderArtifactImages returns empty + warns when pdftoppm
   const storage = new InMemoryProcessingStorage();
   storage.seed("user/session/report.pdf", "not-a-real-pdf");
   const warnings: object[] = [];
+  // Inject a failing execFile (mirrors the extractPdfText seam) so the
+  // pdftoppm-failure path is deterministic and does not depend on whether the
+  // host has poppler-utils installed.
   const processor = new ArtifactProcessor({
     config: { PDFTOTEXT_BINARY_PATH: "pdftotext" },
     logger: {
@@ -157,13 +160,20 @@ test("ArtifactProcessor.renderArtifactImages returns empty + warns when pdftoppm
       },
       error() {}
     },
-    storage
+    storage,
+    execFile: async () => {
+      throw new Error("pdftoppm: not found");
+    }
   });
-  // pdftoppm will fail because the buffer isn't a valid PDF.
   const result = await processor.renderArtifactImages(createPdfArtifact());
   expect(result.paths).toEqual([]);
-  // Warning may or may not fire depending on host pdftoppm; if it fired we
-  // logged a warn entry. Either way we expect graceful empty paths.
-  expect(Array.isArray(result.paths)).toBe(true);
+  // The failure is swallowed into exactly one warn entry that carries the
+  // artifact id and the underlying error message.
+  expect(warnings.length).toBe(1);
+  expect(warnings[0]).toMatchObject({
+    artifactId: "source-artifact",
+    error: "pdftoppm: not found"
+  });
+  // cleanup is still callable after a failed render.
   await result.cleanup();
 });

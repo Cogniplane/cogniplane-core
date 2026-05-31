@@ -90,12 +90,19 @@ test("PiiScanRunStore.create inserts with defaults and returns mapped record", a
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("INSERT INTO pii_scan_runs")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("tenant-1");
-  expect(db.lastQuery.values[1]).toBe("scan-1");
-  expect(db.lastQuery.values[2]).toBe("message");
-  expect(db.lastQuery.values[9]).toBe("pending");
-  expect(db.lastQuery.values[10]).toBe("[]");
+  // Column-presence (not positional binds): the INSERT targets pii_scan_runs
+  // and includes the status + findings_json columns we rely on below.
+  expect(db.lastQuery!.text).toMatch(/INSERT INTO pii_scan_runs/);
+  expect(db.lastQuery!.text).toMatch(/\bstatus\b/);
+  expect(db.lastQuery!.text).toMatch(/\bfindings_json\b/);
+  // The inputs + applied defaults reach the query as bound values, regardless
+  // of column order. Default status is 'pending'; default findings serialize
+  // to "[]".
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("scan-1");
+  expect(db.lastQuery!.values).toContain("message");
+  expect(db.lastQuery!.values).toContain("pending");
+  expect(db.lastQuery!.values).toContain("[]");
   expect(record.scanRunId).toBe("scan-1");
   expect(record.status).toBe("pending");
   expect(record.findings).toEqual([]);
@@ -123,8 +130,19 @@ test("PiiScanRunStore.create serializes findings_json", async () => {
   });
 
   expect(db.lastQuery).toBeTruthy();
-  const findingsParam = db.lastQuery.values[10];
-  const parsed = JSON.parse(String(findingsParam));
+  // findings_json is bound as a serialized JSON string. Locate it by content
+  // (a value that parses to the findings array) rather than by bind position.
+  const serializedFindings = (db.lastQuery!.values as unknown[]).find((v) => {
+    if (typeof v !== "string") return false;
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) && parsed[0]?.entityType === "email";
+    } catch {
+      return false;
+    }
+  });
+  expect(serializedFindings).toBeTruthy();
+  const parsed = JSON.parse(String(serializedFindings));
   expect(parsed.length).toBe(1);
   expect(parsed[0].entityType).toBe("email");
 });
@@ -142,16 +160,24 @@ test("PiiScanRunStore.update builds patch SQL with only provided fields", async 
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("UPDATE pii_scan_runs")).toBeTruthy();
-  expect(db.lastQuery.text.includes("status = $1")).toBeTruthy();
-  expect(db.lastQuery.text.includes("summary_text = $2")).toBeTruthy();
-  expect(db.lastQuery.text.includes("action_taken = $3")).toBeTruthy();
-  expect(db.lastQuery.text.includes("completed_at = $4")).toBeTruthy();
-  expect(db.lastQuery.text.includes("updated_at = NOW()")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("completed");
-  expect(db.lastQuery.values[1]).toBe("ok");
-  expect(db.lastQuery.values[4]).toBe("tenant-1");
-  expect(db.lastQuery.values[5]).toBe("scan-1");
+  expect(db.lastQuery!.text).toMatch(/UPDATE pii_scan_runs/);
+  // The patch builder emits a SET clause for each provided column (and always
+  // bumps updated_at). Assert column presence rather than the generated bind
+  // numbers, which are an implementation detail of clause ordering.
+  expect(db.lastQuery!.text).toMatch(/\bstatus\s*=/);
+  expect(db.lastQuery!.text).toMatch(/\bsummary_text\s*=/);
+  expect(db.lastQuery!.text).toMatch(/\baction_taken\s*=/);
+  expect(db.lastQuery!.text).toMatch(/\bcompleted_at\s*=/);
+  expect(db.lastQuery!.text).toMatch(/updated_at\s*=\s*NOW\(\)/);
+  // Fields NOT in the patch must not appear in the SET clause.
+  expect(db.lastQuery!.text).not.toMatch(/\bprovider_type\s*=/);
+  expect(db.lastQuery!.text).not.toMatch(/\bfindings_json\s*=/);
+  // Patch values + the WHERE scope all reach the query as bound values.
+  expect(db.lastQuery!.values).toContain("completed");
+  expect(db.lastQuery!.values).toContain("ok");
+  expect(db.lastQuery!.values).toContain("report");
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("scan-1");
   expect(updated).toBeTruthy();
   expect(updated?.status).toBe("completed");
 });
@@ -184,11 +210,12 @@ test("PiiScanRunStore.listForSubject queries by subject tuple", async () => {
   const rows = await store.listForSubject("tenant-1", "message", "msg-1", 10);
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("FROM pii_scan_runs")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("tenant-1");
-  expect(db.lastQuery.values[1]).toBe("message");
-  expect(db.lastQuery.values[2]).toBe("msg-1");
-  expect(db.lastQuery.values[3]).toBe(10);
+  expect(db.lastQuery!.text).toMatch(/FROM pii_scan_runs/);
+  // The subject tuple + limit all reach the query as bound values.
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("message");
+  expect(db.lastQuery!.values).toContain("msg-1");
+  expect(db.lastQuery!.values).toContain(10);
   expect(rows.length).toBe(2);
 });
 

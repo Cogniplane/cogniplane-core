@@ -8,7 +8,6 @@ import { registerAdminRuntimeRoutes } from "./admin/admin-runtime-routes.js";
 import { mcpBodySchema } from "./admin/admin-route-schemas.js";
 import { registerAdminSessionDetailRoute } from "./admin/admin-session-detail.js";
 import { registerAdminSessionRoutes } from "./admin/admin-session-routes.js";
-import { registerAdminSkillJudgeRoutes } from "./admin/admin-skill-judge-routes.js";
 import { registerAdminSkillRoutes } from "./admin/admin-skill-routes.js";
 import { registerAdminTenantSettingsRoutes } from "./admin/admin-tenant-settings-routes.js";
 import { registerAdminTokenUsageRoutes } from "./admin/admin-token-usage-routes.js";
@@ -24,7 +23,6 @@ import {
 import { z } from "zod";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import type { SessionJudgeWorker } from "../services/skills/judge/session-judge-worker.js";
 
 // ---------------------------------------------------------------------------
 // Route registration
@@ -34,7 +32,6 @@ export function buildAdminRouteStores(
   deps: AppDependencies,
   extras: {
     config: AppConfig;
-    sessionJudgeWorker?: SessionJudgeWorker;
   }
 ) {
   const tenantSettings = {
@@ -57,10 +54,6 @@ export function buildAdminRouteStores(
     integrationRegistry: deps.integrationRegistry,
     integrationStates: deps.integrationStates,
     tenantSettings,
-    skillImprovementLauncher: deps.skillImprovementLauncher,
-    skillImprovementSessions: deps.skillImprovementSessions,
-    sessionJudgeWorker: extras.sessionJudgeWorker,
-    sessionJudgments: deps.sessionJudgments,
     activations: deps.activationTracker,
     piiCircuitBreaker: deps.piiCircuitBreaker,
     piiProtection: deps.piiProtection,
@@ -83,8 +76,6 @@ export async function registerAdminRoutes(
     skillBundleStorage: stores.skillBundleStorage,
     githubConnections: stores.githubConnections,
     tenantSettings: stores.tenantSettings,
-    skillImprovementLauncher: stores.skillImprovementLauncher,
-    skillImprovementSessions: stores.skillImprovementSessions,
     activations: stores.activations
   });
   await registerAdminUserRoutes(app, {
@@ -112,13 +103,6 @@ export async function registerAdminRoutes(
     dynamicConfig: stores.dynamicConfig,
     auditEvents: stores.auditEvents,
     managedToolCatalog: stores.managedToolCatalog
-  });
-  await registerAdminSkillJudgeRoutes(app, {
-    config: stores.config,
-    dynamicConfig: stores.dynamicConfig,
-    auditEvents: stores.auditEvents,
-    sessionJudgeWorker: stores.sessionJudgeWorker,
-    sessionJudgments: stores.sessionJudgments
   });
   await registerAdminIntegrationsRoutes(app, {
     config: stores.config,

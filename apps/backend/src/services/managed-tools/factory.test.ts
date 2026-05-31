@@ -1,6 +1,7 @@
 import { Readable } from "node:stream";
 import { test, expect } from "vitest";
 
+import { createFakeFetch } from "../../test-helpers/fake-fetch.js";
 import { ManagedToolCatalog } from "./catalog.js";
 import { ManagedToolFactoryRegistry } from "./factory.js";
 import { registerBuiltinManagedTools } from "./register-builtin-managed-tools.js";
@@ -155,9 +156,7 @@ test("github_read_file — returns file content when credentials valid", async (
     content: Buffer.from("hello world", "utf-8").toString("base64") + "\n"
   };
 
-  const origFetch = global.fetch;
-  global.fetch = async () =>
-    ({ ok: true, json: async () => fileData } as unknown as Response);
+  const fake = createFakeFetch(() => ({ ok: true, json: async () => fileData } as unknown as Response));
 
   try {
     const result = await tool.handler({
@@ -168,7 +167,7 @@ test("github_read_file — returns file content when credentials valid", async (
     expect(result["sha"]).toBe("abc123");
     expect(result["path"]).toBe("src/index.ts");
   } finally {
-    global.fetch = origFetch;
+    fake.restore();
   }
 });
 
@@ -197,9 +196,9 @@ test("github_read_file — returns error on GitHub API 404", async () => {
   const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
   const tool = tools.find((t) => t.name === "github_read_file")!;
 
-  const origFetch = global.fetch;
-  global.fetch = async () =>
-    ({ ok: false, status: 404, json: async () => ({ message: "Not Found" }) } as unknown as Response);
+  const fake = createFakeFetch(
+    () => ({ ok: false, status: 404, json: async () => ({ message: "Not Found" }) } as unknown as Response)
+  );
 
   try {
     const result = await tool.handler({
@@ -208,7 +207,7 @@ test("github_read_file — returns error on GitHub API 404", async () => {
     });
     expect(String(result["error"]).includes("404")).toBeTruthy();
   } finally {
-    global.fetch = origFetch;
+    fake.restore();
   }
 });
 
@@ -222,11 +221,10 @@ test("github_write_file — returns commit info on success; uses creds.name/emai
     commit: { sha: "ghi789", html_url: "https://github.com/org/repo/commit/ghi789", committer: { name: "The Octocat" } }
   };
 
-  const origFetch = global.fetch;
-  global.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
+  const fake = createFakeFetch((_url, init) => {
     capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return { ok: true, json: async () => responseData } as unknown as Response;
-  };
+  });
 
   try {
     const result = await tool.handler({
@@ -246,7 +244,7 @@ test("github_write_file — returns commit info on success; uses creds.name/emai
     expect(committer["name"]).toBe("The Octocat");
     expect(committer["email"]).toBe("octocat@github.com");
   } finally {
-    global.fetch = origFetch;
+    fake.restore();
   }
 });
 
@@ -260,11 +258,10 @@ test("github_write_file — falls back to login@users.noreply.github.com when em
     commit: { sha: "ghi789", html_url: "https://github.com/org/repo/commit/ghi789", committer: { name: "octocat" } }
   };
 
-  const origFetch = global.fetch;
-  global.fetch = async (_url: RequestInfo | URL, init?: RequestInit) => {
+  const fake = createFakeFetch((_url, init) => {
     capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     return { ok: true, json: async () => responseData } as unknown as Response;
-  };
+  });
 
   try {
     await tool.handler({
@@ -281,7 +278,7 @@ test("github_write_file — falls back to login@users.noreply.github.com when em
     const committer = capturedBody?.["committer"] as Record<string, string>;
     expect(committer["email"]).toBe("octocat@users.noreply.github.com");
   } finally {
-    global.fetch = origFetch;
+    fake.restore();
   }
 });
 
@@ -299,9 +296,7 @@ test("github_create_pr — returns PR number and URL on success", async () => {
     draft: false
   };
 
-  const origFetch = global.fetch;
-  global.fetch = async () =>
-    ({ ok: true, json: async () => responseData } as unknown as Response);
+  const fake = createFakeFetch(() => ({ ok: true, json: async () => responseData } as unknown as Response));
 
   try {
     const result = await tool.handler({
@@ -319,7 +314,7 @@ test("github_create_pr — returns PR number and URL on success", async () => {
     expect(result["head"]).toBe("feature-branch");
     expect(result["base"]).toBe("main");
   } finally {
-    global.fetch = origFetch;
+    fake.restore();
   }
 });
 

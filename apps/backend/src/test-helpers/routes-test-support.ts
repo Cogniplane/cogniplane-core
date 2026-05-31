@@ -368,6 +368,7 @@ class FakeRuntimeManager {
     toolContextId: string | null;
     assistantMessageId?: string | null;
     effort?: string;
+    model?: string;
   }> = [];
   private readonly eventScripts = new Map<string, RuntimeEvent[]>();
 
@@ -381,7 +382,7 @@ class FakeRuntimeManager {
   }
   async getRuntimePolicyId(_tenantId: string): Promise<string> { return "tenant-settings:test-tenant"; }
   async *runMessage(session: { sessionId: string; runtimeId: string }, input: {
-    prompt: string; userInputs?: RuntimeUserInput[]; runtimePolicyId: string; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; onBeforeTurn?: () => Promise<void>;
+    prompt: string; userInputs?: RuntimeUserInput[]; runtimePolicyId: string; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; model?: string; onBeforeTurn?: () => Promise<void>;
   }) {
     if (input.onBeforeTurn) await input.onBeforeTurn();
     this.runMessageInputs.push({ sessionId: session.sessionId, runtimeId: session.runtimeId, ...input });
@@ -496,16 +497,17 @@ class InMemoryArtifactStore {
     const record: ArtifactDownloadTokenRecord = { token: `download-${this.downloadTokens.size + 1}`, tenantId: input.tenantId ?? "test-tenant", artifactId: input.artifactId, sessionId: input.sessionId, userId: input.userId, storageBackend: input.storageBackend, storageKey: input.storageKey, fileName: input.fileName, contentType: input.contentType, expiresAt: new Date(now + input.ttlMs).toISOString(), createdAt: new Date(now).toISOString() };
     this.downloadTokens.set(record.token, record); return record;
   }
-  // Mirrors production single-use semantics: returns the row only on the
-  // first call AND only when caller identity (tenant + user, with admin
-  // bypass) matches; subsequent calls return null. Identity gating is in
-  // the lookup so an unauthorized request never consumes the token.
-  async consumeDownloadToken(input: {
+  // Shared identity + artifact/session gating for peek and consume so the two
+  // paths can never diverge. Identity gating (tenant + user, with admin bypass)
+  // lives here so an unauthorized request never observes or consumes the token.
+  // Deliberately does NOT filter on expiry — the route surfaces expiry as a
+  // distinct 410 via the peeked record.
+  private async resolveGatedDownloadToken(input: {
     token: string;
     requesterTenantId: string;
     requesterUserId: string;
     callerIsAdmin: boolean;
-  }) {
+  }): Promise<ArtifactDownloadTokenRecord | null> {
     const downloadToken = this.downloadTokens.get(input.token);
     if (!downloadToken) return null;
     if (downloadToken.tenantId !== input.requesterTenantId) return null;
@@ -518,6 +520,33 @@ class InMemoryArtifactStore {
     if (artifact.artifactType !== "upload" && artifact.status !== "ready") {
       return null;
     }
+    return downloadToken;
+  }
+
+  // Non-consuming lookup used by GET /downloads/:token to validate the token
+  // and open the storage stream before committing the single-use consume.
+  // Returns the row (regardless of expiry) on the same gating as consume.
+  async peekDownloadToken(input: {
+    token: string;
+    requesterTenantId: string;
+    requesterUserId: string;
+    callerIsAdmin: boolean;
+  }) {
+    return this.resolveGatedDownloadToken(input);
+  }
+
+  // Mirrors production single-use semantics: returns the row only on the
+  // first call AND only when caller identity matches; subsequent calls return
+  // null. An expired token is never consumed.
+  async consumeDownloadToken(input: {
+    token: string;
+    requesterTenantId: string;
+    requesterUserId: string;
+    callerIsAdmin: boolean;
+  }) {
+    const downloadToken = await this.resolveGatedDownloadToken(input);
+    if (!downloadToken) return null;
+    if (new Date(downloadToken.expiresAt).getTime() <= Date.now()) return null;
     this.downloadTokens.delete(input.token);
     return downloadToken;
   }
@@ -624,10 +653,6 @@ export async function createTestApp(
             "write_artifact"
           ],
           enabledMcpServerIds: ["managed-session-context"],
-          skillJudgeEnabled: false,
-          skillJudgeProvider: null,
-          skillJudgeModel: null,
-          skillJudgeMode: "sync" as const,
           version: 1,
           configHash: "test-hash",
           updatedAt: new Date().toISOString()
@@ -652,7 +677,8 @@ export async function createTestApp(
     artifacts,
     auditEvents,
     storage: artifactStorage,
-    processor: artifactProcessor
+    processor: artifactProcessor,
+    limits
   } as unknown as ArtifactRouteStores);
   const activeTurnMessageMap = new ActiveTurnMessageMap();
   await registerMessageRoutes(app, {

@@ -45,9 +45,27 @@ export const githubImportBodySchema = z.object({
   subdirectory: z.string().trim().min(1).max(300).optional()
 });
 
+// Display name for an inline skill. Allows human-readable text (letters,
+// digits, spaces, common punctuation) but forbids path separators and control
+// characters as defense-in-depth — even though workspace filenames now key on
+// the validated skillId, the name should never be able to carry a `/` or a
+// traversal sequence into any downstream filesystem path.
+const inlineSkillNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  // Forbid path separators (`/`, `\\`) and control characters (NUL, newlines,
+  // etc.). Spaces and ordinary punctuation stay allowed so a name like
+  // "PDF Processing" remains valid.
+  // eslint-disable-next-line no-control-regex
+  .regex(/^[^/\\\u0000-\u001f]+$/, {
+    message: "skillName must not contain path separators or control characters."
+  });
+
 export const inlineSkillImportBodySchema = z.object({
   skillId: adminIdSchema,
-  skillName: z.string().trim().min(1).max(200),
+  skillName: inlineSkillNameSchema,
   description: z.string().trim().min(1).max(1024),
   instructions: z.string().min(1).max(200_000)
 });
@@ -142,5 +160,3 @@ export const adminSessionsListQuerySchema = z.object({
   cursor: z.string().trim().min(1).optional(),
   limit: limitSchema
 });
-
-export type AdminSessionsListQuery = z.infer<typeof adminSessionsListQuerySchema>;

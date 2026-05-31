@@ -3,7 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 
-export type ApprovalCleanupReason = "turn_interrupted";
+export type ApprovalCleanupReason = "turn_interrupted" | "ttl_expired" | "runtime_terminated";
 
 export type CancelPendingApprovalsInput = {
   tenantId: string;
@@ -51,6 +51,61 @@ export type CancelPendingApprovalsInput = {
  * cannot block the cleanup of others. Caller is expected to `void` the
  * returned promise — callers should not block on cleanup before responding.
  */
+/**
+ * Expire a SINGLE pending approval by id. Used by the Claude e2b path when the
+ * per-approval wall-clock TTL fires (the in-sandbox harness has already been
+ * sent a deny so the SDK turn unblocks): the DB row must move off `pending` and
+ * an `approval.expired` audit row must be written, mirroring Codex's TTL sweep.
+ * Unlike `cancelPendingApprovals` this does NOT touch the other approvals in the
+ * session — only the one that aged out.
+ *
+ * Best-effort: every step is wrapped in try/log. If `expire` returns null the
+ * user's decision committed first, so the audit row is skipped.
+ */
+export async function expireApprovalById(input: {
+  tenantId: string;
+  sessionId: string;
+  userId: string;
+  approvalId: string;
+  reason: ApprovalCleanupReason;
+  approvals: Pick<ApprovalStore, "expire">;
+  auditEvents: Pick<AuditEventStore, "create">;
+  logger: Pick<FastifyBaseLogger, "warn" | "error">;
+  /** Release in-memory state (e.g. drop the e2bPendingApprovals entry). */
+  onCancelLocal?: (approvalId: string) => Record<string, unknown> | undefined;
+}): Promise<void> {
+  const { tenantId, sessionId, userId, approvalId, reason, approvals, auditEvents, logger } = input;
+
+  let payloadExtras: Record<string, unknown> = {};
+  try {
+    payloadExtras = input.onCancelLocal?.(approvalId) ?? {};
+  } catch (err) {
+    logger.warn(
+      { err, approvalId, sessionId, reason },
+      "onCancelLocal threw during approval expiry; continuing with empty payload"
+    );
+  }
+
+  try {
+    const expired = await approvals.expire(tenantId, approvalId);
+    if (!expired) return;
+
+    await auditEvents.create({
+      tenantId,
+      sessionId,
+      userId,
+      approvalId,
+      type: "approval.expired",
+      payload: { ...payloadExtras, reason }
+    });
+  } catch (err) {
+    logger.error(
+      { err, approvalId, sessionId, reason },
+      "Failed to expire approval on TTL"
+    );
+  }
+}
+
 export async function cancelPendingApprovals(input: CancelPendingApprovalsInput): Promise<void> {
   const { tenantId, sessionId, userId, reason, approvals, auditEvents, logger } = input;
 

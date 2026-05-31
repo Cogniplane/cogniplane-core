@@ -14,6 +14,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  gitleaks:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the scan covers every commit, not just HEAD.
+          fetch-depth: 0
+      # gitleaks-action is free for public repositories — no GITLEAKS_LICENSE
+      # needed (that key is only required for private orgs).
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
   ci:
     runs-on: ubuntu-24.04
     permissions:
@@ -40,16 +57,30 @@ jobs:
         run: pnpm lint
 
       # shared-types and frontend: full type check.
-      # backend: --noCheck (parse + import resolution only) — full type checking
-      # requires more RAM than free GitHub runners provide; the private CI is the
-      # authoritative type-safety gate for the backend.
+      # backend: split into two cheap gates because the full type check exceeds
+      # available memory on free GitHub runners. The private CI is the
+      # authoritative semantic-type gate for the backend.
+      #   - tsc --noCheck: parse + syntax (no semantic diagnostics)
+      #   - dpdm:          import resolution (catches TS2307-style breakage)
       - name: Typecheck (shared-types + frontend)
         run: pnpm --filter @cogniplane/shared-types --filter @cogniplane/frontend --workspace-concurrency=1 typecheck
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
-      - name: Typecheck (backend — imports + syntax)
+      - name: Backend syntax check
         run: pnpm --filter @cogniplane/backend exec tsc -p tsconfig.json --noEmit --noCheck
+        env:
+          NODE_OPTIONS: --max-old-space-size=2048
+
+      - name: Backend import resolution
+        # dpdm's --exit-code only fires on circular deps, so we tee the output
+        # and grep for `miss "<module>"` warnings (the TS2307 equivalent).
+        run: |
+          pnpm --filter @cogniplane/backend exec dpdm --no-tree --no-circular 'src/**/*.ts' 2>&1 | tee /tmp/dpdm.log
+          if grep -qE '^\s+[0-9]+\)\s+miss ' /tmp/dpdm.log; then
+            echo "::error::dpdm found unresolved imports — see 'miss' entries above"
+            exit 1
+          fi
         env:
           NODE_OPTIONS: --max-old-space-size=2048
 

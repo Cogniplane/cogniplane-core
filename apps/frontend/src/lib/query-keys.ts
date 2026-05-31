@@ -4,8 +4,6 @@ export const queryKeys = {
     skills: () => [...queryKeys.admin.all, "skills"] as const,
     skillRevisions: (skillId: string) =>
       [...queryKeys.admin.all, "skills", skillId, "revisions"] as const,
-    skillImprovementSessions: (skillId: string) =>
-      [...queryKeys.admin.all, "skills", skillId, "improvement-sessions"] as const,
     marketplace: () => [...queryKeys.admin.all, "marketplace"] as const,
     mcpServers: () => [...queryKeys.admin.all, "mcp-servers"] as const,
     managedTools: () => [...queryKeys.admin.all, "managed-tools"] as const,

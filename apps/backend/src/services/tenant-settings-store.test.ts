@@ -59,12 +59,8 @@ class InMemoryTenantSettingsDatabase {
         developer_instructions: params[8] == null ? null : String(params[8]),
         enabled_tool_ids: JSON.parse(String(params[9])) as string[],
         enabled_mcp_server_ids: JSON.parse(String(params[10])) as string[],
-        skill_judge_enabled: Boolean(params[11]),
-        skill_judge_provider: params[12] == null ? null : String(params[12]),
-        skill_judge_model: params[13] == null ? null : String(params[13]),
-        skill_judge_mode: String(params[14]),
         version: previousVersion + 1,
-        config_hash: String(params[15]),
+        config_hash: String(params[11]),
         updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
       };
 
@@ -128,6 +124,7 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
         "session_context",
         "list_artifacts",
         "read_text_artifact",
+        "read_skill_corpus",
         "write_artifact"
       ]);
   expect(created.enabledMcpServerIds).toEqual(["managed-session-context"]);
@@ -184,39 +181,6 @@ test("TenantSettingsStore.upsert deduplicates and normalizes providers", async (
   // Dupes dropped; original order preserved
   expect(result.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
   expect(result.runtimeProvider).toBe("codex");
-});
-
-test("TenantSettingsStore.upsert persists skill judge config", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const result = await store.upsert("tenant-judge", {
-    skillJudgeEnabled: true,
-    skillJudgeProvider: "anthropic",
-    skillJudgeModel: "claude-sonnet",
-    skillJudgeMode: "batch"
-  });
-  expect(result.skillJudgeEnabled).toBe(true);
-  expect(result.skillJudgeProvider).toBe("anthropic");
-  expect(result.skillJudgeModel).toBe("claude-sonnet");
-  expect(result.skillJudgeMode).toBe("batch");
-});
-
-test("TenantSettingsStore.upsert: skillJudgeProvider invalid value coerces to null", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const result = await store.upsert("tenant-sk", {
-    skillJudgeProvider: "garbage" as never
-  });
-  expect(result.skillJudgeProvider).toBe(null);
-});
-
-test("TenantSettingsStore.upsert: invalid skillJudgeMode falls back to 'sync'", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const result = await store.upsert("tenant-sm", {
-    skillJudgeMode: "weird" as never
-  });
-  expect(result.skillJudgeMode).toBe("sync");
 });
 
 test("TenantSettingsStore.upsert persists showEffortSelector", async () => {

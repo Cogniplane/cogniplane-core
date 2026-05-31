@@ -121,6 +121,10 @@ class InMemoryUserSettingsStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
+  async countActiveScheduledJobs(_tenantId: string, userId: string): Promise<number> {
+    return [...this.jobs.values()].filter((job) => job.userId === userId && job.enabled).length;
+  }
+
   async createScheduledJob(input: {
     tenantId: string;
     jobId: string;
@@ -215,6 +219,7 @@ async function createApp(overrides: {
   integrationStates?: SettingsRouteStores["integrationStates"];
   integrationRegistry?: SettingsRouteStores["integrationRegistry"];
   config?: SettingsRouteStores["config"];
+  limits?: SettingsRouteStores["limits"];
 } = {}) {
   const app = Fastify();
   const settings = new InMemoryUserSettingsStore();
@@ -248,6 +253,15 @@ async function createApp(overrides: {
       async getIntegrationsForUser() {
         return [];
       }
+    },
+    limits: overrides.limits ?? {
+      async consumeRateLimit() {
+        return null;
+      },
+      async consumeTurnQuota() {
+        return null;
+      },
+      sweepExpired() {}
     }
   });
   await app.ready();
@@ -394,6 +408,62 @@ test("run history route returns empty runs for a job", async () => {
   });
   expect(runsResponse.statusCode).toBe(200);
   expect(runsResponse.json().runs.length).toBe(0);
+
+  await app.close();
+});
+
+test("active-job cap counts only enabled jobs, not disabled ones", async () => {
+  const { app } = await createApp({
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 1 })
+  });
+
+  const makeJob = (jobName: string, enabled: boolean) =>
+    app.inject({
+      method: "POST",
+      url: "/me/scheduled-jobs",
+      payload: {
+        jobName,
+        cronExpression: "0 9 * * 1-5",
+        timeZone: "UTC",
+        targetType: "prompt",
+        input: { prompt: "Test prompt." },
+        enabled
+      }
+    });
+
+  // First enabled job fills the cap of 1.
+  const first = await makeJob("Job A", true);
+  expect(first.statusCode).toBe(201);
+  const firstId = first.json().scheduledJob.jobId as string;
+
+  // Second enabled job is rejected — cap reached.
+  const blocked = await makeJob("Job B", true);
+  expect(blocked.statusCode).toBe(409);
+  expect(blocked.json().error).toBe("scheduled_job_limit_reached");
+
+  // Creating a DISABLED job while at the cap must still succeed — disabled jobs
+  // don't fire turns, so they don't count against the active cap.
+  const disabledCreate = await makeJob("Job B-disabled", false);
+  expect(disabledCreate.statusCode).toBe(201);
+
+  // Disable the first job; it no longer fires turns, so it must free a slot.
+  const disable = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${firstId}`,
+    payload: {
+      jobName: "Job A",
+      cronExpression: "0 9 * * 1-5",
+      timeZone: "UTC",
+      targetType: "prompt",
+      input: { prompt: "Test prompt." },
+      enabled: false
+    }
+  });
+  expect(disable.statusCode).toBe(200);
+
+  // Now a new enabled job can be created again.
+  const afterDisable = await makeJob("Job C", true);
+  expect(afterDisable.statusCode).toBe(201);
 
   await app.close();
 });

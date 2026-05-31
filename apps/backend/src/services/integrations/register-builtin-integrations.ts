@@ -15,6 +15,7 @@ import {
   NOTION_OAUTH_CALLBACK_PATHS,
   registerNotionOAuthRoutes
 } from "./notion/notion-oauth-routes.js";
+import type { RequestLimitsInterface } from "../request-limits.js";
 
 // Bootstrap module — registers the integrations that ship with core OSS
 // (GitHub, Notion, plus the coming-soon stubs). Optional overlays register
@@ -50,6 +51,8 @@ export type BuiltinIntegrationOAuthCallbacks = {
 export type AttachBuiltinIntegrationRuntimeOptions = {
   probes?: BuiltinIntegrationProbes;
   oauth?: BuiltinIntegrationOAuthCallbacks;
+  /** Rate limiter for the unauthenticated OAuth callback routes (per-IP). */
+  limits?: RequestLimitsInterface;
 };
 
 let descriptorsRegistered = false;
@@ -75,32 +78,34 @@ export function attachBuiltinIntegrationRuntime(
 
   setIntegrationRuntimeWiring("notion", {
     connectionProbe: probes.notion,
-    oauthRoutes: buildNotionOAuthRoutes(oauth.notion)
+    oauthRoutes: buildNotionOAuthRoutes(oauth.notion, options.limits)
   });
   setIntegrationRuntimeWiring("github", {
     connectionProbe: probes.github,
-    oauthRoutes: buildGithubOAuthRoutes(oauth.github)
+    oauthRoutes: buildGithubOAuthRoutes(oauth.github, options.limits)
   });
 }
 
 function buildNotionOAuthRoutes(
-  callbackHandler: NotionConnectionService | undefined
+  callbackHandler: NotionConnectionService | undefined,
+  limits?: RequestLimitsInterface
 ): IntegrationOAuthRoutes {
   return {
     paths: NOTION_OAUTH_CALLBACK_PATHS,
     register: callbackHandler
-      ? (app) => registerNotionOAuthRoutes(app, callbackHandler)
+      ? (app) => registerNotionOAuthRoutes(app, callbackHandler, limits)
       : () => {}
   };
 }
 
 function buildGithubOAuthRoutes(
-  callbackHandler: GithubConnectionService | undefined
+  callbackHandler: GithubConnectionService | undefined,
+  limits?: RequestLimitsInterface
 ): IntegrationOAuthRoutes {
   return {
     paths: GITHUB_OAUTH_CALLBACK_PATHS,
     register: callbackHandler
-      ? (app) => registerGithubOAuthRoutes(app, callbackHandler)
+      ? (app) => registerGithubOAuthRoutes(app, callbackHandler, limits)
       : () => {}
   };
 }

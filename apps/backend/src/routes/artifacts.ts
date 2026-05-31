@@ -66,7 +66,8 @@ export function buildArtifactRouteStores(deps: AppDependencies) {
     auditEvents: deps.auditEvents,
     storage: deps.artifactStorage,
     processor: deps.artifactProcessor,
-    piiScanEnqueuer: deps.piiScanEnqueuer
+    piiScanEnqueuer: deps.piiScanEnqueuer,
+    limits: deps.limits
   };
 }
 
@@ -100,6 +101,20 @@ export async function registerArtifactRoutes(
 
   app.post("/artifacts", async (request, reply) => {
     const { userId, tenantId } = request.auth;
+
+    // Throttle BEFORE buffering the upload so an abusive client can't burn
+    // bandwidth/CPU/storage faster than the limit allows.
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "artifact_upload",
+      userId,
+      tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     await ensureUser(app.db, userId);
 
     if (!request.isMultipart()) {
@@ -258,6 +273,18 @@ export async function registerArtifactRoutes(
     }
 
     const { userId, tenantId } = request.auth;
+
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "artifact_create",
+      userId,
+      tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     const message = await stores.messages.getOwned(tenantId, paramsResult.value.messageId, userId);
     if (!message) {
       reply.code(404);
@@ -393,15 +420,23 @@ export async function registerArtifactRoutes(
       return paramsResult.response;
     }
 
-    // Single-use: `consumeDownloadToken` flips `consumed_at` atomically and
-    // returns the row only on the first call. Caller identity (tenant +
-    // user, with admin bypass) is matched in SQL so an unauthorized request
-    // never consumes the token — otherwise any same-tenant user could burn
-    // a peer's token. Replays of an already-consumed token, cross-tenant
-    // requests, and unknown tokens all return null and map to 404.
+    // Single-use download, ordered so a transient storage error can't burn
+    // the token. Caller identity (tenant + user, with admin bypass) is matched
+    // in SQL on every step so an unauthorized request never observes or
+    // consumes a peer's token.
+    //
+    // 1. `peekDownloadToken` validates without consuming. Unknown token,
+    //    cross-tenant, wrong user, already-consumed, or unreadable artifact
+    //    all return null → 404.
+    // 2. Expiry → 410. The peek does NOT consume, so the 410 is repeatable
+    //    and an expired token is never spent.
+    // 3. Open the storage stream BEFORE consuming. A failure here propagates
+    //    (500) with the token still unconsumed, so the client can retry.
+    // 4. `consumeDownloadToken` flips `consumed_at` atomically and only then.
+    //    A lost race (concurrent request consumed it first) returns null → 404.
     const callerIsAdmin =
       request.auth.role === "owner" || request.auth.role === "admin";
-    const token = await stores.artifacts.consumeDownloadToken({
+    const token = await stores.artifacts.peekDownloadToken({
       token: paramsResult.value.token,
       requesterTenantId: request.auth.tenantId,
       requesterUserId: request.auth.userId,
@@ -418,6 +453,26 @@ export async function registerArtifactRoutes(
     }
 
     const streamHandle = await stores.storage.openReadStream(token.storageKey);
+
+    const consumed = await stores.artifacts.consumeDownloadToken({
+      token: paramsResult.value.token,
+      requesterTenantId: request.auth.tenantId,
+      requesterUserId: request.auth.userId,
+      callerIsAdmin
+    });
+    if (!consumed) {
+      // Lost the single-use race (a concurrent request consumed the token
+      // first). We optimistically opened the storage stream before consuming;
+      // destroy it so an S3/HTTP-backed body/connection isn't left dangling
+      // until timeout under replay or double-click.
+      const closable = streamHandle.stream as { destroy?: () => void };
+      if (typeof closable.destroy === "function") {
+        closable.destroy();
+      }
+      reply.code(404);
+      return notFoundError("download_not_found");
+    }
+
     await stores.auditEvents.create({
       tenantId: token.tenantId,
       sessionId: token.sessionId,

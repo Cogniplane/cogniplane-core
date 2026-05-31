@@ -34,11 +34,40 @@ describe("fetchArtifactContent", () => {
 });
 
 describe("fetchArtifactPreviewText", () => {
-  it("is exported and accepts an artifactId string", () => {
-    expect(typeof fetchArtifactPreviewText).toBe("function");
-    // returns a Promise when called (even if it rejects without a server)
-    const result = fetchArtifactPreviewText("some-id");
-    expect(result instanceof Promise).toBeTruthy();
-    result.catch(() => {}); // suppress unhandled rejection
+  it("returns the parsed text and requests the preview-text endpoint", async () => {
+    const calls: string[] = [];
+    const fakeFetch = vi.fn(async (url: string) => {
+      calls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        // request() reads response.json() (not text()) for preview-text.
+        json: async () => ({ text: "preview body" })
+      };
+    });
+    // @ts-expect-error — stub
+    global.fetch = fakeFetch;
+
+    const text = await fetchArtifactPreviewText("art-1");
+
+    expect(text).toBe("preview body");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].endsWith("/artifacts/art-1/preview-text")).toBe(true);
+  });
+
+  it("rejects with a schema-mismatch error when the payload shape is wrong", async () => {
+    const fakeFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      // Missing the required `text` field → schema validation must reject.
+      json: async () => ({ wrong: 1 })
+    }));
+    // @ts-expect-error — stub
+    global.fetch = fakeFetch;
+
+    const err = await fetchArtifactPreviewText("art-1").catch((e: unknown) => e);
+
+    expect(err instanceof Error).toBe(true);
+    expect((err as Error).message).toContain("Schema mismatch");
   });
 });

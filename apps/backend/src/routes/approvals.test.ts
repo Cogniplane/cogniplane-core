@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import { createRecentlyResolvedCache } from "./approvals.js";
 
@@ -22,15 +22,19 @@ test("recently-resolved cache treats non-existent entries as not recently resolv
 });
 
 test("recently-resolved cache evicts expired entries", () => {
-  const cache = createRecentlyResolvedCache(1); // 1ms TTL
-  cache.remember("tenant-a", "approval-1");
-  // Wait long enough for expiry.
-  return new Promise<void>((resolve) => {
-    setTimeout(() => {
-      expect(cache.wasRecentlyResolved("tenant-a", "approval-1")).toBe(false);
-      resolve();
-    }, 5);
-  });
+  // Drive the TTL deterministically off a frozen clock instead of racing a
+  // real 1ms timer — the cache reads Date.now(), so advancing fake time past
+  // the TTL is the observable expiry signal.
+  vi.useFakeTimers();
+  try {
+    const cache = createRecentlyResolvedCache(1_000);
+    cache.remember("tenant-a", "approval-1");
+    expect(cache.wasRecentlyResolved("tenant-a", "approval-1")).toBe(true);
+    vi.advanceTimersByTime(1_001);
+    expect(cache.wasRecentlyResolved("tenant-a", "approval-1")).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("recently-resolved cache key is composite, not just approvalId", () => {

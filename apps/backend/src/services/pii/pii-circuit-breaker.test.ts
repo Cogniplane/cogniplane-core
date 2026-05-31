@@ -458,9 +458,14 @@ test("Redis: errored zcard pipeline result is treated as count=0 (does not trip)
   // Contract: if the zcard step in the failure-recording pipeline errors out,
   // the breaker reads count=0 and stays closed. Without this guard a transient
   // Redis failure during a failure-record could itself flip the breaker open.
-  // Build a custom fake whose pipeline.exec() returns an error tuple in
-  // results[2] (zcard) so we directly exercise that branch.
+  //
+  // We inject the error by COMMAND NAME ("zcard"), not by a hard-coded result
+  // index. The breaker happens to read the card from results[2] today, but the
+  // contract under test is "the zcard step errored", not "the third pipeline
+  // entry errored" — keeping this by-name means a future reorder of the
+  // pipeline ops still exercises the same branch.
   const store = new Map<string, string>();
+  const failCommand = "zcard";
   const redis = {
     async get(key: string) {
       return store.get(key) ?? null;
@@ -478,23 +483,27 @@ test("Redis: errored zcard pipeline result is treated as count=0 (does not trip)
       return 0;
     },
     pipeline() {
-      // No-op chain — every method returns `this`. Then exec() fabricates the
-      // shape `[ [null, ok], [null, ok], [Error, null], [null, ok] ]` so the
-      // breaker's `cardEntry[0]` truthy-check kicks in and falls back to 0.
+      // Record the (name, ok-result) of each queued op in call order. exec()
+      // then maps each to a result tuple, substituting an error tuple for the
+      // op whose name matches `failCommand` — wherever it lands in the chain.
+      const ops: Array<{ name: string; ok: unknown }> = [];
+      const queue = (name: string, ok: unknown) => {
+        ops.push({ name, ok });
+        return api;
+      };
       const api = {
-        zremrangebyscore() { return api; },
-        zadd() { return api; },
-        zcard() { return api; },
-        pexpire() { return api; },
-        set() { return api; },
-        del() { return api; },
+        zremrangebyscore() { return queue("zremrangebyscore", 1); },
+        zadd() { return queue("zadd", "ok"); },
+        zcard() { return queue("zcard", 1); },
+        pexpire() { return queue("pexpire", 1); },
+        set() { return queue("set", "OK"); },
+        del() { return queue("del", 1); },
         async exec() {
-          return [
-            [null, 1],
-            [null, "ok"],
-            [new Error("zcard failed"), null], // <- the load-bearing error
-            [null, 1]
-          ];
+          return ops.map((op) =>
+            op.name === failCommand
+              ? [new Error(`${op.name} failed`), null]
+              : [null, op.ok]
+          );
         }
       };
       return api;

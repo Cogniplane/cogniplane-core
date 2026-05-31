@@ -9,7 +9,7 @@ export const SessionSchema = z.object({
   userId: z.string(),
   sessionName: z.string(),
   status: z.enum(["active", "deleted"]),
-  // "skill_improvement" identifies improver sessions; default bucket is "normal".
+  // Coarse session bucket (e.g. "normal", "scheduled"); default is "normal".
   // Optional because production rows always carry a value (NOT NULL DEFAULT 'normal')
   // but in-memory test fakes may omit it.
   purpose: z.string().optional(),
@@ -39,11 +39,3 @@ export const SessionMessagesResponseSchema = z.object({
 }).passthrough();
 
 export type SessionMessagesResponse = z.infer<typeof SessionMessagesResponseSchema>;
-
-export const SessionImprovementContextSchema = z.object({
-  skillId: z.string(),
-  skillName: z.string().nullable(),
-  corpusArtifactId: z.string().nullable()
-}).passthrough();
-
-export type SessionImprovementContext = z.infer<typeof SessionImprovementContextSchema>;

@@ -98,10 +98,12 @@ test("PiiScanJobStore.create inserts a queued row with defaults", async () => {
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("INSERT INTO pii_scan_jobs")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("tenant-1");
-  expect(db.lastQuery.values[1]).toBe("job-1");
-  expect(db.lastQuery.values[7]).toBe("detect");
+  expect(db.lastQuery!.text).toMatch(/INSERT INTO pii_scan_jobs/);
+  expect(db.lastQuery!.text).toMatch(/\bmode\b/);
+  // Inputs reach the query as bound values, independent of column order.
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("job-1");
+  expect(db.lastQuery!.values).toContain("detect");
   expect(job.status).toBe("queued");
   expect(job.attempts).toBe(0);
 });
@@ -114,9 +116,12 @@ test("PiiScanJobStore.claimDueJobs returns mapped rows and uses SKIP LOCKED quer
   const claimed = await store.claimDueJobs(5);
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("FOR UPDATE SKIP LOCKED")).toBeTruthy();
-  expect(db.lastQuery.text.includes("SET")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe(5);
+  // FOR UPDATE SKIP LOCKED is the load-bearing concurrency contract (atomic
+  // claim across competing workers), and the claim flips status to 'claimed'.
+  expect(db.lastQuery!.text).toMatch(/FOR UPDATE SKIP LOCKED/);
+  expect(db.lastQuery!.text).toMatch(/status\s*=\s*'claimed'/);
+  // The limit reaches the query as a bound value.
+  expect(db.lastQuery!.values).toContain(5);
   expect(claimed.length).toBe(1);
   expect(claimed[0].status).toBe("claimed");
   expect(claimed[0].attempts).toBe(1);
@@ -130,10 +135,12 @@ test("PiiScanJobStore.markCompleted updates the job status", async () => {
   await store.markCompleted("tenant-1", "job-1");
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("UPDATE pii_scan_jobs")).toBeTruthy();
-  expect(db.lastQuery.text.includes("status = 'completed'")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("tenant-1");
-  expect(db.lastQuery.values[1]).toBe("job-1");
+  expect(db.lastQuery!.text).toMatch(/UPDATE pii_scan_jobs/);
+  // The completion contract: the row's status is set to 'completed'.
+  expect(db.lastQuery!.text).toMatch(/status\s*=\s*'completed'/);
+  // Tenant + job scope reach the query as bound values.
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("job-1");
 });
 
 test("PiiScanJobStore.recordFailure requeues and stores the error message", async () => {
@@ -144,13 +151,16 @@ test("PiiScanJobStore.recordFailure requeues and stores the error message", asyn
   const updated = await store.recordFailure("tenant-1", "job-1", "timeout", { backoffMs: 15_000 });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.text.includes("attempts >= max_attempts")).toBeTruthy();
-  expect(db.lastQuery.values[0]).toBe("tenant-1");
-  expect(db.lastQuery.values[1]).toBe("job-1");
-  expect(db.lastQuery.values[2]).toBe(15_000);
-  expect(db.lastQuery.values[3]).toBe("timeout");
-  // Transient default: permanent flag false.
-  expect(db.lastQuery.values[4]).toBe(false);
+  // The retry guard (`attempts >= max_attempts`) is the load-bearing contract:
+  // it decides requeue vs. terminal-failure. Assert its presence, not bind nums.
+  expect(db.lastQuery!.text).toMatch(/attempts\s*>=\s*max_attempts/);
+  // Scope, backoff, error, and the permanent flag all reach the query as
+  // bound values. Transient default → permanent flag is false.
+  expect(db.lastQuery!.values).toContain("tenant-1");
+  expect(db.lastQuery!.values).toContain("job-1");
+  expect(db.lastQuery!.values).toContain(15_000);
+  expect(db.lastQuery!.values).toContain("timeout");
+  expect(db.lastQuery!.values).toContain(false);
   expect(updated).toBeTruthy();
   expect(updated?.status).toBe("queued");
   expect(updated?.errorMessage).toBe("timeout");
@@ -166,7 +176,10 @@ test("PiiScanJobStore.recordFailure with permanent=true forces status='failed' r
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.values[4]).toBe(true);
+  // The permanent flag is threaded into the query as a bound `true`. The fake's
+  // RETURNING is hardcoded, so the bound value is the only signal that
+  // permanent:true reached the predicate (which forces status='failed').
+  expect(db.lastQuery!.values).toContain(true);
   expect(updated).toBeTruthy();
   expect(updated?.status).toBe("failed");
 });

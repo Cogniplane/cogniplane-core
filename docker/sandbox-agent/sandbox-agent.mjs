@@ -117,6 +117,14 @@ function readSdkVersion() {
 const FILE_CHANGE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "MultiEdit"]);
 const READ_ONLY_NATIVE_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "View"]);
 
+// Mirror the local ClaudeApprovalHandler limits (claude-code-approval-handler.ts).
+// The harness must enforce its own cap + wall-clock TTL because in e2b mode the
+// canUseTool Promise lives here, not in the backend handler — an unanswered
+// approval would otherwise hold the SDK turn (and the in-memory `pending` map)
+// forever. The backend separately expires the DB row.
+const MAX_PENDING_APPROVALS_PER_SESSION = 5;
+const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
+
 function extractManagedToolName(toolName) {
   if (!toolName.startsWith("mcp__")) return null;
   const rest = toolName.slice("mcp__".length);
@@ -148,11 +156,22 @@ function enrichInput(toolInput, toolContextId, toolName) {
  */
 function createApprovalBridge(options) {
   const pending = new Map();
+  const ttlMs =
+    typeof options.approvalTtlMs === "number" && options.approvalTtlMs > 0
+      ? options.approvalTtlMs
+      : DEFAULT_APPROVAL_TTL_MS;
+
+  function clearEntry(approvalId) {
+    const entry = pending.get(approvalId);
+    if (!entry) return null;
+    if (entry.timer) clearTimeout(entry.timer);
+    pending.delete(approvalId);
+    return entry;
+  }
 
   function resolve(approvalId, decision) {
-    const entry = pending.get(approvalId);
+    const entry = clearEntry(approvalId);
     if (!entry) return false;
-    pending.delete(approvalId);
     if (decision === "approve") {
       entry.resolve({
         behavior: "allow",
@@ -166,6 +185,7 @@ function createApprovalBridge(options) {
 
   function cancelAll(reason) {
     for (const [, entry] of pending) {
+      if (entry.timer) clearTimeout(entry.timer);
       entry.resolve({ behavior: "deny", message: reason });
     }
     pending.clear();
@@ -199,23 +219,43 @@ function createApprovalBridge(options) {
       }
     }
 
+    // Cap concurrent prompts so a runaway turn can't queue an unbounded number
+    // of approval requests (mirrors the local handler's per-session limit).
+    if (pending.size >= MAX_PENDING_APPROVALS_PER_SESSION) {
+      return {
+        behavior: "deny",
+        message: `Approval rate limit reached: at most ${MAX_PENDING_APPROVALS_PER_SESSION} approvals may be pending per session at once.`
+      };
+    }
+
     // Fall through — prompt the user via approval_request
     const approvalId = uuidv7();
     const kind = classifyToolKind(toolName);
 
     return new Promise((resolveFn) => {
-      pending.set(approvalId, { resolve: resolveFn, toolName, toolInput });
+      // Wall-clock deny-by-default timer. In e2b mode this Promise is the only
+      // thing keeping the SDK turn (and currentTurn) alive while waiting for a
+      // human decision; without a timeout a closed tab / abandoned turn would
+      // hang the harness forever. Independent of opts.signal, which the SDK may
+      // never fire. The backend separately expires the matching DB row.
+      const timer = setTimeout(() => {
+        const entry = clearEntry(approvalId);
+        if (!entry) return;
+        entry.resolve({ behavior: "deny", message: "Approval request timed out." });
+      }, ttlMs);
+
+      pending.set(approvalId, { resolve: resolveFn, toolName, toolInput, timer });
 
       if (opts?.signal) {
         if (opts.signal.aborted) {
-          pending.delete(approvalId);
+          clearEntry(approvalId);
           resolveFn({ behavior: "deny", message: "Aborted." });
           return;
         }
         opts.signal.addEventListener(
           "abort",
           () => {
-            if (pending.delete(approvalId)) {
+            if (clearEntry(approvalId)) {
               resolveFn({ behavior: "deny", message: "Aborted." });
             }
           },
@@ -244,16 +284,28 @@ function createApprovalBridge(options) {
 // consumed (awaited + cleared) at the start of the first turn.
 let warmStatePromise = null;
 
-async function handleWarmup(frame) {
-  const sdk = await loadSdk();
+// Builds the SDK `mcpServers` map from the protocol frame. We intentionally do
+// NOT set the SDK's `alwaysLoad` flag: as of Claude Agent SDK 0.3.142 MCP
+// startup is non-blocking by default, and forcing `alwaysLoad` would trigger a
+// `tools/list` during warmup (before the per-turn tool context exists), which
+// makes the gateway advertise every managed tool and leaks policy-disabled
+// tools into the cached tool list. Non-blocking startup is acceptable here —
+// see buildClaudeMcpServersConfig in claude-sdk-helpers.ts for the rationale.
+function buildMcpServersConfig(mcpServers) {
   const mcpServersConfig = {};
-  for (const entry of frame.mcpServers ?? []) {
+  for (const entry of mcpServers ?? []) {
     mcpServersConfig[entry.id] = {
       type: "http",
       url: entry.url,
       headers: { Authorization: entry.authorization }
     };
   }
+  return mcpServersConfig;
+}
+
+async function handleWarmup(frame) {
+  const sdk = await loadSdk();
+  const mcpServersConfig = buildMcpServersConfig(frame.mcpServers);
   const systemPrompt = frame.developerInstructions
     ? { type: "preset", preset: "claude_code", append: frame.developerInstructions }
     : { type: "preset", preset: "claude_code" };
@@ -323,7 +375,8 @@ async function runTurn(frame) {
     toolContextId: frame.toolContextId,
     bypass: frame.bypass,
     autoApproveReadOnly: frame.autoApproveReadOnly,
-    readOnlyManagedToolNames: new Set(frame.readOnlyManagedToolNames ?? [])
+    readOnlyManagedToolNames: new Set(frame.readOnlyManagedToolNames ?? []),
+    approvalTtlMs: frame.approvalTtlMs
   });
 
   // pendingInterrupt absorbs Stop clicks that arrive before the SDK iterator
@@ -339,14 +392,7 @@ async function runTurn(frame) {
   try {
     const sdk = await loadSdk();
 
-    const mcpServersConfig = {};
-    for (const entry of frame.mcpServers ?? []) {
-      mcpServersConfig[entry.id] = {
-        type: "http",
-        url: entry.url,
-        headers: { Authorization: entry.authorization }
-      };
-    }
+    const mcpServersConfig = buildMcpServersConfig(frame.mcpServers);
 
     const systemPrompt = frame.developerInstructions
       ? { type: "preset", preset: "claude_code", append: frame.developerInstructions }
@@ -424,6 +470,9 @@ async function runTurn(frame) {
     });
   } finally {
     currentTurn = null;
+    // Reset the pre-warm delegate to the deny stub so a stray canUseTool from a
+    // lingering warm subprocess (between turns) can't reach this turn's bridge.
+    warmCanUseToolFn = null;
   }
 }
 

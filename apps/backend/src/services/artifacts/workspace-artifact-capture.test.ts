@@ -209,7 +209,9 @@ describe("captureWorkspaceArtifacts", () => {
     const ws = await setupWorkspace();
     await writeFile(path.join(ws, "report.md"), "# v2");
 
-    // Pre-existing artifact with the same name
+    // Pre-existing artifact captured from this exact workspace path by a prior
+    // sweep. Idempotency is keyed on `detail.workspacePath`, so re-running the
+    // sweep must skip it.
     const seed: ArtifactRecord = {
       id: 1,
       artifactId: "old-1",
@@ -226,7 +228,7 @@ describe("captureWorkspaceArtifacts", () => {
       status: "ready",
       createdByType: "system",
       createdByRef: "workspace-sweep",
-      detail: {},
+      detail: { source: "workspace-sweep", workspacePath: path.join(ws, "report.md") },
       createdAt: "before",
       updatedAt: "before"
     };

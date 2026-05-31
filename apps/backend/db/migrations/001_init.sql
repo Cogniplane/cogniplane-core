@@ -109,7 +109,12 @@ CREATE TABLE public.approvals (
     request_payload jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    resolved_at timestamp with time zone
+    resolved_at timestamp with time zone,
+    -- Wall-clock deadline after which a still-`pending` approval is stale and
+    -- must be swept to `status='expired'`. In-process TTL timers normally fire
+    -- first; this column is the DB-level backstop that a startup sweep uses to
+    -- recover rows orphaned by a crash/restart before the timer could run.
+    expires_at timestamp with time zone NOT NULL
 );
 
 -- Name: approvals_id_seq; Type: SEQUENCE; Schema: public; Owner: -
@@ -198,7 +203,12 @@ CREATE TABLE public.audit_events (
     id bigint NOT NULL,
     tenant_id text NOT NULL,
     session_id text,
-    user_id text NOT NULL,
+    -- Nullable so the FK can be ON DELETE SET NULL: the audit trail is an
+    -- append-only forensic record and MUST outlive the user/session it
+    -- references. Deleting a user nulls the reference here rather than
+    -- cascade-deleting their audit history (which would be a track-covering
+    -- vector and break forensic continuity).
+    user_id text,
     approval_id text,
     event_type text NOT NULL,
     payload jsonb DEFAULT '{}'::jsonb NOT NULL,
@@ -473,6 +483,10 @@ CREATE TABLE public.scheduled_jobs (
     input_json jsonb DEFAULT '{}'::jsonb NOT NULL,
     settings_snapshot_json jsonb DEFAULT '{}'::jsonb NOT NULL,
     enabled boolean DEFAULT true NOT NULL,
+    -- Consecutive failed runs since the last success. The scheduler worker
+    -- auto-disables a job once this reaches SCHEDULER_MAX_CONSECUTIVE_FAILURES
+    -- so a poison job can't re-fire every tick forever; reset to 0 on success.
+    consecutive_failures integer DEFAULT 0 NOT NULL,
     last_run_at timestamp with time zone,
     next_run_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1086,6 +1100,13 @@ CREATE INDEX idx_approvals_session_id ON public.approvals USING btree (session_i
 
 CREATE INDEX idx_approvals_tenant_session ON public.approvals USING btree (tenant_id, session_id);
 
+-- Name: idx_approvals_stale_sweep; Type: INDEX; Schema: public; Owner: -
+-- Partial index supporting the startup / background sweep of stale pending
+-- approvals: only `pending` rows are ever swept, so indexing just those keeps
+-- the index tiny and the "find rows past their deadline" scan cheap.
+
+CREATE INDEX idx_approvals_stale_sweep ON public.approvals USING btree (expires_at) WHERE (status = 'pending'::text);
+
 -- Name: idx_artifact_download_tokens_lookup; Type: INDEX; Schema: public; Owner: -
 
 CREATE INDEX idx_artifact_download_tokens_lookup ON public.artifact_download_tokens USING btree (token, user_id, expires_at);
@@ -1363,7 +1384,7 @@ ALTER TABLE ONLY public.audit_events
 -- Name: audit_events audit_events_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
 ALTER TABLE ONLY public.audit_events
-    ADD CONSTRAINT audit_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(session_id) ON DELETE CASCADE;
+    ADD CONSTRAINT audit_events_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(session_id) ON DELETE SET NULL;
 
 -- Name: audit_events audit_events_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
@@ -1373,7 +1394,7 @@ ALTER TABLE ONLY public.audit_events
 -- Name: audit_events audit_events_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
 ALTER TABLE ONLY public.audit_events
-    ADD CONSTRAINT audit_events_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
+    ADD CONSTRAINT audit_events_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE SET NULL;
 
 -- Name: message_tool_results message_tool_results_message_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
@@ -1653,6 +1674,7 @@ ALTER TABLE ONLY public.user_settings_sections
 -- Name: admin_mcp_servers; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.admin_mcp_servers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_mcp_servers FORCE ROW LEVEL SECURITY;
 
 -- Name: admin_mcp_servers admin_mcp_servers_tenant_delete; Type: POLICY; Schema: public; Owner: -
 
@@ -1673,6 +1695,7 @@ CREATE POLICY admin_mcp_servers_tenant_update ON public.admin_mcp_servers FOR UP
 -- Name: admin_skill_revisions; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.admin_skill_revisions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_skill_revisions FORCE ROW LEVEL SECURITY;
 
 -- Name: admin_skill_revisions admin_skill_revisions_tenant_delete; Type: POLICY; Schema: public; Owner: -
 
@@ -1693,6 +1716,7 @@ CREATE POLICY admin_skill_revisions_tenant_update ON public.admin_skill_revision
 -- Name: admin_skills; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.admin_skills ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_skills FORCE ROW LEVEL SECURITY;
 
 -- Name: admin_skills admin_skills_tenant_delete; Type: POLICY; Schema: public; Owner: -
 
@@ -1713,6 +1737,7 @@ CREATE POLICY admin_skills_tenant_update ON public.admin_skills FOR UPDATE USING
 -- Name: approvals; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.approvals FORCE ROW LEVEL SECURITY;
 
 -- Name: approvals approvals_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1721,6 +1746,7 @@ CREATE POLICY approvals_tenant_isolation ON public.approvals USING ((tenant_id =
 -- Name: artifact_download_tokens; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.artifact_download_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.artifact_download_tokens FORCE ROW LEVEL SECURITY;
 
 -- Name: artifact_download_tokens artifact_download_tokens_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1729,6 +1755,7 @@ CREATE POLICY artifact_download_tokens_tenant_isolation ON public.artifact_downl
 -- Name: artifacts; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.artifacts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.artifacts FORCE ROW LEVEL SECURITY;
 
 -- Name: artifacts artifacts_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1737,14 +1764,29 @@ CREATE POLICY artifacts_tenant_isolation ON public.artifacts USING ((tenant_id =
 -- Name: audit_events; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_events FORCE ROW LEVEL SECURITY;
 
 -- Name: audit_events audit_events_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
 CREATE POLICY audit_events_tenant_isolation ON public.audit_events USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
 
+-- Name: audit_events audit_events_append_only; Type: POLICY; Schema: public; Owner: -
+-- The audit log is append-only. The tenant-isolation policy above is permissive
+-- and unqualified (applies to ALL commands), which by itself would let an
+-- application-role caller UPDATE or DELETE their own tenant's audit rows. These
+-- RESTRICTIVE policies are AND-ed with every other policy, so a USING(false)
+-- restrictive policy hard-denies UPDATE and DELETE for the RLS-bound app role no
+-- matter what permissive policies exist now or are added later. Migrations run
+-- as a BYPASSRLS superuser, so legitimate retention/GC jobs are unaffected.
+
+CREATE POLICY audit_events_no_update ON public.audit_events AS RESTRICTIVE FOR UPDATE USING (false);
+
+CREATE POLICY audit_events_no_delete ON public.audit_events AS RESTRICTIVE FOR DELETE USING (false);
+
 -- Name: message_tool_results; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.message_tool_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.message_tool_results FORCE ROW LEVEL SECURITY;
 
 -- Name: message_tool_results message_tool_results_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1753,6 +1795,7 @@ CREATE POLICY message_tool_results_tenant_isolation ON public.message_tool_resul
 -- Name: messages; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.messages FORCE ROW LEVEL SECURITY;
 
 -- Name: messages messages_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1761,6 +1804,7 @@ CREATE POLICY messages_tenant_isolation ON public.messages USING ((tenant_id = c
 -- Name: pii_scan_jobs; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.pii_scan_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.pii_scan_jobs FORCE ROW LEVEL SECURITY;
 
 -- Name: pii_scan_jobs pii_scan_jobs_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1769,6 +1813,7 @@ CREATE POLICY pii_scan_jobs_tenant_isolation ON public.pii_scan_jobs USING ((ten
 -- Name: pii_scan_runs; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.pii_scan_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.pii_scan_runs FORCE ROW LEVEL SECURITY;
 
 -- Name: pii_scan_runs pii_scan_runs_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1777,6 +1822,7 @@ CREATE POLICY pii_scan_runs_tenant_isolation ON public.pii_scan_runs USING ((ten
 -- Name: resource_activations; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.resource_activations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.resource_activations FORCE ROW LEVEL SECURITY;
 
 -- Name: resource_activations resource_activations_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1785,6 +1831,7 @@ CREATE POLICY resource_activations_tenant_isolation ON public.resource_activatio
 -- Name: runtime_sessions; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.runtime_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.runtime_sessions FORCE ROW LEVEL SECURITY;
 
 -- Name: runtime_sessions runtime_sessions_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1793,6 +1840,7 @@ CREATE POLICY runtime_sessions_tenant_isolation ON public.runtime_sessions USING
 -- Name: scheduled_job_runs; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.scheduled_job_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.scheduled_job_runs FORCE ROW LEVEL SECURITY;
 
 -- Name: scheduled_job_runs scheduled_job_runs_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1801,6 +1849,7 @@ CREATE POLICY scheduled_job_runs_tenant_isolation ON public.scheduled_job_runs U
 -- Name: scheduled_jobs; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.scheduled_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.scheduled_jobs FORCE ROW LEVEL SECURITY;
 
 -- Name: scheduled_jobs scheduled_jobs_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1809,6 +1858,7 @@ CREATE POLICY scheduled_jobs_tenant_isolation ON public.scheduled_jobs USING ((t
 -- Name: session_judgments; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.session_judgments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_judgments FORCE ROW LEVEL SECURITY;
 
 -- Name: session_judgments session_judgments_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1817,6 +1867,7 @@ CREATE POLICY session_judgments_tenant_isolation ON public.session_judgments USI
 -- Name: session_runtime_overrides; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.session_runtime_overrides ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.session_runtime_overrides FORCE ROW LEVEL SECURITY;
 
 -- Name: session_runtime_overrides session_runtime_overrides_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1825,6 +1876,7 @@ CREATE POLICY session_runtime_overrides_tenant_isolation ON public.session_runti
 -- Name: sessions; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sessions FORCE ROW LEVEL SECURITY;
 
 -- Name: sessions sessions_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1833,6 +1885,7 @@ CREATE POLICY sessions_tenant_isolation ON public.sessions USING ((tenant_id = c
 -- Name: skill_improvement_sessions; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.skill_improvement_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.skill_improvement_sessions FORCE ROW LEVEL SECURITY;
 
 -- Name: skill_improvement_sessions skill_improvement_sessions_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1841,6 +1894,7 @@ CREATE POLICY skill_improvement_sessions_tenant_isolation ON public.skill_improv
 -- Name: tenant_integrations; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tenant_integrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_integrations FORCE ROW LEVEL SECURITY;
 
 -- Name: tenant_integrations tenant_integrations_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1849,6 +1903,7 @@ CREATE POLICY tenant_integrations_tenant_isolation ON public.tenant_integrations
 -- Name: tenant_memberships; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tenant_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_memberships FORCE ROW LEVEL SECURITY;
 
 -- Name: tenant_memberships tenant_memberships_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1857,6 +1912,7 @@ CREATE POLICY tenant_memberships_tenant_isolation ON public.tenant_memberships U
 -- Name: tenant_org_settings; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tenant_org_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_org_settings FORCE ROW LEVEL SECURITY;
 
 -- Name: tenant_org_settings tenant_org_settings_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1865,14 +1921,16 @@ CREATE POLICY tenant_org_settings_tenant_isolation ON public.tenant_org_settings
 -- Name: tenant_settings; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tenant_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenant_settings FORCE ROW LEVEL SECURITY;
 
 -- Name: tenant_settings tenant_settings_isolation; Type: POLICY; Schema: public; Owner: -
 
-CREATE POLICY tenant_settings_isolation ON public.tenant_settings USING ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
+CREATE POLICY tenant_settings_isolation ON public.tenant_settings USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
 
 -- Name: tenants; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tenants FORCE ROW LEVEL SECURITY;
 
 -- Name: tenants tenants_self_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1881,6 +1939,7 @@ CREATE POLICY tenants_self_isolation ON public.tenants USING ((tenant_id = curre
 -- Name: tool_events; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tool_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tool_events FORCE ROW LEVEL SECURITY;
 
 -- Name: tool_events tool_events_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1889,6 +1948,7 @@ CREATE POLICY tool_events_tenant_isolation ON public.tool_events USING ((tenant_
 -- Name: tool_execution_contexts; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.tool_execution_contexts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.tool_execution_contexts FORCE ROW LEVEL SECURITY;
 
 -- Name: tool_execution_contexts tool_execution_contexts_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1897,6 +1957,7 @@ CREATE POLICY tool_execution_contexts_tenant_isolation ON public.tool_execution_
 -- Name: user_github_connections; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.user_github_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_github_connections FORCE ROW LEVEL SECURITY;
 
 -- Name: user_github_connections user_github_connections_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1905,6 +1966,7 @@ CREATE POLICY user_github_connections_tenant_isolation ON public.user_github_con
 -- Name: user_microsoft_connections; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.user_microsoft_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_microsoft_connections FORCE ROW LEVEL SECURITY;
 
 -- Name: user_microsoft_connections user_microsoft_connections_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1913,6 +1975,7 @@ CREATE POLICY user_microsoft_connections_tenant_isolation ON public.user_microso
 -- Name: user_notion_connections; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.user_notion_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_notion_connections FORCE ROW LEVEL SECURITY;
 
 -- Name: user_notion_connections user_notion_connections_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
@@ -1921,6 +1984,7 @@ CREATE POLICY user_notion_connections_tenant_isolation ON public.user_notion_con
 -- Name: user_settings_sections; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.user_settings_sections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_settings_sections FORCE ROW LEVEL SECURITY;
 
 -- Name: user_settings_sections user_settings_sections_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 

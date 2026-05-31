@@ -12,10 +12,8 @@ import type { RuntimeInvalidator } from "./services/integrations/contracts.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
 import { buildRuntimeAdapters } from "./services/runtime/build-runtime-adapters.js";
-import type { SkillImprovementLauncherDeps } from "./services/skills/skill-improvement-launcher.js";
 
 export { buildSchedulerWorker } from "./services/build-scheduler-worker.js";
-export { buildSessionJudgeWorker } from "./services/skills/judge/build-session-judge-worker.js";
 
 export function buildAppDependencies(input: {
   db: Pool;
@@ -54,7 +52,12 @@ export function buildAppDependencies(input: {
     return runtimeManagerRef;
   };
 
-  const integrations = buildIntegrationServices(config, db, stores, resolveRuntimeInvalidator);
+  const integrations = buildIntegrationServices(
+    config,
+    stores,
+    resolveRuntimeInvalidator,
+    bootstrap.limits
+  );
   // Shared by /messages (sets at turn start, clears at end) and the LLM
   // proxy (looks up by rt_*'s sid+rid to charge usage to the right
   // assistant message). Single-process scope — see file docstring.
@@ -113,6 +116,7 @@ export function buildAppDependencies(input: {
   });
 
   return {
+    db,
     sessions: stores.sessions,
     messages: stores.messages,
     artifacts: stores.artifacts,
@@ -159,26 +163,7 @@ export function buildAppDependencies(input: {
     activeTurnMessageMap,
     egressIpPins,
     sessionRuntimeOverrides: stores.sessionRuntimeOverrides,
-    skillImprovementSessions: stores.skillImprovementSessions,
-    sessionJudgments: stores.sessionJudgments,
-    overlays,
-    skillImprovementLauncher: {
-      db,
-      dynamicConfig: bootstrap.dynamicConfig,
-      sessions: stores.sessions,
-      sessionRuntimeOverrides: stores.sessionRuntimeOverrides,
-      skillImprovementSessions: stores.skillImprovementSessions,
-      artifacts: stores.artifacts,
-      artifactStorage: bootstrap.artifactStorage,
-      messages: stores.messages,
-      hasAnthropicApiKey: async (tenantId: string) => {
-        if (config.ANTHROPIC_API_KEY) return true;
-        const tenantKey = await bootstrap.getTenantAnthropicApiKey(tenantId);
-        return Boolean(tenantKey?.trim());
-      },
-      piiProtection: pii.piiProtection,
-      logger
-    } satisfies SkillImprovementLauncherDeps
+    overlays
   };
 }
 

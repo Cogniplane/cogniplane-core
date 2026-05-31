@@ -11,7 +11,7 @@ import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
  * Design note: the harness does NOT invoke the `claude` CLI. We learned during
  * the spike that headless `claude -p` has no stdio approval hook, which forced
  * `--dangerously-skip-permissions` and broke HITL. Running the SDK in-sandbox
- * preserves the `canUseTool` callback exactly as the local-mode adapter expects.
+ * preserves the `canUseTool` callback so HITL approvals work over these frames.
  */
 
 // ---------------------------------------------------------------------------
@@ -53,6 +53,13 @@ export type SandboxTurnFrame = {
   autoApproveReadOnly: boolean;
   /** Catalog names of managed MCP tools known to be read-only. */
   readOnlyManagedToolNames: string[];
+  /**
+   * Wall-clock TTL (ms) for the harness's in-sandbox `canUseTool` deny-by-default
+   * timer. Sourced from `APPROVAL_REQUEST_TTL_MS` so the harness deny matches the
+   * backend's DB-expiry sweep. Optional/defensive: the harness falls back to its
+   * own 10-minute default when absent.
+   */
+  approvalTtlMs?: number;
 };
 
 export type SandboxApprovalResponseFrame = {

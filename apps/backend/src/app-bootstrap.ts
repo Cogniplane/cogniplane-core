@@ -27,20 +27,14 @@ import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/setti
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
-import type { SessionJudgeWorker } from "./services/skills/judge/session-judge-worker.js";
-
-export type AppRouteExtras = {
-  /**
-   * Optional because the worker is only created when SKILL_JUDGE_WORKER_ENABLED
-   * is true. Admin routes degrade gracefully when missing.
-   */
-  sessionJudgeWorker?: SessionJudgeWorker;
-};
+import {
+  sweepStaleApprovals,
+  type StaleApprovalSweeperDeps
+} from "./services/runtime/stale-approval-sweeper.js";
 
 export async function registerAppRoutes(
   app: FastifyInstance,
-  deps: AppDependencies,
-  extras: AppRouteExtras = {}
+  deps: AppDependencies
 ): Promise<void> {
   await registerHealthRoutes(app, buildHealthRouteStores(deps));
   const hasAnthropicApiKey = async (tenantId: string): Promise<boolean> => {
@@ -67,13 +61,7 @@ export async function registerAppRoutes(
       anthropicCapabilitiesCache
     })
   );
-  await registerAdminRoutes(
-    app,
-    buildAdminRouteStores(deps, {
-      config: app.config,
-      sessionJudgeWorker: extras.sessionJudgeWorker
-    })
-  );
+  await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config }));
   await registerSessionRoutes(app, buildSessionRouteStores(deps));
   await registerSettingsRoutes(app, buildSettingsRouteStores(deps, { config: app.config }));
   await registerArtifactRoutes(app, buildArtifactRouteStores(deps));
@@ -145,7 +133,12 @@ export function registerAppLifecycle(input: {
   runtimeAdapters: AppDependencies["runtimeAdapters"];
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
-  sessionJudgeWorker?: SessionJudgeWorker | null;
+  /**
+   * Cross-tenant stale-approval recovery. Backed by the privileged store so the
+   * sweep spans all tenants. Optional only so tests can omit it; production
+   * always wires it.
+   */
+  staleApprovalSweeper?: StaleApprovalSweeperDeps | null;
 }) {
   const {
     app,
@@ -155,19 +148,34 @@ export function registerAppLifecycle(input: {
     runtimeAdapters,
     privilegedDb,
     schedulerWorker,
-    sessionJudgeWorker
+    staleApprovalSweeper
   } = input;
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
-  sessionJudgeWorker?.start(config.SKILL_JUDGE_POLL_INTERVAL_MS);
 
   const sweepInterval = setInterval(() => limits.sweepExpired(), 60_000);
   sweepInterval.unref();
 
+  // Recover approvals orphaned by a prior crash/restart immediately at boot,
+  // then keep sweeping for ones whose in-process TTL timer dies mid-run. The
+  // startup sweep is fire-and-forget so a slow DB can't delay readiness.
+  let approvalSweepInterval: ReturnType<typeof setInterval> | null = null;
+  if (staleApprovalSweeper) {
+    void sweepStaleApprovals(staleApprovalSweeper).catch((err) => {
+      app.log.error({ err }, "Startup stale-approval sweep failed");
+    });
+    approvalSweepInterval = setInterval(() => {
+      void sweepStaleApprovals(staleApprovalSweeper).catch((err) => {
+        app.log.error({ err }, "Periodic stale-approval sweep failed");
+      });
+    }, config.APPROVAL_REQUEST_TTL_MS);
+    approvalSweepInterval.unref();
+  }
+
   app.addHook("onClose", async () => {
     schedulerWorker?.stop();
-    sessionJudgeWorker?.stop();
     clearInterval(sweepInterval);
+    if (approvalSweepInterval) clearInterval(approvalSweepInterval);
     const closedRuntimes = new Set<RuntimeAdapter>();
     for (const adapter of Object.values(runtimeAdapters)) {
       if (adapter) closedRuntimes.add(adapter);

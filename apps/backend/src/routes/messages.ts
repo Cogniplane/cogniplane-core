@@ -123,11 +123,47 @@ export async function registerMessageRoutes(
 
     const { runtimeAdapter, provider: resolvedProvider, selectedModel } = resolution;
 
-    if (runtimeAdapter.hasActiveTurn(input.sessionId)) {
+    // Atomic turn-slot reservation. The adapter only flips `hasActiveTurn` to
+    // true deep inside `runMessage`, which doesn't run until `streamAssistantReply`
+    // far below — after several `await`s that persist the user message and burn
+    // rate-limit/quota. Two requests racing on the same session would BOTH pass
+    // an `hasActiveTurn`-only check and BOTH do those side effects before one
+    // loses. `activeTurns` is the single-process, synchronous registry the stream
+    // writer already marks for the turn's lifetime; check-and-mark it here with
+    // NO `await` in between so the event loop cannot interleave a second request.
+    // The loser returns 429 before persisting anything or consuming quota.
+    //
+    // We release the slot on every early-return path below, and the stream
+    // writer clears it in its own `finally` once the turn ends. `activeTurns`
+    // is optional only in the in-memory test harness; when absent we fall back
+    // to the adapter check alone (single-process, best-effort).
+    const reservedSessionId = input.sessionId;
+    let slotReserved = false;
+    const releaseSlot = () => {
+      if (slotReserved) {
+        stores.activeTurns?.clear(reservedSessionId);
+        slotReserved = false;
+      }
+    };
+
+    const alreadyBusy =
+      runtimeAdapter.hasActiveTurn(input.sessionId) ||
+      (stores.activeTurns?.snapshot().has(input.sessionId) ?? false);
+    if (alreadyBusy) {
       reply.code(429);
       return apiError("session_busy");
     }
+    if (stores.activeTurns) {
+      stores.activeTurns.mark(input.sessionId);
+      slotReserved = true;
+    }
 
+    // Everything past the reservation must release the slot on any early exit
+    // (validation error, PII block, thrown error) UNLESS the turn was handed to
+    // `streamAssistantReply`, which then owns the slot's lifetime and clears it
+    // in its own `finally`.
+    let handedOff = false;
+    try {
     const sessionArtifacts = await stores.artifacts.listBySession(
       tenantId,
       input.sessionId,
@@ -296,27 +332,46 @@ export async function registerMessageRoutes(
       });
     }
 
-    await streamAssistantReply({
-      logger: request.log,
-      reply,
-      messages: stores.messages,
-      toolContexts: stores.toolContexts,
-      runtimeManager: runtimeAdapter,
-      tenantId: request.auth.tenantId,
-      sessionId: input.sessionId,
-      userId: request.auth.userId,
-      modelName: selectedModel?.id ?? input.model ?? app.config.CODEX_MODEL,
-      effort: input.effort as RuntimeReasoningEffort | undefined,
-      prompt: runtimePrompt,
-      scopedArtifacts,
-      artifactProcessor: stores.artifactProcessor,
-      storage: stores.storage,
-      selectedArtifactIds,
-      sourceArtifactNames: scopedArtifacts.map((artifact) => artifact.artifactName),
-      userMessageReplacement,
-      activeTurns: stores.activeTurns,
-      activeTurnMessageMap: stores.activeTurnMessageMap
-    });
+    // From here the stream writer owns the reserved slot (it re-marks at turn
+    // start and clears in its `finally`). Mark handoff so this route's `finally`
+    // does not also clear it. BUT `streamAssistantReply` does setup work
+    // (persisting the assistant message, an opening SSE write) BEFORE it enters
+    // the try/finally that owns slot cleanup — a throw in that window would
+    // otherwise leave the slot reserved until the registry's stale timeout. So
+    // release it ourselves on the throw path. `clear()` is idempotent, so this
+    // never double-frees a slot the writer already cleared.
+    handedOff = true;
+    try {
+      await streamAssistantReply({
+        logger: request.log,
+        reply,
+        messages: stores.messages,
+        toolContexts: stores.toolContexts,
+        runtimeManager: runtimeAdapter,
+        tenantId: request.auth.tenantId,
+        sessionId: input.sessionId,
+        userId: request.auth.userId,
+        modelName: selectedModel?.id ?? input.model ?? app.config.CODEX_MODEL,
+        effort: input.effort as RuntimeReasoningEffort | undefined,
+        prompt: runtimePrompt,
+        scopedArtifacts,
+        artifactProcessor: stores.artifactProcessor,
+        storage: stores.storage,
+        selectedArtifactIds,
+        sourceArtifactNames: scopedArtifacts.map((artifact) => artifact.artifactName),
+        userMessageReplacement,
+        activeTurns: stores.activeTurns,
+        activeTurnMessageMap: stores.activeTurnMessageMap
+      });
+    } catch (streamError) {
+      releaseSlot();
+      throw streamError;
+    }
+    } finally {
+      if (!handedOff) {
+        releaseSlot();
+      }
+    }
   });
 }
 

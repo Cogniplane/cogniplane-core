@@ -182,12 +182,17 @@ export class SkillRevisionStore {
     let allocatedRevisionNumber: number | null = null;
 
     await withTenantScope(this.db, tenantId, async (client) => {
+      // Scope the existence check to THIS tenant only. Including the 'system'
+      // row here would make a tenant import whose skillId collides with a
+      // platform-default skill skip the per-tenant INSERT below, so the
+      // subsequent revision insert would reference a (tenant_id, skill_id) that
+      // doesn't exist for this tenant and fail with an opaque FK violation.
       const existing = await client.query(
         `
           SELECT *
           FROM admin_skills
           WHERE skill_id = $1
-            AND tenant_id IN ($2::text, 'system')
+            AND tenant_id = $2
           LIMIT 1
         `,
         [input.skillId, tenantId]

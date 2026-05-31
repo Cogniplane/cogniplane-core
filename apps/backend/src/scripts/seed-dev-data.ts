@@ -168,22 +168,34 @@ async function run() {
           [userMsgId, TENANT_ID, sessionId, userId, msgDate.toISOString()]
         );
 
-        // Insert assistant turn with token data
+        // Insert assistant turn with token data. ~30% of turns carry a
+        // feedback rating (mostly positive) so the message-feedback dashboard
+        // renders populated. feedback_given_at is set whenever a rating is.
+        const ratingRoll = rand();
+        const feedbackRating =
+          ratingRoll < 0.22 ? "thumbs_up" : ratingRoll < 0.3 ? "thumbs_down" : null;
+        const feedbackNotes =
+          feedbackRating === "thumbs_down" ? "Response missed the point of my question." : null;
         const asstDate = new Date(msgDate.getTime() + randInt(2000, 15000));
+        const feedbackGivenAt = feedbackRating
+          ? new Date(asstDate.getTime() + randInt(20_000, 600_000)).toISOString()
+          : null;
         await db.query(
           `INSERT INTO messages
              (message_id, tenant_id, session_id, user_id, role, status, content_text,
               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
               model_name, cost_usd,
+              feedback_rating, feedback_notes, feedback_given_at,
               created_at, updated_at)
            VALUES ($1,$2,$3,$4,'assistant','completed','Here is my response.',
-                   $5,$6,$7,$8,$9,$10,$11,$12,$12)
+                   $5,$6,$7,$8,$9,$10,$11,$13,$14,$15,$12,$12)
            ON CONFLICT (message_id) DO NOTHING`,
           [
             messageId, TENANT_ID, sessionId, userId,
             inputTokens, cachedInput, outputTokens, 0, totalTokens,
             model.name, costUsd,
-            asstDate.toISOString()
+            asstDate.toISOString(),
+            feedbackRating, feedbackNotes, feedbackGivenAt
           ]
         );
 
@@ -193,7 +205,92 @@ async function run() {
   }
 
   console.log(`Inserted up to ${inserted} assistant messages (skipped existing).`);
-  console.log("Done. Run the token-usage dashboard to see results.");
+
+  // 4. PII scan runs — populate the PII activity dashboard (donut breakdowns,
+  //    stacked time-series, top offenders, recent activity). Concentrated in
+  //    the last 30 days so the default 7d/30d ranges render data. Each run
+  //    carries findings_json with entityType + confidence so the "by entity"
+  //    and "by confidence" charts populate.
+  const PII_ENTITIES = ["email", "phone", "ssn", "credit_card", "ip_address", "person_name"];
+  const PII_CONFIDENCES = ["high", "medium", "low"] as const;
+  // action_taken drives the time-series + action breakdown. Weighted toward
+  // allow/report (the common case), with a realistic minority of block/transform.
+  const PII_ACTIONS: Array<{ action: string; status: string; weight: number }> = [
+    { action: "allow",     status: "completed",   weight: 0.5 },
+    { action: "report",    status: "completed",   weight: 0.25 },
+    { action: "block",     status: "blocked",     weight: 0.1 },
+    { action: "transform", status: "transformed", weight: 0.1 },
+    { action: "failed",    status: "failed",      weight: 0.05 } // action_taken NULL when failed
+  ];
+
+  let piiInserted = 0;
+  const PII_DAYS = 30;
+  for (let day = PII_DAYS - 1; day >= 0; day--) {
+    const dayDate = new Date(now);
+    dayDate.setDate(dayDate.getDate() - day);
+    const dayOfWeek = dayDate.getDay();
+    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+    // A few scans per active day; quieter on weekends.
+    const scans = isWeekend ? randInt(0, 2) : randInt(1, 5);
+
+    for (let s = 0; s < scans; s++) {
+      const session = sessions[randInt(0, sessions.length - 1)];
+      const { userId, sessionId } = session;
+
+      // Weighted action pick.
+      const r = rand();
+      let cumulative = 0;
+      let picked = PII_ACTIONS[0];
+      for (const a of PII_ACTIONS) {
+        cumulative += a.weight;
+        if (r < cumulative) { picked = a; break; }
+      }
+      const isFailed = picked.action === "failed";
+      const subjectType = rand() < 0.8 ? "message" : "artifact";
+
+      // Build 0–3 findings (failed scans have none).
+      const findingCount = isFailed ? 0 : randInt(picked.action === "allow" ? 0 : 1, 3);
+      const findings = Array.from({ length: findingCount }, () => ({
+        entityType: PII_ENTITIES[randInt(0, PII_ENTITIES.length - 1)],
+        confidence: PII_CONFIDENCES[randInt(0, PII_CONFIDENCES.length - 1)],
+        excerpt: "[redacted]"
+      }));
+
+      const hourOffset = randInt(8, 22);
+      const scanDate = new Date(dayDate);
+      scanDate.setUTCHours(hourOffset, randInt(0, 59), randInt(0, 59), 0);
+      const scanRunId = `dev-pii-${day}-${s}-${userId.slice(-4)}`;
+
+      await db.query(
+        `INSERT INTO pii_scan_runs
+           (tenant_id, scan_run_id, subject_type, subject_id, source_session_id, source_user_id,
+            mode, provider_type, provider_model, status, findings_json, action_taken,
+            summary_text, error_message, created_at, updated_at, completed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'rule-based','dev-seed',$8,$9::jsonb,$10,$11,$12,$13,$13,$14)
+         ON CONFLICT (scan_run_id) DO NOTHING`,
+        [
+          TENANT_ID,
+          scanRunId,
+          subjectType,
+          `${subjectType}-${scanRunId}`,
+          sessionId,
+          userId,
+          // mode column: map action to scan mode (failed -> detect attempt).
+          picked.action === "block" ? "block" : picked.action === "transform" ? "transform" : "detect",
+          picked.status,
+          JSON.stringify(findings),
+          isFailed ? null : picked.action,
+          isFailed ? null : `${findingCount} finding(s) detected`,
+          isFailed ? "provider timeout" : null,
+          scanDate.toISOString(),
+          isFailed ? null : new Date(scanDate.getTime() + randInt(200, 3000)).toISOString()
+        ]
+      );
+      piiInserted++;
+    }
+  }
+  console.log(`Inserted up to ${piiInserted} PII scan runs (skipped existing).`);
+  console.log("Done. Run the token-usage / message-feedback / PII dashboards to see results.");
 }
 
 try {

@@ -89,6 +89,27 @@ async function collectWorkspaceFiles(workspacePath: string): Promise<string[]> {
   return results;
 }
 
+// Returns a name not present in `taken`, disambiguating collisions as
+// `base (1).ext`, `base (2).ext`, … (the suffix lands before the extension so
+// the file type stays obvious). The chosen name is added to `taken` so callers
+// can reserve it atomically within a single sweep before yielding to await.
+function reserveUniqueName(fileName: string, taken: Set<string>): string {
+  if (!taken.has(fileName)) {
+    taken.add(fileName);
+    return fileName;
+  }
+
+  const ext = extname(fileName);
+  const base = fileName.slice(0, fileName.length - ext.length);
+  for (let n = 1; ; n += 1) {
+    const candidate = `${base} (${n})${ext}`;
+    if (!taken.has(candidate)) {
+      taken.add(candidate);
+      return candidate;
+    }
+  }
+}
+
 /**
  * Captures newly generated files in the runtime workspace into the
  * `artifacts` table after a turn completes. Does NOT delete files from the
@@ -101,8 +122,10 @@ async function collectWorkspaceFiles(workspacePath: string): Promise<string[]> {
  *   (`.codex`, `.framework`, `node_modules`, `.git`, `artifacts`), and
  *   files in `EXCLUDED_FILE_NAMES` (`AGENTS.md`).
  * - Only files with extensions in `SWEEP_EXTENSIONS` are considered.
- * - Deduplicates by `artifactName` — files already registered for this
- *   session are skipped, so re-running the sweep is idempotent.
+ * - Idempotent by workspace SOURCE PATH (`detail.workspacePath`): a file
+ *   already captured by a prior sweep is skipped. A newly generated file whose
+ *   name collides with an existing artifact (e.g. an upload) is captured under
+ *   a disambiguated name (`report (1).txt`) rather than silently dropped.
  * - Size cap: 500KB text, 5MB images. Empty and over-cap files are skipped.
  * - Each registered artifact is `artifactType: "generated"`,
  *   `createdByType: "system"`, `createdByRef: "workspace-sweep"` and emits
@@ -125,13 +148,34 @@ export async function captureWorkspaceArtifacts(input: {
     input.artifacts.listBySession(input.tenantId, input.sessionId, input.userId)
   ]);
 
-  // Deduplicate by artifact name — skip files already captured this session.
-  const existingNames = new Set(existingArtifacts.map((a) => a.artifactName));
+  // Idempotency is keyed on the workspace SOURCE PATH, not the artifact name:
+  // a generated file is "already captured" only if a prior sweep registered
+  // that exact path (recorded in `detail.workspacePath`). Keying on name would
+  // wrongly drop a generated file whose name collides with an upload, and would
+  // also re-disambiguate the same file on every sweep.
+  const capturedPaths = new Set(
+    existingArtifacts
+      .filter((a) => a.artifactType === "generated")
+      .map((a) => a.detail.workspacePath)
+      .filter((p): p is string => typeof p === "string")
+  );
+
+  // Names already taken (uploads, derived, and previously-captured generated
+  // files). A new capture whose filename collides is DISAMBIGUATED rather than
+  // dropped. Shared and mutated across the sweep so two new files with the same
+  // base name in one run also get distinct names.
+  const takenNames = new Set(existingArtifacts.map((a) => a.artifactName));
 
   await Promise.all(
     files.map(async (filePath) => {
       const fileName = filePath.split("/").pop()!;
-      if (existingNames.has(fileName)) return;
+      // Already captured this exact file in a prior sweep — idempotent skip.
+      if (capturedPaths.has(filePath)) return;
+
+      // Reserve a collision-free name SYNCHRONOUSLY (before any await) so two
+      // concurrent files with the same base name in one sweep cannot both
+      // claim it. `reserveUniqueName` mutates `takenNames` in place.
+      const artifactName = reserveUniqueName(fileName, takenNames);
 
       let content: Buffer;
       let fileSize: number;
@@ -165,7 +209,7 @@ export async function captureWorkspaceArtifacts(input: {
         artifactType: "generated",
         sessionId: input.sessionId,
         userId: input.userId,
-        artifactName: fileName,
+        artifactName,
         mimeType,
         storageBackend: stored.storageBackend,
         storageKey: stored.storageKey,

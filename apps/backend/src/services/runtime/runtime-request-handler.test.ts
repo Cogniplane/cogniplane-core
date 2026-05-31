@@ -4,7 +4,7 @@ import { AsyncQueue } from "../../lib/async-queue.js";
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
-import type { JsonRpcRequest } from "./codex-runtime-process.js";
+import type { JsonRpcRequest } from "./codex-jsonrpc.js";
 import type { ActiveTurnState, RuntimeProcessHandle, RuntimeState } from "./runtime-types.js";
 
 import {

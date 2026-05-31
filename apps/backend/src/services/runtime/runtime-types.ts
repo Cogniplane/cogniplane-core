@@ -6,32 +6,13 @@ import type { RuntimeApprovalKind, RuntimeEvent, RuntimeReasoningEffort } from "
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 
 import type { ResolvedRuntimePolicy, RuntimeConfigBundle, RuntimeProvider } from "../admin-config-records.js";
-import type { CodexRuntimeProcess } from "./codex-runtime-process.js";
+import type { RuntimeProcessHandle } from "./codex-jsonrpc.js";
 import type { PendingApprovalRecord } from "./runtime-approval-coordinator.js";
 import type { WorkspaceArtifacts } from "./runtime-workspace.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import type { SkillBundleStorage } from "../skills/skill-bundle-storage.js";
 
-export type RuntimeProcessHandle = Pick<
-  CodexRuntimeProcess,
-  | "port"
-  | "pid"
-  | "socketReadyState"
-  | "isAlive"
-  | "sendRequest"
-  | "sendNotification"
-  | "closeSocket"
-  | "terminate"
-  | "sendResponse"
-  | "sendError"
-  | "rejectPendingRequests"
-  | "readFile"
-  | "writeFile"
-  | "onNotification"
-  | "onRequest"
-  | "onClose"
-  | "onExit"
->;
+export type { RuntimeProcessHandle };
 
 export type RuntimeWorkspaceFactory = (
   config: AppConfig,

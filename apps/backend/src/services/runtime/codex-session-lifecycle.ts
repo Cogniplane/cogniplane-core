@@ -7,7 +7,7 @@ import { getErrorMessage } from "../../lib/http-errors.js";
 import type { WorkspaceArtifacts } from "./runtime-workspace.js";
 import {
   CodexRuntimeProcessStartError
-} from "./codex-runtime-process.js";
+} from "./codex-jsonrpc.js";
 import type { ResolvedRuntimePolicy } from "../admin-config-records.js";
 import type {
   RuntimeProcessHandle,
@@ -38,7 +38,16 @@ export class CodexSessionLifecycle {
     private readonly logger: FastifyBaseLogger,
     // Optional so unit tests can construct the lifecycle without wiring
     // the pin store; production passes it from build-runtime-adapters.
-    private readonly egressIpPins?: RuntimeEgressIpPinStore
+    private readonly egressIpPins?: RuntimeEgressIpPinStore,
+    // Invoked once per runtime when it is finalized (any teardown path: idle,
+    // crash, socket close, invalidation), BEFORE in-memory approval state is
+    // cleared so the hook can still read `runtime.pendingApprovals` to build
+    // audit payloads. The manager wires this to expire the runtime's still-
+    // pending approval DB rows — otherwise a crash/teardown mid-approval leaves
+    // rows stuck in `status='pending'` forever, with the UI showing a dead
+    // approve/reject prompt and a late decision 404-ing into a torn-down turn.
+    // Best-effort: a throw here is logged but never blocks teardown.
+    private readonly onFinalize?: (runtime: RuntimeState) => Promise<void>
   ) {}
 
   async ensureRuntime(
@@ -104,7 +113,7 @@ export class CodexSessionLifecycle {
       shutdownRequestedAt: new Date().toISOString()
     };
     await this.persistRuntime(runtime, "terminating");
-    runtime.process.closeSocket();
+    // terminate() fires close listeners (stream end) then kills the sandbox.
     runtime.process.terminate();
   }
 
@@ -119,6 +128,22 @@ export class CodexSessionLifecycle {
 
     runtime.finalized = true;
     runtime.closed = true;
+
+    // Expire still-pending approval DB rows BEFORE we drop the in-memory map —
+    // the hook reads `runtime.pendingApprovals` to build audit payloads and to
+    // unblock the codex JSON-RPC requests. Best-effort: never let cleanup
+    // failure abort teardown.
+    if (this.onFinalize) {
+      try {
+        await this.onFinalize(runtime);
+      } catch (err) {
+        this.logger.error(
+          { err, sessionId: runtime.sessionId },
+          "onFinalize hook failed during runtime teardown"
+        );
+      }
+    }
+
     runtime.pendingApprovals.clear();
     for (const timer of runtime.pendingApprovalTimers.values()) {
       clearTimeout(timer);
@@ -163,6 +188,9 @@ export class CodexSessionLifecycle {
     if (isCurrentRuntime) {
       await this.persistRuntime(runtime, finalStatus);
     }
+    // The workspace files that embed the plaintext runtime token (codex.toml,
+    // runtime-manifest.json) live inside the E2B sandbox, which is destroyed
+    // wholesale on teardown — nothing to scrub on the backend filesystem.
   }
 
   async invalidateRuntime(
@@ -351,18 +379,4 @@ export class CodexSessionLifecycle {
     this.runtimes.set(runtime.sessionId, runtime);
   }
 
-  describeSocketState(readyState: number): string {
-    switch (readyState) {
-      case WebSocket.CONNECTING:
-        return "connecting";
-      case WebSocket.OPEN:
-        return "open";
-      case WebSocket.CLOSING:
-        return "closing";
-      case WebSocket.CLOSED:
-        return "closed";
-      default:
-        return "unknown";
-    }
-  }
 }

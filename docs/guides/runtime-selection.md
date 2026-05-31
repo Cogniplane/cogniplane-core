@@ -12,7 +12,7 @@ That bet is provider-agnostic. What matters is that the runtime carries enough i
 
 ### Codex (`codex app-server`)
 
-- JSON-RPC 2.0 over WebSocket (local) or stdio (E2B)
+- JSON-RPC 2.0 over stdio, running inside a per-session E2B sandbox
 - Pinned via `apps/backend/src/codex-release.json`
 - Schema artifacts generated from the pinned binary are the protocol source of truth
 - Strong coding-agent heritage; sandbox control, shell/file/git capabilities gated by policy
@@ -20,7 +20,7 @@ That bet is provider-agnostic. What matters is that the runtime carries enough i
 
 ### Claude Code
 
-- Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) in-process via `query()`
+- Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) driven via `query()` inside the per-session E2B sandbox (the `sandbox-agent.mjs` harness)
 - Requires `ANTHROPIC_API_KEY` (platform-level or per-tenant)
 - Approvals bridged via the SDK's `canUseTool` callback and deferred promises
 - Strong reasoning and planning streaming; first-class extended thinking events

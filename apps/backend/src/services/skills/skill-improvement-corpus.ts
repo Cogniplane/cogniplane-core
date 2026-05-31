@@ -1,12 +1,6 @@
-import { createHash } from "node:crypto";
-import { Readable } from "node:stream";
-import { uuidv7 } from "../../lib/uuid.js";
-
 import { type Pool, withTenantScope } from "../../lib/db.js";
-import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
-import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { MessageRecord, ToolResultRecord } from "../message-store.js";
-import type { PiiProtectionService, PiiSubject } from "../pii/pii-protection-service.js";
+import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import { redactSecrets } from "../redact-secrets.js";
 
 const TOOL_OUTPUT_EXCERPT_BYTES = 800;
@@ -231,43 +225,37 @@ function indent(value: string, spaces: number): string {
 
 // ── Orchestrator ────────────────────────────────────────────────────────────
 
-export type CorpusBuilderDeps = {
+export type GatherCorpusDeps = {
   db: Pool;
-  artifacts: ArtifactStore;
-  storage: ArtifactStorage;
   loadMessagesForSession: (
     tenantId: string,
     sessionId: string,
     userId: string
   ) => Promise<MessageRecord[]>;
   /**
-   * Optional PII gate. When supplied AND the tenant has PII protection
-   * effectively enabled for the chat-prompt scope, the assembled corpus is
-   * scanned via `evaluateText`. The corpus assembler **fails closed**: any
-   * `block` decision or provider error aborts the build before the artifact
-   * is written. `transform` rewrites the markdown to the redacted form,
-   * `report` attaches finding metadata to the artifact, `allow` is a no-op.
+   * Optional PII gate. When supplied, the assembled corpus is scanned via
+   * `evaluateText` with the `chat_prompt` scope before it is returned. The
+   * corpus aggregates many sessions' content, so this is its own fail-closed
+   * boundary — the per-turn `/messages` PII check only evaluates the user's
+   * inbound prompt, never tool outputs. A `block` decision (or provider
+   * error) throws `SkillCorpusPiiBlockedError`; `transform` returns the
+   * redacted text; `report`/`allow` pass through unchanged.
    */
   piiProtection?: PiiProtectionService;
 };
 
-export class SkillImprovementCorpusPiiBlockedError extends Error {
+export class SkillCorpusPiiBlockedError extends Error {
   readonly findingsCount: number;
-  readonly providerType: string | null;
-  readonly providerModel: string | null;
-  constructor(message: string, findingsCount: number, providerType: string | null, providerModel: string | null) {
+  constructor(message: string, findingsCount: number) {
     super(message);
-    this.name = "SkillImprovementCorpusPiiBlockedError";
+    this.name = "SkillCorpusPiiBlockedError";
     this.findingsCount = findingsCount;
-    this.providerType = providerType;
-    this.providerModel = providerModel;
   }
 }
 
-export type BuildCorpusInput = {
+export type GatherCorpusInput = {
   tenantId: string;
   userId: string;
-  newSessionId: string;
   skill: {
     skillId: string;
     skillName: string;
@@ -280,32 +268,31 @@ export type BuildCorpusInput = {
   byteBudget?: number;
 };
 
-export type BuildCorpusResult = {
-  artifact: ArtifactRecord;
+export type GatherCorpusResult = CorpusFormatterOutput & {
   sessionsConsidered: string[];
-  includedSessionCount: number;
-  excludedSessionCount: number;
-  truncatedToolResultCount: number;
   redactionStatus: "applied";
   piiStatus: "skipped" | "allowed" | "transformed" | "reported";
 };
 
 /**
- * Queries `resource_activations` for sessions where the target skill was
- * invoked according to either the LLM judge (Tier 3) or `materialized`
- * fallback (Tier 1, used when no judge has run yet). Sessions that the
- * judge explicitly said the skill was NOT invoked in are excluded — those
- * would be misleading evidence for "improve based on what worked".
+ * Assembles the skill-improvement corpus markdown for a target skill and
+ * returns it directly (no artifact write). Used by the `read_skill_corpus`
+ * managed tool.
  *
- * Assembles the formatted markdown, redacts secrets per-message, applies
- * the whole-corpus byte budget, and (when configured) runs the PII
- * protection service. PII `block` decisions or provider errors abort the
- * build before the artifact is written.
+ * Queries `resource_activations` for sessions where the target skill was
+ * offered (`materialized`) or actually used (`invoked`) according to Tier 1
+ * telemetry (`ActivationTracker`); invoked sessions rank ahead of offered.
+ * Secrets are redacted per-message and the whole-corpus byte budget applies.
+ *
+ * When `deps.piiProtection` is supplied the assembled corpus is run through a
+ * fail-closed PII gate before being returned (see `GatherCorpusDeps`): the
+ * corpus aggregates many past sessions, so it must not lean on the per-turn
+ * `/messages` check, which never sees tool output.
  */
-export async function buildSkillImprovementCorpus(
-  deps: CorpusBuilderDeps,
-  input: BuildCorpusInput
-): Promise<BuildCorpusResult> {
+export async function gatherSkillCorpus(
+  deps: GatherCorpusDeps,
+  input: GatherCorpusInput
+): Promise<GatherCorpusResult> {
   const requestedLimit = input.sessionLimit ?? DEFAULT_SESSIONS;
   const sessionLimit = Math.max(0, Math.min(requestedLimit, ABSOLUTE_MAX_SESSIONS));
   const byteBudget = input.byteBudget ?? DEFAULT_CORPUS_BYTE_BUDGET;
@@ -338,18 +325,16 @@ export async function buildSkillImprovementCorpus(
     byteBudget
   });
 
-  // PII gate — fail-closed before any artifact write. Errors here propagate
-  // to the launcher so the admin sees a clear failure instead of a silent
-  // PII-leaking artifact.
-  let finalMarkdown = formatted.markdown;
-  let piiStatus: BuildCorpusResult["piiStatus"] = "skipped";
-  let piiMetadata: Record<string, unknown> | null = null;
+  // Fail-closed PII gate over the whole assembled corpus. Errors propagate to
+  // the caller (the managed tool surfaces them as a tool error) rather than
+  // returning potentially-sensitive aggregated content to the runtime.
+  let markdown = formatted.markdown;
+  let piiStatus: GatherCorpusResult["piiStatus"] = "skipped";
   if (deps.piiProtection) {
-    const subject: PiiSubject = { kind: "chat_prompt" };
     const decision = await deps.piiProtection.evaluateText({
       tenantId: input.tenantId,
       text: formatted.markdown,
-      subject
+      subject: { kind: "chat_prompt" }
     });
     switch (decision.action) {
       case "allow":
@@ -357,79 +342,23 @@ export async function buildSkillImprovementCorpus(
         break;
       case "report":
         piiStatus = "reported";
-        piiMetadata = {
-          findingsCount: decision.findings.length,
-          providerType: decision.providerType,
-          providerModel: decision.providerModel
-        };
         break;
       case "transform":
         piiStatus = "transformed";
-        finalMarkdown = decision.transformedText;
-        piiMetadata = {
-          findingsCount: decision.findings.length,
-          providerType: decision.providerType,
-          providerModel: decision.providerModel
-        };
+        markdown = decision.transformedText;
         break;
       case "block":
-        throw new SkillImprovementCorpusPiiBlockedError(
+        throw new SkillCorpusPiiBlockedError(
           `Corpus blocked by PII protection (reason: ${decision.blockReason}, ${decision.findings.length} finding(s)).`,
-          decision.findings.length,
-          decision.providerType,
-          decision.providerModel
+          decision.findings.length
         );
     }
   }
 
-  const contentBuffer = Buffer.from(finalMarkdown, "utf-8");
-  const checksumSha256 = createHash("sha256").update(contentBuffer).digest("hex");
-  const safeSkillSlug = input.skill.skillId.replace(/[^a-zA-Z0-9._-]/g, "-");
-  const timestamp = new Date().toISOString().replaceAll(":", "-");
-  const artifactName = `skill-improvement-corpus-${safeSkillSlug}-${timestamp}.md`;
-  const storageKey = `${input.userId}/${input.newSessionId}/${uuidv7()}.md`;
-
-  const stored = await deps.storage.put({
-    storageKey,
-    stream: Readable.from([contentBuffer])
-  });
-
-  const artifact = await deps.artifacts.create({
-    tenantId: input.tenantId,
-    artifactType: "generated",
-    sessionId: input.newSessionId,
-    userId: input.userId,
-    artifactName,
-    mimeType: "text/markdown",
-    storageBackend: stored.storageBackend,
-    storageKey: stored.storageKey,
-    fileSizeBytes: stored.fileSizeBytes,
-    checksumSha256,
-    status: "ready",
-    createdByType: "system",
-    createdByRef: null,
-    detail: {
-      source: "skill_improvement_corpus",
-      skillId: input.skill.skillId,
-      sessionLimit,
-      includedSessionCount: formatted.includedSessionCount,
-      excludedSessionCount: formatted.excludedSessionCount,
-      truncatedSessionCount: formatted.excludedSessionCount,
-      truncatedToolResultCount: formatted.truncatedToolResultCount,
-      byteBudget,
-      finalSizeBytes: contentBuffer.length,
-      redactionStatus: "applied",
-      piiStatus,
-      ...(piiMetadata ? { piiCorpusScan: piiMetadata } : {})
-    }
-  });
-
   return {
-    artifact,
+    ...formatted,
+    markdown,
     sessionsConsidered: sessionIds.map((row) => row.sessionId),
-    includedSessionCount: formatted.includedSessionCount,
-    excludedSessionCount: formatted.excludedSessionCount,
-    truncatedToolResultCount: formatted.truncatedToolResultCount,
     redactionStatus: "applied",
     piiStatus
   };
@@ -443,10 +372,9 @@ type InvokedSessionRow = {
 
 /**
  * Returns up to `limit` sessions where `resource_activations` has at least
- * one `invoked` row for the target skill, OR a `materialized` row in the
- * absence of any LLM-judge negative ruling. Sessions where the LLM judge
- * explicitly said the skill was NOT invoked are filtered out — including
- * them would feed the improver evidence that contradicts its task.
+ * one `invoked` or `materialized` row for the target skill. Sessions where
+ * the skill was actually invoked rank ahead of sessions where it was only
+ * offered.
  *
  * Sessions are returned newest-first by the most recent matching activation.
  */
@@ -461,16 +389,7 @@ async function fetchInvokedSessionIds(
           SELECT
             ra.session_id,
             MAX(ra.occurred_at) AS last_occurred_at,
-            BOOL_OR(ra.event_type = 'invoked') AS had_invoked,
-            -- Judge-negative: the LLM judge wrote a 'materialized' row whose
-            -- metadata explicitly says invoked=false. Persisted by
-            -- session-judge-worker.persistJudgment for skills the judge
-            -- decided were NOT used; they must not feed the improver corpus.
-            BOOL_OR(
-              ra.event_type = 'materialized'
-              AND ra.metadata ->> 'source' = 'llm_judge'
-              AND ra.metadata ->> 'invoked' = 'false'
-            ) AS judge_negative
+            BOOL_OR(ra.event_type = 'invoked') AS had_invoked
           FROM resource_activations ra
           WHERE ra.tenant_id = $1
             AND ra.resource_type = 'skill'
@@ -485,7 +404,6 @@ async function fetchInvokedSessionIds(
         FROM per_session
         JOIN sessions s ON s.session_id = per_session.session_id AND s.tenant_id = $1
         WHERE s.purpose = 'normal'  -- never feed improver sessions back into themselves
-          AND NOT per_session.judge_negative
         ORDER BY per_session.had_invoked DESC, per_session.last_occurred_at DESC
         LIMIT $3
       `,

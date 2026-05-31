@@ -158,6 +158,26 @@
             }
           },
           "title": "InputImageFunctionCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "encrypted_content",
+            "type"
+          ],
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "encrypted_content"
+              ],
+              "title": "EncryptedContentFunctionCallOutputContentItemType"
+            }
+          },
+          "title": "EncryptedContentFunctionCallOutputContentItem"
         }
       ]
     },
@@ -749,6 +769,22 @@
             }
           },
           "title": "CompactionResponseItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "compaction_trigger"
+              ],
+              "title": "CompactionTriggerResponseItemType"
+            }
+          },
+          "title": "CompactionTriggerResponseItem"
         },
         {
           "type": "object",

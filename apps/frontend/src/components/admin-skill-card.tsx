@@ -1,16 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
-
-import {
-  IMPROVER_PREFILL_STORAGE_KEY,
-  type ImproverEditorPrefill
-} from "./improver-session-banner";
+import { useState } from "react";
 
 import { AdminSkillEditModal } from "./admin-skill-edit-modal";
 import { AdminSkillFileModal } from "./admin-skill-file-modal";
 import { AdminSkillGithubImportTab } from "./admin-skill-github-import-tab";
-import { AdminSkillImproveModal } from "./admin-skill-improve-modal";
 import { AdminSkillInlineTab } from "./admin-skill-inline-tab";
 import { AdminSkillMarketplaceTab } from "./admin-skill-marketplace-tab";
 import { AdminSkillZipUploadTab } from "./admin-skill-zip-upload-tab";
@@ -24,14 +18,9 @@ import {
   getRevisionGithubMetadata
 } from "./admin-skill-card-utils";
 import { useSkillImports } from "../hooks/use-skill-imports";
-import { useSkillImprovement } from "../hooks/use-skill-improvement";
 import { useSkillRevisions } from "../hooks/use-skill-revisions";
 import type {
   AdminSkill,
-  EffortLevel,
-  LaunchSkillImprovementResponse,
-  RuntimeProvider,
-  SkillImprovementSessionSummary,
   SkillMarketplaceCatalog,
   SkillMarketplaceEntry,
   SkillRevision
@@ -79,14 +68,6 @@ export function AdminSkillCard(props: {
     reviewNotes?: string | null;
   }) => Promise<void>;
   onSaveManifestUrl: (url: string | null) => Promise<void>;
-  onLaunchImprovement?: (input: {
-    skillId: string;
-    sessionCount: number;
-    provider?: RuntimeProvider | null;
-    model?: string | null;
-    effort?: EffortLevel | null;
-  }) => Promise<LaunchSkillImprovementResponse>;
-  onListImprovementSessions?: (skillId: string) => Promise<SkillImprovementSessionSummary[]>;
 }) {
   const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
   const [filePreview, setFilePreview] = useState<FilePreview | null>(null);
@@ -103,40 +84,6 @@ export function AdminSkillCard(props: {
     onListRevisions: props.onListRevisions,
     onActivateRevision: props.onActivateRevision
   });
-
-  const improvement = useSkillImprovement({
-    expandedSkillId: revisions.expandedSkillId,
-    onLaunchImprovement: props.onLaunchImprovement,
-    onListImprovementSessions: props.onListImprovementSessions
-  });
-
-  // Improver "Copy SKILL.md to editor" handoff.
-  useEffect(() => {
-    const raw = window.sessionStorage.getItem(IMPROVER_PREFILL_STORAGE_KEY);
-    if (!raw) return;
-    let prefill: ImproverEditorPrefill | null = null;
-    try {
-      prefill = JSON.parse(raw) as ImproverEditorPrefill;
-    } catch {
-      window.sessionStorage.removeItem(IMPROVER_PREFILL_STORAGE_KEY);
-      return;
-    }
-    if (!prefill || typeof prefill.skillId !== "string") {
-      window.sessionStorage.removeItem(IMPROVER_PREFILL_STORAGE_KEY);
-      return;
-    }
-    const target = props.skills.find((skill) => skill.skillId === prefill!.skillId);
-    if (!target) return;
-    window.sessionStorage.removeItem(IMPROVER_PREFILL_STORAGE_KEY);
-    // One-shot handoff from sessionStorage on mount; the effect consumes and clears it.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setEditTarget({
-      skillId: target.skillId,
-      skillName: target.skillName ?? prefill.skillId,
-      description: target.description ?? "",
-      instructions: prefill.instructions
-    });
-  }, [props.skills]);
 
   async function handleEditSubmit(input: {
     skillName: string;
@@ -276,7 +223,7 @@ export function AdminSkillCard(props: {
                     {skill.activeSourceType ? <span className={CHIP}>{skill.activeSourceType}</span> : null}
                     <span
                       className={PILL}
-                      title="Distinct sessions in the last 30 days where this skill was actually used (Tier 1 tool-call match or Tier 3 LLM judge verdict)."
+                      title="Distinct sessions in the last 30 days where this skill was actually used (tool-call match)."
                     >
                       Used {skill.invokedSessions30d ?? 0}
                     </span>
@@ -300,11 +247,6 @@ export function AdminSkillCard(props: {
 
                   {isExpanded ? (
                     <div className="mt-4 flex flex-col gap-3">
-                      {props.onListImprovementSessions ? (
-                        <ImprovementHistoryList
-                          sessions={improvement.sessionsBySkill[skill.skillId]}
-                        />
-                      ) : null}
                       {skillRevisions.length ? (
                         skillRevisions.map((revision) => (
                           <RevisionRow
@@ -340,18 +282,6 @@ export function AdminSkillCard(props: {
                   >
                     {isExpanded ? "Hide revisions" : "Review revisions"}
                   </Button>
-                  {props.onLaunchImprovement && !skill.isInherited ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={props.busyKey === `improve-skill-${skill.skillId}`}
-                      onClick={() =>
-                        improvement.setTarget({ skillId: skill.skillId, skillName: skill.skillName })
-                      }
-                    >
-                      Improve with AI
-                    </Button>
-                  ) : null}
                   {skill.isPublished ? (
                     <Button type="button" variant="outline" onClick={() => props.onUnpublish(skill.skillId)}>
                       Unpublish
@@ -389,24 +319,6 @@ export function AdminSkillCard(props: {
           isBusy={props.busyKey === "skill-import-inline"}
           onCancel={() => setEditTarget(null)}
           onSubmit={handleEditSubmit}
-        />
-      ) : null}
-
-      {improvement.target ? (
-        <AdminSkillImproveModal
-          skillId={improvement.target.skillId}
-          skillName={improvement.target.skillName}
-          isBusy={props.busyKey === `improve-skill-${improvement.target.skillId}`}
-          submitError={improvement.launchError}
-          onCancel={improvement.cancel}
-          onSubmit={improvement.launch}
-        />
-      ) : null}
-
-      {improvement.launchNotice ? (
-        <ImprovementLaunchNotice
-          notice={improvement.launchNotice}
-          onDismiss={improvement.dismissNotice}
         />
       ) : null}
     </Card>
@@ -565,72 +477,6 @@ function RevisionRow(props: {
             Inherited from platform — copy to a new skill id to customize
           </span>
         ) : null}
-      </div>
-    </div>
-  );
-}
-
-function ImprovementHistoryList({
-  sessions
-}: {
-  sessions: SkillImprovementSessionSummary[] | undefined;
-}) {
-  if (!sessions) return null;
-  if (sessions.length === 0) {
-    return (
-      <div className="rounded-md bg-surface-container-low p-3">
-        <span className={SECTION_LABEL}>Improvement history</span>
-        <p className="mt-1 text-sm text-on-surface-variant">
-          No improver sessions for this skill yet.
-        </p>
-      </div>
-    );
-  }
-  return (
-    <div className="rounded-md bg-surface-container-low p-3">
-      <span className={SECTION_LABEL}>Improvement history</span>
-      <ul className="mt-2 flex flex-col gap-1">
-        {sessions.map((session) => (
-          <li
-            key={session.sessionId}
-            className="flex items-center justify-between gap-3 rounded px-2 py-1"
-          >
-            <code className="font-mono text-xs text-on-surface-variant">
-              {session.sessionId.slice(0, 8)}…
-            </code>
-            <span className="text-xs text-on-surface-faint">
-              {new Date(session.createdAt).toLocaleString()}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function ImprovementLaunchNotice({
-  notice,
-  onDismiss
-}: {
-  notice: { skillId: string; sessionId: string; includedSessionCount: number };
-  onDismiss: () => void;
-}) {
-  return (
-    <div
-      role="status"
-      aria-live="polite"
-      className="mt-4 rounded-lg border border-outline-variant bg-success-surface p-4"
-    >
-      <p className="text-sm text-on-surface">
-        <strong>Improver session launched.</strong> Corpus included{" "}
-        {notice.includedSessionCount} prior session
-        {notice.includedSessionCount === 1 ? "" : "s"}. Open the chat view to start the
-        conversation — session id <code className="font-mono">{notice.sessionId}</code>.
-      </p>
-      <div className="mt-3 flex justify-end">
-        <Button type="button" variant="outline" size="sm" onClick={onDismiss}>
-          Dismiss
-        </Button>
       </div>
     </div>
   );

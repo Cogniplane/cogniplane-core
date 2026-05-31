@@ -42,7 +42,9 @@ export function buildRuntimeAdapters(input: {
     egressIpPins
   } = input;
 
-  const e2bFactories = config.RUNTIME_BACKEND === "e2b" ? buildE2bCodexFactories(config) : undefined;
+  // E2B is the only execution backend (config.ts requires E2B_API_KEY at boot),
+  // so the Codex process + workspace factories are always sandbox-backed.
+  const e2bFactories = buildE2bCodexFactories(config);
 
   const runtimeManager = new CodexRuntimeManager({
     config,
@@ -59,21 +61,21 @@ export function buildRuntimeAdapters(input: {
     isBetaTester: stores.tenantMembers.isUserBetaTester.bind(stores.tenantMembers),
     githubConnections: integrations.githubConnectionService,
     integrationRegistry: integrations.integrationRegistry,
-    processFactory: e2bFactories?.processFactory,
-    workspaceFactory: e2bFactories?.workspaceFactory,
+    processFactory: e2bFactories.processFactory,
+    workspaceFactory: e2bFactories.workspaceFactory,
     getTenantApiKey: getTenantOpenaiApiKey,
     activationTracker: stores.activationTracker,
     egressIpPins
   });
 
-  const claudeE2bOptions =
-    config.CLAUDE_RUNTIME_BACKEND === "e2b" && config.E2B_API_KEY
-      ? {
-          apiKey: config.E2B_API_KEY,
-          templateId: config.E2B_TEMPLATE_ID,
-          sandboxTimeoutMs: config.E2B_SANDBOX_TIMEOUT_MS
-        }
-      : null;
+  // E2B_API_KEY is guaranteed present (config.ts fails fast otherwise), so the
+  // Claude runtime always runs inside the sandbox.
+  const claudeE2bOptions = {
+    // Non-null: config.ts throws at boot when E2B_API_KEY is unset.
+    apiKey: config.E2B_API_KEY!,
+    templateId: config.E2B_TEMPLATE_ID,
+    sandboxTimeoutMs: config.E2B_SANDBOX_TIMEOUT_MS
+  };
 
   const claudeAdapter = new ClaudeCodeRuntimeAdapter(
     config,

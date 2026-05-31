@@ -1,29 +1,14 @@
 import { test, expect } from "vitest";
 
+import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
 import {
   consumeRefreshJti,
   issueRefreshJti,
-  revokeRefreshFamily,
-  type RefreshTokenRedis
+  revokeRefreshFamily
 } from "./refresh-token-store.js";
 
-function makeFakeRedis(): RefreshTokenRedis & { store: Map<string, string> } {
-  const store = new Map<string, string>();
-  return {
-    store,
-    async get(key: string) {
-      return store.has(key) ? store.get(key)! : null;
-    },
-    async getdel(key: string) {
-      const value = store.get(key) ?? null;
-      store.delete(key);
-      return value;
-    },
-    async set(key: string, value: string) {
-      store.set(key, value);
-      return "OK";
-    }
-  };
+function makeFakeRedis(): FakeRefreshTokenRedis {
+  return new FakeRefreshTokenRedis();
 }
 
 const TTL = 60;
@@ -33,6 +18,26 @@ test("issueRefreshJti binds the jti to the family and marks family active", asyn
   await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
   expect(redis.store.get("refresh_jti:j1")).toBe("f1");
   expect(redis.store.get("refresh_family:f1")).toBe("active");
+});
+
+test("issueRefreshJti writes both keys with a bounded EX TTL", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+
+  // TTL is only observable via the captured set() tuple — the value Map
+  // doesn't model expiry. Pin EX/ttl so neither key is written unbounded.
+  expect(redis.setCalls).toContainEqual({
+    key: "refresh_jti:j1",
+    value: "f1",
+    mode: "EX",
+    ttlSeconds: TTL
+  });
+  expect(redis.setCalls).toContainEqual({
+    key: "refresh_family:f1",
+    value: "active",
+    mode: "EX",
+    ttlSeconds: TTL
+  });
 });
 
 test("consumeRefreshJti returns ok on the first use and removes the jti", async () => {
@@ -99,6 +104,20 @@ test("revokeRefreshFamily marks the family revoked so subsequent consumes fail",
   // because the family-state check runs first.
   const result = await consumeRefreshJti(redis, { jti: "j2", familyId: "f1", ttlSeconds: TTL });
   expect(result).toEqual({ status: "revoked" });
+});
+
+test("revokeRefreshFamily writes the revoked marker with a bounded EX TTL", async () => {
+  const redis = makeFakeRedis();
+  await revokeRefreshFamily(redis, { familyId: "f1", ttlSeconds: TTL });
+
+  // An unbounded revoked-family key is a security smell (it would never
+  // expire). TTL is only observable through the captured set() tuple.
+  expect(redis.setCalls).toContainEqual({
+    key: "refresh_family:f1",
+    value: "revoked",
+    mode: "EX",
+    ttlSeconds: TTL
+  });
 });
 
 test("rotation chain: issue → consume → issue (same family) → consume succeeds", async () => {

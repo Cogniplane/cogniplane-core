@@ -1,7 +1,6 @@
-// Anthropic API proxy for sandboxed Claude runtimes
-// (CLAUDE_RUNTIME_BACKEND=e2b). The harness inside the sandbox holds only
-// a session-scoped rt_* runtime token; this route swaps it for the real
-// ANTHROPIC_API_KEY and forwards to api.anthropic.com.
+// Anthropic API proxy for the sandboxed Claude runtime. The harness inside
+// the E2B sandbox holds only a session-scoped rt_* runtime token; this route
+// swaps it for the real ANTHROPIC_API_KEY and forwards to api.anthropic.com.
 //
 // Provider quirks captured here:
 //   - The Agent SDK sends the API key as `x-api-key`, not as a Bearer

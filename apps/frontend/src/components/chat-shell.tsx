@@ -18,7 +18,6 @@ import { SessionSidebar } from "./session-sidebar";
 import { ArtifactPanel } from "./artifact-panel";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { FileSourcePicker } from "./file-source-picker";
-import { ImproverSessionBanner, IMPROVER_KICKOFF_STORAGE_PREFIX } from "./improver-session-banner";
 import { McpServerErrorBanner } from "./mcp-server-error-banner";
 import { MessageList } from "./message-list";
 import { Composer } from "./composer";
@@ -108,7 +107,7 @@ export function ChatShell() {
     onError
   });
 
-  const { messages, isSessionDataReady, isSending, sendMessage } = chatWorkspace;
+  const { messages } = chatWorkspace;
 
   useAutoScroll(messagesRef, [messages], sessionList.selectedSessionId);
 
@@ -134,31 +133,6 @@ export function ChatShell() {
     },
     onImportedArtifact: chatWorkspace.artifactState.selectArtifact
   });
-
-  // Improver sessions land empty — the admin's launch flow stages a kickoff
-  // prompt in sessionStorage so the agent has something to react to (it
-  // can't auto-start without a user turn). Fire once per session, only
-  // after server-side messages have loaded so we don't race a non-empty
-  // session that was already kicked off in another tab/refresh.
-  useEffect(() => {
-    const sessionId = sessionList.selectedSessionId;
-    if (!sessionId) return;
-    if (typeof window === "undefined") return;
-    if (!isSessionDataReady) return;
-    if (isSending) return;
-    if (messages.length > 0) return;
-    const key = IMPROVER_KICKOFF_STORAGE_PREFIX + sessionId;
-    const prompt = window.sessionStorage.getItem(key);
-    if (!prompt) return;
-    window.sessionStorage.removeItem(key);
-    void sendMessage(prompt);
-  }, [
-    sessionList.selectedSessionId,
-    isSessionDataReady,
-    isSending,
-    messages.length,
-    sendMessage
-  ]);
 
   const startArtifactPaneResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
     const container = chatMainRef.current;
@@ -259,13 +233,6 @@ export function ChatShell() {
           }
         >
           <div className="flex min-h-0 min-w-0 flex-col">
-            {sessionList.selectedSession ? (
-              <ImproverSessionBanner
-                session={sessionList.selectedSession}
-                artifacts={chatWorkspace.artifacts}
-                onError={onError}
-              />
-            ) : null}
             <McpServerErrorBanner
               errors={chatWorkspace.mcpServerErrors}
               onDismiss={(name) => chatWorkspace.dismissMcpServerError(name)}
