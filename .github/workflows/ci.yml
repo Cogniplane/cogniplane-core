@@ -24,12 +24,18 @@ jobs:
         with:
           # Full history so the scan covers every commit, not just HEAD.
           fetch-depth: 0
-      # gitleaks-action is free for public repositories — no GITLEAKS_LICENSE
-      # needed (that key is only required for private orgs).
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
+      # Run the open-source gitleaks CLI directly (MIT, free for any repo).
+      # We deliberately do NOT use gitleaks/gitleaks-action@v2: that wrapper
+      # requires a paid GITLEAKS_LICENSE for any org-owned repo (public or
+      # private). The CLI has no such gate.
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan for secrets
+        run: gitleaks detect --config .gitleaks.toml --log-opts='--all' --no-banner --redact
 
   ci:
     runs-on: ubuntu-24.04
