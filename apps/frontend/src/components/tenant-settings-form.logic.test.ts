@@ -23,11 +23,13 @@ const baseSettings = {
   runtimeProvider: "codex",
   enabledRuntimeProviders: ["codex"],
   showEffortSelector: false,
+  webSearchMode: "cached",
   approvalPolicy: "never",
   approvalReviewer: "user",
   allowCommandExecution: false,
   allowUserTokenForwarding: false,
   autoApproveReadOnlyTools: true,
+  policyEnforcementMode: "monitor",
   developerInstructions: null,
   enabledToolIds: [],
   enabledMcpServerIds: []
@@ -112,6 +114,14 @@ describe("buildDraft", () => {
     expect(settings.enabledToolIds).toEqual(["a"]);
   });
 
+  test("carries webSearchMode through, defaulting to disabled when absent", () => {
+    expect(buildDraft(baseSettings).webSearchMode).toBe("cached");
+    expect(
+      buildDraft({ ...baseSettings, webSearchMode: undefined } as unknown as TenantSettings)
+        .webSearchMode
+    ).toBe("disabled");
+  });
+
   test("normalizes nullish developerInstructions to empty string", () => {
     const draft = buildDraft({ ...baseSettings, developerInstructions: null });
     expect(draft.developerInstructions).toBe("");
@@ -137,12 +147,14 @@ describe("toggleRuntimeProviderInDraft", () => {
     runtimeProvider: "codex",
     enabledRuntimeProviders: ["codex"],
     showEffortSelector: false,
+    webSearchMode: "disabled",
     approvalPolicyKind: "never",
     granularFlags: defaultGranularFlags,
     approvalReviewer: "user",
     allowCommandExecution: false,
     allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor",
     developerInstructions: "",
     enabledToolIds: [],
     enabledMcpServerIds: []

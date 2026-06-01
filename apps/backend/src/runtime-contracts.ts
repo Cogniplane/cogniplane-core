@@ -28,6 +28,25 @@ export type RuntimeToolCall = {
 
 export type RuntimeApprovalKind = "command_execution" | "file_change" | "permissions";
 export type RuntimeApprovalDecision = "approve" | "reject";
+
+// How a Policy Center–routed tool-call approval resolved: a human decision or a
+// TTL expiry. Shared by the gateway router and every adapter's approval method.
+export type PolicyApprovalDisposition = "approve" | "reject" | "expired";
+
+// The request the MCP gateway hands to the session-owning adapter to route a
+// Policy Center `require_approval`. One shape, reused at every hop (the gateway
+// router type, the adapter method, and the per-adapter coordinator) so the call
+// isn't re-described field-by-field at each boundary.
+export type PolicyApprovalRouteInput = {
+  tenantId: string;
+  sessionId: string;
+  userId: string;
+  runtimeId: string | null;
+  toolName: string;
+  serverId: string | null;
+  kind: RuntimeApprovalKind;
+  explanation: string;
+};
 export type RuntimeReasoningEffort = EffortLevel;
 export type RuntimeUserInput =
   | { type: "text"; text: string }
@@ -367,6 +386,26 @@ export interface RuntimeAdapter {
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
   }): Promise<"resolved" | "missing">;
+  /**
+   * Route a Policy Center approval for an MCP tool call and resolve when the
+   * human decides (or the TTL expires). Unlike the runtime's native approvals
+   * (shell/file actions, which the runtime itself initiates over JSON-RPC),
+   * this is driven by the MCP gateway holding its HTTP response open: the
+   * adapter emits the `framework:approval_required` SSE event to its active
+   * turn, persists the approval row, and the existing
+   * `POST /approvals/:id/decision` → {@link resolveApproval} path settles it.
+   *
+   * Returns the disposition the gateway uses to allow or refuse the tool call.
+   * Adapters with no active-turn/SSE plumbing omit it; the gateway then
+   * degrades an enforce-mode require_approval to a deny.
+   */
+  requestPolicyApproval?(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition>;
+  /**
+   * Tear down every active runtime owned by this adapter for `tenantId` after
+   * tenant settings that are snapshotted into runtime config change. The next
+   * turn rebuilds with the new policy/tool/runtime settings.
+   */
+  invalidateTenantRuntimes?(tenantId: string): Promise<string[]>;
   /**
    * Tear down every active runtime owned by this adapter for `tenantId` after
    * an admin flips an integration toggle. The next turn rebuilds with the new

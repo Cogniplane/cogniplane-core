@@ -1,16 +1,11 @@
 "use client";
 
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback } from "react";
 
-import {
-  createArtifactDownload,
-  fetchArtifactContent,
-  fetchArtifactPreviewText,
-  uploadArtifact
-} from "../lib/artifact-api";
+import { uploadArtifact } from "../lib/artifact-api";
 import type { Artifact } from "@cogniplane/shared-types";
 import { isArtifactEligibleForChatContext } from "../lib/artifact-eligibility";
-import { isImageArtifact, isPdfArtifact } from "../lib/artifact-preview";
+import { useArtifactActions } from "./use-artifact-actions";
 
 type ArtifactSelectionMode = "auto" | "manual";
 
@@ -51,18 +46,11 @@ export function useArtifacts(input: {
     useState<ArtifactSelectionMode>("auto");
   const [selectedArtifactIds, setSelectedArtifactIds] = useState<string[]>([]);
   const [isUploadingArtifact, setIsUploadingArtifact] = useState(false);
-  const [downloadArtifactId, setDownloadArtifactId] = useState<string | null>(
-    null,
-  );
-  const [previewArtifactId, setPreviewArtifactId] = useState<string | null>(null);
-  const [previewContent, setPreviewContent] = useState<string | null>(null);
-  const [previewMimeType, setPreviewMimeType] = useState<string>("");
-  const [previewName, setPreviewName] = useState<string>("");
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
-  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
 
-  const previewRequestRef = useRef<symbol | null>(null);
+  // Preview + download are shared with the artifact browser. The chat call
+  // sites pass an artifactId string to openPreview, so hand the hook the
+  // current `artifacts` list to resolve against.
+  const actions = useArtifactActions({ onError, artifacts });
 
   const visibleSelectedArtifactIds = useMemo(() => {
     const candidateIds =
@@ -129,92 +117,28 @@ export function useArtifacts(input: {
     }
   }, [onError, onRefresh, selectedSessionId]);
 
-  const handleDownloadArtifact = useCallback(async (artifactId: string) => {
-    setDownloadArtifactId(artifactId);
-    try {
-      const download = await createArtifactDownload(artifactId);
-      window.location.assign(
-        `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}${download.url}`
-      );
-    } catch {
-      onError("Failed to download artifact.");
-    } finally {
-      setDownloadArtifactId(null);
-    }
-  }, [onError]);
-
-  const openPreview = useCallback(async (artifactId: string) => {
-    const artifact = artifacts.find((a) => a.artifactId === artifactId);
-    if (!artifact) return;
-
-    const thisRequest = Symbol();
-    previewRequestRef.current = thisRequest;
-
-    setPreviewArtifactId(artifactId);
-    setPreviewName(artifact.artifactName);
-    setPreviewMimeType(artifact.mimeType);
-    setPreviewContent(null);
-    setPreviewError(null);
-    setIsLoadingPreview(true);
-    setPreviewImageUrl(null);
-
-    try {
-      if (isImageArtifact(artifact.mimeType)) {
-        const handle = await createArtifactDownload(artifactId);
-        if (previewRequestRef.current === thisRequest) {
-          setPreviewImageUrl(
-            `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}${handle.url}`
-          );
-          // previewContent stays null for images — modal uses previewImageUrl !== null as readiness signal
-        }
-      } else if (isPdfArtifact(artifact.mimeType)) {
-        const text = await fetchArtifactPreviewText(artifactId);
-        if (previewRequestRef.current === thisRequest) setPreviewContent(text);
-      } else {
-        const handle = await createArtifactDownload(artifactId);
-        const text = await fetchArtifactContent(
-          `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001"}${handle.url}`
-        );
-        if (previewRequestRef.current === thisRequest) setPreviewContent(text);
-      }
-    } catch (_err) {
-      if (previewRequestRef.current === thisRequest)
-        setPreviewError("Failed to load preview. Try downloading the file instead.");
-    } finally {
-      setIsLoadingPreview(false);
-    }
-  }, [artifacts]);
-
-  const closePreview = useCallback(() => {
-    setPreviewArtifactId(null);
-    setPreviewContent(null);
-    setPreviewImageUrl(null);
-    setPreviewError(null);
-    setPreviewMimeType("");
-    setPreviewName("");
-    setIsLoadingPreview(false);
-  }, []);
-
   return {
     artifactSelectionMode,
     selectedArtifactIds,
     visibleSelectedArtifactIds,
     isUploadingArtifact,
-    downloadArtifactId,
-    previewArtifactId,
-    previewContent,
-    previewImageUrl,
-    previewMimeType,
-    previewName,
-    previewError,
-    isLoadingPreview,
     resetSelection,
     updateArtifactSelection,
     toggleArtifactSelection,
     selectArtifact,
     handleUploadArtifact,
-    handleDownloadArtifact,
-    openPreview,
-    closePreview,
+    // Preview + download (shared via useArtifactActions) — re-exported so the
+    // chat panel's consumption of useArtifacts is unchanged.
+    downloadArtifactId: actions.downloadArtifactId,
+    previewArtifactId: actions.previewArtifactId,
+    previewContent: actions.previewContent,
+    previewImageUrl: actions.previewImageUrl,
+    previewMimeType: actions.previewMimeType,
+    previewName: actions.previewName,
+    previewError: actions.previewError,
+    isLoadingPreview: actions.isLoadingPreview,
+    handleDownloadArtifact: actions.handleDownloadArtifact,
+    openPreview: actions.openPreview,
+    closePreview: actions.closePreview,
   };
 }

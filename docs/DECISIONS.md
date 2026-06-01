@@ -4,7 +4,7 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 > **Codex framing.** Decisions 0–7 were originally written when Codex was the only runtime. The persistence, gateway pattern, capability policy, and approval flow apply unchanged to both providers. Decision 9 captures the choice to add Claude Code.
 >
-> **Capability profiles → tenant settings.** Decision 6 was originally implemented as admin-facing CRUD over named capability profiles. On 2026-04-15 that surface was replaced by a single per-tenant Agent Settings record (`tenant_settings`). The underlying policy model — versioned, compiled into the runtime manifest, controlling sandbox/network/tool/approval behavior — is unchanged. Only the admin surface collapsed.
+> **Capability profiles → tenant settings → Policy Center.** Decision 7 describes the original capability-profile model. On 2026-04-15 the admin surface collapsed into one per-tenant Agent Settings record (`tenant_settings`). On 2026-05-31 the action-governance layer was simplified again into Policy Center rules plus tenant-level `policy_enforcement_mode`; see Decision 11 for the current shape.
 
 ---
 
@@ -66,13 +66,13 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 ---
 
-## 7. Capability policy model
+## 7. Capability policy model (superseded)
 
 **Decision:** Versioned per-skill / per-tool capability profiles, compiled into the runtime manifest at session start. Profiles control sandbox roots, network egress class, approval mode, tool allowlist, and token-forwarding.
 
 **Why:** Different skill families have genuinely different risk profiles; one global policy is too coarse for a reusable framework. Free-form per-session policy JSON is too easy to misconfigure and too hard to audit.
 
-**Note:** The admin surface was originally multi-profile CRUD; on 2026-04-15 it collapsed to one Agent Settings record per tenant (`tenant_settings`). The underlying versioned policy model is unchanged.
+**Status:** Superseded. The admin surface collapsed to one Agent Settings record per tenant on 2026-04-15, and the current action-governance layer is Policy Center (Decision 11): ordered rules over four dimensions with tenant-level monitor/enforce mode.
 
 ---
 
@@ -108,3 +108,18 @@ A "unified provider-abstraction layer" was rejected: it re-introduces the "rebui
 - The MCP gateway, tool broker, audit, PII, and artifact pipelines are shared. No duplication of platform features.
 
 See `guides/runtime-selection.md` for per-provider guidance.
+
+---
+
+## 11. Policy Center shape — small rule surface, tenant-level enforcement
+
+**Decision:** Keep Policy Center rules as ordered `condition -> effect` statements with four active condition dimensions (`toolNames`, `categories`, `severities`, `turnContexts`) and three effects (`allow`, `require_approval`, `block`). Make monitor vs. enforce a tenant-level setting (`tenant_settings.policy_enforcement_mode`), not a per-rule mode.
+
+**Why:** The gateway needs a rule model operators can reason about under incident pressure. Connector, role, PII, transform, coverage, and per-rule enforcement concepts increased state space faster than they increased control value. A tenant-level monitor/enforce switch lets admins validate the whole rule set against real traffic, then flip it atomically once trusted.
+
+**Implementation rules that followed:**
+
+- Policy decisions are evaluated at the MCP gateway, after the trusted `ToolExecutionContext` is resolved and before the tool call is dispatched.
+- The tenant enforcement mode is snapshotted into the runtime policy on the tool context; no hot-path tenant-settings DB call is needed.
+- Only matched rules write `policy_decision` evidence rows. Default/no-match allows are not recorded.
+- Native runtime approvals (`approval_policy`, shell/file/permission requests) remain separate from Policy Center approvals, even though both use the same frontend event and decision route.

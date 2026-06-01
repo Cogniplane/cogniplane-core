@@ -25,12 +25,14 @@ const runtimeConfig = {
     label: "Phase 4 tools",
     description: null,
     runtimeProvider: "codex" as const,
+    webSearchMode: "disabled" as const,
     approvalPolicy: "on-request" as const,
     sandboxMode: "workspace-write" as const,
     networkMode: "restricted" as const,
     allowCommandExecution: true,
     allowUserTokenForwarding: true,
     autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor" as const,
     enabledToolIds: ["managed-session-context", "session_context"],
     enabledMcpServers: ["managed-session-context"],
     version: 1,
@@ -183,6 +185,8 @@ test("createRuntimeWorkspace writes MCP servers using Codex mcp_servers config",
   expect(codexToml).toMatch(/\[mcp_servers\.managed-session-context\]/);
   expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context\?token=rt_/);
   expect(codexToml).not.toMatch(/\[mcp\]/);
+  // web_search is omitted entirely when the mode is "disabled".
+  expect(codexToml).not.toMatch(/web_search/);
   expect(agentsMd).toMatch(/Do not narrate your step-by-step investigation/);
   expect(agentsMd).toMatch(/Do not search the local workspace as a substitute/);
   expect(agentsMd).toMatch(/list the OneDrive root before falling back to search/);
@@ -473,4 +477,38 @@ test("codex.toml MCP URLs carry the runtime token in ?token= (transport contract
   const codexToml = await readFile(workspace.codexTomlPath, "utf8");
   // Token must be present as `?token=rt_...` on the URL.
   expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context\?token=rt_[A-Za-z0-9._-]+"/);
+});
+
+test("createRuntimeWorkspace writes the web_search key when the mode is enabled", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-runtime-workspace-websearch-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  for (const mode of ["cached", "live"] as const) {
+    const workspace = await createRuntimeWorkspace(
+      {
+        ...createTestConfig(),
+        RUNTIME_WORKSPACE_ROOT: root
+      },
+      {
+        sessionId: "66666666-6666-6666-6666-666666666666",
+        tenantId: "tenant-1",
+        userId: "test-user",
+        runtimeId: `runtime-websearch-${mode}`,
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, `bundle-cache-${mode}`)),
+        managedToolCatalog: makeTestManagedToolCatalog(),
+        runtimeConfig: {
+          ...runtimeConfig,
+          runtimePolicy: { ...runtimeConfig.runtimePolicy, webSearchMode: mode }
+        }
+      }
+    );
+
+    const codexToml = await readFile(workspace.codexTomlPath, "utf8");
+    expect(codexToml).toMatch(new RegExp(`^web_search = "${mode}"$`, "m"));
+
+    const manifest = JSON.parse(await readFile(workspace.manifestPath, "utf8")) as RuntimeManifest;
+    expect(manifest.runtimePolicy.webSearchMode).toBe(mode);
+  }
 });

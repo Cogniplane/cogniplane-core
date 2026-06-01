@@ -20,6 +20,13 @@ export type ApprovalReviewer = "user" | "guardian_subagent";
 
 export type RuntimeProvider = "codex" | "claude-code";
 
+// Codex native web search. Mirrors the Codex config's top-level `web_search`
+// (WebSearchMode). "disabled" turns the tool off; "cached" lets the model
+// search a cached index; "live" hits the network. Only governs the Codex
+// runtime — the Claude runtime exposes WebSearch via its `claude_code` preset.
+export const WEB_SEARCH_MODES = ["disabled", "cached", "live"] as const;
+export type WebSearchMode = (typeof WEB_SEARCH_MODES)[number];
+
 export const EFFORT_LEVELS = [
   "none",
   "minimal",

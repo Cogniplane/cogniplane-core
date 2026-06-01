@@ -1,7 +1,7 @@
 # Security Features — Cogniplane Core
 
 > **Audience:** Operators evaluating Cogniplane Core's security posture; contributors auditing the security model.
-> **Scope:** All security-relevant controls implemented in the codebase as of 2026-04-28.
+> **Scope:** All security-relevant controls implemented in the codebase as of 2026-05-31.
 > **Companion doc:** `ARCHITECTURE.md`.
 
 Inventory of security controls, defensive mechanisms, and isolation boundaries, grouped by domain. Each entry names the control, its location in code, and the relevant config.
@@ -82,7 +82,7 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 
 ### 3.1 Postgres Row-Level Security (RLS)
 - **Coverage:** every tenant-scoped table has `ENABLE ROW LEVEL SECURITY` and a `USING (tenant_id = app.current_tenant_id)` policy.
-- **Tables:** `sessions`, `messages`, `runtime_sessions`, `approvals`, `audit_events`, `tool_execution_contexts`, `artifacts`, `tenant_settings`, `pii_scan_runs`, `pii_scan_jobs`, `tenant_integrations`, all `user_*_connections`.
+- **Tables:** `sessions`, `messages`, `runtime_sessions`, `approvals`, `audit_events`, `tool_execution_contexts`, `artifacts`, `tenant_settings`, `policy_rule`, `policy_decision`, `pii_scan_runs`, `pii_scan_jobs`, `tenant_integrations`, all `user_*_connections`.
 
 ### 3.2 `withTenantScope`
 - Every store method takes `tenantId` first and runs inside `withTenantScope(db, tenantId, fn)`, which issues `SET LOCAL app.current_tenant_id = $1`. Postgres kernel enforces isolation; app-level bugs cannot leak cross-tenant data.
@@ -152,8 +152,8 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ## 6. Human-in-the-Loop Approvals
 
-### 6.1 Approval-policy gating
-- `tenant_settings.approval_policy = "require-approval"` pauses the runtime before flagged tool calls; frontend receives `approval_requested` SSE; user resolves via `POST /approvals/:approvalId/decision`.
+### 6.1 Runtime approval-policy gating
+- `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions. When a request needs review, the frontend receives `framework:approval_required`; the user resolves it via `POST /approvals/:approvalId/decision`.
 - File: `apps/backend/src/routes/approvals.ts`.
 
 ### 6.2 `RuntimeApprovalCoordinator` (Codex)
@@ -175,6 +175,11 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 ### 6.6 Approval flood protection
 - Cap of 5 pending approvals per session.
 - File: `apps/backend/src/services/runtime/runtime-request-handler.ts`.
+
+### 6.7 Policy Center approvals
+- Policy Center rules can return `require_approval` for MCP tool calls. The MCP gateway holds the JSON-RPC response open, persists an `approvals` row through the policy approval coordinator, emits the same `framework:approval_required` SSE event, then proceeds or denies based on the decision.
+- No active turn means no safe human prompt path, so unattended policy approvals fail closed.
+- Files: `apps/backend/src/routes/mcp.ts`, `apps/backend/src/services/policy/*`.
 
 ---
 
@@ -449,8 +454,9 @@ Per-tenant settings in `tenant_settings` (one row per tenant; `system` row is pl
 
 | Setting | Effect |
 |---|---|
-| `approval_policy` | `auto-approve` vs `require-approval` |
-| `auto_approve_read_only_tools` | Skip prompts for read-only tools |
+| `approval_policy` | Native runtime approval posture (`never`, `on-request`, or granular JSON) |
+| `auto_approve_read_only_tools` | Skip native prompts for read-only tools |
+| `policy_enforcement_mode` | Policy Center tenant mode: `monitor` records matched decisions; `enforce` gates matched actions |
 | `allow_command_execution` | Permit shell-command tool calls |
 | `allow_user_token_forwarding` | Permit forwarding user OAuth tokens to integration tools |
 | `enabled_tool_ids` | Allowlist of managed tools available to the runtime |
@@ -461,11 +467,14 @@ Per-tenant settings in `tenant_settings` (one row per tenant; `system` row is pl
 
 File: `apps/backend/src/services/tenant-settings-store.ts`.
 
+Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. Active dimensions are `toolNames`, `categories` (MCP server id), `severities`, and `turnContexts`; effects are `allow`, `require_approval`, and `block`. Only matched rules write `policy_decision` evidence rows.
+
 ---
 
 ## 21. Runtime Config Snapshots
 
-- Every runtime turn captures the effective runtime config (compiled from `tenant_settings`) in the runtime manifest, frozen for the duration of the turn — admin config changes mid-turn cannot retroactively widen or narrow what the agent can do. Eliminates a class of TOCTOU bugs.
+- Every runtime turn captures the effective runtime policy in the runtime manifest and the per-turn `ToolExecutionContext`, frozen for the duration of the turn. Admin config changes mid-turn cannot retroactively widen or narrow what the agent can do.
+- Tenant-setting updates invalidate active runtimes. If any adapter cannot refresh, the settings route returns `503 runtime_refresh_failed` instead of silently leaving a stale runtime active.
 - File: `apps/backend/src/domain/runtime-manifest.ts`.
 
 ---
@@ -520,14 +529,14 @@ File: `apps/backend/src/services/tenant-settings-store.ts`.
 | Token theft (network) | HTTPS (HSTS preload) + httpOnly refresh cookie | Cookie `Secure` + `SameSite=None` |
 | Refresh-token replay | jti consume + family revoke on reuse | 7d TTL ceiling |
 | Sandbox escape | E2B isolated workspace per session | Sandbox + request + idle timeouts |
-| Tool abuse | HITL approvals + capability allowlists | Per-tenant policy + read-only auto-approve scoping |
+| Tool abuse | Native HITL approvals, Policy Center rules, and capability allowlists | Tenant-level monitor/enforce switch + read-only auto-approve scoping |
 | Approval flooding | Max 5 pending per session | TTL-based cleanup |
 | Upload-based attacks | MIME allowlist + magic-byte verify + size cap | Filename sanitization + sandboxed processing |
 | Archive-based attacks (zip bomb, zip-slip, symlink escape) | Per-file + total uncompressed caps, file-count cap, posix-normalized path containment, declared-vs-actual size check | Validator rejects symlinks/non-regular files; tar extraction filter admits only `File`/`Directory` |
 | Log-based credential leak | `redactSecrets` + `sanitizeUrl` | Structured logger filtering |
 | SQL injection | Parameterized queries everywhere | RLS as last line of defense |
 | MCP request spoofing | Runtime token (HMAC) + proxy signature | toolContextId resolution chain |
-| Stale config mid-turn | Capability profile snapshot frozen per turn | Config hash + manifest versioning |
+| Stale config mid-turn | Runtime policy snapshot frozen per turn | Config hash + manifest versioning; settings updates invalidate active runtimes |
 | PII leakage | Provider + rule-based fallback, fail-closed in `block` mode | Per-scope opt-in, scan-job audit trail |
 | Dependency drift | Pinned versions in `codex-release.json` | Drift tests + lockfile |
 

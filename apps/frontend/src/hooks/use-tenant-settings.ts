@@ -3,18 +3,25 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { getTenantSettings, updateTenantAgentSettings } from "../lib/admin-api";
-import type { ApprovalPolicy, TenantSettings } from "@cogniplane/shared-types";
+import type {
+  ApprovalPolicy,
+  PolicyEnforcementMode,
+  TenantSettings,
+  WebSearchMode
+} from "@cogniplane/shared-types";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
 export type TenantSettingsInput = {
   enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
+  webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
   allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
+  policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];

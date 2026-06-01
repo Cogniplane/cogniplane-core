@@ -19,6 +19,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
       label: "Tenant Settings",
       description: "the desc",
       runtimeProvider: "claude-code",
+      webSearchMode: "live",
       approvalPolicy: "on-request",
       approvalReviewer: "guardian_subagent",
       sandboxMode: "workspace-write",
@@ -26,6 +27,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
       allowCommandExecution: true,
       allowUserTokenForwarding: false,
       autoApproveReadOnlyTools: true,
+      policyEnforcementMode: "enforce",
       developerInstructions: "do the thing",
       enabledToolIds: ["session_context", "write_artifact"],
       enabledMcpServers: ["github"],
@@ -40,6 +42,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
     label: "Tenant Settings",
     description: "the desc",
     runtimeProvider: "claude-code",
+    webSearchMode: "live",
     approvalPolicy: "on-request",
     approvalReviewer: "guardian_subagent",
     sandboxMode: "workspace-write",
@@ -47,6 +50,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
     allowCommandExecution: true,
     allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "enforce",
     developerInstructions: "do the thing",
     enabledToolIds: ["session_context", "write_artifact"],
     enabledMcpServers: ["github"],
@@ -85,6 +89,25 @@ test("parseRuntimePolicySnapshot maps unknown enums to safe defaults", () => {
   expect(result.autoApproveReadOnlyTools).toBe(true);
 });
 
+test("parseRuntimePolicySnapshot maps unknown webSearchMode to disabled", () => {
+  const result = parseRuntimePolicySnapshot(
+    { id: "x", runtimeProvider: "codex", webSearchMode: "everywhere" },
+    ctx
+  );
+  expect(result.webSearchMode).toBe("disabled");
+});
+
+test("parseRuntimePolicySnapshot preserves valid webSearchMode values", () => {
+  expect(
+    parseRuntimePolicySnapshot({ id: "x", runtimeProvider: "codex", webSearchMode: "cached" }, ctx)
+      .webSearchMode
+  ).toBe("cached");
+  expect(
+    parseRuntimePolicySnapshot({ id: "x", runtimeProvider: "codex", webSearchMode: "live" }, ctx)
+      .webSearchMode
+  ).toBe("live");
+});
+
 test("parseRuntimePolicySnapshot fills sensible defaults for missing optional fields", () => {
   const result = parseRuntimePolicySnapshot(
     { id: "tenant-settings:t-1", runtimeProvider: "codex" },
@@ -96,6 +119,7 @@ test("parseRuntimePolicySnapshot fills sensible defaults for missing optional fi
   expect(result.allowCommandExecution).toBe(false);
   expect(result.allowUserTokenForwarding).toBe(false);
   expect(result.autoApproveReadOnlyTools).toBe(false);
+  expect(result.webSearchMode).toBe("disabled");
   expect(result.enabledToolIds).toEqual([]);
   expect(result.enabledMcpServers).toEqual([]);
   expect(result.version).toBe(1);

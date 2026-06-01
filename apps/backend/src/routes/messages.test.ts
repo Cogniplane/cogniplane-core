@@ -7,19 +7,9 @@ import { registerMessageRoutes, type MessageRouteStores } from "./messages.js";
 
 const SESSION_ID = "37af657a-2fed-4148-a5fa-ec6b34ccc959";
 
-// ---------------------------------------------------------------------------
-// Minimal app wiring
-//
-// The TOCTOU finding is about the window between the `hasActiveTurn` busy check
-// and the point where the runtime adapter actually flips a session to busy
-// (deep inside `runMessage`, far past several `await`s that persist the user
-// message and consume rate-limit/quota). We exercise the route directly with a
-// real `ActiveTurnsRegistry` (the single-process reservation registry that
-// production wires in) and assert the reservation is atomic: a request that
-// loses the race is rejected with 429 BEFORE it persists a user message or
-// consumes quota.
-// ---------------------------------------------------------------------------
-
+// The TOCTOU risk sits between the route's busy check and the runtime adapter
+// marking the session busy. Exercise the route with a real ActiveTurnsRegistry
+// and assert the losing request is rejected before it persists or consumes quota.
 function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
   const createdMessages: Array<{ role: string; content: string }> = [];
   const consumedRateLimit: string[] = [];
@@ -33,8 +23,6 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
 
   const runtimeManager = {
     id: "codex",
-    // Never reports busy on its own — the registry reservation must be what
-    // stops the second concurrent request.
     hasActiveTurn: () => false,
     async createSession() {
       return {
@@ -45,6 +33,7 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
           label: "Default",
           description: null,
           runtimeProvider: "codex" as const,
+          webSearchMode: "disabled" as const,
           approvalPolicy: "never" as const,
           approvalReviewer: "user" as const,
           sandboxMode: "workspace-write" as const,
@@ -52,6 +41,7 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
           allowCommandExecution: false,
           allowUserTokenForwarding: false,
           autoApproveReadOnlyTools: false,
+          policyEnforcementMode: "monitor" as const,
           developerInstructions: null,
           enabledToolIds: [],
           enabledMcpServers: [],
@@ -61,7 +51,6 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
       };
     },
     async *runMessage() {
-      // Hold the turn open so two requests overlap on the same session.
       await (options.gateRuntime ? options.gateRuntime() : runtimeGate);
       yield { type: "response.created", responseId: "r1" } as const;
       yield { type: "response.completed", responseId: "r1" } as const;
@@ -123,9 +112,7 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
   return {
     stores,
     activeTurns,
-    runtimeManager,
     createdMessages,
-    consumedRateLimit,
     consumedQuota,
     releaseRuntime: () => releaseRuntime?.()
   };
@@ -138,9 +125,10 @@ async function buildApp(stores: MessageRouteStores): Promise<FastifyInstance> {
     CODEX_MODEL: "gpt-5.4"
   } as never);
   app.addHook("preHandler", async (request) => {
-    (request as unknown as { auth: { userId: string; tenantId: string } }).auth = {
+    (request as unknown as { auth: { userId: string; tenantId: string; role: "owner" } }).auth = {
       userId: "platform-user",
-      tenantId: "test-tenant"
+      tenantId: "test-tenant",
+      role: "owner"
     };
   });
   await registerMessageRoutes(app, stores);
@@ -156,19 +144,17 @@ afterEach(async () => {
   }
 });
 
-test("a concurrent second turn on the same session is rejected before persisting or consuming quota (TOCTOU)", async () => {
+test("a concurrent second turn on the same session is rejected before persisting or consuming quota", async () => {
   const harness = makeStores();
   const app = await buildApp(harness.stores);
   activeApp = app;
 
-  // First request: opens an SSE stream and parks inside runMessage (gated).
   const first = app.inject({
     method: "POST",
     url: "/messages",
     payload: { sessionId: SESSION_ID, text: "first" }
   });
 
-  // Wait until the registry shows the slot reserved by the first request.
   for (let i = 0; i < 100 && !harness.activeTurns.snapshot().has(SESSION_ID); i += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -177,7 +163,6 @@ test("a concurrent second turn on the same session is rejected before persisting
   const createdBefore = harness.createdMessages.length;
   const quotaBefore = harness.consumedQuota.length;
 
-  // Second request lands while the first turn is still in flight.
   const second = await app.inject({
     method: "POST",
     url: "/messages",
@@ -186,11 +171,9 @@ test("a concurrent second turn on the same session is rejected before persisting
 
   expect(second.statusCode).toBe(429);
   expect(second.json()).toEqual({ error: "session_busy" });
-  // The loser must not have persisted a user message or burned quota.
   expect(harness.createdMessages.length).toBe(createdBefore);
   expect(harness.consumedQuota.length).toBe(quotaBefore);
 
-  // Let the first turn finish.
   harness.releaseRuntime();
   await first;
 });
@@ -208,7 +191,6 @@ test("the reserved slot is released after the first turn completes, allowing a f
   harness.releaseRuntime();
   await first;
 
-  // The stream writer's `finally` must have cleared the registry slot.
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
 
   const second = app.inject({

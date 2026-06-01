@@ -4,6 +4,7 @@ import { registerAdminArtifactRoutes } from "./admin/admin-artifact-routes.js";
 import { registerAdminCrud } from "./admin/admin-crud-routes.js";
 import { registerAdminIntegrationsRoutes } from "./admin/admin-integrations-routes.js";
 import { registerAdminPiiRoutes } from "./admin/admin-pii-routes.js";
+import { registerAdminPolicyRoutes } from "./admin/admin-policy-routes.js";
 import { registerAdminRuntimeRoutes } from "./admin/admin-runtime-routes.js";
 import { mcpBodySchema } from "./admin/admin-route-schemas.js";
 import { registerAdminSessionDetailRoute } from "./admin/admin-session-detail.js";
@@ -59,7 +60,10 @@ export function buildAdminRouteStores(
     piiProtection: deps.piiProtection,
     piiAnalytics: deps.piiAnalytics,
     platformEvents: deps.platformEvents,
-    managedToolCatalog: deps.managedToolCatalog
+    managedToolCatalog: deps.managedToolCatalog,
+    policyRules: deps.policyRules,
+    policyDecisions: deps.policyDecisions,
+    policyService: deps.policyService
   };
 }
 
@@ -102,7 +106,14 @@ export async function registerAdminRoutes(
   await registerAdminTenantSettingsRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
     auditEvents: stores.auditEvents,
-    managedToolCatalog: stores.managedToolCatalog
+    managedToolCatalog: stores.managedToolCatalog,
+    runtimeAdapters: stores.runtimeAdapters
+  });
+  await registerAdminPolicyRoutes(app, {
+    policyRules: stores.policyRules,
+    policyDecisions: stores.policyDecisions,
+    policyService: stores.policyService,
+    auditEvents: stores.auditEvents
   });
   await registerAdminIntegrationsRoutes(app, {
     config: stores.config,

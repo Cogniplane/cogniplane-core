@@ -3,6 +3,8 @@ import path from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 
 import type {
+  PolicyApprovalDisposition,
+  PolicyApprovalRouteInput,
   RuntimeAdapter,
   RuntimeApprovalDecision,
   RuntimeEvent,
@@ -15,6 +17,7 @@ import type { AppConfig } from "../config.js";
 import { AsyncQueue } from "../lib/async-queue.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { respondToApprovalRequest } from "./runtime/runtime-approval-coordinator.js";
+import { PolicyApprovalCoordinator } from "./runtime/policy-approval-coordinator.js";
 import { cancelPendingApprovals } from "./runtime/approval-cleanup.js";
 import { clearApprovalExpiry } from "./runtime/runtime-request-handler.js";
 import type { DynamicConfigService } from "./dynamic-config-service.js";
@@ -74,6 +77,7 @@ export class CodexRuntimeManager implements RuntimeAdapter {
   private readonly lifecycle: CodexSessionLifecycle;
   private readonly bootstrap: CodexWorkspaceBootstrap;
   private readonly turnOrchestrator: CodexTurnOrchestrator;
+  private readonly policyApprovals: PolicyApprovalCoordinator;
 
   constructor(
     private readonly deps: {
@@ -123,6 +127,10 @@ export class CodexRuntimeManager implements RuntimeAdapter {
           auditEvents: this.deps.auditEvents,
           logger: this.deps.logger,
           onCancelLocal: (approvalId) => {
+            // Release a policy-held tool call immediately (no-op if not ours) so
+            // the gateway's awaiting HTTP response doesn't hang until the
+            // coordinator's own TTL fires.
+            this.policyApprovals.cancel(approvalId);
             const pending = runtime.pendingApprovals.get(approvalId);
             return pending ? { itemId: pending.itemId, kind: pending.kind } : undefined;
           }
@@ -142,6 +150,23 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       this.lifecycle,
       this.startRuntime.bind(this)
     );
+
+    // Policy Center tool-call approvals (gateway-held). Pushes the prompt onto
+    // the session's active turn queue; the existing /approvals decision route
+    // settles it via resolveApproval below.
+    this.policyApprovals = new PolicyApprovalCoordinator({
+      approvals: deps.approvals,
+      auditEvents: deps.auditEvents,
+      logger: deps.logger,
+      ttlMs: deps.config.APPROVAL_REQUEST_TTL_MS,
+      reminderFraction: deps.config.POLICY_APPROVAL_REMINDER_FRACTION,
+      pushFrameworkEvent: (sessionId, event) => {
+        const runtime = this.lifecycle.runtimes.get(sessionId);
+        if (!runtime?.activeTurn) return false;
+        runtime.activeTurn.queue.push(event);
+        return true;
+      }
+    });
 
     this.bootstrap = new CodexWorkspaceBootstrap(
       deps.config,
@@ -298,7 +323,19 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       }
     }
     const pending = runtime?.pendingApprovals.get(input.approvalId);
-    if (!runtime || !pending) return "missing";
+    if (!runtime || !pending) {
+      // Not a native (shell/file) approval owned here — it may be a Policy
+      // Center tool-call approval this adapter is holding at the gateway.
+      if (this.policyApprovals.has(input.approvalId)) {
+        return this.policyApprovals.resolve({
+          tenantId: input.tenantId,
+          approvalId: input.approvalId,
+          userId: input.userId,
+          decision: input.decision
+        });
+      }
+      return "missing";
+    }
 
     const approval = await this.deps.approvals.resolve(
       input.tenantId,
@@ -325,6 +362,10 @@ export class CodexRuntimeManager implements RuntimeAdapter {
     clearApprovalExpiry(runtime, input.approvalId);
     respondToApprovalRequest(runtime.process, pending, input.decision);
     return "resolved";
+  }
+
+  async requestPolicyApproval(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition> {
+    return this.policyApprovals.request(input);
   }
 
   async abortSession(input: {
@@ -404,6 +445,9 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       auditEvents: this.deps.auditEvents,
       logger: this.deps.logger,
       onCancelLocal: (approvalId) => {
+        // Release a policy-held tool call (no-op if not ours) so the gateway's
+        // awaiting HTTP response unblocks immediately on interrupt.
+        this.policyApprovals.cancel(approvalId);
         const pending = runtime.pendingApprovals.get(approvalId);
         runtime.pendingApprovals.delete(approvalId);
         const timer = runtime.pendingApprovalTimers.get(approvalId);
@@ -557,6 +601,18 @@ export class CodexRuntimeManager implements RuntimeAdapter {
         reason: "integration_state_changed",
         message: `Runtime refreshed after ${integrationId} integration state change.`,
         logLabel: `integration:${integrationId}`
+      }
+    );
+  }
+
+  async invalidateTenantRuntimes(tenantId: string): Promise<string[]> {
+    return this.lifecycle.invalidateUserRuntimes(
+      (runtime) => runtime.tenantId === tenantId,
+      (pendingStart) => pendingStart.tenantId === tenantId,
+      {
+        reason: "config_refresh",
+        message: "Runtime refreshed after tenant settings changed.",
+        logLabel: "tenant-settings"
       }
     );
   }

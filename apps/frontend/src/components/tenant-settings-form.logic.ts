@@ -1,7 +1,9 @@
 import type {
   ApprovalPolicy,
   GranularApprovalPolicy,
-  TenantSettings
+  PolicyEnforcementMode,
+  TenantSettings,
+  WebSearchMode
 } from "@cogniplane/shared-types";
 
 export type ApprovalPolicyKind = "never" | "on-request" | "granular";
@@ -18,12 +20,14 @@ export type FormDraft = {
   runtimeProvider: "codex" | "claude-code";
   enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
+  webSearchMode: WebSearchMode;
   approvalPolicyKind: ApprovalPolicyKind;
   granularFlags: GranularFlags;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
   allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
+  policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
@@ -78,12 +82,14 @@ export function buildDraft(settings: TenantSettings): FormDraft {
       ? settings.enabledRuntimeProviders
       : [settings.runtimeProvider ?? "codex"],
     showEffortSelector: settings.showEffortSelector ?? false,
+    webSearchMode: settings.webSearchMode ?? "disabled",
     approvalPolicyKind: toApprovalPolicyKind(settings.approvalPolicy),
     granularFlags: toGranularFlags(settings.approvalPolicy),
     approvalReviewer: settings.approvalReviewer,
     allowCommandExecution: settings.allowCommandExecution,
     allowUserTokenForwarding: settings.allowUserTokenForwarding,
     autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
+    policyEnforcementMode: settings.policyEnforcementMode,
     developerInstructions: settings.developerInstructions ?? "",
     enabledToolIds: [...settings.enabledToolIds],
     enabledMcpServerIds: [...settings.enabledMcpServerIds]

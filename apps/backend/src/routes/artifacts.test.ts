@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { test, expect } from "vitest";
 
 import { registerArtifactRoutes } from "./artifacts.js";
+import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 
 type FakeTokenRow = {
@@ -278,6 +279,167 @@ test("GET /downloads/:token destroys the opened stream when the single-use consu
   expect(res.statusCode).toBe(404);
   expect(res.json().error).toBe("download_not_found");
   expect(destroyed).toBe(true);
+
+  await app.close();
+});
+
+// ── GET /artifacts (cross-session browser) ───────────────────────────────────
+
+type BrowseArtifact = {
+  artifactId: string;
+  userId: string;
+  artifactType: "upload" | "generated" | "derived";
+  status: string;
+  artifactName: string;
+};
+
+function buildBrowseApp(opts: {
+  artifacts: BrowseArtifact[];
+  auth: { userId: string; tenantId: string };
+  onListForUser?: (tenantId: string, userId: string, listOpts: Record<string, unknown>) => unknown;
+}) {
+  const stores = {
+    sessions: { async getOwned() { return null; } },
+    messages: { async getOwned() { return null; } },
+    artifacts: {
+      async getOwned() { return null; },
+      async create() { throw new Error("not used"); },
+      async listBySession() { return []; },
+      async createDownloadToken() { throw new Error("not used"); },
+      async peekDownloadToken() { return null; },
+      async consumeDownloadToken() { return null; },
+      // Realistic-enough fake: honors user isolation + derived exclusion and
+      // returns a {items,nextCursor} shape so the route wiring is exercised.
+      async listForUser(
+        tenantId: string,
+        userId: string,
+        listOpts: Record<string, unknown>
+      ) {
+        if (opts.onListForUser) {
+          return opts.onListForUser(tenantId, userId, listOpts);
+        }
+        const items = opts.artifacts
+          .filter((a) => a.userId === userId)
+          .filter((a) => a.artifactType !== "derived")
+          .filter((a) => a.status !== "deleted");
+        return { items, nextCursor: null };
+      }
+    },
+    auditEvents: new InMemoryAuditEventStore(),
+    storage: { async openReadStream() { return { stream: null, fileSizeBytes: 0 }; } },
+    processor: { async extractArtifactText() { return null; } }
+  };
+
+  const app = Fastify();
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: opts.auth.userId,
+      tenantId: opts.auth.tenantId,
+      isAdmin: false,
+      role: "member"
+    };
+  });
+  return { app, stores };
+}
+
+test("GET /artifacts returns the caller's own artifacts and excludes others' / derived", async () => {
+  const { app, stores } = buildBrowseApp({
+    auth: { userId: "user-1", tenantId: "tenant-A" },
+    artifacts: [
+      { artifactId: "a1", userId: "user-1", artifactType: "upload", status: "ready", artifactName: "mine.pdf" },
+      { artifactId: "a2", userId: "user-2", artifactType: "upload", status: "ready", artifactName: "theirs.pdf" },
+      { artifactId: "a3", userId: "user-1", artifactType: "derived", status: "ready", artifactName: "shadow.txt" }
+    ]
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const res = await app.inject({ method: "GET", url: "/artifacts" });
+  expect(res.statusCode).toBe(200);
+  const body = res.json();
+  expect(body.items.map((a: BrowseArtifact) => a.artifactId)).toEqual(["a1"]);
+  expect(body.nextCursor).toBeNull();
+
+  await app.close();
+});
+
+test("GET /artifacts forwards parsed filters/sort/limit to the store", async () => {
+  let captured: Record<string, unknown> | null = null;
+  const { app, stores } = buildBrowseApp({
+    auth: { userId: "user-1", tenantId: "tenant-A" },
+    artifacts: [],
+    onListForUser: (_t, _u, listOpts) => {
+      captured = listOpts;
+      return { items: [], nextCursor: null };
+    }
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const res = await app.inject({
+    method: "GET",
+    url: "/artifacts?q=report&type=upload&type=generated&status=ready&mimeClass=pdf&sort=name_asc&limit=10"
+  });
+  expect(res.statusCode).toBe(200);
+  expect(captured).toEqual({
+    q: "report",
+    artifactType: ["upload", "generated"],
+    status: ["ready"],
+    mimeClass: ["pdf"],
+    sort: "name_asc",
+    limit: 10,
+    cursor: undefined
+  });
+
+  await app.close();
+});
+
+test("GET /artifacts returns 400 on an invalid sort value", async () => {
+  const { app, stores } = buildBrowseApp({
+    auth: { userId: "user-1", tenantId: "tenant-A" },
+    artifacts: []
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const res = await app.inject({ method: "GET", url: "/artifacts?sort=bogus" });
+  expect(res.statusCode).toBe(400);
+
+  await app.close();
+});
+
+test("GET /artifacts returns 400 when the store rejects a malformed cursor", async () => {
+  const { app, stores } = buildBrowseApp({
+    auth: { userId: "user-1", tenantId: "tenant-A" },
+    artifacts: [],
+    onListForUser: () => {
+      throw new ArtifactCursorError("malformed_cursor");
+    }
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const res = await app.inject({ method: "GET", url: "/artifacts?cursor=garbage" });
+  expect(res.statusCode).toBe(400);
+  expect(res.json().error).toBe("malformed_cursor");
+
+  await app.close();
+});
+
+test("GET /artifacts returns 400 when the store rejects a sort/filter-mismatched cursor", async () => {
+  const { app, stores } = buildBrowseApp({
+    auth: { userId: "user-1", tenantId: "tenant-A" },
+    artifacts: [],
+    onListForUser: () => {
+      throw new ArtifactCursorError("cursor_sort_filter_mismatch");
+    }
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const res = await app.inject({ method: "GET", url: "/artifacts?cursor=valid-but-stale" });
+  expect(res.statusCode).toBe(400);
+  expect(res.json().error).toBe("cursor_sort_filter_mismatch");
 
   await app.close();
 });

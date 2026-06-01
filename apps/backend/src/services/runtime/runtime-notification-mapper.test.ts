@@ -121,6 +121,79 @@ test("mapRuntimeNotification: item/started mcpToolCall returns tool started even
   expect(result.toolCall.kind).toBe("mcp");
 });
 
+test("mapRuntimeNotification: item/completed webSearch returns an mcp-kind tool completed event", () => {
+  const result = mapRuntimeNotification(activeTurn, {
+    method: "item/completed",
+    params: {
+      item: {
+        type: "webSearch",
+        id: "item-ws-1",
+        query: "latest codex release",
+        action: { type: "search", query: "latest codex release", queries: null }
+      }
+    }
+  });
+
+  expect(result.kind).toBe("tool");
+  if (result.kind !== "tool") return;
+  expect(result.phase).toBe("completed");
+  expect(result.toolCall.itemId).toBe("item-ws-1");
+  expect(result.toolCall.kind).toBe("mcp");
+  expect(result.toolCall.server).toBeNull();
+  expect(result.toolCall.toolName).toBe("web_search");
+  expect(result.toolCall.title).toBe("Web search: latest codex release");
+  expect(result.toolCall.input).toBe("latest codex release");
+  expect(result.toolCall.output).toContain("latest codex release");
+  expect(result.toolCall.status).toBe("completed");
+  expect(result.events[0].type).toBe("response.tool.completed");
+});
+
+test("mapRuntimeNotification: item/started webSearch returns an in-progress tool started event", () => {
+  const result = mapRuntimeNotification(activeTurn, {
+    method: "item/started",
+    params: {
+      item: { type: "webSearch", id: "item-ws-2", query: "weather" }
+    }
+  });
+
+  expect(result.kind).toBe("tool");
+  if (result.kind !== "tool") return;
+  expect(result.phase).toBe("started");
+  expect(result.toolCall.itemId).toBe("item-ws-2");
+  expect(result.toolCall.kind).toBe("mcp");
+  expect(result.toolCall.toolName).toBe("web_search");
+  expect(result.toolCall.status).toBe("in_progress");
+  expect(result.events[0].type).toBe("response.tool.started");
+});
+
+test("mapRuntimeNotification: webSearch without an id returns none", () => {
+  expect(
+    mapRuntimeNotification(activeTurn, {
+      method: "item/completed",
+      params: { item: { type: "webSearch", query: "no id" } }
+    }).kind
+  ).toBe("none");
+  expect(
+    mapRuntimeNotification(activeTurn, {
+      method: "item/started",
+      params: { item: { type: "webSearch", query: "no id" } }
+    }).kind
+  ).toBe("none");
+});
+
+test("mapRuntimeNotification: webSearch with no query falls back to a generic title", () => {
+  const result = mapRuntimeNotification(activeTurn, {
+    method: "item/completed",
+    params: { item: { type: "webSearch", id: "item-ws-3" } }
+  });
+
+  expect(result.kind).toBe("tool");
+  if (result.kind !== "tool") return;
+  expect(result.toolCall.title).toBe("Web search");
+  expect(result.toolCall.input).toBe("");
+  expect(result.toolCall.output).toBe("");
+});
+
 test("mapRuntimeNotification: item/completed with missing id returns none", () => {
   const result = mapRuntimeNotification(activeTurn, {
     method: "item/completed",

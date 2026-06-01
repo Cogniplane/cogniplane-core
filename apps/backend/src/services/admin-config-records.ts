@@ -2,7 +2,9 @@ import type {
   GranularApprovalPolicy,
   ApprovalPolicy,
   ApprovalReviewer,
+  PolicyEnforcementMode,
   RuntimeProvider,
+  WebSearchMode,
 } from "@cogniplane/shared-types";
 
 export type {
@@ -10,6 +12,7 @@ export type {
   ApprovalPolicy,
   ApprovalReviewer,
   RuntimeProvider,
+  WebSearchMode,
 };
 
 export type AdminSkillRecord = {
@@ -120,6 +123,7 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
     label: "Tenant Settings",
     description: null,
     runtimeProvider: settings.runtimeProvider,
+    webSearchMode: settings.webSearchMode,
     approvalPolicy: settings.approvalPolicy,
     approvalReviewer: settings.approvalReviewer,
     sandboxMode: "workspace-write",
@@ -127,6 +131,7 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
     allowCommandExecution: settings.allowCommandExecution,
     allowUserTokenForwarding: settings.allowUserTokenForwarding,
     autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
+    policyEnforcementMode: settings.policyEnforcementMode,
     developerInstructions: settings.developerInstructions,
     enabledToolIds: settings.enabledToolIds,
     enabledMcpServers: settings.enabledMcpServerIds,
@@ -182,6 +187,9 @@ export function parseRuntimePolicySnapshot(
     label: String(profile.label ?? profile.id),
     description: profile.description ? String(profile.description) : null,
     runtimeProvider: (profile.runtimeProvider === "claude-code" ? "claude-code" : "codex") as RuntimeProvider,
+    webSearchMode: (profile.webSearchMode === "cached" || profile.webSearchMode === "live"
+      ? profile.webSearchMode
+      : "disabled") as WebSearchMode,
     approvalPolicy: parseSnapshotApprovalPolicy(profile.approvalPolicy),
     approvalReviewer: (profile.approvalReviewer === "guardian_subagent" ? "guardian_subagent" : "user") as ApprovalReviewer,
     sandboxMode: "workspace-write",
@@ -189,6 +197,9 @@ export function parseRuntimePolicySnapshot(
     allowCommandExecution: Boolean(profile.allowCommandExecution),
     allowUserTokenForwarding: Boolean(profile.allowUserTokenForwarding),
     autoApproveReadOnlyTools: Boolean(profile.autoApproveReadOnlyTools),
+    // Default a missing/stale snapshot to "monitor" — fail-safe (never gate
+    // unexpectedly) if a context predates this field.
+    policyEnforcementMode: profile.policyEnforcementMode === "enforce" ? "enforce" : "monitor",
     developerInstructions: profile.developerInstructions ? String(profile.developerInstructions) : null,
     enabledToolIds,
     enabledMcpServers,
@@ -231,6 +242,7 @@ export type ResolvedRuntimePolicy = {
   label: string;
   description: string | null;
   runtimeProvider: RuntimeProvider;
+  webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: ApprovalReviewer;
   sandboxMode: "workspace-write";
@@ -238,6 +250,13 @@ export type ResolvedRuntimePolicy = {
   allowCommandExecution: boolean;
   allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
+  /**
+   * Tenant-level Policy Center switch. "monitor": rules are evaluated and
+   * decisions recorded but nothing is gated; "enforce": matching block /
+   * require_approval rules gate the action. Snapshotted here so the MCP gateway
+   * reads it from the tool-execution context with no hot-path DB call.
+   */
+  policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServers: string[];

@@ -11,6 +11,7 @@ import { buildIntegrationServices } from "./services/integrations/build-integrat
 import type { RuntimeInvalidator } from "./services/integrations/contracts.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
+import { PolicyService } from "./services/policy/policy-service.js";
 import { buildRuntimeAdapters } from "./services/runtime/build-runtime-adapters.js";
 
 export { buildSchedulerWorker } from "./services/build-scheduler-worker.js";
@@ -26,6 +27,17 @@ export function buildAppDependencies(input: {
 
   const stores = buildStores(db, schedulerDb, privilegedDb, logger);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
+
+  // Policy Center — runtime rule engine. Evaluates each proposed tool action
+  // at the MCP gateway choke point and records replayable decisions. The
+  // logger receives best-effort evidence-persistence failures (which never
+  // affect the gating outcome).
+  const policyService = new PolicyService({
+    rules: stores.policyRules,
+    decisions: stores.policyDecisions,
+    auditEvents: stores.auditEvents,
+    logger
+  });
   const bootstrap = buildBootstrapServices({
     config,
     db,
@@ -163,6 +175,9 @@ export function buildAppDependencies(input: {
     activeTurnMessageMap,
     egressIpPins,
     sessionRuntimeOverrides: stores.sessionRuntimeOverrides,
+    policyRules: stores.policyRules,
+    policyDecisions: stores.policyDecisions,
+    policyService,
     overlays
   };
 }

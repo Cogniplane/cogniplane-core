@@ -33,6 +33,7 @@ function buildResolvedProfile(): ResolvedRuntimePolicy {
     allowCommandExecution: false,
     allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor",
     developerInstructions: null,
     enabledToolIds: [],
     enabledMcpServers: [],

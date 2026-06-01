@@ -9,6 +9,7 @@ export const ADMIN_LIVE_SECTIONS = [
   { id: "mcp", label: "MCP servers" },
   { id: "integrations", label: "Integrations" },
   { id: "capabilities", label: "Agent settings" },
+  { id: "policy", label: "Policy Center" },
   { id: "runtime", label: "Runtime rollout" },
   { id: "users", label: "Users" },
   { id: "sessions", label: "Sessions" },

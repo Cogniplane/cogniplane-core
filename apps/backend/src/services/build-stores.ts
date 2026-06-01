@@ -15,6 +15,8 @@ import { McpServerStore } from "./mcp-server-store.js";
 import { PiiAnalyticsStore } from "./pii/pii-analytics-store.js";
 import { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "./pii/pii-scan-run-store.js";
+import { PolicyRuleStore } from "./policy/policy-rule-store.js";
+import { PolicyDecisionStore } from "./policy/policy-decision-store.js";
 import { ActiveTurnsRegistry } from "./active-turns-registry.js";
 import { RuntimeSessionStore } from "./runtime/runtime-session-store.js";
 import { SessionRuntimeOverrideStore } from "./session-runtime-override-store.js";
@@ -51,6 +53,8 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
   const toolEvents = new ToolEventStore(db);
   const toolContexts = new ToolExecutionContextStore(db);
   const integrationStates = new IntegrationStateStore(db);
+  const policyRules = new PolicyRuleStore(db);
+  const policyDecisions = new PolicyDecisionStore(db);
 
   return {
     sessions,
@@ -76,7 +80,9 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
     activationTracker,
     toolEvents,
     toolContexts,
-    integrationStates
+    integrationStates,
+    policyRules,
+    policyDecisions
   };
 }
 

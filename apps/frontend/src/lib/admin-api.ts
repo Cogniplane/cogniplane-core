@@ -15,6 +15,12 @@ import {
   PiiProviderStatusSchema,
   PiiRecentResponseSchema,
   PiiTopResponseSchema,
+  PolicyDecisionDetailResponseSchema,
+  PolicyDecisionsListResponseSchema,
+  PolicyLintResponseSchema,
+  PolicyRuleEnvelopeSchema,
+  PolicyRulesListResponseSchema,
+  PolicySimulateResponseSchema,
   RuntimeOpenAiDiagnosticSchema,
   RuntimeRolloutResponseSchema,
   RuntimeSessionsListResponseSchema,
@@ -52,6 +58,16 @@ import type {
   PiiRecentResponse,
   PiiTopGroupBy,
   PiiTopResponse,
+  PolicyDecisionDetail,
+  PolicyDecisionFilters,
+  PolicyDecisionsListResponse,
+  PolicyEnforcementMode,
+  PolicyLintWarning,
+  PolicyRule,
+  PolicyRuleInput,
+  PolicyRulePatch,
+  PolicySimulateRequest,
+  PolicySimulateResponse,
   RuntimeOpenAiDiagnostic,
   RuntimeSessionSummary,
   SkillImportResponse,
@@ -59,7 +75,8 @@ import type {
   SkillRevision,
   SkillRevisionFilePreview,
   TenantDetails,
-  TenantSettings
+  TenantSettings,
+  WebSearchMode
 } from "@cogniplane/shared-types";
 
 export type {
@@ -380,11 +397,13 @@ export async function getTenantSettings(): Promise<TenantSettings> {
 export async function updateTenantAgentSettings(input: {
   enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
+  webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
   allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
+  policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
@@ -586,3 +605,86 @@ export async function getAdminPiiRecent(input: {
   }
 }
 
+
+// ── Policy Center ────────────────────────────────────────────────────────────
+
+export async function listPolicyRules(): Promise<PolicyRule[]> {
+  const raw = await request<unknown>("/admin/policy/rules");
+  return parseResponse(PolicyRulesListResponseSchema, raw, "GET /admin/policy/rules").rules;
+}
+
+export async function createPolicyRule(input: PolicyRuleInput): Promise<PolicyRule> {
+  const raw = await request<unknown>("/admin/policy/rules", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(PolicyRuleEnvelopeSchema, raw, "POST /admin/policy/rules").rule;
+}
+
+export async function updatePolicyRule(
+  ruleId: string,
+  input: PolicyRulePatch
+): Promise<PolicyRule> {
+  const raw = await request<unknown>(`/admin/policy/rules/${ruleId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(PolicyRuleEnvelopeSchema, raw, "PATCH /admin/policy/rules/:id").rule;
+}
+
+export async function deletePolicyRule(ruleId: string): Promise<void> {
+  await request<void>(`/admin/policy/rules/${ruleId}`, { method: "DELETE" });
+}
+
+export async function simulatePolicy(input: PolicySimulateRequest): Promise<PolicySimulateResponse> {
+  const raw = await request<unknown>("/admin/policy/simulate", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(PolicySimulateResponseSchema, raw, "POST /admin/policy/simulate");
+}
+
+// The list params accept arrays for the multi-value dimensions; they're serialized
+// as comma-separated query values (the backend splits them back into arrays).
+export type PolicyDecisionsListParams = Pick<
+  PolicyDecisionFilters,
+  "sessionId" | "outcomes" | "enforced" | "toolNames" | "severities" | "from" | "to" | "before" | "limit" | "offset"
+>;
+
+export async function listPolicyDecisions(
+  params: PolicyDecisionsListParams = {}
+): Promise<PolicyDecisionsListResponse> {
+  const search = new URLSearchParams();
+  if (params.sessionId) search.set("sessionId", params.sessionId);
+  if (params.outcomes?.length) search.set("outcomes", params.outcomes.join(","));
+  if (params.enforced !== undefined) search.set("enforced", String(params.enforced));
+  if (params.toolNames?.length) search.set("toolNames", params.toolNames.join(","));
+  if (params.severities?.length) search.set("severities", params.severities.join(","));
+  if (params.from) search.set("from", params.from);
+  if (params.to) search.set("to", params.to);
+  if (params.before) search.set("before", params.before);
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  if (params.offset !== undefined) search.set("offset", String(params.offset));
+  const qs = search.toString();
+  const raw = await request<unknown>(`/admin/policy/decisions${qs ? `?${qs}` : ""}`);
+  return parseResponse(PolicyDecisionsListResponseSchema, raw, "GET /admin/policy/decisions");
+}
+
+export async function getPolicyDecision(decisionId: string): Promise<PolicyDecisionDetail> {
+  const raw = await request<unknown>(`/admin/policy/decisions/${encodeURIComponent(decisionId)}`);
+  return parseResponse(PolicyDecisionDetailResponseSchema, raw, "GET /admin/policy/decisions/:id").decision;
+}
+
+
+export async function listPolicyLintWarnings(): Promise<PolicyLintWarning[]> {
+  const raw = await request<unknown>("/admin/policy/lint");
+  return parseResponse(PolicyLintResponseSchema, raw, "GET /admin/policy/lint").warnings;
+}
+
+export async function reorderPolicyRules(ruleIds: string[]): Promise<PolicyRule[]> {
+  const raw = await request<unknown>("/admin/policy/rules/order", {
+    method: "PUT",
+    body: JSON.stringify({ ruleIds })
+  });
+  return parseResponse(PolicyRulesListResponseSchema, raw, "PUT /admin/policy/rules/order").rules;
+}

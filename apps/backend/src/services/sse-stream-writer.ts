@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { FastifyReply } from "fastify";
+import type { PolicyTurnContext } from "@cogniplane/shared-types";
 import type { RuntimeEvent, RuntimeReasoningEffort, RuntimeSessionRef, RuntimeUserInput } from "../runtime-contracts.js";
 import { extractToolResultPayload, runtimeEventToSSEFrame, sseFrame } from "../runtime-contracts.js";
 
@@ -102,6 +103,13 @@ export type StreamAssistantReplyInput = {
    * request keyed off the rt_*'s sid+rid claims.
    */
   activeTurnMessageMap: ActiveTurnMessageMap;
+  /**
+   * Whether this is an interactive or scheduled (unattended) turn. Snapshotted
+   * into the tool-execution context so the Policy Center `turnContexts` condition
+   * dimension can be matched at the MCP gateway without a hot-path DB lookup.
+   * Omitted → recorded as unknown (the dimension acts as "no constraint").
+   */
+  turnContext?: PolicyTurnContext;
 };
 
 /**
@@ -451,7 +459,9 @@ async function runRuntimeTurn(
     messageId: ctx.assistantMessageId,
     metadata: {
       selectedArtifactIds: input.selectedArtifactIds ?? [],
-      runtimePolicy: runtimeSession.runtimePolicy
+      runtimePolicy: runtimeSession.runtimePolicy,
+      // Policy Center turn-context snapshot (read at the MCP gateway).
+      ...(input.turnContext ? { turnContext: input.turnContext } : {})
     },
     ttlMs: 15 * 60 * 1000
   });

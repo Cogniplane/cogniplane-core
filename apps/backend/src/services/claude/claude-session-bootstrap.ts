@@ -187,7 +187,8 @@ export async function bootstrapClaudeSession(
     runtimeToken,
     mcpServerEntries,
     e2bProcess,
-    activeTurnInterrupt: { current: null }
+    activeTurnInterrupt: { current: null },
+    activeTurnPush: { current: null }
   };
 
   const { workspacePath } = state;
@@ -320,6 +321,9 @@ function buildClaudeRuntimeManifest(
       allowCommandExecution: runtimePolicy.allowCommandExecution,
       allowUserTokenForwarding: runtimePolicy.allowUserTokenForwarding,
       autoApproveReadOnlyTools: runtimePolicy.autoApproveReadOnlyTools,
+      // Recorded for manifest parity; the Claude runtime gets WebSearch from
+      // the SDK's `claude_code` tool preset, not from this field.
+      webSearchMode: runtimePolicy.webSearchMode,
       enabledToolIds: runtimePolicy.enabledToolIds
     },
     skills: skills.map((s) => ({

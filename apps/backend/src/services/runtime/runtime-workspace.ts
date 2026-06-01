@@ -66,6 +66,7 @@ function buildRuntimeManifest(input: {
       allowCommandExecution: runtimeConfig.runtimePolicy.allowCommandExecution,
       allowUserTokenForwarding: runtimeConfig.runtimePolicy.allowUserTokenForwarding,
       autoApproveReadOnlyTools: runtimeConfig.runtimePolicy.autoApproveReadOnlyTools,
+      webSearchMode: runtimeConfig.runtimePolicy.webSearchMode,
       enabledToolIds: runtimeConfig.runtimePolicy.enabledToolIds
     },
     skills,
@@ -225,6 +226,15 @@ export async function createRuntimeWorkspace(
     `# Capability profile: ${input.runtimeConfig.runtimePolicy.id}`,
     ""
   ];
+
+  // Codex reads `web_search` (WebSearchMode) from the top of the config. Only
+  // emit it when enabled — omitting the key leaves Codex on its built-in
+  // default (off), which is what "disabled" means for us.
+  const webSearchMode = input.runtimeConfig.runtimePolicy.webSearchMode;
+  if (webSearchMode !== "disabled") {
+    codexToml.push(`web_search = "${webSearchMode}"`);
+    codexToml.push("");
+  }
 
   for (const server of manifest.mcpServers) {
     codexToml.push(`[mcp_servers.${server.id}]`);

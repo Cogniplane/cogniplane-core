@@ -93,7 +93,9 @@ Tool results are passed through `redactSecrets()` (`services/redact-secrets.ts`)
 
 ### Approval flow
 
-When `tenant_settings.approval_policy = "require-approval"` (or equivalent JSON form), the Codex runtime pauses before executing flagged tool calls. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts the JSON-RPC request, holds it in memory, and emits an `approval_requested` SSE event to the frontend. The frontend calls `POST /approvals/:approvalId/decision` with body `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused runtime turn. The Codex `runtimeManager.resolveApproval` is tried first; if it returns `"missing"` the request falls through to the optional Claude resolver. `tenant_settings.auto_approve_read_only_tools` bypasses approval entirely for read-only tools.
+Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes. `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions; `RuntimeApprovalCoordinator` intercepts Codex requests and Claude uses `canUseTool` through `ClaudeApprovalHandler`. The frontend calls `POST /approvals/:approvalId/decision` with body `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused turn. `tenant_settings.auto_approve_read_only_tools` bypasses native approval entirely for read-only tools.
+
+Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the policy approval coordinator, emits `framework:approval_required`, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
 
 Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry: Codex sends a synthetic `reject` to the runtime process so it unblocks, the DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt. Claude's `ClaudeApprovalHandler` runs the same TTL on its `canUseTool` Promise (resolves with `deny`).
 
@@ -103,7 +105,7 @@ A background worker (`services/scheduler-worker.ts`) polls `scheduled_jobs` ever
 
 ### Admin config (skills, MCP servers, tenant settings)
 
-Runtime constraints (enabled tools, enabled MCP servers, approval policy, etc.) live in **one row per tenant** in `tenant_settings`. There is no separate per-profile concept.
+Runtime constraints (enabled tools, enabled MCP servers, native approval policy, Policy Center enforcement mode, etc.) live in **one row per tenant** in `tenant_settings`. There is no separate per-profile concept.
 
 Three admin entities, all tenant-scoped with `tenant_id = 'system'` for platform defaults:
 
@@ -111,7 +113,9 @@ Three admin entities, all tenant-scoped with `tenant_id = 'system'` for platform
 |--------|-------|--------------|
 | Skills | `SkillConfigStore` + `SkillRevisionStore` | `instructions` lives in `revision.metadata->>'instructions'` (NOT a column). Revisions must have `skillName`, `description`, and `instructions` in metadata to be activatable. Skills with `bundle_root_path = NULL` use inline instructions. |
 | MCP servers | `McpServerStore` | Mode is `managed` or `proxy` |
-| Tenant settings | `TenantSettingsStore` (`tenant-settings-store.ts`) | One row per tenant. Controls `enabledToolIds`, `enabledMcpServerIds`, `approvalPolicy`, `approvalReviewer`, `autoApproveReadOnlyTools`, `allowCommandExecution`, `allowUserTokenForwarding`, `developerInstructions`, `runtimeProvider` (`"codex"` or `"claude-code"`), `enabledRuntimeProviders`, and `showEffortSelector`. The `system` tenant's row acts as the platform default. |
+| Tenant settings | `TenantSettingsStore` (`tenant-settings-store.ts`) | One row per tenant. Controls `enabledToolIds`, `enabledMcpServerIds`, `approvalPolicy`, `approvalReviewer`, `autoApproveReadOnlyTools`, `policyEnforcementMode`, `allowCommandExecution`, `allowUserTokenForwarding`, `developerInstructions`, `runtimeProvider` (`"codex"` or `"claude-code"`), `enabledRuntimeProviders`, and `showEffortSelector`. The `system` tenant's row acts as the platform default. |
+
+Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. Active dimensions are `toolNames`, `categories` (MCP server id), `severities`, and `turnContexts`; effects are `allow`, `require_approval`, and `block`. `tenant_settings.policy_enforcement_mode` is the tenant-level monitor/enforce switch.
 
 ### Multi-tenancy and database access
 

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PolicyEnforcementModeSchema } from "@cogniplane/shared-types";
 
 import { httpsUrlSchema } from "../../lib/url-validation.js";
 
@@ -29,11 +30,13 @@ const granularApprovalPolicySchema = z.object({
 export const tenantSettingsBodySchema = z.object({
   enabledRuntimeProviders: z.array(z.enum(["codex", "claude-code"])).min(1).optional(),
   showEffortSelector: z.boolean().optional(),
+  webSearchMode: z.enum(["disabled", "cached", "live"]).optional(),
   approvalPolicy: z.union([z.enum(["never", "on-request"]), granularApprovalPolicySchema]).optional(),
   approvalReviewer: z.enum(["user", "guardian_subagent"]).optional(),
   allowCommandExecution: z.boolean().optional(),
   allowUserTokenForwarding: z.boolean().optional(),
   autoApproveReadOnlyTools: z.boolean().optional(),
+  policyEnforcementMode: PolicyEnforcementModeSchema.optional(),
   developerInstructions: z.string().trim().max(4000).nullable().optional(),
   enabledToolIds: z.array(adminIdSchema).optional(),
   enabledMcpServerIds: z.array(adminIdSchema).optional()

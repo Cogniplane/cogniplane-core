@@ -52,6 +52,7 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
             subtitle={activeSection?.subtitle}
             menuLinks={[
               { href: "/", label: "Chat", description: "Return to the active workspace" },
+              { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
               { href: "/admin", label: "Admin", description: "Open platform control plane" }
             ]}
           />

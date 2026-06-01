@@ -61,6 +61,7 @@ export type RuntimeManifest = {
     allowCommandExecution: boolean;
     allowUserTokenForwarding: boolean;
     autoApproveReadOnlyTools: boolean;
+    webSearchMode: string;
     enabledToolIds: string[];
   };
   skills: RuntimeManifestSkillEntry[];

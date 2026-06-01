@@ -51,16 +51,18 @@ class InMemoryTenantSettingsDatabase {
         tenant_id: String(params[0]),
         enabled_runtime_providers: JSON.parse(String(params[1])) as string[],
         show_effort_selector: Boolean(params[2]),
-        approval_policy: String(params[3]),
-        approval_reviewer: String(params[4]),
-        allow_command_execution: Boolean(params[5]),
-        allow_user_token_forwarding: Boolean(params[6]),
-        auto_approve_read_only_tools: Boolean(params[7]),
-        developer_instructions: params[8] == null ? null : String(params[8]),
-        enabled_tool_ids: JSON.parse(String(params[9])) as string[],
-        enabled_mcp_server_ids: JSON.parse(String(params[10])) as string[],
+        web_search_mode: String(params[3]),
+        approval_policy: String(params[4]),
+        approval_reviewer: String(params[5]),
+        allow_command_execution: Boolean(params[6]),
+        allow_user_token_forwarding: Boolean(params[7]),
+        auto_approve_read_only_tools: Boolean(params[8]),
+        policy_enforcement_mode: String(params[9]),
+        developer_instructions: params[10] == null ? null : String(params[10]),
+        enabled_tool_ids: JSON.parse(String(params[11])) as string[],
+        enabled_mcp_server_ids: JSON.parse(String(params[12])) as string[],
         version: previousVersion + 1,
-        config_hash: String(params[11]),
+        config_hash: String(params[13]),
         updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
       };
 
@@ -81,6 +83,8 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
     allowCommandExecution: true,
     allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: false,
+    policyEnforcementMode: "enforce",
+    webSearchMode: "live",
     developerInstructions: "Initial instructions",
     enabledToolIds: ["custom-tool"],
     enabledMcpServerIds: ["custom-server"]
@@ -93,10 +97,12 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
   expect(updated.approvalPolicy).toBe("never");
   expect(updated.enabledRuntimeProviders).toEqual(["codex"]);
   expect(updated.showEffortSelector).toBe(false);
+  expect(updated.webSearchMode).toBe("live");
   expect(updated.approvalReviewer).toBe("guardian_subagent");
   expect(updated.allowCommandExecution).toBe(true);
   expect(updated.allowUserTokenForwarding).toBe(false);
   expect(updated.autoApproveReadOnlyTools).toBe(false);
+  expect(updated.policyEnforcementMode).toBe("enforce");
   expect(updated.developerInstructions).toBe("Updated instructions");
   expect(updated.enabledToolIds).toEqual(["custom-tool"]);
   expect(updated.enabledMcpServerIds).toEqual(["custom-server"]);
@@ -114,10 +120,12 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
   expect(created.approvalPolicy).toBe("on-request");
   expect(created.enabledRuntimeProviders).toEqual(["codex"]);
   expect(created.showEffortSelector).toBe(false);
+  expect(created.webSearchMode).toBe("disabled");
   expect(created.approvalReviewer).toBe("user");
   expect(created.allowCommandExecution).toBe(false);
   expect(created.allowUserTokenForwarding).toBe(true);
   expect(created.autoApproveReadOnlyTools).toBe(true);
+  expect(created.policyEnforcementMode).toBe("monitor");
   expect(created.developerInstructions).toBe("Tenant-specific instructions");
   expect(created.enabledToolIds).toEqual([
         "managed-session-context",
@@ -198,4 +206,28 @@ test("TenantSettingsStore.upsert persists showEffortSelector", async () => {
   });
 
   expect(updated.showEffortSelector).toBe(false);
+});
+
+test("TenantSettingsStore.upsert persists webSearchMode and preserves it across partial updates", async () => {
+  const db = new InMemoryTenantSettingsDatabase();
+  const store = new TenantSettingsStore(db as unknown as Pool);
+
+  const created = await store.upsert("tenant-5", {
+    webSearchMode: "cached"
+  });
+
+  expect(created.webSearchMode).toBe("cached");
+
+  // A partial update that omits webSearchMode keeps the stored value.
+  const preserved = await store.upsert("tenant-5", {
+    showEffortSelector: true
+  });
+
+  expect(preserved.webSearchMode).toBe("cached");
+
+  const updated = await store.upsert("tenant-5", {
+    webSearchMode: "disabled"
+  });
+
+  expect(updated.webSearchMode).toBe("disabled");
 });

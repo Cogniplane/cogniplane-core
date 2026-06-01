@@ -3,6 +3,9 @@ import { z } from "zod";
 import { IsoDateSchema } from "./_helpers.js";
 
 import { PiiProtectionSettingsSchema } from "./pii.js";
+import { PolicyEnforcementModeSchema } from "./policy.js";
+
+import { WEB_SEARCH_MODES } from "../primitives.js";
 
 // Granular approval policy + literal forms must mirror @cogniplane/shared-types primitive types.
 const GranularApprovalPolicySchema = z.object({
@@ -25,16 +28,24 @@ const ApprovalReviewerSchema = z.enum(["user", "guardian_subagent"]);
 
 const RuntimeProviderSchema = z.enum(["codex", "claude-code"]);
 
+const WebSearchModeSchema = z.enum(WEB_SEARCH_MODES);
+
 export const TenantSettingsSchema = z.object({
   tenantId: z.string(),
   runtimeProvider: RuntimeProviderSchema,
   enabledRuntimeProviders: z.array(RuntimeProviderSchema),
   showEffortSelector: z.boolean(),
+  webSearchMode: WebSearchModeSchema,
   approvalPolicy: ApprovalPolicySchema,
   approvalReviewer: ApprovalReviewerSchema,
   allowCommandExecution: z.boolean(),
   allowUserTokenForwarding: z.boolean(),
   autoApproveReadOnlyTools: z.boolean(),
+  // Tenant-level Policy Center switch. monitor: rules are evaluated and decisions
+  // recorded, but no action is gated. enforce: matching block/require_approval
+  // rules actually gate. The natural rollout is monitor → watch decisions →
+  // enforce. Default monitor so Policy Center is inert until deliberately armed.
+  policyEnforcementMode: PolicyEnforcementModeSchema,
   developerInstructions: z.string().nullable(),
   enabledToolIds: z.array(z.string()),
   enabledMcpServerIds: z.array(z.string()),

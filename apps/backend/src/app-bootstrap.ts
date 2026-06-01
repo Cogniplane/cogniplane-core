@@ -116,6 +116,23 @@ export async function registerAppRoutes(
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.writeRuntimeFile(sessionId, filePath, data);
+      },
+      // Policy Center require_approval routing. The gateway holds its HTTP
+      // response open while this awaits the human decision; the owning adapter
+      // emits the SSE prompt and the /approvals decision route settles it. When
+      // no adapter owns the session (no active turn), an enforce-mode
+      // require_approval degrades to a deny (see PolicyService.routeApproval).
+      requestPolicyApproval: async (input) => {
+        const runtime = resolveOwningFileAdapter(
+          deps.runtimeManager,
+          deps.runtimeAdapters,
+          input.sessionId,
+          input.runtimeId ?? undefined
+        );
+        if (!runtime?.requestPolicyApproval) return null;
+        // input is a PolicyApprovalRouteInput — the adapter method takes the
+        // same shape, so forward it as-is rather than re-listing every field.
+        return runtime.requestPolicyApproval(input);
       }
     })
   );

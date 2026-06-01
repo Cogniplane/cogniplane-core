@@ -6,7 +6,11 @@ import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
 import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
 import { createWriteArtifactTool, WRITE_ARTIFACT_CATALOG } from "./write-artifact.js";
 
-type RawCatalogEntry = { name: string; description: string; readOnly: boolean };
+type RawCatalogEntry = {
+  name: string;
+  description: string;
+  readOnly: boolean;
+};
 
 function asCatalogEntries(
   entries: ReadonlyArray<RawCatalogEntry>,

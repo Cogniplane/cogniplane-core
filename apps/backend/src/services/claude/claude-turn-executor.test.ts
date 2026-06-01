@@ -88,6 +88,7 @@ function makeState(
     mcpServerEntries: [],
     e2bProcess,
     activeTurnInterrupt: { current: null },
+    activeTurnPush: { current: null },
     ...overrides
   };
 }
@@ -262,6 +263,8 @@ describe("executeClaudeTurn", () => {
     // The Stop hook is set during the turn and nulled afterwards so a late Stop
     // click can't reach into the next turn's iterator.
     expect(state.activeTurnInterrupt.current).toBeNull();
+    // Same for the policy-approval push hook.
+    expect(state.activeTurnPush.current).toBeNull();
   });
 
   it("cleans up activeTurns and the interrupt hook even when the turn fails", async () => {

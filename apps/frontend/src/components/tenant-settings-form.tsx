@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import type { AdminManagedTool } from "../lib/admin-api";
 import type { AdminMcpServer } from "@cogniplane/shared-types";
-import type { TenantSettings } from "@cogniplane/shared-types";
+import type { PolicyEnforcementMode, TenantSettings } from "@cogniplane/shared-types";
 import type { TenantSettingsInput } from "../hooks/use-tenant-settings";
 import {
   buildDraft,
@@ -136,11 +136,13 @@ export function TenantSettingsForm({
     const ok = await onSave({
       enabledRuntimeProviders: orderedProviders,
       showEffortSelector: draft.showEffortSelector,
+      webSearchMode: draft.webSearchMode,
       approvalPolicy: toApprovalPolicy(draft.approvalPolicyKind, draft.granularFlags),
       approvalReviewer: draft.approvalReviewer,
       allowCommandExecution: draft.allowCommandExecution,
       allowUserTokenForwarding: draft.allowUserTokenForwarding,
       autoApproveReadOnlyTools: draft.autoApproveReadOnlyTools,
+      policyEnforcementMode: draft.policyEnforcementMode,
       developerInstructions: draft.developerInstructions.trim() || null,
       enabledToolIds: draft.enabledToolIds,
       enabledMcpServerIds: draft.enabledMcpServerIds
@@ -290,6 +292,33 @@ export function TenantSettingsForm({
               </Select>
             </div>
 
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="web-search-mode">Web search</Label>
+              <Select
+                value={draft.webSearchMode}
+                onValueChange={(value) =>
+                  setDraft((current) => ({
+                    ...current,
+                    webSearchMode: value as FormDraft["webSearchMode"]
+                  }))
+                }
+              >
+                <SelectTrigger id="web-search-mode" className="w-full sm:w-80">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="disabled">Disabled</SelectItem>
+                  <SelectItem value="cached">Cached</SelectItem>
+                  <SelectItem value="live">Live</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-on-surface-faint">
+                Lets the Codex runtime search the web. &ldquo;Cached&rdquo; uses an indexed
+                snapshot; &ldquo;Live&rdquo; hits the network. The Claude runtime always has web
+                search available.
+              </p>
+            </div>
+
             {effectiveEnabledProviders(draft).length === 0 ? (
               <p className="text-sm text-danger">
                 Enable at least one runtime provider. Add an API key in Organization settings first
@@ -370,6 +399,31 @@ export function TenantSettingsForm({
                     </SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="policy-enforcement-mode">Policy Center enforcement</Label>
+                <Select
+                  value={draft.policyEnforcementMode}
+                  onValueChange={(value) =>
+                    setDraft((current) => ({
+                      ...current,
+                      policyEnforcementMode: value as PolicyEnforcementMode
+                    }))
+                  }
+                >
+                  <SelectTrigger id="policy-enforcement-mode" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="monitor">Monitor (record only)</SelectItem>
+                    <SelectItem value="enforce">Enforce (gate matching actions)</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-on-surface-faint">
+                  When enforce, Policy Center rules that block or require approval actually gate
+                  tool calls. Monitor records decisions without gating.
+                </p>
               </div>
             </div>
           </div>

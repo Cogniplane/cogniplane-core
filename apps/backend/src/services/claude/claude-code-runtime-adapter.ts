@@ -4,6 +4,8 @@ import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "../../config.js";
 import type {
+  PolicyApprovalDisposition,
+  PolicyApprovalRouteInput,
   RuntimeAdapter,
   RuntimeApprovalDecision,
   RuntimeEvent,
@@ -26,6 +28,7 @@ import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { IntegrationRegistryService } from "../integrations/integration-registry-service.js";
 import { cancelPendingApprovals, expireApprovalById } from "../runtime/approval-cleanup.js";
+import { PolicyApprovalCoordinator } from "../runtime/policy-approval-coordinator.js";
 import type { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
 import type { RuntimeSessionStore } from "../runtime/runtime-session-store.js";
 
@@ -45,23 +48,28 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
    * route through this map to reach the correct sandbox.
    */
   private readonly e2bPendingApprovals = new Map<string, string>();
+  /**
+   * Holds Policy Center gateway-routed tool-call approvals. Distinct from the
+   * sandbox `canUseTool` approvals tracked in {@link e2bPendingApprovals}: those
+   * are the runtime's own per-tool prompts; these are paused at the MCP gateway.
+   * Always constructed (mirrors {@link CodexRuntimeManager}) — `approvals` +
+   * `auditEvents` are required, so both adapters host policy approvals identically.
+   */
+  private readonly policyApprovals: PolicyApprovalCoordinator;
 
   constructor(
     private readonly config: AppConfig,
     private readonly dynamicConfig: DynamicConfigService,
     private readonly log: FastifyBaseLogger,
     private readonly managedToolCatalog: ManagedToolCatalog,
-    private readonly stores?: {
-      approvals?: ApprovalStore;
+    private readonly stores: {
+      // approvals + auditEvents are a REQUIRED pair: every HITL approval flow
+      // writes both the approvals row and an audit event, so neither is useful
+      // without the other. Required (not optional) so the type system enforces
+      // a coherent wiring and the adapter never silently degrades to no-HITL.
+      approvals: ApprovalStore;
+      auditEvents: AuditEventStore;
       runtimeSessions?: RuntimeSessionStore;
-      // Required for HITL approval flows: every cleanup writes an
-      // `approval.expired` audit row. If you have `approvals`, you also
-      // need this — the pair is what makes interrupt-induced cleanup
-      // forensically traceable. The constructor doesn't enforce this
-      // strictly because adapters under test may opt out of approvals
-      // entirely; production wiring (build-runtime-adapters.ts) provides
-      // both.
-      auditEvents?: AuditEventStore;
       // Optional so unit tests can opt out. Production wiring threads
       // this in so abortSession can release the runtime's pin slot
       // immediately rather than waiting on the 24-hour TTL.
@@ -71,7 +79,21 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     private readonly e2bOptions?: ClaudeCodeE2bOptions | null,
     private readonly integrationRegistry?: IntegrationRegistryService,
     private readonly activationTracker?: ActivationTracker
-  ) {}
+  ) {
+    this.policyApprovals = new PolicyApprovalCoordinator({
+      approvals: stores.approvals,
+      auditEvents: stores.auditEvents,
+      logger: log,
+      ttlMs: config.APPROVAL_REQUEST_TTL_MS,
+      reminderFraction: config.POLICY_APPROVAL_REMINDER_FRACTION,
+      pushFrameworkEvent: (sessionId, event) => {
+        const push = this.sessions.get(sessionId)?.activeTurnPush.current;
+        if (!push) return false;
+        push(event);
+        return true;
+      }
+    });
+  }
 
   hasActiveTurn(sessionId: string): boolean {
     return this.activeTurns.has(sessionId);
@@ -229,28 +251,22 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     //     sandbox bridge (handled inside onCancelLocal below).
     //   - expire the DB rows + emit `approval.expired` audit events via the
     //     shared cleanup helper.
-    if (this.stores?.approvals && this.stores?.auditEvents) {
-      void cancelPendingApprovals({
-        tenantId: input.tenantId,
-        sessionId: input.sessionId,
-        userId: input.userId,
-        reason: "turn_interrupted",
-        approvals: this.stores.approvals,
-        auditEvents: this.stores.auditEvents,
-        logger: this.log,
-        onCancelLocal: (approvalId) => {
-          this.e2bPendingApprovals.delete(approvalId);
-          return undefined;
-        }
-      });
-    } else {
-      // Approvals/audit store not wired (test fixtures opting out). Still
-      // drain the in-memory e2b map for this session so a stale decision
-      // can't be forwarded to a torn-down sandbox bridge.
-      for (const [approvalId, sid] of this.e2bPendingApprovals) {
-        if (sid === input.sessionId) this.e2bPendingApprovals.delete(approvalId);
+    void cancelPendingApprovals({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      userId: input.userId,
+      reason: "turn_interrupted",
+      approvals: this.stores.approvals,
+      auditEvents: this.stores.auditEvents,
+      logger: this.log,
+      onCancelLocal: (approvalId) => {
+        // Release a policy-held tool call (no-op if not ours) so the gateway's
+        // awaiting HTTP response unblocks immediately on interrupt.
+        this.policyApprovals.cancel(approvalId);
+        this.e2bPendingApprovals.delete(approvalId);
+        return undefined;
       }
-    }
+    });
     return "interrupted";
   }
 
@@ -281,9 +297,9 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     // edge case where a still-valid leaked rt_* token could be replayed
     // against a fresh slot under the dead runtimeId after the in-memory
     // pin is gone.
-    this.stores?.egressIpPins?.clear(state.runtimeId);
+    this.stores.egressIpPins?.clear(state.runtimeId);
 
-    if (this.stores?.runtimeSessions) {
+    if (this.stores.runtimeSessions) {
       try {
         await this.stores.runtimeSessions.setStatus(
           input.tenantId,
@@ -327,6 +343,10 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     tenantId: string,
     _integrationId: string
   ): Promise<string[]> {
+    return this.invalidateTenantRuntimes(tenantId);
+  }
+
+  async invalidateTenantRuntimes(tenantId: string): Promise<string[]> {
     const targets = [...this.sessions.values()].filter((state) => state.tenantId === tenantId);
     await Promise.all(
       targets.map((state) =>
@@ -355,11 +375,6 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     approvalId: string;
   }): void {
     const { tenantId, sessionId, userId, approvalId } = input;
-    if (!this.stores?.approvals || !this.stores?.auditEvents) {
-      // No approvals/audit wiring (opt-out test fixtures): just release memory.
-      this.e2bPendingApprovals.delete(approvalId);
-      return;
-    }
     void expireApprovalById({
       tenantId,
       sessionId,
@@ -386,6 +401,13 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     const { tenantId, approvalId, userId, decision } = input;
     const decisionStatus = decision === "approve" ? "approve" : "reject";
 
+    // A Policy Center gateway-routed approval is held by the coordinator, not by
+    // a sandbox canUseTool Promise — settle it there first. It returns "missing"
+    // for ids it doesn't own, so the native sandbox path below still runs.
+    if (this.policyApprovals.has(approvalId)) {
+      return this.policyApprovals.resolve({ tenantId, approvalId, userId, decision });
+    }
+
     // Deliver to the owning live runtime FIRST, and confirm it was actually
     // received, BEFORE settling the shared DB row. Two correctness reasons:
     //  1. Cross-adapter: the production route tries adapters in order (Codex,
@@ -399,29 +421,33 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     const forwarded = await this.forwardApprovalDecision(approvalId, tenantId, userId, decision);
     if (!forwarded) return "missing";
 
-    if (this.stores?.approvals) {
-      // Atomic once-only guard: ApprovalStore.resolve flips pending→settled a
-      // single time. A concurrent double-click, a retried POST, or a row already
-      // settled by the TTL sweep returns null — we already delivered to the
-      // runtime, so still report "resolved" but skip a duplicate audit row.
-      const approval = await this.stores.approvals.resolve(
+    // Atomic once-only guard: ApprovalStore.resolve flips pending→settled a
+    // single time. A concurrent double-click, a retried POST, or a row already
+    // settled by the TTL sweep returns null — we already delivered to the
+    // runtime, so still report "resolved" but skip a duplicate audit row.
+    const approval = await this.stores.approvals.resolve(
+      tenantId,
+      approvalId,
+      userId,
+      decisionStatus
+    );
+    if (approval) {
+      await this.stores.auditEvents.create({
         tenantId,
-        approvalId,
-        userId,
-        decisionStatus
-      );
-      if (approval) {
-        await this.stores.auditEvents?.create({
-          tenantId,
-          sessionId: approval.sessionId,
-          userId: approval.userId,
-          approvalId: approval.approvalId,
-          type: decision === "approve" ? "approval.approved" : "approval.rejected",
-          payload: { itemId: approval.itemId, kind: approval.kind }
-        });
-      }
+        sessionId: approval.sessionId,
+        userId: approval.userId,
+        approvalId: approval.approvalId,
+        type: decision === "approve" ? "approval.approved" : "approval.rejected",
+        payload: { itemId: approval.itemId, kind: approval.kind }
+      });
     }
     return "resolved";
+  }
+
+  async requestPolicyApproval(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition> {
+    // The coordinator owns fail-closed behaviour (it denies if it can't persist
+    // the approvals row), so there's no adapter-level guard to duplicate here.
+    return this.policyApprovals.request(input);
   }
 
   /**

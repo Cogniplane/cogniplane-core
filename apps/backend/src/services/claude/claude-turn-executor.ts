@@ -57,6 +57,11 @@ export async function* executeClaudeTurn(
   const responseId = input.assistantMessageId ?? uuidv7();
   const mapperState = createClaudeEventMapperState(responseId);
 
+  // Expose a push hook so out-of-band events (Policy Center gateway-held
+  // approvals + reminders) can be surfaced on this turn's SSE stream while it's
+  // live. Cleared in the finally below so a late push can't reach a dead queue.
+  state.activeTurnPush.current = (event) => eventQueue.push(event);
+
   const dispatchApprovalEvent = async (event: {
     approvalId: string;
     toolName: string;
@@ -139,6 +144,9 @@ export async function* executeClaudeTurn(
       // can't reach into the next turn's iterator. The runtime adapter checks
       // activeTurns first, but this is the per-state defense in depth.
       state.activeTurnInterrupt.current = null;
+      // Same for the push hook — a late policy-approval push must not land on a
+      // queue that's about to be ended.
+      state.activeTurnPush.current = null;
       eventQueue.end();
     }
   })();

@@ -602,6 +602,7 @@ CREATE TABLE public.tenant_settings (
     allow_command_execution boolean DEFAULT false NOT NULL,
     allow_user_token_forwarding boolean DEFAULT true NOT NULL,
     auto_approve_read_only_tools boolean DEFAULT true NOT NULL,
+    policy_enforcement_mode text DEFAULT 'monitor'::text NOT NULL,
     developer_instructions text,
     enabled_tool_ids jsonb DEFAULT '["managed-session-context", "session_context", "list_artifacts", "read_text_artifact", "write_artifact"]'::jsonb NOT NULL,
     enabled_mcp_server_ids jsonb DEFAULT '["managed-session-context"]'::jsonb NOT NULL,
@@ -610,11 +611,14 @@ CREATE TABLE public.tenant_settings (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     enabled_runtime_providers jsonb DEFAULT '["codex"]'::jsonb NOT NULL,
     show_effort_selector boolean DEFAULT false NOT NULL,
+    web_search_mode text DEFAULT 'disabled'::text NOT NULL,
     skill_judge_provider text,
     skill_judge_model text,
     skill_judge_mode text DEFAULT 'sync'::text NOT NULL,
     skill_judge_enabled boolean DEFAULT false NOT NULL,
-    CONSTRAINT tenant_settings_skill_judge_mode_check CHECK ((skill_judge_mode = ANY (ARRAY['sync'::text, 'batch'::text])))
+    CONSTRAINT tenant_settings_policy_enforcement_mode_check CHECK ((policy_enforcement_mode = ANY (ARRAY['monitor'::text, 'enforce'::text]))),
+    CONSTRAINT tenant_settings_skill_judge_mode_check CHECK ((skill_judge_mode = ANY (ARRAY['sync'::text, 'batch'::text]))),
+    CONSTRAINT tenant_settings_web_search_mode_check CHECK ((web_search_mode = ANY (ARRAY['disabled'::text, 'cached'::text, 'live'::text])))
 );
 
 -- Name: tenants; Type: TABLE; Schema: public; Owner: -
@@ -1989,4 +1993,3 @@ ALTER TABLE public.user_settings_sections FORCE ROW LEVEL SECURITY;
 -- Name: user_settings_sections user_settings_sections_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
 CREATE POLICY user_settings_sections_tenant_isolation ON public.user_settings_sections USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
-

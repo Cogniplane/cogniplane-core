@@ -1,10 +1,56 @@
 import { test, expect, onTestFinished } from "vitest";
 
+import type { PolicyRule } from "@cogniplane/shared-types";
+
 import { phase4RuntimePolicy } from "../test-helpers/phase4-runtime-policy.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
 import { createTestApp, createTestToolContext } from "../test-helpers/routes-test-support.js";
+import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { generateRuntimeToken } from "../services/auth/runtime-token.js";
-import { selectAllowlistedHeaders } from "./mcp.js";
+import { PolicyService } from "../services/policy/policy-service.js";
+import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
+import type { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
+import type { AuditEventStore } from "../services/audit-event-store.js";
+import { deriveActionSeverity, selectAllowlistedHeaders } from "./mcp.js";
+
+// A real PolicyService over a fixed rule set, for exercising
+// require_approval / block end-to-end through the MCP gateway.
+function makePolicyService(rules: PolicyRule[]) {
+  const decisions: unknown[] = [];
+  const ruleStore = { async list() { return rules; } };
+  const decisionStore = {
+    async record(_t: string, input: unknown) {
+      decisions.push(input);
+      return { decisionId: `pdc_${decisions.length}` };
+    },
+    async list() { return []; }
+  };
+  const service = new PolicyService({
+    rules: ruleStore as unknown as PolicyRuleStore,
+    decisions: decisionStore as unknown as PolicyDecisionStore,
+    auditEvents: new InMemoryAuditEventStore() as unknown as AuditEventStore,
+    ruleCacheTtlMs: 0 // no cache so each test's rules apply immediately
+  });
+  return { service, decisions };
+}
+
+function makePolicyRule(overrides: Partial<PolicyRule>): PolicyRule {
+  return {
+    ruleId: "pol_test",
+    tenantId: "test-tenant",
+    name: "Test rule",
+    description: null,
+    priority: 100,
+    enabled: true,
+    effect: "block",
+    conditions: {},
+    reason: null,
+    createdBy: null,
+    createdAt: "2026-05-31T00:00:00.000Z",
+    updatedAt: "2026-05-31T00:00:00.000Z",
+    ...overrides
+  };
+}
 
 // The MCP gateway resolves the runtime token with this secret (see
 // routes-test-support.ts → registerMcpRoutes runtimeTokenSecret).
@@ -411,4 +457,227 @@ test("proxy tool/call forwards the allowlisted X-Framework identity but never a 
   expect(response.statusCode).toBe(200);
   expect(upstreamRequests.length).toBe(1);
   expect(upstreamRequests[0].headers["x-framework-user-id"]).toBe("header-user");
+});
+
+// Policy Center severity derivation. Managed tools carry an authoritative
+// readOnly boolean; only forwarded/proxy tools (readOnly=null) fall back to
+// name-based classification. This is the fix for the bug where managed write
+// tools were name-classified as command_execution and never matched a
+// `file_change` rule.
+test("deriveActionSeverity: managed read-only tool → read_only", () => {
+  expect(deriveActionSeverity("read_text_artifact", true)).toBe("read_only");
+});
+
+test("deriveActionSeverity: managed WRITE tool → file_change (not command_execution)", () => {
+  // github_write_file is not a Claude SDK native name; the old code would have
+  // name-classified it to command_execution. With readOnly=false it must be
+  // file_change so `severities: [\"file_change\"]` rules match managed writes.
+  expect(deriveActionSeverity("github_write_file", false)).toBe("file_change");
+  expect(deriveActionSeverity("write_artifact", false)).toBe("file_change");
+});
+
+test("deriveActionSeverity: forwarded/proxy tool (readOnly=null) falls back to name classification", () => {
+  // Unknown proxy tool name → command_execution (the classifier's default).
+  expect(deriveActionSeverity("some_proxy_tool", null)).toBe("command_execution");
+  // A name the classifier DOES know is still honored on the fallback path.
+  expect(deriveActionSeverity("Read", null)).toBe("read_only");
+});
+
+// ---------------------------------------------------------------------------
+// Policy Center gateway end-to-end: block / require_approval route through the
+// gateway and resume or deny. Enforcement is a TENANT-LEVEL switch on the
+// runtime-policy snapshot (policyEnforcementMode), NOT a per-rule mode.
+// ---------------------------------------------------------------------------
+
+// Builds the runtime-policy snapshot stored on the tool-execution context.
+// Defaults to "monitor" enforcement (records but never gates). Pass
+// { policyEnforcementMode: "enforce" } when a test needs the rule to gate.
+function seedRuntimePolicySnapshot(
+  overrides: { policyEnforcementMode?: "monitor" | "enforce" } = {}
+) {
+  return {
+    ...phase4RuntimePolicy,
+    enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"],
+    enabledToolIds: [...phase4RuntimePolicy.enabledToolIds, "test-proxy"],
+    policyEnforcementMode:
+      overrides.policyEnforcementMode ?? phase4RuntimePolicy.policyEnforcementMode
+  };
+}
+
+async function buildProxyApp(
+  policyService: unknown,
+  requestPolicyApproval?: (input: {
+    tenantId: string; sessionId: string; userId: string; runtimeId: string | null;
+    toolName: string; serverId: string | null;
+    severity: "read_only" | "file_change" | "command_execution"; explanation: string;
+  }) => Promise<"approve" | "reject" | "expired" | null>,
+  // Tenant-level enforcement mode + extra tool-context metadata (e.g. turnContext)
+  // the gateway reads for the turn-context dimension.
+  options: {
+    enforcementMode?: "monitor" | "enforce";
+    extraMetadata?: Record<string, unknown>;
+  } = {}
+) {
+  const { enforcementMode = "monitor", extraMetadata = {} } = options;
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts } = await createTestApp({
+    proxyUpstreamUrl: `${upstreamUrl}/`,
+    policyService,
+    requestPolicyApproval
+  });
+  await createTestToolContext(toolContexts, {
+    sessionId: "policy-session",
+    userId: "test-user",
+    runtimeId: "runtime-policy-session",
+    metadata: {
+      runtimePolicy: seedRuntimePolicySnapshot({ policyEnforcementMode: enforcementMode }),
+      ...extraMetadata
+    }
+  });
+  return { app, upstream, upstreamRequests };
+}
+
+function callProxyTool(app: Awaited<ReturnType<typeof buildProxyApp>>["app"], args: Record<string, unknown>) {
+  return app.inject({
+    method: "POST",
+    url: "/mcp/test-proxy",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "policy-session", uid: "test-user" })}` },
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "echo", arguments: args }
+    }
+  });
+}
+
+test("enforce-mode require_approval → APPROVE forwards the call", async () => {
+  const { service } = makePolicyService([
+    makePolicyRule({ effect: "require_approval" })
+  ]);
+  const approvalCalls: unknown[] = [];
+  const { app, upstream, upstreamRequests } = await buildProxyApp(
+    service,
+    async (input) => {
+      approvalCalls.push(input);
+      return "approve";
+    },
+    { enforcementMode: "enforce" }
+  );
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().error).toBeUndefined();
+  expect(approvalCalls).toHaveLength(1);
+  expect(upstreamRequests.length).toBe(1);
+});
+
+test("enforce-mode require_approval → REJECT refuses the call with a -32004 error", async () => {
+  const { service } = makePolicyService([
+    makePolicyRule({ effect: "require_approval", reason: "Needs sign-off." })
+  ]);
+  const { app, upstream, upstreamRequests } = await buildProxyApp(
+    service,
+    async () => "reject",
+    { enforcementMode: "enforce" }
+  );
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+  expect(response.statusCode).toBe(200); // JSON-RPC errors ride a 200
+  expect(response.json().error.code).toBe(-32004);
+  // Refused → never forwarded upstream.
+  expect(upstreamRequests.length).toBe(0);
+});
+
+test("enforce-mode require_approval with no adapter to host it → denied", async () => {
+  const { service } = makePolicyService([
+    makePolicyRule({ effect: "require_approval" })
+  ]);
+  // No requestPolicyApproval override → harness default returns null (no turn).
+  const { app, upstream, upstreamRequests } = await buildProxyApp(service, undefined, {
+    enforcementMode: "enforce"
+  });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+  expect(response.json().error.code).toBe(-32004);
+  expect(upstreamRequests.length).toBe(0);
+});
+
+test("enforce-mode block refuses before reaching the upstream", async () => {
+  const { service } = makePolicyService([makePolicyRule({ effect: "block" })]);
+  const { app, upstream, upstreamRequests } = await buildProxyApp(service, undefined, {
+    enforcementMode: "enforce"
+  });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+  expect(response.json().error.code).toBe(-32004);
+  expect(upstreamRequests.length).toBe(0);
+});
+
+test("monitor-mode block records intent but still forwards the call", async () => {
+  // Default monitor snapshot: the rule is recorded but never gates.
+  const { service, decisions } = makePolicyService([
+    makePolicyRule({ effect: "block" })
+  ]);
+  const { app, upstream, upstreamRequests } = await buildProxyApp(service);
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+  // Monitor mode never gates — the upstream still sees the call unchanged, but a
+  // decision was recorded for the dashboard.
+  expect(response.json().error).toBeUndefined();
+  expect(upstreamRequests.length).toBe(1);
+  const forwarded = upstreamRequests[0].body.params as { arguments: Record<string, unknown> };
+  expect(forwarded.arguments).toEqual({ query: "hello" });
+  expect(decisions).toHaveLength(1);
+});
+
+// ── turnContext dimension end-to-end (from context metadata) ──
+
+test("a turnContext=scheduled rule gates only when the context is marked scheduled", async () => {
+  const { service } = makePolicyService([
+    makePolicyRule({ effect: "block", conditions: { turnContexts: ["scheduled"] } })
+  ]);
+  // Context metadata marks this turn as scheduled → the rule gates (enforce mode).
+  const scheduled = await buildProxyApp(service, undefined, {
+    enforcementMode: "enforce",
+    extraMetadata: { turnContext: "scheduled" }
+  });
+  onTestFinished(async () => {
+    await Promise.all([scheduled.app.close(), scheduled.upstream.close()]);
+  });
+  const blocked = await callProxyTool(scheduled.app, { query: "x" });
+  expect(blocked.json().error.code).toBe(-32004);
+  expect(scheduled.upstreamRequests.length).toBe(0);
+});
+
+test("a turnContext=scheduled rule does NOT gate an interactive turn", async () => {
+  const { service } = makePolicyService([
+    makePolicyRule({ effect: "block", conditions: { turnContexts: ["scheduled"] } })
+  ]);
+  // turnContext=interactive in metadata → the scheduled-only rule doesn't match.
+  const interactive = await buildProxyApp(service, undefined, {
+    enforcementMode: "enforce",
+    extraMetadata: { turnContext: "interactive" }
+  });
+  onTestFinished(async () => {
+    await Promise.all([interactive.app.close(), interactive.upstream.close()]);
+  });
+  const ok = await callProxyTool(interactive.app, { query: "x" });
+  expect(ok.json().error).toBeUndefined();
+  expect(interactive.upstreamRequests.length).toBe(1);
 });

@@ -355,7 +355,8 @@ export class SchedulerWorker {
       const session = await this.deps.sessions.create(
         job.tenantId,
         job.userId,
-        `[Scheduled] ${job.jobName}`
+        `[Scheduled] ${job.jobName}`,
+        { purpose: "scheduled" }
       );
       sessionId = session.sessionId;
       // Expose the session id so the timeout watchdog can abort this runtime.
@@ -395,7 +396,7 @@ export class SchedulerWorker {
         userId: job.userId
       });
 
-      const runtimePolicyId = await this.deps.runtimeManager.getRuntimePolicyId(job.tenantId);
+      const runtimePolicyId = runtimeSession.runtimePolicy.id;
       const toolContext = await this.deps.toolContexts.create({
         tenantId: job.tenantId,
         sessionId,
@@ -403,6 +404,11 @@ export class SchedulerWorker {
         runtimeId: runtimeSession.runtimeId,
         runtimePolicyId,
         messageId: assistantMessage.messageId,
+        // Mark this as an unattended turn so a Policy Center rule can gate
+        // scheduled actions more strictly. Keep the same runtimePolicy snapshot
+        // as interactive turns so the MCP gateway can enforce enabled tools and
+        // servers for scheduled tool calls.
+        metadata: { runtimePolicy: runtimeSession.runtimePolicy, turnContext: "scheduled" },
         ttlMs: this.options.jobTimeoutMs
       });
 

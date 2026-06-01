@@ -64,6 +64,21 @@ export const AUDIT_EVENT_TYPES = [
   "pii_transformed",
   "pii_reported",
 
+  // Policy Center decisions. `recorded` is a monitor-mode (or non-gating)
+  // evaluation; `enforced` is one that actually gated the action.
+  "policy.decision.recorded",
+  "policy.decision.enforced",
+  // Policy Center approval routing. `requested` is emitted when an enforce-mode
+  // require_approval routes a human approval at the gateway; the resolution
+  // reuses the shared approval.approved/rejected/expired events above (tagged
+  // `source: "policy"` in the payload).
+  "policy.approval.requested",
+  // Policy Center rule administration.
+  "admin.policy_rule.created",
+  "admin.policy_rule.updated",
+  "admin.policy_rule.deleted",
+  "admin.policy_rule.reordered",
+
   // Scheduler.
   "scheduler.job.run.completed",
   "scheduler.job.run.failed",

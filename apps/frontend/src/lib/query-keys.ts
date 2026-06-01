@@ -34,7 +34,15 @@ export const queryKeys = {
       limit?: number;
     }) => [...queryKeys.admin.all, "pii", "recent", params] as const,
     piiJobsStats: (params: { range: string; from?: string; to?: string }) =>
-      [...queryKeys.admin.all, "pii", "jobs/stats", params] as const
+      [...queryKeys.admin.all, "pii", "jobs/stats", params] as const,
+    policyRules: () => [...queryKeys.admin.all, "policy", "rules"] as const,
+    // Params are the serializable decisions filter+paging shape; passed verbatim
+    // so two different filter sets get distinct cache entries.
+    policyDecisions: (params?: Record<string, unknown>) =>
+      [...queryKeys.admin.all, "policy", "decisions", params ?? {}] as const,
+    policyDecision: (decisionId: string) =>
+      [...queryKeys.admin.all, "policy", "decision", decisionId] as const,
+    policyLint: () => [...queryKeys.admin.all, "policy", "lint"] as const
   },
   settings: {
     all: ["settings"] as const,
@@ -72,5 +80,10 @@ export const queryKeys = {
   models: {
     all: ["models"] as const,
     list: () => [...queryKeys.models.all, "list"] as const
+  },
+  artifacts: {
+    all: ["artifacts"] as const,
+    browse: (params?: Record<string, unknown>) =>
+      [...queryKeys.artifacts.all, "browse", params ?? {}] as const
   }
 } as const;

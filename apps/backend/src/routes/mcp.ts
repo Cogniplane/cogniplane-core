@@ -14,6 +14,17 @@ import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
+import {
+  POLICY_TURN_CONTEXTS,
+  type PolicySeverity,
+  type PolicyTurnContext
+} from "@cogniplane/shared-types";
+
+import type {
+  PolicyApprovalDisposition,
+  PolicyApprovalRouteInput,
+  RuntimeApprovalKind
+} from "../runtime-contracts.js";
 import type { AppDependencies } from "../app-dependencies.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { signProxyHeaders } from "../lib/mcp-proxy-signature.js";
@@ -27,6 +38,8 @@ import {
   type ResolvedRuntimePolicy
 } from "../services/admin-config-records.js";
 import type { ManagedToolDefinition } from "../services/managed-tools/types.js";
+import { classifyToolSeverity } from "../services/tool-classification.js";
+import { PolicyBlockedError, type PolicyService } from "../services/policy/policy-service.js";
 import type {
   ToolExecutionContext,
   ToolExecutionContextStore
@@ -73,6 +86,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Routes a Policy Center require_approval to whichever adapter owns the
+// session. Returns the human disposition, or null when no adapter could host
+// the approval (no active turn) — the gateway then degrades to a deny.
+export type GatewayPolicyApprovalRouter = (
+  input: PolicyApprovalRouteInput
+) => Promise<PolicyApprovalDisposition | null>;
+
 export function buildMcpRouteStores(
   deps: AppDependencies,
   extras: {
@@ -84,6 +104,7 @@ export function buildMcpRouteStores(
       filePath: string,
       data: Uint8Array | ArrayBuffer | string
     ) => Promise<string>;
+    requestPolicyApproval: GatewayPolicyApprovalRouter;
   }
 ) {
   return {
@@ -99,8 +120,11 @@ export function buildMcpRouteStores(
     notionConnections: deps.notionConnectionService,
     piiProtection: deps.piiProtection,
     managedToolFactoryRegistry: deps.managedToolFactoryRegistry,
+    managedToolCatalog: deps.managedToolCatalog,
+    policyService: deps.policyService,
     readRuntimeFile: extras.readRuntimeFile,
     writeRuntimeFile: extras.writeRuntimeFile,
+    requestPolicyApproval: extras.requestPolicyApproval,
     runtimeTokenSecret: extras.runtimeTokenSecret,
     activationTracker: deps.activationTracker
   };
@@ -239,6 +263,8 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           runtimeTokenClaims,
           requestHeaders: request.headers,
           activationTracker: stores.activationTracker,
+          policyService: stores.policyService,
+          requestPolicyApproval: stores.requestPolicyApproval,
           dataEncryptionSecret: app.config.DATA_ENCRYPTION_SECRET,
           logger: request.log
         });
@@ -357,8 +383,10 @@ async function handleToolsCall(input: {
   runtimeTokenClaims: RuntimeTokenClaims | null;
   requestHeaders: Record<string, string | string[] | undefined>;
   activationTracker?: ActivationTracker;
+  policyService: PolicyService;
+  requestPolicyApproval: GatewayPolicyApprovalRouter;
   dataEncryptionSecret: string;
-  logger: Pick<FastifyBaseLogger, "debug">;
+  logger: Pick<FastifyBaseLogger, "debug" | "warn">;
 }): Promise<RpcResponse> {
   const {
     rpc,
@@ -371,6 +399,8 @@ async function handleToolsCall(input: {
     runtimeTokenClaims,
     requestHeaders,
     activationTracker,
+    policyService,
+    requestPolicyApproval,
     dataEncryptionSecret,
     logger
   } = input;
@@ -394,6 +424,8 @@ async function handleToolsCall(input: {
     return failure(rpc.id, -32602, "Invalid params: 'arguments' must be an object.");
   }
 
+  const policyGate: PolicyGate = { policyService, requestPolicyApproval, logger };
+
   const response =
     server.mode === "managed"
       ? await handleManagedToolCall(
@@ -404,7 +436,8 @@ async function handleToolsCall(input: {
           toolContexts,
           urlToolContextId,
           sessionIdFromRuntimeToken,
-          runtimeTokenClaims
+          runtimeTokenClaims,
+          policyGate
         )
       : await handleForwardedToolCall(
           rpc,
@@ -415,7 +448,8 @@ async function handleToolsCall(input: {
           sessionIdFromRuntimeToken,
           runtimeTokenClaims,
           requestHeaders,
-          dataEncryptionSecret
+          dataEncryptionSecret,
+          policyGate
         );
 
   await recordToolCallTelemetry({
@@ -550,7 +584,8 @@ async function handleManagedToolCall(
   toolContexts: ToolExecutionContextStore,
   urlToolContextId: string | null,
   sessionIdFromRuntimeToken: string | null,
-  runtimeTokenClaims: RuntimeTokenClaims | null
+  runtimeTokenClaims: RuntimeTokenClaims | null,
+  policyGate: PolicyGate
 ): Promise<RpcResponse> {
   const params = rpc.params ?? {};
   const toolName = String(params.name ?? "");
@@ -586,6 +621,13 @@ async function handleManagedToolCall(
     const runtimePolicy = requireMcpServerAllowed(serverId, context);
     requireManagedToolAllowed(tool.name, runtimePolicy);
     enforceManagedToolPolicy(tool, runtimePolicy.id, runtimePolicy.autoApproveReadOnlyTools);
+    // Policy Center gate — records a decision and, in enforce mode, may pause for
+    // human approval (require_approval) or throw PolicyBlockedError (block /
+    // approval denied — surfaced as a distinct RPC error below). Severity is
+    // derived from the managed tool's readOnly flag.
+    await enforcePolicyCenter(policyGate, context, tool.name, serverId, {
+      readOnly: tool.readOnly
+    }, args);
     const result = await tool.handler({
       context,
       arguments: args
@@ -602,6 +644,9 @@ async function handleManagedToolCall(
       isError: false
     });
   } catch (error) {
+    if (error instanceof PolicyBlockedError) {
+      return failure(rpc.id, -32004, error.explanation);
+    }
     return failure(rpc.id, -32000, getErrorMessage(error, "Tool call failed."));
   }
 }
@@ -687,6 +732,130 @@ function enforceManagedToolPolicy(
   }
 }
 
+// Dependencies the Policy Center hook needs at the tool-call choke point.
+type PolicyGate = {
+  policyService: PolicyService;
+  requestPolicyApproval: GatewayPolicyApprovalRouter;
+  logger: Pick<FastifyBaseLogger, "warn">;
+};
+
+/**
+ * Derive the policy severity for a tool action.
+ *
+ * Managed tools carry an authoritative `readOnly` boolean (from the catalog):
+ * read-only → `read_only`, otherwise it's a state-changing call → `file_change`.
+ * We deliberately do NOT name-classify managed tools — `classifyToolSeverity`
+ * only knows Claude SDK native names (Read/Write/Bash/…), so a managed write
+ * like `github_write_file` would mis-classify as `command_execution` and a
+ * `file_change` rule would silently never match it.
+ *
+ * Forwarded/proxy tools have no catalog entry (`readOnly === null`), so their
+ * severity is genuinely unknown — name-based classification is the only signal
+ * available and is used as a best-effort fallback.
+ */
+export function deriveActionSeverity(
+  toolName: string,
+  readOnly: boolean | null
+): PolicySeverity {
+  if (readOnly === true) return "read_only";
+  if (readOnly === false) return "file_change";
+  return classifyToolSeverity(toolName);
+}
+
+// Map the policy severity onto the approval `kind` the SSE prompt + approvals
+// row use. A read-only or state-changing tool surfaces as a "file_change"
+// approval (it isn't a shell command); command_execution maps through directly.
+function severityToApprovalKind(severity: PolicySeverity): RuntimeApprovalKind {
+  return severity === "command_execution" ? "command_execution" : "file_change";
+}
+
+// Read a policy turn-context off the tool-execution context metadata, validating
+// against the enum. Anything unexpected (missing, stale, malformed) degrades to
+// null so the dimension acts as "no constraint" instead of throwing.
+function parsePolicyTurnContext(value: unknown): PolicyTurnContext | null {
+  return typeof value === "string" && (POLICY_TURN_CONTEXTS as readonly string[]).includes(value)
+    ? (value as PolicyTurnContext)
+    : null;
+}
+
+/**
+ * Policy Center gate at the runtime choke point. Evaluates the proposed action
+ * against the tenant's rules, records a decision as evidence (audit +
+ * policy_decision), and either:
+ *   - proceeds (returns) — for allow / monitor mode / no-match; or
+ *   - routes a human approval for an enforce-mode `require_approval`, holding
+ *     this gateway HTTP response open until the decision lands (approve →
+ *     proceed, reject/expire → throw); or
+ *   - throws {@link PolicyBlockedError} for an enforce-mode `block`.
+ *
+ * Whether a gating rule actually gates is the tenant's `policyEnforcementMode`,
+ * read from the runtime-policy snapshot already on the tool-execution context.
+ */
+// The signal that varies per managed/forwarded path and isn't on the
+// ToolExecutionContext: the tool's read/write flag (drives severity). Null for
+// forwarded tools (no catalog entry → name-based severity classification).
+type PolicyToolFacts = {
+  readOnly: boolean | null;
+};
+
+async function enforcePolicyCenter(
+  gate: PolicyGate,
+  context: ToolExecutionContext,
+  toolName: string,
+  serverId: string,
+  facts: PolicyToolFacts,
+  args: Record<string, unknown>
+): Promise<void> {
+  const severity = deriveActionSeverity(toolName, facts.readOnly);
+  // Turn context is snapshotted into the tool-execution context at creation time
+  // (see sse-stream-writer / scheduler), so the hot path reads it with no extra
+  // DB lookup. A malformed snapshot degrades to null ("no constraint").
+  const turnContext = parsePolicyTurnContext(context.metadata.turnContext);
+  // The tenant-level monitor/enforce switch rides on the runtime-policy snapshot
+  // already on the context — no extra DB call.
+  const enforcementMode = getRuntimePolicySnapshot(context).policyEnforcementMode;
+  await gate.policyService.gateAction({
+    tenantId: context.tenantId,
+    sessionId: context.sessionId,
+    userId: context.userId,
+    runtimeId: context.runtimeId,
+    toolName,
+    // The MCP server the tool is hosted on, recorded as `category` (== serverId).
+    category: serverId,
+    severity,
+    serverId,
+    turnContext,
+    enforcementMode,
+    // `toolContextId` is stamped into args by the gateway, not supplied by the
+    // model — exclude it so the evidence snapshot reflects the caller's real
+    // argument set.
+    actionSnapshot: {
+      argumentKeys: Object.keys(args).filter((key) => key !== "toolContextId")
+    },
+    approvalRouter: async (request) => {
+      const disposition = await gate.requestPolicyApproval({
+        tenantId: request.tenantId,
+        sessionId: request.sessionId ?? "",
+        userId: request.userId ?? "",
+        runtimeId: request.runtimeId,
+        toolName: request.toolName,
+        serverId: request.serverId,
+        kind: severityToApprovalKind(request.severity ?? severity),
+        explanation: request.explanation
+      });
+      if (disposition === null) {
+        // No adapter could host the approval (no active turn) — deny.
+        gate.logger.warn(
+          { toolName, serverId, sessionId: context.sessionId },
+          "policy require_approval: no runtime adapter to host approval — denying"
+        );
+        return "reject";
+      }
+      return disposition;
+    }
+  });
+}
+
 async function handleForwardedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
@@ -696,7 +865,8 @@ async function handleForwardedToolCall(
   sessionIdFromRuntimeToken: string | null,
   runtimeTokenClaims: RuntimeTokenClaims | null,
   requestHeaders: Record<string, string | string[] | undefined>,
-  dataEncryptionSecret: string
+  dataEncryptionSecret: string,
+  policyGate: PolicyGate
 ): Promise<RpcResponse> {
   if (!server.upstreamUrl) {
     return failure(rpc.id, -32601, "Trusted MCP upstream is not configured.");
@@ -722,8 +892,30 @@ async function handleForwardedToolCall(
   }
   const context = resolved.context;
 
-  requireMcpServerAllowed(server.id, context);
-  delete args.toolContextId;
+  try {
+    requireMcpServerAllowed(server.id, context);
+    // Forwarded/proxy tools have no managed-tool catalog entry, so readOnly is
+    // unknown (severity falls back to name-based classification) — only a
+    // serverId/category rule can match them. The gate may pause for approval or
+    // refuse the call.
+    await enforcePolicyCenter(
+      policyGate,
+      context,
+      String(params.name ?? ""),
+      server.id,
+      { readOnly: null },
+      args
+    );
+  } catch (error) {
+    if (error instanceof PolicyBlockedError) {
+      return failure(rpc.id, -32004, error.explanation);
+    }
+    return failure(rpc.id, -32000, getErrorMessage(error, "Tool call failed."));
+  }
+  // The runtime token's toolContextId is a gateway concern — never forward it
+  // upstream.
+  const forwardArgs = { ...args };
+  delete forwardArgs.toolContextId;
 
   return forwardRpc(
     server.upstreamUrl,
@@ -731,7 +923,7 @@ async function handleForwardedToolCall(
       ...rpc,
       params: {
         ...params,
-        arguments: args
+        arguments: forwardArgs
       }
     },
     {

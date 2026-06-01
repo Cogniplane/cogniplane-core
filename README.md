@@ -52,7 +52,7 @@ Every turn runs in a per-session sandbox. Tool calls go through a tenant-scoped 
 
 - **Two runtimes, one platform.** Codex (`@openai/codex`) and Claude (`@anthropic-ai/claude-agent-sdk`) both run in the same E2B sandbox image. Pick per tenant. Switch later.
 - **Managed integrations.** GitHub, Notion, artifact upload/download, session context, and a write-artifact tool — credentials brokered server-side, never exposed to the model.
-- **Human-in-the-loop approvals.** Per-tenant approval policy with TTL, reviewer routing, and read-only-tool auto-approval. Frontend renders approval cards inline in the turn.
+- **Human-in-the-loop approvals.** Native runtime approvals plus Policy Center rules with tenant-level monitor/enforce mode. Frontend renders approval cards inline in the turn.
 - **Multi-tenant by default.** Every store method takes `tenantId`. Every query runs inside a `withTenantScope` block that activates Postgres RLS. Migrations bypass RLS as superuser; runtime app role does not.
 - **Skills as content.** Authored as structured operating documents, compiled into `SKILL.md` bundles materialized into the sandbox workspace per turn. Skill bundles can live on local disk or in S3.
 - **Auth modes.** WorkOS SSO (JWT access + rotating httpOnly refresh + Redis `jti` revocation) for production; dev-headers mode for local hacking.

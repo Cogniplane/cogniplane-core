@@ -1,4 +1,5 @@
 import {
+  ArtifactBrowseResponseSchema,
   ArtifactEnvelopeSchema,
   ArtifactPreviewTextResponseSchema,
   ArtifactsListResponseSchema,
@@ -8,11 +9,47 @@ import {
 import { createApiHeaders, request } from "./api-client";
 import { parseResponse } from "./validate-response";
 
-import type { Artifact, DownloadHandle } from "@cogniplane/shared-types";
+import type {
+  Artifact,
+  ArtifactBrowseResponse,
+  ArtifactListQuery,
+  DownloadHandle
+} from "@cogniplane/shared-types";
 
 export async function listArtifacts(sessionId: string): Promise<Artifact[]> {
   const raw = await request<unknown>(`/sessions/${sessionId}/artifacts`);
   return parseResponse(ArtifactsListResponseSchema, raw, "GET /sessions/:id/artifacts").artifacts;
+}
+
+// Query params accepted by the cross-session browser. Cursor is supplied by the
+// data hook's pagination, not the caller's filter state.
+export type ArtifactBrowseParams = Partial<
+  Pick<ArtifactListQuery, "q" | "sort" | "limit">
+> & {
+  type?: string[];
+  status?: string[];
+  mimeClass?: string[];
+  cursor?: string;
+};
+
+function buildArtifactBrowseQuery(params: ArtifactBrowseParams): string {
+  const search = new URLSearchParams();
+  if (params.q) search.set("q", params.q);
+  if (params.sort) search.set("sort", params.sort);
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  if (params.cursor) search.set("cursor", params.cursor);
+  for (const value of params.type ?? []) search.append("type", value);
+  for (const value of params.status ?? []) search.append("status", value);
+  for (const value of params.mimeClass ?? []) search.append("mimeClass", value);
+  return search.toString();
+}
+
+export async function browseArtifacts(
+  params: ArtifactBrowseParams
+): Promise<ArtifactBrowseResponse> {
+  const qs = buildArtifactBrowseQuery(params);
+  const raw = await request<unknown>(`/artifacts${qs ? `?${qs}` : ""}`);
+  return parseResponse(ArtifactBrowseResponseSchema, raw, "GET /artifacts");
 }
 
 export async function uploadArtifact(input: {

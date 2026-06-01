@@ -103,6 +103,10 @@ const envSchema = z.object({
   RUNTIME_TOKEN_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
   TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   APPROVAL_REQUEST_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
+  // Fraction of APPROVAL_REQUEST_TTL_MS after which a one-shot "still pending"
+  // reminder is pushed to the active turn for a Policy Center–routed approval.
+  // 0 (or >= 1) disables reminders. Default: halfway through the TTL window.
+  POLICY_APPROVAL_REMINDER_FRACTION: z.coerce.number().min(0).max(1).default(0.5),
   ARTIFACT_STORAGE_BACKEND: z.enum(["local", "bucket"]).default("local"),
   ARTIFACT_STORAGE_ROOT: z.string().min(1).default(defaultArtifactStorageRoot),
   SKILL_BUNDLE_STORAGE_ROOT: z.string().min(1).default(defaultSkillBundleStorageRoot),
@@ -259,6 +263,17 @@ export type ConfigLogger = {
   warn(meta: object, msg: string): void;
 };
 
+export type LoadConfigOptions = {
+  /**
+   * Skip validations that only matter when the backend actually serves
+   * runtime traffic (E2B sandbox creation, the MCP gateway URL, PII
+   * detection). The DB migration runner sets this: it needs a valid
+   * DATABASE_URL and nothing else, and must not fail because an E2B key
+   * or template id isn't present in the CI/deploy step that runs migrations.
+   */
+  skipRuntimeChecks?: boolean;
+};
+
 const defaultConfigLogger: ConfigLogger = {
   warn(meta, msg) {
     console.warn(JSON.stringify({ level: "warn", msg, ...meta }));
@@ -318,7 +333,8 @@ function validateOAuthProvider(
 
 export function loadConfig(
   source: NodeJS.ProcessEnv = process.env,
-  logger: ConfigLogger = defaultConfigLogger
+  logger: ConfigLogger = defaultConfigLogger,
+  opts: LoadConfigOptions = {}
 ): AppConfig {
   try {
     process.loadEnvFile(envFilePath);
@@ -456,32 +472,38 @@ export function loadConfig(
   const e2bTemplateIdLooksUnset =
     !parsed.E2B_TEMPLATE_ID || parsed.E2B_TEMPLATE_ID === "replace-with-your-template-id";
 
-  if (!parsed.E2B_API_KEY) {
-    throw new Error(
-      "E2B_API_KEY is required: both the Codex and Claude runtimes run inside E2B sandboxes."
-    );
-  }
-  if (e2bTemplateIdLooksUnset) {
-    throw new Error(
-      "E2B_TEMPLATE_ID is not configured. " +
-        "Run `make e2b-build-codex` to build a template in your own E2B account, " +
-        "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
-        "apps/backend/src/codex-release.json so the default picks it up)."
-    );
-  }
-  const gatewayUrl = parsed.RUNTIME_GATEWAY_BASE_URL.toLowerCase();
-  if (gatewayUrl.includes("127.0.0.1") || gatewayUrl.includes("localhost")) {
-    logger.warn(
-      { gatewayUrl: parsed.RUNTIME_GATEWAY_BASE_URL },
-      "RUNTIME_GATEWAY_BASE_URL points to localhost, but E2B sandboxes cannot reach localhost — " +
-        "MCP tool calls from the agent will fail. Use a tunnel (ngrok, cloudflared) or a public URL."
-    );
-  }
+  // Runtime-only validations: these only matter when the backend actually
+  // serves agent traffic. The migration runner passes skipRuntimeChecks so it
+  // can run with nothing but a DATABASE_URL — migrations never touch E2B, the
+  // MCP gateway, or PII detection.
+  if (!opts.skipRuntimeChecks) {
+    if (!parsed.E2B_API_KEY) {
+      throw new Error(
+        "E2B_API_KEY is required: both the Codex and Claude runtimes run inside E2B sandboxes."
+      );
+    }
+    if (e2bTemplateIdLooksUnset) {
+      throw new Error(
+        "E2B_TEMPLATE_ID is not configured. " +
+          "Run `make e2b-build-codex` to build a template in your own E2B account, " +
+          "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
+          "apps/backend/src/codex-release.json so the default picks it up)."
+      );
+    }
+    const gatewayUrl = parsed.RUNTIME_GATEWAY_BASE_URL.toLowerCase();
+    if (gatewayUrl.includes("127.0.0.1") || gatewayUrl.includes("localhost")) {
+      logger.warn(
+        { gatewayUrl: parsed.RUNTIME_GATEWAY_BASE_URL },
+        "RUNTIME_GATEWAY_BASE_URL points to localhost, but E2B sandboxes cannot reach localhost — " +
+          "MCP tool calls from the agent will fail. Use a tunnel (ngrok, cloudflared) or a public URL."
+      );
+    }
 
-  if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_OPENROUTER_API_KEY) {
-    throw new Error(
-      "PII_OPENROUTER_API_KEY is required when PII_PROVIDER_ENABLED=true."
-    );
+    if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_OPENROUTER_API_KEY) {
+      throw new Error(
+        "PII_OPENROUTER_API_KEY is required when PII_PROVIDER_ENABLED=true."
+      );
+    }
   }
 
   const hasBucketAccessKey = Boolean(parsed.ARTIFACT_BUCKET_ACCESS_KEY_ID);

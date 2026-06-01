@@ -9,6 +9,14 @@ How to update this file:
 4. Each bullet should be understandable to someone who didn't read the code or PRs.
 5. Skip low-signal internal cleanup unless it matters to the audience.
 
+## 2026-05-31
+
+Changed
+
+- Simplified Policy Center around four condition dimensions (`toolNames`, `categories`, `severities`, `turnContexts`) and three effects (`allow`, `require_approval`, `block`). Removed connector/role/PII conditions, transform rules, coverage rollups, and the redundant policy-level `auto_approve` effect.
+- Moved Policy Center from per-rule monitor/enforce behavior to tenant-level `policy_enforcement_mode`, snapshotted into each runtime tool context so gateway decisions do not need a hot-path settings read.
+- Kept native runtime approvals separate from Policy Center approvals while routing both through the same approval events and decision endpoint.
+
 ## 2026-04-25
 
 Added

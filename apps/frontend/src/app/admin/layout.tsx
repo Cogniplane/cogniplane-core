@@ -26,6 +26,10 @@ const ADMIN_SECTION_TITLES: Record<string, { title: string; subtitle: string }> 
     subtitle: "Enable third-party services for your tenant. Users connect their own accounts after you toggle an integration on."
   },
   capabilities: { title: "Agent settings", subtitle: "Tune tools, approvals, and guardrails per profile." },
+  policy: {
+    title: "Policy Center",
+    subtitle: "Risk-adaptive rules for agent tool actions, a simulator, and recent decisions."
+  },
   runtime: { title: "Runtime rollout", subtitle: "Control provider selection and runtime configuration." },
   users: { title: "Users", subtitle: "Members, roles, and access management." },
   sessions: { title: "Sessions", subtitle: "Review and investigate chat sessions across the tenant." },
@@ -68,6 +72,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
             subtitle={ADMIN_SECTION_TITLES[activeSectionId]?.subtitle}
             menuLinks={[
               { href: "/", label: "Chat", description: "Return to the live workspace" },
+              { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
               { href: "/settings", label: "Settings", description: "Open user preferences and jobs" }
             ]}
           />

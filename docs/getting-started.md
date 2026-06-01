@@ -105,11 +105,11 @@ Worth poking at:
 
 - **Skills** — the catalog of structured agent operating documents. The seeded `write-artifact` skill teaches the agent to generate downloadable files via the `write_artifact` managed tool.
 - **MCP servers** — gateway for Model Context Protocol tool servers. Add an external MCP server here and it materializes into the agent workspace at the next session start.
-- **Tenant settings** — runtime provider, approval policy, enabled tools/MCP servers, and the system-prompt overlay applied to every turn.
+- **Tenant settings** — runtime provider, native approval policy, Policy Center enforcement mode, enabled tools/MCP servers, and the system-prompt overlay applied to every turn.
 
 ## 7. Try human-in-the-loop approvals
 
-In `Tenant settings`, change `approval_policy` to `require-approval`. Send a new message that asks the agent to write a file (e.g. "Write hello.md with the contents 'hi'"). The runtime pauses before the `write_artifact` tool runs — you'll see an approval card in the chat. Approve it and the turn resumes; reject it and the agent gets a `denied` tool result and adapts.
+In `Tenant settings`, use native approvals to require review for runtime actions, or use Policy Center to create a `require_approval` rule for a specific MCP tool such as `write_artifact` and then switch `policy_enforcement_mode` to `enforce`. Send a new message that asks the agent to write a file (e.g. "Write hello.md with the contents 'hi'"). The turn pauses before the gated action runs, and you'll see an approval card in the chat. Approve it and the turn resumes; reject it and the agent gets a denied tool result and adapts.
 
 You've now seen the platform's core security primitive in action: the model never holds tool credentials directly, every flagged tool call passes through the approval coordinator, and the audit trail captures the decision.
 

@@ -51,7 +51,24 @@ type AgentMessageItem = {
   id?: string;
 };
 
-type RuntimeItem = CommandExecutionItem | McpToolCallItem | FileChangeItem | AgentMessageItem | { type: string; id?: string };
+// Codex emits a `webSearch` thread item when native web search runs (config
+// key `web_search`). Shape per WebSearchThreadItem in the v2 app-server schema:
+// { id, query, type: "webSearch", action?: WebSearchAction | null }. There is
+// no status field — Codex reports the item once the search resolves.
+type WebSearchItem = {
+  type: "webSearch";
+  id: string;
+  query?: string | null;
+  action?: unknown;
+};
+
+type RuntimeItem =
+  | CommandExecutionItem
+  | McpToolCallItem
+  | FileChangeItem
+  | AgentMessageItem
+  | WebSearchItem
+  | { type: string; id?: string };
 
 type NotificationMapping =
   | { kind: "none" }
@@ -166,6 +183,30 @@ function buildFileChangeToolCall(item: {
     output: item.aggregatedOutput ?? "",
     exitCode: null,
     durationMs: item.durationMs ?? null
+  };
+}
+
+function buildWebSearchToolCall(
+  item: { id: string; query?: string | null; action?: unknown },
+  status: "in_progress" | "completed"
+): RuntimeToolCall {
+  const query = item.query ?? "";
+  // Reuse the "mcp" tool kind so the activity renders through the existing
+  // tool-call timeline/admin paths. `toolName: "web_search"` + a null server
+  // is enough for the frontend to classify it as a generic tool call.
+  return {
+    itemId: item.id,
+    kind: "mcp",
+    title: query ? `Web search: ${query}` : "Web search",
+    status,
+    command: null,
+    cwd: null,
+    server: null,
+    toolName: "web_search",
+    input: query,
+    output: item.action != null ? JSON.stringify(item.action) : "",
+    exitCode: null,
+    durationMs: null
   };
 }
 
@@ -299,6 +340,25 @@ export function mapRuntimeNotification(
         };
       }
 
+      if (item?.type === "webSearch") {
+        if (!item.id) {
+          return { kind: "none" };
+        }
+        const toolCall = buildWebSearchToolCall(item as WebSearchItem, "completed");
+        return {
+          kind: "tool",
+          events: [
+            {
+              type: "response.tool.completed",
+              responseId: activeTurn.responseId ?? uuidv7(),
+              toolCall
+            }
+          ],
+          toolCall,
+          phase: "completed"
+        };
+      }
+
       if (item?.type === "agentMessage" && !activeTurn.outputItemDone) {
         return {
           kind: "events",
@@ -354,6 +414,22 @@ export function mapRuntimeNotification(
       if (item?.type === "fileChange" && item.id) {
         const fileItem = item as FileChangeItem;
         const toolCall = buildFileChangeToolCall(fileItem);
+        return {
+          kind: "tool",
+          events: [
+            {
+              type: "response.tool.started",
+              responseId: activeTurn.responseId ?? uuidv7(),
+              toolCall
+            }
+          ],
+          toolCall,
+          phase: "started"
+        };
+      }
+
+      if (item?.type === "webSearch" && item.id) {
+        const toolCall = buildWebSearchToolCall(item as WebSearchItem, "in_progress");
         return {
           kind: "tool",
           events: [

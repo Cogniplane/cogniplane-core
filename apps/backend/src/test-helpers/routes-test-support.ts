@@ -589,6 +589,20 @@ export async function createTestApp(
     tenantRuntimeProvider?: "codex" | "claude-code";
     enabledRuntimeProviders?: Array<"codex" | "claude-code">;
     showEffortSelector?: boolean;
+    // Override the Policy Center gate at the MCP route. Defaults to a no-rules
+    // stub (every action allows). Pass a real PolicyService (+ optional approval
+    // router) to exercise transform / require_approval through the gateway.
+    policyService?: unknown;
+    requestPolicyApproval?: (input: {
+      tenantId: string;
+      sessionId: string;
+      userId: string;
+      runtimeId: string | null;
+      toolName: string;
+      serverId: string | null;
+      severity: "read_only" | "file_change" | "command_execution";
+      explanation: string;
+    }) => Promise<"approve" | "reject" | "expired" | null>;
   } = {}
 ) {
   const {
@@ -597,6 +611,8 @@ export async function createTestApp(
     tenantRuntimeProvider,
     enabledRuntimeProviders,
     showEffortSelector,
+    policyService: policyServiceOverride,
+    requestPolicyApproval: requestPolicyApprovalOverride,
     ...appConfigOverrides
   } = configOverrides;
   const db = new FakeDatabase();
@@ -698,7 +714,8 @@ export async function createTestApp(
     approvals,
     runtimeAdapters: { codex: runtimeManager }
   } as unknown as ApprovalRouteStores);
-  const { factoryRegistry: managedToolFactoryRegistry } = makeTestManagedToolRegistries();
+  const { factoryRegistry: managedToolFactoryRegistry, catalog: managedToolCatalog } =
+    makeTestManagedToolRegistries();
   await registerMcpRoutes(app, {
     dynamicConfig: {
       async getMcpServer(_tenantId: string, serverId: string) {
@@ -717,6 +734,25 @@ export async function createTestApp(
     githubConnections: { async getRuntimeCredentials() { return null; } },
     notionConnections: { async getRuntimeCredentials() { return null; } },
     managedToolFactoryRegistry,
+    managedToolCatalog,
+    // Policy Center with no rules → every action evaluates to default-allow and
+    // nothing is recorded. Tests that exercise rules pass a real PolicyService
+    // via the `policyService` override.
+    policyService: policyServiceOverride ?? {
+      async gateAction() {
+        return {
+          evaluation: { outcome: "allow", matchedRuleId: null, matchedRuleName: null, gating: false, explanation: null },
+          enforced: false
+        };
+      },
+      async evaluate() {
+        return { outcome: "allow", matchedRuleId: null, matchedRuleName: null, gating: false, explanation: null };
+      }
+    },
+    // No active turn in these route tests by default → no adapter hosts
+    // approvals, so the gateway degrades enforce-mode require_approval to a deny
+    // (returns null). Tests can override to simulate a human decision.
+    requestPolicyApproval: requestPolicyApprovalOverride ?? (async () => null),
     runtimeTokenSecret: "test-runtime-token-secret"
   } as unknown as McpRouteStores);
   app.addHook("onClose", async () => { await rm(artifactStorageRoot, { recursive: true, force: true }); });

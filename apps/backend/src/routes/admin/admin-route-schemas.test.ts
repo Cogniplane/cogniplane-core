@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 
-import { mcpBodySchema, githubImportBodySchema } from "./admin-route-schemas.js";
+import {
+  mcpBodySchema,
+  githubImportBodySchema,
+  tenantSettingsBodySchema
+} from "./admin-route-schemas.js";
 
 const validBase = {
   serverName: "test",
@@ -100,5 +104,26 @@ describe("httpsUrlSchema — IPv4 numeric-format bypass", () => {
       upstreamUrl: "https://x.example.com/mcp"
     });
     expect(result.success).toBe(true);
+  });
+});
+
+describe("tenantSettingsBodySchema", () => {
+  it("accepts the Policy Center enforcement mode", () => {
+    const result = tenantSettingsBodySchema.safeParse({
+      policyEnforcementMode: "enforce"
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.policyEnforcementMode).toBe("enforce");
+    }
+  });
+
+  it("rejects unknown Policy Center enforcement modes", () => {
+    const result = tenantSettingsBodySchema.safeParse({
+      policyEnforcementMode: "dry-run"
+    });
+
+    expect(result.success).toBe(false);
   });
 });

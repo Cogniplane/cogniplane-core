@@ -181,6 +181,26 @@ test("loadConfig requires E2B_API_KEY (both runtimes run inside E2B)", () => {
   );
 });
 
+test("loadConfig skipRuntimeChecks bypasses E2B/PII validation for the migration runner", () => {
+  // The migration runner only needs a DATABASE_URL — it must load with no E2B
+  // key/template and no PII key, since those aren't present in the CI/deploy
+  // step that runs `pnpm db:migrate`.
+  const config = loadConfig(
+    { E2B_API_KEY: undefined, E2B_TEMPLATE_ID: undefined, PII_PROVIDER_ENABLED: "true" },
+    undefined,
+    { skipRuntimeChecks: true }
+  );
+  expect(config.DATABASE_URL).toBeDefined();
+});
+
+test("loadConfig skipRuntimeChecks still enforces DB-backed (workos) validations", () => {
+  // skipRuntimeChecks only relaxes runtime-serving checks; production auth
+  // posture must still fail closed even on the migration path.
+  expect(() =>
+    loadConfig(workosConfig({ REDIS_URL: undefined }), undefined, { skipRuntimeChecks: true })
+  ).toThrow(/REDIS_URL is required when AUTH_MODE=workos/);
+});
+
 test("loadConfig warns when RUNTIME_GATEWAY_BASE_URL is localhost", () => {
   const warnings: Array<{ meta: object; msg: string }> = [];
   loadConfig(

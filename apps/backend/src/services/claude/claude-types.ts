@@ -1,5 +1,6 @@
 import type { E2bClaudeRuntimeProcess } from "../runtime/e2b-claude-runtime-process.js";
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
+import type { RuntimeEvent } from "../../runtime-contracts.js";
 
 export type ClaudeCodeE2bOptions = {
   apiKey: string;
@@ -43,4 +44,12 @@ export type ClaudeSessionState = {
    * `response.completed { interrupted }`.
    */
   activeTurnInterrupt: { current: (() => Promise<void>) | null };
+  /**
+   * Hook to push a framework event onto the in-flight turn's SSE event queue.
+   * Set at turn start, cleared at turn end. Used by the Policy Center approval
+   * coordinator (gateway-held tool-call approvals) to surface
+   * `framework:approval_required` / reminder notices on the active turn. Null
+   * when no turn is running.
+   */
+  activeTurnPush: { current: ((event: RuntimeEvent) => void) | null };
 };

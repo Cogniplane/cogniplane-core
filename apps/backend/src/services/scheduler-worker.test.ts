@@ -23,6 +23,7 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
       allowCommandExecution: true,
       allowUserTokenForwarding: false,
       autoApproveReadOnlyTools: false,
+      policyEnforcementMode: "monitor",
       enabledToolIds: [],
       enabledMcpServers: [],
       version: 1,
@@ -141,6 +142,7 @@ function createFakeDeps(options?: {
     runtimeId: string;
     runtimePolicyId: string;
     messageId: string | null;
+    metadata: Record<string, unknown>;
     ttlMs: number;
   }> = [];
   const runtimeSessionsCreated: Array<{ sessionId: string; userId: string }> = [];
@@ -260,6 +262,7 @@ function createFakeDeps(options?: {
           runtimeId: input.runtimeId,
           runtimePolicyId: input.runtimePolicyId,
           messageId: input.messageId,
+          metadata: input.metadata,
           ttlMs: input.ttlMs
         });
         return {
@@ -271,7 +274,7 @@ function createFakeDeps(options?: {
           runtimePolicyId: input.runtimePolicyId,
           messageId: input.messageId,
           credentialEnvelope: {},
-          metadata: {},
+          metadata: input.metadata,
           expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
           createdAt: new Date().toISOString()
         } satisfies ToolExecutionContext;
@@ -350,7 +353,7 @@ describe("SchedulerWorker", () => {
 
   test("tick claims and executes a due job", async () => {
     const job = makeFakeJob();
-    const { deps, sessionsCreated, jobRunsCreated, jobRunsCompleted, messagesCreated, auditEvents } =
+    const { deps, sessionsCreated, jobRunsCreated, jobRunsCompleted, messagesCreated, toolContextsCreated, auditEvents } =
       createFakeDeps({ dueJobs: [job] });
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
     await worker.tick();
@@ -371,6 +374,12 @@ describe("SchedulerWorker", () => {
     expect(messagesCreated.length).toBe(2);
     expect(messagesCreated[0].role).toBe("user");
     expect(messagesCreated[1].role).toBe("assistant");
+    expect(toolContextsCreated[0].metadata.turnContext).toBe("scheduled");
+    expect(toolContextsCreated[0].metadata.runtimePolicy).toMatchObject({
+      id: "default-profile",
+      enabledToolIds: [],
+      enabledMcpServers: []
+    });
 
     const completedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.completed");
     expect(completedAudit).toBeTruthy();

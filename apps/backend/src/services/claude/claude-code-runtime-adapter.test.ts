@@ -124,6 +124,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       return null;
     }
   };
+  // approvals + auditEvents are a required pair on the adapter; the audit fake
+  // is a no-op for the non-approval tests that use the default fixture.
+  const fakeAuditEventStore = { async create() {} };
 
   beforeEach(() => {
     adapter = new ClaudeCodeRuntimeAdapter(
@@ -131,7 +134,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       fakeDynamicConfig,
       fakeLog,
       makeTestManagedToolCatalog(),
-      { approvals: fakeApprovalStore },
+      { approvals: fakeApprovalStore, auditEvents: fakeAuditEventStore as never },
       undefined,
       testE2bOptions
     );
@@ -174,7 +177,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       fakeDynamicConfig,
       fakeLog,
       makeTestManagedToolCatalog(),
-      { approvals: fakeApprovalStore, egressIpPins },
+      { approvals: fakeApprovalStore, auditEvents: fakeAuditEventStore as never, egressIpPins },
       undefined,
       testE2bOptions
     );
@@ -652,6 +655,71 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // The DB row was never touched — the owning adapter, tried next, still sees
     // it as pending and can resolve it.
     expect(resolveCalls).toHaveLength(0);
+  });
+
+  it("requestPolicyApproval emits an SSE prompt on the active turn and resolveApproval settles it", async () => {
+    // Status-aware approvals fake so resolve() flips a pending row exactly once.
+    const rows = new Map<string, { status: string; sessionId: string; userId: string }>();
+    const richApprovals = {
+      async create(input: { approvalId: string; sessionId: string; userId: string }) {
+        rows.set(input.approvalId, { status: "pending", sessionId: input.sessionId, userId: input.userId });
+        return input as unknown as import("./approval-store.js").ApprovalRecord;
+      },
+      async resolve(_t: string, approvalId: string, _u: string, decision: string) {
+        const row = rows.get(approvalId);
+        if (!row || row.status !== "pending") return null;
+        row.status = decision === "approve" ? "approved" : "rejected";
+        return { approvalId, ...row } as unknown as import("./approval-store.js").ApprovalRecord;
+      }
+    };
+    const auditEvents = { async create() {} };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-pol", userId: "user-1" });
+
+    // Simulate an in-flight turn: install the push hook the turn executor sets.
+    const pushed: Array<{ type: string; approvalId?: string; kind?: string }> = [];
+    const state = (wired as unknown as {
+      sessions: Map<string, { activeTurnPush: { current: ((e: { type: string; approvalId?: string; kind?: string }) => void) | null } }>;
+    }).sessions.get("sess-pol")!;
+    state.activeTurnPush.current = (event) => pushed.push(event);
+
+    const promise = wired.requestPolicyApproval({
+      tenantId: "tenant-a",
+      sessionId: "sess-pol",
+      userId: "user-1",
+      runtimeId: "rt-1",
+      toolName: "github_write_file",
+      serverId: "github",
+      kind: "file_change",
+      explanation: "Routed for approval by policy."
+    });
+    // Let the create + push microtasks flush.
+    await new Promise((r) => setTimeout(r, 0));
+
+    const prompt = pushed.find((e) => e.type === "framework:approval_required");
+    expect(prompt).toBeDefined();
+    // The approval `kind` must propagate from the request through to the prompt
+    // (guards the requestPolicyApproval field name against silent drift).
+    expect(prompt!.kind).toBe("file_change");
+    const approvalId = prompt!.approvalId!;
+
+    const resolved = await wired.resolveApproval({
+      tenantId: "tenant-a",
+      approvalId,
+      userId: "user-1",
+      decision: "approve"
+    });
+    expect(resolved).toBe("resolved");
+    await expect(promise).resolves.toBe("approve");
   });
 
   it("buildClaudeSdkOptions enables partial messages so tool-use events reach the UI", async () => {

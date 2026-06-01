@@ -361,7 +361,10 @@ export async function registerMessageRoutes(
         sourceArtifactNames: scopedArtifacts.map((artifact) => artifact.artifactName),
         userMessageReplacement,
         activeTurns: stores.activeTurns,
-        activeTurnMessageMap: stores.activeTurnMessageMap
+        activeTurnMessageMap: stores.activeTurnMessageMap,
+        // Policy Center turn-context snapshot — this is an interactive turn (a
+        // user in the loop); the scheduler passes turnContext: "scheduled".
+        turnContext: "interactive"
       });
     } catch (streamError) {
       releaseSlot();

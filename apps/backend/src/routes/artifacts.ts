@@ -1,7 +1,9 @@
 import { extname } from "node:path";
 import { Readable } from "node:stream";
 import { z } from "zod";
+import { ArtifactListQuerySchema } from "@cogniplane/shared-types";
 import { uuidv7 } from "../lib/uuid.js";
+import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
 
 import type { FastifyInstance } from "fastify";
 
@@ -77,6 +79,38 @@ export async function registerArtifactRoutes(
   app: FastifyInstance,
   stores: ArtifactRouteStores
 ): Promise<void> {
+  // Cross-session artifact browser for the authenticated user. Read-only,
+  // no role gate (own artifacts only); user isolation lives in the store's
+  // `user_id` predicate. Keyset-paginated via an opaque `cursor`.
+  app.get("/artifacts", async (request, reply) => {
+    const queryResult = parseRequestInput(reply, ArtifactListQuerySchema, request.query);
+    if (!queryResult.ok) {
+      return queryResult.response;
+    }
+
+    const { userId, tenantId } = request.auth;
+    const query = queryResult.value;
+
+    try {
+      const { items, nextCursor } = await stores.artifacts.listForUser(tenantId, userId, {
+        q: query.q,
+        artifactType: query.type,
+        status: query.status,
+        mimeClass: query.mimeClass,
+        sort: query.sort,
+        limit: query.limit,
+        cursor: query.cursor
+      });
+      return { items, nextCursor };
+    } catch (error) {
+      if (error instanceof ArtifactCursorError) {
+        reply.code(400);
+        return apiError(error.reason, "Invalid pagination cursor for the requested sort/filter.");
+      }
+      throw error;
+    }
+  });
+
   app.get("/sessions/:sessionId/artifacts", async (request, reply) => {
     const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
     if (!paramsResult.ok) {

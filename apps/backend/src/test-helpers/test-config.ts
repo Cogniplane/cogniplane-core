@@ -29,6 +29,7 @@ const baseTestConfig: AppConfig = {
   RUNTIME_TOKEN_TTL_MS: 24 * 60 * 60 * 1000,
   TOOL_CONTEXT_TTL_MS: 900_000,
   APPROVAL_REQUEST_TTL_MS: 600_000,
+  POLICY_APPROVAL_REMINDER_FRACTION: 0.5,
   ARTIFACT_STORAGE_BACKEND: "local",
   ARTIFACT_STORAGE_ROOT: "/tmp/cogniplane-artifact-tests",
   SKILL_BUNDLE_STORAGE_ROOT: "/tmp/cogniplane-skill-tests",

@@ -201,6 +201,7 @@ export function ChatShell() {
       <main className="flex min-h-0 min-w-0 flex-col">
         <WorkspaceHeader
           menuLinks={[
+            { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
             { href: "/settings", label: "Settings", description: "User preferences and jobs" },
             { href: "/admin", label: "Admin", description: "Platform controls and rollout" }
           ]}

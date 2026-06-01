@@ -120,11 +120,13 @@ class InMemoryAdminConfig {
     runtimeProvider: "codex" as const,
     enabledRuntimeProviders: ["codex"] as const,
     showEffortSelector: false,
+    webSearchMode: "disabled" as const,
     approvalPolicy: "on-request" as const,
     approvalReviewer: "user" as const,
     allowCommandExecution: false,
     allowUserTokenForwarding: true,
     autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor" as const,
     developerInstructions: null as string | null,
     enabledToolIds: [
       "managed-session-context",
@@ -678,6 +680,7 @@ test("admin tenant settings updates are audited", async () => {
     url: "/admin/tenant-settings",
     payload: {
       allowCommandExecution: true,
+      policyEnforcementMode: "enforce",
       enabledToolIds: ["managed-session-context", "write_artifact"],
       enabledMcpServerIds: ["managed-session-context"]
     }
@@ -689,17 +692,145 @@ test("admin tenant settings updates are audited", async () => {
         runtimeProvider: "codex",
         enabledRuntimeProviders: ["codex"],
         showEffortSelector: false,
+        webSearchMode: "disabled",
         approvalPolicy: "on-request",
         approvalReviewer: "user",
         allowCommandExecution: true,
         allowUserTokenForwarding: true,
         autoApproveReadOnlyTools: true,
+        policyEnforcementMode: "enforce",
         developerInstructions: null,
         enabledToolIds: ["managed-session-context", "write_artifact"],
         enabledMcpServerIds: ["managed-session-context"],
+        invalidatedSessionIds: [],
         version: 2,
         configHash: "hash-tenant-settings"
       });
+
+  await app.close();
+});
+
+test("admin tenant settings refresh active runtimes after update", async () => {
+  const app = Fastify();
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: request.headers["x-user-id"]?.toString() || "admin-user",
+      tenantId: request.headers["x-tenant-id"]?.toString() || "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  const invalidatedTenants: string[] = [];
+  const auditEvents = new InMemoryAuditEventStore();
+  await registerAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents,
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    runtimeAdapters: {
+      codex: {
+        async invalidateTenantRuntimes(tenantId: string) {
+          invalidatedTenants.push(tenantId);
+          return ["session-a"];
+        }
+      },
+      "claude-code": {
+        async invalidateTenantRuntimes(tenantId: string) {
+          invalidatedTenants.push(tenantId);
+          return ["session-b"];
+        }
+      }
+    } as never,
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/admin/tenant-settings",
+    payload: {
+      policyEnforcementMode: "enforce"
+    }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(invalidatedTenants).toEqual(["admin-tenant", "admin-tenant"]);
+  expect(auditEvents.events.at(-1)?.payload).toMatchObject({
+    policyEnforcementMode: "enforce",
+    invalidatedSessionIds: ["session-a", "session-b"]
+  });
+
+  await app.close();
+});
+
+test("admin tenant settings returns an error when active runtimes cannot be refreshed", async () => {
+  const app = Fastify();
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: request.headers["x-user-id"]?.toString() || "admin-user",
+      tenantId: request.headers["x-tenant-id"]?.toString() || "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  const auditEvents = new InMemoryAuditEventStore();
+  await registerAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents,
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    runtimeAdapters: {
+      codex: {
+        async invalidateTenantRuntimes() {
+          throw new Error("codex refresh failed");
+        }
+      }
+    } as never,
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/admin/tenant-settings",
+    payload: { policyEnforcementMode: "enforce" }
+  });
+
+  expect(response.statusCode).toBe(503);
+  expect(response.json()).toMatchObject({
+    error: "runtime_refresh_failed"
+  });
+  expect(auditEvents.events).toEqual([]);
 
   await app.close();
 });

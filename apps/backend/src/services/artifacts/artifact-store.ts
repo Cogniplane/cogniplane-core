@@ -161,6 +161,213 @@ function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRe
   };
 }
 
+// ── Cross-session browser query helpers ──────────────────────────────────────
+
+export type ArtifactSortKey =
+  | "created_desc"
+  | "created_asc"
+  | "name_asc"
+  | "name_desc"
+  | "size_desc"
+  | "size_asc";
+
+export type ArtifactMimeClass = "image" | "pdf" | "text" | "code" | "other";
+
+export type ArtifactListOptions = {
+  q?: string;
+  artifactType?: ("upload" | "generated")[];
+  status?: ("pending" | "processing" | "ready" | "failed")[];
+  mimeClass?: ArtifactMimeClass[];
+  sort?: ArtifactSortKey;
+  limit?: number;
+  cursor?: string;
+};
+
+export class ArtifactCursorError extends Error {
+  constructor(public readonly reason: "malformed_cursor" | "cursor_sort_filter_mismatch") {
+    super(reason);
+    this.name = "ArtifactCursorError";
+  }
+}
+
+type ArtifactCursor = { k: string | number; id: number; sort: ArtifactSortKey; fv: string };
+
+// Per-sort SQL: which column the keyset seeks on, the tuple comparator, the
+// full ORDER BY (column then id, same direction, total order), and how the
+// bound key param is cast so the row-tuple comparison is type-correct.
+const ARTIFACT_SORT_ORDER: Record<
+  ArtifactSortKey,
+  { column: string; comparator: "<" | ">"; orderBy: string; castKey: (param: string) => string }
+> = {
+  created_desc: {
+    column: "created_at",
+    comparator: "<",
+    orderBy: "created_at DESC, id DESC",
+    castKey: (p) => `${p}::timestamptz`
+  },
+  created_asc: {
+    column: "created_at",
+    comparator: ">",
+    orderBy: "created_at ASC, id ASC",
+    castKey: (p) => `${p}::timestamptz`
+  },
+  name_asc: {
+    column: "artifact_name",
+    comparator: ">",
+    orderBy: "artifact_name ASC, id ASC",
+    castKey: (p) => `${p}::text`
+  },
+  name_desc: {
+    column: "artifact_name",
+    comparator: "<",
+    orderBy: "artifact_name DESC, id DESC",
+    castKey: (p) => `${p}::text`
+  },
+  size_desc: {
+    column: "file_size_bytes",
+    comparator: "<",
+    orderBy: "file_size_bytes DESC, id DESC",
+    castKey: (p) => `${p}::bigint`
+  },
+  size_asc: {
+    column: "file_size_bytes",
+    comparator: ">",
+    orderBy: "file_size_bytes ASC, id ASC",
+    castKey: (p) => `${p}::bigint`
+  }
+};
+
+function cursorKeyForRow(sort: ArtifactSortKey, row: ArtifactRecord): string | number {
+  switch (sort) {
+    case "created_desc":
+    case "created_asc":
+      return row.createdAt;
+    case "name_asc":
+    case "name_desc":
+      return row.artifactName;
+    case "size_desc":
+    case "size_asc":
+      return row.fileSizeBytes;
+  }
+}
+
+function encodeArtifactCursor(cursor: ArtifactCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+// Validate that the cursor key `k` is shaped for the column the sort seeks on.
+// Without this, a tampered cursor (valid `sort`/`fv`, garbage `k`) would reach
+// the SQL cast (`$key::timestamptz` / `::bigint`) and surface as a Postgres 500
+// instead of the intended 400 malformed-cursor response.
+function isValidCursorKeyForSort(sort: ArtifactSortKey, k: unknown): boolean {
+  switch (sort) {
+    case "created_desc":
+    case "created_asc":
+      // Must cast cleanly to timestamptz.
+      return typeof k === "string" && !Number.isNaN(Date.parse(k));
+    case "size_desc":
+    case "size_asc":
+      // Must cast cleanly to bigint (whole, finite number).
+      return typeof k === "number" && Number.isInteger(k);
+    case "name_asc":
+    case "name_desc":
+      return typeof k === "string";
+  }
+}
+
+function decodeArtifactCursor(raw: string): ArtifactCursor | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as unknown;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      !("k" in parsed) ||
+      !("id" in parsed) ||
+      !("sort" in parsed) ||
+      !("fv" in parsed)
+    ) {
+      return null;
+    }
+    const c = parsed as Record<string, unknown>;
+    if (
+      (typeof c.k !== "string" && typeof c.k !== "number") ||
+      typeof c.id !== "number" ||
+      !Number.isInteger(c.id) ||
+      typeof c.sort !== "string" ||
+      typeof c.fv !== "string" ||
+      !(c.sort in ARTIFACT_SORT_ORDER)
+    ) {
+      return null;
+    }
+    const sort = c.sort as ArtifactSortKey;
+    // The key must match the shape the sort's SQL cast expects, else a tampered
+    // cursor would 500 at the cast rather than 400 here.
+    if (!isValidCursorKeyForSort(sort, c.k)) {
+      return null;
+    }
+    return { k: c.k, id: c.id, sort, fv: c.fv };
+  } catch {
+    return null;
+  }
+}
+
+// Stable fingerprint of the FILTER set (not sort/limit/cursor). A cursor is
+// only valid against the same filters that produced it; this binds them.
+function computeFilterFingerprint(opts: ArtifactListOptions): string {
+  const norm = {
+    q: opts.q ?? null,
+    type: opts.artifactType ? [...opts.artifactType].sort() : null,
+    status: opts.status ? [...opts.status].sort() : null,
+    mimeClass: opts.mimeClass ? [...opts.mimeClass].sort() : null
+  };
+  return Buffer.from(JSON.stringify(norm), "utf8").toString("base64url");
+}
+
+function escapeLike(value: string): string {
+  // Escape LIKE wildcards so a user's literal % or _ doesn't widen the match.
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+// SQL clauses for one mime class. MUST mirror classifyMimeClass() in
+// @cogniplane/shared-types exactly: code = an explicit allowlist; text =
+// any other text/*; other = none of the known classes. Pushes bound params
+// onto `values` and returns the OR-able clause fragments.
+const CODE_MIME_TYPES = [
+  "application/json",
+  "text/javascript",
+  "text/x-python",
+  "text/x-typescript",
+  "application/x-sh",
+  "text/html"
+];
+
+function mimeClassSqlClauses(cls: ArtifactMimeClass, values: unknown[]): string[] {
+  switch (cls) {
+    case "image":
+      return ["mime_type ILIKE 'image/%'"];
+    case "pdf":
+      return ["mime_type = 'application/pdf'"];
+    case "code": {
+      values.push(CODE_MIME_TYPES);
+      return [`mime_type = ANY($${values.length}::text[])`];
+    }
+    case "text": {
+      // text/* that is NOT one of the code allowlist entries.
+      values.push(CODE_MIME_TYPES);
+      return [`(mime_type ILIKE 'text/%' AND mime_type <> ALL($${values.length}::text[]))`];
+    }
+    case "other": {
+      // Anything that is not image/*, not pdf, and not text/* (code is a
+      // subset of text/* or the json/sh extras, all caught below).
+      values.push([...CODE_MIME_TYPES]);
+      return [
+        `(mime_type NOT ILIKE 'image/%' AND mime_type <> 'application/pdf' ` +
+          `AND mime_type NOT ILIKE 'text/%' AND mime_type <> ALL($${values.length}::text[]))`
+      ];
+    }
+  }
+}
+
 export class ArtifactStore {
   constructor(
     private readonly db: Pool,
@@ -244,6 +451,101 @@ export class ArtifactStore {
         [tenantId, sessionId, userId]
       );
       return artifactRows.rows.map(mapArtifact);
+    });
+  }
+
+  // Cross-session, single-user artifact listing for the artifact browser.
+  // Keyset-paginated (NOT offset) so deep pages stay cheap. User isolation is
+  // by the explicit `user_id = $2` predicate — RLS here is tenant-only.
+  // `derived` artifacts are excluded by design (internal, non-user-facing).
+  async listForUser(
+    tenantId: string,
+    userId: string,
+    opts: ArtifactListOptions
+  ): Promise<{ items: ArtifactRecord[]; nextCursor: string | null }> {
+    const limit = Math.min(100, Math.max(1, opts.limit ?? 50));
+    const sort: ArtifactSortKey = opts.sort ?? "created_desc";
+    const filterFingerprint = computeFilterFingerprint(opts);
+
+    const cursor = opts.cursor ? decodeArtifactCursor(opts.cursor) : null;
+    if (opts.cursor && !cursor) {
+      throw new ArtifactCursorError("malformed_cursor");
+    }
+    if (cursor && (cursor.sort !== sort || cursor.fv !== filterFingerprint)) {
+      // A cursor minted under a different sort/filter set must not silently
+      // page a mismatched query — the keyset predicate would be meaningless.
+      throw new ArtifactCursorError("cursor_sort_filter_mismatch");
+    }
+
+    const values: unknown[] = [tenantId, userId];
+    const conditions: string[] = [
+      "tenant_id = $1",
+      "user_id = $2",
+      "status <> 'deleted'",
+      "artifact_type <> 'derived'"
+    ];
+
+    if (opts.q) {
+      values.push(`%${escapeLike(opts.q)}%`);
+      conditions.push(`artifact_name ILIKE $${values.length}`);
+    }
+    if (opts.artifactType && opts.artifactType.length > 0) {
+      values.push(opts.artifactType);
+      conditions.push(`artifact_type = ANY($${values.length}::text[])`);
+    }
+    if (opts.status && opts.status.length > 0) {
+      values.push(opts.status);
+      conditions.push(`status = ANY($${values.length}::text[])`);
+    }
+    if (opts.mimeClass && opts.mimeClass.length > 0) {
+      const clauses: string[] = [];
+      for (const cls of opts.mimeClass) {
+        clauses.push(...mimeClassSqlClauses(cls, values));
+      }
+      if (clauses.length > 0) {
+        conditions.push(`(${clauses.join(" OR ")})`);
+      }
+    }
+
+    const order = ARTIFACT_SORT_ORDER[sort];
+    if (cursor) {
+      // Keyset predicate: (sortCol, id) <comparator> (cursorKey, cursorId).
+      // The row tuple comparison gives a clean, index-friendly seek.
+      values.push(cursor.k, cursor.id);
+      const keyParam = `$${values.length - 1}`;
+      const idParam = `$${values.length}`;
+      conditions.push(
+        `(${order.column}, id) ${order.comparator} (${order.castKey(keyParam)}, ${idParam}::bigint)`
+      );
+    }
+
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const rows = await client.query(
+        `
+          SELECT ${ARTIFACT_COLUMNS}
+          FROM artifacts
+          WHERE ${conditions.join(" AND ")}
+          ORDER BY ${order.orderBy}
+          LIMIT $${values.length + 1}
+        `,
+        [...values, limit + 1]
+      );
+
+      const mapped = rows.rows.map(mapArtifact);
+      const hasMore = mapped.length > limit;
+      const items = hasMore ? mapped.slice(0, limit) : mapped;
+      const last = items[items.length - 1];
+      const nextCursor =
+        hasMore && last
+          ? encodeArtifactCursor({
+              k: cursorKeyForRow(sort, last),
+              id: last.id,
+              sort,
+              fv: filterFingerprint
+            })
+          : null;
+
+      return { items, nextCursor };
     });
   }
 

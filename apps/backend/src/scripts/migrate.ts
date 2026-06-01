@@ -10,7 +10,12 @@ const migrationsDir = path.resolve(dirname, "../../db/migrations");
 
 // Migrations require superuser access to CREATE ROLE, ALTER TABLE, etc.
 // If MIGRATION_DATABASE_URL is set, use it; otherwise fall back to DATABASE_URL.
-const config = loadConfig();
+//
+// skipRuntimeChecks: migrations only need a DB connection. They must not fail
+// because E2B / PII / gateway env vars aren't present in the CI or deploy step
+// that runs `pnpm db:migrate` — those validations only matter when the backend
+// serves agent traffic.
+const config = loadConfig(process.env, undefined, { skipRuntimeChecks: true });
 const migrationConfig = process.env.MIGRATION_DATABASE_URL
   ? { ...config, DATABASE_URL: process.env.MIGRATION_DATABASE_URL }
   : config;

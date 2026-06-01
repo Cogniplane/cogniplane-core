@@ -51,10 +51,10 @@ docs/                    # Architecture, decisions, security features, guides
 - `services/dynamic-config-*`, `services/runtime-workspace.ts`, `services/claude-workspace-renderer.ts`, `services/codex-workspace-bootstrap.ts` — compile admin config from Postgres into runtime workspace files.
 - `services/managed-tools/` — first-party tool implementations (session context, artifacts, GitHub, Notion, write_artifact).
 - `services/managed-tools/factory.ts`, `services/managed-tools/catalog.ts`, `services/redact-secrets.ts` — managed-tool dispatch (factory wires deps; catalog enumerates the allowlist) + audit redaction.
+- `services/policy/` — Policy Center rule evaluation, rule storage, and decision evidence.
 - `services/*-store.ts` — tenant-scoped persistence modules.
 - `services/pii-*`, `services/openrouter-pii-provider.ts` — PII detection/transform pipeline.
 - `services/scheduler-*` — cron-driven scheduler worker for user-owned scheduled jobs.
-- `services/skill-judge/`, `services/skill-improvement-launcher.ts`, `services/session-judgments-*` — skill quality / improvement workers.
 - `services/github-*`, `services/notion-*` — third-party connection lifecycle.
 - `services/skill-bundle-*`, `services/skill-marketplace-*` — versioned skill bundle storage and registry.
 - `lib/db.ts` — `withTenantScope` (RLS activation wrapper used by every tenant-scoped store call).
@@ -227,11 +227,15 @@ Rules:
 
 ## Approval Flow
 
-When `tenant_settings.approval_policy = "require-approval"` (or equivalent JSON form), the runtime pauses before executing flagged tool calls. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts the request, holds it in memory, persists a row in `approvals`, and emits a `framework:approval_required` SSE event.
+Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes.
+
+When `tenant_settings.approval_policy` requests human review for runtime-native actions, the runtime pauses before executing flagged shell/file/permission requests. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts Codex requests, holds them in memory, persists a row in `approvals`, and emits a `framework:approval_required` SSE event. Claude uses `canUseTool` through `ClaudeApprovalHandler`.
 
 The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused runtime turn. `runtimeManager.resolveApproval` is tried first; if it returns `"missing"`, the request falls through to the optional Claude resolver.
 
 `tenant_settings.auto_approve_read_only_tools` bypasses approval entirely for read-only tools.
+
+Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the per-adapter `PolicyApprovalCoordinator`, emits the same `framework:approval_required` event, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
 
 ### TTL and expiry
 
@@ -240,6 +244,14 @@ Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 
 - Claude: `ClaudeApprovalHandler` resolves the `canUseTool` Promise with `deny`.
 
 The DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt.
+
+## Policy Center
+
+Policy Center is a tenant-scoped rule layer evaluated at the MCP gateway before a managed or proxy tool action is executed. Rules are evaluated in ascending `priority` order (ties broken by rule id); the admin UI rewrites priorities via drag-and-drop reordering. Each rule has a simple `condition -> effect` shape.
+
+Effects are `allow`, `require_approval`, and `block`. Conditions have four active dimensions: `toolNames`, `categories` (the MCP server id), `severities` (`read_only`, `file_change`, `command_execution`), and `turnContexts` (`interactive`, `scheduled`). Dimensions are AND-ed together; multiple values inside a dimension are OR-ed; an omitted dimension matches anything.
+
+`tenant_settings.policy_enforcement_mode` is the tenant-level switch. `monitor` evaluates rules and writes `policy_decision` evidence for matches without gating execution; `enforce` applies gating effects. The mode is compiled into the runtime-policy snapshot on the per-turn `ToolExecutionContext`, so the hot path does not read tenant settings from Postgres. Only matched rules write `policy_decision` rows.
 
 ## Tenant Settings
 
@@ -254,11 +266,11 @@ The DB row moves to `status='expired'`, an `approval.expired` audit event is wri
 | `approval_policy` | `"on-request"` / `"require-approval"` / `"never"` |
 | `approval_reviewer` | Who resolves approvals (default `user`) |
 | `auto_approve_read_only_tools` | Bypass approval for read-only tools |
+| `policy_enforcement_mode` | Policy Center mode: `"monitor"` or `"enforce"` |
 | `allow_command_execution` | Gate on shell/exec tools |
 | `allow_user_token_forwarding` | Allow propagating the user's OAuth token to enterprise MCP servers |
 | `developer_instructions` | Extra system prompt content per tenant |
 | `show_effort_selector` | Frontend feature flag |
-| `skill_judge_*` | Per-tenant judge provider/model configuration |
 
 Per-session overrides live in `session_runtime_overrides` and are applied on top of the tenant defaults at turn start.
 
@@ -282,12 +294,11 @@ Admin endpoints live under `routes/admin-*.ts`. Authorization uses `requireRole(
 
 A marketplace manifest URL (per tenant or via `SKILL_MARKETPLACE_MANIFEST_URL` platform default) lets tenants discover and import skill bundles published outside their own tenant. Caching is controlled by `SKILL_MARKETPLACE_CACHE_TTL_MS`.
 
-### Skill judge & skill improvement
+### Skill usage telemetry & improvement
 
-Two background workers operate on session quality:
+Skill adoption is tracked by Tier 1 telemetry. `ActivationTracker` (`services/activation-tracker.ts`) writes `resource_activations` rows inline on the hot path: a `materialized` row when a skill's `SKILL.md` is written into the workspace, and an `invoked` row when a tool call routed through the MCP gateway matches a skill's `associatedToolIds`.
 
-- **Skill judge** (`services/skill-judge/session-judge-worker.ts`): runs on `SKILL_JUDGE_POLL_INTERVAL_MS` ticks when both `SKILL_JUDGE_WORKER_ENABLED=true` and the tenant has `skill_judge_enabled=true` plus a configured provider+model. Eligible sessions (inactive for `SKILL_JUDGE_INACTIVE_BEFORE_MS`) are scored; results land in `session_judgments`. Sync providers that stay in `running` past `SKILL_JUDGE_RUNNING_TIMEOUT_MS` are reaped to `failed`.
-- **Skill improvement** (`services/skill-improvement-launcher.ts`): launches a synthetic agent turn that reviews a skill's recent usage and proposes improvements. Results stored in `skill_improvement_sessions`.
+Improving a skill is a normal agent turn, not a bespoke worker. The built-in `skill-improver` skill calls the `read_skill_corpus` managed tool with a target `skillId`; the tool assembles a redacted markdown corpus of recent sessions where the skill was offered or used plus the current SKILL.md, and returns it inline. The agent proposes a revised SKILL.md via `write_artifact`.
 
 ## PII Pipeline
 
@@ -419,6 +430,8 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 | Table | Notes |
 |---|---|
 | `tenant_settings` | One row per tenant — runtime policy source of truth |
+| `policy_rule` | Ordered Policy Center rules: conditions, effect, reason, enabled flag |
+| `policy_decision` | Evidence rows for matched Policy Center rules |
 | `admin_skills` | Tenant-scoped skill catalog with `active_revision_id` pointer |
 | `admin_skill_revisions` | Versioned bundles; `bundle_storage_uri` (`file://` or `s3://`); `metadata.instructions` |
 | `admin_mcp_servers` | Tenant-scoped MCP server registry; `mode` ∈ {managed, proxy} |
@@ -438,8 +451,7 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 |---|---|
 | `scheduled_jobs` / `scheduled_job_runs` | User-owned scheduler |
 | `pii_scan_runs` / `pii_scan_jobs` | Async PII scan pipeline |
-| `session_judgments` | Tier 3 LLM judge output |
-| `skill_improvement_sessions` | Skill improvement worker output |
+| `resource_activations` | Tier 1 skill/MCP/integration usage telemetry |
 
 ### User settings
 
@@ -473,7 +485,7 @@ For the full security control inventory, see [SECURITY_FEATURES.md](SECURITY_FEA
 - Backend logs via Fastify's pino logger. `console.*` calls are limited to pre-Fastify boot paths (`config.ts`, `lib/redis.ts` defaults) and CLI scripts (`migrate.ts`, `seed-dev-data.ts`).
 - `audit_events` is the durable audit log.
 - `tool_events` is the durable tool-call log (redacted payloads).
-- `session_judgments` records LLM-judge scoring of completed sessions.
+- `resource_activations` records Tier 1 skill/MCP/integration usage per session.
 - Cost tracking: per-turn `usage` is persisted on `messages` (`token_input`, `token_output`, model, estimated cost).
 
 ## Environment
@@ -492,7 +504,6 @@ SKILL_BUNDLE_BUCKET_NAME         # Reuses ARTIFACT_BUCKET_* credentials
 ANTHROPIC_API_KEY                # Required for Claude provider; without it only Codex is registered
 PII_PROVIDER_ENABLED             # Validates the configured PII provider's API key at boot when true
 SCHEDULER_ENABLED=true
-SKILL_JUDGE_WORKER_ENABLED       # Off by default; per-tenant config is the second gate
 AUTH_MODE=workos                 # Production
 WORKOS_API_KEY / WORKOS_CLIENT_ID / WORKOS_REDIRECT_URI
 JWT_SECRET                       # Refresh token signing — must differ from default in prod

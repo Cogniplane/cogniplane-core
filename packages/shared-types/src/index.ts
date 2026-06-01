@@ -2,6 +2,10 @@
 // them directly without forcing a circular re-entry through this barrel.
 export * from "./primitives.js";
 
+// MIME classification shared by the artifact-browser filter (backend) and its
+// filter labels (frontend) — one mapping, no drift.
+export * from "./mime-class.js";
+
 // Re-export zod itself so consumers (notably the frontend, which doesn't
 // list zod as a direct dependency) can write `parseResponse(SomeSchema, ...)`
 // and rely on the same zod major version the schemas were authored against.
@@ -18,6 +22,7 @@ export * from "./schemas/integration.js";
 export * from "./schemas/mcp-server.js";
 export * from "./schemas/message.js";
 export * from "./schemas/pii.js";
+export * from "./schemas/policy.js";
 export * from "./schemas/session.js";
 export * from "./schemas/settings.js";
 export * from "./schemas/skill.js";
