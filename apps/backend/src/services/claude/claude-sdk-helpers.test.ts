@@ -165,8 +165,8 @@ describe("buildClaudeSdkEnv", () => {
     for (const key of SECRET_CONFIG_KEYS) {
       process.env[key] = SECRET_MARKER;
     }
-    // A var the agent legitimately needs must still pass through.
-    process.env.PATH = "/usr/bin:/bin";
+    // An allowlisted SDK knob must still pass through.
+    process.env.HTTPS_PROXY = "http://proxy.corp:8080";
     process.env.HARMLESS_NON_ALLOWED = "kept?";
 
     const env = buildClaudeSdkEnv("test-key");
@@ -181,7 +181,7 @@ describe("buildClaudeSdkEnv", () => {
       expect(value, `marker leaked via key "${key}"`).not.toBe(SECRET_MARKER);
     }
     // Allowlisted essentials survive.
-    expect(env.PATH).toBe("/usr/bin:/bin");
+    expect(env.HTTPS_PROXY).toBe("http://proxy.corp:8080");
     expect(env.ANTHROPIC_API_KEY).toBe("test-key");
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
     // A non-allowlisted, non-secret var is also dropped (fail-closed default).
@@ -201,11 +201,16 @@ describe("buildClaudeSdkEnv", () => {
     expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
   });
 
-  test("allowlist keeps SDK / proxy / OS essentials and drops everything else", () => {
+  test("allowlist keeps SDK / proxy knobs and drops backend OS-environment vars", () => {
     process.env.HTTPS_PROXY = "http://proxy.corp:8080";
     process.env.NODE_EXTRA_CA_CERTS = "/etc/ssl/corp.pem";
     process.env.CLAUDE_CODE_USE_BEDROCK = "1";
-    process.env.HOME = "/home/agent";
+    // OS-baseline vars from the backend container must NOT be forwarded — the
+    // E2B sandbox supplies its own correct values. Forwarding HOME=/home/appuser
+    // broke the spawned `claude` CLI's init ("Query closed before response").
+    process.env.HOME = "/home/appuser";
+    process.env.PATH = "/backend/only/bin";
+    process.env.NODE_PATH = "/backend/node_modules";
     process.env.SOME_RANDOM_BACKEND_VAR = "nope";
 
     const env = buildClaudeSdkEnv("k");
@@ -213,15 +218,21 @@ describe("buildClaudeSdkEnv", () => {
     expect(env.HTTPS_PROXY).toBe("http://proxy.corp:8080");
     expect(env.NODE_EXTRA_CA_CERTS).toBe("/etc/ssl/corp.pem");
     expect(env.CLAUDE_CODE_USE_BEDROCK).toBe("1");
-    expect(env.HOME).toBe("/home/agent");
+    expect(env.HOME).toBeUndefined();
+    expect(env.PATH).toBeUndefined();
+    expect(env.NODE_PATH).toBeUndefined();
     expect(env.SOME_RANDOM_BACKEND_VAR).toBeUndefined();
   });
 
   test("isClaudeSdkEnvAllowed: exact names, prefixes, and rejections", () => {
-    expect(isClaudeSdkEnvAllowed("PATH")).toBe(true);
     expect(isClaudeSdkEnvAllowed("HTTPS_PROXY")).toBe(true);
+    expect(isClaudeSdkEnvAllowed("NODE_OPTIONS")).toBe(true);
     expect(isClaudeSdkEnvAllowed("CLAUDE_CODE_ANYTHING_NEW")).toBe(true);
     expect(isClaudeSdkEnvAllowed("LC_ALL")).toBe(true);
+    // OS-baseline vars are intentionally dropped (sandbox supplies its own).
+    expect(isClaudeSdkEnvAllowed("HOME")).toBe(false);
+    expect(isClaudeSdkEnvAllowed("PATH")).toBe(false);
+    expect(isClaudeSdkEnvAllowed("NODE_PATH")).toBe(false);
     expect(isClaudeSdkEnvAllowed("NOTION_OAUTH_CLIENT_SECRET")).toBe(false);
     expect(isClaudeSdkEnvAllowed("DATABASE_URL")).toBe(false);
     // ANTHROPIC_API_KEY is set explicitly, not inherited — not on the allowlist.

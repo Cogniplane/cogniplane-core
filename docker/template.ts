@@ -32,11 +32,26 @@ const INSTALL_APT_BASE =
   '&& rm -rf /var/lib/apt/lists/*';
 
 // Node 24 from NodeSource — required for both the Codex CLI and the
-// sandbox-agent harness (Claude Agent SDK).
+// sandbox-agent harness (Claude Agent SDK ≥0.3.x spawns a CLI subprocess that
+// needs a modern Node).
+//
+// CRITICAL: the e2b base image (e2bdev/base:latest) ships its OWN Node 20 at
+// /usr/local/bin/node, and /usr/local/bin precedes /usr/bin on PATH. NodeSource
+// installs Node 24 to /usr/bin/node, so without intervention the base image's
+// Node 20 silently wins — both for `npm install -g` at build time AND for the
+// harness at runtime. That left the Claude SDK's spawned subprocess running on
+// Node 20, where it crashed immediately → "Query closed before response
+// received" → Claude produced no output. So after installing Node 24 we shadow
+// the base image's binaries at /usr/local/bin, making Node 24 the only Node any
+// PATH lookup resolves. (`node -v` must print v24 for the build to proceed.)
 const INSTALL_NODEJS =
   'curl -fsSL https://deb.nodesource.com/setup_24.x | bash - ' +
   '&& apt-get install -y nodejs ' +
-  '&& rm -rf /var/lib/apt/lists/*';
+  '&& rm -rf /var/lib/apt/lists/* ' +
+  '&& ln -sf /usr/bin/node /usr/local/bin/node ' +
+  '&& ln -sf /usr/bin/npm /usr/local/bin/npm ' +
+  '&& ln -sf /usr/bin/npx /usr/local/bin/npx ' +
+  '&& test "$(node -v | cut -d. -f1)" = "v24"';
 
 // Python libs used by generated tools (pandas for data munging, jinja2 for
 // templating). Pinned for reproducibility.
@@ -47,10 +62,39 @@ const INSTALL_PYTHON_PACKAGES =
 // Codex runtime. Version is pinned in codex-release.json.
 const INSTALL_CODEX_CLI = `npm install -g @openai/codex@${CODEX_NPM_VERSION}`;
 
-// Claude Agent SDK: globally installed so the sandbox-agent harness can
-// `require()` it via NODE_PATH=/usr/lib/node_modules. Version is pinned in
-// codex-release.json.
-const INSTALL_CLAUDE_AGENT_SDK = `npm install -g @anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_NPM_VERSION}`;
+// Claude Agent SDK: globally installed for the sandbox-agent harness. Version
+// is pinned in codex-release.json.
+//
+// CRITICAL: the SDK does NOT bundle the `claude` CLI it spawns. The ~240 MB
+// native binary ships as a per-platform OPTIONAL dependency
+// (@anthropic-ai/claude-agent-sdk-<platform>-<arch>[-musl]) and the SDK resolves
+// it at runtime via `require.resolve("<that package>/claude")`. `npm install -g`
+// does not reliably pull optionalDependencies, so without an explicit install
+// the binary is absent → the SDK falls back to an unspawnable embedded path →
+// the spawned subprocess never starts → "Query closed before response received"
+// (silent, exit 0, empty stderr) → Claude produces no output. The e2b base image
+// is Debian (glibc), x64, so we install the linux-x64 (non-musl) binary package
+// explicitly and assert it resolves at build time.
+const CLAUDE_AGENT_SDK_BINARY_PKG = '@anthropic-ai/claude-agent-sdk-linux-x64';
+const INSTALL_CLAUDE_AGENT_SDK =
+  `npm install -g @anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_NPM_VERSION} ` +
+  `${CLAUDE_AGENT_SDK_BINARY_PKG}@${CLAUDE_AGENT_SDK_NPM_VERSION} ` +
+  `&& test -x "$(npm root -g)/${CLAUDE_AGENT_SDK_BINARY_PKG}/claude"`;
+
+// The harness loads the SDK with ESM `import("@anthropic-ai/claude-agent-sdk")`,
+// and Node's ESM loader does NOT honor NODE_PATH (it only affects CommonJS
+// `require()`). So we symlink the harness's adjacent node_modules straight at
+// the real global install directory — that dir IS on the harness's ESM
+// resolution path, so the bare import resolves.
+//
+// We resolve the global prefix dynamically via `npm root -g` so this never
+// drifts regardless of which Node won on PATH (INSTALL_NODEJS now forces Node
+// 24). Symlinking the whole node_modules (not just the @anthropic-ai scope)
+// also makes the SDK's own sibling dependencies resolvable from /opt/cogniplane.
+const LINK_CLAUDE_AGENT_SDK =
+  'mkdir -p /opt/cogniplane ' +
+  '&& ln -sfn "$(npm root -g)" /opt/cogniplane/node_modules ' +
+  '&& test -d /opt/cogniplane/node_modules/@anthropic-ai/claude-agent-sdk';
 
 // uv / uvx (Astral's fast Python package manager) — downloaded with sha256
 // verification. Used by Python-based skill bundles.
@@ -91,6 +135,13 @@ export const template = Template()
   .fromImage('e2bdev/base:latest')
   .setUser('root')
   .setWorkdir('/')
+  // INSTALL_NODEJS forces Node 24 (NodeSource) to win on PATH by shadowing the
+  // base image's Node 20 at /usr/local/bin. NodeSource's Debian package puts the
+  // global prefix at /usr/lib/node_modules, so that's where `npm install -g`
+  // lands. NODE_PATH only helps CommonJS require() — the ESM import in the
+  // harness is handled by the /opt/cogniplane/node_modules symlink below — but
+  // we set it correctly so require()-based lookups (e.g. the harness's
+  // readSdkVersion) resolve instead of reporting "unknown".
   .setEnvs({
     NODE_PATH: '/usr/lib/node_modules'
   })
@@ -102,6 +153,7 @@ export const template = Template()
   .runCmd(INSTALL_UV)
   .runCmd(INSTALL_BUN)
   .runCmd(STAGE_SANDBOX_AGENT)
+  .runCmd(LINK_CLAUDE_AGENT_SDK)
   .copy('sandbox-agent/sandbox-agent.mjs', '/opt/cogniplane/sandbox-agent.mjs')
   .runCmd(PREPARE_USER_WORKSPACE)
   .setUser('user')

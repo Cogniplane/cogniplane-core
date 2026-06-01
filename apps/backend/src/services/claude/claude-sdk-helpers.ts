@@ -71,30 +71,22 @@ const CLAUDE_SDK_ENV_ALLOW_NAMES = new Set<string>([
   "SSL_CERT_FILE",
   "SSL_CERT_DIR",
   "REQUESTS_CA_BUNDLE",
-  // ── Node runtime knobs needed by the spawned CLI / harness. ──
+  // ── Node runtime knobs honored by the spawned CLI. NODE_OPTIONS /
+  //    NODE_TLS_REJECT_UNAUTHORIZED are operator-set policy knobs worth
+  //    forwarding. NODE_PATH is deliberately NOT here: the sandbox sets its own
+  //    (NODE_PATH=/usr/lib/node_modules in the template) and the backend's value
+  //    would override it and break the SDK's module resolution. ──
   "NODE_OPTIONS",
-  "NODE_PATH",
-  "NODE_TLS_REJECT_UNAUTHORIZED",
-  // ── Baseline OS environment a subprocess needs to run. ──
-  "PATH",
-  "PATHEXT",
-  "HOME",
-  "USER",
-  "USERPROFILE",
-  "LOGNAME",
-  "SHELL",
-  "TMPDIR",
-  "TMP",
-  "TEMP",
-  "LANG",
-  "LANGUAGE",
-  "TERM",
-  "TZ",
-  "XDG_CONFIG_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_DATA_HOME",
-  "SYSTEMROOT",
-  "WINDIR"
+  "NODE_TLS_REJECT_UNAUTHORIZED"
+  // NOTE: OS-baseline vars (HOME, USER, PATH, LOGNAME, SHELL, TMPDIR/TMP/TEMP,
+  // USERPROFILE, XDG_*, SYSTEMROOT, WINDIR, locale/TZ) are intentionally NOT
+  // forwarded. The SDK runs exclusively inside the E2B sandbox (there is no
+  // local in-process mode), which supplies its OWN correct OS environment.
+  // Forwarding the BACKEND container's values (e.g. HOME=/home/appuser, a PATH
+  // without the sandbox's node) overrides the sandbox's real values
+  // (HOME=/home/user) and made the spawned `claude` CLI fail to initialize —
+  // it closed its protocol stream before responding, surfacing as the opaque
+  // "Query closed before response received" and producing no output.
 ]);
 
 export function isClaudeSdkEnvAllowed(key: string): boolean {

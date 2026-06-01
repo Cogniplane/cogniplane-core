@@ -7,13 +7,16 @@
  * newline-delimited JSON frames with the backend over stdio. The protocol
  * is defined in apps/backend/src/services/sandbox-agent-protocol.ts.
  *
- * The Claude SDK is installed globally in the template image; the harness
- * resolves it via NODE_PATH=/usr/lib/node_modules set in the Dockerfile.
+ * The Claude SDK is installed globally in the template image. Node's ESM
+ * loader ignores NODE_PATH, so the template symlinks the global @anthropic-ai
+ * scope into /opt/cogniplane/node_modules (adjacent to this file) — that dir
+ * is on this module's ESM resolution path, so the bare import() below resolves.
  */
 
 import { createInterface } from "node:readline";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 
@@ -102,8 +105,21 @@ function loadSdk() {
 }
 
 function readSdkVersion() {
+  // Resolve via the symlinked node_modules adjacent to this file (the same path
+  // the ESM import() resolves through) rather than a bare require(), which would
+  // depend on NODE_PATH and is unreliable for scoped-package subpaths.
   try {
     const pkg = require("@anthropic-ai/claude-agent-sdk/package.json");
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    // ignore and try the direct symlink path below
+  }
+  try {
+    const url = new URL(
+      "./node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+      import.meta.url
+    );
+    const pkg = JSON.parse(readFileSync(url, "utf8"));
     return typeof pkg.version === "string" ? pkg.version : "unknown";
   } catch {
     return "unknown";
@@ -318,6 +334,11 @@ async function handleWarmup(frame) {
         systemPrompt,
         tools: { type: "preset", preset: "claude_code" },
         includePartialMessages: true,
+        // Surface the SDK's spawned CLI subprocess stderr. When the subprocess
+        // crashes on launch (e.g. missing dep, bad cwd, settings error) the SDK
+        // otherwise only reports an opaque "Query closed before response
+        // received"; these lines give the real cause.
+        stderr: (line) => log("warn", "Claude SDK subprocess stderr", { line }),
         ...(Object.keys(mcpServersConfig).length > 0 ? { mcpServers: mcpServersConfig } : {}),
         permissionMode: "default",
         settingSources: ["project"],
@@ -405,6 +426,10 @@ async function runTurn(frame) {
       systemPrompt,
       tools: { type: "preset", preset: "claude_code" },
       includePartialMessages: true,
+      // See the matching note in handleWarmup — capture subprocess stderr so a
+      // cold-start launch failure reports its real cause, not just "Query
+      // closed before response received".
+      stderr: (line) => log("warn", "Claude SDK subprocess stderr", { line }),
       ...(Object.keys(mcpServersConfig).length > 0 ? { mcpServers: mcpServersConfig } : {}),
       permissionMode: "default",
       settingSources: ["project"],
