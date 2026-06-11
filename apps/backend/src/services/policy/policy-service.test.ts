@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { PolicyEnforcementMode, PolicyRule } from "@cogniplane/shared-types";
 
+import type { PolicyApprovalDisposition } from "../../runtime-contracts.js";
 import {
   PolicyService,
   PolicyBlockedError,
-  type PolicyApprovalDisposition,
   type PolicyGateInput
 } from "./policy-service.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
@@ -202,6 +202,30 @@ describe("PolicyService.gateAction — enforce-mode require_approval", () => {
     await service.gateAction(gateInput({ approvalRouter: router })).catch((err: unknown) => {
       expect((err as PolicyBlockedError).explanation).toContain("expired");
     });
+  });
+
+  it("denies immediately on a scheduled turn without routing an approval", async () => {
+    // A scheduled turn has no human to decide: the prompt would be delivered to
+    // the scheduler's event consumer and the gateway would hold its response
+    // until the approval TTL — past the scheduler's job timeout. The router
+    // must never be called; the action denies at once with a clear explanation
+    // and recorded evidence.
+    const { service, records, warnings } = buildService([
+      makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
+    ]);
+    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "approve");
+
+    const error = await service
+      .gateAction(gateInput({ turnContext: "scheduled", approvalRouter: router }))
+      .then(() => null)
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(PolicyBlockedError);
+    expect((error as PolicyBlockedError).explanation).toContain("scheduled runs");
+    expect(router).not.toHaveBeenCalled();
+    expect(records[0].outcome).toBe("require_approval");
+    expect((records[0].actionSnapshot as Record<string, unknown>).approvalDisposition).toBe("reject");
+    expect(warnings.some((w) => w.msg.includes("scheduled turn"))).toBe(true);
   });
 
   it("degrades to a deny when no approval router is available", async () => {

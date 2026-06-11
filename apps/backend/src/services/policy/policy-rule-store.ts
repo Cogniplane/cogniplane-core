@@ -10,6 +10,7 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import type { LintableRule } from "./policy-lint.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 // Coerce a JSONB dimension to a clean string[] (or undefined when absent).
 // Non-array or non-string entries are dropped rather than trusted — the engine
@@ -48,8 +49,8 @@ function mapRow(row: Record<string, unknown>): PolicyRule {
     conditions: toConditions(row.conditions_json),
     reason: row.reason == null ? null : String(row.reason),
     createdBy: row.created_by == null ? null : String(row.created_by),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 

@@ -1,7 +1,6 @@
 import type { OverviewStat } from "@cogniplane/shared-types";
+import { SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4 transition-colors hover:border-outline";
 

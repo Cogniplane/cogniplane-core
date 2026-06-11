@@ -218,6 +218,24 @@ function getNotificationErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+// Every turn-scoped v2 notification carries a required `turnId` param
+// (item/* deltas, item/started, item/completed, error, …); turn/completed
+// nests it as `turn.id`. Returns null for notifications that aren't scoped to
+// a turn (mcpServer/startupStatus/updated) —
+// callers must let those through rather than treat null as a mismatch.
+export function extractNotificationTurnId(notification: JsonRpcNotification): string | null {
+  const turnId = notification.params?.turnId;
+  if (typeof turnId === "string") return turnId;
+
+  const turn = notification.params?.turn;
+  if (typeof turn === "object" && turn !== null && "id" in turn) {
+    const id = (turn as { id: unknown }).id;
+    if (typeof id === "string") return id;
+  }
+
+  return null;
+}
+
 export function mapRuntimeNotification(
   activeTurn: ActiveTurnSnapshot,
   notification: JsonRpcNotification
@@ -537,26 +555,6 @@ export function mapRuntimeNotification(
         kind: "runtime-error",
         message: getNotificationErrorMessage(notification.params?.error, "Runtime error"),
         retrying: notification.params?.willRetry === true
-      };
-
-    case "codex/event/stream_error":
-      return {
-        kind: "runtime-error",
-        message: getNotificationErrorMessage(
-          notification.params?.msg ?? notification.params?.error,
-          "Runtime stream error"
-        ),
-        retrying: true
-      };
-
-    case "codex/event/error":
-      return {
-        kind: "runtime-error",
-        message: getNotificationErrorMessage(
-          notification.params?.msg ?? notification.params?.error,
-          "Runtime error"
-        ),
-        retrying: false
       };
 
     case "mcpServer/startupStatus/updated": {

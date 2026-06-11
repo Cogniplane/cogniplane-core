@@ -68,6 +68,11 @@ export interface RuntimeProcessHandle {
   sendError(id: number | string, code: number, message: string): void;
   rejectPendingRequests(message: string): void;
   readFile(filePath: string): Promise<Uint8Array>;
+  /**
+   * Optional: file metadata without reading the content. Lets callers reject
+   * an oversized file BEFORE pulling its bytes into backend memory.
+   */
+  statFile?(filePath: string): Promise<{ sizeBytes: number }>;
   writeFile(filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<void>;
   onNotification(listener: (notification: JsonRpcNotification) => void): () => void;
   onRequest(listener: (request: JsonRpcRequest) => void): () => void;

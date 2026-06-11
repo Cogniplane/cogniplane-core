@@ -7,7 +7,7 @@ import {
   SkillMarketplaceResponseSchema
 } from "@cogniplane/shared-types";
 
-import { apiError, getErrorMessage, requestError } from "../../lib/http-errors.js";
+import { apiError, requestError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import {
   activateSkillRevisionBodySchema,
@@ -27,6 +27,7 @@ import {
   withAdmin
 } from "./admin-route-helpers.js";
 import type { ActivationTracker } from "../../services/activation-tracker.js";
+import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import {
@@ -45,14 +46,33 @@ const skillRevisionFileQuerySchema = z.object({
   path: z.string().min(1).max(1024)
 });
 
-function respondSkillConfigError(reply: FastifyReply, error: unknown, fallback: string) {
-  reply.code(400);
-  return configError(getErrorMessage(error, fallback));
+function respondSkillConfigError(reply: FastifyReply, error: unknown) {
+  if (error instanceof AdminConfigError) {
+    reply.code(400);
+    return configError(error.message);
+  }
+
+  // Unexpected error: rethrow so the global error handler logs it and
+  // returns an opaque 500 instead of leaking the raw message.
+  throw error;
 }
 
-function respondSkillUploadTooLarge(reply: FastifyReply, error: unknown) {
+// @fastify/multipart rejects with this code when a part exceeds the
+// configured fileSize limit (both during request.file() and while buffering
+// via toBuffer()). Other multipart failures are FastifyErrors with their own
+// 4xx statusCode and reach the global handler, which surfaces 4xx verbatim
+// and keeps everything else an opaque 500.
+function isFileTooLargeError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "FST_REQ_FILE_TOO_LARGE"
+  );
+}
+
+function respondSkillUploadTooLarge(reply: FastifyReply) {
   reply.code(413);
-  return apiError("skill_import_too_large", getErrorMessage(error, "Skill import exceeds size limit."));
+  return apiError("skill_import_too_large", "Skill import exceeds size limit.");
 }
 
 export async function registerAdminSkillRoutes(
@@ -184,7 +204,10 @@ export async function registerAdminSkillRoutes(
         }
       });
     } catch (error) {
-      return respondSkillUploadTooLarge(reply, error);
+      if (isFileTooLargeError(error)) {
+        return respondSkillUploadTooLarge(reply);
+      }
+      throw error;
     }
 
     if (!file) {
@@ -193,8 +216,20 @@ export async function registerAdminSkillRoutes(
     }
 
     const fileName = file.filename ?? "skill.zip";
+    // toBuffer() rejects when the stream exceeds the multipart fileSize limit
+    // while buffering — that's a 413, not an internal error. Anything else
+    // (malformed multipart, stream failure) rethrows to the global handler.
+    let archiveBuffer: Buffer;
     try {
-      const archiveBuffer = await file.toBuffer();
+      archiveBuffer = await file.toBuffer();
+    } catch (error) {
+      if (isFileTooLargeError(error)) {
+        return respondSkillUploadTooLarge(reply);
+      }
+      throw error;
+    }
+
+    try {
       const imported = await skillLifecycle.importSkillBundleFromZip(request.auth.tenantId, {
         archiveBuffer,
         originalFileName: fileName,
@@ -204,7 +239,7 @@ export async function registerAdminSkillRoutes(
       reply.code(201);
       return imported;
     } catch (error) {
-      return respondSkillConfigError(reply, error, "Skill import failed.");
+      return respondSkillConfigError(reply, error);
     }
   }));
 
@@ -237,7 +272,7 @@ export async function registerAdminSkillRoutes(
       reply.code(201);
       return imported;
     } catch (error) {
-      return respondSkillConfigError(reply, error, "GitHub skill import failed.");
+      return respondSkillConfigError(reply, error);
     }
   }));
 
@@ -259,7 +294,7 @@ export async function registerAdminSkillRoutes(
       reply.code(201);
       return imported;
     } catch (error) {
-      return respondSkillConfigError(reply, error, "Inline skill import failed.");
+      return respondSkillConfigError(reply, error);
     }
   }));
 
@@ -364,7 +399,7 @@ export async function registerAdminSkillRoutes(
 
         return activated;
       } catch (error) {
-        return respondSkillConfigError(reply, error, "Skill activation failed.");
+        return respondSkillConfigError(reply, error);
       }
     })
   );
@@ -437,7 +472,7 @@ export async function registerAdminSkillRoutes(
 
       return { report };
     } catch (error) {
-      return respondSkillConfigError(reply, error, "Skill cleanup failed.");
+      return respondSkillConfigError(reply, error);
     }
   }));
 

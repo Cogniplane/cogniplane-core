@@ -45,6 +45,24 @@ export type E2bClaudeProcessStartInput = {
    * reject. Best-effort: throws are swallowed by the caller's own logging.
    */
   onApprovalExpired?: (approvalId: string) => void;
+  /**
+   * Called once when the in-sandbox harness exits unexpectedly (crash, OOM,
+   * E2B eviction) — including BETWEEN turns, where nothing else observes the
+   * death. The adapter finalizes from here: terminal runtime_sessions status,
+   * staging-dir cleanup, IP-pin release, stale session-map removal. The
+   * process kills the sandbox itself before invoking this. Also fired after a
+   * turn-watchdog recycle (see turnTimeoutMs).
+   */
+  onHarnessExit?: () => void;
+  /**
+   * Watchdog on a single turn's wall-clock duration (RUNTIME_TURN_TIMEOUT_MS).
+   * runTurn otherwise settles only on a terminal frame or harness exit — a
+   * wedged in-sandbox SDK pins the session busy until the E2B hard timeout.
+   * On expiry the turn fails, the sandbox is killed, and `onHarnessExit` runs
+   * so the adapter finalizes; the next message bootstraps a fresh sandbox.
+   * 0 / undefined disables the watchdog.
+   */
+  turnTimeoutMs?: number;
   /** Loader injection point for tests. Defaults to the real E2B SDK. */
   loadSandboxClass?: E2bStdioHarnessInput["loadSandboxClass"];
 };
@@ -83,6 +101,9 @@ export class E2bClaudeRuntimeProcess {
   private currentTurn: { turnId: string; listeners: PendingTurnListeners } | null = null;
   private readonly approvalRequestTtlMs: number;
   private readonly onApprovalExpired?: (approvalId: string) => void;
+  private readonly onHarnessExit?: () => void;
+  private readonly turnTimeoutMs: number;
+  private turnWatchdog: NodeJS.Timeout | null = null;
   /** approvalId → deny-by-default timer for the matching DB row. */
   private readonly approvalExpiryTimers = new Map<string, NodeJS.Timeout>();
 
@@ -92,13 +113,17 @@ export class E2bClaudeRuntimeProcess {
     logger: FastifyBaseLogger,
     readonly sandboxId: string,
     approvalRequestTtlMs: number,
-    onApprovalExpired?: (approvalId: string) => void
+    onApprovalExpired?: (approvalId: string) => void,
+    onHarnessExit?: () => void,
+    turnTimeoutMs?: number
   ) {
     this.sandbox = sandbox;
     this.processPid = processPid;
     this.logger = logger;
     this.approvalRequestTtlMs = approvalRequestTtlMs;
     this.onApprovalExpired = onApprovalExpired;
+    this.onHarnessExit = onHarnessExit;
+    this.turnTimeoutMs = turnTimeoutMs && turnTimeoutMs > 0 ? turnTimeoutMs : 0;
   }
 
   static async start(input: E2bClaudeProcessStartInput): Promise<E2bClaudeRuntimeProcess> {
@@ -126,27 +151,7 @@ export class E2bClaudeRuntimeProcess {
       stderrLogLabel: "sandbox-agent stderr",
       loadSandboxClass: input.loadSandboxClass,
       onStdoutLine: (line) => proc?.dispatchLine(line),
-      onExit: (result) => {
-        if (!proc || !proc.alive) return;
-        proc.alive = false;
-        if (proc.currentTurn) {
-          // currentTurn is cleared on turn_complete/turn_failed, so reaching
-          // here means the harness died mid-turn with no terminal frame: a
-          // crash, OOM, sandbox kill, or — since Claude Agent SDK 0.3.142 — a
-          // permanent auth/transport close (e.g. a 401/403 on the rt_* proxy
-          // token), which now exits non-zero with a stderr diagnostic instead
-          // of a silent clean exit. Fail the turn so it never hangs, and append
-          // the stderr tail so the diagnostic reaches the SSE stream, not just
-          // the backend logs.
-          const stderrTail = result.stderr?.trim().slice(-500);
-          proc.currentTurn.listeners.onFail(
-            `sandbox-agent exited with code ${result.exitCode}` +
-              (result.error ? `: ${result.error}` : "") +
-              (stderrTail ? `\n${stderrTail}` : "")
-          );
-          proc.currentTurn = null;
-        }
-      }
+      onExit: (result) => proc?.handleHarnessExit(result)
     });
 
     proc = new E2bClaudeRuntimeProcess(
@@ -157,9 +162,51 @@ export class E2bClaudeRuntimeProcess {
       input.approvalRequestTtlMs && input.approvalRequestTtlMs > 0
         ? input.approvalRequestTtlMs
         : DEFAULT_APPROVAL_REQUEST_TTL_MS,
-      input.onApprovalExpired
+      input.onApprovalExpired,
+      input.onHarnessExit,
+      input.turnTimeoutMs
     );
     return proc;
+  }
+
+  /**
+   * Unexpected-exit hook fired by the shared harness exit watcher. Idempotent
+   * — terminate() flips `alive` first, so a watcher firing during an explicit
+   * teardown is a no-op.
+   */
+  private handleHarnessExit(result: { exitCode?: number; stderr?: string; error?: string }): void {
+    if (!this.alive) return;
+    this.alive = false;
+    this.clearTurnWatchdog();
+    this.clearAllApprovalExpiry();
+    if (this.currentTurn) {
+      // currentTurn is cleared on turn_complete/turn_failed, so reaching
+      // here means the harness died mid-turn with no terminal frame: a
+      // crash, OOM, sandbox kill, or — since Claude Agent SDK 0.3.142 — a
+      // permanent auth/transport close (e.g. a 401/403 on the rt_* proxy
+      // token), which now exits non-zero with a stderr diagnostic instead
+      // of a silent clean exit. Fail the turn so it never hangs, and append
+      // the stderr tail so the diagnostic reaches the SSE stream, not just
+      // the backend logs.
+      const stderrTail = result.stderr?.trim().slice(-500);
+      this.currentTurn.listeners.onFail(
+        `sandbox-agent exited with code ${result.exitCode}` +
+          (result.error ? `: ${result.error}` : "") +
+          (stderrTail ? `\n${stderrTail}` : "")
+      );
+      this.currentTurn = null;
+    }
+    // The harness process died but the sandbox itself may still be running
+    // (and billing) — kill it rather than waiting for the E2B hard timeout.
+    void this.sandbox.kill().catch((err: unknown) => {
+      this.logger.warn(
+        { err, sandboxId: this.sandboxId },
+        "E2B Claude sandbox kill failed after harness exit"
+      );
+    });
+    // Adapter-side finalization (terminal DB status, staging cleanup, stale
+    // session-map removal) — between turns nothing else observes this death.
+    this.onHarnessExit?.();
   }
 
   isAlive(): boolean {
@@ -194,14 +241,52 @@ export class E2bClaudeRuntimeProcess {
           }
         }
       };
+      this.armTurnWatchdog(frame.turnId);
 
       this.sendFrame(frame).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
+        this.clearTurnWatchdog();
         this.currentTurn = null;
         listeners.onFail(message);
         reject(err);
       });
     });
+  }
+
+  // Turn-duration watchdog: the promise above settles only on a terminal frame
+  // or harness exit, so a wedged in-sandbox SDK would pin the session busy
+  // until the E2B hard timeout. On expiry: fail the turn (unblocks runTurn and
+  // the SSE consumer), kill the wedged sandbox, and fire onHarnessExit so the
+  // adapter finalizes — the next message bootstraps a fresh sandbox.
+  private armTurnWatchdog(turnId: string): void {
+    if (this.turnTimeoutMs <= 0) return;
+    this.clearTurnWatchdog();
+    this.turnWatchdog = setTimeout(() => {
+      this.turnWatchdog = null;
+      const turn = this.currentTurn;
+      if (!turn || turn.turnId !== turnId) return;
+      this.logger.error(
+        { sandboxId: this.sandboxId, turnId, timeoutMs: this.turnTimeoutMs },
+        "Claude turn watchdog expired — failing turn and recycling sandbox"
+      );
+      this.currentTurn = null;
+      turn.listeners.onFail(`Turn exceeded the ${this.turnTimeoutMs}ms limit and was aborted.`);
+      void this.terminate().catch((err: unknown) => {
+        this.logger.error(
+          { err, sandboxId: this.sandboxId },
+          "failed to terminate sandbox after turn timeout"
+        );
+      });
+      this.onHarnessExit?.();
+    }, this.turnTimeoutMs);
+    this.turnWatchdog.unref?.();
+  }
+
+  private clearTurnWatchdog(): void {
+    if (this.turnWatchdog) {
+      clearTimeout(this.turnWatchdog);
+      this.turnWatchdog = null;
+    }
   }
 
   /** Forwards the user's approve/reject decision to the in-sandbox harness. */
@@ -301,6 +386,12 @@ export class E2bClaudeRuntimeProcess {
     return this.sandbox.files.read(sandboxPath, { format: "bytes" });
   }
 
+  /** File metadata (size) without reading the content into memory. */
+  async statFile(sandboxPath: string): Promise<{ sizeBytes: number }> {
+    const info = await this.sandbox.files.getInfo(sandboxPath);
+    return { sizeBytes: info.size };
+  }
+
   /** Writes a file to the sandbox filesystem. */
   async writeFile(sandboxPath: string, data: string | Uint8Array | ArrayBuffer): Promise<void> {
     // E2B's files.write expects string | ArrayBuffer; normalize Uint8Array
@@ -320,6 +411,7 @@ export class E2bClaudeRuntimeProcess {
   async terminate(): Promise<void> {
     if (!this.alive) return;
     this.alive = false;
+    this.clearTurnWatchdog();
     this.clearAllApprovalExpiry();
     try {
       await this.sendFrame({ type: "shutdown" });
@@ -425,6 +517,7 @@ export class E2bClaudeRuntimeProcess {
           );
           return;
         }
+        this.clearTurnWatchdog();
         this.currentTurn = null;
         this.reconcilePendingApprovalsOnTurnEnd();
         turn.listeners.onComplete(frame.claudeSessionId);
@@ -439,6 +532,7 @@ export class E2bClaudeRuntimeProcess {
           );
           return;
         }
+        this.clearTurnWatchdog();
         this.currentTurn = null;
         this.reconcilePendingApprovalsOnTurnEnd();
         turn.listeners.onFail(frame.error);

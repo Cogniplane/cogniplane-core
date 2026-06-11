@@ -13,6 +13,7 @@ import {
   ssrfSafeGithubFetch,
   MAX_GITHUB_REDIRECTS
 } from "./skill-import-service.js";
+import { AdminConfigError } from "../admin-config-error.js";
 import { LocalSkillBundleStorage } from "./skill-bundle-storage.js";
 import type { ImportedSkillBundleRecord } from "../admin-config-records.js";
 
@@ -146,6 +147,41 @@ test("importSkillBundleFromGithub sends Authorization header when githubToken is
   expect(zipballCall.Authorization).toBe(`Bearer ${TOKEN}`);
 });
 
+test("importSkillBundleFromGithub rejects a nonexistent subdirectory as AdminConfigError", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-subdir-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  const archive = new JSZip();
+  archive.file(
+    "owner-repo-abc123/test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
+  );
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer" });
+
+  const fakeFetch = async (url: string | URL) => {
+    const value = url.toString();
+    if (value.includes("/zipball/")) {
+      return new Response(new Uint8Array(archiveBuffer), {
+        status: 200,
+        headers: { "Content-Type": "application/zip" }
+      });
+    }
+    throw new Error(`Unexpected fetch URL: ${value}`);
+  };
+
+  await expect(importSkillBundleFromGithub({
+        tenantId: "test-tenant",
+        config: createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache") }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        githubUrl: "https://github.com/owner/repo/tree/main/missing-dir",
+        actorUserId: "admin-user",
+        fetchFn: fakeFetch as typeof fetch
+      })).rejects.toThrow(AdminConfigError);
+});
+
 test("importSkillBundleFromGithub omits Authorization header when no githubToken is provided", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-notoken-"));
   onTestFinished(async () => {
@@ -228,6 +264,25 @@ test("importSkillBundleFromZip rejects archives with excessive uncompressed size
         originalFileName: "test-skill.zip",
         actorUserId: "admin-user"
       })).rejects.toThrow(/maximum uncompressed size/);
+});
+
+test("importSkillBundleFromZip rejects malformed (non-zip) bytes as AdminConfigError, not a library error", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-badzip-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer: Buffer.from("this is definitely not a zip archive"),
+        originalFileName: "not-a-zip.zip",
+        actorUserId: "admin-user"
+      })).rejects.toThrow(AdminConfigError);
 });
 
 test("importSkillBundleFromZip auto-promotes single-file SKILL.md zips to inline storage", async () => {
@@ -361,19 +416,13 @@ test("importSkillBundleFromInline rejects empty instructions", async () => {
 });
 
 // --- SSRF redirect-loop coverage -------------------------------------------
-//
-// `ssrfSafeGithubFetch` only enters its real manual-redirect/SSRF-revalidation
-// loop when the public `fetchFn` is identity-equal to the injected low-level
-// fetch. We exploit that by passing the SAME fake as both the public `fetchFn`
-// and the `lowLevelFetch` seam, so the gate falls through and our fake drives
-// the real redirect machinery hop by hop.
 
 type FakeHop = { url: string; headers: Record<string, string> };
 
 /**
- * Builds a low-level fetch fake that returns each scripted Response in order
- * and records the URL + headers it was invoked with on every hop. Reused as
- * both `fetchFn` and `lowLevelFetch` so the production loop runs unmodified.
+ * Builds a fetch fake that returns each scripted Response in order and
+ * records the URL + headers it was invoked with on every hop, so the
+ * production redirect loop runs unmodified.
  */
 function makeRedirectFake(responses: Response[]): { fake: typeof fetch; hops: FakeHop[] } {
   const hops: FakeHop[] = [];
@@ -403,7 +452,7 @@ test("ssrfSafeGithubFetch blocks a redirect to a private/reserved host (SSRF)", 
   ]);
 
   await expect(
-    ssrfSafeGithubFetch(fake, "https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
+    ssrfSafeGithubFetch("https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
   ).rejects.toThrow(/resolves to a private or reserved address/);
 });
 
@@ -418,7 +467,7 @@ test("ssrfSafeGithubFetch blocks a redirect to a non-https private host (SSRF)",
   // A plain-http private target is rejected on the scheme check before the
   // host check ever runs — either way the redirect is refused.
   await expect(
-    ssrfSafeGithubFetch(fake, "https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
+    ssrfSafeGithubFetch("https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
   ).rejects.toThrow(/must use the https:\/\/ scheme/);
 });
 
@@ -434,7 +483,6 @@ test("ssrfSafeGithubFetch deletes the Authorization header on a cross-origin red
   ]);
 
   const response = await ssrfSafeGithubFetch(
-    fake,
     "https://api.github.com/repos/owner/repo/zipball/main",
     { headers: { Authorization: "Bearer ghs_secret_token", "User-Agent": "cogniplane-core" } },
     fake
@@ -463,7 +511,6 @@ test("ssrfSafeGithubFetch retains the Authorization header on a same-origin redi
   ]);
 
   const response = await ssrfSafeGithubFetch(
-    fake,
     "https://api.github.com/repos/owner/repo/zipball/main",
     { headers: { Authorization: "Bearer ghs_secret_token" } },
     fake
@@ -487,7 +534,7 @@ test("ssrfSafeGithubFetch throws after exceeding the maximum redirect count", as
   const { fake, hops } = makeRedirectFake(responses);
 
   await expect(
-    ssrfSafeGithubFetch(fake, "https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
+    ssrfSafeGithubFetch("https://api.github.com/repos/owner/repo/zipball/main", {}, fake)
   ).rejects.toThrow(/exceeded the maximum number of redirects/);
 
   // The loop runs hops 0..MAX inclusive before giving up.
@@ -498,7 +545,6 @@ test("ssrfSafeGithubFetch returns a 3xx with no Location header as-is", async ()
   const { fake, hops } = makeRedirectFake([new Response(null, { status: 304 })]);
 
   const response = await ssrfSafeGithubFetch(
-    fake,
     "https://api.github.com/repos/owner/repo/zipball/main",
     {},
     fake

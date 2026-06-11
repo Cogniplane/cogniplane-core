@@ -2,15 +2,16 @@ import path from "node:path";
 
 import type { FastifyBaseLogger } from "fastify";
 
-import type {
-  PolicyApprovalDisposition,
-  PolicyApprovalRouteInput,
-  RuntimeAdapter,
-  RuntimeApprovalDecision,
-  RuntimeEvent,
-  RuntimeReasoningEffort,
-  RuntimeSessionRef,
-  RuntimeUserInput
+import {
+  SessionBusyError,
+  type PolicyApprovalDisposition,
+  type PolicyApprovalRouteInput,
+  type RuntimeAdapter,
+  type RuntimeApprovalDecision,
+  type RuntimeEvent,
+  type RuntimeReasoningEffort,
+  type RuntimeSessionRef,
+  type RuntimeUserInput
 } from "../runtime-contracts.js";
 
 import type { AppConfig } from "../config.js";
@@ -36,6 +37,7 @@ import type { AuditEventStore } from "./audit-event-store.js";
 import type { RuntimeSessionStore } from "./runtime/runtime-session-store.js";
 import type { ToolEventStore } from "./tool-event-store.js";
 import type {
+  ActiveTurnState,
   RuntimeProcessFactory,
   RuntimeShutdownReason,
   RuntimeState,
@@ -50,12 +52,6 @@ export type { RuntimeProcessFactory, RuntimeShutdownReason, RuntimeState, Runtim
 export type BoundRuntimeSessionRef = Omit<RuntimeSessionRef, "runtimePolicy"> & {
   runtimePolicy: ResolvedRuntimePolicy;
 };
-
-export class SessionBusyError extends Error {
-  constructor(sessionId: string) {
-    super(`A turn is already running for session ${sessionId}.`);
-  }
-}
 
 // Resolve `filePath` against a posix sandbox workspace and reject anything
 // that escapes the root — prevents path-traversal into host paths shared
@@ -263,15 +259,16 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       throw new SessionBusyError(session.sessionId);
     }
 
-    if (input.onBeforeTurn) {
-      await input.onBeforeTurn();
-    }
-
+    // Reserve the turn slot SYNCHRONOUSLY — no await between the busy check
+    // and this assignment — so a concurrent runMessage for the same session
+    // can't pass the check during onBeforeTurn (multi-second artifact sync)
+    // and overwrite this turn.
     const queue = new AsyncQueue<RuntimeEvent>();
-    runtime.activeTurn = {
+    const activeTurn: ActiveTurnState = {
       queue,
       responseId: null,
       outputItemDone: false,
+      watchdogTimer: null,
       runtimePolicyId: input.runtimePolicyId,
       toolContextId: input.toolContextId,
       assistantMessageId: input.assistantMessageId ?? null,
@@ -279,6 +276,21 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       effort: input.effort ?? null,
       autoApprovedKinds: new Set()
     };
+    runtime.activeTurn = activeTurn;
+    this.armTurnWatchdog(session.sessionId, runtime, activeTurn);
+
+    if (input.onBeforeTurn) {
+      try {
+        await input.onBeforeTurn();
+      } catch (error) {
+        // The turn never started — release the reservation (no process-side
+        // turn to interrupt, idle timer untouched) and surface the error.
+        if (runtime.activeTurn?.queue === queue) {
+          runtime.activeTurn = null;
+        }
+        throw error;
+      }
+    }
 
     this.turnOrchestrator
       .startTurn(runtime, input.prompt, input.userInputs)
@@ -291,12 +303,21 @@ export class CodexRuntimeManager implements RuntimeAdapter {
         yield event;
       }
     } finally {
+      // If a runtime still holds this turn here, the consumer exited WITHOUT a
+      // terminal event (e.g. the SSE writer threw mid-stream, or the scheduler
+      // worker died) — every terminal path in the orchestrator nulls the slot
+      // before ending the queue. Nothing else will stop the process-side turn
+      // or re-arm idle teardown (startTurn cleared the idle timer and the
+      // terminal notification handlers early-return once the slot is empty),
+      // so the sandbox would stay warm until the E2B hard timeout and the
+      // runtime_sessions row would stay 'active'. Stop the turn the same way
+      // the Stop button does. The restart path in startTurn can re-point the
+      // turn onto a replacement runtime, so check both candidates.
       const currentRuntime = this.lifecycle.runtimes.get(session.sessionId);
-      if (currentRuntime?.activeTurn?.queue === queue) {
-        currentRuntime.activeTurn = null;
-      }
-      if (runtime !== currentRuntime && runtime.activeTurn?.queue === queue) {
-        runtime.activeTurn = null;
+      for (const owner of new Set([currentRuntime, runtime])) {
+        if (owner?.activeTurn?.queue === queue) {
+          this.stopActiveTurn(owner, "turn_abandoned");
+        }
       }
     }
   }
@@ -337,30 +358,69 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       return "missing";
     }
 
-    const approval = await this.deps.approvals.resolve(
-      input.tenantId,
-      input.approvalId,
-      input.userId,
-      input.decision
-    );
-    if (!approval) return "missing";
-
-    await this.deps.auditEvents.create({
-      tenantId: input.tenantId,
-      sessionId: approval.sessionId,
-      userId: approval.userId,
-      approvalId: approval.approvalId,
-      type: input.decision === "approve" ? "approval.approved" : "approval.rejected",
-      payload: { itemId: approval.itemId, kind: approval.kind }
-    });
-
-    if (input.rememberForTurn && input.decision === "approve" && runtime.activeTurn) {
-      runtime.activeTurn.autoApprovedKinds.add(pending.kind);
+    // Mirror the DB gate (`tenant_id`/`user_id` on approvals.resolve) before
+    // claiming, so a caller who isn't the approval's owner can't disturb the
+    // pending entry — for them this approval simply doesn't exist.
+    if (runtime.tenantId !== input.tenantId || runtime.userId !== input.userId) {
+      return "missing";
     }
 
+    // Claim the entry synchronously (and disarm its TTL timer) BEFORE the DB
+    // write. The expiry timer claims the same way, so exactly one path ever
+    // answers the JSON-RPC request — without this, a TTL tick during the await
+    // below could reject a call the DB just recorded as approved.
     runtime.pendingApprovals.delete(input.approvalId);
     clearApprovalExpiry(runtime, input.approvalId);
+    // Capture the turn that owns this approval NOW: if it ends during the DB
+    // write below, a rememberForTurn must land on the (then-orphaned) old
+    // turn's set, not auto-approve actions in whatever turn replaced it.
+    const turnAtClaim = runtime.activeTurn;
+
+    let approval: Awaited<ReturnType<ApprovalStore["resolve"]>>;
+    try {
+      approval = await this.deps.approvals.resolve(
+        input.tenantId,
+        input.approvalId,
+        input.userId,
+        input.decision
+      );
+    } catch (error) {
+      // We hold the claim — deny so the runtime unblocks, then surface the
+      // error to the decision route. The still-pending row is left for the sweep.
+      respondToApprovalRequest(runtime.process, pending, "reject");
+      throw error;
+    }
+    if (!approval) {
+      // Row settled externally (cross-replica sweep) or never persisted. The
+      // external path can't reach this process's JSON-RPC request, so deny it
+      // here to unblock the runtime instead of leaking the pending slot.
+      respondToApprovalRequest(runtime.process, pending, "reject");
+      return "missing";
+    }
+
+    if (input.rememberForTurn && input.decision === "approve" && turnAtClaim) {
+      turnAtClaim.autoApprovedKinds.add(pending.kind);
+    }
     respondToApprovalRequest(runtime.process, pending, input.decision);
+
+    // Best-effort: the decision has already been delivered to the runtime and
+    // is irreversible — an audit-write failure must not 500 the decision route
+    // and invite a retry of an action whose side effects already occurred.
+    try {
+      await this.deps.auditEvents.create({
+        tenantId: input.tenantId,
+        sessionId: approval.sessionId,
+        userId: approval.userId,
+        approvalId: approval.approvalId,
+        type: input.decision === "approve" ? "approval.approved" : "approval.rejected",
+        payload: { itemId: approval.itemId, kind: approval.kind }
+      });
+    } catch (error) {
+      this.deps.logger.warn(
+        { err: error, approvalId: input.approvalId, sessionId: approval.sessionId },
+        "failed to write approval decision audit event (decision already delivered)"
+      );
+    }
     return "resolved";
   }
 
@@ -409,38 +469,80 @@ export class CodexRuntimeManager implements RuntimeAdapter {
     // Codex process kept running the original turn with no owner — its
     // notifications would be dropped or leak into the next turn. Refuse the
     // request: the user can click again once the turn is fully started.
-    const turnId = runtime.activeTurn.responseId;
-    if (!turnId) {
+    if (!runtime.activeTurn.responseId) {
       this.deps.logger.info(
         { sessionId: input.sessionId },
         "Codex interrupt rejected — turnId not yet assigned"
       );
       return "no_active_turn";
     }
-    try {
-      await runtime.process.sendRequest("turn/interrupt", {
-        threadId: runtime.threadId,
-        turnId
-      });
-    } catch (err) {
-      // The interrupt request can fail if Codex already moved on. Logging is
-      // enough — we still synthesize a terminal frame below so the UI exits
-      // its streaming state.
-      this.deps.logger.warn(
-        { err, sessionId: input.sessionId, turnId },
-        "Codex turn/interrupt request failed; synthesizing terminal frame anyway"
+    this.stopActiveTurn(runtime, "turn_interrupted");
+    return "interrupted";
+  }
+
+  // Turn-duration watchdog (RUNTIME_TURN_TIMEOUT_MS). The turn is
+  // notification-driven: per-request timeouts bound turn/start, but nothing
+  // else bounds how long Codex can sit between notifications — a wedged turn
+  // pins the session busy (SessionBusyError on every send) until the E2B hard
+  // timeout. On expiry: fail the turn (terminal frame unblocks the SSE
+  // consumer) and recycle the runtime — a wedged process can't be trusted
+  // with the next turn.
+  private armTurnWatchdog(sessionId: string, runtime: RuntimeState, activeTurn: ActiveTurnState): void {
+    const timeoutMs = this.deps.config.RUNTIME_TURN_TIMEOUT_MS;
+    if (timeoutMs <= 0) return;
+    activeTurn.watchdogTimer = setTimeout(() => {
+      activeTurn.watchdogTimer = null;
+      // The restart path can re-point the turn onto a replacement runtime —
+      // find the runtime that holds this turn NOW; no holder means it settled.
+      const current = this.lifecycle.runtimes.get(sessionId);
+      const owner =
+        current?.activeTurn === activeTurn ? current : runtime.activeTurn === activeTurn ? runtime : null;
+      if (!owner) return;
+      this.deps.logger.error(
+        { sessionId, runtimeId: owner.runtimeId, timeoutMs },
+        "turn watchdog expired — failing turn and recycling runtime"
       );
-    }
+      this.turnOrchestrator.failActiveTurn(
+        owner,
+        `Turn exceeded the ${timeoutMs}ms limit and was aborted.`
+      );
+      void this.lifecycle.requestRuntimeShutdown(owner, "turn_timeout").catch((err: unknown) => {
+        this.deps.logger.error({ err, sessionId }, "runtime shutdown after turn timeout failed");
+      });
+    }, timeoutMs);
+    activeTurn.watchdogTimer.unref?.();
+  }
+
+  // Shared turn-stopping tail for the Stop button (interruptTurn) and the
+  // abandoned-consumer cleanup in runMessage's finally. Synchronous on
+  // purpose: the active-turn slot must be released before anything awaits so
+  // a follow-up send can't hit SessionBusyError; the turn/interrupt RPC and
+  // the DB writes are best-effort and must not block the caller. Late
+  // notifications from the stopped turn are dropped via staleTurnIds.
+  private stopActiveTurn(runtime: RuntimeState, activity: "turn_interrupted" | "turn_abandoned"): void {
+    const turnId = runtime.activeTurn?.responseId ?? null;
     this.turnOrchestrator.interruptActiveTurn(runtime);
-    // Drop any approvals that were still pending at interrupt time — leaving
-    // them would let the UI keep showing an approve/reject prompt for a turn
-    // that no longer exists, and a later decision would respond to the old
-    // (interrupted) JSON-RPC request. Best-effort, doesn't block the response.
+    if (turnId) {
+      void runtime.process
+        .sendRequest("turn/interrupt", { threadId: runtime.threadId, turnId })
+        .catch((err: unknown) => {
+          // The interrupt request can fail if Codex already moved on. Logging
+          // is enough — the terminal frame was already synthesized above.
+          this.deps.logger.warn(
+            { err, sessionId: runtime.sessionId, turnId },
+            "Codex turn/interrupt request failed; terminal frame already synthesized"
+          );
+        });
+    }
+    // Drop any approvals that were still pending when the turn stopped —
+    // leaving them would let the UI keep showing an approve/reject prompt for
+    // a turn that no longer exists, and a later decision would respond to the
+    // old (stopped) JSON-RPC request. Best-effort, doesn't block the caller.
     void cancelPendingApprovals({
-      tenantId: input.tenantId,
-      sessionId: input.sessionId,
-      userId: input.userId,
-      reason: "turn_interrupted",
+      tenantId: runtime.tenantId,
+      sessionId: runtime.sessionId,
+      userId: runtime.userId,
+      reason: activity,
       approvals: this.deps.approvals,
       auditEvents: this.deps.auditEvents,
       logger: this.deps.logger,
@@ -464,18 +566,17 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       }
     });
     // Re-arm idle cleanup. `startTurn` cleared the idle timer; the normal
-    // turn/completed path re-arms it via scheduleIdleTeardown. The synthetic
-    // interrupt path bypasses that, so without this the runtime would stay
-    // warm forever after a Stop click.
-    this.lifecycle.touchRuntime(runtime, "turn_interrupted");
+    // turn/completed path re-arms it via scheduleIdleTeardown. Both synthetic
+    // stop paths bypass that, so without this the runtime would stay warm
+    // forever (and keep billing the sandbox).
+    this.lifecycle.touchRuntime(runtime, activity);
     void this.lifecycle.persistRuntime(runtime, "active").catch((err: unknown) => {
       this.deps.logger.error(
-        { err, sessionId: input.sessionId },
-        "persistRuntime failed (turn interrupted)"
+        { err, sessionId: runtime.sessionId, activity },
+        "persistRuntime failed (turn stopped)"
       );
     });
     this.lifecycle.scheduleIdleTeardown(runtime);
-    return "interrupted";
   }
 
   async close(): Promise<void> {
@@ -497,6 +598,14 @@ export class CodexRuntimeManager implements RuntimeAdapter {
       throw new Error(`No active runtime for session ${sessionId}.`);
     }
     return runtime.process.readFile(resolveInsideSandbox(runtime.workspacePath, filePath));
+  }
+
+  async statRuntimeFile(sessionId: string, filePath: string): Promise<{ sizeBytes: number }> {
+    const runtime = this.lifecycle.runtimes.get(sessionId);
+    if (!runtime || !runtime.process.isAlive() || !runtime.process.statFile) {
+      throw new Error(`No active runtime for session ${sessionId}.`);
+    }
+    return runtime.process.statFile(resolveInsideSandbox(runtime.workspacePath, filePath));
   }
 
   async writeRuntimeFile(
@@ -521,23 +630,32 @@ export class CodexRuntimeManager implements RuntimeAdapter {
     return this.lifecycle.runtimes.has(sessionId);
   }
 
+  // Aggregate counts only — served by the UNAUTHENTICATED /health endpoint.
+  // Per-runtime identifiers (sessionId, runtimeId, port) span every tenant
+  // and must never appear here; getRuntimeHealthDetail is the tenant-scoped
+  // admin view.
   getHealthSnapshot() {
-    const runtimes = [...this.lifecycle.runtimes.values()].map((runtime) => ({
-      sessionId: runtime.sessionId,
-      runtimeId: runtime.runtimeId,
-      healthStatus: runtime.healthStatus,
-      lastActiveAt: runtime.lastActiveAt,
-      hasActiveTurn: Boolean(runtime.activeTurn),
-      processId: runtime.process.pid,
-      port: runtime.process.port,
-      isAlive: runtime.process.isAlive()
-    }));
-
+    const runtimes = [...this.lifecycle.runtimes.values()];
     return {
       activeRuntimeCount: runtimes.length,
-      activeTurnCount: runtimes.filter((r) => r.hasActiveTurn).length,
-      runtimes
+      activeTurnCount: runtimes.filter((runtime) => Boolean(runtime.activeTurn)).length
     };
+  }
+
+  // Tenant-scoped live process detail for the admin workbench.
+  getRuntimeHealthDetail(tenantId: string) {
+    return [...this.lifecycle.runtimes.values()]
+      .filter((runtime) => runtime.tenantId === tenantId)
+      .map((runtime) => ({
+        sessionId: runtime.sessionId,
+        runtimeId: runtime.runtimeId,
+        healthStatus: runtime.healthStatus,
+        lastActiveAt: runtime.lastActiveAt,
+        hasActiveTurn: Boolean(runtime.activeTurn),
+        processId: runtime.process.pid,
+        port: runtime.process.port,
+        isAlive: runtime.process.isAlive()
+      }));
   }
 
   async refreshIdleRuntimes(

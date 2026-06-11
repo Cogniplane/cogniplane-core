@@ -156,12 +156,13 @@ The runtime resolves the key for a turn as: per-tenant key → env-var fallback 
 
 ```bash
 PII_PROVIDER_ENABLED=false
-PII_OPENROUTER_API_KEY=<provider key>
-PII_OPENROUTER_MODEL=google/gemini-2.5-flash
+PII_LLM_BASE_URL=https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint
+PII_LLM_API_KEY=<provider key>
+PII_LLM_MODEL=google/gemini-2.5-flash
 PII_PROVIDER_TIMEOUT_MS=5000
 ```
 
-PII detection is opt-in. The pipeline is a generic "send-text-to-an-LLM-for-detection" path — you can point it at OpenRouter, Anthropic, OpenAI, or anywhere else compatible. Whatever provider you choose, you accept that vendor's logging posture.
+PII detection is opt-in. The pipeline targets any OpenAI-compatible `/chat/completions` endpoint — point `PII_LLM_BASE_URL` at OpenRouter, a cloud provider, or a model you self-host (e.g. a local Ollama or vLLM server). Whatever provider you choose, you accept that vendor's logging posture; self-hosting the model keeps inference entirely within your own infrastructure.
 
 ### Workers
 

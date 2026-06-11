@@ -14,12 +14,10 @@ import { ChevronDown, ChevronUp, ChevronsUpDown } from "lucide-react";
 import { fetchMessageFeedback, type MessageFeedbackStats } from "../lib/message-feedback-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
 import { DayRangePicker, type Days } from "./token-usage-chart-primitives";
+import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
-const HINT = "text-sm text-on-surface-faint";
 
 export function MessageFeedbackSection() {
   const [days, setDays] = useState<Days>(30);

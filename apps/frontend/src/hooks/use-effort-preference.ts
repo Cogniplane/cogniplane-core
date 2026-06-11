@@ -11,7 +11,7 @@ function resolveModelEffort(model: Model | null): EffortLevel | null {
   return model.defaultEffort ?? model.supportedEfforts[0] ?? null;
 }
 
-export function useEffortPreference(model: Model | null, enabled: boolean) {
+export function useEffortPreference(model: Model | null, enabled: boolean, ready: boolean) {
   const [effort, setEffortState] = useState<EffortLevel | null>(() => {
     if (typeof window === "undefined") return null;
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -28,6 +28,10 @@ export function useEffortPreference(model: Model | null, enabled: boolean) {
   }, []);
 
   useEffect(() => {
+    // Before the models query resolves, `enabled`/`model` are fallback
+    // defaults — syncing against them would wipe the stored preference.
+    if (!ready) return;
+
     if (!enabled) {
       // Auto-correct stored effort when the selected model changes; setEffort
       // here also persists to localStorage (external system sync).
@@ -46,7 +50,14 @@ export function useEffortPreference(model: Model | null, enabled: boolean) {
     }
 
     setEffort(resolveModelEffort(model));
-  }, [effort, enabled, model, setEffort]);
+  }, [effort, enabled, model, ready, setEffort]);
 
-  return { effort, setEffort };
+  // Never return the raw state: it holds the stored value before the config
+  // can validate it, and a send must omit effort rather than submit that.
+  const validatedEffort =
+    ready && enabled && model && effort && model.supportedEfforts.includes(effort)
+      ? effort
+      : null;
+
+  return { effort: validatedEffort, setEffort };
 }

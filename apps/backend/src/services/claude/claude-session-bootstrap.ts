@@ -39,6 +39,12 @@ export async function bootstrapClaudeSession(
      * adapter expires the DB row + writes the `approval.expired` audit event.
      */
     onApprovalExpired?: (approvalId: string) => void;
+    /**
+     * e2b only: called once when the in-sandbox harness exits unexpectedly.
+     * The adapter finalizes the session from here (terminal DB status,
+     * staging cleanup, stale session-map removal).
+     */
+    onHarnessExit?: () => void;
   }
 ): Promise<ClaudeSessionState> {
   const { tenantId, sessionId, userId } = input;
@@ -162,7 +168,9 @@ export async function bootstrapClaudeSession(
     sessionId,
     runtimeId,
     approvalRequestTtlMs: ctx.approvalRequestTtlMs,
-    onApprovalExpired: ctx.onApprovalExpired
+    onApprovalExpired: ctx.onApprovalExpired,
+    onHarnessExit: ctx.onHarnessExit,
+    turnTimeoutMs: config.RUNTIME_TURN_TIMEOUT_MS
   });
 
   e2bProcess
@@ -187,8 +195,10 @@ export async function bootstrapClaudeSession(
     runtimeToken,
     mcpServerEntries,
     e2bProcess,
+    idleTimer: null,
     activeTurnInterrupt: { current: null },
-    activeTurnPush: { current: null }
+    activeTurnPush: { current: null },
+    autoApprovedKindsForTurn: new Set()
   };
 
   const { workspacePath } = state;

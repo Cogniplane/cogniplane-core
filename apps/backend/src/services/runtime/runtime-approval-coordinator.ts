@@ -50,7 +50,7 @@ export function buildApprovalRequest(
   const str = (key: string): string | null =>
     typeof params[key] === "string" && params[key] ? (params[key] as string) : null;
 
-  const result = extractApprovalFields(runtime, request.method, params, str);
+  const result = extractApprovalFields(runtime, request.method, str);
   if (!result) {
     return null;
   }
@@ -71,7 +71,6 @@ export function buildApprovalRequest(
 function extractApprovalFields(
   runtime: RuntimeApprovalContext,
   method: string,
-  params: Record<string, unknown>,
   str: (key: string) => string | null
 ) {
   switch (method) {
@@ -93,26 +92,6 @@ function extractApprovalFields(
       };
     }
 
-    case "execCommandApproval": {
-      const callId = str("callId") ?? uuidv7();
-      const approvalId = str("approvalId") ?? `${callId}:exec-command`;
-      const command = Array.isArray(params.command)
-        ? params.command.filter((entry): entry is string => typeof entry === "string").join(" ")
-        : null;
-      const cwd = str("cwd");
-      const reason = str("reason");
-      return {
-        approvalId,
-        turnId: runtime.activeTurn?.responseId ?? callId,
-        itemId: callId,
-        kind: "command_execution" as const,
-        title: "Approve shell command",
-        summary: [command, cwd ? `cwd: ${cwd}` : null, reason].filter(Boolean).join("\n"),
-        command,
-        cwd
-      };
-    }
-
     case "item/fileChange/requestApproval": {
       const itemId = str("itemId") ?? uuidv7();
       const turnId = str("turnId") ?? itemId;
@@ -125,31 +104,6 @@ function extractApprovalFields(
         summary: str("reason") ?? "The runtime wants to modify files.",
         command: null,
         cwd: null
-      };
-    }
-
-    case "applyPatchApproval": {
-      const callId = str("callId") ?? uuidv7();
-      const grantRoot = str("grantRoot");
-      const reason = str("reason");
-      const fileChanges =
-        params.fileChanges && typeof params.fileChanges === "object"
-          ? Object.keys(params.fileChanges as Record<string, unknown>)
-          : [];
-      const summaryLines = [
-        reason,
-        fileChanges.length ? `files: ${fileChanges.join(", ")}` : null,
-        grantRoot ? `root: ${grantRoot}` : null
-      ].filter(Boolean) as string[];
-      return {
-        approvalId: `${callId}:apply-patch`,
-        turnId: runtime.activeTurn?.responseId ?? callId,
-        itemId: callId,
-        kind: "file_change" as const,
-        title: "Approve file changes",
-        summary: summaryLines.join("\n") || "The runtime wants to modify files.",
-        command: null,
-        cwd: grantRoot
       };
     }
 
@@ -178,8 +132,6 @@ const ITEM_PROTOCOL_METHODS = new Set([
   "item/fileChange/requestApproval"
 ]);
 
-const COMPATIBILITY_METHODS = new Set(["execCommandApproval", "applyPatchApproval"]);
-
 export function respondToApprovalRequest(
   process: ApprovalResponseProcess,
   approval: PendingApprovalRecord,
@@ -190,13 +142,6 @@ export function respondToApprovalRequest(
   if (ITEM_PROTOCOL_METHODS.has(approval.method)) {
     process.sendResponse(approval.requestId, {
       decision: isApproved ? "accept" : "decline"
-    });
-    return;
-  }
-
-  if (COMPATIBILITY_METHODS.has(approval.method)) {
-    process.sendResponse(approval.requestId, {
-      decision: isApproved ? "approved" : "denied"
     });
     return;
   }

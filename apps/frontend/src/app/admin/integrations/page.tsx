@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { AdminIntegrationsList } from "../../../components/admin-integrations-list";
+import { AdminIntegrationsList } from "../../../components/admin/integrations/admin-integrations-list";
 
 function buildInstallFlash(
   githubInstall: string | null,

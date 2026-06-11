@@ -127,17 +127,17 @@ function readSdkVersion() {
 }
 
 // ---------------------------------------------------------------------------
-// Approval bridge — replaces the local adapter's ClaudeApprovalHandler
+// Approval bridge
 // ---------------------------------------------------------------------------
 
 const FILE_CHANGE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "MultiEdit"]);
 const READ_ONLY_NATIVE_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "View"]);
 
-// Mirror the local ClaudeApprovalHandler limits (claude-code-approval-handler.ts).
-// The harness must enforce its own cap + wall-clock TTL because in e2b mode the
-// canUseTool Promise lives here, not in the backend handler — an unanswered
-// approval would otherwise hold the SDK turn (and the in-memory `pending` map)
-// forever. The backend separately expires the DB row.
+// The TTL mirrors the backend's APPROVAL_REQUEST_TTL_MS default. The harness
+// must enforce its own cap + wall-clock TTL because the canUseTool Promise
+// lives here, not in the backend — an unanswered approval would otherwise hold
+// the SDK turn (and the in-memory `pending` map) forever. The backend
+// separately expires the DB row.
 const MAX_PENDING_APPROVALS_PER_SESSION = 5;
 const DEFAULT_APPROVAL_TTL_MS = 10 * 60 * 1000;
 

@@ -8,12 +8,13 @@ import type { McpServerStatusEvent, RuntimeNoticeEvent } from "../lib/streaming-
 
 import { Button } from "@/components/ui/button";
 import { ActivityTimeline } from "./timeline";
+import type { ApprovalDecision, InFlightApprovalDecision } from "./timeline.logic";
 import { PROMPT_SUGGESTIONS, shouldShowRetry } from "./message-list.logic";
 
 export function MessageList({
   messages,
   pendingApprovals,
-  approvalDecisionId,
+  approvalDecision,
   mcpServerEvents,
   runtimeNotices,
   onApprovalDecision,
@@ -26,10 +27,10 @@ export function MessageList({
 }: {
   messages: Message[];
   pendingApprovals: Approval[];
-  approvalDecisionId: string | null;
+  approvalDecision: InFlightApprovalDecision | null;
   mcpServerEvents: McpServerStatusEvent[];
   runtimeNotices: RuntimeNoticeEvent[];
-  onApprovalDecision: (approvalId: string, decision: "approve" | "reject") => void;
+  onApprovalDecision: (approvalId: string, decision: ApprovalDecision) => void;
   onPreviewArtifact?: (artifactId: string) => void;
   onRetry?: () => void;
   onSend?: (text: string) => void;
@@ -52,7 +53,7 @@ export function MessageList({
             <ActivityTimeline
               messages={messages}
               pendingApprovals={pendingApprovals}
-              approvalDecisionId={approvalDecisionId}
+              approvalDecision={approvalDecision}
               mcpServerEvents={mcpServerEvents}
               runtimeNotices={runtimeNotices}
               onApprovalDecision={onApprovalDecision}

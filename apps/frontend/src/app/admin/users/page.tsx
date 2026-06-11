@@ -1,10 +1,8 @@
 "use client";
 
 import { useAdminUsersData } from "../../../hooks/use-admin-users-data";
-import { AdminUsersSection } from "../../../components/admin-users-section";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { AdminUsersSection } from "../../../components/admin/admin-users-section";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminUsersPage() {
   const { users, busyKey, error, available, handleSetBetaTester } = useAdminUsersData();

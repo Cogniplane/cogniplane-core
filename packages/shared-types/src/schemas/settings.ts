@@ -16,7 +16,9 @@ export const ModelSchema = z.object({
   isDefault: z.boolean(),
   provider: RuntimeProviderSchema,
   supportedEfforts: z.array(EffortLevelSchema),
-  defaultEffort: EffortLevelSchema.nullable()
+  defaultEffort: EffortLevelSchema.nullable(),
+  // Max input context in tokens, used by the composer's context-window meter.
+  contextWindow: z.number().int().positive()
 }).passthrough();
 export type Model = z.infer<typeof ModelSchema>;
 

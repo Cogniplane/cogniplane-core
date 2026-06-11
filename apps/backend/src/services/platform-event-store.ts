@@ -1,4 +1,5 @@
 import type { Pool } from "../lib/db.js";
+import { isoTimestamp } from "../lib/db-mappers.js";
 
 export type PlatformEventRecord = {
   id: string;
@@ -45,7 +46,7 @@ export class PlatformEventStore {
         id: String(row.id),
         eventType: String(row.event_type),
         payload: (row.payload as Record<string, unknown>) ?? {},
-        createdAt: new Date(String(row.created_at)).toISOString()
+        createdAt: isoTimestamp(row.created_at)
       }));
     } finally {
       client.release();

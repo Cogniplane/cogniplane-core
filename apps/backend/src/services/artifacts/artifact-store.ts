@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import { type Pool, withTenantScope } from "../../lib/db.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type ArtifactPiiDetail = {
   status?: "pending" | "scanning" | "scanned" | "blocked" | "transformed" | "failed";
@@ -87,8 +88,8 @@ function mapArtifact(row: Record<string, unknown>): ArtifactRecord {
       row.detail_json && typeof row.detail_json === "object"
         ? (row.detail_json as ArtifactDetail)
         : {},
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -156,8 +157,8 @@ function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRe
     storageKey: String(row.storage_key),
     fileName: String(row.file_name),
     contentType: String(row.content_type),
-    expiresAt: new Date(String(row.expires_at)).toISOString(),
-    createdAt: new Date(String(row.created_at)).toISOString()
+    expiresAt: isoTimestamp(row.expires_at),
+    createdAt: isoTimestamp(row.created_at)
   };
 }
 

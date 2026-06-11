@@ -1,3 +1,5 @@
+// Matches anywhere in the key (`accessToken`, `x-api-key`, `passwordHash`);
+// what happens to a matched value depends on its type — see redactSecretValue.
 const SECRET_KEY_PATTERN = /(authorization|token|secret|api[_-]?key|password)/i;
 const BEARER_TOKEN_PATTERN = /(\bBearer\s+)([^\s"',;]+)/gi;
 const GITHUB_TOKEN_PATTERN =
@@ -41,7 +43,18 @@ function redactSecretValue(value: unknown): unknown {
     return value;
   }
 
-  return "[REDACTED]";
+  // Credentials are strings (or lists of them); blank both. Numbers/booleans
+  // under a secret-looking key are token counts and limits, not secrets —
+  // keep them. Plain objects recurse so telemetry like
+  // `tokenUsage: { inputTokens: 12 }` survives while a composite under e.g.
+  // `credentials` still has its inner secret-keyed strings redacted.
+  if (typeof value === "string" || Array.isArray(value)) {
+    return "[REDACTED]";
+  }
+  if (typeof value === "object") {
+    return redactSecrets(value);
+  }
+  return value;
 }
 
 export function redactSecrets<T>(input: T): T {

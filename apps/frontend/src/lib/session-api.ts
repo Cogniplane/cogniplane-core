@@ -62,9 +62,12 @@ export async function listApprovals(sessionId: string): Promise<Approval[]> {
 
 export async function resolveApproval(
   approvalId: string,
-  decision: ApprovalDecisionRequest["decision"]
+  decision: ApprovalDecisionRequest["decision"],
+  rememberForTurn = false
 ): Promise<void> {
-  const body: ApprovalDecisionRequest = { decision };
+  const body: ApprovalDecisionRequest = rememberForTurn
+    ? { decision, rememberForTurn: true }
+    : { decision };
   await request(`/approvals/${approvalId}/decision`, {
     method: "POST",
     body: JSON.stringify(body)

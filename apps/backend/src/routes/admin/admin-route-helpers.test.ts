@@ -1,16 +1,14 @@
 import { describe, test, expect } from "vitest";
 
-import { z } from "zod";
 
 import type { FastifyReply } from "fastify";
+
+import { AdminConfigError } from "../../services/admin-config-error.js";
 
 import {
   adminIdSchema,
   configError,
   createAdminAuditEvent,
-  parseAdminCrudBody,
-  parseAdminCrudUpdateBody,
-  parseAdminInput,
   respondAdminMutationError,
   respondAdminNotFound
 } from "./admin-route-helpers.js";
@@ -78,102 +76,25 @@ describe("respondAdminMutationError", () => {
     expect(body).toEqual({ error: "conflict", message: "Already exists." });
   });
 
-  test("falls back to 400 invalid_config for non-unique-violation errors", () => {
+  test("surfaces AdminConfigError messages as 400 invalid_config", () => {
     const reply = fakeReply();
-    const body = respondAdminMutationError(reply, new Error("bad"), "Failed.");
-    expect(reply._status).toBe(400);
-    expect(body).toEqual({ error: "invalid_config", message: "bad" });
-  });
-
-  test("uses the fallback message when the error is not an Error instance", () => {
-    const reply = fakeReply();
-    const body = respondAdminMutationError(reply, "scalar", "Failed.");
-    expect(reply._status).toBe(400);
-    expect(body).toEqual({ error: "invalid_config", message: "Failed." });
-  });
-});
-
-describe("parseAdminInput", () => {
-  const schema = z.object({ name: z.string().min(2) });
-
-  test("returns ok=true with the parsed value", () => {
-    const reply = fakeReply();
-    const result = parseAdminInput(reply, schema, { name: "ok" });
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.value).toEqual({ name: "ok" });
-  });
-
-  test("returns ok=false with a 400 validation envelope on invalid input", () => {
-    const reply = fakeReply();
-    const result = parseAdminInput(reply, schema, { name: "x" });
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(reply._status).toBe(400);
-    // validationError shape: { error: "invalid_request", details: [...] }
-    expect(result.response.error).toBe("invalid_request");
-  });
-});
-
-describe("parseAdminCrudBody", () => {
-  const schema = z.object({ skillId: z.string().optional(), name: z.string() });
-
-  test("requires the id field to be set", () => {
-    const reply = fakeReply();
-    const result = parseAdminCrudBody(reply, schema, { name: "x" }, "skillId");
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(reply._status).toBe(400);
-    expect(result.response.message).toMatch(/skillId is required/);
-  });
-
-  test("accepts the body when id field is present", () => {
-    const reply = fakeReply();
-    const result = parseAdminCrudBody(reply, schema, { skillId: "x", name: "y" }, "skillId");
-    expect(result.ok).toBe(true);
-  });
-});
-
-describe("parseAdminCrudUpdateBody", () => {
-  const schema = z.object({ skillId: z.string().optional(), name: z.string() });
-
-  test("rejects when body id mismatches route id", () => {
-    const reply = fakeReply();
-    const result = parseAdminCrudUpdateBody(
+    const body = respondAdminMutationError(
       reply,
-      schema,
-      { skillId: "wrong", name: "y" },
-      "skillId",
-      "right"
+      new AdminConfigError("At least one runtime provider must be enabled."),
+      "Failed."
     );
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
     expect(reply._status).toBe(400);
-    expect(result.response.message).toMatch(/skillId must match the route parameter/);
+    expect(body).toEqual({
+      error: "invalid_config",
+      message: "At least one runtime provider must be enabled."
+    });
   });
 
-  test("accepts when body id matches the route id", () => {
+  test("rethrows unexpected errors so the global handler returns an opaque 500", () => {
     const reply = fakeReply();
-    const result = parseAdminCrudUpdateBody(
-      reply,
-      schema,
-      { skillId: "right", name: "y" },
-      "skillId",
-      "right"
-    );
-    expect(result.ok).toBe(true);
-  });
-
-  test("accepts when body id is omitted (route id is canonical)", () => {
-    const reply = fakeReply();
-    const result = parseAdminCrudUpdateBody(
-      reply,
-      schema,
-      { name: "y" },
-      "skillId",
-      "right"
-    );
-    expect(result.ok).toBe(true);
+    const internal = new Error('relation "tenant_settings" does not exist');
+    expect(() => respondAdminMutationError(reply, internal, "Failed.")).toThrow(internal);
+    expect(() => respondAdminMutationError(reply, "scalar", "Failed.")).toThrow("scalar");
   });
 });
 

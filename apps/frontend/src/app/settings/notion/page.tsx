@@ -5,9 +5,7 @@ import { useSearchParams } from "next/navigation";
 
 import { NotionConnectionSection } from "../../../components/notion-connection-section";
 import { useNotionConnection } from "../../../hooks/use-notion-connection";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 function buildFlashMessage(notionAuth: string | null, reason: string | null): string | null {
   if (notionAuth === "connected") {

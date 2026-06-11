@@ -6,7 +6,7 @@ import type { getRedis } from "../../lib/redis.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { TenantOrgSettingsStore } from "../tenant-org-settings-store.js";
 
-import { OpenRouterPiiProvider } from "./openrouter-pii-provider.js";
+import { OpenAiCompatiblePiiProvider } from "./openai-compatible-pii-provider.js";
 import {
   DisabledPiiCircuitBreaker,
   createPiiCircuitBreaker,
@@ -36,7 +36,7 @@ export function buildPiiServices(input: {
   const piiCircuitBreaker: PiiCircuitBreaker = config.PII_BREAKER_ENABLED
     ? createPiiCircuitBreaker({
         redis,
-        name: "openrouter",
+        name: "pii-llm",
         failureThreshold: config.PII_BREAKER_FAILURE_THRESHOLD,
         windowMs: config.PII_BREAKER_WINDOW_MS,
         cooldownMs: config.PII_BREAKER_COOLDOWN_MS,
@@ -45,11 +45,11 @@ export function buildPiiServices(input: {
       })
     : new DisabledPiiCircuitBreaker();
 
-  const piiProvider = config.PII_PROVIDER_ENABLED && config.PII_OPENROUTER_API_KEY
-    ? new OpenRouterPiiProvider({
-        baseUrl: config.PII_OPENROUTER_BASE_URL,
-        apiKey: config.PII_OPENROUTER_API_KEY,
-        model: config.PII_OPENROUTER_MODEL,
+  const piiProvider = config.PII_PROVIDER_ENABLED && config.PII_LLM_API_KEY
+    ? new OpenAiCompatiblePiiProvider({
+        baseUrl: config.PII_LLM_BASE_URL,
+        apiKey: config.PII_LLM_API_KEY,
+        model: config.PII_LLM_MODEL,
         timeoutMs: config.PII_PROVIDER_TIMEOUT_MS,
         breaker: piiCircuitBreaker
       })

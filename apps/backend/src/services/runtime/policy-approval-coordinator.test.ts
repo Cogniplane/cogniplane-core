@@ -170,6 +170,74 @@ test("a decision after the TTL fired does not double-resolve", async () => {
   expect(late).toBe("missing");
 });
 
+test("a TTL tick during the decision's DB write cannot flip an approved decision to expired", async () => {
+  const { coordinator, approvals, audit, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const promise = coordinator.request(baseRequest);
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  // Gate the DB decision write so the TTL deadline passes while it's in flight.
+  const originalResolve = approvals.resolve.bind(approvals);
+  let releaseDb!: () => void;
+  const dbGate = new Promise<void>((r) => {
+    releaseDb = r;
+  });
+  approvals.resolve = async (tenantId, id, userId, decision) => {
+    await dbGate;
+    return originalResolve(tenantId, id, userId, decision);
+  };
+
+  const decisionPromise = coordinator.resolve({
+    tenantId: "t1",
+    approvalId,
+    userId: "u1",
+    decision: "approve"
+  });
+  // The entry was claimed synchronously, so the expiry timer is already
+  // disarmed — advancing past the TTL must not settle the promise as expired.
+  await vi.advanceTimersByTimeAsync(10_000);
+  releaseDb();
+
+  await expect(decisionPromise).resolves.toBe("resolved");
+  await expect(promise).resolves.toBe("approve");
+  expect(approvals.rows.get(approvalId)?.status).toBe("approved");
+  expect(audit.events.some((e) => e.type === "approval.expired")).toBe(false);
+});
+
+test("a decision on a row already settled externally releases the held promise as expired", async () => {
+  const { coordinator, approvals, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const promise = coordinator.request(baseRequest);
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  // External path (sweep/teardown) flips the row without touching the
+  // coordinator. The decision claims the entry, finds the row gone, and must
+  // release the gateway itself instead of leaving it hanging.
+  approvals.rows.get(approvalId)!.status = "expired";
+
+  const late = await coordinator.resolve({ tenantId: "t1", approvalId, userId: "u1", decision: "approve" });
+  expect(late).toBe("missing");
+  await expect(promise).resolves.toBe("expired");
+  expect(coordinator.has(approvalId)).toBe(false);
+});
+
+test("a DB failure during the decision write denies the held tool call and rethrows", async () => {
+  const { coordinator, approvals, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const promise = coordinator.request(baseRequest);
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  approvals.resolve = async () => {
+    throw new Error("approvals table unavailable");
+  };
+
+  await expect(
+    coordinator.resolve({ tenantId: "t1", approvalId, userId: "u1", decision: "approve" })
+  ).rejects.toThrow("approvals table unavailable");
+  await expect(promise).resolves.toBe("expired");
+  expect(coordinator.has(approvalId)).toBe(false);
+});
+
 test("a reminder notice is emitted at the configured fraction of the TTL", async () => {
   const { coordinator, pushed } = build({ ttlMs: 10_000, reminderFraction: 0.5 });
   void coordinator.request(baseRequest);
@@ -284,15 +352,103 @@ test("an externally-expired row still resolves the held promise on the TTL tick 
   expect(audit.events.length).toBe(auditCountBefore);
 });
 
-test("cancelAll denies every pending approval", async () => {
-  const { coordinator, pushed } = build();
-  const p1 = coordinator.request(baseRequest);
+test("gateway disconnect releases the hold, expires the row, and a late decision finds nothing", async () => {
+  const { coordinator, approvals, audit, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const abort = new AbortController();
+  const promise = coordinator.request({ ...baseRequest, signal: abort.signal });
   await vi.advanceTimersByTimeAsync(0);
-  const p2 = coordinator.request({ ...baseRequest, sessionId: "s2" });
-  await vi.advanceTimersByTimeAsync(0);
-  expect(pushed.length).toBeGreaterThanOrEqual(2);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
 
-  coordinator.cancelAll("session torn down");
-  await expect(p1).resolves.toBe("reject");
-  await expect(p2).resolves.toBe("reject");
+  // The runtime's HTTP client gives up while the approval is pending.
+  abort.abort();
+  await expect(promise).resolves.toBe("expired");
+  await vi.advanceTimersByTimeAsync(0);
+
+  // The row is expired so a late human approve can't dispatch an unconsumed
+  // tool call.
+  expect(approvals.rows.get(approvalId)?.status).toBe("expired");
+  expect(
+    audit.events.some(
+      (e) => e.type === "approval.expired" && e.payload.reason === "client_disconnected"
+    )
+  ).toBe(true);
+  // The UI gets a notice so the dead prompt can be cleared.
+  expect(
+    pushed.some(
+      (p) =>
+        p.event.type === "framework:runtime_notice" &&
+        (p.event as { noticeId: string }).noticeId === `policy-approval-expired:${approvalId}`
+    )
+  ).toBe(true);
+
+  const late = await coordinator.resolve({ tenantId: "t1", approvalId, userId: "u1", decision: "approve" });
+  expect(late).toBe("missing");
+});
+
+test("an already-aborted signal denies without writing a row or prompting", async () => {
+  const { coordinator, approvals, pushed } = build();
+  const abort = new AbortController();
+  abort.abort();
+
+  const result = await coordinator.request({ ...baseRequest, signal: abort.signal });
+  expect(result).toBe("reject");
+  expect(approvals.createCalls).toBe(0);
+  expect(pushed).toHaveLength(0);
+});
+
+test("a disconnect during the decision's DB write withholds the tool dispatch (Codex review follow-up)", async () => {
+  // The abort listener is detached when resolve() claims the entry, so a
+  // disconnect during the DB write goes unobserved by the listener. resolve()
+  // must re-check the signal before releasing the hold: the decision is
+  // recorded, but the tool must not dispatch into a dead connection.
+  const { coordinator, approvals, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const abort = new AbortController();
+  const promise = coordinator.request({ ...baseRequest, signal: abort.signal });
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  // Gate the DB write so the disconnect can land mid-flight.
+  const originalResolve = approvals.resolve.bind(approvals);
+  let releaseDb!: () => void;
+  const dbGate = new Promise<void>((r) => {
+    releaseDb = r;
+  });
+  approvals.resolve = async (tenantId, id, userId, decision) => {
+    await dbGate;
+    return originalResolve(tenantId, id, userId, decision);
+  };
+
+  const decisionPromise = coordinator.resolve({
+    tenantId: "t1",
+    approvalId,
+    userId: "u1",
+    decision: "approve"
+  });
+  abort.abort();
+  releaseDb();
+
+  // The decision is recorded as the user made it…
+  await expect(decisionPromise).resolves.toBe("resolved");
+  expect(approvals.rows.get(approvalId)?.status).toBe("approved");
+  // …but the held gateway promise resolves expired, so no dispatch happens.
+  await expect(promise).resolves.toBe("expired");
+});
+
+test("an abort after the decision settled is a no-op (listener detached on claim)", async () => {
+  const { coordinator, approvals, audit, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const abort = new AbortController();
+  const promise = coordinator.request({ ...baseRequest, signal: abort.signal });
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  await coordinator.resolve({ tenantId: "t1", approvalId, userId: "u1", decision: "approve" });
+  await expect(promise).resolves.toBe("approve");
+  const auditCountBefore = audit.events.length;
+
+  abort.abort();
+  await vi.advanceTimersByTimeAsync(0);
+
+  // No second settle, no expiry of the approved row, no extra audit.
+  expect(approvals.rows.get(approvalId)?.status).toBe("approved");
+  expect(audit.events.length).toBe(auditCountBefore);
 });

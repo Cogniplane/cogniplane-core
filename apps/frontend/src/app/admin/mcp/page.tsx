@@ -1,10 +1,8 @@
 "use client";
 
 import { useAdminMcpData } from "../../../hooks/use-admin-mcp-data";
-import { AdminMcpCard } from "../../../components/admin-mcp-card";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { AdminMcpCard } from "../../../components/admin/mcp/admin-mcp-card";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminMcpPage() {
   const {

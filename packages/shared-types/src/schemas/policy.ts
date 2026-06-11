@@ -53,18 +53,27 @@ export type PolicyTurnContext = (typeof POLICY_TURN_CONTEXTS)[number];
 //   severities   — read_only / file_change / command_execution
 //   turnContexts — interactive vs scheduled/unattended
 //
-// The schema is `.passthrough()` so a future dimension (connector, role, PII,
-// team/group) can be stored and matched without a schema rewrite — the engine
-// learns it, the lint warns on anything outside POLICY_CONDITION_KEYS.
-export const PolicyConditionsSchema = z
-  .object({
-    toolNames: z.array(z.string().min(1)).optional(),
-    categories: z.array(z.string().min(1)).optional(),
-    severities: z.array(PolicySeveritySchema).optional(),
-    turnContexts: z.array(PolicyTurnContextSchema).optional()
-  })
-  .passthrough();
+// One field map, two schemas. The STORED/read shape is `.passthrough()` so a
+// future dimension (connector, role, PII, team/group) already written by newer
+// code survives a round-trip through older readers. The admin INPUT shape is
+// `.strict()`: a typo'd key (`toolName` instead of `toolNames`) must 400 at
+// create/patch — stored, it would be dropped by the engine's condition reader
+// and silently turn the rule into a catch-all (a typo'd high-priority allow
+// short-circuits blocks; a typo'd block is a tenant-wide outage in enforce
+// mode). When a new dimension lands, add it to this map and to
+// POLICY_CONDITION_KEYS in the same change.
+const policyConditionDimensions = {
+  toolNames: z.array(z.string().min(1)).optional(),
+  categories: z.array(z.string().min(1)).optional(),
+  severities: z.array(PolicySeveritySchema).optional(),
+  turnContexts: z.array(PolicyTurnContextSchema).optional()
+} as const;
+
+export const PolicyConditionsSchema = z.object(policyConditionDimensions).passthrough();
 export type PolicyConditions = z.infer<typeof PolicyConditionsSchema>;
+
+export const PolicyConditionsInputSchema = z.object(policyConditionDimensions).strict();
+export type PolicyConditionsInput = z.infer<typeof PolicyConditionsInputSchema>;
 
 // The dimension keys the engine actually evaluates. `PolicyConditionsSchema` is
 // `.passthrough()` so a future dimension can be stored before the engine learns
@@ -113,7 +122,9 @@ const policyRuleFields = {
   priority: z.number().int().min(0).max(100000).optional(),
   enabled: z.boolean().optional(),
   effect: PolicyEffectSchema.optional(),
-  conditions: PolicyConditionsSchema.optional(),
+  // Strict input variant: unknown/typo'd condition keys 400 instead of
+  // becoming stored catch-all rules (see PolicyConditionsInputSchema).
+  conditions: PolicyConditionsInputSchema.optional(),
   reason: z.string().trim().max(2000).nullable().optional()
 } as const;
 

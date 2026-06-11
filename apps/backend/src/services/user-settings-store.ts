@@ -1,4 +1,5 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
+import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 
 export const userSettingsSectionKeys = ["scheduled_jobs", "github", "skills", "mcp", "model"] as const;
 
@@ -27,6 +28,15 @@ export type ScheduledJobRunRecord = {
   errorMessage: string | null;
   summary: string | null;
   createdAt: string;
+};
+
+/** Identifying fields of a pending run recovered by `sweepStaleJobRuns`. */
+export type OrphanedJobRunRecord = {
+  tenantId: string;
+  runId: string;
+  jobId: string;
+  userId: string;
+  sessionId: string | null;
 };
 
 export type ScheduledJobRecord = {
@@ -62,8 +72,8 @@ function mapSection(row: Record<string, unknown>): UserSettingsSectionRecord {
     sectionKey: String(row.section_key) as UserSettingsSectionKey,
     version: Number(row.version),
     config: toRecord(row.config_json),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -83,10 +93,10 @@ function mapScheduledJob(row: Record<string, unknown>): ScheduledJobRecord {
     settingsSnapshot: toRecord(row.settings_snapshot_json),
     enabled: Boolean(row.enabled),
     consecutiveFailures: Number(row.consecutive_failures ?? 0),
-    lastRunAt: row.last_run_at ? new Date(String(row.last_run_at)).toISOString() : null,
-    nextRunAt: row.next_run_at ? new Date(String(row.next_run_at)).toISOString() : null,
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    lastRunAt: isoTimestampOrNull(row.last_run_at),
+    nextRunAt: isoTimestampOrNull(row.next_run_at),
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -97,14 +107,14 @@ function mapScheduledJobRun(row: Record<string, unknown>): ScheduledJobRunRecord
     userId: String(row.user_id),
     sessionId: row.session_id ? String(row.session_id) : null,
     status: String(row.status),
-    startedAt: new Date(String(row.started_at)).toISOString(),
-    completedAt: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null,
+    startedAt: isoTimestamp(row.started_at),
+    completedAt: isoTimestampOrNull(row.completed_at),
     durationMs: row.duration_ms !== null && row.duration_ms !== undefined ? Number(row.duration_ms) : null,
     inputTokens: Number(row.input_tokens ?? 0),
     outputTokens: Number(row.output_tokens ?? 0),
     errorMessage: row.error_message ? String(row.error_message) : null,
     summary: row.summary ? String(row.summary) : null,
-    createdAt: new Date(String(row.created_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at)
   };
 }
 
@@ -168,6 +178,25 @@ export class UserSettingsStore {
       );
 
       return result.rows.map((row) => mapScheduledJob(row));
+    });
+  }
+
+  async getScheduledJob(
+    tenantId: string,
+    jobId: string,
+    userId: string
+  ): Promise<ScheduledJobRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          SELECT *
+          FROM scheduled_jobs
+          WHERE tenant_id = $1 AND job_id = $2 AND user_id = $3
+        `,
+        [tenantId, jobId, userId]
+      );
+
+      return result.rows[0] ? mapScheduledJob(result.rows[0]) : null;
     });
   }
 
@@ -475,6 +504,48 @@ export class UserSettingsStore {
 
       return mapScheduledJobRun(result.rows[0]);
     });
+  }
+
+  /**
+   * Recover run rows orphaned by a crash/restart: stuck in `status='pending'`
+   * with no live `executeJob` to ever call `completeJobRun`. Marks them failed
+   * with a deterministic error message and returns identifying fields so the
+   * caller can audit each one. Cross-tenant by design (runs on the
+   * RLS-bypassing scheduler pool); `olderThanMs` must exceed the longest a
+   * healthy run can legitimately stay pending (job timeout + abort-settle
+   * grace), so a live in-flight run is never swept. If a presumed-dead run
+   * does settle later, its `completeJobRun` overwrites this row with the true
+   * outcome — acceptable, since that outcome is strictly more accurate.
+   * `FOR UPDATE SKIP LOCKED` keeps concurrent sweeps from double-claiming.
+   */
+  async sweepStaleJobRuns(olderThanMs: number, limit = 100): Promise<OrphanedJobRunRecord[]> {
+    const result = await this.schedulerDb.query(
+      `
+        UPDATE scheduled_job_runs
+        SET status = 'failed',
+            completed_at = NOW(),
+            error_message = 'Run orphaned by a scheduler crash or restart'
+        WHERE run_id IN (
+          SELECT run_id
+          FROM scheduled_job_runs
+          WHERE status = 'pending'
+            AND started_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          ORDER BY started_at ASC
+          LIMIT $2
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING tenant_id, run_id, job_id, user_id, session_id
+      `,
+      [olderThanMs, limit]
+    );
+
+    return result.rows.map((row) => ({
+      tenantId: String(row.tenant_id),
+      runId: String(row.run_id),
+      jobId: String(row.job_id),
+      userId: String(row.user_id),
+      sessionId: row.session_id ? String(row.session_id) : null
+    }));
   }
 
   async listJobRuns(tenantId: string, jobId: string, userId: string): Promise<ScheduledJobRunRecord[]> {

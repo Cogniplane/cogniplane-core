@@ -8,7 +8,7 @@ export type PiiMode = z.infer<typeof PiiModeSchema>;
 export const PiiRawRetentionSchema = z.enum(["never", "admin_only", "reversible_encrypted"]);
 export type PiiRawRetention = z.infer<typeof PiiRawRetentionSchema>;
 
-export const PiiProviderTypeSchema = z.enum(["openrouter"]);
+export const PiiProviderTypeSchema = z.enum(["openai-compatible"]);
 export type PiiProviderType = z.infer<typeof PiiProviderTypeSchema>;
 
 export const PiiEntityTypeSchema = z.enum([
@@ -50,7 +50,7 @@ export const PiiBreakerStateSchema = z.enum(["closed", "open", "half_open"]);
 export type PiiBreakerState = z.infer<typeof PiiBreakerStateSchema>;
 
 export const PiiProviderStatusSchema = z.object({
-  provider: z.literal("openrouter"),
+  provider: z.literal("pii-llm"),
   state: PiiBreakerStateSchema,
   failureCount: z.number(),
   // Wall-clock millis. null when state === "closed" / "half_open".

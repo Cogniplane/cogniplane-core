@@ -174,7 +174,7 @@ test("setPiiProtection round-trips through the JSONB column", async () => {
     enabled: true,
     mode: "detect",
     rawRetention: "never",
-    provider: { type: "openrouter", model: "meta/llama-guard" },
+    provider: { type: "openai-compatible", model: "meta/llama-guard" },
     scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
     actions: { reportToAdmins: true },
     detectors: { useRulesFirst: true, entityTypes: ["email"] }

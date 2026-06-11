@@ -29,7 +29,7 @@ test("POST /messages in block mode persists a system message and does not dispat
             action: "block",
             findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
             blockReason: "email",
-            providerType: "openrouter",
+            providerType: "openai-compatible",
             providerModel: "google/gemini-2.5-flash"
           };
         }
@@ -91,7 +91,7 @@ test("POST /messages in transform mode emits runtime.user_message_replaced and s
             action: "transform",
             transformedText: "my email is [REDACTED:email]",
             findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
-            providerType: "openrouter",
+            providerType: "openai-compatible",
             providerModel: "google/gemini-2.5-flash"
           };
         }
@@ -155,7 +155,7 @@ test("POST /messages in detect mode persists raw user message with report metada
           return {
             action: "report",
             findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
-            providerType: "openrouter",
+            providerType: "openai-compatible",
             providerModel: "google/gemini-2.5-flash"
           };
         }
@@ -242,7 +242,7 @@ test("POST /messages returns HTTP 503 pii_provider_unavailable when provider fai
   expect(persisted.length).toBe(0);
 });
 
-test("POST /messages does not consume rate limit or turn quota when PII provider fails", async () => {
+test("POST /messages consumes a rate-limit token but never turn quota when PII provider fails", async () => {
   const { app, limits } = await createTestApp({
     pii: {
       piiProtection: {
@@ -285,6 +285,106 @@ test("POST /messages does not consume rate limit or turn quota when PII provider
   });
 
   expect(response.statusCode).toBe(503);
-  expect(messageRateLimitCalls).toBe(0);
+  // The rate limit gates the PII provider call itself (an LLM inference), so
+  // a token is spent before evaluation. The daily turn quota is only spent on
+  // turns that pass the PII gate — never on a fail-closed 503.
+  expect(messageRateLimitCalls).toBe(1);
   expect(turnQuotaCalls).toBe(0);
+});
+
+test("POST /messages consumes a rate-limit token but no turn quota for a PII-blocked turn", async () => {
+  const { app, limits } = await createTestApp({
+    pii: {
+      piiProtection: {
+        async evaluateText() {
+          return {
+            action: "block",
+            findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
+            blockReason: "email",
+            providerType: "openai-compatible",
+            providerModel: "google/gemini-2.5-flash"
+          };
+        }
+      },
+      piiScanRuns: {
+        async create() {
+          return { scanRunId: "scan-blk-2" };
+        }
+      }
+    }
+  });
+  onTestFinished(async () => { await app.close(); });
+
+  const sessionId = await createSessionFor(app);
+
+  let messageRateLimitCalls = 0;
+  let turnQuotaCalls = 0;
+  const originalRateLimit = limits.consumeRateLimit.bind(limits);
+  const originalTurnQuota = limits.consumeTurnQuota.bind(limits);
+  limits.consumeRateLimit = async (input) => {
+    if (input.resource === "message_turn") messageRateLimitCalls += 1;
+    return originalRateLimit(input);
+  };
+  limits.consumeTurnQuota = async (input) => {
+    turnQuotaCalls += 1;
+    return originalTurnQuota(input);
+  };
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/messages",
+    headers: { "x-user-id": "platform-user" },
+    payload: { sessionId, text: "my email is user@example.com" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  const events = parseSseEvents(response.payload);
+  expect(events.some((entry) => entry.event === "framework:message_blocked")).toBe(true);
+  // Probing the PII filter costs a rate-limit token per attempt, but a
+  // blocked turn was never dispatched and must not spend daily quota.
+  expect(messageRateLimitCalls).toBe(1);
+  expect(turnQuotaCalls).toBe(0);
+});
+
+test("POST /messages does not call the PII provider when the rate limit is exhausted", async () => {
+  let evaluateCalls = 0;
+  const { app, limits } = await createTestApp({
+    pii: {
+      piiProtection: {
+        async evaluateText() {
+          evaluateCalls += 1;
+          return {
+            action: "allow",
+            findings: [],
+            providerType: "openai-compatible",
+            providerModel: "google/gemini-2.5-flash"
+          };
+        }
+      },
+      piiScanRuns: {
+        async create() {
+          throw new Error("should not be called");
+        }
+      }
+    }
+  });
+  onTestFinished(async () => { await app.close(); });
+
+  const sessionId = await createSessionFor(app);
+
+  limits.consumeRateLimit = async (input) =>
+    input.resource === "message_turn"
+      ? { error: "rate_limited", message: "Too many requests.", retryAfterMs: 1000 }
+      : null;
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/messages",
+    headers: { "x-user-id": "platform-user" },
+    payload: { sessionId, text: "my email is user@example.com" }
+  });
+
+  expect(response.statusCode).toBe(429);
+  // An over-limit user must not be able to trigger PII-provider inference.
+  expect(evaluateCalls).toBe(0);
 });

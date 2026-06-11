@@ -183,7 +183,7 @@ test("PiiScanJobHandler persists report findings and attaches findingsCount", as
       findings: [
         { entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }
       ],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "google/gemini-2.5-flash"
     }
   });
@@ -205,7 +205,7 @@ test("PiiScanJobHandler records a blocked outcome with block reason on the subje
         { entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }
       ],
       blockReason: "email",
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "google/gemini-2.5-flash"
     }
   });
@@ -259,7 +259,7 @@ test("PiiScanJobHandler emits pii_reported audit event for report decisions", as
       findings: [
         { entityType: "email", value: "", start: 0, end: 7, confidence: "high" }
       ],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "google/gemini"
     },
     withAuditEvents: true
@@ -278,7 +278,7 @@ test("PiiScanJobHandler emits pii_blocked audit event for block decisions", asyn
     decision: {
       action: "block",
       findings: [],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "m",
       blockReason: "email"
     },
@@ -297,7 +297,7 @@ test("PiiScanJobHandler skips audit emission when sourceUserId is null", async (
     decision: {
       action: "report",
       findings: [],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "m"
     },
     withAuditEvents: true

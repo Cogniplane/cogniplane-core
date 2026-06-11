@@ -18,7 +18,7 @@
 // AuditEventType` and still get the discipline at consumption.
 
 export const AUDIT_EVENT_TYPES = [
-  // Admin — MCP servers (registerAdminCrud emits the dynamic verb suffixes).
+  // Admin — MCP servers (emitted by admin-mcp-server-routes.ts).
   "admin.mcp_server.created",
   "admin.mcp_server.updated",
   "admin.mcp_server.disabled",
@@ -58,6 +58,10 @@ export const AUDIT_EVENT_TYPES = [
   // counterpart (bad/missing rt_*, expired claim, blocked egress IP).
   "llm.proxy.forwarded",
   "llm.proxy.rejected",
+
+  // MCP gateway egress-control refusals (CIDR allowlist / per-runtime IP
+  // pin) — the /mcp counterpart of llm.proxy.rejected.
+  "mcp.gateway.rejected",
 
   // PII pipeline (action-taken outcomes).
   "pii_blocked",

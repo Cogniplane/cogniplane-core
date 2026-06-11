@@ -1,4 +1,5 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
+import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 export type ApprovalKind = "command_execution" | "file_change" | "permissions";
@@ -49,10 +50,10 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
       row.request_payload && typeof row.request_payload === "object"
         ? (row.request_payload as Record<string, unknown>)
         : {},
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString(),
-    resolvedAt: row.resolved_at ? new Date(String(row.resolved_at)).toISOString() : null,
-    expiresAt: new Date(String(row.expires_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at),
+    resolvedAt: isoTimestampOrNull(row.resolved_at),
+    expiresAt: isoTimestamp(row.expires_at)
   };
 }
 

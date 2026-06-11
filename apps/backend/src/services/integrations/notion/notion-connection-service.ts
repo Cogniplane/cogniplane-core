@@ -5,6 +5,11 @@ import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import type { AuditEventStore } from "../../audit-event-store.js";
 import type { NotionConnectionRecord, NotionConnectionStore } from "./notion-connection-store.js";
 import type { RuntimeInvalidator } from "../contracts.js";
+import {
+  buildIntegrationRedirectUrl,
+  getSecretKey,
+  toIsoFromNow
+} from "../integration-oauth-helpers.js";
 
 const NOTION_AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize";
 const NOTION_TOKEN_URL = "https://api.notion.com/v1/oauth/token";
@@ -83,16 +88,6 @@ export class NotionConnectionNotConfiguredError extends Error {
   constructor(message = "Notion integration is not configured.") {
     super(message);
   }
-}
-
-function getSecretKey(config: AppConfig): Uint8Array {
-  return new TextEncoder().encode(config.JWT_SECRET);
-}
-
-function toIsoFromNow(seconds: number | undefined): string | null {
-  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
-    ? new Date(Date.now() + seconds * 1000).toISOString()
-    : null;
 }
 
 function isExpired(value: string | null): boolean {
@@ -183,13 +178,13 @@ export class NotionConnectionService {
   }
 
   async completeAuthorization(input: { code?: string | null; state?: string | null }): Promise<string> {
-    const fallbackUrl = this.buildRedirectUrl("/settings/notion", {
+    const fallbackUrl = buildIntegrationRedirectUrl(this.config, "/settings/notion", {
       notionAuth: "error",
       reason: "invalid_state"
     });
 
     if (!input.code || !input.state) {
-      return this.buildRedirectUrl("/settings/notion", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "error",
         reason: input.code ? "missing_state" : "missing_code"
       });
@@ -214,7 +209,7 @@ export class NotionConnectionService {
     try {
       const oauth = readNotionConfig(this.config);
       if (!oauth) {
-        return this.buildRedirectUrl("/settings/notion", {
+        return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
           notionAuth: "error",
           reason: "notion_not_configured"
         });
@@ -285,11 +280,11 @@ export class NotionConnectionService {
       });
       await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "notion");
 
-      return this.buildRedirectUrl("/settings/notion", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "connected"
       });
     } catch (error) {
-      return this.buildRedirectUrl("/settings/notion", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "error",
         reason: error instanceof Error ? error.message : "notion_authorization_failed"
       });
@@ -341,11 +336,4 @@ export class NotionConnectionService {
     };
   }
 
-  private buildRedirectUrl(pathname: string, params: Record<string, string>): string {
-    const url = new URL(pathname, this.config.API_ORIGIN);
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, value);
-    }
-    return url.toString();
-  }
 }

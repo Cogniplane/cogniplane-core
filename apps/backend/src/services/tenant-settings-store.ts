@@ -1,10 +1,12 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
+import { AdminConfigError } from "./admin-config-error.js";
 import { computeConfigHash } from "../lib/crypto-utils.js";
 
 import type { PolicyEnforcementMode, WebSearchMode } from "@cogniplane/shared-types";
 
 import type { ApprovalPolicy, ApprovalReviewer, RuntimeProvider } from "./admin-config-records.js";
 import { parseApprovalPolicy, parseApprovalReviewer } from "./admin-config-store-mappers.js";
+import { isoTimestamp } from "../lib/db-mappers.js";
 
 export const DEFAULT_TENANT_TOOL_IDS = [
   "managed-session-context",
@@ -87,7 +89,7 @@ function mapRow(row: Record<string, unknown>): TenantSettingsRecord {
     enabledMcpServerIds: toStringArray(row.enabled_mcp_server_ids),
     version: Number(row.version),
     configHash: String(row.config_hash),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -148,66 +150,78 @@ export class TenantSettingsStore {
   }
 
   async upsert(tenantId: string, input: TenantSettingsInput): Promise<TenantSettingsRecord> {
-    const existing = await this.get(tenantId);
-    const defaults = buildDefaultTenantSettingsInput();
-
-    const resolvedEnabledRuntimeProviders = hasOwn(input, "enabledRuntimeProviders")
-      ? normalizeRuntimeProviders(input.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders)
-      : (existing?.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders);
-    if (resolvedEnabledRuntimeProviders.length === 0) {
-      throw new Error("At least one runtime provider must be enabled.");
-    }
-    const resolvedPolicy = hasOwn(input, "approvalPolicy")
-      ? (input.approvalPolicy ?? defaults.approvalPolicy)
-      : (existing?.approvalPolicy ?? defaults.approvalPolicy);
-    const resolvedShowEffortSelector = hasOwn(input, "showEffortSelector")
-      ? (input.showEffortSelector ?? defaults.showEffortSelector)
-      : (existing?.showEffortSelector ?? defaults.showEffortSelector);
-    const resolvedWebSearchMode = hasOwn(input, "webSearchMode")
-      ? (input.webSearchMode ?? defaults.webSearchMode)
-      : (existing?.webSearchMode ?? defaults.webSearchMode);
-    const resolvedReviewer = hasOwn(input, "approvalReviewer")
-      ? (input.approvalReviewer ?? defaults.approvalReviewer)
-      : (existing?.approvalReviewer ?? defaults.approvalReviewer);
-    const resolvedCommandExec = hasOwn(input, "allowCommandExecution")
-      ? (input.allowCommandExecution ?? defaults.allowCommandExecution)
-      : (existing?.allowCommandExecution ?? defaults.allowCommandExecution);
-    const resolvedTokenFwd = hasOwn(input, "allowUserTokenForwarding")
-      ? (input.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding)
-      : (existing?.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding);
-    const resolvedReadOnly = hasOwn(input, "autoApproveReadOnlyTools")
-      ? (input.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools)
-      : (existing?.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools);
-    const resolvedPolicyEnforcementMode = hasOwn(input, "policyEnforcementMode")
-      ? (input.policyEnforcementMode ?? defaults.policyEnforcementMode)
-      : (existing?.policyEnforcementMode ?? defaults.policyEnforcementMode);
-    const resolvedInstructions = hasOwn(input, "developerInstructions")
-      ? (input.developerInstructions ?? defaults.developerInstructions)
-      : (existing?.developerInstructions ?? defaults.developerInstructions);
-    const resolvedToolIds = hasOwn(input, "enabledToolIds")
-      ? (input.enabledToolIds ?? defaults.enabledToolIds)
-      : (existing?.enabledToolIds ?? defaults.enabledToolIds);
-    const resolvedMcpIds = hasOwn(input, "enabledMcpServerIds")
-      ? (input.enabledMcpServerIds ?? defaults.enabledMcpServerIds)
-      : (existing?.enabledMcpServerIds ?? defaults.enabledMcpServerIds);
-
-    const configHash = computeConfigHash({
-      tenantId,
-      enabledRuntimeProviders: resolvedEnabledRuntimeProviders,
-      showEffortSelector: resolvedShowEffortSelector,
-      webSearchMode: resolvedWebSearchMode,
-      approvalPolicy: resolvedPolicy,
-      approvalReviewer: resolvedReviewer,
-      allowCommandExecution: resolvedCommandExec,
-      allowUserTokenForwarding: resolvedTokenFwd,
-      autoApproveReadOnlyTools: resolvedReadOnly,
-      policyEnforcementMode: resolvedPolicyEnforcementMode,
-      developerInstructions: resolvedInstructions,
-      enabledToolIds: resolvedToolIds,
-      enabledMcpServerIds: resolvedMcpIds
-    });
-
     return withTenantScope(this.db, tenantId, async (client) => {
+      // Serialize upserts per tenant: the merge below is a read-modify-write,
+      // and a row lock alone cannot cover the first-insert race (no row to
+      // lock). The advisory lock is transaction-scoped and released on
+      // COMMIT/ROLLBACK.
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtextextended('tenant_settings:' || $1, 0))`,
+        [tenantId]
+      );
+      const existingResult = await client.query(
+        `SELECT * FROM tenant_settings WHERE tenant_id = $1 FOR UPDATE`,
+        [tenantId]
+      );
+      const existing = existingResult.rows[0] ? mapRow(existingResult.rows[0]) : null;
+      const defaults = buildDefaultTenantSettingsInput();
+
+      const resolvedEnabledRuntimeProviders = hasOwn(input, "enabledRuntimeProviders")
+        ? normalizeRuntimeProviders(input.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders)
+        : (existing?.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders);
+      if (resolvedEnabledRuntimeProviders.length === 0) {
+        throw new AdminConfigError("At least one runtime provider must be enabled.");
+      }
+      const resolvedPolicy = hasOwn(input, "approvalPolicy")
+        ? (input.approvalPolicy ?? defaults.approvalPolicy)
+        : (existing?.approvalPolicy ?? defaults.approvalPolicy);
+      const resolvedShowEffortSelector = hasOwn(input, "showEffortSelector")
+        ? (input.showEffortSelector ?? defaults.showEffortSelector)
+        : (existing?.showEffortSelector ?? defaults.showEffortSelector);
+      const resolvedWebSearchMode = hasOwn(input, "webSearchMode")
+        ? (input.webSearchMode ?? defaults.webSearchMode)
+        : (existing?.webSearchMode ?? defaults.webSearchMode);
+      const resolvedReviewer = hasOwn(input, "approvalReviewer")
+        ? (input.approvalReviewer ?? defaults.approvalReviewer)
+        : (existing?.approvalReviewer ?? defaults.approvalReviewer);
+      const resolvedCommandExec = hasOwn(input, "allowCommandExecution")
+        ? (input.allowCommandExecution ?? defaults.allowCommandExecution)
+        : (existing?.allowCommandExecution ?? defaults.allowCommandExecution);
+      const resolvedTokenFwd = hasOwn(input, "allowUserTokenForwarding")
+        ? (input.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding)
+        : (existing?.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding);
+      const resolvedReadOnly = hasOwn(input, "autoApproveReadOnlyTools")
+        ? (input.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools)
+        : (existing?.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools);
+      const resolvedPolicyEnforcementMode = hasOwn(input, "policyEnforcementMode")
+        ? (input.policyEnforcementMode ?? defaults.policyEnforcementMode)
+        : (existing?.policyEnforcementMode ?? defaults.policyEnforcementMode);
+      const resolvedInstructions = hasOwn(input, "developerInstructions")
+        ? (input.developerInstructions ?? defaults.developerInstructions)
+        : (existing?.developerInstructions ?? defaults.developerInstructions);
+      const resolvedToolIds = hasOwn(input, "enabledToolIds")
+        ? (input.enabledToolIds ?? defaults.enabledToolIds)
+        : (existing?.enabledToolIds ?? defaults.enabledToolIds);
+      const resolvedMcpIds = hasOwn(input, "enabledMcpServerIds")
+        ? (input.enabledMcpServerIds ?? defaults.enabledMcpServerIds)
+        : (existing?.enabledMcpServerIds ?? defaults.enabledMcpServerIds);
+
+      const configHash = computeConfigHash({
+        tenantId,
+        enabledRuntimeProviders: resolvedEnabledRuntimeProviders,
+        showEffortSelector: resolvedShowEffortSelector,
+        webSearchMode: resolvedWebSearchMode,
+        approvalPolicy: resolvedPolicy,
+        approvalReviewer: resolvedReviewer,
+        allowCommandExecution: resolvedCommandExec,
+        allowUserTokenForwarding: resolvedTokenFwd,
+        autoApproveReadOnlyTools: resolvedReadOnly,
+        policyEnforcementMode: resolvedPolicyEnforcementMode,
+        developerInstructions: resolvedInstructions,
+        enabledToolIds: resolvedToolIds,
+        enabledMcpServerIds: resolvedMcpIds
+      });
+
       const result = await client.query(
         `
           INSERT INTO tenant_settings (

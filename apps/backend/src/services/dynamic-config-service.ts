@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config.js";
+import { AdminConfigError } from "./admin-config-error.js";
 import {
   compileRuntimeConfig as compileRuntimeConfigBundle,
   normalizeMcpServer
@@ -87,10 +88,6 @@ export class DynamicConfigService {
 
   // --- Tenant Settings ---
 
-  async getTenantSettings(tenantId: string): Promise<TenantSettingsRecord | null> {
-    return this.stores.tenantSettings.get(tenantId);
-  }
-
   async updateTenantSettings(tenantId: string, input: TenantSettingsInput): Promise<TenantSettingsRecord> {
     await this.validateTenantSettingsReferences(tenantId, input);
     return this.stores.tenantSettings.upsert(tenantId, input);
@@ -110,7 +107,7 @@ export class DynamicConfigService {
   async getMcpServer(tenantId: string, serverId: string): Promise<McpServerRegistration> {
     const server = await this.stores.mcpServers.getMcpServer(tenantId, serverId);
     if (!server || !server.enabled) {
-      throw new Error(`Unknown MCP server: ${serverId}`);
+      throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
     }
 
     return normalizeMcpServer(server);
@@ -233,7 +230,7 @@ export class DynamicConfigService {
     if (tenantId !== "system") {
       const ownerTenantId = await this.stores.skills.getSkillOwnerTenantId(tenantId, input.skillId);
       if (ownerTenantId === "system") {
-        throw new Error(
+        throw new AdminConfigError(
           `Skill "${input.skillId}" is a system-provided skill and cannot be edited. ` +
             "Create a copy under a different skill id to customize it."
         );
@@ -273,7 +270,7 @@ export class DynamicConfigService {
       ?? buildDefaultTenantSettingsInput().enabledMcpServerIds;
 
     if (enabledMcpServerIds.includes(serverId)) {
-      throw new Error(
+      throw new AdminConfigError(
         `Cannot disable MCP server "${serverId}" — it is referenced by the tenant's active settings. Remove it from enabled MCP servers first.`
       );
     }
@@ -332,7 +329,7 @@ function validateEnabledMcpServerIds(
 ): void {
   const invalid = uniqueIds(enabledMcpServerIds.filter((serverId) => !validMcpServerIds.has(serverId)));
   if (invalid.length > 0) {
-    throw new Error(`Unknown enabled MCP server IDs: ${invalid.join(", ")}.`);
+    throw new AdminConfigError(`Unknown enabled MCP server IDs: ${invalid.join(", ")}.`);
   }
 }
 
@@ -349,6 +346,6 @@ function validateEnabledToolIds(
   ]);
   const invalid = uniqueIds(enabledToolIds.filter((toolId) => !validToolIds.has(toolId)));
   if (invalid.length > 0) {
-    throw new Error(`Unknown enabled tool IDs: ${invalid.join(", ")}.`);
+    throw new AdminConfigError(`Unknown enabled tool IDs: ${invalid.join(", ")}.`);
   }
 }

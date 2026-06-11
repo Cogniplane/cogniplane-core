@@ -1,24 +1,11 @@
 import { describe, expect, test } from "vitest";
 import type { Message } from "@cogniplane/shared-types";
 
-import {
-  formatCostUsd,
-  formatMessageTimestamp,
-  formatTokenCount,
-  shouldShowRetry
-} from "./message-list.logic";
+import { formatCostUsd, formatTokenCount, shouldShowRetry } from "./message-list.logic";
 
 function asMessage(overrides: Partial<Message>): Message {
   return { ...({} as Message), ...overrides } as Message;
 }
-
-describe("formatMessageTimestamp", () => {
-  test("returns a formatted hh:mm string", () => {
-    const iso = "2026-05-09T14:35:00Z";
-    const result = formatMessageTimestamp(iso);
-    expect(result).toMatch(/\d{1,2}:\d{2}/);
-  });
-});
 
 describe("formatTokenCount", () => {
   test("handles all magnitude buckets", () => {

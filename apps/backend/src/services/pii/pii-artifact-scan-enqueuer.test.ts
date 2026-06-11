@@ -208,7 +208,7 @@ test("block mode on a dirty artifact marks it failed and returns blocked", async
         { entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }
       ],
       blockReason: "email",
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "google/gemini-2.5-flash"
     }
   });
@@ -298,7 +298,7 @@ test("block mode 'report' decision counts findings and stamps scanned", async ()
     settings: { enabled: true, mode: "block" },
     decision: {
       action: "report",
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "google/gemini",
       findings: [
         { entityType: "email", value: "a@b", start: 0, end: 3, confidence: "high" },
@@ -315,7 +315,7 @@ test("block mode 'report' decision counts findings and stamps scanned", async ()
   // Scan run update carries provider info from the report
   const completed = scanRunUpdateCalls.find((c) => c.patch.status === "completed");
   expect(completed).toBeTruthy();
-  expect((completed!.patch.providerType as string)).toBe("openrouter");
+  expect((completed!.patch.providerType as string)).toBe("openai-compatible");
 });
 
 test("block mode allow with no provider info: providerType=null on completed run", async () => {
@@ -347,7 +347,7 @@ test("block decision emits pii_blocked audit event with subject metadata", async
     decision: {
       action: "block",
       findings: [],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "m",
       blockReason: "email"
     },
@@ -371,7 +371,7 @@ test("block decision: missing auditEvents store does not block the path", async 
     decision: {
       action: "block",
       findings: [],
-      providerType: "openrouter",
+      providerType: "openai-compatible",
       providerModel: "m",
       blockReason: "email"
     }

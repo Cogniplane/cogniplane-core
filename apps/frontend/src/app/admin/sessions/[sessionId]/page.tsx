@@ -4,20 +4,15 @@ import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { useMemo } from "react";
 
-import { AdminChatReplay } from "../../../../components/admin-chat-replay";
-import { AdminSessionDetailSidebar } from "../../../../components/admin-session-detail-sidebar";
-import { AdminSessionResourcesCard } from "../../../../components/admin-session-resources-card";
+import { AdminChatReplay } from "../../../../components/admin/sessions/admin-chat-replay";
+import { AdminSessionDetailSidebar } from "../../../../components/admin/sessions/admin-session-detail-sidebar";
+import { AdminSessionResourcesCard } from "../../../../components/admin/sessions/admin-session-resources-card";
 import { useAdminSessionDetailData } from "../../../../hooks/use-admin-session-detail";
 import type { AdminSessionDetailOverview } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
-const PILL_BASE = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium";
-const PILL_GRAY = `${PILL_BASE} bg-surface-container text-on-surface-variant`;
-const PILL_GREEN = `${PILL_BASE} bg-success-surface text-success`;
-const HINT = "text-sm text-on-surface-faint";
+import { formatTimestamp } from "../../../../lib/time-format";
+import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL } from "../../../../lib/ui-tokens";
 
 function buildBackHref(fromParam: string | null): string {
   if (!fromParam) return "/admin/sessions";
@@ -26,14 +21,6 @@ function buildBackHref(fromParam: string | null): string {
     return decoded ? `/admin/sessions?${decoded}` : "/admin/sessions";
   } catch {
     return "/admin/sessions";
-  }
-}
-
-function formatDateTime(value: string): string {
-  try {
-    return new Date(value).toLocaleString();
-  } catch {
-    return value;
   }
 }
 
@@ -70,7 +57,7 @@ function HeaderStrip(props: { overview: AdminSessionDetailOverview; backHref: st
             </h2>
             <p className="mt-1 text-sm text-on-surface-variant">
               {overview.userEmail ?? overview.userId} · started{" "}
-              {formatDateTime(overview.createdAt)}
+              {formatTimestamp(overview.createdAt)}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">

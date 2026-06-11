@@ -2,7 +2,9 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import { ensureUser } from "../../lib/db.js";
-import { apiError, getErrorMessage, notFoundError, validationError } from "../../lib/http-errors.js";
+import { apiError, notFoundError } from "../../lib/http-errors.js";
+import { parseRequestInput } from "../../lib/route-validation.js";
+import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
 
@@ -36,8 +38,15 @@ export function respondAdminMutationError(reply: FastifyReply, error: unknown, f
     return conflictError(error.constraint ? `${fallback} (${error.constraint}).` : fallback);
   }
 
-  reply.code(400);
-  return configError(getErrorMessage(error, fallback));
+  if (error instanceof AdminConfigError) {
+    reply.code(400);
+    return configError(error.message);
+  }
+
+  // Unexpected error (Postgres, SDK, fs, ...): rethrow so the global error
+  // handler logs the real cause and returns an opaque 500. Raw internal
+  // error strings must not reach the client.
+  throw error;
 }
 
 export async function requireAdmin(
@@ -67,74 +76,9 @@ export function withAdmin(
   };
 }
 
-export function parseAdminInput<T extends z.ZodTypeAny>(
-  reply: FastifyReply,
-  schema: T,
-  input: unknown
-) {
-  const parsed = schema.safeParse(input);
-  if (!parsed.success) {
-    reply.code(400);
-    return {
-      ok: false as const,
-      response: validationError(parsed.error)
-    };
-  }
-
-  return {
-    ok: true as const,
-    value: parsed.data
-  };
-}
-
-export const parseAdminBody = parseAdminInput;
-export const parseAdminParams = parseAdminInput;
-
-export function parseAdminCrudBody<T extends z.ZodTypeAny>(
-  reply: FastifyReply,
-  schema: T,
-  body: unknown,
-  idField: string
-) {
-  const bodyResult = parseAdminBody(reply, schema, body);
-  if (!bodyResult.ok) {
-    return bodyResult;
-  }
-
-  if (!(bodyResult.value as Record<string, unknown>)[idField]) {
-    reply.code(400);
-    return {
-      ok: false as const,
-      response: configError(`${idField} is required.`)
-    };
-  }
-
-  return bodyResult;
-}
-
-export function parseAdminCrudUpdateBody<T extends z.ZodTypeAny>(
-  reply: FastifyReply,
-  schema: T,
-  body: unknown,
-  idField: string,
-  expectedId: string
-) {
-  const bodyResult = parseAdminBody(reply, schema, body);
-  if (!bodyResult.ok) {
-    return bodyResult;
-  }
-
-  const providedId = (bodyResult.value as Record<string, unknown>)[idField];
-  if (providedId !== undefined && providedId !== expectedId) {
-    reply.code(400);
-    return {
-      ok: false as const,
-      response: configError(`${idField} must match the route parameter.`)
-    };
-  }
-
-  return bodyResult;
-}
+// Semantic names for the shared request-input parser at admin call sites.
+export const parseAdminBody = parseRequestInput;
+export const parseAdminParams = parseRequestInput;
 
 export function respondAdminNotFound(reply: FastifyReply, errorCode: string) {
   reply.code(404);

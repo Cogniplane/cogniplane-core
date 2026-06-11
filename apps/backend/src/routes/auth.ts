@@ -352,10 +352,6 @@ export async function registerAuthRoutes(
 
         const redis = requireRefreshTokenStore(app);
 
-        if (!payload.fid) {
-          return reply.code(401).send({ error: "token_revoked" });
-        }
-
         // Atomically consume the jti and detect replay against its family.
         const consumed = await consumeRefreshJti(redis, {
           jti: payload.jti,
@@ -453,18 +449,15 @@ export async function registerAuthRoutes(
       const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
 
       // Revoke the entire refresh-token family so any rotated jti from the
-      // same login chain becomes unusable. Legacy tokens (no fid) have no
-      // family to revoke; the cookie is still cleared below.
+      // same login chain becomes unusable.
       if (refreshToken) {
         try {
           const payload = await verifyRefreshToken(config, refreshToken);
-          if (payload.fid) {
-            const redis = requireRefreshTokenStore(app);
-            await revokeRefreshFamily(redis, {
-              familyId: payload.fid,
-              ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
-            });
-          }
+          const redis = requireRefreshTokenStore(app);
+          await revokeRefreshFamily(redis, {
+            familyId: payload.fid,
+            ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
+          });
         } catch {
           // If the token is already expired/invalid, nothing to revoke.
         }

@@ -59,6 +59,7 @@ type E2bSandboxLike = {
   files: {
     write: (files: Array<{ path: string; data: string | ArrayBuffer }>) => Promise<void>;
     read: (path: string, opts: { format: "bytes" }) => Promise<Uint8Array>;
+    getInfo: (path: string) => Promise<{ size: number }>;
   };
   commands: {
     run: (
@@ -133,6 +134,8 @@ export class E2bRuntimeProcess {
      * responsible for the env swap; this method only renders the config.
      */
     proxyBaseUrl?: string;
+    /** Test-only sandbox class injection (forwarded to the stdio harness). */
+    loadSandboxClass?: typeof loadE2bSandboxClass;
   }): Promise<E2bRuntimeProcess> {
     const sandboxCwd = input.cwd;
     const codexConfig = await buildCodexConfigForSandbox({
@@ -182,7 +185,8 @@ export class E2bRuntimeProcess {
           }
         },
         onStdoutLine: (line) => proc?.dispatchStdoutLine(line),
-        onExit: (result) => proc?.handleHarnessExit(result)
+        onExit: (result) => proc?.handleHarnessExit(result),
+        ...(input.loadSandboxClass ? { loadSandboxClass: input.loadSandboxClass } : {})
       });
 
       proc = new E2bRuntimeProcess(
@@ -204,19 +208,43 @@ export class E2bRuntimeProcess {
   }
 
   /**
-   * Unexpected-exit hook called by the harness's exit watcher. Idempotent —
-   * if the proc is already torn down, do nothing. Otherwise, mark dead, fire
-   * close/exit listeners, and reject every pending JSON-RPC request so
-   * callers stop awaiting forever.
+   * Unexpected-exit hook called by the harness's exit watcher. The Codex
+   * process died but the sandbox itself may still be running (and billing) —
+   * markDead kills it rather than letting it idle until the E2B hard timeout.
    */
   private handleHarnessExit(result: E2bStdioHarnessExitResult): void {
-    if (!this.alive) return;
-    this.alive = false;
-    for (const listener of this.closeListeners) listener();
-    for (const listener of this.exitListeners) listener(result.exitCode ?? null, null);
-    this.rejectPendingRequests(
+    this.markDead(
+      result.exitCode ?? null,
       `E2B Codex app-server exited with code ${result.exitCode}${result.error ? `: ${result.error}` : ""}`
     );
+  }
+
+  /**
+   * Single teardown path for every way the process can die: explicit
+   * terminate(), the harness exit watcher, and sendStdin failure. Idempotent —
+   * the first caller wins. Fires close listeners first so the turn
+   * orchestrator sees the stream end before the sandbox is torn down, kills
+   * the sandbox (best-effort: it may already be gone), fires exit listeners
+   * (the lifecycle's finalizeRuntimeClosure hook — terminal DB status,
+   * approval expiry, IP-pin release), and rejects pending JSON-RPC requests
+   * so callers stop awaiting forever.
+   */
+  private markDead(exitCode: number | null, message: string): void {
+    if (!this.alive) return;
+    this.alive = false;
+    for (const listener of this.closeListeners) {
+      listener();
+    }
+    void this.sandbox.kill().catch((err: unknown) => {
+      this.logger?.warn(
+        { err, sandboxId: this.sandboxId },
+        "E2B sandbox kill failed during teardown"
+      );
+    });
+    for (const listener of this.exitListeners) {
+      listener(exitCode, null);
+    }
+    this.rejectPendingRequests(message);
   }
 
   /**
@@ -276,7 +304,6 @@ export class E2bRuntimeProcess {
   private sendLine(json: string): void {
     this.sandbox.commands.sendStdin(this.processPid, json + "\n").catch((err) => {
       if (!this.alive) return;
-      this.alive = false;
 
       // The harness's exit watcher (see startE2bStdioHarness) is the
       // authoritative source of stderr/exitCode diagnostics — it fires
@@ -291,8 +318,8 @@ export class E2bRuntimeProcess {
         "E2B sendStdin failed — Codex process is gone"
       );
 
-      for (const listener of this.closeListeners) listener();
-      this.rejectPendingRequests(
+      this.markDead(
+        null,
         `E2B Codex app-server exited: ${err instanceof Error ? err.message : "unknown error"}`
       );
     });
@@ -341,6 +368,11 @@ export class E2bRuntimeProcess {
     return this.sandbox.files.read(filePath, { format: "bytes" });
   }
 
+  async statFile(filePath: string): Promise<{ sizeBytes: number }> {
+    const info = await this.sandbox.files.getInfo(filePath);
+    return { sizeBytes: info.size };
+  }
+
   async writeFile(filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<void> {
     // E2B SDK expects string | ArrayBuffer. Convert Uint8Array (including Buffer)
     // to a properly sliced ArrayBuffer to avoid pooled-buffer corruption.
@@ -356,24 +388,9 @@ export class E2bRuntimeProcess {
   }
 
   terminate(): void {
-    // Idempotent: a second terminate() (e.g. lifecycle shutdown racing an exit
-    // watcher) must not re-fire listeners or re-kill the sandbox.
-    if (!this.alive) return;
-    this.alive = false;
-    // Fire close listeners first so the turn orchestrator sees the stream end
-    // before the sandbox is torn down, then kill, then signal exit.
-    for (const listener of this.closeListeners) {
-      listener();
-    }
-    void this.sandbox.kill().catch((err: unknown) => {
-      this.logger?.warn(
-        { err, sandboxId: this.sandbox.sandboxId },
-        "E2B sandbox kill failed during terminate"
-      );
-    });
-    for (const listener of this.exitListeners) {
-      listener(null, null);
-    }
+    // Idempotent via markDead: a second terminate() (e.g. lifecycle shutdown
+    // racing an exit watcher) must not re-fire listeners or re-kill the sandbox.
+    this.markDead(null, "E2B Codex app-server terminated.");
   }
 
   rejectPendingRequests(message: string): void {

@@ -153,6 +153,36 @@ test("RuntimeSessionStore.setStatus returns the updated row when matched", async
   expect(result!.status).toBe("terminated");
 });
 
+test("RuntimeSessionStore.setStatus scopes the update to runtime_id when provided", async () => {
+  const updates: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    async connect() {
+      return {
+        async query(sql: string, params: unknown[] = []) {
+          if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 };
+          if (sql.startsWith("SELECT set_config")) return { rows: [], rowCount: 0 };
+          if (sql.includes("UPDATE runtime_sessions")) {
+            updates.push({ sql, params });
+            return { rows: [], rowCount: 0 };
+          }
+          throw new Error(`Unexpected ${sql}`);
+        },
+        async release() {}
+      };
+    }
+  } as unknown as Pool;
+  const store = new RuntimeSessionStore(db);
+
+  // Teardown of a specific runtime: must never clobber a replacement's row.
+  await store.setStatus("t", "s", "u", "terminated", "rt-old");
+  expect(updates[0].sql).toMatch(/runtime_id = \$5/);
+  expect(updates[0].params[4]).toBe("rt-old");
+
+  // Session-level form passes null and matches any nonterminal row.
+  await store.setStatus("t", "s", "u", "inactive");
+  expect(updates[1].params[4]).toBeNull();
+});
+
 test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
   const db = {
     async connect() {

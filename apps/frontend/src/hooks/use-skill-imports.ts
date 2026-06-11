@@ -5,11 +5,11 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import {
   emptyInlineSkillDraft,
   type InlineSkillDraft
-} from "../components/admin-skill-inline-tab";
+} from "../components/admin/skills/admin-skill-inline-tab";
 import {
   emptyGithubImportDraft,
   type GithubImportDraft
-} from "../components/admin-skill-card-utils";
+} from "../components/admin/skills/admin-skill-card-utils";
 
 export type ImportTab = "marketplace" | "github" | "zip" | "inline";
 

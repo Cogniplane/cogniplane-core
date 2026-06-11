@@ -8,7 +8,6 @@ import {
   formatBucketLabel,
   formatLatency,
   formatRelativeTime,
-  formatTimestamp,
   readPersistedBoolean,
   shortId,
   sparklineFromTimeSeries,
@@ -211,21 +210,6 @@ test("buildSegmentTooltip: typical case returns count + rounded percentage", () 
 });
 
 // ─── Row helpers (shared with the per-session PII tab) ──────────────────────
-
-test("formatTimestamp: nullish returns em dash", () => {
-  expect(formatTimestamp(null)).toBe("—");
-});
-
-test("formatTimestamp: invalid date returns input verbatim", () => {
-  expect(formatTimestamp("not-a-date")).toBe("not-a-date");
-});
-
-test("formatTimestamp: valid ISO is locale-formatted (contains a digit)", () => {
-  // Locale string varies by env; the load-bearing assertion is that the
-  // helper returns SOMETHING resembling a date, not the raw ISO.
-  const out = formatTimestamp("2026-04-30T12:00:00Z");
-  expect(out).toMatch(/\d/);
-});
 
 test("shortId: truncates long IDs with an ellipsis", () => {
   expect(shortId("aaaaaaaabbbbb")).toBe("aaaaaaaa…");

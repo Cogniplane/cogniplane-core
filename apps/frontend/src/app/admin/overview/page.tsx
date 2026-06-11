@@ -1,7 +1,7 @@
 "use client";
 
 import { useAdminOverviewData } from "../../../hooks/use-admin-overview-data";
-import { AdminOverviewSection } from "../../../components/admin-overview-section";
+import { AdminOverviewSection } from "../../../components/admin/admin-overview-section";
 import { ADMIN_LIVE_SECTIONS } from "../admin-sections";
 
 export default function AdminOverviewPage() {

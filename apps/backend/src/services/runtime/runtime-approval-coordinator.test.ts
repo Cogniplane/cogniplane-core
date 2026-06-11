@@ -67,63 +67,6 @@ test("item/commandExecution/requestApproval: empty-string params are coerced to 
   expect(result!.approvalId).not.toBe("");
 });
 
-test("execCommandApproval: joins array command into single line and includes reason", () => {
-  const result = buildApprovalRequest(ctx("active-resp"), {
-    id: 7,
-    method: "execCommandApproval",
-    params: {
-      callId: "call-77",
-      command: ["bash", "-c", "echo hi"],
-      cwd: "/work",
-      reason: "needs network"
-    }
-  });
-  expect(result).toBeTruthy();
-  expect(result!.approvalId).toBe("call-77:exec-command");
-  expect(result!.itemId).toBe("call-77");
-  expect(result!.turnId).toBe("active-resp");
-  expect(result!.command).toBe("bash -c echo hi");
-  expect(result!.cwd).toBe("/work");
-  expect(result!.summary).toMatch(/bash -c echo hi/);
-  expect(result!.summary).toMatch(/cwd: \/work/);
-  expect(result!.summary).toMatch(/needs network/);
-});
-
-test("execCommandApproval: non-array command becomes null and missing turn falls back to callId", () => {
-  const result = buildApprovalRequest(
-    { activeTurn: null },
-    {
-      id: 7,
-      method: "execCommandApproval",
-      params: { callId: "c1", command: "not-an-array" }
-    }
-  );
-  expect(result).toBeTruthy();
-  expect(result!.command).toBe(null);
-  expect(result!.turnId).toBe("c1");
-});
-
-test("execCommandApproval: missing callId generates one and approvalId derives from it", () => {
-  const result = buildApprovalRequest(ctx(), {
-    id: 1,
-    method: "execCommandApproval",
-    params: {}
-  });
-  expect(result).toBeTruthy();
-  // approvalId ends with ":exec-command"
-  expect(result!.approvalId).toMatch(/:exec-command$/);
-  expect(result!.itemId).toBe(result!.approvalId.replace(/:exec-command$/, ""));
-});
-
-test("execCommandApproval: array command filters non-string entries", () => {
-  const result = buildApprovalRequest(ctx(), {
-    id: 1,
-    method: "execCommandApproval",
-    params: { callId: "c", command: ["echo", 42, "ok"] }
-  });
-  expect(result!.command).toBe("echo ok");
-});
-
 test("item/fileChange/requestApproval: kind=file_change, defaults summary when no reason", () => {
   const result = buildApprovalRequest(ctx(), {
     id: 1,
@@ -149,50 +92,6 @@ test("item/fileChange/requestApproval: uses provided reason when present", () =>
   expect(result!.summary).toBe("rewrites README");
   // turnId falls back to itemId when not provided
   expect(result!.turnId).toBe("p");
-});
-
-test("applyPatchApproval: aggregates fileChanges keys + reason + grantRoot into summary", () => {
-  const result = buildApprovalRequest(ctx("active-r"), {
-    id: 1,
-    method: "applyPatchApproval",
-    params: {
-      callId: "patch-1",
-      reason: "fix bug",
-      fileChanges: { "a.ts": {}, "b.ts": {} },
-      grantRoot: "/repo"
-    }
-  });
-  expect(result).toBeTruthy();
-  expect(result!.kind).toBe("file_change");
-  expect(result!.approvalId).toBe("patch-1:apply-patch");
-  expect(result!.itemId).toBe("patch-1");
-  expect(result!.turnId).toBe("active-r");
-  expect(result!.cwd).toBe("/repo");
-  expect(result!.summary).toMatch(/fix bug/);
-  expect(result!.summary).toMatch(/files: a\.ts, b\.ts/);
-  expect(result!.summary).toMatch(/root: \/repo/);
-});
-
-test("applyPatchApproval: with no params returns the default summary text", () => {
-  const result = buildApprovalRequest({ activeTurn: null }, {
-    id: 1,
-    method: "applyPatchApproval",
-    params: {}
-  });
-  expect(result).toBeTruthy();
-  // turnId falls back to the (generated) callId, never throws.
-  expect(result!.turnId).toBe(result!.itemId);
-  expect(result!.summary).toMatch(/modify files/);
-});
-
-test("applyPatchApproval: ignores non-object fileChanges", () => {
-  const result = buildApprovalRequest(ctx(), {
-    id: 1,
-    method: "applyPatchApproval",
-    params: { fileChanges: "not-an-object" }
-  });
-  expect(result).toBeTruthy();
-  expect(result!.summary).not.toMatch(/files:/);
 });
 
 test("item/permissions/requestApproval: kind=permissions, default summary if no reason", () => {
@@ -256,24 +155,6 @@ test("respond: item/fileChange + approve => decision: accept", () => {
     "approve"
   );
   expect(proc.responses).toEqual([{ id: "rid", result: { decision: "accept" } }]);
-});
-
-test("respond: execCommandApproval (legacy) + approve => decision: approved", () => {
-  const proc = captureProcess();
-  respondToApprovalRequest(proc, pending({ method: "execCommandApproval" }), "approve");
-  expect(proc.responses).toEqual([{ id: "rid", result: { decision: "approved" } }]);
-});
-
-test("respond: execCommandApproval (legacy) + reject => decision: denied", () => {
-  const proc = captureProcess();
-  respondToApprovalRequest(proc, pending({ method: "execCommandApproval" }), "reject");
-  expect(proc.responses).toEqual([{ id: "rid", result: { decision: "denied" } }]);
-});
-
-test("respond: applyPatchApproval (legacy) + approve => decision: approved", () => {
-  const proc = captureProcess();
-  respondToApprovalRequest(proc, pending({ method: "applyPatchApproval" }), "approve");
-  expect(proc.responses).toEqual([{ id: "rid", result: { decision: "approved" } }]);
 });
 
 test("respond: item/permissions + approve => empty permissions object", () => {

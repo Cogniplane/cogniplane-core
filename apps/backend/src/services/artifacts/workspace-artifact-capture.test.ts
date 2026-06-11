@@ -134,6 +134,32 @@ describe("captureWorkspaceArtifacts", () => {
     }
   });
 
+  test("captures every file when the count exceeds the worker-pool concurrency cap", async () => {
+    const ws = await setupWorkspace();
+    const fileCount = 17; // > CAPTURE_CONCURRENCY (5) so the pool must drain the queue
+    for (let i = 0; i < fileCount; i += 1) {
+      await writeFile(path.join(ws, `file-${String(i).padStart(2, "0")}.txt`), `content ${i}`);
+    }
+
+    const artifacts = makeArtifactsFake();
+    const { storage, puts } = makeStorage();
+    const auditEvents = new InMemoryAuditEventStore();
+
+    await captureWorkspaceArtifacts({
+      tenantId: "t1",
+      sessionId: "s1",
+      userId: "u1",
+      workspacePath: ws,
+      artifacts: artifacts as unknown as Parameters<typeof captureWorkspaceArtifacts>[0]["artifacts"],
+      storage: storage as unknown as ArtifactStorage,
+      auditEvents
+    });
+
+    expect(artifacts.records).toHaveLength(fileCount);
+    expect(puts).toHaveLength(fileCount);
+    expect(new Set(artifacts.records.map((r) => r.artifactName)).size).toBe(fileCount);
+  });
+
   test("skips dotfiles and excluded directories at the top level", async () => {
     const ws = await setupWorkspace();
     await mkdir(path.join(ws, ".codex"));

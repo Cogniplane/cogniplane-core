@@ -61,6 +61,24 @@ export const AdminRuntimeConfigSchema = z.object({
 }).passthrough();
 export type AdminRuntimeConfig = z.infer<typeof AdminRuntimeConfigSchema>;
 
+// Live in-memory Codex process detail (tenant-scoped). The unauthenticated
+// /health endpoint exposes only aggregate counts; this is the admin view.
+export const AdminRuntimeHealthResponseSchema = z.object({
+  runtimes: z.array(
+    z.object({
+      sessionId: z.string(),
+      runtimeId: z.string(),
+      healthStatus: z.enum(["starting", "healthy", "terminating", "terminated", "error"]),
+      lastActiveAt: z.string(),
+      hasActiveTurn: z.boolean(),
+      processId: z.number().nullable(),
+      port: z.number(),
+      isAlive: z.boolean()
+    }).passthrough()
+  )
+}).passthrough();
+export type AdminRuntimeHealthResponse = z.infer<typeof AdminRuntimeHealthResponseSchema>;
+
 // ── Codex/OpenAI runtime diagnostic (admin debug page) ──────────────────────
 
 const ProbeOkSchema = z.object({

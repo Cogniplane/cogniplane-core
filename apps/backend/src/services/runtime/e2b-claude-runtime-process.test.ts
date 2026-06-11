@@ -338,3 +338,149 @@ test("E2bClaudeRuntimeProcess turn_failed surfaces to onFail and rejects runTurn
     await rm(staging, { recursive: true, force: true });
   }
 });
+
+test("harness exit kills the sandbox and fires onHarnessExit (even between turns)", async () => {
+  const staging = await makeStagingDir("claude-e2b-exit");
+  try {
+    const { sandbox } = createFakeSandbox();
+    let killCount = 0;
+    sandbox.kill = async () => {
+      killCount += 1;
+    };
+    let resolveWait: (r: { exitCode?: number; stderr?: string }) => void = () => {};
+    sandbox.commands.run = async (_cmd: string, _options?: HandleCallbacks) => ({
+      pid: 4242,
+      wait: () =>
+        new Promise<{ exitCode?: number; stderr?: string }>((resolve) => {
+          resolveWait = resolve;
+        }) as never
+    });
+
+    let harnessExitCalls = 0;
+    const proc = await E2bClaudeRuntimeProcess.start({
+      e2bApiKey: "k",
+      e2bTemplateId: "tpl",
+      e2bSandboxTimeoutMs: 60000,
+      workspacePath: "/home/user/workspace/sess-exit",
+      localWorkspacePath: staging,
+      logger: silentLog,
+      sessionId: "sess-exit",
+      runtimeId: "claude-exit",
+      onHarnessExit: () => {
+        harnessExitCalls += 1;
+      },
+      loadSandboxClass: async () => ({ create: async () => sandbox })
+    });
+
+    // No turn in flight — the death must still be observed.
+    resolveWait({ exitCode: 1, stderr: "harness crashed" });
+    for (let i = 0; i < 20 && proc.isAlive(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(proc.isAlive()).toBe(false);
+    // The node harness died but the sandbox would keep billing — must be killed.
+    expect(killCount).toBe(1);
+    // The adapter finalization hook fires exactly once.
+    expect(harnessExitCalls).toBe(1);
+
+    // A racing terminate() after the watcher already tore down is a no-op.
+    await proc.terminate();
+    expect(killCount).toBe(1);
+    expect(harnessExitCalls).toBe(1);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+});
+
+test("turn watchdog fails a wedged turn, kills the sandbox, and fires onHarnessExit", async () => {
+  const staging = await makeStagingDir("claude-e2b-watchdog");
+  try {
+    const { sandbox } = createFakeSandbox();
+    let killCount = 0;
+    sandbox.kill = async () => {
+      killCount += 1;
+    };
+
+    let harnessExitCalls = 0;
+    const proc = await E2bClaudeRuntimeProcess.start({
+      e2bApiKey: "k",
+      e2bTemplateId: "tpl",
+      e2bSandboxTimeoutMs: 60000,
+      workspacePath: "/home/user/workspace/sess-wd",
+      localWorkspacePath: staging,
+      logger: silentLog,
+      sessionId: "sess-wd",
+      runtimeId: "claude-wd",
+      turnTimeoutMs: 25,
+      onHarnessExit: () => {
+        harnessExitCalls += 1;
+      },
+      loadSandboxClass: async () => ({ create: async () => sandbox })
+    });
+
+    const failures: string[] = [];
+    // The harness never answers — runTurn would otherwise hang forever,
+    // pinning the session busy until the E2B hard timeout.
+    await expect(
+      proc.runTurn(turnFrame("turn-wedged"), {
+        onSdkMessage: () => {},
+        onApprovalRequest: () => {},
+        onComplete: () => {},
+        onFail: (error) => {
+          failures.push(error);
+        }
+      })
+    ).rejects.toThrow(/exceeded the 25ms limit/);
+
+    expect(failures).toEqual([expect.stringMatching(/exceeded the 25ms limit/)]);
+    // The wedged sandbox was recycled and the adapter finalization hook fired.
+    expect(proc.isAlive()).toBe(false);
+    expect(killCount).toBe(1);
+    expect(harnessExitCalls).toBe(1);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+});
+
+test("turn watchdog does not fire on a turn that completes in time", async () => {
+  const staging = await makeStagingDir("claude-e2b-watchdog-ok");
+  try {
+    const { sandbox, callbacks } = createFakeSandbox();
+    let killCount = 0;
+    sandbox.kill = async () => {
+      killCount += 1;
+    };
+
+    const proc = await E2bClaudeRuntimeProcess.start({
+      e2bApiKey: "k",
+      e2bTemplateId: "tpl",
+      e2bSandboxTimeoutMs: 60000,
+      workspacePath: "/home/user/workspace/sess-ok",
+      localWorkspacePath: staging,
+      logger: silentLog,
+      sessionId: "sess-ok",
+      runtimeId: "claude-ok",
+      turnTimeoutMs: 30,
+      loadSandboxClass: async () => ({ create: async () => sandbox })
+    });
+
+    const turn = proc.runTurn(turnFrame("turn-fast"), {
+      onSdkMessage: () => {},
+      onApprovalRequest: () => {},
+      onComplete: () => {},
+      onFail: () => {}
+    });
+    callbacks.onStdout?.(
+      JSON.stringify({ type: "turn_complete", turnId: "turn-fast", claudeSessionId: "c-1" }) + "\n"
+    );
+    await turn;
+
+    // Past the watchdog window: the disarmed timer must not have recycled anything.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(proc.isAlive()).toBe(true);
+    expect(killCount).toBe(0);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
+  }
+});

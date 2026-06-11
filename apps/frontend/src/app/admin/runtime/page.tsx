@@ -1,10 +1,8 @@
 "use client";
 
 import { useAdminRuntimeData } from "../../../hooks/use-admin-runtime-data";
-import { AdminRuntimeCard } from "../../../components/admin-runtime-card";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { AdminRuntimeCard } from "../../../components/admin/runtime/admin-runtime-card";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminRuntimePage() {
   const {

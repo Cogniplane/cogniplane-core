@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import type { Pool } from "../../lib/db.js";
 import { withTenantScope } from "../../lib/db.js";
 import { canActivateRevision } from "../../domain/skill-lifecycle.js";
+import { AdminConfigError } from "../admin-config-error.js";
 
 import type { SkillConfigStore } from "./skill-config-store.js";
 import {
@@ -283,12 +284,12 @@ export class SkillRevisionStore {
     }
 
     if (!canActivateRevision(revision.validationStatus)) {
-      throw new Error(`Skill revision ${input.skillRevisionId} is not valid for activation.`);
+      throw new AdminConfigError(`Skill revision ${input.skillRevisionId} is not valid for activation.`);
     }
 
     const parsed = parseSkillActivationMetadata(revision.metadata);
     if (!parsed.ok) {
-      throw new Error(
+      throw new AdminConfigError(
         `Skill revision ${input.skillRevisionId} is missing activation metadata: ${parsed.missing.join(", ")}.`
       );
     }

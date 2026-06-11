@@ -128,26 +128,26 @@ test("loadConfig accepts AUTH_MODE=workos when NODE_ENV=production", () => {
 test("loadConfig boots when PII provider is disabled and no API key is set", () => {
   const config = loadConfig(devConfig());
   expect(config.PII_PROVIDER_ENABLED).toBe(false);
-  expect(config.PII_OPENROUTER_API_KEY).toBe(undefined);
+  expect(config.PII_LLM_API_KEY).toBe(undefined);
   expect(config.PII_PROVIDER_TIMEOUT_MS).toBe(5000);
-  expect(config.PII_OPENROUTER_BASE_URL).toBe("https://openrouter.ai/api/v1");
-  expect(config.PII_OPENROUTER_MODEL).toBe("google/gemini-2.5-flash");
+  expect(config.PII_LLM_BASE_URL).toBe("https://openrouter.ai/api/v1");
+  expect(config.PII_LLM_MODEL).toBe("google/gemini-2.5-flash");
 });
 
-test("loadConfig requires OpenRouter API key when PII provider is enabled", () => {
-  expect(() => loadConfig(devConfig({ PII_PROVIDER_ENABLED: "true" }))).toThrow(/PII_OPENROUTER_API_KEY is required when PII_PROVIDER_ENABLED=true/);
+test("loadConfig requires a PII model API key when PII provider is enabled", () => {
+  expect(() => loadConfig(devConfig({ PII_PROVIDER_ENABLED: "true" }))).toThrow(/PII_LLM_API_KEY is required when PII_PROVIDER_ENABLED=true/);
 });
 
 test("loadConfig accepts PII provider config when enabled with an API key", () => {
   const config = loadConfig(devConfig({
     PII_PROVIDER_ENABLED: "true",
-    PII_OPENROUTER_API_KEY: "sk-or-test-123",
-    PII_OPENROUTER_MODEL: "custom/model-id",
+    PII_LLM_API_KEY: "sk-or-test-123",
+    PII_LLM_MODEL: "google/gemma-4-E2B-it-qat-w4a16-ct",
     PII_PROVIDER_TIMEOUT_MS: "7500"
   }));
   expect(config.PII_PROVIDER_ENABLED).toBe(true);
-  expect(config.PII_OPENROUTER_API_KEY).toBe("sk-or-test-123");
-  expect(config.PII_OPENROUTER_MODEL).toBe("custom/model-id");
+  expect(config.PII_LLM_API_KEY).toBe("sk-or-test-123");
+  expect(config.PII_LLM_MODEL).toBe("google/gemma-4-E2B-it-qat-w4a16-ct");
   expect(config.PII_PROVIDER_TIMEOUT_MS).toBe(7500);
 });
 
@@ -294,4 +294,25 @@ test("loadConfig warns when JWT_SECRET is the default and AUTH_MODE != workos", 
   expect(config.AUTH_MODE).toBe("dev-headers");
   expect(warnings.some((w) => w.msg.includes("JWT_SECRET is using the well-known default"))).toBe(true);
   expect(warnings.some((w) => w.msg.includes("DATA_ENCRYPTION_SECRET is using the well-known default"))).toBe(true);
+});
+
+test("loadConfig rejects a turn timeout at or below the approval TTL", () => {
+  expect(() =>
+    loadConfig(
+      devConfig({ RUNTIME_TURN_TIMEOUT_MS: "600000", APPROVAL_REQUEST_TTL_MS: "600000" })
+    )
+  ).toThrow(/RUNTIME_TURN_TIMEOUT_MS must exceed APPROVAL_REQUEST_TTL_MS/);
+});
+
+test("loadConfig rejects a turn timeout at or above the sandbox lifetime", () => {
+  expect(() =>
+    loadConfig(
+      devConfig({ RUNTIME_TURN_TIMEOUT_MS: "1800000", E2B_SANDBOX_TIMEOUT_MS: "1800000" })
+    )
+  ).toThrow(/RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS/);
+});
+
+test("loadConfig accepts a disabled turn watchdog (0) regardless of the other timeouts", () => {
+  const config = loadConfig(devConfig({ RUNTIME_TURN_TIMEOUT_MS: "0" }));
+  expect(config.RUNTIME_TURN_TIMEOUT_MS).toBe(0);
 });

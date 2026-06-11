@@ -1,5 +1,6 @@
 import { describe, it, vi, expect } from "vitest";
 
+import { setAccessToken, setTokenRefresher } from "./api-client";
 import { streamMessage } from "./streaming-api";
 
 function createSseResponse(frames: string[]): Response {
@@ -148,6 +149,74 @@ describe("streamMessage", () => {
     });
 
     expect(completions).toEqual(["completed"]);
+  });
+
+  it("refreshes the access token and retries once on a 401", async () => {
+    setAccessToken("stale-token");
+    setTokenRefresher(async () => {
+      setAccessToken("fresh-token");
+      return "fresh-token";
+    });
+
+    const authHeaders: Array<string | null> = [];
+    const fakeFetch = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+      authHeaders.push(new Headers(init?.headers).get("Authorization"));
+      if (fakeFetch.mock.calls.length === 1) {
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+      }
+      return createSseResponse([createdFrame, textDeltaFrame("Hello"), completedFrame]);
+    });
+
+    (global as unknown as { fetch: typeof fetch }).fetch = fakeFetch;
+
+    const deltas: string[] = [];
+    const completions: string[] = [];
+
+    try {
+      await streamMessage({
+        sessionId: "session-1",
+        text: "hi",
+        onDelta: (delta) => {
+          deltas.push(delta);
+        },
+        onComplete: (status) => {
+          completions.push(status);
+        }
+      });
+    } finally {
+      setAccessToken(null);
+      setTokenRefresher(async () => null);
+    }
+
+    expect(authHeaders).toEqual(["Bearer stale-token", "Bearer fresh-token"]);
+    expect(deltas).toEqual(["Hello"]);
+    expect(completions).toEqual(["completed"]);
+  });
+
+  it("surfaces the 401 error when the refresher cannot produce a token", async () => {
+    setAccessToken("stale-token");
+    setTokenRefresher(async () => null);
+
+    const fakeFetch = vi.fn(async () =>
+      new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 })
+    );
+
+    (global as unknown as { fetch: typeof fetch }).fetch = fakeFetch;
+
+    try {
+      await expect(
+        streamMessage({
+          sessionId: "session-1",
+          text: "hi",
+          onDelta: () => {},
+          onComplete: () => {}
+        })
+      ).rejects.toThrow("unauthorized");
+    } finally {
+      setAccessToken(null);
+    }
+
+    expect(fakeFetch.mock.calls.length).toBe(1);
   });
 
   it("fires onFailed with a reason when the stream closes without a terminal event", async () => {

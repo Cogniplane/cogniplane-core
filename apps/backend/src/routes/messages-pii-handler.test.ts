@@ -54,7 +54,7 @@ test("block action persists scan run and surfaces blockReason", async () => {
   const stores = makeStores({ capture: captured });
   const decision: PiiDecision = {
     action: "block",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: [{ piiType: "email", confidence: "high" } as never],
     blockReason: "blocked_email"
@@ -93,7 +93,7 @@ test("transform action substitutes runtime prompt and persists scanRun", async (
   const stores = makeStores({ capture: captured });
   const decision: PiiDecision = {
     action: "transform",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: [{ piiType: "phone", confidence: "high" } as never],
     transformedText: "raw with [REDACTED]"
@@ -143,7 +143,7 @@ test("report action keeps raw text but emits a 'detected' detail block", async (
   const stores = makeStores({ capture: captured });
   const decision: PiiDecision = {
     action: "report",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: [
       { piiType: "ssn", confidence: "high" } as never,
@@ -203,7 +203,7 @@ test("block action emits pii_blocked audit event with scanRunId + blockReason", 
   const audit = makeAuditCapture();
   const decision: PiiDecision = {
     action: "block",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: [{ piiType: "email", confidence: "high" } as never],
     blockReason: "blocked_email"
@@ -229,7 +229,7 @@ test("transform action emits pii_transformed audit event", async () => {
   const audit = makeAuditCapture();
   const decision: PiiDecision = {
     action: "transform",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: [{ piiType: "phone", confidence: "high" } as never],
     transformedText: "X"
@@ -246,7 +246,7 @@ test("report action emits pii_reported audit event", async () => {
   const audit = makeAuditCapture();
   const decision: PiiDecision = {
     action: "report",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini",
     findings: []
   };
@@ -276,7 +276,7 @@ test("allow action does NOT emit an audit event", async () => {
 test("non-allow action with no auditEvents store does not throw", async () => {
   const decision: PiiDecision = {
     action: "block",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "m",
     findings: [],
     blockReason: "x"

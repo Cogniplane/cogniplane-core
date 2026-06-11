@@ -278,7 +278,7 @@ test("Redis: shouldAllow open→half_open routes through transitionTo (clears op
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const nowMs = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 1_000,
@@ -291,14 +291,14 @@ test("Redis: shouldAllow open→half_open routes through transitionTo (clears op
   });
 
   // Pre-seed Redis as if we were already open and past the cool-down.
-  store.set("pii:breaker:openrouter:state", "open");
-  store.set("pii:breaker:openrouter:openedAt", String(nowMs - 5_000));
+  store.set("pii:breaker:pii-llm:state", "open");
+  store.set("pii:breaker:pii-llm:openedAt", String(nowMs - 5_000));
 
   const allowed = await breaker.shouldAllow();
   expect(allowed).toBe(true);
-  expect(store.get("pii:breaker:openrouter:state")).toBe("half_open");
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("half_open");
   // openedAt key is cleared because half_open is not "open".
-  expect(store.has("pii:breaker:openrouter:openedAt")).toBe(false);
+  expect(store.has("pii:breaker:pii-llm:openedAt")).toBe(false);
   // Transition event was emitted.
   expect(events.length).toBe(1);
   expect(events[0]?.payload.from).toBe("open");
@@ -309,7 +309,7 @@ test("Redis: failures accumulate and trip the breaker at the threshold", async (
   const { redis, store } = makeFakeRedis();
   const now = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 3,
     windowMs: 60_000,
     cooldownMs: 30_000,
@@ -318,10 +318,10 @@ test("Redis: failures accumulate and trip the breaker at the threshold", async (
 
   await breaker.record("failure");
   await breaker.record("failure");
-  expect(store.get("pii:breaker:openrouter:state") ?? "closed").toBe("closed");
+  expect(store.get("pii:breaker:pii-llm:state") ?? "closed").toBe("closed");
   await breaker.record("failure");
-  expect(store.get("pii:breaker:openrouter:state")).toBe("open");
-  expect(store.get("pii:breaker:openrouter:openedAt")).toBe(String(now));
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("open");
+  expect(store.get("pii:breaker:pii-llm:openedAt")).toBe(String(now));
   expect(await breaker.shouldAllow()).toBe(false);
 });
 
@@ -329,7 +329,7 @@ test("Redis: failures outside the window do not count toward the threshold", asy
   const { redis, store } = makeFakeRedis();
   let now = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 3,
     windowMs: 1_000,
     cooldownMs: 30_000,
@@ -341,7 +341,7 @@ test("Redis: failures outside the window do not count toward the threshold", asy
   now += 2_000; // outside window
   await breaker.record("failure");
   // Older entries got trimmed; only the latest failure counts → still closed.
-  expect(store.get("pii:breaker:openrouter:state") ?? "closed").toBe("closed");
+  expect(store.get("pii:breaker:pii-llm:state") ?? "closed").toBe("closed");
 });
 
 test("Redis: success transitions from half_open to closed and clears failures", async () => {
@@ -349,7 +349,7 @@ test("Redis: success transitions from half_open to closed and clears failures", 
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   let now = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 1_000,
@@ -359,12 +359,12 @@ test("Redis: success transitions from half_open to closed and clears failures", 
 
   await breaker.record("failure");
   await breaker.record("failure"); // closed -> open
-  expect(store.get("pii:breaker:openrouter:state")).toBe("open");
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("open");
   now += 1_000;
   expect(await breaker.shouldAllow()).toBe(true); // -> half_open
   await breaker.record("success"); // -> closed
-  expect(store.get("pii:breaker:openrouter:state")).toBe("closed");
-  expect(zsets.get("pii:breaker:openrouter:failures")?.size ?? 0).toBe(0);
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("closed");
+  expect(zsets.get("pii:breaker:pii-llm:failures")?.size ?? 0).toBe(0);
   // closed transition is logged as an event
   expect(events.some((e) => e.payload.to === "closed")).toBe(true);
 });
@@ -373,7 +373,7 @@ test("Redis: half_open probe failure re-opens immediately", async () => {
   const { redis, store } = makeFakeRedis();
   let now = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 1_000,
@@ -384,34 +384,34 @@ test("Redis: half_open probe failure re-opens immediately", async () => {
   await breaker.record("failure"); // open
   now += 1_000;
   await breaker.shouldAllow(); // half_open
-  expect(store.get("pii:breaker:openrouter:state")).toBe("half_open");
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("half_open");
   await breaker.record("failure"); // -> open
-  expect(store.get("pii:breaker:openrouter:state")).toBe("open");
-  expect(store.get("pii:breaker:openrouter:openedAt")).toBe(String(now));
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("open");
+  expect(store.get("pii:breaker:pii-llm:openedAt")).toBe(String(now));
 });
 
 test("Redis: record('failure') while open is a no-op", async () => {
   const { redis, store } = makeFakeRedis();
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 30_000,
     now: () => 1_000_000
   });
-  store.set("pii:breaker:openrouter:state", "open");
-  store.set("pii:breaker:openrouter:openedAt", "999000");
+  store.set("pii:breaker:pii-llm:state", "open");
+  store.set("pii:breaker:pii-llm:openedAt", "999000");
   await breaker.record("failure");
   // Still open, openedAt unchanged
-  expect(store.get("pii:breaker:openrouter:state")).toBe("open");
-  expect(store.get("pii:breaker:openrouter:openedAt")).toBe("999000");
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("open");
+  expect(store.get("pii:breaker:pii-llm:openedAt")).toBe("999000");
 });
 
 test("Redis: snapshot reports state, willRetryAt, and failure count", async () => {
   const { redis } = makeFakeRedis();
   const now = 1_000_000;
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 30_000,
@@ -439,18 +439,18 @@ test("Redis: success on already-open transitions to closed (e.g., admin reset pa
   const { redis, store } = makeFakeRedis();
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 30_000,
     now: () => 1_000_000,
     events: { async create(input) { events.push(input); } }
   });
-  store.set("pii:breaker:openrouter:state", "open");
-  store.set("pii:breaker:openrouter:openedAt", "999000");
+  store.set("pii:breaker:pii-llm:state", "open");
+  store.set("pii:breaker:pii-llm:openedAt", "999000");
 
   await breaker.record("success");
-  expect(store.get("pii:breaker:openrouter:state")).toBe("closed");
+  expect(store.get("pii:breaker:pii-llm:state")).toBe("closed");
   expect(events.some((e) => e.payload.from === "open" && e.payload.to === "closed")).toBe(true);
 });
 
@@ -511,7 +511,7 @@ test("Redis: errored zcard pipeline result is treated as count=0 (does not trip)
   } as unknown as import("ioredis").Redis;
 
   const breaker = new RedisPiiCircuitBreaker(redis, {
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 1, // would normally trip on the very first failure
     windowMs: 60_000,
     cooldownMs: 30_000,
@@ -519,7 +519,7 @@ test("Redis: errored zcard pipeline result is treated as count=0 (does not trip)
   });
   await breaker.record("failure");
   // count fell back to 0, which is below threshold=1 → state stays closed.
-  expect(store.get("pii:breaker:openrouter:state") ?? "closed").toBe("closed");
+  expect(store.get("pii:breaker:pii-llm:state") ?? "closed").toBe("closed");
 });
 
 test("DisabledPiiCircuitBreaker: always allows, never trips", async () => {
@@ -537,7 +537,7 @@ test("InMemory: emits a transition event to the configured sink", async () => {
   const clock = makeClock();
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const breaker = new InMemoryPiiCircuitBreaker({
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 1_000,
@@ -562,9 +562,9 @@ test("InMemory: emits a transition event to the configured sink", async () => {
           to: e.payload.to,
           provider: e.payload.provider
         }))).toEqual([
-          { type: "pii_breaker_transition", from: "closed", to: "open", provider: "openrouter" },
-          { type: "pii_breaker_transition", from: "open", to: "half_open", provider: "openrouter" },
-          { type: "pii_breaker_transition", from: "half_open", to: "closed", provider: "openrouter" }
+          { type: "pii_breaker_transition", from: "closed", to: "open", provider: "pii-llm" },
+          { type: "pii_breaker_transition", from: "open", to: "half_open", provider: "pii-llm" },
+          { type: "pii_breaker_transition", from: "half_open", to: "closed", provider: "pii-llm" }
         ]);
 });
 
@@ -574,7 +574,7 @@ test("InMemory: a failing event sink does not break the breaker", async () => {
   const clock = makeClock();
   const warnings: object[] = [];
   const breaker = new InMemoryPiiCircuitBreaker({
-    name: "openrouter",
+    name: "pii-llm",
     failureThreshold: 2,
     windowMs: 60_000,
     cooldownMs: 1_000,

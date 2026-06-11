@@ -69,6 +69,24 @@ export function messagesContainHistory(messages: Message[]): boolean {
   return messages.some((message) => message.role !== "system" && message.content.trim().length > 0);
 }
 
+// The most recent assistant turn's total token count approximates how much of
+// the context window the runtime is currently carrying — that's the number the
+// composer's context meter shows. 0 when no assistant turn has reported usage.
+export function latestContextTokens(messages: Message[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const usage = messages[index]?.tokenUsage;
+    if (usage) return usage.totalTokens;
+  }
+  return 0;
+}
+
+// The context-window size of the currently selected model. When the model
+// record is unresolved we fall back to 200K — the smallest real window — so the
+// meter errs toward showing context pressure rather than hiding it.
+export function contextWindowForModel(model: Model | null | undefined): number {
+  return model?.contextWindow ?? 200_000;
+}
+
 export function clampArtifactPaneWidth(rectRight: number, clientX: number): number {
   return Math.max(
     ARTIFACT_PANE_WIDTH.min,

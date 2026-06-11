@@ -8,6 +8,7 @@ import { fetch as undiciFetch } from "undici";
 import YAML from "yaml";
 
 import type { AppConfig } from "../../config.js";
+import { AdminConfigError } from "../admin-config-error.js";
 import { isPrivateOrReservedHost, ssrfSafeAgent } from "../../lib/url-validation.js";
 import type {
   AdminSkillRecord,
@@ -35,7 +36,7 @@ function humanizeSkillName(bundleName: string): string {
 
 function assertArchiveWithinLimit(archiveBuffer: Buffer, maxBytes: number): void {
   if (archiveBuffer.byteLength > maxBytes) {
-    throw new Error(`Archive exceeds the maximum allowed size of ${maxBytes} bytes.`);
+    throw new AdminConfigError(`Archive exceeds the maximum allowed size of ${maxBytes} bytes.`);
   }
 }
 
@@ -61,7 +62,14 @@ function formatValidationErrors(messages: SkillBundleValidationMessage[]): strin
 }
 
 async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxTotalBytes: number): Promise<void> {
-  const archive = await JSZip.loadAsync(archiveBuffer);
+  let archive: JSZip;
+  try {
+    archive = await JSZip.loadAsync(archiveBuffer);
+  } catch {
+    // JSZip rejects with a library error on malformed bytes; that's bad user
+    // input, not a server fault — surface it as a 400, not an opaque 500.
+    throw new AdminConfigError("Uploaded file is not a valid zip archive.");
+  }
   let totalUncompressedBytes = 0;
   let fileCount = 0;
   const maxAllowedTotalBytes = Math.min(MAX_SKILL_BUNDLE_TOTAL_BYTES, maxTotalBytes);
@@ -75,7 +83,7 @@ async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxT
 
     const absolutePath = path.join(targetPath, normalizedPath);
     if (!absolutePath.startsWith(`${targetPath}${path.sep}`) && absolutePath !== targetPath) {
-      throw new Error(`Unsafe zip entry path: ${entry.name}`);
+      throw new AdminConfigError(`Unsafe zip entry path: ${entry.name}`);
     }
 
     if (entry.dir) {
@@ -85,26 +93,26 @@ async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxT
 
     fileCount += 1;
     if (fileCount > MAX_SKILL_BUNDLE_FILES) {
-      throw new Error(`Skill bundle archive exceeds the maximum file count of ${MAX_SKILL_BUNDLE_FILES}.`);
+      throw new AdminConfigError(`Skill bundle archive exceeds the maximum file count of ${MAX_SKILL_BUNDLE_FILES}.`);
     }
 
     const uncompressedSize = getUncompressedSize(entry);
     if (uncompressedSize === null) {
-      throw new Error(`Unable to determine uncompressed size for zip entry: ${entry.name}`);
+      throw new AdminConfigError(`Unable to determine uncompressed size for zip entry: ${entry.name}`);
     }
     if (uncompressedSize > maxFileBytes) {
-      throw new Error(`Zip entry ${entry.name} exceeds the maximum file size of ${maxFileBytes} bytes.`);
+      throw new AdminConfigError(`Zip entry ${entry.name} exceeds the maximum file size of ${maxFileBytes} bytes.`);
     }
 
     totalUncompressedBytes += uncompressedSize;
     if (totalUncompressedBytes > maxAllowedTotalBytes) {
-      throw new Error(`Skill bundle archive exceeds the maximum uncompressed size of ${maxAllowedTotalBytes} bytes.`);
+      throw new AdminConfigError(`Skill bundle archive exceeds the maximum uncompressed size of ${maxAllowedTotalBytes} bytes.`);
     }
 
     await mkdir(path.dirname(absolutePath), { recursive: true });
     const content = await entry.async("nodebuffer");
     if (content.byteLength !== uncompressedSize) {
-      throw new Error(`Zip entry ${entry.name} size changed while extracting.`);
+      throw new AdminConfigError(`Zip entry ${entry.name} size changed while extracting.`);
     }
     await writeFile(absolutePath, content);
   }
@@ -117,7 +125,7 @@ function normalizeZipEntryPath(entryPath: string): string | null {
   }
 
   if (normalized.startsWith("/") || normalized.startsWith("../") || normalized === "..") {
-    throw new Error(`Unsafe zip entry path: ${entryPath}`);
+    throw new AdminConfigError(`Unsafe zip entry path: ${entryPath}`);
   }
 
   return normalized;
@@ -171,7 +179,7 @@ async function locateSingleSkillBundleRoot(extractedRoot: string): Promise<strin
   const bundleRoots = await findSkillBundleRoots(archiveRoot);
 
   if (bundleRoots.length !== 1) {
-    throw new Error("Archive must contain exactly one skill bundle root with SKILL.md.");
+    throw new AdminConfigError("Archive must contain exactly one skill bundle root with SKILL.md.");
   }
 
   return bundleRoots[0];
@@ -184,12 +192,12 @@ export function parseGitHubSkillSource(input: {
 }) {
   const url = new URL(input.githubUrl);
   if (url.hostname !== "github.com") {
-    throw new Error("Only github.com skill imports are currently supported.");
+    throw new AdminConfigError("Only github.com skill imports are currently supported.");
   }
 
   const pathParts = url.pathname.split("/").filter(Boolean);
   if (pathParts.length < 2) {
-    throw new Error("GitHub URL must include an owner and repository.");
+    throw new AdminConfigError("GitHub URL must include an owner and repository.");
   }
 
   const owner = pathParts[0];
@@ -198,12 +206,12 @@ export function parseGitHubSkillSource(input: {
   let subdirectory = normalizeRelativeSubdirectory(input.subdirectory);
 
   if (pathParts.length > 2 && pathParts[2] !== "tree") {
-    throw new Error("GitHub URL must point to a repository root or tree path.");
+    throw new AdminConfigError("GitHub URL must point to a repository root or tree path.");
   }
 
   if (pathParts[2] === "tree") {
     if (!pathParts[3]) {
-      throw new Error("GitHub tree URL must include a ref.");
+      throw new AdminConfigError("GitHub tree URL must include a ref.");
     }
 
     ref = ref ?? pathParts[3];
@@ -214,7 +222,7 @@ export function parseGitHubSkillSource(input: {
   }
 
   if (!owner || !repo) {
-    throw new Error("GitHub URL must include an owner and repository.");
+    throw new AdminConfigError("GitHub URL must include an owner and repository.");
   }
 
   return {
@@ -237,7 +245,7 @@ function normalizeRelativeSubdirectory(value: string | null | undefined): string
   }
 
   if (normalized.startsWith("../") || normalized === ".." || path.posix.isAbsolute(normalized)) {
-    throw new Error("subdirectory must stay within the imported repository.");
+    throw new AdminConfigError("subdirectory must stay within the imported repository.");
   }
 
   return normalized;
@@ -260,39 +268,30 @@ function assertFetchableHttpsUrl(rawUrl: string): URL {
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error("GitHub import target is not a valid URL.");
+    throw new AdminConfigError("GitHub import target is not a valid URL.");
   }
   if (parsed.protocol !== "https:") {
-    throw new Error("GitHub import target must use the https:// scheme.");
+    throw new AdminConfigError("GitHub import target must use the https:// scheme.");
   }
   if (isPrivateOrReservedHost(parsed.hostname)) {
-    throw new Error("GitHub import target resolves to a private or reserved address.");
+    throw new AdminConfigError("GitHub import target resolves to a private or reserved address.");
   }
   return parsed;
 }
 
 export async function ssrfSafeGithubFetch(
-  fetchFn: typeof fetch,
   url: string,
   init: RequestInit,
-  // Low-level fetch used inside the manual-redirect loop. Defaults to undici's
-  // fetch (Node's global fetch ignores the `dispatcher` option). Injectable
-  // only so tests can drive the real redirect/SSRF machinery with a fake — the
-  // production call sites omit this argument, so behavior is unchanged.
-  lowLevelFetch: typeof fetch = undiciFetch as unknown as typeof fetch
+  // Fetch used inside the manual-redirect loop. Defaults to undici's fetch
+  // (Node's global fetch ignores the `dispatcher` option). Injectable so tests
+  // can drive the real redirect/SSRF machinery with a fake.
+  fetchFn: typeof fetch = undiciFetch as unknown as typeof fetch
 ): Promise<Response> {
-  // A caller-supplied fetchFn (used only in tests) bypasses the dispatcher and
-  // manual-redirect machinery, since the test harness controls every response.
-  // The production path always uses undici + ssrfSafeAgent.
-  if (fetchFn !== lowLevelFetch) {
-    return fetchFn(url, init);
-  }
-
   let currentUrl = assertFetchableHttpsUrl(url).toString();
   const headers = { ...(init.headers as Record<string, string> | undefined) };
 
   for (let hop = 0; hop <= MAX_GITHUB_REDIRECTS; hop += 1) {
-    const response = (await lowLevelFetch(currentUrl, {
+    const response = (await fetchFn(currentUrl, {
       ...init,
       headers,
       redirect: "manual",
@@ -317,7 +316,7 @@ export async function ssrfSafeGithubFetch(
     currentUrl = next.toString();
   }
 
-  throw new Error("GitHub import exceeded the maximum number of redirects.");
+  throw new AdminConfigError("GitHub import exceeded the maximum number of redirects.");
 }
 
 async function resolveGitHubDefaultBranch(
@@ -326,7 +325,6 @@ async function resolveGitHubDefaultBranch(
   githubToken?: string
 ): Promise<string> {
   const response = await ssrfSafeGithubFetch(
-    fetchFn,
     `https://api.github.com/repos/${source.owner}/${source.repo}`,
     {
       headers: {
@@ -334,16 +332,17 @@ async function resolveGitHubDefaultBranch(
         "User-Agent": "cogniplane-core",
         ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {})
       }
-    }
+    },
+    fetchFn
   );
 
   if (!response.ok) {
-    throw new Error(`Unable to resolve default branch for ${source.owner}/${source.repo}.`);
+    throw new AdminConfigError(`Unable to resolve default branch for ${source.owner}/${source.repo}.`);
   }
 
   const payload = (await response.json()) as { default_branch?: string };
   if (!payload.default_branch) {
-    throw new Error(`Repository ${source.owner}/${source.repo} does not expose a default branch.`);
+    throw new AdminConfigError(`Repository ${source.owner}/${source.repo} does not expose a default branch.`);
   }
 
   return payload.default_branch;
@@ -361,10 +360,19 @@ async function resolveGitHubBundleSubdirectory(
   const resolvedPath = path.join(archiveRoot, subdirectory);
 
   if (!resolvedPath.startsWith(`${archiveRoot}${path.sep}`) && resolvedPath !== archiveRoot) {
-    throw new Error("GitHub subdirectory resolves outside the repository archive.");
+    throw new AdminConfigError("GitHub subdirectory resolves outside the repository archive.");
   }
 
-  await access(resolvedPath);
+  try {
+    await access(resolvedPath);
+  } catch {
+    // A nonexistent subdirectory is bad user input (the URL/subdirectory the
+    // admin typed), not a server fault — don't let the raw ENOENT become an
+    // opaque 500.
+    throw new AdminConfigError(
+      `GitHub subdirectory "${subdirectory}" does not exist in the repository archive.`
+    );
+  }
   return resolvedPath;
 }
 
@@ -433,7 +441,7 @@ async function validateSkillBundleOrThrow(bundleRootPath: string) {
   const validation = await validateSkillBundle(bundleRootPath);
   const blockingMessages = validation.messages.filter((message) => message.level === "error");
   if (!validation.bundle || blockingMessages.length) {
-    throw new Error(formatValidationErrors(blockingMessages));
+    throw new AdminConfigError(formatValidationErrors(blockingMessages));
   }
 
   return {
@@ -505,18 +513,18 @@ export async function importSkillBundleFromInline(input: {
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
   const skillId = input.skillId.trim();
   if (!skillIdPattern.test(skillId) || skillId.length > 64) {
-    throw new Error(
+    throw new AdminConfigError(
       "skillId must be 1-64 characters using lowercase letters, numbers, and single hyphens."
     );
   }
   if (!input.skillName.trim()) {
-    throw new Error("skillName is required.");
+    throw new AdminConfigError("skillName is required.");
   }
   if (!input.description.trim()) {
-    throw new Error("description is required.");
+    throw new AdminConfigError("description is required.");
   }
   if (!input.instructions.trim()) {
-    throw new Error("instructions is required.");
+    throw new AdminConfigError("instructions is required.");
   }
 
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-inline-"));
@@ -587,15 +595,19 @@ export async function importSkillBundleFromGithub(input: {
   });
   const resolvedRef = source.ref ?? (await resolveGitHubDefaultBranch(source, fetchFn, input.githubToken));
   const archiveUrl = buildGitHubZipballUrl(source, resolvedRef);
-  const response = await ssrfSafeGithubFetch(fetchFn, archiveUrl, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "cogniplane-core",
-      ...(input.githubToken ? { Authorization: `Bearer ${input.githubToken}` } : {})
-    }
-  });
+  const response = await ssrfSafeGithubFetch(
+    archiveUrl,
+    {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "cogniplane-core",
+        ...(input.githubToken ? { Authorization: `Bearer ${input.githubToken}` } : {})
+      }
+    },
+    fetchFn
+  );
   if (!response.ok) {
-    throw new Error(`GitHub archive download failed with status ${response.status}.`);
+    throw new AdminConfigError(`GitHub archive download failed with status ${response.status}.`);
   }
 
   const archiveBuffer = Buffer.from(await response.arrayBuffer());

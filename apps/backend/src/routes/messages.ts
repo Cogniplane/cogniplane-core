@@ -197,9 +197,22 @@ export async function registerMessageRoutes(
       }
     }
 
-    // Evaluate PII policy BEFORE consuming rate limits or turn quota so a
-    // provider timeout (503 fail-closed) never burns a user's quota for a turn
-    // that was neither persisted nor dispatched.
+    // The rate limit is consumed BEFORE the PII evaluation so the PII provider
+    // (an LLM call) cannot be triggered by an over-limit user, and so probing
+    // the PII filter costs a rate-limit token per attempt. The daily turn
+    // quota is only consumed AFTER the PII gate: a blocked turn (or a provider
+    // 503 fail-closed) never burns quota for a turn that was never dispatched.
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "message_turn",
+      userId: request.auth.userId,
+      tenantId: request.auth.tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     let piiDecision: PiiDecision | null = null;
     if (stores.piiProtection) {
       try {
@@ -219,27 +232,6 @@ export async function registerMessageRoutes(
         }
         throw error;
       }
-    }
-
-    const rateLimitError = await stores.limits.consumeRateLimit({
-      resource: "message_turn",
-      userId: request.auth.userId,
-      tenantId: request.auth.tenantId
-    });
-    if (rateLimitError) {
-      reply.code(429);
-      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
-      return rateLimitError;
-    }
-
-    const quotaError = await stores.limits.consumeTurnQuota({
-      userId: request.auth.userId,
-      tenantId: request.auth.tenantId
-    });
-    if (quotaError) {
-      reply.code(429);
-      reply.header("retry-after", Math.max(1, Math.ceil(quotaError.retryAfterMs / 1000)));
-      return quotaError;
     }
 
     const scopedArtifacts = selectedArtifactIds
@@ -291,6 +283,18 @@ export async function registerMessageRoutes(
       return;
     }
 
+    // Past the PII gate: this turn will actually be dispatched, so it now
+    // spends a daily-quota unit.
+    const quotaError = await stores.limits.consumeTurnQuota({
+      userId: request.auth.userId,
+      tenantId: request.auth.tenantId
+    });
+    if (quotaError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(quotaError.retryAfterMs / 1000)));
+      return quotaError;
+    }
+
     const { persistedText: persistedUserText, runtimePrompt, userDetail, transformScanRunId } = piiOutcome;
 
     const persistedUserMessage = await stores.messages.create({
@@ -333,13 +337,10 @@ export async function registerMessageRoutes(
     }
 
     // From here the stream writer owns the reserved slot (it re-marks at turn
-    // start and clears in its `finally`). Mark handoff so this route's `finally`
-    // does not also clear it. BUT `streamAssistantReply` does setup work
-    // (persisting the assistant message, an opening SSE write) BEFORE it enters
-    // the try/finally that owns slot cleanup — a throw in that window would
-    // otherwise leave the slot reserved until the registry's stale timeout. So
-    // release it ourselves on the throw path. `clear()` is idempotent, so this
-    // never double-frees a slot the writer already cleared.
+    // start and clears in its `finally`, whose try covers every await on the
+    // hijacked reply). Mark handoff so this route's `finally` does not also
+    // clear it. The throw-path release below is defense in depth — `clear()`
+    // is idempotent, so it never double-frees a slot the writer already cleared.
     handedOff = true;
     try {
       await streamAssistantReply({

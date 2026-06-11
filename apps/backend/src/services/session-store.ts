@@ -1,6 +1,7 @@
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
+import { isoTimestamp } from "../lib/db-mappers.js";
 
 export type SessionRecord = {
   sessionId: string;
@@ -26,8 +27,8 @@ function mapSession(row: Record<string, unknown>): SessionRecord {
     sessionName: String(row.session_name),
     status: row.status === "deleted" ? "deleted" : "active",
     purpose: row.purpose ? String(row.purpose) : "normal",
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
   if (row.has_pending_approvals !== undefined) {
     record.hasPendingApprovals = Boolean(row.has_pending_approvals);

@@ -349,6 +349,104 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     expect(adapter.hasSession("b-1")).toBe(true);
   });
 
+  it("tears down an idle session after RUNTIME_IDLE_TIMEOUT_MS (sandbox killed, terminal DB status)", async () => {
+    const runtimeSessions = {
+      upsert: vi.fn(async () => ({})),
+      setStatus: vi.fn(async () => {})
+    };
+    const idleAdapter = new ClaudeCodeRuntimeAdapter(
+      createTestConfig({
+        RUNTIME_WORKSPACE_ROOT: testWorkspaceRoot,
+        ANTHROPIC_API_KEY: "sk-ant-test-key",
+        RUNTIME_IDLE_TIMEOUT_MS: 25
+      }),
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      {
+        approvals: fakeApprovalStore,
+        auditEvents: fakeAuditEventStore as never,
+        runtimeSessions: runtimeSessions as never
+      },
+      undefined,
+      testE2bOptions
+    );
+
+    await idleAdapter.createSession({
+      tenantId: "test-tenant",
+      sessionId: "sess-idle",
+      userId: "user-1"
+    });
+    expect(idleAdapter.hasSession("sess-idle")).toBe(true);
+
+    // No turn ever runs — the idle timer must abort the session by itself.
+    for (let i = 0; i < 50 && idleAdapter.hasSession("sess-idle"); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(idleAdapter.hasSession("sess-idle")).toBe(false);
+    // Terminal status is scoped to the dying runtime's row so a racing
+    // replacement's 'active' row can never be clobbered.
+    expect(runtimeSessions.setStatus).toHaveBeenCalledWith(
+      "test-tenant",
+      "sess-idle",
+      "user-1",
+      "terminated",
+      expect.stringMatching(/^claude-/)
+    );
+  });
+
+  it("finalizes the session when the sandbox harness exits between turns", async () => {
+    // Capture the onHarnessExit callback the adapter wires into the process.
+    let capturedOnHarnessExit: (() => void) | undefined;
+    vi.spyOn(E2bClaudeRuntimeProcess, "start").mockImplementation(async (input) => {
+      capturedOnHarnessExit = (input as { onHarnessExit?: () => void }).onHarnessExit;
+      return makeFakeE2bProcess() as unknown as E2bClaudeRuntimeProcess;
+    });
+
+    const runtimeSessions = {
+      upsert: vi.fn(async () => ({})),
+      setStatus: vi.fn(async () => {})
+    };
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      {
+        approvals: fakeApprovalStore,
+        auditEvents: fakeAuditEventStore as never,
+        runtimeSessions: runtimeSessions as never
+      },
+      undefined,
+      testE2bOptions
+    );
+
+    await wired.createSession({
+      tenantId: "test-tenant",
+      sessionId: "sess-harness-exit",
+      userId: "user-1"
+    });
+    expect(capturedOnHarnessExit).toBeDefined();
+
+    // Simulate the harness dying between turns (no in-flight turn observes it).
+    capturedOnHarnessExit!();
+    for (let i = 0; i < 50 && wired.hasSession("sess-harness-exit"); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    // Without the exit hook the runtime_sessions row would stay 'active' and
+    // the stale map entry would linger until the next createSession.
+    expect(wired.hasSession("sess-harness-exit")).toBe(false);
+    expect(runtimeSessions.setStatus).toHaveBeenCalledWith(
+      "test-tenant",
+      "sess-harness-exit",
+      "user-1",
+      "terminated",
+      expect.stringMatching(/^claude-/)
+    );
+  });
+
   it("interruptTurn expires every pending approval row and emits one approval.expired audit event per row", async () => {
     type PendingRow = { approvalId: string };
     const pending: PendingRow[] = [{ approvalId: "appr-1" }, { approvalId: "appr-2" }];
@@ -414,14 +512,153 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     }
   });
 
+  it("fails createSession and finalizes when the harness dies during bootstrap", async () => {
+    // The harness exits after E2bClaudeRuntimeProcess.start returned but
+    // before the state lands in the sessions map — the onHarnessExit
+    // finalization was a no-op in that window.
+    const deadProc = makeFakeE2bProcess();
+    deadProc.isAlive = () => false;
+    vi.spyOn(E2bClaudeRuntimeProcess, "start").mockImplementationOnce(
+      async () => deadProc as unknown as E2bClaudeRuntimeProcess
+    );
+
+    const runtimeSessions = {
+      upsert: vi.fn(async () => ({})),
+      setStatus: vi.fn(async () => {})
+    };
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      {
+        approvals: fakeApprovalStore,
+        auditEvents: fakeAuditEventStore as never,
+        runtimeSessions: runtimeSessions as never
+      },
+      undefined,
+      testE2bOptions
+    );
+
+    await expect(
+      wired.createSession({ tenantId: "test-tenant", sessionId: "sess-doa", userId: "user-1" })
+    ).rejects.toThrow(/exited during session bootstrap/);
+
+    // No dead session handed back, and the DB row reached a terminal status.
+    expect(wired.hasSession("sess-doa")).toBe(false);
+    expect(runtimeSessions.setStatus).toHaveBeenCalledWith(
+      "test-tenant",
+      "sess-doa",
+      "user-1",
+      "terminated",
+      expect.stringMatching(/^claude-/)
+    );
+  });
+
+  it("abortSession does not delete a replacement session created during teardown", async () => {
+    // First session gets a process whose terminate blocks until the test
+    // releases it — abortSession parks mid-teardown on that await.
+    const slowProc = makeFakeE2bProcess();
+    let releaseTerminate: () => void = () => {};
+    slowProc.terminate = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseTerminate = resolve;
+        })
+    );
+    vi.spyOn(E2bClaudeRuntimeProcess, "start").mockImplementationOnce(
+      async () => slowProc as unknown as E2bClaudeRuntimeProcess
+    );
+
+    await adapter.createSession({ tenantId: "t", sessionId: "sess-race", userId: "u" });
+
+    const abortPromise = adapter.abortSession({ tenantId: "t", sessionId: "sess-race", userId: "u" });
+    // Wait until the teardown is parked inside terminate().
+    for (let i = 0; i < 50 && slowProc.terminate.mock.calls.length === 0; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(slowProc.terminate).toHaveBeenCalled();
+
+    // A new message arrives mid-teardown: createSession sees the aborted state
+    // and bootstraps a replacement (the beforeEach start mock supplies it).
+    const replacement = await adapter.createSession({
+      tenantId: "t",
+      sessionId: "sess-race",
+      userId: "u"
+    });
+
+    releaseTerminate();
+    await abortPromise;
+
+    // The finished teardown must NOT have removed the replacement.
+    expect(adapter.hasSession("sess-race")).toBe(true);
+    expect(adapter.hasRuntime("sess-race", replacement.runtimeId)).toBe(true);
+  });
+
+  it("abortSession expires pending approval rows (harness death / idle teardown path)", async () => {
+    const pending = [{ approvalId: "appr-dead-1" }];
+    const expireCalls: string[] = [];
+    const auditCalls: Array<Record<string, unknown>> = [];
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async listPending() {
+        return [...pending];
+      },
+      async expire(_t: string, approvalId: string) {
+        expireCalls.push(approvalId);
+        return { approvalId };
+      }
+    };
+    const auditEvents = {
+      async create(input: Record<string, unknown>) {
+        auditCalls.push(input);
+      }
+    };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+
+    await wired.createSession({ tenantId: "tenant-x", sessionId: "sess-dead", userId: "user-x" });
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+      "appr-dead-1",
+      { sessionId: "sess-dead", kind: "command_execution" }
+    );
+
+    // Teardown clears the process's per-approval TTL timers, so the DB rows
+    // must be expired here — otherwise they pend until the periodic sweep.
+    await wired.abortSession({ tenantId: "tenant-x", sessionId: "sess-dead", userId: "user-x" });
+
+    expect(expireCalls).toEqual(["appr-dead-1"]);
+    expect(auditCalls).toHaveLength(1);
+    expect(auditCalls[0]).toMatchObject({
+      tenantId: "tenant-x",
+      sessionId: "sess-dead",
+      userId: "user-x",
+      type: "approval.expired",
+      payload: { reason: "runtime_terminated" }
+    });
+    expect(
+      (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.size
+    ).toBe(0);
+  });
+
   it("resolveApproval returns 'missing' when sandbox-bound approval has wrong tenant/user", async () => {
     // Seed a pending e2b approval owned by tenant-a/u, then attempt to resolve
     // it as a different user. forwardApprovalDecision's tenant/user gate must
     // reject without flipping the DB row or forwarding to the sandbox.
     await adapter.createSession({ tenantId: "tenant-a", sessionId: "s", userId: "u" });
-    (adapter as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+    (adapter as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
       "appr-mismatch",
-      "s"
+      { sessionId: "s", kind: "command_execution" }
     );
     expect(
       await adapter.resolveApproval({
@@ -475,9 +712,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // canUseTool Promise lives inside the sandbox harness, so the adapter
     // forwards the decision over the bridge (state.e2bProcess.sendApprovalResponse).
     const approvalId = "appr-1";
-    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      "sess-approve"
+      { sessionId: "sess-approve", kind: "command_execution" }
     );
     const sandboxProcess = (wired as unknown as {
       sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
@@ -507,6 +744,92 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     });
     // The decision was forwarded to the in-sandbox harness as "approve".
     expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(approvalId, "approve");
+  });
+
+  it("resolveApproval with rememberForTurn records the kind for in-turn auto-approval", async () => {
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async resolve(_t: string, approvalId: string, userId: string) {
+        return {
+          approvalId,
+          sessionId: "sess-remember",
+          userId,
+          itemId: "item-m",
+          kind: "command_execution"
+        } as unknown as import("./approval-store.js").ApprovalRecord;
+      }
+    };
+    const auditEvents = { async create() {} };
+
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+    await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-remember", userId: "user-1" });
+    const state = (wired as unknown as {
+      sessions: Map<string, { autoApprovedKindsForTurn: Set<string> }>;
+    }).sessions.get("sess-remember")!;
+    const pendingMap = (wired as unknown as {
+      e2bPendingApprovals: Map<string, { sessionId: string; kind: string; autoApprovedKinds: Set<string> }>;
+    }).e2bPendingApprovals;
+
+    pendingMap.set("appr-mem", {
+      sessionId: "sess-remember",
+      kind: "command_execution",
+      autoApprovedKinds: state.autoApprovedKindsForTurn
+    });
+    expect(
+      await wired.resolveApproval({
+        approvalId: "appr-mem",
+        tenantId: "tenant-a",
+        userId: "user-1",
+        decision: "approve",
+        rememberForTurn: true
+      })
+    ).toBe("resolved");
+    expect(state.autoApprovedKindsForTurn.has("command_execution")).toBe(true);
+
+    // A rejected decision must never remember, even when the flag is set.
+    pendingMap.set("appr-mem-2", {
+      sessionId: "sess-remember",
+      kind: "file_change",
+      autoApprovedKinds: state.autoApprovedKindsForTurn
+    });
+    await wired.resolveApproval({
+      approvalId: "appr-mem-2",
+      tenantId: "tenant-a",
+      userId: "user-1",
+      decision: "reject",
+      rememberForTurn: true
+    });
+    expect(state.autoApprovedKindsForTurn.has("file_change")).toBe(false);
+
+    // A decision that lands AFTER its turn ended carries the old turn's set —
+    // remembering must mutate that orphaned set, never the session's current
+    // one (Codex review follow-up: no cross-turn auto-approval leak).
+    const orphanedSet = new Set<string>();
+    pendingMap.set("appr-mem-3", {
+      sessionId: "sess-remember",
+      kind: "command_execution",
+      autoApprovedKinds: orphanedSet
+    });
+    state.autoApprovedKindsForTurn = new Set(); // next turn replaced the instance
+    await wired.resolveApproval({
+      approvalId: "appr-mem-3",
+      tenantId: "tenant-a",
+      userId: "user-1",
+      decision: "approve",
+      rememberForTurn: true
+    });
+    expect(orphanedSet.has("command_execution")).toBe(true);
+    expect(state.autoApprovedKindsForTurn.size).toBe(0);
   });
 
   it("resolveApproval emits approval.rejected and forwards a reject to the sandbox", async () => {
@@ -543,9 +866,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-reject", userId: "user-1" });
 
     const approvalId = "appr-r";
-    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      "sess-reject"
+      { sessionId: "sess-reject", kind: "file_change" }
     );
     const sandboxProcess = (wired as unknown as {
       sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
@@ -599,9 +922,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // Seed the pending entry so forwarding succeeds and we reach the DB guard;
     // resolve() returns null (row already settled) so no audit row is written.
     const approvalId = "already-settled";
-    (wired as unknown as { e2bPendingApprovals: Map<string, string> }).e2bPendingApprovals.set(
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      "sess-dbl"
+      { sessionId: "sess-dbl", kind: "command_execution" }
     );
 
     expect(

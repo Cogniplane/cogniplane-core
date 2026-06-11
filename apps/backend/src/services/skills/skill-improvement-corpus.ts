@@ -2,6 +2,7 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { MessageRecord, ToolResultRecord } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import { redactSecrets } from "../redact-secrets.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 const TOOL_OUTPUT_EXCERPT_BYTES = 800;
 const TOOL_INPUT_EXCERPT_BYTES = 400;
@@ -234,12 +235,14 @@ export type GatherCorpusDeps = {
   ) => Promise<MessageRecord[]>;
   /**
    * Optional PII gate. When supplied, the assembled corpus is scanned via
-   * `evaluateText` with the `chat_prompt` scope before it is returned. The
-   * corpus aggregates many sessions' content, so this is its own fail-closed
-   * boundary — the per-turn `/messages` PII check only evaluates the user's
-   * inbound prompt, never tool outputs. A `block` decision (or provider
-   * error) throws `SkillCorpusPiiBlockedError`; `transform` returns the
-   * redacted text; `report`/`allow` pass through unchanged.
+   * `evaluateText` with the always-on `skill_corpus` subject before it is
+   * returned. The corpus aggregates many sessions' content, so this is its
+   * own fail-closed boundary — the per-turn `/messages` PII check only
+   * evaluates the user's inbound prompt, never tool outputs, and tenant
+   * scope toggles (e.g. chatPrompts off) must not disable this gate. A
+   * `block` decision (or provider error) throws `SkillCorpusPiiBlockedError`;
+   * `transform` returns the redacted text; `report`/`allow` pass through
+   * unchanged.
    */
   piiProtection?: PiiProtectionService;
 };
@@ -334,7 +337,9 @@ export async function gatherSkillCorpus(
     const decision = await deps.piiProtection.evaluateText({
       tenantId: input.tenantId,
       text: formatted.markdown,
-      subject: { kind: "chat_prompt" }
+      // Dedicated always-on subject: the corpus gate must hold even when the
+      // tenant has switched the chatPrompts scope off.
+      subject: { kind: "skill_corpus" }
     });
     switch (decision.action) {
       case "allow":
@@ -413,7 +418,7 @@ async function fetchInvokedSessionIds(
     return result.rows.map((row) => ({
       sessionId: String(row.session_id),
       sessionName: row.session_name ? String(row.session_name) : null,
-      occurredAt: new Date(String(row.last_occurred_at)).toISOString()
+      occurredAt: isoTimestamp(row.last_occurred_at)
     }));
   });
 }

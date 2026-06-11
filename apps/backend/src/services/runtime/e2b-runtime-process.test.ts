@@ -417,3 +417,131 @@ async function waitForPathRemoval(targetPath: string): Promise<void> {
 
   throw new Error(`Expected ${targetPath} to be removed.`);
 }
+
+// ---------------------------------------------------------------------------
+// markDead: unified teardown on every death path
+// ---------------------------------------------------------------------------
+
+// Boots a real E2bRuntimeProcess against a fake sandbox whose background
+// process exit (wait) and stdin failures are test-controlled.
+async function startProcessWithFakeSandbox(opts: {
+  sendStdinError?: Error;
+}): Promise<{
+  proc: E2bRuntimeProcess;
+  resolveWait: (result: E2bStdioHarnessExitResult) => void;
+  killCalls: () => number;
+}> {
+  const emptyWorkspace = await mkdtemp(path.join(os.tmpdir(), "e2b-markdead-"));
+  onTestFinished(() => rm(emptyWorkspace, { recursive: true, force: true }));
+
+  let resolveWait: (result: E2bStdioHarnessExitResult) => void = () => {};
+  const handle = {
+    pid: 4321,
+    wait: () =>
+      new Promise<E2bStdioHarnessExitResult>((resolve) => {
+        resolveWait = resolve;
+      }),
+    kill: async () => true
+  };
+
+  let killCount = 0;
+  const fakeSandbox: E2bSandboxLike = {
+    sandboxId: "sbx-markdead",
+    files: {
+      write: async () => {},
+      read: async () => new Uint8Array()
+    },
+    commands: {
+      run: async (_cmd, options) =>
+        options?.background ? (handle as never) : ({ exitCode: 0, stdout: "", stderr: "" } as never),
+      sendStdin: async () => {
+        if (opts.sendStdinError) throw opts.sendStdinError;
+      },
+      list: async () => []
+    },
+    kill: async () => {
+      killCount += 1;
+    }
+  };
+
+  const proc = await E2bRuntimeProcess.start({
+    binaryPath: "codex",
+    cwd: "/home/user/workspace/session-md",
+    logger: createSilentLogger(),
+    requestTimeoutMs: 1_000,
+    startTimeoutMs: 1_000,
+    runtimeId: "runtime-md",
+    sessionId: "session-md",
+    e2bApiKey: "e2b_test_key",
+    e2bTemplateId: "test-template",
+    e2bSandboxTimeoutMs: 60_000,
+    localWorkspacePath: emptyWorkspace,
+    model: "gpt-5.4",
+    loadSandboxClass: async () => ({ create: async () => fakeSandbox })
+  });
+
+  return { proc, resolveWait: (r) => resolveWait(r), killCalls: () => killCount };
+}
+
+async function settle(): Promise<void> {
+  for (let i = 0; i < 10; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test("harness exit kills the sandbox and fires close+exit listeners exactly once", async () => {
+  const { proc, resolveWait, killCalls } = await startProcessWithFakeSandbox({});
+
+  let closeCount = 0;
+  const exits: Array<number | null> = [];
+  proc.onClose(() => {
+    closeCount += 1;
+  });
+  proc.onExit((code) => {
+    exits.push(code);
+  });
+
+  const pending = proc.sendRequest("turn/start", {});
+  resolveWait({ exitCode: 137, stderr: "oom" });
+
+  await expect(pending).rejects.toThrow(/exited with code 137/);
+  await settle();
+
+  expect(proc.isAlive()).toBe(false);
+  // The Codex process died but the sandbox would keep running (and billing)
+  // until the E2B hard timeout — markDead must kill it.
+  expect(killCalls()).toBe(1);
+  expect(closeCount).toBe(1);
+  // Exit listeners are the lifecycle's finalizeRuntimeClosure hook (terminal
+  // DB status, approval expiry, IP-pin release) — they must fire here too.
+  expect(exits).toEqual([137]);
+
+  // A racing terminate() must not re-fire listeners or re-kill the sandbox.
+  proc.terminate();
+  expect(killCalls()).toBe(1);
+  expect(closeCount).toBe(1);
+  expect(exits).toEqual([137]);
+});
+
+test("sendLine failure kills the sandbox and fires exit listeners (finalization hook)", async () => {
+  const { proc, killCalls } = await startProcessWithFakeSandbox({
+    sendStdinError: new Error("stdin pipe broke")
+  });
+
+  let closeCount = 0;
+  const exits: Array<number | null> = [];
+  proc.onClose(() => {
+    closeCount += 1;
+  });
+  proc.onExit((code) => {
+    exits.push(code);
+  });
+
+  await expect(proc.sendRequest("turn/start", {})).rejects.toThrow(/stdin pipe broke/);
+  await settle();
+
+  expect(proc.isAlive()).toBe(false);
+  expect(killCalls()).toBe(1);
+  expect(closeCount).toBe(1);
+  expect(exits).toEqual([null]);
+});

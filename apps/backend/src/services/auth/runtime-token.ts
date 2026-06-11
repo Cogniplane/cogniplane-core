@@ -19,12 +19,12 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
  * session); operators can shorten via the env var. Verification still tolerates
  * absence of `exp` so older in-flight tokens keep working through a deploy.
  *
- * Every minted token carries a unique `jti` (token id). On its own the token is
- * still a bearer credential valid until `exp`, but `jti` gives each token a
- * stable identity so a caller can (a) correlate it in audit logs and (b) check
- * it against a revocation deny-list — see `verifyRuntimeToken`'s optional
- * `isRevoked` hook — to get an immediate kill switch for a leaked token instead
- * of waiting out the full TTL.
+ * The token is a bearer credential valid until `exp` — there is no revocation
+ * deny-list. The leak window is bounded by two controls instead: the TTL, and
+ * the per-runtime egress IP pin (runtime-egress-ip-pin.ts) enforced by the
+ * MCP gateway and the LLM proxy, which refuses a leaked token replayed from
+ * any host other than the sandbox that made the first call. Every minted
+ * token carries a unique `jti` (token id) for audit/log correlation.
  */
 
 const TOKEN_PREFIX = "rt_";
@@ -53,7 +53,7 @@ export function runtimeTokenExpiry(ttlMs: number, now: Date = new Date()): strin
 }
 
 export type RuntimeTokenClaims = {
-  /** Unique token id — enables revocation + audit correlation. */
+  /** Unique token id — audit/log correlation. */
   jti: string;
   /** Session ID */
   sid: string;
@@ -87,12 +87,10 @@ export function generateRuntimeToken(
 // Verification result. `expired` is distinguished from `invalid` so callers
 // can log/respond differently — an expired token is operationally normal at
 // the end of a long session, while `invalid` means malformed, tampered, or
-// signed under a rotated secret. `revoked` means the signature/expiry are fine
-// but the token's `jti` is on the deny-list (an explicit kill switch).
+// signed under a rotated secret.
 export type RuntimeTokenVerification =
   | { kind: "valid"; claims: RuntimeTokenClaims }
   | { kind: "expired" }
-  | { kind: "revoked"; claims: RuntimeTokenClaims }
   | { kind: "invalid" };
 
 export function verifyRuntimeToken(
@@ -149,32 +147,4 @@ export function verifyRuntimeToken(
   }
 
   return { kind: "valid", claims };
-}
-
-/**
- * Verify a token AND check its `jti` against a revocation deny-list. Kept
- * separate from the synchronous `verifyRuntimeToken` so the hot HMAC/expiry
- * path stays sync and dependency-free; callers that have a revocation store
- * (e.g. Redis) wire it here to get an immediate kill switch. Fail-closed: an
- * `isRevoked` that throws is treated as revoked rather than letting a token
- * through during a revocation-store outage.
- */
-export async function verifyRuntimeTokenWithRevocation(
-  token: string,
-  secret: string,
-  isRevoked: (jti: string) => Promise<boolean>
-): Promise<RuntimeTokenVerification> {
-  const result = verifyRuntimeToken(token, secret);
-  if (result.kind !== "valid") {
-    return result;
-  }
-  try {
-    if (await isRevoked(result.claims.jti)) {
-      return { kind: "revoked", claims: result.claims };
-    }
-  } catch {
-    // Fail-closed: if we cannot confirm the token is NOT revoked, deny it.
-    return { kind: "revoked", claims: result.claims };
-  }
-  return result;
 }

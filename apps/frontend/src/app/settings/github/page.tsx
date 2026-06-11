@@ -5,9 +5,7 @@ import { useSearchParams } from "next/navigation";
 
 import { GithubConnectionSection } from "../../../components/github-connection-section";
 import { useGithubConnection } from "../../../hooks/use-github-connection";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 function buildFlashMessage(githubAuth: string | null, reason: string | null): string | null {
   if (githubAuth === "connected") {

@@ -40,6 +40,10 @@ const PRICING: Record<string, ModelPricing> = {
   // tokens (1.25x input in reality) are folded into `inputTokens` at the
   // mapper and billed at the regular input rate — small under-bill on that
   // bucket, not worth a dedicated pricing tier.
+  "claude-opus-4-8": {
+    short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
+    long:  null
+  },
   "claude-opus-4-7": {
     short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
     long:  null

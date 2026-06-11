@@ -142,7 +142,7 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 5.4 Boot-time secret validation (Zod)
 - `config.ts` fails fast on missing required secrets.
-- **Conditional requirements:** `ANTHROPIC_API_KEY` (Claude runtime), `E2B_API_KEY` (any `e2b` backend), `GITHUB_APP_PRIVATE_KEY` + `GITHUB_APP_CLIENT_SECRET` (GitHub integration), `PII_OPENROUTER_API_KEY` (`PII_PROVIDER_ENABLED=true`).
+- **Conditional requirements:** `ANTHROPIC_API_KEY` (Claude runtime), `E2B_API_KEY` (any `e2b` backend), `GITHUB_APP_PRIVATE_KEY` + `GITHUB_APP_CLIENT_SECRET` (GitHub integration), `PII_LLM_API_KEY` (`PII_PROVIDER_ENABLED=true`).
 
 ### 5.5 URL sanitization for logging
 - `sanitizeUrl()` strips `token`, `toolContextId`, etc. from any URL logged at warn/error.
@@ -157,13 +157,13 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 - File: `apps/backend/src/routes/approvals.ts`.
 
 ### 6.2 `RuntimeApprovalCoordinator` (Codex)
-- **Intercepts:** `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, plus legacy `execCommandApproval` / `applyPatchApproval`.
+- **Intercepts:** `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`.
 - **Behavior:** holds the request in memory, persists an `approvals` row, blocks the runtime turn until the operator decides.
 - File: `apps/backend/src/services/runtime/runtime-approval-coordinator.ts`.
 
-### 6.3 `ClaudeApprovalHandler`
-- Same flow via the SDK's `canUseTool`. In E2B mode, decisions round-trip as `approval_request` / `approval_response` frames over stdio.
-- Files: `apps/backend/src/services/claude/claude-code-approval-handler.ts`, `apps/backend/src/services/sandbox-agent-protocol.ts`.
+### 6.3 Claude approval bridge
+- Same flow via the SDK's `canUseTool`, which lives in the in-sandbox harness; decisions round-trip as `approval_request` / `approval_response` frames over stdio.
+- Files: `docker/sandbox-agent/sandbox-agent.mjs`, `apps/backend/src/services/claude/claude-code-runtime-adapter.ts`, `apps/backend/src/services/runtime/sandbox-agent-protocol.ts`.
 
 ### 6.4 Auto-approve read-only tools
 - `tenant_settings.auto_approve_read_only_tools` skips prompts for tools tagged `readOnly` (`session_context`, `list_artifacts`, `read_text_artifact`, GitHub/Notion read ops).
@@ -559,7 +559,7 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | MCP proxy signature | `apps/backend/src/lib/mcp-proxy-signature.ts` |
 | MCP gateway | `apps/backend/src/routes/mcp.ts` |
 | Approval coordinator (Codex) | `apps/backend/src/services/runtime/runtime-approval-coordinator.ts` |
-| Approval handler (Claude) | `apps/backend/src/services/claude/claude-code-approval-handler.ts` |
+| Approval bridge (Claude) | `docker/sandbox-agent/sandbox-agent.mjs`, `apps/backend/src/services/claude/claude-code-runtime-adapter.ts` |
 | Rate limits / quotas | `apps/backend/src/services/request-limits.ts` |
 | Security headers | `apps/backend/src/lib/security-headers.ts` |
 | CORS | `apps/backend/src/lib/cors.ts` |

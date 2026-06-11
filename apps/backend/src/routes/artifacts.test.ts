@@ -256,6 +256,26 @@ test("GET /downloads/:token does NOT consume the token when the storage read fai
   await app.close();
 });
 
+test("GET /downloads/:token still streams the file when the audit write fails — the consumed token is not burned", async () => {
+  const { app, stores, audit } = buildApp({
+    initialRows: [makeRow()],
+    auth: { userId: "user-1", tenantId: "tenant-A", role: "member" }
+  });
+  // The audit write runs AFTER consumeDownloadToken; if its failure escaped,
+  // the client would get a 500 with the single-use token already spent.
+  audit.create = async () => {
+    throw new Error("audit table unavailable");
+  };
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
+  expect(response.statusCode).toBe(200);
+  expect(response.body).toBe("PAYLOAD");
+
+  await app.close();
+});
+
 test("GET /downloads/:token destroys the opened stream when the single-use consume race is lost", async () => {
   let destroyed = false;
   const { app, stores } = buildApp({

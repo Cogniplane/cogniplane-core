@@ -7,30 +7,11 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { formatMediumDateTime } from "../lib/time-format";
+import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN, HINT, LIST_ITEM, SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
-const PILL_BASE = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium";
-const PILL_GRAY = `${PILL_BASE} bg-surface-container text-on-surface-variant`;
-const PILL_GREEN = `${PILL_BASE} bg-success-surface text-success`;
-const PILL_RED = `${PILL_BASE} bg-danger-surface text-danger`;
-const PILL_BLUE = `${PILL_BASE} bg-accent-soft text-accent`;
 const CHIP =
   "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
-const HINT = "text-sm text-on-surface-faint";
-const LIST_ITEM = "rounded-lg border border-outline-variant bg-surface-container-lowest p-3";
-
-function formatTimestamp(value: string | null): string {
-  if (!value) return "Not scheduled yet";
-  try {
-    return new Intl.DateTimeFormat("en-US", {
-      dateStyle: "medium",
-      timeStyle: "short"
-    }).format(new Date(value));
-  } catch {
-    return value;
-  }
-}
 
 function runStatusPillClass(status: ScheduledJobRun["status"]): string {
   if (status === "completed") return PILL_GREEN;
@@ -317,7 +298,7 @@ export function ScheduledJobsSection(input: {
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         <span className={CHIP}>{job.cronExpression}</span>
                         <span className={CHIP}>tz {job.timeZone}</span>
-                        <span className={CHIP}>next {formatTimestamp(job.nextRunAt)}</span>
+                        <span className={CHIP}>next {formatMediumDateTime(job.nextRunAt, "Not scheduled yet")}</span>
                       </div>
 
                       {expandedRunsJobId === job.jobId ? (
@@ -334,7 +315,7 @@ export function ScheduledJobsSection(input: {
                                   <span className={runStatusPillClass(run.status)}>
                                     {run.status}
                                   </span>
-                                  <span className={CHIP}>{formatTimestamp(run.startedAt)}</span>
+                                  <span className={CHIP}>{formatMediumDateTime(run.startedAt, "Not scheduled yet")}</span>
                                   {run.durationMs != null ? (
                                     <span className={CHIP}>
                                       {(run.durationMs / 1000).toFixed(1)}s

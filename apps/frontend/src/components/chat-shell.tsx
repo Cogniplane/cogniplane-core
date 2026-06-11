@@ -25,9 +25,11 @@ import { WorkspaceHeader } from "./workspace-header";
 import {
   ARTIFACT_PANE_WIDTH,
   clampArtifactPaneWidth,
+  contextWindowForModel,
   deriveAttentionSessionIds,
   deriveStreamingSessionIds,
   formatSessionForClipboard,
+  latestContextTokens,
   messagesContainHistory,
   modelFallbackForProvider,
   readStoredArtifactPaneWidth,
@@ -68,7 +70,11 @@ export function ChatShell() {
   const selectedModel = displayModels.find((entry) => entry.id === model)
     ?? fallbackModels.find((entry) => entry.id === model)
     ?? null;
-  const { effort, setEffort } = useEffortPreference(selectedModel, showEffortSelector);
+  const { effort, setEffort } = useEffortPreference(
+    selectedModel,
+    showEffortSelector,
+    modelsQuery.data !== undefined
+  );
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -168,6 +174,8 @@ export function ChatShell() {
   );
 
   const hasConversationHistory = messagesContainHistory(chatWorkspace.messages);
+  const contextTokens = latestContextTokens(chatWorkspace.messages);
+  const contextWindow = contextWindowForModel(selectedModel);
 
   const sidebarColClass = isSidebarOpen ? "grid-cols-[280px_minmax(0,1fr)]" : "grid-cols-[0_minmax(0,1fr)]";
   const showArtifactPane = Boolean(sessionList.selectedSession) && isArtifactPaneOpen;
@@ -262,7 +270,7 @@ export function ChatShell() {
                 <MessageList
                   messages={chatWorkspace.messages}
                   pendingApprovals={chatWorkspace.pendingApprovals}
-                  approvalDecisionId={chatWorkspace.approvalDecisionId}
+                  approvalDecision={chatWorkspace.approvalDecision}
                   mcpServerEvents={chatWorkspace.mcpServerErrors}
                   runtimeNotices={chatWorkspace.runtimeNotices}
                   onApprovalDecision={(id, decision) => void chatWorkspace.handleApprovalDecision(id, decision)}
@@ -286,6 +294,8 @@ export function ChatShell() {
               models={displayModels}
               showEffortSelector={showEffortSelector}
               hasConversationHistory={hasConversationHistory}
+              contextTokens={contextTokens}
+              contextWindow={contextWindow}
               onProviderChange={(provider) => {
                 const nextModel = modelFallbackForProvider(provider, displayModels, model);
                 if (nextModel) setModel(nextModel);

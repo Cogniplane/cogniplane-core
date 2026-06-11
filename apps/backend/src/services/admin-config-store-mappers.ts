@@ -6,6 +6,7 @@ import type {
   ApprovalReviewer,
   TenantMemberRecord
 } from "./admin-config-records.js";
+import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -71,8 +72,8 @@ export function mapSkill(row: Record<string, unknown>, requestTenantId?: string)
     enabled: Boolean(row.enabled),
     isPublished: Boolean(row.is_published),
     createdBy: String(row.created_by),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString(),
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at),
     activeRevisionId: row.active_revision_id ? Number(row.active_revision_id) : null,
     activeSourceType: toNullableString(row.active_source_type),
     activeBundleName: toNullableString(row.active_bundle_name),
@@ -137,10 +138,10 @@ export function mapSkillRevision(row: Record<string, unknown>): AdminSkillRevisi
     reviewNotes: toNullableString(row.review_notes),
     metadata: toObjectRecord(row.metadata),
     createdBy: String(row.created_by),
-    createdAt: new Date(String(row.created_at)).toISOString(),
+    createdAt: isoTimestamp(row.created_at),
     reviewedBy: toNullableString(row.reviewed_by),
-    reviewedAt: row.reviewed_at ? new Date(String(row.reviewed_at)).toISOString() : null,
-    activatedAt: row.activated_at ? new Date(String(row.activated_at)).toISOString() : null
+    reviewedAt: isoTimestampOrNull(row.reviewed_at),
+    activatedAt: isoTimestampOrNull(row.activated_at)
   };
 }
 
@@ -159,8 +160,8 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
     enabled: Boolean(row.enabled),
     isPublished: Boolean(row.is_published),
     createdBy: String(row.created_by),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -172,8 +173,8 @@ export function mapTenantMember(row: Record<string, unknown>): TenantMemberRecor
     displayName: toNullableString(row.display_name),
     role: assertEnum(row.role, ["owner", "admin", "member"], "membership role"),
     isBetaTester: Boolean(row.is_beta_tester),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 

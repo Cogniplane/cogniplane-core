@@ -211,7 +211,7 @@ async function buildApp() {
     auditEvents: audit as unknown as AuditEventStore
   });
   await app.ready();
-  return { app, audit, decisionStore };
+  return { app, audit, decisionStore, ruleStore };
 }
 
 test("create → list round-trips a rule and audits the creation", async () => {
@@ -314,6 +314,51 @@ test("create round-trips the kept condition dimensions (categories/severities/tu
     turnContexts: ["scheduled"],
     severities: ["file_change"]
   });
+  await app.close();
+});
+
+test("create rejects a typo'd condition key with 400 instead of storing a catch-all", async () => {
+  // `toolName` (singular) would previously pass the .passthrough() schema,
+  // be dropped by the store's condition reader, and leave a rule matching
+  // EVERYTHING — a typo'd block is a tenant-wide outage in enforce mode.
+  const { app } = await buildApp();
+  const res = await app.inject({
+    method: "POST",
+    url: "/admin/policy/rules",
+    payload: {
+      name: "Block github writes",
+      effect: "block",
+      conditions: { toolName: ["github_write_file"] }
+    }
+  });
+  expect(res.statusCode).toBe(400);
+  expect(JSON.stringify(res.json().details)).toContain("Unrecognized");
+
+  // Nothing was stored.
+  const list = await app.inject({ method: "GET", url: "/admin/policy/rules" });
+  expect(list.json().rules).toEqual([]);
+  await app.close();
+});
+
+test("patch rejects a typo'd condition key with 400", async () => {
+  const { app } = await buildApp();
+  const created = await app.inject({
+    method: "POST",
+    url: "/admin/policy/rules",
+    payload: { name: "Block github writes", effect: "block", conditions: { toolNames: ["github_write_file"] } }
+  });
+  const ruleId = created.json().rule.ruleId as string;
+
+  const res = await app.inject({
+    method: "PATCH",
+    url: `/admin/policy/rules/${ruleId}`,
+    payload: { conditions: { severity: ["file_change"] } }
+  });
+  expect(res.statusCode).toBe(400);
+
+  // The stored conditions are untouched.
+  const list = await app.inject({ method: "GET", url: "/admin/policy/rules" });
+  expect(list.json().rules[0].conditions).toEqual({ toolNames: ["github_write_file"] });
   await app.close();
 });
 
@@ -761,16 +806,21 @@ test("lint endpoint returns no warnings for a clean rule set", async () => {
 });
 
 test("lint endpoint flags an unknown/typo'd condition key on a PERSISTED rule", async () => {
-  const { app } = await buildApp();
-  // `toolName` (singular) is not a known dimension. The API .passthrough()s it,
-  // and the lint reads the raw stored conditions (listForLint) — so the warning
-  // must fire even though toConditions() would drop the key for the engine.
-  const created = await app.inject({
-    method: "POST",
-    url: "/admin/policy/rules",
-    payload: { name: "typo rule", effect: "allow", conditions: { toolName: ["github_write_file"] } }
-  });
-  expect(created.statusCode).toBe(200);
+  const { app, ruleStore } = await buildApp();
+  // `toolName` (singular) is not a known dimension. The create/patch routes now
+  // reject it (strict input schema), but a row written before that
+  // fix — or by a newer writer with a dimension this build doesn't know — can
+  // still carry one. The lint reads the raw stored conditions (listForLint),
+  // so seed the bad row directly through the store.
+  await ruleStore.create(
+    "t1",
+    {
+      name: "typo rule",
+      effect: "allow",
+      conditions: { toolName: ["github_write_file"] } as never
+    },
+    "admin-user"
+  );
   const res = await app.inject({ method: "GET", url: "/admin/policy/lint" });
   const warnings = res.json().warnings;
   expect(warnings).toHaveLength(1);

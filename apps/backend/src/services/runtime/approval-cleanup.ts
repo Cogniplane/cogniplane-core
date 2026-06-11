@@ -3,7 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 
-export type ApprovalCleanupReason = "turn_interrupted" | "ttl_expired" | "runtime_terminated";
+export type ApprovalCleanupReason = "turn_interrupted" | "turn_abandoned" | "ttl_expired" | "runtime_terminated";
 
 export type CancelPendingApprovalsInput = {
   tenantId: string;

@@ -53,6 +53,7 @@ function makeActiveTurn(overrides: Partial<ActiveTurnState> = {}): ActiveTurnSta
     queue: new AsyncQueue<RuntimeEvent>(),
     responseId: "resp-1",
     outputItemDone: false,
+    watchdogTimer: null,
     runtimePolicyId: "default",
     toolContextId: null,
     assistantMessageId: null,
@@ -81,9 +82,8 @@ function makeRuntime(opts: {
     runtimePolicy: phase4RuntimePolicy as unknown as RuntimeState["runtimePolicy"],
     process: opts.proc as unknown as RuntimeProcessHandle,
     threadId: "thread",
-    claudeSessionId: null,
-    claudeResumeAt: null,
     activeTurn: opts.activeTurn === undefined ? makeActiveTurn() : opts.activeTurn,
+    staleTurnIds: new Set(),
     pendingApprovals: new Map(),
     pendingApprovalTimers: new Map(),
     idleTimer: null,
@@ -330,6 +330,37 @@ test("startTurn retry-fails fallback: owner runtime is not holding this turn, fa
   expect(events.some((e) => e.type === "response.failed")).toBe(false);
 });
 
+test("startTurn: turn released while turn/start is in flight — marks the unowned id stale and interrupts it", async () => {
+  const proc = new FakeRuntimeProcess();
+  const activeTurn = makeActiveTurn({ responseId: null });
+  const runtime = makeRuntime({ proc, activeTurn });
+
+  // The consumer abandons the turn (runMessage finally releases the slot)
+  // while the turn/start RPC is still awaiting its response.
+  proc.turnStartImpl = async () => {
+    runtime.activeTurn = null;
+    return { turn: { id: "turn-zombie" } };
+  };
+
+  const { lifecycle } = makeLifecycle({});
+  const { deps } = makeDeps();
+  const orchestrator = new CodexTurnOrchestrator(deps, lifecycle, startFn);
+
+  await orchestrator.startTurn(runtime, "hello");
+
+  // The unowned process-side turn is registered stale and interrupted.
+  expect(runtime.staleTurnIds.has("turn-zombie")).toBe(true);
+  const interrupts = proc.requestLog.filter((r) => r.method === "turn/interrupt");
+  expect(interrupts).toEqual([
+    { method: "turn/interrupt", params: { threadId: "thread", turnId: "turn-zombie" } }
+  ]);
+
+  // No response.created leaked onto the released turn's queue.
+  activeTurn.queue.end();
+  const events = await drain(activeTurn.queue);
+  expect(events).toEqual([]);
+});
+
 // ---------------------------------------------------------------------------
 // Branch 3: interruptActiveTurn
 // ---------------------------------------------------------------------------
@@ -440,11 +471,11 @@ test("handleNotification runtime-error (retrying:false): emits an error notice A
   const { deps } = makeDeps();
   const orchestrator = new CodexTurnOrchestrator(deps, lifecycle, startFn);
 
-  // codex/event/error maps to runtime-error with retrying:false. The mapper
-  // pulls the human message out of the `msg` object's `.message` field.
+  // A v2 `error` notification without willRetry maps to runtime-error with
+  // retrying:false, which drives the terminal-error branch.
   bindAndEmit(orchestrator, runtime, proc, {
-    method: "codex/event/error",
-    params: { msg: { message: "the model crashed" } }
+    method: "error",
+    params: { error: { message: "the model crashed" } }
   });
 
   // Turn was failed (terminal path): slot released, status error.
@@ -465,6 +496,121 @@ test("handleNotification runtime-error (retrying:false): emits an error notice A
   expect(notice.level).toBe("error");
   expect(notice.message).toBe("the model crashed");
   expect(events.some((e) => e.type === "response.failed")).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Branch 5: handleNotification turn-id scoping
+// ---------------------------------------------------------------------------
+
+test("handleNotification: interrupted turn's notifications are dropped before the next turn's id is assigned", async () => {
+  const proc = new FakeRuntimeProcess();
+  const turnA = makeActiveTurn({ responseId: "turn-A" });
+  const runtime = makeRuntime({ proc, activeTurn: turnA });
+
+  const { lifecycle } = makeLifecycle({});
+  const { deps } = makeDeps();
+  const orchestrator = new CodexTurnOrchestrator(deps, lifecycle, startFn);
+
+  // Stop button: terminal frame synthesized without waiting for the runtime's
+  // own turn/completed — turn-A becomes a zombie that may keep emitting.
+  orchestrator.interruptActiveTurn(runtime);
+  expect(runtime.staleTurnIds.has("turn-A")).toBe(true);
+
+  // Next turn starts; turn/start has not returned yet (responseId still null).
+  const turnB = makeActiveTurn({ responseId: null });
+  runtime.activeTurn = turnB;
+
+  // Zombie delta must NOT land in turn B's queue.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "item/agentMessage/delta",
+    params: { delta: "zombie text", turnId: "turn-A", threadId: "thread", itemId: "item-1" }
+  });
+
+  // Zombie turn/completed must NOT terminate turn B; it retires the stale entry.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "turn/completed",
+    params: { threadId: "thread", turn: { id: "turn-A", status: "completed", items: [] } }
+  });
+  expect(runtime.activeTurn).toBe(turnB);
+  expect(runtime.staleTurnIds.has("turn-A")).toBe(false);
+
+  // Once turn B's id is assigned, its own notifications flow normally.
+  turnB.responseId = "turn-B";
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "item/agentMessage/delta",
+    params: { delta: "real text", turnId: "turn-B", threadId: "thread", itemId: "item-2" }
+  });
+
+  turnB.queue.end();
+  const events = await drain(turnB.queue);
+  expect(events).toEqual([
+    { type: "response.output_text.delta", responseId: "turn-B", delta: "real text" }
+  ]);
+});
+
+test("handleNotification: drops notifications whose turnId mismatches the active turn", async () => {
+  const proc = new FakeRuntimeProcess();
+  const turnB = makeActiveTurn({ responseId: "turn-B" });
+  const runtime = makeRuntime({ proc, activeTurn: turnB });
+
+  const { lifecycle, calls } = makeLifecycle({});
+  const { deps } = makeDeps();
+  const orchestrator = new CodexTurnOrchestrator(deps, lifecycle, startFn);
+
+  // A stray delta from an unknown old turn (not on the stale list) is dropped.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "item/agentMessage/delta",
+    params: { delta: "stray", turnId: "turn-A", threadId: "thread", itemId: "item-1" }
+  });
+
+  // An old turn/completed must not terminate the active turn.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "turn/completed",
+    params: { threadId: "thread", turn: { id: "turn-A", status: "completed", items: [] } }
+  });
+  expect(runtime.activeTurn).toBe(turnB);
+  expect(calls.some((c) => c.fn === "persistRuntime" || c.fn === "scheduleIdleTeardown")).toBe(false);
+
+  // Notifications without a turn id are not turn-scoped and still pass through.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "mcpServer/startupStatus/updated",
+    params: { name: "github", status: "ready" }
+  });
+
+  // The active turn's own notifications are delivered.
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "item/agentMessage/delta",
+    params: { delta: "mine", turnId: "turn-B", threadId: "thread", itemId: "item-2" }
+  });
+
+  turnB.queue.end();
+  const events = await drain(turnB.queue);
+  expect(events).toEqual([
+    { type: "framework:mcp_server_status", serverName: "github", status: "ready", error: undefined },
+    { type: "response.output_text.delta", responseId: "turn-B", delta: "mine" }
+  ]);
+});
+
+test("handleNotification: the active turn's own turn/completed still completes it and marks it stale", async () => {
+  const proc = new FakeRuntimeProcess();
+  const turnA = makeActiveTurn({ responseId: "turn-A" });
+  const runtime = makeRuntime({ proc, activeTurn: turnA });
+
+  const { lifecycle } = makeLifecycle({});
+  const { deps } = makeDeps();
+  const orchestrator = new CodexTurnOrchestrator(deps, lifecycle, startFn);
+
+  bindAndEmit(orchestrator, runtime, proc, {
+    method: "turn/completed",
+    params: { threadId: "thread", turn: { id: "turn-A", status: "completed", items: [] } }
+  });
+
+  expect(runtime.activeTurn).toBeNull();
+  // Any post-completion straggler for turn-A (item/completed flushed late) is
+  // now identifiable as stale.
+  expect(runtime.staleTurnIds.has("turn-A")).toBe(true);
+  const events = await drain(turnA.queue);
+  expect(events.map((e) => e.type)).toEqual(["response.output_item.done", "response.completed"]);
 });
 
 test("handleNotification runtime-error (retrying:true): emits a warning notice and does NOT fail the turn", async () => {

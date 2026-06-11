@@ -704,3 +704,36 @@ test("streamAssistantReply emits the terminal failure frame even when persistenc
   expect(sseEvents.some((e) => e.event === "response.failed")).toBeTruthy();
   expect(reply.ended).toBeTruthy();
 });
+
+test("streamAssistantReply emits a terminal frame and ends the socket when the assistant insert throws", async () => {
+  // The reply is hijacked before streamAssistantReply runs, so a throw here
+  // can never become an HTTP error response — the writer itself must deliver
+  // the terminal frame and close the socket, or the client hangs forever.
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  messages.create = async () => {
+    throw new Error("db down");
+  };
+  const cleared: string[] = [];
+  const input = makeInput(reply, [{ type: "response.created", responseId: "r1" }], {
+    messages,
+    activeTurns: {
+      mark: () => {},
+      clear: (sessionId: string) => {
+        cleared.push(sessionId);
+      },
+      snapshot: () => new Set<string>()
+    }
+  });
+
+  // Must resolve (not rethrow into Fastify, which cannot respond post-hijack).
+  await streamAssistantReply(input as never);
+
+  const events = reply.events();
+  const failed = events.find((e) => e.event === "response.failed");
+  expect(failed).toBeDefined();
+  expect((failed?.data.response as { id: unknown }).id).toBeNull();
+  expect((failed?.data.error as { message: string }).message).toBe("db down");
+  expect(reply.ended).toBe(true);
+  expect(cleared).toEqual(["session-1"]);
+});

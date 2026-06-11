@@ -58,15 +58,31 @@ const envSchema = z.object({
     .string()
     .url()
     .default("https://api.openai.com"),
-  // Comma-separated CIDR allowlist for the /llm/anthropic proxy. Only the
-  // direct socket peer (request.ip) is checked — no X-Forwarded-For trust.
-  // Set to the documented E2B egress CIDRs so a leaked runtime token cannot
-  // be redeemed from outside the sandbox provider's NAT range. Empty (the
-  // default) disables the check, which is appropriate for local dev where
-  // the proxy is not in use anyway. The check applies in addition to the
-  // rt_* token's session-scoped HMAC claims; both must pass.
+  // Comma-separated CIDR allowlist for the /llm and /mcp egress controls.
+  // `request.ip` is checked — which is only the true sandbox peer when
+  // TRUST_PROXY is set correctly for the deployment (see below). Set to the
+  // documented E2B egress CIDRs so a leaked runtime token cannot be redeemed
+  // from outside the sandbox provider's NAT range. Empty (the default)
+  // disables the check, which is appropriate for local dev. The check applies
+  // in addition to the rt_* token's session-scoped HMAC claims and the
+  // per-runtime egress IP pin; all configured checks must pass.
   E2B_EGRESS_CIDRS: z.string().trim().default(""),
-  CLAUDE_CODE_MODEL: z.string().trim().min(1).default("claude-sonnet-4-6"),
+  // Fastify `trustProxy` value. Controls how `request.ip` is resolved from
+  // `X-Forwarded-For`, which the /mcp and /llm egress controls (CIDR allowlist
+  // + per-runtime IP pin) depend on to see the real sandbox peer rather than
+  // the load balancer.
+  //   - "1" (default): trust exactly one proxy hop — correct for the
+  //     documented ECS-behind-ALB topology where the ALB is the only hop and
+  //     the backend is reachable only through it. `request.ip` becomes the
+  //     address the ALB recorded for the client (the sandbox's egress IP),
+  //     ignoring any client-forged earlier XFF entries.
+  //   - "0" / "false": trust nothing — `request.ip` is the socket peer.
+  //     Use for direct-exposure deployments with no trusted proxy, otherwise
+  //     a client could spoof `X-Forwarded-For` to defeat the IP pin.
+  //   - a number N: trust N proxy hops (e.g. "2" for CDN-in-front-of-ALB).
+  //   - a comma-separated IP/CIDR list: trust those proxy addresses.
+  TRUST_PROXY: z.string().trim().default("1"),
+  CLAUDE_CODE_MODEL: z.string().trim().min(1).default("claude-opus-4-8"),
   CLAUDE_AGENT_SDK_VERSION: z.string().trim().min(1).default(codexRelease.claudeAgentSdkVersion),
   OPENAI_API_KEY: z.string().trim().min(1).optional(),
   SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-4-5-20251001"),
@@ -80,6 +96,15 @@ const envSchema = z.object({
   RUNTIME_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   RUNTIME_START_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
   RUNTIME_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // Watchdog on a single turn's wall-clock duration, for both runtimes. A
+  // wedged turn (hung model call, stuck in-sandbox SDK) otherwise pins the
+  // session busy — 429 on every new message — until the sandbox dies at
+  // E2B_SANDBOX_TIMEOUT_MS. On expiry the turn is failed with a terminal frame
+  // and the sandbox is recycled (the next message bootstraps a fresh one).
+  // Must comfortably exceed APPROVAL_REQUEST_TTL_MS (a pending approval can
+  // legitimately stall a turn for that long) and stay under
+  // E2B_SANDBOX_TIMEOUT_MS to be useful. 0 disables the watchdog.
+  RUNTIME_TURN_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(20 * 60 * 1000),
   // Lifetime of the HMAC-signed runtime token embedded in the generated
   // codex.toml / .mcp.json so the sandbox can call back to /mcp/:serverId.
   // Default: 24 hours. The token is the only thing tying a sandbox to its
@@ -200,16 +225,25 @@ const envSchema = z.object({
   E2B_TEMPLATE_ID: z.string().trim().min(1).default(codexRelease.e2bTemplateId),
   E2B_SANDBOX_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
   PII_PROVIDER_ENABLED: booleanFromEnvSchema.default(false),
-  PII_OPENROUTER_BASE_URL: z.string().url().default("https://openrouter.ai/api/v1"),
-  PII_OPENROUTER_API_KEY: z.string().trim().min(1).optional(),
-  // Default model selection rationale:
-  //   google/gemini-2.5-flash is routed by OpenRouter to Google's Vertex AI, which
-  //   under OpenRouter's "Zero Data Retention" (ZDR) routing does not retain or
-  //   train on inputs. Operators who want stronger guarantees should set
-  //   PII_OPENROUTER_MODEL explicitly and verify the provider's posture at
-  //   https://openrouter.ai/docs/features/privacy-and-logging and the upstream
-  //   provider's own policy page.
-  PII_OPENROUTER_MODEL: z.string().trim().min(1).default("google/gemini-2.5-flash"),
+  // OpenAI-compatible /chat/completions endpoint for the PII detection model.
+  // Two intended deployments share this one contract:
+  //   - Cogniplane Cloud: a Cogniplane-operated, in-VPC Gemma 4 E2B (QAT 4-bit)
+  //     served by vLLM on a g6.xlarge (no third-party inference API, no external
+  //     query logs). This is what backs the "private PII detection (no
+  //     third-party, no logs)" claim. Point this at the in-VPC vLLM service on
+  //     its fixed ENI address, e.g. http://10.x.x.x:8000/v1. See infra/gemma-pii/
+  //     and docs/runbooks/gemma-pii-inference.md.
+  //   - OSS / dev convenience: any OpenAI-compatible provider (OpenRouter,
+  //     a local Ollama/vLLM, etc.). The operator accepts that provider's
+  //     logging posture.
+  PII_LLM_BASE_URL: z.string().url().default("https://openrouter.ai/api/v1"),
+  PII_LLM_API_KEY: z.string().trim().min(1).optional(),
+  // Default model id. For the in-VPC vLLM deployment this is the served model
+  // name ("google/gemma-4-E2B-it-qat-w4a16-ct"). For OpenRouter dev use, the default below
+  // routes to Google's Vertex AI under ZDR. Operators who want stronger
+  // guarantees should set PII_LLM_MODEL explicitly and verify the provider's
+  // posture (for OpenRouter, https://openrouter.ai/docs/features/privacy-and-logging).
+  PII_LLM_MODEL: z.string().trim().min(1).default("google/gemini-2.5-flash"),
   PII_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   // Hard cap on artifact bytes the PII service will read into memory before
   // a scan. Anything larger throws file_too_large (a permanent failure) and
@@ -376,6 +410,23 @@ export function loadConfig(
     throw new Error("SKILL_BUNDLE_BUCKET_NAME is required when SKILL_BUNDLE_STORAGE_BACKEND=bucket.");
   }
 
+  // Enforce the turn-watchdog bounds documented at the schema field: a value
+  // at or below the approval TTL would abort legitimate turns that are merely
+  // waiting on a human decision, and a value at or above the sandbox lifetime
+  // can never fire before E2B kills the sandbox anyway.
+  if (parsed.RUNTIME_TURN_TIMEOUT_MS > 0) {
+    if (parsed.RUNTIME_TURN_TIMEOUT_MS <= parsed.APPROVAL_REQUEST_TTL_MS) {
+      throw new Error(
+        "RUNTIME_TURN_TIMEOUT_MS must exceed APPROVAL_REQUEST_TTL_MS (a pending approval can stall a turn that long), or be 0 to disable the watchdog."
+      );
+    }
+    if (parsed.RUNTIME_TURN_TIMEOUT_MS >= parsed.E2B_SANDBOX_TIMEOUT_MS) {
+      throw new Error(
+        "RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS — at or above it the sandbox dies before the watchdog can recover the turn."
+      );
+    }
+  }
+
   if (parsed.AUTH_MODE === "workos") {
     if (!parsed.WORKOS_API_KEY) throw new Error("WORKOS_API_KEY is required when AUTH_MODE=workos.");
     if (!parsed.WORKOS_CLIENT_ID) throw new Error("WORKOS_CLIENT_ID is required when AUTH_MODE=workos.");
@@ -463,7 +514,7 @@ export function loadConfig(
     parsed.NOTION_OAUTH_REDIRECT_URI
   );
 
-  // Set E2B_TEMPLATE_ID via env after running `make e2b-build-codex`. The
+  // Set E2B_TEMPLATE_ID via env after running `make e2b-build`. The
   // default in codex-release.json is the placeholder string `replace-with-
   // your-template-id` — booting against E2B with the placeholder would fail
   // opaquely in `Sandbox.create()`, so we surface a clearer error here.
@@ -485,7 +536,7 @@ export function loadConfig(
     if (e2bTemplateIdLooksUnset) {
       throw new Error(
         "E2B_TEMPLATE_ID is not configured. " +
-          "Run `make e2b-build-codex` to build a template in your own E2B account, " +
+          "Run `make e2b-build` to build a template in your own E2B account, " +
           "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
           "apps/backend/src/codex-release.json so the default picks it up)."
       );
@@ -499,9 +550,9 @@ export function loadConfig(
       );
     }
 
-    if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_OPENROUTER_API_KEY) {
+    if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_LLM_API_KEY) {
       throw new Error(
-        "PII_OPENROUTER_API_KEY is required when PII_PROVIDER_ENABLED=true."
+        "PII_LLM_API_KEY is required when PII_PROVIDER_ENABLED=true."
       );
     }
   }

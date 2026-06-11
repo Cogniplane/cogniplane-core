@@ -45,6 +45,10 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ".webp": "image/webp"
 };
 
+// Max files processed concurrently by a sweep — bounds memory (file buffers)
+// and parallel storage uploads.
+const CAPTURE_CONCURRENCY = 5;
+
 // Directories relative to workspacePath that are never swept.
 const EXCLUDED_DIR_NAMES = new Set([".codex", ".framework", "node_modules", ".git", "artifacts"]);
 const EXCLUDED_FILE_NAMES = new Set(["AGENTS.md"]);
@@ -166,8 +170,7 @@ export async function captureWorkspaceArtifacts(input: {
   // base name in one run also get distinct names.
   const takenNames = new Set(existingArtifacts.map((a) => a.artifactName));
 
-  await Promise.all(
-    files.map(async (filePath) => {
+  const captureOne = async (filePath: string): Promise<void> => {
       const fileName = filePath.split("/").pop()!;
       // Already captured this exact file in a prior sweep — idempotent skip.
       if (capturedPaths.has(filePath)) return;
@@ -177,19 +180,23 @@ export async function captureWorkspaceArtifacts(input: {
       // claim it. `reserveUniqueName` mutates `takenNames` in place.
       const artifactName = reserveUniqueName(fileName, takenNames);
 
-      let content: Buffer;
-      let fileSize: number;
-      try {
-        content = await readFile(filePath);
-        fileSize = (await stat(filePath)).size;
-      } catch {
-        return; // file disappeared between scan and read — skip
-      }
-
       const ext = extname(fileName).toLowerCase();
       const mimeType = MIME_BY_EXTENSION[ext] ?? "text/plain";
       const maxBytes = mimeType.startsWith("image/") ? 5_000_000 : 500_000;
-      if (fileSize === 0 || fileSize > maxBytes) return;
+
+      // Stat BEFORE reading: an over-cap file (a model can write arbitrarily
+      // large outputs) must be skipped without buffering it into memory.
+      let content: Buffer;
+      try {
+        const fileSize = (await stat(filePath)).size;
+        if (fileSize === 0 || fileSize > maxBytes) return;
+        content = await readFile(filePath);
+      } catch {
+        return; // file disappeared between scan and read — skip
+      }
+      // The file may have grown between stat and read — re-check the bytes
+      // actually buffered.
+      if (content.length === 0 || content.length > maxBytes) return;
       const checksumSha256 = createHash("sha256").update(content).digest("hex");
       const safeExt = ext.slice(0, 32).replace(/[^a-zA-Z0-9._-]/g, "");
       const storageKey = `${input.userId}/${input.sessionId}/${uuidv7()}${safeExt}`;
@@ -235,6 +242,15 @@ export async function captureWorkspaceArtifacts(input: {
           source: "workspace-sweep"
         }
       });
-    })
-  );
+  };
+
+  // Bounded worker pool: a sweep over a workspace with many files must not
+  // read them all into memory (or open that many storage uploads) at once.
+  const queue = [...files];
+  const workers = Array.from({ length: Math.min(CAPTURE_CONCURRENCY, queue.length) }, async () => {
+    for (let filePath = queue.shift(); filePath !== undefined; filePath = queue.shift()) {
+      await captureOne(filePath);
+    }
+  });
+  await Promise.all(workers);
 }

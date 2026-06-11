@@ -45,6 +45,7 @@ function makeActiveTurn(overrides: Partial<ActiveTurnState> = {}): ActiveTurnSta
     queue: new AsyncQueue(),
     responseId: "resp-1",
     outputItemDone: false,
+    watchdogTimer: null,
     runtimePolicyId: "default",
     toolContextId: null,
     assistantMessageId: null,
@@ -84,9 +85,8 @@ function makeRuntime(opts: {
     runtimePolicy: {} as RuntimeState["runtimePolicy"],
     process: opts.proc as unknown as RuntimeProcessHandle,
     threadId: "thread",
-    claudeSessionId: null,
-    claudeResumeAt: null,
     activeTurn: opts.activeTurn === undefined ? makeActiveTurn() : opts.activeTurn,
+    staleTurnIds: new Set(),
     pendingApprovals,
     pendingApprovalTimers: new Map(),
     idleTimer: null,
@@ -129,10 +129,13 @@ function makeStores() {
   return { approvals, auditEvents, approvalCalls, auditCalls };
 }
 
+// On the real wire the request's turnId matches the active turn's responseId
+// (both come from turn/start) — mismatching ids are now rejected by the
+// non-active-turn guard, exercised in its own tests below.
 const baseRequest = (overrides: Partial<JsonRpcRequest> = {}): JsonRpcRequest => ({
   id: 1,
   method: "item/commandExecution/requestApproval",
-  params: { command: "ls", cwd: "/tmp", approvalId: "ap-1", itemId: "it-1", turnId: "t-1" },
+  params: { command: "ls", cwd: "/tmp", approvalId: "ap-1", itemId: "it-1", turnId: "resp-1" },
   ...overrides
 });
 
@@ -196,6 +199,62 @@ test("rejects with -32000 when MAX_PENDING_APPROVALS is hit", async () => {
   expect((events[0] as ErrorRecord).code).toBe(-32000);
   expect((events[0] as ErrorRecord).message).toMatch(/rate limit/i);
   expect(stores.approvalCalls.length).toBe(0);
+});
+
+test("rejects an approval request from a stale (interrupted) turn without persisting or prompting", async () => {
+  const { process: proc, events } = makeProcess();
+  // Post-interrupt window: the next turn's id is not assigned yet, and the
+  // interrupted turn was registered stale.
+  const turn = makeActiveTurn({ responseId: null });
+  const runtime = makeRuntime({ proc, activeTurn: turn });
+  runtime.staleTurnIds.add("turn-old");
+  const stores = makeStores();
+
+  await handleRuntimeRequest({
+    tenantId: "t",
+    runtime,
+    request: baseRequest({
+      params: { command: "rm -rf /", approvalId: "ap-old", itemId: "it-old", turnId: "turn-old" }
+    }),
+    approvals: stores.approvals,
+    auditEvents: stores.auditEvents,
+    approvalTtlMs: 1_000,
+    logger: createSilentLogger()
+  });
+
+  // The dying turn gets a protocol-correct denial so it unblocks…
+  expect(events).toEqual([{ kind: "response", id: 1, result: { decision: "decline" } }]);
+  // …and nothing is persisted or surfaced on the new turn.
+  expect(stores.approvalCalls.length).toBe(0);
+  expect(stores.auditCalls.length).toBe(0);
+  expect(runtime.pendingApprovals.size).toBe(0);
+  turn.queue.end();
+  const queued = [];
+  for await (const event of turn.queue) queued.push(event);
+  expect(queued).toEqual([]);
+});
+
+test("rejects an approval request whose turnId mismatches the active turn", async () => {
+  const { process: proc, events } = makeProcess();
+  const turn = makeActiveTurn({ responseId: "resp-1" });
+  const runtime = makeRuntime({ proc, activeTurn: turn });
+  const stores = makeStores();
+
+  await handleRuntimeRequest({
+    tenantId: "t",
+    runtime,
+    request: baseRequest({
+      params: { command: "ls", approvalId: "ap-x", itemId: "it-x", turnId: "turn-other" }
+    }),
+    approvals: stores.approvals,
+    auditEvents: stores.auditEvents,
+    approvalTtlMs: 1_000,
+    logger: createSilentLogger()
+  });
+
+  expect(events).toEqual([{ kind: "response", id: 1, result: { decision: "decline" } }]);
+  expect(stores.approvalCalls.length).toBe(0);
+  expect(runtime.pendingApprovals.size).toBe(0);
 });
 
 test("rejects with -32601 for an unknown method", async () => {
@@ -364,7 +423,12 @@ test("expiry timer fires: synthesizes reject and writes approval.expired audit",
   expect((queued[1] as Record<string, unknown>).type).toBe("framework:runtime_notice");
 });
 
-test("expiry no-ops when the DB row was already resolved (race)", async () => {
+test("expiry with an externally-settled DB row still unblocks the runtime and frees the slot", async () => {
+  // The row can be gone from `pending` without a local decision: the
+  // cross-replica sweep expired it. A decision can't be mid-flight here —
+  // resolveApproval claims the in-memory entry synchronously before its DB
+  // write — so the timer must claim, reject to the process, and clean up
+  // rather than early-return and wedge the turn / leak the pending slot.
   const { process: proc, events } = makeProcess();
   const runtime = makeRuntime({ proc });
 
@@ -372,7 +436,7 @@ test("expiry no-ops when the DB row was already resolved (race)", async () => {
     async create(input) {
       return { ...input, decision: null, createdAt: "n", updatedAt: "n", resolvedAt: null } as unknown as Awaited<ReturnType<ApprovalStore["create"]>>;
     },
-    // DB returns null => already approved/rejected by the user concurrently.
+    // DB returns null => row already settled by an external path (sweep).
     async expire() {
       return null;
     }
@@ -397,15 +461,113 @@ test("expiry no-ops when the DB row was already resolved (race)", async () => {
 
   await new Promise((r) => setTimeout(r, 30));
 
-  // Pending approval is preserved (the user's decision will resolve it)
-  expect(runtime.pendingApprovals.size).toBe(1);
-  // No reject was sent to the process — only the original (none)
-  expect(events.filter((e) => e.kind === "response").length).toBe(0);
-  // Only the original approval.requested audit event is present
+  // The pending entry and its timer are released — no leaked slot.
+  expect(runtime.pendingApprovals.size).toBe(0);
+  expect(runtime.pendingApprovalTimers.size).toBe(0);
+  // The JSON-RPC request was answered with a protocol-correct denial.
+  const responses = events.filter((e): e is ResponseRecord => e.kind === "response");
+  expect(responses).toEqual([{ kind: "response", id: 1, result: { decision: "decline" } }]);
+  // No approval.expired audit — the external owner of the row wrote its own.
   expect(auditCalls.length).toBe(1);
+  expect((auditCalls[0] as Record<string, unknown>).type).toBe("approval.requested");
+  // The expiry notice is still pushed so the UI can clear the prompt.
+  runtime.activeTurn!.queue.end();
+  const queued: unknown[] = [];
+  for await (const v of runtime.activeTurn!.queue) queued.push(v);
+  expect((queued.at(-1) as Record<string, unknown>).type).toBe("framework:runtime_notice");
+});
 
-  // Cleanup
-  clearAllApprovalExpiries(runtime);
+test("a turn that ends during the row write is not armed against — deny and expire (Codex review follow-up)", async () => {
+  // Interrupt/teardown cleanup runs before the entry is armed and cannot see
+  // it. The handler must notice the turn changed across the create await and
+  // back out instead of arming a pending slot + timer against a dead turn.
+  const { process: proc, events } = makeProcess();
+  const runtime = makeRuntime({ proc });
+
+  const expireCalls: string[] = [];
+  let releaseCreate!: () => void;
+  const createGate = new Promise<void>((r) => {
+    releaseCreate = r;
+  });
+  const approvals: Pick<ApprovalStore, "create" | "expire"> = {
+    async create(input) {
+      await createGate;
+      return { ...input, decision: null, createdAt: "n", updatedAt: "n", resolvedAt: null } as unknown as Awaited<ReturnType<ApprovalStore["create"]>>;
+    },
+    async expire(_tenantId, approvalId) {
+      expireCalls.push(approvalId);
+      return { approvalId, status: "expired" } as unknown as Awaited<ReturnType<ApprovalStore["expire"]>>;
+    }
+  };
+  const auditCalls: unknown[] = [];
+  const auditEvents: Pick<AuditEventStore, "create"> = {
+    async create(input) {
+      auditCalls.push(input);
+      return {} as unknown as Awaited<ReturnType<AuditEventStore["create"]>>;
+    }
+  };
+
+  const handled = handleRuntimeRequest({
+    tenantId: "t",
+    runtime,
+    request: baseRequest(),
+    approvals,
+    auditEvents,
+    approvalTtlMs: 60_000,
+    logger: createSilentLogger()
+  });
+
+  // The turn is torn down while the row write is in flight.
+  runtime.activeTurn = null;
+  releaseCreate();
+  await handled;
+
+  // Denied to the process, row expired, nothing armed, no prompt queued.
+  expect(events).toEqual([{ kind: "response", id: 1, result: { decision: "decline" } }]);
+  expect(expireCalls).toEqual(["ap-1"]);
+  expect(runtime.pendingApprovals.size).toBe(0);
+  expect(runtime.pendingApprovalTimers.size).toBe(0);
+  expect(auditCalls).toHaveLength(0);
+});
+
+test("approvals.create failure denies the request instead of arming an unanswerable approval", async () => {
+  const { process: proc, events } = makeProcess();
+  const runtime = makeRuntime({ proc });
+
+  const approvals: Pick<ApprovalStore, "create" | "expire"> = {
+    async create() {
+      throw new Error("approvals table unwritable");
+    },
+    async expire() {
+      return null;
+    }
+  };
+  const auditCalls: unknown[] = [];
+  const auditEvents: Pick<AuditEventStore, "create"> = {
+    async create(input) {
+      auditCalls.push(input);
+      return {} as unknown as Awaited<ReturnType<AuditEventStore["create"]>>;
+    }
+  };
+
+  await expect(
+    handleRuntimeRequest({
+      tenantId: "t",
+      runtime,
+      request: baseRequest(),
+      approvals,
+      auditEvents,
+      approvalTtlMs: 60_000,
+      logger: createSilentLogger()
+    })
+  ).rejects.toThrow("approvals table unwritable");
+
+  // The runtime got a denial, and no entry/timer was armed — nothing to leak
+  // against MAX_PENDING_APPROVALS, nothing the user could never resolve.
+  expect(events).toEqual([{ kind: "response", id: 1, result: { decision: "decline" } }]);
+  expect(runtime.pendingApprovals.size).toBe(0);
+  expect(runtime.pendingApprovalTimers.size).toBe(0);
+  expect(auditCalls.length).toBe(0);
 });
 
 test("clearApprovalExpiry removes only the matching timer", () => {

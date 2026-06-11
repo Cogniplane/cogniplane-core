@@ -36,6 +36,41 @@ test("redactSecrets redacts known secret-bearing fields and preserves non-sensit
       });
 });
 
+test("redactSecrets blanks secret-keyed strings (including composite names) but preserves numeric telemetry", () => {
+  const result = redactSecrets({
+    accessToken: "abc",
+    refresh_token: "def",
+    "x-api-key": "ghi",
+    clientSecret: "jkl",
+    dbPassword: "mno",
+    // Composite names where the secret word is NOT the final segment must
+    // still be blanked — these are real credential shapes.
+    secretAccessKey: "aws-secret",
+    passwordHash: "$2b$10$hash",
+    tokenValue: "rt_value",
+    tokens: ["rt_1", "rt_2"],
+    // Numeric/object telemetry under token-ish keys must survive.
+    tokenUsage: { inputTokens: 12, outputTokens: 34 },
+    maxTokens: 4096,
+    tokenCount: 7
+  });
+
+  expect(result).toEqual({
+    accessToken: "[REDACTED]",
+    refresh_token: "[REDACTED]",
+    "x-api-key": "[REDACTED]",
+    clientSecret: "[REDACTED]",
+    dbPassword: "[REDACTED]",
+    secretAccessKey: "[REDACTED]",
+    passwordHash: "[REDACTED]",
+    tokenValue: "[REDACTED]",
+    tokens: "[REDACTED]",
+    tokenUsage: { inputTokens: 12, outputTokens: 34 },
+    maxTokens: 4096,
+    tokenCount: 7
+  });
+});
+
 test("redactSecrets redacts inline bearer tokens without blanking the surrounding text", () => {
   const result = redactSecrets(
     "curl -H 'Authorization: Bearer top-secret-token' https://example.com"

@@ -88,7 +88,9 @@ export function useArtifactActions(input: {
       if (previewRequestRef.current === thisRequest)
         setPreviewError("Failed to load preview. Try downloading the file instead.");
     } finally {
-      setIsLoadingPreview(false);
+      if (previewRequestRef.current === thisRequest) {
+        setIsLoadingPreview(false);
+      }
     }
   }, [artifacts]);
 

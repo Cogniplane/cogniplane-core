@@ -17,9 +17,10 @@ export function useChatWorkspace(input: {
 
   const {
     pendingApprovals,
-    approvalDecisionId,
+    approvalDecision,
     replacePendingApprovals,
     registerPendingApproval,
+    removePendingApproval,
     handleApprovalDecision
   } = useApprovalState({ onError });
 
@@ -28,6 +29,7 @@ export function useChatWorkspace(input: {
     setMessages,
     artifacts,
     refreshSessionData,
+    invalidateInFlightSessionRefreshes,
     isSessionDataReady
   } = useSessionData({
     selectedSessionId,
@@ -48,7 +50,9 @@ export function useChatWorkspace(input: {
     onError,
     setMessages,
     registerPendingApproval,
+    removePendingApproval,
     refreshSessionData,
+    invalidateInFlightSessionRefreshes,
     model,
     effort
   });
@@ -63,7 +67,7 @@ export function useChatWorkspace(input: {
     messages,
     artifacts,
     pendingApprovals,
-    approvalDecisionId,
+    approvalDecision,
     handleApprovalDecision,
     artifactState,
     isSending,

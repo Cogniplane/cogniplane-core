@@ -13,6 +13,7 @@ import {
   updateMessageById as updateMessageCollectionById
 } from "./chat-message-state";
 import { createChatStreamHandlers } from "./chat-stream-handlers";
+import { expiredApprovalIdFromNotice } from "./use-approval-state";
 
 export function useChatMessageStreaming(input: {
   selectedSessionId: string | null;
@@ -20,7 +21,9 @@ export function useChatMessageStreaming(input: {
   onError: (message: string) => void;
   setMessages: Dispatch<SetStateAction<Message[]>>;
   registerPendingApproval: (approval: Approval) => void;
+  removePendingApproval: (approvalId: string) => void;
   refreshSessionData: (sessionId: string) => Promise<void>;
+  invalidateInFlightSessionRefreshes: () => void;
   model: string;
   effort?: EffortLevel;
 }) {
@@ -30,7 +33,9 @@ export function useChatMessageStreaming(input: {
     onError,
     setMessages,
     registerPendingApproval,
+    removePendingApproval,
     refreshSessionData,
+    invalidateInFlightSessionRefreshes,
     model,
     effort
   } = input;
@@ -93,6 +98,7 @@ export function useChatMessageStreaming(input: {
         content: ""
       });
 
+      invalidateInFlightSessionRefreshes();
       setMessages((current) => [...current, userMessage, assistantMessage]);
       setMcpServerErrors([]);
       setRuntimeNotices([]);
@@ -118,6 +124,10 @@ export function useChatMessageStreaming(input: {
           },
           onRuntimeNotice: (event) => {
             setRuntimeNotices((current) => [...current, event]);
+            const expiredApprovalId = expiredApprovalIdFromNotice(event.noticeId);
+            if (expiredApprovalId) {
+              removePendingApproval(expiredApprovalId);
+            }
           },
           refreshSessionData,
           sessionId,
@@ -147,21 +157,25 @@ export function useChatMessageStreaming(input: {
           updatedAt: new Date().toISOString()
         }));
       } finally {
+        // A superseded send's finally runs while the replacing send is still
+        // streaming — only the owner of the active controller may reset state.
         if (activeAbortRef.current === controller) {
           activeAbortRef.current = null;
+          setIsSending(false);
+          setStreamingSessionId((current) => (current === sessionId ? null : current));
         }
-        setIsSending(false);
-        setStreamingSessionId((current) => (current === sessionId ? null : current));
       }
     },
     [
       model,
       effort,
+      invalidateInFlightSessionRefreshes,
       onError,
       patchMessage,
       patchToolResult,
       refreshSessionData,
       registerPendingApproval,
+      removePendingApproval,
       selectedSessionId,
       setMessages,
       updateMessageById,

@@ -53,7 +53,7 @@ docs/                    # Architecture, decisions, security features, guides
 - `services/managed-tools/factory.ts`, `services/managed-tools/catalog.ts`, `services/redact-secrets.ts` — managed-tool dispatch (factory wires deps; catalog enumerates the allowlist) + audit redaction.
 - `services/policy/` — Policy Center rule evaluation, rule storage, and decision evidence.
 - `services/*-store.ts` — tenant-scoped persistence modules.
-- `services/pii-*`, `services/openrouter-pii-provider.ts` — PII detection/transform pipeline.
+- `services/pii/*`, `services/pii/openai-compatible-pii-provider.ts` — PII detection/transform pipeline.
 - `services/scheduler-*` — cron-driven scheduler worker for user-owned scheduled jobs.
 - `services/github-*`, `services/notion-*` — third-party connection lifecycle.
 - `services/skill-bundle-*`, `services/skill-marketplace-*` — versioned skill bundle storage and registry.
@@ -229,7 +229,7 @@ Rules:
 
 Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes.
 
-When `tenant_settings.approval_policy` requests human review for runtime-native actions, the runtime pauses before executing flagged shell/file/permission requests. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts Codex requests, holds them in memory, persists a row in `approvals`, and emits a `framework:approval_required` SSE event. Claude uses `canUseTool` through `ClaudeApprovalHandler`.
+When `tenant_settings.approval_policy` requests human review for runtime-native actions, the runtime pauses before executing flagged shell/file/permission requests. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts Codex requests, holds them in memory, persists a row in `approvals`, and emits a `framework:approval_required` SSE event. Claude uses `canUseTool` through the in-sandbox approval bridge (`docker/sandbox-agent/sandbox-agent.mjs`).
 
 The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused runtime turn. `runtimeManager.resolveApproval` is tried first; if it returns `"missing"`, the request falls through to the optional Claude resolver.
 
@@ -241,7 +241,7 @@ Policy Center can also return `require_approval` for an MCP tool call. In that p
 
 Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry:
 - Codex: a synthetic `reject` is sent to the runtime process so it unblocks.
-- Claude: `ClaudeApprovalHandler` resolves the `canUseTool` Promise with `deny`.
+- Claude: the in-sandbox approval bridge resolves the `canUseTool` Promise with `deny`.
 
 The DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt.
 
@@ -302,13 +302,13 @@ Improving a skill is a normal agent turn, not a bespoke worker. The built-in `sk
 
 ## PII Pipeline
 
-PII detection is opt-in (`PII_PROVIDER_ENABLED`). The pipeline is a generic "send-text-to-an-LLM-for-detection" path parameterized by the `PII_*` env vars; you bring your own model provider and accept that vendor's logging posture. The default configuration uses an OpenRouter-routed LLM (default `google/gemini-2.5-flash`) with a rule-based fallback for when the LLM provider is unavailable or times out.
+PII detection is opt-in (`PII_PROVIDER_ENABLED`). The pipeline targets any OpenAI-compatible `/chat/completions` endpoint, parameterized by the `PII_LLM_*` env vars; you bring your own model provider (a hosted API or a self-hosted Ollama/vLLM server) and accept that vendor's logging posture. The default configuration points at OpenRouter (default model `google/gemini-2.5-flash`) with a rule-based fallback for when the LLM endpoint is unavailable or times out.
 
 Two paths:
 - **Sync** — message text passes through `pii-detect-handler` before being forwarded to the runtime. Detect/block/transform actions are configured per tenant.
 - **Async** — `pii_scan_runs` + `pii_scan_jobs` queue scans of stored content (artifacts, message history). Findings persisted with severity and category.
 
-Configuration knobs: `PII_OPENROUTER_API_KEY`, `PII_OPENROUTER_MODEL`, `PII_OPENROUTER_BASE_URL`, `PII_PROVIDER_TIMEOUT_MS`.
+Configuration knobs: `PII_LLM_API_KEY`, `PII_LLM_MODEL`, `PII_LLM_BASE_URL`, `PII_PROVIDER_TIMEOUT_MS`.
 
 ## Scheduler
 

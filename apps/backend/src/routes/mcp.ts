@@ -26,6 +26,8 @@ import type {
   RuntimeApprovalKind
 } from "../runtime-contracts.js";
 import type { AppDependencies } from "../app-dependencies.js";
+import { cidrAllowlistAllows, parseCidrAllowlist } from "../lib/cidr-allowlist.js";
+import { resolveEgressClientIp } from "../lib/egress-client-ip.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { signProxyHeaders } from "../lib/mcp-proxy-signature.js";
 import { ssrfSafeAgent } from "../lib/url-validation.js";
@@ -86,6 +88,34 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Best-effort audit row for gateway-level refusals (egress controls). A
+// failed audit write must never change the gating outcome — the 403 already
+// protects the platform; losing the evidence row is the lesser failure.
+async function recordGatewayRejection(
+  stores: Pick<McpRouteStores, "auditEvents">,
+  reason: string,
+  ctx: {
+    claims: RuntimeTokenClaims;
+    ipAddress: string | null;
+    serverId: string;
+    rpcMethod: string;
+  },
+  log: FastifyBaseLogger
+): Promise<void> {
+  try {
+    await stores.auditEvents.create({
+      tenantId: ctx.claims.tid,
+      sessionId: ctx.claims.sid,
+      userId: ctx.claims.uid,
+      type: "mcp.gateway.rejected",
+      payload: { reason, serverId: ctx.serverId, rpcMethod: ctx.rpcMethod },
+      ipAddress: ctx.ipAddress
+    });
+  } catch (err) {
+    log.warn({ err, reason, serverId: ctx.serverId }, "failed to persist mcp.gateway.rejected audit event");
+  }
+}
+
 // Routes a Policy Center require_approval to whichever adapter owns the
 // session. Returns the human disposition, or null when no adapter could host
 // the approval (no active turn) — the gateway then degrades to a deny.
@@ -97,7 +127,13 @@ export function buildMcpRouteStores(
   deps: AppDependencies,
   extras: {
     runtimeTokenSecret: string;
+    egressCidrs: string;
     readRuntimeFile: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
+    statRuntimeFile: (
+      sessionId: string,
+      runtimeId: string,
+      filePath: string
+    ) => Promise<{ sizeBytes: number }>;
     writeRuntimeFile: (
       sessionId: string,
       runtimeId: string,
@@ -123,9 +159,12 @@ export function buildMcpRouteStores(
     managedToolCatalog: deps.managedToolCatalog,
     policyService: deps.policyService,
     readRuntimeFile: extras.readRuntimeFile,
+    statRuntimeFile: extras.statRuntimeFile,
     writeRuntimeFile: extras.writeRuntimeFile,
     requestPolicyApproval: extras.requestPolicyApproval,
     runtimeTokenSecret: extras.runtimeTokenSecret,
+    egressAllowlist: parseCidrAllowlist(extras.egressCidrs),
+    egressIpPins: deps.egressIpPins,
     activationTracker: deps.activationTracker
   };
 }
@@ -145,6 +184,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     notionConnections: stores.notionConnections,
     piiProtection: stores.piiProtection,
     readRuntimeFile: stores.readRuntimeFile,
+    statRuntimeFile: stores.statRuntimeFile,
     writeRuntimeFile: stores.writeRuntimeFile
   });
 
@@ -180,6 +220,81 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     const serverId = mcpRouteParamsSchema.parse(request.params).serverId;
     const rpc = parsed.data;
 
+    // The MCP gateway exists for the sandboxed runtime alone — every request,
+    // including initialize, must carry a valid session-scoped rt_* token
+    // (Authorization header for Claude; ?token= for Codex, whose Streamable
+    // HTTP transport drops the header on the initialize POST). User JWTs and
+    // dev headers are deliberately rejected: resolveBoundToolContext binds
+    // caller-supplied toolContextIds to these claims, so admitting non-runtime
+    // callers would let a same-tenant user substitute another user's context
+    // id and execute tools under that identity. We re-verify the token here
+    // rather than threading claims through request.auth so the rest of the
+    // API surface stays unchanged.
+    const runtimeTokenClaims = resolveRuntimeTokenClaims(
+      request.headers.authorization,
+      request.url,
+      stores.runtimeTokenSecret
+    );
+    if (!runtimeTokenClaims) {
+      request.log.warn(
+        { serverId, rpcMethod: rpc.method, tenantId: request.auth.tenantId },
+        "MCP gateway 401: request authenticated without a valid runtime token (rt_*)"
+      );
+      reply.code(401);
+      return failure(rpc.id, -32000, "The MCP gateway requires a valid runtime token (rt_*).");
+    }
+    const sessionIdFromRuntimeToken = runtimeTokenClaims.sid;
+
+    // Same egress controls as the LLM proxy (llm-proxy-core.ts). The CIDR
+    // allowlist (E2B_EGRESS_CIDRS) is dormant unless configured — E2B does not
+    // publish egress ranges — so the per-runtime IP pin is the operative
+    // control: the first gateway/proxy call for a runtimeId records the peer
+    // IP, and a leaked rt_* token replayed from any other host is refused for
+    // the rest of its TTL. The pin store is shared with /llm/*, so whichever
+    // route the sandbox hits first establishes the pin for both.
+    //
+    // The pinned IP must be the real sandbox peer, not an intermediate proxy.
+    // Behind Cloudflare (CDN → ALB → backend) `request.ip` resolves to a
+    // rotating Cloudflare edge IP, so resolveEgressClientIp prefers the
+    // origin client from CF-Connecting-IP when the request crossed a trusted
+    // proxy hop, falling back to request.ip otherwise (see egress-client-ip.ts).
+    const ipAddress = resolveEgressClientIp(request);
+    if (stores.egressAllowlist && !cidrAllowlistAllows(stores.egressAllowlist, ipAddress ?? "")) {
+      await recordGatewayRejection(stores, "egress_ip_not_allowed", {
+        claims: runtimeTokenClaims,
+        ipAddress,
+        serverId,
+        rpcMethod: rpc.method
+      }, request.log);
+      reply.code(403);
+      return failure(rpc.id, -32000, "Egress IP is not allowed.");
+    }
+    if (ipAddress) {
+      const pinResult = stores.egressIpPins.checkAndPin(runtimeTokenClaims.rid, ipAddress);
+      if (pinResult.kind === "mismatch") {
+        await recordGatewayRejection(stores, "egress_ip_mismatch", {
+          claims: runtimeTokenClaims,
+          ipAddress,
+          serverId,
+          rpcMethod: rpc.method
+        }, request.log);
+        // Log expected/observed at warn so an operator investigating a leak
+        // can see both — the audit payload deliberately omits the expected IP
+        // to avoid storing per-runtime peer addresses in a long-retention
+        // table (mirrors the LLM proxy).
+        request.log.warn(
+          {
+            runtimeId: runtimeTokenClaims.rid,
+            expectedIp: pinResult.expectedIp,
+            observedIp: pinResult.observedIp
+          },
+          "MCP gateway egress IP mismatch — refusing rt_* call from unexpected peer"
+        );
+        reply.code(403);
+        return failure(rpc.id, -32000, "Egress IP mismatch.");
+      }
+    }
+
     let server: Awaited<ReturnType<typeof stores.dynamicConfig.getMcpServer>>;
     try {
       server = await stores.dynamicConfig.getMcpServer(request.auth.tenantId, serverId);
@@ -201,24 +316,6 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
         return null;
       }
     })();
-
-    // Session-scoped fallback: when neither args nor URL carry a
-    // toolContextId, the gateway looks up the active turn's context by
-    // sessionId. The sessionId comes from the runtime token (rt_*) that
-    // authenticated this request — we re-verify it here rather than threading
-    // the claim through request.auth so the rest of the API surface stays
-    // unchanged.
-    //
-    // The full claims (sid + uid) are also used to BIND an arg/URL-supplied
-    // toolContextId to the caller: a same-tenant attacker must not be able to
-    // substitute another user's or session's context id into a tool call (see
-    // assertContextBoundToCaller in the tool-call handlers).
-    const runtimeTokenClaims = resolveRuntimeTokenClaims(
-      request.headers.authorization,
-      request.url,
-      stores.runtimeTokenSecret
-    );
-    const sessionIdFromRuntimeToken = runtimeTokenClaims?.sid ?? null;
 
     request.log.debug(
       {
@@ -251,7 +348,16 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           logger: request.log
         });
 
-      case "tools/call":
+      case "tools/call": {
+        // A Policy Center require_approval can hold this response open for
+        // minutes. If the connection dies first (runtime HTTP client timeout,
+        // sandbox teardown) nobody will consume the result — abort the held
+        // approval so a late human approve can't dispatch a tool call with no
+        // consumer (the runtime may meanwhile have retried the call).
+        const clientDisconnect = new AbortController();
+        reply.raw.on("close", () => {
+          if (!reply.raw.writableEnded) clientDisconnect.abort();
+        });
         return handleToolsCall({
           rpc,
           server,
@@ -266,8 +372,10 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           policyService: stores.policyService,
           requestPolicyApproval: stores.requestPolicyApproval,
           dataEncryptionSecret: app.config.DATA_ENCRYPTION_SECRET,
+          clientDisconnectSignal: clientDisconnect.signal,
           logger: request.log
         });
+      }
 
       default:
         return failure(rpc.id, -32601, `Unsupported MCP method ${rpc.method}.`);
@@ -299,7 +407,7 @@ async function handleToolsList(input: {
   tenantId: string;
   managedTools: ManagedToolDefinition[];
   toolContexts: ToolExecutionContextStore;
-  sessionIdFromRuntimeToken: string | null;
+  sessionIdFromRuntimeToken: string;
   logger: Pick<FastifyBaseLogger, "debug">;
 }): Promise<RpcResponse> {
   const { rpc, server, tenantId, managedTools, toolContexts, sessionIdFromRuntimeToken, logger } = input;
@@ -379,13 +487,14 @@ async function handleToolsCall(input: {
   managedTools: ManagedToolDefinition[];
   toolContexts: ToolExecutionContextStore;
   urlToolContextId: string | null;
-  sessionIdFromRuntimeToken: string | null;
-  runtimeTokenClaims: RuntimeTokenClaims | null;
+  sessionIdFromRuntimeToken: string;
+  runtimeTokenClaims: RuntimeTokenClaims;
   requestHeaders: Record<string, string | string[] | undefined>;
   activationTracker?: ActivationTracker;
   policyService: PolicyService;
   requestPolicyApproval: GatewayPolicyApprovalRouter;
   dataEncryptionSecret: string;
+  clientDisconnectSignal?: AbortSignal;
   logger: Pick<FastifyBaseLogger, "debug" | "warn">;
 }): Promise<RpcResponse> {
   const {
@@ -402,6 +511,7 @@ async function handleToolsCall(input: {
     policyService,
     requestPolicyApproval,
     dataEncryptionSecret,
+    clientDisconnectSignal,
     logger
   } = input;
 
@@ -424,7 +534,7 @@ async function handleToolsCall(input: {
     return failure(rpc.id, -32602, "Invalid params: 'arguments' must be an object.");
   }
 
-  const policyGate: PolicyGate = { policyService, requestPolicyApproval, logger };
+  const policyGate: PolicyGate = { policyService, requestPolicyApproval, clientDisconnectSignal, logger };
 
   const response =
     server.mode === "managed"
@@ -476,13 +586,13 @@ async function handleToolsCall(input: {
 async function recordToolCallTelemetry(input: {
   activationTracker?: ActivationTracker;
   tenantId: string;
-  sessionIdFromRuntimeToken: string | null;
+  sessionIdFromRuntimeToken: string;
   server: McpServerRegistration;
   rpc: z.infer<typeof rpcRequestSchema>;
   response: RpcResponse;
 }): Promise<void> {
   const { activationTracker, tenantId, sessionIdFromRuntimeToken, server, rpc, response } = input;
-  if (!activationTracker || !sessionIdFromRuntimeToken) return;
+  if (!activationTracker) return;
 
   const toolName = typeof rpc.params?.name === "string" ? (rpc.params.name as string) : null;
   const eventCtx = { tenantId, sessionId: sessionIdFromRuntimeToken };
@@ -525,25 +635,23 @@ async function recordToolCallTelemetry(input: {
  * We therefore assert that the resolved context belongs to the runtime token's
  * sid + uid. Path 3 is inherently bound: it looks up by the token's sid.
  *
- * Binding only applies when a runtime token is present. In production the
- * `/mcp/` path is reachable only with a valid `rt_*` token (the auth middleware
- * 401s otherwise), so an attacker cannot drop the token to skip the check.
- * When no token is present the caller was authenticated some other way
- * (dev-headers) and is already trusted at tenant scope.
+ * The claims are always present: the POST /mcp/:serverId handler rejects any
+ * request that did not authenticate with a valid rt_* token before this
+ * function is reached, so the binding is unconditional.
  */
 async function resolveBoundToolContext(input: {
   rpc: z.infer<typeof rpcRequestSchema>;
   tenantId: string;
   args: Record<string, unknown>;
   urlToolContextId: string | null;
-  sessionIdFromRuntimeToken: string | null;
-  runtimeTokenClaims: RuntimeTokenClaims | null;
+  sessionIdFromRuntimeToken: string;
+  runtimeTokenClaims: RuntimeTokenClaims;
   toolContexts: ToolExecutionContextStore;
 }): Promise<{ context: ToolExecutionContext } | { error: RpcResponse }> {
   const { rpc, tenantId, args, urlToolContextId, sessionIdFromRuntimeToken, runtimeTokenClaims, toolContexts } = input;
   const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
 
-  let context: ToolExecutionContext | null = null;
+  let context: ToolExecutionContext | null;
   let suppliedByCaller = false;
 
   try {
@@ -553,7 +661,7 @@ async function resolveBoundToolContext(input: {
     } else if (urlToolContextId) {
       context = await toolContexts.require(tenantId, urlToolContextId);
       suppliedByCaller = true;
-    } else if (sessionIdFromRuntimeToken) {
+    } else {
       context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
     }
   } catch (error) {
@@ -566,8 +674,7 @@ async function resolveBoundToolContext(input: {
 
   // Bind a caller-supplied context id to the authenticated runtime token so a
   // same-tenant caller cannot substitute another user's/session's context.
-  // Only enforced when a runtime token is present (see docstring).
-  if (suppliedByCaller && runtimeTokenClaims) {
+  if (suppliedByCaller) {
     if (context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid) {
       return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
     }
@@ -583,8 +690,8 @@ async function handleManagedToolCall(
   managedTools: ManagedToolDefinition[],
   toolContexts: ToolExecutionContextStore,
   urlToolContextId: string | null,
-  sessionIdFromRuntimeToken: string | null,
-  runtimeTokenClaims: RuntimeTokenClaims | null,
+  sessionIdFromRuntimeToken: string,
+  runtimeTokenClaims: RuntimeTokenClaims,
   policyGate: PolicyGate
 ): Promise<RpcResponse> {
   const params = rpc.params ?? {};
@@ -620,7 +727,13 @@ async function handleManagedToolCall(
   try {
     const runtimePolicy = requireMcpServerAllowed(serverId, context);
     requireManagedToolAllowed(tool.name, runtimePolicy);
-    enforceManagedToolPolicy(tool, runtimePolicy.id, runtimePolicy.autoApproveReadOnlyTools);
+    // Approval for managed tool calls is NOT enforced here. Claude gates every
+    // tool call (including MCP) through canUseTool inside the sandbox, where
+    // autoApproveReadOnlyTools decides whether read-only tools skip the prompt
+    // — by the time the HTTP call arrives the approval already happened. For
+    // Codex, Policy Center (below) is the control plane for gating MCP calls;
+    // its require_approval rules pause right here at the gateway.
+    //
     // Policy Center gate — records a decision and, in enforce mode, may pause for
     // human approval (require_approval) or throw PolicyBlockedError (block /
     // approval denied — surfaced as a distinct RPC error below). Severity is
@@ -656,12 +769,8 @@ async function getVisibleManagedTools(input: {
   serverId: string;
   managedTools: ManagedToolDefinition[];
   toolContexts: ToolExecutionContextStore;
-  sessionIdFromRuntimeToken: string | null;
+  sessionIdFromRuntimeToken: string;
 }): Promise<ManagedToolDefinition[]> {
-  if (!input.sessionIdFromRuntimeToken) {
-    return input.managedTools;
-  }
-
   const context = await input.toolContexts.findLatestActiveBySession(
     input.tenantId,
     input.sessionIdFromRuntimeToken
@@ -712,30 +821,12 @@ function getRuntimePolicySnapshot(context: ToolExecutionContext): ResolvedRuntim
   });
 }
 
-/**
- * Enforces the auto-approval policy for managed MCP tools.
- *
- * Read-only tools are allowed when autoApproveReadOnlyTools is enabled.
- * Write tools are always allowed through at the MCP layer — the runtime's
- * approval flow (based on the profile's approvalPolicy) gates destructive
- * operations separately.
- */
-function enforceManagedToolPolicy(
-  tool: { name: string; readOnly: boolean },
-  runtimePolicyId: string,
-  autoApproveReadOnlyTools: boolean
-): void {
-  if (tool.readOnly && !autoApproveReadOnlyTools) {
-    throw new Error(
-      `Read-only managed tool ${tool.name} is not auto-approved by runtime policy ${runtimePolicyId}.`
-    );
-  }
-}
-
 // Dependencies the Policy Center hook needs at the tool-call choke point.
 type PolicyGate = {
   policyService: PolicyService;
   requestPolicyApproval: GatewayPolicyApprovalRouter;
+  /** Aborts when the gateway's HTTP response dies before the tool call returns. */
+  clientDisconnectSignal?: AbortSignal;
   logger: Pick<FastifyBaseLogger, "warn">;
 };
 
@@ -841,7 +932,8 @@ async function enforcePolicyCenter(
         toolName: request.toolName,
         serverId: request.serverId,
         kind: severityToApprovalKind(request.severity ?? severity),
-        explanation: request.explanation
+        explanation: request.explanation,
+        signal: gate.clientDisconnectSignal
       });
       if (disposition === null) {
         // No adapter could host the approval (no active turn) — deny.
@@ -862,8 +954,8 @@ async function handleForwardedToolCall(
   server: McpServerRegistration,
   toolContexts: ToolExecutionContextStore,
   urlToolContextId: string | null,
-  sessionIdFromRuntimeToken: string | null,
-  runtimeTokenClaims: RuntimeTokenClaims | null,
+  sessionIdFromRuntimeToken: string,
+  runtimeTokenClaims: RuntimeTokenClaims,
   requestHeaders: Record<string, string | string[] | undefined>,
   dataEncryptionSecret: string,
   policyGate: PolicyGate

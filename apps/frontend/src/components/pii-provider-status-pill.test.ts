@@ -13,7 +13,7 @@ test("resolvePill: null status returns neutral", () => {
 
 test("resolvePill: closed with no failures shows OK without detail", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "closed",
     failureCount: 0,
     openedAt: null,
@@ -27,7 +27,7 @@ test("resolvePill: closed with no failures shows OK without detail", () => {
 
 test("resolvePill: closed with recent failures shows OK with count detail", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "closed",
     failureCount: 3,
     openedAt: null,
@@ -40,7 +40,7 @@ test("resolvePill: closed with recent failures shows OK with count detail", () =
 
 test("resolvePill: closed with one failure uses singular form", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "closed",
     failureCount: 1,
     openedAt: null,
@@ -52,7 +52,7 @@ test("resolvePill: closed with one failure uses singular form", () => {
 
 test("resolvePill: half_open shows probing variant", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "half_open",
     failureCount: 0,
     openedAt: null,
@@ -65,7 +65,7 @@ test("resolvePill: half_open shows probing variant", () => {
 
 test("resolvePill: open with willRetryAt in the future shows countdown in seconds", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "open",
     failureCount: 5,
     openedAt: 1_000_000,
@@ -78,7 +78,7 @@ test("resolvePill: open with willRetryAt in the future shows countdown in second
 
 test("resolvePill: open with willRetryAt already passed clamps to 0s (not negative)", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "open",
     failureCount: 5,
     openedAt: 1_000_000,
@@ -93,7 +93,7 @@ test("resolvePill: open with willRetryAt already passed clamps to 0s (not negati
 
 test("resolvePill: open with no willRetryAt falls back to generic detail", () => {
   const status: PiiProviderStatus = {
-    provider: "openrouter",
+    provider: "pii-llm",
     state: "open",
     failureCount: 5,
     openedAt: 1_000_000,

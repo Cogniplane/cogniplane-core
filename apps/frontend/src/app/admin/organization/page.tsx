@@ -2,12 +2,9 @@
 
 import { useAdminOrganizationData } from "../../../hooks/use-admin-organization-data";
 import { useAuth } from "../../../lib/auth-context";
-import { AdminOrganizationCard } from "../../../components/admin-organization-card";
+import { AdminOrganizationCard } from "../../../components/admin/admin-organization-card";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
-const LIST_ITEM = "rounded-lg border border-outline-variant bg-surface-container-lowest p-3";
+import { LIST_ITEM, SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminOrganizationPage() {
   const { user } = useAuth();

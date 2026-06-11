@@ -16,6 +16,10 @@ import type {
 } from "./runtime-types.js";
 import type { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
 import type { RuntimeSessionStore } from "./runtime-session-store.js";
+import {
+  clearIdleTimer as clearIdleTimerShared,
+  scheduleIdleTeardown as scheduleIdleTeardownShared
+} from "./idle-teardown.js";
 
 type PendingRuntimeStart = {
   tenantId: string;
@@ -308,21 +312,17 @@ export class CodexSessionLifecycle {
   }
 
   clearIdleTimer(runtime: RuntimeState): void {
-    if (runtime.idleTimer) {
-      clearTimeout(runtime.idleTimer);
-      runtime.idleTimer = null;
-    }
+    clearIdleTimerShared(runtime);
   }
 
   scheduleIdleTeardown(runtime: RuntimeState): void {
-    this.clearIdleTimer(runtime);
-    if (runtime.closed || runtime.activeTurn) return;
-    runtime.idleTimer = setTimeout(() => {
-      void this.requestRuntimeShutdown(runtime, "idle_timeout").catch((err: unknown) => {
-        this.logger.error({ err, sessionId: runtime.sessionId }, "idle shutdown failed");
-      });
-    }, this.config.RUNTIME_IDLE_TIMEOUT_MS);
-    runtime.idleTimer.unref?.();
+    scheduleIdleTeardownShared(runtime, {
+      timeoutMs: this.config.RUNTIME_IDLE_TIMEOUT_MS,
+      isBusy: () => runtime.closed || Boolean(runtime.activeTurn),
+      onIdle: () => this.requestRuntimeShutdown(runtime, "idle_timeout"),
+      logger: this.logger,
+      logContext: { sessionId: runtime.sessionId }
+    });
   }
 
   touchRuntime(runtime: RuntimeState, activity: string): void {
@@ -352,9 +352,8 @@ export class CodexSessionLifecycle {
       runtimePolicy: input.runtimePolicy,
       process: input.process,
       threadId: "",
-      claudeSessionId: null,
-      claudeResumeAt: null,
       activeTurn: null,
+      staleTurnIds: new Set(),
       pendingApprovals: new Map(),
       pendingApprovalTimers: new Map(),
       idleTimer: null,

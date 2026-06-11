@@ -496,25 +496,6 @@ CREATE TABLE public.scheduled_jobs (
 -- (schema_migrations is created by the migration runner itself; see
 -- src/scripts/migrate.ts. Intentionally not declared here.)
 
--- Name: session_judgments; Type: TABLE; Schema: public; Owner: -
-
-CREATE TABLE public.session_judgments (
-    tenant_id text NOT NULL,
-    session_id text NOT NULL,
-    judgment_kind text NOT NULL,
-    provider text NOT NULL,
-    model text NOT NULL,
-    mode text NOT NULL,
-    batch_id text,
-    status text NOT NULL,
-    submitted_at timestamp with time zone DEFAULT now() NOT NULL,
-    completed_at timestamp with time zone,
-    error text,
-    metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    CONSTRAINT session_judgments_mode_check CHECK ((mode = ANY (ARRAY['sync'::text, 'batch'::text]))),
-    CONSTRAINT session_judgments_status_check CHECK ((status = ANY (ARRAY['submitted'::text, 'running'::text, 'completed'::text, 'failed'::text])))
-);
-
 -- Name: session_runtime_overrides; Type: TABLE; Schema: public; Owner: -
 
 CREATE TABLE public.session_runtime_overrides (
@@ -541,20 +522,6 @@ CREATE TABLE public.sessions (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     purpose text DEFAULT 'normal'::text NOT NULL
-);
-
--- Name: skill_improvement_sessions; Type: TABLE; Schema: public; Owner: -
-
-CREATE TABLE public.skill_improvement_sessions (
-    tenant_id text NOT NULL,
-    session_id text NOT NULL,
-    skill_id text NOT NULL,
-    corpus_artifact_id text,
-    session_limit integer NOT NULL,
-    model text,
-    effort text,
-    created_by text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 -- Name: tenant_integrations; Type: TABLE; Schema: public; Owner: -
@@ -604,7 +571,7 @@ CREATE TABLE public.tenant_settings (
     auto_approve_read_only_tools boolean DEFAULT true NOT NULL,
     policy_enforcement_mode text DEFAULT 'monitor'::text NOT NULL,
     developer_instructions text,
-    enabled_tool_ids jsonb DEFAULT '["managed-session-context", "session_context", "list_artifacts", "read_text_artifact", "write_artifact"]'::jsonb NOT NULL,
+    enabled_tool_ids jsonb DEFAULT '["managed-session-context", "session_context", "list_artifacts", "read_text_artifact", "read_skill_corpus", "write_artifact"]'::jsonb NOT NULL,
     enabled_mcp_server_ids jsonb DEFAULT '["managed-session-context"]'::jsonb NOT NULL,
     version bigint DEFAULT 1 NOT NULL,
     config_hash text DEFAULT ''::text NOT NULL,
@@ -612,12 +579,7 @@ CREATE TABLE public.tenant_settings (
     enabled_runtime_providers jsonb DEFAULT '["codex"]'::jsonb NOT NULL,
     show_effort_selector boolean DEFAULT false NOT NULL,
     web_search_mode text DEFAULT 'disabled'::text NOT NULL,
-    skill_judge_provider text,
-    skill_judge_model text,
-    skill_judge_mode text DEFAULT 'sync'::text NOT NULL,
-    skill_judge_enabled boolean DEFAULT false NOT NULL,
     CONSTRAINT tenant_settings_policy_enforcement_mode_check CHECK ((policy_enforcement_mode = ANY (ARRAY['monitor'::text, 'enforce'::text]))),
-    CONSTRAINT tenant_settings_skill_judge_mode_check CHECK ((skill_judge_mode = ANY (ARRAY['sync'::text, 'batch'::text]))),
     CONSTRAINT tenant_settings_web_search_mode_check CHECK ((web_search_mode = ANY (ARRAY['disabled'::text, 'cached'::text, 'live'::text])))
 );
 
@@ -954,11 +916,6 @@ ALTER TABLE ONLY public.scheduled_jobs
 
 -- (schema_migrations PK comes from the runner-side CREATE TABLE.)
 
--- Name: session_judgments session_judgments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.session_judgments
-    ADD CONSTRAINT session_judgments_pkey PRIMARY KEY (tenant_id, session_id, judgment_kind);
-
 -- Name: session_runtime_overrides session_runtime_overrides_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 
 ALTER TABLE ONLY public.session_runtime_overrides
@@ -968,11 +925,6 @@ ALTER TABLE ONLY public.session_runtime_overrides
 
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_pkey PRIMARY KEY (session_id);
-
--- Name: skill_improvement_sessions skill_improvement_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.skill_improvement_sessions
-    ADD CONSTRAINT skill_improvement_sessions_pkey PRIMARY KEY (tenant_id, session_id);
 
 -- Name: tenant_integrations tenant_integrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 
@@ -1231,10 +1183,6 @@ CREATE INDEX idx_scheduled_jobs_tenant ON public.scheduled_jobs USING btree (ten
 
 CREATE INDEX idx_scheduled_jobs_user_id ON public.scheduled_jobs USING btree (user_id, updated_at DESC);
 
--- Name: idx_session_judgments_inflight; Type: INDEX; Schema: public; Owner: -
-
-CREATE INDEX idx_session_judgments_inflight ON public.session_judgments USING btree (tenant_id, status, submitted_at) WHERE (status = ANY (ARRAY['submitted'::text, 'running'::text]));
-
 -- Name: idx_sessions_tenant_purpose; Type: INDEX; Schema: public; Owner: -
 
 CREATE INDEX idx_sessions_tenant_purpose ON public.sessions USING btree (tenant_id, purpose) WHERE (purpose <> 'normal'::text);
@@ -1246,10 +1194,6 @@ CREATE INDEX idx_sessions_tenant_user ON public.sessions USING btree (tenant_id,
 -- Name: idx_sessions_user_id; Type: INDEX; Schema: public; Owner: -
 
 CREATE INDEX idx_sessions_user_id ON public.sessions USING btree (user_id);
-
--- Name: idx_skill_improvement_sessions_skill; Type: INDEX; Schema: public; Owner: -
-
-CREATE INDEX idx_skill_improvement_sessions_skill ON public.skill_improvement_sessions USING btree (tenant_id, skill_id, created_at DESC);
 
 -- Name: idx_tenant_integrations_enabled; Type: INDEX; Schema: public; Owner: -
 
@@ -1500,16 +1444,6 @@ ALTER TABLE ONLY public.scheduled_jobs
 ALTER TABLE ONLY public.scheduled_jobs
     ADD CONSTRAINT scheduled_jobs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE;
 
--- Name: session_judgments session_judgments_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.session_judgments
-    ADD CONSTRAINT session_judgments_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(session_id) ON DELETE CASCADE;
-
--- Name: session_judgments session_judgments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.session_judgments
-    ADD CONSTRAINT session_judgments_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(tenant_id);
-
 -- Name: session_runtime_overrides session_runtime_overrides_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
 ALTER TABLE ONLY public.session_runtime_overrides
@@ -1534,21 +1468,6 @@ ALTER TABLE ONLY public.sessions
 
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id);
-
--- Name: skill_improvement_sessions skill_improvement_sessions_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.skill_improvement_sessions
-    ADD CONSTRAINT skill_improvement_sessions_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(user_id);
-
--- Name: skill_improvement_sessions skill_improvement_sessions_session_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.skill_improvement_sessions
-    ADD CONSTRAINT skill_improvement_sessions_session_id_fkey FOREIGN KEY (session_id) REFERENCES public.sessions(session_id) ON DELETE CASCADE;
-
--- Name: skill_improvement_sessions skill_improvement_sessions_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
-
-ALTER TABLE ONLY public.skill_improvement_sessions
-    ADD CONSTRAINT skill_improvement_sessions_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(tenant_id);
 
 -- Name: tenant_integrations tenant_integrations_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 
@@ -1859,15 +1778,6 @@ ALTER TABLE public.scheduled_jobs FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY scheduled_jobs_tenant_isolation ON public.scheduled_jobs USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
 
--- Name: session_judgments; Type: ROW SECURITY; Schema: public; Owner: -
-
-ALTER TABLE public.session_judgments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.session_judgments FORCE ROW LEVEL SECURITY;
-
--- Name: session_judgments session_judgments_tenant_isolation; Type: POLICY; Schema: public; Owner: -
-
-CREATE POLICY session_judgments_tenant_isolation ON public.session_judgments USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
-
 -- Name: session_runtime_overrides; Type: ROW SECURITY; Schema: public; Owner: -
 
 ALTER TABLE public.session_runtime_overrides ENABLE ROW LEVEL SECURITY;
@@ -1885,15 +1795,6 @@ ALTER TABLE public.sessions FORCE ROW LEVEL SECURITY;
 -- Name: sessions sessions_tenant_isolation; Type: POLICY; Schema: public; Owner: -
 
 CREATE POLICY sessions_tenant_isolation ON public.sessions USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
-
--- Name: skill_improvement_sessions; Type: ROW SECURITY; Schema: public; Owner: -
-
-ALTER TABLE public.skill_improvement_sessions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.skill_improvement_sessions FORCE ROW LEVEL SECURITY;
-
--- Name: skill_improvement_sessions skill_improvement_sessions_tenant_isolation; Type: POLICY; Schema: public; Owner: -
-
-CREATE POLICY skill_improvement_sessions_tenant_isolation ON public.skill_improvement_sessions USING ((tenant_id = current_setting('app.current_tenant_id'::text, true))) WITH CHECK ((tenant_id = current_setting('app.current_tenant_id'::text, true)));
 
 -- Name: tenant_integrations; Type: ROW SECURITY; Schema: public; Owner: -
 

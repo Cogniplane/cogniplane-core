@@ -73,7 +73,7 @@ const defaultSettings: PiiProtectionSettings = {
   enabled: true,
   mode: "detect",
   rawRetention: "never",
-  provider: { type: "openrouter", model: "" },
+  provider: { type: "openai-compatible", model: "" },
   scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
   actions: { reportToAdmins: true },
   detectors: {
@@ -139,7 +139,7 @@ test("provider-status: admin sees the closed-state shape", async () => {
   const res = await app.inject({ method: "GET", url: "/admin/pii/provider-status" });
   expect(res.statusCode).toBe(200);
   expect(res.json()).toEqual({
-        provider: "openrouter",
+        provider: "pii-llm",
         state: "closed",
         failureCount: 0,
         openedAt: null,
@@ -486,7 +486,7 @@ test("recent: returns rows shaped without raw value, default actions = block,tra
                   mode: "block",
                   action_taken: "block",
                   status: "blocked",
-                  provider_type: "openrouter",
+                  provider_type: "openai-compatible",
                   provider_model: "google/gemini-2.5-flash",
                   findings_count: 2,
                   error_message: null,
@@ -699,13 +699,13 @@ test("jobs/stats: surfaces queue, latency, top errors, breaker timeline", async 
       {
         id: "2",
         eventType: "pii_breaker_transition",
-        payload: { provider: "openrouter", from: "open", to: "half_open", failureCount: 0 },
+        payload: { provider: "pii-llm", from: "open", to: "half_open", failureCount: 0 },
         createdAt: "2026-04-30T05:01:00.000Z"
       },
       {
         id: "1",
         eventType: "pii_breaker_transition",
-        payload: { provider: "openrouter", from: "closed", to: "open", failureCount: 5 },
+        payload: { provider: "pii-llm", from: "closed", to: "open", failureCount: 5 },
         createdAt: "2026-04-30T05:00:00.000Z"
       }
     ]

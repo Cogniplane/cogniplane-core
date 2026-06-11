@@ -397,6 +397,44 @@ test("write_artifact rejects empty content", async () => {
       })).rejects.toThrow(/Either content or filePath is required/);
 });
 
+test("write_artifact rejects an oversized filePath via stat WITHOUT reading the file", async () => {
+  let readCalls = 0;
+  const deps = {
+    ...makeDeps(),
+    readRuntimeFile: async () => {
+      readCalls += 1;
+      return new Uint8Array([1, 2, 3]);
+    },
+    statRuntimeFile: async () => ({ sizeBytes: 50_000_000 })
+  };
+  const tools = createManagedToolDefinitions(deps);
+  const tool = tools.find((t) => t.name === "write_artifact")!;
+
+  await expect(() => tool.handler({
+        context: makeContext(),
+        arguments: { toolContextId: "ctx-1", name: "huge.bin", filePath: "output/huge.bin" }
+      })).rejects.toThrow(/File too large \(50000000 bytes\)/);
+  // The whole point of the stat probe: the oversized file is never buffered.
+  expect(readCalls).toBe(0);
+});
+
+test("write_artifact reads the file when the stat probe passes", async () => {
+  const deps = {
+    ...makeDeps(),
+    readRuntimeFile: async () => new TextEncoder().encode("file body"),
+    statRuntimeFile: async () => ({ sizeBytes: 9 })
+  };
+  const tools = createManagedToolDefinitions(deps);
+  const tool = tools.find((t) => t.name === "write_artifact")!;
+
+  const result = await tool.handler({
+    context: makeContext(),
+    arguments: { toolContextId: "ctx-1", name: "notes.txt", filePath: "output/notes.txt" }
+  });
+  expect(result["status"]).toBe("ready");
+  expect(result["fileSizeBytes"]).toBe(9);
+});
+
 test("ManagedToolFactoryRegistry rejects duplicate factory keys", () => {
   const registry = new ManagedToolFactoryRegistry();
   const noop = () => [];

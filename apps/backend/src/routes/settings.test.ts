@@ -125,6 +125,15 @@ class InMemoryUserSettingsStore {
     return [...this.jobs.values()].filter((job) => job.userId === userId && job.enabled).length;
   }
 
+  async getScheduledJob(
+    _tenantId: string,
+    jobId: string,
+    userId: string
+  ): Promise<ScheduledJobRecord | null> {
+    const job = this.jobs.get(jobId);
+    return job && job.userId === userId ? job : null;
+  }
+
   async createScheduledJob(input: {
     tenantId: string;
     jobId: string;
@@ -464,6 +473,149 @@ test("active-job cap counts only enabled jobs, not disabled ones", async () => {
   // Now a new enabled job can be created again.
   const afterDisable = await makeJob("Job C", true);
   expect(afterDisable.statusCode).toBe(201);
+
+  await app.close();
+});
+
+test("PUT cannot bypass the active-job cap by enabling a disabled job", async () => {
+  // A user at the cap could create N disabled jobs and PUT-enable
+  // them all — the disabled→enabled transition must hit the same cap as POST.
+  const { app } = await createApp({
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 1 })
+  });
+
+  const jobPayload = (jobName: string, enabled: boolean) => ({
+    jobName,
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    targetType: "prompt",
+    input: { prompt: "Test prompt." },
+    enabled
+  });
+
+  const enabledJob = await app.inject({
+    method: "POST",
+    url: "/me/scheduled-jobs",
+    payload: jobPayload("Job A", true)
+  });
+  expect(enabledJob.statusCode).toBe(201);
+  const enabledJobId = enabledJob.json().scheduledJob.jobId as string;
+
+  const disabledJob = await app.inject({
+    method: "POST",
+    url: "/me/scheduled-jobs",
+    payload: jobPayload("Job B", false)
+  });
+  expect(disabledJob.statusCode).toBe(201);
+  const disabledJobId = disabledJob.json().scheduledJob.jobId as string;
+
+  // Enabling Job B while Job A holds the only slot must be rejected.
+  const blocked = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${disabledJobId}`,
+    payload: jobPayload("Job B", true)
+  });
+  expect(blocked.statusCode).toBe(409);
+  expect(blocked.json().error).toBe("scheduled_job_limit_reached");
+
+  // Updating the already-enabled job (it counts against the cap itself) must
+  // NOT be blocked — staying enabled adds nothing to the active count.
+  const renameEnabled = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${enabledJobId}`,
+    payload: jobPayload("Job A renamed", true)
+  });
+  expect(renameEnabled.statusCode).toBe(200);
+
+  // Free the slot, then the enable transition succeeds.
+  const disableA = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${enabledJobId}`,
+    payload: jobPayload("Job A renamed", false)
+  });
+  expect(disableA.statusCode).toBe(200);
+
+  const enableB = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${disabledJobId}`,
+    payload: jobPayload("Job B", true)
+  });
+  expect(enableB.statusCode).toBe(200);
+  expect(enableB.json().scheduledJob.enabled).toBe(true);
+
+  await app.close();
+});
+
+test("PUT enable transition consumes the scheduled_job_create rate limit; other updates do not", async () => {
+  const consumed: string[] = [];
+  let rejectNext = false;
+  const { app } = await createApp({
+    limits: {
+      async consumeRateLimit(input: { resource: string }) {
+        consumed.push(input.resource);
+        if (rejectNext) {
+          return { error: "rate_limited", retryAfterMs: 30_000 };
+        }
+        return null;
+      },
+      async consumeTurnQuota() {
+        return null;
+      },
+      sweepExpired() {}
+    } as SettingsRouteStores["limits"]
+  });
+
+  const jobPayload = (enabled: boolean) => ({
+    jobName: "Rate limit probe",
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    targetType: "prompt",
+    input: { prompt: "Test prompt." },
+    enabled
+  });
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/me/scheduled-jobs",
+    payload: jobPayload(false)
+  });
+  expect(created.statusCode).toBe(201);
+  const jobId = created.json().scheduledJob.jobId as string;
+  expect(consumed).toEqual(["scheduled_job_create"]); // POST consumed one
+
+  // A disabled→disabled update consumes nothing.
+  const plainUpdate = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${jobId}`,
+    payload: jobPayload(false)
+  });
+  expect(plainUpdate.statusCode).toBe(200);
+  expect(consumed).toEqual(["scheduled_job_create"]);
+
+  // The disabled→enabled transition consumes the creation rate limit and is
+  // rejected with 429 when the limiter says no.
+  rejectNext = true;
+  const throttled = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${jobId}`,
+    payload: jobPayload(true)
+  });
+  expect(throttled.statusCode).toBe(429);
+  expect(throttled.headers["retry-after"]).toBe("30");
+  expect(consumed).toEqual(["scheduled_job_create", "scheduled_job_create"]);
+
+  // The job is still disabled — the throttled request must not have applied.
+  rejectNext = false;
+  const list = await app.inject({ method: "GET", url: "/me/scheduled-jobs" });
+  expect(list.json().scheduledJobs[0].enabled).toBe(false);
+
+  const enable = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${jobId}`,
+    payload: jobPayload(true)
+  });
+  expect(enable.statusCode).toBe(200);
+  expect(consumed).toEqual(["scheduled_job_create", "scheduled_job_create", "scheduled_job_create"]);
 
   await app.close();
 });

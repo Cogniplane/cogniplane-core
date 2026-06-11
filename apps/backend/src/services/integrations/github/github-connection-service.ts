@@ -15,9 +15,13 @@ import {
   isTokenExpired,
   parseScopes,
   refreshAndPersistAccessToken,
-  shouldRefreshToken,
-  toIsoFromNow
+  shouldRefreshToken
 } from "./github-token-lifecycle.js";
+import {
+  buildIntegrationRedirectUrl,
+  getSecretKey,
+  toIsoFromNow
+} from "../integration-oauth-helpers.js";
 import type { RuntimeInvalidator } from "../contracts.js";
 
 export { GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
@@ -56,10 +60,6 @@ export type GithubRuntimeCredentials = {
   email: string | null;
   token: string;
 };
-
-function getSecretKey(config: AppConfig): Uint8Array {
-  return new TextEncoder().encode(config.JWT_SECRET);
-}
 
 function isGithubConfigured(config: AppConfig): boolean {
   return Boolean(
@@ -133,13 +133,13 @@ export class GithubConnectionService {
   }
 
   async completeAuthorization(input: { code?: string | null; state?: string | null }): Promise<string> {
-    const fallbackUrl = this.buildRedirectUrl("/settings/github", {
+    const fallbackUrl = buildIntegrationRedirectUrl(this.config, "/settings/github", {
       githubAuth: "error",
       reason: "invalid_state"
     });
 
     if (!input.code || !input.state) {
-      return this.buildRedirectUrl("/settings/github", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "error",
         reason: "missing_code"
       });
@@ -194,11 +194,11 @@ export class GithubConnectionService {
       });
       await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "github");
 
-      return this.buildRedirectUrl("/settings/github", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "connected"
       });
     } catch (error) {
-      return this.buildRedirectUrl("/settings/github", {
+      return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "error",
         reason: error instanceof Error ? error.message : "github_authorization_failed"
       });
@@ -274,11 +274,4 @@ export class GithubConnectionService {
     };
   }
 
-  private buildRedirectUrl(pathname: string, params: Record<string, string>): string {
-    const url = new URL(pathname, this.config.API_ORIGIN);
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, value);
-    }
-    return url.toString();
-  }
 }

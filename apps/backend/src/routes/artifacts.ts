@@ -507,16 +507,25 @@ export async function registerArtifactRoutes(
       return notFoundError("download_not_found");
     }
 
-    await stores.auditEvents.create({
-      tenantId: token.tenantId,
-      sessionId: token.sessionId,
-      userId: token.userId,
-      type: "artifact_downloaded",
-      payload: {
-        artifactId: token.artifactId,
-        fileName: token.fileName
-      }
-    });
+    // Best-effort: the token is already consumed, so failing here would burn
+    // the single-use token (retry 404s) just to report a 500. Serve the file.
+    try {
+      await stores.auditEvents.create({
+        tenantId: token.tenantId,
+        sessionId: token.sessionId,
+        userId: token.userId,
+        type: "artifact_downloaded",
+        payload: {
+          artifactId: token.artifactId,
+          fileName: token.fileName
+        }
+      });
+    } catch (err) {
+      request.log.warn(
+        { err, artifactId: token.artifactId },
+        "Failed to record artifact_downloaded audit event"
+      );
+    }
 
     reply.header("referrer-policy", "no-referrer");
     reply.header("content-type", token.contentType);

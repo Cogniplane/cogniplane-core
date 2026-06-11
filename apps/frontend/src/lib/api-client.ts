@@ -79,26 +79,31 @@ export function createApiHeaders(init?: HeadersInit, body?: BodyInit | null): He
   return headers;
 }
 
-export async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response = await fetch(buildApiUrl(path), {
-    ...init,
-    headers: createApiHeaders(init?.headers, init?.body),
-    credentials: "include",
-    cache: "no-store"
-  });
+// Returns the raw Response (not parsed JSON) so SSE callers can stream the body.
+export async function fetchWithAuthRetry(path: string, init?: RequestInit): Promise<Response> {
+  const doFetch = () =>
+    fetch(buildApiUrl(path), {
+      ...init,
+      headers: createApiHeaders(init?.headers, init?.body),
+      credentials: "include",
+      cache: "no-store"
+    });
+
+  let response = await doFetch();
 
   // Auto-refresh on 401 and retry once
   if (response.status === 401 && !DEV_USER_ID) {
     const newToken = await refreshAccessToken();
     if (newToken) {
-      response = await fetch(buildApiUrl(path), {
-        ...init,
-        headers: createApiHeaders(init?.headers, init?.body),
-        credentials: "include",
-        cache: "no-store"
-      });
+      response = await doFetch();
     }
   }
+
+  return response;
+}
+
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetchWithAuthRetry(path, init);
 
   if (!response.ok) {
     throw new Error(await buildErrorMessage(response));

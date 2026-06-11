@@ -2,6 +2,7 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { PiiScanSubjectType } from "./pii-scan-run-store.js";
 import { uuidv7 } from "../../lib/uuid.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type PiiScanJobMode = "detect" | "block" | "transform";
 
@@ -79,12 +80,12 @@ function mapRow(row: Record<string, unknown>): PiiScanJobRecord {
     status: row.status as PiiScanJobStatus,
     attempts: Number(row.attempts ?? 0),
     maxAttempts: Number(row.max_attempts ?? 3),
-    runAfter: new Date(String(row.run_after)).toISOString(),
-    claimedAt: row.claimed_at == null ? null : new Date(String(row.claimed_at)).toISOString(),
-    completedAt: row.completed_at == null ? null : new Date(String(row.completed_at)).toISOString(),
+    runAfter: isoTimestamp(row.run_after),
+    claimedAt: row.claimed_at == null ? null : isoTimestamp(row.claimed_at),
+    completedAt: row.completed_at == null ? null : isoTimestamp(row.completed_at),
     errorMessage: row.error_message == null ? null : String(row.error_message),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 

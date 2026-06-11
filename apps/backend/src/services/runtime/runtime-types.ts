@@ -51,6 +51,10 @@ export type ActiveTurnState = {
   queue: AsyncQueue<RuntimeEvent>;
   responseId: string | null;
   outputItemDone: boolean;
+  // Turn-duration watchdog (RUNTIME_TURN_TIMEOUT_MS): armed when the slot is
+  // reserved, cleared on every terminal path. Fires failActiveTurn + runtime
+  // recycle so a wedged turn can't pin the session busy until the E2B timeout.
+  watchdogTimer: NodeJS.Timeout | null;
   runtimePolicyId: string;
   toolContextId: string | null;
   assistantMessageId: string | null;
@@ -67,6 +71,7 @@ export type RuntimeHealthStatus = "starting" | "healthy" | "terminating" | "term
 export type RuntimeShutdownReason =
   | "session_abort"
   | "idle_timeout"
+  | "turn_timeout"
   | "app_shutdown"
   | "config_drain"
   | "config_refresh"
@@ -88,9 +93,14 @@ export type RuntimeState = {
   runtimePolicy: ResolvedRuntimePolicy;
   process: RuntimeProcessHandle;
   threadId: string;
-  claudeSessionId: string | null;
-  claudeResumeAt: string | null;
   activeTurn: ActiveTurnState | null;
+  // Codex turn ids whose turns ended on our side (completed/failed/interrupted)
+  // but whose process-side turn may still be emitting notifications — after
+  // `turn/interrupt` we synthesize the terminal frame without waiting for the
+  // runtime's own turn/completed. Notifications carrying one of these ids are
+  // dropped so a zombie turn can't contaminate the next turn's queue. An id is
+  // retired when the zombie's own turn/completed finally arrives.
+  staleTurnIds: Set<string>;
   pendingApprovals: PendingApprovalMap;
   pendingApprovalTimers: PendingApprovalTimerMap;
   idleTimer: NodeJS.Timeout | null;

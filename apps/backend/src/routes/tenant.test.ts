@@ -667,7 +667,7 @@ test("GET /tenant returns default piiProtection when setting is absent", async (
   expect(body.settings.piiProtection.enabled).toBe(false);
   expect(body.settings.piiProtection.mode).toBe("off");
   expect(body.settings.piiProtection.rawRetention).toBe("never");
-  expect(body.settings.piiProtection.provider.type).toBe("openrouter");
+  expect(body.settings.piiProtection.provider.type).toBe("openai-compatible");
   expect(body.settings.piiProtection.scopes.chatPrompts).toBe(true);
   expect(Array.isArray(body.settings.piiProtection.detectors.entityTypes)).toBeTruthy();
 });
@@ -677,7 +677,7 @@ test("GET /tenant returns stored piiProtection when present and valid", async ()
     enabled: true,
     mode: "detect",
     rawRetention: "never",
-    provider: { type: "openrouter", model: "meta/llama-guard" },
+    provider: { type: "openai-compatible", model: "meta/llama-guard" },
     scopes: { chatPrompts: true, uploads: false, microsoftImports: true },
     actions: { reportToAdmins: true },
     detectors: { useRulesFirst: true, entityTypes: ["email", "phone"] }
@@ -708,7 +708,7 @@ const VALID_PII_PAYLOAD = {
   enabled: true,
   mode: "detect" as const,
   rawRetention: "never" as const,
-  provider: { type: "openrouter" as const, model: "meta/llama-guard" },
+  provider: { type: "openai-compatible" as const, model: "meta/llama-guard" },
   scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
   actions: { reportToAdmins: true },
   detectors: { useRulesFirst: true, entityTypes: ["email", "phone"] as const }

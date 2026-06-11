@@ -87,6 +87,21 @@ test("github_read_file rejects malformed repo with extra path segments", async (
   expect(capturedUrl()).toBe(null);
 });
 
+test("github_read_file rejects a repo with a dot-dot segment that survives the regex", async () => {
+  // "../user" has a single slash, so REPO_PATTERN matches (the character
+  // class allows all-dot segments). Without the explicit dot-segment guard
+  // the URL parser would resolve ".." and pivot to /user under the PAT.
+  installFakeFetch();
+  for (const repo of ["../user", "owner/..", "..", "owner/."]) {
+    const result = await readTool!.handler({
+      context: fakeContext,
+      arguments: { repo, path: "README.md" }
+    });
+    expect(String(result.error ?? "")).toMatch(/Invalid repo/i);
+    expect(capturedUrl()).toBe(null);
+  }
+});
+
 test("github_read_file rejects repo containing query string", async () => {
   installFakeFetch();
   const result = await readTool!.handler({

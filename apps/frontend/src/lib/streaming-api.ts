@@ -1,6 +1,6 @@
 import { SseFrameSchemas, type SseEventType, type SseFramePayloads } from "@cogniplane/shared-types";
 
-import { buildApiUrl, buildErrorMessage, createApiHeaders } from "./api-client";
+import { buildErrorMessage, fetchWithAuthRetry } from "./api-client";
 
 import type { Approval, EffortLevel, MessagePostRequest, Message, TokenUsage, ToolResult } from "@cogniplane/shared-types";
 
@@ -216,10 +216,9 @@ export async function streamMessage(input: {
 
   const body = JSON.stringify(requestBody);
 
-  const response = await fetch(buildApiUrl("/messages"), {
+  // Retrying this POST on 401 is safe: the backend rejects before the turn starts.
+  const response = await fetchWithAuthRetry("/messages", {
     method: "POST",
-    headers: createApiHeaders(undefined, body),
-    credentials: "include",
     body,
     signal: input.signal
   });

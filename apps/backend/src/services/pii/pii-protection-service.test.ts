@@ -65,6 +65,33 @@ test("evaluateText fails closed (throws pii_timeout) when the provider hangs pas
   ).rejects.toMatchObject({ code: "pii_timeout" });
 });
 
+test("evaluateText aborts the in-flight provider call when the timeout budget fires", async () => {
+  let providerSignal: AbortSignal | undefined;
+  const hangingProvider = stubProvider({
+    detectText: (_input, signal) => {
+      providerSignal = signal;
+      // Hang until aborted — the service's budget timer must cancel the call
+      // rather than leave the HTTP request dangling.
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
+  });
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "block" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: hangingProvider,
+    timeoutMs: 25
+  });
+
+  await expect(
+    service.evaluateText({ tenantId: "t1", text: "call me at name John Smith", subject: CHAT })
+  ).rejects.toMatchObject({ code: "pii_timeout" });
+
+  expect(providerSignal).toBeTruthy();
+  expect(providerSignal?.aborted).toBe(true);
+});
+
 test("evaluateText allows when PII protection is disabled", async () => {
   const service = new PiiProtectionService({
     policyReader: stubReader(buildSettings({ enabled: false })),
@@ -100,6 +127,29 @@ test("evaluateText allows when scope is excluded", async () => {
   });
   expect(decision.action).toBe("allow");
   if (decision.action === "allow") expect(decision.reason).toBe("scope_excluded");
+});
+
+test("the skill_corpus subject is evaluated even when every tenant scope toggle is off", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(
+      buildSettings({
+        enabled: true,
+        mode: "block",
+        scopes: { chatPrompts: false, uploads: false, microsoftImports: false }
+      })
+    ),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: stubProvider(),
+    timeoutMs: 5000
+  });
+  const decision = await service.evaluateText({
+    tenantId: "t1",
+    text: "reach me at someone@example.com",
+    subject: { kind: "skill_corpus" }
+  });
+  // The rule detector flags the email and block mode blocks — the corpus
+  // gate must not silently degrade to "scope_excluded".
+  expect(decision.action).toBe("block");
 });
 
 test("detect mode reports rule-detected findings without a provider", async () => {
@@ -312,7 +362,7 @@ test("tenant-configured provider model overrides the provider default", async ()
       buildSettings({
         enabled: true,
         mode: "detect",
-        provider: { type: "openrouter", model: "tenant/custom-model" }
+        provider: { type: "openai-compatible", model: "tenant/custom-model" }
       })
     ),
     ruleDetector: new RuleBasedPiiDetector(),
@@ -337,7 +387,7 @@ test("empty tenant model falls through to provider default", async () => {
       buildSettings({
         enabled: true,
         mode: "detect",
-        provider: { type: "openrouter", model: "" }
+        provider: { type: "openai-compatible", model: "" }
       })
     ),
     ruleDetector: new RuleBasedPiiDetector(),
@@ -362,7 +412,7 @@ test("whitespace-only tenant model falls through to provider default", async () 
       buildSettings({
         enabled: true,
         mode: "detect",
-        provider: { type: "openrouter", model: "   " }
+        provider: { type: "openai-compatible", model: "   " }
       })
     ),
     ruleDetector: new RuleBasedPiiDetector(),

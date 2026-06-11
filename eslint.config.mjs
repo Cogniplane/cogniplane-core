@@ -78,7 +78,26 @@ export default tseslint.config(
       ...downgradeToWarn(reactHooks.configs.recommended.rules),
       ...downgradeToWarn(nextPlugin.configs.recommended.rules),
       // App Router only — no pages/ dir for this rule to validate against.
-      "@next/next/no-html-link-for-pages": "off"
+      "@next/next/no-html-link-for-pages": "off",
+      // Boundary guard: the frontend may only consume backend functionality
+      // through @cogniplane/shared-types contracts, never by importing
+      // backend code directly. Held by convention until now; enforced here.
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: [
+                "@cogniplane/backend",
+                "@cogniplane/backend/**",
+                "**/apps/backend/**",
+                "**/backend/src/**"
+              ],
+              message: "Frontend must not import backend code — use @cogniplane/shared-types contracts."
+            }
+          ]
+        }
+      ]
     }
   }
 );

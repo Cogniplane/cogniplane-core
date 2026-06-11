@@ -1,4 +1,5 @@
 import { withTenantScope, type Pool } from "../../lib/db.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type IntegrationStateRecord = {
   tenantId: string;
@@ -31,8 +32,8 @@ function toRecord(row: Record<string, unknown>): IntegrationStateRecord {
     readsEnabled: Boolean(row.reads_enabled),
     writesEnabled: Boolean(row.writes_enabled),
     config,
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString(),
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at),
     updatedBy: row.updated_by == null ? null : String(row.updated_by)
   };
 }

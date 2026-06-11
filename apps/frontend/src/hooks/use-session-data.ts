@@ -35,6 +35,7 @@ export function useSessionData(input: {
   const [messages, setMessages] = useState<Message[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const selectedSessionIdRef = useRef<string | null>(null);
+  const refreshEpochRef = useRef(0);
 
   useEffect(() => {
     selectedSessionIdRef.current = selectedSessionId;
@@ -108,17 +109,27 @@ export function useSessionData(input: {
     setArtifacts(artifactsPollQuery.data);
   }, [artifactsPollQuery.data, selectedSessionId]);
 
+  // Called when a send appends optimistic bubbles: any refresh already in
+  // flight predates them and must discard its snapshot instead of landing.
+  const invalidateInFlightSessionRefreshes = useCallback(() => {
+    refreshEpochRef.current += 1;
+  }, []);
+
   const refreshSessionData = useCallback(
     async (sessionId: string) => {
+      // Overlapping refreshes resolve last-call-wins via the epoch.
+      const epoch = ++refreshEpochRef.current;
       const nextData = await loadSessionData(sessionId);
+      // When superseded, skip the cache write too — setQueryData feeds the
+      // populate effect, which would re-apply the stale messages anyway.
+      if (refreshEpochRef.current !== epoch) return;
       // Keep the cache in sync so navigating away and back within the stale
       // window serves fresh data instead of the pre-turn snapshot.
       queryClient.setQueryData(queryKeys.sessions.detail(sessionId), nextData);
-      if (selectedSessionIdRef.current === sessionId) {
-        setMessages(nextData.messages);
-        setArtifacts(nextData.artifacts);
-        replacePendingApprovals(nextData.approvals);
-      }
+      if (selectedSessionIdRef.current !== sessionId) return;
+      setMessages(nextData.messages);
+      setArtifacts(nextData.artifacts);
+      replacePendingApprovals(nextData.approvals);
     },
     [queryClient, replacePendingApprovals]
   );
@@ -129,6 +140,7 @@ export function useSessionData(input: {
     artifacts,
     setArtifacts,
     refreshSessionData,
+    invalidateInFlightSessionRefreshes,
     isSessionDataReady:
       selectedSessionId !== null && sessionDetailQuery.isSuccess && sessionDetailQuery.data !== undefined
   };

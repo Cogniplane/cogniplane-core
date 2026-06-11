@@ -1,6 +1,7 @@
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
+import { isoTimestamp } from "../lib/db-mappers.js";
 
 export type ToolResultRecord = {
   id: number;
@@ -89,8 +90,8 @@ function mapToolResult(row: Record<string, unknown>): ToolResultRecord {
     output: String(row.output_text ?? ""),
     exitCode: row.exit_code == null ? null : Number(row.exit_code),
     durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -140,8 +141,8 @@ function mapMessage(row: Record<string, unknown>): Omit<MessageRecord, "toolResu
         ? row.feedback_rating
         : null,
     detail: mapDetail(row.detail_json),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { useAdminSkillsData } from "../../../hooks/use-admin-skills-data";
-import { AdminSkillCard } from "../../../components/admin-skill-card";
+import { AdminSkillCard } from "../../../components/admin/skills/admin-skill-card";
 
 export default function AdminSkillsPage() {
   const {

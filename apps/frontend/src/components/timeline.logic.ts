@@ -22,6 +22,22 @@ export type McpServerTransitionStatus = "starting" | "failed" | "cancelled";
 
 export type ApprovalDecisionState = "pending" | "approving" | "rejecting";
 
+// A user's verdict on a pending approval. `rememberForTurn` upgrades a plain
+// "approve" into "allow every matching action for the rest of this turn" — the
+// backend already honors this flag on POST /approvals/:id/decision; the UI just
+// has to send it.
+export type ApprovalDecision = {
+  decision: "approve" | "reject";
+  rememberForTurn?: boolean;
+};
+
+// The decision currently being submitted; `kind` tells the approval card
+// which button to mark as working.
+export type InFlightApprovalDecision = {
+  approvalId: string;
+  kind: "approve" | "reject";
+};
+
 // Concrete row variants. Discriminated by `type`.
 
 export type UserMessageRow = {
@@ -195,7 +211,7 @@ export type RuntimeNoticeInput = {
 export type TimelineInputs = {
   messages: Message[];
   pendingApprovals: Approval[];
-  approvalDecisionId: string | null;
+  approvalDecision: InFlightApprovalDecision | null;
   mcpServerEvents: McpServerEventInput[];
   runtimeNotices: RuntimeNoticeInput[];
 };
@@ -439,7 +455,11 @@ export function buildTimeline(inputs: TimelineInputs): TimelineRow[] {
   // currently-streaming turn.
   for (const approval of inputs.pendingApprovals) {
     const decisionState: ApprovalDecisionState =
-      inputs.approvalDecisionId === approval.approvalId ? "approving" : "pending";
+      inputs.approvalDecision?.approvalId === approval.approvalId
+        ? inputs.approvalDecision.kind === "approve"
+          ? "approving"
+          : "rejecting"
+        : "pending";
     rows.push(approvalRow(approval, decisionState));
   }
 

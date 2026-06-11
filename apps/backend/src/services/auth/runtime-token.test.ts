@@ -3,7 +3,6 @@ import {
   generateRuntimeToken,
   runtimeTokenExpiry,
   verifyRuntimeToken,
-  verifyRuntimeTokenWithRevocation,
   type RuntimeTokenMintClaims
 } from "./runtime-token.js";
 
@@ -142,37 +141,5 @@ describe("runtime token", () => {
     const token = generateRuntimeToken({ ...validClaims(), jti: "fixed-jti" }, SECRET);
     const result = verifyRuntimeToken(token, SECRET);
     expect(result.kind === "valid" && result.claims.jti).toBe("fixed-jti");
-  });
-
-  describe("verifyRuntimeTokenWithRevocation", () => {
-    it("returns valid when the jti is not on the deny-list", async () => {
-      const token = generateRuntimeToken(validClaims(), SECRET);
-      const result = await verifyRuntimeTokenWithRevocation(token, SECRET, async () => false);
-      expect(result.kind).toBe("valid");
-    });
-
-    it("returns revoked when the jti is on the deny-list", async () => {
-      const token = generateRuntimeToken(validClaims(), SECRET);
-      const result = await verifyRuntimeTokenWithRevocation(token, SECRET, async () => true);
-      expect(result.kind).toBe("revoked");
-    });
-
-    it("fails closed (revoked) when the revocation check throws", async () => {
-      const token = generateRuntimeToken(validClaims(), SECRET);
-      const result = await verifyRuntimeTokenWithRevocation(token, SECRET, async () => {
-        throw new Error("redis down");
-      });
-      expect(result.kind).toBe("revoked");
-    });
-
-    it("does not consult the deny-list for an already-invalid token", async () => {
-      let consulted = false;
-      const result = await verifyRuntimeTokenWithRevocation("rt_bogus.sig", SECRET, async () => {
-        consulted = true;
-        return false;
-      });
-      expect(result.kind).toBe("invalid");
-      expect(consulted).toBe(false);
-    });
   });
 });

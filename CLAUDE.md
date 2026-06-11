@@ -23,8 +23,7 @@ pnpm --filter @cogniplane/backend exec vitest run -t "my test" apps/backend/src/
 pnpm db:migrate   # run DB migrations
 pnpm test:e2e:local  # E2E smoke test (requires running stack)
 
-make e2b-build-codex    # build Codex E2B sandbox template
-make e2b-build-all      # build all supported E2B templates
+make e2b-build          # build the unified agent-runtime E2B template (hosts Codex + Claude)
 ```
 
 Backend: `http://localhost:3001` — Frontend: `http://localhost:3000` — Admin workbench: `http://localhost:3000/admin`
@@ -68,15 +67,14 @@ When `runtimeProvider = "claude-code"`, the platform uses `ClaudeCodeRuntimeAdap
 
 The same `agent-runtime` E2B template (`E2B_TEMPLATE_ID`) hosts **both** the Codex `app-server` and the Claude sandbox-agent harness — they're independent processes that share the workspace filesystem. This makes future per-turn model switching possible without rebuilding the template.
 
-**Event + approval flow is identical in both modes.** `claude-code-event-mapper.ts` consumes typed `SDKMessage`s whether they arrive from `query()` directly (local) or over stdio from the harness (e2b). Approvals bridge through `canUseTool` in both paths — in e2b mode the `canUseTool` Promise lives inside the harness, and decisions round-trip as `approval_request` / `approval_response` frames (see `apps/backend/src/services/sandbox-agent-protocol.ts`).
+**Event + approval flow.** `claude-code-event-mapper.ts` consumes typed `SDKMessage`s that arrive over stdio from the harness. Approvals bridge through the SDK's `canUseTool` inside the sandbox; the `canUseTool` Promise lives in the harness, and decisions round-trip as `approval_request` / `approval_response` frames (see `apps/backend/src/services/runtime/sandbox-agent-protocol.ts`).
 
 **Workspace generation:** `claude-workspace-renderer.ts` generates `CLAUDE.md`, `.mcp.json`, and `.claude/commands/<name>.md` from the same compiled admin config used by Codex. In local mode the files land under `RUNTIME_WORKSPACE_ROOT/<runtimeId>/`; in e2b mode they're staged locally then uploaded to `/home/user/workspace/<sessionId>/` inside the sandbox.
 
 **Key files:**
-- `claude-code-runtime-adapter.ts` — `RuntimeAdapter` implementation, branches on `CLAUDE_RUNTIME_BACKEND`
-- `claude-code-event-mapper.ts` — `SDKMessage` → `RuntimeEvent` (used in both modes)
-- `claude-code-approval-handler.ts` — `canUseTool` ↔ deferred promise bridge (local mode only)
-- `claude-workspace-renderer.ts` — workspace file generation; in e2b mode the renderer writes to a local staging dir tracked on the adapter state (`localStagingPath`) before upload
+- `claude-code-runtime-adapter.ts` — `RuntimeAdapter` implementation
+- `claude-code-event-mapper.ts` — `SDKMessage` → `RuntimeEvent`
+- `claude-workspace-renderer.ts` — workspace file generation; the renderer writes to a local staging dir tracked on the adapter state (`localStagingPath`) before upload
 - `e2b-claude-runtime-process.ts` — creates the sandbox, uploads the staged workspace, and runs a long-lived stdio bridge to the in-sandbox harness (e2b mode)
 - `sandbox-agent-protocol.ts` — newline-delimited JSON frame types exchanged with the harness
 - `docker/sandbox-agent/sandbox-agent.mjs` — the harness itself (runs inside the E2B sandbox)
@@ -93,11 +91,11 @@ Tool results are passed through `redactSecrets()` (`services/redact-secrets.ts`)
 
 ### Approval flow
 
-Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes. `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions; `RuntimeApprovalCoordinator` intercepts Codex requests and Claude uses `canUseTool` through `ClaudeApprovalHandler`. The frontend calls `POST /approvals/:approvalId/decision` with body `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused turn. `tenant_settings.auto_approve_read_only_tools` bypasses native approval entirely for read-only tools.
+Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes. `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions; `RuntimeApprovalCoordinator` intercepts Codex requests and Claude uses `canUseTool` through the in-sandbox approval bridge (`docker/sandbox-agent/sandbox-agent.mjs`). The frontend calls `POST /approvals/:approvalId/decision` with body `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused turn. `tenant_settings.auto_approve_read_only_tools` bypasses native approval entirely for read-only tools.
 
 Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the policy approval coordinator, emits `framework:approval_required`, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
 
-Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry: Codex sends a synthetic `reject` to the runtime process so it unblocks, the DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt. Claude's `ClaudeApprovalHandler` runs the same TTL on its `canUseTool` Promise (resolves with `deny`).
+Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry: Codex sends a synthetic `reject` to the runtime process so it unblocks, the DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt. Claude's in-sandbox approval bridge runs the same TTL on its `canUseTool` Promise (resolves with `deny`).
 
 ### Scheduler
 
@@ -194,8 +192,9 @@ CLAUDE_RUNTIME_BACKEND     # local (in-process Agent SDK) | e2b (in-sandbox harn
 CLAUDE_AGENT_SDK_VERSION   # pinned Agent SDK version for diagnostics; defaults from codex-release.json
 E2B_TEMPLATE_ID            # the unified agent-runtime template ID; hosts both Codex and the Claude harness
 PII_PROVIDER_ENABLED       # opt-in switch for the PII detection provider; validates config at boot when true
-PII_OPENROUTER_API_KEY     # API key for the configured PII detection model provider — supply whatever provider you want via the env-var contract
-PII_OPENROUTER_MODEL       # default: "google/gemini-2.5-flash" (see config.ts comment for retention posture)
+PII_LLM_BASE_URL           # OpenAI-compatible /chat/completions endpoint for PII detection — a hosted API or a self-hosted Ollama/vLLM. Default: https://openrouter.ai/api/v1
+PII_LLM_API_KEY            # bearer token for the endpoint above — supply whatever provider you want via the env-var contract
+PII_LLM_MODEL              # default: "google/gemini-2.5-flash" (see config.ts comment for retention posture)
 PII_PROVIDER_TIMEOUT_MS    # sync-path budget for detect/transform; default 5000ms
 PII_RETENTION_KEK          # 32-byte hex (openssl rand -hex 32); required when any tenant uses rawRetention='reversible_encrypted' — without it, that mode throws pii_kek_missing rather than silently downgrading. Per-tenant DEKs derived via HKDF-SHA256(KEK, salt=tenantId).
 ```
@@ -263,7 +262,7 @@ Claude-specific operational notes (applies when `CLAUDE_RUNTIME_BACKEND=e2b`):
 - The backend does NOT invoke the `claude` CLI — that approach forced `--dangerously-skip-permissions` because headless `claude -p` has no stdio hook for `canUseTool`. Instead, `sandbox-agent.mjs` loads the Agent SDK and speaks newline-delimited JSON over stdio. HITL approvals work identically to local mode.
 - MCP servers reach the harness through the SDK's `mcpServers` option (NOT a `.mcp.json` file read) — the staged `.mcp.json` is retained for developer visibility but not consulted by the harness
 - The harness emits `ready` on startup with its SDK + Node versions; `E2bClaudeRuntimeProcess` logs it for diagnostics
-- `toolContextId` is threaded per turn via the `turn` frame and injected into managed MCP tool inputs inside the sandbox (mirrors `ClaudeApprovalHandler.enrichInput`)
+- `toolContextId` is threaded per turn via the `turn` frame and injected into managed MCP tool inputs inside the sandbox (`enrichInput` in the harness)
 - After bumping the Claude SDK version: update `claudeAgentSdkVersion` in `apps/backend/src/codex-release.json`, `@anthropic-ai/claude-agent-sdk` in `apps/backend/package.json`, and rebuild the E2B template
 - **MCP token transport (Claude vs Codex):** Claude MCP URLs do NOT carry `?token=rt_...` — the runtime token is delivered exclusively via `Authorization: Bearer rt_...` header (set in the SDK's `mcpServers` option and in `.mcp.json`). Codex still requires `?token=` in the URL because its Streamable HTTP transport does not forward `Authorization` headers on the `initialize` POST. Do not add `?token=` back to Claude URLs — the MCP gateway already accepts both paths, headers take priority.
 

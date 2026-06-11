@@ -29,6 +29,12 @@ export type ManagedToolFactoryDeps = {
   /** Optional — forwarded to tools that aggregate cross-session content. */
   piiProtection?: PiiProtectionService;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
+  /** Optional — size probe so oversized files are rejected before buffering. */
+  statRuntimeFile?: (
+    sessionId: string,
+    runtimeId: string,
+    filePath: string
+  ) => Promise<{ sizeBytes: number }>;
   writeRuntimeFile?: (
     sessionId: string,
     runtimeId: string,

@@ -1,7 +1,6 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
 
 import type { FileSourceDefinition } from "../components/file-source-picker";
 import { fetchIntegrationsAvailability } from "../lib/integrations-api";
@@ -47,19 +46,23 @@ export function registerFileSource(factory: FileSourceFactory): void {
   factories.push(factory);
 }
 
+// Must run every render, never memoized: each factory's `useEntry` returns
+// fresh closures (search state, selected session) that go stale if cached.
+export function selectEnabledFileSources(
+  entries: ReadonlyArray<{ factory: FileSourceFactory; entry: FileSourceDefinition }>,
+  enabledIntegrationIds: ReadonlyArray<string>
+): FileSourceDefinition[] {
+  const enabledIds = new Set(enabledIntegrationIds);
+  return entries
+    .filter(({ factory }) => enabledIds.has(factory.integrationId))
+    .map(({ entry }) => entry);
+}
+
 export function useFileSources(input: FileSourceFactoryInput) {
   const availabilityQuery = useQuery({
     queryKey: queryKeys.settings.integrationsAvailability(),
     queryFn: fetchIntegrationsAvailability
   });
-
-  const enabledIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const view of availabilityQuery.data ?? []) {
-      set.add(view.id);
-    }
-    return set;
-  }, [availabilityQuery.data]);
 
   // Call every registered factory unconditionally to keep hook order
   // stable. Filter the results afterwards based on integration enablement.
@@ -68,20 +71,9 @@ export function useFileSources(input: FileSourceFactoryInput) {
     entry: factory.useEntry(input)
   }));
 
-  // Collapse the entry list into a single change key — eslint's
-  // react-hooks/use-memo rule requires a literal deps array, and each
-  // entry's id+connection-kind captures the meaningful shape changes that
-  // should trigger a re-filter.
-  const entriesKey = entries
-    .map(({ entry }) => `${entry.id}:${entry.connection.kind}`)
-    .join("|");
-  const sources = useMemo<FileSourceDefinition[]>(
-    () =>
-      entries
-        .filter(({ factory }) => enabledIds.has(factory.integrationId))
-        .map(({ entry }) => entry),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [enabledIds, entriesKey]
+  const sources = selectEnabledFileSources(
+    entries,
+    (availabilityQuery.data ?? []).map((view) => view.id)
   );
 
   return {

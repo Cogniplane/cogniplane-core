@@ -208,8 +208,8 @@ test("resolveRuntimeProviderAndModel: claude with key resolves ok using the clau
   if (result.kind !== "ok") return;
   expect(result.provider).toBe("claude-code");
   expect(result.runtimeAdapter).toBe(claudeAdapter);
-  // Claude default model
-  expect(result.selectedModel?.id).toBe("claude-sonnet-4-6");
+  // Claude default model — `claude-opus-4-8` is the isDefault=true claude-code model
+  expect(result.selectedModel?.id).toBe("claude-opus-4-8");
 });
 
 test("resolveRuntimeProviderAndModel: requested model overrides tenant default provider", async () => {

@@ -1,5 +1,6 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
+import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
 
 const RUNTIME_SESSION_COLUMNS = `
   id,
@@ -75,16 +76,16 @@ function mapRuntimeSession(row: Record<string, unknown>): RuntimeSessionRecord {
     manifestPath: String(row.manifest_path),
     manifestMetadata: row.manifest_metadata as RuntimeManifest,
     healthStatus: String(row.health_status),
-    lastActiveAt: row.last_active_at ? new Date(String(row.last_active_at)).toISOString() : null,
-    startedAt: row.started_at ? new Date(String(row.started_at)).toISOString() : null,
-    terminatedAt: row.terminated_at ? new Date(String(row.terminated_at)).toISOString() : null,
+    lastActiveAt: isoTimestampOrNull(row.last_active_at),
+    startedAt: isoTimestampOrNull(row.started_at),
+    terminatedAt: isoTimestampOrNull(row.terminated_at),
     lifecycleMetadata:
       row.lifecycle_metadata && typeof row.lifecycle_metadata === "object"
         ? (row.lifecycle_metadata as Record<string, unknown>)
         : {},
     status: String(row.status),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 
@@ -198,17 +199,30 @@ export class RuntimeSessionStore {
     });
   }
 
-  async setStatus(tenantId: string, sessionId: string, userId: string, status: string): Promise<RuntimeSessionRecord | null> {
+  /**
+   * Pass `runtimeId` whenever the caller is tearing down a SPECIFIC runtime:
+   * teardown can race session recreation, and an unscoped update would mark
+   * the replacement's freshly inserted 'active' row as terminated. The
+   * unscoped form is for session-level operations with no live runtime.
+   */
+  async setStatus(
+    tenantId: string,
+    sessionId: string,
+    userId: string,
+    status: string,
+    runtimeId?: string
+  ): Promise<RuntimeSessionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           UPDATE runtime_sessions
           SET status = $3, updated_at = NOW()
           WHERE tenant_id = $4 AND session_id = $1 AND user_id = $2
+            AND ($5::text IS NULL OR runtime_id = $5)
             AND status NOT IN ('terminated', 'error')
           RETURNING ${RUNTIME_SESSION_COLUMNS}
         `,
-        [sessionId, userId, status, tenantId]
+        [sessionId, userId, status, tenantId, runtimeId ?? null]
       );
 
       return result.rows[0] ? mapRuntimeSession(result.rows[0]) : null;

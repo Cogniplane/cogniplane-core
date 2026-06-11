@@ -57,6 +57,7 @@ try {
     port: app.config.API_PORT
   });
 } catch (error) {
-  app.log.error(error);
-  process.exitCode = 1;
+  // Close the app so the pools/workers bootstrapped by buildApp don't keep
+  // the event loop (and thus a non-serving process) alive forever.
+  await shutdown("listen_failed", 1, error);
 }

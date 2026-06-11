@@ -1,15 +1,11 @@
 import type { NotionConnectionStatus } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { formatMediumDateTime } from "../lib/time-format";
+import { PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
-const PILL_BASE = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium";
-const PILL_GRAY = `${PILL_BASE} bg-surface-container text-on-surface-variant`;
-const PILL_BLUE = `${PILL_BASE} bg-accent-soft text-accent`;
 const CHIP =
   "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
-const HINT = "text-sm text-on-surface-faint";
 
 type NotionConnectionSectionProps = {
   status: NotionConnectionStatus | null;
@@ -19,18 +15,6 @@ type NotionConnectionSectionProps = {
   onConnect: () => void;
   onDisconnect: () => void;
 };
-
-function formatTimestamp(value: string | null): string {
-  if (!value) return "Not available";
-  try {
-    return new Intl.DateTimeFormat("en-US", {
-      dateStyle: "medium",
-      timeStyle: "short"
-    }).format(new Date(value));
-  } catch {
-    return value;
-  }
-}
 
 function getConnectionHeadline(status: NotionConnectionStatus | null): string {
   if (status?.userConnection) {
@@ -162,14 +146,14 @@ export function NotionConnectionSection(input: NotionConnectionSectionProps) {
                     <span className={CHIP}>{userConnection.notionOwnerEmail}</span>
                   ) : null}
                   <span className={CHIP}>
-                    connected {formatTimestamp(userConnection.connectedAt)}
+                    connected {formatMediumDateTime(userConnection.connectedAt, "Not available")}
                   </span>
                   <span className={CHIP}>
-                    last used {formatTimestamp(userConnection.lastUsedAt)}
+                    last used {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}
                   </span>
                 </div>
                 <p className={`${HINT} mt-2`}>
-                  Token expiry: {formatTimestamp(userConnection.accessTokenExpiresAt)}.
+                  Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}.
                 </p>
               </>
             ) : (

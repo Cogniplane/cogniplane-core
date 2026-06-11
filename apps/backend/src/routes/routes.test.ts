@@ -19,6 +19,19 @@ import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js"
 import { generateRuntimeToken } from "../services/auth/runtime-token.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 
+// The MCP gateway is runtime-token-only: every /mcp request must carry a valid
+// rt_* token, and caller-supplied toolContextIds are bound to its sid/uid.
+// Defaults mirror createTestToolContext (session-1 / test-user).
+function mcpAuthHeaders(claims: { sid?: string; uid?: string } = {}): { authorization: string } {
+  const sid = claims.sid ?? "session-1";
+  return {
+    authorization: `Bearer ${generateRuntimeToken(
+      { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: `runtime-${sid}` },
+      "test-runtime-token-secret"
+    )}`
+  };
+}
+
 
 describe("session lifecycle: create, stream, replay", () => {
   let app: Awaited<ReturnType<typeof createTestApp>>["app"];
@@ -756,6 +769,7 @@ test("serves the managed MCP tool and resolves context from toolContextId", asyn
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders({ sid: session.sessionId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -789,6 +803,7 @@ test("managed MCP tools/list omits outputSchema", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders(),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -878,6 +893,7 @@ test("lists and reads scoped text artifacts through the managed MCP server", asy
   const listResponse = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders({ sid: session.sessionId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -898,6 +914,7 @@ test("lists and reads scoped text artifacts through the managed MCP server", asy
   const readResponse = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders({ sid: session.sessionId }),
     payload: {
       jsonrpc: "2.0",
       id: 2,
@@ -942,6 +959,7 @@ test("denies managed MCP tools that are not enabled by the runtime policy", asyn
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders(),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -992,6 +1010,7 @@ test("allows write_artifact through the baseline runtime policy", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders(),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1018,6 +1037,59 @@ test("allows write_artifact through the baseline runtime policy", async () => {
   expect(artifact.artifactName).toBe("baseline.txt");
 });
 
+test("read-only managed tools are not blocked when autoApproveReadOnlyTools is off", async () => {
+  // autoApproveReadOnlyTools controls whether the runtime's approval layer
+  // (Claude's in-sandbox canUseTool) prompts for read-only tools — it is NOT a
+  // gateway allow/deny gate. With the flag off, the approval already happened
+  // before the HTTP call; the gateway must dispatch the tool, not refuse it.
+  const { app, sessions, messages, toolContexts } = await createTestApp();
+  onTestFinished(async () => {
+        await app.close();
+      });
+
+  const session = await sessions.create("test-tenant", "test-user", "No auto-approve");
+  await messages.create({
+    tenantId: "test-tenant",
+    sessionId: session.sessionId,
+    userId: "test-user",
+    role: "assistant",
+    status: "completed",
+    content: "Stored assistant message"
+  });
+  const toolContext = await createTestToolContext(toolContexts, {
+    sessionId: session.sessionId,
+    metadata: {
+      runtimePolicy: {
+        ...phase4RuntimePolicy,
+        autoApproveReadOnlyTools: false
+      }
+    }
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders({ sid: session.sessionId }),
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "session_context",
+        arguments: {
+          toolContextId: toolContext.toolContextId,
+          recentMessageCount: 1
+        }
+      }
+    }
+  });
+
+  expect(response.statusCode).toBe(200);
+  const payload = response.json();
+  expect(payload.error).toBeUndefined();
+  expect(payload.result.isError).toBe(false);
+});
+
 test("surfaces managed MCP broker errors as JSON-RPC failures", async () => {
   const { app, toolContexts } = await createTestApp();
   onTestFinished(async () => {
@@ -1031,6 +1103,7 @@ test("surfaces managed MCP broker errors as JSON-RPC failures", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
+    headers: mcpAuthHeaders({ sid: toolContext.sessionId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1077,6 +1150,7 @@ test("forwards proxy MCP calls with validated context headers", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/test-proxy",
+    headers: mcpAuthHeaders(),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1207,6 +1281,27 @@ test("allows CORS preflight for tenant-scoped session requests", async () => {
   expect(response.statusCode).toBe(204);
   expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
   expect(String(response.headers["access-control-allow-headers"] ?? "")).toMatch(/X-Tenant-Id/i);
+});
+
+test("allows CORS preflight for PATCH requests (message feedback, policy rule edits)", async () => {
+  const { app } = await createTestApp();
+  onTestFinished(async () => {
+        await app.close();
+      });
+
+  const response = await app.inject({
+    method: "OPTIONS",
+    url: "/messages/some-message-id/feedback",
+    headers: {
+      origin: "http://localhost:3000",
+      "access-control-request-method": "PATCH",
+      "access-control-request-headers": "Content-Type, X-User-Id, X-Tenant-Id"
+    }
+  });
+
+  expect(response.statusCode).toBe(204);
+  expect(response.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+  expect(String(response.headers["access-control-allow-methods"] ?? "")).toMatch(/\bPATCH\b/);
 });
 
 test("rate limits session creation per user with a structured 429 response", async () => {

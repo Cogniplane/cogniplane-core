@@ -1,9 +1,10 @@
-import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
+
+import { applyMigrations } from "./migrate-lib.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const migrationsDir = path.resolve(dirname, "../../db/migrations");
@@ -33,41 +34,8 @@ function extractPassword(databaseUrl: string): string | null {
   }
 }
 
-async function ensureMigrationsTable() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version TEXT PRIMARY KEY,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
-
 async function run() {
-  await ensureMigrationsTable();
-  const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
-
-  for (const file of files) {
-    const alreadyApplied = await db.query(
-      "SELECT version FROM schema_migrations WHERE version = $1 LIMIT 1",
-      [file]
-    );
-
-    if (alreadyApplied.rowCount) {
-      continue;
-    }
-
-    const sql = await readFile(path.join(migrationsDir, file), "utf8");
-    await db.query("BEGIN");
-    try {
-      await db.query(sql);
-      await db.query("INSERT INTO schema_migrations (version) VALUES ($1)", [file]);
-      await db.query("COMMIT");
-      console.log(`Applied migration ${file}`);
-    } catch (error) {
-      await db.query("ROLLBACK");
-      throw error;
-    }
-  }
+  await applyMigrations(db, migrationsDir);
 
   // Ensure app_user exists and has the correct password from DATABASE_URL.
   // The role may not exist if migrations were previously applied without it

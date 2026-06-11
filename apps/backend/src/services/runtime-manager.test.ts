@@ -56,6 +56,10 @@ class FakeRuntimeProcess {
   // the active turn exists with a still-null responseId (a fast Stop click).
   turnStartGate: Promise<void> | null = null;
 
+  // Each turn/start hands out a fresh id (turn-1, turn-2, …) like the real
+  // app-server — multi-turn tests need distinct ids for stale-turn scoping.
+  private turnCounter = 0;
+
   private readonly notificationListeners = new Set<(notification: JsonRpcNotification) => void>();
   private readonly requestListeners = new Set<(request: JsonRpcRequest) => void>();
   private readonly closeListeners = new Set<() => void>();
@@ -87,7 +91,7 @@ class FakeRuntimeProcess {
     if (method === "turn/start") {
       return {
         turn: {
-          id: "turn-1"
+          id: `turn-${++this.turnCounter}`
         }
       } as T;
     }
@@ -664,7 +668,11 @@ test("initializes the pinned protocol and starts a thread before the session bec
   expect(runtimeSessions.upserts[0].status).toBe("starting");
   expect(runtimeSessions.upserts[1].status).toBe("active");
   expect(runtimeSessions.upserts[1].healthStatus).toBe("healthy");
-  expect(manager.getHealthSnapshot().activeRuntimeCount).toEqual(1);
+  expect(manager.getHealthSnapshot()).toEqual({ activeRuntimeCount: 1, activeTurnCount: 0 });
+  // Per-runtime detail is tenant-scoped: the owning tenant sees its runtime,
+  // any other tenant sees nothing.
+  expect(manager.getRuntimeHealthDetail("test-tenant").map((r) => r.sessionId)).toEqual(["session-1"]);
+  expect(manager.getRuntimeHealthDetail("other-tenant")).toEqual([]);
   const threadStartRequest = process.requestLog.find((entry) => entry.method === "thread/start");
   expect((threadStartRequest?.params as { approvalPolicy?: string }).approvalPolicy).toBe("on-request");
   expect((runtimeSessions.upserts[1].lifecycleMetadata as { discoveredSkillNames?: string[] })
@@ -921,7 +929,7 @@ test("maps turn start and streaming notifications into framework response events
   expect(runtimeSessions.upserts.at(-1)?.status).toBe("active");
 });
 
-test("translates execCommandApproval requests into pending approvals and resumes on approval", async () => {
+test("translates command-execution approval requests into pending approvals and resumes on approval", async () => {
   const runtimeSessions = new InMemoryRuntimeSessionStore();
   const approvals = new RecordingApprovalStore();
   const process = new FakeRuntimeProcess();
@@ -960,15 +968,13 @@ test("translates execCommandApproval requests into pending approvals and resumes
 
   process.emitRequest({
     id: 42,
-    method: "execCommandApproval",
+    method: "item/commandExecution/requestApproval",
     params: {
-      conversationId: "thread-1",
-      callId: "call-1",
       approvalId: "approval-1",
-      command: ["python", "fib.py"],
-      cwd: "/tmp/cogniplane-runtime-tests",
-      reason: "Need to run a helper script",
-      parsedCmd: []
+      itemId: "call-1",
+      turnId: "turn-1",
+      command: "python fib.py",
+      cwd: "/tmp/cogniplane-runtime-tests"
     }
   });
 
@@ -999,7 +1005,7 @@ test("translates execCommandApproval requests into pending approvals and resumes
           itemId: "call-1",
           kind: "command_execution",
           title: "Approve shell command",
-          summary: "python fib.py\ncwd: /tmp/cogniplane-runtime-tests\nNeed to run a helper script",
+          summary: "python fib.py\ncwd: /tmp/cogniplane-runtime-tests",
           availableDecisions: ["approve", "reject"],
           command: "python fib.py",
           cwd: "/tmp/cogniplane-runtime-tests"
@@ -1010,9 +1016,178 @@ test("translates execCommandApproval requests into pending approvals and resumes
   expect(process.responseLog.at(-1)).toEqual({
         id: 42,
         result: {
-          decision: "approved"
+          decision: "accept"
         }
       });
+});
+
+test("a TTL tick during the decision's DB write cannot reject an approved command", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const approvals = new RecordingApprovalStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: createTestConfig({ APPROVAL_REQUEST_TTL_MS: 25 }),
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals,
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  // Gate the store's resolve so the TTL deadline passes while the decision's
+  // DB write is still in flight.
+  let releaseResolve!: () => void;
+  const resolveGate = new Promise<void>((r) => {
+    releaseResolve = r;
+  });
+  const originalResolve = approvals.resolve.bind(approvals);
+  approvals.resolve = (async (tenantId, approvalId, userId, decision) => {
+    await resolveGate;
+    return originalResolve(tenantId, approvalId, userId, decision);
+  }) as typeof approvals.resolve;
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const eventsPromise = collectEvents(
+    manager.runMessage(session, {
+      prompt: "Run a thing",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    })
+  );
+
+  await waitFor(() => {
+    expect(process.requestLog.some((entry) => entry.method === "turn/start")).toBeTruthy();
+  });
+
+  process.emitRequest({
+    id: 7,
+    method: "item/commandExecution/requestApproval",
+    params: {
+      approvalId: "approval-race",
+      itemId: "call-7",
+      turnId: "turn-1",
+      command: "python fib.py",
+      cwd: "/tmp"
+    }
+  });
+
+  await waitFor(() => {
+    expect(approvals.created.length).toBe(1);
+  });
+
+  // The decision claims the pending entry synchronously (disarming the TTL
+  // timer), then blocks on the gated DB write.
+  const decisionPromise = manager.resolveApproval({
+    tenantId: "test-tenant",
+    approvalId: "approval-race",
+    userId: "test-user",
+    decision: "approve"
+  });
+
+  // Let the (disarmed) TTL deadline pass — no denial may reach the process
+  // and the row must not be expired out from under the in-flight decision.
+  await new Promise((r) => setTimeout(r, 80));
+  expect(process.responseLog.some((entry) => entry.id === 7)).toBe(false);
+  expect(approvals.expired).toEqual([]);
+
+  releaseResolve();
+  await expect(decisionPromise).resolves.toBe("resolved");
+  expect(process.responseLog.at(-1)).toEqual({ id: 7, result: { decision: "accept" } });
+
+  process.emitNotification({
+    method: "turn/completed",
+    params: { turn: { status: "completed" } }
+  });
+  await eventsPromise;
+});
+
+test("an audit-write failure after the decision was delivered does not fail the decision (Codex review follow-up)", async () => {
+  // The approve has already been sent to the runtime and is irreversible — a
+  // failing approval.approved audit write must not 500 the route and invite a
+  // retry of an action whose side effects already occurred.
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const approvals = new RecordingApprovalStore();
+  const process = new FakeRuntimeProcess();
+  const audit = {
+    async create(input: { type: string }) {
+      if (input.type === "approval.approved") throw new Error("audit table unavailable");
+    }
+  };
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals,
+    auditEvents: audit as never,
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const eventsPromise = collectEvents(
+    manager.runMessage(session, {
+      prompt: "Run a thing",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    })
+  );
+
+  await waitFor(() => {
+    expect(process.requestLog.some((entry) => entry.method === "turn/start")).toBeTruthy();
+  });
+
+  process.emitRequest({
+    id: 11,
+    method: "item/commandExecution/requestApproval",
+    params: {
+      approvalId: "approval-audit",
+      itemId: "call-11",
+      turnId: "turn-1",
+      command: "ls",
+      cwd: "/tmp"
+    }
+  });
+
+  await waitFor(() => {
+    expect(approvals.created.length).toBe(1);
+  });
+
+  await expect(
+    manager.resolveApproval({
+      tenantId: "test-tenant",
+      approvalId: "approval-audit",
+      userId: "test-user",
+      decision: "approve"
+    })
+  ).resolves.toBe("resolved");
+  expect(process.responseLog.at(-1)).toEqual({ id: 11, result: { decision: "accept" } });
+
+  process.emitNotification({
+    method: "turn/completed",
+    params: { turn: { status: "completed" } }
+  });
+  await eventsPromise;
 });
 
 test("approval expires after TTL: rejects to runtime, marks DB row, emits warning notice", async () => {
@@ -1055,14 +1230,13 @@ test("approval expires after TTL: rejects to runtime, marks DB row, emits warnin
 
   process.emitRequest({
     id: 99,
-    method: "execCommandApproval",
+    method: "item/commandExecution/requestApproval",
     params: {
-      conversationId: "thread-1",
-      callId: "call-99",
       approvalId: "approval-99",
-      command: ["sleep", "1000"],
-      cwd: "/tmp",
-      reason: "expiry test"
+      itemId: "call-99",
+      turnId: "turn-1",
+      command: "sleep 1000",
+      cwd: "/tmp"
     }
   });
 
@@ -1073,7 +1247,7 @@ test("approval expires after TTL: rejects to runtime, marks DB row, emits warnin
   // Wait for the TTL to fire and the runtime to be unblocked.
   await waitFor(() => {
     expect(approvals.expired.includes("approval-99")).toBeTruthy();
-    expect(process.responseLog.some((entry) => entry.id === 99 && entry.result?.decision === "denied")).toBeTruthy();
+    expect(process.responseLog.some((entry) => entry.id === 99 && entry.result?.decision === "decline")).toBeTruthy();
   });
 
   // The turn never completed naturally — close the runtime to terminate the stream.
@@ -1817,6 +1991,369 @@ test("interruptTurn: refuses to interrupt before turn/start assigns a turnId —
   await manager.close();
 });
 
+test("runMessage: consumer throwing mid-stream stops the orphaned turn and frees the session", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  // The SSE writer (or scheduler worker) blowing up mid-turn: the for-await
+  // body throws, which unwinds runMessage without any terminal event.
+  await expect(
+    (async () => {
+      for await (const event of manager.runMessage(session, {
+        prompt: "First turn",
+        runtimePolicyId: "phase4-tools",
+        toolContextId: "ctx-test"
+      })) {
+        if ((event as { type?: string }).type === "response.created") {
+          throw new Error("consumer exploded");
+        }
+      }
+    })()
+  ).rejects.toThrow("consumer exploded");
+
+  // The orphaned process-side turn was interrupted (not left billing tokens).
+  const interruptRequests = process.requestLog.filter((entry) => entry.method === "turn/interrupt");
+  expect(interruptRequests.length).toBe(1);
+  expect(interruptRequests[0].params).toMatchObject({ threadId: "thread-1", turnId: "turn-1" });
+  // The runtime stays warm for a follow-up.
+  expect(process.alive).toBe(true);
+
+  // The active-turn slot was released: a second turn starts without
+  // SessionBusyError, and stragglers from the dead turn don't leak into it.
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Second turn",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+  await collected.reached;
+
+  process.emitNotification({
+    method: "item/agentMessage/delta",
+    params: { delta: "zombie", turnId: "turn-1", threadId: "thread-1", itemId: "item-z" }
+  });
+  process.emitNotification({
+    method: "item/agentMessage/delta",
+    params: { delta: "fresh", turnId: "turn-2", threadId: "thread-1", itemId: "item-f" }
+  });
+  process.emitNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-2", status: "completed" } }
+  });
+
+  const events = await collected.done;
+  expect(events).toContainEqual({
+    type: "response.output_text.delta",
+    responseId: "turn-2",
+    delta: "fresh"
+  });
+  expect(events.some((e) => (e as { delta?: string }).delta === "zombie")).toBe(false);
+  expect(events.at(-1)).toEqual({ type: "response.completed", responseId: "turn-2" });
+
+  await manager.close();
+});
+
+test("runMessage: reserves the turn slot before onBeforeTurn so a concurrent send gets SessionBusyError", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  // First turn parks inside onBeforeTurn (the multi-second artifact sync).
+  let releaseFirst: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "First",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test",
+      onBeforeTurn: () => gate
+    }),
+    isResponseCreated
+  );
+  await waitFor(() => {
+    expect(manager.hasActiveTurn("session-1")).toBe(true);
+  });
+
+  // A concurrent send must lose at the busy check, not overwrite the slot.
+  await expect(
+    (async () => {
+      for await (const event of manager.runMessage(session, {
+        prompt: "Second",
+        runtimePolicyId: "phase4-tools",
+        toolContextId: "ctx-test"
+      })) {
+        void event;
+      }
+    })()
+  ).rejects.toThrow(/already running/);
+
+  // The first turn is unharmed: release the gate and complete it normally.
+  releaseFirst();
+  await collected.reached;
+  process.emitNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }
+  });
+  const events = await collected.done;
+  expect(events.at(-1)).toEqual({ type: "response.completed", responseId: "turn-1" });
+
+  await manager.close();
+});
+
+test("runMessage: releases the reservation when onBeforeTurn throws", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: testConfig,
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  await expect(
+    (async () => {
+      for await (const event of manager.runMessage(session, {
+        prompt: "Doomed",
+        runtimePolicyId: "phase4-tools",
+        toolContextId: "ctx-test",
+        onBeforeTurn: async () => {
+          throw new Error("artifact sync failed");
+        }
+      })) {
+        void event;
+      }
+    })()
+  ).rejects.toThrow("artifact sync failed");
+
+  // The slot is free again — a follow-up turn starts and completes normally.
+  expect(manager.hasActiveTurn("session-1")).toBe(false);
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Retry",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+  await collected.reached;
+  process.emitNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }
+  });
+  const events = await collected.done;
+  expect(events.at(-1)).toEqual({ type: "response.completed", responseId: "turn-1" });
+
+  await manager.close();
+});
+
+test("runMessage: consumer abandonment re-arms idle teardown so the runtime is torn down", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: createTestConfig({
+      RUNTIME_WORKSPACE_ROOT: "/tmp/cogniplane-runtime-tests",
+      RUNTIME_IDLE_TIMEOUT_MS: 25
+    }),
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  await expect(
+    (async () => {
+      for await (const event of manager.runMessage(session, {
+        prompt: "Doomed turn",
+        runtimePolicyId: "phase4-tools",
+        toolContextId: "ctx-test"
+      })) {
+        if ((event as { type?: string }).type === "response.created") {
+          throw new Error("consumer exploded");
+        }
+      }
+    })()
+  ).rejects.toThrow("consumer exploded");
+
+  // startTurn cleared the idle timer; without the abandoned-turn cleanup the
+  // runtime would stay warm forever (the terminal notification handlers
+  // early-return once the slot is empty). The cleanup re-arms it, so the idle
+  // timeout fires and tears the runtime down.
+  await waitFor(() => {
+    expect(process.alive).toBe(false);
+  });
+  await waitFor(() => {
+    expect(runtimeSessions.upserts.some((u) => u.status === "inactive")).toBe(true);
+  });
+});
+
+test("runMessage: turn watchdog fails a wedged turn and recycles the runtime", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: createTestConfig({
+      RUNTIME_WORKSPACE_ROOT: "/tmp/cogniplane-runtime-tests",
+      RUNTIME_TURN_TIMEOUT_MS: 30
+    }),
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  // The turn starts but Codex never sends another notification — wedged.
+  const events: unknown[] = [];
+  for await (const event of manager.runMessage(session, {
+    prompt: "Wedge me",
+    runtimePolicyId: "phase4-tools",
+    toolContextId: "ctx-test"
+  })) {
+    events.push(event);
+  }
+
+  // The watchdog delivered a terminal failure frame so the consumer unblocked.
+  const last = events.at(-1) as { type: string; message?: string };
+  expect(last.type).toBe("response.failed");
+  expect(last.message).toMatch(/exceeded the 30ms limit/);
+
+  // The wedged runtime was recycled, not left warm for the next turn.
+  await waitFor(() => {
+    expect(process.alive).toBe(false);
+  });
+  expect(manager.hasActiveTurn("session-1")).toBe(false);
+});
+
+test("runMessage: turn watchdog does not fire on a turn that completes in time", async () => {
+  const runtimeSessions = new InMemoryRuntimeSessionStore();
+  const process = new FakeRuntimeProcess();
+  const manager = new CodexRuntimeManager({
+    config: createTestConfig({
+      RUNTIME_WORKSPACE_ROOT: "/tmp/cogniplane-runtime-tests",
+      RUNTIME_TURN_TIMEOUT_MS: 5_000
+    }),
+    dynamicConfig,
+    logger: createLogger(),
+    runtimeSessions,
+    approvals: new NoopApprovalStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    toolEvents: new NoopToolEventStore(),
+    artifacts: noopArtifacts,
+    storage: noopStorage,
+    skillBundleStorage: noopSkillBundleStorage,
+    workspaceFactory: async () => workspaceArtifacts,
+    processFactory: async () => process
+  });
+
+  const session = await manager.createSession({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "test-user"
+  });
+
+  const collected = collectEventsUntil(
+    manager.runMessage(session, {
+      prompt: "Quick turn",
+      runtimePolicyId: "phase4-tools",
+      toolContextId: "ctx-test"
+    }),
+    isResponseCreated
+  );
+  await collected.reached;
+  process.emitNotification({
+    method: "turn/completed",
+    params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } }
+  });
+  const events = await collected.done;
+
+  expect(events.at(-1)).toEqual({ type: "response.completed", responseId: "turn-1" });
+  // The watchdog was disarmed on completion — the runtime stays warm.
+  expect(process.alive).toBe(true);
+
+  await manager.close();
+});
+
 test("interruptTurn: clears a still-pending approval — rejects it to the runtime and drops the DB row", async () => {
   const runtimeSessions = new InMemoryRuntimeSessionStore();
   const approvals = new RecordingApprovalStore();
@@ -1856,14 +2393,13 @@ test("interruptTurn: clears a still-pending approval — rejects it to the runti
 
   process.emitRequest({
     id: 77,
-    method: "execCommandApproval",
+    method: "item/commandExecution/requestApproval",
     params: {
-      conversationId: "thread-1",
-      callId: "call-77",
       approvalId: "approval-77",
-      command: ["rm", "-rf", "/tmp/x"],
-      cwd: "/tmp",
-      reason: "interrupt-while-pending"
+      itemId: "call-77",
+      turnId: "turn-1",
+      command: "rm -rf /tmp/x",
+      cwd: "/tmp"
     }
   });
 
@@ -1879,12 +2415,12 @@ test("interruptTurn: clears a still-pending approval — rejects it to the runti
   expect(outcome).toBe("interrupted");
 
   // cancelPendingApprovals is fire-and-forget: wait for its observable effects.
-  // 1. The runtime is unblocked with a reject ("denied" for the compat method).
+  // 1. The runtime is unblocked with a reject ("decline").
   // 2. The DB row is expired (dropped from pending).
   await waitFor(() => {
     expect(
       process.responseLog.some(
-        (entry) => entry.id === 77 && (entry.result as { decision?: string } | undefined)?.decision === "denied"
+        (entry) => entry.id === 77 && (entry.result as { decision?: string } | undefined)?.decision === "decline"
       )
     ).toBeTruthy();
     expect(approvals.expired).toContain("approval-77");
@@ -1991,14 +2527,13 @@ test("resolveApproval: rememberForTurn auto-approves the next same-kind request 
   // First command-execution approval — surfaced to the user.
   process.emitRequest({
     id: 10,
-    method: "execCommandApproval",
+    method: "item/commandExecution/requestApproval",
     params: {
-      conversationId: "thread-1",
-      callId: "call-10",
       approvalId: "approval-10",
-      command: ["ls"],
-      cwd: "/tmp",
-      reason: "first"
+      itemId: "call-10",
+      turnId: "turn-1",
+      command: "ls",
+      cwd: "/tmp"
     }
   });
 
@@ -2019,23 +2554,22 @@ test("resolveApproval: rememberForTurn auto-approves the next same-kind request 
   // recorded the kind, it must auto-approve WITHOUT creating a second DB row.
   process.emitRequest({
     id: 11,
-    method: "execCommandApproval",
+    method: "item/commandExecution/requestApproval",
     params: {
-      conversationId: "thread-1",
-      callId: "call-11",
       approvalId: "approval-11",
-      command: ["pwd"],
-      cwd: "/tmp",
-      reason: "second"
+      itemId: "call-11",
+      turnId: "turn-1",
+      command: "pwd",
+      cwd: "/tmp"
     }
   });
 
-  // Observable signal: the runtime is auto-approved (compat method → "approved")
-  // for request id 11, and no new approval row was created.
+  // Observable signal: the runtime is auto-approved ("accept") for request
+  // id 11, and no new approval row was created.
   await waitFor(() => {
     expect(
       process.responseLog.some(
-        (entry) => entry.id === 11 && (entry.result as { decision?: string } | undefined)?.decision === "approved"
+        (entry) => entry.id === 11 && (entry.result as { decision?: string } | undefined)?.decision === "accept"
       )
     ).toBeTruthy();
   });

@@ -381,7 +381,7 @@ describe("buildTimeline", () => {
       buildTimeline({
         messages: [],
         pendingApprovals: [],
-        approvalDecisionId: null,
+        approvalDecision: null,
         mcpServerEvents: [],
         runtimeNotices: []
       })
@@ -392,7 +392,7 @@ describe("buildTimeline", () => {
     const rows = buildTimeline({
       messages: [makeUser({})],
       pendingApprovals: [makeApproval({ approvalId: "a-1" })],
-      approvalDecisionId: null,
+      approvalDecision: null,
       mcpServerEvents: [],
       runtimeNotices: []
     });
@@ -402,16 +402,28 @@ describe("buildTimeline", () => {
     expect(approval.decisionState).toBe("pending");
   });
 
-  it("flips an approval to 'approving' state when its id matches approvalDecisionId", () => {
+  it("flips an approval to 'approving' state when an approve decision is in flight", () => {
     const rows = buildTimeline({
       messages: [],
       pendingApprovals: [makeApproval({ approvalId: "a-1" })],
-      approvalDecisionId: "a-1",
+      approvalDecision: { approvalId: "a-1", kind: "approve" },
       mcpServerEvents: [],
       runtimeNotices: []
     });
     const approval = rows[0] as ApprovalRow;
     expect(approval.decisionState).toBe("approving");
+  });
+
+  it("flips an approval to 'rejecting' state when a reject decision is in flight", () => {
+    const rows = buildTimeline({
+      messages: [],
+      pendingApprovals: [makeApproval({ approvalId: "a-1" })],
+      approvalDecision: { approvalId: "a-1", kind: "reject" },
+      mcpServerEvents: [],
+      runtimeNotices: []
+    });
+    const approval = rows[0] as ApprovalRow;
+    expect(approval.decisionState).toBe("rejecting");
   });
 
   it("preserves the order of multiple pending approvals", () => {
@@ -421,7 +433,7 @@ describe("buildTimeline", () => {
         makeApproval({ approvalId: "a-1" }),
         makeApproval({ approvalId: "a-2" })
       ],
-      approvalDecisionId: null,
+      approvalDecision: null,
       mcpServerEvents: [],
       runtimeNotices: []
     });
@@ -437,7 +449,7 @@ describe("buildTimeline", () => {
     const rows = buildTimeline({
       messages: [],
       pendingApprovals: [],
-      approvalDecisionId: null,
+      approvalDecision: null,
       mcpServerEvents: events,
       runtimeNotices: []
     });
@@ -461,7 +473,7 @@ describe("buildTimeline", () => {
     const rows = buildTimeline({
       messages: [],
       pendingApprovals: [],
-      approvalDecisionId: null,
+      approvalDecision: null,
       mcpServerEvents: [{ serverName: "github", status: "starting", error: null }],
       runtimeNotices: notices
     });
@@ -479,7 +491,7 @@ describe("buildTimeline", () => {
         makeAssistant({ content: "Working on it…", status: "streaming" })
       ],
       pendingApprovals: [makeApproval({ approvalId: "a-1" })],
-      approvalDecisionId: null,
+      approvalDecision: null,
       mcpServerEvents: [{ serverName: "github", status: "starting", error: null }],
       runtimeNotices: [
         {

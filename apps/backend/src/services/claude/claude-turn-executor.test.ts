@@ -7,7 +7,7 @@ import { ManagedToolFactoryRegistry } from "../managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "../managed-tools/register-builtin-managed-tools.js";
 import type { ClaudeSessionState } from "./claude-types.js";
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
-import type { RuntimeEvent, RuntimeSessionRef } from "../../runtime-contracts.js";
+import { SessionBusyError, type RuntimeEvent, type RuntimeSessionRef } from "../../runtime-contracts.js";
 import type { SandboxApprovalRequestFrame } from "../runtime/sandbox-agent-protocol.js";
 import type { E2bClaudeRuntimeProcess } from "../runtime/e2b-claude-runtime-process.js";
 import type { FastifyBaseLogger } from "fastify";
@@ -48,6 +48,7 @@ function makeFakeE2bProcess(
 ): E2bClaudeRuntimeProcess {
   return {
     interruptCurrentTurn: vi.fn(async () => true),
+    sendApprovalResponse: vi.fn(async () => {}),
     runTurn: async (_frame: unknown, listeners: RunTurnListeners) => {
       await drive(listeners);
     }
@@ -89,6 +90,7 @@ function makeState(
     e2bProcess,
     activeTurnInterrupt: { current: null },
     activeTurnPush: { current: null },
+    autoApprovedKindsForTurn: new Set(),
     ...overrides
   };
 }
@@ -106,7 +108,7 @@ function makeCtx(
   return {
     state,
     activeTurns: new Set<string>(),
-    e2bPendingApprovals: new Map<string, string>(),
+    e2bPendingApprovals: new Map<string, { sessionId: string; kind: import("../../runtime-contracts.js").RuntimeApprovalKind }>(),
     stores: undefined,
     config: { CLAUDE_CODE_MODEL: "sonnet", APPROVAL_REQUEST_TTL_MS: 600_000 },
     log: silentLog,
@@ -280,7 +282,7 @@ describe("executeClaudeTurn", () => {
     expect(state.activeTurnInterrupt.current).toBeNull();
   });
 
-  it("awaits onBeforeTurn before adding the session to activeTurns", async () => {
+  it("reserves the activeTurns slot synchronously, before awaiting onBeforeTurn", async () => {
     const callOrder: string[] = [];
     const e2bProcess = makeFakeE2bProcess(async (listeners) => {
       listeners.onComplete(null);
@@ -288,14 +290,110 @@ describe("executeClaudeTurn", () => {
     const state = makeState(e2bProcess);
     const ctx = makeCtx(state);
     const onBeforeTurn = vi.fn(async () => {
-      // At this point the turn must not yet be marked active.
+      // The slot must already be reserved here — otherwise a concurrent turn
+      // could slip past the busy check during this (multi-second) await.
       callOrder.push(`before:active=${ctx.activeTurns.has(session.sessionId)}`);
     });
 
     await drain(executeClaudeTurn(session, { ...baseInput, onBeforeTurn }, ctx));
 
     expect(onBeforeTurn).toHaveBeenCalledOnce();
-    expect(callOrder).toEqual(["before:active=false"]);
+    expect(callOrder).toEqual(["before:active=true"]);
+    expect(ctx.activeTurns.has(session.sessionId)).toBe(false);
+  });
+
+  it("rejects a concurrent turn with SessionBusyError while the first is inside onBeforeTurn", async () => {
+    let releaseFirst: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+      listeners.onComplete(null);
+    });
+    const state = makeState(e2bProcess);
+    const ctx = makeCtx(state);
+
+    const first = drain(
+      executeClaudeTurn(session, { ...baseInput, onBeforeTurn: () => gate }, ctx)
+    );
+    // Let the first turn enter onBeforeTurn (generator bodies start lazily).
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(ctx.activeTurns.has(session.sessionId)).toBe(true);
+
+    // A second turn for the same session must lose immediately — without the
+    // synchronous reservation it would pass the busy check, and its failure
+    // path would clobber the first turn's activeTurns flag and hooks.
+    await expect(drain(executeClaudeTurn(session, baseInput, ctx))).rejects.toThrow(
+      SessionBusyError
+    );
+
+    // The loser must NOT have clobbered the first turn's reservation.
+    expect(ctx.activeTurns.has(session.sessionId)).toBe(true);
+
+    releaseFirst();
+    await first;
+    expect(ctx.activeTurns.has(session.sessionId)).toBe(false);
+  });
+
+  it("fires onTurnStart at reservation and onTurnEnd when the turn settles (idle-timer hooks)", async () => {
+    const order: string[] = [];
+    const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+      order.push("turn-running");
+      listeners.onComplete(null);
+    });
+    const ctx = makeCtx(makeState(e2bProcess), {
+      onTurnStart: () => order.push("start"),
+      onTurnEnd: () => order.push("end")
+    });
+
+    await drain(executeClaudeTurn(session, baseInput, ctx));
+    expect(order).toEqual(["start", "turn-running", "end"]);
+
+    // onBeforeTurn failure must still re-arm via onTurnEnd.
+    order.length = 0;
+    await expect(
+      drain(
+        executeClaudeTurn(
+          session,
+          {
+            ...baseInput,
+            onBeforeTurn: async () => {
+              throw new Error("sync failed");
+            }
+          },
+          ctx
+        )
+      )
+    ).rejects.toThrow("sync failed");
+    expect(order).toEqual(["start", "end"]);
+  });
+
+  it("releases the reservation when onBeforeTurn throws", async () => {
+    const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+      listeners.onComplete(null);
+    });
+    const state = makeState(e2bProcess);
+    const ctx = makeCtx(state);
+
+    await expect(
+      drain(
+        executeClaudeTurn(
+          session,
+          {
+            ...baseInput,
+            onBeforeTurn: async () => {
+              throw new Error("artifact sync failed");
+            }
+          },
+          ctx
+        )
+      )
+    ).rejects.toThrow("artifact sync failed");
+
+    // The slot is free again — a follow-up turn runs normally.
+    expect(ctx.activeTurns.has(session.sessionId)).toBe(false);
+    const events = await drain(executeClaudeTurn(session, baseInput, ctx));
+    expect(events.some((e) => e.type === "response.completed")).toBe(true);
   });
 
   describe("onApprovalRequest", () => {
@@ -335,7 +433,7 @@ describe("executeClaudeTurn", () => {
 
       // The approvalId → sessionId mapping is registered so resolveApproval can
       // forward the decision to the right sandbox.
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toBe(state.sessionId);
+      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
 
       // Persisted exactly once, with the TTL deadline = now + APPROVAL_REQUEST_TTL_MS.
       expect(createCalls).toHaveLength(1);
@@ -385,7 +483,7 @@ describe("executeClaudeTurn", () => {
       const events = await drain(executeClaudeTurn(session, baseInput, ctx));
 
       // Mapping registered regardless of the store outcome.
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toBe(state.sessionId);
+      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
       const approvalEvent = events.find((e) => e.type === "framework:approval_required");
       expect(approvalEvent).toBeDefined();
       expect(
@@ -407,8 +505,60 @@ describe("executeClaudeTurn", () => {
 
       const events = await drain(executeClaudeTurn(session, baseInput, ctx));
 
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toBe(state.sessionId);
+      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
       expect(events.some((e) => e.type === "framework:approval_required")).toBe(true);
+    });
+
+    it("auto-approves a remembered kind without a DB row or prompt (rememberForTurn)", async () => {
+      const createCalls: unknown[] = [];
+      const approvals = {
+        async create(input: unknown) {
+          createCalls.push(input);
+          return {} as never;
+        }
+      };
+
+      const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+        // Simulates a prior approve-with-remember earlier in this same turn
+        // (forwardApprovalDecision records the kind mid-turn, after the
+        // executor's turn-start clear).
+        state.autoApprovedKindsForTurn.add("command_execution");
+        listeners.onApprovalRequest(approvalFrame);
+        await Promise.resolve();
+        await Promise.resolve();
+        listeners.onComplete(null);
+      });
+      const state = makeState(e2bProcess);
+      const ctx = makeCtx(state, { stores: { approvals: approvals as never } });
+
+      const events = await drain(executeClaudeTurn(session, baseInput, ctx));
+
+      // Answered straight back to the harness: no pending entry, no DB row,
+      // no user prompt.
+      expect(e2bProcess.sendApprovalResponse).toHaveBeenCalledWith("appr-1", "approve");
+      expect(ctx.e2bPendingApprovals.has("appr-1")).toBe(false);
+      expect(createCalls).toHaveLength(0);
+      expect(events.some((e) => e.type === "framework:approval_required")).toBe(false);
+    });
+
+    it("clears remembered kinds at turn start", async () => {
+      const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+        listeners.onApprovalRequest(approvalFrame);
+        await Promise.resolve();
+        await Promise.resolve();
+        listeners.onComplete(null);
+      });
+      const state = makeState(e2bProcess);
+      // Left over from a previous turn — must not leak into this one.
+      state.autoApprovedKindsForTurn.add("command_execution");
+      const ctx = makeCtx(state);
+
+      const events = await drain(executeClaudeTurn(session, baseInput, ctx));
+
+      // The stale remembered kind was cleared, so the request prompts normally.
+      expect(e2bProcess.sendApprovalResponse).not.toHaveBeenCalled();
+      expect(events.some((e) => e.type === "framework:approval_required")).toBe(true);
+      expect(ctx.e2bPendingApprovals.has("appr-1")).toBe(true);
     });
   });
 

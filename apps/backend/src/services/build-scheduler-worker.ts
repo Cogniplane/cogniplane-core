@@ -1,12 +1,16 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "../config.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
+import type { RuntimeProvider } from "./admin-config-records.js";
 import type { AuditEventStore } from "./audit-event-store.js";
+import type { DynamicConfigService } from "./dynamic-config-service.js";
 import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
-import type { CodexRuntimeManager } from "./runtime-manager.js";
-import { SchedulerWorker } from "./scheduler-worker.js";
+import { buildApiKeyPresenceCheckers } from "./runtime/api-key-presence.js";
+import { resolveRuntimeProviderAndModel } from "./runtime/runtime-provider-resolver.js";
+import { SchedulerWorker, type SchedulerRuntimeResolution } from "./scheduler-worker.js";
 import type { SessionStore } from "./session-store.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { UserSettingsStore } from "./user-settings-store.js";
@@ -18,7 +22,11 @@ export function buildSchedulerWorker(
     sessions: SessionStore;
     messages: MessageStore;
     toolContexts: ToolExecutionContextStore;
-    runtimeManager: CodexRuntimeManager;
+    runtimeManager: RuntimeAdapter;
+    runtimeAdapters: Partial<Record<RuntimeProvider, RuntimeAdapter>>;
+    dynamicConfig: DynamicConfigService;
+    getTenantAnthropicApiKey: (tenantId: string) => Promise<string | null>;
+    getTenantOpenaiApiKey: (tenantId: string) => Promise<string | null>;
     auditEvents: AuditEventStore;
     piiScanJobs?: PiiScanJobStore;
     piiScanJobHandler?: PiiScanJobHandler;
@@ -43,13 +51,51 @@ export function buildSchedulerWorker(
     return null;
   }
 
+  const { hasAnthropicApiKey, hasOpenaiApiKey } = buildApiKeyPresenceCheckers({
+    config,
+    getTenantAnthropicApiKey: input.getTenantAnthropicApiKey,
+    getTenantOpenaiApiKey: input.getTenantOpenaiApiKey
+  });
+
+  const resolveRuntime = async (tenantId: string): Promise<SchedulerRuntimeResolution> => {
+    const resolution = await resolveRuntimeProviderAndModel({
+      tenantId,
+      requestedModel: undefined,
+      requestedEffort: undefined,
+      defaultAdapter: input.runtimeManager,
+      stores: {
+        dynamicConfig: input.dynamicConfig,
+        runtimeAdapters: input.runtimeAdapters,
+        hasAnthropicApiKey,
+        hasOpenaiApiKey
+      }
+    });
+
+    if (resolution.kind === "error") {
+      // The resolver speaks HTTP error envelopes; flatten to the most useful
+      // human-readable string for the run ledger and audit trail.
+      const message =
+        resolution.body.message ??
+        resolution.body.details?.map((d) => d.message).join("; ") ??
+        resolution.body.error;
+      return { kind: "error", message };
+    }
+
+    return {
+      kind: "ok",
+      adapter: resolution.runtimeAdapter,
+      provider: resolution.provider,
+      modelId: resolution.selectedModel?.id ?? null
+    };
+  };
+
   return new SchedulerWorker(
     {
       settings: input.userSettings,
       sessions: input.sessions,
       messages: input.messages,
       toolContexts: input.toolContexts,
-      runtimeManager: input.runtimeManager,
+      resolveRuntime,
       auditEvents: input.auditEvents,
       // Only thread the PII drain in when it's safe to run (see above); when
       // disabled, the worker's drainPiiScanJobs no-ops because the deps are

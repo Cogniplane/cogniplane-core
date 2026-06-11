@@ -73,6 +73,49 @@ function runtimeToken(claims: { sid: string; uid: string; rid?: string }): strin
 // sid + uid, preventing same-tenant cross-user/session context substitution.
 // ---------------------------------------------------------------------------
 
+test("pins the first peer IP per runtime and refuses the same rt_* token from another host", async () => {
+  const { app } = await createTestApp();
+  onTestFinished(async () => {
+    await app.close();
+  });
+
+  const headers = {
+    authorization: `Bearer ${runtimeToken({ sid: "pin-session", uid: "test-user", rid: "runtime-pin" })}`
+  };
+  const payload = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+
+  // First call pins the observed peer IP for runtime-pin.
+  const first = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    remoteAddress: "203.0.113.10",
+    headers,
+    payload
+  });
+  expect(first.statusCode).toBe(200);
+
+  // Same valid token replayed from a different host → refused.
+  const second = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    remoteAddress: "203.0.113.99",
+    headers,
+    payload
+  });
+  expect(second.statusCode).toBe(403);
+  expect(second.json().error.message).toMatch(/egress ip mismatch/i);
+
+  // The pinned host keeps working.
+  const third = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    remoteAddress: "203.0.113.10",
+    headers,
+    payload
+  });
+  expect(third.statusCode).toBe(200);
+});
+
 test("rejects a managed tool call whose toolContextId belongs to another user/session", async () => {
   const { app, sessions, messages, toolContexts } = await createTestApp();
   onTestFinished(async () => {
@@ -219,27 +262,23 @@ test("rejects a proxy tool call with a substituted toolContextId (no signed iden
   expect(upstreamRequests.length).toBe(0);
 });
 
-test("binding is skipped when no runtime token is present (dev-headers callers)", async () => {
-  const { app, sessions, messages, toolContexts } = await createTestApp();
+test("rejects gateway calls without a valid runtime token even when otherwise authenticated", async () => {
+  // The toolContextId binding in resolveBoundToolContext relies on runtime
+  // token claims. A caller authenticated some other way (user JWT,
+  // dev-headers) must be rejected outright — otherwise a same-tenant user
+  // could substitute another user's context id and skip the binding check.
+  const { app, sessions, toolContexts } = await createTestApp();
   onTestFinished(async () => {
     await app.close();
   });
 
   const session = await sessions.create("test-tenant", "test-user", "Dev session");
-  await messages.create({
-    tenantId: "test-tenant",
-    sessionId: session.sessionId,
-    userId: "test-user",
-    role: "assistant",
-    status: "completed",
-    content: "Dev assistant message"
-  });
   const context = await createTestToolContext(toolContexts, {
     sessionId: session.sessionId
   });
 
   // No Authorization header — the dev-headers preHandler authenticates the
-  // request, and there is no runtime token to bind against.
+  // request, but there is no runtime token.
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
@@ -257,10 +296,9 @@ test("binding is skipped when no runtime token is present (dev-headers callers)"
     }
   });
 
-  expect(response.statusCode).toBe(200);
+  expect(response.statusCode).toBe(401);
   const payload = response.json();
-  expect(payload.error).toBeUndefined();
-  expect(payload.result.isError).toBe(false);
+  expect(payload.error.message).toMatch(/runtime token/i);
 });
 
 // ---------------------------------------------------------------------------

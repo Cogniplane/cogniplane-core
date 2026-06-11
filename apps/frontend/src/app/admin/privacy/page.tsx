@@ -1,11 +1,9 @@
 "use client";
 
 import { useAdminOrganizationData } from "../../../hooks/use-admin-organization-data";
-import { AdminPiiProtectionSection } from "../../../components/admin-pii-protection-section";
+import { AdminPiiProtectionSection } from "../../../components/admin/pii/admin-pii-protection-section";
 import { Card, CardContent } from "@/components/ui/card";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminPrivacyPage() {
   const { tenant, busyKey, error, successMessage, handleSavePiiProtection } =

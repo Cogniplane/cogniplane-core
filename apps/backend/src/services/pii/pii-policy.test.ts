@@ -37,7 +37,7 @@ test("parsePiiProtection accepts a fully valid payload", () => {
     enabled: true,
     mode: "transform" as const,
     rawRetention: "admin_only" as const,
-    provider: { type: "openrouter" as const, model: "model-x" },
+    provider: { type: "openai-compatible" as const, model: "model-x" },
     scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
     actions: { reportToAdmins: false },
     detectors: {
@@ -67,7 +67,7 @@ test("piiProtectionSchema rejects missing required field", () => {
 test("piiProtectionSchema accepts empty provider model (=use provider default)", () => {
   const parsed = piiProtectionSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
-    provider: { type: "openrouter", model: "" }
+    provider: { type: "openai-compatible", model: "" }
   });
   expect(parsed.success).toBe(true);
   if (parsed.success) {
@@ -78,7 +78,7 @@ test("piiProtectionSchema accepts empty provider model (=use provider default)",
 test("piiProtectionSchema trims whitespace-only provider model to empty string", () => {
   const parsed = piiProtectionSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
-    provider: { type: "openrouter", model: "   " }
+    provider: { type: "openai-compatible", model: "   " }
   });
   expect(parsed.success).toBe(true);
   if (parsed.success) {
@@ -89,7 +89,7 @@ test("piiProtectionSchema trims whitespace-only provider model to empty string",
 test("piiProtectionSchema trims provider model whitespace", () => {
   const parsed = piiProtectionSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
-    provider: { type: "openrouter", model: "  my-model  " }
+    provider: { type: "openai-compatible", model: "  my-model  " }
   });
   expect(parsed.success).toBe(true);
   if (parsed.success) {

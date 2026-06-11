@@ -26,6 +26,7 @@ import { buildSessionRouteStores, registerSessionRoutes } from "./routes/session
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
+import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
 import {
   sweepStaleApprovals,
@@ -37,16 +38,11 @@ export async function registerAppRoutes(
   deps: AppDependencies
 ): Promise<void> {
   await registerHealthRoutes(app, buildHealthRouteStores(deps));
-  const hasAnthropicApiKey = async (tenantId: string): Promise<boolean> => {
-    if (app.config.ANTHROPIC_API_KEY) return true;
-    const tenantKey = await deps.getTenantAnthropicApiKey(tenantId);
-    return Boolean(tenantKey?.trim());
-  };
-  const hasOpenaiApiKey = async (tenantId: string): Promise<boolean> => {
-    if (app.config.OPENAI_API_KEY) return true;
-    const tenantKey = await deps.getTenantOpenaiApiKey(tenantId);
-    return Boolean(tenantKey?.trim());
-  };
+  const { hasAnthropicApiKey, hasOpenaiApiKey } = buildApiKeyPresenceCheckers({
+    config: app.config,
+    getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
+    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey
+  });
   const anthropicCapabilitiesCache = createAnthropicCapabilitiesCache({
     successTtlMs: app.config.MODEL_LIST_CACHE_TTL_MS,
     negativeTtlMs: app.config.MODEL_LIST_CACHE_NEGATIVE_TTL_MS
@@ -103,12 +99,20 @@ export async function registerAppRoutes(
     app,
     buildMcpRouteStores(deps, {
       runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
+      egressCidrs: app.config.E2B_EGRESS_CIDRS,
       readRuntimeFile: async (sessionId, runtimeId, filePath) => {
         const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);
         if (!runtime?.readRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.readRuntimeFile(sessionId, filePath);
+      },
+      statRuntimeFile: async (sessionId, runtimeId, filePath) => {
+        const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);
+        if (!runtime?.statRuntimeFile) {
+          throw new Error(`No active runtime for session ${sessionId}.`);
+        }
+        return runtime.statRuntimeFile(sessionId, filePath);
       },
       writeRuntimeFile: async (sessionId, runtimeId, filePath, data) => {
         const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);

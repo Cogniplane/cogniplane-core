@@ -7,7 +7,7 @@ import type { RuntimeToolCall } from "../../runtime-contracts.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import { handleRuntimeRequest } from "./runtime-request-handler.js";
-import { mapRuntimeNotification } from "./runtime-notification-mapper.js";
+import { extractNotificationTurnId, mapRuntimeNotification } from "./runtime-notification-mapper.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { captureWorkspaceArtifacts } from "../artifacts/workspace-artifact-capture.js";
 import type {
@@ -172,6 +172,23 @@ export class CodexTurnOrchestrator {
       activeTurn.model ?? undefined,
       activeTurn.effort ?? undefined
     );
+    if (runtime.activeTurn !== activeTurn) {
+      // The turn was released while turn/start was in flight (the consumer
+      // abandoned it before a turnId existed, so the cleanup path could not
+      // send turn/interrupt). The process-side turn is running unowned:
+      // register its id as stale so late notifications can't leak into a
+      // follow-up turn, and best-effort interrupt it.
+      runtime.staleTurnIds.add(responseId);
+      void runtime.process
+        .sendRequest("turn/interrupt", { threadId: runtime.threadId, turnId: responseId })
+        .catch((err: unknown) => {
+          this.deps.logger.warn(
+            { err, sessionId: runtime.sessionId, turnId: responseId },
+            "turn/interrupt for abandoned turn failed"
+          );
+        });
+      return;
+    }
     activeTurn.responseId = responseId;
     activeTurn.queue.push({ type: "response.created", responseId });
   }
@@ -204,10 +221,30 @@ export class CodexTurnOrchestrator {
     return result.turn?.id ?? uuidv7();
   }
 
+  // Record a terminal turn's id so late notifications from its (possibly still
+  // running) process-side turn are dropped instead of leaking into the next
+  // turn. Ids are normally retired when the zombie's own turn/completed
+  // arrives; the size cap covers a process that dies before sending one.
+  // Also disarms the turn watchdog — every terminal path runs through here.
+  private markTurnStale(runtime: RuntimeState, activeTurn: ActiveTurnState): void {
+    if (activeTurn.watchdogTimer) {
+      clearTimeout(activeTurn.watchdogTimer);
+      activeTurn.watchdogTimer = null;
+    }
+    if (!activeTurn.responseId) return;
+    runtime.staleTurnIds.add(activeTurn.responseId);
+    while (runtime.staleTurnIds.size > 32) {
+      const oldest = runtime.staleTurnIds.values().next().value;
+      if (oldest === undefined) break;
+      runtime.staleTurnIds.delete(oldest);
+    }
+  }
+
   completeActiveTurn(runtime: RuntimeState): void {
     const activeTurn = runtime.activeTurn;
     if (!activeTurn) return;
 
+    this.markTurnStale(runtime, activeTurn);
     runtime.healthStatus = "healthy";
     if (!activeTurn.outputItemDone) {
       activeTurn.outputItemDone = true;
@@ -246,6 +283,7 @@ export class CodexTurnOrchestrator {
     const activeTurn = runtime.activeTurn;
     if (!activeTurn) return;
 
+    this.markTurnStale(runtime, activeTurn);
     runtime.healthStatus = "healthy";
     if (!activeTurn.outputItemDone) {
       activeTurn.outputItemDone = true;
@@ -265,6 +303,7 @@ export class CodexTurnOrchestrator {
     const activeTurn = runtime.activeTurn;
     if (!activeTurn) return;
 
+    this.markTurnStale(runtime, activeTurn);
     runtime.healthStatus = "error";
     runtime.lifecycleMetadata = { ...runtime.lifecycleMetadata, lastError: message };
     // Normal path: deliver a terminal `response.failed` frame, then close the
@@ -292,6 +331,35 @@ export class CodexTurnOrchestrator {
   private handleNotification(runtime: RuntimeState, notification: JsonRpcNotification): void {
     const activeTurn = runtime.activeTurn;
     if (!activeTurn) return;
+
+    // Scope turn-carrying notifications to the turn that owns the queue. After
+    // an interrupt we don't wait for the runtime's own turn/completed, so the
+    // old turn can still be emitting while the next turn is live — without this
+    // its deltas would contaminate the new queue and its turn/completed would
+    // terminate the new turn instantly. Notifications without a turn id
+    // (mcpServer status) pass through unscoped.
+    const notificationTurnId = extractNotificationTurnId(notification);
+    if (notificationTurnId) {
+      if (runtime.staleTurnIds.has(notificationTurnId)) {
+        if (notification.method === "turn/completed") {
+          // The zombie turn finally finished — retire its deny-list entry.
+          runtime.staleTurnIds.delete(notificationTurnId);
+        }
+        return;
+      }
+      if (activeTurn.responseId && notificationTurnId !== activeTurn.responseId) {
+        this.deps.logger.warn(
+          {
+            sessionId: runtime.sessionId,
+            method: notification.method,
+            notificationTurnId,
+            activeTurnId: activeTurn.responseId
+          },
+          "dropping runtime notification for non-active turn"
+        );
+        return;
+      }
+    }
 
     const mapping = mapRuntimeNotification(activeTurn, notification);
 

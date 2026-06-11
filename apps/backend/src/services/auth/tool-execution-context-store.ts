@@ -1,6 +1,7 @@
 
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 /**
  * Thrown when a `require`/`requireOwned` lookup finds no live tool context
@@ -48,8 +49,8 @@ function mapContext(row: Record<string, unknown>): ToolExecutionContext {
       row.metadata && typeof row.metadata === "object"
         ? (row.metadata as Record<string, unknown>)
         : {},
-    expiresAt: new Date(String(row.expires_at)).toISOString(),
-    createdAt: new Date(String(row.created_at)).toISOString()
+    expiresAt: isoTimestamp(row.expires_at),
+    createdAt: isoTimestamp(row.created_at)
   };
 }
 

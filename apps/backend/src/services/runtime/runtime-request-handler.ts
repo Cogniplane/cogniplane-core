@@ -31,6 +31,38 @@ export async function handleRuntimeRequest(input: {
     return;
   }
 
+  // Scope turn-carrying approval requests to the turn that owns the queue —
+  // the request-side mirror of the notification guard in the orchestrator.
+  // After an interrupt the slot is freed before Codex acknowledges
+  // turn/interrupt, so a late requestApproval from the canceled turn would
+  // otherwise be persisted and prompted on the NEXT turn — letting the user
+  // approve an action they meant to cancel. Reject it so the dying turn
+  // unblocks with a denial. Requests without a turnId pass through unscoped.
+  const requestTurnId =
+    typeof request.params?.turnId === "string" ? request.params.turnId : null;
+  if (
+    requestTurnId &&
+    (runtime.staleTurnIds.has(requestTurnId) ||
+      (runtime.activeTurn?.responseId && requestTurnId !== runtime.activeTurn.responseId))
+  ) {
+    input.logger.warn(
+      {
+        sessionId: runtime.sessionId,
+        method: request.method,
+        requestTurnId,
+        activeTurnId: runtime.activeTurn?.responseId ?? null
+      },
+      "rejecting approval request from non-active turn"
+    );
+    const stale = buildApprovalRequest(runtime, request);
+    if (stale) {
+      respondToApprovalRequest(runtime.process, stale.pending as PendingApprovalRecord, "reject");
+    } else {
+      runtime.process.sendError(request.id, -32000, "Turn is no longer active.");
+    }
+    return;
+  }
+
   const activeTurn = runtime.activeTurn;
   if (!activeTurn) {
     runtime.process.sendError(request.id, -32000, "No active turn is available.");
@@ -54,9 +86,56 @@ export async function handleRuntimeRequest(input: {
 
   // If the user already approved this kind for the current turn, auto-approve
   // without surfacing another prompt or writing a DB row.
-  // Claude equivalent: ClaudeApprovalHandler.autoApprovedKindsForTurn in claude-code-approval-handler.ts — keep both in sync.
+  // Claude equivalent: autoApprovedKindsForTurn check in claude-turn-executor.ts — keep both in sync.
   if (activeTurn.autoApprovedKinds.has(approval.kind)) {
     respondToApprovalRequest(runtime.process, approval.pending as PendingApprovalRecord, "approve");
+    return;
+  }
+
+  // Persist the row BEFORE arming the in-memory entry/timer. The row is the
+  // durable anchor every decision resolves against — if it can't be written,
+  // an armed entry could never be settled by a user and would leak a pending
+  // slot while Codex waits on an unanswerable request. Deny instead.
+  try {
+    await input.approvals.create({
+      tenantId: input.tenantId,
+      approvalId: approval.approvalId,
+      sessionId: runtime.sessionId,
+      userId: runtime.userId,
+      runtimeId: runtime.runtimeId,
+      turnId: approval.turnId,
+      itemId: approval.itemId,
+      requestMethod: request.method,
+      requestId: String(request.id),
+      kind: approval.kind,
+      title: approval.title,
+      summary: approval.summary,
+      status: "pending",
+      decision: null,
+      requestPayload: approval.requestPayload,
+      // DB-level deadline mirroring the in-process TTL timer below, so a crash
+      // before the timer fires still lets the startup sweep recover this row.
+      expiresAt: new Date(Date.now() + input.approvalTtlMs).toISOString()
+    });
+  } catch (error) {
+    respondToApprovalRequest(runtime.process, approval.pending as PendingApprovalRecord, "reject");
+    throw error;
+  }
+
+  // The turn may have been interrupted or torn down while the row write was in
+  // flight — its cleanup ran before this entry was armed and could not see it.
+  // Don't arm an approval against a dead turn (a pending slot leaked until TTL,
+  // a prompt pushed onto a closed queue): deny and expire the row we just wrote.
+  if (runtime.activeTurn !== activeTurn) {
+    respondToApprovalRequest(runtime.process, approval.pending as PendingApprovalRecord, "reject");
+    try {
+      await input.approvals.expire(input.tenantId, approval.approvalId);
+    } catch (error) {
+      input.logger.warn(
+        { err: error, approvalId: approval.approvalId, sessionId: runtime.sessionId },
+        "failed to expire approval row created for a turn that ended mid-write"
+      );
+    }
     return;
   }
 
@@ -69,27 +148,6 @@ export async function handleRuntimeRequest(input: {
     approvals: input.approvals,
     auditEvents: input.auditEvents,
     logger: input.logger
-  });
-
-  await input.approvals.create({
-    tenantId: input.tenantId,
-    approvalId: approval.approvalId,
-    sessionId: runtime.sessionId,
-    userId: runtime.userId,
-    runtimeId: runtime.runtimeId,
-    turnId: approval.turnId,
-    itemId: approval.itemId,
-    requestMethod: request.method,
-    requestId: String(request.id),
-    kind: approval.kind,
-    title: approval.title,
-    summary: approval.summary,
-    status: "pending",
-    decision: null,
-    requestPayload: approval.requestPayload,
-    // DB-level deadline mirroring the in-process TTL timer above, so a crash
-    // before the timer fires still lets the startup sweep recover this row.
-    expiresAt: new Date(Date.now() + input.approvalTtlMs).toISOString()
   });
 
   await input.auditEvents.create({
@@ -162,32 +220,42 @@ async function expireApproval(input: {
 }): Promise<void> {
   const { runtime, approvalId, tenantId } = input;
 
-  // Claim the DB row first. `approvals.expire` is atomic on `status='pending'`,
-  // so if the user's decision committed first we get null here and must NOT
-  // touch in-memory pending state or message the runtime — otherwise an
-  // already-approved tool call would be rejected to the process while the DB
-  // shows `approved`.
-  const expired = await input.approvals.expire(tenantId, approvalId);
-  if (!expired) return;
-
+  // Claim the in-memory entry synchronously BEFORE any await. A user decision
+  // (`resolveApproval`) claims the same entry synchronously before its own DB
+  // write, so whoever holds the entry owns answering the JSON-RPC request —
+  // there is no window where both paths respond. `pending` can be missing if
+  // the runtime was torn down or a decision won; nothing left to message then.
   const pending = runtime.pendingApprovals.get(approvalId);
   runtime.pendingApprovals.delete(approvalId);
   runtime.pendingApprovalTimers.delete(approvalId);
-  // `pending` can be missing if the runtime was torn down between scheduling
-  // and firing; the DB row is already expired, nothing left to message.
   if (!pending) return;
 
-  // Unblock the codex process: synthesize a "reject" so the JSON-RPC request returns.
+  // Unblock the codex process first: synthesize a "reject" so the JSON-RPC
+  // request returns even if the row update below fails or finds no row (the
+  // row may have been expired by the cross-replica sweep, or never persisted).
   respondToApprovalRequest(runtime.process, pending, "reject");
 
-  await input.auditEvents.create({
-    tenantId,
-    sessionId: runtime.sessionId,
-    userId: runtime.userId,
-    approvalId,
-    type: "approval.expired",
-    payload: { itemId: pending.itemId, kind: pending.kind }
-  });
+  let expired: Awaited<ReturnType<ApprovalStore["expire"]>> = null;
+  try {
+    expired = await input.approvals.expire(tenantId, approvalId);
+  } catch (error) {
+    input.logger.error(
+      { err: error, approvalId, sessionId: runtime.sessionId },
+      "approval expiry failed to update approvals row"
+    );
+  }
+  // Row already settled externally (sweep / teardown) or never written — the
+  // external owner wrote its own audit trail, so only ours gets one here.
+  if (expired) {
+    await input.auditEvents.create({
+      tenantId,
+      sessionId: runtime.sessionId,
+      userId: runtime.userId,
+      approvalId,
+      type: "approval.expired",
+      payload: { itemId: pending.itemId, kind: pending.kind }
+    });
+  }
 
   const activeTurn = runtime.activeTurn;
   if (activeTurn) {

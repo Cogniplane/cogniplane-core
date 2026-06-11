@@ -2,6 +2,7 @@ import { type Pool, withTenantScope } from "../lib/db.js";
 
 import type { ApprovalPolicy, RuntimeProvider } from "./admin-config-records.js";
 import { parseApprovalPolicy } from "./admin-config-store-mappers.js";
+import { isoTimestamp } from "../lib/db-mappers.js";
 
 /**
  * Per-session narrowing of the resolved runtime policy. Absence of a row
@@ -60,7 +61,7 @@ function mapRow(row: Record<string, unknown>): SessionRuntimeOverrideRecord {
     approvalPolicy: parseApprovalPolicy(row.approval_policy),
     autoApproveReadOnlyTools: Boolean(row.auto_approve_read_only_tools),
     createdBy: String(row.created_by),
-    createdAt: new Date(String(row.created_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at)
   };
 }
 
@@ -123,15 +124,6 @@ export class SessionRuntimeOverrideStore {
         ]
       );
       return mapRow(result.rows[0]);
-    });
-  }
-
-  async delete(tenantId: string, sessionId: string): Promise<void> {
-    await withTenantScope(this.db, tenantId, async (client) => {
-      await client.query(
-        `DELETE FROM session_runtime_overrides WHERE tenant_id = $1 AND session_id = $2`,
-        [tenantId, sessionId]
-      );
     });
   }
 }

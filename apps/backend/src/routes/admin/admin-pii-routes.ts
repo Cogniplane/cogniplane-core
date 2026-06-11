@@ -43,7 +43,7 @@ export async function registerAdminPiiRoutes(
   app.get("/admin/pii/provider-status", withAdmin(app, async () => {
     const snapshot = await stores.piiCircuitBreaker.snapshot();
     return {
-      provider: "openrouter",
+      provider: "pii-llm",
       state: snapshot.state,
       failureCount: snapshot.failureCount,
       openedAt: snapshot.openedAt,

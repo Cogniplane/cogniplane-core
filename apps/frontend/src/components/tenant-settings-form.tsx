@@ -27,13 +27,10 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { PILL_GRAY, SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
 const FORM_SECTION_LABEL =
   "text-[0.7rem] font-semibold uppercase tracking-[0.12em] text-on-surface-variant";
-const PILL_GRAY =
-  "inline-flex items-center rounded-full bg-surface-container px-2 py-0.5 text-xs font-medium text-on-surface-variant";
 
 type Props = {
   settings: TenantSettings;
@@ -91,13 +88,23 @@ export function TenantSettingsForm({
   const effectiveEnabledProviders = (draft: FormDraft): Array<"codex" | "claude-code"> =>
     draft.enabledRuntimeProviders.filter((provider) => providerKeyConfigured[provider]);
   const [draft, setDraft] = useState<FormDraft>(() => buildDraft(settings));
+  const [isDirty, setIsDirty] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
 
+  // User edits must go through here (never setDraft directly) so the resync
+  // effect knows to protect them.
+  function updateDraft(recipe: (current: FormDraft) => FormDraft): void {
+    setIsDirty(true);
+    setDraft(recipe);
+  }
+
   useEffect(() => {
-    // Resync form draft when saved settings change (e.g., after successful save).
+    // A refocus refetch must not clobber in-progress edits. A successful save
+    // clears isDirty, re-running this against the already-updated settings.
+    if (isDirty) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setDraft(buildDraft(settings));
-  }, [settings]);
+  }, [settings, isDirty]);
 
   const sortedTools = useMemo(
     () => [...managedTools].sort((a, b) => a.id.localeCompare(b.id)),
@@ -125,7 +132,7 @@ export function TenantSettingsForm({
   );
 
   function toggleRuntimeProvider(provider: "codex" | "claude-code", enabled: boolean): void {
-    setDraft((current) => toggleRuntimeProviderInDraft(current, provider, enabled));
+    updateDraft((current) => toggleRuntimeProviderInDraft(current, provider, enabled));
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -148,6 +155,7 @@ export function TenantSettingsForm({
       enabledMcpServerIds: draft.enabledMcpServerIds
     });
     if (ok) {
+      setIsDirty(false);
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     }
@@ -261,7 +269,7 @@ export function TenantSettingsForm({
             <CheckboxRow
               checked={draft.showEffortSelector}
               onChange={(checked) =>
-                setDraft((current) => ({ ...current, showEffortSelector: checked }))
+                updateDraft((current) => ({ ...current, showEffortSelector: checked }))
               }
               label="Show effort selector in chat"
               hint="Lets users pick reasoning depth when the selected model supports it."
@@ -272,7 +280,7 @@ export function TenantSettingsForm({
               <Select
                 value={draft.runtimeProvider}
                 onValueChange={(value) =>
-                  setDraft((current) => ({
+                  updateDraft((current) => ({
                     ...current,
                     runtimeProvider: value as "codex" | "claude-code"
                   }))
@@ -297,7 +305,7 @@ export function TenantSettingsForm({
               <Select
                 value={draft.webSearchMode}
                 onValueChange={(value) =>
-                  setDraft((current) => ({
+                  updateDraft((current) => ({
                     ...current,
                     webSearchMode: value as FormDraft["webSearchMode"]
                   }))
@@ -339,7 +347,7 @@ export function TenantSettingsForm({
                   <Select
                     value={draft.approvalPolicyKind}
                     onValueChange={(value) =>
-                      setDraft((current) => ({
+                      updateDraft((current) => ({
                         ...current,
                         approvalPolicyKind: value as ApprovalPolicyKind
                       }))
@@ -365,7 +373,7 @@ export function TenantSettingsForm({
                         key={key}
                         checked={draft.granularFlags[key]}
                         onChange={(checked) =>
-                          setDraft((current) => ({
+                          updateDraft((current) => ({
                             ...current,
                             granularFlags: { ...current.granularFlags, [key]: checked }
                           }))
@@ -383,7 +391,7 @@ export function TenantSettingsForm({
                 <Select
                   value={draft.approvalReviewer}
                   onValueChange={(value) =>
-                    setDraft((current) => ({
+                    updateDraft((current) => ({
                       ...current,
                       approvalReviewer: value as "user" | "guardian_subagent"
                     }))
@@ -406,7 +414,7 @@ export function TenantSettingsForm({
                 <Select
                   value={draft.policyEnforcementMode}
                   onValueChange={(value) =>
-                    setDraft((current) => ({
+                    updateDraft((current) => ({
                       ...current,
                       policyEnforcementMode: value as PolicyEnforcementMode
                     }))
@@ -439,7 +447,7 @@ export function TenantSettingsForm({
                   key={key}
                   checked={draft[key]}
                   onChange={(checked) =>
-                    setDraft((current) => ({ ...current, [key]: checked }))
+                    updateDraft((current) => ({ ...current, [key]: checked }))
                   }
                   label={label}
                   hint={hint}
@@ -468,7 +476,7 @@ export function TenantSettingsForm({
                         key={tool.id}
                         checked={draft.enabledToolIds.includes(tool.id)}
                         onChange={(checked) =>
-                          setDraft((current) => ({
+                          updateDraft((current) => ({
                             ...current,
                             enabledToolIds: toggleInArray(current.enabledToolIds, tool.id, checked)
                           }))
@@ -489,7 +497,7 @@ export function TenantSettingsForm({
                         key={id}
                         checked={true}
                         onChange={(checked) =>
-                          setDraft((current) => ({
+                          updateDraft((current) => ({
                             ...current,
                             enabledToolIds: toggleInArray(current.enabledToolIds, id, checked)
                           }))
@@ -515,7 +523,7 @@ export function TenantSettingsForm({
                         key={server.serverId}
                         checked={draft.enabledMcpServerIds.includes(server.serverId)}
                         onChange={(checked) =>
-                          setDraft((current) => ({
+                          updateDraft((current) => ({
                             ...current,
                             enabledMcpServerIds: toggleInArray(
                               current.enabledMcpServerIds,
@@ -540,7 +548,7 @@ export function TenantSettingsForm({
                         key={id}
                         checked={true}
                         onChange={(checked) =>
-                          setDraft((current) => ({
+                          updateDraft((current) => ({
                             ...current,
                             enabledMcpServerIds: toggleInArray(
                               current.enabledMcpServerIds,
@@ -570,7 +578,7 @@ export function TenantSettingsForm({
                 id="developer-instructions"
                 value={draft.developerInstructions}
                 onChange={(event) =>
-                  setDraft((current) => ({
+                  updateDraft((current) => ({
                     ...current,
                     developerInstructions: event.target.value
                   }))

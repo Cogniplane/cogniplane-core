@@ -58,7 +58,7 @@ function sampleRow(overrides: Record<string, unknown> = {}): Record<string, unkn
     source_session_id: "session-1",
     source_user_id: "user-1",
     mode: "block",
-    provider_type: "openrouter",
+    provider_type: "openai-compatible",
     provider_model: "google/gemini-2.5-flash",
     status: "pending",
     findings_json: [],
@@ -85,7 +85,7 @@ test("PiiScanRunStore.create inserts with defaults and returns mapped record", a
     sourceSessionId: "session-1",
     sourceUserId: "user-1",
     mode: "block",
-    providerType: "openrouter",
+    providerType: "openai-compatible",
     providerModel: "google/gemini-2.5-flash"
   });
 

@@ -21,11 +21,19 @@ function makeInput(overrides?: {
   // create/skip + scheduling-gate decision rather than the turn machinery.
   const listDueJobs = vi.fn(async () => []);
   const input = {
-    userSettings: { listDueJobs, disableJob: vi.fn(async () => {}) },
+    userSettings: {
+      listDueJobs,
+      disableJob: vi.fn(async () => {}),
+      sweepStaleJobRuns: vi.fn(async () => [])
+    },
     sessions: {},
     messages: {},
     toolContexts: {},
     runtimeManager: {},
+    runtimeAdapters: {},
+    dynamicConfig: {},
+    getTenantAnthropicApiKey: vi.fn(async () => null),
+    getTenantOpenaiApiKey: vi.fn(async () => null),
     auditEvents: {},
     logger: createSilentLogger(),
     ...overrides

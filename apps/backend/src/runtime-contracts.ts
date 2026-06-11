@@ -8,6 +8,16 @@ export type RuntimeSessionRef = {
   runtimePolicy: ResolvedRuntimePolicy;
 };
 
+// Thrown by an adapter's runMessage when the session already has a turn in
+// flight. Lives here (not in an adapter module) because both adapters throw it
+// and the slot must be reserved synchronously inside each adapter — the route
+// registry is per-process and the scheduler bypasses it entirely.
+export class SessionBusyError extends Error {
+  constructor(sessionId: string) {
+    super(`A turn is already running for session ${sessionId}.`);
+  }
+}
+
 export type RuntimeToolKind = "command" | "mcp";
 export type RuntimeToolStatus = "in_progress" | "completed" | "failed" | "declined";
 
@@ -46,6 +56,13 @@ export type PolicyApprovalRouteInput = {
   serverId: string | null;
   kind: RuntimeApprovalKind;
   explanation: string;
+  /**
+   * Aborts when the gateway's held HTTP response dies before a decision lands
+   * (the runtime's HTTP client timed out or the sandbox went away). The
+   * coordinator releases the hold and expires the approval so a late human
+   * approve can't dispatch a tool call nobody is waiting for.
+   */
+  signal?: AbortSignal;
 };
 export type RuntimeReasoningEffort = EffortLevel;
 export type RuntimeUserInput =
@@ -372,6 +389,11 @@ export interface RuntimeAdapter {
     userId: string;
   }): Promise<"interrupted" | "no_active_turn">;
   readRuntimeFile?(sessionId: string, filePath: string): Promise<Uint8Array>;
+  /**
+   * Optional: size of a workspace file without reading it. Used to reject
+   * oversized `write_artifact` filePath inputs before buffering the bytes.
+   */
+  statRuntimeFile?(sessionId: string, filePath: string): Promise<{ sizeBytes: number }>;
   writeRuntimeFile?(sessionId: string, filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<string>;
   /**
    * Forward an approval decision to whichever in-flight turn is waiting on it.

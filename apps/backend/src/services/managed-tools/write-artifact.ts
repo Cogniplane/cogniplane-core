@@ -12,6 +12,11 @@ type WriteArtifactDeps = {
   storage: ArtifactStorage;
   auditEvents: AuditEventStore;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
+  statRuntimeFile?: (
+    sessionId: string,
+    runtimeId: string,
+    filePath: string
+  ) => Promise<{ sizeBytes: number }>;
 };
 
 // ── MIME type inference ───────────────────────────────────────────────────────
@@ -113,6 +118,14 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
         if (hasFilePath) {
           if (!deps.readRuntimeFile) throw new Error("filePath is not supported on this runtime backend.");
           const filePath = String(args.filePath).trim();
+          // Probe the size BEFORE buffering the file into backend memory —
+          // an oversized sandbox file must not be read just to be rejected.
+          if (deps.statRuntimeFile) {
+            const { sizeBytes } = await deps.statRuntimeFile(context.sessionId, context.runtimeId, filePath);
+            if (sizeBytes > MAX_FILE_BYTES) {
+              throw new Error(`File too large (${sizeBytes} bytes). Maximum is ${MAX_FILE_BYTES} bytes (10 MB).`);
+            }
+          }
           const bytes = await deps.readRuntimeFile(context.sessionId, context.runtimeId, filePath);
           contentBuffer = Buffer.from(bytes);
         } else {

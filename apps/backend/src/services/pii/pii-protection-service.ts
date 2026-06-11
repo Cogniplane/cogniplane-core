@@ -23,7 +23,13 @@ export interface PiiPolicyReader {
 export type PiiSubject =
   | { kind: "chat_prompt" }
   | { kind: "upload" }
-  | { kind: "microsoft_import" };
+  | { kind: "microsoft_import" }
+  /**
+   * Aggregated skill-improvement corpus (many sessions' prompts AND tool
+   * outputs). Not tied to any tenant scope toggle: disabling the chatPrompts
+   * scope must not silently disable the corpus gate.
+   */
+  | { kind: "skill_corpus" };
 
 export type PiiDecision =
   | { action: "allow"; reason: "disabled" | "scope_excluded" | "no_findings" }
@@ -115,15 +121,25 @@ export class PiiProtectionService {
    * must never block the turn indefinitely. On timeout we REJECT (fail-closed):
    * the caller treats a thrown PII error as "do not forward the text", which is
    * the safe outcome for block/transform and a hard stop for sync detect.
+   *
+   * The timeout also ABORTS the in-flight work via the AbortSignal passed to
+   * `run` (threaded down to the provider's HTTP call) — losing the race must
+   * not leave a dangling LLM request holding a connection until the provider's
+   * own timeout fires.
    */
-  private async withTimeout<T>(op: string, run: () => Promise<T>): Promise<T> {
+  private async withTimeout<T>(
+    op: string,
+    run: (signal: AbortSignal | undefined) => Promise<T>
+  ): Promise<T> {
     const budget = this.options.timeoutMs;
     if (!budget || budget <= 0) {
-      return run();
+      return run(undefined);
     }
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
+        controller.abort(new DOMException(`PII ${op} timeout`, "AbortError"));
         reject(
           new PiiProtectionServiceError(
             "pii_timeout",
@@ -133,17 +149,20 @@ export class PiiProtectionService {
       }, budget);
     });
     try {
-      return await Promise.race([run(), timeout]);
+      return await Promise.race([run(controller.signal), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
   async evaluateText(input: PiiServiceEvaluateTextInput): Promise<PiiDecision> {
-    return this.withTimeout("text evaluation", () => this.evaluateTextUnbounded(input));
+    return this.withTimeout("text evaluation", (signal) => this.evaluateTextUnbounded(input, signal));
   }
 
-  private async evaluateTextUnbounded(input: PiiServiceEvaluateTextInput): Promise<PiiDecision> {
+  private async evaluateTextUnbounded(
+    input: PiiServiceEvaluateTextInput,
+    signal: AbortSignal | undefined
+  ): Promise<PiiDecision> {
     const settings = await this.getActiveSettings(input.tenantId);
 
     if (!isEffectivelyEnabled(settings)) {
@@ -167,7 +186,8 @@ export class PiiProtectionService {
       const combined = await this.runDetectWithOptionalProvider({
         settings,
         text: input.text,
-        ruleFindings: ruleResult.findings
+        ruleFindings: ruleResult.findings,
+        signal
       });
       return this.decideFromCombined(combined, settings, input.tenantId, (sealed) => ({
         action: "report",
@@ -182,7 +202,8 @@ export class PiiProtectionService {
         settings,
         text: input.text,
         ruleFindings: ruleResult.findings,
-        failClosed: true
+        failClosed: true,
+        signal
       });
       return this.decideFromCombined(combined, settings, input.tenantId, (sealed) => ({
         action: "block",
@@ -208,7 +229,7 @@ export class PiiProtectionService {
           entityTypes: settings.detectors.entityTypes,
           model: resolveProviderModel(settings)
         },
-        undefined
+        signal
       )
     );
 
@@ -247,10 +268,13 @@ export class PiiProtectionService {
   }
 
   async evaluateArtifact(input: PiiServiceEvaluateArtifactInput): Promise<PiiDecision> {
-    return this.withTimeout("artifact evaluation", () => this.evaluateArtifactUnbounded(input));
+    return this.withTimeout("artifact evaluation", (signal) => this.evaluateArtifactUnbounded(input, signal));
   }
 
-  private async evaluateArtifactUnbounded(input: PiiServiceEvaluateArtifactInput): Promise<PiiDecision> {
+  private async evaluateArtifactUnbounded(
+    input: PiiServiceEvaluateArtifactInput,
+    signal: AbortSignal | undefined
+  ): Promise<PiiDecision> {
     const settings = await this.getActiveSettings(input.tenantId);
 
     if (!isEffectivelyEnabled(settings) || !isScopeEnabled(settings, input.subject)) {
@@ -290,7 +314,7 @@ export class PiiProtectionService {
 
     if (this.options.provider) {
       try {
-        const scan = await this.callProvider(() => this.scanWithProvider(input.artifact, content, settings));
+        const scan = await this.callProvider(() => this.scanWithProvider(input.artifact, content, settings, signal));
         combinedFindings = mergeFindings(ruleFindings, scan.findings);
         providerType = scan.providerType;
         providerModel = scan.providerModel;
@@ -332,6 +356,7 @@ export class PiiProtectionService {
     text: string;
     ruleFindings: PiiFinding[];
     failClosed?: boolean;
+    signal?: AbortSignal;
   }): Promise<{
     findings: PiiFinding[];
     providerType: string | null;
@@ -356,7 +381,7 @@ export class PiiProtectionService {
             entityTypes: args.settings.detectors.entityTypes,
             model: resolveProviderModel(args.settings)
           },
-          undefined
+          args.signal
         )
       );
     } catch (error) {
@@ -386,7 +411,8 @@ export class PiiProtectionService {
   private async scanWithProvider(
     artifact: PiiScanArtifactInput,
     content: string,
-    settings: PiiProtectionSettings
+    settings: PiiProtectionSettings,
+    signal: AbortSignal | undefined
   ): Promise<{
     findings: PiiFinding[];
     providerType: string | null;
@@ -404,7 +430,7 @@ export class PiiProtectionService {
           entityTypes: settings.detectors.entityTypes,
           model: resolveProviderModel(settings)
         },
-        undefined
+        signal
       );
       return {
         findings: result.findings,
@@ -420,7 +446,7 @@ export class PiiProtectionService {
         entityTypes: settings.detectors.entityTypes,
         model: resolveProviderModel(settings)
       },
-      undefined
+      signal
     );
     return {
       findings: result.findings,
@@ -535,6 +561,10 @@ function isScopeEnabled(settings: PiiProtectionSettings, subject: PiiSubject): b
       return settings.scopes.uploads;
     case "microsoft_import":
       return settings.scopes.microsoftImports;
+    case "skill_corpus":
+      // Always-on while PII protection itself is enabled — the corpus is an
+      // aggregation boundary, not one of the per-surface tenant toggles.
+      return true;
   }
 }
 

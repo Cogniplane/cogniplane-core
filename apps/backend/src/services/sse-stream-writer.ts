@@ -188,7 +188,7 @@ type RawSseResponse = {
  */
 class SseWriter {
   private closed = false;
-  private readonly onCloseCallbacks: Array<() => void> = [];
+  private readonly onCloseCallbacks = new Set<() => void>();
 
   constructor(private readonly raw: RawSseResponse) {
     raw.on?.("close", () => {
@@ -209,7 +209,7 @@ class SseWriter {
       cb();
       return;
     }
-    this.onCloseCallbacks.push(cb);
+    this.onCloseCallbacks.add(cb);
   }
 
   // Fire-and-forget write that still honours backpressure. Returns a promise
@@ -225,6 +225,9 @@ class SseWriter {
       const finish = () => {
         if (settled) return;
         settled = true;
+        // Deregister so a long-lived stream with many backpressured writes
+        // doesn't accumulate one dead callback per drain.
+        this.onCloseCallbacks.delete(finish);
         resolve();
       };
       this.raw.once!("drain", finish);
@@ -599,76 +602,82 @@ async function runRuntimeTurn(
 export async function streamAssistantReply(input: StreamAssistantReplyInput): Promise<void> {
   const writer = new SseWriter(input.reply.raw as unknown as RawSseResponse);
 
-  if (input.userMessageReplacement) {
-    await writer.write(
-      sseFrame("runtime.user_message_replaced", {
-        type: "runtime.user_message_replaced",
-        message_id: input.userMessageReplacement.messageId,
-        text: input.userMessageReplacement.text,
-        scan_run_id: input.userMessageReplacement.scanRunId ?? null
-      })
-    );
-  }
-
-  const assistant = await input.messages.create({
-    tenantId: input.tenantId,
-    sessionId: input.sessionId,
-    userId: input.userId,
-    role: "assistant",
-    status: "pending",
-    content: ""
-  });
-
-  const ctx: TurnContext = {
-    tenantId: input.tenantId,
-    sessionId: input.sessionId,
-    userId: input.userId,
-    modelName: input.modelName,
-    assistantMessageId: assistant.messageId,
-    writer,
-    messages: input.messages,
-    sourceArtifactNames: input.sourceArtifactNames,
-    streamingContent: {
-      assistant: "",
-      reasoning: "",
-      plan: ""
-    },
-    provenanceAppended: false,
-    completed: false,
-    latestResponseId: assistant.messageId,
-    async persistAssistantStatus(status, content) {
-      await input.messages.updateContent(
-        input.tenantId,
-        assistant.messageId,
-        input.userId,
-        status,
-        content
-      );
-    },
-    async persistToolResult(payload) {
-      await input.messages.upsertToolResult({
-        tenantId: input.tenantId,
-        messageId: assistant.messageId,
-        sessionId: input.sessionId,
-        userId: input.userId,
-        ...payload
-      });
-    },
-    async appendToolResultOutput(toolResultId, delta) {
-      await input.messages.appendToolResultOutput(
-        input.tenantId,
-        toolResultId,
-        input.userId,
-        delta
+  // The reply is already hijacked by the route (openSseResponse): from here on
+  // Fastify can never turn a throw into an HTTP error response. The try below
+  // must therefore cover EVERY await — including the replacement frame write
+  // and the assistant-row insert — so a failure anywhere still delivers a
+  // terminal frame and `writer.end()` always closes the socket.
+  let ctx: TurnContext | undefined;
+  try {
+    if (input.userMessageReplacement) {
+      await writer.write(
+        sseFrame("runtime.user_message_replaced", {
+          type: "runtime.user_message_replaced",
+          message_id: input.userMessageReplacement.messageId,
+          text: input.userMessageReplacement.text,
+          scan_run_id: input.userMessageReplacement.scanRunId ?? null
+        })
       );
     }
-  };
 
-  input.activeTurns?.mark(input.sessionId);
-  try {
+    const assistant = await input.messages.create({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      userId: input.userId,
+      role: "assistant",
+      status: "pending",
+      content: ""
+    });
+
+    ctx = {
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      userId: input.userId,
+      modelName: input.modelName,
+      assistantMessageId: assistant.messageId,
+      writer,
+      messages: input.messages,
+      sourceArtifactNames: input.sourceArtifactNames,
+      streamingContent: {
+        assistant: "",
+        reasoning: "",
+        plan: ""
+      },
+      provenanceAppended: false,
+      completed: false,
+      latestResponseId: assistant.messageId,
+      async persistAssistantStatus(status, content) {
+        await input.messages.updateContent(
+          input.tenantId,
+          assistant.messageId,
+          input.userId,
+          status,
+          content
+        );
+      },
+      async persistToolResult(payload) {
+        await input.messages.upsertToolResult({
+          tenantId: input.tenantId,
+          messageId: assistant.messageId,
+          sessionId: input.sessionId,
+          userId: input.userId,
+          ...payload
+        });
+      },
+      async appendToolResultOutput(toolResultId, delta) {
+        await input.messages.appendToolResultOutput(
+          input.tenantId,
+          toolResultId,
+          input.userId,
+          delta
+        );
+      }
+    };
+
+    input.activeTurns?.mark(input.sessionId);
     await runRuntimeTurn(input, ctx);
   } catch (error) {
-    ctx.completed = true;
+    if (ctx) ctx.completed = true;
     const message = error instanceof Error ? error.message : "Runtime request failed";
     input.logger?.error(
       { err: error, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
@@ -682,21 +691,25 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
     await writer.write(
       sseFrame("response.failed", {
         type: "response.failed",
-        response: { id: ctx.latestResponseId, status: "failed" },
+        response: { id: ctx?.latestResponseId ?? null, status: "failed" },
         error: { message }
       })
     );
-    try {
-      await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
-      await persistStreamingAuxContent(ctx);
-    } catch (persistError) {
-      input.logger?.error(
-        { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
-        "failed to persist runtime turn failure"
-      );
+    // No assistant row exists when the insert itself failed — nothing to persist.
+    if (ctx) {
+      try {
+        await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
+        await persistStreamingAuxContent(ctx);
+      } catch (persistError) {
+        input.logger?.error(
+          { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
+          "failed to persist runtime turn failure"
+        );
+      }
     }
   } finally {
-    if (!ctx.completed) {
+    // ctx undefined means the catch above already emitted response.failed.
+    if (ctx && !ctx.completed) {
       await writer.write(
         sseFrame("response.completed", {
           type: "response.completed",

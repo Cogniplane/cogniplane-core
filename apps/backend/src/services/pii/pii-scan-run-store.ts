@@ -2,6 +2,7 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { PiiFinding } from "./pii-provider.js";
 import { uuidv7 } from "../../lib/uuid.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type PiiScanSubjectType = "message" | "artifact";
 
@@ -97,10 +98,10 @@ function mapRow(row: Record<string, unknown>): PiiScanRunRecord {
     summaryText: row.summary_text == null ? null : String(row.summary_text),
     actionTaken: row.action_taken == null ? null : (String(row.action_taken) as PiiScanActionTaken),
     errorMessage: row.error_message == null ? null : String(row.error_message),
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString(),
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at),
     completedAt:
-      row.completed_at == null ? null : new Date(String(row.completed_at)).toISOString()
+      row.completed_at == null ? null : isoTimestamp(row.completed_at)
   };
 }
 

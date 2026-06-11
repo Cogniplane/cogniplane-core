@@ -3,6 +3,7 @@ import type {
   PiiBucketGranularity,
   PiiRangePreset
 } from "@cogniplane/shared-types";
+import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN } from "./ui-tokens";
 
 export type PiiKpiKey = "scans" | "findings" | "blocked" | "transformed" | "failed";
 
@@ -154,22 +155,6 @@ export function buildSegmentTooltip(count: number, total: number): string {
 
 // ─── Row helpers shared with the per-session PII tab ────────────────────────
 
-/**
- * Locale-aware absolute timestamp. "—" for nullish input. Catches Invalid
- * Date by falling through to the raw string so a malformed API response
- * doesn't render "Invalid Date" in the table.
- */
-export function formatTimestamp(iso: string | null): string {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString();
-  } catch {
-    return iso;
-  }
-}
-
 /** Trim long IDs so they fit in a table cell. */
 export function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -178,11 +163,6 @@ export function shortId(id: string): string {
 // Pill base used by status / breaker classifiers. The tone modifiers below
 // extend this. Status values come from the backend's pii_scan_runs.status
 // CHECK constraint and from the breaker state machine.
-const PILL_BASE = "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium";
-const PILL_RED = `${PILL_BASE} bg-danger-surface text-danger`;
-const PILL_BLUE = `${PILL_BASE} bg-accent-soft text-accent`;
-const PILL_GRAY = `${PILL_BASE} bg-surface-container text-on-surface-variant`;
-const PILL_GREEN = `${PILL_BASE} bg-success-surface text-success`;
 
 /**
  * Tailwind utility classes for a scan run status pill.

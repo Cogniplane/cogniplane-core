@@ -185,7 +185,7 @@ test("admin session detail — happy path returns all sections in camelCase", as
           subject_id: "m-1",
           source_user_id: "user-1",
           mode: "transform",
-          provider_type: "openrouter",
+          provider_type: "openai-compatible",
           provider_model: "google/gemini-2.5-flash",
           status: "transformed",
           findings_json: [{ kind: "email", count: 2 }],

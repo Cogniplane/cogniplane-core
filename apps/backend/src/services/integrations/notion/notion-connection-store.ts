@@ -1,4 +1,5 @@
 import { withTenantScope, type Pool } from "../../../lib/db.js";
+import { isoTimestamp, isoTimestampOrNull } from "../../../lib/db-mappers.js";
 
 export type NotionConnectionRecord = {
   tenantId: string;
@@ -44,21 +45,13 @@ function mapNotionConnection(row: Record<string, unknown>): NotionConnectionReco
     tokenType: String(row.token_type ?? "bearer"),
     grantedScopes: toStringArray(row.granted_scopes),
     accessTokenEncrypted: String(row.access_token_encrypted),
-    accessTokenExpiresAt: row.access_token_expires_at
-      ? new Date(String(row.access_token_expires_at)).toISOString()
-      : null,
+    accessTokenExpiresAt: isoTimestampOrNull(row.access_token_expires_at),
     refreshTokenEncrypted: row.refresh_token_encrypted ? String(row.refresh_token_encrypted) : null,
-    refreshTokenExpiresAt: row.refresh_token_expires_at
-      ? new Date(String(row.refresh_token_expires_at)).toISOString()
-      : null,
-    tokenLastRefreshedAt: row.notion_token_last_refreshed_at
-      ? new Date(String(row.notion_token_last_refreshed_at)).toISOString()
-      : null,
-    tokenLastUsedAt: row.notion_token_last_used_at
-      ? new Date(String(row.notion_token_last_used_at)).toISOString()
-      : null,
-    createdAt: new Date(String(row.created_at)).toISOString(),
-    updatedAt: new Date(String(row.updated_at)).toISOString()
+    refreshTokenExpiresAt: isoTimestampOrNull(row.refresh_token_expires_at),
+    tokenLastRefreshedAt: isoTimestampOrNull(row.notion_token_last_refreshed_at),
+    tokenLastUsedAt: isoTimestampOrNull(row.notion_token_last_used_at),
+    createdAt: isoTimestamp(row.created_at),
+    updatedAt: isoTimestamp(row.updated_at)
   };
 }
 

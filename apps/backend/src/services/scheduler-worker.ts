@@ -8,16 +8,30 @@ import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
-import type { CodexRuntimeManager } from "./runtime-manager.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
+import type { RuntimeProvider } from "./admin-config-records.js";
 import type { SessionStore } from "./session-store.js";
 import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
+
+/**
+ * Per-job runtime resolution, mirroring the interactive /messages path
+ * (`resolveRuntimeProviderAndModel`): the tenant's `runtimeProvider` setting
+ * picks the adapter and default model so a scheduled turn runs on the same
+ * runtime a user-initiated turn would. `kind: "error"` carries the
+ * human-readable reason (provider disabled, adapter unavailable, missing API
+ * key) — the run is recorded as failed rather than silently falling back to
+ * Codex.
+ */
+export type SchedulerRuntimeResolution =
+  | { kind: "ok"; adapter: RuntimeAdapter; provider: RuntimeProvider; modelId: string | null }
+  | { kind: "error"; message: string };
 
 export type SchedulerWorkerDeps = {
   settings: UserSettingsStore;
   sessions: SessionStore;
   messages: MessageStore;
   toolContexts: ToolExecutionContextStore;
-  runtimeManager: CodexRuntimeManager;
+  resolveRuntime: (tenantId: string) => Promise<SchedulerRuntimeResolution>;
   auditEvents: AuditEventStore;
   /**
    * Optional PII scan subsystem. When both are provided, each worker tick also
@@ -66,13 +80,15 @@ export type SchedulerWorkerOptions = {
 
 /**
  * Shared mutable handle between `executeJobWithTimeout` (the watchdog) and
- * `executeJob` (the worker). The worker publishes its `sessionId` so the
- * watchdog can abort the runtime on timeout; the watchdog sets `timedOut` so
- * the worker records a deterministic timeout failure regardless of which
+ * `executeJob` (the worker). The worker publishes its `sessionId` and the
+ * resolved runtime adapter so the watchdog can abort the runtime on timeout
+ * via the adapter that actually owns the session; the watchdog sets `timedOut`
+ * so the worker records a deterministic timeout failure regardless of which
  * terminal event won the abort race.
  */
 type ScheduledTurnHandle = {
   sessionId: string | null;
+  adapter: RuntimeAdapter | null;
   timedOut: boolean;
 };
 
@@ -85,6 +101,17 @@ type ScheduledTurnHandle = {
  * `executeJob`, if still alive, records its outcome whenever it finally settles).
  */
 const ABORT_SETTLE_GRACE_MS = 30_000;
+
+/**
+ * Safety margin added on top of (job timeout + abort-settle grace) before a
+ * pending `scheduled_job_runs` row is considered orphaned by a crash/restart.
+ * A healthy run can stay pending for at most timeout + grace; anything older
+ * has no live `executeJob` left to complete it.
+ */
+const STALE_RUN_SWEEP_BUFFER_MS = 60_000;
+
+/** Max orphaned run rows recovered per tick; the rest drain on later ticks. */
+const STALE_RUN_SWEEP_BATCH_SIZE = 100;
 
 export class SchedulerWorker {
   private interval: ReturnType<typeof setInterval> | null = null;
@@ -119,6 +146,12 @@ export class SchedulerWorker {
     const executions: Promise<void>[] = [];
 
     const schedulingEnabled = this.options.schedulingEnabled ?? true;
+    if (schedulingEnabled) {
+      // Every tick, not just boot: the query is a no-op (partial-index scan,
+      // zero rows) in steady state.
+      await this.sweepStaleJobRuns();
+    }
+
     const available = this.options.maxConcurrentJobs - this.activeCount;
     if (schedulingEnabled && available > 0) {
       const dueJobs = await this.deps.settings.listDueJobs(available);
@@ -137,12 +170,30 @@ export class SchedulerWorker {
           continue;
         }
 
-        const claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt);
+        // Reserve the slot synchronously BEFORE the claim await. tick() can
+        // overlap itself (a stalled tick plus the next interval firing), and
+        // `available` was computed before any await — two overlapping ticks
+        // would otherwise both admit with the same headroom and transiently
+        // exceed maxConcurrentJobs. Check-and-increment with no await in
+        // between makes over-admission impossible; the reservation is
+        // released when the claim loses or throws. Unclaimed due jobs stay
+        // due and are picked up by a later tick.
+        if (this.activeCount >= this.options.maxConcurrentJobs) {
+          break;
+        }
+        this.activeCount += 1;
+        let claimed: ScheduledJobRecord | null = null;
+        try {
+          claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt);
+        } finally {
+          if (!claimed) {
+            this.activeCount -= 1;
+          }
+        }
         if (!claimed) {
           continue;
         }
 
-        this.activeCount += 1;
         executions.push(
           this.executeJobWithTimeout(claimed).finally(() => {
             this.activeCount -= 1;
@@ -221,6 +272,55 @@ export class SchedulerWorker {
     }
   }
 
+  /**
+   * Mark `scheduled_job_runs` rows stuck in `pending` past any legitimate
+   * lifetime as failed. A run is only ever completed by the `executeJob` that
+   * created it, so a process crash/restart strands its rows forever without
+   * this. The cutoff is strictly longer than the watchdog's worst case
+   * (timeout + abort-settle grace) plus a buffer, so live runs are never
+   * swept. Best-effort: a sweep failure must not break the tick, and the
+   * poison counter is NOT touched — a crash is not the job's fault.
+   */
+  private async sweepStaleJobRuns(): Promise<void> {
+    const cutoffMs =
+      this.options.jobTimeoutMs +
+      (this.options.abortSettleGraceMs ?? ABORT_SETTLE_GRACE_MS) +
+      STALE_RUN_SWEEP_BUFFER_MS;
+
+    let orphaned;
+    try {
+      orphaned = await this.deps.settings.sweepStaleJobRuns(cutoffMs, STALE_RUN_SWEEP_BATCH_SIZE);
+    } catch (error) {
+      this.deps.logger.error({ error }, "Failed to sweep orphaned scheduled job runs");
+      return;
+    }
+
+    for (const run of orphaned) {
+      this.deps.logger.warn(
+        { runId: run.runId, jobId: run.jobId, sessionId: run.sessionId },
+        "Recovered scheduled job run orphaned by a crash/restart"
+      );
+      try {
+        await this.deps.auditEvents.create({
+          tenantId: run.tenantId,
+          sessionId: run.sessionId,
+          userId: run.userId,
+          type: "scheduler.job.run.failed",
+          payload: {
+            jobId: run.jobId,
+            runId: run.runId,
+            reason: "orphaned_on_sweep"
+          }
+        });
+      } catch (error) {
+        this.deps.logger.error(
+          { error, runId: run.runId },
+          "Failed to create audit event for orphaned job run"
+        );
+      }
+    }
+  }
+
   private async drainPiiScanJobs(executions: Promise<void>[]): Promise<void> {
     const { piiScanJobs, piiScanJobHandler } = this.deps;
     if (!piiScanJobs || !piiScanJobHandler) {
@@ -233,16 +333,25 @@ export class SchedulerWorker {
       return;
     }
 
+    // Reserve the full headroom synchronously BEFORE the claim await (same
+    // overlapping-tick hazard as the cron half: two ticks computing the same
+    // `available` would over-admit). The DB claim is atomic, so jobs never
+    // double-run — only the concurrency cap was at stake. Unused reservations
+    // are released once the claim returns.
+    this.activePiiCount += available;
+
     let claimed: PiiScanJobRecord[];
     try {
       claimed = await piiScanJobs.claimDueJobs(available);
     } catch (error) {
+      this.activePiiCount -= available;
       this.deps.logger.error({ error }, "SchedulerWorker failed to claim PII scan jobs");
       return;
     }
 
+    this.activePiiCount -= available - claimed.length;
+
     for (const job of claimed) {
-      this.activePiiCount += 1;
       executions.push(
         piiScanJobHandler
           .execute(job)
@@ -269,7 +378,7 @@ export class SchedulerWorker {
     // queue and end it — that unblocks the `for await` loop inside `executeJob`,
     // so the same promise settles with status="failed" and records the outcome.
     // We therefore never need to invent a second completeJobRun here.
-    const turn: ScheduledTurnHandle = { sessionId: null, timedOut: false };
+    const turn: ScheduledTurnHandle = { sessionId: null, adapter: null, timedOut: false };
     const execution = this.executeJob(job, turn);
 
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -290,9 +399,12 @@ export class SchedulerWorker {
           "Scheduled job exceeded timeout; aborting runtime session"
         );
 
-        if (turn.sessionId) {
+        // No adapter yet means the runtime was never resolved/started for this
+        // job, so there is nothing to abort — the slot-release grace below
+        // still bounds the wait.
+        if (turn.sessionId && turn.adapter) {
           try {
-            await this.deps.runtimeManager.abortSession({
+            await turn.adapter.abortSession({
               tenantId: job.tenantId,
               sessionId: turn.sessionId,
               userId: job.userId
@@ -370,6 +482,16 @@ export class SchedulerWorker {
         sessionId
       });
 
+      // Ordering: after createJobRun so a failure lands on a real run row,
+      // before the message rows so it leaves no dangling pending assistant.
+      const resolution = await this.deps.resolveRuntime(job.tenantId);
+      if (resolution.kind === "error") {
+        throw new Error(`Runtime provider resolution failed: ${resolution.message}`);
+      }
+      const runtime = resolution.adapter;
+      // Expose the adapter so the timeout watchdog aborts via the owning runtime.
+      turn.adapter = runtime;
+
       const prompt = typeof job.input.prompt === "string" ? job.input.prompt : JSON.stringify(job.input);
 
       await this.deps.messages.create({
@@ -390,7 +512,7 @@ export class SchedulerWorker {
         content: ""
       });
 
-      const runtimeSession = await this.deps.runtimeManager.createSession({
+      const runtimeSession = await runtime.createSession({
         tenantId: job.tenantId,
         sessionId,
         userId: job.userId
@@ -412,11 +534,12 @@ export class SchedulerWorker {
         ttlMs: this.options.jobTimeoutMs
       });
 
-      const stream = this.deps.runtimeManager.runMessage(runtimeSession, {
+      const stream = runtime.runMessage(runtimeSession, {
         prompt,
         runtimePolicyId,
         toolContextId: toolContext.toolContextId,
-        assistantMessageId: assistantMessage.messageId
+        assistantMessageId: assistantMessage.messageId,
+        model: resolution.modelId ?? undefined
       });
 
       for await (const event of stream) {

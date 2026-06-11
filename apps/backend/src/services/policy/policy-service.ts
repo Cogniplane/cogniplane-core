@@ -77,10 +77,6 @@ export type PolicyApprovalRouter = (request: {
   explanation: string;
 }) => Promise<PolicyApprovalDisposition>;
 
-// Single source: runtime-contracts. Re-exported so existing importers of this
-// module's PolicyApprovalDisposition keep working.
-export type { PolicyApprovalDisposition };
-
 // The result of gating an action that may proceed.
 export type PolicyGateResult = {
   evaluation: PolicyEvaluation;
@@ -196,6 +192,22 @@ export class PolicyService {
 
     // Enforce-mode require_approval → route a human approval and resume/deny.
     if (evaluation.outcome === "require_approval") {
+      // A scheduled turn has no human at the other end: the prompt would be
+      // "delivered" to the scheduler's event consumer and the gateway would
+      // hold its response until the approval TTL — longer than the scheduler's
+      // job timeout, so the job dies first. Deny immediately instead.
+      if (input.turnContext === "scheduled") {
+        this.logger.warn("policy: require_approval matched on a scheduled turn — no human to prompt; denying", {
+          tenantId: input.tenantId,
+          toolName: input.toolName,
+          matchedRuleId: evaluation.matchedRuleId
+        });
+        await this.recordEvidence(input, evaluation, enforced, "reject");
+        throw new PolicyBlockedError(
+          `${evaluation.explanation ?? "Action requires approval."} Approval is not available on scheduled runs, so the action was denied.`.trim(),
+          evaluation.matchedRuleId
+        );
+      }
       const disposition = await this.routeApproval(input, evaluation);
       await this.recordEvidence(input, evaluation, enforced, disposition);
       if (disposition === "approve") {

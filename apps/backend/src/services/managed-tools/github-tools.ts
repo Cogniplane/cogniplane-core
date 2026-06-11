@@ -22,6 +22,12 @@ const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 function parseRepo(repo: string): { owner: string; name: string } | null {
   if (!REPO_PATTERN.test(repo)) return null;
   const [owner, name] = repo.split("/", 2) as [string, string];
+  // The character class permits a segment that is entirely dots, so `repo`
+  // like "../name" or "owner/.." passes the regex. The WHATWG URL parser then
+  // resolves the `..` and the request lands on a different api.github.com
+  // endpoint under the user's PAT. Reject `.`/`..` segments outright (mirrors
+  // encodeRepoPath's per-segment guard).
+  if (owner === "." || owner === ".." || name === "." || name === "..") return null;
   return { owner, name };
 }
 

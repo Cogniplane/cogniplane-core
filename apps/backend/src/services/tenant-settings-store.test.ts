@@ -12,13 +12,34 @@ type QueryResult = {
 class InMemoryTenantSettingsDatabase {
   private row: Record<string, unknown> | null = null;
   private nowCounter = 0;
+  // Models pg_advisory_xact_lock: a mutex acquired in-transaction and
+  // released on COMMIT/ROLLBACK, so concurrency tests exercise real blocking.
+  private lockTail: Promise<void> = Promise.resolve();
 
   async connect(): Promise<{
     query: (sql: string, params?: unknown[]) => Promise<QueryResult>;
     release: () => void;
   }> {
+    let releaseLock: (() => void) | null = null;
     return {
-      query: (sql: string, params: unknown[] = []) => this.query(sql, params),
+      query: async (sql: string, params: unknown[] = []) => {
+        if (sql === "COMMIT" || sql === "ROLLBACK") {
+          releaseLock?.();
+          releaseLock = null;
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.includes("pg_advisory_xact_lock")) {
+          const previousHolder = this.lockTail;
+          let release!: () => void;
+          this.lockTail = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          await previousHolder;
+          releaseLock = release;
+          return { rows: [], rowCount: 0 };
+        }
+        return this.query(sql, params);
+      },
       release: () => {}
     };
   }
@@ -107,6 +128,30 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
   expect(updated.enabledToolIds).toEqual(["custom-tool"]);
   expect(updated.enabledMcpServerIds).toEqual(["custom-server"]);
   expect(updated.version).toBe(2);
+});
+
+test("TenantSettingsStore.upsert serializes concurrent partial updates without losing either write", async () => {
+  const db = new InMemoryTenantSettingsDatabase();
+  const store = new TenantSettingsStore(db as unknown as Pool);
+
+  await store.upsert("tenant-c", {
+    developerInstructions: "initial",
+    webSearchMode: "live"
+  });
+
+  // Two partial updates racing on different fields. Without per-tenant
+  // serialization both read the same baseline row and the second write
+  // resurrects stale values over the first.
+  await Promise.all([
+    store.upsert("tenant-c", { developerInstructions: "from writer A" }),
+    store.upsert("tenant-c", { showEffortSelector: true })
+  ]);
+
+  const final = await store.get("tenant-c");
+  expect(final?.developerInstructions).toBe("from writer A");
+  expect(final?.showEffortSelector).toBe(true);
+  expect(final?.webSearchMode).toBe("live");
+  expect(final?.version).toBe(3);
 });
 
 test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async () => {

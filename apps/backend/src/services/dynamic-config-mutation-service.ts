@@ -1,5 +1,7 @@
 import { computeConfigHash, unique } from "../lib/crypto-utils.js";
 
+import { AdminConfigError } from "./admin-config-error.js";
+
 import type { AdminMcpServerRecord } from "./admin-config-records.js";
 import type { McpServerStore } from "./mcp-server-store.js";
 
@@ -9,11 +11,11 @@ function validateMcpServerInput(input: {
   upstreamUrl: string | null;
 }): void {
   if (!input.routePath.startsWith("/mcp/")) {
-    throw new Error("routePath must start with /mcp/.");
+    throw new AdminConfigError("routePath must start with /mcp/.");
   }
 
   if (input.mode === "proxy" && !input.upstreamUrl) {
-    throw new Error("Proxy MCP servers require an upstreamUrl.");
+    throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
   }
 }
 

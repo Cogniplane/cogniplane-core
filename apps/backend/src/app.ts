@@ -9,7 +9,7 @@ import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.j
 import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
-import { isCorsOriginAllowed } from "./lib/cors.js";
+import { CORS_ALLOWED_METHODS, isCorsOriginAllowed } from "./lib/cors.js";
 import { createDatabase } from "./lib/db.js";
 import { getRedis } from "./lib/redis.js";
 import { sanitizeUrl } from "./lib/sanitize-url.js";
@@ -50,9 +50,30 @@ export function handleAppError(
   });
 }
 
+/**
+ * Parse the TRUST_PROXY config string into the shape Fastify's `trustProxy`
+ * option expects. `request.ip` resolution (and therefore the /mcp and /llm
+ * egress IP controls) depend on this matching the deployment's real proxy
+ * topology. See the TRUST_PROXY docs in config.ts for the value semantics.
+ */
+export function parseTrustProxy(raw: string): boolean | number | string {
+  const value = raw.trim();
+  if (value === "" || value.toLowerCase() === "false") return false;
+  if (value.toLowerCase() === "true") return true;
+  if (/^\d+$/.test(value)) return Number(value);
+  // Otherwise treat as a comma-separated IP/CIDR allowlist of trusted proxies.
+  return value;
+}
+
 export async function buildApp() {
   const config = loadConfig();
   const app = Fastify({
+    // Resolve `request.ip` from X-Forwarded-For per the deployment's proxy
+    // topology. Without this, behind the ECS ALB `request.ip` is the ALB node
+    // and the per-runtime egress IP pin (/mcp + /llm) would pin a shared LB
+    // address — useless at best, intermittently rejecting cross-AZ traffic at
+    // worst. Default "1" trusts exactly the ALB hop.
+    trustProxy: parseTrustProxy(config.TRUST_PROXY),
     // Defense-in-depth HTTP-layer cap on JSON/raw request bodies. Field-level
     // schemas (e.g. MessagePostRequestSchema.text) enforce tighter per-field
     // limits, but those only run *after* the whole body is buffered, so a global
@@ -132,7 +153,7 @@ export async function buildApp() {
   await app.register(cors, {
     origin: (requestOrigin, cb) => cb(null, isCorsOriginAllowed(requestOrigin, config.API_ORIGIN)),
     credentials: true,
-    methods: ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: CORS_ALLOWED_METHODS,
     allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "X-Tenant-Id"]
   });
   await app.register(cookie);
@@ -189,6 +210,10 @@ export async function buildApp() {
     messages: deps.messages,
     toolContexts: deps.toolContexts,
     runtimeManager: deps.runtimeManager,
+    runtimeAdapters: deps.runtimeAdapters,
+    dynamicConfig: deps.dynamicConfig,
+    getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
+    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey,
     auditEvents: deps.auditEvents,
     piiScanJobs: deps.piiScanJobs,
     piiScanJobHandler: deps.piiScanJobHandler,

@@ -5,8 +5,10 @@ import Fastify from "fastify";
 import JSZip from "jszip";
 
 import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
+import { handleAppError } from "../../app.js";
 import codexRelease from "../../codex-release.json" with { type: "json" };
 import type { Pool } from "../../lib/db.js";
+import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
@@ -889,6 +891,59 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
   await app.close();
 });
 
+test("admin routes require serverId when creating an MCP server", async () => {
+  const app = Fastify();
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: request.headers["x-user-id"]?.toString() || "admin-user",
+      tenantId: request.headers["x-tenant-id"]?.toString() || "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  await registerAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverName: "Trusted echo",
+      mode: "proxy",
+      routePath: "/mcp/trusted-echo"
+    }
+  });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({
+    error: "invalid_config",
+    message: "serverId is required."
+  });
+
+  await app.close();
+});
+
 test("admin routes return structured errors for referenced MCP disables", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
@@ -929,6 +984,73 @@ test("admin routes return structured errors for referenced MCP disables", async 
   });
   // Mock returns null (server not found) — route returns 404
   expect(disableReferencedMcpResponse.statusCode).toBe(404);
+
+  await app.close();
+});
+
+test("admin mutations surface AdminConfigError messages but keep internal errors opaque", async () => {
+  const app = Fastify({ logger: false });
+  app.setErrorHandler(handleAppError);
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: "admin-user",
+      tenantId: "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  const dynamicConfig = new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"];
+  dynamicConfig.disableMcpServer = async () => {
+    throw new AdminConfigError('Cannot disable MCP server "trusted-echo" — it is referenced.');
+  };
+  dynamicConfig.setMcpServerPublished = async () => {
+    throw new Error('duplicate key value violates constraint "pg_internal_detail"');
+  };
+
+  await registerAdminRoutes(app, {
+    dynamicConfig,
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const validationResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers/trusted-echo/disable"
+  });
+  expect(validationResponse.statusCode).toBe(400);
+  expect(validationResponse.json()).toEqual({
+    error: "invalid_config",
+    message: 'Cannot disable MCP server "trusted-echo" — it is referenced.'
+  });
+
+  const internalResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers/trusted-echo/publish"
+  });
+  expect(internalResponse.statusCode).toBe(500);
+  expect(internalResponse.json()).toEqual({
+    error: "internal_error",
+    message: "An unexpected error occurred."
+  });
+  expect(internalResponse.body).not.toContain("pg_internal_detail");
 
   await app.close();
 });
@@ -999,6 +1121,147 @@ test("admin routes import a skill bundle zip", async () => {
   expect(response.json().skill.skillId).toBe("pdf-processing");
   expect(response.json().revision.reviewStatus).toBe("pending_review");
   expect(auditEvents.events.at(-1)?.type).toBe("admin.skill.imported");
+
+  await app.close();
+});
+
+test("admin zip import returns 413 with a fixed message when the upload exceeds the size limit", async () => {
+  const app = Fastify({ logger: false });
+  app.setErrorHandler(handleAppError);
+  await app.register(multipart);
+  app.decorate("config", createTestConfig({
+    LOCAL_DEV_USER_ID: "admin-user",
+    ARTIFACT_MAX_UPLOAD_BYTES: 64
+  }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: "admin-user",
+      tenantId: "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  await registerAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const boundary = "----cogniplane-skill-boundary";
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="big.zip"\r\n` +
+        "Content-Type: application/zip\r\n\r\n"
+    ),
+    Buffer.alloc(4096, 0x61),
+    Buffer.from(`\r\n--${boundary}--\r\n`)
+  ]);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/skills/import/zip",
+    headers: {
+      "content-type": `multipart/form-data; boundary=${boundary}`
+    },
+    payload
+  });
+
+  expect(response.statusCode).toBe(413);
+  expect(response.json()).toEqual({
+    error: "skill_import_too_large",
+    message: "Skill import exceeds size limit."
+  });
+
+  await app.close();
+});
+
+test("admin zip import returns 400 (not 500) for a malformed zip upload", async () => {
+  const app = Fastify({ logger: false });
+  app.setErrorHandler(handleAppError);
+  await app.register(multipart);
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: "admin-user",
+      tenantId: "admin-tenant",
+      isAdmin: true,
+      role: "owner" as const
+    };
+  });
+
+  // The real zip parse (and its AdminConfigError) lives in
+  // skill-import-service; here the stub throws the same error so the route's
+  // error mapping is exercised end-to-end through the prod error handler.
+  const dynamicConfig = new InMemoryAdminConfig();
+  dynamicConfig.importSkillBundleFromZip = async () => {
+    throw new AdminConfigError("Uploaded file is not a valid zip archive.");
+  };
+
+  await registerAdminRoutes(app, {
+    dynamicConfig: dynamicConfig as unknown as AdminRouteStores["dynamicConfig"],
+    skillMarketplace: createMarketplaceStore(),
+    auditEvents: new InMemoryAuditEventStore(),
+    runtimeSessions: {
+      async listRecent(_tenantId: string) {
+        return [];
+      }
+    },
+    runtimeManager: {
+      async refreshIdleRuntimes() {
+        return [];
+      }
+    },
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const boundary = "----cogniplane-skill-boundary";
+  const payload = Buffer.concat([
+    Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="not-a-zip.zip"\r\n` +
+        "Content-Type: application/zip\r\n\r\n"
+    ),
+    Buffer.from("this is definitely not a zip archive"),
+    Buffer.from(`\r\n--${boundary}--\r\n`)
+  ]);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/admin/skills/import/zip",
+    headers: {
+      "content-type": `multipart/form-data; boundary=${boundary}`
+    },
+    payload
+  });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({
+    error: "invalid_config",
+    message: "Uploaded file is not a valid zip archive."
+  });
 
   await app.close();
 });

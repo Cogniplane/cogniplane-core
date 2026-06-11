@@ -1,11 +1,10 @@
 "use client";
 
-import { AdminPolicyDecisionsCard } from "../../../components/admin-policy-decisions-card";
-import { AdminPolicyRulesCard } from "../../../components/admin-policy-rules-card";
-import { AdminPolicySimulator } from "../../../components/admin-policy-simulator";
+import { AdminPolicyDecisionsCard } from "../../../components/admin/policy/admin-policy-decisions-card";
+import { AdminPolicyRulesCard } from "../../../components/admin/policy/admin-policy-rules-card";
+import { AdminPolicySimulator } from "../../../components/admin/policy/admin-policy-simulator";
 import { useDecisionsData, usePolicyData } from "../../../hooks/use-policy-data";
-
-const SECTION_LABEL = "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminPolicyPage() {
   const {

@@ -109,7 +109,7 @@ const DEFAULT_PII_PROTECTION: PiiProtectionSettings = {
   enabled: false,
   mode: "off",
   rawRetention: "never",
-  provider: { type: "openrouter", model: "" },
+  provider: { type: "openai-compatible", model: "" },
   scopes: { chatPrompts: true, uploads: true, microsoftImports: true },
   actions: { reportToAdmins: true },
   detectors: {

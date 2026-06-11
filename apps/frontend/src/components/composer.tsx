@@ -3,6 +3,7 @@
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { EffortLevel, Model, RuntimeProvider } from "@cogniplane/shared-types";
 import { ProviderModelSelector } from "./provider-model-selector";
+import { ContextWindowMeter } from "./context-window-meter";
 import {
   canSubmitDraft,
   canSubmitDraftViaKeyboard,
@@ -32,6 +33,8 @@ export function Composer(props: {
   models: Model[];
   showEffortSelector: boolean;
   hasConversationHistory: boolean;
+  contextTokens: number;
+  contextWindow: number;
   onProviderChange: (provider: RuntimeProvider) => void;
   onModelChange: (modelId: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
@@ -109,18 +112,24 @@ export function Composer(props: {
             {props.error ? (
               <p className="text-sm text-danger">{props.error}</p>
             ) : (
-              <ProviderModelSelector
-                provider={props.provider}
-                enabledProviders={props.enabledProviders}
-                model={props.model}
-                effort={props.effort}
-                models={props.models}
-                showEffortSelector={props.showEffortSelector}
-                disabled={!props.selectedSessionId || props.isSending}
-                onProviderChange={handleProviderChange}
-                onModelChange={props.onModelChange}
-                onEffortChange={props.onEffortChange}
-              />
+              <>
+                <ProviderModelSelector
+                  provider={props.provider}
+                  enabledProviders={props.enabledProviders}
+                  model={props.model}
+                  effort={props.effort}
+                  models={props.models}
+                  showEffortSelector={props.showEffortSelector}
+                  disabled={!props.selectedSessionId || props.isSending}
+                  onProviderChange={handleProviderChange}
+                  onModelChange={props.onModelChange}
+                  onEffortChange={props.onEffortChange}
+                />
+                <ContextWindowMeter
+                  usedTokens={props.contextTokens}
+                  contextWindow={props.contextWindow}
+                />
+              </>
             )}
           </div>
           {props.isSending ? (

@@ -16,6 +16,7 @@ import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest }
 import { fetch as undiciFetch } from "undici";
 
 import { cidrAllowlistAllows } from "../lib/cidr-allowlist.js";
+import { resolveEgressClientIp } from "../lib/egress-client-ip.js";
 import type { ActiveTurnMessageMap } from "../services/active-turn-message-map.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import { verifyRuntimeToken } from "../services/auth/runtime-token.js";
@@ -194,7 +195,7 @@ async function handleProxyRequest(
   stores: LlmProxyRouteStores
 ): Promise<unknown> {
   const pathname = request.url.split("?", 1)[0]!;
-  const ipAddress = request.ip ?? null;
+  const ipAddress = resolveEgressClientIp(request);
 
   const claims = extractRuntimeClaims(
     request.headers as Record<string, string | string[] | undefined>,

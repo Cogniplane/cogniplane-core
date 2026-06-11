@@ -14,6 +14,7 @@ import {
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { redactSecrets } from "../redact-secrets.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type PolicyDecisionInput = {
   sessionId: string | null;
@@ -53,7 +54,7 @@ function mapRow(row: Record<string, unknown>): PolicyDecision {
     outcome: String(row.outcome) as PolicyEffect,
     enforced: Boolean(row.enforced),
     explanation: row.explanation == null ? null : String(row.explanation),
-    createdAt: new Date(String(row.created_at)).toISOString()
+    createdAt: isoTimestamp(row.created_at)
   };
 }
 

@@ -2,6 +2,7 @@ import type { AppConfig } from "../../../config.js";
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import { refreshUserAccessToken } from "./github-api-client.js";
 import type { GithubConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
+import { toIsoFromNow } from "../integration-oauth-helpers.js";
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
@@ -12,12 +13,6 @@ export function parseScopes(scope: string | undefined): string[] {
         .map((entry) => entry.trim())
         .filter(Boolean)
     : [];
-}
-
-export function toIsoFromNow(seconds: number | undefined): string | null {
-  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
-    ? new Date(Date.now() + seconds * 1000).toISOString()
-    : null;
 }
 
 /**

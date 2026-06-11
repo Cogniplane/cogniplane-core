@@ -3,20 +3,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
-import { AdminSessionsSection } from "../../../components/admin-sessions-section";
-import { AdminSessionsFilters } from "../../../components/admin-sessions-filters";
+import { AdminSessionsSection } from "../../../components/admin/sessions/admin-sessions-section";
+import { AdminSessionsFilters } from "../../../components/admin/sessions/admin-sessions-filters";
 import {
   EMPTY_FILTER_STATE,
   defaultLast7dRange,
   filterStateToParams,
   type SessionsFilterState
-} from "../../../components/admin-sessions-filters.logic";
-import { AdminSessionsPresets } from "../../../components/admin-sessions-presets";
+} from "../../../components/admin/sessions/admin-sessions-filters.logic";
+import { AdminSessionsPresets } from "../../../components/admin/sessions/admin-sessions-presets";
 import { useAdminSessionsData } from "../../../hooks/use-admin-sessions-data";
 import type { AdminSessionAlertKind, AdminSessionRow } from "@cogniplane/shared-types";
-
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 const FILTER_KEYS: Array<keyof SessionsFilterState> = [
   "userId",

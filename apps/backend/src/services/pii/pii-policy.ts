@@ -6,7 +6,7 @@ export type PiiMode = (typeof PII_MODES)[number];
 export const PII_RAW_RETENTION = ["never", "admin_only", "reversible_encrypted"] as const;
 export type PiiRawRetention = (typeof PII_RAW_RETENTION)[number];
 
-export const PII_PROVIDER_TYPES = ["openrouter"] as const;
+export const PII_PROVIDER_TYPES = ["openai-compatible"] as const;
 export type PiiProviderType = (typeof PII_PROVIDER_TYPES)[number];
 
 export const PII_ENTITY_TYPES = [
@@ -58,8 +58,8 @@ export const DEFAULT_PII_PROTECTION: PiiProtectionSettings = {
   mode: "off",
   rawRetention: "never",
   provider: {
-    type: "openrouter",
-    // Empty = fall back to PII_OPENROUTER_MODEL env var (provider's default).
+    type: "openai-compatible",
+    // Empty = fall back to PII_LLM_MODEL env var (provider's default).
     model: ""
   },
   scopes: {

@@ -50,9 +50,7 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-
-const PILL_GRAY =
-  "inline-flex items-center rounded-full bg-surface-container px-2 py-0.5 text-xs font-medium text-on-surface-variant";
+import { PILL_GRAY } from "../lib/ui-tokens";
 
 const PII_TONE_CLASS: Record<PiiTone, string> = {
   neutral: PILL_GRAY,

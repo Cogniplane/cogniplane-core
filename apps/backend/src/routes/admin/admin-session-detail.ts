@@ -8,6 +8,7 @@ import { parseRequestInput } from "../../lib/route-validation.js";
 import { sessionIdParams } from "../../lib/route-schemas.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { withAdmin } from "./admin-route-helpers.js";
+import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type AdminSessionDetailOverview = {
   sessionId: string;
@@ -144,7 +145,7 @@ export type AdminSessionDetailResponse = {
 
 function toIso(value: unknown): string {
   if (value instanceof Date) return value.toISOString();
-  return new Date(String(value)).toISOString();
+  return isoTimestamp(value);
 }
 
 function toIsoOrNull(value: unknown): string | null {

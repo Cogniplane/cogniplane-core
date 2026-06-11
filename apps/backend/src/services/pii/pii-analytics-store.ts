@@ -13,6 +13,7 @@ import type {
   SubjectRow,
   TimeSeriesPoint
 } from "../../routes/admin/admin-pii-schemas.js";
+import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
 
 export type KpiRow = {
   scans: number;
@@ -145,7 +146,7 @@ export class PiiAnalyticsStore {
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
         return {
-          bucket: new Date(String(row.bucket)).toISOString(),
+          bucket: isoTimestamp(row.bucket),
           allow: Number(row.allow ?? 0),
           report: Number(row.report ?? 0),
           block: Number(row.block ?? 0),
@@ -276,7 +277,7 @@ export class PiiAnalyticsStore {
           blockCount: Number(row.block_count ?? 0),
           transformCount: Number(row.transform_count ?? 0),
           failedCount: Number(row.failed_count ?? 0),
-          lastSeenAt: row.last_seen_at ? new Date(String(row.last_seen_at)).toISOString() : null
+          lastSeenAt: isoTimestampOrNull(row.last_seen_at)
         };
       });
     });
@@ -325,9 +326,7 @@ export class PiiAnalyticsStore {
             transform: Number(row.transform_count ?? 0),
             failed: Number(row.failed_count ?? 0)
           },
-          lastActivityAt: row.last_activity_at
-            ? new Date(String(row.last_activity_at)).toISOString()
-            : null
+          lastActivityAt: isoTimestampOrNull(row.last_activity_at)
         };
       });
     });
@@ -404,10 +403,8 @@ export class PiiAnalyticsStore {
         }
         return {
           scanRunId: String(row.scan_run_id),
-          createdAt: new Date(String(row.created_at)).toISOString(),
-          completedAt: row.completed_at
-            ? new Date(String(row.completed_at)).toISOString()
-            : null,
+          createdAt: isoTimestamp(row.created_at),
+          completedAt: isoTimestampOrNull(row.completed_at),
           subjectType: String(row.subject_type),
           subjectId: String(row.subject_id),
           sessionId: row.source_session_id ? String(row.source_session_id) : null,
@@ -448,9 +445,7 @@ export class PiiAnalyticsStore {
         claimed: Number(row.claimed ?? 0),
         completed: Number(row.completed ?? 0),
         failed: Number(row.failed ?? 0),
-        oldestQueuedAt: row.oldest_queued_at
-          ? new Date(String(row.oldest_queued_at)).toISOString()
-          : null,
+        oldestQueuedAt: isoTimestampOrNull(row.oldest_queued_at),
         maxAttemptsHit: Number(row.max_attempts_hit ?? 0)
       };
     });

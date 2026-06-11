@@ -154,7 +154,10 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
     artifactProcessor: {},
     runtimeManager: {
       getHealthSnapshot() {
-        return { activeRuntimeCount: 0, activeTurnCount: 0, runtimes: [] };
+        return { activeRuntimeCount: 0, activeTurnCount: 0 };
+      },
+      getRuntimeHealthDetail() {
+        return [];
       },
       async refreshIdleRuntimes() {
         return [];
@@ -180,6 +183,10 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
   const healthResponse = await app.inject({ method: "GET", url: "/health" });
   expect(healthResponse.statusCode).toBe(200);
   expect(healthResponse.json().status).toBe("ok");
+  // The unauthenticated health endpoint exposes aggregate counts only —
+  // per-runtime detail (sessionId/runtimeId/port) is cross-tenant data and
+  // lives behind GET /admin/runtime-health.
+  expect(healthResponse.json().runtimes).toEqual({ activeRuntimeCount: 0, activeTurnCount: 0 });
 
   const adminResponse = await app.inject({ method: "GET", url: "/admin/skills" });
   expect(adminResponse.statusCode).toBe(200);

@@ -271,6 +271,58 @@ describe("UserSettingsStore – scheduler methods", () => {
     });
   });
 
+  // ---- sweepStaleJobRuns ---------------------------------------------------
+
+  describe("sweepStaleJobRuns", () => {
+    it("marks stale pending runs failed and returns identifying fields", async () => {
+      db.onQuery((sql) => {
+        if (sql.includes("UPDATE") && sql.includes("scheduled_job_runs")) {
+          return {
+            rows: [
+              {
+                tenant_id: "tenant-1",
+                run_id: "run-stale",
+                job_id: "job-1",
+                user_id: "user-1",
+                session_id: "session-9"
+              }
+            ],
+            rowCount: 1
+          };
+        }
+        return { rows: [], rowCount: 0 };
+      });
+
+      const result = await store.sweepStaleJobRuns(600_000, 50);
+
+      expect(result).toEqual([
+        {
+          tenantId: "tenant-1",
+          runId: "run-stale",
+          jobId: "job-1",
+          userId: "user-1",
+          sessionId: "session-9"
+        }
+      ]);
+
+      const call = db.calls[0];
+      // Only orphans are eligible: still pending and past the cutoff, claimed
+      // with SKIP LOCKED so concurrent sweeps never double-recover a row.
+      expect(call.sql).toContain("status = 'pending'");
+      expect(call.sql).toContain("FOR UPDATE SKIP LOCKED");
+      expect(call.sql).toContain("status = 'failed'");
+      expect(call.params).toEqual([600_000, 50]);
+    });
+
+    it("returns an empty array when nothing is stale", async () => {
+      db.onQuery(() => ({ rows: [], rowCount: 0 }));
+
+      const result = await store.sweepStaleJobRuns(600_000);
+
+      expect(result).toEqual([]);
+    });
+  });
+
   // ---- listJobRuns --------------------------------------------------------
 
   describe("listJobRuns", () => {

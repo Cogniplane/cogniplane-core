@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import cors from "@fastify/cors";
+import { CORS_ALLOWED_METHODS } from "../lib/cors.js";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
@@ -23,6 +24,7 @@ import { registerApprovalRoutes, type ApprovalRouteStores } from "../routes/appr
 import { registerArtifactRoutes, type ArtifactRouteStores } from "../routes/artifacts.js";
 import { registerHealthRoutes, type HealthRouteStores } from "../routes/health.js";
 import { registerMcpRoutes, type McpRouteStores } from "../routes/mcp.js";
+import { RuntimeEgressIpPinStore } from "../services/runtime-egress-ip-pin.js";
 import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "../services/managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "../services/managed-tools/register-builtin-managed-tools.js";
@@ -395,7 +397,7 @@ class FakeRuntimeManager {
   }
   async readRuntimeFile(_sessionId: string, _filePath: string): Promise<Uint8Array> { return new Uint8Array(0); }
   async writeRuntimeFile(_sessionId: string, filePath: string, _data: Uint8Array | ArrayBuffer | string): Promise<string> { return filePath; }
-  getHealthSnapshot() { return { activeRuntimeCount: 0, activeTurnCount: 0, runtimes: [] }; }
+  getHealthSnapshot() { return { activeRuntimeCount: 0, activeTurnCount: 0 }; }
 }
 
 class InMemoryToolContextStore {
@@ -631,7 +633,7 @@ export async function createTestApp(
   const limits = RequestLimits.fromAppConfig(config);
   app.decorate("config", config);
   app.decorate("db", db as unknown as Pool);
-  await app.register(cors, { origin: config.API_ORIGIN, methods: ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: ["Content-Type", "X-User-Id", "X-Tenant-Id"] });
+  await app.register(cors, { origin: config.API_ORIGIN, methods: CORS_ALLOWED_METHODS, allowedHeaders: ["Content-Type", "X-User-Id", "X-Tenant-Id"] });
   await app.register(multipart, {
     limits: { fileSize: config.ARTIFACT_MAX_UPLOAD_BYTES, files: 1 }
   });
@@ -753,7 +755,12 @@ export async function createTestApp(
     // approvals, so the gateway degrades enforce-mode require_approval to a deny
     // (returns null). Tests can override to simulate a human decision.
     requestPolicyApproval: requestPolicyApprovalOverride ?? (async () => null),
-    runtimeTokenSecret: "test-runtime-token-secret"
+    runtimeTokenSecret: "test-runtime-token-secret",
+    // Egress controls: no CIDR allowlist; a real pin store so the per-runtime
+    // IP pin behaves as in production (inject() always presents the same peer
+    // IP, so pins are consistent within a test unless remoteAddress is varied).
+    egressAllowlist: null,
+    egressIpPins: new RuntimeEgressIpPinStore(60_000)
   } as unknown as McpRouteStores);
   app.addHook("onClose", async () => { await rm(artifactStorageRoot, { recursive: true, force: true }); });
   await app.ready();

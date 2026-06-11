@@ -1,6 +1,6 @@
 import { test, expect } from "vitest";
 
-import { mapRuntimeNotification } from "./runtime-notification-mapper.js";
+import { extractNotificationTurnId, mapRuntimeNotification } from "./runtime-notification-mapper.js";
 
 const activeTurn = { responseId: "r1", outputItemDone: false };
 
@@ -262,20 +262,6 @@ test("mapRuntimeNotification: non-retryable runtime error returns runtime-error"
   expect(result.retrying).toBe(false);
 });
 
-test("mapRuntimeNotification: stream error returns retryable runtime-error", () => {
-  const result = mapRuntimeNotification(activeTurn, {
-    method: "codex/event/stream_error",
-    params: {
-      msg: { message: "WebSocket disconnected while streaming." }
-    }
-  });
-
-  expect(result.kind).toBe("runtime-error");
-  if (result.kind !== "runtime-error") return;
-  expect(result.message).toBe("WebSocket disconnected while streaming.");
-  expect(result.retrying).toBe(true);
-});
-
 test("mapRuntimeNotification: agentMessage delta forwards a text delta event", () => {
   const result = mapRuntimeNotification(activeTurn, {
     method: "item/agentMessage/delta",
@@ -479,18 +465,6 @@ test("mapRuntimeNotification: token usage update is dropped (proxy owns cost)", 
   expect(result.kind).toBe("none");
 });
 
-test("mapRuntimeNotification: codex/event/error returns non-retrying runtime-error", () => {
-  const result = mapRuntimeNotification(activeTurn, {
-    method: "codex/event/error",
-    params: { error: { message: "fatal" } }
-  });
-  expect(result.kind).toBe("runtime-error");
-  if (result.kind === "runtime-error") {
-    expect(result.retrying).toBe(false);
-    expect(result.message).toBe("fatal");
-  }
-});
-
 test("mapRuntimeNotification: error fallback message when error has no message field", () => {
   const result = mapRuntimeNotification(activeTurn, {
     method: "error",
@@ -584,4 +558,35 @@ test("mapRuntimeNotification: item/completed mcp tool call without server/tool u
     expect(result.toolCall.output).toBe("");
     expect(result.toolCall.input).toBe("");
   }
+});
+
+test("extractNotificationTurnId: reads params.turnId from turn-scoped notifications", () => {
+  expect(
+    extractNotificationTurnId({
+      method: "item/agentMessage/delta",
+      params: { delta: "hi", turnId: "turn-9", threadId: "t", itemId: "i" }
+    })
+  ).toBe("turn-9");
+});
+
+test("extractNotificationTurnId: reads turn.id from turn/completed", () => {
+  expect(
+    extractNotificationTurnId({
+      method: "turn/completed",
+      params: { threadId: "t", turn: { id: "turn-9", status: "completed", items: [] } }
+    })
+  ).toBe("turn-9");
+});
+
+test("extractNotificationTurnId: returns null for notifications without a turn id", () => {
+  expect(
+    extractNotificationTurnId({
+      method: "mcpServer/startupStatus/updated",
+      params: { name: "srv", status: "ready" }
+    })
+  ).toBeNull();
+  expect(extractNotificationTurnId({ method: "thread/started" })).toBeNull();
+  expect(
+    extractNotificationTurnId({ method: "item/agentMessage/delta", params: { delta: "x", turnId: 42 } })
+  ).toBeNull();
 });

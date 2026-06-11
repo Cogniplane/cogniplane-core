@@ -1,7 +1,46 @@
-import { test, expect } from "vitest";
+import { test, expect, describe } from "vitest";
 import Fastify from "fastify";
 
-import { handleAppError } from "./app.js";
+import { handleAppError, parseTrustProxy } from "./app.js";
+
+describe("parseTrustProxy", () => {
+  test("defaults to a single trusted hop for the documented ALB topology", () => {
+    expect(parseTrustProxy("1")).toBe(1);
+  });
+
+  test("treats empty / false as untrusted (socket peer)", () => {
+    expect(parseTrustProxy("")).toBe(false);
+    expect(parseTrustProxy("false")).toBe(false);
+    expect(parseTrustProxy("FALSE")).toBe(false);
+  });
+
+  test("treats true as trust-all", () => {
+    expect(parseTrustProxy("true")).toBe(true);
+  });
+
+  test("parses a hop count", () => {
+    expect(parseTrustProxy("2")).toBe(2);
+  });
+
+  test("passes a CIDR/IP list through as a string", () => {
+    expect(parseTrustProxy("10.0.0.0/8,172.16.0.0/12")).toBe("10.0.0.0/8,172.16.0.0/12");
+  });
+});
+
+test("trustProxy resolves request.ip from X-Forwarded-For when trusting one hop", async () => {
+  // With trustProxy=1 the rightmost XFF entry (appended by the trusted proxy)
+  // wins, so a client-forged leftmost entry cannot spoof request.ip.
+  const app = Fastify({ logger: false, trustProxy: parseTrustProxy("1") });
+  app.get("/whoami", async (request) => ({ ip: request.ip }));
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/whoami",
+    remoteAddress: "10.0.0.5",
+    headers: { "x-forwarded-for": "203.0.113.7" }
+  });
+  expect(response.json().ip).toBe("203.0.113.7");
+});
 
 function buildAppWithErrorHandler() {
   // Silence the error log so the test output stays clean; handleAppError still

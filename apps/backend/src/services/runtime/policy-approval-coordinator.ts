@@ -10,10 +10,6 @@ import { uuidv7 } from "../../lib/uuid.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 
-// Disposition the MCP gateway uses to allow (`approve`) or refuse
-// (`reject`/`expired`) a policy-routed tool call. Single source: runtime-contracts.
-export type { PolicyApprovalDisposition };
-
 // The synthetic request method stored on the approvals row for a Policy
 // Center–routed approval. Distinguishes these rows from the runtime's native
 // shell/file approvals (which carry their JSON-RPC method here).
@@ -27,6 +23,14 @@ type PendingPolicyApproval = {
   resolve: (disposition: PolicyApprovalDisposition) => void;
   expiryTimer: NodeJS.Timeout;
   reminderTimer: NodeJS.Timeout | null;
+  /** Detaches the gateway-disconnect abort listener; null when no signal given. */
+  removeAbortListener: (() => void) | null;
+  /**
+   * The gateway-disconnect signal itself. The listener is detached when the
+   * entry is claimed, so resolve() re-checks `aborted` after its DB write —
+   * a disconnect during that await must still prevent the tool dispatch.
+   */
+  signal: AbortSignal | null;
 };
 
 export type PolicyApprovalRequest = {
@@ -38,6 +42,8 @@ export type PolicyApprovalRequest = {
   serverId: string | null;
   kind: RuntimeApprovalKind;
   explanation: string;
+  /** Aborts when the gateway's held HTTP response dies (see PolicyApprovalRouteInput). */
+  signal?: AbortSignal;
 };
 
 // Pushes a framework event onto the owning session's active turn. Returns false
@@ -79,6 +85,11 @@ export class PolicyApprovalCoordinator {
    * to `reject`/`expired` so the gateway always gets a clean disposition.
    */
   async request(request: PolicyApprovalRequest): Promise<PolicyApprovalDisposition> {
+    // The gateway's response is already dead — don't write a row or prompt a
+    // human for a tool call nobody is waiting for.
+    if (request.signal?.aborted) {
+      return "reject";
+    }
     const approvalId = `polapr_${uuidv7()}`;
     const expiresAt = new Date(Date.now() + this.deps.ttlMs).toISOString();
     const title = "Approve tool action";
@@ -161,6 +172,14 @@ export class PolicyApprovalCoordinator {
 
       const reminderTimer = this.scheduleReminder(approvalId, request, title);
 
+      const signal = request.signal;
+      const onAbort = () => {
+        void this.onClientDisconnect(request.tenantId, approvalId, request.sessionId).catch((err) => {
+          this.deps.logger.error({ err, approvalId }, "policy approval disconnect cleanup failed");
+        });
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+
       this.pending.set(approvalId, {
         approvalId,
         tenantId: request.tenantId,
@@ -168,8 +187,16 @@ export class PolicyApprovalCoordinator {
         userId: request.userId,
         resolve: resolveFn,
         expiryTimer,
-        reminderTimer
+        reminderTimer,
+        removeAbortListener: signal ? () => signal.removeEventListener("abort", onAbort) : null,
+        signal: signal ?? null
       });
+
+      // The signal may have aborted during the awaits above (row/audit/prompt) —
+      // a listener added to an already-aborted signal never fires, so settle here.
+      if (signal?.aborted) {
+        onAbort();
+      }
     });
   }
 
@@ -184,21 +211,46 @@ export class PolicyApprovalCoordinator {
     userId: string;
     decision: RuntimeApprovalDecision;
   }): Promise<"resolved" | "missing"> {
-    const entry = this.pending.get(input.approvalId);
+    // Mirror the DB gate (`tenant_id`/`user_id` on approvals.resolve) before
+    // claiming, so a caller who isn't the approval's owner can't disturb the
+    // held entry — for them this approval simply doesn't exist.
+    const candidate = this.pending.get(input.approvalId);
+    if (!candidate) return "missing";
+    if (candidate.tenantId !== input.tenantId || candidate.userId !== input.userId) {
+      return "missing";
+    }
+
+    // Claim the entry synchronously (removes it from `pending` and disarms its
+    // timers) BEFORE any await. Otherwise the expiry timer can fire during the
+    // DB write below and settle the gateway's promise as `expired` while the
+    // row, audit trail, and decision route all report approved.
+    const entry = this.clearEntry(input.approvalId);
     if (!entry) return "missing";
 
-    // Atomically flip the DB row. A null means the TTL sweep (or a concurrent
-    // decision) already settled it — the in-memory promise was/will be resolved
-    // by the expiry path, so report missing and don't double-resolve.
-    const approval = await this.deps.approvals.resolve(
-      input.tenantId,
-      input.approvalId,
-      input.userId,
-      input.decision
-    );
-    if (!approval) return "missing";
-
-    this.clearEntry(input.approvalId);
+    // Atomically flip the DB row. We hold the claim, so no other path can reach
+    // the promise anymore — every branch below must settle it.
+    let approval: Awaited<ReturnType<ApprovalStore["resolve"]>>;
+    try {
+      approval = await this.deps.approvals.resolve(
+        input.tenantId,
+        input.approvalId,
+        input.userId,
+        input.decision
+      );
+    } catch (error) {
+      // Fail closed: deny the held tool call rather than hang the gateway, and
+      // surface the error to the decision route. The still-pending row is left
+      // for the sweep.
+      entry.resolve("expired");
+      throw error;
+    }
+    if (!approval) {
+      // The row was already settled externally (DB sweep, teardown, or a
+      // concurrent decision that won the row). Those paths can't see our
+      // claimed entry, so release the promise here.
+      entry.resolve("expired");
+      return "missing";
+    }
 
     await this.createAuditEvent({
       tenantId: input.tenantId,
@@ -209,6 +261,20 @@ export class PolicyApprovalCoordinator {
       payload: { source: "policy" }
     });
 
+    // The abort listener was detached when we claimed the entry, so a gateway
+    // disconnect during the awaits above went unobserved. Re-check before
+    // releasing the hold: the decision is recorded (row + audit), but if the
+    // runtime client is gone the tool must NOT be dispatched into a dead
+    // connection — the runtime will have retried with a fresh gateway call.
+    if (entry.signal?.aborted) {
+      this.deps.logger.warn(
+        { approvalId: input.approvalId, sessionId: entry.sessionId },
+        "policy approval: gateway client disconnected during decision write — withholding dispatch"
+      );
+      entry.resolve("expired");
+      return "resolved";
+    }
+
     entry.resolve(input.decision === "approve" ? "approve" : "reject");
     return "resolved";
   }
@@ -216,17 +282,6 @@ export class PolicyApprovalCoordinator {
   /** True when this coordinator currently holds the given approval id. */
   has(approvalId: string): boolean {
     return this.pending.has(approvalId);
-  }
-
-  /** Deny every pending approval (used on adapter/session teardown). */
-  cancelAll(reason: string): void {
-    for (const [approvalId, entry] of this.pending) {
-      clearTimeout(entry.expiryTimer);
-      if (entry.reminderTimer) clearTimeout(entry.reminderTimer);
-      this.deps.logger.warn({ approvalId, reason }, "policy approval cancelled");
-      entry.resolve("reject");
-    }
-    this.pending.clear();
   }
 
   private scheduleReminder(
@@ -258,8 +313,61 @@ export class PolicyApprovalCoordinator {
     if (!entry) return null;
     clearTimeout(entry.expiryTimer);
     if (entry.reminderTimer) clearTimeout(entry.reminderTimer);
+    entry.removeAbortListener?.();
     this.pending.delete(approvalId);
     return entry;
+  }
+
+  /**
+   * The gateway's held HTTP response died (runtime client timeout / sandbox
+   * gone) while this approval was pending. Nobody will consume an approve
+   * anymore, so release the hold and expire the row — a late human decision
+   * then finds nothing to resolve instead of dispatching an unconsumed tool
+   * call (which the runtime may meanwhile have retried).
+   */
+  private async onClientDisconnect(
+    tenantId: string,
+    approvalId: string,
+    sessionId: string
+  ): Promise<void> {
+    const entry = this.clearEntry(approvalId);
+    if (!entry) return;
+
+    // Release the gateway await first — its response is already dead.
+    entry.resolve("expired");
+    this.deps.logger.warn(
+      { approvalId, sessionId },
+      "policy approval: gateway client disconnected while awaiting decision — expiring"
+    );
+
+    let expired: Awaited<ReturnType<ApprovalStore["expire"]>> = null;
+    try {
+      expired = await this.deps.approvals.expire(tenantId, approvalId);
+    } catch (error) {
+      this.deps.logger.error(
+        { err: error, approvalId, sessionId },
+        "policy approval disconnect failed to update approvals row"
+      );
+    }
+    if (expired) {
+      await this.createAuditEvent({
+        tenantId,
+        sessionId,
+        userId: entry.userId,
+        approvalId,
+        type: "approval.expired",
+        payload: { source: "policy", reason: "client_disconnected" }
+      });
+      this.deps.pushFrameworkEvent(sessionId, {
+        type: "framework:runtime_notice",
+        responseId: sessionId,
+        noticeId: `policy-approval-expired:${approvalId}`,
+        level: "warning",
+        title: "Approval request cancelled",
+        message: "The tool call awaiting approval was abandoned by the runtime and has been cancelled.",
+        createdAt: new Date().toISOString()
+      });
+    }
   }
 
   private async onExpiry(tenantId: string, approvalId: string, sessionId: string): Promise<void> {

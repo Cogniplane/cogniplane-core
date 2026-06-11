@@ -7,6 +7,7 @@ import type { FastifyInstance } from "fastify";
 
 import {
   AdminRuntimeConfigSchema,
+  AdminRuntimeHealthResponseSchema,
   RuntimeOpenAiDiagnosticSchema,
   RuntimeSessionsListResponseSchema
 } from "@cogniplane/shared-types";
@@ -59,6 +60,15 @@ export async function registerAdminRuntimeRoutes(
         // typed column for the local-vs-e2b distinction yet.
         mode: extractLifecycleMode(runtimeSession.lifecycleMetadata)
       }))
+    });
+  }));
+
+  // Live in-memory Codex process detail (pid, port, liveness, active turn),
+  // scoped to the caller's tenant. This is the relocated detail that the
+  // unauthenticated /health endpoint used to expose for every tenant.
+  app.get("/admin/runtime-health", withAdmin(app, async (request) => {
+    return serialize(AdminRuntimeHealthResponseSchema, {
+      runtimes: stores.runtimeManager.getRuntimeHealthDetail(request.auth.tenantId)
     });
   }));
 

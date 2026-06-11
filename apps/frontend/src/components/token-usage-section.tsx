@@ -13,12 +13,10 @@ import {
   type Days,
   ViewToggle
 } from "./token-usage-chart-primitives";
+import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
-const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
-const HINT = "text-sm text-on-surface-faint";
 
 function shortUserId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;

@@ -8,13 +8,6 @@ export const STATUS_LABELS: Record<Message["status"], string> = {
   interrupted: "Stopped"
 };
 
-export function formatMessageTimestamp(iso: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(new Date(iso));
-}
-
 export function formatTokenCount(n: number): string {
   if (n < 1_000) return `${Math.round(n)}`;
   if (n < 10_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;

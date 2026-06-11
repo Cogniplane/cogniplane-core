@@ -381,6 +381,48 @@ export async function registerSettingsRoutes(
       return persistenceInputResult.response;
     }
 
+    const existing = await stores.settings.getScheduledJob(
+      tenantId,
+      paramsResult.value.jobId,
+      userId
+    );
+    if (!existing) {
+      reply.code(404);
+      return notFoundError("scheduled_job_not_found");
+    }
+
+    // Enabling a previously-disabled job is what makes it start firing turns,
+    // so treat the disabled→enabled transition exactly like creating an
+    // enabled job: it consumes the creation rate limit and is subject to the
+    // total-active-job cap. Without this, a user at the cap could create N
+    // disabled jobs and PUT-enable them all, bypassing both controls. Updates
+    // that keep the job enabled (or disable it) are not gated — the active
+    // count already includes the job itself.
+    if (persistenceInputResult.value.enabled && !existing.enabled) {
+      const rateLimitError = await stores.limits.consumeRateLimit({
+        resource: "scheduled_job_create",
+        userId,
+        tenantId
+      });
+      if (rateLimitError) {
+        reply.code(429);
+        reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+        return rateLimitError;
+      }
+
+      const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
+      if (maxActive > 0) {
+        const activeCount = await stores.settings.countActiveScheduledJobs(tenantId, userId);
+        if (activeCount >= maxActive) {
+          reply.code(409);
+          return apiError(
+            "scheduled_job_limit_reached",
+            `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before enabling this one.`
+          );
+        }
+      }
+    }
+
     const job = await stores.settings.updateScheduledJob({
       jobId: paramsResult.value.jobId,
       ...persistenceInputResult.value

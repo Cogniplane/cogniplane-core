@@ -2,12 +2,13 @@ import type { FastifyBaseLogger } from "fastify";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import { AsyncQueue } from "../../lib/async-queue.js";
-import type {
-  RuntimeApprovalKind,
-  RuntimeEvent,
-  RuntimeReasoningEffort,
-  RuntimeSessionRef,
-  RuntimeUserInput
+import {
+  SessionBusyError,
+  type RuntimeApprovalKind,
+  type RuntimeEvent,
+  type RuntimeReasoningEffort,
+  type RuntimeSessionRef,
+  type RuntimeUserInput
 } from "../../runtime-contracts.js";
 import {
   createClaudeEventMapperState,
@@ -17,7 +18,7 @@ import {
 import type { AppConfig } from "../../config.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import type { SandboxTurnFrame } from "../runtime/sandbox-agent-protocol.js";
-import type { ClaudeSessionState } from "./claude-types.js";
+import type { ClaudeSessionState, PendingE2bApproval } from "./claude-types.js";
 import { buildClaudeContentBlocks, isInitMessage } from "./claude-sdk-helpers.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
 
@@ -35,11 +36,15 @@ type TurnInput = {
 export type ClaudeTurnContext = {
   state: ClaudeSessionState;
   activeTurns: Set<string>;
-  e2bPendingApprovals: Map<string, string>;
+  e2bPendingApprovals: Map<string, PendingE2bApproval>;
   stores: { approvals?: ApprovalStore } | undefined;
   config: Pick<AppConfig, "CLAUDE_CODE_MODEL" | "APPROVAL_REQUEST_TTL_MS">;
   log: FastifyBaseLogger;
   managedToolCatalog: ManagedToolCatalog;
+  /** Fired when the turn slot is reserved — the adapter clears the idle timer. */
+  onTurnStart?: () => void;
+  /** Fired when the turn settles (any path) — the adapter re-arms idle teardown. */
+  onTurnEnd?: () => void;
 };
 
 export async function* executeClaudeTurn(
@@ -49,10 +54,32 @@ export async function* executeClaudeTurn(
 ): AsyncIterable<RuntimeEvent> {
   const { state, activeTurns, e2bPendingApprovals, stores, config, log } = ctx;
 
-  if (input.onBeforeTurn) {
-    await input.onBeforeTurn();
+  // Reserve the turn slot SYNCHRONOUSLY — check-and-add with no await in
+  // between — so a concurrent runMessage for the same session can't slip past
+  // during onBeforeTurn (multi-second artifact sync). Without this, the
+  // second turn's failure path would clobber the first turn's activeTurns
+  // flag and interrupt/push hooks.
+  if (activeTurns.has(session.sessionId)) {
+    throw new SessionBusyError(session.sessionId);
   }
   activeTurns.add(session.sessionId);
+  ctx.onTurnStart?.();
+  // "Remember for this turn" decisions are scoped to a single turn. REPLACE the
+  // set (don't clear it): pending approvals capture their turn's instance, so a
+  // decision still in flight from the previous turn mutates the orphaned set
+  // instead of leaking an auto-approval into this one.
+  state.autoApprovedKindsForTurn = new Set();
+
+  if (input.onBeforeTurn) {
+    try {
+      await input.onBeforeTurn();
+    } catch (error) {
+      // The turn never started — release the reservation and surface the error.
+      activeTurns.delete(session.sessionId);
+      ctx.onTurnEnd?.();
+      throw error;
+    }
+  }
   const eventQueue = new AsyncQueue<RuntimeEvent>();
   const responseId = input.assistantMessageId ?? uuidv7();
   const mapperState = createClaudeEventMapperState(responseId);
@@ -147,6 +174,7 @@ export async function* executeClaudeTurn(
       // Same for the push hook — a late policy-approval push must not land on a
       // queue that's about to be ended.
       state.activeTurnPush.current = null;
+      ctx.onTurnEnd?.();
       eventQueue.end();
     }
   })();
@@ -168,7 +196,7 @@ async function runE2bTurn(ctx: {
     toolInput: Record<string, unknown>;
     kind: RuntimeApprovalKind;
   }) => Promise<void>;
-  e2bPendingApprovals: Map<string, string>;
+  e2bPendingApprovals: Map<string, PendingE2bApproval>;
   config: Pick<AppConfig, "CLAUDE_CODE_MODEL" | "APPROVAL_REQUEST_TTL_MS">;
   log: FastifyBaseLogger;
   session: RuntimeSessionRef;
@@ -260,7 +288,26 @@ async function runE2bTurn(ctx: {
       }
     },
     onApprovalRequest: (frame) => {
-      e2bPendingApprovals.set(frame.approvalId, state.sessionId);
+      // If the user already approved this kind for the current turn
+      // (rememberForTurn), answer the harness immediately — no DB row, no
+      // prompt. Codex equivalent: autoApprovedKinds check in
+      // runtime-request-handler.ts — keep both in sync.
+      if (state.autoApprovedKindsForTurn.has(frame.kind)) {
+        void state.e2bProcess.sendApprovalResponse(frame.approvalId, "approve").catch((err) => {
+          log.warn(
+            { err, approvalId: frame.approvalId },
+            "Failed to forward remembered auto-approval to E2B sandbox"
+          );
+        });
+        return;
+      }
+      e2bPendingApprovals.set(frame.approvalId, {
+        sessionId: state.sessionId,
+        kind: frame.kind,
+        // Capture THIS turn's remember-set so a decision landing after the
+        // turn ends can't pollute the next turn's set.
+        autoApprovedKinds: state.autoApprovedKindsForTurn
+      });
       void ctx.dispatchApprovalEvent({
         approvalId: frame.approvalId,
         toolName: frame.toolName,
