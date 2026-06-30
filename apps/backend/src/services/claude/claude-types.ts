@@ -9,6 +9,8 @@ import type { RuntimeApprovalKind, RuntimeEvent } from "../../runtime-contracts.
  */
 export type PendingE2bApproval = {
   sessionId: string;
+  /** Harness-generated correlation id, used only for the stdio response frame. */
+  sandboxApprovalId: string;
   kind: RuntimeApprovalKind;
   autoApprovedKinds: Set<RuntimeApprovalKind>;
 };

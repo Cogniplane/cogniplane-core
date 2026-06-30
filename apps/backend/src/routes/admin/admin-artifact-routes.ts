@@ -9,9 +9,13 @@ import { apiError, notFoundError } from "../../lib/http-errors.js";
 import { artifactIdParams } from "../../lib/route-schemas.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
 import { serialize } from "../../lib/serialize-response.js";
-import { withAdmin } from "./admin-route-helpers.js";
+import type { AuditEventStore } from "../../services/audit-event-store.js";
+import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
-export async function registerAdminArtifactRoutes(app: FastifyInstance): Promise<void> {
+export async function registerAdminArtifactRoutes(
+  app: FastifyInstance,
+  stores: { auditEvents: AuditEventStore }
+): Promise<void> {
   app.post(
     "/admin/artifacts/:artifactId/download-token",
     withAdmin(app, async (request, reply) => {
@@ -81,7 +85,8 @@ export async function registerAdminArtifactRoutes(app: FastifyInstance): Promise
         return {
           kind: "ok" as const,
           token: String(row.token),
-          expiresAt: new Date(row.expires_at).toISOString()
+          expiresAt: new Date(row.expires_at).toISOString(),
+          ownerUserId: String(artifact.user_id)
         };
       });
 
@@ -93,6 +98,19 @@ export async function registerAdminArtifactRoutes(app: FastifyInstance): Promise
         reply.code(409);
         return apiError("artifact_not_ready");
       }
+
+      await createAdminAuditEvent(stores.auditEvents, {
+        tenantId,
+        userId: request.auth.userId,
+        type: "admin.artifact.download_token_minted",
+        payload: {
+          artifactId,
+          actorUserId: request.auth.userId,
+          ownerUserId: result.ownerUserId
+        },
+        ipAddress: request.ip,
+        userAgent: request.headers["user-agent"] ?? null
+      });
 
       return serialize(DownloadHandleEnvelopeSchema, {
         download: {

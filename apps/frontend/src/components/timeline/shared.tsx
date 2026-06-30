@@ -15,7 +15,7 @@ import type { ToolCallRow } from "../timeline.logic";
 // ---------------------------------------------------------------------------
 
 export const STATUS_BORDER: Record<ToolCallRow["status"], string> = {
-  in_progress: "border-l-accent",
+  in_progress: "border-l-info",
   completed: "border-l-outline-variant",
   failed: "border-l-danger",
   declined: "border-l-warning"

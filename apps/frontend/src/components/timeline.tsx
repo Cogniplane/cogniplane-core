@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { ChevronDownIcon } from "lucide-react";
 
 import {
@@ -140,14 +141,24 @@ export type ActivityTimelineProps = TimelineInputs & {
 };
 
 export function ActivityTimeline(props: ActivityTimelineProps) {
-  const rows = buildTimeline({
-    messages: props.messages,
-    pendingApprovals: props.pendingApprovals,
-    approvalDecision: props.approvalDecision,
-    mcpServerEvents: props.mcpServerEvents,
-    runtimeNotices: props.runtimeNotices
-  });
-  const fragments = groupTimelineRows(rows);
+  const rows = useMemo(
+    () =>
+      buildTimeline({
+        messages: props.messages,
+        pendingApprovals: props.pendingApprovals,
+        approvalDecision: props.approvalDecision,
+        mcpServerEvents: props.mcpServerEvents,
+        runtimeNotices: props.runtimeNotices
+      }),
+    [
+      props.messages,
+      props.pendingApprovals,
+      props.approvalDecision,
+      props.mcpServerEvents,
+      props.runtimeNotices
+    ]
+  );
+  const fragments = useMemo(() => groupTimelineRows(rows), [rows]);
 
   return (
     <>

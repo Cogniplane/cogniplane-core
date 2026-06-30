@@ -174,7 +174,7 @@ describe("tryAuthenticateRuntimeToken — credential precedence", () => {
     expect(request.auth).toBeUndefined();
   });
 
-  test("x-api-key rt_ is IGNORED for /mcp/ (only Authorization/query honored there)", () => {
+  test("x-api-key rt_ is IGNORED for /mcp/ (only Authorization honored there)", () => {
     const request = fakeRequest({
       url: "/mcp/server-1",
       headers: { "x-api-key": validToken() }
@@ -184,27 +184,18 @@ describe("tryAuthenticateRuntimeToken — credential precedence", () => {
     expect(request.auth).toBeUndefined();
   });
 
-  test("?token=rt_ fallback authenticates /mcp/ when no header is present", () => {
+  test("?token=rt_ in the URL is REJECTED — header transport only", () => {
     const request = fakeRequest({
       url: `/mcp/server-1?token=${validToken()}`
     });
 
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
-    expect(request.auth?.tenantId).toBe(CLAIMS.tid);
-  });
-
-  test("?token=rt_ fallback authenticates /llm/openai/", () => {
-    const request = fakeRequest({
-      url: `/llm/openai/v1/responses?token=${validToken()}`
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
-    expect(request.auth?.tenantId).toBe(CLAIMS.tid);
+    expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
+    expect(request.auth).toBeUndefined();
   });
 });
 
 describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
-  test("Bearer JWT (non-rt_) is ignored and falls through to ?token=", () => {
+  test("Bearer JWT (non-rt_) is ignored", () => {
     const request = fakeRequest({
       url: "/mcp/server-1",
       headers: { authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig" }
@@ -226,14 +217,6 @@ describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
     expect(request.auth).toBeUndefined();
   });
 
-  test("?token= with a non-rt_ value is ignored", () => {
-    const request = fakeRequest({
-      url: "/mcp/server-1?token=not-a-runtime-token"
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
-    expect(request.auth).toBeUndefined();
-  });
 });
 
 describe("tryAuthenticateRuntimeToken — rejected tokens", () => {

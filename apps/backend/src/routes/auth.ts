@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { WorkOS } from "@workos-inc/node";
@@ -8,45 +8,45 @@ import { uuidv7 } from "../lib/uuid.js";
 import type { AppConfig } from "../config.js";
 import { isCorsOriginAllowed } from "../lib/cors.js";
 import type { Pool } from "../lib/db.js";
-import { withTransaction } from "../lib/db.js";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../lib/jwt.js";
-import {
-  consumeRefreshJti,
-  issueRefreshJti,
-  revokeRefreshFamily
-} from "../lib/refresh-token-store.js";
+import type { RefreshRotationResult } from "../lib/refresh-token-store.js";
 import { getWorkOS } from "../lib/workos-client.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
+import { RefreshTokenRotationService } from "../services/auth/refresh-token-rotation-service.js";
+import {
+  provisionTenantIdentity,
+  resolveWorkOsOrganization
+} from "../services/auth/workos-tenant-provisioning.js";
 import { listIntegrationDescriptors } from "../services/integrations/integration-registry.js";
+import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
+import type { RequestLimitsInterface } from "../services/request-limits.js";
 
 const REFRESH_COOKIE_NAME = "cogniplane_refresh";
 const REFRESH_COOKIE_MAX_AGE_S = 7 * 24 * 60 * 60;
+const REFRESH_COOKIE_PATH = "/auth";
 
 const OAUTH_STATE_COOKIE = "cogniplane_oauth_state";
+const OAUTH_PKCE_COOKIE = "cogniplane_oauth_pkce";
 const OAUTH_STATE_TTL_S = 600;
 const OAUTH_PARAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+const PKCE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
+
+function sendRefreshResult(reply: FastifyReply, result: RefreshRotationResult): FastifyReply {
+  reply.setCookie(REFRESH_COOKIE_NAME, result.refreshToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    path: REFRESH_COOKIE_PATH,
+    maxAge: REFRESH_COOKIE_MAX_AGE_S
+  });
+  return reply.send({ accessToken: result.accessToken });
+}
 
 export function timingSafeEqualString(a: string, b: string): boolean {
   if (a.length !== b.length) {
     return false;
   }
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
-
-export function resolveTenantMembershipRole(input: {
-  existingRole: string | null;
-  isFirstMember: boolean;
-  workosRoleSlug: string | null | undefined;
-}): "owner" | "admin" | "member" {
-  if (input.existingRole === "owner") {
-    return "owner";
-  }
-
-  if (input.isFirstMember) {
-    return "owner";
-  }
-
-  return input.workosRoleSlug === "admin" ? "admin" : "member";
 }
 
 /**
@@ -113,11 +113,13 @@ export async function registerAuthRoutes(
     db,
     config,
     auditEvents,
+    limits,
     workos: injectedWorkos
   }: {
     db: Pool;
     config: AppConfig;
     auditEvents: AuditEventStore;
+    limits?: RequestLimitsInterface;
     /** Optional WorkOS instance — overrides the module-level singleton. Tests pass a stub. */
     workos?: WorkOS;
   }
@@ -135,8 +137,14 @@ export async function registerAuthRoutes(
 
   if (config.AUTH_MODE === "workos") {
     const workos = injectedWorkos ?? getWorkOS(config);
+    const refreshTokens = new RefreshTokenRotationService(
+      requireRefreshTokenStore(app),
+      REFRESH_COOKIE_MAX_AGE_S
+    );
 
     app.get("/auth/login", async (request, reply) => {
+      if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
+
       const { organization, connection } = request.query as Record<string, string | undefined>;
 
       if (organization !== undefined && !OAUTH_PARAM_PATTERN.test(organization)) {
@@ -146,7 +154,14 @@ export async function registerAuthRoutes(
         return reply.code(400).send({ error: "invalid_oauth_param", field: "connection" });
       }
 
-      const state = randomBytes(32).toString("base64url");
+      const { url: authorizationUrl, state, codeVerifier } =
+        await workos.userManagement.getAuthorizationUrlWithPKCE({
+          provider: "authkit",
+          clientId: config.WORKOS_CLIENT_ID!,
+          redirectUri: config.WORKOS_REDIRECT_URI!,
+          ...(organization ? { organizationId: organization, prompt: "login" } : {}),
+          ...(connection ? { connectionId: connection } : {})
+        });
 
       reply.setCookie(OAUTH_STATE_COOKIE, state, {
         httpOnly: true,
@@ -155,29 +170,30 @@ export async function registerAuthRoutes(
         path: "/",
         maxAge: OAUTH_STATE_TTL_S
       });
-
-      const authorizationUrl = workos.userManagement.getAuthorizationUrl({
-        provider: "authkit",
-        clientId: config.WORKOS_CLIENT_ID!,
-        redirectUri: config.WORKOS_REDIRECT_URI!,
-        state,
-        ...(organization ? { organizationId: organization, prompt: "login" } : {}),
-        ...(connection ? { connectionId: connection } : {})
+      reply.setCookie(OAUTH_PKCE_COOKIE, codeVerifier, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        path: REFRESH_COOKIE_PATH,
+        maxAge: OAUTH_STATE_TTL_S
       });
 
       return reply.send({ url: authorizationUrl });
     });
 
     app.post("/auth/callback", async (request, reply) => {
+      if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
+
       const { code, state } = (request.body ?? {}) as { code?: string; state?: string };
+      const cookieState = (request.cookies as Record<string, string>)?.[OAUTH_STATE_COOKIE];
+      const codeVerifier = (request.cookies as Record<string, string>)?.[OAUTH_PKCE_COOKIE];
+      // Always clear the flow cookies — both are single-use regardless of outcome.
+      reply.clearCookie(OAUTH_STATE_COOKIE, { path: "/" });
+      reply.clearCookie(OAUTH_PKCE_COOKIE, { path: REFRESH_COOKIE_PATH });
 
       if (!code) {
         return reply.code(400).send({ error: "missing_code" });
       }
-
-      const cookieState = (request.cookies as Record<string, string>)?.[OAUTH_STATE_COOKIE];
-      // Always clear the state cookie — it's single-use regardless of outcome.
-      reply.clearCookie(OAUTH_STATE_COOKIE, { path: "/" });
 
       if (
         !state ||
@@ -188,9 +204,14 @@ export async function registerAuthRoutes(
         return reply.code(400).send({ error: "invalid_state" });
       }
 
+      if (!codeVerifier || !PKCE_VERIFIER_PATTERN.test(codeVerifier)) {
+        return reply.code(400).send({ error: "invalid_pkce_verifier" });
+      }
+
       const authResponse = await workos.userManagement.authenticateWithCode({
         code,
-        clientId: config.WORKOS_CLIENT_ID!
+        clientId: config.WORKOS_CLIENT_ID!,
+        codeVerifier
       });
 
       const workosUser = authResponse.user;
@@ -200,139 +221,83 @@ export async function registerAuthRoutes(
         return reply.code(403).send({ error: "email_required" });
       }
 
-      const orgMemberships = await workos.userManagement.listOrganizationMemberships({
-        userId: workosUser.id
+      const organization = await resolveWorkOsOrganization(workos, {
+        workosUserId: workosUser.id,
+        organizationIdHint: authResponse.organizationId
       });
 
-      // If the auth flow was initiated with a specific organization, prefer that one.
-      const orgMembership = authResponse.organizationId
-        ? orgMemberships.data.find((m) => m.organizationId === authResponse.organizationId)
-        : orgMemberships.data[0];
+      if (organization.status === "selection_required") {
+        return reply.code(409).send({
+          error: "organization_selection_required",
+          organizations: organization.organizations
+        });
+      }
 
-      if (!orgMembership) {
+      if (organization.status === "no_organization") {
         return reply.code(403).send({ error: "no_organization" });
       }
 
-      const workosOrg = await workos.organizations.getOrganization(orgMembership.organizationId);
-
-      // Wrap the entire user/tenant/membership upsert in a single transaction to
-      // prevent race conditions in first-member owner promotion.
-      const { tenantId, resolvedUserId, finalRole, previousRole } = await withTransaction(db, async (client) => {
-        // Upsert tenant
-        const tenantResult = await client.query(
-          `INSERT INTO tenants (tenant_id, tenant_name, slug, workos_org_id)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (workos_org_id) DO UPDATE SET
-             tenant_name = EXCLUDED.tenant_name,
-             updated_at = NOW()
-           RETURNING tenant_id`,
-          [uuidv7(), workosOrg.name, workosOrg.id.toLowerCase(), workosOrg.id]
-        );
-        const tenantId = tenantResult.rows[0].tenant_id as string;
-
-        // Upsert user
-        const userId = uuidv7();
-        const userResult = await client.query(
-          `INSERT INTO users (user_id, email, display_name, workos_user_id)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (workos_user_id) DO UPDATE SET
-             email = EXCLUDED.email,
-             display_name = EXCLUDED.display_name,
-             updated_at = NOW()
-           RETURNING user_id`,
-          [
-            userId,
-            workosUser.email,
-            `${workosUser.firstName ?? ""} ${workosUser.lastName ?? ""}`.trim(),
-            workosUser.id
-          ]
-        );
-        const resolvedUserId = userResult.rows[0].user_id as string;
-
-        // Check member count before upserting membership — inside the same transaction
-        // to prevent concurrent first-login races.
-        const memberCount = await client.query(
-          `SELECT COUNT(*) AS cnt FROM tenant_memberships WHERE tenant_id = $1`,
-          [tenantId]
-        );
-        const isFirstMember = Number(memberCount.rows[0].cnt) === 0;
-
-        const existingMembership = await client.query(
-          `SELECT role FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2 LIMIT 1`,
-          [tenantId, resolvedUserId]
-        );
-        const previousRole = existingMembership.rows[0]?.role as string | undefined;
-        const finalRole = resolveTenantMembershipRole({
-          existingRole: previousRole ?? null,
-          isFirstMember,
-          workosRoleSlug: orgMembership.role?.slug
-        });
-
-        await client.query(
-          `INSERT INTO tenant_memberships (tenant_id, user_id, role)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (tenant_id, user_id) DO UPDATE SET
-             role = EXCLUDED.role,
-             updated_at = NOW()`,
-          [tenantId, resolvedUserId, finalRole]
-        );
-
-        return { tenantId, resolvedUserId, finalRole, previousRole };
+      const displayName = `${workosUser.firstName ?? ""} ${workosUser.lastName ?? ""}`.trim();
+      const identity = await provisionTenantIdentity(db, {
+        organizationId: organization.organizationId,
+        organizationName: organization.organizationName,
+        workosUserId: workosUser.id,
+        email: workosUser.email,
+        displayName,
+        workosRoleSlug: organization.roleSlug
       });
 
-      if (previousRole !== undefined && previousRole !== finalRole) {
+      if (identity.previousRole !== undefined && identity.previousRole !== identity.role) {
         await auditEvents.create({
-          tenantId,
+          tenantId: identity.tenantId,
           sessionId: null,
-          userId: resolvedUserId,
+          userId: identity.userId,
           type: "role_changed",
-          payload: { from: previousRole, to: finalRole },
+          payload: { from: identity.previousRole, to: identity.role },
           ipAddress: request.ip,
           userAgent: request.headers["user-agent"] ?? null
         });
       }
 
       const accessToken = await signAccessToken(config, {
-        sub: resolvedUserId,
-        tid: tenantId,
-        role: finalRole,
+        sub: identity.userId,
+        tid: identity.tenantId,
+        role: identity.role,
         email: workosUser.email
       });
 
       const refreshTokenId = uuidv7();
       const refreshFamilyId = uuidv7();
       const refreshToken = await signRefreshToken(config, {
-        sub: resolvedUserId,
-        tid: tenantId,
+        sub: identity.userId,
+        tid: identity.tenantId,
         jti: refreshTokenId,
         fid: refreshFamilyId
       });
 
       // Bind the jti to its family. Rotations stay within the same family so
       // we can detect refresh-token reuse (see lib/refresh-token-store.ts).
-      const redis = requireRefreshTokenStore(app);
-      await issueRefreshJti(redis, {
+      await refreshTokens.issue({
         jti: refreshTokenId,
-        familyId: refreshFamilyId,
-        ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
+        familyId: refreshFamilyId
       });
 
       reply.setCookie(REFRESH_COOKIE_NAME, refreshToken, {
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        path: "/",
+        path: REFRESH_COOKIE_PATH,
         maxAge: REFRESH_COOKIE_MAX_AGE_S
       });
 
       return reply.send({
         accessToken,
         user: {
-          userId: resolvedUserId,
+          userId: identity.userId,
           email: workosUser.email,
-          displayName: `${workosUser.firstName ?? ""} ${workosUser.lastName ?? ""}`.trim(),
-          tenantId,
-          role: finalRole
+          displayName,
+          tenantId: identity.tenantId,
+          role: identity.role
         }
       });
     });
@@ -341,6 +306,7 @@ export async function registerAuthRoutes(
       if (!passesCsrfOriginCheck(request, reply, config.API_ORIGIN)) {
         return reply;
       }
+      if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
 
       const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
       if (!refreshToken) {
@@ -350,26 +316,28 @@ export async function registerAuthRoutes(
       try {
         const payload = await verifyRefreshToken(config, refreshToken);
 
-        const redis = requireRefreshTokenStore(app);
-
-        // Atomically consume the jti and detect replay against its family.
-        const consumed = await consumeRefreshJti(redis, {
+        const claim = await refreshTokens.claim({
           jti: payload.jti,
-          familyId: payload.fid,
-          ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
+          familyId: payload.fid
         });
 
-        if (consumed.status === "reuse_detected") {
+        if (claim.status === "completed") {
+          return sendRefreshResult(reply, claim.result);
+        }
+
+        if (claim.status === "in_progress") {
+          reply.header("Retry-After", "1");
+          return reply.code(503).send({ error: "refresh_in_progress" });
+        }
+
+        if (claim.status === "reuse_detected") {
           // A jti from this family was replayed after rotation. Treat as
           // theft: revoke the entire family so the legitimate user is forced
           // back through login. Clear the cookie so the legitimate session
           // doesn't keep replaying the now-revoked token.
-          await revokeRefreshFamily(redis, {
-            familyId: consumed.familyId,
-            ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
-          });
+          await refreshTokens.revoke(claim.familyId);
           request.log.warn(
-            { userId: payload.sub, tenantId: payload.tid, familyId: consumed.familyId },
+            { userId: payload.sub, tenantId: payload.tid, familyId: claim.familyId },
             "auth refresh: reuse detected — revoking family"
           );
           await auditEvents.create({
@@ -377,16 +345,20 @@ export async function registerAuthRoutes(
             sessionId: null,
             userId: payload.sub,
             type: "auth.refresh_token_reuse_detected",
-            payload: { familyId: consumed.familyId },
+            payload: { familyId: claim.familyId },
             ipAddress: request.ip,
             userAgent: request.headers["user-agent"] ?? null
           });
-          reply.clearCookie(REFRESH_COOKIE_NAME, { path: "/" });
+          reply.clearCookie(REFRESH_COOKIE_NAME, { path: REFRESH_COOKIE_PATH });
           return reply.code(401).send({ error: "token_revoked" });
         }
 
-        if (consumed.status !== "ok") {
-          // "revoked" or "not_found" — refuse without further action.
+        if (claim.status === "expired") {
+          reply.clearCookie(REFRESH_COOKIE_NAME, { path: REFRESH_COOKIE_PATH });
+          return reply.code(401).send({ error: "session_expired" });
+        }
+
+        if (claim.status !== "claimed") {
           return reply.code(401).send({ error: "token_revoked" });
         }
 
@@ -421,21 +393,14 @@ export async function registerAuthRoutes(
           fid: familyId
         });
 
-        await issueRefreshJti(redis, {
+        await refreshTokens.issue({
           jti: newJti,
-          familyId,
-          ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
+          familyId
         });
 
-        reply.setCookie(REFRESH_COOKIE_NAME, newRefreshToken, {
-          httpOnly: true,
-          secure: true,
-          sameSite: "none",
-          path: "/",
-          maxAge: REFRESH_COOKIE_MAX_AGE_S
-        });
-
-        return reply.send({ accessToken });
+        const result = { accessToken, refreshToken: newRefreshToken };
+        await refreshTokens.complete(payload.jti, result);
+        return sendRefreshResult(reply, result);
       } catch {
         return reply.code(401).send({ error: "invalid_refresh_token" });
       }
@@ -445,6 +410,7 @@ export async function registerAuthRoutes(
       if (!passesCsrfOriginCheck(request, reply, config.API_ORIGIN)) {
         return reply;
       }
+      if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
 
       const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
 
@@ -453,11 +419,7 @@ export async function registerAuthRoutes(
       if (refreshToken) {
         try {
           const payload = await verifyRefreshToken(config, refreshToken);
-          const redis = requireRefreshTokenStore(app);
-          await revokeRefreshFamily(redis, {
-            familyId: payload.fid,
-            ttlSeconds: REFRESH_COOKIE_MAX_AGE_S
-          });
+          await refreshTokens.revoke(payload.fid);
         } catch {
           // If the token is already expired/invalid, nothing to revoke.
         }
@@ -467,7 +429,7 @@ export async function registerAuthRoutes(
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        path: "/"
+        path: REFRESH_COOKIE_PATH
       });
       return reply.send({ ok: true });
     });

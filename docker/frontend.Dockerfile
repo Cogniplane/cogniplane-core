@@ -36,6 +36,15 @@ RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build
 
+RUN groupadd -g 1001 appgroup && useradd -u 1001 -g appgroup -m -s /bin/bash appuser \
+  && chown -R appuser:appgroup /app
+
+USER appuser
+
 EXPOSE 3000
+
+# No wget install: Node 24 has fetch. 302→/login counts as healthy, hence <500.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
 
 CMD ["pnpm", "--filter", "@cogniplane/frontend", "exec", "next", "start", "--hostname", "0.0.0.0", "--port", "3000"]

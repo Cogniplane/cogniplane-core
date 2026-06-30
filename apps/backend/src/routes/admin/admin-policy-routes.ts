@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import type { FastifyInstance } from "fastify";
 
 import {
@@ -29,7 +30,6 @@ import type { PolicyService } from "../../services/policy/policy-service.js";
 import {
   configError,
   createAdminAuditEvent,
-  parseAdminBody,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -129,7 +129,7 @@ export async function registerAdminPolicyRoutes(
 
   // Create a rule.
   app.post("/admin/policy/rules", withAdmin(app, async (request, reply) => {
-    const parsed = parseAdminBody(reply, PolicyRuleInputSchema, request.body);
+    const parsed = parseRequestInput(reply, PolicyRuleInputSchema, request.body);
     if (!parsed.ok) return parsed.response;
 
     try {
@@ -139,7 +139,7 @@ export async function registerAdminPolicyRoutes(
         request.auth.userId
       );
       // Drop the hot-path rule cache so the new rule takes effect immediately.
-      stores.policyService.invalidate(request.auth.tenantId);
+      await stores.policyService.invalidate(request.auth.tenantId);
       await createAdminAuditEvent(stores.auditEvents, {
         tenantId: request.auth.tenantId,
         userId: request.auth.userId,
@@ -159,7 +159,7 @@ export async function registerAdminPolicyRoutes(
     const params = ruleIdParamsSchema.safeParse(request.params);
     if (!params.success) return respondAdminNotFound(reply, "policy_rule_not_found");
 
-    const parsed = parseAdminBody(reply, PolicyRulePatchSchema, request.body);
+    const parsed = parseRequestInput(reply, PolicyRulePatchSchema, request.body);
     if (!parsed.ok) return parsed.response;
 
     try {
@@ -169,7 +169,7 @@ export async function registerAdminPolicyRoutes(
         parsed.value
       );
       if (!rule) return respondAdminNotFound(reply, "policy_rule_not_found");
-      stores.policyService.invalidate(request.auth.tenantId);
+      await stores.policyService.invalidate(request.auth.tenantId);
       await createAdminAuditEvent(stores.auditEvents, {
         tenantId: request.auth.tenantId,
         userId: request.auth.userId,
@@ -191,7 +191,7 @@ export async function registerAdminPolicyRoutes(
 
     const deleted = await stores.policyRules.delete(request.auth.tenantId, params.data.ruleId);
     if (!deleted) return respondAdminNotFound(reply, "policy_rule_not_found");
-    stores.policyService.invalidate(request.auth.tenantId);
+    await stores.policyService.invalidate(request.auth.tenantId);
     await createAdminAuditEvent(stores.auditEvents, {
       tenantId: request.auth.tenantId,
       userId: request.auth.userId,
@@ -206,7 +206,7 @@ export async function registerAdminPolicyRoutes(
 
   // Simulate: evaluate a hypothetical action without recording or gating.
   app.post("/admin/policy/simulate", withAdmin(app, async (request, reply) => {
-    const parsed = parseAdminBody(reply, PolicySimulateRequestSchema, request.body);
+    const parsed = parseRequestInput(reply, PolicySimulateRequestSchema, request.body);
     if (!parsed.ok) return parsed.response;
 
     const evaluation = await stores.policyService.evaluate(request.auth.tenantId, {
@@ -270,7 +270,7 @@ export async function registerAdminPolicyRoutes(
   // 409 so the UI refetches), then the engine cache is dropped so the new order
   // takes effect immediately.
   app.put("/admin/policy/rules/order", withAdmin(app, async (request, reply) => {
-    const parsed = parseAdminBody(reply, PolicyReorderRequestSchema, request.body);
+    const parsed = parseRequestInput(reply, PolicyReorderRequestSchema, request.body);
     if (!parsed.ok) return parsed.response;
 
     let rules;
@@ -284,7 +284,7 @@ export async function registerAdminPolicyRoutes(
       return respondAdminMutationError(reply, error, "Failed to reorder policy rules.");
     }
 
-    stores.policyService.invalidate(request.auth.tenantId);
+    await stores.policyService.invalidate(request.auth.tenantId);
     await createAdminAuditEvent(stores.auditEvents, {
       tenantId: request.auth.tenantId,
       userId: request.auth.userId,

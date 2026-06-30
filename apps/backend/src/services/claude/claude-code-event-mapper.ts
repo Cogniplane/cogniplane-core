@@ -32,6 +32,28 @@ export type ClaudeEventMapperState = {
   // `errors[]` / subtype, so we stash the typed assistant error here to turn it
   // into an actionable failure message in mapResult.
   assistantError: string | null;
+  // ── Retraction bookkeeping (model refusal fallback) ─────────────────────
+  // Text emitted as output_text.delta for the in-flight assistant message
+  // (cleared when the message's snapshot frame closes it).
+  currentMessageText: string;
+  // Reasoning (thinking_delta) emitted under the in-flight message.
+  currentMessageReasoning: string;
+  // Tool itemIds whose tool.started was emitted under the in-flight message.
+  currentMessageToolItemIds: string[];
+  // Closed per-message text segments keyed by SDK message uuid, in emission
+  // order. When the SDK retracts messages (`supersedes` on the replacement
+  // frame, or `retracted_message_uuids` on the end-of-turn
+  // model_refusal_fallback notice — idempotent pair), we drop the matching
+  // segments and emit a whole-text replace so downstream buffers shed the
+  // refused partial.
+  closedTextSegments: Map<string, string>;
+  // Reasoning emitted under each closed SDK frame (only frames that produced
+  // any — keeps eviction from emitting spurious replace frames).
+  closedReasoningSegments: Map<string, string>;
+  // Tool itemIds emitted under each closed SDK frame (assistant frames that
+  // started tools, user frames that carried tool_results). Retracting one of
+  // these uuids retracts the tool cards/rows it produced.
+  frameToolItemIds: Map<string, string[]>;
 };
 
 export function createClaudeEventMapperState(responseId: string): ClaudeEventMapperState {
@@ -41,8 +63,73 @@ export function createClaudeEventMapperState(responseId: string): ClaudeEventMap
     assistantTextStreamed: false,
     pendingToolCalls: new Map(),
     indexToToolUseId: new Map(),
-    assistantError: null
+    assistantError: null,
+    currentMessageText: "",
+    currentMessageReasoning: "",
+    currentMessageToolItemIds: [],
+    closedTextSegments: new Map(),
+    closedReasoningSegments: new Map(),
+    frameToolItemIds: new Map()
   };
+}
+
+/**
+ * Drops retracted message segments. When text segments matched, returns a
+ * whole-text replace event reflecting the corrected transcript (surviving
+ * closed segments + the in-flight message's streamed text); when tool events
+ * were emitted under a retracted frame, returns a tool.retracted event so
+ * downstream deletes the persisted rows and removes the cards.
+ * Idempotent: unknown or already-evicted uuids are a no-op, so the
+ * replacement frame's `supersedes` and the end-of-turn
+ * `model_refusal_fallback.retracted_message_uuids` can both fire.
+ */
+function evictRetractedSegments(state: ClaudeEventMapperState, uuids: unknown): RuntimeEvent[] {
+  if (!Array.isArray(uuids)) return [];
+  let textEvicted = false;
+  let reasoningEvicted = false;
+  const retractedToolItemIds: string[] = [];
+  for (const uuid of uuids) {
+    if (typeof uuid !== "string") continue;
+    if (state.closedTextSegments.delete(uuid)) textEvicted = true;
+    if (state.closedReasoningSegments.delete(uuid)) reasoningEvicted = true;
+    const toolItemIds = state.frameToolItemIds.get(uuid);
+    if (toolItemIds) {
+      state.frameToolItemIds.delete(uuid);
+      retractedToolItemIds.push(...toolItemIds);
+    }
+  }
+
+  // Retracted tools must not resurrect via a late (tombstoned) tool_result.
+  for (const itemId of retractedToolItemIds) {
+    state.pendingToolCalls.delete(itemId);
+    for (const [idx, id] of state.indexToToolUseId) {
+      if (id === itemId) state.indexToToolUseId.delete(idx);
+    }
+  }
+
+  const events: RuntimeEvent[] = [];
+  if (textEvicted) {
+    events.push({
+      type: "response.output_text.replace",
+      responseId: state.responseId,
+      text: [...state.closedTextSegments.values()].join("") + state.currentMessageText
+    });
+  }
+  if (reasoningEvicted) {
+    events.push({
+      type: "framework:reasoning_summary.replace",
+      responseId: state.responseId,
+      text: [...state.closedReasoningSegments.values()].join("") + state.currentMessageReasoning
+    });
+  }
+  if (retractedToolItemIds.length > 0) {
+    events.push({
+      type: "response.tool.retracted",
+      responseId: state.responseId,
+      itemIds: [...new Set(retractedToolItemIds)]
+    });
+  }
+  return events;
 }
 
 /**
@@ -75,6 +162,29 @@ function mapLooseMessage(
       if (message.subtype === "init") {
         return [{ type: "response.created", responseId: state.responseId }];
       }
+      // The SDK retried the turn on a fallback model after the primary model
+      // refused (SDKModelRefusalFallbackMessage, Agent SDK >= 0.3.174). The
+      // swap persists for the session, so tell the user instead of silently
+      // serving a different model.
+      if (message.subtype === "model_refusal_fallback") {
+        const fallbackModel = typeof message.fallback_model === "string" ? message.fallback_model : "a fallback model";
+        const originalModel = typeof message.original_model === "string" ? message.original_model : "the selected model";
+        return [
+          // Evict the refused partial first (usually a no-op — the replacement
+          // assistant frame's `replaces_message_uuids` already did it; this is
+          // the idempotent end-of-turn audit signal).
+          ...evictRetractedSegments(state, message.retracted_message_uuids),
+          {
+            type: "framework:runtime_notice",
+            responseId: state.responseId,
+            noticeId: `model-refusal-fallback:${typeof message.uuid === "string" ? message.uuid : uuidv7()}`,
+            level: "warning",
+            title: "Model fallback",
+            message: `${originalModel} refused to answer; the turn was retried on ${fallbackModel}, which stays active for the rest of this session.`,
+            createdAt: new Date().toISOString()
+          }
+        ];
+      }
       return [];
     }
 
@@ -86,6 +196,12 @@ function mapLooseMessage(
     // ── 7. assistant message complete ────────────────────────────────
     case "assistant": {
       const events: RuntimeEvent[] = [];
+
+      // Refusal-fallback replacement: this frame supersedes earlier refused
+      // messages (SDKAssistantMessage.supersedes). Evict them BEFORE
+      // accounting for this frame's own text so the replace event reflects
+      // the corrected transcript.
+      events.push(...evictRetractedSegments(state, message.supersedes));
 
       // Capture the typed assistant error (e.g. "model_not_found") so the
       // terminal result mapper can render an actionable message. Since 0.3.144
@@ -107,6 +223,7 @@ function mapLooseMessage(
             if (typeof block === "object" && block !== null && (block as Record<string, unknown>).type === "text") {
               const text = (block as Record<string, unknown>).text;
               if (typeof text === "string" && text) {
+                state.currentMessageText += text;
                 events.push({
                   type: "response.output_text.delta",
                   responseId: state.responseId,
@@ -140,6 +257,21 @@ function mapLooseMessage(
           }
         }
       }
+
+      // Close this message's text + tool segments under its SDK uuid so a
+      // later retraction (refusal fallback) can evict exactly this
+      // contribution.
+      const frameUuid = typeof message.uuid === "string" ? message.uuid : uuidv7();
+      state.closedTextSegments.set(frameUuid, state.currentMessageText);
+      if (state.currentMessageReasoning) {
+        state.closedReasoningSegments.set(frameUuid, state.currentMessageReasoning);
+      }
+      if (state.currentMessageToolItemIds.length > 0) {
+        state.frameToolItemIds.set(frameUuid, state.currentMessageToolItemIds);
+      }
+      state.currentMessageText = "";
+      state.currentMessageReasoning = "";
+      state.currentMessageToolItemIds = [];
 
       // Reset for the next assistant message in this turn (multi-step turns).
       state.assistantTextStreamed = false;
@@ -201,6 +333,7 @@ function mapStreamEvent(
         const text = delta.text;
         if (typeof text !== "string") return [];
         state.assistantTextStreamed = true;
+        state.currentMessageText += text;
         return [
           {
             type: "response.output_text.delta",
@@ -214,6 +347,7 @@ function mapStreamEvent(
       if (deltaType === "thinking_delta") {
         const thinking = delta.thinking;
         if (typeof thinking !== "string") return [];
+        state.currentMessageReasoning += thinking;
         return [
           {
             type: "framework:reasoning_summary.delta",
@@ -300,6 +434,7 @@ function mapUserMessage(
   if (!Array.isArray(content)) return [];
 
   const events: RuntimeEvent[] = [];
+  const completedToolItemIds: string[] = [];
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const blockRecord = block as Record<string, unknown>;
@@ -324,11 +459,18 @@ function mapUserMessage(
       responseId: state.responseId,
       toolCall: cloneToolCall(pending.toolCall)
     });
+    completedToolItemIds.push(toolUseId);
 
     state.pendingToolCalls.delete(toolUseId);
     for (const [idx, id] of state.indexToToolUseId) {
       if (id === toolUseId) state.indexToToolUseId.delete(idx);
     }
+  }
+
+  // A refusal-fallback retraction can name this tool_result frame's uuid
+  // (tombstoned results) — remember which tool cards it produced.
+  if (completedToolItemIds.length > 0 && typeof message.uuid === "string") {
+    state.frameToolItemIds.set(message.uuid, completedToolItemIds);
   }
 
   return events;
@@ -476,6 +618,7 @@ function recordPendingToolCall(
     inputJsonBuffer: "",
     startedAt: Date.now()
   });
+  state.currentMessageToolItemIds.push(toolCall.itemId);
   if (index !== null) state.indexToToolUseId.set(index, toolCall.itemId);
   state.lastToolUseId = toolCall.itemId;
   return {

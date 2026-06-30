@@ -38,12 +38,18 @@ test("a catch-all rule (empty conditions) matches every action", () => {
   expect(result.gating).toBe(true);
 });
 
-test("toolNames condition matches by exact tool name", () => {
+test("toolNames condition matches case-insensitively with Unicode NFC normalization", () => {
   const matched = evaluatePolicy(
-    [rule({ conditions: { toolNames: ["github_write_file"] } })],
+    [rule({ conditions: { toolNames: ["GITHUB_WRITE_FILE"] } })],
     action
   );
   expect(matched.matchedRuleId).toBe("pol_1");
+
+  const unicodeMatched = evaluatePolicy(
+    [rule({ conditions: { toolNames: ["CAFÉ_TOOL"] } })],
+    { ...action, toolName: "cafe\u0301_tool" }
+  );
+  expect(unicodeMatched.matchedRuleId).toBe("pol_1");
 
   const notMatched = evaluatePolicy(
     [rule({ conditions: { toolNames: ["notion_create_page"] } })],

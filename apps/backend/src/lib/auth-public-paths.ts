@@ -2,7 +2,7 @@
 // callbacks, refresh, logout). Earlier this matched with `String.startsWith`
 // against the raw `request.url`, which let attackers smuggle URLs that begin
 // with an allowlisted prefix (e.g. `/auth/login.attack`,
-// `/auth/github/install/callbackXYZ`) past authentication. Strip the query
+// `/auth/github/user/callbackXYZ`) past authentication. Strip the query
 // string and require an exact match against the set.
 export function isPublicAuthPath(url: string, publicPaths: ReadonlySet<string>): boolean {
   const queryStart = url.indexOf("?");

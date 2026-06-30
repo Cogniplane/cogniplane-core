@@ -15,6 +15,12 @@ export type {
   WebSearchMode,
 };
 
+// The platform-default runtime provider, used when a tenant hasn't selected one
+// (mirrors the `runtimeProvider` fallback at the tenant-settings default below).
+// Centralised so the "default adapter" is `runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]`
+// rather than a separate `runtimeManager` field.
+export const DEFAULT_RUNTIME_PROVIDER: RuntimeProvider = "codex";
+
 export type AdminSkillRecord = {
   skillId: string;
   skillName: string;
@@ -186,7 +192,7 @@ export function parseRuntimePolicySnapshot(
     id: String(profile.id),
     label: String(profile.label ?? profile.id),
     description: profile.description ? String(profile.description) : null,
-    runtimeProvider: (profile.runtimeProvider === "claude-code" ? "claude-code" : "codex") as RuntimeProvider,
+    runtimeProvider: (profile.runtimeProvider === "claude-code" ? "claude-code" : DEFAULT_RUNTIME_PROVIDER) as RuntimeProvider,
     webSearchMode: (profile.webSearchMode === "cached" || profile.webSearchMode === "live"
       ? profile.webSearchMode
       : "disabled") as WebSearchMode,

@@ -162,7 +162,14 @@ export class CodexSessionLifecycle {
     // clearing it here reclaims the slot immediately and closes a
     // narrow edge case where a leaked rt_* could re-pin a fresh
     // sandbox under the dead runtimeId.
-    this.egressIpPins?.clear(runtime.runtimeId);
+    try {
+      await this.egressIpPins?.clear(runtime.runtimeId);
+    } catch (err) {
+      this.logger.warn(
+        { err, runtimeId: runtime.runtimeId },
+        "failed to clear runtime egress IP pin during teardown"
+      );
+    }
 
     runtime.terminatedAt = new Date().toISOString();
     runtime.healthStatus = "terminated";

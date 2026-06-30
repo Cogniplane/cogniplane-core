@@ -169,6 +169,18 @@ const STRIPPED_UPSTREAM_HEADERS = new Set([
   "content-encoding"
 ]);
 
+// Both proxied APIs (Anthropic /v1/messages, OpenAI /v1/responses) carry the
+// model as a top-level `"model"` field in the JSON request body.
+function extractModelFromRequestBody(requestBody: string | undefined): string | null {
+  if (!requestBody) return null;
+  try {
+    const parsed = JSON.parse(requestBody) as Record<string, unknown>;
+    return typeof parsed.model === "string" && parsed.model ? parsed.model : null;
+  } catch {
+    return null;
+  }
+}
+
 function buildUpstreamHeaders(
   inbound: Record<string, string | string[] | undefined>,
   authHeaders: Record<string, string>
@@ -260,7 +272,7 @@ async function handleProxyRequest(
   // rt_* token's TTL, so eviction is handled by token expiry rather
   // than an explicit teardown hook.
   if (ipAddress) {
-    const pinResult = stores.egressIpPins.checkAndPin(claims.runtimeId, ipAddress);
+    const pinResult = await stores.egressIpPins.checkAndPin(claims.runtimeId, ipAddress);
     if (pinResult.kind === "mismatch") {
       await recordRejection(
         stores,
@@ -392,7 +404,12 @@ async function handleProxyRequest(
   if (tokenUsage) {
     const active = stores.activeTurnMessageMap.get(claims.sessionId, claims.runtimeId);
     if (active) {
-      const modelName = active.modelName ?? null;
+      // Prefer the model actually sent upstream on THIS request over the
+      // turn-registered model: the runtime can switch models mid-turn (e.g.
+      // the Claude SDK's refusal fallback retries on a different model), and
+      // attributing those tokens to the originally selected model would
+      // stamp the wrong model_name and price usage with the wrong table.
+      const modelName = extractModelFromRequestBody(requestBody) ?? active.modelName ?? null;
       try {
         cumulativeUsage = await stores.messages.addTokenUsage(
           claims.tenantId,

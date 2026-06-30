@@ -31,27 +31,6 @@ export type CancelPendingApprovalsInput = {
 };
 
 /**
- * Drop every pending approval for `sessionId` in a way that is safe to call
- * from any runtime adapter. Used when a turn is interrupted: leaving rows in
- * `status='pending'` would let the UI keep showing approve/reject prompts
- * for a turn that no longer exists, and a late decision would resolve into
- * a torn-down JSON-RPC request.
- *
- * Behavior, in order, per pending approval:
- *   1. Run `onCancelLocal(approvalId)` to release in-memory state and capture
- *      audit-payload extras in one pass — Codex drops its pendingApprovals
- *      entry, unblocks the JSON-RPC request, and returns `{itemId, kind}`;
- *      Claude drops its e2bPendingApprovals entry and returns nothing.
- *   2. Atomically `expire` the DB row. If it returns null (the user's
- *      decision committed first) skip the audit event — that decision will
- *      have its own audit row.
- *   3. Emit one `approval.expired` audit row carrying `{ reason, ...extras }`.
- *
- * Best-effort: every step is wrapped in try/log so a single failing approval
- * cannot block the cleanup of others. Caller is expected to `void` the
- * returned promise — callers should not block on cleanup before responding.
- */
-/**
  * Expire a SINGLE pending approval by id. Used by the Claude e2b path when the
  * per-approval wall-clock TTL fires (the in-sandbox harness has already been
  * sent a deny so the SDK turn unblocks): the DB row must move off `pending` and
@@ -106,6 +85,27 @@ export async function expireApprovalById(input: {
   }
 }
 
+/**
+ * Drop every pending approval for `sessionId` in a way that is safe to call
+ * from any runtime adapter. Used when a turn is interrupted: leaving rows in
+ * `status='pending'` would let the UI keep showing approve/reject prompts
+ * for a turn that no longer exists, and a late decision would resolve into
+ * a torn-down JSON-RPC request.
+ *
+ * Behavior, in order, per pending approval (see `expireApprovalById`):
+ *   1. Run `onCancelLocal(approvalId)` to release in-memory state and capture
+ *      audit-payload extras in one pass — Codex drops its pendingApprovals
+ *      entry, unblocks the JSON-RPC request, and returns `{itemId, kind}`;
+ *      Claude drops its e2bPendingApprovals entry and returns nothing.
+ *   2. Atomically `expire` the DB row. If it returns null (the user's
+ *      decision committed first) skip the audit event — that decision will
+ *      have its own audit row.
+ *   3. Emit one `approval.expired` audit row carrying `{ reason, ...extras }`.
+ *
+ * Best-effort: every step is wrapped in try/log so a single failing approval
+ * cannot block the cleanup of others. Caller is expected to `void` the
+ * returned promise — callers should not block on cleanup before responding.
+ */
 export async function cancelPendingApprovals(input: CancelPendingApprovalsInput): Promise<void> {
   const { tenantId, sessionId, userId, reason, approvals, auditEvents, logger } = input;
 
@@ -121,35 +121,16 @@ export async function cancelPendingApprovals(input: CancelPendingApprovalsInput)
   }
 
   for (const row of pendingRows) {
-    const { approvalId } = row;
-
-    let payloadExtras: Record<string, unknown> = {};
-    try {
-      payloadExtras = input.onCancelLocal?.(approvalId) ?? {};
-    } catch (err) {
-      logger.warn(
-        { err, approvalId, sessionId, reason },
-        "onCancelLocal threw during approval cleanup; continuing with empty payload"
-      );
-    }
-
-    try {
-      const expired = await approvals.expire(tenantId, approvalId);
-      if (!expired) continue;
-
-      await auditEvents.create({
-        tenantId,
-        sessionId,
-        userId,
-        approvalId,
-        type: "approval.expired",
-        payload: { ...payloadExtras, reason }
-      });
-    } catch (err) {
-      logger.error(
-        { err, approvalId, sessionId, reason },
-        "Failed to expire approval during cleanup"
-      );
-    }
+    await expireApprovalById({
+      tenantId,
+      sessionId,
+      userId,
+      approvalId: row.approvalId,
+      reason,
+      approvals,
+      auditEvents,
+      logger,
+      onCancelLocal: input.onCancelLocal
+    });
   }
 }

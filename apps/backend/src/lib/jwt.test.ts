@@ -90,3 +90,55 @@ test("issued refresh tokens carry the configured kid in the protected header", a
   expect(header.alg).toBe("HS256");
   expect(header.kid).toBe(config.JWT_KEY_ID);
 });
+
+test("verification accepts access and refresh tokens signed by a retained previous key", async () => {
+  const previousConfig = createTestConfig({
+    JWT_KEY_ID: "previous",
+    JWT_SECRET: "previous-jwt-secret-must-be-at-least-32chars!"
+  });
+  const rotatedConfig = createTestConfig({
+    JWT_KEY_ID: "current",
+    JWT_SECRET: "current-jwt-secret-must-be-at-least-32chars!",
+    JWT_VERIFICATION_KEYS: {
+      previous: previousConfig.JWT_SECRET
+    }
+  });
+  const accessToken = await signAccessToken(previousConfig, {
+    sub: "user-1",
+    tid: "tenant-1",
+    role: "owner"
+  });
+  const refreshToken = await signRefreshToken(previousConfig, {
+    sub: "user-1",
+    tid: "tenant-1",
+    jti: "j1",
+    fid: "f1"
+  });
+
+  await expect(verifyAccessToken(rotatedConfig, accessToken)).resolves.toMatchObject({
+    sub: "user-1"
+  });
+  await expect(verifyRefreshToken(rotatedConfig, refreshToken)).resolves.toMatchObject({
+    jti: "j1"
+  });
+});
+
+test("verification rejects unknown and missing key ids", async () => {
+  const unknownKid = await new SignJWT({ sub: "user-1", tid: "tenant-1", role: "owner" })
+    .setProtectedHeader({ alg: "HS256", kid: "unknown" })
+    .setIssuedAt()
+    .setExpirationTime("15m")
+    .setIssuer("cogniplane")
+    .setAudience("cogniplane")
+    .sign(secretKey);
+  const missingKid = await new SignJWT({ sub: "user-1", tid: "tenant-1", role: "owner" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime("15m")
+    .setIssuer("cogniplane")
+    .setAudience("cogniplane")
+    .sign(secretKey);
+
+  await expect(() => verifyAccessToken(config, unknownKid)).rejects.toThrow(/Unknown JWT kid/);
+  await expect(() => verifyAccessToken(config, missingKid)).rejects.toThrow(/missing kid/);
+});

@@ -1,6 +1,14 @@
 import { test, expect } from "vitest";
 
-import { toIsoFromNow } from "./integration-oauth-helpers.js";
+import { mapOAuthProviderError, toIsoFromNow } from "./integration-oauth-helpers.js";
+
+test("mapOAuthProviderError returns only fixed public reason codes", () => {
+  expect(mapOAuthProviderError("access_denied")).toBe("access_denied");
+  expect(mapOAuthProviderError("temporarily_unavailable")).toBe("provider_unavailable");
+  expect(mapOAuthProviderError("server_error")).toBe("provider_unavailable");
+  expect(mapOAuthProviderError("upstream detail containing user data")).toBe("provider_error");
+  expect(mapOAuthProviderError(undefined)).toBe("provider_error");
+});
 
 // toIsoFromNow
 

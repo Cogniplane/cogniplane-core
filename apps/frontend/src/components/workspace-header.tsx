@@ -141,6 +141,8 @@ export function WorkspaceHeader(props: {
           onKeyDown={isTitleEditable ? handleTitleKeyDown : undefined}
           spellCheck={false}
           suppressContentEditableWarning
+          role={isTitleEditable ? "textbox" : undefined}
+          aria-label={isTitleEditable ? "Session title" : undefined}
           title={isTitleEditable ? "Click to rename session" : undefined}
         >
           {title}

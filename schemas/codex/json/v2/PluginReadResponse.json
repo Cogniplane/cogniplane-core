@@ -47,6 +47,69 @@
         }
       }
     },
+    "AppTemplateSummary": {
+      "type": "object",
+      "required": [
+        "materializedAppIds",
+        "name",
+        "templateId"
+      ],
+      "properties": {
+        "canonicalConnectorId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logoUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logoUrlDark": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "materializedAppIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppTemplateUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "templateId": {
+          "type": "string"
+        }
+      }
+    },
+    "AppTemplateUnavailableReason": {
+      "type": "string",
+      "enum": [
+        "NOT_CONFIGURED_FOR_WORKSPACE",
+        "NO_ACTIVE_WORKSPACE"
+      ]
+    },
     "HookEventName": {
       "type": "string",
       "enum": [
@@ -89,6 +152,7 @@
     "PluginDetail": {
       "type": "object",
       "required": [
+        "appTemplates",
         "apps",
         "hooks",
         "marketplaceName",
@@ -97,6 +161,12 @@
         "summary"
       ],
       "properties": {
+        "appTemplates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AppTemplateSummary"
+          }
+        },
         "apps": {
           "type": "array",
           "items": {

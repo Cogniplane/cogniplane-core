@@ -27,10 +27,10 @@ export function tryAuthenticateRuntimeToken(
     return false;
   }
 
-  // Order matters and varies by transport:
-  //  - MCP (Codex Streamable HTTP): Authorization header is dropped on the
-  //    initialize POST, so the token is in ?token=. Other RPCs use the
-  //    header. We try header first, then query.
+  // Token transport varies by caller:
+  //  - MCP (Codex + Claude): `Authorization: Bearer rt_...` — Codex's
+  //    `[mcp_servers.*.http_headers]` and the Claude SDK's `mcpServers`
+  //    option both send it on every request, including initialize.
   //  - LLM/anthropic (Claude Agent SDK): the SDK sends `x-api-key` with
   //    whatever string we put in env.ANTHROPIC_API_KEY. For the proxy we
   //    put the rt_* token there. Some SDK code paths also accept
@@ -47,12 +47,6 @@ export function tryAuthenticateRuntimeToken(
     token = authHeader.slice(7); // strip "Bearer "
   } else if (isLlmAnthropic && typeof xApiKey === "string" && xApiKey.startsWith("rt_")) {
     token = xApiKey;
-  } else {
-    const url = new URL(request.url, "http://localhost");
-    const queryToken = url.searchParams.get("token");
-    if (queryToken?.startsWith("rt_")) {
-      token = queryToken;
-    }
   }
 
   if (!token) {

@@ -24,6 +24,7 @@ export const AUDIT_EVENT_TYPES = [
   "admin.mcp_server.disabled",
   "admin.mcp_server.published",
   "admin.mcp_server.unpublished",
+  "admin.artifact.download_token_minted",
   // Admin — runtime / skill / tenant settings / users.
   "admin.runtime_rollout.executed",
   "admin.skill.activated",

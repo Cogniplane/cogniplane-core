@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 
@@ -20,8 +21,6 @@ import {
   adminIdSchema,
   configError,
   createAdminAuditEvent,
-  parseAdminBody,
-  parseAdminParams,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -155,7 +154,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.post("/admin/skills/:skillId/disable", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, skillIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
@@ -244,7 +243,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.post("/admin/skills/import/github", withAdmin(app, async (request, reply) => {
-    const bodyResult = parseAdminBody(reply, githubImportBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, githubImportBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
@@ -277,7 +276,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.post("/admin/skills/import/inline", withAdmin(app, async (request, reply) => {
-    const bodyResult = parseAdminBody(reply, inlineSkillImportBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, inlineSkillImportBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
@@ -299,7 +298,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.get("/admin/skills/:skillId/revisions", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, skillIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
@@ -312,7 +311,7 @@ export async function registerAdminSkillRoutes(
   app.get(
     "/admin/skills/:skillId/revisions/:skillRevisionId/files",
     withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, skillRevisionParamsSchema, request.params);
+      const paramsResult = parseRequestInput(reply, skillRevisionParamsSchema, request.params);
       if (!paramsResult.ok) {
         return paramsResult.response;
       }
@@ -375,12 +374,12 @@ export async function registerAdminSkillRoutes(
   app.post(
     "/admin/skills/:skillId/revisions/:skillRevisionId/activate",
     withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, skillRevisionParamsSchema, request.params);
+      const paramsResult = parseRequestInput(reply, skillRevisionParamsSchema, request.params);
       if (!paramsResult.ok) {
         return paramsResult.response;
       }
 
-      const bodyResult = parseAdminBody(reply, activateSkillRevisionBodySchema, request.body ?? {});
+      const bodyResult = parseRequestInput(reply, activateSkillRevisionBodySchema, request.body ?? {});
       if (!bodyResult.ok) {
         return bodyResult.response;
       }
@@ -405,7 +404,7 @@ export async function registerAdminSkillRoutes(
   );
 
   app.post("/admin/skills/:skillId/publish", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, skillIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
@@ -432,7 +431,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.post("/admin/skills/:skillId/unpublish", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, skillIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, skillIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
@@ -459,7 +458,7 @@ export async function registerAdminSkillRoutes(
   }));
 
   app.post("/admin/skills/revisions/cleanup", withAdmin(app, async (request, reply) => {
-    const bodyResult = parseAdminBody(reply, cleanupSkillRevisionsBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, cleanupSkillRevisionsBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }

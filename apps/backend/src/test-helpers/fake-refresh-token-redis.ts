@@ -37,6 +37,81 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
     return value;
   }
 
+  async eval(script: string, numberOfKeys: number, ...args: string[]): Promise<unknown> {
+    if (script.includes("refresh-token-issue-v1") && numberOfKeys === 3) {
+      const [jtiKey, familyKey, loginAtKey, familyId, revoked, loginAt, absoluteTtl, ttl, active] =
+        args;
+      if (
+        !jtiKey ||
+        !familyKey ||
+        !loginAtKey ||
+        !familyId ||
+        !revoked ||
+        !loginAt ||
+        !absoluteTtl ||
+        !ttl ||
+        !active
+      ) {
+        throw new Error("Invalid refresh issue script arguments");
+      }
+      if (this.store.get(familyKey) === revoked) return 0;
+      if (!this.store.has(loginAtKey)) {
+        await this.set(loginAtKey, loginAt, "EX", Number(absoluteTtl));
+      }
+      await this.set(jtiKey, familyId, "EX", Number(ttl));
+      await this.set(familyKey, active, "EX", Number(ttl));
+      return 1;
+    }
+
+    if (!script.includes("refresh-token-rotation-claim-v1") || numberOfKeys !== 4) {
+      throw new Error("Unsupported fake Redis script");
+    }
+
+    const [jtiKey, familyKey, rotationKey, loginAtKey] = args;
+    const [claimedFamily, revoked, pendingPrefix, grace, active, now, absoluteLifetime, familyTtl] =
+      args.slice(4);
+    if (
+      !jtiKey ||
+      !familyKey ||
+      !rotationKey ||
+      !loginAtKey ||
+      !claimedFamily ||
+      !revoked ||
+      !pendingPrefix ||
+      !grace ||
+      !active ||
+      !now ||
+      !absoluteLifetime ||
+      !familyTtl
+    ) {
+      throw new Error("Invalid refresh rotation script arguments");
+    }
+
+    const familyState = this.store.get(familyKey);
+    if (familyState === revoked) return [2];
+    const loginAt = Number(this.store.get(loginAtKey));
+    if (
+      familyState === active &&
+      (!Number.isFinite(loginAt) || Number(now) - loginAt >= Number(absoluteLifetime))
+    ) {
+      await this.set(familyKey, revoked, "EX", Number(familyTtl));
+      return [5];
+    }
+
+    const consumed = this.store.get(jtiKey);
+    if (consumed !== undefined) {
+      this.store.delete(jtiKey);
+      if (consumed !== claimedFamily) return [1, consumed];
+      await this.set(rotationKey, `${pendingPrefix}${consumed}`, "EX", Number(grace));
+      return [0, consumed];
+    }
+
+    const rotation = this.store.get(rotationKey);
+    if (rotation !== undefined) return [3, rotation];
+    if (familyState === active) return [1, claimedFamily];
+    return [4];
+  }
+
   async set(key: string, value: string, mode: "EX", ttlSeconds: number): Promise<unknown> {
     this.setCalls.push({ key, value, mode, ttlSeconds });
     this.store.set(key, value);
@@ -45,7 +120,7 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
 
   /**
    * Cast helper so the fake can be `app.decorate`d as `redis` (typed as the
-   * full ioredis `Redis`). Only the three methods above are exercised by the
+   * full ioredis `Redis`). Only the methods above are exercised by the
    * auth route; everything else would throw at runtime if hit.
    */
   asAppRedis(): Redis {

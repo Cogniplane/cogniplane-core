@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config.js";
+import { unique } from "../lib/crypto-utils.js";
 import { AdminConfigError } from "./admin-config-error.js";
 import {
   compileRuntimeConfig as compileRuntimeConfigBundle,
@@ -285,16 +286,16 @@ export class DynamicConfigService {
     tenantId: string,
     input: TenantSettingsInput
   ): Promise<void> {
-    if (!hasOwn(input, "enabledToolIds") && !hasOwn(input, "enabledMcpServerIds")) {
+    if (!Object.hasOwn(input, "enabledToolIds") && !Object.hasOwn(input, "enabledMcpServerIds")) {
       return;
     }
 
     const defaults = buildDefaultTenantSettingsInput();
     const existing = await this.stores.tenantSettings.get(tenantId);
-    const enabledToolIds = hasOwn(input, "enabledToolIds")
+    const enabledToolIds = Object.hasOwn(input, "enabledToolIds")
       ? (input.enabledToolIds ?? defaults.enabledToolIds)
       : (existing?.enabledToolIds ?? defaults.enabledToolIds);
-    const enabledMcpServerIds = hasOwn(input, "enabledMcpServerIds")
+    const enabledMcpServerIds = Object.hasOwn(input, "enabledMcpServerIds")
       ? (input.enabledMcpServerIds ?? defaults.enabledMcpServerIds)
       : (existing?.enabledMcpServerIds ?? defaults.enabledMcpServerIds);
     const availableMcpServers = await this.stores.mcpServers.listMcpServers(tenantId, true);
@@ -303,14 +304,6 @@ export class DynamicConfigService {
     validateEnabledMcpServerIds(enabledMcpServerIds, validMcpServerIds);
     validateEnabledToolIds(enabledToolIds, defaults, validMcpServerIds, this.managedToolCatalog);
   }
-}
-
-function hasOwn(input: TenantSettingsInput, key: keyof TenantSettingsInput): boolean {
-  return Object.prototype.hasOwnProperty.call(input, key);
-}
-
-function uniqueIds(ids: string[]): string[] {
-  return Array.from(new Set(ids));
 }
 
 function collectValidMcpServerIds(
@@ -327,7 +320,7 @@ function validateEnabledMcpServerIds(
   enabledMcpServerIds: string[],
   validMcpServerIds: Set<string>
 ): void {
-  const invalid = uniqueIds(enabledMcpServerIds.filter((serverId) => !validMcpServerIds.has(serverId)));
+  const invalid = unique(enabledMcpServerIds.filter((serverId) => !validMcpServerIds.has(serverId)));
   if (invalid.length > 0) {
     throw new AdminConfigError(`Unknown enabled MCP server IDs: ${invalid.join(", ")}.`);
   }
@@ -344,7 +337,7 @@ function validateEnabledToolIds(
     ...managedToolCatalog.listIds(),
     ...validMcpServerIds
   ]);
-  const invalid = uniqueIds(enabledToolIds.filter((toolId) => !validToolIds.has(toolId)));
+  const invalid = unique(enabledToolIds.filter((toolId) => !validToolIds.has(toolId)));
   if (invalid.length > 0) {
     throw new AdminConfigError(`Unknown enabled tool IDs: ${invalid.join(", ")}.`);
   }

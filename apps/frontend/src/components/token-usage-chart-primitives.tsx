@@ -23,7 +23,7 @@ export { fmtCost, fmtTokens, type Days } from "./token-usage-chart-primitives.lo
 // ---------------------------------------------------------------------------
 
 export type BarChartProps = {
-  data: Array<{ label: string; primary: number; secondary: number }>;
+  data: Array<{ label: string; inputSeries: number; outputSeries: number }>;
   primaryColor: string;
   secondaryColor: string;
   primaryLabel: string;
@@ -70,8 +70,8 @@ export function BarChart({
           content={<ChartTooltipContent labelFormatter={(label) => formatBarLabel(String(label))} />}
         />
         <ChartLegend content={<ChartLegendContent />} />
-        <Bar dataKey="primary" name={primaryLabel} fill="var(--color-inputSeries)" radius={2} />
-        <Bar dataKey="secondary" name={secondaryLabel} fill="var(--color-outputSeries)" radius={2} />
+        <Bar dataKey="inputSeries" name={primaryLabel} fill="var(--color-inputSeries)" radius={2} />
+        <Bar dataKey="outputSeries" name={secondaryLabel} fill="var(--color-outputSeries)" radius={2} />
       </RechartsBarChart>
     </ChartContainer>
   );

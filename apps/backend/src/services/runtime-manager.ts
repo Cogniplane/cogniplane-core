@@ -1,5 +1,3 @@
-import path from "node:path";
-
 import type { FastifyBaseLogger } from "fastify";
 
 import {
@@ -18,8 +16,10 @@ import type { AppConfig } from "../config.js";
 import { AsyncQueue } from "../lib/async-queue.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { respondToApprovalRequest } from "./runtime/runtime-approval-coordinator.js";
-import { PolicyApprovalCoordinator } from "./runtime/policy-approval-coordinator.js";
+import type { PolicyApprovalCoordinator } from "./runtime/policy-approval-coordinator.js";
+import { createRuntimePolicyApprovals } from "./runtime/policy-approval-factory.js";
 import { cancelPendingApprovals } from "./runtime/approval-cleanup.js";
+import { resolveInsideSandbox } from "./runtime/sandbox-path.js";
 import { clearApprovalExpiry } from "./runtime/runtime-request-handler.js";
 import type { DynamicConfigService } from "./dynamic-config-service.js";
 import type { GithubConnectionService } from "./integrations/github/github-connection-service.js";
@@ -52,20 +52,6 @@ export type { RuntimeProcessFactory, RuntimeShutdownReason, RuntimeState, Runtim
 export type BoundRuntimeSessionRef = Omit<RuntimeSessionRef, "runtimePolicy"> & {
   runtimePolicy: ResolvedRuntimePolicy;
 };
-
-// Resolve `filePath` against a posix sandbox workspace and reject anything
-// that escapes the root — prevents path-traversal into host paths shared
-// by the sandbox.
-export function resolveInsideSandbox(workspacePath: string, filePath: string): string {
-  const root = workspacePath.endsWith("/") ? workspacePath : workspacePath + "/";
-  const resolved = path.posix.isAbsolute(filePath)
-    ? path.posix.normalize(filePath)
-    : path.posix.normalize(path.posix.join(workspacePath, filePath));
-  if (!resolved.startsWith(root) && resolved !== workspacePath) {
-    throw new Error("filePath must be inside the session workspace.");
-  }
-  return resolved;
-}
 
 export class CodexRuntimeManager implements RuntimeAdapter {
   readonly id = "codex-app-server";
@@ -150,12 +136,11 @@ export class CodexRuntimeManager implements RuntimeAdapter {
     // Policy Center tool-call approvals (gateway-held). Pushes the prompt onto
     // the session's active turn queue; the existing /approvals decision route
     // settles it via resolveApproval below.
-    this.policyApprovals = new PolicyApprovalCoordinator({
+    this.policyApprovals = createRuntimePolicyApprovals({
+      config: deps.config,
       approvals: deps.approvals,
       auditEvents: deps.auditEvents,
       logger: deps.logger,
-      ttlMs: deps.config.APPROVAL_REQUEST_TTL_MS,
-      reminderFraction: deps.config.POLICY_APPROVAL_REMINDER_FRACTION,
       pushFrameworkEvent: (sessionId, event) => {
         const runtime = this.lifecycle.runtimes.get(sessionId);
         if (!runtime?.activeTurn) return false;

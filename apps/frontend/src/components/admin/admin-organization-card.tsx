@@ -7,10 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { PILL_GRAY, PILL_GREEN, SECTION_LABEL } from "../../lib/ui-tokens";
-
-const CHIP =
-  "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
+import { CHIP, PILL_GRAY, PILL_GREEN, SECTION_LABEL } from "../../lib/ui-tokens";
 
 type ApiKeyFormProps = {
   inputId: string;

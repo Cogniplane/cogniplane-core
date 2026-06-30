@@ -10,8 +10,10 @@ import {
   listAdminMcpServers
 } from "../../../lib/admin-api";
 import { queryKeys } from "../../../lib/query-keys";
+import { useAuth } from "../../../lib/auth-context";
 
 export default function AdminAgentSettingsPage() {
+  const { user } = useAuth();
   const { settings, saving, error, save } = useTenantSettings();
 
   const managedToolsQuery = useQuery({
@@ -43,6 +45,7 @@ export default function AdminAgentSettingsPage() {
           anthropicKeyConfigured={Boolean(
             tenantDetailsQuery.data?.settings.anthropicApiKeyConfigured
           )}
+          isOwner={user?.role === "owner"}
         />
       ) : null}
     </section>

@@ -30,7 +30,9 @@ export function workosAuth(config: AppConfig, tenantMembers: Pick<TenantMemberSt
   const publicAuthPaths = buildPublicAuthPaths();
 
   return async function authenticate(request: FastifyRequest, reply: FastifyReply) {
-    if (request.url === "/health") {
+    // Compare the path only — request.url includes any query string, so an
+    // exact match would send a probe like /health?probe=1 through full auth.
+    if (request.url.split("?", 1)[0] === "/health") {
       return;
     }
 

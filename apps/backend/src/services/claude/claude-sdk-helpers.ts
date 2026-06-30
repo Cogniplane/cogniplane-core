@@ -310,25 +310,6 @@ export function resolveWorkspacePath(workspacePath: string, filePath: string): s
   return resolvedPath;
 }
 
-/**
- * Resolves a relative path inside the E2B sandbox's workspace. Uses POSIX
- * semantics regardless of the backend's OS, since sandbox paths are always
- * Linux-style. Guards against directory traversal so callers cannot escape
- * the sandbox workspace.
- */
-export function resolveSandboxWorkspacePath(sandboxWorkspacePath: string, filePath: string): string {
-  const resolvedPath = path.posix.resolve(sandboxWorkspacePath, filePath);
-  const workspaceRoot = sandboxWorkspacePath.endsWith("/")
-    ? sandboxWorkspacePath
-    : sandboxWorkspacePath + "/";
-
-  if (!resolvedPath.startsWith(workspaceRoot) && resolvedPath !== sandboxWorkspacePath) {
-    throw new Error("filePath must be inside the session workspace.");
-  }
-
-  return resolvedPath;
-}
-
 // ── SDK message type guards ───────────────────────────────────────────────────
 
 export function isInitMessage(m: unknown): m is SDKSystemMessage {

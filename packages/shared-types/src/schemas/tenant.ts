@@ -37,6 +37,8 @@ export const TenantSettingsSchema = z.object({
   showEffortSelector: z.boolean(),
   webSearchMode: WebSearchModeSchema,
   approvalPolicy: ApprovalPolicySchema,
+  // Reviewer for runtime-native approvals only. Policy Center
+  // require_approval is actor confirmation by the initiating user.
   approvalReviewer: ApprovalReviewerSchema,
   allowCommandExecution: z.boolean(),
   allowUserTokenForwarding: z.boolean(),

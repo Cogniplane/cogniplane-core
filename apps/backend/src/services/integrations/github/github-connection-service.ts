@@ -20,19 +20,24 @@ import {
 import {
   buildIntegrationRedirectUrl,
   getSecretKey,
+  getVerificationKey,
   toIsoFromNow
 } from "../integration-oauth-helpers.js";
 import type { RuntimeInvalidator } from "../contracts.js";
+import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
+import { uuidv7 } from "../../../lib/uuid.js";
 
 export { GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
 
 const GITHUB_USER_STATE_AUDIENCE = "cogniplane-github-user-connect";
 const GITHUB_STATE_ISSUER = "cogniplane";
 const GITHUB_STATE_TTL = "10m";
+const GITHUB_STATE_TTL_SECONDS = 10 * 60;
 
 type GithubUserStatePayload = {
   tid: string;
   sub: string;
+  jti: string;
 };
 
 export type GithubUserConnectionSummary = {
@@ -90,7 +95,8 @@ export class GithubConnectionService {
     private readonly config: AppConfig,
     private readonly store: GithubConnectionStore,
     private readonly auditEvents?: AuditEventStore,
-    private readonly runtimeManager?: RuntimeInvalidator
+    private readonly runtimeManager?: RuntimeInvalidator,
+    private readonly oauthStates = new IntegrationOAuthStateStore()
   ) {}
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<GithubConnectionStatus> {
@@ -113,11 +119,14 @@ export class GithubConnectionService {
   async getAuthorizationUrl(input: { tenantId: string; userId: string }): Promise<string> {
     this.assertConfigured();
 
+    const jti = uuidv7();
+    await this.oauthStates.issue("github", jti, GITHUB_STATE_TTL_SECONDS);
     const state = await new SignJWT({
       tid: input.tenantId,
-      sub: input.userId
+      sub: input.userId,
+      jti
     } satisfies GithubUserStatePayload)
-      .setProtectedHeader({ alg: "HS256" })
+      .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(GITHUB_STATE_ISSUER)
       .setAudience(GITHUB_USER_STATE_AUDIENCE)
       .setIssuedAt()
@@ -147,16 +156,27 @@ export class GithubConnectionService {
 
     let state: GithubUserStatePayload;
     try {
-      const verified = await jwtVerify(input.state, getSecretKey(this.config), {
-        issuer: GITHUB_STATE_ISSUER,
-        audience: GITHUB_USER_STATE_AUDIENCE,
-        algorithms: ["HS256"]
-      });
+      const verified = await jwtVerify(
+        input.state,
+        (protectedHeader) => getVerificationKey(this.config, protectedHeader.kid),
+        {
+          issuer: GITHUB_STATE_ISSUER,
+          audience: GITHUB_USER_STATE_AUDIENCE,
+          algorithms: ["HS256"]
+        }
+      );
       const payload = verified.payload as Partial<GithubUserStatePayload>;
-      if (typeof payload.tid !== "string" || typeof payload.sub !== "string") {
+      if (
+        typeof payload.tid !== "string" ||
+        typeof payload.sub !== "string" ||
+        typeof payload.jti !== "string"
+      ) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub };
+      if (!(await this.oauthStates.consume("github", payload.jti))) {
+        return fallbackUrl;
+      }
+      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti };
     } catch {
       return fallbackUrl;
     }
@@ -197,10 +217,10 @@ export class GithubConnectionService {
       return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "connected"
       });
-    } catch (error) {
+    } catch {
       return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "error",
-        reason: error instanceof Error ? error.message : "github_authorization_failed"
+        reason: "github_authorization_failed"
       });
     }
   }

@@ -11,7 +11,9 @@ import { PolicyService } from "../services/policy/policy-service.js";
 import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import type { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
-import { deriveActionSeverity, selectAllowlistedHeaders } from "./mcp.js";
+import { deriveActionSeverity } from "../services/mcp/policy-gate.js";
+import { forwardRpc, selectAllowlistedHeaders } from "../lib/mcp-upstream-client.js";
+import { MCP_REQUEST_BODY_LIMIT_BYTES } from "./mcp.js";
 
 // A real PolicyService over a fixed rule set, for exercising
 // require_approval / block end-to-end through the MCP gateway.
@@ -67,6 +69,31 @@ function runtimeToken(claims: { sid: string; uid: string; rid?: string }): strin
     RUNTIME_TOKEN_SECRET
   );
 }
+
+test("enforces an MCP-specific request body limit even when the global limit is higher", async () => {
+  const { app } = await createTestApp({
+    MAX_REQUEST_BODY_BYTES: MCP_REQUEST_BODY_LIMIT_BYTES * 2
+  });
+  onTestFinished(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    headers: {
+      authorization: `Bearer ${runtimeToken({ sid: "body-limit-session", uid: "test-user" })}`
+    },
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { padding: "x".repeat(MCP_REQUEST_BODY_LIMIT_BYTES) }
+    }
+  });
+
+  expect(response.statusCode).toBe(413);
+});
 
 // ---------------------------------------------------------------------------
 // authz-1: arg/URL-supplied toolContextId must be bound to the runtime token's
@@ -495,6 +522,71 @@ test("proxy tool/call forwards the allowlisted X-Framework identity but never a 
   expect(response.statusCode).toBe(200);
   expect(upstreamRequests.length).toBe(1);
   expect(upstreamRequests[0].headers["x-framework-user-id"]).toBe("header-user");
+});
+
+test("forwardRpc follows a bounded same-origin HTTPS redirect manually", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchFn = async (input: string | URL, init?: RequestInit) => {
+    calls.push({ url: input.toString(), init: init ?? {} });
+    if (calls.length === 1) {
+      return new Response(null, { status: 307, headers: { location: "/mcp/v2" } });
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+
+  const result = await forwardRpc(
+    "https://mcp.example.test/v1",
+    { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    { "X-Framework-User-Id": "u1" },
+    fetchFn as never
+  );
+
+  expect(result.result).toEqual({ ok: true });
+  expect(calls.map((call) => call.url)).toEqual([
+    "https://mcp.example.test/v1",
+    "https://mcp.example.test/mcp/v2"
+  ]);
+  expect(calls[0]!.init.redirect).toBe("manual");
+  expect(calls[1]!.init.headers).toMatchObject({ "X-Framework-User-Id": "u1" });
+});
+
+test.each([
+  ["HTTPS downgrade", "http://mcp.example.test/v2", /must use HTTPS/],
+  ["private target", "https://127.0.0.1/mcp", /private or reserved/],
+  ["cross-origin target", "https://attacker.example/mcp", /cross-origin redirect/]
+])("forwardRpc rejects %s", async (_name, location, expectedMessage) => {
+  let calls = 0;
+  const result = await forwardRpc(
+    "https://mcp.example.test/v1",
+    { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    { "X-Framework-Signature": "secret" },
+    (async () => {
+      calls += 1;
+      return new Response(null, { status: 302, headers: { location } });
+    }) as never
+  );
+
+  expect(result.error?.message).toMatch(expectedMessage);
+  expect(calls).toBe(1);
+});
+
+test("forwardRpc rejects redirect loops after the maximum hop count", async () => {
+  let calls = 0;
+  const result = await forwardRpc(
+    "https://mcp.example.test/v1",
+    { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    {},
+    (async () => {
+      calls += 1;
+      return new Response(null, { status: 307, headers: { location: `/mcp/${calls}` } });
+    }) as never
+  );
+
+  expect(result.error?.message).toMatch(/redirect limit/);
+  expect(calls).toBe(6);
 });
 
 // Policy Center severity derivation. Managed tools carry an authoritative

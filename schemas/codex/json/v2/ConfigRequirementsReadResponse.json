@@ -119,13 +119,13 @@
             "$ref": "#/definitions/ApprovalsReviewer"
           }
         },
-        "allowedPermissions": {
+        "allowedPermissionProfiles": {
           "type": [
-            "array",
+            "object",
             "null"
           ],
-          "items": {
-            "type": "string"
+          "additionalProperties": {
+            "type": "boolean"
           }
         },
         "allowedSandboxModes": {
@@ -146,6 +146,15 @@
             "$ref": "#/definitions/WebSearchMode"
           }
         },
+        "allowedWindowsSandboxImplementations": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/WindowsSandboxSetupMode"
+          }
+        },
         "computerUse": {
           "anyOf": [
             {
@@ -154,6 +163,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "defaultPermissions": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "enforceResidency": {
@@ -505,7 +520,7 @@
       "type": "string",
       "enum": [
         "allow",
-        "none"
+        "deny"
       ]
     },
     "ResidencyRequirement": {
@@ -528,6 +543,13 @@
         "disabled",
         "cached",
         "live"
+      ]
+    },
+    "WindowsSandboxSetupMode": {
+      "type": "string",
+      "enum": [
+        "elevated",
+        "unelevated"
       ]
     }
   }

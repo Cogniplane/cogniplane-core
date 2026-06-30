@@ -60,10 +60,22 @@ function arrayMatches(
   return values.includes(candidate);
 }
 
+function normalizeToolName(value: string): string {
+  return value.normalize("NFC").toLowerCase();
+}
+
+function toolNameMatches(values: readonly string[] | undefined, candidate: string): boolean {
+  if (!Array.isArray(values) || values.length === 0) return true;
+  const normalizedCandidate = normalizeToolName(candidate);
+  return values.some(
+    (value) => typeof value === "string" && normalizeToolName(value) === normalizedCandidate
+  );
+}
+
 function ruleMatches(rule: EvaluableRule, action: PolicyActionContext): boolean {
   const { conditions } = rule;
   return (
-    arrayMatches(conditions.toolNames, action.toolName) &&
+    toolNameMatches(conditions.toolNames, action.toolName) &&
     arrayMatches(conditions.categories, action.category) &&
     arrayMatches(conditions.severities, action.severity) &&
     arrayMatches(conditions.turnContexts, action.turnContext)

@@ -11,7 +11,8 @@ import { IsoDateSchema } from "./_helpers.js";
 //
 // Effects:
 //   allow            — let the action through (explicit, for an early-wins rule)
-//   require_approval — pause the action, route a human approval, resume/deny
+//   require_approval — pause for confirmation by the user who initiated the
+//                      turn, then resume/deny
 //   block            — refuse the action with an explanation
 //
 // Whether a rule actually gates (enforce) or only records a would-have decision

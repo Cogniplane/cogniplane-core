@@ -104,10 +104,6 @@
         "null"
       ]
     },
-    "persistExtendedHistory": {
-      "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-      "type": "boolean"
-    },
     "personality": {
       "anyOf": [
         {
@@ -119,13 +115,13 @@
       ]
     },
     "runtimeWorkspaceRoots": {
-      "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+      "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
       "type": [
         "array",
         "null"
       ],
       "items": {
-        "type": "string"
+        "$ref": "#/definitions/AbsolutePathBuf"
       }
     },
     "sandbox": {

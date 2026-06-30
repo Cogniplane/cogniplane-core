@@ -103,7 +103,7 @@ export default function AdminSessionDetailPage() {
           <CardContent className="pt-6">
             <p className="text-sm text-danger">Session not found or not in your tenant.</p>
             <p className="mt-2 text-sm text-on-surface-variant">
-              <Link href={backHref} className="text-accent hover:underline">
+              <Link href={backHref} className="text-info hover:underline">
                 Back to sessions
               </Link>
             </p>

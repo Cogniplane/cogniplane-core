@@ -139,7 +139,7 @@ const baseRequest = (overrides: Partial<JsonRpcRequest> = {}): JsonRpcRequest =>
   ...overrides
 });
 
-test("auto-approves mcpServer/elicitation/request without touching stores", async () => {
+test("auto-accepts MCP elicitation without creating a second approval plane", async () => {
   const { process: proc, events } = makeProcess();
   const runtime = makeRuntime({ proc });
   const stores = makeStores();

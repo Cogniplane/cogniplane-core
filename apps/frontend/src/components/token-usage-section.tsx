@@ -13,7 +13,7 @@ import {
   type Days,
   ViewToggle
 } from "./token-usage-chart-primitives";
-import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
+import { HINT, SECTION_LABEL, TOKEN_USAGE_COL_GRID as COL_GRID } from "../lib/ui-tokens";
 
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
@@ -71,8 +71,8 @@ export function TokenUsageSection() {
     () =>
       (usage?.daily ?? []).map((d) => ({
         label: d.date,
-        primary: d.inputTokens,
-        secondary: d.outputTokens
+        inputSeries: d.inputTokens,
+        outputSeries: d.outputTokens
       })),
     [usage]
   );
@@ -81,8 +81,8 @@ export function TokenUsageSection() {
     () =>
       (usage?.byUser ?? []).map((u) => ({
         label: shortUserId(u.userId),
-        primary: u.inputTokens,
-        secondary: u.outputTokens
+        inputSeries: u.inputTokens,
+        outputSeries: u.outputTokens
       })),
     [usage]
   );
@@ -91,8 +91,8 @@ export function TokenUsageSection() {
     () =>
       (usage?.byModel ?? []).map((m) => ({
         label: m.modelName,
-        primary: m.inputTokens,
-        secondary: m.outputTokens
+        inputSeries: m.inputTokens,
+        outputSeries: m.outputTokens
       })),
     [usage]
   );
@@ -229,8 +229,6 @@ type BreakdownRow = {
   costUsd: number;
 };
 
-const COL_GRID = "grid grid-cols-[1fr_80px_80px_80px_90px] gap-x-4";
-
 function BreakdownTable({
   rows,
   barColor,
@@ -240,7 +238,7 @@ function BreakdownTable({
 }: {
   rows: BreakdownRow[];
   barColor: string;
-  chartBars: Array<{ label: string; primary: number; secondary: number }>;
+  chartBars: Array<{ label: string; inputSeries: number; outputSeries: number }>;
   chartPrimaryColor: string;
   chartSecondaryColor: string;
 }) {

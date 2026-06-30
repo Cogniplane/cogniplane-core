@@ -80,7 +80,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
   const [renameDraft, setRenameDraft] = useState("");
   const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null);
   const [pinnedSessionIds, setPinnedSessionIds] = useState<Set<string>>(() => new Set());
-  const [error, setError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
 
   useEffect(() => {
     // SSR-safe localStorage hydration: lazy init would cause hydration mismatch.
@@ -113,17 +113,16 @@ export function useSessionList(input?: { enabled?: boolean }) {
     setHasRestored(true);
   }, [enabled, hasRestored, sessionsQuery.status, sessions]);
 
-  // Surface query errors through the hook's `error` so consumers keep their
-  // existing UX (the original silently ignored polling errors; we preserve
-  // that by only surfacing errors from non-polling fetches).
-  useEffect(() => {
-    if (sessionsQuery.status === "error" && !sessionsQuery.isRefetching) {
-      const err = sessionsQuery.error;
-      // Mirror query error to the hook's error surface for consumers.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setError(err instanceof Error ? err.message : "Failed to load sessions");
-    }
-  }, [sessionsQuery.status, sessionsQuery.isRefetching, sessionsQuery.error]);
+  // Surface query errors through the hook's `error` derived during render (no
+  // effect/extra state). Polling errors stay hidden — only non-refetch failures
+  // surface, matching the original UX. A mutation error takes precedence.
+  const queryError =
+    sessionsQuery.status === "error" && !sessionsQuery.isRefetching
+      ? sessionsQuery.error instanceof Error
+        ? sessionsQuery.error.message
+        : "Failed to load sessions"
+      : null;
+  const error = mutationError ?? queryError;
 
   const activeListKey = queryKeys.sessions.list();
 
@@ -142,7 +141,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
       setSelectedSessionId(session.sessionId);
       persistSelectedSessionId(session.sessionId);
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Failed to create session")
+    onError: (err) => setMutationError(err instanceof Error ? err.message : "Failed to create session")
   });
 
   const renameMutation = useMutation({
@@ -154,7 +153,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
       );
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Failed to rename session")
+    onError: (err) => setMutationError(err instanceof Error ? err.message : "Failed to rename session")
   });
 
   const deleteMutation = useMutation({
@@ -182,7 +181,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
         return next;
       });
     },
-    onError: (err) => setError(err instanceof Error ? err.message : "Failed to delete session")
+    onError: (err) => setMutationError(err instanceof Error ? err.message : "Failed to delete session")
   });
 
   const selectedSession = useMemo(
@@ -196,7 +195,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
   }, []);
 
   const createSession = useCallback(async () => {
-    setError(null);
+    setMutationError(null);
     createMutation.mutate(`Session ${sessions.length + 1}`);
   }, [createMutation, sessions.length]);
 
@@ -214,10 +213,10 @@ export function useSessionList(input?: { enabled?: boolean }) {
     async (sessionId: string, nextName: string) => {
       const trimmed = nextName.trim();
       if (!trimmed) {
-        setError("Session name cannot be empty.");
+        setMutationError("Session name cannot be empty.");
         return;
       }
-      setError(null);
+      setMutationError(null);
       renameMutation.mutate({ sessionId, nextName: trimmed });
     },
     [renameMutation]
@@ -244,7 +243,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
     const sessionId = pendingDeleteSessionId;
     if (!sessionId) return;
     setPendingDeleteSessionId(null);
-    setError(null);
+    setMutationError(null);
     deleteMutation.mutate(sessionId);
   }, [deleteMutation, pendingDeleteSessionId]);
 
@@ -277,7 +276,7 @@ export function useSessionList(input?: { enabled?: boolean }) {
     selectedSession,
     isLoadingSessions: sessionsQuery.isPending && enabled,
     error,
-    setError,
+    setError: setMutationError,
     selectSession,
     createSession,
     renameSessionId,

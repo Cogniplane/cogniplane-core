@@ -71,6 +71,7 @@ test("attachBuiltinIntegrationRuntime overwrites wiring after a no-arg registrat
   // paths should still be exposed for the public-path allowlist.
   const callbackPaths = listIntegrationOAuthCallbackPaths();
   expect(callbackPaths.includes("/auth/github/user/callback")).toBeTruthy();
+  expect(callbackPaths.includes("/auth/github/install/callback")).toBeFalsy();
   expect(callbackPaths.includes("/integrations/notion/callback")).toBeTruthy();
 });
 

@@ -183,10 +183,19 @@ test("createRuntimeWorkspace writes MCP servers using Codex mcp_servers config",
     "utf8"
   );
   expect(codexToml).toMatch(/\[mcp_servers\.managed-session-context\]/);
-  expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context\?token=rt_/);
+  expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context"/);
   expect(codexToml).not.toMatch(/\[mcp\]/);
   // web_search is omitted entirely when the mode is "disabled".
   expect(codexToml).not.toMatch(/web_search/);
+  // codex.toml is the full sandbox config (installed verbatim as
+  // ~/.codex/config.toml) — root keys must precede the first [section].
+  expect(codexToml).toMatch(/model = /);
+  expect(codexToml).toMatch(/model_provider = "cogniplane_proxy"/);
+  expect(codexToml).toMatch(/\[model_providers\.cogniplane_proxy\]/);
+  expect(codexToml).toMatch(/base_url = "http:\/\/localhost:3001\/llm\/openai\/v1"/);
+  expect(codexToml).toMatch(/\[features\]/);
+  expect(codexToml).toMatch(/\[projects\."\/home\/user\/workspace"\]/);
+  expect(codexToml.indexOf('model_provider = "cogniplane_proxy"')).toBeLessThan(codexToml.indexOf("["));
   expect(agentsMd).toMatch(/Do not narrate your step-by-step investigation/);
   expect(agentsMd).toMatch(/Do not search the local workspace as a substitute/);
   expect(agentsMd).toMatch(/list the OneDrive root before falling back to search/);
@@ -422,11 +431,11 @@ test("createRuntimeWorkspace YAML-escapes skill descriptions containing special 
   expect(parsed.description).toBe(trickyDescription);
 });
 
-// MCP transport contract: Codex's Streamable HTTP transport does not forward
-// `Authorization` headers on the `initialize` POST, so the runtime token MUST
-// be embedded as `?token=rt_...` in the codex.toml URL. The Claude side
-// enforces the inverse (header-only) — see claude-workspace-renderer.test.ts.
-test("codex.toml MCP URLs carry the runtime token in ?token= (transport contract)", async () => {
+// MCP transport contract: the runtime token rides exclusively in
+// `[mcp_servers.*.http_headers]` (sent on every request including the
+// initialize POST since Codex 0.139) — URLs must stay token-free so logs,
+// AGENTS.md, and the manifest never carry the secret.
+test("codex.toml MCP auth is header-only — URLs carry no token (transport contract)", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-runtime-workspace-codex-token-"));
   onTestFinished(async () => {
         await rm(root, { recursive: true, force: true });
@@ -475,8 +484,12 @@ test("codex.toml MCP URLs carry the runtime token in ?token= (transport contract
   );
 
   const codexToml = await readFile(workspace.codexTomlPath, "utf8");
-  // Token must be present as `?token=rt_...` on the URL.
-  expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context\?token=rt_[A-Za-z0-9._-]+"/);
+  expect(codexToml).toMatch(/url = "http:\/\/localhost:3001\/mcp\/managed-session-context"/);
+  expect(codexToml).not.toMatch(/\?token=/);
+  expect(codexToml).toMatch(/\[mcp_servers\.managed-session-context\.http_headers\]/);
+  expect(codexToml).toMatch(/Authorization = "Bearer rt_[A-Za-z0-9._-]+"/);
+  // The manifest must not carry the token either.
+  expect(JSON.stringify(workspace.manifest)).not.toMatch(/rt_/);
 });
 
 test("createRuntimeWorkspace writes the web_search key when the mode is enabled", async () => {

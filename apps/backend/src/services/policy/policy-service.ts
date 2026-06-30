@@ -16,6 +16,7 @@ import {
 } from "./policy-engine.js";
 import type { PolicyDecisionStore } from "./policy-decision-store.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
+import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
 
 // Raised when an enforce-mode rule refuses the action: a `block`, or a
 // `require_approval` whose human decision was reject/expire. The MCP gateway
@@ -100,6 +101,8 @@ export class PolicyService {
   // change whether the action is gated. Failures are logged, never thrown.
   private readonly logger: { warn: (msg: string, meta?: unknown) => void };
   private readonly ruleCacheTtlMs: number;
+  private readonly invalidationBus?: PolicyInvalidationBus;
+  private invalidationUnsubscribe: (() => Promise<void>) | null = null;
 
   constructor(options: {
     rules: PolicyRuleStore;
@@ -107,12 +110,31 @@ export class PolicyService {
     auditEvents: AuditEventStore;
     logger?: { warn: (msg: string, meta?: unknown) => void };
     ruleCacheTtlMs?: number;
+    invalidationBus?: PolicyInvalidationBus;
   }) {
     this.rules = options.rules;
     this.decisions = options.decisions;
     this.auditEvents = options.auditEvents;
     this.logger = options.logger ?? { warn: (msg, meta) => console.warn(msg, meta) };
     this.ruleCacheTtlMs = options.ruleCacheTtlMs ?? 5_000;
+    this.invalidationBus = options.invalidationBus;
+  }
+
+  /**
+   * Subscribe to cross-replica cache invalidations. Call once at boot, before
+   * serving traffic. A subscription failure is logged, not thrown — pub/sub is
+   * a consistency optimization and the short rule-cache TTL remains the
+   * fallback (see {@link invalidate}).
+   */
+  async start(): Promise<void> {
+    if (!this.invalidationBus || this.invalidationUnsubscribe) return;
+    try {
+      this.invalidationUnsubscribe = await this.invalidationBus.subscribe((tenantId) =>
+        this.ruleCache.delete(tenantId)
+      );
+    } catch (error) {
+      this.logger.warn("policy: failed to subscribe to cache invalidations", { error });
+    }
   }
 
   private async loadRules(tenantId: string): Promise<EvaluableRule[]> {
@@ -130,8 +152,21 @@ export class PolicyService {
    * the store. Call after a rule mutation to make the change take effect
    * immediately instead of waiting out the TTL.
    */
-  invalidate(tenantId: string): void {
+  async invalidate(tenantId: string): Promise<void> {
     this.ruleCache.delete(tenantId);
+    if (!this.invalidationBus) return;
+    try {
+      await this.invalidationBus.publish(tenantId);
+    } catch (error) {
+      // The short local TTL remains the fallback if Redis is unavailable or a
+      // replica misses a pub/sub message while reconnecting.
+      this.logger.warn("policy: failed to broadcast cache invalidation", { error, tenantId });
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.invalidationUnsubscribe?.();
+    this.invalidationUnsubscribe = null;
   }
 
   /** Pure evaluation against the tenant's active rules (used by the simulator). */

@@ -114,7 +114,7 @@ export function AdminIntegrationPane(props: Props) {
                 href={integration.docsUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="text-sm text-accent underline-offset-2 hover:underline"
+                className="text-sm text-info underline-offset-2 hover:underline"
               >
                 Learn more →
               </a>

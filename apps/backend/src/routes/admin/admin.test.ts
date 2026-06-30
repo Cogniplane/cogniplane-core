@@ -542,7 +542,7 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
         ];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return ["session-1"];
       }
@@ -619,7 +619,7 @@ test("admin routes reject non-admin callers", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -647,17 +647,19 @@ test("admin tenant settings updates are audited", async () => {
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
   app.addHook("preHandler", async (request) => {
+    const role = request.headers["x-test-role"] === "admin" ? "admin" : "owner";
     request.auth = {
       userId: request.headers["x-user-id"]?.toString() || "admin-user",
       tenantId: request.headers["x-tenant-id"]?.toString() || "admin-tenant",
       isAdmin: true,
-      role: "owner" as const
+      role
     };
   });
 
   const auditEvents = new InMemoryAuditEventStore();
+  const adminConfig = new InMemoryAdminConfig();
   await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+    dynamicConfig: adminConfig as AdminRouteStores["dynamicConfig"],
     skillMarketplace: createMarketplaceStore(),
     auditEvents,
     runtimeSessions: {
@@ -665,7 +667,7 @@ test("admin tenant settings updates are audited", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -709,6 +711,32 @@ test("admin tenant settings updates are audited", async () => {
         configHash: "hash-tenant-settings"
       });
 
+  const forbidden = await app.inject({
+    method: "PUT",
+    url: "/admin/tenant-settings",
+    headers: { "x-test-role": "admin" },
+    payload: {
+      allowCommandExecution: false,
+      allowUserTokenForwarding: true
+    }
+  });
+  expect(forbidden.statusCode).toBe(403);
+  expect(forbidden.json()).toEqual({ error: "owner_required_for_sensitive_settings" });
+  expect(adminConfig.tenantSettings.allowCommandExecution).toBe(true);
+
+  const adminUpdate = await app.inject({
+    method: "PUT",
+    url: "/admin/tenant-settings",
+    headers: { "x-test-role": "admin" },
+    payload: {
+      showEffortSelector: true,
+      allowCommandExecution: true,
+      allowUserTokenForwarding: true
+    }
+  });
+  expect(adminUpdate.statusCode).toBe(200);
+  expect(adminConfig.tenantSettings.showEffortSelector).toBe(true);
+
   await app.close();
 });
 
@@ -736,7 +764,7 @@ test("admin tenant settings refresh active runtimes after update", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -803,7 +831,7 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -859,7 +887,7 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -913,7 +941,7 @@ test("admin routes require serverId when creating an MCP server", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -966,7 +994,7 @@ test("admin routes return structured errors for referenced MCP disables", async 
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1019,7 +1047,7 @@ test("admin mutations surface AdminConfigError messages but keep internal errors
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1079,7 +1107,7 @@ test("admin routes import a skill bundle zip", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1152,7 +1180,7 @@ test("admin zip import returns 413 with a fixed message when the upload exceeds 
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1225,7 +1253,7 @@ test("admin zip import returns 400 (not 500) for a malformed zip upload", async 
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1289,7 +1317,7 @@ test("admin routes import a skill bundle from GitHub", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1341,7 +1369,7 @@ test("admin routes list and activate skill revisions", async () => {
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }
@@ -1400,7 +1428,7 @@ test("admin routes run skill revision cleanup and audit the result", async () =>
         return [];
       }
     },
-    runtimeManager: {
+    codexRuntimeManager: {
       async refreshIdleRuntimes() {
         return [];
       }

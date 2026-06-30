@@ -50,14 +50,14 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { PILL_GRAY } from "../lib/ui-tokens";
+import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN } from "../lib/ui-tokens";
 
 const PII_TONE_CLASS: Record<PiiTone, string> = {
   neutral: PILL_GRAY,
-  pending: "inline-flex items-center rounded-full bg-accent-soft px-2 py-0.5 text-xs font-medium text-accent",
-  blocked: "inline-flex items-center rounded-full bg-danger-soft px-2 py-0.5 text-xs font-medium text-danger",
-  failed: "inline-flex items-center rounded-full bg-danger-soft px-2 py-0.5 text-xs font-medium text-danger",
-  transformed: "inline-flex items-center rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success"
+  pending: PILL_BLUE,
+  blocked: PILL_RED,
+  failed: PILL_RED,
+  transformed: PILL_GREEN
 };
 
 function MultiSelectFilter(props: {

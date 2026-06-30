@@ -38,7 +38,7 @@ export function buildAdminRouteStores(
     auditEvents: deps.auditEvents,
     skillBundleStorage: deps.skillBundleStorage,
     runtimeSessions: deps.runtimeSessions,
-    runtimeManager: deps.runtimeManager,
+    codexRuntimeManager: deps.codexRuntimeManager,
     runtimeAdapters: deps.runtimeAdapters,
     tenantMembers: deps.tenantMembers,
     githubConnections: deps.githubConnectionService,
@@ -79,11 +79,11 @@ export async function registerAdminRoutes(
   await registerAdminTokenUsageRoutes(app);
   await registerAdminSessionRoutes(app);
   await registerAdminSessionDetailRoute(app);
-  await registerAdminArtifactRoutes(app);
+  await registerAdminArtifactRoutes(app, { auditEvents: stores.auditEvents });
   await registerAdminRuntimeRoutes(app, {
     auditEvents: stores.auditEvents,
     runtimeSessions: stores.runtimeSessions,
-    runtimeManager: stores.runtimeManager
+    codexRuntimeManager: stores.codexRuntimeManager
   });
   if (stores.piiCircuitBreaker) {
     await registerAdminPiiRoutes(app, {

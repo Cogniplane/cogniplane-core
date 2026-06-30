@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 
@@ -5,8 +6,6 @@ import {
   adminIdSchema,
   configError,
   createAdminAuditEvent,
-  parseAdminBody,
-  parseAdminParams,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -103,7 +102,7 @@ export async function registerAdminMcpServerRoutes(
   }));
 
   app.post("/admin/mcp-servers", withAdmin(app, async (request, reply) => {
-    const bodyResult = parseAdminBody(reply, mcpBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, mcpBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
@@ -137,12 +136,12 @@ export async function registerAdminMcpServerRoutes(
   }));
 
   app.put("/admin/mcp-servers/:serverId", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, serverIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, serverIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
 
-    const bodyResult = parseAdminBody(reply, mcpBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, mcpBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
@@ -179,7 +178,7 @@ export async function registerAdminMcpServerRoutes(
   }));
 
   app.post("/admin/mcp-servers/:serverId/disable", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, serverIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, serverIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
@@ -213,7 +212,7 @@ export async function registerAdminMcpServerRoutes(
     errorMessage: string
   ): void {
     app.post(`/admin/mcp-servers/:serverId/${action}`, withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, serverIdParamsSchema, request.params);
+      const paramsResult = parseRequestInput(reply, serverIdParamsSchema, request.params);
       if (!paramsResult.ok) {
         return paramsResult.response;
       }

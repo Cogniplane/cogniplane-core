@@ -73,6 +73,13 @@ export type RuntimeUserInput =
 export type RuntimeEvent =
   | { type: "response.created"; responseId: string }
   | { type: "response.output_text.delta"; responseId: string; delta: string }
+  // Whole-text replacement of the assistant text streamed so far this turn.
+  // Emitted when the runtime retracts already-streamed content (Claude model
+  // refusal fallback); consumers overwrite their accumulated buffer.
+  | { type: "response.output_text.replace"; responseId: string; text: string }
+  // Same retraction semantics for the reasoning pane: refused-leg thinking
+  // must not survive alongside the fallback's reasoning.
+  | { type: "framework:reasoning_summary.replace"; responseId: string; text: string }
   | { type: "framework:reasoning_text.delta"; responseId: string; delta: string }
   | { type: "framework:reasoning_summary.delta"; responseId: string; delta: string }
   | { type: "framework:plan.delta"; responseId: string; delta: string }
@@ -88,6 +95,9 @@ export type RuntimeEvent =
       itemId: string;
       delta: string;
     }
+  // Tool events emitted under a since-retracted message (Claude refusal
+  // fallback): downstream deletes the persisted rows and removes the cards.
+  | { type: "response.tool.retracted"; responseId: string; itemIds: string[] }
   | {
       type: "response.tool.completed";
       responseId: string;
@@ -241,6 +251,18 @@ export function runtimeEventToSSEFrame(
         }
       };
 
+    case "response.output_text.replace":
+    case "framework:reasoning_summary.replace":
+      return {
+        event: event.type,
+        data: {
+          type: event.type,
+          response_id: event.responseId,
+          item_id: itemId,
+          text: event.text
+        }
+      };
+
     case "response.output_item.done":
       return {
         event: event.type,
@@ -272,6 +294,17 @@ export function runtimeEventToSSEFrame(
           response_id: event.responseId,
           item_id: event.itemId,
           delta: event.delta
+        }
+      };
+
+    case "response.tool.retracted":
+      return {
+        event: event.type,
+        data: {
+          type: event.type,
+          response_id: event.responseId,
+          item_id: itemId,
+          item_ids: event.itemIds
         }
       };
 
@@ -436,6 +469,20 @@ export interface RuntimeAdapter {
    */
   invalidateIntegrationRuntimesForTenant?(
     tenantId: string,
+    integrationId: string
+  ): Promise<string[]>;
+  /**
+   * Tear down every active runtime this adapter owns for a specific user after
+   * they (re)connect or disconnect an integration (the credentials in their
+   * live sandbox are now stale). User-scoped counterpart to
+   * {@link invalidateIntegrationRuntimesForTenant}; the gateway fans a single
+   * integration reconnect across every registered adapter so a tenant on Claude
+   * also gets its Claude sessions torn down. Optional: adapters with no
+   * integration coupling omit it.
+   */
+  invalidateRuntimesForIntegration?(
+    tenantId: string,
+    userId: string,
     integrationId: string
   ): Promise<string[]>;
   close?(): Promise<void>;

@@ -33,7 +33,7 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 
 ### 1.4 Public-path allowlist
 - **Match:** exact, after stripping query string — defends against `/auth/login.attack` smuggling.
-- **Allowed:** `/auth/login`, `/auth/callback`, `/auth/refresh`, `/auth/logout`, `/auth/github/install/callback`, `/auth/github/user/callback`.
+- **Allowed:** `/auth/login`, `/auth/callback`, `/auth/refresh`, `/auth/logout`, `/auth/github/user/callback`.
 - File: `apps/backend/src/lib/auth-public-paths.ts`.
 
 ### 1.5 `.well-known/` returns 404 (not 401)
@@ -243,7 +243,7 @@ File: `apps/backend/src/routes/mcp.ts`.
 
 ### 9.2 Runtime token authentication
 - **Token:** `rt_…`, HMAC-derived from `DATA_ENCRYPTION_SECRET`.
-- **Codex:** Streamable HTTP transport drops `Authorization` on `initialize` POST → token-in-URL fallback (`?token=rt_…`) supported.
+- **Codex:** `[mcp_servers.*.http_headers]` sends `Authorization: Bearer rt_…` on every request, including `initialize` (Codex ≥ 0.139). Query-param tokens are rejected.
 - **Claude:** `Authorization: Bearer rt_…` header only; no token in URL.
 - File: `apps/backend/src/lib/auth-runtime-token.ts`.
 

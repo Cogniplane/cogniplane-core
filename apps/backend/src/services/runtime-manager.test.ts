@@ -8,7 +8,7 @@ import type { FastifyBaseLogger } from "fastify";
 import codexRelease from "../codex-release.json" with { type: "json" };
 import { CodexRuntimeProcessStartError } from "./runtime/codex-jsonrpc.js";
 import type { DynamicConfigService } from "./dynamic-config-service.js";
-import { CodexRuntimeManager, resolveInsideSandbox } from "./runtime-manager.js";
+import { CodexRuntimeManager } from "./runtime-manager.js";
 import type { ApprovalRecord } from "./auth/approval-store.js";
 import type { RuntimeSessionUpsertInput } from "./runtime/runtime-session-store.js";
 import type { WorkspaceArtifacts } from "./runtime/runtime-workspace.js";
@@ -563,44 +563,6 @@ async function waitFor(assertion: () => void, timeoutMs = 1_000): Promise<void> 
 
   assertion();
 }
-
-test("resolveInsideSandbox: returns relative paths joined to the workspace root", () => {
-  expect(resolveInsideSandbox("/home/user/workspace", "out.txt")).toBe(
-    "/home/user/workspace/out.txt"
-  );
-});
-
-test("resolveInsideSandbox: normalizes . and .. segments while staying inside root", () => {
-  expect(resolveInsideSandbox("/home/user/ws", "./a/b/../c.txt")).toBe(
-    "/home/user/ws/a/c.txt"
-  );
-});
-
-test("resolveInsideSandbox: keeps absolute paths that are already inside root", () => {
-  expect(resolveInsideSandbox("/home/user/ws", "/home/user/ws/inner/file.md")).toBe(
-    "/home/user/ws/inner/file.md"
-  );
-});
-
-test("resolveInsideSandbox: rejects relative traversal that escapes root", () => {
-  expect(() => resolveInsideSandbox("/home/user/ws", "../etc/passwd")).toThrow(
-    /must be inside the session workspace/
-  );
-});
-
-test("resolveInsideSandbox: rejects absolute paths outside root", () => {
-  expect(() => resolveInsideSandbox("/home/user/ws", "/etc/passwd")).toThrow(
-    /must be inside the session workspace/
-  );
-});
-
-test("resolveInsideSandbox: allows the workspace root itself", () => {
-  expect(resolveInsideSandbox("/home/user/ws", ".")).toBe("/home/user/ws");
-});
-
-test("resolveInsideSandbox: handles workspace paths with trailing slash", () => {
-  expect(resolveInsideSandbox("/home/user/ws/", "x.txt")).toBe("/home/user/ws/x.txt");
-});
 
 test("initializes the pinned protocol and starts a thread before the session becomes active", async () => {
   const runtimeSessions = new InMemoryRuntimeSessionStore();

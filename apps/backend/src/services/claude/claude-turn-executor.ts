@@ -301,20 +301,25 @@ async function runE2bTurn(ctx: {
         });
         return;
       }
-      e2bPendingApprovals.set(frame.approvalId, {
+      const approvalId = `claapr_${uuidv7()}`;
+      e2bPendingApprovals.set(approvalId, {
         sessionId: state.sessionId,
+        sandboxApprovalId: frame.approvalId,
         kind: frame.kind,
         // Capture THIS turn's remember-set so a decision landing after the
         // turn ends can't pollute the next turn's set.
         autoApprovedKinds: state.autoApprovedKindsForTurn
       });
       void ctx.dispatchApprovalEvent({
-        approvalId: frame.approvalId,
+        approvalId,
         toolName: frame.toolName,
         toolInput: frame.toolInput,
         kind: frame.kind
       }).catch((err) => {
-        log.warn({ err, approvalId: frame.approvalId }, "Failed to dispatch E2B approval event");
+        log.warn(
+          { err, approvalId, sandboxApprovalId: frame.approvalId },
+          "Failed to dispatch E2B approval event"
+        );
       });
     },
     onComplete: () => {

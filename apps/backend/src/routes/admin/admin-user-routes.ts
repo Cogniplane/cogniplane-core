@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
@@ -10,8 +11,6 @@ import { serialize } from "../../lib/serialize-response.js";
 import {
   adminIdSchema,
   createAdminAuditEvent,
-  parseAdminBody,
-  parseAdminParams,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -37,12 +36,12 @@ export async function registerAdminUserRoutes(
   }));
 
   app.post("/admin/users/:userId/set-beta-tester", withAdmin(app, async (request, reply) => {
-    const paramsResult = parseAdminParams(reply, userIdParamsSchema, request.params);
+    const paramsResult = parseRequestInput(reply, userIdParamsSchema, request.params);
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
 
-    const bodyResult = parseAdminBody(reply, setBetaTesterBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, setBetaTesterBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }

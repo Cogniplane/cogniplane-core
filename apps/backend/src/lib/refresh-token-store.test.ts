@@ -2,9 +2,12 @@ import { test, expect } from "vitest";
 
 import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
 import {
+  completeRefreshRotation,
   consumeRefreshJti,
+  REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS,
   issueRefreshJti,
-  revokeRefreshFamily
+  revokeRefreshFamily,
+  waitForRefreshRotation
 } from "./refresh-token-store.js";
 
 function makeFakeRedis(): FakeRefreshTokenRedis {
@@ -40,25 +43,122 @@ test("issueRefreshJti writes both keys with a bounded EX TTL", async () => {
   });
 });
 
+test("issueRefreshJti stores the family login time once and never extends it", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, {
+    jti: "j1",
+    familyId: "f1",
+    ttlSeconds: TTL,
+    loginAtEpochSeconds: 100
+  });
+  await issueRefreshJti(redis, {
+    jti: "j2",
+    familyId: "f1",
+    ttlSeconds: TTL,
+    loginAtEpochSeconds: 200
+  });
+
+  expect(redis.store.get("refresh_family_login_at:f1")).toBe("100");
+  expect(
+    redis.setCalls.filter((call) => call.key === "refresh_family_login_at:f1")
+  ).toHaveLength(1);
+});
+
+test("issueRefreshJti refuses to resurrect a revoked family", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  await revokeRefreshFamily(redis, { familyId: "f1", ttlSeconds: TTL });
+
+  await expect(
+    issueRefreshJti(redis, { jti: "j2", familyId: "f1", ttlSeconds: TTL })
+  ).rejects.toThrow("revoked family");
+  expect(redis.store.has("refresh_jti:j2")).toBe(false);
+});
+
 test("consumeRefreshJti returns ok on the first use and removes the jti", async () => {
   const redis = makeFakeRedis();
   await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
-  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(result).toEqual({ status: "ok", familyId: "f1" });
   expect(redis.store.has("refresh_jti:j1")).toBe(false);
 });
 
-test("consumeRefreshJti detects reuse when the jti is replayed after rotation", async () => {
+test("consumeRefreshJti treats a second request inside the grace window as concurrent", async () => {
   const redis = makeFakeRedis();
   await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
 
   // Legitimate first use rotates the token.
-  const first = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  const first = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(first.status).toBe("ok");
 
-  // Attacker replays the same jti — family is still active → reuse_detected.
-  const replay = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
-  expect(replay).toEqual({ status: "reuse_detected", familyId: "f1" });
+  const concurrent = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  expect(concurrent).toEqual({ status: "concurrent", result: null });
+});
+
+test("completed rotations are returned idempotently during the grace window", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  const result = { accessToken: "access", refreshToken: "refresh" };
+  await completeRefreshRotation(redis, { jti: "j1", result });
+
+  expect(await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" })).toEqual({
+    status: "concurrent",
+    result
+  });
+  expect(await waitForRefreshRotation(redis, { jti: "j1", timeoutMs: 0 })).toEqual(result);
+});
+
+test("consumeRefreshJti detects reuse after the rotation grace record expires", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  redis.store.delete("refresh_rotation:j1");
+
+  expect(await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" })).toEqual({
+    status: "reuse_detected",
+    familyId: "f1"
+  });
+});
+
+test("consumeRefreshJti revokes a family at the absolute session lifetime", async () => {
+  const redis = makeFakeRedis();
+  const loginAt = 1_000;
+  await issueRefreshJti(redis, {
+    jti: "j1",
+    familyId: "f1",
+    ttlSeconds: TTL,
+    loginAtEpochSeconds: loginAt
+  });
+
+  const result = await consumeRefreshJti(redis, {
+    jti: "j1",
+    familyId: "f1",
+    nowEpochSeconds: loginAt + REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS,
+    familyTtlSeconds: TTL
+  });
+
+  expect(result).toEqual({ status: "absolute_expired" });
+  expect(redis.store.get("refresh_family:f1")).toBe("revoked");
+  expect(redis.store.has("refresh_jti:j1")).toBe(true);
+});
+
+test("consumeRefreshJti allows the final second before the absolute lifetime", async () => {
+  const redis = makeFakeRedis();
+  const loginAt = 1_000;
+  await issueRefreshJti(redis, {
+    jti: "j1",
+    familyId: "f1",
+    ttlSeconds: TTL,
+    loginAtEpochSeconds: loginAt
+  });
+
+  const result = await consumeRefreshJti(redis, {
+    jti: "j1",
+    familyId: "f1",
+    nowEpochSeconds: loginAt + REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS - 1
+  });
+  expect(result).toEqual({ status: "ok", familyId: "f1" });
 });
 
 test("consumeRefreshJti returns revoked when the family was already revoked", async () => {
@@ -66,7 +166,7 @@ test("consumeRefreshJti returns revoked when the family was already revoked", as
   await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
   await revokeRefreshFamily(redis, { familyId: "f1", ttlSeconds: TTL });
 
-  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(result).toEqual({ status: "revoked" });
 });
 
@@ -74,8 +174,7 @@ test("consumeRefreshJti returns not_found when neither the jti nor the family ex
   const redis = makeFakeRedis();
   const result = await consumeRefreshJti(redis, {
     jti: "unknown",
-    familyId: "unknown",
-    ttlSeconds: TTL
+    familyId: "unknown"
   });
   expect(result).toEqual({ status: "not_found" });
 });
@@ -87,7 +186,7 @@ test("consumeRefreshJti flags reuse when the jti belongs to a different family",
   // Make f2 active too so we hit the family-mismatch branch (not "not_found").
   await issueRefreshJti(redis, { jti: "j99", familyId: "f2", ttlSeconds: TTL });
 
-  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f2", ttlSeconds: TTL });
+  const result = await consumeRefreshJti(redis, { jti: "j1", familyId: "f2" });
   // The replay should expose the *real* family of the jti so the route can
   // revoke whichever chain actually owns it.
   expect(result).toEqual({ status: "reuse_detected", familyId: "f1" });
@@ -102,7 +201,7 @@ test("revokeRefreshFamily marks the family revoked so subsequent consumes fail",
 
   // Even though j2's record still exists, consuming it returns "revoked"
   // because the family-state check runs first.
-  const result = await consumeRefreshJti(redis, { jti: "j2", familyId: "f1", ttlSeconds: TTL });
+  const result = await consumeRefreshJti(redis, { jti: "j2", familyId: "f1" });
   expect(result).toEqual({ status: "revoked" });
 });
 
@@ -125,16 +224,17 @@ test("rotation chain: issue → consume → issue (same family) → consume succ
   await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
 
   // First refresh: consume j1, issue j2 (same family).
-  const first = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  const first = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(first.status).toBe("ok");
   await issueRefreshJti(redis, { jti: "j2", familyId: "f1", ttlSeconds: TTL });
 
   // Second refresh on j2 succeeds.
-  const second = await consumeRefreshJti(redis, { jti: "j2", familyId: "f1", ttlSeconds: TTL });
+  const second = await consumeRefreshJti(redis, { jti: "j2", familyId: "f1" });
   expect(second.status).toBe("ok");
 
   // Replaying j1 now is reuse — family was active when the chain was
   // continuing, so reuse_detected.
-  const replay = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  redis.store.delete("refresh_rotation:j1");
+  const replay = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(replay.status).toBe("reuse_detected");
 });

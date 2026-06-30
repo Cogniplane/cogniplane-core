@@ -83,6 +83,34 @@ test("loadConfig rejects WorkOS mode when JWT_SECRET is left at the default", ()
           )).toThrow(/JWT_SECRET must be changed from the default/);
 });
 
+test("loadConfig parses verification-only JWT keys from JSON", () => {
+  const config = loadConfig(
+    devConfig({
+      JWT_KEY_ID: "current",
+      JWT_VERIFICATION_KEYS: JSON.stringify({
+        previous: "previous-jwt-secret-must-be-at-least-32chars!"
+      })
+    })
+  );
+  expect(config.JWT_VERIFICATION_KEYS).toEqual({
+    previous: "previous-jwt-secret-must-be-at-least-32chars!"
+  });
+});
+
+test("loadConfig rejects conflicting active JWT key definitions", () => {
+  expect(() =>
+    loadConfig(
+      devConfig({
+        JWT_KEY_ID: "current",
+        JWT_SECRET: "current-jwt-secret-must-be-at-least-32chars!",
+        JWT_VERIFICATION_KEYS: JSON.stringify({
+          current: "different-jwt-secret-must-be-at-least-32chars!"
+        })
+      })
+    )
+  ).toThrow(/must not redefine JWT_KEY_ID/);
+});
+
 test("loadConfig rejects ARTIFACT_STORAGE_BACKEND=bucket without ARTIFACT_BUCKET_NAME", () => {
   expect(() => loadConfig({ ARTIFACT_STORAGE_BACKEND: "bucket" })).toThrow(/ARTIFACT_BUCKET_NAME is required when ARTIFACT_STORAGE_BACKEND=bucket/);
 });
@@ -120,9 +148,42 @@ test("loadConfig still allows dev-headers for unset / development / test NODE_EN
   expect(loadConfig(devConfig({ NODE_ENV: "test" })).AUTH_MODE).toBe("dev-headers");
 });
 
+test("loadConfig defaults dev-headers to the IPv4 loopback listener", () => {
+  expect(loadConfig(devConfig()).API_HOST).toBe("127.0.0.1");
+});
+
+test("loadConfig allows loopback listeners in dev-headers mode", () => {
+  expect(loadConfig(devConfig({ API_HOST: "127.0.0.1" })).API_HOST).toBe("127.0.0.1");
+  expect(loadConfig(devConfig({ API_HOST: "::1" })).API_HOST).toBe("::1");
+  expect(loadConfig(devConfig({ API_HOST: "localhost" })).API_HOST).toBe("localhost");
+});
+
+test("loadConfig rejects network-exposed listeners in dev-headers mode", () => {
+  expect(() => loadConfig(devConfig({ API_HOST: "0.0.0.0" }))).toThrow(/API_HOST must be a loopback address/);
+  expect(() => loadConfig(devConfig({ API_HOST: "::" }))).toThrow(/API_HOST must be a loopback address/);
+  expect(() => loadConfig(devConfig({ API_HOST: "192.168.1.10" }))).toThrow(/API_HOST must be a loopback address/);
+  expect(() => loadConfig(devConfig({ API_HOST: "backend.internal" }))).toThrow(/API_HOST must be a loopback address/);
+});
+
+test("loadConfig allows dev-headers on a non-loopback listener only when the container opt-in is set", () => {
+  // Without the opt-in, the guard still throws (covered above). With it, boot
+  // succeeds — the operator has acknowledged the host firewall is the boundary.
+  expect(loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1" })).API_HOST).toBe(
+    "0.0.0.0"
+  );
+  expect(loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "true" })).API_HOST).toBe(
+    "0.0.0.0"
+  );
+  // Unknown / falsy values must NOT bypass the guard.
+  expect(() => loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "no" }))).toThrow(
+    /API_HOST must be a loopback address/
+  );
+});
+
 test("loadConfig accepts AUTH_MODE=workos when NODE_ENV=production", () => {
-  const config = loadConfig(workosConfig({ NODE_ENV: "production" }));
+  const config = loadConfig(workosConfig({ NODE_ENV: "production", API_HOST: "0.0.0.0" }));
   expect(config.AUTH_MODE).toBe("workos");
+  expect(config.API_HOST).toBe("0.0.0.0");
 });
 
 test("loadConfig boots when PII provider is disabled and no API key is set", () => {

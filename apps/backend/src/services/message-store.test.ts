@@ -591,6 +591,52 @@ test("MessageStore.updateStreamingContent: passes provided fields through and nu
   expect(captured![4]).toBe(null);
 });
 
+test("MessageStore.updateContent redacts secrets before persisting assistant text", async () => {
+  const db = new ScriptedDatabase();
+  let captured: unknown[] | null = null;
+  db.scripts = [
+    {
+      match: (t) => t.includes("UPDATE messages") && t.includes("content_text = $5"),
+      fn: (vals) => {
+        captured = vals;
+        return { rows: [], rowCount: 0 };
+      }
+    }
+  ];
+  const store = new MessageStore(db as unknown as Pool);
+  await store.updateContent(
+    "t",
+    "m-1",
+    "u",
+    "completed",
+    `The key is sk-ant-abc123def456ghi789jkl012mno and token rt_xyz.sender.v1 for you.`
+  );
+  expect(captured).toBeTruthy();
+  expect(captured![4]).toBe("The key is [REDACTED] and token [REDACTED] for you.");
+});
+
+test("MessageStore.updateStreamingContent redacts secrets in reasoning and plan", async () => {
+  const db = new ScriptedDatabase();
+  let captured: unknown[] | null = null;
+  db.scripts = [
+    {
+      match: (t) => t.includes("UPDATE messages") && t.includes("reasoning_content"),
+      fn: (vals) => {
+        captured = vals;
+        return { rows: [], rowCount: 1 };
+      }
+    }
+  ];
+  const store = new MessageStore(db as unknown as Pool);
+  await store.updateStreamingContent("t", "m-1", "u", {
+    reasoningContent: "use bearer rt_secretabc123xyz to auth",
+    planContent: "Anthropic key sk-ant-zzzzzzzzzzzzzzzzzzzzz"
+  });
+  expect(captured).toBeTruthy();
+  expect(captured![3]).toBe("use bearer [REDACTED] to auth");
+  expect(captured![4]).toBe("Anthropic key [REDACTED]");
+});
+
 test("MessageStore.addTokenUsage increments token columns and returns the new totals", async () => {
   const db = new ScriptedDatabase();
   let captured: unknown[] | null = null;

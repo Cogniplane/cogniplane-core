@@ -48,6 +48,46 @@ test("parseOutboundFrame accepts approval_request and preserves toolInput", () =
   }
 });
 
+test("parseOutboundFrame rejects malformed known frame types", () => {
+  const malformedFrames = [
+    { type: "ready", sdkVersion: "0.3.0" },
+    { type: "sdk_message", turnId: "t-1", payload: [] },
+    {
+      type: "approval_request",
+      approvalId: "a-1",
+      toolName: "Bash",
+      toolInput: { command: "pwd" },
+      kind: "network_access"
+    },
+    { type: "turn_complete", turnId: "", claudeSessionId: null },
+    { type: "turn_failed", turnId: "t-1", error: 42 },
+    { type: "log", level: "fatal", message: "nope" }
+  ];
+
+  for (const frame of malformedFrames) {
+    expect(parseOutboundFrame(JSON.stringify(frame))).toBe(null);
+  }
+});
+
+test("parseOutboundFrame rejects oversized harness-controlled metadata", () => {
+  expect(
+    parseOutboundFrame(
+      JSON.stringify({
+        type: "approval_request",
+        approvalId: "a-1",
+        toolName: "x".repeat(257),
+        toolInput: {},
+        kind: "command_execution"
+      })
+    )
+  ).toBe(null);
+  expect(
+    parseOutboundFrame(
+      JSON.stringify({ type: "log", level: "info", message: "x".repeat(8 * 1024 + 1) })
+    )
+  ).toBe(null);
+});
+
 test("parseOutboundFrame returns null for unknown type", () => {
   const frame = parseOutboundFrame(JSON.stringify({ type: "mystery", x: 1 }));
   expect(frame).toBe(null);

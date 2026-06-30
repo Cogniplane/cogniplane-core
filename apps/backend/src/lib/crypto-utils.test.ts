@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { computeConfigHash, decrypt, encrypt, sha256, unique } from "./crypto-utils.js";
+import { computeConfigHash, decrypt, encrypt, unique } from "./crypto-utils.js";
 
 // Envelope framing constants — mirrored from crypto-utils.ts. The layout is
 // [ iv (12 bytes) | ciphertext (variable) | authTag (16 bytes) ], base64-encoded.
@@ -126,14 +126,6 @@ describe("computeConfigHash", () => {
 
   test("returns a 64-char hex SHA-256 digest", () => {
     expect(computeConfigHash({ x: 1 })).toMatch(/^[0-9a-f]{64}$/);
-  });
-});
-
-describe("sha256", () => {
-  test("is deterministic and distinguishes inputs", () => {
-    expect(sha256("hello")).toBe(sha256("hello"));
-    expect(sha256("hello")).not.toBe(sha256("world"));
-    expect(sha256("hello")).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 

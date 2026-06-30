@@ -1,6 +1,6 @@
-// Strips sensitive query parameters from a URL before it reaches logs.
-// Long-term log retention (CloudWatch, Datadog) would otherwise capture
-// runtime tokens embedded as `?token=rt_...` in MCP URLs.
+// Strips sensitive query parameters from a URL before it reaches logs —
+// defense in depth so a caller-supplied `?token=`/`?apiKey=` never lands in
+// long-term log retention (CloudWatch, Datadog).
 
 const SENSITIVE_QUERY_PARAMS = new Set(["token", "accessToken", "refreshToken", "apiKey", "api_key"]);
 

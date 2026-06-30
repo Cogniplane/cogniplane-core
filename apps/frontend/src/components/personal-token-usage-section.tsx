@@ -12,11 +12,10 @@ import {
   type Days,
   ViewToggle
 } from "./token-usage-chart-primitives";
-import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
+import { HINT, SECTION_LABEL, TOKEN_USAGE_COL_GRID as COL_GRID } from "../lib/ui-tokens";
 
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
-const COL_GRID = "grid grid-cols-[1fr_80px_80px_80px_90px] gap-x-4";
 
 type View = "day" | "model";
 
@@ -55,8 +54,8 @@ export function PersonalTokenUsageSection() {
     () =>
       (usage?.daily ?? []).map((d) => ({
         label: d.date,
-        primary: d.inputTokens,
-        secondary: d.outputTokens
+        inputSeries: d.inputTokens,
+        outputSeries: d.outputTokens
       })),
     [usage]
   );
@@ -65,8 +64,8 @@ export function PersonalTokenUsageSection() {
     () =>
       (usage?.byModel ?? []).map((m) => ({
         label: m.modelName,
-        primary: m.inputTokens,
-        secondary: m.outputTokens
+        inputSeries: m.inputTokens,
+        outputSeries: m.outputTokens
       })),
     [usage]
   );

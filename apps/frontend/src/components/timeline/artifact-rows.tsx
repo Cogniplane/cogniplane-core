@@ -59,7 +59,7 @@ export function ArtifactReadRowView({ row }: { row: ArtifactReadRow }) {
 
   return (
     <details className={`group rounded-md border-l-2 bg-surface-container-low pl-3 pr-2 py-2 ${STATUS_BORDER[row.status]}`}>
-      <summary className="flex cursor-pointer items-center gap-2 text-sm outline-none">
+      <summary className="flex cursor-pointer items-center gap-2 rounded-sm text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <ChevronDownIcon className="size-3 -rotate-90 text-on-surface-faint transition-transform group-open:rotate-0" />
         <FileTextIcon className="size-3 shrink-0 text-on-surface-faint" />
         <span className="min-w-0 flex-1 truncate font-mono text-on-surface">

@@ -1,4 +1,5 @@
 import { test, expect } from "vitest";
+import { decodeProtectedHeader } from "jose";
 
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import { createTestConfig } from "../../../test-helpers/test-config.js";
@@ -108,6 +109,7 @@ test("getAuthorizationUrl returns valid Notion URL", async () => {
   expect(parsed.searchParams.get("response_type")).toBe("code");
   expect(parsed.searchParams.get("owner")).toBe("user");
   expect(parsed.searchParams.has("state")).toBeTruthy();
+  expect(decodeProtectedHeader(parsed.searchParams.get("state")!).kid).toBe(config.JWT_KEY_ID);
   expect(parsed.searchParams.get("redirect_uri")).toBe("http://localhost:3001/integrations/notion/callback");
 });
 
@@ -197,6 +199,37 @@ test("completeAuthorization returns error redirect when state is invalid", async
   expect(redirectUrl).toMatch(/notionAuth=error/);
 });
 
+test("completeAuthorization consumes Notion OAuth state before token exchange", async () => {
+  const config = createTestConfig({
+    API_ORIGIN: "http://localhost:3000",
+    ...NOTION_OAUTH_OVERRIDES
+  });
+  const store = new InMemoryNotionConnectionStore();
+  const service = new NotionConnectionService(config, store);
+  const state = new URL(
+    await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })
+  ).searchParams.get("state")!;
+  let exchangeCalls = 0;
+  const fake = createFakeFetch(() => {
+    exchangeCalls += 1;
+    return new Response(JSON.stringify({ error: "invalid_grant" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  });
+
+  try {
+    const first = await service.completeAuthorization({ code: "code-1", state });
+    const replay = await service.completeAuthorization({ code: "code-2", state });
+
+    expect(first).toMatch(/notionAuth=error/);
+    expect(replay).toMatch(/reason=invalid_state/);
+    expect(exchangeCalls).toBe(1);
+  } finally {
+    fake.restore();
+  }
+});
+
 test("completeAuthorization fails when token endpoint returns error", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
   const store = new InMemoryNotionConnectionStore();
@@ -219,7 +252,8 @@ test("completeAuthorization fails when token endpoint returns error", async () =
       state: validStateJwt
     });
     expect(redirectUrl).toMatch(/notionAuth=error/);
-    expect(redirectUrl).toMatch(/code\+expired|code%20expired/);
+    expect(redirectUrl).toMatch(/reason=notion_authorization_failed/);
+    expect(redirectUrl).not.toMatch(/code\+expired|code%20expired/);
     expect(store.record).toBe(null);
   } finally {
     fake.restore();

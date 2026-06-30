@@ -6,8 +6,9 @@ import { MessagePostRequestSchema } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
 import { apiError, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
+import { STATIC_SECURITY_HEADERS } from "../lib/security-headers.js";
 import { sseFrame, type RuntimeReasoningEffort } from "../runtime-contracts.js";
-import type { RuntimeProvider } from "../services/admin-config-records.js";
+import { DEFAULT_RUNTIME_PROVIDER, type RuntimeProvider } from "../services/admin-config-records.js";
 import type { ArtifactRecord } from "../services/artifacts/artifact-store.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
@@ -16,7 +17,7 @@ import { streamAssistantReply } from "../services/sse-stream-writer.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
 import { isCorsOriginAllowed } from "../lib/cors.js";
-import { handlePiiDecision } from "./messages-pii-handler.js";
+import { handlePiiDecision, type PiiHandlerOutcome } from "./messages-pii-handler.js";
 import { AVAILABLE_MODELS } from "../domain/models.js";
 
 function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: FastifyReply): void {
@@ -31,7 +32,14 @@ function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: F
     reply.raw.setHeader("Vary", "Origin");
   }
   reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
+  // reply.hijack() bypasses the onSend security-headers hook, so set the same
+  // static headers here to keep parity (otherwise CSP/HSTS/X-Frame are absent
+  // on the SSE stream).
+  for (const [name, value] of STATIC_SECURITY_HEADERS) {
+    reply.raw.setHeader(name, value);
+  }
+  reply.raw.setHeader("X-Request-Id", request.id);
+  reply.raw.setHeader("Cache-Control", "no-store, no-cache, no-transform");
   reply.raw.setHeader("Connection", "keep-alive");
   reply.raw.flushHeaders();
 }
@@ -59,7 +67,6 @@ export function buildMessageRouteStores(
     limits: deps.limits,
     messages: deps.messages,
     toolContexts: deps.toolContexts,
-    runtimeManager: deps.runtimeManager,
     dynamicConfig: deps.dynamicConfig,
     runtimeAdapters: deps.runtimeAdapters,
     hasAnthropicApiKey: extras.hasAnthropicApiKey,
@@ -107,7 +114,7 @@ export async function registerMessageRoutes(
       tenantId,
       requestedModel: input.model,
       requestedEffort: input.effort,
-      defaultAdapter: stores.runtimeManager,
+      defaultAdapter: stores.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
       stores: {
         dynamicConfig: stores.dynamicConfig,
         runtimeAdapters: stores.runtimeAdapters,
@@ -164,38 +171,16 @@ export async function registerMessageRoutes(
     // in its own `finally`.
     let handedOff = false;
     try {
-    const sessionArtifacts = await stores.artifacts.listBySession(
+    const artifactScope = await resolveEligibleArtifacts(reply, stores, {
       tenantId,
-      input.sessionId,
-      userId
-    );
-    // An artifact is eligible for chat context only when it is `ready` AND
-    // its PII scan is not pending/scanning/blocked. This prevents an async
-    // detect/transform scan that hasn't completed, or a blocked document,
-    // from leaking into the prompt just because the row happens to be ready.
-    const readyArtifacts = sessionArtifacts.filter((artifact) => {
-      if (artifact.status !== "ready") return false;
-      const piiStatus = (artifact.detail?.pii as { status?: string } | undefined)?.status;
-      return piiStatus !== "pending" && piiStatus !== "scanning" && piiStatus !== "blocked";
+      sessionId: input.sessionId,
+      userId,
+      requestedArtifactIds: input.artifactIds
     });
-    const readyArtifactById = new Map(
-      readyArtifacts.map((artifact) => [artifact.artifactId, artifact])
-    );
-    const selectedArtifactIds = input.artifactIds ? Array.from(new Set(input.artifactIds)) : [];
-
-    if (input.artifactIds?.length) {
-      for (const artifactId of selectedArtifactIds) {
-        if (!readyArtifactById.has(artifactId)) {
-          reply.code(400);
-          return requestError([
-            {
-              path: "artifactIds",
-              message: `Artifact ${artifactId} is not ready or is not available in this session.`
-            }
-          ]);
-        }
-      }
+    if (!artifactScope.ok) {
+      return artifactScope.response;
     }
+    const { readyArtifactById, selectedArtifactIds } = artifactScope;
 
     // The rate limit is consumed BEFORE the PII evaluation so the PII provider
     // (an LLM call) cannot be triggered by an over-limit user, and so probing
@@ -213,26 +198,15 @@ export async function registerMessageRoutes(
       return rateLimitError;
     }
 
-    let piiDecision: PiiDecision | null = null;
-    if (stores.piiProtection) {
-      try {
-        piiDecision = await stores.piiProtection.evaluateText({
-          tenantId,
-          text: input.text,
-          subject: { kind: "chat_prompt" }
-        });
-      } catch (error) {
-        if (error instanceof PiiProtectionServiceError) {
-          request.log.warn(
-            { err: error, tenantId, sessionId: input.sessionId },
-            "PII provider unavailable; failing closed"
-          );
-          reply.code(503);
-          return apiError(error.code, error.message);
-        }
-        throw error;
-      }
+    const piiEvaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
+      tenantId,
+      sessionId: input.sessionId,
+      text: input.text
+    });
+    if (!piiEvaluation.ok) {
+      return piiEvaluation.response;
     }
+    const { piiDecision } = piiEvaluation;
 
     const scopedArtifacts = selectedArtifactIds
       .map((artifactId) => readyArtifactById.get(artifactId))
@@ -245,42 +219,16 @@ export async function registerMessageRoutes(
     );
 
     if (piiOutcome.kind === "block") {
-      // Persist a system message so the blocked event shows up in history —
-      // the raw user prompt is NOT persisted.
-      await stores.messages.create({
+      return respondWithPiiBlock({
+        app,
+        request,
+        reply,
+        stores,
         tenantId,
         sessionId: input.sessionId,
         userId,
-        role: "system",
-        status: "completed",
-        content: "Message blocked by organization policy.",
-        detail: {
-          pii: {
-            status: "blocked",
-            modeApplied: "block",
-            blockReason: piiOutcome.blockReason,
-            ...(piiOutcome.scanRunId ? { scanRunId: piiOutcome.scanRunId } : {})
-          }
-        }
+        outcome: piiOutcome
       });
-
-      // Frontend consumes /messages as an SSE stream; stay on that contract
-      // and emit a terminal blocked frame so existing streamMessage() handlers
-      // complete cleanly with the block payload visible to the UI.
-      openSseResponse(app, request, reply);
-      reply.raw.write(sseFrame("framework:message_blocked", {
-        type: "framework:message_blocked",
-        reason: "pii_block",
-        block_reason: piiOutcome.blockReason,
-        scan_run_id: piiOutcome.scanRunId,
-        message: "Message blocked by organization policy."
-      }));
-      reply.raw.write(sseFrame("response.completed", {
-        type: "response.completed",
-        response: { id: null, status: "blocked" }
-      }));
-      reply.raw.end();
-      return;
     }
 
     // Past the PII gate: this turn will actually be dispatched, so it now
@@ -295,26 +243,14 @@ export async function registerMessageRoutes(
       return quotaError;
     }
 
-    const { persistedText: persistedUserText, runtimePrompt, userDetail, transformScanRunId } = piiOutcome;
-
-    const persistedUserMessage = await stores.messages.create({
+    const { persistedText: persistedUserText, runtimePrompt } = piiOutcome;
+    const { userMessageReplacement } = await persistUserTurnMessage(stores, {
       tenantId,
       sessionId: input.sessionId,
       userId,
-      role: "user",
-      status: "completed",
-      content: persistedUserText,
-      ...(userDetail ? { detail: userDetail } : {})
+      piiOutcome,
+      piiDecision
     });
-
-    const userMessageReplacement: { messageId: string; text: string; scanRunId?: string } | undefined =
-      piiDecision?.action === "transform"
-        ? {
-            messageId: persistedUserMessage.messageId,
-            text: persistedUserText,
-            ...(transformScanRunId ? { scanRunId: transformScanRunId } : {})
-          }
-        : undefined;
 
     openSseResponse(app, request, reply);
 
@@ -348,7 +284,7 @@ export async function registerMessageRoutes(
         reply,
         messages: stores.messages,
         toolContexts: stores.toolContexts,
-        runtimeManager: runtimeAdapter,
+        runtimeAdapter: runtimeAdapter,
         tenantId: request.auth.tenantId,
         sessionId: input.sessionId,
         userId: request.auth.userId,
@@ -377,6 +313,172 @@ export async function registerMessageRoutes(
       }
     }
   });
+}
+
+// An artifact is eligible for chat context only when it is `ready` AND its
+// PII scan is not pending/scanning/blocked. This prevents an async
+// detect/transform scan that hasn't completed, or a blocked document, from
+// leaking into the prompt just because the row happens to be ready.
+async function resolveEligibleArtifacts(
+  reply: FastifyReply,
+  stores: MessageRouteStores,
+  input: { tenantId: string; sessionId: string; userId: string; requestedArtifactIds?: string[] }
+): Promise<
+  | { ok: false; response: unknown }
+  | { ok: true; readyArtifactById: Map<string, ArtifactRecord>; selectedArtifactIds: string[] }
+> {
+  const sessionArtifacts = await stores.artifacts.listBySession(
+    input.tenantId,
+    input.sessionId,
+    input.userId
+  );
+  const readyArtifacts = sessionArtifacts.filter((artifact) => {
+    if (artifact.status !== "ready") return false;
+    const piiStatus = (artifact.detail?.pii as { status?: string } | undefined)?.status;
+    return piiStatus !== "pending" && piiStatus !== "scanning" && piiStatus !== "blocked";
+  });
+  const readyArtifactById = new Map(
+    readyArtifacts.map((artifact) => [artifact.artifactId, artifact])
+  );
+  const selectedArtifactIds = input.requestedArtifactIds
+    ? Array.from(new Set(input.requestedArtifactIds))
+    : [];
+
+  if (input.requestedArtifactIds?.length) {
+    for (const artifactId of selectedArtifactIds) {
+      if (!readyArtifactById.has(artifactId)) {
+        reply.code(400);
+        return {
+          ok: false,
+          response: requestError([
+            {
+              path: "artifactIds",
+              message: `Artifact ${artifactId} is not ready or is not available in this session.`
+            }
+          ])
+        };
+      }
+    }
+  }
+
+  return { ok: true, readyArtifactById, selectedArtifactIds };
+}
+
+// Fail closed when the PII provider is unavailable: a 503 is returned rather
+// than letting an unscanned prompt through. A null decision means PII
+// protection is not configured for this deployment.
+async function evaluatePiiDecisionOrFailClosed(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  stores: MessageRouteStores,
+  input: { tenantId: string; sessionId: string; text: string }
+): Promise<{ ok: false; response: unknown } | { ok: true; piiDecision: PiiDecision | null }> {
+  if (!stores.piiProtection) {
+    return { ok: true, piiDecision: null };
+  }
+  try {
+    const piiDecision = await stores.piiProtection.evaluateText({
+      tenantId: input.tenantId,
+      text: input.text,
+      subject: { kind: "chat_prompt" }
+    });
+    return { ok: true, piiDecision };
+  } catch (error) {
+    if (error instanceof PiiProtectionServiceError) {
+      request.log.warn(
+        { err: error, tenantId: input.tenantId, sessionId: input.sessionId },
+        "PII provider unavailable; failing closed"
+      );
+      reply.code(503);
+      return { ok: false, response: apiError(error.code, error.message) };
+    }
+    throw error;
+  }
+}
+
+async function respondWithPiiBlock(args: {
+  app: FastifyInstance;
+  request: FastifyRequest;
+  reply: FastifyReply;
+  stores: MessageRouteStores;
+  tenantId: string;
+  sessionId: string;
+  userId: string;
+  outcome: Extract<PiiHandlerOutcome, { kind: "block" }>;
+}): Promise<void> {
+  const { app, request, reply, stores, tenantId, sessionId, userId, outcome } = args;
+
+  // Persist a system message so the blocked event shows up in history —
+  // the raw user prompt is NOT persisted.
+  await stores.messages.create({
+    tenantId,
+    sessionId,
+    userId,
+    role: "system",
+    status: "completed",
+    content: "Message blocked by organization policy.",
+    detail: {
+      pii: {
+        status: "blocked",
+        modeApplied: "block",
+        blockReason: outcome.blockReason,
+        ...(outcome.scanRunId ? { scanRunId: outcome.scanRunId } : {})
+      }
+    }
+  });
+
+  // Frontend consumes /messages as an SSE stream; stay on that contract
+  // and emit a terminal blocked frame so existing streamMessage() handlers
+  // complete cleanly with the block payload visible to the UI.
+  openSseResponse(app, request, reply);
+  reply.raw.write(sseFrame("framework:message_blocked", {
+    type: "framework:message_blocked",
+    reason: "pii_block",
+    block_reason: outcome.blockReason,
+    scan_run_id: outcome.scanRunId,
+    message: "Message blocked by organization policy."
+  }));
+  reply.raw.write(sseFrame("response.completed", {
+    type: "response.completed",
+    response: { id: null, status: "blocked" }
+  }));
+  reply.raw.end();
+}
+
+async function persistUserTurnMessage(
+  stores: MessageRouteStores,
+  input: {
+    tenantId: string;
+    sessionId: string;
+    userId: string;
+    piiOutcome: Extract<PiiHandlerOutcome, { kind: "continue" }>;
+    piiDecision: PiiDecision | null;
+  }
+): Promise<{
+  userMessageReplacement: { messageId: string; text: string; scanRunId?: string } | undefined;
+}> {
+  const { tenantId, sessionId, userId, piiOutcome, piiDecision } = input;
+
+  const persistedUserMessage = await stores.messages.create({
+    tenantId,
+    sessionId,
+    userId,
+    role: "user",
+    status: "completed",
+    content: piiOutcome.persistedText,
+    ...(piiOutcome.userDetail ? { detail: piiOutcome.userDetail } : {})
+  });
+
+  const userMessageReplacement =
+    piiDecision?.action === "transform"
+      ? {
+          messageId: persistedUserMessage.messageId,
+          text: piiOutcome.persistedText,
+          ...(piiOutcome.transformScanRunId ? { scanRunId: piiOutcome.transformScanRunId } : {})
+        }
+      : undefined;
+
+  return { userMessageReplacement };
 }
 
 async function titleSessionAsync(input: {

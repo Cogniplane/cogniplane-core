@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import { access } from "node:fs/promises";
 import { lookup } from "node:dns/promises";
 import os from "node:os";
@@ -20,7 +21,6 @@ import type { CodexRuntimeManager } from "../../services/runtime-manager.js";
 import { rolloutBodySchema } from "./admin-route-schemas.js";
 import {
   createAdminAuditEvent,
-  parseAdminBody,
   withAdmin
 } from "./admin-route-helpers.js";
 
@@ -44,7 +44,7 @@ export async function registerAdminRuntimeRoutes(
   stores: {
     auditEvents: AuditEventStore;
     runtimeSessions: RuntimeSessionStore;
-    runtimeManager: CodexRuntimeManager;
+    codexRuntimeManager: CodexRuntimeManager;
   }
 ): Promise<void> {
   app.get("/admin/runtime-sessions", withAdmin(app, async (request) => {
@@ -68,7 +68,7 @@ export async function registerAdminRuntimeRoutes(
   // unauthenticated /health endpoint used to expose for every tenant.
   app.get("/admin/runtime-health", withAdmin(app, async (request) => {
     return serialize(AdminRuntimeHealthResponseSchema, {
-      runtimes: stores.runtimeManager.getRuntimeHealthDetail(request.auth.tenantId)
+      runtimes: stores.codexRuntimeManager.getRuntimeHealthDetail(request.auth.tenantId)
     });
   }));
 
@@ -129,12 +129,12 @@ export async function registerAdminRuntimeRoutes(
   }));
 
   app.post("/admin/runtime-sessions/rollout", withAdmin(app, async (request, reply) => {
-    const parsed = parseAdminBody(reply, rolloutBodySchema, request.body);
+    const parsed = parseRequestInput(reply, rolloutBodySchema, request.body);
     if (!parsed.ok) {
       return parsed.response;
     }
 
-    const affectedSessionIds = await stores.runtimeManager.refreshIdleRuntimes(
+    const affectedSessionIds = await stores.codexRuntimeManager.refreshIdleRuntimes(
       request.auth.tenantId,
       parsed.value.action
     );

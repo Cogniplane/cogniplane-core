@@ -18,9 +18,9 @@ import { bootstrapClaudeSession } from "./claude-session-bootstrap.js";
 import { executeClaudeTurn } from "./claude-turn-executor.js";
 import {
   buildClaudeContentBlocks,
-  buildClaudeSdkOptions,
-  resolveSandboxWorkspacePath
+  buildClaudeSdkOptions
 } from "./claude-sdk-helpers.js";
+import { resolveInsideSandbox } from "../runtime/sandbox-path.js";
 import type {
   ClaudeCodeE2bOptions,
   ClaudeMcpServerEntry,
@@ -37,7 +37,8 @@ import {
   clearIdleTimer as clearIdleTimerShared,
   scheduleIdleTeardown as scheduleIdleTeardownShared
 } from "../runtime/idle-teardown.js";
-import { PolicyApprovalCoordinator } from "../runtime/policy-approval-coordinator.js";
+import type { PolicyApprovalCoordinator } from "../runtime/policy-approval-coordinator.js";
+import { createRuntimePolicyApprovals } from "../runtime/policy-approval-factory.js";
 import type { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
 import type { RuntimeSessionStore } from "../runtime/runtime-session-store.js";
 
@@ -89,12 +90,11 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     private readonly integrationRegistry?: IntegrationRegistryService,
     private readonly activationTracker?: ActivationTracker
   ) {
-    this.policyApprovals = new PolicyApprovalCoordinator({
+    this.policyApprovals = createRuntimePolicyApprovals({
+      config,
       approvals: stores.approvals,
       auditEvents: stores.auditEvents,
       logger: log,
-      ttlMs: config.APPROVAL_REQUEST_TTL_MS,
-      reminderFraction: config.POLICY_APPROVAL_REMINDER_FRACTION,
       pushFrameworkEvent: (sessionId, event) => {
         const push = this.sessions.get(sessionId)?.activeTurnPush.current;
         if (!push) return false;
@@ -169,8 +169,13 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
       // arms a per-approval TTL that (a) sends the harness a deny so the turn
       // unblocks and (b) calls this back so the DB row + audit mirror Codex.
       approvalRequestTtlMs: this.config.APPROVAL_REQUEST_TTL_MS,
-      onApprovalExpired: (approvalId) =>
-        this.handleE2bApprovalExpired({ tenantId, sessionId, userId, approvalId }),
+      onApprovalExpired: (sandboxApprovalId) =>
+        this.handleE2bApprovalExpired({
+          tenantId,
+          sessionId,
+          userId,
+          sandboxApprovalId
+        }),
       // Harness death between turns: nothing else observes it (the dead state
       // would otherwise linger — runtime_sessions stuck on 'active', stale
       // sessions-map entry — until the next createSession). abortSession is
@@ -267,12 +272,12 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
 
   async readRuntimeFile(sessionId: string, filePath: string): Promise<Uint8Array> {
     const state = this.requireSessionState(sessionId);
-    return state.e2bProcess.readFile(resolveSandboxWorkspacePath(state.workspacePath, filePath));
+    return state.e2bProcess.readFile(resolveInsideSandbox(state.workspacePath, filePath));
   }
 
   async statRuntimeFile(sessionId: string, filePath: string): Promise<{ sizeBytes: number }> {
     const state = this.requireSessionState(sessionId);
-    return state.e2bProcess.statFile(resolveSandboxWorkspacePath(state.workspacePath, filePath));
+    return state.e2bProcess.statFile(resolveInsideSandbox(state.workspacePath, filePath));
   }
 
   async writeRuntimeFile(
@@ -281,7 +286,7 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     data: Uint8Array | ArrayBuffer | string
   ): Promise<string> {
     const state = this.requireSessionState(sessionId);
-    const sandboxPath = resolveSandboxWorkspacePath(state.workspacePath, filePath);
+    const sandboxPath = resolveInsideSandbox(state.workspacePath, filePath);
     await state.e2bProcess.writeFile(sandboxPath, data);
     return sandboxPath;
   }
@@ -389,7 +394,14 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     // edge case where a still-valid leaked rt_* token could be replayed
     // against a fresh slot under the dead runtimeId after the in-memory
     // pin is gone.
-    this.stores.egressIpPins?.clear(state.runtimeId);
+    try {
+      await this.stores.egressIpPins?.clear(state.runtimeId);
+    } catch (err) {
+      this.log.warn(
+        { err, runtimeId: state.runtimeId },
+        "failed to clear runtime egress IP pin during teardown"
+      );
+    }
 
     if (this.stores.runtimeSessions) {
       try {
@@ -461,6 +473,37 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     return targets.map((state) => state.sessionId);
   }
 
+  // User-scoped counterpart after a (re)connect/disconnect: only that user's
+  // Claude sessions are stale. Mirrors CodexRuntimeManager.invalidateRuntimesForIntegration.
+  //
+  // Known parity gaps vs Codex (consistent with invalidateTenantRuntimes above,
+  // tracked as a follow-up): (1) Codex also sweeps pending starts via its
+  // lifecycle machinery, so a session mid-bootstrap is invalidated too — Claude
+  // has no pending-start tracking, so a session that is still bootstrapping when
+  // this runs is missed (narrow window; self-heals on the next createSession).
+  // (2) Codex threads `integrationId` into an audit reason + user-facing
+  // "credentials refreshed" runtime notice; Claude drops it here, so the
+  // teardown audit doesn't record which integration triggered it.
+  async invalidateRuntimesForIntegration(
+    tenantId: string,
+    userId: string,
+    _integrationId: string
+  ): Promise<string[]> {
+    const targets = [...this.sessions.values()].filter(
+      (state) => state.tenantId === tenantId && state.userId === userId
+    );
+    await Promise.all(
+      targets.map((state) =>
+        this.abortSession({
+          tenantId: state.tenantId,
+          sessionId: state.sessionId,
+          userId: state.userId
+        })
+      )
+    );
+    return targets.map((state) => state.sessionId);
+  }
+
   /**
    * Backend sweep for an e2b approval that aged out. The process has already
    * sent the harness a deny (so the SDK turn unblocks); here we move the DB row
@@ -473,9 +516,15 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     tenantId: string;
     sessionId: string;
     userId: string;
-    approvalId: string;
+    sandboxApprovalId: string;
   }): void {
-    const { tenantId, sessionId, userId, approvalId } = input;
+    const { tenantId, sessionId, userId, sandboxApprovalId } = input;
+    const match = [...this.e2bPendingApprovals].find(
+      ([, entry]) =>
+        entry.sessionId === sessionId && entry.sandboxApprovalId === sandboxApprovalId
+    );
+    if (!match) return;
+    const [approvalId] = match;
     void expireApprovalById({
       tenantId,
       sessionId,
@@ -599,7 +648,7 @@ export class ClaudeCodeRuntimeAdapter implements RuntimeAdapter {
     this.e2bPendingApprovals.delete(approvalId);
     try {
       await state.e2bProcess.sendApprovalResponse(
-        approvalId,
+        entry.sandboxApprovalId,
         decision === "approve" ? "approve" : "reject"
       );
       // Record the remembered kind only after the decision actually reached

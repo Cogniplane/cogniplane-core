@@ -17,6 +17,18 @@ const defaultSkillBundleStorageRoot = path.join(os.tmpdir(), "cogniplane-core-sk
 const defaultSkillBundleCacheRoot = path.join(os.tmpdir(), "cogniplane-skill-cache");
 const DEFAULT_DATA_ENCRYPTION_SECRET = "local-dev-data-encryption-secret-change-in-production!!";
 const DEFAULT_JWT_SECRET = "local-dev-jwt-secret-change-in-production!!";
+const jwtKeyIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/);
+const jwtVerificationKeysSchema = z.preprocess((value) => {
+  if (value === undefined || value === "") return {};
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}, z.record(jwtKeyIdSchema, z.string().min(32)).default({}));
 const booleanFromEnvSchema = z.preprocess((value) => {
   if (typeof value === "string") {
     return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
@@ -26,7 +38,7 @@ const booleanFromEnvSchema = z.preprocess((value) => {
 }, z.boolean());
 
 const envSchema = z.object({
-  API_HOST: z.string().default("::"),
+  API_HOST: z.string().default("127.0.0.1"),
   API_PORT: z.coerce.number().int().positive().default(3001),
   API_ORIGIN: z.string().url().default("http://localhost:3000"),
   DATABASE_URL: z
@@ -154,6 +166,9 @@ const envSchema = z.object({
   // still rejecting body-bomb DoS. File uploads bypass this via the multipart
   // plugin's own `fileSize` limit (ARTIFACT_MAX_UPLOAD_BYTES).
   MAX_REQUEST_BODY_BYTES: z.coerce.number().int().positive().default(2 * 1024 * 1024),
+  // Pino log level. Lets operators raise verbosity (debug/trace) for an
+  // incident or lower it to cut log volume without a redeploy.
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   ARTIFACT_DOWNLOAD_TTL_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   SKILL_BUNDLE_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
   SKILL_MARKETPLACE_MANIFEST_URL: z.string().url().optional(),
@@ -203,6 +218,9 @@ const envSchema = z.object({
   // path is wired, even when SCHEDULER_ENABLED=false.
   PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
   AUTH_MODE: z.enum(["workos", "dev-headers"]).default("dev-headers"),
+  // Docker port publishing needs 0.0.0.0 *inside* the container, which the
+  // dev-headers loopback guard below rejects; this is the operator opt-in.
+  COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: booleanFromEnvSchema.default(false),
   DATA_ENCRYPTION_SECRET: z.string().min(32).default(DEFAULT_DATA_ENCRYPTION_SECRET),
   WORKOS_API_KEY: z.string().trim().min(1).optional(),
   WORKOS_CLIENT_ID: z.string().trim().min(1).optional(),
@@ -215,11 +233,10 @@ const envSchema = z.object({
   NOTION_OAUTH_REDIRECT_URI: z.string().url().optional(),
   MIGRATION_DATABASE_URL: z.string().url().optional(),
   JWT_SECRET: z.string().min(32).default(DEFAULT_JWT_SECRET),
-  // Forward-compat handle for JWT secret rotation. Stamped into the `kid`
-  // header of every issued access/refresh token. Verification currently
-  // ignores it; a future multi-key resolver will route on this value
-  // without invalidating tokens already in flight.
-  JWT_KEY_ID: z.string().trim().min(1).default("default"),
+  // Active signing key id plus additional verification-only keys retained
+  // during zero-downtime rotation. JWT_VERIFICATION_KEYS is a JSON object.
+  JWT_KEY_ID: jwtKeyIdSchema.default("default"),
+  JWT_VERIFICATION_KEYS: jwtVerificationKeysSchema,
   REDIS_URL: z.string().url().optional(),
   E2B_API_KEY: z.string().trim().min(1).optional(),
   E2B_TEMPLATE_ID: z.string().trim().min(1).default(codexRelease.e2bTemplateId),
@@ -448,6 +465,13 @@ export function loadConfig(
     }
   }
 
+  const configuredActiveSecret = parsed.JWT_VERIFICATION_KEYS[parsed.JWT_KEY_ID];
+  if (configuredActiveSecret && configuredActiveSecret !== parsed.JWT_SECRET) {
+    throw new Error(
+      "JWT_VERIFICATION_KEYS must not redefine JWT_KEY_ID with a different secret."
+    );
+  }
+
   // dev-headers mode trusts X-User-Id / X-Tenant-Id from request headers, which
   // lets any caller impersonate any user or tenant. It is intended for local
   // development only and must never be active in production.
@@ -469,6 +493,31 @@ export function loadConfig(
         `[development, dev, test] (got NODE_ENV=${JSON.stringify(source.NODE_ENV)}). ` +
         "Any other value — including typos like 'prod' or 'Production' — is treated as production " +
         "and requires AUTH_MODE=workos."
+    );
+  }
+
+  // dev-headers grants identity based entirely on caller-controlled headers.
+  // Keep that trust boundary local even when NODE_ENV is unset or explicitly
+  // development/test: binding to a wildcard, LAN address, or hostname would
+  // let any reachable client impersonate any user or tenant.
+  const DEV_HEADERS_LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+  if (
+    parsed.AUTH_MODE === "dev-headers" &&
+    !DEV_HEADERS_LOOPBACK_HOSTS.has(parsed.API_HOST.trim().toLowerCase()) &&
+    !parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK
+  ) {
+    throw new Error(
+      `API_HOST must be a loopback address [127.0.0.1, ::1, localhost] when AUTH_MODE=dev-headers ` +
+        `(got API_HOST=${JSON.stringify(parsed.API_HOST)}). Use AUTH_MODE=workos before exposing the backend on a network interface, ` +
+        `or set COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1 if the backend runs inside a container whose host firewall is the real trust boundary.`
+    );
+  }
+  if (parsed.AUTH_MODE === "dev-headers" && parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK) {
+    logger.warn(
+      { authMode: parsed.AUTH_MODE, apiHost: parsed.API_HOST },
+      "dev-headers mode is bound to a non-loopback interface by explicit operator opt-in " +
+        "(COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1). This is only safe when the host " +
+        "firewall or network isolation prevents untrusted clients from reaching the backend."
     );
   }
 

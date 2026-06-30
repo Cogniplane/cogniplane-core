@@ -38,6 +38,18 @@
     "cwd": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
+    "initialTurnsPage": {
+      "description": "`thread/turns/list` page returned when requested by `initialTurnsPage`.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TurnsPage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "instructionSources": {
       "description": "Instruction source files currently loaded for this thread.",
       "default": [],
@@ -806,16 +818,9 @@
       ]
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ]
+      "minLength": 1
     },
     "SandboxPolicy": {
       "oneOf": [
@@ -1139,6 +1144,13 @@
             "null"
           ]
         },
+        "parentThreadId": {
+          "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "[UNSTABLE] Path to the thread on disk.",
           "type": [
@@ -1215,6 +1227,12 @@
             "type"
           ],
           "properties": {
+            "clientId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "content": {
               "type": "array",
               "items": {
@@ -2082,6 +2100,32 @@
         "failed",
         "inProgress"
       ]
+    },
+    "TurnsPage": {
+      "type": "object",
+      "required": [
+        "data"
+      ],
+      "properties": {
+        "backwardsCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "UserInput": {
       "oneOf": [

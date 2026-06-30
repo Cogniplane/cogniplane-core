@@ -151,7 +151,7 @@ export function describeConditions(conditions: PolicyConditions): string {
 
 export const EFFECT_LABELS: Record<PolicyEffect, string> = {
   allow: "Allow",
-  require_approval: "Require approval",
+  require_approval: "Require actor confirmation",
   block: "Block"
 };
 

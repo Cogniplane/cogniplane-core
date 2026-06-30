@@ -13,7 +13,6 @@ import {
   inferImageMediaType,
   isClaudeSdkEnvAllowed,
   isInitMessage,
-  resolveSandboxWorkspacePath,
   resolveWorkspacePath
 } from "./claude-sdk-helpers.js";
 
@@ -59,40 +58,6 @@ describe("resolveWorkspacePath", () => {
   test("handles workspace paths that already end with separator", () => {
     const ws = "/tmp/workspace/";
     expect(resolveWorkspacePath(ws, "file.txt")).toBe(path.resolve(ws, "file.txt"));
-  });
-});
-
-describe("resolveSandboxWorkspacePath", () => {
-  test("resolves relative paths under sandbox root", () => {
-    const sandbox = "/home/user/workspace/sess-1";
-    expect(resolveSandboxWorkspacePath(sandbox, "out.txt")).toBe(
-      "/home/user/workspace/sess-1/out.txt"
-    );
-  });
-
-  test("normalizes nested paths", () => {
-    const sandbox = "/home/user/workspace/sess-1";
-    expect(resolveSandboxWorkspacePath(sandbox, "a/b/../c/d.md")).toBe(
-      "/home/user/workspace/sess-1/a/c/d.md"
-    );
-  });
-
-  test("rejects traversal that escapes the sandbox", () => {
-    expect(() =>
-      resolveSandboxWorkspacePath("/home/user/workspace/sess-1", "../../etc/passwd")
-    ).toThrow(/must be inside the session workspace/);
-  });
-
-  test("allows the sandbox root itself", () => {
-    const sandbox = "/home/user/workspace/sess-1";
-    expect(resolveSandboxWorkspacePath(sandbox, ".")).toBe(sandbox);
-  });
-
-  test("uses POSIX semantics regardless of host OS", () => {
-    // On Windows, path.resolve would default to backslash. We force POSIX
-    // because sandbox paths are always Linux.
-    expect(resolveSandboxWorkspacePath("/home/u/ws", "x/y.txt")).toContain("/");
-    expect(resolveSandboxWorkspacePath("/home/u/ws", "x/y.txt")).not.toContain("\\");
   });
 });
 

@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
+import { DEFAULT_RUNTIME_PROVIDER } from "./services/admin-config-records.js";
 import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
@@ -17,7 +18,6 @@ import { registerSecurityHeaders } from "./lib/security-headers.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerTenantRoutes } from "./routes/tenant.js";
 import { TenantMemberStore } from "./services/tenant-member-store.js";
-import { TenantOrgSettingsStore } from "./services/tenant-org-settings-store.js";
 import { ApprovalStore } from "./services/auth/approval-store.js";
 import { Pool } from "pg";
 
@@ -81,10 +81,28 @@ export async function buildApp() {
     // the multipart plugin's own `fileSize` limit and are unaffected by this.
     bodyLimit: config.MAX_REQUEST_BODY_BYTES,
     logger: {
-      // Redact runtime tokens (and similar) that callers embed as query
-      // parameters on MCP URLs. Fastify's automatic request-completion log
-      // serializes `req.url`, so without this strings like `?token=rt_...`
-      // would end up in long-term log retention.
+      // Operators can raise/lower verbosity per environment without a code
+      // change (e.g. `debug` to diagnose a prod incident).
+      level: config.LOG_LEVEL,
+      // Logging-layer safety net. The `req` serializer below already omits the
+      // headers object, but redact common secret-bearing paths so any future
+      // ad-hoc `request.log.*({ ... })` call that includes one of these can't
+      // print a token/password verbatim.
+      redact: {
+        paths: [
+          "req.headers.authorization",
+          "req.headers.cookie",
+          "*.authorization",
+          "*.password",
+          "*.secret",
+          "*.token"
+        ],
+        censor: "[REDACTED]"
+      },
+      // Redact secrets that callers may embed as query parameters. Fastify's
+      // automatic request-completion log serializes `req.url`, so without
+      // this a caller-supplied `?token=`/`?apiKey=` would end up in
+      // long-term log retention.
       serializers: {
         req(req) {
           return {
@@ -100,6 +118,12 @@ export async function buildApp() {
   });
 
   app.setErrorHandler(handleAppError);
+  // Unmatched routes return the app's standard `{ error }` envelope rather than
+  // Fastify's default `{ statusCode, error, message }` body, so clients parse a
+  // single 404 contract whether the route is missing or the request was rejected.
+  app.setNotFoundHandler((_request, reply) => {
+    reply.code(404).send({ error: "not_found" });
+  });
 
   app.decorate("config", config);
   app.decorate("db", createDatabase(config));
@@ -175,19 +199,26 @@ export async function buildApp() {
     logger: app.log
   });
 
+  // Subscribe to cross-replica policy cache invalidations before serving
+  // traffic. Failure is logged inside start(); the rule-cache TTL is the
+  // fallback, so boot proceeds either way.
+  await deps.policyService.start();
+
   if (config.AUTH_MODE === "workos") {
     // Auth callback and membership lookups must bypass RLS because they run before
     // the tenant context is established. Use a separate privileged connection pool.
     const authTenantMembers = new TenantMemberStore(privilegedDb);
-    app.addHook("preHandler", workosAuth(config, authTenantMembers));
+    // onRequest, not preHandler: authentication only reads headers/url, so
+    // gating here rejects unauthenticated callers before body parsing/validation.
+    app.addHook("onRequest", workosAuth(config, authTenantMembers));
     await registerTenantRoutes(app, {
-      db: privilegedDb,
-      tenantOrgSettings: new TenantOrgSettingsStore(privilegedDb, config.DATA_ENCRYPTION_SECRET),
+      db: app.db,
+      tenantOrgSettings: deps.tenantOrgSettings,
       githubConnections: deps.githubConnectionService,
       getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
     });
   } else {
-    app.addHook("preHandler", localDevAuth(config));
+    app.addHook("onRequest", localDevAuth(config));
     await registerTenantRoutes(app, {
       db: app.db,
       tenantOrgSettings: deps.tenantOrgSettings,
@@ -199,7 +230,8 @@ export async function buildApp() {
   await registerAuthRoutes(app, {
     db: config.AUTH_MODE === "workos" ? privilegedDb : app.db,
     config,
-    auditEvents: deps.auditEvents
+    auditEvents: deps.auditEvents,
+    limits: deps.limits
   });
 
   await registerAppRoutes(app, deps);
@@ -209,7 +241,7 @@ export async function buildApp() {
     sessions: deps.sessions,
     messages: deps.messages,
     toolContexts: deps.toolContexts,
-    runtimeManager: deps.runtimeManager,
+    defaultAdapter: deps.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
     runtimeAdapters: deps.runtimeAdapters,
     dynamicConfig: deps.dynamicConfig,
     getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
@@ -224,7 +256,7 @@ export async function buildApp() {
     app,
     config,
     limits: deps.limits,
-    runtimeManager: deps.runtimeManager,
+    policyService: deps.policyService,
     runtimeAdapters: deps.runtimeAdapters,
     privilegedDb,
     schedulerWorker,

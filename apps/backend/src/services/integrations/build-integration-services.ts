@@ -1,6 +1,7 @@
 import type { AppConfig } from "../../config.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
 import type { RuntimeInvalidator } from "./contracts.js";
+import { IntegrationOAuthStateStore } from "./integration-oauth-state-store.js";
 import { GithubConnectionService } from "./github/github-connection-service.js";
 import { IntegrationRegistryService } from "./integration-registry-service.js";
 import { NotionConnectionService } from "./notion/notion-connection-service.js";
@@ -10,6 +11,7 @@ import {
 } from "./register-builtin-integrations.js";
 
 import type { Stores } from "../build-stores.js";
+import type { Redis } from "ioredis";
 
 export function buildIntegrationServices(
   config: AppConfig,
@@ -21,7 +23,8 @@ export function buildIntegrationServices(
   // manager exists, which would indicate a wiring bug.
   resolveRuntimeInvalidator: () => RuntimeInvalidator,
   // Rate limiter applied (per-IP) to the unauthenticated OAuth callback routes.
-  limits?: RequestLimitsInterface
+  limits?: RequestLimitsInterface,
+  redis?: Redis | null
 ) {
   const runtimeInvalidator: RuntimeInvalidator = {
     invalidateRuntimesForIntegration(tenantId, userId, integrationId) {
@@ -33,17 +36,20 @@ export function buildIntegrationServices(
     }
   };
 
+  const oauthStates = new IntegrationOAuthStateStore(redis);
   const githubConnectionService = new GithubConnectionService(
     config,
     stores.githubConnections,
     stores.auditEvents,
-    runtimeInvalidator
+    runtimeInvalidator,
+    oauthStates
   );
   const notionConnectionService = new NotionConnectionService(
     config,
     stores.notionConnections,
     stores.auditEvents,
-    runtimeInvalidator
+    runtimeInvalidator,
+    oauthStates
   );
 
   // Register the built-in integration descriptors (idempotent across

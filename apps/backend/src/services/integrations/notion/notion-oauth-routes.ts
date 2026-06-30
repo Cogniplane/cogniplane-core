@@ -2,7 +2,10 @@ import type { FastifyInstance } from "fastify";
 
 import type { RequestLimitsInterface } from "../../request-limits.js";
 import { enforceOAuthCallbackRateLimit } from "../oauth-callback-rate-limit.js";
-import { buildIntegrationRedirectUrl } from "../integration-oauth-helpers.js";
+import {
+  buildIntegrationRedirectUrl,
+  mapOAuthProviderError
+} from "../integration-oauth-helpers.js";
 import type { NotionConnectionService } from "./notion-connection-service.js";
 
 export const NOTION_OAUTH_CALLBACK_PATHS = ["/integrations/notion/callback"] as const;
@@ -24,7 +27,7 @@ export function registerNotionOAuthRoutes(
       return reply.redirect(
         buildIntegrationRedirectUrl(app.config, "/settings/notion", {
           notionAuth: "error",
-          reason: query.error_description ?? query.error
+          reason: mapOAuthProviderError(query.error)
         })
       );
     }

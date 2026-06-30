@@ -13,6 +13,7 @@ import { notFoundError } from "../lib/http-errors.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
+import { DEFAULT_RUNTIME_PROVIDER } from "../services/admin-config-records.js";
 import type { RuntimeAdapter } from "../runtime-contracts.js";
 
 const createSessionSchema = z.object({
@@ -31,7 +32,7 @@ export function buildSessionRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
     messages: deps.messages,
-    runtimeManager: deps.runtimeManager,
+    defaultAdapter: deps.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
     limits: deps.limits,
     activeTurns: deps.activeTurns,
     runtimeAdapters: deps.runtimeAdapters,
@@ -158,7 +159,7 @@ export async function registerSessionRoutes(
     const owningAdapter =
       registeredAdapters.find((adapter) => adapter.hasActiveTurn(sessionId))
       ?? registeredAdapters.find((adapter) => adapter.hasSession?.(sessionId))
-      ?? stores.runtimeManager;
+      ?? stores.defaultAdapter;
 
     if (!owningAdapter.interruptTurn) {
       reply.code(501);
@@ -217,7 +218,7 @@ export async function registerSessionRoutes(
     const owningAdapter = registeredAdapters.find((adapter) =>
       adapter.hasSession?.(sessionId)
     );
-    const abortTarget: RuntimeAdapter = owningAdapter ?? stores.runtimeManager;
+    const abortTarget: RuntimeAdapter = owningAdapter ?? stores.defaultAdapter;
 
     try {
       await abortTarget.abortSession({

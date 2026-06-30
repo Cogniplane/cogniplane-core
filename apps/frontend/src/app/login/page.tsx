@@ -61,6 +61,7 @@ export default function LoginPage() {
         <form onSubmit={handleSsoLogin} className="flex flex-col gap-3">
           <Input
             type="text"
+            aria-label="Organization ID or slug"
             placeholder="Organization ID or slug"
             value={ssoOrg}
             onChange={(e) => setSsoOrg(e.target.value)}

@@ -29,7 +29,7 @@ function makeInput(overrides?: {
     sessions: {},
     messages: {},
     toolContexts: {},
-    runtimeManager: {},
+    defaultAdapter: {},
     runtimeAdapters: {},
     dynamicConfig: {},
     getTenantAnthropicApiKey: vi.fn(async () => null),

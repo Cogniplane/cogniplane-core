@@ -2,7 +2,7 @@ import { apiError, requestError } from "../../lib/http-errors.js";
 import type { ApiError } from "../../lib/http-errors.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../../runtime-contracts.js";
-import type { RuntimeProvider } from "../admin-config-records.js";
+import { DEFAULT_RUNTIME_PROVIDER, type RuntimeProvider } from "../admin-config-records.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 
 export type ResolverModel = (typeof AVAILABLE_MODELS)[number];
@@ -38,7 +38,7 @@ export async function resolveRuntimeProviderAndModel(
   input: RuntimeResolutionInput
 ): Promise<RuntimeResolutionResult> {
   let runtimeAdapter = input.defaultAdapter;
-  let provider: RuntimeProvider = "codex";
+  let provider: RuntimeProvider = DEFAULT_RUNTIME_PROVIDER;
 
   const { stores, tenantId, requestedModel } = input;
 

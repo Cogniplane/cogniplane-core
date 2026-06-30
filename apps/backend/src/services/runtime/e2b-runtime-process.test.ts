@@ -4,12 +4,9 @@ import path from "node:path";
 import { test, expect, onTestFinished } from "vitest";
 
 import {
-  buildCodexStdioCommand,
   buildE2bCodexFactories,
-  buildSandboxCodexConfig,
   collectLocalWorkspaceFiles,
   createLineBufferedStdoutHandler,
-  extractMcpServersToml,
   E2bRuntimeProcess,
   E2B_WORKSPACE_BASE,
   startE2bStdioHarness
@@ -109,27 +106,6 @@ test("collectLocalWorkspaceFiles returns empty for empty directory", async () =>
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
   }
-});
-
-test("buildSandboxCodexConfig mirrors codex API-key bootstrap defaults", () => {
-  const config = buildSandboxCodexConfig({
-    model: "gpt-5.4",
-    workspaceRoot: E2B_WORKSPACE_BASE
-  });
-
-  expect(config).toMatch(/model = "gpt-5\.4"/);
-  expect(config).toMatch(/tool_output_token_limit = 25000/);
-  expect(config).toMatch(/\[features\]/);
-  expect(config).toMatch(/unified_exec = true/);
-  expect(config).toMatch(/apply_patch_freeform = true/);
-  expect(config).toMatch(/skills = true/);
-  expect(config).toMatch(/shell_snapshot = false/);
-  expect(config).toMatch(/\[projects\."\/home\/user\/workspace"\]/);
-  expect(config).toMatch(/trust_level = "trusted"/);
-});
-
-test("buildCodexStdioCommand starts app-server with the documented default transport", () => {
-  expect(buildCodexStdioCommand("codex")).toBe("codex app-server --listen stdio://");
 });
 
 test("buildE2bCodexFactories workspace factory remaps paths to sandbox", async () => {
@@ -263,85 +239,6 @@ test("buildE2bCodexFactories processFactory cleans up the staging path on failur
         })).rejects.toThrow(/sandbox start failed/);
 
   await waitForPathRemoval(localWorkspacePath);
-});
-
-test("extractMcpServersToml extracts mcp_servers sections from codex.toml", () => {
-  const toml = [
-    "# Auto-generated for Cogniplane",
-    "# Session: abc-123",
-    "# Capability profile: phase4-tools",
-    "",
-    "[mcp_servers.managed-session-context]",
-    'url = "https://api.example.com/mcp/managed-session-context"',
-    "",
-    "[mcp_servers.managed-session-context.headers]",
-    'Authorization = "Bearer rt_secret"',
-    ""
-  ].join("\n");
-
-  const result = extractMcpServersToml(toml);
-  expect(result).toMatch(/\[mcp_servers\.managed-session-context\]/);
-  expect(result).toMatch(/url = "https:\/\/api\.example\.com\/mcp\/managed-session-context"/);
-  expect(result).toMatch(/\[mcp_servers\.managed-session-context\.headers\]/);
-  expect(result).toMatch(/Authorization = "Bearer rt_secret"/);
-});
-
-test("extractMcpServersToml returns empty string when no mcp_servers present", () => {
-  const toml = [
-    "# Auto-generated",
-    'model = "gpt-5.4"',
-    "",
-    "[features]",
-    "unified_exec = true",
-    ""
-  ].join("\n");
-
-  const result = extractMcpServersToml(toml);
-  expect(result).toBe("");
-});
-
-test("extractMcpServersToml handles multiple mcp servers", () => {
-  const toml = [
-    "[mcp_servers.server-a]",
-    'url = "https://a.example.com"',
-    "",
-    "[mcp_servers.server-a.headers]",
-    'Authorization = "Bearer token-a"',
-    "",
-    "[mcp_servers.server-b]",
-    'url = "https://b.example.com"',
-    "",
-    "[mcp_servers.server-b.headers]",
-    'Authorization = "Bearer token-b"',
-    ""
-  ].join("\n");
-
-  const result = extractMcpServersToml(toml);
-  expect(result).toMatch(/\[mcp_servers\.server-a\]/);
-  expect(result).toMatch(/\[mcp_servers\.server-b\]/);
-  expect(result).toMatch(/token-a/);
-  expect(result).toMatch(/token-b/);
-});
-
-test("buildSandboxCodexConfig includes mcpServersToml when provided", () => {
-  const mcpToml = [
-    "[mcp_servers.managed-session-context]",
-    'url = "https://api.example.com/mcp/managed-session-context"',
-    "",
-    "[mcp_servers.managed-session-context.headers]",
-    'Authorization = "Bearer rt_secret"'
-  ].join("\n");
-
-  const config = buildSandboxCodexConfig({
-    model: "gpt-5.4",
-    workspaceRoot: E2B_WORKSPACE_BASE,
-    mcpServersToml: mcpToml
-  });
-
-  expect(config).toMatch(/model = "gpt-5\.4"/);
-  expect(config).toMatch(/\[mcp_servers\.managed-session-context\]/);
-  expect(config).toMatch(/url = "https:\/\/api\.example\.com\/mcp\/managed-session-context"/);
-  expect(config).toMatch(/Authorization = "Bearer rt_secret"/);
 });
 
 test("startE2bStdioHarness exit watcher fires onExit when CommandHandle.wait() rejects", async () => {

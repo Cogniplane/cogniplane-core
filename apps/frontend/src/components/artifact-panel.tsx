@@ -54,7 +54,7 @@ function ArtifactRow(props: {
 }) {
   const { artifact } = props;
   const pii = artifact.detail?.pii;
-  const sourceIsMicrosoft = artifact.detail?.source === "microsoft";
+  const isMicrosoftSource = artifact.detail?.source === "microsoft";
 
   return (
     <article className="flex items-start gap-3 rounded-md bg-surface-container-lowest p-3">
@@ -73,7 +73,7 @@ function ArtifactRow(props: {
             </strong>
             <span
               className={`shrink-0 rounded px-1.5 py-0.5 text-[0.62rem] font-semibold ${
-                sourceIsMicrosoft
+                isMicrosoftSource
                   ? "bg-accent-soft text-accent"
                   : "bg-surface-container text-on-surface-variant"
               }`}

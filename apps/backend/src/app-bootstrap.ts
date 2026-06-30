@@ -101,21 +101,21 @@ export async function registerAppRoutes(
       runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
       egressCidrs: app.config.E2B_EGRESS_CIDRS,
       readRuntimeFile: async (sessionId, runtimeId, filePath) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
         if (!runtime?.readRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.readRuntimeFile(sessionId, filePath);
       },
       statRuntimeFile: async (sessionId, runtimeId, filePath) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
         if (!runtime?.statRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.statRuntimeFile(sessionId, filePath);
       },
       writeRuntimeFile: async (sessionId, runtimeId, filePath, data) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeManager, deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
         if (!runtime?.writeRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
@@ -128,7 +128,6 @@ export async function registerAppRoutes(
       // require_approval degrades to a deny (see PolicyService.routeApproval).
       requestPolicyApproval: async (input) => {
         const runtime = resolveOwningFileAdapter(
-          deps.runtimeManager,
           deps.runtimeAdapters,
           input.sessionId,
           input.runtimeId ?? undefined
@@ -150,7 +149,7 @@ export function registerAppLifecycle(input: {
   app: FastifyInstance;
   config: AppConfig;
   limits: AppDependencies["limits"];
-  runtimeManager: AppDependencies["runtimeManager"];
+  policyService: AppDependencies["policyService"];
   runtimeAdapters: AppDependencies["runtimeAdapters"];
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
@@ -165,7 +164,7 @@ export function registerAppLifecycle(input: {
     app,
     config,
     limits,
-    runtimeManager,
+    policyService,
     runtimeAdapters,
     privilegedDb,
     schedulerWorker,
@@ -201,10 +200,10 @@ export function registerAppLifecycle(input: {
     for (const adapter of Object.values(runtimeAdapters)) {
       if (adapter) closedRuntimes.add(adapter);
     }
-    closedRuntimes.add(runtimeManager);
     for (const adapter of closedRuntimes) {
       await adapter.close?.();
     }
+    await policyService.close();
     await closeRedis();
     await app.db.end();
     if (privilegedDb && privilegedDb !== app.db) {
@@ -221,7 +220,6 @@ export function registerAppLifecycle(input: {
 // would succeed against the wrong workspace and the file would be invisible
 // to the active turn.
 function resolveOwningFileAdapter(
-  runtimeManager: AppDependencies["runtimeManager"],
   runtimeAdapters: AppDependencies["runtimeAdapters"],
   sessionId: string,
   runtimeId?: string
@@ -232,18 +230,12 @@ function resolveOwningFileAdapter(
         return adapter;
       }
     }
-    if (runtimeManager.hasRuntime?.(sessionId, runtimeId)) {
-      return runtimeManager;
-    }
   }
 
   for (const adapter of Object.values(runtimeAdapters)) {
     if (adapter?.hasSession?.(sessionId)) {
       return adapter;
     }
-  }
-  if (runtimeManager.hasSession?.(sessionId)) {
-    return runtimeManager;
   }
   return null;
 }

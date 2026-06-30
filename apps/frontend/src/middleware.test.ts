@@ -16,10 +16,24 @@ function makeRequest(pathname: string, cookies: Record<string, string> = {}): Ne
   return req;
 }
 
+function expectSecurityHeaders(res: Response) {
+  const csp = res.headers.get("content-security-policy");
+  expect(csp).toContain("frame-ancestors 'none'");
+  expect(csp).toMatch(/'nonce-[A-Za-z0-9]+'/);
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  expect(res.headers.get("strict-transport-security")).toContain("max-age=63072000");
+}
+
 test("public paths bypass auth (login)", () => {
   const res = middleware(makeRequest("/login"));
   expect(res.status).toBe(200);
   expect(res.headers.get("location")).toBe(null);
+  expectSecurityHeaders(res);
+  const nonce = res.headers.get("x-middleware-request-x-nonce");
+  expect(nonce).toMatch(/^[A-Za-z0-9]+$/);
+  expect(res.headers.get("x-middleware-request-content-security-policy")).toContain(
+    `'nonce-${nonce}'`
+  );
 });
 
 test("public paths bypass auth (auth/callback)", () => {
@@ -35,6 +49,7 @@ test("/api paths bypass middleware (handled by route handlers)", () => {
 test("static files (with extension) bypass", () => {
   const res = middleware(makeRequest("/favicon.ico"));
   expect(res.status).toBe(200);
+  expectSecurityHeaders(res);
 });
 
 test("protected path with no session cookie redirects to /login", () => {
@@ -43,11 +58,13 @@ test("protected path with no session cookie redirects to /login", () => {
   const location = res.headers.get("location");
   expect(location).toBeTruthy();
   expect(new URL(location!).pathname).toBe("/login");
+  expectSecurityHeaders(res);
 });
 
 test("protected path with session-hint cookie passes through", () => {
   const res = middleware(makeRequest("/admin", { cogniplane_session_hint: "1" }));
   expect(res.status).toBe(200);
+  expectSecurityHeaders(res);
 });
 
 test("session-hint cookie with wrong value still redirects", () => {

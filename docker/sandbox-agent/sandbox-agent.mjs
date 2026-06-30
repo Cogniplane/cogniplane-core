@@ -295,6 +295,21 @@ function createApprovalBridge(options) {
 // ---------------------------------------------------------------------------
 // Pre-warm state
 // ---------------------------------------------------------------------------
+//
+// Module-level mutable state and its lifecycle (the harness is single-turn-at-
+// a-time, so no concurrent turns ever share these):
+//
+//   sdkPromise        — memoized dynamic import of the Agent SDK; set on the
+//                       first loadSdk() call, never reset.
+//   warmStatePromise  — set by handleWarmup when a `warmup` frame arrives,
+//                       awaited AND cleared at the start of the next turn. The
+//                       turn either adopts the warm query (first turn, same
+//                       model, no effort override) or closes it; either way
+//                       the promise is consumed exactly once.
+//   warmCanUseToolFn  — per-turn delegate for the warm query's canUseTool
+//                       closure (captured at warmup, before any turn exists).
+//                       Set when a turn starts, reset to null in the turn's
+//                       `finally`; while null, the closure denies tool use.
 
 // Promise<{ query: WarmQuery; model: string } | null> — set by handleWarmup,
 // consumed (awaited + cleared) at the start of the first turn.

@@ -22,7 +22,7 @@ export function buildSchedulerWorker(
     sessions: SessionStore;
     messages: MessageStore;
     toolContexts: ToolExecutionContextStore;
-    runtimeManager: RuntimeAdapter;
+    defaultAdapter: RuntimeAdapter;
     runtimeAdapters: Partial<Record<RuntimeProvider, RuntimeAdapter>>;
     dynamicConfig: DynamicConfigService;
     getTenantAnthropicApiKey: (tenantId: string) => Promise<string | null>;
@@ -62,7 +62,7 @@ export function buildSchedulerWorker(
       tenantId,
       requestedModel: undefined,
       requestedEffort: undefined,
-      defaultAdapter: input.runtimeManager,
+      defaultAdapter: input.defaultAdapter,
       stores: {
         dynamicConfig: input.dynamicConfig,
         runtimeAdapters: input.runtimeAdapters,

@@ -1,4 +1,5 @@
 import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import { z } from "zod";
 
 /**
  * Stdio protocol between the backend and the in-sandbox Claude harness.
@@ -125,6 +126,7 @@ export type SandboxSdkMessageFrame = {
 export type SandboxApprovalRequestFrame = {
   type: "approval_request";
   approvalId: string;
+  /** Harness-asserted display metadata; authorization never relies on these fields. */
   toolName: string;
   toolInput: Record<string, unknown>;
   /** `file_change` for Write/Edit/MultiEdit/NotebookEdit, `command_execution` otherwise. */
@@ -163,6 +165,51 @@ export type SandboxOutboundFrame =
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
+const FRAME_ID_MAX_LENGTH = 512;
+const VERSION_MAX_LENGTH = 128;
+const TOOL_NAME_MAX_LENGTH = 256;
+const ERROR_MAX_LENGTH = 16 * 1024;
+const LOG_MESSAGE_MAX_LENGTH = 8 * 1024;
+
+const frameIdSchema = z.string().min(1).max(FRAME_ID_MAX_LENGTH);
+const frameRecordSchema = z.record(z.string(), z.unknown());
+
+const outboundFrameSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("ready"),
+    sdkVersion: z.string().min(1).max(VERSION_MAX_LENGTH),
+    nodeVersion: z.string().min(1).max(VERSION_MAX_LENGTH)
+  }),
+  z.object({
+    type: z.literal("sdk_message"),
+    turnId: frameIdSchema,
+    payload: frameRecordSchema
+  }),
+  z.object({
+    type: z.literal("approval_request"),
+    approvalId: frameIdSchema,
+    toolName: z.string().min(1).max(TOOL_NAME_MAX_LENGTH),
+    toolInput: frameRecordSchema,
+    kind: z.enum(["file_change", "command_execution"])
+  }),
+  z.object({
+    type: z.literal("turn_complete"),
+    turnId: frameIdSchema,
+    claudeSessionId: frameIdSchema.nullable()
+  }),
+  z.object({
+    type: z.literal("turn_failed"),
+    turnId: frameIdSchema,
+    error: z.string().min(1).max(ERROR_MAX_LENGTH)
+  }),
+  z.object({
+    type: z.literal("log"),
+    level: z.enum(["debug", "info", "warn", "error"]),
+    message: z.string().max(LOG_MESSAGE_MAX_LENGTH),
+    fields: frameRecordSchema.optional()
+  })
+]);
+
 /**
  * Parses a single line of harness output into a typed frame. Returns null for
  * unrecognized or malformed shapes so the bridge can skip them cleanly (we
@@ -178,19 +225,8 @@ export function parseOutboundFrame(line: string): SandboxOutboundFrame | null {
   } catch {
     return null;
   }
-  if (!parsed || typeof parsed !== "object") return null;
-  const t = (parsed as { type?: unknown }).type;
-  if (
-    t === "ready" ||
-    t === "sdk_message" ||
-    t === "approval_request" ||
-    t === "turn_complete" ||
-    t === "turn_failed" ||
-    t === "log"
-  ) {
-    return parsed as SandboxOutboundFrame;
-  }
-  return null;
+  const result = outboundFrameSchema.safeParse(parsed);
+  return result.success ? result.data : null;
 }
 
 export function encodeInboundFrame(frame: SandboxInboundFrame): string {

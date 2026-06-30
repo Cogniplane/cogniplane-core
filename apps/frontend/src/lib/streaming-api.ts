@@ -35,12 +35,18 @@ export type StreamMessageHandlers = {
   onCreated?: () => void;
   onStatusChange?: (status: Message["status"]) => void;
   onDelta: (delta: string) => void;
+  /** Whole-text replacement (runtime retracted already-streamed content). */
+  onTextReplaced?: (text: string) => void;
   onReasoningDelta?: (delta: string) => void;
   onReasoningSummaryDelta?: (delta: string) => void;
+  /** Whole-text replacement of accumulated reasoning (retraction). */
+  onReasoningReplaced?: (text: string) => void;
   onPlanDelta?: (delta: string) => void;
   onToolStarted?: (toolResult: ToolResult) => void;
   onToolDelta?: (toolResultId: string, delta: string) => void;
   onToolCompleted?: (toolResult: ToolResult) => void;
+  /** Tool results retracted by the runtime (refusal fallback) — remove them. */
+  onToolsRetracted?: (toolResultIds: string[]) => void;
   onApprovalRequired?: (approval: Approval) => void;
   onMcpServerStatus?: (event: McpServerStatusEvent) => void;
   onRuntimeNotice?: (event: RuntimeNoticeEvent) => void;
@@ -74,6 +80,9 @@ const eventDispatch: EventDispatch = {
       handlers.onDelta(payload.delta);
     }
   },
+  "response.output_text.replace": (payload, { handlers }) => {
+    handlers.onTextReplaced?.(payload.text);
+  },
   "framework:reasoning_text.delta": (payload, { handlers }) => {
     if (payload.delta) {
       handlers.onReasoningDelta?.(payload.delta);
@@ -83,6 +92,9 @@ const eventDispatch: EventDispatch = {
     if (payload.delta) {
       handlers.onReasoningSummaryDelta?.(payload.delta);
     }
+  },
+  "framework:reasoning_summary.replace": (payload, { handlers }) => {
+    handlers.onReasoningReplaced?.(payload.text);
   },
   "framework:plan.delta": (payload, { handlers }) => {
     if (payload.delta) {
@@ -103,6 +115,9 @@ const eventDispatch: EventDispatch = {
   },
   "response.tool.completed": (payload, { handlers }) => {
     handlers.onToolCompleted?.(payload.tool_result);
+  },
+  "response.tool.retracted": (payload, { handlers }) => {
+    handlers.onToolsRetracted?.(payload.item_ids);
   },
   "framework:approval_required": (payload, { sessionId, handlers }) => {
     // Wire payload omits sessionId and status — synthesize them from context.

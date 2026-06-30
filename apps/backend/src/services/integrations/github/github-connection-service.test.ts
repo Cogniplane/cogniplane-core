@@ -1,4 +1,5 @@
 import { test, expect } from "vitest";
+import { decodeProtectedHeader } from "jose";
 
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import { createTestConfig } from "../../../test-helpers/test-config.js";
@@ -90,6 +91,7 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
   });
   const authState = new URL(authorizeUrl).searchParams.get("state");
   expect(authState).toBeTruthy();
+  expect(decodeProtectedHeader(authState!).kid).toBe(config.JWT_KEY_ID);
 
   const fake = createFakeFetch((url) => {
     if (url === "https://github.com/login/oauth/access_token") {
@@ -214,6 +216,36 @@ test("getAuthorizationUrl throws when GitHub OAuth is not configured", async () 
   const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
 
   await expect(() => service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })).rejects.toThrow(GithubConnectionNotConfiguredError);
+});
+
+test("completeAuthorization consumes GitHub OAuth state before token exchange", async () => {
+  const config = createOAuthConfig();
+  const store = new InMemoryGithubConnectionStore();
+  const service = new GithubConnectionService(config, store);
+  const state = new URL(
+    await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })
+  ).searchParams.get("state")!;
+  let exchangeCalls = 0;
+  const fake = createFakeFetch(() => {
+    exchangeCalls += 1;
+    return new Response(JSON.stringify({ error: "invalid_grant" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  });
+
+  try {
+    const first = await service.completeAuthorization({ code: "code-1", state });
+    const replay = await service.completeAuthorization({ code: "code-2", state });
+
+    expect(first).toMatch(/githubAuth=error/);
+    expect(first).toMatch(/reason=github_authorization_failed/);
+    expect(first).not.toMatch(/invalid_grant/);
+    expect(replay).toMatch(/reason=invalid_state/);
+    expect(exchangeCalls).toBe(1);
+  } finally {
+    fake.restore();
+  }
 });
 
 test("hasConnection returns false when GitHub OAuth is not configured", async () => {

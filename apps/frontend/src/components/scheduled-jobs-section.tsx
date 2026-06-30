@@ -8,10 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { formatMediumDateTime } from "../lib/time-format";
-import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN, HINT, LIST_ITEM, SECTION_LABEL } from "../lib/ui-tokens";
-
-const CHIP =
-  "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
+import { CHIP, PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN, HINT, LIST_ITEM, SECTION_LABEL } from "../lib/ui-tokens";
 
 function runStatusPillClass(status: ScheduledJobRun["status"]): string {
   if (status === "completed") return PILL_GREEN;

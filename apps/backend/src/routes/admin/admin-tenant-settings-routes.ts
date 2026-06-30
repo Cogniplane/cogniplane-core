@@ -97,10 +97,33 @@ export async function registerAdminTenantSettingsRoutes(
       });
     }
 
+    let updateInput = parseResult.data;
+    if (request.auth.role !== "owner") {
+      const current = await stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId);
+      const sensitiveChanges =
+        (parseResult.data.allowCommandExecution !== undefined &&
+          parseResult.data.allowCommandExecution !== current.allowCommandExecution) ||
+        (parseResult.data.allowUserTokenForwarding !== undefined &&
+          parseResult.data.allowUserTokenForwarding !== current.allowUserTokenForwarding);
+      if (sensitiveChanges) {
+        return reply.status(403).send(apiError("owner_required_for_sensitive_settings"));
+      }
+
+      // Admin forms submit the full settings snapshot. Remove unchanged
+      // owner-only fields so an admin's stale form can never overwrite a
+      // concurrent owner decision.
+      const {
+        allowCommandExecution: _allowCommandExecution,
+        allowUserTokenForwarding: _allowUserTokenForwarding,
+        ...adminUpdateInput
+      } = parseResult.data;
+      updateInput = adminUpdateInput;
+    }
+
     try {
       const settings = await stores.dynamicConfig.updateTenantSettings(
         request.auth.tenantId,
-        parseResult.data
+        updateInput
       );
       const invalidatedSessionIds = await invalidateTenantRuntimes(
         app,

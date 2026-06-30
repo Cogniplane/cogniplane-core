@@ -626,10 +626,10 @@ export async function createTestApp(
   const artifacts = new InMemoryArtifactStore(sessions);
   const auditEvents = new InMemoryAuditEventStore();
   const artifactProcessor = new NoopArtifactProcessor();
-  const app = Fastify();
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-core-artifact-tests-"));
   const artifactStorage = new LocalArtifactStorage(artifactStorageRoot);
   const config = createTestConfig({ ARTIFACT_STORAGE_ROOT: artifactStorageRoot, ...appConfigOverrides });
+  const app = Fastify({ bodyLimit: config.MAX_REQUEST_BODY_BYTES });
   const limits = RequestLimits.fromAppConfig(config);
   app.decorate("config", config);
   app.decorate("db", db as unknown as Pool);
@@ -647,7 +647,7 @@ export async function createTestApp(
       role: isAdmin ? ("owner" as const) : ("member" as const)
     };
   });
-  await registerHealthRoutes(app, { runtimeManager: runtimeManager as unknown as HealthRouteStores["runtimeManager"] });
+  await registerHealthRoutes(app, { codexRuntimeManager: runtimeManager as unknown as HealthRouteStores["codexRuntimeManager"] });
   await registerModelRoutes(app, {
     dynamicConfig: {
       async getOrCreateTenantSettings() {
@@ -686,7 +686,7 @@ export async function createTestApp(
   await registerSessionRoutes(app, {
     sessions,
     messages,
-    runtimeManager,
+    defaultAdapter: runtimeManager,
     limits
   } as unknown as SessionRouteStores);
   await registerArtifactRoutes(app, {
@@ -707,7 +707,7 @@ export async function createTestApp(
     limits,
     messages,
     toolContexts,
-    runtimeManager,
+    runtimeAdapters: { codex: runtimeManager },
     activeTurnMessageMap,
     ...(pii?.piiProtection ? { piiProtection: pii.piiProtection as never } : {}),
     ...(pii?.piiScanRuns ? { piiScanRuns: pii.piiScanRuns as never } : {})

@@ -17,8 +17,34 @@ export type RefreshTokenPayload = {
   fid: string;
 };
 
-function getSecretKey(config: AppConfig): Uint8Array {
+type JwtKeyConfig = Pick<
+  AppConfig,
+  "JWT_SECRET" | "JWT_KEY_ID" | "JWT_VERIFICATION_KEYS"
+>;
+
+export function getJwtSigningKey(config: JwtKeyConfig): Uint8Array {
   return new TextEncoder().encode(config.JWT_SECRET);
+}
+
+export function resolveJwtVerificationKey(
+  config: JwtKeyConfig,
+  kid: unknown,
+  options: { allowMissingKid?: boolean } = {}
+): Uint8Array {
+  if (kid === undefined && options.allowMissingKid) {
+    return getJwtSigningKey(config);
+  }
+  if (typeof kid !== "string" || !kid) {
+    throw new Error("JWT protected header is missing kid.");
+  }
+  if (kid === config.JWT_KEY_ID) {
+    return getJwtSigningKey(config);
+  }
+  const previousSecret = config.JWT_VERIFICATION_KEYS[kid];
+  if (!previousSecret) {
+    throw new Error(`Unknown JWT kid: ${kid}`);
+  }
+  return new TextEncoder().encode(previousSecret);
 }
 
 const ACCESS_TOKEN_TTL = "15m";
@@ -34,7 +60,7 @@ export async function signAccessToken(
     .setExpirationTime(ACCESS_TOKEN_TTL)
     .setIssuer("cogniplane")
     .setAudience("cogniplane")
-    .sign(getSecretKey(config));
+    .sign(getJwtSigningKey(config));
 }
 
 export async function signRefreshToken(
@@ -47,7 +73,7 @@ export async function signRefreshToken(
     .setExpirationTime(REFRESH_TOKEN_TTL)
     .setIssuer("cogniplane")
     .setAudience("cogniplane-refresh")
-    .sign(getSecretKey(config));
+    .sign(getJwtSigningKey(config));
 }
 
 function assertAccessTokenPayload(p: unknown): AccessTokenPayload {
@@ -75,11 +101,15 @@ export async function verifyAccessToken(
   config: AppConfig,
   token: string
 ): Promise<AccessTokenPayload> {
-  const { payload } = await jwtVerify(token, getSecretKey(config), {
-    issuer: "cogniplane",
-    audience: "cogniplane",
-    algorithms: ["HS256"]
-  });
+  const { payload } = await jwtVerify(
+    token,
+    (protectedHeader) => resolveJwtVerificationKey(config, protectedHeader.kid),
+    {
+      issuer: "cogniplane",
+      audience: "cogniplane",
+      algorithms: ["HS256"]
+    }
+  );
   return assertAccessTokenPayload(payload);
 }
 
@@ -87,11 +117,15 @@ export async function verifyRefreshToken(
   config: AppConfig,
   token: string
 ): Promise<RefreshTokenPayload> {
-  const { payload } = await jwtVerify(token, getSecretKey(config), {
-    issuer: "cogniplane",
-    audience: "cogniplane-refresh",
-    algorithms: ["HS256"]
-  });
+  const { payload } = await jwtVerify(
+    token,
+    (protectedHeader) => resolveJwtVerificationKey(config, protectedHeader.kid),
+    {
+      issuer: "cogniplane",
+      audience: "cogniplane-refresh",
+      algorithms: ["HS256"]
+    }
+  );
   return assertRefreshTokenPayload(payload);
 }
 

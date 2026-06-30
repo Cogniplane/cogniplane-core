@@ -51,8 +51,8 @@ describe("claude workspace renderer", () => {
       developerInstructions: null,
       skills: [],
       mcpServers: [
-        { id: "managed", url: "http://localhost:3001/mcp/managed?token=rt_test", mode: "managed" },
-        { id: "sharepoint", url: "http://localhost:3001/mcp/sharepoint?token=rt_test", mode: "proxy" }
+        { id: "managed", url: "http://localhost:3001/mcp/managed", mode: "managed" },
+        { id: "sharepoint", url: "http://localhost:3001/mcp/sharepoint", mode: "proxy" }
       ],
       enabledToolIds: [],
       runtimeToken: "rt_test",
@@ -162,9 +162,9 @@ describe("claude workspace renderer", () => {
     expect(skillMode).toBe(0o600);
   });
 
-  // MCP transport contract: Claude MCP URLs must NOT carry `?token=rt_...` —
-  // the runtime token is delivered exclusively via `Authorization: Bearer`.
-  // Codex enforces the inverse (token-in-URL) — see runtime-workspace.test.ts.
+  // MCP transport contract: MCP URLs must NOT carry `?token=rt_...` — the
+  // runtime token is delivered exclusively via `Authorization: Bearer` for
+  // both runtimes (Codex side: runtime-workspace.test.ts).
   test(".mcp.json MCP URLs do not carry ?token= (transport contract)", async () => {
     const TOKEN = "rt_claude_contract_token_123";
     await renderClaudeWorkspace({

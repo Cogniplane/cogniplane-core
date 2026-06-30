@@ -108,7 +108,7 @@ function makeCtx(
   return {
     state,
     activeTurns: new Set<string>(),
-    e2bPendingApprovals: new Map<string, { sessionId: string; kind: import("../../runtime-contracts.js").RuntimeApprovalKind }>(),
+    e2bPendingApprovals: new Map(),
     stores: undefined,
     config: { CLAUDE_CODE_MODEL: "sonnet", APPROVAL_REQUEST_TTL_MS: 600_000 },
     log: silentLog,
@@ -431,15 +431,25 @@ describe("executeClaudeTurn", () => {
 
       const events = await drain(executeClaudeTurn(session, baseInput, ctx));
 
-      // The approvalId → sessionId mapping is registered so resolveApproval can
-      // forward the decision to the right sandbox.
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
+      // The backend owns the persisted/public id; the harness id is retained
+      // only as private stdio correlation metadata.
+      const pendingEntries = [...ctx.e2bPendingApprovals.entries()];
+      expect(pendingEntries).toHaveLength(1);
+      const [backendApprovalId, pending] = pendingEntries[0]!;
+      expect(backendApprovalId).toMatch(/^claapr_/);
+      expect(backendApprovalId).not.toBe(approvalFrame.approvalId);
+      expect(pending).toEqual({
+        sessionId: state.sessionId,
+        sandboxApprovalId: approvalFrame.approvalId,
+        kind: "command_execution",
+        autoApprovedKinds: expect.any(Set)
+      });
 
       // Persisted exactly once, with the TTL deadline = now + APPROVAL_REQUEST_TTL_MS.
       expect(createCalls).toHaveLength(1);
       expect(createCalls[0]).toMatchObject({
         tenantId: state.tenantId,
-        approvalId: "appr-1",
+        approvalId: backendApprovalId,
         sessionId: state.sessionId,
         userId: state.userId,
         runtimeId: state.runtimeId,
@@ -455,7 +465,7 @@ describe("executeClaudeTurn", () => {
       const approvalEvent = events.find((e) => e.type === "framework:approval_required");
       expect(approvalEvent).toBeDefined();
       const ev = approvalEvent as Extract<RuntimeEvent, { type: "framework:approval_required" }>;
-      expect(ev.approvalId).toBe("appr-1");
+      expect(ev.approvalId).toBe(backendApprovalId);
       expect(ev.availableDecisions).toEqual(["approve", "reject"]);
       expect(ev.kind).toBe("command_execution");
       expect(ev.command).toBe("Bash");
@@ -483,7 +493,14 @@ describe("executeClaudeTurn", () => {
       const events = await drain(executeClaudeTurn(session, baseInput, ctx));
 
       // Mapping registered regardless of the store outcome.
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
+      expect([...ctx.e2bPendingApprovals.values()]).toEqual([
+        {
+          sessionId: state.sessionId,
+          sandboxApprovalId: "appr-1",
+          kind: "command_execution",
+          autoApprovedKinds: expect.any(Set)
+        }
+      ]);
       const approvalEvent = events.find((e) => e.type === "framework:approval_required");
       expect(approvalEvent).toBeDefined();
       expect(
@@ -505,8 +522,40 @@ describe("executeClaudeTurn", () => {
 
       const events = await drain(executeClaudeTurn(session, baseInput, ctx));
 
-      expect(ctx.e2bPendingApprovals.get("appr-1")).toEqual({ sessionId: state.sessionId, kind: "command_execution", autoApprovedKinds: expect.any(Set) });
+      expect([...ctx.e2bPendingApprovals.values()]).toEqual([
+        {
+          sessionId: state.sessionId,
+          sandboxApprovalId: "appr-1",
+          kind: "command_execution",
+          autoApprovedKinds: expect.any(Set)
+        }
+      ]);
       expect(events.some((e) => e.type === "framework:approval_required")).toBe(true);
+    });
+
+    it("does not overwrite approvals when the harness reuses an approval id", async () => {
+      const e2bProcess = makeFakeE2bProcess(async (listeners) => {
+        listeners.onApprovalRequest(approvalFrame);
+        listeners.onApprovalRequest({
+          ...approvalFrame,
+          toolInput: { command: "pwd" }
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+        listeners.onComplete(null);
+      });
+      const state = makeState(e2bProcess);
+      const ctx = makeCtx(state, { stores: undefined });
+
+      const events = await drain(executeClaudeTurn(session, baseInput, ctx));
+      const pendingEntries = [...ctx.e2bPendingApprovals.entries()];
+      const approvalEvents = events.filter((event) => event.type === "framework:approval_required");
+
+      expect(pendingEntries).toHaveLength(2);
+      expect(new Set(pendingEntries.map(([approvalId]) => approvalId)).size).toBe(2);
+      expect(pendingEntries.every(([, entry]) => entry.sandboxApprovalId === "appr-1")).toBe(true);
+      expect(approvalEvents).toHaveLength(2);
+      expect(new Set(approvalEvents.map((event) => event.approvalId)).size).toBe(2);
     });
 
     it("auto-approves a remembered kind without a DB row or prompt (rememberForTurn)", async () => {
@@ -536,7 +585,7 @@ describe("executeClaudeTurn", () => {
       // Answered straight back to the harness: no pending entry, no DB row,
       // no user prompt.
       expect(e2bProcess.sendApprovalResponse).toHaveBeenCalledWith("appr-1", "approve");
-      expect(ctx.e2bPendingApprovals.has("appr-1")).toBe(false);
+      expect(ctx.e2bPendingApprovals.size).toBe(0);
       expect(createCalls).toHaveLength(0);
       expect(events.some((e) => e.type === "framework:approval_required")).toBe(false);
     });
@@ -558,7 +607,9 @@ describe("executeClaudeTurn", () => {
       // The stale remembered kind was cleared, so the request prompts normally.
       expect(e2bProcess.sendApprovalResponse).not.toHaveBeenCalled();
       expect(events.some((e) => e.type === "framework:approval_required")).toBe(true);
-      expect(ctx.e2bPendingApprovals.has("appr-1")).toBe(true);
+      expect([...ctx.e2bPendingApprovals.values()]).toEqual([
+        expect.objectContaining({ sandboxApprovalId: "appr-1" })
+      ]);
     });
   });
 

@@ -5,7 +5,7 @@ import { isTextReadableArtifact, readArtifactExcerpt } from "./artifacts/artifac
 const MAX_ARTIFACT_BUDGET_CHARS = 18_000;
 const PER_ARTIFACT_EXCERPT_CHARS = 6_000;
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
-import type { ArtifactProcessor } from "./artifacts/artifact-processor.js";
+import { NO_OP_CLEANUP, type ArtifactProcessor } from "./artifacts/artifact-processor.js";
 import type { ArtifactRecord } from "./artifacts/artifact-store.js";
 import type { SyncedArtifact } from "./artifacts/artifact-workspace-sync.js";
 
@@ -21,6 +21,21 @@ export type PreparedTurnInputs = {
   userInputs?: RuntimeUserInput[];
   cleanup: Array<() => Promise<void>>;
 };
+
+function buildArtifactContentBlock(
+  artifact: ArtifactRecord,
+  sourceLabel: string,
+  content: string
+): string {
+  return [
+    `Artifact content: ${artifact.artifactName}`,
+    `- Source artifact id: ${artifact.artifactId}`,
+    sourceLabel,
+    "```text",
+    content,
+    "```"
+  ].join("\n");
+}
 
 export async function buildArtifactTurnInputs(
   input: ArtifactTurnInput
@@ -77,14 +92,11 @@ export async function buildArtifactTurnInputs(
       if (content.trim()) {
         remainingBudget -= content.length;
         inlineArtifactBlocks.push(
-          [
-            `Artifact content: ${artifact.artifactName}`,
-            `- Source artifact id: ${artifact.artifactId}`,
+          buildArtifactContentBlock(
+            artifact,
             `- Readable artifact: ${artifact.artifactName} (${artifact.mimeType})`,
-            "```text",
-            content,
-            "```"
-          ].join("\n")
+            content
+          )
         );
       }
       continue;
@@ -103,21 +115,18 @@ export async function buildArtifactTurnInputs(
         : Promise.resolve(""),
       input.artifactProcessor.renderArtifactImages(artifact).catch(() => ({
         paths: [],
-        cleanup: async () => {}
+        cleanup: NO_OP_CLEANUP
       }))
     ]);
 
     if (extractedTextResult.trim()) {
       remainingBudget -= extractedTextResult.length;
       inlineArtifactBlocks.push(
-        [
-          `Artifact content: ${artifact.artifactName}`,
-          `- Source artifact id: ${artifact.artifactId}`,
+        buildArtifactContentBlock(
+          artifact,
           `- Extracted on demand from PDF: ${artifact.artifactName} (${artifact.mimeType})`,
-          "```text",
-          extractedTextResult,
-          "```"
-        ].join("\n")
+          extractedTextResult
+        )
       );
     }
 

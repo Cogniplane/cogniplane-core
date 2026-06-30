@@ -2,6 +2,7 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
+import { redactSecrets } from "./redact-secrets.js";
 
 export type ToolResultRecord = {
   id: number;
@@ -401,7 +402,7 @@ export class MessageStore {
           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
           RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
-        [tenantId, messageId, userId, status, truncateForStorage(content, MAX_MESSAGE_CONTENT_LENGTH)]
+        [tenantId, messageId, userId, status, truncateForStorage(redactSecrets(content), MAX_MESSAGE_CONTENT_LENGTH)]
       );
 
       return updatedMessage.rows[0]
@@ -440,10 +441,10 @@ export class MessageStore {
           userId,
           content.reasoningContent === undefined
             ? null
-            : truncateForStorage(content.reasoningContent, MAX_MESSAGE_CONTENT_LENGTH),
+            : truncateForStorage(redactSecrets(content.reasoningContent), MAX_MESSAGE_CONTENT_LENGTH),
           content.planContent === undefined
             ? null
-            : truncateForStorage(content.planContent, MAX_MESSAGE_CONTENT_LENGTH)
+            : truncateForStorage(redactSecrets(content.planContent), MAX_MESSAGE_CONTENT_LENGTH)
         ]
       );
     });
@@ -591,6 +592,19 @@ export class MessageStore {
     );
 
       return mapToolResult(upsertedToolResult.rows[0]);
+    });
+  }
+
+  // Refusal-fallback retraction: the runtime evicted tool events that were
+  // already persisted this turn. Hard-delete — the rows are superseded
+  // transcript content, not audit evidence (audit_events carries that).
+  async deleteToolResults(tenantId: string, toolResultIds: string[], userId: string): Promise<void> {
+    if (toolResultIds.length === 0) return;
+    await withTenantScope(this.db, tenantId, async (client) => {
+      await client.query(
+        `DELETE FROM message_tool_results WHERE tenant_id = $1 AND user_id = $2 AND tool_result_id = ANY($3)`,
+        [tenantId, userId, toolResultIds]
+      );
     });
   }
 

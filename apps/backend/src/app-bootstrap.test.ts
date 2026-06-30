@@ -152,7 +152,7 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
     limits: {},
     artifactStorage: {},
     artifactProcessor: {},
-    runtimeManager: {
+    codexRuntimeManager: {
       getHealthSnapshot() {
         return { activeRuntimeCount: 0, activeTurnCount: 0 };
       },

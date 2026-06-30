@@ -9,13 +9,6 @@ export function computeConfigHash(config: unknown): string {
 }
 
 /**
- * Compute a SHA-256 hex digest of an arbitrary string value.
- */
-export function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-/**
  * Return a new array with duplicate string values removed.
  */
 export function unique(values: string[]): string[] {

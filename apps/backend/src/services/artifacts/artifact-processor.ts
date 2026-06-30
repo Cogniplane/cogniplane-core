@@ -9,10 +9,12 @@ import type { FastifyBaseLogger } from "fastify";
 import type { AppConfig } from "../../config.js";
 import type { ArtifactStorage } from "./artifact-storage.js";
 
-const NO_OP_CLEANUP = async () => {};
 import type { ArtifactRecord } from "./artifact-store.js";
 
 const execFile = promisify(execFileCallback);
+
+/** Shared "nothing to clean up" sentinel for artifact render results. */
+export const NO_OP_CLEANUP = async () => {};
 
 /**
  * Narrow shape of the promisified `execFile` used for PDF rasterization.

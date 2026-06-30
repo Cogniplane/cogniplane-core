@@ -29,7 +29,11 @@ function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
   } as TenantSettings;
 }
 
-function renderForm(settings: TenantSettings, onSave = vi.fn(async () => true)) {
+function renderForm(
+  settings: TenantSettings,
+  onSave = vi.fn(async () => true),
+  isOwner = true
+) {
   const view = render(
     <TenantSettingsForm
       settings={settings}
@@ -39,6 +43,7 @@ function renderForm(settings: TenantSettings, onSave = vi.fn(async () => true)) 
       mcpServers={[]}
       openaiKeyConfigured={true}
       anthropicKeyConfigured={false}
+      isOwner={isOwner}
     />
   );
   return { view, onSave };
@@ -68,6 +73,7 @@ describe("TenantSettingsForm resync", () => {
         mcpServers={[]}
         openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
+        isOwner={true}
       />
     );
 
@@ -87,6 +93,7 @@ describe("TenantSettingsForm resync", () => {
         mcpServers={[]}
         openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
+        isOwner={true}
       />
     );
 
@@ -116,6 +123,7 @@ describe("TenantSettingsForm resync", () => {
         mcpServers={[]}
         openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
+        isOwner={true}
       />
     );
 
@@ -139,9 +147,19 @@ describe("TenantSettingsForm resync", () => {
         mcpServers={[]}
         openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
+        isOwner={true}
       />
     );
 
     expect(instructionsTextarea().value).toBe("unsaved edits");
+  });
+
+  it("disables owner-only execution settings for admins", () => {
+    renderForm(makeSettings(), vi.fn(async () => true), false);
+
+    expect((screen.getByLabelText(/Allow command execution/) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/Forward user tokens/) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByLabelText(/Auto-approve read-only tools/) as HTMLInputElement).disabled).toBe(false);
+    expect(screen.getAllByText(/Owner role required/)).toHaveLength(2);
   });
 });

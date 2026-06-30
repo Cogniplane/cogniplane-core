@@ -43,7 +43,7 @@ export function ApprovalRowView({
               <button
                 type="button"
                 onClick={() => setExpanded((value) => !value)}
-                className="mt-0.5 flex w-full items-start gap-1 text-left text-xs text-on-surface-variant outline-none"
+                className="mt-0.5 flex w-full items-start gap-1 rounded-sm text-left text-xs text-on-surface-variant outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 aria-expanded={expanded}
               >
                 <ChevronDownIcon

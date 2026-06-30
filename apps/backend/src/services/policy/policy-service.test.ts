@@ -11,6 +11,7 @@ import {
 import type { PolicyRuleStore } from "./policy-rule-store.js";
 import type { PolicyDecisionStore } from "./policy-decision-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
+import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
 
 type RuleSeed = Partial<PolicyRule> & { ruleId: string; effect: PolicyRule["effect"] };
 
@@ -303,7 +304,7 @@ describe("PolicyService rule cache", () => {
     });
     expect(ruleStore.list).toHaveBeenCalledTimes(1);
 
-    service.invalidate("t1");
+    await service.invalidate("t1");
     await service.evaluate("t1", {
       toolName: "x",
       category: null,
@@ -312,5 +313,56 @@ describe("PolicyService rule cache", () => {
       turnContext: null
     });
     expect(ruleStore.list).toHaveBeenCalledTimes(2);
+  });
+
+  it("broadcast invalidation evicts another replica's cached rules", async () => {
+    const subscribers = new Set<(tenantId: string) => void>();
+    const bus: PolicyInvalidationBus = {
+      async subscribe(onInvalidate) {
+        subscribers.add(onInvalidate);
+        return async () => {
+          subscribers.delete(onInvalidate);
+        };
+      },
+      async publish(tenantId) {
+        for (const subscriber of subscribers) subscriber(tenantId);
+      }
+    };
+    let currentRules = [makeRule({ ruleId: "pol_1", effect: "block", conditions: {} })];
+    const ruleStore = {
+      list: vi.fn(async () => currentRules)
+    } as unknown as PolicyRuleStore;
+    const { store: decisions } = fakeDecisionStore();
+    const { store: auditEvents } = fakeAuditStore();
+    const replicaA = new PolicyService({ rules: ruleStore, decisions, auditEvents, invalidationBus: bus });
+    const replicaB = new PolicyService({ rules: ruleStore, decisions, auditEvents, invalidationBus: bus });
+    await replicaA.start();
+    await replicaB.start();
+
+    expect(
+      await replicaB.evaluate("t1", {
+        toolName: "x",
+        category: null,
+        severity: null,
+        serverId: null,
+        turnContext: null
+      })
+    ).toMatchObject({ outcome: "block" });
+    currentRules = [];
+
+    await replicaA.invalidate("t1");
+    expect(
+      await replicaB.evaluate("t1", {
+        toolName: "x",
+        category: null,
+        severity: null,
+        serverId: null,
+        turnContext: null
+      })
+    ).toMatchObject({ outcome: "allow", matchedRuleId: null });
+    expect(ruleStore.list).toHaveBeenCalledTimes(2);
+
+    await replicaA.close();
+    await replicaB.close();
   });
 });

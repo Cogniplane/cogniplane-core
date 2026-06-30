@@ -132,6 +132,38 @@ test("redactSecrets redacts multiple distinct provider keys in one string", () =
   expect(result).toBe("[REDACTED] [REDACTED] [REDACTED] [REDACTED]");
 });
 
+test.each([
+  ["runtime", "rt_eyJzaWQiOiJzMSJ9.signature", "token [REDACTED] done"],
+  [
+    "jwt",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.c2lnbmF0dXJl",
+    "token [REDACTED] done"
+  ],
+  ["stripe secret", `sk_live_${"a".repeat(24)}`, "token [REDACTED] done"],
+  ["stripe restricted", `rk_live_${"b".repeat(24)}`, "token [REDACTED] done"],
+  ["stripe webhook", `whsec_${"c".repeat(24)}`, "token [REDACTED] done"],
+  ["gitlab", `glpat-${"d".repeat(24)}`, "token [REDACTED] done"],
+  ["npm", `npm_${"e".repeat(36)}`, "token [REDACTED] done"],
+  ["twilio api key", `SK${"a1".repeat(16)}`, "token [REDACTED] done"],
+  [
+    "twilio auth token assignment",
+    `TWILIO_AUTH_TOKEN=${"f".repeat(32)}`,
+    "token TWILIO_AUTH_TOKEN=[REDACTED] done"
+  ],
+  [
+    "sendgrid",
+    `SG.${"g".repeat(22)}.${"h".repeat(43)}`,
+    "token [REDACTED] done"
+  ]
+])("redactSecrets redacts %s credentials in plain text", (_name, credential, expected) => {
+  expect(redactSecrets(`token ${credential} done`)).toBe(expected);
+});
+
+test("redactSecrets does not redact incomplete provider prefixes or ordinary identifiers", () => {
+  const value = "rt_ sk_live_ glpat-short npm_short SK1234 SG.short user_SK123456 task_rt_status";
+  expect(redactSecrets(value)).toBe(value);
+});
+
 test("redactSecrets strips runtime tokens embedded in URL query strings", () => {
   const result = redactSecrets(
     "calling https://api.example.com/mcp/srv?token=rt_eyJzaWQiOiJzMSJ9.abcDEF now"

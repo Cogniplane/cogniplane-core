@@ -12,12 +12,7 @@ import type {
   JsonRpcSuccess
 } from "./codex-jsonrpc.js";
 import { CodexRuntimeProcessStartError } from "./codex-jsonrpc.js";
-import {
-  buildCodexStdioCommand,
-  buildSandboxCodexConfig,
-  extractMcpServersToml
-} from "./e2b-codex-mcp-config.js";
-import { createRuntimeWorkspace } from "./runtime-workspace.js";
+import { createRuntimeWorkspace, E2B_WORKSPACE_BASE } from "./runtime-workspace.js";
 import type { RuntimeProcessFactory, RuntimeWorkspaceFactory } from "./runtime-types.js";
 
 /**
@@ -83,7 +78,6 @@ type E2bSandboxLike = {
   kill: () => Promise<void>;
 };
 
-const E2B_WORKSPACE_BASE = "/home/user/workspace";
 const E2B_CODEX_HOME = "/home/user/.codex";
 
 /**
@@ -125,25 +119,10 @@ export class E2bRuntimeProcess {
     e2bTemplateId: string;
     e2bSandboxTimeoutMs: number;
     localWorkspacePath: string;
-    model: string;
-    /**
-     * When set, configure Codex to route model calls through the backend
-     * LLM proxy at this URL. `input.env.OPENAI_API_KEY` must be a rt_*
-     * runtime token (NOT the real OpenAI key) — the proxy verifies it
-     * and swaps for the real key before forwarding upstream. Caller is
-     * responsible for the env swap; this method only renders the config.
-     */
-    proxyBaseUrl?: string;
     /** Test-only sandbox class injection (forwarded to the stdio harness). */
     loadSandboxClass?: typeof loadE2bSandboxClass;
   }): Promise<E2bRuntimeProcess> {
     const sandboxCwd = input.cwd;
-    const codexConfig = await buildCodexConfigForSandbox({
-      localWorkspacePath: input.localWorkspacePath,
-      sandboxCwd,
-      model: input.model,
-      ...(input.proxyBaseUrl ? { proxyBaseUrl: input.proxyBaseUrl } : {})
-    });
 
     // Late-bound closure: the harness's onStdoutLine/onExit callbacks are
     // registered synchronously inside `startE2bStdioHarness`, but no stdout
@@ -162,10 +141,10 @@ export class E2bRuntimeProcess {
         env: input.env,
         localWorkspacePath: input.localWorkspacePath,
         sandboxWorkspacePath: sandboxCwd,
-        command: buildCodexStdioCommand(input.binaryPath),
+        command: `${input.binaryPath} app-server --listen stdio://`,
         stderrLogLabel: "Codex runtime (E2B)",
         preLaunch: async (sandbox) => {
-          await installCodexConfigInSandbox(sandbox, sandboxCwd, codexConfig);
+          await installCodexConfigInSandbox(sandbox, sandboxCwd);
           // Skip `codex login --with-api-key` when using the cogniplane
           // proxy: the rt_* token doesn't match Codex's sk-... format
           // validator, and the custom model_provider reads OPENAI_API_KEY
@@ -423,10 +402,7 @@ export class E2bRuntimeProcess {
 }
 
 export {
-  buildCodexStdioCommand,
-  buildSandboxCodexConfig,
   buildE2bCodexFactories,
-  extractMcpServersToml,
   E2B_WORKSPACE_BASE,
   remapEnvPathsToSandbox,
   startE2bStdioHarness,
@@ -486,11 +462,6 @@ function buildE2bCodexFactories(
       throw new Error(`No local workspace path was provided for session ${input.sessionId}.`);
     }
     const remappedEnv = remapEnvPathsToSandbox(input.env, localPath, input.cwd);
-    // In e2b mode the sandbox routes model calls through the backend's
-    // /llm/openai proxy. The sandbox's OPENAI_API_KEY is the session's
-    // rt_* token (set by codex-workspace-bootstrap); the proxy verifies it
-    // and swaps for the real key before forwarding to api.openai.com.
-    const proxyBaseUrl = `${config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "")}/llm/openai/v1`;
     try {
       // start() awaits the full file upload to the sandbox before returning,
       // so the local staging directory is safe to remove in the finally block.
@@ -506,9 +477,7 @@ function buildE2bCodexFactories(
         e2bApiKey: config.E2B_API_KEY!,
         e2bTemplateId: config.E2B_TEMPLATE_ID,
         e2bSandboxTimeoutMs: config.E2B_SANDBOX_TIMEOUT_MS,
-        localWorkspacePath: localPath,
-        model: config.CODEX_MODEL,
-        proxyBaseUrl
+        localWorkspacePath: localPath
       });
     } finally {
       rm(localPath, { recursive: true, force: true }).catch((err: unknown) => {
@@ -528,51 +497,21 @@ function buildE2bCodexFactories(
 // ---------------------------------------------------------------------------
 
 /**
- * Pre-read the workspace `codex.toml` and merge its `[mcp_servers.*]`
- * sections into the global `~/.codex/config.toml` we'll install in the
- * sandbox. Codex app-server in some versions ignores those sections from
- * project-level codex.toml, so we duplicate them globally to guarantee
- * MCP-server discovery.
+ * Reset and install `~/.codex/config.toml` inside the sandbox as a verbatim
+ * copy of the workspace `codex.toml` (already uploaded by the harness — this
+ * runs in preLaunch, after the workspace upload). The workspace render is the
+ * single source of truth for the full Codex config. The `rm` of `auth.json`
+ * ensures we start from a known state — sandboxes can be reused or restarted,
+ * and stale auth from a previous tenant must not leak into the next session.
  */
-async function buildCodexConfigForSandbox(input: {
-  localWorkspacePath: string;
-  sandboxCwd: string;
-  model: string;
-  proxyBaseUrl?: string;
-}): Promise<string> {
-  const files = await collectLocalWorkspaceFiles(input.localWorkspacePath);
-  const workspaceToml = files.find((f) => f.relativePath === "codex.toml");
-  const mcpTomlSection = workspaceToml
-    ? extractMcpServersToml(
-        typeof workspaceToml.data === "string"
-          ? workspaceToml.data
-          : new TextDecoder().decode(workspaceToml.data)
-      )
-    : "";
-  return buildSandboxCodexConfig({
-    model: input.model,
-    workspaceRoot: path.posix.dirname(input.sandboxCwd),
-    mcpServersToml: mcpTomlSection,
-    ...(input.proxyBaseUrl ? { proxy: { baseUrl: input.proxyBaseUrl } } : {})
-  });
-}
-
-/**
- * Reset and install `~/.codex/config.toml` inside the sandbox. The `rm` of
- * `auth.json` and the previous `config.toml` ensures we start from a known
- * state — sandboxes can be reused or restarted, and stale auth/config from
- * a previous tenant or model must not leak into the next session.
- */
-async function installCodexConfigInSandbox(
-  sandbox: E2bSandboxLike,
-  sandboxCwd: string,
-  codexConfig: string
-): Promise<void> {
-  await sandbox.commands.run(
-    `mkdir -p ${E2B_CODEX_HOME} && rm -f ${E2B_CODEX_HOME}/auth.json ${E2B_CODEX_HOME}/config.toml`,
+async function installCodexConfigInSandbox(sandbox: E2bSandboxLike, sandboxCwd: string): Promise<void> {
+  const result = await sandbox.commands.run(
+    `mkdir -p ${E2B_CODEX_HOME} && rm -f ${E2B_CODEX_HOME}/auth.json && cp ${sandboxCwd}/codex.toml ${E2B_CODEX_HOME}/config.toml`,
     { cwd: sandboxCwd }
   );
-  await sandbox.files.write([{ path: `${E2B_CODEX_HOME}/config.toml`, data: codexConfig }]);
+  if (isE2bCommandResult(result) && result.exitCode !== 0) {
+    throw new Error(`Failed to install Codex config in sandbox: ${result.stderr || result.error || "unknown error"}`);
+  }
 }
 
 /**

@@ -2,10 +2,7 @@ import type { GithubConnectionStatus } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { formatMediumDateTime } from "../lib/time-format";
-import { PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
-
-const CHIP =
-  "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
+import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
 type GithubConnectionSectionProps = {
   status: GithubConnectionStatus | null;

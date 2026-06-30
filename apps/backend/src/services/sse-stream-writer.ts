@@ -17,6 +17,22 @@ import { redactSecrets } from "./redact-secrets.js";
 
 type ToolResultPersistPayload = ReturnType<typeof extractToolResultPayload>;
 
+// The SSE reply is hijacked, so a runtime failure never passes through the
+// global `handleAppError` that opaques internal 5xx messages. Apply the same
+// policy here: only surface `error.message` for errors that deliberately set a
+// 4xx status (client-safe by the app's convention); everything else (DB,
+// E2B/runtime, unset status) gets a generic message so connection strings,
+// internal hostnames, or stack detail can't reach the client — or get
+// persisted as the assistant row's content. The full error is always logged
+// server-side at the call site.
+function clientSafeFailureMessage(error: unknown): string {
+  const status = (error as { statusCode?: unknown } | null | undefined)?.statusCode;
+  if (typeof status === "number" && status >= 400 && status < 500 && error instanceof Error) {
+    return error.message;
+  }
+  return "The assistant run failed.";
+}
+
 // Tool result `input` and `output` strings can contain secrets echoed by an
 // upstream MCP server (Bearer headers, GitHub PATs, etc.). They are persisted
 // to message_tool_results and later replayed back to the model — sanitize at
@@ -39,7 +55,7 @@ export type StreamAssistantReplyInput = {
   reply: FastifyReply;
   messages: MessageStore;
   toolContexts: ToolExecutionContextStore;
-  runtimeManager: {
+  runtimeAdapter: {
     createSession(input: { tenantId: string; sessionId: string; userId: string }): Promise<RuntimeSessionRef>;
     runMessage(
       session: RuntimeSessionRef,
@@ -161,6 +177,8 @@ type TurnContext = {
   persistToolResult: (payload: ToolResultPayload) => Promise<void>;
   /** Bundles identity for tool-output deltas. */
   appendToolResultOutput: (toolResultId: string, delta: string) => Promise<void>;
+  /** Bundles identity for retraction deletes (refusal fallback). */
+  deleteToolResults: (toolResultIds: string[]) => Promise<void>;
 };
 
 // ---------------------------------------------------------------------------
@@ -389,6 +407,28 @@ async function persistEvent(
       ctx.streamingContent.assistant += event.delta;
       return { break: false };
 
+    // Retraction: the runtime evicted already-streamed content (e.g. a Claude
+    // refusal fallback) — overwrite the accumulated buffer and the persisted
+    // row so the refused partial doesn't survive in the transcript.
+    case "response.output_text.replace":
+      ctx.latestResponseId = event.responseId;
+      ctx.streamingContent.assistant = event.text;
+      // The replacement text never carries the writer-appended Sources footer
+      // — re-arm provenance so the corrected response gets it again.
+      ctx.provenanceAppended = false;
+      await ctx.persistAssistantStatus("streaming", ctx.streamingContent.assistant);
+      return { break: false };
+
+    case "framework:reasoning_summary.replace":
+      ctx.latestResponseId = event.responseId;
+      ctx.streamingContent.reasoning = event.text;
+      // Persist directly (not via persistStreamingAuxContent, which skips
+      // empty strings) so a replace-to-empty clears the stored reasoning too.
+      await ctx.messages.updateStreamingContent(ctx.tenantId, ctx.assistantMessageId, ctx.userId, {
+        reasoningContent: ctx.streamingContent.reasoning
+      });
+      return { break: false };
+
     case "framework:reasoning_text.delta":
     case "framework:reasoning_summary.delta":
       ctx.latestResponseId = event.responseId;
@@ -420,6 +460,14 @@ async function persistEvent(
       await persistToolCompleted(ctx, event);
       return { break: false };
 
+    // Retraction: tool events from a since-retracted message (refusal
+    // fallback) — drop the persisted rows so the superseded activity doesn't
+    // survive in the transcript.
+    case "response.tool.retracted":
+      ctx.latestResponseId = event.responseId;
+      await ctx.deleteToolResults(event.itemIds);
+      return { break: false };
+
     case "response.completed":
       ctx.latestResponseId = event.responseId;
       return persistResponseCompleted(ctx, event);
@@ -447,7 +495,7 @@ async function runRuntimeTurn(
   input: StreamAssistantReplyInput,
   ctx: TurnContext
 ): Promise<void> {
-  const runtimeSession = await input.runtimeManager.createSession({
+  const runtimeSession = await input.runtimeAdapter.createSession({
     tenantId: input.tenantId,
     sessionId: input.sessionId,
     userId: input.userId
@@ -477,7 +525,7 @@ async function runRuntimeTurn(
     cleanup: []
   };
 
-  const onBeforeTurn = scopedArtifacts.length && input.artifactProcessor && input.storage && input.runtimeManager.writeRuntimeFile
+  const onBeforeTurn = scopedArtifacts.length && input.artifactProcessor && input.storage && input.runtimeAdapter.writeRuntimeFile
     ? async () => {
         let syncedArtifacts: Awaited<ReturnType<typeof syncArtifactsToWorkspace>> | undefined;
         try {
@@ -485,7 +533,7 @@ async function runRuntimeTurn(
             sessionId: input.sessionId,
             scopedArtifacts,
             storage: input.storage!,
-            writeRuntimeFile: (sid, fp, data) => input.runtimeManager.writeRuntimeFile!(sid, fp, data)
+            writeRuntimeFile: (sid, fp, data) => input.runtimeAdapter.writeRuntimeFile!(sid, fp, data)
           });
         } catch (err) {
           input.logger?.warn({ err, sessionId: input.sessionId }, "artifact workspace sync failed");
@@ -529,7 +577,7 @@ async function runRuntimeTurn(
     if (interruptedByDisconnect || turnSettled) return;
     interruptedByDisconnect = true;
     void Promise.resolve(
-      input.runtimeManager.interruptTurn?.({
+      input.runtimeAdapter.interruptTurn?.({
         tenantId: input.tenantId,
         sessionId: input.sessionId,
         userId: input.userId
@@ -552,7 +600,7 @@ async function runRuntimeTurn(
     if (ctx.writer.isClosed) {
       abandoned = true;
     } else {
-    for await (const event of input.runtimeManager.runMessage(runtimeSession, {
+    for await (const event of input.runtimeAdapter.runMessage(runtimeSession, {
       prompt: input.prompt,
       runtimePolicyId: runtimeSession.runtimePolicy.id,
       toolContextId: toolContext.toolContextId,
@@ -590,6 +638,9 @@ async function runRuntimeTurn(
     turnSettled = true;
     input.activeTurnMessageMap.clear(input.sessionId, runtimeSession.runtimeId);
     if (turnState.cleanup.length) {
+      // Cleanup callbacks are best-effort (temp-file removal etc.) and log
+      // their own failures where it matters; a rejection here must never mask
+      // the turn's real outcome, so rejections are intentionally not surfaced.
       await Promise.allSettled(turnState.cleanup.map((fn) => fn()));
     }
   }
@@ -599,8 +650,22 @@ async function runRuntimeTurn(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+// Below typical proxy/ALB idle timeouts (60s) so a long quiet stretch — a slow
+// tool call or a long model think with no deltas — can't be closed by an
+// intermediary as idle.
+const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
+
 export async function streamAssistantReply(input: StreamAssistantReplyInput): Promise<void> {
   const writer = new SseWriter(input.reply.raw as unknown as RawSseResponse);
+
+  // Idle keep-alive. An SSE comment frame (`: ...`) is ignored by EventSource
+  // but keeps the socket warm. write() already no-ops once the client is gone
+  // and respects backpressure, so this is fire-and-forget.
+  const heartbeat = setInterval(() => {
+    void writer.write(": keep-alive\n\n");
+  }, SSE_HEARTBEAT_INTERVAL_MS);
+  // Don't let the heartbeat timer keep the process alive on its own.
+  heartbeat.unref?.();
 
   // The reply is already hijacked by the route (openSseResponse): from here on
   // Fastify can never turn a throw into an HTTP error response. The try below
@@ -671,6 +736,9 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
           input.userId,
           delta
         );
+      },
+      async deleteToolResults(toolResultIds) {
+        await input.messages.deleteToolResults(input.tenantId, toolResultIds, input.userId);
       }
     };
 
@@ -678,7 +746,8 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
     await runRuntimeTurn(input, ctx);
   } catch (error) {
     if (ctx) ctx.completed = true;
-    const message = error instanceof Error ? error.message : "Runtime request failed";
+    // Client-facing message is sanitized; the full error is logged below.
+    const message = clientSafeFailureMessage(error);
     input.logger?.error(
       { err: error, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
       "runtime turn failed"
@@ -696,18 +765,13 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
       })
     );
     // No assistant row exists when the insert itself failed — nothing to persist.
+    // The sanitized message is also what gets persisted as the assistant row's
+    // fallback content, so the raw error can't leak via listMessages either.
     if (ctx) {
-      try {
-        await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
-        await persistStreamingAuxContent(ctx);
-      } catch (persistError) {
-        input.logger?.error(
-          { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
-          "failed to persist runtime turn failure"
-        );
-      }
+      await persistTurnFailureBestEffort(input, ctx, message);
     }
   } finally {
+    clearInterval(heartbeat);
     // ctx undefined means the catch above already emitted response.failed.
     if (ctx && !ctx.completed) {
       await writer.write(
@@ -719,5 +783,25 @@ export async function streamAssistantReply(input: StreamAssistantReplyInput): Pr
     }
     writer.end();
     input.activeTurns?.clear(input.sessionId);
+  }
+}
+
+// Best-effort persistence of a failed turn. The terminal failure frame has
+// already been written by the caller; a persistence failure here (e.g. the DB
+// is unreachable — a plausible cause of the runtime failure in the first
+// place) must not propagate and disrupt the socket-closing path.
+async function persistTurnFailureBestEffort(
+  input: StreamAssistantReplyInput,
+  ctx: TurnContext,
+  message: string
+): Promise<void> {
+  try {
+    await ctx.persistAssistantStatus("error", ctx.streamingContent.assistant || message);
+    await persistStreamingAuxContent(ctx);
+  } catch (persistError) {
+    input.logger?.error(
+      { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId, userId: input.userId },
+      "failed to persist runtime turn failure"
+    );
   }
 }

@@ -127,7 +127,7 @@ Both modes use stdio JSON-RPC 2.0. The E2B path uses `E2bRuntimeProcess` which:
 3. Performs an API-key login if `OPENAI_API_KEY` is set.
 4. Launches `codex app-server --listen stdio://` as a background command and bridges stdin/stdout to the backend.
 
-Runtime tokens reach Codex via `?token=rt_...` embedded in MCP server URLs because Codex's Streamable HTTP transport does not forward `Authorization` headers on the `initialize` POST.
+Runtime tokens reach Codex via `Authorization: Bearer rt_...` headers configured as `[mcp_servers.*.http_headers]` in the Codex config — sent on every request, including the `initialize` POST. MCP URLs carry no token.
 
 ### Claude Code runtime
 
@@ -142,7 +142,7 @@ Event mapping is identical in both modes: `claude-code-event-mapper.ts` consumes
 
 Workspace files (`CLAUDE.md`, `.mcp.json`, `.claude/commands/<name>.md`) are produced by `claude-workspace-renderer.ts` from the same compiled admin config used by Codex. In e2b mode they're staged locally, then uploaded.
 
-Runtime tokens reach Claude only via `Authorization: Bearer rt_...` headers — Claude MCP URLs do **not** carry `?token=` in the URL. The MCP gateway accepts both paths, but headers take priority and never end up in long-term URL logs.
+Runtime tokens reach Claude the same way: `Authorization: Bearer rt_...` headers only. MCP URLs never carry `?token=` for either runtime, and the MCP gateway rejects query-param tokens — bearer tokens never end up in long-term URL logs.
 
 ### Unified E2B template
 
@@ -237,6 +237,8 @@ The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "app
 
 Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the per-adapter `PolicyApprovalCoordinator`, emits the same `framework:approval_required` event, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
 
+Codex MCP elicitation is not a separate confirmation plane in Cogniplane. `mcpServer/elicitation/request` is answered with `{ action: "accept" }`; authorization and human confirmation are enforced at the Cogniplane MCP gateway through runtime policy and Policy Center. Configured upstream MCP tools must not rely on elicitation as their only guardrail.
+
 ### TTL and expiry
 
 Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry:
@@ -256,6 +258,8 @@ Effects are `allow`, `require_approval`, and `block`. Conditions have four activ
 ## Tenant Settings
 
 `tenant_settings` is one row per tenant — the single source of truth for runtime policy. The `system` tenant's row acts as the platform default; effective config merges the tenant row over the system row.
+
+Owners exclusively control `allowCommandExecution` and `allowUserTokenForwarding`. Admins may update the remaining Agent Settings, but unchanged copies of those owner-only fields are removed from admin writes to prevent stale forms from overwriting an owner decision.
 
 | Field | Purpose |
 |---|---|
@@ -472,7 +476,7 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 | Transport | HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin`, restrictive CSP |
 | Request tracing | `X-Request-Id` on every response |
 | Secrets at rest | AES-256-GCM via `encrypt()` / `decrypt()` (`lib/crypto-utils.ts`); scrypt-derived key (N=16384, r=8, p=1), memoized per process |
-| URL log redaction | Fastify request logs sanitize runtime tokens (e.g. `?token=rt_...`) via `lib/sanitize-url.ts` |
+| URL log redaction | Fastify request logs sanitize sensitive query params (e.g. `?token=`, `?apiKey=`) via `lib/sanitize-url.ts` (defense in depth) |
 | Audit | `audit_events` captures `ip_address` (INET) and `user_agent` on every admin and auth action |
 | CSRF | Refresh cookie is httpOnly, backend-scoped, sent only to the configured CORS origin |
 | Tool result redaction | `redactSecrets()` strips known secret patterns before persistence |

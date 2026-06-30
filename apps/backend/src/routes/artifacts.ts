@@ -513,11 +513,13 @@ export async function registerArtifactRoutes(
       await stores.auditEvents.create({
         tenantId: token.tenantId,
         sessionId: token.sessionId,
-        userId: token.userId,
+        userId: request.auth.userId,
         type: "artifact_downloaded",
         payload: {
           artifactId: token.artifactId,
-          fileName: token.fileName
+          fileName: token.fileName,
+          actorUserId: request.auth.userId,
+          ownerUserId: token.userId
         }
       });
     } catch (err) {

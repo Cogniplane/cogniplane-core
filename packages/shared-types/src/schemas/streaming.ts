@@ -67,6 +67,25 @@ export const SsePlanDeltaSchema = z.object({
   ...DeltaFrameBase
 }).passthrough();
 
+// Full-text replacement of the assistant message streamed so far. Emitted when
+// the Claude SDK retracts refused content (model refusal fallback): the refused
+// partial was already streamed as deltas, so the corrected transcript is sent
+// as a whole-text snapshot. Consumers replace, not append.
+export const SseOutputTextReplaceSchema = z.object({
+  type: z.literal("response.output_text.replace"),
+  response_id: z.string(),
+  item_id: z.string().nullable(),
+  text: z.string()
+}).passthrough();
+
+// Same retraction semantics for the reasoning pane.
+export const SseReasoningSummaryReplaceSchema = z.object({
+  type: z.literal("framework:reasoning_summary.replace"),
+  response_id: z.string(),
+  item_id: z.string().nullable(),
+  text: z.string()
+}).passthrough();
+
 export const SseOutputItemDoneSchema = z.object({
   type: z.literal("response.output_item.done"),
   response_id: z.string(),
@@ -85,6 +104,15 @@ export const SseToolOutputDeltaSchema = z.object({
   response_id: z.string(),
   item_id: z.string(),
   delta: z.string()
+}).passthrough();
+
+// Tool events emitted under a since-retracted message (refusal fallback) —
+// consumers remove the named tool results from the transcript.
+export const SseToolRetractedSchema = z.object({
+  type: z.literal("response.tool.retracted"),
+  response_id: z.string(),
+  item_id: z.string().nullable(),
+  item_ids: z.array(z.string())
 }).passthrough();
 
 export const SseToolCompletedSchema = z.object({
@@ -177,13 +205,16 @@ void ApprovalSchema;
 export const SseFrameSchemas = {
   "response.created": SseResponseCreatedSchema,
   "response.output_text.delta": SseOutputTextDeltaSchema,
+  "response.output_text.replace": SseOutputTextReplaceSchema,
   "framework:reasoning_text.delta": SseReasoningTextDeltaSchema,
   "framework:reasoning_summary.delta": SseReasoningSummaryDeltaSchema,
+  "framework:reasoning_summary.replace": SseReasoningSummaryReplaceSchema,
   "framework:plan.delta": SsePlanDeltaSchema,
   "response.output_item.done": SseOutputItemDoneSchema,
   "response.tool.started": SseToolStartedSchema,
   "response.tool.output.delta": SseToolOutputDeltaSchema,
   "response.tool.completed": SseToolCompletedSchema,
+  "response.tool.retracted": SseToolRetractedSchema,
   "framework:approval_required": SseApprovalRequiredSchema,
   "framework:runtime_notice": SseRuntimeNoticeSchema,
   "framework:mcp_server_status": SseMcpServerStatusSchema,

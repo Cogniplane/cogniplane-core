@@ -1,3 +1,4 @@
+import { parseRequestInput } from "../../lib/route-validation.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
@@ -24,8 +25,6 @@ import {
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin,
-  parseAdminBody,
-  parseAdminParams
 } from "./admin-route-helpers.js";
 
 export type AdminIntegrationsRouteStores = {
@@ -116,10 +115,10 @@ export async function registerAdminIntegrationsRoutes(
   app.put(
     "/admin/integrations/:integrationId",
     withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, integrationIdParamsSchema, request.params);
+      const paramsResult = parseRequestInput(reply, integrationIdParamsSchema, request.params);
       if (!paramsResult.ok) return paramsResult.response;
 
-      const bodyResult = parseAdminBody(reply, updateIntegrationBodySchema, request.body);
+      const bodyResult = parseRequestInput(reply, updateIntegrationBodySchema, request.body);
       if (!bodyResult.ok) return bodyResult.response;
 
       const { integrationId } = paramsResult.value;
@@ -210,7 +209,7 @@ export async function registerAdminIntegrationsRoutes(
   app.delete(
     "/admin/integrations/:integrationId/config",
     withAdmin(app, async (request, reply) => {
-      const paramsResult = parseAdminParams(reply, integrationIdParamsSchema, request.params);
+      const paramsResult = parseRequestInput(reply, integrationIdParamsSchema, request.params);
       if (!paramsResult.ok) return paramsResult.response;
 
       const { integrationId } = paramsResult.value;

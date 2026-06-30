@@ -21,6 +21,9 @@ export type WorkspaceArtifacts = {
   runtimeToken: string;
 };
 
+/** Base directory for session workspaces inside the E2B sandbox. */
+export const E2B_WORKSPACE_BASE = "/home/user/workspace";
+
 const RUNTIME_MANIFEST_VERSION = "cogniplane.runtime-manifest.v1";
 const skillDirectoryNamePattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
@@ -39,11 +42,10 @@ function buildRuntimeManifest(input: {
   workspacePath: string;
   runtimeConfig: RuntimeConfigBundle;
   skills: RuntimeManifestSkillEntry[];
-  runtimeToken: string;
   codexTomlPath: string;
   skillsPath: string;
 }): RuntimeManifest {
-  const { config, runtimeConfig, skills, runtimeToken } = input;
+  const { config, runtimeConfig, skills } = input;
   const manifestBase = {
     manifestVersion: RUNTIME_MANIFEST_VERSION,
     sessionId: input.sessionId,
@@ -72,9 +74,6 @@ function buildRuntimeManifest(input: {
     skills,
     mcpServers: runtimeConfig.mcpServers.map((server) => {
       const serverUrl = new URL(server.routePath, ensureTrailingSlash(config.RUNTIME_GATEWAY_BASE_URL));
-      // Embed the runtime token in the URL so Codex's Streamable HTTP transport
-      // authenticates even on the initialize POST (where it doesn't send headers).
-      serverUrl.searchParams.set("token", runtimeToken);
       return {
         id: server.id,
         version: server.version,
@@ -128,7 +127,7 @@ export async function createRuntimeWorkspace(
     rm(frameworkPath, { recursive: true, force: true })
   ]);
 
-  // Workspace files contain the runtime token (codex.toml, runtime-manifest.json).
+  // Workspace files contain the runtime token (codex.toml).
   // Lock the workspace tree to owner-only so same-host neighbors and forensic
   // captures cannot read the bearer token.
   await mkdir(workspacePath, { recursive: true, mode: 0o700 });
@@ -207,7 +206,6 @@ export async function createRuntimeWorkspace(
     workspacePath,
     runtimeConfig: input.runtimeConfig,
     skills: generatedSkills,
-    runtimeToken,
     codexTomlPath,
     skillsPath
   });
@@ -218,13 +216,19 @@ export async function createRuntimeWorkspace(
     }
   }
 
-  const authHeaderValue = `Bearer ${runtimeToken}`;
-
+  // codex.toml is the COMPLETE Codex config: the E2B bootstrap installs it
+  // verbatim as the sandbox-global ~/.codex/config.toml. Root-table keys must
+  // come before any [section] header — TOML tables extend until the next
+  // bracketed header, so a root key emitted later would silently land inside
+  // the preceding table.
+  const proxyBaseUrl = `${config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "")}/llm/openai/v1`;
   const codexToml = [
     "# Auto-generated for Cogniplane",
     `# Session: ${input.sessionId}`,
     `# Capability profile: ${input.runtimeConfig.runtimePolicy.id}`,
-    ""
+    `model = "${config.CODEX_MODEL}"`,
+    "tool_output_token_limit = 25000",
+    'model_provider = "cogniplane_proxy"'
   ];
 
   // Codex reads `web_search` (WebSearchMode) from the top of the config. Only
@@ -233,15 +237,38 @@ export async function createRuntimeWorkspace(
   const webSearchMode = input.runtimeConfig.runtimePolicy.webSearchMode;
   if (webSearchMode !== "disabled") {
     codexToml.push(`web_search = "${webSearchMode}"`);
-    codexToml.push("");
   }
+
+  codexToml.push(
+    "",
+    // The sandbox's OPENAI_API_KEY is the session's rt_* runtime token (NOT
+    // the real key); the backend's /llm/openai proxy verifies it and swaps in
+    // the real OPENAI_API_KEY before forwarding upstream.
+    "[model_providers.cogniplane_proxy]",
+    'name = "Cogniplane Proxy"',
+    `base_url = "${proxyBaseUrl}"`,
+    'env_key = "OPENAI_API_KEY"',
+    'wire_api = "responses"',
+    "",
+    "[features]",
+    "unified_exec = true",
+    "apply_patch_freeform = true",
+    "skills = true",
+    "shell_snapshot = false",
+    "",
+    `[projects."${E2B_WORKSPACE_BASE}"]`,
+    'trust_level = "trusted"',
+    ""
+  );
 
   for (const server of manifest.mcpServers) {
     codexToml.push(`[mcp_servers.${server.id}]`);
     codexToml.push(`url = "${server.url}"`);
     codexToml.push("");
-    codexToml.push(`[mcp_servers.${server.id}.headers]`);
-    codexToml.push(`Authorization = "${authHeaderValue}"`);
+    // `http_headers` ride as default headers on every request, including the
+    // initialize POST — no token-in-URL workaround needed (Codex >= 0.139).
+    codexToml.push(`[mcp_servers.${server.id}.http_headers]`);
+    codexToml.push(`Authorization = "Bearer ${runtimeToken}"`);
     codexToml.push("");
   }
 

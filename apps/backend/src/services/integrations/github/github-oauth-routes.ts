@@ -2,13 +2,13 @@ import type { FastifyInstance } from "fastify";
 
 import type { RequestLimitsInterface } from "../../request-limits.js";
 import { enforceOAuthCallbackRateLimit } from "../oauth-callback-rate-limit.js";
-import { buildIntegrationRedirectUrl } from "../integration-oauth-helpers.js";
+import {
+  buildIntegrationRedirectUrl,
+  mapOAuthProviderError
+} from "../integration-oauth-helpers.js";
 import type { GithubConnectionService } from "./github-connection-service.js";
 
-export const GITHUB_OAUTH_CALLBACK_PATHS = [
-  "/auth/github/install/callback",
-  "/auth/github/user/callback"
-] as const;
+export const GITHUB_OAUTH_CALLBACK_PATHS = ["/auth/github/user/callback"] as const;
 
 export function registerGithubOAuthRoutes(
   app: FastifyInstance,
@@ -27,7 +27,7 @@ export function registerGithubOAuthRoutes(
       return reply.redirect(
         buildIntegrationRedirectUrl(app.config, "/settings/github", {
           githubAuth: "error",
-          reason: query.error_description ?? query.error
+          reason: mapOAuthProviderError(query.error)
         })
       );
     }
@@ -37,8 +37,4 @@ export function registerGithubOAuthRoutes(
     });
     return reply.redirect(redirectUrl);
   });
-
-  // `/auth/github/install/callback` is reserved for future GitHub App
-  // installation flow. The path stays in the public allowlist so that
-  // when the route is wired up no auth middleware change is needed.
 }

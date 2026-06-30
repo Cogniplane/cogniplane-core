@@ -30,9 +30,8 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { SECTION_LABEL } from "../../../lib/ui-tokens";
+import { CHIP, SECTION_LABEL } from "../../../lib/ui-tokens";
 
-const CHIP = "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
 const PILL = "inline-flex items-center rounded-full bg-primary-container px-2 py-0.5 text-xs font-medium text-on-primary-container";
 
 type EditTarget = {

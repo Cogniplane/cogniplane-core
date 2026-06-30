@@ -10,7 +10,7 @@
 //     etc.). The rt_* token does NOT start with `sk-`, so this is a clean
 //     defense-in-depth check.
 //   - Codex resolves its base URL from `[model_providers.<id>].base_url`
-//     in ~/.codex/config.toml. The renderer in e2b-codex-mcp-config.ts
+//     in ~/.codex/config.toml. The codex.toml renderer in runtime-workspace.ts
 //     points that at this route under `/llm/openai/v1`.
 //
 // All shared logic (auth, audit, CIDR, forwarding) lives in

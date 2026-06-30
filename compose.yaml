@@ -2,13 +2,16 @@
 #
 # This file is intended for OSS self-hosters who want to run the full platform
 # on one machine via `docker compose up`. It boots Postgres + Redis + the
-# backend + the frontend with sensible defaults (AUTH_MODE=dev-headers,
-# RUNTIME_BACKEND=local, no E2B sandbox isolation).
+# backend + the frontend with sensible defaults (AUTH_MODE=dev-headers).
 #
 # Required env vars (export before `docker compose up`, or put in a .env file):
+#   E2B_API_KEY        — required at boot; both runtimes execute inside E2B
+#   E2B_TEMPLATE_ID    — required at boot; run `make e2b-build` to create one
 #   ANTHROPIC_API_KEY  — to use the Claude runtime (otherwise hidden in UI)
 #   OPENAI_API_KEY     — to use the Codex runtime (otherwise hidden in UI)
-# At least one is required for any agent turn to work.
+# At least one of ANTHROPIC_API_KEY / OPENAI_API_KEY is required for any agent
+# turn to work; E2B_API_KEY / E2B_TEMPLATE_ID are required for the backend to
+# boot at all.
 #
 # After bring-up:
 #   Frontend: http://localhost:3000
@@ -17,9 +20,6 @@
 # Production caveats:
 #   - dev-headers mode reads X-User-Id from the request — never expose this
 #     stack to the internet without first switching AUTH_MODE=workos.
-#   - RUNTIME_BACKEND=local executes Codex in the backend container with no
-#     sandbox isolation. Trusted internal users only. Switch to
-#     RUNTIME_BACKEND=e2b (and CLAUDE_RUNTIME_BACKEND=e2b) for real isolation.
 #   - See docs/docker-deploy.md for the full walkthrough.
 
 services:
@@ -27,7 +27,7 @@ services:
     image: redis:7-alpine
     container_name: cogniplane-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -44,7 +44,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -61,7 +61,7 @@ services:
       # (apps/backend/src/codex-release.test.ts) — bumping them requires
       # rebuilding the E2B template too. See docs/self-hosting.md.
       args:
-        CODEX_NPM_VERSION: 0.135.0
+        CODEX_NPM_VERSION: 0.142.4
     container_name: cogniplane-backend
     security_opt:
       - no-new-privileges:true
@@ -71,7 +71,7 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     volumes:
       - runtime-workspaces:/runtime-workspaces
     environment:
@@ -79,19 +79,24 @@ services:
       API_PORT: 3001
       API_ORIGIN: http://localhost:3000
       AUTH_MODE: dev-headers
+      # dev-headers lets anyone who can reach the port impersonate any user/tenant
+      # via X-User-Id. API_HOST must be 0.0.0.0 *inside* the container (Docker
+      # bridge networking requires it), which the loopback guard rejects — hence
+      # the opt-in. The real exposure control is the host port publish bound to
+      # 127.0.0.1 above, so the backend is reachable only from the host. To expose
+      # it on a network, switch AUTH_MODE=workos (and drop this opt-in) first.
+      COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1"
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
       MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/cogniplane
       APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
       LOCAL_DEV_USER_ID: local-dev-user
-      CODEX_VERSION: 0.135.0
-      RUNTIME_BACKEND: local
-      CLAUDE_RUNTIME_BACKEND: local
+      CODEX_VERSION: 0.142.4
       RUNTIME_WORKSPACE_ROOT: /runtime-workspaces
       REDIS_URL: redis://redis:6379
-      # Provider keys are optional but the backend's Zod schema rejects
-      # empty strings. Use `${VAR:?}` to fail fast if explicitly set empty,
-      # or omit. Compose forwards these from the host env / .env file when
-      # they are non-empty; when unset they're not added to the container.
+      # Forwarded from host env / .env when non-empty. E2B_* are required at
+      # boot (config.ts fails fast); provider keys are optional.
+      E2B_API_KEY:
+      E2B_TEMPLATE_ID:
       ANTHROPIC_API_KEY:
       OPENAI_API_KEY:
     healthcheck:
@@ -118,7 +123,7 @@ services:
       backend:
         condition: service_started
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
 volumes:
   redis-data:

@@ -158,6 +158,7 @@ export function AdminRuntimeCard(props: {
         <div className="flex flex-wrap items-center gap-2">
           <Input
             type="search"
+            aria-label="Filter by session or runtime ID"
             value={search}
             placeholder="Filter by session or runtime ID…"
             onChange={(e) => {

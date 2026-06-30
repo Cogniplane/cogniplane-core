@@ -26,6 +26,169 @@ test("mapClaudeEvent: system with unknown subtype returns empty", () => {
   expect(events.length).toBe(0);
 });
 
+test("mapClaudeEvent: model_refusal_fallback emits a runtime notice", () => {
+  const state = freshState();
+  const events = mapClaudeEvent(state, {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    original_model: "claude-fable-5",
+    fallback_model: "claude-opus-4-8",
+    uuid: "u-1"
+  });
+
+  expect(events.length).toBe(1);
+  const notice = events[0] as Extract<(typeof events)[number], { type: "framework:runtime_notice" }>;
+  expect(notice.type).toBe("framework:runtime_notice");
+  expect(notice.noticeId).toBe("model-refusal-fallback:u-1");
+  expect(notice.level).toBe("warning");
+  expect(notice.message).toContain("claude-fable-5");
+  expect(notice.message).toContain("claude-opus-4-8");
+});
+
+// Refusal-fallback retraction: the refused partial was already streamed as
+// deltas; the replacement frame's `supersedes` (and, idempotently, the
+// end-of-turn notice's retracted_message_uuids) must evict it via a
+// whole-text replace event.
+test("mapClaudeEvent: refusal fallback retracts the refused partial from the transcript", () => {
+  const state = freshState();
+
+  const streamText = (text: string) =>
+    mapClaudeEvent(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } }
+    });
+  const closeMessage = (uuid: string) =>
+    mapClaudeEvent(state, { type: "assistant", uuid, message: { content: [] } });
+
+  // Healthy first message survives the retraction.
+  streamText("Good intro. ");
+  closeMessage("uuid-good");
+
+  // Refused partial streams, then its snapshot closes it.
+  streamText("Refused partial text");
+  closeMessage("uuid-refused");
+
+  // Replacement frame retracts the refused message and streams its own text.
+  const replaceEvents = mapClaudeEvent(state, {
+    type: "assistant",
+    uuid: "uuid-replacement",
+    supersedes: ["uuid-refused"],
+    message: { content: [{ type: "text", text: "Safe replacement." }] }
+  });
+
+  const replace = replaceEvents.find((e) => e.type === "response.output_text.replace");
+  expect(replace).toBeTruthy();
+  if (replace?.type !== "response.output_text.replace") return;
+  // Corrected transcript at eviction time: surviving segment only.
+  expect(replace.text).toBe("Good intro. ");
+  // The replacement's own text still arrives as a normal delta after the replace.
+  const delta = replaceEvents.find((e) => e.type === "response.output_text.delta");
+  expect(delta && "delta" in delta && delta.delta).toBe("Safe replacement.");
+
+  // End-of-turn notice repeats the retraction — idempotent, no second replace.
+  const noticeEvents = mapClaudeEvent(state, {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    original_model: "a",
+    fallback_model: "b",
+    retracted_message_uuids: ["uuid-refused"],
+    uuid: "u-2"
+  });
+  expect(noticeEvents.some((e) => e.type === "response.output_text.replace")).toBe(false);
+  expect(noticeEvents.some((e) => e.type === "framework:runtime_notice")).toBe(true);
+});
+
+test("mapClaudeEvent: retraction via the end-of-turn notice alone also replaces", () => {
+  const state = freshState();
+  mapClaudeEvent(state, {
+    type: "stream_event",
+    event: { type: "content_block_delta", delta: { type: "text_delta", text: "Refused text" } }
+  });
+  mapClaudeEvent(state, { type: "assistant", uuid: "uuid-refused", message: { content: [] } });
+
+  const events = mapClaudeEvent(state, {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    original_model: "a",
+    fallback_model: "b",
+    retracted_message_uuids: ["uuid-refused"],
+    uuid: "u-3"
+  });
+
+  const replace = events.find((e) => e.type === "response.output_text.replace");
+  expect(replace && "text" in replace && replace.text).toBe("");
+});
+
+test("mapClaudeEvent: retraction also evicts reasoning from the refused leg", () => {
+  const state = freshState();
+  const thinkOn = (thinking: string) =>
+    mapClaudeEvent(state, {
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking } }
+    });
+
+  thinkOn("Benign plan. ");
+  mapClaudeEvent(state, { type: "assistant", uuid: "uuid-good", message: { content: [] } });
+  thinkOn("Refused reasoning");
+  mapClaudeEvent(state, { type: "assistant", uuid: "uuid-refused", message: { content: [] } });
+
+  const events = mapClaudeEvent(state, {
+    type: "assistant",
+    uuid: "uuid-replacement",
+    supersedes: ["uuid-refused"],
+    message: { content: [] }
+  });
+
+  const replace = events.find((e) => e.type === "framework:reasoning_summary.replace");
+  expect(replace && "text" in replace && replace.text).toBe("Benign plan. ");
+});
+
+test("mapClaudeEvent: retraction also evicts tool events from the refused leg", () => {
+  const state = freshState();
+
+  // Refused assistant message starts a tool; its (tombstoned) result lands.
+  mapClaudeEvent(state, {
+    type: "assistant",
+    uuid: "uuid-refused-tools",
+    message: {
+      content: [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: "ls" } }]
+    }
+  });
+  mapClaudeEvent(state, {
+    type: "user",
+    uuid: "uuid-tool-result",
+    message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: "files" }] }
+  });
+
+  const events = mapClaudeEvent(state, {
+    type: "system",
+    subtype: "model_refusal_fallback",
+    trigger: "refusal",
+    direction: "retry",
+    original_model: "a",
+    fallback_model: "b",
+    retracted_message_uuids: ["uuid-refused-tools", "uuid-tool-result"],
+    uuid: "u-4"
+  });
+
+  const retracted = events.find((e) => e.type === "response.tool.retracted");
+  expect(retracted && "itemIds" in retracted && retracted.itemIds).toEqual(["tool-1"]);
+  // Idempotent: a second retraction of the same uuids emits nothing.
+  const again = mapClaudeEvent(state, {
+    type: "assistant",
+    uuid: "uuid-replacement-2",
+    supersedes: ["uuid-refused-tools", "uuid-tool-result"],
+    message: { content: [] }
+  });
+  expect(again.some((e) => e.type === "response.tool.retracted")).toBe(false);
+});
+
 // ── 2. stream_event text delta → response.output_text.delta ──────────────────
 
 test("mapClaudeEvent: text_delta emits output_text.delta", () => {

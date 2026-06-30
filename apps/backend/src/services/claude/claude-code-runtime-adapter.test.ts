@@ -187,7 +187,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       userId: "user-1"
     });
     // Simulate the proxy having pinned this runtime to a peer IP.
-    expect(egressIpPins.checkAndPin(ref.runtimeId, "203.0.113.5").kind).toBe("pinned");
+    expect((await egressIpPins.checkAndPin(ref.runtimeId, "203.0.113.5")).kind).toBe("pinned");
 
     await adapterWithPins.abortSession({
       tenantId: "test-tenant",
@@ -196,7 +196,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     });
 
     // After abort the slot must be reclaimable — next call pins fresh.
-    expect(egressIpPins.checkAndPin(ref.runtimeId, "198.51.100.42").kind).toBe("pinned");
+    expect((await egressIpPins.checkAndPin(ref.runtimeId, "198.51.100.42")).kind).toBe("pinned");
   });
 
   it("abortSession removes the session", async () => {
@@ -628,9 +628,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     );
 
     await wired.createSession({ tenantId: "tenant-x", sessionId: "sess-dead", userId: "user-x" });
-    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string }> }).e2bPendingApprovals.set(
       "appr-dead-1",
-      { sessionId: "sess-dead", kind: "command_execution" }
+      { sessionId: "sess-dead", sandboxApprovalId: "sandbox-dead-1", kind: "command_execution" }
     );
 
     // Teardown clears the process's per-approval TTL timers, so the DB rows
@@ -651,14 +651,82 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     ).toBe(0);
   });
 
+  it("translates a sandbox approval timeout to the backend-owned approval id", async () => {
+    const expireCalls: string[] = [];
+    const auditCalls: Array<Record<string, unknown>> = [];
+    const richApprovals = {
+      async create() {
+        return {} as import("./approval-store.js").ApprovalRecord;
+      },
+      async expire(_tenantId: string, approvalId: string) {
+        expireCalls.push(approvalId);
+        return { approvalId };
+      }
+    };
+    const auditEvents = {
+      async create(input: Record<string, unknown>) {
+        auditCalls.push(input);
+      }
+    };
+    let onApprovalExpired: ((approvalId: string) => void) | undefined;
+    vi.spyOn(E2bClaudeRuntimeProcess, "start").mockImplementationOnce(async (input) => {
+      onApprovalExpired = input.onApprovalExpired;
+      return makeFakeE2bProcess() as unknown as E2bClaudeRuntimeProcess;
+    });
+    const wired = new ClaudeCodeRuntimeAdapter(
+      testConfig,
+      fakeDynamicConfig,
+      fakeLog,
+      makeTestManagedToolCatalog(),
+      { approvals: richApprovals as never, auditEvents: auditEvents as never },
+      undefined,
+      testE2bOptions
+    );
+
+    await wired.createSession({ tenantId: "tenant-x", sessionId: "sess-timeout", userId: "user-x" });
+    const pendingMap = (wired as unknown as {
+      e2bPendingApprovals: Map<
+        string,
+        { sessionId: string; sandboxApprovalId: string; kind: string }
+      >;
+    }).e2bPendingApprovals;
+    pendingMap.set("claapr_backend", {
+      sessionId: "sess-timeout",
+      sandboxApprovalId: "sandbox-reused",
+      kind: "command_execution"
+    });
+    pendingMap.set("claapr_other_session", {
+      sessionId: "another-session",
+      sandboxApprovalId: "sandbox-reused",
+      kind: "command_execution"
+    });
+
+    expect(onApprovalExpired).toBeTypeOf("function");
+    onApprovalExpired!("sandbox-reused");
+    await vi.waitFor(() => expect(expireCalls).toEqual(["claapr_backend"]));
+
+    expect(pendingMap.has("claapr_backend")).toBe(false);
+    expect(pendingMap.has("claapr_other_session")).toBe(true);
+    expect(auditCalls).toEqual([
+      expect.objectContaining({
+        approvalId: "claapr_backend",
+        tenantId: "tenant-x",
+        sessionId: "sess-timeout",
+        userId: "user-x",
+        type: "approval.expired",
+        payload: { reason: "ttl_expired" }
+      })
+    ]);
+  });
+
   it("resolveApproval returns 'missing' when sandbox-bound approval has wrong tenant/user", async () => {
     // Seed a pending e2b approval owned by tenant-a/u, then attempt to resolve
     // it as a different user. forwardApprovalDecision's tenant/user gate must
     // reject without flipping the DB row or forwarding to the sandbox.
     await adapter.createSession({ tenantId: "tenant-a", sessionId: "s", userId: "u" });
-    (adapter as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+    (adapter as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string }> }).e2bPendingApprovals.set(
       "appr-mismatch",
-      { sessionId: "s", kind: "command_execution" }
+      { sessionId: "s", sandboxApprovalId: "sandbox-mismatch", kind: "command_execution" }
     );
     expect(
       await adapter.resolveApproval({
@@ -712,9 +780,10 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // canUseTool Promise lives inside the sandbox harness, so the adapter
     // forwards the decision over the bridge (state.e2bProcess.sendApprovalResponse).
     const approvalId = "appr-1";
-    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+    const sandboxApprovalId = "sandbox-appr-1";
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      { sessionId: "sess-approve", kind: "command_execution" }
+      { sessionId: "sess-approve", sandboxApprovalId, kind: "command_execution" }
     );
     const sandboxProcess = (wired as unknown as {
       sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
@@ -743,7 +812,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       payload: { itemId: "item-9", kind: "command_execution" }
     });
     // The decision was forwarded to the in-sandbox harness as "approve".
-    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(approvalId, "approve");
+    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(sandboxApprovalId, "approve");
   });
 
   it("resolveApproval with rememberForTurn records the kind for in-turn auto-approval", async () => {
@@ -777,11 +846,12 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       sessions: Map<string, { autoApprovedKindsForTurn: Set<string> }>;
     }).sessions.get("sess-remember")!;
     const pendingMap = (wired as unknown as {
-      e2bPendingApprovals: Map<string, { sessionId: string; kind: string; autoApprovedKinds: Set<string> }>;
+      e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string; autoApprovedKinds: Set<string> }>;
     }).e2bPendingApprovals;
 
     pendingMap.set("appr-mem", {
       sessionId: "sess-remember",
+      sandboxApprovalId: "sandbox-mem",
       kind: "command_execution",
       autoApprovedKinds: state.autoApprovedKindsForTurn
     });
@@ -799,6 +869,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // A rejected decision must never remember, even when the flag is set.
     pendingMap.set("appr-mem-2", {
       sessionId: "sess-remember",
+      sandboxApprovalId: "sandbox-mem-2",
       kind: "file_change",
       autoApprovedKinds: state.autoApprovedKindsForTurn
     });
@@ -817,6 +888,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     const orphanedSet = new Set<string>();
     pendingMap.set("appr-mem-3", {
       sessionId: "sess-remember",
+      sandboxApprovalId: "sandbox-mem-3",
       kind: "command_execution",
       autoApprovedKinds: orphanedSet
     });
@@ -866,9 +938,10 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     await wired.createSession({ tenantId: "tenant-a", sessionId: "sess-reject", userId: "user-1" });
 
     const approvalId = "appr-r";
-    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+    const sandboxApprovalId = "sandbox-appr-r";
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      { sessionId: "sess-reject", kind: "file_change" }
+      { sessionId: "sess-reject", sandboxApprovalId, kind: "file_change" }
     );
     const sandboxProcess = (wired as unknown as {
       sessions: Map<string, { e2bProcess: { sendApprovalResponse: ReturnType<typeof vi.fn> } }>;
@@ -888,7 +961,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       payload: { itemId: "item-r", kind: "file_change" }
     });
     // The decision was forwarded to the in-sandbox harness as "reject".
-    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(approvalId, "reject");
+    expect(sandboxProcess.sendApprovalResponse).toHaveBeenCalledWith(sandboxApprovalId, "reject");
   });
 
   it("resolveApproval returns 'missing' without auditing when the DB row is not pending", async () => {
@@ -922,9 +995,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     // Seed the pending entry so forwarding succeeds and we reach the DB guard;
     // resolve() returns null (row already settled) so no audit row is written.
     const approvalId = "already-settled";
-    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; kind: string }> }).e2bPendingApprovals.set(
+    (wired as unknown as { e2bPendingApprovals: Map<string, { sessionId: string; sandboxApprovalId: string; kind: string }> }).e2bPendingApprovals.set(
       approvalId,
-      { sessionId: "sess-dbl", kind: "command_execution" }
+      { sessionId: "sess-dbl", sandboxApprovalId: "sandbox-already-settled", kind: "command_execution" }
     );
 
     expect(
@@ -1054,7 +1127,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       mcpServersConfig: {
         framework: {
           type: "http",
-          url: "http://localhost:3001/mcp/framework?token=rt_test",
+          url: "http://localhost:3001/mcp/framework",
           headers: { Authorization: "Bearer rt_test" }
         }
       },
@@ -1071,7 +1144,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     expect(options.mcpServers).toEqual({
             framework: {
               type: "http",
-              url: "http://localhost:3001/mcp/framework?token=rt_test",
+              url: "http://localhost:3001/mcp/framework",
               headers: { Authorization: "Bearer rt_test" }
             }
           });

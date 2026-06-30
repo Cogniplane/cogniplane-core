@@ -740,6 +740,30 @@
         "method": {
           "type": "string",
           "enum": [
+            "skills/extraRoots/set"
+          ],
+          "title": "Skills/extraRoots/setRequestMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/SkillsExtraRootsSetParams"
+        }
+      },
+      "title": "Skills/extraRoots/setRequest"
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
             "hooks/list"
           ],
           "title": "Hooks/listRequestMethod"
@@ -1756,6 +1780,102 @@
       "title": "RemoteControl/status/readRequest"
     },
     {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "remoteControl/pairing/start"
+          ],
+          "title": "RemoteControl/pairing/startRequestMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/RemoteControlPairingStartParams"
+        }
+      },
+      "title": "RemoteControl/pairing/startRequest"
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "remoteControl/pairing/status"
+          ],
+          "title": "RemoteControl/pairing/statusRequestMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/RemoteControlPairingStatusParams"
+        }
+      },
+      "title": "RemoteControl/pairing/statusRequest"
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "remoteControl/client/list"
+          ],
+          "title": "RemoteControl/client/listRequestMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/RemoteControlClientsListParams"
+        }
+      },
+      "title": "RemoteControl/client/listRequest"
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "remoteControl/client/revoke"
+          ],
+          "title": "RemoteControl/client/revokeRequestMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/RemoteControlClientsRevokeParams"
+        }
+      },
+      "title": "RemoteControl/client/revokeRequest"
+    },
+    {
       "description": "Lists collaboration mode presets.",
       "type": "object",
       "required": [
@@ -2089,6 +2209,29 @@
         }
       },
       "title": "Account/rateLimits/readRequest"
+    },
+    {
+      "type": "object",
+      "required": [
+        "id",
+        "method"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "account/usage/read"
+          ],
+          "title": "Account/usage/readRequestMethod"
+        },
+        "params": {
+          "type": "null"
+        }
+      },
+      "title": "Account/usage/readRequest"
     },
     {
       "type": "object",
@@ -2634,6 +2777,30 @@
       "enum": [
         "untrusted",
         "application"
+      ]
+    },
+    "AgentMessageInputContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "encrypted_content",
+            "type"
+          ],
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "encrypted_content"
+              ],
+              "title": "EncryptedContentAgentMessageInputContentType"
+            }
+          },
+          "title": "EncryptedContentAgentMessageInputContent"
+        }
       ]
     },
     "ApprovalsReviewer": {
@@ -4797,16 +4964,9 @@
       ]
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ]
+      "minLength": 1
     },
     "ReasoningItemContent": {
       "oneOf": [
@@ -4896,6 +5056,88 @@
         }
       ]
     },
+    "RemoteControlClientsListOrder": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "RemoteControlClientsListParams": {
+      "type": "object",
+      "required": [
+        "environmentId"
+      ],
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "order": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RemoteControlClientsListOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RemoteControlClientsRevokeParams": {
+      "type": "object",
+      "required": [
+        "clientId",
+        "environmentId"
+      ],
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "environmentId": {
+          "type": "string"
+        }
+      }
+    },
+    "RemoteControlPairingStartParams": {
+      "type": "object",
+      "properties": {
+        "manualCode": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RemoteControlPairingStatusParams": {
+      "type": "object",
+      "properties": {
+        "manualPairingCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pairingCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -4952,6 +5194,37 @@
             }
           },
           "title": "MessageResponseItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "author",
+            "content",
+            "recipient",
+            "type"
+          ],
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AgentMessageInputContent"
+              }
+            },
+            "recipient": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agent_message"
+              ],
+              "title": "AgentMessageResponseItemType"
+            }
+          },
+          "title": "AgentMessageResponseItem"
         },
         {
           "type": "object",
@@ -5814,6 +6087,20 @@
         }
       }
     },
+    "SkillsExtraRootsSetParams": {
+      "type": "object",
+      "required": [
+        "extraRoots"
+      ],
+      "properties": {
+        "extraRoots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          }
+        }
+      }
+    },
     "SkillsListParams": {
       "type": "object",
       "properties": {
@@ -6020,18 +6307,14 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -6555,6 +6838,42 @@
         }
       }
     },
+    "ThreadResumeInitialTurnsPageParams": {
+      "type": "object",
+      "properties": {
+        "itemsView": {
+          "description": "How much item detail to include for each returned turn; defaults to summary.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "description": "Optional turn page size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sortDirection": {
+          "description": "Optional turn pagination direction; defaults to descending.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SortDirection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
     "ThreadResumeParams": {
       "description": "There are three ways to resume a thread: 1. By thread_id: load the thread from disk by thread_id and resume it. 2. By history: instantiate the thread from memory and resume it. 3. By path: load the thread from disk by path and resume it.\n\nFor non-running threads, the precedence is: history > non-empty path > thread_id. If using history or a non-empty path for a non-running thread, the thread_id param will be ignored.\n\nIf thread_id identifies a running thread, app-server rejoins that thread and treats a non-empty path as a consistency check against the active rollout path. Empty string path values are treated as absent.\n\nPrefer using thread_id whenever possible.",
       "type": "object",
@@ -6622,6 +6941,17 @@
             "$ref": "#/definitions/ResponseItem"
           }
         },
+        "initialTurnsPage": {
+          "description": "When present, include a `thread/turns/list` page in the resume response so clients can bootstrap recent turns without a second request.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadResumeInitialTurnsPageParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "model": {
           "description": "Configuration overrides for the resumed thread, if any.",
           "type": [
@@ -6650,10 +6980,6 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "personality": {
           "anyOf": [
             {
@@ -6665,13 +6991,13 @@
           ]
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -7061,10 +7387,6 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "personality": {
           "anyOf": [
             {
@@ -7076,13 +7398,13 @@
           ]
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -7344,6 +7666,12 @@
             }
           ]
         },
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "collaborationMode": {
           "description": "EXPERIMENTAL - Set a pre-set collaboration mode. Takes precedence over model, reasoning_effort, and developer instructions if set.\n\nFor `collaboration_mode.settings.developer_instructions`, `null` means \"use the built-in instructions for the selected mode\".",
           "anyOf": [
@@ -7374,7 +7702,7 @@
           ]
         },
         "environments": {
-          "description": "Optional turn-scoped environments.\n\nOmitted uses the thread sticky environments. Empty disables environment access for this turn. Non-empty selects the first environment as the current turn environment for this turn.",
+          "description": "Optional environments for this turn and subsequent turns.\n\nOmitted uses the thread sticky environments. Empty disables environment access for this turn. Non-empty selects the first environment as the current turn environment for this turn.",
           "type": [
             "array",
             "null"
@@ -7428,13 +7756,13 @@
           }
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Relative paths are resolved against the effective cwd for the turn.",
+          "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandboxPolicy": {
@@ -7488,6 +7816,12 @@
           "additionalProperties": {
             "$ref": "#/definitions/AdditionalContextEntry"
           }
+        },
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "expectedTurnId": {
           "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",

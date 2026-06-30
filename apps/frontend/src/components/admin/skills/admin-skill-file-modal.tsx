@@ -9,7 +9,7 @@ import { getSkillRevisionFile, type SkillRevisionFilePreview } from "../../../li
 import { getPreviewLanguage, isImageArtifact } from "../../../lib/artifact-preview";
 import { parseCsvPreview } from "../../../lib/csv-preview";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 type Props = {
   skillId: string;
@@ -54,6 +54,7 @@ export function AdminSkillFileModal({ skillId, skillRevisionId, path, onClose }:
       <DialogContent className="flex max-h-[85vh] max-w-4xl flex-col gap-0 p-0 sm:max-w-4xl">
         <DialogHeader className="flex flex-row items-center justify-between border-b border-outline-variant px-6 py-4">
           <DialogTitle className="truncate text-base">{path}</DialogTitle>
+          <DialogDescription className="sr-only">Viewing the contents of {path}.</DialogDescription>
           {state.status === "ready" && state.file.contentType === "text/csv" ? (
             <Button
               type="button"

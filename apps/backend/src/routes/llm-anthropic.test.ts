@@ -467,6 +467,34 @@ describe("POST /llm/anthropic/v1/messages", () => {
     expect(row!.costUsd!).toBeGreaterThan(0);
   });
 
+  // Refusal fallback: the SDK can retry a turn on a different model than the
+  // one registered for the turn. The model on the upstream request body wins
+  // so usage is attributed and priced against what actually served the call.
+  test("attributes usage to the request-body model, not the registered turn model", async () => {
+    harness = await buildHarness({
+      upstreamUrl: upstream.url,
+      tenantApiKey: "sk-real",
+      activeTurn: {
+        sessionId: "session-1",
+        runtimeId: "runtime-1",
+        messageId: "assistant-msg-1",
+        modelName: "claude-fable-5"
+      }
+    });
+    const token = mintToken();
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/llm/anthropic/v1/messages",
+      headers: { "x-api-key": token },
+      payload: { model: "claude-opus-4-8", stream: true, messages: [] }
+    });
+    expect(res.statusCode).toBe(200);
+
+    const row = harness.messages.rows.get("assistant-msg-1");
+    expect(row!.modelName).toBe("claude-opus-4-8");
+  });
+
   test("accumulates usage across multiple proxied calls within the same turn", async () => {
     // Tool-using turns can fire N upstream model requests before one
     // assistant message completes. The proxy must SUM the usage onto the
@@ -547,7 +575,7 @@ describe("POST /llm/anthropic/v1/messages", () => {
     // 127.0.0.1 source — simulates "rt_* leaked, attacker tries from a
     // different egress IP inside the CIDR allowlist."
     const pins = new RuntimeEgressIpPinStore(60_000);
-    pins.checkAndPin("runtime-1", "198.51.100.42");
+    await pins.checkAndPin("runtime-1", "198.51.100.42");
 
     harness = await buildHarness({
       upstreamUrl: upstream.url,

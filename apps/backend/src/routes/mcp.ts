@@ -11,41 +11,41 @@
 // must keep working — don't collapse them into one path.
 
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
-import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
-import {
-  POLICY_TURN_CONTEXTS,
-  type PolicySeverity,
-  type PolicyTurnContext
-} from "@cogniplane/shared-types";
-
-import type {
-  PolicyApprovalDisposition,
-  PolicyApprovalRouteInput,
-  RuntimeApprovalKind
-} from "../runtime-contracts.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import { cidrAllowlistAllows, parseCidrAllowlist } from "../lib/cidr-allowlist.js";
+import { parseCidrAllowlist } from "../lib/cidr-allowlist.js";
 import { resolveEgressClientIp } from "../lib/egress-client-ip.js";
 import { getErrorMessage } from "../lib/http-errors.js";
 import { signProxyHeaders } from "../lib/mcp-proxy-signature.js";
-import { ssrfSafeAgent } from "../lib/url-validation.js";
-import { verifyRuntimeToken, type RuntimeTokenClaims } from "../services/auth/runtime-token.js";
+import {
+  forwardRpc,
+  rpcFailure as failure,
+  rpcOk as ok,
+  selectAllowlistedHeaders,
+  type McpRpcResponse as RpcResponse
+} from "../lib/mcp-upstream-client.js";
+import type { RuntimeTokenClaims } from "../services/auth/runtime-token.js";
 
 import type { ActivationTracker } from "../services/activation-tracker.js";
 import {
-  parseRuntimePolicySnapshot,
   type McpServerRegistration,
   type ResolvedRuntimePolicy
 } from "../services/admin-config-records.js";
 import type { ManagedToolDefinition } from "../services/managed-tools/types.js";
-import { classifyToolSeverity } from "../services/tool-classification.js";
 import { PolicyBlockedError, type PolicyService } from "../services/policy/policy-service.js";
 import type {
   ToolExecutionContext,
   ToolExecutionContextStore
 } from "../services/auth/tool-execution-context-store.js";
+import {
+  enforcePolicyCenter,
+  getRuntimePolicySnapshot,
+  type GatewayPolicyApprovalRouter,
+  type PolicyGate
+} from "../services/mcp/policy-gate.js";
+import { resolveBoundToolContext } from "../services/mcp/tool-context-binder.js";
+import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
 
 const rpcRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
@@ -58,70 +58,11 @@ const mcpRouteParamsSchema = z.object({
   serverId: z.string().min(1)
 });
 
-type RpcResponse = {
-  jsonrpc: "2.0";
-  id: string | number | null;
-  result?: unknown;
-  error?: {
-    code: number;
-    message: string;
-  };
-};
-
-function ok(id: string | number | undefined, result: unknown): RpcResponse {
-  return {
-    jsonrpc: "2.0",
-    id: id ?? null,
-    result
-  };
-}
-
-function failure(id: string | number | undefined, code: number, message: string): RpcResponse {
-  return {
-    jsonrpc: "2.0",
-    id: id ?? null,
-    error: { code, message }
-  };
-}
+export const MCP_REQUEST_BODY_LIMIT_BYTES = 2 * 1024 * 1024;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
-// Best-effort audit row for gateway-level refusals (egress controls). A
-// failed audit write must never change the gating outcome — the 403 already
-// protects the platform; losing the evidence row is the lesser failure.
-async function recordGatewayRejection(
-  stores: Pick<McpRouteStores, "auditEvents">,
-  reason: string,
-  ctx: {
-    claims: RuntimeTokenClaims;
-    ipAddress: string | null;
-    serverId: string;
-    rpcMethod: string;
-  },
-  log: FastifyBaseLogger
-): Promise<void> {
-  try {
-    await stores.auditEvents.create({
-      tenantId: ctx.claims.tid,
-      sessionId: ctx.claims.sid,
-      userId: ctx.claims.uid,
-      type: "mcp.gateway.rejected",
-      payload: { reason, serverId: ctx.serverId, rpcMethod: ctx.rpcMethod },
-      ipAddress: ctx.ipAddress
-    });
-  } catch (err) {
-    log.warn({ err, reason, serverId: ctx.serverId }, "failed to persist mcp.gateway.rejected audit event");
-  }
-}
-
-// Routes a Policy Center require_approval to whichever adapter owns the
-// session. Returns the human disposition, or null when no adapter could host
-// the approval (no active turn) — the gateway then degrades to a deny.
-export type GatewayPolicyApprovalRouter = (
-  input: PolicyApprovalRouteInput
-) => Promise<PolicyApprovalDisposition | null>;
 
 export function buildMcpRouteStores(
   deps: AppDependencies,
@@ -210,7 +151,10 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     return null;
   });
 
-  app.post("/mcp/:serverId", async (request, reply) => {
+  app.post(
+    "/mcp/:serverId",
+    { bodyLimit: MCP_REQUEST_BODY_LIMIT_BYTES },
+    async (request, reply) => {
     const parsed = rpcRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       reply.code(400);
@@ -220,80 +164,23 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     const serverId = mcpRouteParamsSchema.parse(request.params).serverId;
     const rpc = parsed.data;
 
-    // The MCP gateway exists for the sandboxed runtime alone — every request,
-    // including initialize, must carry a valid session-scoped rt_* token
-    // (Authorization header for Claude; ?token= for Codex, whose Streamable
-    // HTTP transport drops the header on the initialize POST). User JWTs and
-    // dev headers are deliberately rejected: resolveBoundToolContext binds
-    // caller-supplied toolContextIds to these claims, so admitting non-runtime
-    // callers would let a same-tenant user substitute another user's context
-    // id and execute tools under that identity. We re-verify the token here
-    // rather than threading claims through request.auth so the rest of the
-    // API surface stays unchanged.
-    const runtimeTokenClaims = resolveRuntimeTokenClaims(
-      request.headers.authorization,
-      request.url,
-      stores.runtimeTokenSecret
-    );
-    if (!runtimeTokenClaims) {
-      request.log.warn(
-        { serverId, rpcMethod: rpc.method, tenantId: request.auth.tenantId },
-        "MCP gateway 401: request authenticated without a valid runtime token (rt_*)"
-      );
-      reply.code(401);
-      return failure(rpc.id, -32000, "The MCP gateway requires a valid runtime token (rt_*).");
-    }
-    const sessionIdFromRuntimeToken = runtimeTokenClaims.sid;
-
-    // Same egress controls as the LLM proxy (llm-proxy-core.ts). The CIDR
-    // allowlist (E2B_EGRESS_CIDRS) is dormant unless configured — E2B does not
-    // publish egress ranges — so the per-runtime IP pin is the operative
-    // control: the first gateway/proxy call for a runtimeId records the peer
-    // IP, and a leaked rt_* token replayed from any other host is refused for
-    // the rest of its TTL. The pin store is shared with /llm/*, so whichever
-    // route the sandbox hits first establishes the pin for both.
-    //
-    // The pinned IP must be the real sandbox peer, not an intermediate proxy.
-    // Behind Cloudflare (CDN → ALB → backend) `request.ip` resolves to a
-    // rotating Cloudflare edge IP, so resolveEgressClientIp prefers the
-    // origin client from CF-Connecting-IP when the request crossed a trusted
-    // proxy hop, falling back to request.ip otherwise (see egress-client-ip.ts).
     const ipAddress = resolveEgressClientIp(request);
-    if (stores.egressAllowlist && !cidrAllowlistAllows(stores.egressAllowlist, ipAddress ?? "")) {
-      await recordGatewayRejection(stores, "egress_ip_not_allowed", {
-        claims: runtimeTokenClaims,
-        ipAddress,
-        serverId,
-        rpcMethod: rpc.method
-      }, request.log);
-      reply.code(403);
-      return failure(rpc.id, -32000, "Egress IP is not allowed.");
+    const admission = await runGatewayAdmission({
+      authorizationHeader: request.headers.authorization,
+      rpcId: rpc.id,
+      rpcMethod: rpc.method,
+      serverId,
+      tenantId: request.auth.tenantId,
+      ipAddress,
+      stores,
+      logger: request.log
+    });
+    if (!admission.ok) {
+      reply.code(admission.statusCode);
+      return admission.body;
     }
-    if (ipAddress) {
-      const pinResult = stores.egressIpPins.checkAndPin(runtimeTokenClaims.rid, ipAddress);
-      if (pinResult.kind === "mismatch") {
-        await recordGatewayRejection(stores, "egress_ip_mismatch", {
-          claims: runtimeTokenClaims,
-          ipAddress,
-          serverId,
-          rpcMethod: rpc.method
-        }, request.log);
-        // Log expected/observed at warn so an operator investigating a leak
-        // can see both — the audit payload deliberately omits the expected IP
-        // to avoid storing per-runtime peer addresses in a long-retention
-        // table (mirrors the LLM proxy).
-        request.log.warn(
-          {
-            runtimeId: runtimeTokenClaims.rid,
-            expectedIp: pinResult.expectedIp,
-            observedIp: pinResult.observedIp
-          },
-          "MCP gateway egress IP mismatch — refusing rt_* call from unexpected peer"
-        );
-        reply.code(403);
-        return failure(rpc.id, -32000, "Egress IP mismatch.");
-      }
-    }
+    const runtimeTokenClaims = admission.claims;
+    const sessionIdFromRuntimeToken = runtimeTokenClaims.sid;
 
     let server: Awaited<ReturnType<typeof stores.dynamicConfig.getMcpServer>>;
     try {
@@ -380,7 +267,8 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
       default:
         return failure(rpc.id, -32601, `Unsupported MCP method ${rpc.method}.`);
     }
-  });
+    }
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -639,50 +527,6 @@ async function recordToolCallTelemetry(input: {
  * request that did not authenticate with a valid rt_* token before this
  * function is reached, so the binding is unconditional.
  */
-async function resolveBoundToolContext(input: {
-  rpc: z.infer<typeof rpcRequestSchema>;
-  tenantId: string;
-  args: Record<string, unknown>;
-  urlToolContextId: string | null;
-  sessionIdFromRuntimeToken: string;
-  runtimeTokenClaims: RuntimeTokenClaims;
-  toolContexts: ToolExecutionContextStore;
-}): Promise<{ context: ToolExecutionContext } | { error: RpcResponse }> {
-  const { rpc, tenantId, args, urlToolContextId, sessionIdFromRuntimeToken, runtimeTokenClaims, toolContexts } = input;
-  const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
-
-  let context: ToolExecutionContext | null;
-  let suppliedByCaller = false;
-
-  try {
-    if (argToolContextId) {
-      context = await toolContexts.require(tenantId, argToolContextId);
-      suppliedByCaller = true;
-    } else if (urlToolContextId) {
-      context = await toolContexts.require(tenantId, urlToolContextId);
-      suppliedByCaller = true;
-    } else {
-      context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
-    }
-  } catch (error) {
-    return { error: failure(rpc.id, -32000, getErrorMessage(error, "Tool context lookup failed.")) };
-  }
-
-  if (!context) {
-    return { error: failure(rpc.id, -32602, "toolContextId is required.") };
-  }
-
-  // Bind a caller-supplied context id to the authenticated runtime token so a
-  // same-tenant caller cannot substitute another user's/session's context.
-  if (suppliedByCaller) {
-    if (context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid) {
-      return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
-    }
-  }
-
-  return { context };
-}
-
 async function handleManagedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
@@ -815,139 +659,6 @@ function requireManagedToolAllowed(
   }
 }
 
-function getRuntimePolicySnapshot(context: ToolExecutionContext): ResolvedRuntimePolicy {
-  return parseRuntimePolicySnapshot(context.metadata.runtimePolicy, {
-    toolContextId: context.toolContextId
-  });
-}
-
-// Dependencies the Policy Center hook needs at the tool-call choke point.
-type PolicyGate = {
-  policyService: PolicyService;
-  requestPolicyApproval: GatewayPolicyApprovalRouter;
-  /** Aborts when the gateway's HTTP response dies before the tool call returns. */
-  clientDisconnectSignal?: AbortSignal;
-  logger: Pick<FastifyBaseLogger, "warn">;
-};
-
-/**
- * Derive the policy severity for a tool action.
- *
- * Managed tools carry an authoritative `readOnly` boolean (from the catalog):
- * read-only → `read_only`, otherwise it's a state-changing call → `file_change`.
- * We deliberately do NOT name-classify managed tools — `classifyToolSeverity`
- * only knows Claude SDK native names (Read/Write/Bash/…), so a managed write
- * like `github_write_file` would mis-classify as `command_execution` and a
- * `file_change` rule would silently never match it.
- *
- * Forwarded/proxy tools have no catalog entry (`readOnly === null`), so their
- * severity is genuinely unknown — name-based classification is the only signal
- * available and is used as a best-effort fallback.
- */
-export function deriveActionSeverity(
-  toolName: string,
-  readOnly: boolean | null
-): PolicySeverity {
-  if (readOnly === true) return "read_only";
-  if (readOnly === false) return "file_change";
-  return classifyToolSeverity(toolName);
-}
-
-// Map the policy severity onto the approval `kind` the SSE prompt + approvals
-// row use. A read-only or state-changing tool surfaces as a "file_change"
-// approval (it isn't a shell command); command_execution maps through directly.
-function severityToApprovalKind(severity: PolicySeverity): RuntimeApprovalKind {
-  return severity === "command_execution" ? "command_execution" : "file_change";
-}
-
-// Read a policy turn-context off the tool-execution context metadata, validating
-// against the enum. Anything unexpected (missing, stale, malformed) degrades to
-// null so the dimension acts as "no constraint" instead of throwing.
-function parsePolicyTurnContext(value: unknown): PolicyTurnContext | null {
-  return typeof value === "string" && (POLICY_TURN_CONTEXTS as readonly string[]).includes(value)
-    ? (value as PolicyTurnContext)
-    : null;
-}
-
-/**
- * Policy Center gate at the runtime choke point. Evaluates the proposed action
- * against the tenant's rules, records a decision as evidence (audit +
- * policy_decision), and either:
- *   - proceeds (returns) — for allow / monitor mode / no-match; or
- *   - routes a human approval for an enforce-mode `require_approval`, holding
- *     this gateway HTTP response open until the decision lands (approve →
- *     proceed, reject/expire → throw); or
- *   - throws {@link PolicyBlockedError} for an enforce-mode `block`.
- *
- * Whether a gating rule actually gates is the tenant's `policyEnforcementMode`,
- * read from the runtime-policy snapshot already on the tool-execution context.
- */
-// The signal that varies per managed/forwarded path and isn't on the
-// ToolExecutionContext: the tool's read/write flag (drives severity). Null for
-// forwarded tools (no catalog entry → name-based severity classification).
-type PolicyToolFacts = {
-  readOnly: boolean | null;
-};
-
-async function enforcePolicyCenter(
-  gate: PolicyGate,
-  context: ToolExecutionContext,
-  toolName: string,
-  serverId: string,
-  facts: PolicyToolFacts,
-  args: Record<string, unknown>
-): Promise<void> {
-  const severity = deriveActionSeverity(toolName, facts.readOnly);
-  // Turn context is snapshotted into the tool-execution context at creation time
-  // (see sse-stream-writer / scheduler), so the hot path reads it with no extra
-  // DB lookup. A malformed snapshot degrades to null ("no constraint").
-  const turnContext = parsePolicyTurnContext(context.metadata.turnContext);
-  // The tenant-level monitor/enforce switch rides on the runtime-policy snapshot
-  // already on the context — no extra DB call.
-  const enforcementMode = getRuntimePolicySnapshot(context).policyEnforcementMode;
-  await gate.policyService.gateAction({
-    tenantId: context.tenantId,
-    sessionId: context.sessionId,
-    userId: context.userId,
-    runtimeId: context.runtimeId,
-    toolName,
-    // The MCP server the tool is hosted on, recorded as `category` (== serverId).
-    category: serverId,
-    severity,
-    serverId,
-    turnContext,
-    enforcementMode,
-    // `toolContextId` is stamped into args by the gateway, not supplied by the
-    // model — exclude it so the evidence snapshot reflects the caller's real
-    // argument set.
-    actionSnapshot: {
-      argumentKeys: Object.keys(args).filter((key) => key !== "toolContextId")
-    },
-    approvalRouter: async (request) => {
-      const disposition = await gate.requestPolicyApproval({
-        tenantId: request.tenantId,
-        sessionId: request.sessionId ?? "",
-        userId: request.userId ?? "",
-        runtimeId: request.runtimeId,
-        toolName: request.toolName,
-        serverId: request.serverId,
-        kind: severityToApprovalKind(request.severity ?? severity),
-        explanation: request.explanation,
-        signal: gate.clientDisconnectSignal
-      });
-      if (disposition === null) {
-        // No adapter could host the approval (no active turn) — deny.
-        gate.logger.warn(
-          { toolName, serverId, sessionId: context.sessionId },
-          "policy require_approval: no runtime adapter to host approval — denying"
-        );
-        return "reject";
-      }
-      return disposition;
-    }
-  });
-}
-
 async function handleForwardedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
@@ -1028,116 +739,4 @@ async function handleForwardedToolCall(
       })
     }
   );
-}
-
-/**
- * Picks the incoming request headers named in the MCP server's
- * `headersAllowlist` so they can be forwarded to the proxy upstream. Header
- * names are matched case-insensitively (Fastify lower-cases incoming header
- * keys). Two classes of header are reserved and dropped regardless of the
- * allowlist:
- *   - The framework's own signed identity headers (`X-Framework-*`), which are
- *     set separately and take priority so a caller can never spoof them.
- *   - Inbound credential headers. The request that reaches `/mcp` carries the
- *     gateway runtime token (`Authorization: Bearer rt_*`) plus any session
- *     cookies; reflecting those to a third-party proxy upstream would hand it a
- *     gateway credential it could replay against `/mcp` until expiry. These are
- *     NEVER forwardable, even if an admin lists them in `headersAllowlist`.
- */
-export function selectAllowlistedHeaders(
-  requestHeaders: Record<string, string | string[] | undefined>,
-  allowlist: string[]
-): Record<string, string> {
-  const reservedLower = new Set(
-    [
-      "x-framework-user-id",
-      "x-framework-session-id",
-      "x-framework-runtime-id",
-      "x-framework-timestamp",
-      "x-framework-signature",
-      // Inbound credentials — must never leak to a proxy upstream.
-      "authorization",
-      "proxy-authorization",
-      "cookie",
-      "x-api-key"
-    ]
-  );
-  const selected: Record<string, string> = {};
-  for (const name of allowlist) {
-    const lower = name.toLowerCase();
-    if (reservedLower.has(lower)) continue;
-    const value = requestHeaders[lower];
-    const resolved = Array.isArray(value) ? value[0] : value;
-    if (typeof resolved === "string") {
-      selected[name] = resolved;
-    }
-  }
-  return selected;
-}
-
-async function forwardRpc(
-  upstreamUrl: string | null,
-  payload: z.infer<typeof rpcRequestSchema>,
-  headers: Record<string, string>
-): Promise<RpcResponse> {
-  if (!upstreamUrl) {
-    return failure(payload.id, -32601, "MCP upstream is not configured.");
-  }
-
-  // dispatcher pins the connection to the pre-validated resolved IP, closing
-  // the DNS-rebinding TOCTOU window between admin-time URL validation and
-  // this runtime fetch. Must use undici's fetch directly — the Node global
-  // fetch (also undici-backed) ignores the `dispatcher` option as of undici v8.
-  const response = await undiciFetch(upstreamUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...headers
-    },
-    body: JSON.stringify(payload),
-    dispatcher: ssrfSafeAgent
-  });
-
-  if (!response.ok) {
-    return failure(payload.id, -32000, `Upstream MCP request failed with ${response.status}.`);
-  }
-
-  return (await response.json()) as RpcResponse;
-}
-
-/**
- * Extracts the full claims from a runtime token (rt_*) on the incoming request,
- * checking the Authorization header then the `?token=` query param.
- *
- * The auth middleware already verified this token before the handler ran;
- * re-verifying here keeps the claim extraction localised to MCP routes instead
- * of widening `request.auth` for every endpoint. Callers use `sid` for the
- * session-scoped context fallback/telemetry and `sid` + `uid` to bind a
- * caller-supplied toolContextId to the authenticated identity.
- */
-function resolveRuntimeTokenClaims(
-  authHeader: string | string[] | undefined,
-  requestUrl: string,
-  secret: string
-): RuntimeTokenClaims | null {
-  const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-  let token: string | null = null;
-
-  if (header?.startsWith("Bearer rt_")) {
-    token = header.slice("Bearer ".length);
-  } else {
-    try {
-      const url = new URL(requestUrl, "http://localhost");
-      const queryToken = url.searchParams.get("token");
-      if (queryToken?.startsWith("rt_")) {
-        token = queryToken;
-      }
-    } catch {
-      // Malformed URL — nothing to resolve from
-    }
-  }
-
-  if (!token) return null;
-  const result = verifyRuntimeToken(token, secret);
-  return result.kind === "valid" ? result.claims : null;
 }

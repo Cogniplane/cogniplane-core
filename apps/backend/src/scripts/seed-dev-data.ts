@@ -15,6 +15,15 @@
 import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
 
+const RECOGNIZED_NON_PROD_ENVS = new Set(["development", "dev", "test", ""]);
+const nodeEnv = (typeof process.env.NODE_ENV === "string" ? process.env.NODE_ENV : "").trim().toLowerCase();
+if (!RECOGNIZED_NON_PROD_ENVS.has(nodeEnv)) {
+  throw new Error(
+    `seed-dev-data refuses to run outside a dev/test environment (got NODE_ENV=${JSON.stringify(process.env.NODE_ENV)}). ` +
+      "This script inserts fake token-usage rows into local-dev-tenant and must never touch a shared/staging/prod DB."
+  );
+}
+
 const TENANT_ID = "local-dev-tenant";
 
 const USERS = [

@@ -1,9 +1,16 @@
 "use client";
 
+import dynamic from "next/dynamic";
+
 import { SafeMarkdown } from "./safe-markdown";
-import SyntaxHighlighter from "react-syntax-highlighter";
-import { atomOneDark } from "react-syntax-highlighter/dist/esm/styles/hljs";
 import { getPreviewLanguage, isImageArtifact, isPdfArtifact } from "../lib/artifact-preview";
+
+// react-syntax-highlighter's default export eagerly bundles every highlight.js
+// language grammar (100KB+). It's only reached for the non-image/markdown/html
+// fallback branch, so split it into its own chunk fetched on demand instead of
+// shipping it in the hot chat route bundle.
+const CodeBlock = dynamic(() => import("./artifact-code-block"), { ssr: false });
+import { getInertHtmlPreviewProps } from "./artifact-preview-modal.logic";
 import {
   Dialog,
   DialogContent,
@@ -20,6 +27,10 @@ export function ArtifactPreviewModal(props: {
   onClose: () => void;
 }) {
   const language = getPreviewLanguage(props.mimeType);
+  const htmlPreviewProps =
+    props.mimeType === "text/html" && props.content !== null
+      ? getInertHtmlPreviewProps(props.content)
+      : null;
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) props.onClose(); }}>
@@ -46,22 +57,20 @@ export function ArtifactPreviewModal(props: {
             <div className="prose prose-sm max-w-none">
               <SafeMarkdown>{props.content!}</SafeMarkdown>
             </div>
-          ) : props.mimeType === "text/html" && props.content !== null ? (
+          ) : htmlPreviewProps ? (
             <iframe
               title={props.artifactName}
-              srcDoc={props.content}
-              sandbox="allow-scripts"
+              srcDoc={htmlPreviewProps.srcDoc}
+              // Never add allow-scripts or allow-same-origin: artifact HTML is
+              // agent-authored and may contain prompt-injected active content.
+              sandbox={htmlPreviewProps.sandbox}
               className="h-[60vh] w-full rounded border border-outline-variant"
             />
           ) : (
-            <SyntaxHighlighter
+            <CodeBlock
               language={isPdfArtifact(props.mimeType) ? "plaintext" : language}
-              style={atomOneDark}
-              customStyle={{ margin: 0, borderRadius: 4, fontSize: "0.85rem", lineHeight: 1.6 }}
-              wrapLongLines
-            >
-              {props.content ?? ""}
-            </SyntaxHighlighter>
+              code={props.content ?? ""}
+            />
           )}
         </div>
       </DialogContent>

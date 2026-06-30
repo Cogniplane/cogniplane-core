@@ -8,14 +8,18 @@ import type { RuntimeInvalidator } from "../contracts.js";
 import {
   buildIntegrationRedirectUrl,
   getSecretKey,
+  getVerificationKey,
   toIsoFromNow
 } from "../integration-oauth-helpers.js";
+import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
+import { uuidv7 } from "../../../lib/uuid.js";
 
 const NOTION_AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize";
 const NOTION_TOKEN_URL = "https://api.notion.com/v1/oauth/token";
 const NOTION_STATE_AUDIENCE = "cogniplane-notion-user-connect";
 const NOTION_STATE_ISSUER = "cogniplane";
 const NOTION_STATE_TTL = "10m";
+const NOTION_STATE_TTL_SECONDS = 10 * 60;
 
 export type NotionOAuthConfig = {
   clientId: string;
@@ -26,6 +30,7 @@ export type NotionOAuthConfig = {
 type NotionStatePayload = {
   tid: string;
   sub: string;
+  jti: string;
 };
 
 type NotionOwner = {
@@ -129,7 +134,8 @@ export class NotionConnectionService {
     private readonly config: AppConfig,
     private readonly store: NotionConnectionStore,
     private readonly auditEvents?: AuditEventStore,
-    private readonly runtimeManager?: RuntimeInvalidator
+    private readonly runtimeManager?: RuntimeInvalidator,
+    private readonly oauthStates = new IntegrationOAuthStateStore()
   ) {}
 
   isConfigured(): boolean {
@@ -157,11 +163,14 @@ export class NotionConnectionService {
     const oauth = readNotionConfig(this.config);
     if (!oauth) throw new NotionConnectionNotConfiguredError();
 
+    const jti = uuidv7();
+    await this.oauthStates.issue("notion", jti, NOTION_STATE_TTL_SECONDS);
     const state = await new SignJWT({
       tid: input.tenantId,
-      sub: input.userId
+      sub: input.userId,
+      jti
     } satisfies NotionStatePayload)
-      .setProtectedHeader({ alg: "HS256" })
+      .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(NOTION_STATE_ISSUER)
       .setAudience(NOTION_STATE_AUDIENCE)
       .setIssuedAt()
@@ -192,16 +201,27 @@ export class NotionConnectionService {
 
     let state: NotionStatePayload;
     try {
-      const verified = await jwtVerify(input.state, getSecretKey(this.config), {
-        issuer: NOTION_STATE_ISSUER,
-        audience: NOTION_STATE_AUDIENCE,
-        algorithms: ["HS256"]
-      });
+      const verified = await jwtVerify(
+        input.state,
+        (protectedHeader) => getVerificationKey(this.config, protectedHeader.kid),
+        {
+          issuer: NOTION_STATE_ISSUER,
+          audience: NOTION_STATE_AUDIENCE,
+          algorithms: ["HS256"]
+        }
+      );
       const payload = verified.payload as Partial<NotionStatePayload>;
-      if (typeof payload.tid !== "string" || typeof payload.sub !== "string") {
+      if (
+        typeof payload.tid !== "string" ||
+        typeof payload.sub !== "string" ||
+        typeof payload.jti !== "string"
+      ) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub };
+      if (!(await this.oauthStates.consume("notion", payload.jti))) {
+        return fallbackUrl;
+      }
+      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti };
     } catch {
       return fallbackUrl;
     }
@@ -283,10 +303,10 @@ export class NotionConnectionService {
       return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "connected"
       });
-    } catch (error) {
+    } catch {
       return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "error",
-        reason: error instanceof Error ? error.message : "notion_authorization_failed"
+        reason: "notion_authorization_failed"
       });
     }
   }

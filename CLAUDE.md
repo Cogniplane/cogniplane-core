@@ -113,6 +113,8 @@ Three admin entities, all tenant-scoped with `tenant_id = 'system'` for platform
 | MCP servers | `McpServerStore` | Mode is `managed` or `proxy` |
 | Tenant settings | `TenantSettingsStore` (`tenant-settings-store.ts`) | One row per tenant. Controls `enabledToolIds`, `enabledMcpServerIds`, `approvalPolicy`, `approvalReviewer`, `autoApproveReadOnlyTools`, `policyEnforcementMode`, `allowCommandExecution`, `allowUserTokenForwarding`, `developerInstructions`, `runtimeProvider` (`"codex"` or `"claude-code"`), `enabledRuntimeProviders`, and `showEffortSelector`. The `system` tenant's row acts as the platform default. |
 
+`allowCommandExecution` and `allowUserTokenForwarding` are owner-controlled security posture. Admins can edit other Agent Settings, but the backend rejects changes to these two fields and strips unchanged full-form values before persistence so stale admin forms cannot overwrite an owner's decision.
+
 Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. Active dimensions are `toolNames`, `categories` (MCP server id), `severities`, and `turnContexts`; effects are `allow`, `require_approval`, and `block`. `tenant_settings.policy_enforcement_mode` is the tenant-level monitor/enforce switch.
 
 ### Multi-tenancy and database access
@@ -252,10 +254,10 @@ Must export `export const dynamic = "force-dynamic"` to prevent edge hosts from 
 **Template-ID rollback path.** `codex-release.json.e2bTemplateId` is the single source of truth. To cut over to a new template: build under a different name in `build.prod.ts` temporarily, update `e2bTemplateId` once verified, and redeploy. Old template IDs stay in the E2B account so rolling back is a git revert + redeploy.
 
 Codex-specific operational notes:
-- MCP server config must be in **both** the workspace `codex.toml` and the global `~/.codex/config.toml` for E2B sandboxes — `e2b-runtime-process.ts` handles this via `extractMcpServersToml()`
-- Runtime tokens are embedded in MCP server URLs as `?token=rt_...` because Codex Streamable HTTP transport doesn't send `Authorization` headers on the `initialize` POST
+- The workspace `codex.toml` (rendered by `createRuntimeWorkspace` in `runtime-workspace.ts`) is the **complete** Codex config — model, proxy provider, features, trust, and MCP servers. The E2B bootstrap installs it verbatim as the sandbox-global `~/.codex/config.toml` (`installCodexConfigInSandbox`); there is no extraction/merging step.
+- MCP auth uses `[mcp_servers.<id>.http_headers]` with `Authorization: Bearer rt_...` — sent on every request including the `initialize` POST (Codex ≥ 0.139). The TOML key is `http_headers`, NOT `headers`. MCP URLs carry no `?token=`; the gateway accepts header auth only.
 - `/.well-known/` paths must return 404 (not 401) — Codex probes these for OAuth before connecting to MCP servers
-- `mcpServer/elicitation/request` is auto-approved with `{ action: "accept" }` in `runtime-request-handler.ts` — valid values are `accept`/`decline`/`cancel` (not `allow`, not `decision`)
+- `mcpServer/elicitation/request` is intentionally auto-accepted with `{ action: "accept" }` in `runtime-request-handler.ts` — valid values are `accept`/`decline`/`cancel` (not `allow`, not `decision`). Cogniplane treats the MCP gateway and Policy Center as the sole confirmation boundary; upstream MCP elicitation is not an independent guardrail and must not be relied on by configured tools.
 - After bumping `CODEX_VERSION`: rebuild E2B template, update `E2B_TEMPLATE_ID` in your deployment environment, run `pnpm codex:release:check`
 
 Claude-specific operational notes (applies when `CLAUDE_RUNTIME_BACKEND=e2b`):
@@ -264,7 +266,7 @@ Claude-specific operational notes (applies when `CLAUDE_RUNTIME_BACKEND=e2b`):
 - The harness emits `ready` on startup with its SDK + Node versions; `E2bClaudeRuntimeProcess` logs it for diagnostics
 - `toolContextId` is threaded per turn via the `turn` frame and injected into managed MCP tool inputs inside the sandbox (`enrichInput` in the harness)
 - After bumping the Claude SDK version: update `claudeAgentSdkVersion` in `apps/backend/src/codex-release.json`, `@anthropic-ai/claude-agent-sdk` in `apps/backend/package.json`, and rebuild the E2B template
-- **MCP token transport (Claude vs Codex):** Claude MCP URLs do NOT carry `?token=rt_...` — the runtime token is delivered exclusively via `Authorization: Bearer rt_...` header (set in the SDK's `mcpServers` option and in `.mcp.json`). Codex still requires `?token=` in the URL because its Streamable HTTP transport does not forward `Authorization` headers on the `initialize` POST. Do not add `?token=` back to Claude URLs — the MCP gateway already accepts both paths, headers take priority.
+- **MCP token transport:** both runtimes deliver the runtime token exclusively via `Authorization: Bearer rt_...` header (Claude: the SDK's `mcpServers` option and `.mcp.json`; Codex: `[mcp_servers.*.http_headers]`). MCP URLs never carry `?token=` and the gateway rejects query-param tokens.
 
 ## Docs
 

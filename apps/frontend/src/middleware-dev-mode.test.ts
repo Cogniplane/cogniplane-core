@@ -14,4 +14,6 @@ test("dev mode bypasses auth on otherwise-protected paths", () => {
   const res = middleware(req);
   expect(res.status).toBe(200);
   expect(res.headers.get("location")).toBe(null);
+  expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+  expect(res.headers.get("x-content-type-options")).toBe("nosniff");
 });

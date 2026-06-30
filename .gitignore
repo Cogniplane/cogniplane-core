@@ -17,4 +17,3 @@ schemas/codex/ts/
 *.tsbuildinfo
 .worktrees/
 *:Zone.Identifier
-docker/codex-runtime-dev/

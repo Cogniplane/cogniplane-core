@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Manrope, Inter } from "next/font/google";
+import { headers } from "next/headers";
 import { ReactNode } from "react";
 
 import "./globals.css";
@@ -28,12 +29,16 @@ export const metadata: Metadata = {
   }
 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export const dynamic = "force-dynamic";
+
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
+
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
         {/* eslint-disable-next-line @next/next/no-sync-scripts */}
-        <script src="/theme-init.js" />
+        <script src="/theme-init.js" nonce={nonce} />
       </head>
       <body className={`${manrope.variable} ${inter.variable}`}>
         <OverlayBootstrap />

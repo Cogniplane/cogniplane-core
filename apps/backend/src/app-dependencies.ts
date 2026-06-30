@@ -11,8 +11,10 @@ import { buildIntegrationServices } from "./services/integrations/build-integrat
 import type { RuntimeInvalidator } from "./services/integrations/contracts.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
+import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
 import { PolicyService } from "./services/policy/policy-service.js";
 import { buildRuntimeAdapters } from "./services/runtime/build-runtime-adapters.js";
+import { createFanOutRuntimeInvalidator } from "./services/runtime/fan-out-invalidator.js";
 
 export { buildSchedulerWorker } from "./services/build-scheduler-worker.js";
 
@@ -28,16 +30,6 @@ export function buildAppDependencies(input: {
   const stores = buildStores(db, schedulerDb, privilegedDb, logger);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
 
-  // Policy Center — runtime rule engine. Evaluates each proposed tool action
-  // at the MCP gateway choke point and records replayable decisions. The
-  // logger receives best-effort evidence-persistence failures (which never
-  // affect the gating outcome).
-  const policyService = new PolicyService({
-    rules: stores.policyRules,
-    decisions: stores.policyDecisions,
-    auditEvents: stores.auditEvents,
-    logger
-  });
   const bootstrap = buildBootstrapServices({
     config,
     db,
@@ -45,6 +37,18 @@ export function buildAppDependencies(input: {
     logger,
     stores,
     managedToolCatalog
+  });
+  // Policy Center — runtime rule engine. Redis pub/sub evicts cached rule sets
+  // across replicas after admin mutations; the short TTL remains a fallback
+  // for local deployments and transient Redis disconnects.
+  const policyService = new PolicyService({
+    rules: stores.policyRules,
+    decisions: stores.policyDecisions,
+    auditEvents: stores.auditEvents,
+    logger,
+    invalidationBus: bootstrap.redis
+      ? new RedisPolicyInvalidationBus(bootstrap.redis, logger)
+      : undefined
   });
 
   // Construction-order inversion: integration connection services need a
@@ -68,7 +72,8 @@ export function buildAppDependencies(input: {
     config,
     stores,
     resolveRuntimeInvalidator,
-    bootstrap.limits
+    bootstrap.limits,
+    bootstrap.redis
   );
   // Shared by /messages (sets at turn start, clears at end) and the LLM
   // proxy (looks up by rt_*'s sid+rid to charge usage to the right
@@ -80,9 +85,12 @@ export function buildAppDependencies(input: {
   // runtime adapters additionally clear pins on explicit teardown.
   // Constructed here so the LLM proxy and the runtime adapters share
   // the same instance.
-  const egressIpPins = new RuntimeEgressIpPinStore(config.RUNTIME_TOKEN_TTL_MS);
+  const egressIpPins = new RuntimeEgressIpPinStore(
+    config.RUNTIME_TOKEN_TTL_MS,
+    bootstrap.redis ?? undefined
+  );
 
-  const { runtimeManager, runtimeAdapters } = buildRuntimeAdapters({
+  const { runtimeAdapters, codexRuntimeManager } = buildRuntimeAdapters({
     config,
     logger,
     stores,
@@ -96,7 +104,9 @@ export function buildAppDependencies(input: {
     egressIpPins
   });
 
-  runtimeManagerRef = runtimeManager;
+  // Fan a (re)connect/disconnect out to every adapter so a user's stale
+  // sessions are torn down regardless of provider (Codex and Claude alike).
+  runtimeManagerRef = createFanOutRuntimeInvalidator(runtimeAdapters);
 
   const pii = buildPiiServices({
     config,
@@ -159,8 +169,12 @@ export function buildAppDependencies(input: {
     limits: bootstrap.limits,
     artifactStorage: bootstrap.artifactStorage,
     artifactProcessor: bootstrap.artifactProcessor,
-    runtimeManager,
     runtimeAdapters,
+    // Codex manager exposed concretely for the admin/health routes that call
+    // Codex-specific methods (getHealthSnapshot, getRuntimeHealthDetail,
+    // refreshIdleRuntimes) — not on the RuntimeAdapter interface. Generic
+    // routing goes through `runtimeAdapters` above.
+    codexRuntimeManager,
     tenantOrgSettings: bootstrap.tenantOrgSettings,
     getTenantAnthropicApiKey: bootstrap.getTenantAnthropicApiKey,
     getTenantOpenaiApiKey: bootstrap.getTenantOpenaiApiKey,

@@ -24,8 +24,10 @@ export async function handleRuntimeRequest(input: {
   const { runtime, request } = input;
 
   // Codex 0.120+ sends mcpServer/elicitation/request to ask whether to proceed
-  // with an MCP tool call. Auto-approve these — actual authorization is enforced
-  // at the MCP route level (runtime policy, tool enablement, token scope).
+  // with an MCP tool call. Cogniplane intentionally does not expose this as a
+  // second confirmation plane: auto-accept it and enforce authorization plus
+  // any human confirmation at the MCP gateway through Policy Center. Upstream
+  // MCP elicitation is therefore not a supported security boundary here.
   if (request.method === "mcpServer/elicitation/request") {
     runtime.process.sendResponse(request.id, { action: "accept" });
     return;

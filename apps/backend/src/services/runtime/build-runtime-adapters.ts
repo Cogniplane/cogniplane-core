@@ -99,5 +99,5 @@ export function buildRuntimeAdapters(input: {
     "claude-code": claudeAdapter
   };
 
-  return { runtimeManager, runtimeAdapters };
+  return { runtimeAdapters, codexRuntimeManager: runtimeManager };
 }

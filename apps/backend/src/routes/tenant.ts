@@ -29,6 +29,9 @@ const marketplaceSchema = z.object({
 const memberRoleSchema = z.object({
   role: z.string()
 });
+const memberParamsSchema = z.object({
+  userId: z.string().trim().min(1).max(80).regex(/^[a-z0-9][a-z0-9-_]*$/)
+});
 
 export async function registerTenantRoutes(
   app: FastifyInstance,
@@ -224,13 +227,15 @@ export async function registerTenantRoutes(
 
     const { tenantId } = request.auth;
 
-    const result = await db.query(
-      `SELECT u.user_id, u.email, u.display_name, tm.role, tm.created_at
-       FROM tenant_memberships tm
-       JOIN users u ON u.user_id = tm.user_id
-       WHERE tm.tenant_id = $1
-       ORDER BY tm.created_at ASC`,
-      [tenantId]
+    const result = await withTenantScope(db, tenantId, (client) =>
+      client.query(
+        `SELECT u.user_id, u.email, u.display_name, tm.role, tm.created_at
+         FROM tenant_memberships tm
+         JOIN users u ON u.user_id = tm.user_id
+         WHERE tm.tenant_id = $1
+         ORDER BY tm.created_at ASC`,
+        [tenantId]
+      )
     );
 
     return reply.send(
@@ -249,7 +254,9 @@ export async function registerTenantRoutes(
     if (!requireRole(request, reply, "owner", "admin")) return;
 
     const { tenantId } = request.auth;
-    const targetUserId = (request.params as { userId: string }).userId;
+    const params = parseRequestInput(reply, memberParamsSchema, request.params);
+    if (!params.ok) return params.response;
+    const targetUserId = params.value.userId;
     const parsed = parseRequestInput(reply, memberRoleSchema, request.body);
     if (!parsed.ok) return parsed.response;
     const { role } = parsed.value;
@@ -308,7 +315,9 @@ export async function registerTenantRoutes(
     if (!requireRole(request, reply, "owner", "admin")) return;
 
     const { tenantId } = request.auth;
-    const targetUserId = (request.params as { userId: string }).userId;
+    const params = parseRequestInput(reply, memberParamsSchema, request.params);
+    if (!params.ok) return params.response;
+    const targetUserId = params.value.userId;
 
     // Cannot remove yourself
     if (targetUserId === request.auth.userId) {

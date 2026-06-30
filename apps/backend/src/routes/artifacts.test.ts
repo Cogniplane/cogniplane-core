@@ -184,11 +184,11 @@ test("GET /downloads/:token returns 404 for a same-tenant different-user caller 
   await app.close();
 });
 
-test("GET /downloads/:token lets an admin in the same tenant download a peer's token (admin bypass)", async () => {
+test("GET /downloads/:token attributes an admin peer download to the actor and records the owner", async () => {
   // Admin-minted tokens carry the artifact OWNER's user_id, not the admin's.
   // role=admin sets callerIsAdmin=true, which skips the user-equality check so
   // the admin can resolve and consume the token.
-  const { app, stores, rows } = buildApp({
+  const { app, stores, rows, audit } = buildApp({
     initialRows: [makeRow({ tenantId: "tenant-A", userId: "user-1" })],
     auth: { userId: "admin-user", tenantId: "tenant-A", role: "admin" }
   });
@@ -200,6 +200,13 @@ test("GET /downloads/:token lets an admin in the same tenant download a peer's t
   expect(response.body).toBe("PAYLOAD");
   // The bypass path still consumes the token exactly once.
   expect(rows.get("tok-1")?.consumedAt).not.toBeNull();
+  const event = audit.events.find((entry) => entry.type === "artifact_downloaded");
+  expect(event?.userId).toBe("admin-user");
+  expect(event?.payload).toMatchObject({
+    artifactId: "artifact-1",
+    actorUserId: "admin-user",
+    ownerUserId: "user-1"
+  });
 
   await app.close();
 });

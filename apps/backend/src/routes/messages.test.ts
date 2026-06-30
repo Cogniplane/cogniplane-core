@@ -104,7 +104,7 @@ function makeStores(options: { gateRuntime?: () => Promise<void> } = {}) {
         return { toolContextId: "ctx-1" };
       }
     },
-    runtimeManager,
+    runtimeAdapters: { codex: runtimeManager },
     activeTurns,
     activeTurnMessageMap: new ActiveTurnMessageMap()
   } as unknown as MessageRouteStores;
@@ -201,4 +201,21 @@ test("the reserved slot is released after the first turn completes, allowing a f
   harness.releaseRuntime();
   const secondResult = await second;
   expect(secondResult.statusCode).toBe(200);
+});
+
+test("hijacked SSE responses set security and no-store cache headers directly", async () => {
+  const harness = makeStores({ gateRuntime: async () => undefined });
+  const app = await buildApp(harness.stores);
+  activeApp = app;
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "stream" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.headers["content-type"]).toBe("text/event-stream; charset=utf-8");
+  expect(response.headers["x-content-type-options"]).toBe("nosniff");
+  expect(response.headers["cache-control"]).toBe("no-store, no-cache, no-transform");
 });

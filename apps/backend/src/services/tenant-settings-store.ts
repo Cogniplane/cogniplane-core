@@ -113,10 +113,6 @@ export type TenantSettingsInput = {
   enabledMcpServerIds?: string[];
 };
 
-function hasOwn(input: TenantSettingsInput, key: keyof TenantSettingsInput): boolean {
-  return Object.prototype.hasOwnProperty.call(input, key);
-}
-
 export function buildDefaultTenantSettingsInput(): Required<TenantSettingsInput> {
   return {
     enabledRuntimeProviders: ["codex"],
@@ -166,43 +162,43 @@ export class TenantSettingsStore {
       const existing = existingResult.rows[0] ? mapRow(existingResult.rows[0]) : null;
       const defaults = buildDefaultTenantSettingsInput();
 
-      const resolvedEnabledRuntimeProviders = hasOwn(input, "enabledRuntimeProviders")
+      const resolvedEnabledRuntimeProviders = Object.hasOwn(input, "enabledRuntimeProviders")
         ? normalizeRuntimeProviders(input.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders)
         : (existing?.enabledRuntimeProviders ?? defaults.enabledRuntimeProviders);
       if (resolvedEnabledRuntimeProviders.length === 0) {
         throw new AdminConfigError("At least one runtime provider must be enabled.");
       }
-      const resolvedPolicy = hasOwn(input, "approvalPolicy")
+      const resolvedPolicy = Object.hasOwn(input, "approvalPolicy")
         ? (input.approvalPolicy ?? defaults.approvalPolicy)
         : (existing?.approvalPolicy ?? defaults.approvalPolicy);
-      const resolvedShowEffortSelector = hasOwn(input, "showEffortSelector")
+      const resolvedShowEffortSelector = Object.hasOwn(input, "showEffortSelector")
         ? (input.showEffortSelector ?? defaults.showEffortSelector)
         : (existing?.showEffortSelector ?? defaults.showEffortSelector);
-      const resolvedWebSearchMode = hasOwn(input, "webSearchMode")
+      const resolvedWebSearchMode = Object.hasOwn(input, "webSearchMode")
         ? (input.webSearchMode ?? defaults.webSearchMode)
         : (existing?.webSearchMode ?? defaults.webSearchMode);
-      const resolvedReviewer = hasOwn(input, "approvalReviewer")
+      const resolvedReviewer = Object.hasOwn(input, "approvalReviewer")
         ? (input.approvalReviewer ?? defaults.approvalReviewer)
         : (existing?.approvalReviewer ?? defaults.approvalReviewer);
-      const resolvedCommandExec = hasOwn(input, "allowCommandExecution")
+      const resolvedCommandExec = Object.hasOwn(input, "allowCommandExecution")
         ? (input.allowCommandExecution ?? defaults.allowCommandExecution)
         : (existing?.allowCommandExecution ?? defaults.allowCommandExecution);
-      const resolvedTokenFwd = hasOwn(input, "allowUserTokenForwarding")
+      const resolvedTokenFwd = Object.hasOwn(input, "allowUserTokenForwarding")
         ? (input.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding)
         : (existing?.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding);
-      const resolvedReadOnly = hasOwn(input, "autoApproveReadOnlyTools")
+      const resolvedReadOnly = Object.hasOwn(input, "autoApproveReadOnlyTools")
         ? (input.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools)
         : (existing?.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools);
-      const resolvedPolicyEnforcementMode = hasOwn(input, "policyEnforcementMode")
+      const resolvedPolicyEnforcementMode = Object.hasOwn(input, "policyEnforcementMode")
         ? (input.policyEnforcementMode ?? defaults.policyEnforcementMode)
         : (existing?.policyEnforcementMode ?? defaults.policyEnforcementMode);
-      const resolvedInstructions = hasOwn(input, "developerInstructions")
+      const resolvedInstructions = Object.hasOwn(input, "developerInstructions")
         ? (input.developerInstructions ?? defaults.developerInstructions)
         : (existing?.developerInstructions ?? defaults.developerInstructions);
-      const resolvedToolIds = hasOwn(input, "enabledToolIds")
+      const resolvedToolIds = Object.hasOwn(input, "enabledToolIds")
         ? (input.enabledToolIds ?? defaults.enabledToolIds)
         : (existing?.enabledToolIds ?? defaults.enabledToolIds);
-      const resolvedMcpIds = hasOwn(input, "enabledMcpServerIds")
+      const resolvedMcpIds = Object.hasOwn(input, "enabledMcpServerIds")
         ? (input.enabledMcpServerIds ?? defaults.enabledMcpServerIds)
         : (existing?.enabledMcpServerIds ?? defaults.enabledMcpServerIds);
 

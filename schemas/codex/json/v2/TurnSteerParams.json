@@ -18,6 +18,12 @@
         "$ref": "#/definitions/AdditionalContextEntry"
       }
     },
+    "clientUserMessageId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "expectedTurnId": {
       "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
       "type": "string"

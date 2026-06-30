@@ -89,24 +89,11 @@ type NotificationMapping =
     };
 
 function mapCommandExecutionStatus(status: unknown): "in_progress" | "completed" | "failed" | "declined" {
-  switch (status) {
-    case "completed":
-    case "failed":
-    case "declined":
-      return status;
-    default:
-      return "in_progress";
-  }
+  return status === "completed" || status === "failed" || status === "declined" ? status : "in_progress";
 }
 
 function mapMcpStatus(status: unknown): "in_progress" | "completed" | "failed" {
-  switch (status) {
-    case "completed":
-    case "failed":
-      return status;
-    default:
-      return "in_progress";
-  }
+  return status === "completed" || status === "failed" ? status : "in_progress";
 }
 
 function buildCommandToolCall(item: {

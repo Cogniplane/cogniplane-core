@@ -248,7 +248,7 @@ function makeInput(reply: FakeReply, events: RuntimeEvent[], overrides: Record<s
     reply: reply as unknown as import("fastify").FastifyReply,
     messages: makeMessages() as ReturnType<typeof makeMessages>,
     toolContexts: makeToolContexts(),
-    runtimeManager: makeRuntimeManager(events),
+    runtimeAdapter: makeRuntimeManager(events),
     tenantId: "tenant-1",
     sessionId: "session-1",
     userId: "user-1",
@@ -548,7 +548,7 @@ test("streamAssistantReply cancels the runtime turn and stops writing when the c
   const controllable = makeControllableRuntimeManager(events);
 
   const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
-  (input as Record<string, unknown>).runtimeManager = controllable.manager;
+  (input as Record<string, unknown>).runtimeAdapter = controllable.manager;
   (input as Record<string, unknown>).messages = messages;
 
   const done = streamAssistantReply(input);
@@ -593,7 +593,7 @@ test("streamAssistantReply does not interrupt the runtime when the stream closes
   ];
   const interruptCalls: Array<{ sessionId: string }> = [];
   const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
-  (input as Record<string, unknown>).runtimeManager = {
+  (input as Record<string, unknown>).runtimeAdapter = {
     ...makeRuntimeManager(events),
     async interruptTurn(i: { sessionId: string }) {
       interruptCalls.push({ sessionId: i.sessionId });
@@ -630,7 +630,7 @@ test("streamAssistantReply does not start the runtime turn if the client disconn
   };
 
   const input = makeInput(reply, []) as Parameters<typeof streamAssistantReply>[0];
-  (input as Record<string, unknown>).runtimeManager = manager;
+  (input as Record<string, unknown>).runtimeAdapter = manager;
   (input as Record<string, unknown>).messages = messages;
 
   await streamAssistantReply(input);
@@ -683,7 +683,7 @@ test("streamAssistantReply emits the terminal failure frame even when persistenc
     throw new Error("db unreachable");
   }) as unknown as typeof messages.updateContent;
 
-  const runtimeManager = {
+  const runtimeAdapter = {
     ...makeRuntimeManager([]),
     async *runMessage() {
       throw new Error("runtime exploded");
@@ -696,7 +696,7 @@ test("streamAssistantReply emits the terminal failure frame even when persistenc
 
   const input = makeInput(reply, []) as Parameters<typeof streamAssistantReply>[0];
   (input as Record<string, unknown>).messages = messages;
-  (input as Record<string, unknown>).runtimeManager = runtimeManager;
+  (input as Record<string, unknown>).runtimeAdapter = runtimeAdapter;
 
   await streamAssistantReply(input);
 
@@ -733,7 +733,27 @@ test("streamAssistantReply emits a terminal frame and ends the socket when the a
   const failed = events.find((e) => e.event === "response.failed");
   expect(failed).toBeDefined();
   expect((failed?.data.response as { id: unknown }).id).toBeNull();
-  expect((failed?.data.error as { message: string }).message).toBe("db down");
+  // Internal errors (no 4xx statusCode) must NOT leak their raw message to the
+  // client — the hijacked path can't rely on the global error handler.
+  const failedMessage = (failed?.data.error as { message: string }).message;
+  expect(failedMessage).toBe("The assistant run failed.");
+  expect(failedMessage).not.toContain("db down");
   expect(reply.ended).toBe(true);
   expect(cleared).toEqual(["session-1"]);
+});
+
+test("streamAssistantReply surfaces the message for errors that set a 4xx statusCode", async () => {
+  // Client errors (4xx) are safe to show, mirroring the global handler's policy.
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  messages.create = async () => {
+    const err = Object.assign(new Error("model not enabled for tenant"), { statusCode: 400 });
+    throw err;
+  };
+  const input = makeInput(reply, [{ type: "response.created", responseId: "r1" }], { messages });
+
+  await streamAssistantReply(input as never);
+
+  const failed = reply.events().find((e) => e.event === "response.failed");
+  expect((failed?.data.error as { message: string }).message).toBe("model not enabled for tenant");
 });

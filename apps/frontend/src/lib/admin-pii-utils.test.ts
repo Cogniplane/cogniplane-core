@@ -221,8 +221,8 @@ test("statusPillClass: blocked / failed get the danger tone", () => {
   expect(statusPillClass("failed")).toMatch(/text-danger/);
 });
 
-test("statusPillClass: transformed gets the accent tone", () => {
-  expect(statusPillClass("transformed")).toMatch(/text-accent/);
+test("statusPillClass: transformed gets the info tone", () => {
+  expect(statusPillClass("transformed")).toMatch(/text-info/);
 });
 
 test("statusPillClass: anything else gets the muted tone", () => {

@@ -2,7 +2,7 @@ import type { WorkOS } from "@workos-inc/node";
 import { vi, type Mock } from "vitest";
 
 export type FakeWorkOSHandlers = {
-  getAuthorizationUrl: Mock;
+  getAuthorizationUrlWithPKCE: Mock;
   authenticateWithCode: Mock;
   listOrganizationMemberships: Mock;
   getOrganization: Mock;
@@ -15,7 +15,7 @@ export type FakeWorkOSHandlers = {
  */
 export function createFakeWorkOS(): { workos: WorkOS; mocks: FakeWorkOSHandlers } {
   const mocks: FakeWorkOSHandlers = {
-    getAuthorizationUrl: vi.fn(),
+    getAuthorizationUrlWithPKCE: vi.fn(),
     authenticateWithCode: vi.fn(),
     listOrganizationMemberships: vi.fn(),
     getOrganization: vi.fn()
@@ -23,7 +23,7 @@ export function createFakeWorkOS(): { workos: WorkOS; mocks: FakeWorkOSHandlers 
 
   const workos = {
     userManagement: {
-      getAuthorizationUrl: mocks.getAuthorizationUrl,
+      getAuthorizationUrlWithPKCE: mocks.getAuthorizationUrlWithPKCE,
       authenticateWithCode: mocks.authenticateWithCode,
       listOrganizationMemberships: mocks.listOrganizationMemberships
     },

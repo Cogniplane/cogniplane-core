@@ -3,7 +3,6 @@ import { z } from "zod";
 
 import { ensureUser } from "../../lib/db.js";
 import { apiError, notFoundError } from "../../lib/http-errors.js";
-import { parseRequestInput } from "../../lib/route-validation.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
@@ -75,10 +74,6 @@ export function withAdmin(
     return handler(request, reply);
   };
 }
-
-// Semantic names for the shared request-input parser at admin call sites.
-export const parseAdminBody = parseRequestInput;
-export const parseAdminParams = parseRequestInput;
 
 export function respondAdminNotFound(reply: FastifyReply, errorCode: string) {
   reply.code(404);

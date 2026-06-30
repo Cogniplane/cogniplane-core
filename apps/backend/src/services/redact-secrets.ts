@@ -17,9 +17,18 @@ const OPENAI_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{20,}/g;
 const AWS_ACCESS_KEY_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g;
 const SLACK_TOKEN_PATTERN = /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g;
 const GOOGLE_API_KEY_PATTERN = /\bAIza[0-9A-Za-z_-]{35}\b/g;
+const RUNTIME_TOKEN_PATTERN = /\brt_[A-Za-z0-9._-]+\b/g;
+const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+const STRIPE_KEY_PATTERN = /\b(?:(?:sk|rk)_(?:live|test)|whsec)_[A-Za-z0-9]{16,}\b/g;
+const GITLAB_TOKEN_PATTERN = /\bglpat-[A-Za-z0-9_-]{20,}\b/g;
+const NPM_TOKEN_PATTERN = /\bnpm_[A-Za-z0-9]{20,}\b/g;
+const TWILIO_API_KEY_PATTERN = /\bSK[0-9a-fA-F]{32}\b/g;
+const TWILIO_SECRET_ASSIGNMENT_PATTERN =
+  /(TWILIO_(?:AUTH_TOKEN|API_KEY_SECRET)\s*[:=]\s*["']?)[A-Za-z0-9]{20,}/gi;
+const SENDGRID_KEY_PATTERN = /\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}\b/g;
 
-// URL query parameters carrying tokens. Mirrors sanitize-url.ts so that
-// `?token=rt_...` inside a string body (e.g. a tool-result echoing the MCP
+// URL query parameters carrying tokens. Mirrors sanitize-url.ts so that a
+// `?token=`/`?apiKey=` inside a string body (e.g. a tool-result echoing a
 // URL) is redacted before persistence. Stops at whitespace, `&`, quote, `;`,
 // or `#` to preserve surrounding text. Key set matches sanitize-url.ts.
 const URL_QUERY_SECRET_PATTERN =
@@ -35,6 +44,14 @@ function redactInlineSecrets(value: string): string {
     .replace(AWS_ACCESS_KEY_PATTERN, "[REDACTED]")
     .replace(SLACK_TOKEN_PATTERN, "[REDACTED]")
     .replace(GOOGLE_API_KEY_PATTERN, "[REDACTED]")
+    .replace(RUNTIME_TOKEN_PATTERN, "[REDACTED]")
+    .replace(JWT_PATTERN, "[REDACTED]")
+    .replace(STRIPE_KEY_PATTERN, "[REDACTED]")
+    .replace(GITLAB_TOKEN_PATTERN, "[REDACTED]")
+    .replace(NPM_TOKEN_PATTERN, "[REDACTED]")
+    .replace(TWILIO_API_KEY_PATTERN, "[REDACTED]")
+    .replace(TWILIO_SECRET_ASSIGNMENT_PATTERN, "$1[REDACTED]")
+    .replace(SENDGRID_KEY_PATTERN, "[REDACTED]")
     .replace(URL_QUERY_SECRET_PATTERN, "$1$2=REDACTED");
 }
 

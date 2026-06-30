@@ -244,10 +244,6 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "personality": {
           "anyOf": [
             {
@@ -259,13 +255,13 @@
           ]
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -312,6 +308,30 @@
           ]
         }
       }
+    },
+    "AgentMessageInputContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "encrypted_content",
+            "type"
+          ],
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "encrypted_content"
+              ],
+              "title": "EncryptedContentAgentMessageInputContentType"
+            }
+          },
+          "title": "EncryptedContentAgentMessageInputContent"
+        }
+      ]
     },
     "ContentItem": {
       "oneOf": [
@@ -680,6 +700,37 @@
             }
           },
           "title": "MessageResponseItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "author",
+            "content",
+            "recipient",
+            "type"
+          ],
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AgentMessageInputContent"
+              }
+            },
+            "recipient": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "agent_message"
+              ],
+              "title": "AgentMessageResponseItemType"
+            }
+          },
+          "title": "AgentMessageResponseItem"
         },
         {
           "type": "object",
@@ -1221,6 +1272,74 @@
         }
       ]
     },
+    "SortDirection": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "ThreadResumeInitialTurnsPageParams": {
+      "type": "object",
+      "properties": {
+        "itemsView": {
+          "description": "How much item detail to include for each returned turn; defaults to summary.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limit": {
+          "description": "Optional turn page size.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "sortDirection": {
+          "description": "Optional turn pagination direction; defaults to descending.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SortDirection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TurnItemsView": {
+      "oneOf": [
+        {
+          "description": "`items` was not loaded for this turn. The field is intentionally empty.",
+          "type": "string",
+          "enum": [
+            "notLoaded"
+          ]
+        },
+        {
+          "description": "`items` contains only a display summary for this turn.",
+          "type": "string",
+          "enum": [
+            "summary"
+          ]
+        },
+        {
+          "description": "`items` contains every ThreadItem available from persisted app-server history for this turn.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
+    },
     "ThreadResumeParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "ThreadResumeParams",
@@ -1290,6 +1409,17 @@
             "$ref": "#/definitions/ResponseItem"
           }
         },
+        "initialTurnsPage": {
+          "description": "When present, include a `thread/turns/list` page in the resume response so clients can bootstrap recent turns without a second request.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadResumeInitialTurnsPageParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "model": {
           "description": "Configuration overrides for the resumed thread, if any.",
           "type": [
@@ -1318,10 +1448,6 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "personality": {
           "anyOf": [
             {
@@ -1333,13 +1459,13 @@
           ]
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -1453,18 +1579,14 @@
             "null"
           ]
         },
-        "persistExtendedHistory": {
-          "description": "Deprecated and ignored by app-server. Kept only so older clients can continue sending the field while rollout persistence always uses the limited history policy.",
-          "type": "boolean"
-        },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots. Relative paths are resolved against the effective cwd for the thread.",
+          "description": "Replace the thread's runtime workspace roots. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandbox": {
@@ -1727,16 +1849,9 @@
       ]
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": [
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh"
-      ]
+      "minLength": 1
     },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
@@ -2121,13 +2236,6 @@
         }
       }
     },
-    "SortDirection": {
-      "type": "string",
-      "enum": [
-        "asc",
-        "desc"
-      ]
-    },
     "ThreadListCwdFilter": {
       "anyOf": [
         {
@@ -2366,31 +2474,6 @@
         }
       }
     },
-    "TurnItemsView": {
-      "oneOf": [
-        {
-          "description": "`items` was not loaded for this turn. The field is intentionally empty.",
-          "type": "string",
-          "enum": [
-            "notLoaded"
-          ]
-        },
-        {
-          "description": "`items` contains only a display summary for this turn.",
-          "type": "string",
-          "enum": [
-            "summary"
-          ]
-        },
-        {
-          "description": "`items` contains every ThreadItem available from persisted app-server history for this turn.",
-          "type": "string",
-          "enum": [
-            "full"
-          ]
-        }
-      ]
-    },
     "ThreadTurnsListParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "ThreadTurnsListParams",
@@ -2520,6 +2603,22 @@
         "forceReload": {
           "description": "When true, bypass the skills cache and re-scan skills from disk.",
           "type": "boolean"
+        }
+      }
+    },
+    "SkillsExtraRootsSetParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "SkillsExtraRootsSetParams",
+      "type": "object",
+      "required": [
+        "extraRoots"
+      ],
+      "properties": {
+        "extraRoots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          }
         }
       }
     },
@@ -3412,6 +3511,12 @@
             }
           ]
         },
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "collaborationMode": {
           "description": "EXPERIMENTAL - Set a pre-set collaboration mode. Takes precedence over model, reasoning_effort, and developer instructions if set.\n\nFor `collaboration_mode.settings.developer_instructions`, `null` means \"use the built-in instructions for the selected mode\".",
           "anyOf": [
@@ -3442,7 +3547,7 @@
           ]
         },
         "environments": {
-          "description": "Optional turn-scoped environments.\n\nOmitted uses the thread sticky environments. Empty disables environment access for this turn. Non-empty selects the first environment as the current turn environment for this turn.",
+          "description": "Optional environments for this turn and subsequent turns.\n\nOmitted uses the thread sticky environments. Empty disables environment access for this turn. Non-empty selects the first environment as the current turn environment for this turn.",
           "type": [
             "array",
             "null"
@@ -3496,13 +3601,13 @@
           }
         },
         "runtimeWorkspaceRoots": {
-          "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Relative paths are resolved against the effective cwd for the turn.",
+          "description": "Replace the thread's runtime workspace roots for this turn and subsequent turns. Paths must be absolute.",
           "type": [
             "array",
             "null"
           ],
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/AbsolutePathBuf"
           }
         },
         "sandboxPolicy": {
@@ -3558,6 +3663,12 @@
           "additionalProperties": {
             "$ref": "#/definitions/AdditionalContextEntry"
           }
+        },
+        "clientUserMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "expectedTurnId": {
           "description": "Required active turn id precondition. The request fails when it does not match the currently active turn.",
@@ -4059,6 +4170,96 @@
           "additionalProperties": {
             "type": "boolean"
           }
+        }
+      }
+    },
+    "RemoteControlPairingStartParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlPairingStartParams",
+      "type": "object",
+      "properties": {
+        "manualCode": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RemoteControlPairingStatusParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlPairingStatusParams",
+      "type": "object",
+      "properties": {
+        "manualPairingCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pairingCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RemoteControlClientsListOrder": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "RemoteControlClientsListParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlClientsListParams",
+      "type": "object",
+      "required": [
+        "environmentId"
+      ],
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "order": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RemoteControlClientsListOrder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RemoteControlClientsRevokeParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlClientsRevokeParams",
+      "type": "object",
+      "required": [
+        "clientId",
+        "environmentId"
+      ],
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "environmentId": {
+          "type": "string"
         }
       }
     },
@@ -5924,6 +6125,13 @@
             "null"
           ]
         },
+        "parentThreadId": {
+          "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "[UNSTABLE] Path to the thread on disk.",
           "type": [
@@ -6000,6 +6208,12 @@
             "type"
           ],
           "properties": {
+            "clientId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "content": {
               "type": "array",
               "items": {
@@ -7027,6 +7241,32 @@
         }
       }
     },
+    "TurnsPage": {
+      "type": "object",
+      "required": [
+        "data"
+      ],
+      "properties": {
+        "backwardsCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "ThreadResumeResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "ThreadResumeResponse",
@@ -7066,6 +7306,18 @@
         },
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "initialTurnsPage": {
+          "description": "`thread/turns/list` page returned when requested by `initialTurnsPage`.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnsPage"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "instructionSources": {
           "description": "Instruction source files currently loaded for this thread.",
@@ -7850,6 +8102,11 @@
         }
       }
     },
+    "SkillsExtraRootsSetResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "SkillsExtraRootsSetResponse",
+      "type": "object"
+    },
     "HookErrorInfo": {
       "type": "object",
       "required": [
@@ -7976,6 +8233,7 @@
         "sessionFlags",
         "plugin",
         "cloudRequirements",
+        "cloudManagedConfig",
         "legacyManagedConfigFile",
         "legacyManagedConfigMdm",
         "unknown"
@@ -8692,9 +8950,73 @@
         }
       }
     },
+    "AppTemplateSummary": {
+      "type": "object",
+      "required": [
+        "materializedAppIds",
+        "name",
+        "templateId"
+      ],
+      "properties": {
+        "canonicalConnectorId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logoUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logoUrlDark": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "materializedAppIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppTemplateUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "templateId": {
+          "type": "string"
+        }
+      }
+    },
+    "AppTemplateUnavailableReason": {
+      "type": "string",
+      "enum": [
+        "NOT_CONFIGURED_FOR_WORKSPACE",
+        "NO_ACTIVE_WORKSPACE"
+      ]
+    },
     "PluginDetail": {
       "type": "object",
       "required": [
+        "appTemplates",
         "apps",
         "hooks",
         "marketplaceName",
@@ -8703,6 +9025,12 @@
         "summary"
       ],
       "properties": {
+        "appTemplates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AppTemplateSummary"
+          }
+        },
         "apps": {
           "type": "array",
           "items": {
@@ -10037,6 +10365,128 @@
         }
       }
     },
+    "RemoteControlPairingStartResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlPairingStartResponse",
+      "type": "object",
+      "required": [
+        "environmentId",
+        "expiresAt",
+        "pairingCode"
+      ],
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "expiresAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "manualPairingCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pairingCode": {
+          "type": "string"
+        }
+      }
+    },
+    "RemoteControlPairingStatusResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlPairingStatusResponse",
+      "type": "object",
+      "required": [
+        "claimed"
+      ],
+      "properties": {
+        "claimed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "RemoteControlClient": {
+      "type": "object",
+      "required": [
+        "clientId"
+      ],
+      "properties": {
+        "appVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "deviceModel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deviceType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastSeenAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "osVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RemoteControlClientsListResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlClientsListResponse",
+      "type": "object",
+      "required": [
+        "data"
+      ],
+      "properties": {
+        "data": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RemoteControlClient"
+          }
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RemoteControlClientsRevokeResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "RemoteControlClientsRevokeResponse",
+      "type": "object"
+    },
     "CollaborationModeMask": {
       "description": "EXPERIMENTAL - collaboration mode preset metadata for clients.",
       "type": "object",
@@ -10145,6 +10595,47 @@
         "oAuth"
       ]
     },
+    "McpServerInfo": {
+      "description": "Presentation metadata advertised by an initialized MCP server.",
+      "type": "object",
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "icons": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": true
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "string"
+        },
+        "websiteUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "McpServerStatus": {
       "type": "object",
       "required": [
@@ -10172,6 +10663,16 @@
           "items": {
             "$ref": "#/definitions/Resource"
           }
+        },
+        "serverInfo": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tools": {
           "type": "object",
@@ -10627,6 +11128,16 @@
             }
           ]
         },
+        "individualLimit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpendControlLimitSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "limitId": {
           "type": [
             "string",
@@ -10707,6 +11218,31 @@
         }
       }
     },
+    "SpendControlLimitSnapshot": {
+      "type": "object",
+      "required": [
+        "limit",
+        "remainingPercent",
+        "resetsAt",
+        "used"
+      ],
+      "properties": {
+        "limit": {
+          "type": "string"
+        },
+        "remainingPercent": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "resetsAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "used": {
+          "type": "string"
+        }
+      }
+    },
     "GetAccountRateLimitsResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "GetAccountRateLimitsResponse",
@@ -10732,6 +11268,84 @@
           "additionalProperties": {
             "$ref": "#/definitions/RateLimitSnapshot"
           }
+        }
+      }
+    },
+    "AccountTokenUsageDailyBucket": {
+      "type": "object",
+      "required": [
+        "startDate",
+        "tokens"
+      ],
+      "properties": {
+        "startDate": {
+          "type": "string"
+        },
+        "tokens": {
+          "type": "integer",
+          "format": "int64"
+        }
+      }
+    },
+    "AccountTokenUsageSummary": {
+      "type": "object",
+      "properties": {
+        "currentStreakDays": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "lifetimeTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "longestRunningTurnSec": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "longestStreakDays": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "peakDailyTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "GetAccountTokenUsageResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "GetAccountTokenUsageResponse",
+      "type": "object",
+      "required": [
+        "summary"
+      ],
+      "properties": {
+        "dailyUsageBuckets": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/AccountTokenUsageDailyBucket"
+          }
+        },
+        "summary": {
+          "$ref": "#/definitions/AccountTokenUsageSummary"
         }
       }
     },
@@ -10851,6 +11465,16 @@
     "AppConfig": {
       "type": "object",
       "properties": {
+        "approvals_reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "default_tools_approval_mode": {
           "anyOf": [
             {
@@ -11282,6 +11906,33 @@
           "title": "SystemConfigLayerSource"
         },
         {
+          "description": "Enterprise-managed config layer delivered by the cloud config bundle.",
+          "type": "object",
+          "required": [
+            "id",
+            "name",
+            "type"
+          ],
+          "properties": {
+            "id": {
+              "description": "Stable identifier for the delivered layer.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Admin-facing name for the delivered layer. This is surfaced in diagnostics so users know which cloud layer needs administrator attention.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "enterpriseManaged"
+              ],
+              "title": "EnterpriseManagedConfigLayerSourceType"
+            }
+          },
+          "title": "EnterpriseManagedConfigLayerSource"
+        },
+        {
           "description": "User config layer from $CODEX_HOME/config.toml. This layer is special in that it is expected to be: - writable by the user - generally outside the workspace directory",
           "type": "object",
           "required": [
@@ -11695,13 +12346,13 @@
             "$ref": "#/definitions/ApprovalsReviewer"
           }
         },
-        "allowedPermissions": {
+        "allowedPermissionProfiles": {
           "type": [
-            "array",
+            "object",
             "null"
           ],
-          "items": {
-            "type": "string"
+          "additionalProperties": {
+            "type": "boolean"
           }
         },
         "allowedSandboxModes": {
@@ -11722,6 +12373,15 @@
             "$ref": "#/definitions/WebSearchMode"
           }
         },
+        "allowedWindowsSandboxImplementations": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/WindowsSandboxSetupMode"
+          }
+        },
         "computerUse": {
           "anyOf": [
             {
@@ -11730,6 +12390,12 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "defaultPermissions": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "enforceResidency": {
@@ -12081,7 +12747,7 @@
       "type": "string",
       "enum": [
         "allow",
-        "none"
+        "deny"
       ]
     },
     "ResidencyRequirement": {
@@ -13950,6 +14616,12 @@
         },
         "status": {
           "$ref": "#/definitions/McpServerStartupState"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -13982,6 +14654,13 @@
           "type": "string",
           "enum": [
             "agentIdentity"
+          ]
+        },
+        {
+          "description": "Programmatic Codex auth backed by a personal access token.",
+          "type": "string",
+          "enum": [
+            "personalAccessToken"
           ]
         }
       ]
@@ -14016,6 +14695,7 @@
     "AccountRateLimitsUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "AccountRateLimitsUpdatedNotification",
+      "description": "Sparse rolling rate-limit update.\n\nClients should merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot. Nullable account metadata may be unavailable in a rolling update and does not clear a previously observed value.",
       "type": "object",
       "required": [
         "rateLimits"
@@ -14265,6 +14945,25 @@
           "items": {
             "$ref": "#/definitions/ModelVerification"
           }
+        }
+      }
+    },
+    "TurnModerationMetadataNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "TurnModerationMetadataNotification",
+      "type": "object",
+      "required": [
+        "metadata",
+        "threadId",
+        "turnId"
+      ],
+      "properties": {
+        "metadata": true,
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
         }
       }
     },
@@ -14645,6 +15344,19 @@
         }
       }
     },
+    "FuzzyFileSearchSessionCompletedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchSessionCompletedNotification",
+      "type": "object",
+      "required": [
+        "sessionId"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      }
+    },
     "ClientInfo": {
       "type": "object",
       "required": [
@@ -14663,46 +15375,6 @@
         },
         "version": {
           "type": "string"
-        }
-      }
-    },
-    "FuzzyFileSearchSessionUpdateParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchSessionUpdateParams",
-      "type": "object",
-      "required": [
-        "query",
-        "sessionId"
-      ],
-      "properties": {
-        "query": {
-          "type": "string"
-        },
-        "sessionId": {
-          "type": "string"
-        }
-      }
-    },
-    "InitializeParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "InitializeParams",
-      "type": "object",
-      "required": [
-        "clientInfo"
-      ],
-      "properties": {
-        "capabilities": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/InitializeCapabilities"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "clientInfo": {
-          "$ref": "#/definitions/ClientInfo"
         }
       }
     },
@@ -14729,46 +15401,6 @@
           "items": {
             "type": "string"
           }
-        }
-      }
-    },
-    "FuzzyFileSearchSessionCompletedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchSessionCompletedNotification",
-      "type": "object",
-      "required": [
-        "sessionId"
-      ],
-      "properties": {
-        "sessionId": {
-          "type": "string"
-        }
-      }
-    },
-    "FuzzyFileSearchMatchType": {
-      "type": "string",
-      "enum": [
-        "file",
-        "directory"
-      ]
-    },
-    "FuzzyFileSearchSessionStartParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchSessionStartParams",
-      "type": "object",
-      "required": [
-        "roots",
-        "sessionId"
-      ],
-      "properties": {
-        "roots": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "sessionId": {
-          "type": "string"
         }
       }
     },
@@ -14813,6 +15445,53 @@
         }
       }
     },
+    "FuzzyFileSearchSessionUpdatedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchSessionUpdatedNotification",
+      "type": "object",
+      "required": [
+        "files",
+        "query",
+        "sessionId"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FuzzyFileSearchResult"
+          }
+        },
+        "query": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      }
+    },
+    "InitializeParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "InitializeParams",
+      "type": "object",
+      "required": [
+        "clientInfo"
+      ],
+      "properties": {
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InitializeCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clientInfo": {
+          "$ref": "#/definitions/ClientInfo"
+        }
+      }
+    },
     "InitializeCapabilities": {
       "description": "Client-declared capabilities negotiated during initialize.",
       "type": "object",
@@ -14839,6 +15518,50 @@
         }
       }
     },
+    "FuzzyFileSearchMatchType": {
+      "type": "string",
+      "enum": [
+        "file",
+        "directory"
+      ]
+    },
+    "FuzzyFileSearchSessionStartParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchSessionStartParams",
+      "type": "object",
+      "required": [
+        "roots",
+        "sessionId"
+      ],
+      "properties": {
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      }
+    },
+    "FuzzyFileSearchSessionUpdateParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "FuzzyFileSearchSessionUpdateParams",
+      "type": "object",
+      "required": [
+        "query",
+        "sessionId"
+      ],
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      }
+    },
     "FuzzyFileSearchSessionStopParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "title": "FuzzyFileSearchSessionStopParams",
@@ -14847,30 +15570,6 @@
         "sessionId"
       ],
       "properties": {
-        "sessionId": {
-          "type": "string"
-        }
-      }
-    },
-    "FuzzyFileSearchSessionUpdatedNotification": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "title": "FuzzyFileSearchSessionUpdatedNotification",
-      "type": "object",
-      "required": [
-        "files",
-        "query",
-        "sessionId"
-      ],
-      "properties": {
-        "files": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/FuzzyFileSearchResult"
-          }
-        },
-        "query": {
-          "type": "string"
-        },
         "sessionId": {
           "type": "string"
         }
@@ -15603,6 +16302,30 @@
             }
           },
           "title": "Skills/listRequest"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "skills/extraRoots/set"
+              ],
+              "title": "Skills/extraRoots/setRequestMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/SkillsExtraRootsSetParams"
+            }
+          },
+          "title": "Skills/extraRoots/setRequest"
         },
         {
           "type": "object",
@@ -16634,6 +17357,102 @@
           "title": "RemoteControl/status/readRequest"
         },
         {
+          "type": "object",
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "remoteControl/pairing/start"
+              ],
+              "title": "RemoteControl/pairing/startRequestMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/RemoteControlPairingStartParams"
+            }
+          },
+          "title": "RemoteControl/pairing/startRequest"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "remoteControl/pairing/status"
+              ],
+              "title": "RemoteControl/pairing/statusRequestMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/RemoteControlPairingStatusParams"
+            }
+          },
+          "title": "RemoteControl/pairing/statusRequest"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "remoteControl/client/list"
+              ],
+              "title": "RemoteControl/client/listRequestMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/RemoteControlClientsListParams"
+            }
+          },
+          "title": "RemoteControl/client/listRequest"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "remoteControl/client/revoke"
+              ],
+              "title": "RemoteControl/client/revokeRequestMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/RemoteControlClientsRevokeParams"
+            }
+          },
+          "title": "RemoteControl/client/revokeRequest"
+        },
+        {
           "description": "Lists collaboration mode presets.",
           "type": "object",
           "required": [
@@ -16967,6 +17786,29 @@
             }
           },
           "title": "Account/rateLimits/readRequest"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "method"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "account/usage/read"
+              ],
+              "title": "Account/usage/readRequestMethod"
+            },
+            "params": {
+              "type": "null"
+            }
+          },
+          "title": "Account/usage/readRequest"
         },
         {
           "type": "object",
@@ -18432,6 +19274,26 @@
             }
           },
           "title": "Model/verificationNotification"
+        },
+        {
+          "type": "object",
+          "required": [
+            "method",
+            "params"
+          ],
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": [
+                "turn/moderationMetadata"
+              ],
+              "title": "Turn/moderationMetadataNotificationMethod"
+            },
+            "params": {
+              "$ref": "#/definitions/TurnModerationMetadataNotification"
+            }
+          },
+          "title": "Turn/moderationMetadataNotification"
         },
         {
           "type": "object",

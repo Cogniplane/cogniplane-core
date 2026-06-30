@@ -111,6 +111,70 @@ function makeOrgSettingsApp(role: string = "owner") {
   return app;
 }
 
+test("tenant member listing runs through the RLS-bound tenant scope", async () => {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  let released = false;
+  const client = {
+    async query(text: string, values?: unknown[]) {
+      queries.push({ text, values });
+      if (text.includes("FROM tenant_memberships tm")) {
+        return {
+          rows: [
+            {
+              user_id: "member-user",
+              email: "member@example.com",
+              display_name: "Member",
+              role: "member",
+              created_at: "2026-06-10T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      return { rows: [] };
+    },
+    release() {
+      released = true;
+    }
+  };
+  const db = {
+    async connect() {
+      return client;
+    },
+    async query() {
+      throw new Error("tenant member listing must not use an unscoped pool query");
+    }
+  };
+  const app = makeOrgSettingsApp("admin");
+  onTestFinished(async () => {
+    await app.close();
+  });
+  await registerTenantRoutes(app, {
+    db: db as never,
+    tenantOrgSettings: makeFakeOrgSettingsStore().store
+  });
+
+  const response = await app.inject({ method: "GET", url: "/tenant/members" });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual([
+    {
+      userId: "member-user",
+      email: "member@example.com",
+      displayName: "Member",
+      role: "member",
+      joinedAt: "2026-06-10T00:00:00.000Z"
+    }
+  ]);
+  expect(queries.map((query) => query.text)).toEqual([
+    "BEGIN",
+    "SELECT set_config('app.current_tenant_id', $1, true)",
+    expect.stringContaining("FROM tenant_memberships tm"),
+    "COMMIT"
+  ]);
+  expect(queries[1]?.values).toEqual(["tenant-1"]);
+  expect(released).toBe(true);
+});
+
 test("tenant role updates reject demoting an owner", async () => {
   let updateCalled = false;
   const client = {
@@ -239,6 +303,7 @@ test("tenant role updates still allow changing a non-owner member", async () => 
 
 function makeMembersDb(targetRole: string | null) {
   const tracked = {
+    connectCalled: false,
     deleteCalled: false,
     updateCalled: false,
     deleteValues: null as unknown[] | null,
@@ -273,6 +338,7 @@ function makeMembersDb(targetRole: string | null) {
   };
   const db = {
     async connect() {
+      tracked.connectCalled = true;
       return client;
     }
   };
@@ -309,6 +375,20 @@ test("DELETE member: removing yourself returns 400 cannot_remove_self and never 
   expect(response.json()).toEqual({ error: "cannot_remove_self" });
   // Self-removal is rejected before opening a tenant-scoped transaction.
   expect(tracked.deleteCalled).toBe(false);
+});
+
+test("DELETE member: rejects a malformed userId before opening a transaction", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/bad!id" });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toMatchObject({ error: "invalid_request" });
+  expect(tracked.connectCalled).toBe(false);
 });
 
 test("DELETE member: removing an owner returns 403 cannot_remove_owner and never issues a DELETE", async () => {
@@ -377,6 +457,24 @@ test("PUT member role: invalid role value returns 400 invalid_role and never iss
   expect(response.statusCode).toBe(400);
   expect(response.json()).toEqual({ error: "invalid_role" });
   expect(tracked.updateCalled).toBe(false);
+});
+
+test("PUT member role: rejects an oversized userId before opening a transaction", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: `/tenant/members/${"u".repeat(81)}/role`,
+    payload: { role: "member" }
+  });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toMatchObject({ error: "invalid_request" });
+  expect(tracked.connectCalled).toBe(false);
 });
 
 test("SECURITY REGRESSION: PUT member role — a non-owner admin cannot assign owner; rejected 403 before any DB write", async () => {

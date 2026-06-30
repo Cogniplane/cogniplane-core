@@ -15,8 +15,8 @@ const release = JSON.parse(
 
 const CODEX_NPM_VERSION = release.codexVersion;
 const CLAUDE_AGENT_SDK_NPM_VERSION = release.claudeAgentSdkVersion;
-const UV_VERSION = '0.11.2';
-const BUN_VERSION = '1.3.11';
+const UV_VERSION = '0.11.26';
+const BUN_VERSION = '1.3.14';
 
 // Core apt packages + GitHub CLI keyring. Run first so later steps can assume
 // curl/gnupg/git/unzip/etc. are present.

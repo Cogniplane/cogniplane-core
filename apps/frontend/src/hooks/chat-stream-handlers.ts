@@ -57,6 +57,14 @@ export function createChatStreamHandlers(input: {
       patchToolResult(assistantMessageId, toolResultId, delta);
     },
     onToolCompleted: applyToolResult,
+    onToolsRetracted: (toolResultIds) => {
+      const retracted = new Set(toolResultIds);
+      updateMessageById(assistantMessageId, (message) => ({
+        ...message,
+        toolResults: message.toolResults.filter((toolResult) => !retracted.has(toolResult.toolResultId)),
+        updatedAt: new Date().toISOString()
+      }));
+    },
     onApprovalRequired: (approval) => {
       registerPendingApproval(approval);
     },
@@ -96,6 +104,15 @@ export function createChatStreamHandlers(input: {
         updatedAt: new Date().toISOString()
       }));
     },
+    onTextReplaced: (text) => {
+      // Runtime retracted already-streamed content (model refusal fallback) —
+      // replace the bubble's accumulated text instead of appending.
+      updateMessageById(assistantMessageId, (message) => ({
+        ...message,
+        content: text,
+        updatedAt: new Date().toISOString()
+      }));
+    },
     onReasoningDelta: (delta) => {
       updateMessageById(assistantMessageId, (message) => ({
         ...message,
@@ -107,6 +124,13 @@ export function createChatStreamHandlers(input: {
       updateMessageById(assistantMessageId, (message) => ({
         ...message,
         reasoningContent: `${message.reasoningContent}${delta}`,
+        updatedAt: new Date().toISOString()
+      }));
+    },
+    onReasoningReplaced: (text) => {
+      updateMessageById(assistantMessageId, (message) => ({
+        ...message,
+        reasoningContent: text,
         updatedAt: new Date().toISOString()
       }));
     },

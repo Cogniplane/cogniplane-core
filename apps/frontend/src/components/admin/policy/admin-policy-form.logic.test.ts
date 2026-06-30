@@ -8,6 +8,7 @@ import {
   draftConditions,
   draftFromRule,
   draftToInput,
+  EFFECT_LABELS,
   emptyDraft,
   isDraftValid,
   parseCsv,
@@ -41,6 +42,10 @@ describe("emptyDraft", () => {
     expect(d.severities).toEqual([]);
     expect(d.turnContexts).toEqual([]);
   });
+});
+
+test("require_approval is labeled as actor confirmation", () => {
+  expect(EFFECT_LABELS.require_approval).toBe("Require actor confirmation");
 });
 
 describe("draftFromRule / draftToInput round-trip", () => {
