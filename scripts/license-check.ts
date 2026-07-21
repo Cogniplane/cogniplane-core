@@ -19,12 +19,12 @@ import { execFileSync } from "node:child_process";
 // security patches without value, since the license posture rarely changes
 // between minor versions of an upstream package.
 const ALLOWED_PROPRIETARY_PACKAGES: Record<string, string> = {
-  "@anthropic-ai/claude-agent-sdk":
-    "Anthropic SDK; proprietary terms via Anthropic's Commercial Terms of Service. Required for the Claude Code runtime.",
-  "@anthropic-ai/claude-agent-sdk-linux-x64":
-    "Native binary companion to @anthropic-ai/claude-agent-sdk; same proprietary terms.",
-  "@anthropic-ai/claude-agent-sdk-darwin-arm64":
-    "Native binary companion to @anthropic-ai/claude-agent-sdk for macOS ARM; same proprietary terms."
+  // Actually MIT — the repo ships a LICENSE file
+  // (github.com/fabiospampinato/khroma, "The MIT License (MIT)"), but the
+  // maintainer omitted the `license` field from package.json, so npm/pnpm
+  // report it as Unknown. Transitive dep of mermaid (itself MIT), pulled in
+  // via CopilotKit's diagram rendering. Not a real license risk.
+  khroma: "MIT (declared in LICENSE file, missing from package.json metadata)"
 };
 
 // Licenses that, if found in a non-allowlisted production dependency, MUST

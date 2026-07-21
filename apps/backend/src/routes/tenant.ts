@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import { TenantDetailsSchema } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import type { Pool } from "../lib/db.js";
 import { withTenantScope } from "../lib/db.js";
@@ -17,9 +18,14 @@ const tenantUpdateSchema = z.object({
   tenantName: z.string().trim().min(1).max(200).optional()
 });
 
+// Backward-compatible: the legacy body is `{ anthropicApiKey }`; the new body
+// is `{ provider, apiKey }`. Accept either — `provider` defaults to anthropic
+// and `apiKey` falls back to the legacy `anthropicApiKey` field.
 const apiKeysSchema = z.object({
-  openaiApiKey: z.string().optional(),
-  anthropicApiKey: z.string().optional()
+  provider: z.enum(MODEL_PROVIDERS).optional(),
+  // Provider keys are well under 512 chars; cap to reject junk payloads early.
+  apiKey: z.string().max(512).optional(),
+  anthropicApiKey: z.string().max(512).optional()
 });
 
 const marketplaceSchema = z.object({
@@ -79,8 +85,8 @@ export async function registerTenantRoutes(
       ssoProvider: row.sso_provider,
       plan: row.plan,
       settings: {
-        openaiApiKeyConfigured: orgSettings.hasOpenaiApiKey,
         anthropicApiKeyConfigured: orgSettings.hasAnthropicApiKey,
+        providerKeys: orgSettings.providerKeys,
         skillMarketplaceManifestUrl: orgSettings.skillMarketplaceManifestUrl,
         piiProtection: orgSettings.piiProtection,
         github: {
@@ -140,23 +146,21 @@ export async function registerTenantRoutes(
     const { tenantId } = request.auth;
     const parsed = parseRequestInput(reply, apiKeysSchema, request.body);
     if (!parsed.ok) return parsed.response;
-    const { openaiApiKey, anthropicApiKey } = parsed.value;
+    const provider = parsed.value.provider ?? "anthropic";
+    const rawKey = parsed.value.apiKey ?? parsed.value.anthropicApiKey;
 
-    const trimmedOpenai = openaiApiKey?.trim() || undefined;
-    const trimmedAnthropic = anthropicApiKey?.trim() || undefined;
-    if (!trimmedOpenai && !trimmedAnthropic) {
-      return reply.code(400).send({ error: "api_key_required" });
-    }
-
-    await tenantOrgSettings.setApiKeys(tenantId, {
-      openaiApiKey: trimmedOpenai,
-      anthropicApiKey: trimmedAnthropic
-    });
+    // An empty/absent apiKey CLEARS the selected provider's stored key (the
+    // off-boarding / revocation path). A non-empty key sets it. Passing `null`
+    // to setApiKey removes the encrypted column value.
+    const trimmedKey = rawKey?.trim() || null;
+    await tenantOrgSettings.setApiKey(tenantId, provider, trimmedKey);
+    const refreshed = await tenantOrgSettings.get(tenantId);
 
     return reply.send({
       ok: true,
-      openaiApiKeyConfigured: Boolean(trimmedOpenai),
-      anthropicApiKeyConfigured: Boolean(trimmedAnthropic)
+      providerKeys: refreshed.providerKeys,
+      // Backward-compat echo for older clients.
+      anthropicApiKeyConfigured: refreshed.providerKeys.anthropic
     });
   });
 

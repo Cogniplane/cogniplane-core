@@ -4,9 +4,9 @@ import { useState } from "react";
 
 import type {
   AdminRuntimeConfig,
-  RuntimeOpenAiDiagnostic,
   RuntimeSessionSummary
 } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 import {
   countActiveSessions,
   filterRuntimeSessions,
@@ -30,11 +30,9 @@ const PAGE_SIZE = 20;
 export function AdminRuntimeCard(props: {
   runtimeSessions: RuntimeSessionSummary[];
   runtimeConfig: AdminRuntimeConfig | null;
-  runtimeDiagnostic: RuntimeOpenAiDiagnostic | null;
   busyKey: string | null;
   onDrainIdle: () => void;
   onRefreshIdle: () => void;
-  onRunRuntimeDiagnostic: () => void;
 }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<RuntimeStatusFilter>("all");
@@ -76,17 +74,15 @@ export function AdminRuntimeCard(props: {
                   {props.runtimeConfig.e2bTemplateId || "—"}
                 </code>
               </span>
-              <span
-                className={props.runtimeConfig.openaiKeyConfigured ? PILL_GREEN : PILL_RED}
-              >
-                OpenAI key {props.runtimeConfig.openaiKeyConfigured ? "set" : "missing"}
-              </span>
-              <span
-                className={props.runtimeConfig.anthropicKeyConfigured ? PILL_GREEN : PILL_RED}
-              >
-                Anthropic key{" "}
-                {props.runtimeConfig.anthropicKeyConfigured ? "set" : "missing"}
-              </span>
+              {MODEL_PROVIDERS.map((provider) => {
+                const configured = props.runtimeConfig!.platformProviders.includes(provider);
+                return (
+                  <span key={provider} className={configured ? PILL_GREEN : PILL_RED}>
+                    {MODEL_PROVIDER_META[provider].label} key{" "}
+                    {configured ? "set" : "missing"}
+                  </span>
+                );
+              })}
             </div>
           </div>
         ) : null}
@@ -98,17 +94,6 @@ export function AdminRuntimeCard(props: {
             <span className={CHIP}>idle controls</span>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={props.busyKey === "runtime-diagnostic"}
-              onClick={() => props.onRunRuntimeDiagnostic()}
-            >
-              {props.busyKey === "runtime-diagnostic"
-                ? "Running diagnostic..."
-                : "Run OpenAI diagnostic"}
-            </Button>
             <Button
               type="button"
               variant="outline"
@@ -127,32 +112,6 @@ export function AdminRuntimeCard(props: {
               {props.busyKey === "refresh" ? "Refreshing..." : "Refresh idle"}
             </Button>
           </div>
-        </div>
-
-        <div className="rounded-lg border border-outline-variant bg-surface-container-low p-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <strong className="text-sm font-semibold text-on-surface">
-              Container OpenAI diagnostic
-            </strong>
-            {props.runtimeDiagnostic ? (
-              <span className="text-xs text-on-surface-faint">
-                Last checked {formatRuntimeTimestamp(props.runtimeDiagnostic.checkedAt)}
-              </span>
-            ) : (
-              <span className="text-xs text-on-surface-faint">
-                Run this from the admin UI to avoid manual bearer-token calls.
-              </span>
-            )}
-          </div>
-          {props.runtimeDiagnostic ? (
-            <pre className="mt-2 max-h-72 overflow-auto rounded bg-surface-container px-3 py-2 text-[11px]">
-              {JSON.stringify(props.runtimeDiagnostic, null, 2)}
-            </pre>
-          ) : (
-            <p className={`${HINT} mt-2`}>
-              Checks DNS, model reachability, and direct `/v1/responses` calls from the container.
-            </p>
-          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -203,18 +162,6 @@ export function AdminRuntimeCard(props: {
                     </span>
                     {rs.runtimeProvider ? (
                       <span className={PILL_GRAY}>{rs.runtimeProvider}</span>
-                    ) : null}
-                    {rs.mode ? (
-                      <span
-                        className={PILL_GRAY}
-                        title={
-                          rs.mode === "e2b"
-                            ? "Claude SDK ran inside the E2B sandbox via the sandbox-agent harness."
-                            : "Claude SDK ran in-process on the backend."
-                        }
-                      >
-                        mode: {rs.mode}
-                      </span>
                     ) : null}
                   </div>
                 </div>

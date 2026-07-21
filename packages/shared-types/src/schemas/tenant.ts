@@ -5,7 +5,7 @@ import { IsoDateSchema } from "./_helpers.js";
 import { PiiProtectionSettingsSchema } from "./pii.js";
 import { PolicyEnforcementModeSchema } from "./policy.js";
 
-import { WEB_SEARCH_MODES } from "../primitives.js";
+import { EFFORT_LEVELS, MODEL_PROVIDERS, WEB_SEARCH_MODES } from "../primitives.js";
 
 // Granular approval policy + literal forms must mirror @cogniplane/shared-types primitive types.
 const GranularApprovalPolicySchema = z.object({
@@ -26,14 +26,10 @@ const ApprovalPolicySchema = z.union([
 
 const ApprovalReviewerSchema = z.enum(["user", "guardian_subagent"]);
 
-const RuntimeProviderSchema = z.enum(["codex", "claude-code"]);
-
 const WebSearchModeSchema = z.enum(WEB_SEARCH_MODES);
 
 export const TenantSettingsSchema = z.object({
   tenantId: z.string(),
-  runtimeProvider: RuntimeProviderSchema,
-  enabledRuntimeProviders: z.array(RuntimeProviderSchema),
   showEffortSelector: z.boolean(),
   webSearchMode: WebSearchModeSchema,
   approvalPolicy: ApprovalPolicySchema,
@@ -51,6 +47,17 @@ export const TenantSettingsSchema = z.object({
   developerInstructions: z.string().nullable(),
   enabledToolIds: z.array(z.string()),
   enabledMcpServerIds: z.array(z.string()),
+  // Model availability (admin-controlled). A model is selectable iff its
+  // provider is in enabledProviders AND a key is configured for that provider
+  // AND (enabledModelIds is null OR contains the model id). enabledModelIds
+  // null means "all catalog models" so newly shipped models appear without an
+  // admin action; an explicit array is a strict allowlist.
+  enabledProviders: z.array(z.enum(MODEL_PROVIDERS)),
+  enabledModelIds: z.array(z.string()).nullable(),
+  // Per-model default reasoning effort overriding the catalog default. Applied
+  // server-side when a turn omits an explicit effort, and echoed through
+  // /models as each model's defaultEffort.
+  modelDefaultEfforts: z.record(z.string(), z.enum(EFFORT_LEVELS)),
   version: z.number(),
   configHash: z.string(),
   updatedAt: IsoDateSchema
@@ -81,8 +88,12 @@ export const TenantDetailsSchema = z.object({
   ssoProvider: z.string().nullable(),
   plan: z.string(),
   settings: z.object({
-    openaiApiKeyConfigured: z.boolean(),
+    // Retained for backward compat with older clients; equals
+    // providerKeys.anthropic.
     anthropicApiKeyConfigured: z.boolean(),
+    // Per-provider key-presence map (booleans only — the keys themselves are
+    // never returned). Keyed by public ModelProvider id.
+    providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean()),
     skillMarketplaceManifestUrl: z.string().nullable(),
     piiProtection: PiiProtectionSettingsSchema,
     github: z.object({
@@ -102,17 +113,17 @@ export type TenantDetails = z.infer<typeof TenantDetailsSchema>;
 // Each settings PUT returns `{ ok, ... }` with the relevant flag echoed back.
 // Shared so frontend and backend agree on the wire shape.
 
-export const TenantOpenAiKeyUpdateResponseSchema = z.object({
+// PUT /tenant/settings response for a provider-key set/clear. The request body
+// (`{ provider?, apiKey? }`) is validated server-side by apiKeysSchema; an
+// empty/absent apiKey clears the selected provider's key.
+export const TenantProviderKeyUpdateResponseSchema = z.object({
   ok: z.boolean(),
-  openaiApiKeyConfigured: z.boolean()
-}).passthrough();
-export type TenantOpenAiKeyUpdateResponse = z.infer<typeof TenantOpenAiKeyUpdateResponseSchema>;
-
-export const TenantAnthropicKeyUpdateResponseSchema = z.object({
-  ok: z.boolean(),
+  // Full refreshed presence map so the client updates every provider chip.
+  providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean()),
+  // Backward-compat echo for older clients that only read this field.
   anthropicApiKeyConfigured: z.boolean()
 }).passthrough();
-export type TenantAnthropicKeyUpdateResponse = z.infer<typeof TenantAnthropicKeyUpdateResponseSchema>;
+export type TenantProviderKeyUpdateResponse = z.infer<typeof TenantProviderKeyUpdateResponseSchema>;
 
 export const TenantMarketplaceManifestUrlUpdateResponseSchema = z.object({
   ok: z.boolean(),

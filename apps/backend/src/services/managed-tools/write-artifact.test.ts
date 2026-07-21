@@ -185,10 +185,11 @@ test("write_artifact: filename without extension yields no extension on storage 
     context: ctx(),
     arguments: { name: "noext", content: "data" }
   });
-  // Storage key looks like "<userId>/<sessionId>/<uuid>"
-  // (no trailing extension since there was no dot)
+  // The load-bearing contract is extension handling, not the internal key
+  // layout: a name with no dot yields NO trailing extension. Assert that, not
+  // the u/s/uuid prefix (a private storage.put() detail).
   const key = storageCalls[0].storageKey;
-  expect(key).toMatch(/^u\/s\/[a-f0-9-]+$/);
+  expect(key.includes(".")).toBe(false);
 });
 
 test("write_artifact: extension is sanitized of unsafe chars", async () => {
@@ -198,7 +199,9 @@ test("write_artifact: extension is sanitized of unsafe chars", async () => {
     // Tricky filename with a leading dot in the "extension"
     arguments: { name: "weird.tar.g$", content: "x" }
   });
-  // Only safe chars from the last segment after the final '.'
+  // The load-bearing contract is extension sanitization: the unsafe `$` is
+  // stripped, leaving `.g`. Assert the sanitized suffix, not the u/s/uuid prefix.
   const key = storageCalls[0].storageKey;
-  expect(key).toMatch(/^u\/s\/[a-f0-9-]+\.g$/);
+  expect(key.endsWith(".g")).toBe(true);
+  expect(key).not.toContain("$");
 });

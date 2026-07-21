@@ -1,16 +1,15 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 /**
- * Session-scoped runtime tokens allow the Codex CLI (running inside an E2B
- * sandbox or local child process) to authenticate HTTP requests back to the
- * backend's MCP gateway without holding a real user JWT.
+ * Session-scoped runtime tokens allow the agent runtime to authenticate HTTP
+ * requests back to the backend's MCP gateway without holding a real user JWT.
  *
  * Token format: `rt_<payload>.<signature>`
  *   payload = base64url(JSON.stringify({ jti, sid, tid, uid, rid, exp? }))
  *   signature = HMAC-SHA256(payload, secret)
  *
- * The token is generated once per runtime session and embedded as an
- * Authorization header in the generated codex.toml MCP server entries.
+ * The token is generated once per runtime session and sent as the
+ * `Authorization: Bearer rt_...` header on every MCP gateway request.
  *
  * Production callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`
  * to bound the leak window if a workspace file or sandbox snapshot is
@@ -22,9 +21,9 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
  * The token is a bearer credential valid until `exp` — there is no revocation
  * deny-list. The leak window is bounded by two controls instead: the TTL, and
  * the per-runtime egress IP pin (runtime-egress-ip-pin.ts) enforced by the
- * MCP gateway and the LLM proxy, which refuses a leaked token replayed from
- * any host other than the sandbox that made the first call. Every minted
- * token carries a unique `jti` (token id) for audit/log correlation.
+ * MCP gateway, which refuses a leaked token replayed from any host other than
+ * the sandbox that made the first call. Every minted token carries a unique
+ * `jti` (token id) for audit/log correlation.
  */
 
 const TOKEN_PREFIX = "rt_";

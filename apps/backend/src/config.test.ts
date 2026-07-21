@@ -152,6 +152,14 @@ test("loadConfig defaults dev-headers to the IPv4 loopback listener", () => {
   expect(loadConfig(devConfig()).API_HOST).toBe("127.0.0.1");
 });
 
+test("loadConfig defaults workos to the dual-stack all-interfaces listener", () => {
+  // Networked deployments (ECS behind an ALB) rely on this default: a loopback
+  // default would make the container unreachable and fail ELB health checks.
+  expect(loadConfig(workosConfig()).API_HOST).toBe("::");
+  // An explicit value still wins over the auth-mode default.
+  expect(loadConfig(workosConfig({ API_HOST: "0.0.0.0" })).API_HOST).toBe("0.0.0.0");
+});
+
 test("loadConfig allows loopback listeners in dev-headers mode", () => {
   expect(loadConfig(devConfig({ API_HOST: "127.0.0.1" })).API_HOST).toBe("127.0.0.1");
   expect(loadConfig(devConfig({ API_HOST: "::1" })).API_HOST).toBe("::1");
@@ -212,8 +220,9 @@ test("loadConfig accepts PII provider config when enabled with an API key", () =
   expect(config.PII_PROVIDER_TIMEOUT_MS).toBe(7500);
 });
 
-// Both runtimes run exclusively inside E2B, so E2B config is validated at boot
-// unconditionally — there is no in-process local execution mode.
+// The Deep Agents runtime executes exclusively inside E2B, so E2B config is
+// validated at boot unconditionally — there is no in-process local execution
+// mode.
 
 test("loadConfig accepts a real E2B template", () => {
   const config = loadConfig({
@@ -236,7 +245,7 @@ test("loadConfig refuses the placeholder E2B_TEMPLATE_ID default", () => {
   ).toThrow(/E2B_TEMPLATE_ID is not configured/);
 });
 
-test("loadConfig requires E2B_API_KEY (both runtimes run inside E2B)", () => {
+test("loadConfig requires E2B_API_KEY (the runtime executes inside E2B)", () => {
   expect(() => loadConfig({ E2B_API_KEY: undefined })).toThrow(
     /E2B_API_KEY is required/
   );
@@ -262,7 +271,11 @@ test("loadConfig skipRuntimeChecks still enforces DB-backed (workos) validations
   ).toThrow(/REDIS_URL is required when AUTH_MODE=workos/);
 });
 
-test("loadConfig warns when RUNTIME_GATEWAY_BASE_URL is localhost", () => {
+test("loadConfig does not warn on a localhost RUNTIME_GATEWAY_BASE_URL", () => {
+  // The MCP client runs in the backend process (deep-agents-graph.ts), so
+  // localhost IS reachable — the correct default for local dev. Verified live
+  // (bead 5qpj): a session_context tools/call succeeds against
+  // http://localhost:3001 from the in-process MultiServerMCPClient.
   const warnings: Array<{ meta: object; msg: string }> = [];
   loadConfig(
     {
@@ -276,8 +289,8 @@ test("loadConfig warns when RUNTIME_GATEWAY_BASE_URL is localhost", () => {
       }
     }
   );
-  const localhostWarn = warnings.find((w) => w.msg.includes("E2B sandboxes cannot reach localhost"));
-  expect(localhostWarn).toBeDefined();
+  const gatewayWarn = warnings.find((w) => w.msg.includes("RUNTIME_GATEWAY_BASE_URL"));
+  expect(gatewayWarn).toBeUndefined();
 });
 
 test("loadConfig parses ADMIN_USER_IDS as comma-separated list", () => {

@@ -104,13 +104,11 @@ export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise
     return { ok: false, statusCode: 401, body: failure(rpcId, -32000, "The MCP gateway requires a valid runtime token (rt_*).") };
   }
 
-  // Same egress controls as the LLM proxy (llm-proxy-core.ts). The CIDR
-  // allowlist (E2B_EGRESS_CIDRS) is dormant unless configured — E2B does not
-  // publish egress ranges — so the per-runtime IP pin is the operative
-  // control: the first gateway/proxy call for a runtimeId records the peer
-  // IP, and a leaked rt_* token replayed from any other host is refused for
-  // the rest of its TTL. The pin store is shared with /llm/*, so whichever
-  // route the sandbox hits first establishes the pin for both.
+  // Egress controls for the /mcp gateway. The CIDR allowlist
+  // (E2B_EGRESS_CIDRS) is dormant unless configured — E2B does not publish
+  // egress ranges — so the per-runtime IP pin is the operative control: the
+  // first gateway call for a runtimeId records the peer IP, and a leaked rt_*
+  // token replayed from any other host is refused for the rest of its TTL.
   if (stores.egressAllowlist && !cidrAllowlistAllows(stores.egressAllowlist, ipAddress ?? "")) {
     await recordGatewayRejection(stores.auditEvents, "egress_ip_not_allowed", { claims, ipAddress, serverId, rpcMethod }, logger);
     return { ok: false, statusCode: 403, body: failure(rpcId, -32000, "Egress IP is not allowed.") };
@@ -122,7 +120,7 @@ export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise
       // Log expected/observed at warn so an operator investigating a leak
       // can see both — the audit payload deliberately omits the expected IP
       // to avoid storing per-runtime peer addresses in a long-retention
-      // table (mirrors the LLM proxy).
+      // table.
       logger.warn(
         { runtimeId: claims.rid, expectedIp: pinResult.expectedIp, observedIp: pinResult.observedIp },
         "MCP gateway egress IP mismatch — refusing rt_* call from unexpected peer"

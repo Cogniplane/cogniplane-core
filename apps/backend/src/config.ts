@@ -4,14 +4,8 @@ import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
 
-import codexRelease from "./codex-release.json" with { type: "json" };
-
 const envFilePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env");
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const defaultRuntimeWorkspaceRoot = path.join(
-  os.tmpdir(),
-  "cogniplane-core-runtime-workspaces"
-);
 const defaultArtifactStorageRoot = path.join(os.tmpdir(), "cogniplane-core-artifacts");
 const defaultSkillBundleStorageRoot = path.join(os.tmpdir(), "cogniplane-core-skills");
 const defaultSkillBundleCacheRoot = path.join(os.tmpdir(), "cogniplane-skill-cache");
@@ -38,7 +32,11 @@ const booleanFromEnvSchema = z.preprocess((value) => {
 }, z.boolean());
 
 const envSchema = z.object({
-  API_HOST: z.string().default("127.0.0.1"),
+  // No flat default: the effective default depends on AUTH_MODE and is resolved
+  // in loadConfig (dev-headers → IPv4 loopback; workos → dual-stack all-interfaces).
+  // A flat loopback default would silently break networked deployments — an ALB
+  // health check can't reach 127.0.0.1 inside an awsvpc task → rollback.
+  API_HOST: z.string().optional(),
   API_PORT: z.coerce.number().int().positive().default(3001),
   API_ORIGIN: z.string().url().default("http://localhost:3000"),
   DATABASE_URL: z
@@ -47,40 +45,30 @@ const envSchema = z.object({
     .default("postgres://postgres:postgres@localhost:5432/cogniplane"),
   LOCAL_DEV_USER_ID: z.string().min(1).default("local-dev-user"),
   ADMIN_USER_IDS: z.string().optional(),
-  CODEX_BINARY_PATH: z.string().min(1).default("codex"),
-  CODEX_VERSION: z.string().trim().min(1).default(codexRelease.codexVersion),
-  CODEX_SCHEMA_VERSION: z.string().trim().min(1).default(codexRelease.schemaVersion),
-  CODEX_MODEL: z.string().trim().min(1).default("gpt-5.4-mini"),
-  CODEX_SANDBOX_MODE: z.enum(["workspace-write", "danger-full-access", "read-only"]).optional(),
   ANTHROPIC_API_KEY: z.string().trim().min(1).optional(),
-  // Upstream Anthropic API base URL used by the in-backend proxy at
-  // /llm/anthropic. Override for local mocking, regional routing, or
-  // gateway/bedrock front-ends. Production: leave at the default.
-  ANTHROPIC_UPSTREAM_BASE_URL: z
-    .string()
-    .url()
-    .default("https://api.anthropic.com"),
-  // Upstream OpenAI API base URL used by the in-backend proxy at
-  // /llm/openai. Codex inside the sandbox is configured (via the
-  // [model_providers.cogniplane_proxy] block in ~/.codex/config.toml) to
-  // talk to this route, NOT to api.openai.com — that way the real
-  // OPENAI_API_KEY never leaves the backend. Override for testing or
-  // regional routing; production should leave at the default.
-  OPENAI_UPSTREAM_BASE_URL: z
-    .string()
-    .url()
-    .default("https://api.openai.com"),
-  // Comma-separated CIDR allowlist for the /llm and /mcp egress controls.
-  // `request.ip` is checked — which is only the true sandbox peer when
-  // TRUST_PROXY is set correctly for the deployment (see below). Set to the
-  // documented E2B egress CIDRs so a leaked runtime token cannot be redeemed
-  // from outside the sandbox provider's NAT range. Empty (the default)
-  // disables the check, which is appropriate for local dev. The check applies
-  // in addition to the rt_* token's session-scoped HMAC claims and the
-  // per-runtime egress IP pin; all configured checks must pass.
+  // Platform-level fallback keys for the non-Anthropic model providers. A set
+  // value satisfies the provider-presence check for ALL tenants (same
+  // semantics as ANTHROPIC_API_KEY); otherwise the tenant's own stored key
+  // decides. See MODEL_PROVIDER_META.envKey in @cogniplane/shared-types.
+  OPENAI_API_KEY: z.string().trim().min(1).optional(),
+  GOOGLE_API_KEY: z.string().trim().min(1).optional(),
+  OPENROUTER_API_KEY: z.string().trim().min(1).optional(),
+  // Z.AI (Zhipu / GLM) platform key. Reaches Z.AI's international
+  // OpenAI-compatible API (base URL in MODEL_PROVIDER_META — the GLM Coding
+  // Plan endpoint https://api.z.ai/api/coding/paas/v4 by default).
+  ZAI_API_KEY: z.string().trim().min(1).optional(),
+  // Comma-separated CIDR allowlist for the /mcp gateway egress controls.
+  // `request.ip` is checked — which is only the true caller peer when
+  // TRUST_PROXY is set correctly for the deployment (see below). Dormant when
+  // empty (the default) — E2B does not publish egress ranges, so the
+  // per-runtime IP pin is the operative control: the first gateway/proxy call
+  // for a runtimeId records the peer IP and a leaked rt_* token replayed from
+  // any other host is refused for the rest of its TTL. Configure a CIDR list
+  // only when your deployment has a known egress range; all configured checks
+  // must pass in addition to the rt_* token's session-scoped HMAC claims.
   E2B_EGRESS_CIDRS: z.string().trim().default(""),
   // Fastify `trustProxy` value. Controls how `request.ip` is resolved from
-  // `X-Forwarded-For`, which the /mcp and /llm egress controls (CIDR allowlist
+  // `X-Forwarded-For`, which the /mcp gateway egress controls (CIDR allowlist
   // + per-runtime IP pin) depend on to see the real sandbox peer rather than
   // the load balancer.
   //   - "1" (default): trust exactly one proxy hop — correct for the
@@ -94,22 +82,26 @@ const envSchema = z.object({
   //   - a number N: trust N proxy hops (e.g. "2" for CDN-in-front-of-ALB).
   //   - a comma-separated IP/CIDR list: trust those proxy addresses.
   TRUST_PROXY: z.string().trim().default("1"),
-  CLAUDE_CODE_MODEL: z.string().trim().min(1).default("claude-opus-4-8"),
-  CLAUDE_AGENT_SDK_VERSION: z.string().trim().min(1).default(codexRelease.claudeAgentSdkVersion),
-  OPENAI_API_KEY: z.string().trim().min(1).optional(),
   SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-4-5-20251001"),
-  SESSION_TITLER_CODEX_MODEL: z.string().trim().min(1).default("gpt-5.4-nano"),
   SESSION_TITLER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
-  RUNTIME_WORKSPACE_ROOT: z
-    .string()
-    .min(1)
-    .default(defaultRuntimeWorkspaceRoot),
+  // Optional operator-run endpoint for small background LLM jobs (session
+  // titling today). When enabled, these jobs try the local endpoint FIRST and
+  // fall back to the provider APIs, so raw user prompts stay in-perimeter and
+  // titles work even for tenants without provider keys. Wire-format semantics
+  // match PII_LLM_WIRE_FORMAT: "ollama" hits <base>/api/chat (host root, no
+  // /v1) and honors UTILITY_LLM_DISABLE_THINKING; "openai" hits
+  // <base>/chat/completions (base ends in /v1).
+  UTILITY_LLM_ENABLED: booleanFromEnvSchema.default(false),
+  UTILITY_LLM_BASE_URL: z.string().url().optional(),
+  UTILITY_LLM_API_KEY: z.string().trim().min(1).optional(),
+  UTILITY_LLM_MODEL: z.string().trim().min(1).optional(),
+  UTILITY_LLM_WIRE_FORMAT: z.enum(["openai", "ollama"]).default("ollama"),
+  UTILITY_LLM_DISABLE_THINKING: booleanFromEnvSchema.default(false),
+  UTILITY_LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   RUNTIME_GATEWAY_BASE_URL: z.string().url().default("http://localhost:3001"),
   RUNTIME_IDLE_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
-  RUNTIME_START_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
-  RUNTIME_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
-  // Watchdog on a single turn's wall-clock duration, for both runtimes. A
-  // wedged turn (hung model call, stuck in-sandbox SDK) otherwise pins the
+  // Watchdog on a single turn's wall-clock duration. A
+  // wedged turn (hung model call) otherwise pins the
   // session busy — 429 on every new message — until the sandbox dies at
   // E2B_SANDBOX_TIMEOUT_MS. On expiry the turn is failed with a terminal frame
   // and the sandbox is recycled (the next message bootstraps a fresh one).
@@ -117,28 +109,35 @@ const envSchema = z.object({
   // legitimately stall a turn for that long) and stay under
   // E2B_SANDBOX_TIMEOUT_MS to be useful. 0 disables the watchdog.
   RUNTIME_TURN_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(20 * 60 * 1000),
-  // Lifetime of the HMAC-signed runtime token embedded in the generated
-  // codex.toml / .mcp.json so the sandbox can call back to /mcp/:serverId.
-  // Default: 24 hours. The token is the only thing tying a sandbox to its
+  // Lifetime of the HMAC-signed runtime token the runtime's MCP client
+  // presents when calling back to /mcp/:serverId.
+  // Default: 24 hours. The token is the only thing tying a runtime to its
   // tenant/user/session; if it leaks (workspace tarball, log line, snapshot)
   // an attacker can call MCP tools for the bound session until expiry.
   //
   // The TTL must outlive the longest realistic session because the token is
-  // minted once at workspace bootstrap and not refreshed for the lifetime of
-  // the runtime — Codex caches its Authorization header at process start and
-  // the Claude SDK pins MCP tokens at session start, so an in-place refresh
-  // would require tearing down and rebuilding the runtime mid-session.
-  // Idle timeout (RUNTIME_IDLE_TIMEOUT_MS, default 5 min) tears Codex down on
-  // inactivity, but a session with a turn every few minutes can stay alive
-  // indefinitely. The sandbox lifetime is bounded by E2B_SANDBOX_TIMEOUT_MS
-  // (default 30 min).
+  // minted once at session bootstrap and not refreshed for the lifetime of
+  // the runtime — the MCP client pins its Authorization header at session
+  // start, so an in-place refresh would require tearing down and rebuilding
+  // the runtime mid-session.
+  // Idle timeout (RUNTIME_IDLE_TIMEOUT_MS, default 5 min) tears the runtime
+  // down on inactivity, but a session with a turn every few minutes can stay
+  // alive indefinitely. The sandbox lifetime is bounded by
+  // E2B_SANDBOX_TIMEOUT_MS (default 30 min).
   //
   // 24 hours is the floor that comfortably exceeds long debugging sessions
   // while still being 7x tighter than the previous 7-day default. Tighten to
   // 1 hour (3600000) only if you accept that any session running continuously
   // past that will fail with `runtime_token_expired` until it's restarted.
   RUNTIME_TOKEN_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
-  TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
+  // Lifetime of the per-turn tool-execution context that the MCP gateway
+  // resolves on every managed/proxy tool call. The gateway filters out expired
+  // contexts, so this MUST outlive the longest turn — otherwise a turn running
+  // past the TTL loses all managed MCP tool access mid-flight (every call fails
+  // with -32000). Validation below pins it strictly above RUNTIME_TURN_TIMEOUT_MS
+  // (which itself already exceeds APPROVAL_REQUEST_TTL_MS). Default: 25 min, one
+  // margin above the 20-min turn watchdog.
+  TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(25 * 60 * 1000),
   APPROVAL_REQUEST_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   // Fraction of APPROVAL_REQUEST_TTL_MS after which a one-shot "still pending"
   // reminder is pushed to the active turn for a Policy Center–routed approval.
@@ -182,7 +181,8 @@ const envSchema = z.object({
   // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
   ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
-  // Artifact creation from a message (POST /messages/:id/artifact).
+  // Reserved for programmatic artifact creation (the `artifact_create` rate-limit
+  // resource). No route currently consumes it; kept as a dormant limit knob.
   ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(30),
   ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(150),
   // Scheduled-job creation (POST /me/scheduled-jobs) — each job later runs as a
@@ -217,6 +217,11 @@ const envSchema = z.object({
   // share a single budget. The worker's PII drain runs whenever the async PII
   // path is wired, even when SCHEDULER_ENABLED=false.
   PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
+  // Route a turn through the AG-UI agent (DeepAgentsAGUIAgent) and stream AG-UI
+  // BaseEvents on `POST /messages?format=agui`. The CopilotKit frontend is now
+  // the default chat UI and always requests `?format=agui`, so this defaults ON;
+  // the guard remains only as an operator kill-switch (`AGUI_WIRE=false`).
+  AGUI_WIRE: booleanFromEnvSchema.default(true),
   AUTH_MODE: z.enum(["workos", "dev-headers"]).default("dev-headers"),
   // Docker port publishing needs 0.0.0.0 *inside* the container, which the
   // dev-headers loopback guard below rejects; this is the operator opt-in.
@@ -239,8 +244,16 @@ const envSchema = z.object({
   JWT_VERIFICATION_KEYS: jwtVerificationKeysSchema,
   REDIS_URL: z.string().url().optional(),
   E2B_API_KEY: z.string().trim().min(1).optional(),
-  E2B_TEMPLATE_ID: z.string().trim().min(1).default(codexRelease.e2bTemplateId),
+  // Deep Agents code-execution template (docker/template.ts), built by
+  // `make e2b-build`. The default is a placeholder so boot can produce a
+  // clear error instead of an opaque Sandbox.create() failure.
+  E2B_TEMPLATE_ID: z.string().trim().min(1).default("replace-with-your-template-id"),
   E2B_SANDBOX_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
+  // Per-execute() wall-clock budget for Deep Agents sandbox commands. The
+  // agent loop runs in the backend, so a runaway command (infinite loop,
+  // fork bomb) must be bounded at OUR layer — the sandbox-level
+  // E2B_SANDBOX_TIMEOUT_MS is a lifetime cap, not a per-command one.
+  DEEP_AGENTS_EXECUTE_TIMEOUT_MS: z.coerce.number().int().positive().default(2 * 60 * 1000),
   PII_PROVIDER_ENABLED: booleanFromEnvSchema.default(false),
   // OpenAI-compatible /chat/completions endpoint for the PII detection model.
   // Two intended deployments share this one contract:
@@ -261,6 +274,19 @@ const envSchema = z.object({
   // guarantees should set PII_LLM_MODEL explicitly and verify the provider's
   // posture (for OpenRouter, https://openrouter.ai/docs/features/privacy-and-logging).
   PII_LLM_MODEL: z.string().trim().min(1).default("google/gemini-2.5-flash"),
+  // Wire dialect the PII endpoint speaks.
+  //   - "openai" (default): POST <base>/chat/completions. Base URL ends in /v1.
+  //     Works for OpenRouter, vLLM, and Ollama's OpenAI-compat layer.
+  //   - "ollama": POST <base>/api/chat (base URL is the host root, NO /v1).
+  //     The only dialect that honors PII_LLM_DISABLE_THINKING — Ollama's /v1
+  //     layer silently ignores `think:false`. Use this to run a reasoning-tuned
+  //     local Gemma without paying the thought-channel latency.
+  PII_LLM_WIRE_FORMAT: z.enum(["openai", "ollama"]).default("openai"),
+  // Ollama-only: send `think:false` so reasoning-tuned models (e.g. the unsloth
+  // Gemma-4 GGUFs) skip the thought channel. Measured ~40% faster on the
+  // homelab GTX 1070 with no loss of detection recall. Ignored for wire
+  // format "openai".
+  PII_LLM_DISABLE_THINKING: booleanFromEnvSchema.default(false),
   PII_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   // Hard cap on artifact bytes the PII service will read into memory before
   // a scan. Anything larger throws file_too_large (a permanent failure) and
@@ -287,15 +313,7 @@ const envSchema = z.object({
   // HKDF-SHA256(KEK, salt=tenantId). Required when any tenant has
   // `rawRetention='reversible_encrypted'` configured; otherwise that mode
   // throws `pii_kek_missing` instead of silently downgrading.
-  PII_RETENTION_KEK: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
-  MODEL_LIST_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(3000),
-  // Per-tenant TTL for the Anthropic /v1/models capability cache used by
-  // GET /models. Capability data rarely changes; a 10-minute success TTL
-  // keeps an authed client from triggering a billable upstream call on
-  // every chat-screen render. Negative cache (timeouts, non-2xx) is kept
-  // short so a freshly-fixed key isn't locked out for a full window.
-  MODEL_LIST_CACHE_TTL_MS: z.coerce.number().int().nonnegative().default(600_000),
-  MODEL_LIST_CACHE_NEGATIVE_TTL_MS: z.coerce.number().int().nonnegative().default(30_000)
+  PII_RETENTION_KEK: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
 });
 
 type ParsedAppConfig = z.infer<typeof envSchema>;
@@ -394,14 +412,14 @@ export function loadConfig(
   }
   const parsed = envSchema.parse(source);
 
-  const resolvedRuntimeWorkspaceRoot = resolveStoragePath(
-    parsed.RUNTIME_WORKSPACE_ROOT,
-    "RUNTIME_WORKSPACE_ROOT",
-    defaultRuntimeWorkspaceRoot,
-    "can restart dev watchers",
-    source.NODE_ENV,
-    logger
-  );
+  // Resolve the API_HOST default by auth mode: dev-headers must stay on the IPv4
+  // loopback (its trust boundary), while workos binds dual-stack so a load
+  // balancer / ingress can reach it without extra config. An explicit API_HOST
+  // always wins (and is still validated by the dev-headers loopback guard below).
+  if (parsed.API_HOST === undefined) {
+    parsed.API_HOST = parsed.AUTH_MODE === "dev-headers" ? "127.0.0.1" : "::";
+  }
+
   const resolvedArtifactStorageRoot = resolveStoragePath(
     parsed.ARTIFACT_STORAGE_ROOT,
     "ARTIFACT_STORAGE_ROOT",
@@ -440,6 +458,14 @@ export function loadConfig(
     if (parsed.RUNTIME_TURN_TIMEOUT_MS >= parsed.E2B_SANDBOX_TIMEOUT_MS) {
       throw new Error(
         "RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS — at or above it the sandbox dies before the watchdog can recover the turn."
+      );
+    }
+    // The per-turn tool-execution context must outlive the whole turn, or a
+    // long turn loses managed MCP tool access mid-flight when the context
+    // expires at the gateway. Keep it strictly above the turn watchdog.
+    if (parsed.TOOL_CONTEXT_TTL_MS <= parsed.RUNTIME_TURN_TIMEOUT_MS) {
+      throw new Error(
+        "TOOL_CONTEXT_TTL_MS must exceed RUNTIME_TURN_TIMEOUT_MS — otherwise a turn running past the context TTL loses all managed MCP tool access mid-turn."
       );
     }
   }
@@ -563,12 +589,12 @@ export function loadConfig(
     parsed.NOTION_OAUTH_REDIRECT_URI
   );
 
-  // Set E2B_TEMPLATE_ID via env after running `make e2b-build`. The
-  // default in codex-release.json is the placeholder string `replace-with-
-  // your-template-id` — booting against E2B with the placeholder would fail
-  // opaquely in `Sandbox.create()`, so we surface a clearer error here.
-  // Both runtimes run exclusively inside E2B sandboxes — there is no in-process
-  // local execution mode. E2B is therefore required at boot, unconditionally.
+  // Set E2B_TEMPLATE_ID via env after running `make e2b-build` — booting
+  // against E2B with the placeholder default would fail opaquely in
+  // `Sandbox.create()`, so we surface a clearer error here. The Deep Agents
+  // runtime executes shell/file tools exclusively inside E2B sandboxes —
+  // there is no in-process local execution mode — so E2B is required at
+  // boot, unconditionally.
   const e2bTemplateIdLooksUnset =
     !parsed.E2B_TEMPLATE_ID || parsed.E2B_TEMPLATE_ID === "replace-with-your-template-id";
 
@@ -579,31 +605,27 @@ export function loadConfig(
   if (!opts.skipRuntimeChecks) {
     if (!parsed.E2B_API_KEY) {
       throw new Error(
-        "E2B_API_KEY is required: both the Codex and Claude runtimes run inside E2B sandboxes."
+        "E2B_API_KEY is required: the Deep Agents runtime executes shell/file tools inside E2B sandboxes."
       );
     }
     if (e2bTemplateIdLooksUnset) {
       throw new Error(
         "E2B_TEMPLATE_ID is not configured. " +
           "Run `make e2b-build` to build a template in your own E2B account, " +
-          "then set E2B_TEMPLATE_ID to the printed template id (or commit the updated " +
-          "apps/backend/src/codex-release.json so the default picks it up)."
+          "then set E2B_TEMPLATE_ID to the printed template id."
       );
     }
-    const gatewayUrl = parsed.RUNTIME_GATEWAY_BASE_URL.toLowerCase();
-    if (gatewayUrl.includes("127.0.0.1") || gatewayUrl.includes("localhost")) {
-      logger.warn(
-        { gatewayUrl: parsed.RUNTIME_GATEWAY_BASE_URL },
-        "RUNTIME_GATEWAY_BASE_URL points to localhost, but E2B sandboxes cannot reach localhost — " +
-          "MCP tool calls from the agent will fail. Use a tunnel (ngrok, cloudflared) or a public URL."
-      );
-    }
-
     if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_LLM_API_KEY) {
       throw new Error(
         "PII_LLM_API_KEY is required when PII_PROVIDER_ENABLED=true."
       );
     }
+  }
+
+  if (parsed.UTILITY_LLM_ENABLED && (!parsed.UTILITY_LLM_BASE_URL || !parsed.UTILITY_LLM_MODEL)) {
+    throw new Error(
+      "UTILITY_LLM_BASE_URL and UTILITY_LLM_MODEL are required when UTILITY_LLM_ENABLED=true."
+    );
   }
 
   const hasBucketAccessKey = Boolean(parsed.ARTIFACT_BUCKET_ACCESS_KEY_ID);
@@ -620,7 +642,6 @@ export function loadConfig(
       parsed.ADMIN_USER_IDS?.split(",")
         .map((entry) => entry.trim())
         .filter(Boolean) ?? [parsed.LOCAL_DEV_USER_ID],
-    RUNTIME_WORKSPACE_ROOT: resolvedRuntimeWorkspaceRoot,
     ARTIFACT_STORAGE_ROOT: resolvedArtifactStorageRoot,
     SKILL_BUNDLE_STORAGE_ROOT: resolvedSkillBundleStorageRoot
   };

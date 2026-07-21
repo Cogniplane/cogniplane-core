@@ -1,5 +1,6 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
 
+import { AdminConfigError } from "./admin-config-error.js";
 import type { AdminMcpServerRecord } from "./admin-config-records.js";
 import { mapMcpServer } from "./admin-config-store-mappers.js";
 
@@ -11,10 +12,14 @@ export class McpServerStore {
       const result = await client.query(
         `
           SELECT *
-          FROM admin_mcp_servers
-          WHERE ($1::boolean = TRUE OR enabled = TRUE)
-            AND ($3::boolean = TRUE OR is_published = TRUE)
-            AND tenant_id IN ($2::text, 'system')
+          FROM (
+            SELECT DISTINCT ON (server_id) *
+            FROM admin_mcp_servers
+            WHERE ($1::boolean = TRUE OR enabled = TRUE)
+              AND ($3::boolean = TRUE OR is_published = TRUE)
+              AND tenant_id IN ($2::text, 'system')
+            ORDER BY server_id, (tenant_id = $2::text) DESC, updated_at DESC
+          ) AS visible_servers
           ORDER BY server_name ASC, updated_at DESC
         `,
         [includeDisabled, tenantId, isBetaTester]
@@ -32,6 +37,7 @@ export class McpServerStore {
           FROM admin_mcp_servers
           WHERE server_id = $1
             AND tenant_id IN ($2::text, 'system')
+          ORDER BY (tenant_id = $2::text) DESC
           LIMIT 1
         `,
         [serverId, tenantId]
@@ -55,6 +61,26 @@ export class McpServerStore {
     createdBy: string;
   }): Promise<AdminMcpServerRecord> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      if (tenantId !== "system") {
+        const systemServer = await client.query(
+          `
+            SELECT 1
+            FROM admin_mcp_servers
+            WHERE server_id = $1
+              AND tenant_id = 'system'
+            LIMIT 1
+          `,
+          [input.serverId]
+        );
+
+        if (systemServer.rows[0]) {
+          throw new AdminConfigError(
+            `MCP server "${input.serverId}" is system-provided and cannot be created. ` +
+              "Create a server with a different ID to customize it."
+          );
+        }
+      }
+
       const result = await client.query(
         `
           INSERT INTO admin_mcp_servers (

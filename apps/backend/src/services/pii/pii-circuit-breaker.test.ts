@@ -600,33 +600,7 @@ test("InMemory: a failing event sink does not break the breaker", async () => {
   expect(warnings.length).toBe(1);
 });
 
-test("InMemory: emits a structured log on each transition", async () => {
-  const clock = makeClock();
-  const transitions: Array<{ from: string; to: string }> = [];
-  const breaker = new InMemoryPiiCircuitBreaker({
-    name: "test",
-    failureThreshold: 2,
-    windowMs: 60_000,
-    cooldownMs: 1_000,
-    now: clock.now,
-    logger: {
-      info(meta: object) {
-        const m = meta as { from: string; to: string };
-        transitions.push({ from: m.from, to: m.to });
-      },
-      warn() {}
-    }
-  });
-
-  await breaker.record("failure");
-  await breaker.record("failure"); // closed -> open
-  clock.advance(1_000);
-  await breaker.shouldAllow(); // open -> half_open
-  await breaker.record("success"); // half_open -> closed
-
-  expect(transitions).toEqual([
-        { from: "closed", to: "open" },
-        { from: "open", to: "half_open" },
-        { from: "half_open", to: "closed" }
-      ]);
-});
+// (Removed "emits a structured log on each transition": it pinned the exact
+// logger.info {from,to} meta sequence — a side-channel duplicating the
+// event-sink test above, which already pins the same closed→open→half_open→
+// closed transition sequence as the observable contract.)

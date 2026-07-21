@@ -45,12 +45,6 @@ const STATUS_OPTIONS: Array<{ value: SessionsFilterState["status"] | "all"; labe
   { value: "errored", label: "Errored" }
 ];
 
-const RUNTIME_OPTIONS: Array<{ value: SessionsFilterState["runtime"] | "all"; label: string }> = [
-  { value: "all", label: "All runtimes" },
-  { value: "codex", label: "Codex" },
-  { value: "claude-code", label: "Claude Code" }
-];
-
 const ALERT_OPTIONS: Array<{ value: AdminSessionAlertKind | "all"; label: string }> = [
   { value: "all", label: "All alerts" },
   { value: "pii-blocked", label: "PII blocked" },
@@ -168,30 +162,6 @@ export function AdminSessionsFilters(props: {
                 </SelectTrigger>
                 <SelectContent>
                   {STATUS_OPTIONS.map((opt) => (
-                    <SelectItem key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="filter-runtime">Runtime</Label>
-              <Select
-                value={state.runtime === "" ? "all" : state.runtime}
-                onValueChange={(value) =>
-                  apply({
-                    runtime:
-                      value === "all" ? "" : (value as SessionsFilterState["runtime"])
-                  })
-                }
-              >
-                <SelectTrigger id="filter-runtime" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {RUNTIME_OPTIONS.map((opt) => (
                     <SelectItem key={opt.value} value={opt.value}>
                       {opt.label}
                     </SelectItem>

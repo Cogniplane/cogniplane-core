@@ -25,6 +25,9 @@ export const AUDIT_EVENT_TYPES = [
   "admin.mcp_server.published",
   "admin.mcp_server.unpublished",
   "admin.artifact.download_token_minted",
+  // Admin — custom models (emitted by admin-model-routes.ts).
+  "admin.custom_model.created",
+  "admin.custom_model.deleted",
   // Admin — runtime / skill / tenant settings / users.
   "admin.runtime_rollout.executed",
   "admin.skill.activated",
@@ -44,6 +47,10 @@ export const AUDIT_EVENT_TYPES = [
   "approval.approved",
   "approval.rejected",
   "approval.expired",
+  // Emitted when a "remember for this turn" decision auto-approves a later
+  // action of the same kind without a prompt or a new DB row. Without this the
+  // remembered fast path leaves no audit trace of what it approved.
+  "approval.auto_approved",
 
   // Artifact lifecycle. Snake_case retained from pre-enum era.
   "artifact_uploaded",
@@ -54,20 +61,18 @@ export const AUDIT_EVENT_TYPES = [
   "auth.refresh_token_reuse_detected",
   "role_changed",
 
-  // LLM proxy (/llm/anthropic). `forwarded` is one row per upstream
-  // request with token usage and latency; `rejected` is the auth-failure
-  // counterpart (bad/missing rt_*, expired claim, blocked egress IP).
-  "llm.proxy.forwarded",
-  "llm.proxy.rejected",
-
   // MCP gateway egress-control refusals (CIDR allowlist / per-runtime IP
-  // pin) — the /mcp counterpart of llm.proxy.rejected.
+  // pin) — a leaked rt_* token replayed from an unexpected peer is refused.
   "mcp.gateway.rejected",
 
   // PII pipeline (action-taken outcomes).
   "pii_blocked",
   "pii_transformed",
   "pii_reported",
+  // A PII block succeeded (status flipped) but purging the stored object bytes
+  // failed. Makes the residual orphan queryable — block-mode's data-perimeter
+  // guarantee is otherwise silently violated. A future sweep keys off this.
+  "pii_block_object_orphaned",
 
   // Policy Center decisions. `recorded` is a monitor-mode (or non-gating)
   // evaluation; `enforced` is one that actually gated the action.

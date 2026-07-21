@@ -1,6 +1,7 @@
 import { test, expect } from "vitest";
 
 import { generateSessionTitle } from "./session-titler.js";
+import { UtilityLlmClient } from "./utility-llm-client.js";
 
 type FetchCall = { url: string; init: RequestInit };
 
@@ -28,11 +29,10 @@ function mockFetch(responses: Array<Partial<Response> & { json: unknown; ok?: bo
 
 const CFG = {
   claudeModel: "claude-haiku-4-5-20251001",
-  codexModel: "gpt-5.4-nano",
   timeoutMs: 2000
 };
 
-test("generateSessionTitle: claude-code uses Anthropic and maps usage", async () => {
+test("generateSessionTitle: deep-agents uses Anthropic and maps usage", async () => {
   const fake = mockFetch([
     {
       json: {
@@ -43,7 +43,6 @@ test("generateSessionTitle: claude-code uses Anthropic and maps usage", async ()
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "Why does my useEffect run twice in strict mode?",
       keys: { anthropicApiKey: "sk-ant-test" },
       config: CFG
@@ -62,56 +61,38 @@ test("generateSessionTitle: claude-code uses Anthropic and maps usage", async ()
   }
 });
 
-test("generateSessionTitle: codex uses OpenAI chat completions", async () => {
+test("generateSessionTitle: deep-agents uses Anthropic (Anthropic-only tenants must title)", async () => {
   const fake = mockFetch([
     {
       json: {
-        choices: [{ message: { content: "\"Fixing Postgres RLS Bug\"" } }],
-        usage: {
-          prompt_tokens: 60,
-          completion_tokens: 9,
-          prompt_tokens_details: { cached_tokens: 10 }
-        }
+        content: [{ type: "text", text: "Quarterly Sales Analysis" }],
+        usage: { input_tokens: 30, output_tokens: 5 }
       }
     }
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "codex",
-      firstMessage: "My RLS policy on the messages table isn't blocking other tenants.",
-      keys: { openaiApiKey: "sk-openai-test" },
+      firstMessage: "Analyze the Q3 sales CSV and chart revenue.",
+      keys: { anthropicApiKey: "sk-ant-test" },
       config: CFG
     });
     expect(result).toBeTruthy();
-    expect(result!.title).toBe("Fixing Postgres RLS Bug");
-    expect(result!.modelName).toBe("gpt-5.4-nano");
-    expect(result!.tokenUsage.inputTokens).toBe(60);
-    expect(result!.tokenUsage.cachedInputTokens).toBe(10);
-    expect(result!.tokenUsage.outputTokens).toBe(9);
-    expect(result!.tokenUsage.totalTokens).toBe(69);
-    expect(fake.calls[0]?.url).toBe("https://api.openai.com/v1/chat/completions");
-    expect((fake.calls[0]?.init.headers as Record<string, string>).authorization).toBe("Bearer sk-openai-test");
+    expect(result!.title).toBe("Quarterly Sales Analysis");
+    expect(fake.calls[0]?.url).toBe("https://api.anthropic.com/v1/messages");
   } finally {
     fake.restore();
   }
 });
 
-test("generateSessionTitle: returns null when no key for provider", async () => {
-  const claudeResult = await generateSessionTitle({
-    runtimeProvider: "claude-code",
-    firstMessage: "Hello",
-    keys: { anthropicApiKey: null, openaiApiKey: "sk-openai" },
-    config: CFG
-  });
-  expect(claudeResult).toBe(null);
 
-  const codexResult = await generateSessionTitle({
-    runtimeProvider: "codex",
+
+test("generateSessionTitle: returns null when no Anthropic key", async () => {
+  const result = await generateSessionTitle({
     firstMessage: "Hello",
-    keys: { anthropicApiKey: "sk-ant", openaiApiKey: null },
+    keys: { anthropicApiKey: null },
     config: CFG
   });
-  expect(codexResult).toBe(null);
+  expect(result).toBe(null);
 });
 
 test("generateSessionTitle: strips quotes, prefix, trailing punctuation", async () => {
@@ -125,7 +106,6 @@ test("generateSessionTitle: strips quotes, prefix, trailing punctuation", async 
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "how do I deploy?",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -141,7 +121,6 @@ test("generateSessionTitle: returns null on http error", async () => {
   const fake = mockFetch([{ ok: false, json: {} }]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "hi",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -154,7 +133,6 @@ test("generateSessionTitle: returns null on http error", async () => {
 
 test("generateSessionTitle: returns null on empty message", async () => {
   const result = await generateSessionTitle({
-    runtimeProvider: "claude-code",
     firstMessage: "   ",
     keys: { anthropicApiKey: "sk-ant" },
     config: CFG
@@ -168,7 +146,6 @@ test("generateSessionTitle: anthropic returns null when text block missing", asy
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "hi",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -185,7 +162,6 @@ test("generateSessionTitle: anthropic missing usage fields default to zeros", as
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "hi",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -208,7 +184,6 @@ test("generateSessionTitle: anthropic returns null when sanitization yields empt
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "hi",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -226,7 +201,6 @@ test("generateSessionTitle: anthropic returns null when fetch rejects", async ()
   }) as typeof fetch;
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "claude-code",
       firstMessage: "hi",
       keys: { anthropicApiKey: "sk-ant" },
       config: CFG
@@ -237,67 +211,25 @@ test("generateSessionTitle: anthropic returns null when fetch rejects", async ()
   }
 });
 
-test("generateSessionTitle: openai non-2xx returns null", async () => {
-  const fake = mockFetch([{ ok: false, json: {} }]);
-  try {
-    const result = await generateSessionTitle({
-      runtimeProvider: "codex",
-      firstMessage: "hi",
-      keys: { openaiApiKey: "k" },
-      config: CFG
-    });
-    expect(result).toBe(null);
-  } finally {
-    fake.restore();
-  }
-});
 
-test("generateSessionTitle: openai missing choices returns null", async () => {
-  const fake = mockFetch([{ json: { choices: [] } }]);
-  try {
-    const result = await generateSessionTitle({
-      runtimeProvider: "codex",
-      firstMessage: "hi",
-      keys: { openaiApiKey: "k" },
-      config: CFG
-    });
-    expect(result).toBe(null);
-  } finally {
-    fake.restore();
-  }
-});
 
-test("generateSessionTitle: openai returns null when fetch rejects", async () => {
-  const original = globalThis.fetch;
-  globalThis.fetch = (async () => {
-    throw new Error("boom");
-  }) as typeof fetch;
-  try {
-    const result = await generateSessionTitle({
-      runtimeProvider: "codex",
-      firstMessage: "hi",
-      keys: { openaiApiKey: "k" },
-      config: CFG
-    });
-    expect(result).toBe(null);
-  } finally {
-    globalThis.fetch = original;
-  }
-});
+
+
+
 
 test("generateSessionTitle: caps title at 8 words", async () => {
   const fake = mockFetch([
     {
       json: {
-        choices: [{ message: { content: "one two three four five six seven eight nine ten" } }]
+        content: [{ type: "text", text: "one two three four five six seven eight nine ten" }],
+        usage: {}
       }
     }
   ]);
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "codex",
       firstMessage: "hi",
-      keys: { openaiApiKey: "k" },
+      keys: { anthropicApiKey: "sk-ant" },
       config: CFG
     });
     expect(result!.title).toBe("one two three four five six seven eight");
@@ -308,10 +240,6 @@ test("generateSessionTitle: caps title at 8 words", async () => {
 
 test("generateSessionTitle: very long first message is truncated to 2000 chars in prompt", async () => {
   let observedUserContent = "";
-  const fake = mockFetch([{ json: { choices: [{ message: { content: "Truncated Topic" } }] } }]);
-  // The mockFetch helper does not expose init body in calls; but we can
-  // capture via a separate stub. Restore original after.
-  fake.restore();
   const original = globalThis.fetch;
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body));
@@ -319,14 +247,13 @@ test("generateSessionTitle: very long first message is truncated to 2000 chars i
     return {
       ok: true,
       status: 200,
-      json: async () => ({ choices: [{ message: { content: "Truncated Topic" } }] })
+      json: async () => ({ content: [{ type: "text", text: "Truncated Topic" }], usage: {} })
     } as Response;
   }) as typeof fetch;
   try {
     const result = await generateSessionTitle({
-      runtimeProvider: "codex",
       firstMessage: "x".repeat(5_000),
-      keys: { openaiApiKey: "k" },
+      keys: { anthropicApiKey: "sk-ant" },
       config: CFG
     });
     expect(result!.title).toBe("Truncated Topic");
@@ -335,5 +262,73 @@ test("generateSessionTitle: very long first message is truncated to 2000 chars i
     expect(payload.length).toBe(2000);
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+// --- Local utility LLM (UTILITY_LLM_*) ----------------------------------------
+
+test("generateSessionTitle: utility client wins without touching provider APIs or keys", async () => {
+  const utilityFetch = (async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      message: { content: '"Fibonacci Program Request."' },
+      prompt_eval_count: 40,
+      eval_count: 5
+    })
+  })) as unknown as typeof fetch;
+  const client = new UtilityLlmClient({
+    baseUrl: "http://10.0.0.1:11434",
+    model: "gemma-local",
+    timeoutMs: 2000,
+    wireFormat: "ollama",
+    disableThinking: true,
+    fetch: utilityFetch
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error("provider API must not be called when the utility client succeeds");
+  }) as typeof fetch;
+  try {
+    const result = await generateSessionTitle({
+      firstMessage: "write fibonacci",
+      keys: {}, // no provider keys at all — local path must still title
+      config: CFG,
+      utilityClient: client
+    });
+    // sanitizeTitle applies to the local output too (quotes/period stripped).
+    expect(result!.title).toBe("Fibonacci Program Request");
+    expect(result!.modelName).toBe("gemma-local");
+    expect(result!.tokenUsage.totalTokens).toBe(45);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("generateSessionTitle: falls back to provider API when utility client fails", async () => {
+  const failingFetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as unknown as typeof fetch;
+  const client = new UtilityLlmClient({
+    baseUrl: "http://10.0.0.1:11434",
+    model: "gemma-local",
+    timeoutMs: 2000,
+    wireFormat: "ollama",
+    fetch: failingFetch
+  });
+
+  const fake = mockFetch([
+    { json: { content: [{ type: "text", text: "Fallback Title" }], usage: {} } }
+  ]);
+  try {
+    const result = await generateSessionTitle({
+      firstMessage: "hello",
+      keys: { anthropicApiKey: "sk-ant" },
+      config: CFG,
+      utilityClient: client
+    });
+    expect(result!.title).toBe("Fallback Title");
+    expect(fake.calls[0].url).toBe("https://api.anthropic.com/v1/messages");
+  } finally {
+    fake.restore();
   }
 });

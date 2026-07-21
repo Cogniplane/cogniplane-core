@@ -11,9 +11,9 @@ export function clearIdleTimer(host: IdleTimerHost): void {
 }
 
 /**
- * (Re-)arm the RUNTIME_IDLE_TIMEOUT_MS teardown timer shared by both runtime
- * providers: cleared at turn start, re-armed at turn end and at session
- * creation, so an idle sandbox doesn't bill until the E2B hard timeout.
+ * (Re-)arm the RUNTIME_IDLE_TIMEOUT_MS teardown timer for a runtime session:
+ * cleared at turn start, re-armed at turn end and at session creation, so an
+ * idle sandbox doesn't bill until the E2B hard timeout.
  * Skipped while the session is busy or already torn down — onIdle must never
  * fire mid-turn.
  */
@@ -23,7 +23,7 @@ export function scheduleIdleTeardown(
     timeoutMs: number;
     /** Busy or already-closed sessions must not arm the timer. */
     isBusy: () => boolean;
-    /** Teardown action (Codex: requestRuntimeShutdown; Claude: abortSession). */
+    /** Teardown action (deep-agents: abortSession). */
     onIdle: () => Promise<void>;
     logger: Pick<FastifyBaseLogger, "error">;
     logContext: Record<string, unknown>;

@@ -42,4 +42,14 @@ test("SkillLifecycleService emits audit events for activation and rollback", asy
 
   expect(result?.revision.skillRevisionId).toBe(3);
   expect(auditEvents.events.map((event) => event.type)).toEqual(["admin.skill.reviewed", "admin.skill.activated", "admin.skill.rollback"]);
+
+  // Pin the rollback payload's direction so a from/to swap (which would keep the
+  // event-type sequence intact) is caught: FROM the previous active revision (2)
+  // TO the newly-activated one (3).
+  const rollback = auditEvents.events.find((event) => event.type === "admin.skill.rollback");
+  expect(rollback?.payload).toMatchObject({
+    skillId: "pdf-processing",
+    fromSkillRevisionId: 2,
+    toSkillRevisionId: 3
+  });
 });

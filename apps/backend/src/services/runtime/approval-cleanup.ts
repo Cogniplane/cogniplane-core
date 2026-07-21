@@ -14,9 +14,9 @@ export type CancelPendingApprovalsInput = {
   auditEvents: Pick<AuditEventStore, "create">;
   logger: Pick<FastifyBaseLogger, "warn" | "error">;
   /**
-   * Per-runtime in-memory cleanup. Called once per pending approvalId. Codex
-   * unblocks the JSON-RPC request and drops its in-memory map entry; Claude
-   * drops its e2b-pending map entry. The return value (if any) is merged
+   * Adapter-local in-memory cleanup. Called once per pending approvalId. The
+   * deep-agents adapter settles the pending HITL promise ("reject") and
+   * releases any policy-held tool call. The return value (if any) is merged
    * into the `approval.expired` audit payload — pass `{ itemId, kind }` or
    * similar from the in-memory record while it is still in scope. Throws
    * are logged but never abort the loop.
@@ -31,10 +31,10 @@ export type CancelPendingApprovalsInput = {
 };
 
 /**
- * Expire a SINGLE pending approval by id. Used by the Claude e2b path when the
- * per-approval wall-clock TTL fires (the in-sandbox harness has already been
- * sent a deny so the SDK turn unblocks): the DB row must move off `pending` and
- * an `approval.expired` audit row must be written, mirroring Codex's TTL sweep.
+ * Expire a SINGLE pending approval by id. Used when a per-approval wall-clock
+ * TTL fires (the adapter has already settled the pending HITL promise with a
+ * reject so the turn unblocks): the DB row must move off `pending` and an
+ * `approval.expired` audit row must be written.
  * Unlike `cancelPendingApprovals` this does NOT touch the other approvals in the
  * session — only the one that aged out.
  *
@@ -87,16 +87,16 @@ export async function expireApprovalById(input: {
 
 /**
  * Drop every pending approval for `sessionId` in a way that is safe to call
- * from any runtime adapter. Used when a turn is interrupted: leaving rows in
+ * from the runtime adapter. Used when a turn is interrupted: leaving rows in
  * `status='pending'` would let the UI keep showing approve/reject prompts
  * for a turn that no longer exists, and a late decision would resolve into
- * a torn-down JSON-RPC request.
+ * a torn-down turn.
  *
  * Behavior, in order, per pending approval (see `expireApprovalById`):
  *   1. Run `onCancelLocal(approvalId)` to release in-memory state and capture
- *      audit-payload extras in one pass — Codex drops its pendingApprovals
- *      entry, unblocks the JSON-RPC request, and returns `{itemId, kind}`;
- *      Claude drops its e2bPendingApprovals entry and returns nothing.
+ *      audit-payload extras in one pass — the deep-agents adapter settles the
+ *      pending HITL promise with a reject, releases any policy-held tool
+ *      call, and returns nothing.
  *   2. Atomically `expire` the DB row. If it returns null (the user's
  *      decision committed first) skip the audit event — that decision will
  *      have its own audit row.

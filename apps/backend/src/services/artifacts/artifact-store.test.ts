@@ -1,8 +1,10 @@
 import { test, expect } from "vitest";
+import { classifyMimeClass, MIME_CLASSES } from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 
-import { ArtifactCursorError, ArtifactStore } from "./artifact-store.js";
+import { ArtifactCursorError, ArtifactStore, mimeClassSqlClauses } from "./artifact-store.js";
+import type { ArtifactMimeClass } from "./artifact-store.js";
 
 class CaptureDatabase {
   lastQuery: { text: string; values: unknown[] } | null = null;
@@ -326,13 +328,80 @@ test("ArtifactStore.listForUser binds array filters as text[] ANY predicates", a
   expect(db.lastQuery.values).toContainEqual(["ready"]);
 });
 
-test("ArtifactStore.listForUser builds mimeClass SQL mirroring classifyMimeClass (text excludes code allowlist)", async () => {
-  const db = new CaptureDatabase();
-  const store = new ArtifactStore(db as unknown as Pool);
+/**
+ * Evaluate the production `mimeClassSqlClauses` output against a mime string,
+ * mimicking Postgres semantics for the small clause vocabulary the builder
+ * emits (ILIKE prefix, `= 'literal'`, `= ANY($n)`, `<> ALL($n)`, NOT ILIKE).
+ * This lets us run a real mime string through the *actual* SQL predicate and
+ * compare the bucket to `classifyMimeClass` — so a drift between the two
+ * duplicated `CODE_MIME_TYPES` lists (or the branch logic) is caught, which a
+ * pure SQL-substring assertion cannot see.
+ */
+function sqlClauseMatches(cls: ArtifactMimeClass, mime: string): boolean {
+  const values: unknown[] = [];
+  const clauses = mimeClassSqlClauses(cls, values);
+  const m = mime.toLowerCase();
+  const arrayParam = (n: string) => (values[Number(n) - 1] as string[]).map((s) => s.toLowerCase());
 
-  await store.listForUser("tenant-A", "user-1", { mimeClass: ["image", "text"] });
+  // Each predicate atom the builder can emit, matched anywhere in a fragment.
+  // A fragment's truth is the AND of every atom it contains (the builder only
+  // ever ANDs atoms within one fragment); the class matches if ANY fragment holds.
+  const evalFragment = (fragment: string): boolean => {
+    const results: boolean[] = [];
+    for (const mt of fragment.matchAll(/mime_type NOT ILIKE '([^']+)'/g)) {
+      results.push(!m.startsWith(mt[1].replace(/%$/, "").toLowerCase()));
+    }
+    for (const mt of fragment.matchAll(/mime_type ILIKE '([^']+)'/g)) {
+      if (fragment.slice(0, mt.index).endsWith("NOT ")) continue; // already handled above
+      results.push(m.startsWith(mt[1].replace(/%$/, "").toLowerCase()));
+    }
+    for (const mt of fragment.matchAll(/mime_type = '([^']+)'/g)) {
+      results.push(m === mt[1].toLowerCase());
+    }
+    for (const mt of fragment.matchAll(/mime_type <> '([^']+)'/g)) {
+      results.push(m !== mt[1].toLowerCase());
+    }
+    for (const mt of fragment.matchAll(/mime_type = ANY\(\$(\d+)::text\[\]\)/g)) {
+      results.push(arrayParam(mt[1]).includes(m));
+    }
+    for (const mt of fragment.matchAll(/mime_type <> ALL\(\$(\d+)::text\[\]\)/g)) {
+      results.push(!arrayParam(mt[1]).includes(m));
+    }
+    if (results.length === 0) throw new Error(`Unhandled clause fragment: ${fragment}`);
+    return results.every(Boolean);
+  };
 
-  expect(db.lastQuery.text).toContain("mime_type ILIKE 'image/%'");
-  // text/* but NOT the code allowlist.
-  expect(db.lastQuery.text).toContain("mime_type ILIKE 'text/%' AND mime_type <> ALL($");
+  return clauses.some(evalFragment);
+}
+
+test("mimeClass SQL predicate agrees with classifyMimeClass for every class and mime type", () => {
+  // A corpus that exercises each bucket, both code-allowlist members and
+  // adjacent text/* non-members (the drift-prone boundary).
+  const corpus = [
+    "image/png",
+    "image/svg+xml",
+    "application/pdf",
+    "application/json",
+    "text/javascript",
+    "text/x-python",
+    "text/x-typescript",
+    "application/x-sh",
+    "text/html",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/octet-stream",
+    "application/zip",
+    "audio/mpeg"
+  ];
+
+  for (const mime of corpus) {
+    const expected = classifyMimeClass(mime);
+    for (const cls of MIME_CLASSES) {
+      // A mime string must match exactly the class SQL for its canonical bucket
+      // and no other. This fails loudly if either duplicated CODE_MIME_TYPES
+      // list, or the SQL branch logic, drifts from classifyMimeClass.
+      expect(sqlClauseMatches(cls, mime)).toBe(cls === expected);
+    }
+  }
 });

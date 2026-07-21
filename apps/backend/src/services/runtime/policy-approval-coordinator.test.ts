@@ -142,6 +142,111 @@ test("resolve for an unknown approval id returns 'missing'", async () => {
   expect(result).toBe("missing");
 });
 
+test("resolving one of two concurrent pending approvals leaves the other untouched", async () => {
+  // Everything is keyed by approvalId in one Map with per-entry timers/signal.
+  // Two parallel task subagents can each hit a gated tool, so two approvals are
+  // held at once. Resolving A must settle A only (its own decision) and leave B
+  // fully pending — a mis-keyed timer/decision would settle the wrong hold.
+  const { coordinator, approvals, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
+  const promiseA = coordinator.request({ ...baseRequest, toolName: "github_write_file" });
+  const promiseB = coordinator.request({ ...baseRequest, toolName: "notion_create_page" });
+  await vi.advanceTimersByTimeAsync(0);
+
+  // Two distinct pending approvals were prompted.
+  const ids = pushed
+    .filter((p) => p.event.type === "framework:approval_required")
+    .map((p) => (p.event as { approvalId: string }).approvalId);
+  expect(new Set(ids).size).toBe(2);
+  const [idA, idB] = ids;
+  expect(coordinator.has(idA)).toBe(true);
+  expect(coordinator.has(idB)).toBe(true);
+
+  // Resolve A → only A settles; B is still held and its row still pending.
+  await coordinator.resolve({ tenantId: "t1", approvalId: idA, userId: "u1", decision: "approve" });
+  await expect(promiseA).resolves.toBe("approve");
+  expect(coordinator.has(idA)).toBe(false);
+  expect(coordinator.has(idB)).toBe(true);
+  expect(approvals.rows.get(idB)?.status).toBe("pending");
+
+  // Now expire B independently → only B is affected (A already settled approved).
+  await vi.advanceTimersByTimeAsync(10_000);
+  await expect(promiseB).resolves.toBe("expired");
+  expect(approvals.rows.get(idA)?.status).toBe("approved");
+  expect(approvals.rows.get(idB)?.status).toBe("expired");
+});
+
+test("resolve by a different userId returns 'missing', leaves the hold intact, and does not dispatch", async () => {
+  // Ownership gate: Policy Center require_approval is actor confirmation — only
+  // the initiating user (u1) may decide. A decision from another user (u2) with
+  // the correct approvalId must be treated as if the approval doesn't exist.
+  const { coordinator, approvals, audit, pushed } = build();
+  const promise = coordinator.request(baseRequest);
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  const resolveSpy = vi.spyOn(approvals, "resolve");
+
+  const result = await coordinator.resolve({
+    tenantId: "t1",
+    approvalId,
+    userId: "u2",
+    decision: "approve"
+  });
+
+  expect(result).toBe("missing");
+  // The tool call is NOT dispatched: no DB flip, no approval audit, the row is
+  // still pending, and the coordinator still holds the entry.
+  expect(resolveSpy).not.toHaveBeenCalled();
+  expect(approvals.rows.get(approvalId)?.status).toBe("pending");
+  expect(audit.events.some((e) => e.type === "approval.approved")).toBe(false);
+  expect(coordinator.has(approvalId)).toBe(true);
+
+  // The held promise is untouched — the legitimate owner can still decide, which
+  // proves the wrong-user call left the pending entry fully intact.
+  const owner = await coordinator.resolve({
+    tenantId: "t1",
+    approvalId,
+    userId: "u1",
+    decision: "approve"
+  });
+  expect(owner).toBe("resolved");
+  await expect(promise).resolves.toBe("approve");
+});
+
+test("resolve by a different tenantId returns 'missing', leaves the hold intact, and does not dispatch", async () => {
+  // The tenant half of the ownership gate: a decision carrying the correct
+  // approvalId and userId but a foreign tenant must not settle the hold.
+  const { coordinator, approvals, audit, pushed } = build();
+  const promise = coordinator.request(baseRequest);
+  await vi.advanceTimersByTimeAsync(0);
+  const approvalId = (pushed[0].event as { approvalId: string }).approvalId;
+
+  const resolveSpy = vi.spyOn(approvals, "resolve");
+
+  const result = await coordinator.resolve({
+    tenantId: "t2",
+    approvalId,
+    userId: "u1",
+    decision: "approve"
+  });
+
+  expect(result).toBe("missing");
+  expect(resolveSpy).not.toHaveBeenCalled();
+  expect(approvals.rows.get(approvalId)?.status).toBe("pending");
+  expect(audit.events.some((e) => e.type === "approval.approved")).toBe(false);
+  expect(coordinator.has(approvalId)).toBe(true);
+
+  // The rightful tenant/user can still resolve it afterwards.
+  const owner = await coordinator.resolve({
+    tenantId: "t1",
+    approvalId,
+    userId: "u1",
+    decision: "approve"
+  });
+  expect(owner).toBe("resolved");
+  await expect(promise).resolves.toBe("approve");
+});
+
 test("TTL expiry resolves with 'expired', expires the row, and notifies the turn", async () => {
   const { coordinator, approvals, audit, pushed } = build({ ttlMs: 10_000, reminderFraction: 0 });
   const promise = coordinator.request(baseRequest);

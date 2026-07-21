@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { MODEL_PROVIDERS } from "../primitives.js";
 import { IsoDateSchema } from "./_helpers.js";
 
 export const RuntimeSessionConfigSummarySchema = z.object({
@@ -32,9 +33,7 @@ export const RuntimeSessionSummarySchema = z.object({
   lastActiveAt: IsoDateSchema.nullable(),
   updatedAt: IsoDateSchema,
   configSummary: RuntimeSessionConfigSummarySchema,
-  runtimeProvider: z.string().nullable(),
-  // Claude adapter execution mode — "local" or "e2b". null for Codex or older rows.
-  mode: z.enum(["local", "e2b"]).nullable()
+  runtimeProvider: z.literal("deep-agents").nullable()
 }).passthrough();
 export type RuntimeSessionSummary = z.infer<typeof RuntimeSessionSummarySchema>;
 
@@ -54,14 +53,16 @@ export type RuntimeRolloutResponse = z.infer<typeof RuntimeRolloutResponseSchema
 
 export const AdminRuntimeConfigSchema = z.object({
   e2bTemplateId: z.string(),
-  codexModel: z.string(),
-  claudeModel: z.string(),
+  // Retained for backward compatibility; prefer `platformProviders`, which
+  // reports the full per-provider platform-key map (an OpenAI/Google/Z.AI-only
+  // deployment reads "missing" on the Anthropic flag alone while working fine).
   anthropicKeyConfigured: z.boolean(),
-  openaiKeyConfigured: z.boolean()
+  /** Providers with a platform-level env key configured (tenant-independent). */
+  platformProviders: z.array(z.enum(MODEL_PROVIDERS))
 }).passthrough();
 export type AdminRuntimeConfig = z.infer<typeof AdminRuntimeConfigSchema>;
 
-// Live in-memory Codex process detail (tenant-scoped). The unauthenticated
+// Live in-memory session-runtime detail (tenant-scoped). The unauthenticated
 // /health endpoint exposes only aggregate counts; this is the admin view.
 export const AdminRuntimeHealthResponseSchema = z.object({
   runtimes: z.array(
@@ -70,66 +71,9 @@ export const AdminRuntimeHealthResponseSchema = z.object({
       runtimeId: z.string(),
       healthStatus: z.enum(["starting", "healthy", "terminating", "terminated", "error"]),
       lastActiveAt: z.string(),
-      hasActiveTurn: z.boolean(),
-      processId: z.number().nullable(),
-      port: z.number(),
-      isAlive: z.boolean()
+      hasActiveTurn: z.boolean()
     }).passthrough()
   )
 }).passthrough();
 export type AdminRuntimeHealthResponse = z.infer<typeof AdminRuntimeHealthResponseSchema>;
 
-// ── Codex/OpenAI runtime diagnostic (admin debug page) ──────────────────────
-
-const ProbeOkSchema = z.object({
-  ok: z.literal(true),
-  status: z.number(),
-  statusText: z.string()
-}).passthrough();
-const ProbeErrSchema = z.object({
-  ok: z.literal(false),
-  error: z.string()
-}).passthrough();
-const ProbeSkippedSchema = z.object({ skipped: z.literal(true) }).passthrough();
-
-const StreamingProbeOkSchema = z.object({
-  ok: z.literal(true),
-  status: z.number(),
-  statusText: z.string(),
-  stream: z.boolean(),
-  firstChunkBytes: z.number().nullable(),
-  completedStream: z.boolean().nullable(),
-  totalChunkBytes: z.number().nullable()
-}).passthrough();
-const StreamingProbeErrSchema = z.object({
-  ok: z.literal(false),
-  stream: z.boolean(),
-  error: z.string()
-}).passthrough();
-
-export const RuntimeOpenAiDiagnosticSchema = z.object({
-  checkedAt: IsoDateSchema,
-  home: z.string(),
-  codexAuth: z.object({
-    openAiApiKeyPresent: z.boolean(),
-    authFilePresent: z.boolean(),
-    configFilePresent: z.boolean()
-  }).passthrough(),
-  dns: z.union([
-    z.object({
-      ok: z.literal(true),
-      addresses: z.array(z.object({
-        address: z.string(),
-        family: z.number()
-      }).passthrough())
-    }).passthrough(),
-    z.object({ ok: z.literal(false), error: z.string() }).passthrough()
-  ]),
-  probes: z.object({
-    unauthenticated: z.union([ProbeSkippedSchema, ProbeOkSchema, ProbeErrSchema]),
-    authenticated: z.union([ProbeSkippedSchema, ProbeOkSchema, ProbeErrSchema]),
-    responsesNonStreaming: z.union([ProbeSkippedSchema, StreamingProbeOkSchema, StreamingProbeErrSchema]).optional(),
-    responsesStreaming: z.union([ProbeSkippedSchema, StreamingProbeOkSchema, StreamingProbeErrSchema]).optional()
-  }).passthrough()
-}).passthrough();
-export type RuntimeOpenAiDiagnostic = z.infer<typeof RuntimeOpenAiDiagnosticSchema>;

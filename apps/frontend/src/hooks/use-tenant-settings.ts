@@ -13,7 +13,6 @@ import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
 export type TenantSettingsInput = {
-  enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;

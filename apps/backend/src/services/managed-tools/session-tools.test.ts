@@ -136,6 +136,14 @@ test("session_context: invalid recentMessageCount falls back to 4", async () => 
   expect((result as { recentMessages: unknown[] }).recentMessages.length).toBe(4);
 });
 
+test("session_context: echoes the context's runtimePolicyId in the result", async () => {
+  // runtimePolicyId is a declared output-contract field; assert the plain
+  // passthrough so a dropped/renamed field doesn't ship uncaught.
+  const tool = findTool(baseDeps, "session_context");
+  const result = await tool.handler({ context: ctx({ runtimePolicyId: "policy-xyz" }), arguments: {} });
+  expect((result as { runtimePolicyId: string }).runtimePolicyId).toBe("policy-xyz");
+});
+
 // list_artifacts
 
 test("list_artifacts throws when session not active", async () => {

@@ -2,7 +2,7 @@ import type { OverviewStat } from "@cogniplane/shared-types";
 import { SECTION_LABEL } from "../../lib/ui-tokens";
 
 const STAT_CARD =
-  "rounded-lg border border-outline-variant bg-surface-container-lowest p-4 transition-colors hover:border-outline";
+  "rounded-lg border border-outline-variant bg-surface-container-lowest p-5 transition-colors hover:border-outline";
 
 export function AdminOverviewSection(input: {
   error: string | null;
@@ -15,7 +15,7 @@ export function AdminOverviewSection(input: {
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       <section
         id="overview"
-        className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4"
+        className="grid grid-cols-1 gap-4 pt-5 sm:grid-cols-2 lg:grid-cols-4"
       >
         {overviewStats.map((stat) => (
           <article className={STAT_CARD} key={stat.label}>

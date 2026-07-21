@@ -30,6 +30,12 @@ const skillSelectSql = `
     ON revision.skill_revision_id = skill.active_revision_id
 `;
 
+const skillVisibilityOrderSql = `
+  skill.skill_id,
+  (skill.tenant_id = $2::text) DESC,
+  skill.updated_at DESC
+`;
+
 export class SkillConfigStore {
   constructor(private readonly db: Pool) {}
 
@@ -37,11 +43,38 @@ export class SkillConfigStore {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
-          ${skillSelectSql}
-          WHERE ($1::boolean = TRUE OR skill.enabled = TRUE)
-            AND ($3::boolean = TRUE OR skill.is_published = TRUE)
-            AND skill.tenant_id IN ($2::text, 'system')
-          ORDER BY skill.skill_name ASC, skill.updated_at DESC
+          SELECT *
+          FROM (
+            SELECT DISTINCT ON (skill.skill_id)
+              skill.tenant_id,
+              skill.skill_id,
+              skill.skill_name,
+              skill.description,
+              COALESCE(revision.metadata ->> 'instructions', '') AS instructions,
+              skill.version,
+              COALESCE(revision.bundle_hash, '') AS content_hash,
+              skill.enabled,
+              skill.is_published,
+              skill.created_by,
+              skill.created_at,
+              skill.updated_at,
+              revision.skill_revision_id AS active_revision_id,
+              revision.source_type AS active_source_type,
+              revision.bundle_name AS active_bundle_name,
+              revision.bundle_storage_uri AS active_bundle_storage_uri,
+              revision.bundle_hash AS active_bundle_hash,
+              revision.validation_status AS active_validation_status,
+              revision.review_status AS active_review_status,
+              revision.metadata -> 'associatedToolIds' AS active_associated_tool_ids
+            FROM admin_skills AS skill
+            LEFT JOIN admin_skill_revisions AS revision
+              ON revision.skill_revision_id = skill.active_revision_id
+            WHERE ($1::boolean = TRUE OR skill.enabled = TRUE)
+              AND ($3::boolean = TRUE OR skill.is_published = TRUE)
+              AND skill.tenant_id IN ($2::text, 'system')
+            ORDER BY ${skillVisibilityOrderSql}
+          ) AS visible_skills
+          ORDER BY skill_name ASC, updated_at DESC
         `,
         [includeDisabled, tenantId, isBetaTester]
       );
@@ -57,6 +90,7 @@ export class SkillConfigStore {
           ${skillSelectSql}
           WHERE skill.skill_id = $1
             AND skill.tenant_id IN ($2::text, 'system')
+          ORDER BY (skill.tenant_id = $2::text) DESC
           LIMIT 1
         `,
         [skillId, tenantId]

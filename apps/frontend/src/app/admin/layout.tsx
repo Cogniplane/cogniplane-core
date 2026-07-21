@@ -18,6 +18,10 @@ const ADMIN_SECTION_TITLES: Record<string, { title: string; subtitle: string }> 
     title: "Privacy",
     subtitle: "PII detection and transformation policy applied before the runtime sees user content."
   },
+  pii: {
+    title: "PII activity",
+    subtitle: "Detection scans, findings, and outcomes across the tenant."
+  },
   organization: { title: "Organization", subtitle: "Tenant profile and platform defaults." },
   skills: { title: "Skills", subtitle: "Manage the skill library exposed to the runtime." },
   mcp: { title: "MCP servers", subtitle: "Register and configure gateway routes." },
@@ -65,7 +69,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
           basePath="/admin"
         />
 
-        <div className="min-w-0 px-4 pb-10 pt-4 md:px-8 md:pt-6">
+        <div className="mx-auto w-full min-w-0 max-w-6xl px-4 pb-10 pt-4 md:px-8 md:pt-6">
           <ConsolePageHeader
             eyebrow="Admin"
             title={ADMIN_SECTION_TITLES[activeSectionId]?.title ?? "Control plane"}

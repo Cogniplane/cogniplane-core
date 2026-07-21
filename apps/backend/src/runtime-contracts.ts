@@ -1,5 +1,7 @@
+import type { BaseEvent } from "@ag-ui/client";
+
 import { SseFrameSchemas, type SseEventType } from "@cogniplane/shared-types";
-import type { EffortLevel } from "@cogniplane/shared-types";
+import type { EffortLevel, UiResource } from "@cogniplane/shared-types";
 import type { ResolvedRuntimePolicy } from "./services/admin-config-records.js";
 
 export type RuntimeSessionRef = {
@@ -34,9 +36,16 @@ export type RuntimeToolCall = {
   output: string;
   exitCode: number | null;
   durationMs: number | null;
+  // MCP Apps UI resource blocks returned by the tool, if any.
+  uiResources?: UiResource[];
 };
 
-export type RuntimeApprovalKind = "command_execution" | "file_change" | "permissions";
+// `mcp_tool` is distinct from `command_execution` on purpose: the adapter's
+// HITL interceptor gates ALL tool kinds, so an MCP tool call and a shell
+// command must not share a "remember for this turn" bucket — otherwise
+// approving one benign shell command would silently auto-approve every MCP
+// write for the rest of the turn.
+export type RuntimeApprovalKind = "command_execution" | "file_change" | "permissions" | "mcp_tool";
 export type RuntimeApprovalDecision = "approve" | "reject";
 
 // How a Policy Center–routed tool-call approval resolved: a human decision or a
@@ -133,9 +142,10 @@ export type RuntimeEvent =
        * persisted and the UI renders an in-bubble "Stopped" badge instead of
        * a red error.
        *
-       * Token usage + cost are NOT carried on this event. The LLM proxy
-       * persists them directly to `messages.cost_usd` / `messages.input_tokens`
-       * / etc., and the frontend reads them from the messages row.
+       * Token usage + cost are NOT carried on this event. The in-process
+       * runtime adapter persists them directly to `messages.cost_usd` /
+       * `messages.input_tokens` / etc., and the frontend reads them from the
+       * messages row.
        */
       interrupted?: boolean;
     }
@@ -170,6 +180,7 @@ type ToolResultPayload = {
   output: string;
   exitCode: number | null;
   durationMs: number | null;
+  uiResources?: UiResource[];
 };
 
 function toolResultPayload(
@@ -188,7 +199,10 @@ function toolResultPayload(
     input: toolCall.input,
     output: overrides?.output ?? toolCall.output,
     exitCode: overrides?.exitCode !== undefined ? overrides.exitCode : toolCall.exitCode,
-    durationMs: overrides?.durationMs !== undefined ? overrides.durationMs : toolCall.durationMs
+    durationMs: overrides?.durationMs !== undefined ? overrides.durationMs : toolCall.durationMs,
+    ...(toolCall.uiResources && toolCall.uiResources.length > 0
+      ? { uiResources: toolCall.uiResources }
+      : {})
   };
 }
 
@@ -375,23 +389,25 @@ export function extractToolResultPayload(
   return toolResultPayload(toolCall, overrides);
 }
 
+// Deep Agents is the sole runtime adapter (the Codex/Claude-Code adapters and
+// their registry were retired in 2026-06/07). The methods below are therefore
+// all required — the optional `?.`-guarded surface that once let the framework
+// fan actions across multiple providers is gone.
 export interface RuntimeAdapter {
   readonly id: string;
   hasActiveTurn(sessionId: string): boolean;
   /**
-   * Returns true when this adapter currently holds in-memory state for the
-   * given session (e.g. a live child process or SDK query). Used by routes
-   * that must route session-level actions to the owning adapter instead of
-   * fanning out to every registered runtime.
+   * True when this adapter holds live in-memory state for the session. Used to
+   * route file-op managed tools only to a runtime that owns the active turn's
+   * workspace (see resolveOwningFileAdapter).
    */
-  hasSession?(sessionId: string): boolean;
+  hasSession(sessionId: string): boolean;
   /**
-   * Returns true when this adapter owns the specific runtime instance for the
-   * given session. This is stricter than `hasSession` and lets the framework
-   * disambiguate when multiple providers have live state for the same
-   * conversation.
+   * True when this adapter owns the specific runtime instance for the session —
+   * stricter than `hasSession`, used to disambiguate a stale workspace from the
+   * live one.
    */
-  hasRuntime?(sessionId: string, runtimeId: string): boolean;
+  hasRuntime(sessionId: string, runtimeId: string): boolean;
   createSession(input: { tenantId: string; sessionId: string; userId: string }): Promise<RuntimeSessionRef>;
   runMessage(
     session: RuntimeSessionRef,
@@ -406,6 +422,25 @@ export interface RuntimeAdapter {
       onBeforeTurn?: () => Promise<void>;
     }
   ): AsyncIterable<RuntimeEvent>;
+  /**
+   * AG-UI counterpart to {@link runMessage}: drives one turn and yields AG-UI
+   * `BaseEvent`s (the wire CopilotKit consumes) instead of `RuntimeEvent`s.
+   * Same session/tenant/toolContext/approval plane; only the emitted vocabulary
+   * differs. Declared here so the `?format=agui` route passes the adapter to
+   * `streamAssistantReplyAGUI` without a cast — signature drift is a type error.
+   */
+  runMessageAGUI(
+    session: RuntimeSessionRef,
+    input: {
+      prompt: string;
+      userInputs?: RuntimeUserInput[];
+      toolContextId: string | null;
+      assistantMessageId?: string | null;
+      model?: string;
+      effort?: RuntimeReasoningEffort;
+      onBeforeTurn?: () => Promise<void>;
+    }
+  ): AsyncIterable<BaseEvent>;
   abortSession(input: { tenantId: string; sessionId: string; userId: string }): Promise<void>;
   /**
    * Stop the in-flight turn for `sessionId` while keeping the session warm.
@@ -416,25 +451,24 @@ export interface RuntimeAdapter {
    *   - leave the runtime/session itself alive (do NOT shut the process down) so
    *     the user can immediately send a follow-up message in the same context.
    */
-  interruptTurn?(input: {
+  interruptTurn(input: {
     tenantId: string;
     sessionId: string;
     userId: string;
   }): Promise<"interrupted" | "no_active_turn">;
-  readRuntimeFile?(sessionId: string, filePath: string): Promise<Uint8Array>;
+  readRuntimeFile(sessionId: string, filePath: string): Promise<Uint8Array>;
   /**
-   * Optional: size of a workspace file without reading it. Used to reject
-   * oversized `write_artifact` filePath inputs before buffering the bytes.
+   * Size of a workspace file without reading it. Used to reject oversized
+   * `write_artifact` filePath inputs before buffering the bytes.
    */
-  statRuntimeFile?(sessionId: string, filePath: string): Promise<{ sizeBytes: number }>;
-  writeRuntimeFile?(sessionId: string, filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<string>;
+  statRuntimeFile(sessionId: string, filePath: string): Promise<{ sizeBytes: number }>;
+  writeRuntimeFile(sessionId: string, filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<string>;
   /**
-   * Forward an approval decision to whichever in-flight turn is waiting on it.
-   * Returns `"resolved"` when this adapter owned the approval, `"missing"`
-   * when it didn't (the route falls through to the next adapter). Optional:
-   * adapters that have no approval flow omit it.
+   * Forward an approval decision to the in-flight turn waiting on it. Returns
+   * `"resolved"` when the approval was owned, `"missing"` when no matching
+   * pending approval exists.
    */
-  resolveApproval?(input: {
+  resolveApproval(input: {
     tenantId: string;
     approvalId: string;
     userId: string;
@@ -451,39 +485,37 @@ export interface RuntimeAdapter {
    * `POST /approvals/:id/decision` → {@link resolveApproval} path settles it.
    *
    * Returns the disposition the gateway uses to allow or refuse the tool call.
-   * Adapters with no active-turn/SSE plumbing omit it; the gateway then
-   * degrades an enforce-mode require_approval to a deny.
+   * With no active turn to host the prompt, the gateway degrades an
+   * enforce-mode require_approval to a deny.
    */
-  requestPolicyApproval?(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition>;
+  requestPolicyApproval(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition>;
   /**
-   * Tear down every active runtime owned by this adapter for `tenantId` after
-   * tenant settings that are snapshotted into runtime config change. The next
-   * turn rebuilds with the new policy/tool/runtime settings.
+   * Delete durable per-session runtime data (e.g. checkpointer threads) after
+   * the session row itself is deleted. Unlike {@link abortSession} — which
+   * also fires on idle teardown and config invalidation and must NOT destroy
+   * conversation state — this is called only from session deletion. Idempotent.
    */
-  invalidateTenantRuntimes?(tenantId: string): Promise<string[]>;
+  purgeSessionData(input: {
+    tenantId: string;
+    sessionId: string;
+    userId: string;
+  }): Promise<void>;
   /**
-   * Tear down every active runtime owned by this adapter for `tenantId` after
-   * an admin flips an integration toggle. The next turn rebuilds with the new
-   * tool catalog. Returns the session ids that were invalidated. Optional:
-   * adapters with no integration coupling omit it.
+   * Tear down every active runtime for `tenantId` after tenant settings that
+   * are snapshotted into runtime config change (also covers admin integration
+   * toggles). The next turn rebuilds with the new policy/tool settings. Returns
+   * the invalidated session ids.
    */
-  invalidateIntegrationRuntimesForTenant?(
-    tenantId: string,
-    integrationId: string
-  ): Promise<string[]>;
+  invalidateTenantRuntimes(tenantId: string): Promise<string[]>;
   /**
-   * Tear down every active runtime this adapter owns for a specific user after
-   * they (re)connect or disconnect an integration (the credentials in their
-   * live sandbox are now stale). User-scoped counterpart to
-   * {@link invalidateIntegrationRuntimesForTenant}; the gateway fans a single
-   * integration reconnect across every registered adapter so a tenant on Claude
-   * also gets its Claude sessions torn down. Optional: adapters with no
-   * integration coupling omit it.
+   * Tear down every active runtime for a specific user after they (re)connect
+   * or disconnect an integration (the credentials in their live sandbox are now
+   * stale). User-scoped counterpart to {@link invalidateTenantRuntimes}.
    */
-  invalidateRuntimesForIntegration?(
+  invalidateRuntimesForIntegration(
     tenantId: string,
     userId: string,
     integrationId: string
   ): Promise<string[]>;
-  close?(): Promise<void>;
+  close(): Promise<void>;
 }

@@ -188,7 +188,7 @@ export class PolicyService {
    *                                degrades to a block.
    *
    * The gateway holds its HTTP response open while this awaits the approval —
-   * both Codex and Claude call managed tools over HTTP, so an `await` here is a
+   * the agent loop calls managed tools over HTTP, so an `await` here is a
    * legitimate pause without touching the runtime's native approval coordinator
    * (which gates shell/file actions on an entirely separate path).
    */

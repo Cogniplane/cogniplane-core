@@ -7,7 +7,7 @@ import { uuidv7 } from "../lib/uuid.js";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 
-import { phase4RuntimePolicy } from "../test-helpers/phase4-runtime-policy.js";
+import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
 import {
   createTestApp,
@@ -660,38 +660,6 @@ test("uploads a PDF as a single visible artifact and keeps conversion on demand"
   expect(auditEvents.events.filter((event) => event.type === "artifact_uploaded").length).toBe(1);
 });
 
-test("creates a generated artifact from an assistant message", async () => {
-  const { app, sessions, messages } = await createTestApp();
-  onTestFinished(async () => {
-        await app.close();
-      });
-
-  const session = await sessions.create("test-tenant", "platform-user", "Generated artifact session");
-  const assistantMessage = await messages.create({
-    tenantId: "test-tenant",
-    sessionId: session.sessionId,
-    userId: "platform-user",
-    role: "assistant",
-    status: "completed",
-    content: "Report output"
-  });
-
-  const response = await app.inject({
-    method: "POST",
-    url: `/messages/${assistantMessage.messageId}/artifact`,
-    headers: {
-      "x-user-id": "platform-user"
-    },
-    payload: {
-      name: "report.md"
-    }
-  });
-
-  expect(response.statusCode).toBe(201);
-  expect(response.json().artifact.artifactType).toBe("generated");
-  expect(response.json().artifact.artifactName).toBe("report.md");
-});
-
 test("lists pending approvals and resolves a decision", async () => {
   const { app, approvals, runtimeManager } = await createTestApp();
   const sessionId = uuidv7();
@@ -829,7 +797,7 @@ test("managed MCP tools/list only exposes tools enabled by the active runtime po
     sessionId,
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
+        ...testRuntimePolicy,
         enabledToolIds: ["session_context", "list_artifacts"],
         enabledMcpServers: ["managed-session-context"]
       }
@@ -944,7 +912,7 @@ test("denies managed MCP tools that are not enabled by the runtime policy", asyn
     runtimePolicyId: "baseline-chat",
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
+        ...testRuntimePolicy,
         id: "baseline-chat",
         label: "Baseline chat",
         allowCommandExecution: false,
@@ -995,7 +963,7 @@ test("allows write_artifact through the baseline runtime policy", async () => {
     runtimePolicyId: "baseline-chat",
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
+        ...testRuntimePolicy,
         id: "baseline-chat",
         label: "Baseline chat",
         allowCommandExecution: false,
@@ -1060,7 +1028,7 @@ test("read-only managed tools are not blocked when autoApproveReadOnlyTools is o
     sessionId: session.sessionId,
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
+        ...testRuntimePolicy,
         autoApproveReadOnlyTools: false
       }
     }
@@ -1140,9 +1108,9 @@ test("forwards proxy MCP calls with validated context headers", async () => {
   const toolContext = await createTestToolContext(toolContexts, {
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
-        enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"],
-        enabledToolIds: [...phase4RuntimePolicy.enabledToolIds, "test-proxy"]
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"],
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "test-proxy"]
       }
     }
   });
@@ -1459,48 +1427,24 @@ test("GET /models returns the hardcoded model list", async () => {
   expect(response.statusCode).toBe(200);
   const body = response.json() as {
     models: Array<{ id: string; displayName: string; description: string; isDefault: boolean; provider: string; supportedEfforts: string[] }>;
-    enabledRuntimeProviders: string[];
-    defaultRuntimeProvider: string;
     showEffortSelector: boolean;
   };
   expect(Array.isArray(body.models)).toBeTruthy();
   expect(body.models.length > 0).toBeTruthy();
-  expect(body.enabledRuntimeProviders).toEqual(["codex"]);
-  expect(body.defaultRuntimeProvider).toBe("codex");
   expect(body.showEffortSelector).toBe(false);
   const defaultModel = body.models.find((m) => m.isDefault);
   expect(defaultModel).toBeTruthy();
-  expect(defaultModel.id).toBe("gpt-5.4-mini");
-  expect(defaultModel.supportedEfforts).toEqual(["none", "low", "medium", "high", "xhigh"]);
+  expect(defaultModel.id).toBe("deepagents/claude-sonnet-5");
+  // Reasoning-capable models now advertise effort levels (bead i52g); the
+  // Anthropic default supports the none/low/medium/high scale.
+  expect(defaultModel.supportedEfforts).toEqual(["none", "low", "medium", "high"]);
 });
 
-test("GET /models returns both provider families when both are enabled", async () => {
-  const { app } = await createTestApp({
-    tenantRuntimeProvider: "claude-code",
-    enabledRuntimeProviders: ["codex", "claude-code"]
-  });
-  onTestFinished(async () => { await app.close(); });
-
-  const response = await app.inject({
-    method: "GET",
-    url: "/models",
-    headers: { "x-user-id": "platform-user" }
-  });
-
-  expect(response.statusCode).toBe(200);
-  const body = response.json() as {
-    models: Array<{ id: string; provider: string; isDefault: boolean }>;
-    enabledRuntimeProviders: string[];
-    defaultRuntimeProvider: string;
-    showEffortSelector: boolean;
-  };
-  expect(body.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-  expect(body.defaultRuntimeProvider).toBe("claude-code");
-  expect(body.showEffortSelector).toBe(false);
-  expect(body.models[0]?.provider).toBe("claude-code");
-  expect(body.models.some((model) => model.provider === "codex")).toBeTruthy();
-  expect(body.models.some((model) => model.provider === "claude-code")).toBeTruthy();
-});
+// Per-provider filtering of /models is covered comprehensively by
+// routes/models.test.ts (anthropic-only, single-provider, empty-state). The
+// former "lists every model with the anthropic provider" duplicate here has
+// been dropped; the default-model contract test above is the unique coverage
+// this integration app adds.
 
 test("POST /messages accepts optional model override", async () => {
   const { app, runtimeManager } = await createTestApp();
@@ -1516,21 +1460,23 @@ test("POST /messages accepts optional model override", async () => {
 
   runtimeManager.queueEvents(session.sessionId, [
     { type: "response.created", responseId: "resp-1" },
-    { type: "response.completed", responseId: "resp-1", status: "completed", tokenUsage: undefined, costUsd: undefined, modelName: "gpt-5.2" }
+    { type: "response.completed", responseId: "resp-1", status: "completed", tokenUsage: undefined, costUsd: undefined, modelName: "deepagents/claude-haiku-4-5" }
   ]);
 
   const msgResponse = await app.inject({
     method: "POST",
     url: "/messages",
     headers: { "x-user-id": "platform-user" },
-    payload: { sessionId: session.sessionId, text: "hello", model: "gpt-5.2" }
+    payload: { sessionId: session.sessionId, text: "hello", model: "deepagents/claude-haiku-4-5" }
   });
 
   expect(msgResponse.statusCode).toBe(200);
-  expect(runtimeManager.runMessageInputs.at(-1)?.model).toBe("gpt-5.2");
+  expect(runtimeManager.runMessageInputs.at(-1)?.model).toBe("deepagents/claude-haiku-4-5");
 });
 
-test("POST /messages forwards an effort override when the model supports it", async () => {
+
+
+test("POST /messages passes a supported effort through to the runtime", async () => {
   const { app, runtimeManager } = await createTestApp();
   onTestFinished(async () => { await app.close(); });
 
@@ -1538,24 +1484,25 @@ test("POST /messages forwards an effort override when the model supports it", as
     method: "POST",
     url: "/sessions",
     headers: { "x-user-id": "platform-user" },
-    payload: { name: "effort-override-test" }
+    payload: { name: "effort-passthrough-test" }
   });
   const { session } = createResponse.json() as { session: { sessionId: string } };
 
   runtimeManager.queueEvents(session.sessionId, [
-    { type: "response.created", responseId: "resp-effort" },
-    { type: "response.completed", responseId: "resp-effort" }
+    { type: "response.created", responseId: "resp-1" },
+    { type: "response.completed", responseId: "resp-1", status: "completed", tokenUsage: undefined, costUsd: undefined, modelName: "deepagents/claude-sonnet-5" }
   ]);
 
   const msgResponse = await app.inject({
     method: "POST",
     url: "/messages",
     headers: { "x-user-id": "platform-user" },
-    payload: { sessionId: session.sessionId, text: "hello", model: "gpt-5.4", effort: "xhigh" }
+    payload: { sessionId: session.sessionId, text: "hello", model: "deepagents/claude-sonnet-5", effort: "medium" }
   });
 
   expect(msgResponse.statusCode).toBe(200);
-  expect(runtimeManager.runMessageInputs.at(-1)?.effort).toBe("xhigh");
+  // Effort reaches runMessage so the graph can bake it into initChatModel.
+  expect(runtimeManager.runMessageInputs.at(-1)?.effort).toBe("medium");
 });
 
 test("POST /messages rejects an unsupported effort for the selected model", async () => {
@@ -1574,11 +1521,11 @@ test("POST /messages rejects an unsupported effort for the selected model", asyn
     method: "POST",
     url: "/messages",
     headers: { "x-user-id": "platform-user" },
-    payload: { sessionId: session.sessionId, text: "hello", model: "gpt-5.1-codex-mini", effort: "xhigh" }
+    payload: { sessionId: session.sessionId, text: "hello", model: "deepagents/claude-sonnet-5", effort: "xhigh" }
   });
 
   expect(msgResponse.statusCode).toBe(400);
-  expect(msgResponse.body).toMatch(/gpt-5\.1-codex-mini/);
+  expect(msgResponse.body).toMatch(/deepagents\/claude-sonnet-5/);
 });
 
 test("GET /artifacts/:id/preview-text returns extracted text for a ready PDF artifact", async () => {

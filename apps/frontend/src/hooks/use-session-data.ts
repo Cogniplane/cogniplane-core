@@ -34,6 +34,13 @@ export function useSessionData(input: {
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  // The session whose rows currently populate `messages`. Distinct from the
+  // query's `isSuccess` (which flips a render EARLIER, before the populate effect
+  // runs) and survives a cache-hit switch where `messages` still holds the prior
+  // session. Consumers seed UI (e.g. the CopilotChat transcript) from `messages`,
+  // so readiness must mean "messages belong to the selected session", not merely
+  // "the query resolved" — else the seed is stale or empty.
+  const [readySessionId, setReadySessionId] = useState<string | null>(null);
   const selectedSessionIdRef = useRef<string | null>(null);
   const refreshEpochRef = useRef(0);
 
@@ -61,6 +68,9 @@ export function useSessionData(input: {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setMessages([]);
     setArtifacts([]);
+    // Invalidate readiness immediately so a cache-hit switch can't seed UI from
+    // the prior session's messages before the populate effect swaps them.
+    setReadySessionId(null);
   }, [selectedSessionId]);
 
   // Populate from query data once it is available (sync on cache hit, async on miss).
@@ -74,6 +84,7 @@ export function useSessionData(input: {
     if (selectedSessionIdRef.current !== selectedSessionId) return;
     setMessages(data.messages);
     setArtifacts(data.artifacts);
+    setReadySessionId(selectedSessionId);
     replacePendingApprovals(data.approvals);
   }, [selectedSessionId, sessionDetailQuery.data, replacePendingApprovals]);
 
@@ -129,6 +140,7 @@ export function useSessionData(input: {
       if (selectedSessionIdRef.current !== sessionId) return;
       setMessages(nextData.messages);
       setArtifacts(nextData.artifacts);
+      setReadySessionId(sessionId);
       replacePendingApprovals(nextData.approvals);
     },
     [queryClient, replacePendingApprovals]
@@ -141,7 +153,10 @@ export function useSessionData(input: {
     setArtifacts,
     refreshSessionData,
     invalidateInFlightSessionRefreshes,
-    isSessionDataReady:
-      selectedSessionId !== null && sessionDetailQuery.isSuccess && sessionDetailQuery.data !== undefined
+    // Ready only once `messages` state actually holds the selected session's rows
+    // (set together with readySessionId in the populate effect / refresh), so a
+    // consumer seeding from `messages` in the same render sees this session's data
+    // — not the prior session's (cache-hit switch) or an empty pre-populate array.
+    isSessionDataReady: selectedSessionId !== null && readySessionId === selectedSessionId
   };
 }

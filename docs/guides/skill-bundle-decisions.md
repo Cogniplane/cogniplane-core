@@ -28,7 +28,13 @@ Store bundle-backed skill changes as immutable entries in `admin_skill_revisions
 - Registry reads require joining the active revision context.
 - Review, cleanup, and audit flows become much clearer.
 
-## ADR-002: Treat full bundle directories as the unit of runtime installation
+## ADR-002 (partially superseded): Treat full bundle directories as the unit of runtime installation
+
+> **Status note (2026-07):** bundle storage and revisions still work this way,
+> but the deep-agents runtime currently inlines only the SKILL.md instructions
+> text into the agent system prompt — companion files (`references/`,
+> `assets/`, `scripts/`) are not yet staged into the sandbox. Re-materializing
+> full bundles for the lazy sandbox is a tracked follow-up.
 
 ### Context
 
@@ -50,7 +56,14 @@ Install full validated bundle directories into runtime workspaces instead of fla
 - Validation must enforce allowed root layout before storage and installation.
 - Runtime manifests must track bundle-aware metadata such as `revisionId` and `bundleHash`.
 
-## ADR-003: Verify installed skills through Codex, not local assumptions
+## ADR-003 (superseded): Verify installed skills through Codex, not local assumptions
+
+> **Superseded by the runtime retirement (2026-07):** the Codex runtime and its
+> `skills/config/write` / `skills/list` discovery APIs are gone. With the
+> deep-agents runtime, enabled skills are inlined into the agent system prompt
+> at session start — there is no in-runtime skill discovery step to verify.
+> Kept for the rationale, which still applies to any future runtime with its
+> own skill-discovery surface.
 
 ### Context
 

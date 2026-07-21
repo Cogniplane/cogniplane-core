@@ -93,12 +93,8 @@ export function AdminPiiDashboard() {
   const isLoading = metricsQuery.isLoading;
 
   return (
-    <section id="pii" className="flex flex-col gap-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <p className={SECTION_LABEL}>Activity</p>
-          <h3 className="text-lg font-semibold text-on-surface">PII activity</h3>
-        </div>
+    <section id="pii" className="flex flex-col gap-5 pt-5">
+      <div className="flex justify-end">
         <Button type="button" variant="ghost" onClick={refresh}>
           Refresh
         </Button>

@@ -2,7 +2,7 @@ import { test, expect, onTestFinished } from "vitest";
 
 import type { PolicyRule } from "@cogniplane/shared-types";
 
-import { phase4RuntimePolicy } from "../test-helpers/phase4-runtime-policy.js";
+import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
 import { createTestApp, createTestToolContext } from "../test-helpers/routes-test-support.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
@@ -256,9 +256,9 @@ test("rejects a proxy tool call with a substituted toolContextId (no signed iden
     runtimeId: "runtime-victim",
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
-        enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"],
-        enabledToolIds: [...phase4RuntimePolicy.enabledToolIds, "test-proxy"]
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"],
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "test-proxy"]
       }
     }
   });
@@ -346,7 +346,7 @@ test("proxy tools/list returns no tools when the runtime policy forbids the serv
     sessionId,
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
+        ...testRuntimePolicy,
         // "test-proxy" intentionally absent from enabledMcpServers.
         enabledMcpServers: ["managed-session-context"]
       }
@@ -386,8 +386,8 @@ test("proxy tools/list forwards to the upstream when the runtime policy allows t
     sessionId,
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
-        enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"]
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"]
       }
     }
   });
@@ -491,9 +491,9 @@ test("proxy tool/call forwards the allowlisted X-Framework identity but never a 
     runtimeId: "runtime-header",
     metadata: {
       runtimePolicy: {
-        ...phase4RuntimePolicy,
-        enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"],
-        enabledToolIds: [...phase4RuntimePolicy.enabledToolIds, "test-proxy"]
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"],
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "test-proxy"]
       }
     }
   });
@@ -522,6 +522,59 @@ test("proxy tool/call forwards the allowlisted X-Framework identity but never a 
   expect(response.statusCode).toBe(200);
   expect(upstreamRequests.length).toBe(1);
   expect(upstreamRequests[0].headers["x-framework-user-id"]).toBe("header-user");
+});
+
+test("redacts credentials in a proxy tool result before returning to the runtime", async () => {
+  // A proxy upstream that echoes an OpenAI-shaped key back in its result body.
+  // The gateway must strip it at the boundary so it never lands in the durable
+  // LangGraph checkpoint (restored into model context on later turns).
+  const { upstream, upstreamUrl } = await createProxyMcpUpstream();
+  const { app, toolContexts } = await createTestApp({
+    proxyUpstreamUrl: `${upstreamUrl}/`
+  });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const sessionId = "session-proxy-redact";
+  const context = await createTestToolContext(toolContexts, {
+    sessionId,
+    userId: "redact-user",
+    runtimeId: "runtime-redact",
+    metadata: {
+      runtimePolicy: {
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"],
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "test-proxy"]
+      }
+    }
+  });
+
+  const secret = "sk-abcdefghijklmnopqrstuvwxyz0123";
+  const response = await app.inject({
+    method: "POST",
+    url: "/mcp/test-proxy",
+    headers: {
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "redact-user" })}`
+    },
+    payload: {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "echo",
+        arguments: {
+          toolContextId: context.toolContextId,
+          query: `here is the key ${secret}`
+        }
+      }
+    }
+  });
+
+  expect(response.statusCode).toBe(200);
+  const body = response.body;
+  expect(body).not.toContain(secret);
+  expect(body).toContain("[REDACTED]");
 });
 
 test("forwardRpc follows a bounded same-origin HTTPS redirect manually", async () => {
@@ -626,11 +679,11 @@ function seedRuntimePolicySnapshot(
   overrides: { policyEnforcementMode?: "monitor" | "enforce" } = {}
 ) {
   return {
-    ...phase4RuntimePolicy,
-    enabledMcpServers: [...phase4RuntimePolicy.enabledMcpServers, "test-proxy"],
-    enabledToolIds: [...phase4RuntimePolicy.enabledToolIds, "test-proxy"],
+    ...testRuntimePolicy,
+    enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"],
+    enabledToolIds: [...testRuntimePolicy.enabledToolIds, "test-proxy"],
     policyEnforcementMode:
-      overrides.policyEnforcementMode ?? phase4RuntimePolicy.policyEnforcementMode
+      overrides.policyEnforcementMode ?? testRuntimePolicy.policyEnforcementMode
   };
 }
 

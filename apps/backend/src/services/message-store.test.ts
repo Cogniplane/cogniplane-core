@@ -5,6 +5,7 @@ import type { Pool } from "../lib/db.js";
 import {
   MAX_MESSAGE_CONTENT_LENGTH,
   MAX_TOOL_RESULT_TEXT_LENGTH,
+  MAX_UI_RESOURCES_JSON_LENGTH,
   MessageStore
 } from "./message-store.js";
 
@@ -93,6 +94,8 @@ class CaptureMessageDatabase {
             output_text: String(values[13]),
             exit_code: values[14],
             duration_ms: values[15],
+            text_offset: values[16],
+            ui_resources: values[17] == null ? null : JSON.parse(String(values[17])),
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           }
@@ -148,6 +151,132 @@ test("MessageStore.upsertToolResult normalizes nullable tool fields for persiste
   expect(result.cwd).toBe(null);
 });
 
+test("MessageStore.upsertToolResult round-trips MCP UI resources as jsonb", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const uiResources = [{ uri: "ui://card", mimeType: "text/html", text: "<b>hi</b>" }];
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "widgets",
+    toolName: "render_card",
+    input: "",
+    output: "",
+    exitCode: null,
+    durationMs: 1,
+    uiResources
+  });
+
+  // $18 is bound as a jsonb string, not a raw JS array (node-pg would coerce an
+  // array to Postgres array syntax otherwise). ($17 is the nullable text_offset.)
+  expect(db.lastValues![17]).toBe(JSON.stringify(uiResources));
+  expect(result.uiResources).toEqual(uiResources);
+});
+
+test("MessageStore.upsertToolResult redacts secrets and neutralizes NUL bytes in UI resources", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const NUL = String.fromCharCode(0);
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "widgets",
+    toolName: "render_card",
+    input: "",
+    output: "",
+    exitCode: null,
+    durationMs: 1,
+    // A hostile/buggy widget echoes a Bearer token and a raw NUL byte into its HTML.
+    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: `Authorization: Bearer sekret-abc${NUL}end` }]
+  });
+
+  const persistedJson = String(db.lastValues![17]);
+  // Postgres jsonb rejects a backslash-u-0000 escape — the serialized value must not carry one.
+  expect(persistedJson).not.toContain("\\u0000");
+  // The credential is stripped from what actually reaches storage.
+  expect(persistedJson).not.toContain("sekret-abc");
+  expect(result.uiResources![0].text).toContain("[REDACTED]");
+  expect(result.uiResources![0].text).not.toContain(NUL);
+});
+
+test("MessageStore.upsertToolResult preserves literal backslash-u-0000 text in UI resources", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  // The widget source legitimately contains the six-character escape sequence
+  // (backslash u 0 0 0 0) as TEXT, not a raw NUL byte, so it must round-trip
+  // unchanged; only real NUL chars are neutralized.
+  const literal = "example: \\u0000 in a code block";
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "widgets",
+    toolName: "render_card",
+    input: "",
+    output: "",
+    exitCode: null,
+    durationMs: 1,
+    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: literal }]
+  });
+
+  expect(result.uiResources![0].text).toBe(literal);
+});
+
+
+test("MessageStore.upsertToolResult drops oversized UI resources instead of persisting them", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "widgets",
+    toolName: "render_card",
+    input: "",
+    output: "",
+    exitCode: null,
+    durationMs: 1,
+    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: "x".repeat(MAX_UI_RESOURCES_JSON_LENGTH) }]
+  });
+
+  expect(db.lastValues![17]).toBe(null);
+  expect(result.uiResources).toBeUndefined();
+});
+
 test("MessageStore.upsertToolResult truncates oversized tool output before persistence", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
@@ -178,6 +307,107 @@ test("MessageStore.upsertToolResult truncates oversized tool output before persi
   expect(result.output.length).toBeLessThan(huge.length);
   expect(result.output.startsWith("x".repeat(MAX_TOOL_RESULT_TEXT_LENGTH))).toBe(true);
   expect(result.output).toContain("truncated");
+});
+
+test("MessageStore.upsertToolResult redacts secrets in tool input/output before persistence", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  // An upstream MCP tool echoes credentials into its call args and result.
+  // Both the RuntimeEvent and AG-UI writers funnel through upsertToolResult,
+  // and only the RuntimeEvent path redacted upstream — the store boundary must
+  // redact so the AG-UI (?format=agui) path can't leak the secret into durable
+  // storage or the next turn's prompt context.
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "github",
+    toolName: "fetch_repo",
+    input: "curl -H 'Authorization: Bearer sekret-input-token' https://api.example.com",
+    output: "cloned via https://x-access-token:ghp_FAKE_not_a_real_pat_for_tests@github.com/acme/repo",
+    exitCode: 0,
+    durationMs: 1
+  });
+
+  // The fake's RETURNING echoes the persisted input_text/output_text (indices
+  // 12/13), so the mapped record reflects exactly what reached storage.
+  const persistedInput = String(db.lastValues![12]);
+  const persistedOutput = String(db.lastValues![13]);
+
+  expect(persistedInput).not.toContain("sekret-input-token");
+  expect(persistedInput).toContain("[REDACTED]");
+  expect(persistedOutput).not.toContain("ghp_FAKE_not_a_real_pat_for_tests");
+  expect(persistedOutput).toContain("[REDACTED]");
+
+  expect(result.input).not.toContain("sekret-input-token");
+  expect(result.output).not.toContain("ghp_FAKE_not_a_real_pat_for_tests");
+});
+
+test("MessageStore.upsertToolResult strips NUL bytes from tool text before persistence", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  // Postgres text columns reject \u0000 (22021); a binary-surfacing tool must
+  // degrade to U+FFFD at the persistence boundary instead of failing the turn.
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "command",
+    title: "Shell command",
+    status: "completed",
+    command: "cat chart.png",
+    cwd: null,
+    server: null,
+    toolName: null,
+    input: '{"path":"chart\u0000.png"}',
+    output: "PNG\u0000\u0000header",
+    exitCode: 0,
+    durationMs: 1
+  });
+
+  expect(result.input).toBe('{"path":"chart\uFFFD.png"}');
+  expect(result.output).toBe("PNG\uFFFD\uFFFDheader");
+});
+
+test("MessageStore.updateContent and appendToolResultOutput strip NUL bytes", async () => {
+  const db = new ScriptedDatabase();
+  let contentBind: unknown[] | null = null;
+  let deltaBind: unknown[] | null = null;
+  db.scripts = [
+    {
+      match: (t) => t.includes("UPDATE messages") && t.includes("content_text = $5"),
+      fn: (vals) => {
+        contentBind = vals;
+        return { rows: [], rowCount: 0 };
+      }
+    },
+    {
+      match: (t) => t.includes("UPDATE message_tool_results") && t.includes("output_text || $4"),
+      fn: (vals) => {
+        deltaBind = vals;
+        return { rows: [], rowCount: 0 };
+      }
+    }
+  ];
+  const store = new MessageStore(db as unknown as Pool);
+
+  await store.updateContent("t", "m-1", "u", "completed", "before\u0000after");
+  expect(contentBind![4]).toBe("before\uFFFDafter");
+
+  await store.appendToolResultOutput("t", "tool-1", "u", "chunk\u0000");
+  // The append binds the delta as $4 — the bound value is what reaches storage.
+  expect(deltaBind![3]).toBe("chunk\uFFFD");
 });
 
 test("MessageStore.create truncates oversized content before persistence", async () => {

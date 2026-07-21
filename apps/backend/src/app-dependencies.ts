@@ -3,7 +3,6 @@ import type { FastifyBaseLogger } from "fastify";
 import type { AppConfig } from "./config.js";
 import { type Pool } from "./lib/db.js";
 import { attachOverlays, type OverlayHandles } from "./overlays.js";
-import { ActiveTurnMessageMap } from "./services/active-turn-message-map.js";
 import { buildBootstrapServices } from "./services/build-bootstrap-services.js";
 import { buildStores } from "./services/build-stores.js";
 import { RuntimeEgressIpPinStore } from "./services/runtime-egress-ip-pin.js";
@@ -13,8 +12,7 @@ import { buildManagedToolRegistries } from "./services/managed-tools/build-manag
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
 import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
 import { PolicyService } from "./services/policy/policy-service.js";
-import { buildRuntimeAdapters } from "./services/runtime/build-runtime-adapters.js";
-import { createFanOutRuntimeInvalidator } from "./services/runtime/fan-out-invalidator.js";
+import { buildRuntimeAdapter } from "./services/runtime/build-runtime-adapters.js";
 
 export { buildSchedulerWorker } from "./services/build-scheduler-worker.js";
 
@@ -75,22 +73,16 @@ export function buildAppDependencies(input: {
     bootstrap.limits,
     bootstrap.redis
   );
-  // Shared by /messages (sets at turn start, clears at end) and the LLM
-  // proxy (looks up by rt_*'s sid+rid to charge usage to the right
-  // assistant message). Single-process scope — see file docstring.
-  const activeTurnMessageMap = new ActiveTurnMessageMap();
-  // Per-runtime egress IP pin for /llm/* — first observed peer IP for a
-  // runtimeId is recorded and subsequent calls must match. TTL aligned
-  // with the rt_* token so eviction is handled by token expiry; the
-  // runtime adapters additionally clear pins on explicit teardown.
-  // Constructed here so the LLM proxy and the runtime adapters share
-  // the same instance.
+  // Per-runtime egress IP pin for the /mcp gateway — first observed peer IP
+  // for a runtimeId is recorded and subsequent calls must match. TTL aligned
+  // with the rt_* token so eviction is handled by token expiry; the runtime
+  // adapters additionally clear pins on explicit teardown.
   const egressIpPins = new RuntimeEgressIpPinStore(
     config.RUNTIME_TOKEN_TTL_MS,
     bootstrap.redis ?? undefined
   );
 
-  const { runtimeAdapters, codexRuntimeManager } = buildRuntimeAdapters({
+  const { deepAgentsAdapter } = buildRuntimeAdapter({
     config,
     logger,
     stores,
@@ -99,14 +91,16 @@ export function buildAppDependencies(input: {
     artifactStorage: bootstrap.artifactStorage,
     skillBundleStorage: bootstrap.skillBundleStorage,
     managedToolCatalog,
-    getTenantAnthropicApiKey: bootstrap.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: bootstrap.getTenantOpenaiApiKey,
-    egressIpPins
+    providerCredentials: bootstrap.providerCredentials,
+    policyService
   });
 
-  // Fan a (re)connect/disconnect out to every adapter so a user's stale
-  // sessions are torn down regardless of provider (Codex and Claude alike).
-  runtimeManagerRef = createFanOutRuntimeInvalidator(runtimeAdapters);
+  // Integration (re)connect/disconnect tears down the user's stale sessions
+  // on the runtime adapter.
+  runtimeManagerRef = {
+    invalidateRuntimesForIntegration: (tenantId, userId, integrationId) =>
+      deepAgentsAdapter.invalidateRuntimesForIntegration(tenantId, userId, integrationId)
+  };
 
   const pii = buildPiiServices({
     config,
@@ -141,12 +135,14 @@ export function buildAppDependencies(input: {
     db,
     sessions: stores.sessions,
     messages: stores.messages,
+    memories: stores.memories,
     artifacts: stores.artifacts,
     runtimeSessions: stores.runtimeSessions,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
     mcpServers: stores.mcpServers,
     tenantSettings: stores.tenantSettings,
+    customModels: stores.customModels,
     userSettings: stores.userSettings,
     tenantMembers: stores.tenantMembers,
     githubConnections: stores.githubConnections,
@@ -169,15 +165,16 @@ export function buildAppDependencies(input: {
     limits: bootstrap.limits,
     artifactStorage: bootstrap.artifactStorage,
     artifactProcessor: bootstrap.artifactProcessor,
-    runtimeAdapters,
-    // Codex manager exposed concretely for the admin/health routes that call
-    // Codex-specific methods (getHealthSnapshot, getRuntimeHealthDetail,
-    // refreshIdleRuntimes) — not on the RuntimeAdapter interface. Generic
-    // routing goes through `runtimeAdapters` above.
-    codexRuntimeManager,
+    runtimeAdapter: deepAgentsAdapter,
+    // The same adapter exposed concretely for the admin/health routes that
+    // call methods not on the RuntimeAdapter interface (getHealthSnapshot,
+    // getRuntimeHealthDetail, invalidateTenantRuntimes). Generic routing goes
+    // through `runtimeAdapter` above.
+    deepAgentsAdapter,
     tenantOrgSettings: bootstrap.tenantOrgSettings,
     getTenantAnthropicApiKey: bootstrap.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: bootstrap.getTenantOpenaiApiKey,
+    getTenantProviderKey: bootstrap.getTenantProviderKey,
+    providerCredentials: bootstrap.providerCredentials,
     piiProtection: pii.piiProtection,
     piiCircuitBreaker: pii.piiCircuitBreaker,
     piiScanRuns: stores.piiScanRuns,
@@ -186,9 +183,7 @@ export function buildAppDependencies(input: {
     piiScanJobHandler: pii.piiScanJobHandler,
     piiScanEnqueuer: pii.piiScanEnqueuer,
     activeTurns: stores.activeTurns,
-    activeTurnMessageMap,
     egressIpPins,
-    sessionRuntimeOverrides: stores.sessionRuntimeOverrides,
     policyRules: stores.policyRules,
     policyDecisions: stores.policyDecisions,
     policyService,

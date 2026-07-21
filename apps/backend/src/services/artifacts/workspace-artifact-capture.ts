@@ -50,7 +50,22 @@ const MIME_BY_EXTENSION: Record<string, string> = {
 const CAPTURE_CONCURRENCY = 5;
 
 // Directories relative to workspacePath that are never swept.
-const EXCLUDED_DIR_NAMES = new Set([".codex", ".framework", "node_modules", ".git", "artifacts"]);
+// "conversation_history" and "large_tool_results" are deepagents runtime
+// internals written through the workspace-rooted backend: the summarization
+// middleware offloads raw conversation history to
+// conversation_history/<sessionId>.md, and the fs middleware evicts oversized
+// tool results to large_tool_results/<toolCallId>.txt. Neither is a
+// user-facing deliverable — sweeping them would publish raw transcript
+// content as artifacts (AgenticEntrepriseFramework-g2ua).
+const EXCLUDED_DIR_NAMES = new Set([
+  ".codex",
+  ".framework",
+  "node_modules",
+  ".git",
+  "artifacts",
+  "conversation_history",
+  "large_tool_results"
+]);
 const EXCLUDED_FILE_NAMES = new Set(["AGENTS.md"]);
 
 async function collectWorkspaceFiles(workspacePath: string): Promise<string[]> {

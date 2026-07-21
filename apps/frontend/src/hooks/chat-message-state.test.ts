@@ -23,6 +23,7 @@ function makeToolResult(overrides: Partial<ToolResult> = {}): ToolResult {
     output: "",
     exitCode: null,
     durationMs: null,
+    textOffset: null,
     ...overrides
   };
 }
@@ -35,6 +36,7 @@ function makeMessage(overrides: Partial<Message> = {}): Message {
     status: "streaming",
     content: "",
     reasoningContent: "",
+    reasoningSegments: null,
     planContent: "",
     toolResults: [],
     tokenUsage: null,

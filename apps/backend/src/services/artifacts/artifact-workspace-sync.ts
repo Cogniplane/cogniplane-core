@@ -46,10 +46,8 @@ function uniqueWorkspacePath(artifact: ArtifactRecord, usedNames: Set<string>): 
 }
 
 // Note: if the agent creates `./artifacts` as a symlink during a prior turn,
-// subsequent syncs will follow the symlink. Codex sandbox mode (workspace-write)
-// prevents symlinks outside the workspace, so this is intra-workspace only.
-// The writeRuntimeFile path check ensures the resolved path stays in the
-// workspace regardless.
+// subsequent syncs will follow the symlink. The writeRuntimeFile path check
+// ensures the resolved path stays in the workspace regardless.
 export async function syncArtifactsToWorkspace(input: {
   sessionId: string;
   scopedArtifacts: ArtifactRecord[];

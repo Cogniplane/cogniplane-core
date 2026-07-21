@@ -1,6 +1,5 @@
 FROM node:24-trixie-slim
 
-ARG CODEX_NPM_VERSION=0.142.4
 ARG UV_VERSION=0.11.2
 ARG BUN_VERSION=1.3.11
 ARG BUILD_SHA=""
@@ -41,7 +40,6 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 RUN corepack enable
-RUN npm install -g @openai/codex@${CODEX_NPM_VERSION}
 
 # uv — fast Python package/project manager (pinned, checksum-verified)
 RUN ARCH=$(uname -m) \
@@ -87,7 +85,7 @@ RUN pnpm build
 RUN chmod +x /usr/local/bin/backend-entrypoint.sh
 
 RUN groupadd -g 1001 appgroup && useradd -u 1001 -g appgroup -m -s /bin/bash appuser \
-  && mkdir -p /home/appuser/.codex /home/appuser/bin /runtime-workspaces \
+  && mkdir -p /home/appuser/bin /runtime-workspaces \
   && chown -R appuser:appgroup /home/appuser /runtime-workspaces
 
 ENV PATH=/home/appuser/bin:/home/appuser/.local/bin:$PATH

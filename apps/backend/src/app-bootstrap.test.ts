@@ -92,7 +92,7 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
       async getRuntimePolicy() {
         return {
           id: "tenant-settings:admin-tenant", label: "Tenant Settings", description: null,
-          runtimeProvider: "codex" as const, approvalPolicy: "on-request" as const,
+          approvalPolicy: "on-request" as const,
           approvalReviewer: "user" as const, sandboxMode: "workspace-write" as const,
           networkMode: "restricted" as const, allowCommandExecution: false,
           allowUserTokenForwarding: true, autoApproveReadOnlyTools: true,
@@ -103,8 +103,6 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
       async getOrCreateTenantSettings() {
         return {
           tenantId: "admin-tenant",
-          runtimeProvider: "codex" as const,
-          enabledRuntimeProviders: ["codex"] as const,
           showEffortSelector: false,
           approvalPolicy: "on-request",
           approvalReviewer: "user",
@@ -122,8 +120,6 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
       async updateTenantSettings() {
         return {
           tenantId: "admin-tenant",
-          runtimeProvider: "codex" as const,
-          enabledRuntimeProviders: ["codex"] as const,
           showEffortSelector: false,
           approvalPolicy: "on-request",
           approvalReviewer: "user",
@@ -152,18 +148,23 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
     limits: {},
     artifactStorage: {},
     artifactProcessor: {},
-    codexRuntimeManager: {
+    runtimeAdapter: {
+      hasActiveTurn: () => false,
+      async invalidateTenantRuntimes() {
+        return [];
+      }
+    },
+    deepAgentsAdapter: {
       getHealthSnapshot() {
         return { activeRuntimeCount: 0, activeTurnCount: 0 };
       },
       getRuntimeHealthDetail() {
         return [];
       },
-      async refreshIdleRuntimes() {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
-    runtimeAdapters: {},
     overlays: { attachRoutes: () => {} },
     managedToolCatalog: (() => {
       const catalog = new ManagedToolCatalog();

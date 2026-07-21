@@ -58,12 +58,7 @@ export function MessageFeedbackSection() {
   const totals = stats?.totals;
 
   return (
-    <section id="message-feedback" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Observability</p>
-        <h3 className="text-lg font-semibold text-on-surface">Message feedback</h3>
-      </div>
-
+    <section id="message-feedback" className="flex flex-col gap-5 pt-5">
       {available ? (
         <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
           <DayRangePicker value={days} onChange={setDays} />

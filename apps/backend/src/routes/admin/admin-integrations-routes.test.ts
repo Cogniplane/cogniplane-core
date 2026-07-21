@@ -118,26 +118,11 @@ class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "up
 }
 
 class FakeRuntimeManager {
-  invalidations: Array<{ tenantId: string; integrationId: string }> = [];
+  invalidations: Array<{ tenantId: string }> = [];
 
-  async invalidateIntegrationRuntimesForTenant(
-    tenantId: string,
-    integrationId: string
-  ): Promise<string[]> {
-    this.invalidations.push({ tenantId, integrationId });
+  async invalidateTenantRuntimes(tenantId: string): Promise<string[]> {
+    this.invalidations.push({ tenantId });
     return ["session-1"];
-  }
-}
-
-class FakeClaudeAdapter {
-  invalidations: Array<{ tenantId: string; integrationId: string }> = [];
-
-  async invalidateIntegrationRuntimesForTenant(
-    tenantId: string,
-    integrationId: string
-  ): Promise<string[]> {
-    this.invalidations.push({ tenantId, integrationId });
-    return ["claude-session-1"];
   }
 }
 
@@ -156,7 +141,6 @@ function buildProbes(): IntegrationConnectionProbes {
 async function buildApp(opts: {
   config?: Partial<AppConfig>;
   states?: IntegrationStateRecord[];
-  withClaude?: boolean;
 }) {
   const app = Fastify();
   const config = createTestConfig({
@@ -181,24 +165,18 @@ async function buildApp(opts: {
 
   const registry = new IntegrationRegistryService(config, stateStore, buildProbes());
   const runtime = new FakeRuntimeManager();
-  const claudeAdapter = opts.withClaude ? new FakeClaudeAdapter() : undefined;
   const auditEvents = new InMemoryAuditEventStore();
-
-  const runtimeAdapters: Record<string, { invalidateIntegrationRuntimesForTenant?: (tenantId: string, integrationId: string) => Promise<string[]> }> = {
-    codex: runtime
-  };
-  if (claudeAdapter) runtimeAdapters["claude-code"] = claudeAdapter;
 
   await registerAdminIntegrationsRoutes(app, {
     config,
     integrationRegistry: registry,
     integrationStates: stateStore,
     auditEvents,
-    runtimeAdapters: runtimeAdapters as never
+    runtimeAdapter: runtime as never
   });
   await app.ready();
 
-  return { app, stateStore, runtime, claudeAdapter, auditEvents, config };
+  return { app, stateStore, runtime, auditEvents, config };
 }
 
 test("GET /admin/integrations returns the registry with per-tenant state", async () => {
@@ -247,9 +225,10 @@ test("PUT /admin/integrations/:id flips toggles, audits, and invalidates runtime
   expect(notion!.readsEnabled).toBe(true);
   expect(notion!.updatedBy).toBe("admin-user");
 
-  // Audit + runtime invalidation triggered (since toggles changed).
+  // Audit + runtime invalidation triggered (since toggles changed). The tenant
+  // runtimes are torn down wholesale; the integrationId is carried on the audit
+  // event (asserted below), not the invalidation call.
   expect(runtime.invalidations.length).toBe(1);
-  expect(runtime.invalidations[0].integrationId).toBe("notion");
 
   const updateEvents = auditEvents.events.filter((e) => e.type === "tenant.integration.updated");
   expect(updateEvents.length).toBe(1);
@@ -451,7 +430,7 @@ test("non-admin requests are rejected with 403", async () => {
     integrationRegistry: registry,
     integrationStates: stateStore,
     auditEvents: new InMemoryAuditEventStore(),
-    runtimeAdapters: { codex: new FakeRuntimeManager() } as never
+    runtimeAdapter: new FakeRuntimeManager() as never
   });
   await app.ready();
 
@@ -510,21 +489,6 @@ test("GET /admin/integrations reports github platform unconfigured when env vars
   const gh = body.integrations.find((i) => i.id === "github")!;
   expect(gh.platformConfigured).toBe(false);
   expect(gh.platformConfigMessage?.includes("GITHUB_OAUTH_CLIENT_ID")).toBeTruthy();
-});
-
-test("toggle changes also invalidate Claude sessions when the adapter is wired", async () => {
-  const { app, runtime, claudeAdapter } = await buildApp({ withClaude: true });
-  onTestFinished(() => app.close());
-
-  const response = await app.inject({
-    method: "PUT",
-    url: "/admin/integrations/notion",
-    payload: { readsEnabled: true }
-  });
-  expect(response.statusCode).toBe(200);
-  expect(runtime.invalidations.length).toBe(1);
-  expect(claudeAdapter!.invalidations.length).toBe(1);
-  expect(claudeAdapter!.invalidations[0].integrationId).toBe("notion");
 });
 
 test("DELETE /admin/integrations/microsoft/config clears the integration row", async () => {

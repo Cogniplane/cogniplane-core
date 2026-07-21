@@ -14,14 +14,12 @@ import {
 import { AdminSessionsPresets } from "../../../components/admin/sessions/admin-sessions-presets";
 import { useAdminSessionsData } from "../../../hooks/use-admin-sessions-data";
 import type { AdminSessionAlertKind, AdminSessionRow } from "@cogniplane/shared-types";
-import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 const FILTER_KEYS: Array<keyof SessionsFilterState> = [
   "userId",
   "from",
   "to",
   "status",
-  "runtime",
   "alert"
 ];
 
@@ -36,7 +34,6 @@ const ALERT_KINDS: AdminSessionAlertKind[] = [
 
 function parseStateFromSearchParams(params: URLSearchParams): SessionsFilterState {
   const status = params.get("status");
-  const runtime = params.get("runtime");
   const alert = params.get("alert");
   const alertTokens =
     alert
@@ -53,7 +50,6 @@ function parseStateFromSearchParams(params: URLSearchParams): SessionsFilterStat
     to: params.get("to") ?? "",
     status:
       status === "active" || status === "errored" ? status : "",
-    runtime: runtime === "codex" || runtime === "claude-code" ? runtime : "",
     alert: alertTokens
   };
 }
@@ -64,7 +60,6 @@ function stateToSearchString(state: SessionsFilterState): string {
   if (state.from) params.set("from", state.from);
   if (state.to) params.set("to", state.to);
   if (state.status) params.set("status", state.status);
-  if (state.runtime) params.set("runtime", state.runtime);
   if (state.alert.length > 0) params.set("alert", state.alert.join(","));
   return params.toString();
 }
@@ -130,11 +125,7 @@ export default function AdminSessionsPage() {
   };
 
   return (
-    <section id="sessions" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Review</p>
-        <h3 className="text-lg font-semibold text-on-surface">Sessions</h3>
-      </div>
+    <section id="sessions" className="flex flex-col gap-5 pt-5">
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       <AdminSessionsPresets state={state} onApply={setState} />
       <AdminSessionsFilters state={state} onChange={setState} onClear={handleClear} />

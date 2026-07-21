@@ -61,8 +61,37 @@ class FakeToolContextDatabase {
     }
 
     if (text.includes("FROM tool_execution_contexts")) {
+      const tenantId = String(values[0]);
+      const isUnexpired = (row: StoredContextRow) => Date.parse(row.expires_at) > this.nowMs;
+
+      // findLatestActiveBySession: scope by tenant + session, drop expired, take
+      // the most-recently-created. Each clause is honored ONLY IF the emitted SQL
+      // actually contains it — so dropping a predicate/ordering from the store's
+      // query changes this fake's result and the test catches it (no-DB analog of
+      // running the real WHERE/ORDER BY).
+      if (text.includes("FROM tool_execution_contexts") && text.includes("ORDER BY created_at")) {
+        const scopesSession = text.includes("session_id = $2");
+        const filtersExpiry = text.includes("expires_at > NOW()");
+        const scopesTenant = text.includes("tenant_id = $1");
+        const sessionId = String(values[1]);
+        let matches = [...this.rows.values()].filter(
+          (row) =>
+            (!scopesTenant || row.tenant_id === tenantId) &&
+            (!scopesSession || row.session_id === sessionId) &&
+            (!filtersExpiry || isUnexpired(row))
+        );
+        matches = matches.sort((a, b) =>
+          text.includes("ORDER BY created_at DESC")
+            ? Date.parse(b.created_at) - Date.parse(a.created_at)
+            : Date.parse(a.created_at) - Date.parse(b.created_at)
+        );
+        const latest = matches[0];
+        return { rows: latest ? [latest] : [], rowCount: latest ? 1 : 0 };
+      }
+
+      // get / requireOwned: scope by tenant + tool_context_id, drop expired.
       const row = this.rows.get(String(values[1]));
-      const isActive = row && row.tenant_id === String(values[0]) && Date.parse(row.expires_at) > this.nowMs;
+      const isActive = row && row.tenant_id === tenantId && isUnexpired(row);
       return {
         rows: isActive ? [row] : [],
         rowCount: isActive ? 1 : 0
@@ -92,7 +121,7 @@ test("ToolExecutionContextStore resolves a valid owned context before expiry", a
     sessionId: "session-1",
     userId: "user-1",
     runtimeId: "runtime-1",
-    runtimePolicyId: "phase4-tools",
+    runtimePolicyId: "test-tools",
     messageId: "message-1",
     credentialEnvelope: {
       accessToken: "secret"
@@ -123,7 +152,7 @@ test("ToolExecutionContextStore treats expired contexts as missing", async () =>
     sessionId: "session-1",
     userId: "user-1",
     runtimeId: "runtime-1",
-    runtimePolicyId: "phase4-tools",
+    runtimePolicyId: "test-tools",
     messageId: null,
     ttlMs: 50
   });
@@ -140,4 +169,68 @@ test("ToolExecutionContextStore treats expired contexts as missing", async () =>
   expect(error).toBeInstanceOf(ToolContextUnavailableError);
   expect((error as ToolContextUnavailableError).code).toBe("TOOL_CONTEXT_UNAVAILABLE");
   expect((error as ToolContextUnavailableError).toolContextId).toBe(created.toolContextId);
+});
+
+test("findLatestActiveBySession returns the most-recently-created active context", async () => {
+  // The MCP gateway falls back to this when a tools/call arrives without a
+  // toolContextId — it must resolve the ACTIVE turn's context (the newest row),
+  // carrying the runtimePolicy snapshot + credential envelope the tool runs under.
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+  const base = {
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: null,
+    ttlMs: 10_000
+  };
+
+  await store.create({ ...base, credentialEnvelope: { accessToken: "old" } });
+  db.advanceBy(1_000); // the second context is created strictly later
+  const newer = await store.create({ ...base, credentialEnvelope: { accessToken: "new" } });
+
+  const resolved = await store.findLatestActiveBySession("test-tenant", "session-1");
+  expect(resolved?.toolContextId).toBe(newer.toolContextId);
+  expect(resolved?.credentialEnvelope).toEqual({ accessToken: "new" });
+});
+
+test("findLatestActiveBySession returns null when the only match has expired", async () => {
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+
+  await store.create({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: null,
+    ttlMs: 50
+  });
+
+  db.advanceBy(51);
+
+  expect(await store.findLatestActiveBySession("test-tenant", "session-1")).toBe(null);
+});
+
+test("findLatestActiveBySession never returns another tenant or session's context", async () => {
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+
+  await store.create({
+    tenantId: "tenant-a",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: null,
+    ttlMs: 10_000
+  });
+
+  // A different session in the same tenant, and a same-named session in a
+  // different tenant, must both be invisible.
+  expect(await store.findLatestActiveBySession("tenant-a", "session-OTHER")).toBe(null);
+  expect(await store.findLatestActiveBySession("tenant-b", "session-1")).toBe(null);
 });

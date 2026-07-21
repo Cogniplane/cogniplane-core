@@ -3,18 +3,13 @@
 import { useAdminOrganizationData } from "../../../hooks/use-admin-organization-data";
 import { AdminPiiProtectionSection } from "../../../components/admin/pii/admin-pii-protection-section";
 import { Card, CardContent } from "@/components/ui/card";
-import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminPrivacyPage() {
   const { tenant, busyKey, error, successMessage, handleSavePiiProtection } =
     useAdminOrganizationData();
 
   return (
-    <section id="privacy" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Configuration</p>
-        <h3 className="text-lg font-semibold text-on-surface">Privacy</h3>
-      </div>
+    <section id="privacy" className="flex flex-col gap-5 pt-5">
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       {successMessage ? <p className="text-sm text-on-surface-faint">{successMessage}</p> : null}
       <Card>

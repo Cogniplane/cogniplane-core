@@ -216,6 +216,35 @@ export class PiiScanJobStore {
     });
   }
 
+  /**
+   * Recovers jobs stranded in `claimed` by a worker that crashed between claim
+   * and completion (deploy, OOM). Without this the row — and the artifact's PII
+   * status — stays stuck forever, since the only transitions out of `claimed`
+   * are markCompleted / recordFailure, both driven by the in-process handler
+   * that died. Runs cross-tenant on `schedulerDb` (no tenant context while
+   * polling), mirroring `claimDueJobs` and the scheduler's own
+   * `sweepStaleJobRuns`. A row whose attempts are exhausted is failed; otherwise
+   * it is requeued for another attempt. Returns the number of rows swept.
+   */
+  async sweepStaleClaims(staleAfterMs: number): Promise<number> {
+    const result = await this.schedulerDb.query(
+      `
+        UPDATE pii_scan_jobs
+        SET
+          status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
+          run_after = CASE WHEN attempts >= max_attempts THEN run_after ELSE NOW() END,
+          claimed_at = NULL,
+          completed_at = CASE WHEN attempts >= max_attempts THEN NOW() ELSE NULL END,
+          error_message = 'claim expired (worker presumed crashed before completion)',
+          updated_at = NOW()
+        WHERE status = 'claimed'
+          AND claimed_at < NOW() - ($1::int * INTERVAL '1 millisecond')
+      `,
+      [staleAfterMs]
+    );
+    return result.rowCount ?? 0;
+  }
+
   async getById(tenantId: string, jobId: string): Promise<PiiScanJobRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(

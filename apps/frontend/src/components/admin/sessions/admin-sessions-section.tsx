@@ -4,10 +4,11 @@ import { AdminSessionAlertBadge } from "./admin-session-alert-badge";
 import type { AdminSessionRow } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { formatTimestamp } from "../../../lib/time-format";
 import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL, LIST_ITEM } from "../../../lib/ui-tokens";
 
-const LIST_ITEM_HOVER = `${LIST_ITEM} transition-colors hover:border-outline`;
+const LIST_ITEM_HOVER = `${LIST_ITEM} hover-lift hover:border-outline`;
 
 function statusBadgeClass(status: AdminSessionRow["status"]): string {
   switch (status) {
@@ -17,12 +18,6 @@ function statusBadgeClass(status: AdminSessionRow["status"]): string {
     default:
       return PILL_GRAY;
   }
-}
-
-function runtimeLabel(provider: AdminSessionRow["runtimeProvider"]): string {
-  if (provider === "claude-code") return "Claude Code";
-  if (provider === "codex") return "Codex";
-  return "—";
 }
 
 function userDisplay(row: AdminSessionRow): string {
@@ -67,8 +62,19 @@ export function AdminSessionsSection(props: {
   if (props.isLoading) {
     return (
       <Card>
-        <CardContent className="pt-6">
-          <p className={HINT}>Loading sessions…</p>
+        <CardContent className="flex flex-col gap-3 pt-6">
+          {Array.from({ length: 5 }, (_, i) => (
+            <div key={i} className={LIST_ITEM} style={{ opacity: 1 - i * 0.15 }}>
+              <div className="flex items-center justify-between gap-2">
+                <Skeleton className="h-4 w-40" />
+                <div className="flex gap-1.5">
+                  <Skeleton className="h-4 w-14 rounded-full" />
+                  <Skeleton className="h-4 w-14 rounded-full" />
+                </div>
+              </div>
+              <Skeleton className="mt-2 h-3 w-72" />
+            </div>
+          ))}
         </CardContent>
       </Card>
     );
@@ -125,7 +131,6 @@ export function AdminSessionsSection(props: {
                   </strong>
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={statusBadgeClass(row.status)}>{row.status}</span>
-                    <span className={PILL_GRAY}>{runtimeLabel(row.runtimeProvider)}</span>
                     {row.modelName ? <span className={PILL_GRAY}>{row.modelName}</span> : null}
                     <span
                       className={PILL_GRAY}

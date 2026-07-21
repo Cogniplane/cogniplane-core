@@ -45,12 +45,6 @@ export type RuntimeManifest = {
   userId: string;
   generatedAt: string;
   workspacePath: string;
-  codex: {
-    binaryPath: string;
-    version: string;
-    schemaVersion: string;
-    model: string;
-  };
   runtimePolicy: {
     id: string;
     version: number;
@@ -68,7 +62,6 @@ export type RuntimeManifest = {
   mcpServers: RuntimeManifestMcpServerEntry[];
   configSources: RuntimeManifestConfigSources;
   config: {
-    codexTomlPath: string;
     skillsPath: string;
     customSkillsEnabled: boolean;
     customMcpServersEnabled: boolean;

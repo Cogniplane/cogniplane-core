@@ -40,10 +40,19 @@ const PRICING: Record<string, ModelPricing> = {
   // tokens (1.25x input in reality) are folded into `inputTokens` at the
   // mapper and billed at the regular input rate — small under-bill on that
   // bucket, not worth a dedicated pricing tier.
+  "claude-fable-5": {
+    short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
+    long:  null
+  },
   "claude-opus-4-8": {
     short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
     long:  null
   },
+  "claude-sonnet-5": {
+    short: { input:  3.00, cachedInput: 0.30,  output: 15.00 },
+    long:  null
+  },
+  // Retired from the model picker but kept for billing history on past messages.
   "claude-opus-4-7": {
     short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
     long:  null
@@ -56,8 +65,88 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input:  3.00, cachedInput: 0.30,  output: 15.00 },
     long:  null
   },
+  // Alias id used by the current catalog entry; the dated snapshot below is
+  // kept for billing history on past messages.
+  "claude-haiku-4-5": {
+    short: { input:  1.00, cachedInput: 0.10,  output:  5.00 },
+    long:  null
+  },
   "claude-haiku-4-5-20251001": {
     short: { input:  1.00, cachedInput: 0.10,  output:  5.00 },
+    long:  null
+  },
+
+  // Google / OpenRouter / Z.AI rates. All sourced from OpenRouter's public
+  // models API (GET https://openrouter.ai/api/v1/models — `pricing.prompt` /
+  // `.input_cache_read` / `.completion`, converted from per-token to per-1M).
+  // The UI labels this "Est. cost", so a single cross-provider reference rate
+  // is the intended precision. None of these publish a distinct long-context
+  // tier, so `long` stays null (the >272K threshold logic then no-ops).
+  //
+  // Keys are the bare VENDOR model id (catalog id with its first namespace
+  // segment stripped — inner slashes and the `:free` suffix preserved), which
+  // is exactly what resolveModelConstruction().vendorModel yields.
+  "gemini-3.5-flash": {
+    short: { input: 1.50, cachedInput: 0.15,   output:  9.00 },
+    long:  null
+  },
+  "gemini-3.1-pro-preview": {
+    short: { input: 2.00, cachedInput: 0.20,   output: 12.00 },
+    long:  null
+  },
+  "gemini-2.5-pro": {
+    short: { input: 1.25, cachedInput: 0.125,  output: 10.00 },
+    long:  null
+  },
+  "gemini-2.5-flash": {
+    short: { input: 0.30, cachedInput: 0.03,   output:  2.50 },
+    long:  null
+  },
+
+  // OpenRouter-served (paid). Free `:free` routes below bill at zero.
+  "z-ai/glm-5.2": {
+    short: { input: 0.9086, cachedInput: 0.1687, output: 2.8556 },
+    long:  null
+  },
+  "deepseek/deepseek-v4-pro": {
+    short: { input: 0.435, cachedInput: 0.0036, output: 0.87 },
+    long:  null
+  },
+  "deepseek/deepseek-v4-flash": {
+    short: { input: 0.09,  cachedInput: 0.018,  output: 0.18 },
+    long:  null
+  },
+  "nvidia/nemotron-3-super-120b-a12b:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "openai/gpt-oss-120b:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "google/gemma-4-31b-it:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "tencent/hy3:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+
+  // Z.AI native (GLM Coding Plan endpoint). That plan is a flat subscription,
+  // not per-token, so these rates are OpenRouter's per-token GLM prices used
+  // as the best available cost estimate — same values as the OpenRouter
+  // z-ai/glm-5.2 row above.
+  "glm-5.2": {
+    short: { input: 0.9086, cachedInput: 0.1687, output: 2.8556 },
+    long:  null
+  },
+  "glm-4.7": {
+    short: { input: 0.40, cachedInput: 0.08,   output: 1.75 },
+    long:  null
+  },
+  "glm-4.7-flash": {
+    short: { input: 0.06, cachedInput: 0.01,   output: 0.40 },
     long:  null
   }
 };

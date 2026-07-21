@@ -77,12 +77,7 @@ export function ScheduledJobsSection(input: {
   } = input;
 
   return (
-    <section id="scheduled-jobs" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Live module</p>
-        <h3 className="text-lg font-semibold text-on-surface">Scheduled jobs</h3>
-      </div>
-
+    <section id="scheduled-jobs" className="flex flex-col gap-5 pt-5">
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>

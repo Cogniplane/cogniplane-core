@@ -2,35 +2,54 @@
 
 import { useState } from "react";
 
-import type { TenantDetails } from "@cogniplane/shared-types";
+import type { AdminProviderStatus, ModelProvider, TenantDetails } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { CHIP, PILL_GRAY, PILL_GREEN, SECTION_LABEL } from "../../lib/ui-tokens";
+import { CHIP, PILL_BLUE, PILL_GRAY, PILL_GREEN, SECTION_LABEL } from "../../lib/ui-tokens";
+
+type KeySource = AdminProviderStatus["keySource"];
+
+function keySourcePill(source: KeySource) {
+  switch (source) {
+    case "tenant":
+      return <span className={PILL_GREEN}>organization key</span>;
+    case "platform":
+      return <span className={PILL_BLUE}>platform key</span>;
+    default:
+      return <span className={PILL_GRAY}>no key</span>;
+  }
+}
 
 type ApiKeyFormProps = {
   inputId: string;
   label: string;
   description: string;
-  configured: boolean;
-  busy: boolean;
+  /** Where the provider's effective key comes from (tenant wins). */
+  keySource: KeySource;
+  /** Whether an org-level key is stored (the only kind this form can remove). */
+  tenantKeyConfigured: boolean;
   busyKey: string;
   currentBusyKey: string | null;
   successMessage: string | null;
   placeholderConfigured: string;
   placeholderUnconfigured: string;
   onSave: (apiKey: string) => void;
+  onRemove: () => void;
 };
 
 function ApiKeyForm(props: ApiKeyFormProps) {
   const [value, setValue] = useState("");
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (value.trim()) {
       props.onSave(value.trim());
       setValue("");
+      setConfirmingRemove(false);
     }
   };
 
@@ -44,9 +63,7 @@ function ApiKeyForm(props: ApiKeyFormProps) {
           <h2 className="text-lg font-semibold text-on-surface">{props.label}</h2>
           <p className="mt-1 max-w-prose text-sm text-on-surface-variant">{props.description}</p>
         </div>
-        <span className={props.configured ? PILL_GREEN : PILL_GRAY}>
-          {props.configured ? "configured" : "not configured"}
-        </span>
+        {keySourcePill(props.keySource)}
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -70,61 +87,114 @@ function ApiKeyForm(props: ApiKeyFormProps) {
             type="password"
             value={value}
             placeholder={
-              props.configured ? props.placeholderConfigured : props.placeholderUnconfigured
+              props.tenantKeyConfigured
+                ? props.placeholderConfigured
+                : props.placeholderUnconfigured
             }
             onChange={(e) => setValue(e.target.value)}
           />
         </div>
-        <div>
+        <div className="flex flex-wrap items-center gap-2">
           <Button type="submit" disabled={isBusy || !value.trim()}>
             {isBusy ? "Saving..." : "Save API key"}
           </Button>
+          {props.tenantKeyConfigured ? (
+            confirmingRemove ? (
+              <>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  disabled={isBusy}
+                  onClick={() => {
+                    setConfirmingRemove(false);
+                    props.onRemove();
+                  }}
+                >
+                  Confirm removal
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={isBusy}
+                  onClick={() => setConfirmingRemove(false)}
+                >
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isBusy}
+                onClick={() => setConfirmingRemove(true)}
+              >
+                Remove key
+              </Button>
+            )
+          ) : null}
         </div>
       </form>
     </div>
   );
 }
 
+/** Example key prefixes shown as input placeholders per provider. */
+const PROVIDER_KEY_PLACEHOLDER: Record<ModelProvider, string> = {
+  anthropic: "sk-ant-...",
+  openai: "sk-...",
+  google: "AIza...",
+  openrouter: "sk-or-...",
+  zai: "..."
+};
+
+/** Stable busyKey per provider so only the saving form shows a spinner. */
+export function providerKeyBusyKey(provider: ModelProvider): string {
+  return `save-${provider}-key`;
+}
+
 export function AdminOrganizationCard(props: {
   tenant: TenantDetails | null;
   busyKey: string | null;
-  openaiSuccessMessage: string | null;
-  anthropicSuccessMessage: string | null;
-  onSaveApiKey: (apiKey: string) => void;
-  onSaveAnthropicKey: (apiKey: string) => void;
+  /** Success message keyed by provider (only the last-saved one is set). */
+  providerSuccessMessage: Partial<Record<ModelProvider, string | null>>;
+  /**
+   * Per-provider key source from GET /admin/models. Optional so the card
+   * degrades to tenant-key presence alone while the catalog loads.
+   */
+  providerStatuses?: AdminProviderStatus[];
+  onSaveProviderKey: (provider: ModelProvider, apiKey: string) => void;
 }) {
+  const statusByProvider = new Map(
+    (props.providerStatuses ?? []).map((status) => [status.id, status])
+  );
   return (
     <Card>
-      <CardContent className="flex flex-col gap-6 pt-6">
-        <ApiKeyForm
-          inputId="openai-api-key"
-          label="OpenAI API key"
-          description="Set the OpenAI API key for this organization. This key is injected into the runtime when agent sessions start and is never exposed after saving."
-          configured={Boolean(props.tenant?.settings.openaiApiKeyConfigured)}
-          busy={props.busyKey === "save-api-key"}
-          busyKey="save-api-key"
-          currentBusyKey={props.busyKey}
-          successMessage={props.openaiSuccessMessage}
-          placeholderConfigured="sk-... (leave blank to keep current)"
-          placeholderUnconfigured="sk-..."
-          onSave={props.onSaveApiKey}
-        />
-
-        <div className="border-t border-outline-variant" />
-
-        <ApiKeyForm
-          inputId="anthropic-api-key"
-          label="Anthropic API key"
-          description="Set the Anthropic API key for this organization. Required for the Claude Code runtime provider. This key is injected into the runtime when agent sessions start and is never exposed after saving."
-          configured={Boolean(props.tenant?.settings.anthropicApiKeyConfigured)}
-          busy={props.busyKey === "save-anthropic-key"}
-          busyKey="save-anthropic-key"
-          currentBusyKey={props.busyKey}
-          successMessage={props.anthropicSuccessMessage}
-          placeholderConfigured="sk-ant-... (leave blank to keep current)"
-          placeholderUnconfigured="sk-ant-..."
-          onSave={props.onSaveAnthropicKey}
-        />
+      <CardContent className="flex flex-col gap-8 pt-6">
+        {MODEL_PROVIDERS.map((provider) => {
+          const meta = MODEL_PROVIDER_META[provider];
+          const tenantKeyConfigured = Boolean(props.tenant?.settings.providerKeys?.[provider]);
+          const keySource: KeySource =
+            statusByProvider.get(provider)?.keySource ??
+            (tenantKeyConfigured ? "tenant" : "none");
+          const placeholder = PROVIDER_KEY_PLACEHOLDER[provider];
+          return (
+            <ApiKeyForm
+              key={provider}
+              inputId={`${provider}-api-key`}
+              label={`${meta.label} API key`}
+              description={`Set the ${meta.label} API key for this organization. Together with the provider toggle below, it makes ${meta.label} models selectable in the model picker. This key is injected into the runtime when agent sessions start and is never exposed after saving.`}
+              keySource={keySource}
+              tenantKeyConfigured={tenantKeyConfigured}
+              busyKey={providerKeyBusyKey(provider)}
+              currentBusyKey={props.busyKey}
+              successMessage={props.providerSuccessMessage[provider] ?? null}
+              placeholderConfigured={`${placeholder} (leave blank to keep current)`}
+              placeholderUnconfigured={placeholder}
+              onSave={(apiKey) => props.onSaveProviderKey(provider, apiKey)}
+              onRemove={() => props.onSaveProviderKey(provider, "")}
+            />
+          );
+        })}
       </CardContent>
     </Card>
   );

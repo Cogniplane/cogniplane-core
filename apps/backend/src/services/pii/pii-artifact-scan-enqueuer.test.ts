@@ -14,6 +14,7 @@ function buildDeps(overrides: {
   evaluateThrows?: Error;
   readerReturnsNull?: boolean;
   scanRunCreateThrows?: Error;
+  storageDeleteThrows?: Error;
   withAuditEvents?: boolean;
 } = {}) {
   const settings: PiiProtectionSettings = {
@@ -30,6 +31,7 @@ function buildDeps(overrides: {
   const artifactUpdateCalls: Array<{ tenantId: string; artifactId: string; input: Record<string, unknown> }> = [];
   const logWarnCalls: Array<{ payload: unknown; message: string }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
+  const deleteCalls: string[] = [];
   let scanRunCounter = 0;
 
   const reader: PiiArtifactSubjectReader = {
@@ -83,6 +85,12 @@ function buildDeps(overrides: {
         return null as never;
       }
     },
+    storage: {
+      async delete(storageKey: string) {
+        if (overrides.storageDeleteThrows) throw overrides.storageDeleteThrows;
+        deleteCalls.push(storageKey);
+      }
+    },
     subjectReader: reader,
     logger: {
       warn(payload: unknown, message: string) {
@@ -109,7 +117,8 @@ function buildDeps(overrides: {
     piiDetailCalls,
     artifactUpdateCalls,
     logWarnCalls,
-    auditCalls
+    auditCalls,
+    deleteCalls
   };
 }
 
@@ -199,19 +208,21 @@ test("block mode evaluates synchronously and allows a clean artifact", async () 
   expect(artifactUpdateCalls.length).toBe(0);
 });
 
-test("block mode on a dirty artifact marks it failed and returns blocked", async () => {
-  const { deps, scanRunUpdateCalls, piiDetailCalls, artifactUpdateCalls, jobCalls } = buildDeps({
-    settings: { enabled: true, mode: "block" },
-    decision: {
-      action: "block",
-      findings: [
-        { entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }
-      ],
-      blockReason: "email",
-      providerType: "openai-compatible",
-      providerModel: "google/gemini-2.5-flash"
-    }
-  });
+const dirtyBlockDecision = {
+  action: "block" as const,
+  findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" as const }],
+  blockReason: "email",
+  providerType: "openai-compatible",
+  providerModel: "google/gemini-2.5-flash"
+};
+
+test("block mode on a dirty artifact marks it failed, deletes the object, and returns blocked", async () => {
+  const { deps, scanRunUpdateCalls, piiDetailCalls, artifactUpdateCalls, jobCalls, deleteCalls, auditCalls } =
+    buildDeps({
+      settings: { enabled: true, mode: "block" },
+      decision: dirtyBlockDecision,
+      withAuditEvents: true
+    });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
   expect(result.kind).toBe("blocked");
   if (result.kind !== "blocked") return;
@@ -223,10 +234,31 @@ test("block mode on a dirty artifact marks it failed and returns blocked", async
   expect(artifactUpdateCalls[0].input.status).toBe("failed");
   expect(piiDetailCalls.at(-1)?.pii.status).toBe("blocked");
   expect(piiDetailCalls.at(-1)?.pii.blockReason).toBe("email");
+  // The stored bytes are purged and the audit records the delete.
+  expect(deleteCalls).toEqual(["users/user-1/session-1/art-1.txt"]);
+  const blockedAudit = auditCalls.find((a) => a.type === "pii_blocked");
+  expect((blockedAudit!.payload as Record<string, unknown>).objectDeleted).toBe(true);
+});
+
+test("block still returns blocked and audits an orphan when object delete fails", async () => {
+  const { deps, scanRunUpdateCalls, auditCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: dirtyBlockDecision,
+    storageDeleteThrows: new Error("s3 down"),
+    withAuditEvents: true
+  });
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+  // The block outcome must stand even though cleanup failed.
+  expect(result.kind).toBe("blocked");
+  expect(scanRunUpdateCalls.some((c) => c.patch.status === "blocked")).toBe(true);
+  // The orphan is queryable, and pii_blocked records objectDeleted:false.
+  expect(auditCalls.some((a) => a.type === "pii_block_object_orphaned")).toBe(true);
+  const blockedAudit = auditCalls.find((a) => a.type === "pii_blocked");
+  expect((blockedAudit!.payload as Record<string, unknown>).objectDeleted).toBe(false);
 });
 
 test("block mode fails closed when the provider throws", async () => {
-  const { deps, scanRunUpdateCalls, artifactUpdateCalls, piiDetailCalls } = buildDeps({
+  const { deps, scanRunUpdateCalls, artifactUpdateCalls, piiDetailCalls, deleteCalls } = buildDeps({
     settings: { enabled: true, mode: "block" },
     evaluateThrows: new PiiProtectionServiceError("pii_provider_unavailable", "timeout")
   });
@@ -238,6 +270,9 @@ test("block mode fails closed when the provider throws", async () => {
   expect(piiDetailCalls.at(-1)?.pii.status).toBe("failed");
   const failed = scanRunUpdateCalls.find((c) => c.patch.status === "failed");
   expect(failed).toBeTruthy();
+  // A provider ERROR is not a confirmed block — the content was never scanned,
+  // so the object must NOT be deleted (transient-outage safety).
+  expect(deleteCalls).toEqual([]);
 });
 
 test("block mode fails closed when the artifact is not found by the reader", async () => {

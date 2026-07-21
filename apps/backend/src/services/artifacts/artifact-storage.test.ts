@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test, expect, onTestFinished } from "vitest";
-import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { BucketArtifactStorage, LocalArtifactStorage } from "./artifact-storage.js";
 
@@ -217,4 +217,46 @@ test("bucket storage throws when GetObject body cannot be turned into a Node str
   const storage = new BucketArtifactStorage({ client, bucketName: "bkt" });
   await storage.put({ storageKey: "k2", stream: Readable.from(["x"]) });
   await expect(() => storage.openReadStream("k2")).rejects.toThrow(/Unsupported bucket object body stream/);
+});
+
+test("local storage delete removes the object; missing key is a no-op", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-as-del-test-"));
+  onTestFinished(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const storage = new LocalArtifactStorage(root);
+  await storage.put({ storageKey: "u/s/f.txt", stream: Readable.from(["bytes"]) });
+
+  await storage.delete("u/s/f.txt");
+  await expect(storage.openReadStream("u/s/f.txt")).rejects.toThrow();
+
+  // Idempotent: deleting a key that no longer exists must not throw.
+  await expect(storage.delete("u/s/f.txt")).resolves.toBeUndefined();
+});
+
+test("bucket storage delete issues DeleteObjectCommand with the prefixed key", async () => {
+  const deletedKeys: Array<{ Bucket?: string; Key?: string }> = [];
+  const client = {
+    async send(command: unknown) {
+      if (command instanceof DeleteObjectCommand) {
+        deletedKeys.push({ Bucket: command.input.Bucket, Key: command.input.Key });
+        return {};
+      }
+      throw new Error("Unexpected command");
+    }
+  };
+
+  const storage = new BucketArtifactStorage({
+    client,
+    bucketName: "artifact-bucket",
+    keyPrefix: "tenant-a"
+  });
+
+  await storage.delete("user/session/file.txt");
+
+  // Prefix applied exactly once — must match the key put() would have written.
+  expect(deletedKeys).toEqual([
+    { Bucket: "artifact-bucket", Key: "tenant-a/user/session/file.txt" }
+  ]);
 });

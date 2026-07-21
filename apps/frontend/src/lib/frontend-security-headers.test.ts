@@ -42,8 +42,22 @@ describe("buildFrontendContentSecurityPolicy", () => {
     });
 
     expect(csp).toContain("'unsafe-eval'");
+    expect(csp).toContain("script-src 'self' 'nonce-dev' 'unsafe-eval' http://localhost:8400");
+    expect(csp).toContain(
+      "connect-src 'self' http://localhost:3001 http://localhost:8400 ws: wss:"
+    );
     expect(csp).toContain("ws: wss:");
     expect(csp).not.toContain("upgrade-insecure-requests");
+  });
+
+  it("never includes the Impeccable live origin in production", () => {
+    const csp = buildFrontendContentSecurityPolicy({
+      nonce: "prod",
+      apiUrl: "https://api.example.test",
+      development: false
+    });
+
+    expect(csp).not.toContain("http://localhost:8400");
   });
 });
 

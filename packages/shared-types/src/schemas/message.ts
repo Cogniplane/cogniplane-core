@@ -15,6 +15,18 @@ export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export const MessageFeedbackRatingSchema = z.enum(["thumbs_up", "thumbs_down"]);
 export type MessageFeedbackRating = z.infer<typeof MessageFeedbackRatingSchema>;
 
+// MCP Apps / MCP-UI resource embedded in a tool result (the `{type:"resource"}`
+// content block). Rendered client-side as a sandboxed iframe by @mcp-ui/client.
+// `uri` uses the `ui://` scheme; content is either inline `text` HTML or a
+// base64 `blob`. Kept `.passthrough()` so forward-compatible fields survive.
+export const UiResourceSchema = z.object({
+  uri: z.string(),
+  mimeType: z.string(),
+  text: z.string().optional(),
+  blob: z.string().optional()
+}).passthrough();
+export type UiResource = z.infer<typeof UiResourceSchema>;
+
 export const ToolResultSchema = z.object({
   toolResultId: z.string(),
   kind: z.enum(["command", "mcp"]),
@@ -27,9 +39,19 @@ export const ToolResultSchema = z.object({
   input: z.string(),
   output: z.string(),
   exitCode: z.number().nullable(),
-  durationMs: z.number().nullable()
+  durationMs: z.number().nullable(),
+  // Character length of the assistant text when this tool call started; lets a
+  // session reload interleave the card back into the right spot in the turn's
+  // text. Null/absent on legacy rows — reload then falls back to text-then-tools.
+  textOffset: z.number().nullable().default(null),
+  // Present only when an MCP tool returns UI resource blocks (MCP Apps).
+  uiResources: z.array(UiResourceSchema).optional()
 }).passthrough();
 export type ToolResult = z.infer<typeof ToolResultSchema>;
+
+// A reasoning burst positioned by its character offset into the assistant text.
+export const ReasoningSegmentSchema = z.object({ offset: z.number(), text: z.string() });
+export type ReasoningSegment = z.infer<typeof ReasoningSegmentSchema>;
 
 export const MessageSchema = z.object({
   messageId: z.string(),
@@ -38,6 +60,10 @@ export const MessageSchema = z.object({
   status: z.enum(["pending", "streaming", "completed", "error", "interrupted"]),
   content: z.string(),
   reasoningContent: z.string(),
+  // Reasoning bursts positioned by their character offset into the assistant
+  // text, for interleaved reload of AG-UI turns. Null on legacy/RuntimeEvent
+  // rows — reload then renders the single `reasoningContent` block.
+  reasoningSegments: z.array(ReasoningSegmentSchema).nullable().default(null),
   planContent: z.string(),
   toolResults: z.array(ToolResultSchema),
   tokenUsage: TokenUsageSchema.nullable(),
@@ -60,7 +86,7 @@ export const ApprovalSchema = z.object({
   approvalId: z.string(),
   sessionId: z.string(),
   itemId: z.string(),
-  kind: z.enum(["command_execution", "file_change", "permissions"]),
+  kind: z.enum(["command_execution", "file_change", "permissions", "mcp_tool"]),
   title: z.string(),
   summary: z.string(),
   status: z.enum(["pending", "approved", "rejected", "expired"])

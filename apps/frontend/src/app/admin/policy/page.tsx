@@ -4,7 +4,6 @@ import { AdminPolicyDecisionsCard } from "../../../components/admin/policy/admin
 import { AdminPolicyRulesCard } from "../../../components/admin/policy/admin-policy-rules-card";
 import { AdminPolicySimulator } from "../../../components/admin/policy/admin-policy-simulator";
 import { useDecisionsData, usePolicyData } from "../../../hooks/use-policy-data";
-import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 export default function AdminPolicyPage() {
   const {
@@ -23,16 +22,12 @@ export default function AdminPolicyPage() {
   const decisions = useDecisionsData();
 
   return (
-    <section id="policy" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Governance</p>
-        <h3 className="text-lg font-semibold text-on-surface">Policy Center</h3>
-        <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-          Rules are evaluated at the MCP gateway for every agent tool action. Whether matching rules
-          actually gate is the tenant-level enforcement mode in Agent settings — until it&rsquo;s set
-          to enforce, rules only record decisions you can review below.
-        </p>
-      </div>
+    <section id="policy" className="flex flex-col gap-5 pt-5">
+      <p className="max-w-prose text-sm text-on-surface-variant">
+        Rules are evaluated at the MCP gateway for every agent tool action. Whether matching rules
+        actually gate is the tenant-level enforcement mode in Agent settings — until it&rsquo;s set
+        to enforce, rules only record decisions you can review below.
+      </p>
       {error ? <p className="text-sm text-danger">{error}</p> : null}
 
       <AdminPolicyRulesCard

@@ -10,6 +10,7 @@ import { API_URL } from "../lib/api-client";
 import type { Session } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -111,14 +112,16 @@ export function SessionSidebar(props: {
     return (
       <article
         key={session.sessionId}
-        className={`group relative flex items-center gap-1 px-3 py-2 transition-colors ${
-          isActive ? "bg-surface-container" : "hover:bg-surface-container-low"
+        className={`group relative mx-2 flex min-h-10 items-center gap-1 rounded-md px-2 py-2 transition-colors ${
+          isActive
+            ? "bg-brand-surface ring-1 ring-inset ring-brand-border"
+            : "hover:bg-surface-container"
         }`}
       >
         <button
           type="button"
           onClick={() => props.onSelectSession(session.sessionId)}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none"
+          className="flex min-h-8 min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-brand/60 focus-visible:ring-offset-1"
         >
           <span
             className={`min-w-0 flex-1 truncate text-sm ${
@@ -131,7 +134,7 @@ export function SessionSidebar(props: {
             {needsAttention ? (
               <span aria-label="Needs attention" className="size-1.5 rounded-full bg-warning" />
             ) : isStreaming ? (
-              <span aria-label="Streaming" className="size-1.5 animate-pulse rounded-full bg-accent" />
+              <span aria-label="Streaming" className="size-1.5 animate-pulse rounded-full bg-brand" />
             ) : hasError ? (
               <span aria-label="Error" className="size-1.5 rounded-full bg-danger" />
             ) : (
@@ -201,12 +204,22 @@ export function SessionSidebar(props: {
       </div>
 
       <div className="px-3 pb-2">
-        <Button type="button" variant="outline" className="w-full" onClick={props.onCreateSession}>
+        <Button type="button" className="w-full" onClick={props.onCreateSession}>
           New chat
         </Button>
       </div>
 
       <div className="flex-1 overflow-y-auto pb-2">
+        {props.isLoadingSessions && props.sessions.length === 0 ? (
+          <div className="flex flex-col gap-2 px-4 pt-3">
+            {Array.from({ length: 6 }, (_, i) => (
+              <div key={i} className="flex items-center gap-2" style={{ opacity: 1 - i * 0.14 }}>
+                <Skeleton className="h-4 flex-1" />
+                <Skeleton className="h-3 w-6" />
+              </div>
+            ))}
+          </div>
+        ) : null}
         {groups.pinned.length > 0 ? (
           <SessionGroupSection title="Pinned" count={groups.pinned.length}>
             {groups.pinned.map(renderSessionRow)}

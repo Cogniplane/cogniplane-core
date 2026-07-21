@@ -19,7 +19,6 @@ import {
 import type { IntegrationRegistryService } from "../../services/integrations/integration-registry-service.js";
 import type { IntegrationStateStore } from "../../services/integrations/integration-state-store.js";
 import type { RuntimeAdapter } from "../../runtime-contracts.js";
-import type { RuntimeProvider } from "../../services/admin-config-records.js";
 import {
   createAdminAuditEvent,
   respondAdminMutationError,
@@ -32,7 +31,7 @@ export type AdminIntegrationsRouteStores = {
   integrationRegistry: IntegrationRegistryService;
   integrationStates: IntegrationStateStore;
   auditEvents: AuditEventStore;
-  runtimeAdapters: Partial<Record<RuntimeProvider, RuntimeAdapter>>;
+  runtimeAdapter: RuntimeAdapter;
 };
 
 const integrationIdParamsSchema = z.object({
@@ -81,11 +80,12 @@ async function invalidateAndAudit(
 ): Promise<void> {
   const tenantId = request.auth.tenantId;
   const collected = new Set<string>();
-  for (const adapter of Object.values(stores.runtimeAdapters)) {
-    if (!adapter?.invalidateIntegrationRuntimesForTenant) continue;
-    const ids = await adapter.invalidateIntegrationRuntimesForTenant(tenantId, integrationId);
-    for (const id of ids) collected.add(id);
-  }
+  // Integration toggles snapshot into runtime config, so tearing down every
+  // tenant runtime is the correct blast radius (the runtime rebuilds with the
+  // new tool catalog on the next turn). `integrationId` is retained only for
+  // the audit payload below.
+  const ids = await stores.runtimeAdapter.invalidateTenantRuntimes(tenantId);
+  for (const id of ids) collected.add(id);
   if (collected.size > 0) {
     await createAdminAuditEvent(stores.auditEvents, {
       tenantId,

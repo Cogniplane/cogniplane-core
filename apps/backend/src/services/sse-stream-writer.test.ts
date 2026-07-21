@@ -1,7 +1,6 @@
 import { test, expect, vi } from "vitest";
 
 import type { RuntimeEvent } from "../runtime-contracts.js";
-import { ActiveTurnMessageMap } from "./active-turn-message-map.js";
 import { streamAssistantReply } from "./sse-stream-writer.js";
 
 // ---------------------------------------------------------------------------
@@ -84,16 +83,12 @@ function makeMessages(messageId = "msg-assistant") {
   const contentLog: Array<{ status: string; content: string }> = [];
   const toolResultLog: Array<Record<string, unknown>> = [];
   const toolOutputDeltaLog: Array<{ toolResultId: string; delta: string }> = [];
-  const tokenUsageLog: Array<{
-    tokenUsage: { totalTokens: number; inputTokens: number; outputTokens: number };
-    modelName: string;
-    costUsd: number | null;
-  }> = [];
+  const deleteToolResultsLog: Array<string[]> = [];
   return {
     contentLog,
     toolResultLog,
     toolOutputDeltaLog,
-    tokenUsageLog,
+    deleteToolResultsLog,
     async create(input: { role: string }) {
       return {
         id: 1,
@@ -145,16 +140,12 @@ function makeMessages(messageId = "msg-assistant") {
       toolOutputDeltaLog.push({ toolResultId, delta });
       return null;
     },
-    async updateTokenUsage(
-      _tid: string,
-      _mid: string,
-      _uid: string,
-      tokenUsage: { totalTokens: number; inputTokens: number; outputTokens: number },
-      modelName: string,
-      costUsd: number | null
-    ) {
-      tokenUsageLog.push({ tokenUsage, modelName, costUsd });
+    async deleteToolResults(_tid: string, toolResultIds: string[], _uid: string) {
+      deleteToolResultsLog.push(toolResultIds);
     }
+    // NOTE: no updateTokenUsage here — live SSE no longer carries tokenUsage /
+    // costUsd (token capture moved to the in-process deep-agents adapter). See
+    // sse-stream-writer.ts ~L374.
   };
 }
 
@@ -188,7 +179,6 @@ function makeRuntimeManager(events: RuntimeEvent[]) {
           id: "default",
           label: "Default",
           description: null,
-          runtimeProvider: "codex" as const,
           approvalPolicy: "never" as const,
           approvalReviewer: "user" as const,
           sandboxMode: "workspace-write" as const,
@@ -254,7 +244,6 @@ function makeInput(reply: FakeReply, events: RuntimeEvent[], overrides: Record<s
     userId: "user-1",
     modelName: "gpt-5.4",
     prompt: "Hello",
-    activeTurnMessageMap: new ActiveTurnMessageMap(),
     ...overrides
   };
 }
@@ -380,9 +369,9 @@ test("streamAssistantReply persists partial assistant text under 'interrupted' s
     "interrupted"
   );
 
-  // Token usage is no longer captured in the runtime layer — the LLM proxy
-  // writes it directly to messages.cost_usd. See llm-anthropic.test.ts /
-  // llm-openai.test.ts for the usage-attribution coverage.
+  // Token usage is not carried on the SSE response.completed event — the
+  // in-process runtime adapter persists it to messages.cost_usd directly. See
+  // deep-agents-runtime-adapter.test.ts for the usage-attribution coverage.
 });
 
 test("streamAssistantReply writes response.failed SSE frame and ends stream on runtime failure", async () => {
@@ -536,6 +525,43 @@ test("streamAssistantReply redacts secrets from persisted tool input/output and 
   expect(!/Bearer\s+(?!\[REDACTED\])\S+/.test(deltaText)).toBeTruthy();
 });
 
+test("streamAssistantReply deletes persisted tool results on a response.tool.retracted event", async () => {
+  // The legacy SSE persistence path drops retracted tool cards from the DB via
+  // deleteToolResults(itemIds) so a reload doesn't render a phantom card.
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  const events: RuntimeEvent[] = [
+    { type: "response.created", responseId: "r1" },
+    {
+      type: "response.tool.started",
+      responseId: "r1",
+      toolCall: {
+        itemId: "tool-1",
+        kind: "command",
+        title: "execute",
+        status: "in_progress",
+        command: "ls",
+        cwd: null,
+        server: null,
+        toolName: "execute",
+        input: "{}",
+        output: "",
+        exitCode: null,
+        durationMs: null
+      }
+    },
+    { type: "response.tool.retracted", responseId: "r1", itemIds: ["tool-1"] },
+    { type: "response.completed", responseId: "r1" }
+  ];
+
+  const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).messages = messages;
+
+  await streamAssistantReply(input);
+
+  expect(messages.deleteToolResultsLog).toEqual([["tool-1"]]);
+});
+
 test("streamAssistantReply cancels the runtime turn and stops writing when the client disconnects mid-stream", async () => {
   const reply = makeRawResponse();
   const messages = makeMessages();
@@ -610,6 +636,53 @@ test("streamAssistantReply does not interrupt the runtime when the stream closes
 
   // The post-completion close must not have triggered an interrupt.
   expect(interruptCalls.length).toBe(0);
+});
+
+test("streamAssistantReply interrupts the runtime turn when per-event persistence throws", async () => {
+  // A DB failure while persisting a streamed event must cancel the in-process
+  // runtime turn (R28) — otherwise it keeps generating into an unbounded queue
+  // nobody drains, burning tokens for output that will never be persisted.
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  // A `replace` event persists via updateContent; make that throw once the
+  // turn is under way.
+  messages.updateContent = async (
+    _tid: string,
+    _mid: string,
+    _uid: string,
+    status: string,
+    content: string
+  ) => {
+    if (status === "streaming") throw new Error("db write failed mid-stream");
+    messages.contentLog.push({ status, content });
+    return null;
+  };
+  const events: RuntimeEvent[] = [
+    { type: "response.created", responseId: "r1" },
+    { type: "response.output_text.replace", responseId: "r1", text: "boom" },
+    { type: "response.output_text.delta", responseId: "r1", delta: "never persisted" },
+    { type: "response.completed", responseId: "r1" }
+  ];
+  const interruptCalls: Array<{ sessionId: string }> = [];
+  const input = makeInput(reply, events) as Parameters<typeof streamAssistantReply>[0];
+  (input as Record<string, unknown>).messages = messages;
+  (input as Record<string, unknown>).runtimeAdapter = {
+    ...makeRuntimeManager(events),
+    async interruptTurn(i: { sessionId: string }) {
+      interruptCalls.push({ sessionId: i.sessionId });
+      return "interrupted" as const;
+    }
+  };
+
+  await streamAssistantReply(input);
+
+  // The persistence failure interrupted the turn exactly once.
+  expect(interruptCalls.length).toBe(1);
+  expect(interruptCalls[0]?.sessionId).toBe("session-1");
+  // The client still got a terminal failure frame (outer catch path).
+  const failed = reply.events().find((e) => e.event === "response.failed");
+  expect(failed).toBeTruthy();
+  expect(reply.ended).toBe(true);
 });
 
 test("streamAssistantReply does not start the runtime turn if the client disconnected during setup", async () => {
@@ -756,4 +829,21 @@ test("streamAssistantReply surfaces the message for errors that set a 4xx status
 
   const failed = reply.events().find((e) => e.event === "response.failed");
   expect((failed?.data.error as { message: string }).message).toBe("model not enabled for tenant");
+});
+
+test("streamAssistantReply surfaces the message for provider errors that set a 4xx status", async () => {
+  // Real Anthropic/OpenAI SDK errors carry `.status` (not `.statusCode`); they
+  // are still client-actionable (invalid key, rate limit) and must pass through.
+  const reply = makeRawResponse();
+  const messages = makeMessages();
+  messages.create = async () => {
+    const err = Object.assign(new Error("invalid x-api-key"), { status: 401 });
+    throw err;
+  };
+  const input = makeInput(reply, [{ type: "response.created", responseId: "r1" }], { messages });
+
+  await streamAssistantReply(input as never);
+
+  const failed = reply.events().find((e) => e.event === "response.failed");
+  expect((failed?.data.error as { message: string }).message).toBe("invalid x-api-key");
 });

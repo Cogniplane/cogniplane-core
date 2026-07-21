@@ -5,13 +5,10 @@
 # backend + the frontend with sensible defaults (AUTH_MODE=dev-headers).
 #
 # Required env vars (export before `docker compose up`, or put in a .env file):
-#   E2B_API_KEY        — required at boot; both runtimes execute inside E2B
+#   E2B_API_KEY        — required at boot; the runtime executes inside E2B
 #   E2B_TEMPLATE_ID    — required at boot; run `make e2b-build` to create one
-#   ANTHROPIC_API_KEY  — to use the Claude runtime (otherwise hidden in UI)
-#   OPENAI_API_KEY     — to use the Codex runtime (otherwise hidden in UI)
-# At least one of ANTHROPIC_API_KEY / OPENAI_API_KEY is required for any agent
-# turn to work; E2B_API_KEY / E2B_TEMPLATE_ID are required for the backend to
-# boot at all.
+#   ANTHROPIC_API_KEY  — required for any agent turn to work
+# E2B_API_KEY / E2B_TEMPLATE_ID are required for the backend to boot at all.
 #
 # After bring-up:
 #   Frontend: http://localhost:3000
@@ -57,11 +54,6 @@ services:
     build:
       context: .
       dockerfile: docker/backend.Dockerfile
-      # These pins are checked by the codex-release drift test
-      # (apps/backend/src/codex-release.test.ts) — bumping them requires
-      # rebuilding the E2B template too. See docs/self-hosting.md.
-      args:
-        CODEX_NPM_VERSION: 0.142.4
     container_name: cogniplane-backend
     security_opt:
       - no-new-privileges:true
@@ -72,8 +64,6 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:3001:3001"
-    volumes:
-      - runtime-workspaces:/runtime-workspaces
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 3001
@@ -90,15 +80,12 @@ services:
       MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/cogniplane
       APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
       LOCAL_DEV_USER_ID: local-dev-user
-      CODEX_VERSION: 0.142.4
-      RUNTIME_WORKSPACE_ROOT: /runtime-workspaces
       REDIS_URL: redis://redis:6379
       # Forwarded from host env / .env when non-empty. E2B_* are required at
-      # boot (config.ts fails fast); provider keys are optional.
+      # boot (config.ts fails fast); the Anthropic key is optional at boot (turns need it).
       E2B_API_KEY:
       E2B_TEMPLATE_ID:
       ANTHROPIC_API_KEY:
-      OPENAI_API_KEY:
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
       interval: 10s
@@ -128,4 +115,3 @@ services:
 volumes:
   redis-data:
   postgres-data:
-  runtime-workspaces:

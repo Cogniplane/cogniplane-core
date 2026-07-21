@@ -42,12 +42,12 @@ body:
     attributes:
       label: Environment
       description: |
-        Output of `node --version`, `pnpm --version`, OS, runtime provider (Codex/Claude), `CLAUDE_RUNTIME_BACKEND` (local/e2b), and the cogniplane-core commit hash.
+        Output of `node --version`, `pnpm --version`, OS, the model used, and the cogniplane-core commit hash.
       placeholder: |
         Node: 24.5.0
         pnpm: 10.32.1
         OS: Ubuntu 24.04
-        Runtime: claude-code (local backend)
+        Model: deepagents/claude-sonnet-5
         Commit: abc1234
     validations:
       required: true

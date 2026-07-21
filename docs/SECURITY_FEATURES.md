@@ -1,7 +1,7 @@
 # Security Features — Cogniplane Core
 
 > **Audience:** Operators evaluating Cogniplane Core's security posture; contributors auditing the security model.
-> **Scope:** All security-relevant controls implemented in the codebase as of 2026-05-31.
+> **Scope:** All security-relevant controls implemented in the codebase as of 2026-07-04 (Deep Agents runtime).
 > **Companion doc:** `ARCHITECTURE.md`.
 
 Inventory of security controls, defensive mechanisms, and isolation boundaries, grouped by domain. Each entry names the control, its location in code, and the relevant config.
@@ -33,27 +33,23 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 
 ### 1.4 Public-path allowlist
 - **Match:** exact, after stripping query string — defends against `/auth/login.attack` smuggling.
-- **Allowed:** `/auth/login`, `/auth/callback`, `/auth/refresh`, `/auth/logout`, `/auth/github/user/callback`.
-- File: `apps/backend/src/lib/auth-public-paths.ts`.
+- **Allowed:** the static set `/auth/login`, `/auth/callback`, `/auth/refresh`, `/auth/logout`, plus the integration OAuth callback paths sourced from the integration registry (e.g. the GitHub user callback).
+- Files: `apps/backend/src/lib/auth-public-paths.ts`, `apps/backend/src/lib/auth-workos.ts`.
 
-### 1.5 `.well-known/` returns 404 (not 401)
-- OAuth probes return 404 so Codex skips OAuth discovery and falls back to the static Bearer token. Returning 401 would break MCP connections.
-- Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`.
-
-### 1.6 Frontend session-hint cookie
+### 1.5 Frontend session-hint cookie
 - **Cookie:** `cogniplane_session_hint=1`, Max-Age 7d, `SameSite=Lax`, `Secure` over HTTPS.
 - **Role:** UI-only short-circuit for the redirect-to-login flow; not a credential.
 - Files: `apps/frontend/src/lib/auth-context.tsx`, `apps/frontend/src/middleware.ts`.
 
-### 1.7 Refresh cookie hardening
+### 1.6 Refresh cookie hardening
 - **Cookie:** `cogniplane_refresh` — `httpOnly`, `Secure`, `SameSite=None`, scoped to backend domain.
 - Frontend JS cannot read it; route protection is therefore handled by `AuthGuard`.
 
-### 1.8 Access token storage
-- **Storage:** `sessionStorage` only (no `localStorage`) — cleared on tab close, smaller XSS persistence window.
+### 1.7 Access token storage
+- **Storage:** held in React state (memory) only — never written to `localStorage` or `sessionStorage`, so no persistence surface for XSS to read; a page reload re-authenticates via the refresh cookie.
 - File: `apps/frontend/src/lib/auth-context.tsx`.
 
-### 1.9 JWT key id (`kid`) for forward-compatible rotation
+### 1.8 JWT key id (`kid`) for forward-compatible rotation
 - Every token stamped with `kid` (env `JWT_KEY_ID`, default `"default"`); enables future multi-key rotation without invalidating in-flight tokens.
 
 ---
@@ -102,23 +98,24 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 
 ## 4. Sandboxing & Runtime Isolation
 
-### 4.1 E2B sandbox isolation (Codex + Claude)
-- **Template:** E2B `agent-runtime`, id pinned in `apps/backend/src/codex-release.json`.
+### 4.1 E2B sandbox isolation (Deep Agents code execution)
+- The agent loop runs **in-process in the backend**; only shell/file tools execute inside a per-session E2B sandbox. The template (`docker/template.ts`, built by `make e2b-build`) is a dumb code-execution box — Python data stack, **no agent CLIs or SDKs, no secrets in the sandbox env**.
+- **Lazy:** the sandbox is created on first shell/file tool use and memoized per session; chat-only sessions never create one. `allowCommandExecution=false` attaches no sandbox at all, so the `execute` tool is never exposed.
 - **Workspace:** isolated per session at `/home/user/workspace/<sessionId>/`.
-- **Processes:** Codex `app-server` and the Claude harness run as independent processes in the same image, sharing only the workspace filesystem.
-- **No `claude` CLI:** the in-sandbox harness uses `canUseTool` over a stdio JSON protocol instead of `--dangerously-skip-permissions`.
-- Files: `apps/backend/src/services/runtime-manager.ts`, `apps/backend/src/services/e2b-claude-runtime-process.ts`, `docker/sandbox-agent/sandbox-agent.mjs`.
+- Files: `apps/backend/src/services/deep-agents/deep-agents-e2b-backend.ts`, `docker/template.ts`.
 
 ### 4.2 Workspace path validation
-- Tool-call paths validated against the posix workspace root; symlinks resolved relative to sandbox root only.
+- All model-visible paths are remapped into the session workspace and confined by a shared traversal guard (`resolveInsideSandbox`); paths that escape the workspace return a structured error to the model instead of silently retargeting.
+- File: `apps/backend/src/services/runtime/sandbox-path.ts`.
 
-### 4.3 Sandbox + request timeouts
-- `E2B_SANDBOX_TIMEOUT_MS` (default 30 min) — hard sandbox kill.
-- `RUNTIME_REQUEST_TIMEOUT_MS` (default 2 min) — JSON-RPC call ceiling.
-- `RUNTIME_IDLE_TIMEOUT_MS` (default 5 min) — idle runtime termination.
+### 4.3 Sandbox + turn timeouts
+- `E2B_SANDBOX_TIMEOUT_MS` (default 30 min) — hard sandbox lifetime cap.
+- `DEEP_AGENTS_EXECUTE_TIMEOUT_MS` (default 2 min) — per-command ceiling inside the sandbox, with a 64k output cap.
+- `RUNTIME_TURN_TIMEOUT_MS` (default 20 min) — turn watchdog; a wedged model/tool call aborts the graph run and frees the session slot. Disarmed while a human approval is pending.
+- `RUNTIME_IDLE_TIMEOUT_MS` (default 5 min) — idle session teardown.
 
 ### 4.4 Per-session workspace identity
-- Workspace dir keyed by UUIDv7 `runtimeId`; no cross-session reuse.
+- Workspace dir keyed by session id; sandboxes are never shared across sessions.
 
 ---
 
@@ -131,7 +128,7 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 5.2 ToolExecutionContext — model-blind credential envelope
 - Model receives an opaque `toolContextId`; backend resolves and injects credentials at the MCP gateway.
-- **TTL:** `TOOL_CONTEXT_TTL_MS` (default 15 min), per-turn.
+- **TTL:** `TOOL_CONTEXT_TTL_MS` (default 25 min), per-turn; boot validation pins it strictly above the turn watchdog so a long turn never loses tool access mid-flight.
 - File: `apps/backend/src/services/auth/tool-execution-context-store.ts`.
 
 ### 5.3 At-rest encryption for connection credentials
@@ -142,7 +139,7 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 5.4 Boot-time secret validation (Zod)
 - `config.ts` fails fast on missing required secrets.
-- **Conditional requirements:** `ANTHROPIC_API_KEY` (Claude runtime), `E2B_API_KEY` (any `e2b` backend), `GITHUB_APP_PRIVATE_KEY` + `GITHUB_APP_CLIENT_SECRET` (GitHub integration), `PII_LLM_API_KEY` (`PII_PROVIDER_ENABLED=true`).
+- **Requirements:** `E2B_API_KEY` + a real `E2B_TEMPLATE_ID` (unconditional — the runtime executes shell/file tools inside E2B; the migration runner is exempt), `PII_LLM_API_KEY` when `PII_PROVIDER_ENABLED=true`, GitHub app credentials when the GitHub integration is configured. At least one model-provider key (Anthropic / OpenAI / Google / OpenRouter / Z.AI — per-tenant or the matching platform env var) is validated at session start.
 
 ### 5.5 URL sanitization for logging
 - `sanitizeUrl()` strips `token`, `toolContextId`, etc. from any URL logged at warn/error.
@@ -156,27 +153,21 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 - `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions. When a request needs review, the frontend receives `framework:approval_required`; the user resolves it via `POST /approvals/:approvalId/decision`.
 - File: `apps/backend/src/routes/approvals.ts`.
 
-### 6.2 `RuntimeApprovalCoordinator` (Codex)
-- **Intercepts:** `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`.
-- **Behavior:** holds the request in memory, persists an `approvals` row, blocks the runtime turn until the operator decides.
-- File: `apps/backend/src/services/runtime/runtime-approval-coordinator.ts`.
+### 6.2 Interrupt-based native HITL
+- Gated tools (all MCP gateway tools plus the mutating built-ins `execute`/`write_file`/`edit_file`) pause the LangGraph run **before execution** via `interruptOn` and checkpoint. The adapter persists an `approvals` row, emits `framework:approval_required`, and resumes the graph with the decision.
+- Resume is **keyed per interrupt id**, so concurrent interrupts (parallel subagents each hitting a gated tool) cannot mis-route decisions.
+- Files: `apps/backend/src/services/deep-agents/deep-agents-graph.ts`, `apps/backend/src/services/deep-agents/deep-agents-runtime-adapter.ts`.
 
-### 6.3 Claude approval bridge
-- Same flow via the SDK's `canUseTool`, which lives in the in-sandbox harness; decisions round-trip as `approval_request` / `approval_response` frames over stdio.
-- Files: `docker/sandbox-agent/sandbox-agent.mjs`, `apps/backend/src/services/claude/claude-code-runtime-adapter.ts`, `apps/backend/src/services/runtime/sandbox-agent-protocol.ts`.
-
-### 6.4 Auto-approve read-only tools
+### 6.3 Auto-approve read-only tools
 - `tenant_settings.auto_approve_read_only_tools` skips prompts for tools tagged `readOnly` (`session_context`, `list_artifacts`, `read_text_artifact`, GitHub/Notion read ops).
 
-### 6.5 Wall-clock TTL on pending approvals
+### 6.4 Wall-clock TTL on pending approvals
 - **TTL:** `APPROVAL_REQUEST_TTL_MS` (default 10 min).
-- **On expiry:** synthetic `reject` to runtime, `status='expired'` in DB, `approval.expired` audit event, `framework:runtime_notice` SSE (`noticeId = approval-expired:<id>`).
+- **On expiry:** the paused graph is resumed with a reject, `status='expired'` in DB, `approval.expired` audit event, `framework:runtime_notice` SSE (`noticeId = approval-expired:<id>`).
+- **Crash recovery:** the row carries a DB-level `expires_at`, so a process death that kills the in-memory timer still lets the startup sweep expire stuck `pending` rows.
+- Files: `apps/backend/src/services/runtime/approval-cleanup.ts`, `apps/backend/src/services/runtime/stale-approval-sweeper.ts`.
 
-### 6.6 Approval flood protection
-- Cap of 5 pending approvals per session.
-- File: `apps/backend/src/services/runtime/runtime-request-handler.ts`.
-
-### 6.7 Policy Center approvals
+### 6.5 Policy Center approvals
 - Policy Center rules can return `require_approval` for MCP tool calls. The MCP gateway holds the JSON-RPC response open, persists an `approvals` row through the policy approval coordinator, emits the same `framework:approval_required` SSE event, then proceeds or denies based on the decision.
 - No active turn means no safe human prompt path, so unattended policy approvals fail closed.
 - Files: `apps/backend/src/routes/mcp.ts`, `apps/backend/src/services/policy/*`.
@@ -236,15 +227,15 @@ Files: `apps/backend/src/services/skills/skill-import-service.ts`, `skill-bundle
 ### 9.1 Two modes, both authenticated
 | Mode | Description |
 |---|---|
-| `managed` | Tool dispatched to internal `MANAGED_TOOL_CATALOG` (session tools, `write_artifact`, GitHub, Notion) |
+| `managed` | Tool dispatched to the internal `ManagedToolCatalog` (session tools, `write_artifact`, memory tools, GitHub, Notion) |
 | `proxy` | Forwarded to upstream URL with HMAC-signed framework context headers |
 
 File: `apps/backend/src/routes/mcp.ts`.
 
 ### 9.2 Runtime token authentication
 - **Token:** `rt_…`, HMAC-derived from `DATA_ENCRYPTION_SECRET`.
-- **Codex:** `[mcp_servers.*.http_headers]` sends `Authorization: Bearer rt_…` on every request, including `initialize` (Codex ≥ 0.139). Query-param tokens are rejected.
-- **Claude:** `Authorization: Bearer rt_…` header only; no token in URL.
+- **Transport:** the runtime's MCP client sends `Authorization: Bearer rt_…` as a header on every request. Query-param tokens are rejected; MCP URLs never carry `?token=`.
+- **Scope:** the token is session-scoped (HMAC claims bind tenant/user/session/runtime); only the per-turn `toolContextId` rotates.
 - File: `apps/backend/src/lib/auth-runtime-token.ts`.
 
 ### 9.3 `toolContextId` resolution chain
@@ -257,7 +248,7 @@ File: `apps/backend/src/routes/mcp.ts`.
 - File: `apps/backend/src/lib/mcp-proxy-signature.ts`.
 
 ### 9.5 Managed tool allowlist
-- Only entries in `MANAGED_TOOL_CATALOG` are invocable; unknown tool names rejected.
+- Only entries registered in the `ManagedToolCatalog` are invocable; unknown tool names rejected.
 - Files: `apps/backend/src/services/managed-tools/catalog.ts` (the allowlist) and `apps/backend/src/services/managed-tools/factory.ts` (dispatch).
 
 ---
@@ -383,7 +374,7 @@ File: `apps/backend/src/lib/security-headers.ts`.
 - `src/middleware.ts` does a fast pre-render check via the session-hint cookie; non-allowlisted paths redirect to `/login`.
 
 ### 15.3 Token storage
-- Access token in `sessionStorage`; no `localStorage` persistence.
+- Access token held in memory (React state) only; no `localStorage` or `sessionStorage` persistence.
 
 ### 15.4 No `dangerouslySetInnerHTML`
 - Codebase contains no `dangerouslySetInnerHTML`; model markdown rendered through a sanitizing renderer.
@@ -392,20 +383,20 @@ File: `apps/backend/src/lib/security-headers.ts`.
 - `/auth/callback/page.tsx` exports `dynamic = "force-dynamic"` so edge hosts cannot serve a static prerender that skips the token exchange.
 
 ### 15.6 Auth-callback race-condition mitigation
-- Access token written to `sessionStorage` before `router.replace("/")` so `AuthProvider` picks it up directly instead of round-tripping through `/auth/refresh`.
+- The callback page awaits `completeLogin(accessToken)` — which sets the in-memory token and populates the user — before `router.replace("/")`, so `AuthProvider` is ready without a `/auth/refresh` round-trip.
 
 ---
 
 ## 16. Supply-Chain & Dependency Hygiene
 
 ### 16.1 Pinned runtime versions
-- `apps/backend/src/codex-release.json` pins `codexVersion`, `claudeAgentSdkVersion`, `e2bTemplateId`, protocol `schemaVersion`.
+- The agent runtime is an in-process library: `deepagents` (+ LangChain/LangGraph) is version-pinned in `apps/backend/package.json` and locked by `pnpm-lock.yaml` — there is no separately-versioned agent CLI to drift.
 
-### 16.2 Drift-by-construction prevention
-- `docker/template.ts` imports pinned versions from `codex-release.json` at build time; the E2B template installs exactly that version.
+### 16.2 SDK bump guard
+- `deep-agents-graph.test.ts` pins the hardcoded builtin-tool-name list against `createDeepAgent`'s actual collision behavior, so a library bump that changes the builtin tool set fails the suite loudly instead of silently changing which MCP tool names are dropped.
 
-### 16.3 Drift tests
-- `apps/backend/src/codex-release.test.ts` asserts `E2B_TEMPLATE_ID` matches the JSON and that the sandbox-agent harness file exists.
+### 16.3 Template contents pinned
+- `docker/template.ts` installs a pinned Python package set into the E2B template; the template contains no agent code or secrets.
 
 ### 16.4 Deterministic dependency resolution
 - pnpm workspace with checked-in `pnpm-lock.yaml`.
@@ -439,8 +430,8 @@ File: `apps/backend/src/lib/security-headers.ts`.
 | Access token | JWT, header-bound | 15 min |
 | Refresh token | JWT + Redis jti, rotation + reuse detection | 7 days |
 | Session-hint cookie | UI-only, lax | 7 days |
-| Runtime session | E2B sandbox + `runtime_sessions` row | idle 5 min, hard 30 min |
-| Tool execution context | per-turn credential envelope | 15 min |
+| Runtime session | in-process Deep Agents session (+ optional lazy E2B sandbox) | idle 5 min; sandbox hard cap 30 min |
+| Tool execution context | per-turn credential envelope | 25 min |
 | Pending approval | wall-clock TTL | 10 min |
 | Artifact download token | HMAC, single-use | configurable, short |
 
@@ -461,8 +452,6 @@ Per-tenant settings in `tenant_settings` (one row per tenant; `system` row is pl
 | `allow_user_token_forwarding` | Permit forwarding user OAuth tokens to integration tools |
 | `enabled_tool_ids` | Allowlist of managed tools available to the runtime |
 | `enabled_mcp_server_ids` | Allowlist of MCP servers wired into the workspace |
-| `runtime_provider` | Which agent runtime (`codex` / `claude-code`) |
-| `enabled_runtime_providers` | Which providers are exposed to end users |
 | `developer_instructions` | Per-tenant system-prompt overlay |
 
 File: `apps/backend/src/services/tenant-settings-store.ts`.
@@ -486,8 +475,7 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | `PII_PROVIDER_ENABLED` | Opt-in PII detection provider |
 | `SCHEDULER_ENABLED` | Background job scheduler |
 | `SCHEDULER_MAX_CONCURRENT_JOBS`, `SCHEDULER_JOB_TIMEOUT_MS` | Scheduler bounds |
-| `RUNTIME_BACKEND` | `local` vs `e2b` for Codex |
-| `CLAUDE_RUNTIME_BACKEND` | `local` vs `e2b` for Claude (independent from Codex) |
+| `RUNTIME_TURN_TIMEOUT_MS` | Turn watchdog; `0` disables |
 | `ARTIFACT_STORAGE_BACKEND` | `local` vs `bucket` (S3) |
 | `SKILL_BUNDLE_STORAGE_BACKEND` | `local` vs `bucket` (S3) |
 | `AUTH_MODE` | `dev-headers` vs `workos` (production-locked to `workos`) |
@@ -530,7 +518,7 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | Refresh-token replay | jti consume + family revoke on reuse | 7d TTL ceiling |
 | Sandbox escape | E2B isolated workspace per session | Sandbox + request + idle timeouts |
 | Tool abuse | Native HITL approvals, Policy Center rules, and capability allowlists | Tenant-level monitor/enforce switch + read-only auto-approve scoping |
-| Approval flooding | Max 5 pending per session | TTL-based cleanup |
+| Approval flooding | Wall-clock TTL on every pending approval + startup sweep of stale rows | Turn abort rejects all pending approvals for the session |
 | Upload-based attacks | MIME allowlist + magic-byte verify + size cap | Filename sanitization + sandboxed processing |
 | Archive-based attacks (zip bomb, zip-slip, symlink escape) | Per-file + total uncompressed caps, file-count cap, posix-normalized path containment, declared-vs-actual size check | Validator rejects symlinks/non-regular files; tar extraction filter admits only `File`/`Directory` |
 | Log-based credential leak | `redactSecrets` + `sanitizeUrl` | Structured logger filtering |
@@ -538,7 +526,7 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | MCP request spoofing | Runtime token (HMAC) + proxy signature | toolContextId resolution chain |
 | Stale config mid-turn | Runtime policy snapshot frozen per turn | Config hash + manifest versioning; settings updates invalidate active runtimes |
 | PII leakage | Provider + rule-based fallback, fail-closed in `block` mode | Per-scope opt-in, scan-job audit trail |
-| Dependency drift | Pinned versions in `codex-release.json` | Drift tests + lockfile |
+| Dependency drift | Runtime library pinned in `package.json` + lockfile | Builtin-tool-name pin test on SDK bumps |
 
 ---
 
@@ -558,8 +546,8 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | Runtime token | `apps/backend/src/lib/auth-runtime-token.ts` |
 | MCP proxy signature | `apps/backend/src/lib/mcp-proxy-signature.ts` |
 | MCP gateway | `apps/backend/src/routes/mcp.ts` |
-| Approval coordinator (Codex) | `apps/backend/src/services/runtime/runtime-approval-coordinator.ts` |
-| Approval bridge (Claude) | `docker/sandbox-agent/sandbox-agent.mjs`, `apps/backend/src/services/claude/claude-code-runtime-adapter.ts` |
+| Native HITL (interrupts + approval loop) | `apps/backend/src/services/deep-agents/deep-agents-runtime-adapter.ts`, `apps/backend/src/services/deep-agents/deep-agents-graph.ts` |
+| Policy approval coordinator (gateway) | `apps/backend/src/services/runtime/policy-approval-coordinator.ts` |
 | Rate limits / quotas | `apps/backend/src/services/request-limits.ts` |
 | Security headers | `apps/backend/src/lib/security-headers.ts` |
 | CORS | `apps/backend/src/lib/cors.ts` |
@@ -575,8 +563,8 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | Approval store | `apps/backend/src/services/auth/approval-store.ts` |
 | Frontend AuthGuard | `apps/frontend/src/lib/auth-guard.tsx` |
 | Frontend middleware | `apps/frontend/src/middleware.ts` |
-| Sandbox harness | `docker/sandbox-agent/sandbox-agent.mjs` |
-| Pinned versions | `apps/backend/src/codex-release.json` |
+| Sandbox backend + path guard | `apps/backend/src/services/deep-agents/deep-agents-e2b-backend.ts`, `apps/backend/src/services/runtime/sandbox-path.ts` |
+| E2B template | `docker/template.ts` |
 | RLS migrations | `apps/backend/db/migrations/*.sql` |
 
 ---

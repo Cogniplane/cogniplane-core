@@ -1,4 +1,5 @@
 import { summarizePiiRun } from "../../../lib/admin-session-pii-utils";
+import { shortId } from "../../../lib/admin-pii-utils";
 import type {
   AdminSessionDetailApproval,
   AdminSessionDetailMessage,
@@ -14,10 +15,6 @@ export type AlertItem = {
   summary: string;
   jumpToMessageId: string | null;
 };
-
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
 
 /**
  * Pull the canonical scanRunId out of a message's detail_json, if present.

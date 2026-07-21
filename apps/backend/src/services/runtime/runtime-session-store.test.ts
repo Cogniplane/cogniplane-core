@@ -67,8 +67,8 @@ function buildRuntimeSessionRow(params: unknown[]): Record<string, unknown> {
     user_id: String(params[2]),
     runtime_id: String(params[3]),
     workspace_path: String(params[4]),
-    codex_version: String(params[5]),
-    codex_schema_version: String(params[6]),
+    runtime_version: String(params[5]),
+    runtime_schema_version: String(params[6]),
     manifest_path: String(params[7]),
     manifest_metadata: JSON.parse(String(params[8])) as RuntimeManifest,
     health_status: String(params[9]),
@@ -81,10 +81,6 @@ function buildRuntimeSessionRow(params: unknown[]): Record<string, unknown> {
     created_at: "2026-04-08T12:00:00.000Z",
     updated_at: "2026-04-08T12:00:00.000Z"
   };
-}
-
-function extractPlaceholderNumbers(sql: string): number[] {
-  return [...sql.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]));
 }
 
 test("RuntimeSessionStore.setStatus returns null when no row matched", async () => {
@@ -123,8 +119,8 @@ test("RuntimeSessionStore.setStatus returns the updated row when matched", async
                   user_id: params[1],
                   runtime_id: "rt",
                   workspace_path: "/ws",
-                  codex_version: "1",
-                  codex_schema_version: "v2",
+                  runtime_version: "1",
+                  runtime_schema_version: "v2",
                   manifest_path: "/m",
                   manifest_metadata: {},
                   health_status: "terminated",
@@ -133,7 +129,7 @@ test("RuntimeSessionStore.setStatus returns the updated row when matched", async
                   terminated_at: null,
                   lifecycle_metadata: {},
                   status: params[2],
-                  runtime_provider: "codex",
+                  runtime_provider: "deep-agents",
                   created_at: "2026-04-08T12:00:00.000Z",
                   updated_at: "2026-04-08T12:00:00.000Z"
                 }
@@ -153,17 +149,76 @@ test("RuntimeSessionStore.setStatus returns the updated row when matched", async
   expect(result!.status).toBe("terminated");
 });
 
-test("RuntimeSessionStore.setStatus scopes the update to runtime_id when provided", async () => {
-  const updates: Array<{ sql: string; params: unknown[] }> = [];
+/**
+ * A fake `runtime_sessions` table that evaluates `setStatus`'s UPDATE predicate
+ * against real rows instead of matching SQL text. Critically, it derives the
+ * runtime-id guard from the *actual SQL emitted by production* — so the
+ * anti-clobber contract (`$5 IS NULL OR runtime_id = $5`) is behaviorally
+ * exercised: flipping the `OR` to `AND`, or dropping the guard entirely, changes
+ * which rows this fake updates and the assertions below fail.
+ */
+function makeSetStatusTable(rows: Array<{ runtime_id: string; status: string }>) {
+  const table = rows.map((r, i) => ({
+    id: i + 1,
+    tenant_id: "t",
+    session_id: "s",
+    user_id: "u",
+    runtime_id: r.runtime_id,
+    runtime_provider: "deep-agents",
+    workspace_path: "/ws",
+    runtime_version: "1",
+    runtime_schema_version: "v2",
+    manifest_path: "/m",
+    manifest_metadata: {},
+    health_status: "ok",
+    last_active_at: null,
+    started_at: null,
+    terminated_at: null,
+    lifecycle_metadata: {},
+    status: r.status,
+    created_at: "2026-04-08T12:00:00.000Z",
+    updated_at: "2026-04-08T12:00:00.000Z"
+  }));
+
   const db = {
     async connect() {
       return {
         async query(sql: string, params: unknown[] = []) {
           if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 };
           if (sql.startsWith("SELECT set_config")) return { rows: [], rowCount: 0 };
-          if (sql.includes("UPDATE runtime_sessions")) {
-            updates.push({ sql, params });
-            return { rows: [], rowCount: 0 };
+          if (sql.includes("UPDATE runtime_sessions") && sql.includes("SET status = $3")) {
+            const [sessionId, userId, status, tenantId, runtimeId] = params as [
+              string,
+              string,
+              string,
+              string,
+              string | null
+            ];
+            // Re-derive the guard from the production SQL. If production ever
+            // drops the `($5 IS NULL OR runtime_id = $5)` clause, or flips the
+            // OR to an AND, the effective predicate here changes with it.
+            const usesOrGuard = /\(\s*\$5::text IS NULL OR runtime_id = \$5\s*\)/.test(sql);
+            const usesAndGuard = /\$5::text IS NOT NULL AND runtime_id = \$5/.test(sql);
+            const hasRuntimeGuard = sql.includes("runtime_id = $5");
+
+            const matched = table.filter((row) => {
+              if (row.tenant_id !== tenantId) return false;
+              if (row.session_id !== sessionId) return false;
+              if (row.user_id !== userId) return false;
+              if (row.status === "terminated" || row.status === "error") return false;
+              if (!hasRuntimeGuard) return true; // unscoped: any nonterminal row
+              if (usesOrGuard) return runtimeId === null || row.runtime_id === runtimeId;
+              if (usesAndGuard) return runtimeId !== null && row.runtime_id === runtimeId;
+              // Some other guard shape — scope strictly to be safe.
+              return row.runtime_id === runtimeId;
+            });
+
+            for (const row of matched) {
+              row.status = status;
+              row.updated_at = "2026-04-08T12:00:01.000Z";
+            }
+
+            return { rows: matched.map((r) => ({ ...r })), rowCount: matched.length };
           }
           throw new Error(`Unexpected ${sql}`);
         },
@@ -171,16 +226,47 @@ test("RuntimeSessionStore.setStatus scopes the update to runtime_id when provide
       };
     }
   } as unknown as Pool;
+
+  return { db, table };
+}
+
+test("RuntimeSessionStore.setStatus scoped to a runtime_id never clobbers a replacement row", async () => {
+  // A stale runtime is being torn down while its replacement is already live.
+  const { db, table } = makeSetStatusTable([
+    { runtime_id: "rt-old", status: "active" },
+    { runtime_id: "rt-new", status: "active" }
+  ]);
   const store = new RuntimeSessionStore(db);
 
-  // Teardown of a specific runtime: must never clobber a replacement's row.
-  await store.setStatus("t", "s", "u", "terminated", "rt-old");
-  expect(updates[0].sql).toMatch(/runtime_id = \$5/);
-  expect(updates[0].params[4]).toBe("rt-old");
+  const result = await store.setStatus("t", "s", "u", "terminated", "rt-old");
 
-  // Session-level form passes null and matches any nonterminal row.
-  await store.setStatus("t", "s", "u", "inactive");
-  expect(updates[1].params[4]).toBeNull();
+  // Only the targeted runtime's row is terminated...
+  expect(result).toBeTruthy();
+  expect(result!.runtimeId).toBe("rt-old");
+  expect(result!.status).toBe("terminated");
+  // ...and the freshly-inserted replacement is left untouched.
+  expect(table.find((r) => r.runtime_id === "rt-new")!.status).toBe("active");
+});
+
+test("RuntimeSessionStore.setStatus without a runtime_id matches any nonterminal row for the session", async () => {
+  const { db, table } = makeSetStatusTable([{ runtime_id: "rt-only", status: "active" }]);
+  const store = new RuntimeSessionStore(db);
+
+  const result = await store.setStatus("t", "s", "u", "inactive");
+
+  expect(result).toBeTruthy();
+  expect(result!.status).toBe("inactive");
+  expect(table[0].status).toBe("inactive");
+});
+
+test("RuntimeSessionStore.setStatus never revives a terminated row", async () => {
+  const { db } = makeSetStatusTable([{ runtime_id: "rt-old", status: "terminated" }]);
+  const store = new RuntimeSessionStore(db);
+
+  // Session-level (unscoped) form must still skip terminal rows.
+  const result = await store.setStatus("t", "s", "u", "active");
+
+  expect(result).toBe(null);
 });
 
 test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
@@ -200,8 +286,8 @@ test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
                   user_id: "u",
                   runtime_id: "rt",
                   workspace_path: "/ws",
-                  codex_version: "1",
-                  codex_schema_version: "v2",
+                  runtime_version: "1",
+                  runtime_schema_version: "v2",
                   manifest_path: "/m",
                   manifest_metadata: {},
                   health_status: "healthy",
@@ -210,7 +296,7 @@ test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
                   terminated_at: null,
                   lifecycle_metadata: {},
                   status: "active",
-                  runtime_provider: "codex",
+                  runtime_provider: "deep-agents",
                   created_at: "2026-04-08T12:00:00.000Z",
                   updated_at: "2026-04-08T12:00:00.000Z"
                 }
@@ -230,16 +316,13 @@ test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
   expect(result[0].sessionId).toBe("s");
 });
 
-test("RuntimeSessionStore.upsert uses a contiguous parameter list for runtime-id updates", async () => {
-  const db = new CaptureRuntimeSessionDatabase();
-  const store = new RuntimeSessionStore(db as unknown as Pool);
-
-  const record = await store.upsert({
+function makeUpsertInput() {
+  return {
     tenantId: "tenant-1",
     sessionId: "session-1",
     userId: "user-1",
     runtimeId: "runtime-1",
-    runtimeProvider: "codex",
+    runtimeProvider: "deep-agents" as const,
     workspacePath: "/tmp/runtime-1",
     runtimeVersion: "1.2.3",
     runtimeSchemaVersion: "v2",
@@ -251,7 +334,7 @@ test("RuntimeSessionStore.upsert uses a contiguous parameter list for runtime-id
         id: "cap-1",
         enabledToolIds: [],
         enabledMcpServerIds: [],
-        approvalPolicy: "never",
+        approvalPolicy: "never" as const,
         autoApproveReadOnlyTools: false
       },
       mcpServers: [],
@@ -261,22 +344,101 @@ test("RuntimeSessionStore.upsert uses a contiguous parameter list for runtime-id
     lastActiveAt: "2026-04-08T12:00:00.000Z",
     startedAt: "2026-04-08T12:00:00.000Z",
     terminatedAt: null,
-    lifecycleMetadata: {
-      reason: "test"
-    },
+    lifecycleMetadata: { reason: "test" },
     status: "active"
-  });
+  };
+}
 
-  const updateCall = db.calls.find(
-    (call) => call.sql.includes("UPDATE runtime_sessions") && call.sql.includes("WHERE runtime_id =")
+test("RuntimeSessionStore.upsert terminates the prior runtime before inserting the replacement", async () => {
+  // On a runtime_id UPDATE miss (a fresh runtime for the session), upsert must
+  // first terminate any prior non-terminal runtime for this session so a stale
+  // 'active' row can't outlive its replacement — then INSERT, in that order.
+  const db = new CaptureRuntimeSessionDatabase();
+  const store = new RuntimeSessionStore(db as unknown as Pool);
+
+  const record = await store.upsert(makeUpsertInput());
+
+  const terminateIndex = db.calls.findIndex(
+    (call) =>
+      call.sql.includes("UPDATE runtime_sessions") && call.sql.includes("SET status = 'terminated'")
   );
+  const insertIndex = db.calls.findIndex((call) => call.sql.includes("INSERT INTO runtime_sessions"));
 
-  expect(updateCall).toBeTruthy();
-  expect([...new Set(extractPlaceholderNumbers(updateCall.sql))].sort((left, right) => left - right)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-  expect(updateCall.params.length).toBe(15);
-  expect(updateCall.params[0]).toBe("tenant-1");
-  expect(updateCall.params[1]).toBe("user-1");
-  expect(updateCall.params[2]).toBe("runtime-1");
+  // The terminate UPDATE fired, scoped to the session id...
+  expect(terminateIndex).toBeGreaterThanOrEqual(0);
+  expect(db.calls[terminateIndex]!.params).toEqual(["session-1"]);
+  // ...and it strictly precedes the INSERT of the replacement row.
+  expect(insertIndex).toBeGreaterThan(terminateIndex);
+  // The returned record reflects the freshly inserted row.
   expect(record.sessionId).toBe("session-1");
   expect(record.runtimeId).toBe("runtime-1");
+  expect(record.status).toBe("active");
+});
+
+test("RuntimeSessionStore.upsert updates the existing runtime row in place (no terminate, no insert)", async () => {
+  // Update-HIT path: when the runtime_id UPDATE matches an existing row, upsert
+  // returns that updated row and does NOT run the terminate-previous or INSERT
+  // branches. (The miss path is covered by the terminate-previous-runtime test.)
+  const calls: QueryCall[] = [];
+  const db = {
+    async connect() {
+      return {
+        query: async (sql: string, params: unknown[] = []): Promise<QueryResult> => {
+          calls.push({ sql, params });
+          if (
+            sql === "BEGIN" ||
+            sql === "COMMIT" ||
+            sql === "ROLLBACK" ||
+            sql.startsWith("SELECT set_config")
+          ) {
+            return { rows: [], rowCount: 0 };
+          }
+          if (sql.includes("UPDATE runtime_sessions") && sql.includes("WHERE runtime_id =")) {
+            // The runtime_id UPDATE HITS — return the updated row. The UPDATE
+            // binds $1=tenant, $2=user, $3=runtime_id (WHERE), so build the row
+            // from those rather than the INSERT-ordered helper.
+            return {
+              rows: [
+                {
+                  id: 1,
+                  tenant_id: String(params[0]),
+                  session_id: "session-1",
+                  user_id: String(params[1]),
+                  runtime_id: String(params[2]),
+                  workspace_path: "/ws",
+                  runtime_version: "1",
+                  runtime_schema_version: "v2",
+                  manifest_path: "/m",
+                  manifest_metadata: {},
+                  health_status: "healthy",
+                  last_active_at: null,
+                  started_at: null,
+                  terminated_at: null,
+                  lifecycle_metadata: {},
+                  status: "active",
+                  runtime_provider: "deep-agents",
+                  created_at: "2026-04-08T12:00:00.000Z",
+                  updated_at: "2026-04-08T12:00:00.000Z"
+                }
+              ],
+              rowCount: 1
+            };
+          }
+          throw new Error(`Unexpected query (update-hit path should not reach it): ${sql}`);
+        },
+        release: () => {}
+      };
+    }
+  };
+  const store = new RuntimeSessionStore(db as unknown as Pool);
+
+  const record = await store.upsert(makeUpsertInput());
+
+  // The returned record reflects the updated row...
+  expect(record.sessionId).toBe("session-1");
+  expect(record.runtimeId).toBe("runtime-1");
+  expect(record.status).toBe("active");
+  // ...and neither the terminate-previous nor the INSERT branch ran.
+  expect(calls.some((c) => c.sql.includes("SET status = 'terminated'"))).toBe(false);
+  expect(calls.some((c) => c.sql.includes("INSERT INTO runtime_sessions"))).toBe(false);
 });

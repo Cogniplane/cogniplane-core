@@ -6,21 +6,12 @@ import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
 import { buildArtifactRouteStores, registerArtifactRoutes } from "./routes/artifacts.js";
 import { buildHealthRouteStores, registerHealthRoutes } from "./routes/health.js";
-import { createAnthropicCapabilitiesCache } from "./routes/models-anthropic-cache.js";
 import { buildModelRouteStores, registerModelRoutes } from "./routes/models.js";
 import { buildMessageRouteStores, registerMessageRoutes } from "./routes/messages.js";
 import {
   buildMessageFeedbackRouteStores,
   registerMessageFeedbackRoutes
 } from "./routes/message-feedback-routes.js";
-import {
-  buildLlmAnthropicRouteStores,
-  registerLlmAnthropicRoutes
-} from "./routes/llm-anthropic.js";
-import {
-  buildLlmOpenaiRouteStores,
-  registerLlmOpenaiRoutes
-} from "./routes/llm-openai.js";
 import { buildMcpRouteStores, registerMcpRoutes } from "./routes/mcp.js";
 import { buildSessionRouteStores, registerSessionRoutes } from "./routes/sessions.js";
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
@@ -38,23 +29,13 @@ export async function registerAppRoutes(
   deps: AppDependencies
 ): Promise<void> {
   await registerHealthRoutes(app, buildHealthRouteStores(deps));
-  const { hasAnthropicApiKey, hasOpenaiApiKey } = buildApiKeyPresenceCheckers({
-    config: app.config,
-    getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey
-  });
-  const anthropicCapabilitiesCache = createAnthropicCapabilitiesCache({
-    successTtlMs: app.config.MODEL_LIST_CACHE_TTL_MS,
-    negativeTtlMs: app.config.MODEL_LIST_CACHE_NEGATIVE_TTL_MS
+  const { hasProviderKey, configuredProviders } = buildApiKeyPresenceCheckers({
+    credentials: deps.providerCredentials
   });
   await registerModelRoutes(
     app,
     buildModelRouteStores(deps, {
-      hasAnthropicApiKey,
-      hasOpenaiApiKey,
-      getAnthropicApiKey: async (tenantId: string) =>
-        app.config.ANTHROPIC_API_KEY ?? (await deps.getTenantAnthropicApiKey(tenantId)),
-      anthropicCapabilitiesCache
+      configuredProviders
     })
   );
   await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config }));
@@ -63,59 +44,31 @@ export async function registerAppRoutes(
   await registerArtifactRoutes(app, buildArtifactRouteStores(deps));
   await registerMessageRoutes(
     app,
-    buildMessageRouteStores(deps, { hasAnthropicApiKey, hasOpenaiApiKey })
+    buildMessageRouteStores(deps, { hasProviderKey })
   );
   await registerMessageFeedbackRoutes(app, buildMessageFeedbackRouteStores(deps));
   await registerApprovalRoutes(app, buildApprovalRouteStores(deps));
-  await registerLlmAnthropicRoutes(
-    app,
-    buildLlmAnthropicRouteStores({
-      upstreamBaseUrl: app.config.ANTHROPIC_UPSTREAM_BASE_URL,
-      runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
-      platformAnthropicApiKey: app.config.ANTHROPIC_API_KEY ?? null,
-      egressCidrs: app.config.E2B_EGRESS_CIDRS,
-      egressIpPins: deps.egressIpPins,
-      getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
-      auditEvents: deps.auditEvents,
-      messages: deps.messages,
-      activeTurnMessageMap: deps.activeTurnMessageMap
-    })
-  );
-  await registerLlmOpenaiRoutes(
-    app,
-    buildLlmOpenaiRouteStores({
-      upstreamBaseUrl: app.config.OPENAI_UPSTREAM_BASE_URL,
-      runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
-      platformOpenaiApiKey: app.config.OPENAI_API_KEY ?? null,
-      egressCidrs: app.config.E2B_EGRESS_CIDRS,
-      egressIpPins: deps.egressIpPins,
-      getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey,
-      auditEvents: deps.auditEvents,
-      messages: deps.messages,
-      activeTurnMessageMap: deps.activeTurnMessageMap
-    })
-  );
   await registerMcpRoutes(
     app,
     buildMcpRouteStores(deps, {
       runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
       egressCidrs: app.config.E2B_EGRESS_CIDRS,
       readRuntimeFile: async (sessionId, runtimeId, filePath) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapter, sessionId, runtimeId);
         if (!runtime?.readRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.readRuntimeFile(sessionId, filePath);
       },
       statRuntimeFile: async (sessionId, runtimeId, filePath) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapter, sessionId, runtimeId);
         if (!runtime?.statRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.statRuntimeFile(sessionId, filePath);
       },
       writeRuntimeFile: async (sessionId, runtimeId, filePath, data) => {
-        const runtime = resolveOwningFileAdapter(deps.runtimeAdapters, sessionId, runtimeId);
+        const runtime = resolveOwningFileAdapter(deps.runtimeAdapter, sessionId, runtimeId);
         if (!runtime?.writeRuntimeFile) {
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
@@ -128,7 +81,7 @@ export async function registerAppRoutes(
       // require_approval degrades to a deny (see PolicyService.routeApproval).
       requestPolicyApproval: async (input) => {
         const runtime = resolveOwningFileAdapter(
-          deps.runtimeAdapters,
+          deps.runtimeAdapter,
           input.sessionId,
           input.runtimeId ?? undefined
         );
@@ -150,7 +103,7 @@ export function registerAppLifecycle(input: {
   config: AppConfig;
   limits: AppDependencies["limits"];
   policyService: AppDependencies["policyService"];
-  runtimeAdapters: AppDependencies["runtimeAdapters"];
+  runtimeAdapter: AppDependencies["runtimeAdapter"];
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /**
@@ -165,7 +118,7 @@ export function registerAppLifecycle(input: {
     config,
     limits,
     policyService,
-    runtimeAdapters,
+    runtimeAdapter,
     privilegedDb,
     schedulerWorker,
     staleApprovalSweeper
@@ -196,13 +149,7 @@ export function registerAppLifecycle(input: {
     schedulerWorker?.stop();
     clearInterval(sweepInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
-    const closedRuntimes = new Set<RuntimeAdapter>();
-    for (const adapter of Object.values(runtimeAdapters)) {
-      if (adapter) closedRuntimes.add(adapter);
-    }
-    for (const adapter of closedRuntimes) {
-      await adapter.close?.();
-    }
+    await runtimeAdapter.close();
     await policyService.close();
     await closeRedis();
     await app.db.end();
@@ -212,30 +159,17 @@ export function registerAppLifecycle(input: {
   });
 }
 
-// Route managed tool file ops (write_artifact, read_text_artifact, …) to the
-// adapter that actually holds live in-memory state for this session. A naive
-// "try each adapter in order" loop can silently hit a stale workspace when a
-// tenant's `runtimeProvider` has been switched mid-session and both adapters
-// transiently hold a session under the same `sessionId` — the managed tool
-// would succeed against the wrong workspace and the file would be invisible
-// to the active turn.
+// Route managed tool file ops (write_artifact, read_text_artifact, …) only to
+// a runtime that actually holds live in-memory state for this session, so a
+// managed tool can't silently succeed against a stale workspace invisible to
+// the active turn.
 function resolveOwningFileAdapter(
-  runtimeAdapters: AppDependencies["runtimeAdapters"],
+  runtimeAdapter: RuntimeAdapter,
   sessionId: string,
   runtimeId?: string
 ): RuntimeAdapter | null {
-  if (runtimeId) {
-    for (const adapter of Object.values(runtimeAdapters)) {
-      if (adapter?.hasRuntime?.(sessionId, runtimeId)) {
-        return adapter;
-      }
-    }
+  if (runtimeId && runtimeAdapter.hasRuntime(sessionId, runtimeId)) {
+    return runtimeAdapter;
   }
-
-  for (const adapter of Object.values(runtimeAdapters)) {
-    if (adapter?.hasSession?.(sessionId)) {
-      return adapter;
-    }
-  }
-  return null;
+  return runtimeAdapter.hasSession(sessionId) ? runtimeAdapter : null;
 }

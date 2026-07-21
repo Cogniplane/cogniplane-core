@@ -7,9 +7,9 @@ import {
 
 import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
+import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { RuntimeAdapter } from "../../runtime-contracts.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
-import type { RuntimeProvider } from "../../services/admin-config-records.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import type { ManagedToolCatalog } from "../../services/managed-tools/catalog.js";
 import { tenantSettingsBodySchema } from "./admin-route-schemas.js";
@@ -23,7 +23,16 @@ export type TenantSettingsRouteStores = {
   dynamicConfig: DynamicConfigService;
   auditEvents: AuditEventStore;
   managedToolCatalog: ManagedToolCatalog;
-  runtimeAdapters?: Partial<Record<RuntimeProvider, RuntimeAdapter>>;
+  runtimeAdapter: RuntimeAdapter;
+  /**
+   * The tenant's admin-added custom models (id + supported efforts are all
+   * this route needs). Merged with AVAILABLE_MODELS when validating
+   * enabledModelIds / modelDefaultEfforts so availability settings can
+   * reference custom models. Optional: absent in minimal test wirings.
+   */
+  listCustomModels?: (
+    tenantId: string
+  ) => Promise<{ id: string; supportedEfforts: readonly string[] }[]>;
 };
 
 class TenantRuntimeInvalidationError extends Error {
@@ -41,32 +50,20 @@ async function invalidateTenantRuntimes(
   stores: TenantSettingsRouteStores,
   tenantId: string
 ): Promise<string[]> {
-  const invalidated = new Set<string>();
-  const failures: unknown[] = [];
-  const results = await Promise.allSettled(
-    Object.values(stores.runtimeAdapters ?? {}).map(async (adapter) => {
-      if (!adapter?.invalidateTenantRuntimes) return [];
-      return adapter.invalidateTenantRuntimes(tenantId);
-    })
-  );
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      for (const sessionId of result.value) invalidated.add(sessionId);
-    } else {
-      failures.push(result.reason);
-      app.log.warn(
-        { err: result.reason, tenantId },
-        "tenant settings runtime invalidation failed"
-      );
-    }
-  }
-  if (failures.length > 0) {
+  // Deep Agents is the sole adapter, so this is a single direct call — the old
+  // Promise.allSettled fan-out existed to tolerate one provider failing among
+  // several. The settings row is already persisted by the caller; a failure
+  // here means the live runtimes still hold the old config, so surface it as a
+  // retryable error rather than silently reporting success.
+  try {
+    return await stores.runtimeAdapter.invalidateTenantRuntimes(tenantId);
+  } catch (err) {
+    app.log.warn({ err, tenantId }, "tenant settings runtime invalidation failed");
     throw new TenantRuntimeInvalidationError(
       "Tenant settings were saved, but active runtimes could not be refreshed. Retry before relying on the new settings.",
-      failures
+      [err]
     );
   }
-  return [...invalidated];
 }
 
 export async function registerAdminTenantSettingsRoutes(
@@ -95,6 +92,42 @@ export async function registerAdminTenantSettingsRoutes(
         error: "validation_error",
         message: parseResult.error.issues.map((issue) => issue.message).join(", ")
       });
+    }
+
+    // Semantic validation against the model catalog (the zod schema only
+    // checks shapes): unknown model ids are rejected rather than silently
+    // stored, and a default effort must be one the model actually supports.
+    // The catalog here is built-ins + the tenant's custom models.
+    const customModels = stores.listCustomModels
+      ? await stores.listCustomModels(request.auth.tenantId)
+      : [];
+    const modelsById = new Map<string, { supportedEfforts: readonly string[] }>([
+      ...AVAILABLE_MODELS.map((m) => [m.id, m] as const),
+      ...customModels.map((m) => [m.id, m] as const)
+    ]);
+    const unknownIds = (parseResult.data.enabledModelIds ?? []).filter(
+      (id) => !modelsById.has(id)
+    );
+    if (unknownIds.length > 0) {
+      return reply.status(400).send({
+        error: "validation_error",
+        message: `Unknown model ids: ${unknownIds.join(", ")}`
+      });
+    }
+    for (const [modelId, effort] of Object.entries(parseResult.data.modelDefaultEfforts ?? {})) {
+      const model = modelsById.get(modelId);
+      if (!model) {
+        return reply.status(400).send({
+          error: "validation_error",
+          message: `Unknown model id in modelDefaultEfforts: ${modelId}`
+        });
+      }
+      if (!model.supportedEfforts.includes(effort)) {
+        return reply.status(400).send({
+          error: "validation_error",
+          message: `Effort "${effort}" is not supported by model "${modelId}".`
+        });
+      }
     }
 
     let updateInput = parseResult.data;
@@ -135,8 +168,6 @@ export async function registerAdminTenantSettingsRoutes(
         userId: request.auth.userId,
         type: "admin.tenant_settings.updated",
         payload: {
-          runtimeProvider: settings.runtimeProvider,
-          enabledRuntimeProviders: settings.enabledRuntimeProviders,
           showEffortSelector: settings.showEffortSelector,
           webSearchMode: settings.webSearchMode,
           approvalPolicy: settings.approvalPolicy,
@@ -148,6 +179,9 @@ export async function registerAdminTenantSettingsRoutes(
           developerInstructions: settings.developerInstructions,
           enabledToolIds: settings.enabledToolIds,
           enabledMcpServerIds: settings.enabledMcpServerIds,
+          enabledProviders: settings.enabledProviders,
+          enabledModelIds: settings.enabledModelIds,
+          modelDefaultEfforts: settings.modelDefaultEfforts,
           invalidatedSessionIds,
           version: settings.version,
           configHash: settings.configHash

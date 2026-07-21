@@ -6,25 +6,20 @@
 
 Cogniplane Core is a multi-tenant agent platform with a backend-controlled agent runtime. The backend owns auth, persistence, tool security, session lifecycle, policy compilation, event normalization, and the admin control plane. The runtime provides multi-step planning, tool orchestration, approvals, and richer streaming behavior than a thin LLM-plus-tool-loop stack.
 
-Two runtime providers are supported, selected per tenant via `tenant_settings.runtime_provider`:
+The runtime is **Deep Agents** — LangChain's [deepagentsjs](https://reference.langchain.com/javascript/deepagents) — running **in-process in the Fastify backend** (`services/deep-agents/deep-agents-runtime-adapter.ts`). The library version is pinned via the exact `deepagents` version in `apps/backend/package.json`.
 
-1. **Codex** — OpenAI's `codex app-server` protocol (JSON-RPC 2.0 over stdio).
-2. **Claude Code** — the `@anthropic-ai/claude-agent-sdk` Agent SDK.
-
-Each runtime can execute either in-process on the backend (`local`) or inside a per-session E2B Firecracker VM. In-process mode is suited for local development; E2B is the recommended production posture.
-
-Codex protocol is pinned via `apps/backend/src/codex-release.json`; schema artifacts generated from the pinned binary are the protocol source of truth. Claude Code is pinned via the exact `@anthropic-ai/claude-agent-sdk` version in `apps/backend/package.json`.
+E2B provides a **code-execution sandbox**: a per-session Firecracker VM created **lazily on first shell/file tool use**. Chat-only sessions never create one, and when the tenant's `allowCommandExecution` is off, no sandbox is attached at all.
 
 ## Technology Stack
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Frontend | Next.js 16 | Deployable to any Next.js host (Vercel, Cloudflare Workers via `@cloudflare/next-on-pages`, Node container, etc.) |
-| Backend | Fastify (ESM TypeScript) | API, session lifecycle, MCP gateway, scheduler, policy compilation, audit, streaming |
-| Runtime A | OpenAI Codex `codex app-server` | Pinned via `codex-release.json` |
-| Runtime B | `@anthropic-ai/claude-agent-sdk` | Per-tenant or platform-level `ANTHROPIC_API_KEY` |
-| Sandbox | E2B Firecracker VM (`agent-runtime-dev` template) | One template hosts both Codex and the Claude harness |
-| Database | PostgreSQL with Row-Level Security | One DB pool for `app_user` (RLS-active), one for migrations (superuser) |
+| Frontend | Next.js 16 | Deployable to any Next.js host (Vercel, Cloudflare Workers via `@opennextjs/cloudflare`, Node container, etc.) |
+| Backend | Fastify (ESM TypeScript) | API, session lifecycle, in-process agent loop, MCP gateway, scheduler, policy compilation, audit, streaming |
+| Runtime | LangChain [deepagentsjs](https://reference.langchain.com/javascript/deepagents) (LangGraph agent loop, in-process) | Multi-provider via `initChatModel` (Anthropic/OpenAI/Google/OpenRouter/Z.AI); per-provider tenant key or platform env fallback |
+| Agent state | LangGraph `PostgresSaver` checkpointer | Postgres schema `deep_agents`; `thread_id` == session id |
+| Sandbox | E2B Firecracker VM (`deep-agents-runtime-dev` template) | Lazy, per-session, code-execution only — no agent CLIs or SDKs inside |
+| Database | PostgreSQL with Row-Level Security | One DB pool for `app_user` (RLS-active), one for migrations (superuser); the checkpointer manages its own named `app_user` pool |
 | Cache / coordination | Redis (optional) | When configured: shared rate limits, refresh token `jti` revocation, turn quotas. Without it, rate limits are per-process. |
 | Object storage | S3-compatible bucket (production), local filesystem (dev) | Artifacts and skill bundles share `ARTIFACT_BUCKET_*` credentials |
 | Auth | WorkOS (SAML / OIDC / AuthKit) or `dev-headers` mode for local hacking | HS256 JWT access tokens (15 min) + httpOnly refresh cookies (7 day, Redis-revocable) |
@@ -35,28 +30,28 @@ Codex protocol is pinned via `apps/backend/src/codex-release.json`; schema artif
 The repo is a pnpm workspace.
 
 ```
-apps/backend             # Fastify API, runtime managers, MCP gateway, admin config, workers
+apps/backend             # Fastify API, Deep Agents runtime, MCP gateway, admin config, workers
 apps/frontend            # Next.js 16 UI (chat workspace, admin workbench, user settings)
 packages/shared-types    # Shared API contracts (Zod schemas) used by both apps
-docker/                  # Backend Dockerfile + E2B sandbox template + sandbox-agent harness
+docker/                  # Backend Dockerfile + E2B code-execution template
 docs/                    # Architecture, decisions, security features, guides
 ```
 
 ### Backend module map
 
-- `routes/` — HTTP entrypoints. Hot path: `messages.ts`, `mcp.ts`, `approvals.ts`. Admin: `admin-*.ts`. Auth: `auth.ts`. Health, models, sessions, settings, artifacts, integrations.
-- `services/runtime-*` — provider-neutral lifecycle, approval coordinator, notification mapper, request handler, turn-state orchestrator.
-- `services/codex-*`, `services/e2b-runtime-process.ts`, `services/e2b-codex-mcp-config.ts` — Codex execution paths.
-- `services/claude-code-*`, `services/e2b-claude-runtime-process.ts`, `services/sandbox-agent-protocol.ts` — Claude execution paths.
-- `services/dynamic-config-*`, `services/runtime-workspace.ts`, `services/claude-workspace-renderer.ts`, `services/codex-workspace-bootstrap.ts` — compile admin config from Postgres into runtime workspace files.
-- `services/managed-tools/` — first-party tool implementations (session context, artifacts, GitHub, Notion, write_artifact).
-- `services/managed-tools/factory.ts`, `services/managed-tools/catalog.ts`, `services/redact-secrets.ts` — managed-tool dispatch (factory wires deps; catalog enumerates the allowlist) + audit redaction.
+- `routes/` — HTTP entrypoints. Hot path: `messages.ts`, `mcp.ts`, `approvals.ts`. Admin: `routes/admin/admin-*.ts`. Auth: `auth.ts`. Health, models, sessions, settings, artifacts, tenant.
+- `services/deep-agents/` — the runtime: `deep-agents-runtime-adapter.ts` (RuntimeAdapter), `deep-agents-graph.ts` (agent construction), `deep-agents-e2b-backend.ts` (lazy sandbox backend), `deep-agents-checkpointer.ts` (durable state), `deep-agents-event-mapper.ts` (LangGraph → `RuntimeEvent`).
+- `services/runtime/` — runtime-adjacent lifecycle: `runtime-model-resolver.ts`, `provider-credentials.ts`, `runtime-session-store.ts`, `idle-teardown.ts`, `policy-approval-coordinator.ts`, `stale-approval-sweeper.ts`, `e2b-sandbox.ts`.
+- `services/dynamic-config-*` — compile admin config from Postgres into the per-turn runtime-policy snapshot.
+- `services/managed-tools/` — first-party tool implementations (session tools, `write_artifact`, memory tools, skill-corpus tool, GitHub, Notion).
+- `services/managed-tools/factory.ts`, `services/managed-tools/catalog.ts` (+ `register-builtin-managed-tools.ts`), `services/redact-secrets.ts` — managed-tool dispatch (factory wires deps; catalog enumerates the allowlist) + audit redaction.
 - `services/policy/` — Policy Center rule evaluation, rule storage, and decision evidence.
 - `services/*-store.ts` — tenant-scoped persistence modules.
 - `services/pii/*`, `services/pii/openai-compatible-pii-provider.ts` — PII detection/transform pipeline.
 - `services/scheduler-*` — cron-driven scheduler worker for user-owned scheduled jobs.
-- `services/github-*`, `services/notion-*` — third-party connection lifecycle.
-- `services/skill-bundle-*`, `services/skill-marketplace-*` — versioned skill bundle storage and registry.
+- `services/integrations/` — third-party connection lifecycle (GitHub, Notion).
+- `services/skills/` — skill import/lifecycle, bundle storage, marketplace, improvement corpus.
+- `services/artifacts/` — artifact storage, processing, and workspace sync.
 - `lib/db.ts` — `withTenantScope` (RLS activation wrapper used by every tenant-scoped store call).
 
 ## Request Lifecycle
@@ -66,8 +61,8 @@ sequenceDiagram
     participant B as Browser
     participant F as Next.js Frontend
     participant A as Fastify API
-    participant SM as Runtime Manager
-    participant CW as Runtime (Codex/Claude in E2B)
+    participant DA as Deep Agents Adapter (in-process)
+    participant SB as E2B Sandbox (lazy)
     participant MCP as MCP Gateway
     participant TB as Managed Tool Broker
     participant Ext as External Service
@@ -76,99 +71,72 @@ sequenceDiagram
     B->>F: User sends message
     F->>A: POST /messages (Bearer access token)
     A->>A: Verify token, validate session ownership, rate-limit, quota check
-    A->>SM: Resolve provider via tenant_settings.runtime_provider
-    A->>SM: Create per-turn ToolExecutionContext (TTL)
-    SM->>PG: Persist toolContextId
-    A->>SM: runMessage(prompt, toolContextId)
-    SM-->>A: AsyncIterable<RuntimeEvent>
+    A->>A: Resolve model via resolveRuntimeModel
+    A->>DA: Create per-turn ToolExecutionContext (TTL)
+    DA->>PG: Persist toolContextId
+    A->>DA: runMessage(prompt, toolContextId)
+    DA-->>A: AsyncIterable<RuntimeEvent>
 
-    loop Streaming
-        CW-->>SM: Native runtime events
-        SM-->>A: Normalized RuntimeEvent
+    loop Streaming (LangGraph streamEvents v2)
+        DA->>DA: Agent loop calls the Anthropic API
+        DA-->>A: Normalized RuntimeEvent
         A-->>F: SSE (response.* / framework:*)
         F-->>B: Render incremental state
     end
 
-    Note over CW,MCP: Runtime invokes a tool
-    CW->>MCP: JSON-RPC 2.0 (toolContextId in headers/URL)
+    Note over DA,SB: Shell / file tool → sandbox created on first use
+    DA->>SB: execute() / uploadFiles() / downloadFiles()
+
+    Note over DA,MCP: MCP tool → gateway call from the backend
+    DA->>MCP: JSON-RPC 2.0 (Authorization: Bearer rt_..., toolContextId in args)
     MCP->>TB: Resolve trusted context
     TB->>Ext: Inject service auth + forwarded user token
     Ext-->>TB: Result
     TB-->>MCP: Redacted result
-    MCP-->>CW: Tool response
+    MCP-->>DA: Tool response
 
-    CW-->>A: turn/completed (usage)
+    DA-->>A: turn complete (usage from stream usage_metadata)
     A->>PG: Persist message, tool events, usage
     A-->>F: response.completed
 ```
 
-`POST /messages` (`routes/messages.ts`) hijacks the raw socket, sets SSE headers, and delegates to `streamAssistantReply` (`services/sse-stream-writer.ts`). `streamAssistantReply` builds a `ToolExecutionContext` and calls `runtimeManager.runMessage`. The runtime manager is selected via the per-tenant `runtimeProvider`; both providers expose the same `RuntimeAdapter` interface and emit a normalized `RuntimeEvent` stream.
+`POST /messages` (`routes/messages.ts`) validates input, resolves the model via `resolveRuntimeModel` (`services/runtime/runtime-model-resolver.ts` — models come from `AVAILABLE_MODELS` in `domain/models.ts`, ids namespaced `deepagents/<anthropic-model>`; unknown ids get a 400), then hijacks the raw socket, sets SSE headers, and delegates to `streamAssistantReply` (`services/sse-stream-writer.ts`). `streamAssistantReply` builds a `ToolExecutionContext` and calls `runtimeAdapter.runMessage`. There is a **single** `runtimeAdapter` — no provider map and no provider resolution step.
 
 ## Runtime Architecture
 
-### Dual-runtime model
+### Single-runtime model
 
-`routes/messages.ts` receives a `runtimeAdapters: Partial<Record<RuntimeProvider, RuntimeAdapter>>` map. `resolveRuntimeProviderAndModel` (`services/runtime/runtime-provider-resolver.ts`) picks the provider for the turn, honoring per-session overrides (`session_runtime_overrides`) on top of the tenant default.
+`DeepAgentsRuntimeAdapter` (`services/deep-agents/deep-agents-runtime-adapter.ts`) implements the `RuntimeAdapter` contract. It lazily builds a per-session deepagentsjs agent (`createDeepAgent`) and runs each turn as a LangGraph `streamEvents` (v2) stream inside the backend process, returning an `AsyncIterable<RuntimeEvent>`. `deep-agents-event-mapper.ts` normalizes the stream envelopes to the `RuntimeEvent` wire shapes the frontend consumes.
 
-When `ANTHROPIC_API_KEY` is unset platform-wide and no per-tenant key is configured, only Codex is registered.
+Agent construction lives in `deep-agents-graph.ts`:
+- **Model** — multi-provider `initChatModel` via `resolveModelConstruction` (maps a catalog id to `<initPrefix>:<vendorModel>` + base URL per `MODEL_PROVIDER_META`): Anthropic, OpenAI, Google (`google-genai`), OpenRouter and Z.AI (both via the OpenAI client with a custom base URL). The key is resolved per-provider for the selected model (`provider-credentials.ts`): the tenant's stored key first, then the platform env fallback. Reasoning effort is baked in per provider by `applyReasoningEffort`. The in-process loop calls each provider's API directly. Token usage is captured from stream `usage_metadata` and persisted per turn.
+- **State** — the shared Postgres checkpointer (below); `thread_id` is the session id, so multi-turn resume is a checkpointer read, and threads survive process restarts.
+- **Sandbox** — the lazy E2B backend (below) when `allowCommandExecution` is on; otherwise no sandbox, no `execute` tool, and file tools fall back to deepagents' checkpointed StateBackend.
+- **MCP tools** — a `MultiServerMCPClient` (`@langchain/mcp-adapters`) speaking streamable HTTP from the backend to the platform's own `/mcp/:serverId` gateway, authenticated with a session-scoped `Authorization: Bearer rt_...` header (URLs never carry `?token=`; the gateway rejects query-param tokens). The per-turn `toolContextId` is injected into managed tool args at call time via the client's top-level `beforeToolCall` hook, always overriding any model-supplied value. Tools load per-server with degradation (one broken server skips its tools, not all), and names colliding with deepagents built-ins (`RESERVED_BUILTIN_TOOL_NAMES`) or duplicated across servers are dropped with a warning.
+- **Approvals** — an `interruptOn` map (LangGraph human-in-the-loop middleware) built from the tenant's approval settings; see Approval Flow.
 
-### Codex runtime
+### Durable state (checkpointer)
 
-Two execution modes, controlled by `RUNTIME_BACKEND`:
+`deep-agents-checkpointer.ts` wires a LangGraph `PostgresSaver` into its own Postgres schema **`deep_agents`**, with an explicit named pool. DDL runs from `migrate.ts` (superuser) via `setupDeepAgentsCheckpointer`; the runtime saver connects as `app_user`. **The checkpointer tables have no tenant column and no RLS** — isolation is app-layer: `thread_id` IS the session id, and every route that reaches the checkpointer resolves the session through the RLS-scoped `sessions` table first. Session deletion purges the thread; idle teardown does not.
 
-| Mode | Process location | When to use |
-|---|---|---|
-| `local` | `codex app-server` child process on the backend host | Local dev only |
-| `e2b` | `codex app-server` inside a per-session E2B sandbox, stdio transport | **Production default** |
+### E2B sandbox backend
 
-Both modes use stdio JSON-RPC 2.0. The E2B path uses `E2bRuntimeProcess` which:
-1. Stages the local workspace (codex.toml, skills, manifest), uploads it to the sandbox.
-2. Writes `~/.codex/config.toml` inside the sandbox with the workspace's MCP servers duplicated into the global config (Codex app-server in some versions ignores project-level `[mcp_servers.*]`).
-3. Performs an API-key login if `OPENAI_API_KEY` is set.
-4. Launches `codex app-server --listen stdio://` as a background command and bridges stdin/stdout to the backend.
+`deep-agents-e2b-backend.ts` implements `E2bDeepAgentsSandbox extends BaseSandbox` (deepagents' sandbox protocol — the library has no official E2B backend). It implements `execute()`/`uploadFiles()`/`downloadFiles()` over the E2B JS SDK and overrides `ls`/`read`/`grep`/`glob` to remap "/"-rooted paths into the session workspace (`/home/user/workspace/<sessionId>/`); workspace-escaping paths return the protocol's structured error. The sandbox is **created on first use and memoized per session** — chat-only sessions never pay for one. A per-command timeout (`DEEP_AGENTS_EXECUTE_TIMEOUT_MS`, default 2 min) and a 64k output cap are enforced at this layer; `E2B_SANDBOX_TIMEOUT_MS` (default 30 min) caps sandbox lifetime.
 
-Runtime tokens reach Codex via `Authorization: Bearer rt_...` headers configured as `[mcp_servers.*.http_headers]` in the Codex config — sent on every request, including the `initialize` POST. MCP URLs carry no token.
-
-### Claude Code runtime
-
-Two execution modes, controlled by `CLAUDE_RUNTIME_BACKEND` (independent of `RUNTIME_BACKEND`):
-
-| Mode | Process location | When to use |
-|---|---|---|
-| `local` | `@anthropic-ai/claude-agent-sdk` `query()` in the backend process | Local dev, regional fallback |
-| `e2b` | The same Agent SDK loaded inside the E2B sandbox by `docker/sandbox-agent/sandbox-agent.mjs` | **Production default** |
-
-Event mapping is identical in both modes: `claude-code-event-mapper.ts` consumes typed `SDKMessage`s whether they arrive from `query()` directly (local) or as newline-delimited JSON frames over stdio from the sandbox-agent harness (e2b). Approvals bridge through `canUseTool` in both paths — in e2b mode the `canUseTool` Promise lives inside the harness and decisions round-trip as `approval_request` / `approval_response` frames (`services/sandbox-agent-protocol.ts`).
-
-Workspace files (`CLAUDE.md`, `.mcp.json`, `.claude/commands/<name>.md`) are produced by `claude-workspace-renderer.ts` from the same compiled admin config used by Codex. In e2b mode they're staged locally, then uploaded.
-
-Runtime tokens reach Claude the same way: `Authorization: Bearer rt_...` headers only. MCP URLs never carry `?token=` for either runtime, and the MCP gateway rejects query-param tokens — bearer tokens never end up in long-term URL logs.
-
-### Unified E2B template
-
-`docker/template.ts` defines the `agent-runtime-dev` template (ID sourced from `codex-release.json.e2bTemplateId`, exposed as `E2B_TEMPLATE_ID`). It installs:
-- `@openai/codex` CLI (for the Codex runtime)
-- `@anthropic-ai/claude-agent-sdk` globally so the harness can `require()` it via `NODE_PATH=/usr/lib/node_modules`
-- `docker/sandbox-agent/sandbox-agent.mjs` copied to `/opt/cogniplane/sandbox-agent.mjs`
-
-The two runtimes are independent processes that share the workspace filesystem at `/home/user/workspace/<sessionId>/`. Per-turn provider switching becomes possible without rebuilding the template.
+The template (`docker/template.ts`, name `deep-agents-runtime-dev`, built by `make e2b-build`, id wired via `E2B_TEMPLATE_ID`) is deliberately a dumb code-execution box: the stock `e2bdev/base` image plus Python 3 with a pinned knowledge-worker data stack (pandas, openpyxl, matplotlib, jinja2), ripgrep/sqlite3/git — **no agent CLIs or SDKs**. Building under the same name updates the template in place, preserving its id; cutover/rollback is an `E2B_TEMPLATE_ID` env change.
 
 ### Session lifecycle
 
-- One runtime per active session, created on demand, torn down after `RUNTIME_IDLE_TIMEOUT_MS`.
-- Runtimes emit lifecycle audit events (start, resume, idle teardown, crash, interrupt).
-- Multi-turn resume: Codex uses thread IDs persisted in `runtime_sessions`; Claude uses the SDK `resume` option.
-- No shared worker pool. Cold-start optimization is deferred until measured.
+- One session runtime per active session, created on demand, torn down after `RUNTIME_IDLE_TIMEOUT_MS` (`services/runtime/idle-teardown.ts`). Teardown kills the sandbox but leaves the checkpointer thread — conversations resume across teardowns and process restarts.
+- Runtimes emit lifecycle audit events (start, resume, idle teardown, interrupt).
+- A per-turn watchdog (`RUNTIME_TURN_TIMEOUT_MS`, default 20 min) aborts a wedged turn via the graph's abort signal; it is disarmed while an approval prompt is pending, and config validation pins it above `APPROVAL_REQUEST_TTL_MS` and below `E2B_SANDBOX_TIMEOUT_MS`.
+- Turn failures surface client-safe messages: 4xx provider errors pass through; internals collapse to a generic message.
 
-## Workspace Generation & Skill Pipeline
+## System Prompt & Skill Pipeline
 
-When a session runtime starts, `createRuntimeWorkspace` (`services/runtime-workspace.ts`) materializes:
-- `codex.toml` — MCP server URLs derived from the tenant's `tenant_settings` (enabled tools + MCP servers)
-- `.codex/skills/<id>/SKILL.md` — one file per enabled skill (Codex)
-- `CLAUDE.md`, `.mcp.json`, `.claude/commands/<name>.md` (Claude)
-- `.framework/runtime-manifest.json` — versioned snapshot of the full config bundle
+There is **no rendered workspace config** — the adapter assembles the agent **system prompt at session start**: tenant `developerInstructions` + recent long-term memories (gated on `memory_search` enablement and a Policy Center evaluation). Skills are NOT inlined into the prompt — `buildSkillsLibraryFiles` renders each enabled skill to a read-only `/skills/<slug>/SKILL.md` (plus materialized bundle companion files), mounted as a `CompositeBackend` route and surfaced by the native deepagents skills middleware. Progressive disclosure: only each skill's name/description/path reaches the prompt; the model `read_file`s the full SKILL.md on demand.
 
-Config is compiled from Postgres by `DynamicConfigService` (`services/dynamic-config-service.ts`).
+Config is compiled from Postgres by `DynamicConfigService` (`services/dynamic-config-service.ts`) and snapshotted onto the per-turn `ToolExecutionContext`.
 
 ### Skill data flow
 
@@ -176,10 +144,12 @@ Config is compiled from Postgres by `DynamicConfigService` (`services/dynamic-co
 SKILL.md body → validateSkillBundle → buildSkillImportPayload
   → importSkillBundle (merges skillName/description/instructions INTO metadata JSONB)
   → activateSkillRevision (reads metadata.skillName + metadata.instructions — fails if absent)
-  → compileRuntimeConfig → createRuntimeWorkspace → .codex/skills/<id>/SKILL.md
+  → compileRuntimeConfig → DeepAgentsRuntimeAdapter.createSession
+  → buildSkillsLibraryFiles → read-only /skills/<slug>/ library (generated SKILL.md + bundle companions)
+  → native deepagents skills middleware (progressive disclosure in the system prompt)
 ```
 
-`instructions` lives in `revision.metadata->>'instructions'` (NOT a column). Skills with `bundle_root_path = NULL` use inline instructions.
+`instructions` lives in `revision.metadata->>'instructions'` (NOT a column). Skills with a null `bundle_storage_uri` use inline instructions.
 
 ### Skill bundle storage
 
@@ -192,9 +162,9 @@ Each `admin_skill_revisions` row stores the canonical `bundle_storage_uri` (`fil
 
 ## MCP Gateway & Tool Security
 
-`/mcp/:serverId` (`routes/mcp.ts`) receives JSON-RPC 2.0 from the runtime. Two modes per server:
+`/mcp/:serverId` (`routes/mcp.ts`) receives JSON-RPC 2.0 from the runtime's `MultiServerMCPClient`. Two modes per server:
 
-- **managed** — the call dispatches to `createManagedToolDefinitions` in `services/managed-tools/factory.ts`. The `MANAGED_TOOL_CATALOG` (in `services/managed-tools/catalog.ts`) aggregates per-domain catalogs from `services/managed-tools/`: session tools (`session_context`, `list_artifacts`, `read_text_artifact`), `write_artifact`, GitHub tools, Notion tools.
+- **managed** — the call dispatches to the `ManagedToolFactoryRegistry` (`services/managed-tools/factory.ts`, `createDefinitions`). The `ManagedToolCatalog` (`services/managed-tools/catalog.ts`, registered in `register-builtin-managed-tools.ts`) aggregates per-domain catalogs: session tools, `write_artifact`, memory tools, the skill-corpus tool, GitHub tools, Notion tools.
 - **proxy** — forwarded to an upstream URL with framework context headers injected.
 
 Every tool call requires a `toolContextId` resolved against `ToolExecutionContextStore`. The context carries `userId`, `sessionId`, `runtimeId`, and a snapshot of the tenant's effective runtime config (compiled from `tenant_settings`) — the model never sees credentials directly.
@@ -204,9 +174,9 @@ Tool results pass through `redactSecrets()` (`services/redact-secrets.ts`) befor
 ### Trust boundary
 
 ```
-Frontend --[JWT]--> Backend --[toolContextId only]--> Runtime (Codex/Claude)
+Frontend --[JWT]--> Backend --+-- Deep Agents loop (in-process; toolContextId only, never user tokens)
                               |
-                              +--[toolContextId]--> MCP Gateway
+                              +--[Bearer rt_... + toolContextId]--> MCP Gateway
                                                         |
                                   +----------managed----+----proxy----+
                                   |                                    |
@@ -216,36 +186,30 @@ Frontend --[JWT]--> Backend --[toolContextId only]--> Runtime (Codex/Claude)
 ```
 
 Rules:
-1. Never give user JWTs or bearer tokens to the model. The runtime receives only `toolContextId` and compiled policy.
-2. Never trust model-supplied identity fields. The model cannot author `user_id`, `session_id`, or `auth_token` in tool arguments.
+1. Never give user JWTs or bearer tokens to the model. The agent loop receives only `toolContextId` and compiled policy.
+2. Never trust model-supplied identity fields. The model cannot author `user_id`, `session_id`, or `auth_token` in tool arguments — `beforeToolCall` overwrites `toolContextId` on every managed call.
 3. Validate provenance server-side on every tool call. Verify session ownership before routing.
 4. Authorization stays at the service boundary. Managed tools enforce downstream access via the tool broker; enterprise MCP servers enforce their own.
-5. Workspaces are isolated per session. No cross-session filesystem access.
+5. Sandbox workspaces are isolated per session. File tools remap "/"-rooted paths into the session workspace and refuse escapes.
 6. Tool event payloads are scrubbed of tokens, auth headers, and credentials before being written to Postgres.
-7. Tool execution contexts expire (`TOOL_CONTEXT_TTL_MS`, default 15 min).
+7. Tool execution contexts expire (`TOOL_CONTEXT_TTL_MS`, validated strictly above `RUNTIME_TURN_TIMEOUT_MS`).
 8. Stored OAuth credentials and runtime tokens are encrypted at rest with AES-256-GCM (`lib/crypto-utils.ts`, scrypt-derived key memoized per process).
 
 ## Approval Flow
 
 Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes.
 
-When `tenant_settings.approval_policy` requests human review for runtime-native actions, the runtime pauses before executing flagged shell/file/permission requests. `RuntimeApprovalCoordinator` (`services/runtime-approval-coordinator.ts`) intercepts Codex requests, holds them in memory, persists a row in `approvals`, and emits a `framework:approval_required` SSE event. Claude uses `canUseTool` through the in-sandbox approval bridge (`docker/sandbox-agent/sandbox-agent.mjs`).
+**Native HITL approvals are LangGraph interrupt-based.** `tenant_settings.approval_policy` (`"never"` bypasses gating) drives an `interruptOn` map built in `deep-agents-graph.ts`: all MCP gateway tools (minus read-only ones when `auto_approve_read_only_tools` is on) plus the mutating built-ins (`execute`, `write_file`, `edit_file`), plus the read-only built-ins when the read-only bypass is off. An interrupt pauses the graph **before** tool execution and checkpoints; the adapter detects pending interrupts after the stream ends, persists an approval row, emits `framework:approval_required`, and resumes the graph with a `Command` once decided. Resume is keyed **per interrupt id**, so concurrent interrupts (parallel `task` subagents each hitting a gated tool) get their own decisions.
 
-The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which unblocks the paused runtime turn. `runtimeManager.resolveApproval` is tried first; if it returns `"missing"`, the request falls through to the optional Claude resolver.
+The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which resumes the paused graph. The adapter's `resolveApproval` consults its Policy Center coordinator after a native-approval miss (see below).
 
-`tenant_settings.auto_approve_read_only_tools` bypasses approval entirely for read-only tools.
+Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the adapter's `PolicyApprovalCoordinator` (`services/runtime/policy-approval-coordinator.ts`), emits the same `framework:approval_required` event, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
 
-Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the per-adapter `PolicyApprovalCoordinator`, emits the same `framework:approval_required` event, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
-
-Codex MCP elicitation is not a separate confirmation plane in Cogniplane. `mcpServer/elicitation/request` is answered with `{ action: "accept" }`; authorization and human confirmation are enforced at the Cogniplane MCP gateway through runtime policy and Policy Center. Configured upstream MCP tools must not rely on elicitation as their only guardrail.
+MCP elicitation is not a separate confirmation plane in Cogniplane: authorization and human confirmation are enforced at the Cogniplane MCP gateway through native HITL and Policy Center. Configured upstream MCP tools must not rely on elicitation as their only guardrail.
 
 ### TTL and expiry
 
-Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry:
-- Codex: a synthetic `reject` is sent to the runtime process so it unblocks.
-- Claude: the in-sandbox approval bridge resolves the `canUseTool` Promise with `deny`.
-
-The DB row moves to `status='expired'`, an `approval.expired` audit event is written, and a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt.
+Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry the DB row moves to `status='expired'`, an `approval.expired` audit event is written, a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt, and the paused graph is resumed with a reject. Rows also carry a DB-level `expires_at`, so a process death still lets the startup sweep (`services/runtime/stale-approval-sweeper.ts`) recover them.
 
 ## Policy Center
 
@@ -263,20 +227,19 @@ Owners exclusively control `allowCommandExecution` and `allowUserTokenForwarding
 
 | Field | Purpose |
 |---|---|
-| `runtime_provider` | `"codex"` or `"claude-code"` |
-| `enabled_runtime_providers` | Subset shown to the user when `show_effort_selector` is on |
-| `enabled_tool_ids` | Allowlist of managed tool ids materialized into the workspace |
-| `enabled_mcp_server_ids` | Allowlist of MCP servers materialized into the workspace |
-| `approval_policy` | `"on-request"` / `"require-approval"` / `"never"` |
-| `approval_reviewer` | Who resolves approvals (default `user`) |
+| `enabled_tool_ids` | Allowlist of managed tool ids exposed to the agent |
+| `enabled_mcp_server_ids` | Allowlist of MCP servers exposed to the agent |
+| `approval_policy` | Native HITL gating (string policy or granular object; `"never"` bypasses) |
+| `approval_reviewer` | Who resolves runtime-native approvals (default `user`) |
 | `auto_approve_read_only_tools` | Bypass approval for read-only tools |
 | `policy_enforcement_mode` | Policy Center mode: `"monitor"` or `"enforce"` |
-| `allow_command_execution` | Gate on shell/exec tools |
+| `allow_command_execution` | Gate on shell/exec tools — when off, no sandbox is attached at all |
 | `allow_user_token_forwarding` | Allow propagating the user's OAuth token to enterprise MCP servers |
 | `developer_instructions` | Extra system prompt content per tenant |
+| `web_search_mode` | Web search availability for the agent |
 | `show_effort_selector` | Frontend feature flag |
 
-Per-session overrides live in `session_runtime_overrides` and are applied on top of the tenant defaults at turn start.
+Per-tenant model-provider keys (one per provider — Anthropic/OpenAI/Google/OpenRouter/Z.AI) are managed via organization settings and stored encrypted per-provider in `tenant_org_settings`.
 
 ## Admin Configuration
 
@@ -288,11 +251,11 @@ Three admin entities, all tenant-scoped with `tenant_id = 'system'` rows acting 
 | MCP servers | `McpServerStore` | `mode` is `managed` or `proxy` |
 | Tenant settings | `TenantSettingsStore` | One row per tenant (see above) |
 
-Admin endpoints live under `routes/admin-*.ts`. Authorization uses `requireRole(request, 'admin' | 'owner')`.
+Admin endpoints live under `routes/admin/admin-*.ts`. Authorization uses `requireRole(request, 'admin' | 'owner')`.
 
 ### Integrations registry
 
-`tenant_integrations` + `IntegrationRegistry` track which third-party integrations a tenant has enabled (GitHub App, Notion). `routes/admin-integrations-routes.ts` exposes the management CRUD; per-user OAuth tokens land in `user_github_connections`, `user_notion_connections`.
+`tenant_integrations` + `IntegrationRegistry` track which third-party integrations a tenant has enabled (GitHub App, Notion). `routes/admin/admin-integrations-routes.ts` exposes the management CRUD; per-user OAuth tokens land in `user_github_connections`, `user_notion_connections`.
 
 ### Skill marketplace
 
@@ -300,19 +263,19 @@ A marketplace manifest URL (per tenant or via `SKILL_MARKETPLACE_MANIFEST_URL` p
 
 ### Skill usage telemetry & improvement
 
-Skill adoption is tracked by Tier 1 telemetry. `ActivationTracker` (`services/activation-tracker.ts`) writes `resource_activations` rows inline on the hot path: a `materialized` row when a skill's `SKILL.md` is written into the workspace, and an `invoked` row when a tool call routed through the MCP gateway matches a skill's `associatedToolIds`.
+Skill adoption is tracked by Tier 1 telemetry. `ActivationTracker` (`services/activation-tracker.ts`) writes `resource_activations` rows inline on the hot path: a `materialized` row when a skill is inlined into the session's system prompt, and an `invoked` row when a tool call routed through the MCP gateway matches a skill's `associatedToolIds`.
 
 Improving a skill is a normal agent turn, not a bespoke worker. The built-in `skill-improver` skill calls the `read_skill_corpus` managed tool with a target `skillId`; the tool assembles a redacted markdown corpus of recent sessions where the skill was offered or used plus the current SKILL.md, and returns it inline. The agent proposes a revised SKILL.md via `write_artifact`.
 
 ## PII Pipeline
 
-PII detection is opt-in (`PII_PROVIDER_ENABLED`). The pipeline targets any OpenAI-compatible `/chat/completions` endpoint, parameterized by the `PII_LLM_*` env vars; you bring your own model provider (a hosted API or a self-hosted Ollama/vLLM server) and accept that vendor's logging posture. The default configuration points at OpenRouter (default model `google/gemini-2.5-flash`) with a rule-based fallback for when the LLM endpoint is unavailable or times out.
+PII detection is opt-in (`PII_PROVIDER_ENABLED`). The pipeline targets any OpenAI-compatible `/chat/completions` endpoint (or a native Ollama `/api/chat` endpoint via `PII_LLM_WIRE_FORMAT`), parameterized by the `PII_LLM_*` env vars; you bring your own model provider (a hosted API or a self-hosted Ollama/vLLM server) and accept that vendor's logging posture. The default configuration points at OpenRouter (default model `google/gemini-2.5-flash`) with a rule-based fallback for when the LLM endpoint is unavailable or times out.
 
 Two paths:
-- **Sync** — message text passes through `pii-detect-handler` before being forwarded to the runtime. Detect/block/transform actions are configured per tenant.
+- **Sync** — message text passes through `PiiProtectionService.evaluateText` (`services/pii/pii-protection-service.ts`, invoked from `routes/messages.ts`) before being forwarded to the runtime. Detect/block/transform actions are configured per tenant.
 - **Async** — `pii_scan_runs` + `pii_scan_jobs` queue scans of stored content (artifacts, message history). Findings persisted with severity and category.
 
-Configuration knobs: `PII_LLM_API_KEY`, `PII_LLM_MODEL`, `PII_LLM_BASE_URL`, `PII_PROVIDER_TIMEOUT_MS`.
+Configuration knobs: `PII_LLM_API_KEY`, `PII_LLM_MODEL`, `PII_LLM_BASE_URL`, `PII_LLM_WIRE_FORMAT`, `PII_PROVIDER_TIMEOUT_MS`.
 
 ## Scheduler
 
@@ -330,6 +293,8 @@ Two DB pools:
 - `db` — `app_user` (non-superuser, RLS-active).
 - `privilegedDb` — superuser, used only for `getDownloadToken` (where the token IS the auth) and migration runs.
 
+The Deep Agents checkpointer additionally manages its own named `app_user` pool. Its tables (schema `deep_agents`) have **no RLS** — isolation is app-layer via the RLS-scoped `sessions` table (see Runtime Architecture).
+
 Every tenant-scoped store call wraps its work in `withTenantScope(db, tenantId, fn)` (`lib/db.ts`), which sets `SET LOCAL app.current_tenant_id` inside a transaction.
 
 ## Authentication
@@ -344,11 +309,13 @@ Production uses `AUTH_MODE=workos`:
 | `POST /auth/logout` | Revoke jti → clear cookie |
 | `GET /auth/me` | Current user, tenant, role |
 
-**Access token**: HS256, 15-minute TTL, carried in `Authorization: Bearer`. Held in memory (sessionStorage during the auth-callback hand-off only).
+**Access token**: HS256, 15-minute TTL, carried in `Authorization: Bearer`. Held in React state (memory) only — never persisted to localStorage or sessionStorage.
 
 **Refresh token**: httpOnly, `SameSite=None`, `Secure`, scoped to the **backend domain**. 7-day TTL. Each token carries a unique `jti` stored in Redis. Every refresh rotates the `jti` (delete old, store new). Logout deletes immediately.
 
 **First-member owner promotion**: the auth callback wraps tenant upsert, user upsert, membership count, and membership upsert in a single transaction. The count is taken before the new membership is inserted, so the first user to authenticate into a new organization atomically receives `owner`.
+
+The Deep Agents runtime requires at least one model-provider API key (Anthropic, OpenAI, Google, OpenRouter, or Z.AI) — a per-provider tenant key or a platform env fallback. `/models` filters the catalog to models whose provider is configured, returning an empty list as the "configure a key" state when none is present.
 
 ### Public auth paths
 
@@ -386,11 +353,12 @@ Core standard events:
 Framework extensions (named with `framework:` prefix per OpenResponses extension conventions):
 
 - `framework:approval_required`
-- `framework:approval_resolved`
 - `framework:runtime_notice` — non-fatal status messages (e.g. approval-expired)
-- `framework:runtime_status`
+- `framework:mcp_server_status`
+- `framework:plan.delta` — plan pane updates (`write_todos`)
+- `framework:reasoning_text.delta` / `framework:reasoning_summary.delta` / `framework:reasoning_summary.replace`
 
-Exact event names and payload shapes come from the generated Codex schema for the pinned version, not from hand-maintained markdown.
+Exact event names and payload shapes are defined by `RuntimeEvent` in `apps/backend/src/runtime-contracts.ts`, not by hand-maintained markdown.
 
 ### Concurrency
 
@@ -398,7 +366,7 @@ The backend rejects concurrent turns on the same session with HTTP 429.
 
 ## Persistence
 
-The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the consolidated baseline; everything after it is incremental. Below is a summary of the live tables — types and constraints are illustrative.
+The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the consolidated baseline and `002_seed_system_data.sql` seeds the system tenant; everything after them is incremental. `migrate.ts` also runs the Deep Agents checkpointer DDL (schema `deep_agents`, tables managed by LangGraph's `PostgresSaver`). Below is a summary of the live tables — types and constraints are illustrative.
 
 ### Identity
 
@@ -412,15 +380,14 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 
 | Table | Notes |
 |---|---|
-| `sessions` | App-level chat sessions |
-| `runtime_sessions` | Per-session runtime mapping; `runtime_provider`, `codex_version`, `codex_schema_version`, `manifest_path`, `manifest_metadata`, `lifecycle_metadata` |
-| `session_runtime_overrides` | Per-session override of tenant defaults |
-| `session_purpose` | Session classification (chat vs skill-improvement vs scheduled) |
-| `messages` | `role`, `status`, `content_text`; tool tokens recorded inline |
+| `sessions` | App-level chat sessions; `purpose` column classifies `normal` chat vs `scheduled` |
+| `runtime_sessions` | Per-session runtime mapping; `runtime_provider` (default `deep-agents`), `runtime_version`, `runtime_schema_version`, `manifest_path`, `manifest_metadata`, `lifecycle_metadata` |
+| `messages` | `role`, `status`, `content_text`; token usage recorded inline |
 | `message_tool_results` | Streamed tool results joined to a parent message |
 | `tool_events` | Audit-grade tool call log; `phase`, `status`, redacted `payload` |
 | `tool_execution_contexts` | Short-lived per-turn credentials carrier (TTL via `expires_at`) |
 | `approvals` | Approval state machine; `kind`, `status`, `decision`, `resolved_at` |
+| `deep_agents.*` | LangGraph checkpointer tables (conversation state); no tenant column, no RLS — app-layer isolation via `sessions` |
 
 ### Artifacts
 
@@ -447,7 +414,6 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 | `tenant_integrations` | Per-tenant integration enablement |
 | `user_github_connections` | OAuth tokens encrypted at rest |
 | `user_notion_connections` | OAuth tokens encrypted at rest |
-| `resource_activations` | Per-resource activation tracking (e.g. specific repos / pages a user has authorized) |
 
 ### Workers & quality
 
@@ -473,14 +439,14 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 
 | Layer | Mechanism |
 |---|---|
-| Transport | HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin`, restrictive CSP |
+| Transport | HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, restrictive CSP |
 | Request tracing | `X-Request-Id` on every response |
 | Secrets at rest | AES-256-GCM via `encrypt()` / `decrypt()` (`lib/crypto-utils.ts`); scrypt-derived key (N=16384, r=8, p=1), memoized per process |
 | URL log redaction | Fastify request logs sanitize sensitive query params (e.g. `?token=`, `?apiKey=`) via `lib/sanitize-url.ts` (defense in depth) |
 | Audit | `audit_events` captures `ip_address` (INET) and `user_agent` on every admin and auth action |
 | CSRF | Refresh cookie is httpOnly, backend-scoped, sent only to the configured CORS origin |
 | Tool result redaction | `redactSecrets()` strips known secret patterns before persistence |
-| MCP probe handling | `/.well-known/*` returns 404 (not 401) so Codex's OAuth probe falls through cleanly |
+| MCP token transport | Session-scoped `Authorization: Bearer rt_...` header only; the gateway rejects query-param tokens |
 
 For the full security control inventory, see [SECURITY_FEATURES.md](SECURITY_FEATURES.md).
 
@@ -490,22 +456,24 @@ For the full security control inventory, see [SECURITY_FEATURES.md](SECURITY_FEA
 - `audit_events` is the durable audit log.
 - `tool_events` is the durable tool-call log (redacted payloads).
 - `resource_activations` records Tier 1 skill/MCP/integration usage per session.
-- Cost tracking: per-turn `usage` is persisted on `messages` (`token_input`, `token_output`, model, estimated cost).
+- Cost tracking: per-turn usage is captured from LangGraph stream `usage_metadata` and persisted on `messages` (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, `model_name`, `cost_usd`).
 
 ## Environment
 
 Full schema with defaults is in `apps/backend/src/config.ts`. Production-relevant non-obvious knobs:
 
 ```
-RUNTIME_BACKEND=e2b              # Codex execution mode
-CLAUDE_RUNTIME_BACKEND=e2b       # Claude execution mode (independent)
-E2B_API_KEY                      # Required when either *_BACKEND=e2b
-E2B_TEMPLATE_ID                  # Unified template ID — sourced from codex-release.json
-RUNTIME_GATEWAY_BASE_URL         # Public URL the runtime uses to reach /mcp (must be reachable from sandbox)
+E2B_API_KEY                      # Required — shell/file tools execute inside E2B; boot fails fast without it
+E2B_TEMPLATE_ID                  # Deep Agents code-execution template id (docker/template.ts, `make e2b-build`)
+E2B_SANDBOX_TIMEOUT_MS           # Sandbox lifetime cap (default 30 min)
+DEEP_AGENTS_EXECUTE_TIMEOUT_MS   # Per-execute() wall-clock budget inside the sandbox (default 2 min)
+RUNTIME_TURN_TIMEOUT_MS          # Per-turn watchdog (default 20 min); must exceed APPROVAL_REQUEST_TTL_MS, stay under E2B_SANDBOX_TIMEOUT_MS
+TOOL_CONTEXT_TTL_MS              # Per-turn tool-context lifetime; validated strictly above RUNTIME_TURN_TIMEOUT_MS
+RUNTIME_GATEWAY_BASE_URL         # URL the runtime's MCP client uses to reach /mcp
 ARTIFACT_STORAGE_BACKEND=bucket  # S3-backed artifacts in production
 SKILL_BUNDLE_STORAGE_BACKEND=bucket
 SKILL_BUNDLE_BUCKET_NAME         # Reuses ARTIFACT_BUCKET_* credentials
-ANTHROPIC_API_KEY                # Required for Claude provider; without it only Codex is registered
+ANTHROPIC_API_KEY                # Platform-level Anthropic key (tenant per-provider key overrides). Peers: OPENAI_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY / ZAI_API_KEY
 PII_PROVIDER_ENABLED             # Validates the configured PII provider's API key at boot when true
 SCHEDULER_ENABLED=true
 AUTH_MODE=workos                 # Production
@@ -513,13 +481,17 @@ WORKOS_API_KEY / WORKOS_CLIENT_ID / WORKOS_REDIRECT_URI
 JWT_SECRET                       # Refresh token signing — must differ from default in prod
 DATA_ENCRYPTION_SECRET           # Symmetric secret encryption — must differ from default in prod
 REDIS_URL                        # Required when AUTH_MODE=workos (jti revocation, rate limits)
-MIGRATION_DATABASE_URL           # Superuser DSN; bypasses RLS for migrations only
+MIGRATION_DATABASE_URL           # Superuser DSN; bypasses RLS for migrations + checkpointer DDL only
 ```
+
+## Historical note: retired dual-runtime architecture
+
+Earlier versions of Cogniplane ran two sandbox-hosted runtimes — OpenAI's `codex app-server` and the Claude Agent SDK driven by an in-sandbox harness — selected per tenant, with rendered workspace config (`codex.toml`, `CLAUDE.md`, `.mcp.json`, per-skill `SKILL.md` files) and a shared E2B template hosting both. That architecture was fully removed in favor of the in-process [deepagentsjs](https://reference.langchain.com/javascript/deepagents) runtime; the SSE streaming contract and the MCP gateway/Policy Center control planes were carried forward unchanged.
 
 ## Pointers
 
 - `CLAUDE.md` — operational runbook for working in this repo (commands, file paths, env vars, gotchas)
 - [SECURITY_FEATURES.md](SECURITY_FEATURES.md) — full security control inventory
 - [DECISIONS.md](DECISIONS.md) — architectural decision records
+- <https://reference.langchain.com/javascript/deepagents> — official deepagentsjs API reference
 - `apps/backend/db/migrations/` — authoritative schema
-- `apps/backend/src/codex-release.json` — pinned runtime versions and E2B template ID

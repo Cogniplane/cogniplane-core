@@ -12,7 +12,7 @@ import { serialize } from "../lib/serialize-response.js";
 export function buildApprovalRouteStores(deps: AppDependencies) {
   return {
     approvals: deps.approvals,
-    runtimeAdapters: deps.runtimeAdapters
+    runtimeAdapter: deps.runtimeAdapter
   };
 }
 
@@ -107,24 +107,15 @@ export async function registerApprovalRoutes(
 
     const { decision, rememberForTurn } = bodyResult.value;
 
-    // Iterate registered adapters and forward the decision to whichever one
-    // owns the pending approval. Map insertion order is Codex → Claude (set
-    // in build-runtime-adapters.ts), so Codex is tried first as before.
-    let result: "resolved" | "missing" = "missing";
-    for (const adapter of Object.values(stores.runtimeAdapters)) {
-      if (!adapter?.resolveApproval) continue;
-      const adapterResult = await adapter.resolveApproval({
-        tenantId: request.auth.tenantId,
-        approvalId,
-        userId: request.auth.userId,
-        decision,
-        rememberForTurn
-      });
-      if (adapterResult === "resolved") {
-        result = "resolved";
-        break;
-      }
-    }
+    // Forward the decision to the runtime adapter (native approvals first,
+    // then its policy coordinator — see resolveApproval on the adapter).
+    const result = await stores.runtimeAdapter.resolveApproval({
+      tenantId: request.auth.tenantId,
+      approvalId,
+      userId: request.auth.userId,
+      decision,
+      rememberForTurn
+    });
 
     if (result === "missing") {
       // Return the original outcome on retry rather than 404.

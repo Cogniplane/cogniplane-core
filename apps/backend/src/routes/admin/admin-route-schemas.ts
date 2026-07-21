@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { PolicyEnforcementModeSchema } from "@cogniplane/shared-types";
+import { EFFORT_LEVELS, MODEL_PROVIDERS, PolicyEnforcementModeSchema } from "@cogniplane/shared-types";
 
 import { httpsUrlSchema } from "../../lib/url-validation.js";
 
@@ -28,7 +28,6 @@ const granularApprovalPolicySchema = z.object({
 });
 
 export const tenantSettingsBodySchema = z.object({
-  enabledRuntimeProviders: z.array(z.enum(["codex", "claude-code"])).min(1).optional(),
   showEffortSelector: z.boolean().optional(),
   webSearchMode: z.enum(["disabled", "cached", "live"]).optional(),
   approvalPolicy: z.union([z.enum(["never", "on-request"]), granularApprovalPolicySchema]).optional(),
@@ -39,7 +38,13 @@ export const tenantSettingsBodySchema = z.object({
   policyEnforcementMode: PolicyEnforcementModeSchema.optional(),
   developerInstructions: z.string().trim().max(4000).nullable().optional(),
   enabledToolIds: z.array(adminIdSchema).optional(),
-  enabledMcpServerIds: z.array(adminIdSchema).optional()
+  enabledMcpServerIds: z.array(adminIdSchema).optional(),
+  // Model availability. Model ids are catalog-namespaced ("openrouter/z-ai/…"),
+  // so a plain bounded string — semantic validation against AVAILABLE_MODELS
+  // happens in the route, where the catalog is in scope.
+  enabledProviders: z.array(z.enum(MODEL_PROVIDERS)).optional(),
+  enabledModelIds: z.array(z.string().trim().min(1).max(200)).nullable().optional(),
+  modelDefaultEfforts: z.record(z.string().trim().min(1).max(200), z.enum(EFFORT_LEVELS)).optional()
 });
 
 export const githubImportBodySchema = z.object({
@@ -93,8 +98,6 @@ export const rolloutBodySchema = z.object({
 });
 
 const sessionStatusSchema = z.enum(["active", "errored"]);
-
-const sessionRuntimeSchema = z.enum(["codex", "claude-code"]);
 
 const sessionAlertSchema = z.enum([
   "pii-blocked",
@@ -158,7 +161,6 @@ export const adminSessionsListQuerySchema = z.object({
   from: optionalIsoDate,
   to: optionalIsoDate,
   status: sessionStatusSchema.optional(),
-  runtime: sessionRuntimeSchema.optional(),
   alert: commaSeparatedAlerts,
   cursor: z.string().trim().min(1).optional(),
   limit: limitSchema

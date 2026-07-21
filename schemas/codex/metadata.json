@@ -1,9 +1,0 @@
-{
-  "codexVersion": "0.142.4",
-  "schemaVersion": "v2",
-  "generatedAt": "2026-06-12T21:09:12.494Z",
-  "commands": [
-    "codex app-server generate-ts --experimental --out schemas/codex/ts",
-    "codex app-server generate-json-schema --experimental --out schemas/codex/json"
-  ]
-}

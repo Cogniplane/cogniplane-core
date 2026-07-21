@@ -131,6 +131,28 @@ test("detectText honors per-call model override in both request body and result"
   expect(result.providerModel).toBe("tenant/custom-model");
 });
 
+test("extraHeaders (OpenRouter attribution) are merged into the request without clobbering the base headers", async () => {
+  // The constructor merges extraHeaders (HTTP-Referer / X-Title) into the request
+  // headers. They must appear ALONGSIDE Authorization + Content-Type — a merge
+  // reorder letting the spread overwrite Content-Type would break the JSON body.
+  const capture: CapturedRequest[] = [];
+  const fetchImpl = buildFakeFetch({
+    capture,
+    responsePayload: { choices: [{ message: { content: JSON.stringify({ findings: [] }) } }] }
+  });
+  const provider = buildProvider(fetchImpl, {
+    extraHeaders: { "HTTP-Referer": "https://cogniplane.ai", "X-Title": "Cogniplane" }
+  });
+
+  await provider.detectText({ text: "hi", entityTypes: ["email"] });
+
+  const headers = capture[0]!.headers;
+  expect(headers["HTTP-Referer"]).toBe("https://cogniplane.ai");
+  expect(headers["X-Title"]).toBe("Cogniplane");
+  expect(headers.Authorization).toBe("Bearer sk-or-test");
+  expect(headers["Content-Type"]).toBe("application/json");
+});
+
 test("detectText drops findings with unknown entityType", async () => {
   const fetchImpl = buildFakeFetch({
     responsePayload: {
@@ -373,6 +395,59 @@ test("callChat throws timeout error when provider exceeds the budget", async () 
   expect((error as OpenAiCompatiblePiiProviderError).code).toBe("timeout");
 });
 
+test("callChat maps a rejected fetch (not a timeout) to network_error", async () => {
+  // A fetch that rejects with a plain Error (DNS/connection refused/reset) — not
+  // via the timeout AbortController — must map to network_error. The circuit
+  // breaker records on this code, so mis-mapping it mis-drives breaker health.
+  const fetchImpl = (async () => {
+    throw new Error("ECONNREFUSED 127.0.0.1:11434");
+  }) as unknown as typeof fetch;
+
+  const provider = buildProvider(fetchImpl);
+  const error = await provider.detectText({ text: "hi", entityTypes: ["email"] }).catch((e: unknown) => e);
+  expect(error instanceof OpenAiCompatiblePiiProviderError).toBeTruthy();
+  expect((error as OpenAiCompatiblePiiProviderError).code).toBe("network_error");
+});
+
+test("callChat throws empty_response when a 200 carries no message content", async () => {
+  // A syntactically valid 200 whose choices[0].message.content is null must map
+  // to empty_response, NOT invalid_json (there's nothing to JSON.parse).
+  const fetchImpl = buildFakeFetch({
+    responsePayload: { choices: [{ message: { content: null } }] }
+  });
+
+  const provider = buildProvider(fetchImpl);
+  const error = await provider.detectText({ text: "hi", entityTypes: ["email"] }).catch((e: unknown) => e);
+  expect(error instanceof OpenAiCompatiblePiiProviderError).toBeTruthy();
+  expect((error as OpenAiCompatiblePiiProviderError).code).toBe("empty_response");
+});
+
+test("callChat distinguishes an external-caller abort from the internal timeout", async () => {
+  // When the CALLER's signal aborts (turn cancelled / gateway disconnect), the
+  // error must NOT be reported as `timeout` — that would blame the PII model for
+  // a client-side cancellation and skew breaker/latency signals.
+  // A realistic fetch rejects immediately on an already-aborted signal.
+  const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+    return new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  }) as unknown as typeof fetch;
+  const provider = buildProvider(fetchImpl, { timeoutMs: 5_000 });
+  const controller = new AbortController();
+  controller.abort(); // already aborted before the call
+
+  const error = await provider
+    .detectText({ text: "hi", entityTypes: ["email"] }, controller.signal)
+    .catch((e: unknown) => e);
+  // The internal timeout controller never fired (externalSignal.aborted is true),
+  // so this must NOT be classified as a timeout.
+  if (error instanceof OpenAiCompatiblePiiProviderError) {
+    expect(error.code).not.toBe("timeout");
+  }
+});
+
 test("callChat surfaces HTTP errors with a bounded message", async () => {
   const fetchImpl = buildFakeFetch({
     status: 500,
@@ -579,4 +654,80 @@ test("scanCsvPreview: drops findings with unknown entity types", async () => {
 
   // passport_number isn't in PII_ENTITY_TYPES, so it's dropped.
   expect(result.findings.length).toBe(0);
+});
+
+// --- Ollama native wire format ------------------------------------------------
+
+test("ollama wire format posts to /api/chat with format:json and parses message.content", async () => {
+  const capture: CapturedRequest[] = [];
+  const fetchImpl = buildFakeFetch({
+    capture,
+    // Ollama native shape: findings live at message.content, not choices[].
+    responsePayload: {
+      message: {
+        content: JSON.stringify({
+          findings: [
+            { entityType: "email", value: "a@b.co", start: 12, end: 18, confidence: "high" }
+          ]
+        })
+      }
+    }
+  });
+
+  const provider = buildProvider(fetchImpl, {
+    baseUrl: "http://10.0.0.1:11434",
+    wireFormat: "ollama"
+  });
+  const result = await provider.detectText({
+    text: "contact me: a@b.co",
+    entityTypes: ["email", "phone"]
+  });
+
+  expect(result.findings.length).toBe(1);
+  expect(result.findings[0]?.entityType).toBe("email");
+
+  const request = capture[0];
+  expect(request.url).toBe("http://10.0.0.1:11434/api/chat");
+  const body = request.body as {
+    stream: boolean;
+    format: string;
+    options: { temperature: number };
+    think?: boolean;
+  };
+  expect(body.stream).toBe(false);
+  expect(body.format).toBe("json");
+  expect(body.options.temperature).toBe(0);
+  // think is omitted unless disableThinking is set.
+  expect(body.think).toBeUndefined();
+  // response_format is an OpenAI-only concept; must not leak into ollama body.
+  expect((body as Record<string, unknown>).response_format).toBeUndefined();
+});
+
+test("ollama wire format sends think:false when disableThinking is set", async () => {
+  const capture: CapturedRequest[] = [];
+  const fetchImpl = buildFakeFetch({
+    capture,
+    responsePayload: { message: { content: JSON.stringify({ findings: [] }) } }
+  });
+
+  const provider = buildProvider(fetchImpl, {
+    baseUrl: "http://10.0.0.1:11434",
+    wireFormat: "ollama",
+    disableThinking: true
+  });
+  await provider.detectText({ text: "nothing here", entityTypes: ["email"] });
+
+  const body = capture[0].body as { think?: boolean };
+  expect(body.think).toBe(false);
+});
+
+test("ollama wire format surfaces a string-typed error field as provider_error", async () => {
+  const fetchImpl = buildFakeFetch({
+    responsePayload: { error: "model not found" }
+  });
+  const provider = buildProvider(fetchImpl, { wireFormat: "ollama" });
+
+  await expect(
+    provider.detectText({ text: "x", entityTypes: ["email"] })
+  ).rejects.toMatchObject({ code: "provider_error" });
 });

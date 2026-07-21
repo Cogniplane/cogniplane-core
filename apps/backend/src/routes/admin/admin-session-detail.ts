@@ -17,7 +17,7 @@ export type AdminSessionDetailOverview = {
   tenantId: string;
   sessionName: string;
   status: "active" | "completed" | "errored";
-  runtimeProvider: "codex" | "claude-code" | null;
+  runtimeProvider: "deep-agents" | null;
   createdAt: string;
   lastActivityAt: string;
   messageCount: number;

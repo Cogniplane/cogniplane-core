@@ -192,3 +192,23 @@ test("PiiScanJobStore.getById returns null when missing", async () => {
   const record = await store.getById("tenant-1", "missing");
   expect(record).toBe(null);
 });
+
+test("PiiScanJobStore.sweepStaleClaims requeues/fails claimed rows past the cutoff", async () => {
+  const db = new CaptureDatabase();
+  // The sweep runs a bare UPDATE; the fake returns rowCount 1 when updateReturn
+  // is set. We only need the query shape + the returned count here.
+  db.updateReturn = sampleRow({ status: "queued" });
+  const store = new PiiScanJobStore(db as unknown as Pool);
+
+  const swept = await store.sweepStaleClaims(120_000);
+
+  expect(db.lastQuery).toBeTruthy();
+  // Only rows stuck in 'claimed' past the cutoff are touched.
+  expect(db.lastQuery!.text).toMatch(/status\s*=\s*'claimed'/);
+  expect(db.lastQuery!.text).toMatch(/claimed_at\s*<\s*NOW\(\)/);
+  // The retry guard decides requeue vs. terminal failure, mirroring recordFailure.
+  expect(db.lastQuery!.text).toMatch(/attempts\s*>=\s*max_attempts/);
+  // The cutoff reaches the query as a bound value (ms → interval).
+  expect(db.lastQuery!.values).toContain(120_000);
+  expect(swept).toBe(1);
+});

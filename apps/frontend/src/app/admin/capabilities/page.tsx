@@ -32,7 +32,7 @@ export default function AdminAgentSettingsPage() {
   });
 
   return (
-    <section id="capabilities" className="flex flex-col gap-5">
+    <section id="capabilities" className="flex flex-col gap-5 pt-5">
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       {settings ? (
         <TenantSettingsForm
@@ -41,7 +41,6 @@ export default function AdminAgentSettingsPage() {
           onSave={save}
           managedTools={managedToolsQuery.data ?? []}
           mcpServers={mcpServersQuery.data ?? []}
-          openaiKeyConfigured={Boolean(tenantDetailsQuery.data?.settings.openaiApiKeyConfigured)}
           anthropicKeyConfigured={Boolean(
             tenantDetailsQuery.data?.settings.anthropicApiKeyConfigured
           )}

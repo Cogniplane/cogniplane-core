@@ -7,7 +7,10 @@ export type FrontendSecurityPolicyInput = {
 export function buildFrontendContentSecurityPolicy(input: FrontendSecurityPolicyInput): string {
   const apiOrigin = new URL(input.apiUrl).origin;
   const scriptSources = ["'self'", `'nonce-${input.nonce}'`];
-  if (input.development) scriptSources.push("'unsafe-eval'");
+  const developmentConnectSources = input.development
+    ? " http://localhost:8400 ws: wss:"
+    : "";
+  if (input.development) scriptSources.push("'unsafe-eval'", "http://localhost:8400");
 
   return [
     "default-src 'self'",
@@ -15,7 +18,7 @@ export function buildFrontendContentSecurityPolicy(input: FrontendSecurityPolicy
     "style-src 'self' 'unsafe-inline'",
     `img-src 'self' data: blob: ${apiOrigin}`,
     "font-src 'self' data:",
-    `connect-src 'self' ${apiOrigin}${input.development ? " ws: wss:" : ""}`,
+    `connect-src 'self' ${apiOrigin}${developmentConnectSources}`,
     "frame-src 'self'",
     "object-src 'none'",
     "base-uri 'self'",

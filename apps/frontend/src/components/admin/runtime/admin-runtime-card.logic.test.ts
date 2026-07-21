@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import type { RuntimeSessionSummary } from "@cogniplane/shared-types";
+import { RuntimeSessionSummarySchema, type RuntimeSessionSummary } from "@cogniplane/shared-types";
 
 import {
   countActiveSessions,
@@ -11,22 +11,26 @@ import {
 function makeSession(
   partial: Partial<RuntimeSessionSummary> & { runtimeId: string; sessionId: string }
 ): RuntimeSessionSummary {
-  return {
+  // Parse through the real schema so this fixture can never drift from the
+  // wire contract: a removed/renamed field (the old `mode`) or a newly-required
+  // one (the configSummary hashes) fails here instead of hiding behind a cast.
+  return RuntimeSessionSummarySchema.parse({
     runtimeId: partial.runtimeId,
     sessionId: partial.sessionId,
     status: partial.status ?? "running",
     healthStatus: partial.healthStatus ?? "healthy",
-    runtimeProvider: partial.runtimeProvider ?? "codex",
-    mode: partial.mode ?? null,
+    runtimeProvider: partial.runtimeProvider ?? "deep-agents",
     startedAt: partial.startedAt ?? "2026-05-09T12:00:00Z",
     lastActiveAt: partial.lastActiveAt ?? "2026-05-09T12:00:00Z",
     updatedAt: partial.updatedAt ?? "2026-05-09T12:00:00Z",
     configSummary: partial.configSummary ?? {
-      runtimePolicy: { id: "default", version: 1 },
+      manifestHash: "manifest-hash",
+      configBundleHash: "config-bundle-hash",
+      runtimePolicy: { id: "default", version: 1, hash: "policy-hash" },
       skillVersions: [],
       mcpServerVersions: []
     }
-  } as RuntimeSessionSummary;
+  });
 }
 
 describe("filterRuntimeSessions", () => {

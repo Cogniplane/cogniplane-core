@@ -88,6 +88,21 @@ export function isGatingEffect(effect: PolicyEffect): boolean {
 }
 
 /**
+ * The canonical rule evaluation order: ascending priority, then ruleId for a
+ * stable tie-break. This is the ONE definition of evaluation order — the engine
+ * sorts by it before first-match-wins, the lint sorts by it so a "shadowed"
+ * verdict reflects real evaluation order, and it must mirror the store's SQL
+ * `ORDER BY priority ASC, rule_id ASC` (policy-rule-store.ts). If these three
+ * ever disagree, the lint validates an order the engine doesn't enforce.
+ */
+export function compareRuleEvaluationOrder(
+  a: { priority: number; ruleId: string },
+  b: { priority: number; ruleId: string }
+): number {
+  return a.priority !== b.priority ? a.priority - b.priority : a.ruleId.localeCompare(b.ruleId);
+}
+
+/**
  * Evaluate an action against an ordered set of rules. The first enabled rule
  * (by ascending priority, then ruleId for stable ties) whose conditions all
  * match decides the outcome. No match → default allow.
@@ -103,7 +118,7 @@ export function evaluatePolicy(
   const candidates = rules
     .filter((rule) => rule.enabled)
     .slice()
-    .sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.ruleId.localeCompare(b.ruleId)));
+    .sort(compareRuleEvaluationOrder);
 
   for (const rule of candidates) {
     if (!ruleMatches(rule, action)) continue;

@@ -13,6 +13,7 @@ export default tseslint.config(
       "**/node_modules/**",
       "**/.wrangler/**",
       ".claude/plugins/**",
+      ".claude/worktrees/**",
       ".worktrees/**",
       "**/coverage/**",
       "docs/**",
@@ -24,6 +25,18 @@ export default tseslint.config(
     ]
   },
   js.configs.recommended,
+  // Pin the TSConfig root to THIS repo's directory. Without it, typescript-eslint
+  // 8.x probes upward for a tsconfig and, when sibling checkouts exist next to
+  // this repo (../cogniplane-core, ../cogniplane.demo, …), fails with
+  // "No tsconfigRootDir was set, and multiple candidate TSConfigRootDirs are
+  // present" — a parse error on every file. See tseslint.com/parser-tsconfigrootdir.
+  {
+    languageOptions: {
+      parserOptions: {
+        tsconfigRootDir: import.meta.dirname
+      }
+    }
+  },
   {
     files: ["**/*.{js,mjs,cjs}"],
     languageOptions: {

@@ -9,10 +9,8 @@ import type { TenantSettingsInput } from "../hooks/use-tenant-settings";
 import {
   buildDraft,
   formatRelativeTime,
-  orderProvidersWithDefaultFirst,
   toApprovalPolicy,
   toggleInArray,
-  toggleRuntimeProviderInDraft,
   type ApprovalPolicyKind,
   type FormDraft
 } from "./tenant-settings-form.logic";
@@ -32,8 +30,6 @@ import { PILL_GRAY, SECTION_LABEL } from "../lib/ui-tokens";
 const FORM_SECTION_LABEL =
   "text-[0.7rem] font-semibold uppercase tracking-[0.12em] text-on-surface-variant";
 
-type RuntimeProviderId = "codex" | "claude-code";
-
 type UpdateDraft = (recipe: (current: FormDraft) => FormDraft) => void;
 
 type Props = {
@@ -42,7 +38,6 @@ type Props = {
   onSave: (input: TenantSettingsInput) => Promise<boolean>;
   managedTools: AdminManagedTool[];
   mcpServers: AdminMcpServer[];
-  openaiKeyConfigured: boolean;
   anthropicKeyConfigured: boolean;
   isOwner: boolean;
 };
@@ -132,16 +127,9 @@ export function TenantSettingsForm({
   onSave,
   managedTools,
   mcpServers,
-  openaiKeyConfigured,
   anthropicKeyConfigured,
   isOwner
 }: Props) {
-  const providerKeyConfigured: Record<RuntimeProviderId, boolean> = {
-    codex: openaiKeyConfigured,
-    "claude-code": anthropicKeyConfigured
-  };
-  const effectiveEnabledProviders = (draft: FormDraft): RuntimeProviderId[] =>
-    draft.enabledRuntimeProviders.filter((provider) => providerKeyConfigured[provider]);
   const [draft, setDraft] = useState<FormDraft>(() => buildDraft(settings));
   const [isDirty, setIsDirty] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
@@ -186,17 +174,9 @@ export function TenantSettingsForm({
     [draft.enabledMcpServerIds, knownServerIds]
   );
 
-  function toggleRuntimeProvider(provider: RuntimeProviderId, enabled: boolean): void {
-    updateDraft((current) => toggleRuntimeProviderInDraft(current, provider, enabled));
-  }
-
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    const effective = effectiveEnabledProviders(draft);
-    if (effective.length === 0) return;
-    const orderedProviders = orderProvidersWithDefaultFirst(effective, draft.runtimeProvider);
     const ok = await onSave({
-      enabledRuntimeProviders: orderedProviders,
       showEffortSelector: draft.showEffortSelector,
       webSearchMode: draft.webSearchMode,
       approvalPolicy: toApprovalPolicy(draft.approvalPolicyKind, draft.granularFlags),
@@ -215,8 +195,6 @@ export function TenantSettingsForm({
       setTimeout(() => setShowSuccess(false), 3000);
     }
   }
-
-  const effectiveProviders = effectiveEnabledProviders(draft);
 
   return (
     <Card>
@@ -239,13 +217,10 @@ export function TenantSettingsForm({
 
       <CardContent>
         <form className="flex flex-col gap-6" onSubmit={(event) => void handleSubmit(event)}>
-          <RuntimeProvidersSection
+          <RuntimeSection
             draft={draft}
             updateDraft={updateDraft}
-            openaiKeyConfigured={openaiKeyConfigured}
             anthropicKeyConfigured={anthropicKeyConfigured}
-            effectiveProviders={effectiveProviders}
-            toggleRuntimeProvider={toggleRuntimeProvider}
           />
 
           <div className="border-t border-outline-variant" />
@@ -277,7 +252,7 @@ export function TenantSettingsForm({
                 Settings saved successfully.
               </span>
             ) : null}
-            <Button type="submit" disabled={saving || effectiveProviders.length === 0}>
+            <Button type="submit" disabled={saving}>
               {saving ? "Saving…" : "Save settings"}
             </Button>
           </div>
@@ -287,60 +262,29 @@ export function TenantSettingsForm({
   );
 }
 
-function RuntimeProvidersSection(props: {
+function RuntimeSection(props: {
   draft: FormDraft;
   updateDraft: UpdateDraft;
-  openaiKeyConfigured: boolean;
   anthropicKeyConfigured: boolean;
-  effectiveProviders: RuntimeProviderId[];
-  toggleRuntimeProvider: (provider: RuntimeProviderId, enabled: boolean) => void;
 }) {
-  const {
-    draft,
-    updateDraft,
-    openaiKeyConfigured,
-    anthropicKeyConfigured,
-    effectiveProviders,
-    toggleRuntimeProvider
-  } = props;
+  const { draft, updateDraft, anthropicKeyConfigured } = props;
 
   return (
     <div className="flex flex-col gap-3">
       <div>
-        <p className={FORM_SECTION_LABEL}>Runtime providers</p>
+        <p className={FORM_SECTION_LABEL}>Runtime</p>
         <p className="mt-1 text-xs text-on-surface-faint">
-          Enable the model families this tenant can use. The default provider is used when a
-          turn does not specify a model. API keys are configured separately in Organization
-          settings.
+          All sessions run on the Deep Agents runtime (Anthropic models). The API key is
+          configured in Organization settings.
         </p>
       </div>
 
-      <div className="flex flex-col gap-2">
-        <CheckboxRow
-          checked={openaiKeyConfigured && draft.enabledRuntimeProviders.includes("codex")}
-          onChange={(checked) => toggleRuntimeProvider("codex", checked)}
-          disabled={!openaiKeyConfigured}
-          label="Codex"
-          hint={
-            openaiKeyConfigured
-              ? "OpenAI-backed coding models."
-              : "Disabled — add an OpenAI API key in Organization settings to enable."
-          }
-        />
-        <CheckboxRow
-          checked={
-            anthropicKeyConfigured && draft.enabledRuntimeProviders.includes("claude-code")
-          }
-          onChange={(checked) => toggleRuntimeProvider("claude-code", checked)}
-          disabled={!anthropicKeyConfigured}
-          label="Claude Code"
-          hint={
-            anthropicKeyConfigured
-              ? "Anthropic-backed Claude models."
-              : "Disabled — add an Anthropic API key in Organization settings to enable."
-          }
-        />
-      </div>
+      {!anthropicKeyConfigured ? (
+        <p className="text-sm text-danger">
+          No Anthropic API key is configured — agent turns will fail. Add one in Organization
+          settings.
+        </p>
+      ) : null}
 
       <CheckboxRow
         checked={draft.showEffortSelector}
@@ -350,31 +294,6 @@ function RuntimeProvidersSection(props: {
         label="Show effort selector in chat"
         hint="Lets users pick reasoning depth when the selected model supports it."
       />
-
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="default-provider">Default provider</Label>
-        <Select
-          value={draft.runtimeProvider}
-          onValueChange={(value) =>
-            updateDraft((current) => ({
-              ...current,
-              runtimeProvider: value as RuntimeProviderId
-            }))
-          }
-        >
-          <SelectTrigger id="default-provider" className="w-full sm:w-80">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {effectiveProviders.includes("codex") ? (
-              <SelectItem value="codex">Codex (OpenAI)</SelectItem>
-            ) : null}
-            {effectiveProviders.includes("claude-code") ? (
-              <SelectItem value="claude-code">Claude Code (Anthropic)</SelectItem>
-            ) : null}
-          </SelectContent>
-        </Select>
-      </div>
 
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="web-search-mode">Web search</Label>
@@ -397,18 +316,10 @@ function RuntimeProvidersSection(props: {
           </SelectContent>
         </Select>
         <p className="text-xs text-on-surface-faint">
-          Lets the Codex runtime search the web. &ldquo;Cached&rdquo; uses an indexed
-          snapshot; &ldquo;Live&rdquo; hits the network. The Claude runtime always has web
-          search available.
+          Web-search posture for agent turns. &ldquo;Cached&rdquo; uses an indexed snapshot;
+          &ldquo;Live&rdquo; hits the network.
         </p>
       </div>
-
-      {effectiveProviders.length === 0 ? (
-        <p className="text-sm text-danger">
-          Enable at least one runtime provider. Add an API key in Organization settings first
-          to unlock its provider here.
-        </p>
-      ) : null}
     </div>
   );
 }

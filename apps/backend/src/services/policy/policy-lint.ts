@@ -3,6 +3,7 @@ import {
   type PolicyConditions,
   type PolicyLintWarning
 } from "@cogniplane/shared-types";
+import { compareRuleEvaluationOrder } from "./policy-engine.js";
 
 // A rule as the lint sees it — the subset of fields that affect reachability.
 // Mirrors the engine's EvaluableRule but the lint only needs identity, order,
@@ -110,7 +111,7 @@ function unknownConditionKeys(conditions: PolicyConditions): string[] {
 export function lintRules(rules: readonly LintableRule[]): PolicyLintWarning[] {
   const ordered = rules
     .slice()
-    .sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.ruleId.localeCompare(b.ruleId)));
+    .sort(compareRuleEvaluationOrder);
 
   const warnings: PolicyLintWarning[] = [];
 

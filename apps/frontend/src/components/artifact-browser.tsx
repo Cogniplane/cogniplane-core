@@ -103,7 +103,7 @@ function ArtifactBrowserRow(props: {
   const piiLabel = pii ? formatPiiLabel(pii) : null;
 
   return (
-    <div className="flex items-center gap-3 border-b border-outline-variant px-3 py-2.5 text-sm">
+    <div className="flex items-center gap-3 border-b border-outline-variant px-3 py-2.5 text-sm transition-colors hover:bg-surface-container-low">
       <div className="min-w-0 flex-1">
         <p className="truncate font-medium text-on-surface" title={artifact.artifactName}>
           {artifact.artifactName}

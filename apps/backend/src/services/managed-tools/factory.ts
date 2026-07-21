@@ -5,6 +5,7 @@ import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { GithubConnectionService } from "../integrations/github/github-connection-service.js";
 import type { NotionConnectionService } from "../integrations/notion/notion-connection-service.js";
+import type { MemoryStore } from "../memory-store.js";
 import type { MessageStore } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import type { SessionStore } from "../session-store.js";
@@ -21,6 +22,7 @@ export type ManagedToolFactoryDeps = {
   dynamicConfig: DynamicConfigService;
   sessions: SessionStore;
   messages: MessageStore;
+  memories: MemoryStore;
   artifacts: ArtifactStore;
   storage: ArtifactStorage;
   auditEvents: AuditEventStore;
@@ -62,8 +64,14 @@ export class ManagedToolFactoryRegistry {
 
   createDefinitions(deps: ManagedToolFactoryDeps): ManagedToolDefinition[] {
     const out: ManagedToolDefinition[] = [];
-    for (const factory of this.factories.values()) {
-      out.push(...factory(deps));
+    for (const [domainKey, factory] of this.factories.entries()) {
+      // Stamp the factory's domain key onto every tool it produces so the
+      // gateway can bind a tool to its true domain (used as the Policy Center
+      // category). A factory may still set its own `category` explicitly; we
+      // only fill it in when unset.
+      for (const def of factory(deps)) {
+        out.push(def.category ? def : { ...def, category: domainKey });
+      }
     }
     return out;
   }

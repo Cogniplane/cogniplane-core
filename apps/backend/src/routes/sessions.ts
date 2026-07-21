@@ -9,12 +9,10 @@ import {
 
 import type { AppDependencies } from "../app-dependencies.js";
 import { ensureUser } from "../lib/db.js";
-import { notFoundError } from "../lib/http-errors.js";
+import { apiError, notFoundError } from "../lib/http-errors.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
-import { DEFAULT_RUNTIME_PROVIDER } from "../services/admin-config-records.js";
-import type { RuntimeAdapter } from "../runtime-contracts.js";
 
 const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(120).optional()
@@ -32,10 +30,9 @@ export function buildSessionRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
     messages: deps.messages,
-    defaultAdapter: deps.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
+    runtimeAdapter: deps.runtimeAdapter,
     limits: deps.limits,
     activeTurns: deps.activeTurns,
-    runtimeAdapters: deps.runtimeAdapters,
     auditEvents: deps.auditEvents
   };
 }
@@ -138,9 +135,9 @@ export async function registerSessionRoutes(
   });
 
   // Stop button — interrupt the in-flight turn while keeping the runtime warm.
-  // Routes to whichever adapter currently holds in-memory state for the session
-  // (mirrors DELETE /sessions/:sessionId so single-tenant Codex<->Claude swaps
-  // hit the right runtime). 200 on stop dispatched, 409 when nothing was running.
+  // Routes to the adapter holding in-memory state for the session (mirrors
+  // DELETE /sessions/:sessionId). 200 on stop dispatched, 409 when nothing
+  // was running.
   app.post("/sessions/:sessionId/interrupt", async (request, reply) => {
     const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
     if (!paramsResult.ok) return paramsResult.response;
@@ -154,23 +151,18 @@ export async function registerSessionRoutes(
       return notFoundError("session_not_found");
     }
 
-    const registeredAdapters = Object.values(stores.runtimeAdapters ?? {})
-      .filter((adapter): adapter is RuntimeAdapter => Boolean(adapter));
-    const owningAdapter =
-      registeredAdapters.find((adapter) => adapter.hasActiveTurn(sessionId))
-      ?? registeredAdapters.find((adapter) => adapter.hasSession?.(sessionId))
-      ?? stores.defaultAdapter;
+    const owningAdapter = stores.runtimeAdapter;
 
     if (!owningAdapter.interruptTurn) {
       reply.code(501);
-      return { error: "interrupt_not_supported" };
+      return apiError("interrupt_not_supported", "This runtime does not support interrupting a turn.");
     }
 
     const result = await owningAdapter.interruptTurn({ tenantId, sessionId, userId });
 
     if (result === "no_active_turn") {
       reply.code(409);
-      return { error: "no_active_turn" };
+      return apiError("no_active_turn", "There is no active turn to interrupt for this session.");
     }
 
     // Telemetry — useful for "are users hitting Stop a lot?" (signal that
@@ -207,21 +199,10 @@ export async function registerSessionRoutes(
       return notFoundError("session_not_found");
     }
 
-    // Route to the adapter that actually holds in-memory state for this
-    // session. Fanning out to every adapter would race on the shared
-    // runtime_sessions row (Codex's fallback path marks sessions "inactive"
-    // which can clobber the Claude adapter's "terminated" status).
-    // If no adapter claims the session, fall back to the Codex runtime
-    // manager so stale runtime_sessions rows still get DB cleanup.
-    const registeredAdapters = Object.values(stores.runtimeAdapters ?? {})
-      .filter((adapter): adapter is RuntimeAdapter => Boolean(adapter));
-    const owningAdapter = registeredAdapters.find((adapter) =>
-      adapter.hasSession?.(sessionId)
-    );
-    const abortTarget: RuntimeAdapter = owningAdapter ?? stores.defaultAdapter;
-
+    // abortSession also cleans up stale runtime_sessions rows when the
+    // adapter holds no in-memory state for this session.
     try {
-      await abortTarget.abortSession({
+      await stores.runtimeAdapter.abortSession({
         tenantId,
         sessionId,
         userId
@@ -230,6 +211,18 @@ export async function registerSessionRoutes(
       request.log.warn(
         { err, sessionId },
         "Runtime cleanup failed after session deletion"
+      );
+    }
+
+    // Durable per-session runtime data (Deep Agents checkpointer threads, …)
+    // is only deleted here — never from abortSession, which also fires on
+    // idle teardown. Purge is idempotent and works with no in-memory state.
+    try {
+      await stores.runtimeAdapter.purgeSessionData({ tenantId, sessionId, userId });
+    } catch (err) {
+      request.log.warn(
+        { err, sessionId, adapter: stores.runtimeAdapter.id },
+        "Failed to purge per-session runtime data after session deletion"
       );
     }
 

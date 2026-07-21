@@ -2,19 +2,24 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import { MessagePostRequestSchema } from "@cogniplane/shared-types";
+import type { ModelProvider } from "@cogniplane/shared-types";
 
 import type { AppDependencies } from "../app-dependencies.js";
 import { apiError, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { STATIC_SECURITY_HEADERS } from "../lib/security-headers.js";
-import { sseFrame, type RuntimeReasoningEffort } from "../runtime-contracts.js";
-import { DEFAULT_RUNTIME_PROVIDER, type RuntimeProvider } from "../services/admin-config-records.js";
+import { EventType, type BaseEvent } from "@ag-ui/client";
+import { sseFrame } from "../runtime-contracts.js";
+import { uuidv7 } from "../lib/uuid.js";
 import type { ArtifactRecord } from "../services/artifacts/artifact-store.js";
+import { toAvailableModel } from "../services/custom-model-store.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
-import { resolveRuntimeProviderAndModel } from "../services/runtime/runtime-provider-resolver.js";
+import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 import { streamAssistantReply } from "../services/sse-stream-writer.js";
+import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
 import { generateSessionTitle } from "../services/session-titler.js";
+import { UtilityLlmClient } from "../services/utility-llm-client.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
 import { isCorsOriginAllowed } from "../lib/cors.js";
 import { handlePiiDecision, type PiiHandlerOutcome } from "./messages-pii-handler.js";
@@ -44,19 +49,18 @@ function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: F
   reply.raw.flushHeaders();
 }
 
-// Wire shape lives in `@cogniplane/shared-types`; the route adds a stricter
-// `model` check (allowlist via AVAILABLE_MODELS) that doesn't belong in the
-// shared package — the frontend can't enumerate platform-internal model IDs
-// without depending on the backend.
+// Wire shape lives in `@cogniplane/shared-types`. `model` is a bounded string
+// here, NOT a static enum: the catalog is tenant-dependent (built-ins plus
+// admin-added custom models), so membership is validated per-tenant by
+// resolveRuntimeModel, which 400s unknown or disabled ids.
 const sendMessageSchema = MessagePostRequestSchema.extend({
-  model: z.enum(AVAILABLE_MODELS.map((m) => m.id) as [string, ...string[]]).optional()
+  model: z.string().trim().min(1).max(200).optional()
 });
 
 export function buildMessageRouteStores(
   deps: AppDependencies,
   extras: {
-    hasAnthropicApiKey: (tenantId: string) => Promise<boolean>;
-    hasOpenaiApiKey: (tenantId: string) => Promise<boolean>;
+    hasProviderKey: (tenantId: string, provider: ModelProvider) => Promise<boolean>;
   }
 ) {
   return {
@@ -68,20 +72,21 @@ export function buildMessageRouteStores(
     messages: deps.messages,
     toolContexts: deps.toolContexts,
     dynamicConfig: deps.dynamicConfig,
-    runtimeAdapters: deps.runtimeAdapters,
-    hasAnthropicApiKey: extras.hasAnthropicApiKey,
-    hasOpenaiApiKey: extras.hasOpenaiApiKey,
+    customModels: deps.customModels,
+    runtimeAdapter: deps.runtimeAdapter,
+    hasProviderKey: extras.hasProviderKey,
     getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey,
     piiProtection: deps.piiProtection,
     piiScanRuns: deps.piiScanRuns,
     auditEvents: deps.auditEvents,
-    activeTurns: deps.activeTurns,
-    activeTurnMessageMap: deps.activeTurnMessageMap
+    activeTurns: deps.activeTurns
   };
 }
 
 export type MessageRouteStores = ReturnType<typeof buildMessageRouteStores>;
+
+const DEFAULT_MODEL_ID =
+  AVAILABLE_MODELS.find((m) => m.isDefault)?.id ?? AVAILABLE_MODELS[0]!.id;
 
 const DEFAULT_SESSION_NAME = "New session";
 const AUTO_NAMED_SESSION_PATTERN = /^Session \d+$/;
@@ -102,6 +107,20 @@ export async function registerMessageRoutes(
 
     const { userId, tenantId } = request.auth;
     const input = inputResult.value;
+
+    // Track B spike: `?format=agui` opts into the AG-UI BaseEvent stream. Reject
+    // it up front (before any side effects) when the wire is disabled, instead
+    // of silently falling through to the RuntimeEvent SSE path — an AG-UI client
+    // (CopilotKit) would otherwise receive frames it can't parse and fail opaquely.
+    const wantsAgui = (request.query as { format?: string } | undefined)?.format === "agui";
+    if (wantsAgui && !app.config.AGUI_WIRE) {
+      reply.code(400);
+      return apiError(
+        "agui_wire_disabled",
+        "AG-UI streaming (?format=agui) is not enabled on this backend (set AGUI_WIRE=true)."
+      );
+    }
+
     const session = await stores.sessions.getOwned(tenantId, input.sessionId, userId);
 
     if (!session || session.status !== "active") {
@@ -109,17 +128,25 @@ export async function registerMessageRoutes(
       return notFoundError("session_not_found");
     }
 
-    // Resolve the correct runtime adapter early so hasActiveTurn checks the right provider.
-    const resolution = await resolveRuntimeProviderAndModel({
+    const resolution = await resolveRuntimeModel({
       tenantId,
       requestedModel: input.model,
       requestedEffort: input.effort,
-      defaultAdapter: stores.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
+      runtimeAdapter: stores.runtimeAdapter,
       stores: {
-        dynamicConfig: stores.dynamicConfig,
-        runtimeAdapters: stores.runtimeAdapters,
-        hasAnthropicApiKey: stores.hasAnthropicApiKey,
-        hasOpenaiApiKey: stores.hasOpenaiApiKey
+        hasProviderKey: stores.hasProviderKey,
+        // Admin-controlled provider/model enablement + default-effort
+        // overrides (tenant_settings). Gates disabled models even on direct
+        // API calls that bypass the /models-filtered picker.
+        getModelAvailability: (tenantId) =>
+          stores.dynamicConfig.getOrCreateTenantSettings(tenantId),
+        // Built-ins + this tenant's admin-added custom models.
+        listModels: async (tenantId) => [
+          ...AVAILABLE_MODELS,
+          ...(stores.customModels
+            ? (await stores.customModels.list(tenantId)).map(toAvailableModel)
+            : [])
+        ]
       }
     });
 
@@ -128,7 +155,7 @@ export async function registerMessageRoutes(
       return resolution.body;
     }
 
-    const { runtimeAdapter, provider: resolvedProvider, selectedModel } = resolution;
+    const { runtimeAdapter, selectedModel, selectedEffort } = resolution;
 
     // Atomic turn-slot reservation. The adapter only flips `hasActiveTurn` to
     // true deep inside `runMessage`, which doesn't run until `streamAssistantReply`
@@ -153,6 +180,8 @@ export async function registerMessageRoutes(
       }
     };
 
+    // OR source-order is not priority: `activeTurns` is the primary guard (see
+    // above), the adapter check is the best-effort fallback.
     const alreadyBusy =
       runtimeAdapter.hasActiveTurn(input.sessionId) ||
       (stores.activeTurns?.snapshot().has(input.sessionId) ?? false);
@@ -227,7 +256,8 @@ export async function registerMessageRoutes(
         tenantId,
         sessionId: input.sessionId,
         userId,
-        outcome: piiOutcome
+        outcome: piiOutcome,
+        wantsAgui
       });
     }
 
@@ -254,9 +284,13 @@ export async function registerMessageRoutes(
 
     openSseResponse(app, request, reply);
 
+    // Session auto-titling is fire-and-forget and path-agnostic (it keys off the
+    // persisted user message, not the runtime stream), so trigger it BEFORE the
+    // AG-UI branch below — otherwise AG-UI turns would skip titling and sessions
+    // would stay named "New session"/"Session N".
     if (isUntitledSessionName(session.sessionName)) {
       request.log.info(
-        { sessionId: input.sessionId, runtimeProvider: resolvedProvider, currentName: session.sessionName },
+        { sessionId: input.sessionId, currentName: session.sessionName },
         "session titler triggered"
       );
       void titleSessionAsync({
@@ -266,10 +300,42 @@ export async function registerMessageRoutes(
         userId,
         sessionId: input.sessionId,
         currentSessionName: session.sessionName,
-        runtimeProvider: resolvedProvider,
         firstMessage: persistedUserText,
         logger: request.log
       });
+    }
+
+    // Track B spike (boundary b): stream AG-UI BaseEvents instead of the
+    // RuntimeEvent SSE frames. Opt-in per request (`?format=agui`); the early
+    // guard above already rejected this when AGUI_WIRE is off, so reaching here
+    // means the wire is enabled. Owns the reserved slot for the turn's lifetime;
+    // releases it here (the AG-UI writer has no slot registry).
+    if (wantsAgui) {
+      try {
+        await streamAssistantReplyAGUI({
+          logger: request.log,
+          reply,
+          messages: stores.messages,
+          toolContexts: stores.toolContexts,
+          runtimeAdapter,
+          tenantId: request.auth.tenantId,
+          sessionId: input.sessionId,
+          userId: request.auth.userId,
+          modelName: selectedModel?.id ?? input.model ?? DEFAULT_MODEL_ID,
+          effort: selectedEffort,
+          prompt: runtimePrompt,
+          scopedArtifacts,
+          artifactProcessor: stores.artifactProcessor,
+          storage: stores.storage,
+          selectedArtifactIds,
+          userMessageReplacement,
+          turnContext: "interactive",
+          toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS
+        });
+      } finally {
+        releaseSlot();
+      }
+      return;
     }
 
     // From here the stream writer owns the reserved slot (it re-marks at turn
@@ -288,8 +354,8 @@ export async function registerMessageRoutes(
         tenantId: request.auth.tenantId,
         sessionId: input.sessionId,
         userId: request.auth.userId,
-        modelName: selectedModel?.id ?? input.model ?? app.config.CODEX_MODEL,
-        effort: input.effort as RuntimeReasoningEffort | undefined,
+        modelName: selectedModel?.id ?? input.model ?? DEFAULT_MODEL_ID,
+        effort: selectedEffort,
         prompt: runtimePrompt,
         scopedArtifacts,
         artifactProcessor: stores.artifactProcessor,
@@ -298,7 +364,7 @@ export async function registerMessageRoutes(
         sourceArtifactNames: scopedArtifacts.map((artifact) => artifact.artifactName),
         userMessageReplacement,
         activeTurns: stores.activeTurns,
-        activeTurnMessageMap: stores.activeTurnMessageMap,
+        toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS,
         // Policy Center turn-context snapshot — this is an interactive turn (a
         // user in the loop); the scheduler passes turnContext: "scheduled".
         turnContext: "interactive"
@@ -344,20 +410,18 @@ async function resolveEligibleArtifacts(
     ? Array.from(new Set(input.requestedArtifactIds))
     : [];
 
-  if (input.requestedArtifactIds?.length) {
-    for (const artifactId of selectedArtifactIds) {
-      if (!readyArtifactById.has(artifactId)) {
-        reply.code(400);
-        return {
-          ok: false,
-          response: requestError([
-            {
-              path: "artifactIds",
-              message: `Artifact ${artifactId} is not ready or is not available in this session.`
-            }
-          ])
-        };
-      }
+  for (const artifactId of selectedArtifactIds) {
+    if (!readyArtifactById.has(artifactId)) {
+      reply.code(400);
+      return {
+        ok: false,
+        response: requestError([
+          {
+            path: "artifactIds",
+            message: `Artifact ${artifactId} is not ready or is not available in this session.`
+          }
+        ])
+      };
     }
   }
 
@@ -405,8 +469,16 @@ async function respondWithPiiBlock(args: {
   sessionId: string;
   userId: string;
   outcome: Extract<PiiHandlerOutcome, { kind: "block" }>;
+  // The block short-circuit runs before the wantsAgui dispatch below, so it must
+  // emit the right wire format itself: RuntimeEvent frames for the legacy SSE
+  // client, AG-UI BaseEvents for the CopilotKit HttpAgent. Emitting RuntimeEvent
+  // frames on an AG-UI request makes the client's EventSchemas.parse throw and
+  // the block message never renders live.
+  wantsAgui: boolean;
 }): Promise<void> {
-  const { app, request, reply, stores, tenantId, sessionId, userId, outcome } = args;
+  const { app, request, reply, stores, tenantId, sessionId, userId, outcome, wantsAgui } = args;
+
+  const blockMessage = "Message blocked by organization policy.";
 
   // Persist a system message so the blocked event shows up in history —
   // the raw user prompt is NOT persisted.
@@ -416,7 +488,7 @@ async function respondWithPiiBlock(args: {
     userId,
     role: "system",
     status: "completed",
-    content: "Message blocked by organization policy.",
+    content: blockMessage,
     detail: {
       pii: {
         status: "blocked",
@@ -427,16 +499,37 @@ async function respondWithPiiBlock(args: {
     }
   });
 
-  // Frontend consumes /messages as an SSE stream; stay on that contract
-  // and emit a terminal blocked frame so existing streamMessage() handlers
-  // complete cleanly with the block payload visible to the UI.
   openSseResponse(app, request, reply);
+
+  if (wantsAgui) {
+    // AG-UI wire: a valid, minimal run that carries the block copy as an
+    // assistant text message and terminates cleanly. threadId === sessionId
+    // (matches the AG-UI writer/driver), runId/messageId are fresh ids.
+    const runId = uuidv7();
+    const messageId = uuidv7();
+    const aguiFrame = (event: BaseEvent) => `data: ${JSON.stringify(event)}\n\n`;
+    reply.raw.write(aguiFrame({ type: EventType.RUN_STARTED, threadId: sessionId, runId } as BaseEvent));
+    reply.raw.write(
+      aguiFrame({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent)
+    );
+    reply.raw.write(
+      aguiFrame({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: blockMessage } as BaseEvent)
+    );
+    reply.raw.write(aguiFrame({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent));
+    reply.raw.write(aguiFrame({ type: EventType.RUN_FINISHED, threadId: sessionId, runId } as BaseEvent));
+    reply.raw.end();
+    return;
+  }
+
+  // Legacy SSE: stay on the RuntimeEvent contract and emit a terminal blocked
+  // frame so existing streamMessage() handlers complete cleanly with the block
+  // payload visible to the UI.
   reply.raw.write(sseFrame("framework:message_blocked", {
     type: "framework:message_blocked",
     reason: "pii_block",
     block_reason: outcome.blockReason,
     scan_run_id: outcome.scanRunId,
-    message: "Message blocked by organization policy."
+    message: blockMessage
   }));
   reply.raw.write(sseFrame("response.completed", {
     type: "response.completed",
@@ -488,47 +581,53 @@ async function titleSessionAsync(input: {
   userId: string;
   sessionId: string;
   currentSessionName: string;
-  runtimeProvider: RuntimeProvider;
   firstMessage: string;
   logger: FastifyRequest["log"];
 }): Promise<void> {
-  const { app, stores, tenantId, userId, sessionId, currentSessionName, runtimeProvider, firstMessage, logger } = input;
+  const { app, stores, tenantId, userId, sessionId, currentSessionName, firstMessage, logger } = input;
 
   try {
-    let anthropicApiKey: string | null = null;
-    let openaiApiKey: string | null = null;
+    const tenantKey = stores.getTenantAnthropicApiKey
+      ? (await stores.getTenantAnthropicApiKey(tenantId))?.trim() ?? null
+      : null;
+    const anthropicApiKey = tenantKey || app.config.ANTHROPIC_API_KEY || null;
 
-    if (runtimeProvider === "claude-code") {
-      const tenantKey = stores.getTenantAnthropicApiKey
-        ? (await stores.getTenantAnthropicApiKey(tenantId))?.trim() ?? null
-        : null;
-      anthropicApiKey = tenantKey || app.config.ANTHROPIC_API_KEY || null;
-    } else {
-      const tenantKey = stores.getTenantOpenaiApiKey
-        ? (await stores.getTenantOpenaiApiKey(tenantId))?.trim() ?? null
-        : null;
-      openaiApiKey = tenantKey || app.config.OPENAI_API_KEY || null;
-    }
+    // Local-first titling: when UTILITY_LLM_* is configured (the homelab demo
+    // points it at the local Gemma on Ollama), the raw first message goes to
+    // the operator-run endpoint instead of a third-party API. Only if that path
+    // is absent/fails does generateSessionTitle fall back to the Anthropic API
+    // (best-effort — a non-Anthropic-only tenant simply skips titling, since
+    // titles are non-critical and the Gemma path covers the demo).
+    const utilityClient =
+      app.config.UTILITY_LLM_ENABLED && app.config.UTILITY_LLM_BASE_URL && app.config.UTILITY_LLM_MODEL
+        ? new UtilityLlmClient({
+            baseUrl: app.config.UTILITY_LLM_BASE_URL,
+            apiKey: app.config.UTILITY_LLM_API_KEY,
+            model: app.config.UTILITY_LLM_MODEL,
+            timeoutMs: app.config.UTILITY_LLM_TIMEOUT_MS,
+            wireFormat: app.config.UTILITY_LLM_WIRE_FORMAT,
+            disableThinking: app.config.UTILITY_LLM_DISABLE_THINKING
+          })
+        : undefined;
 
     const result = await generateSessionTitle({
-      runtimeProvider,
       firstMessage,
-      keys: { anthropicApiKey, openaiApiKey },
+      keys: { anthropicApiKey },
       config: {
         claudeModel: app.config.SESSION_TITLER_CLAUDE_MODEL,
-        codexModel: app.config.SESSION_TITLER_CODEX_MODEL,
         timeoutMs: app.config.SESSION_TITLER_TIMEOUT_MS
-      }
+      },
+      utilityClient
     });
 
     if (!result) {
       logger.warn(
-        { sessionId, runtimeProvider, hasAnthropicKey: Boolean(anthropicApiKey), hasOpenaiKey: Boolean(openaiApiKey) },
+        { sessionId, hasAnthropicKey: Boolean(anthropicApiKey) },
         "session titler skipped or failed"
       );
       return;
     }
-    logger.info({ sessionId, runtimeProvider, title: result.title, tokens: result.tokenUsage.totalTokens }, "session titled");
+    logger.info({ sessionId, title: result.title, tokens: result.tokenUsage.totalTokens }, "session titled");
 
     const renamed = await stores.sessions.renameIfCurrent(
       tenantId,
@@ -553,8 +652,7 @@ async function titleSessionAsync(input: {
       status: "completed",
       content: result.title,
       detail: {
-        kind: "session_titling",
-        runtimeProvider
+        kind: "session_titling"
       }
     });
     // Titler is a backend-direct LLM call (not routed through the proxy),

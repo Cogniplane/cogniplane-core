@@ -13,13 +13,12 @@ You need:
 - **Docker** with the Compose plugin (`docker compose version` should work). The `make dev` flow runs Postgres in a container.
 - **Git**.
 
-Optional, for the full agent experience:
+And two service accounts:
 
-- **An `OPENAI_API_KEY`** — required to use the Codex runtime. Without it, the Codex provider is hidden from the model selector. Get a paid key at [platform.openai.com](https://platform.openai.com).
-- **An `ANTHROPIC_API_KEY`** — required to use the Claude runtime. Without it, the Claude provider is hidden from the model selector. The Claude Agent SDK requires a paid API key from [console.anthropic.com](https://console.anthropic.com); **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used. Your use of the SDK is governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms).
-- **An `E2B_API_KEY`** — required if you want runtimes to execute inside isolated sandboxes (`RUNTIME_BACKEND=e2b` or `CLAUDE_RUNTIME_BACKEND=e2b`). For the quickstart you can leave these on `local` and skip E2B entirely.
+- **An `ANTHROPIC_API_KEY`** — the model key for the Deep Agents runtime. Without it (or a per-tenant key), the model selector is empty and no agent turn can run. A paid API key from [console.anthropic.com](https://console.anthropic.com) is required; **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used.
+- **An `E2B_API_KEY` + `E2B_TEMPLATE_ID`** — the runtime executes shell and file tools inside per-session [E2B](https://e2b.dev) sandboxes; there is no unsandboxed local-execution mode, and the backend fails fast at boot without them. Run `make e2b-build` once to build the code-execution template in your E2B account, then set `E2B_TEMPLATE_ID` to the printed id. Sandboxes are created lazily — chat-only sessions never start one.
 
-**You need at least one of `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for any agent turn to actually work.** Cogniplane Core does not bundle a free model — agents need a paid model-provider account.
+Cogniplane Core does not bundle a free model — agents need a paid model-provider account.
 
 ## 1. Clone and install
 
@@ -38,13 +37,14 @@ cp apps/backend/.env.example apps/backend/.env
 cp apps/frontend/.env.example apps/frontend/.env.local
 ```
 
-The defaults in `.env.example` are tuned for the make-dev flow: dev-headers auth (no SSO required), local Postgres on the standard port, in-process runtime mode. Open `apps/backend/.env` and confirm:
+The defaults in `.env.example` are tuned for the make-dev flow: dev-headers auth (no SSO required), local Postgres on the standard port. Open `apps/backend/.env` and confirm:
 
 - `AUTH_MODE=dev-headers` — bypasses WorkOS for local hacking.
 - `DATABASE_URL` and `MIGRATION_DATABASE_URL` — the make target stands these up automatically.
-- Add `ANTHROPIC_API_KEY=sk-ant-...` if you want Claude as a runtime option.
+- `ANTHROPIC_API_KEY=sk-ant-...` — the model key for agent turns.
+- `E2B_API_KEY` and `E2B_TEMPLATE_ID` — from your E2B account and the `make e2b-build` output.
 
-**Where API keys live (env vs. per-tenant).** `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` in `.env` are the **server-level fallback**. The runtime resolves a key as: per-tenant key (saved in admin → org settings, encrypted at rest) → env-var fallback → null. For local solo dev, putting the key in `.env` is the fastest path. For production multi-tenant deployments, prefer the per-tenant path so each tenant uses its own billing account and the key never leaves the database.
+**Where the model key lives (env vs. per-tenant).** `ANTHROPIC_API_KEY` in `.env` is the **server-level fallback**. The runtime resolves a key as: per-tenant key (saved in admin → org settings, encrypted at rest) → env-var fallback → null. For local solo dev, putting the key in `.env` is the fastest path. For production multi-tenant deployments, prefer the per-tenant path so each tenant uses its own billing account and the key never leaves the database.
 
 ## 3. Start the stack
 
@@ -87,15 +87,15 @@ In dev-headers mode there is no login screen — the frontend sends `X-User-Id: 
 
 You'll land on the chat workspace. To send a message:
 
-1. Pick a runtime in the model selector (top right). The selector lists every provider whose API key is configured (server-level env var or per-tenant). With both keys set you'll see "Codex" and "Claude"; with only one, just that one. With neither, the selector is empty and the frontend shows a "configure a model provider key" empty state.
+1. Pick a model in the selector (top right). The selector lists the available models when an Anthropic key is configured (server-level env var or per-tenant). With no key, the selector is empty and the frontend shows a "configure a model provider key" empty state.
 2. Type "What files are in this workspace?" and hit send.
-3. Watch the streaming response. You'll see the agent invoke a tool (`session_context` or filesystem-listing depending on the runtime), and the tool result streams back inline.
+3. Watch the streaming response. You'll see the agent invoke a tool (`ls`, `session_context`, …), and the tool result streams back inline.
 
 A few things to notice:
 
-- **Tool calls show up as collapsible cards** in the chat. Click into one to see the JSON-RPC arguments and the (redacted) result.
-- **The runtime is per-session.** Your second message in the same session reuses the same runtime process — no cold start.
-- **Open a second session** (left sidebar, "New session") and you get a fresh runtime with a fresh workspace. Sessions are fully isolated.
+- **Tool calls show up as collapsible cards** in the chat. Click into one to see the arguments and the (redacted) result.
+- **The session is warm.** Your second message in the same session reuses the same agent state and sandbox — no cold start, and conversation history survives backend restarts thanks to the Postgres checkpointer.
+- **Open a second session** (left sidebar, "New session") and you get a fresh agent with a fresh workspace. Sessions are fully isolated.
 
 ## 6. Visit the admin workbench
 
@@ -104,8 +104,8 @@ A few things to notice:
 Worth poking at:
 
 - **Skills** — the catalog of structured agent operating documents. The seeded `write-artifact` skill teaches the agent to generate downloadable files via the `write_artifact` managed tool.
-- **MCP servers** — gateway for Model Context Protocol tool servers. Add an external MCP server here and it materializes into the agent workspace at the next session start.
-- **Tenant settings** — runtime provider, native approval policy, Policy Center enforcement mode, enabled tools/MCP servers, and the system-prompt overlay applied to every turn.
+- **MCP servers** — gateway for Model Context Protocol tool servers. Add an external MCP server here and its tools become available to the agent at the next session start.
+- **Tenant settings** — native approval policy, Policy Center enforcement mode, enabled tools/MCP servers, command-execution posture, and the system-prompt overlay applied to every turn.
 
 ## 7. Try human-in-the-loop approvals
 
@@ -118,7 +118,7 @@ You've now seen the platform's core security primitive in action: the model neve
 - **Read the architecture overview** — [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit together.
 - **Run in production** — [self-hosting.md](self-hosting.md) walks through the production checklist (RLS verification, WorkOS setup, S3 storage, E2B sandboxes, secrets management).
 - **Understand the security model** — [SECURITY_FEATURES.md](SECURITY_FEATURES.md) is the full inventory of controls.
-- **Pick a runtime** — [guides/runtime-selection.md](guides/runtime-selection.md) explains when Codex vs Claude is the right choice.
+- **Learn the runtime** — the agent loop is LangChain's [Deep Agents](https://reference.langchain.com/javascript/deepagents) (planning, subagents, human-in-the-loop interrupts, durable checkpointing).
 - **Add a skill** — [guides/skill-bundle-decisions.md](guides/skill-bundle-decisions.md) covers the skill bundle format and lifecycle.
 
 ---
@@ -141,12 +141,16 @@ Docker isn't running. Start Docker Desktop (Mac/Windows) or `sudo systemctl star
 
 The `MIGRATION_DATABASE_URL` must be a **superuser** DSN (`postgres://postgres:...`), not the `app_user` DSN. The migration runner uses superuser privileges to create the `app_user` role and enable RLS policies. Check `apps/backend/.env`.
 
-### Claude runtime says "ANTHROPIC_API_KEY missing"
+### The model selector is empty / turns fail with a key error
 
-The backend only registers the Claude provider when an Anthropic key is available — either at the server level (`ANTHROPIC_API_KEY` in `apps/backend/.env`, requires a restart) or saved per-tenant in admin → org settings (no restart needed; takes effect on the next session start). Without either, you can still use Codex.
+The backend lists models only when an Anthropic key is available — either at the server level (`ANTHROPIC_API_KEY` in `apps/backend/.env`, requires a restart) or saved per-tenant in admin → org settings (no restart needed; takes effect on the next session start).
 
-The Claude Agent SDK requires a paid API key from [console.anthropic.com](https://console.anthropic.com). Consumer Free/Pro/Max subscriptions and OAuth tokens from the consumer apps cannot be used with the SDK.
+A paid API key from [console.anthropic.com](https://console.anthropic.com) is required. Consumer Free/Pro/Max subscriptions and OAuth tokens from the consumer apps cannot be used.
+
+### Boot fails with "E2B_API_KEY is required" or "E2B_TEMPLATE_ID is not configured"
+
+The runtime executes shell/file tools inside E2B sandboxes, so both are required at boot. Create an account at [e2b.dev](https://e2b.dev), set `E2B_API_KEY`, run `make e2b-build`, and set `E2B_TEMPLATE_ID` to the printed template id.
 
 ### Tool calls fail with "MCP server not reachable"
 
-`RUNTIME_GATEWAY_BASE_URL` must be a URL the runtime process can reach. For `make dev` (in-process runtime mode), `http://localhost:3001` works. If you're running runtimes in E2B sandboxes, they need a publicly-reachable URL — see [self-hosting.md](self-hosting.md).
+`RUNTIME_GATEWAY_BASE_URL` must be a URL the backend's MCP client can reach. For `make dev`, `http://localhost:3001` works — the agent loop and its MCP client run in the backend process itself. See [self-hosting.md](self-hosting.md) for networked deployments.

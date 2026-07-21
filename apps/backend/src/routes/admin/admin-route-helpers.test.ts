@@ -136,7 +136,7 @@ describe("createAdminAuditEvent", () => {
     ]);
   });
 
-  test("works without ip/userAgent", async () => {
+  test("omits ipAddress/userAgent and nulls sessionId when they are not provided", async () => {
     const events: Array<Record<string, unknown>> = [];
     const auditEvents = {
       async create(input: Record<string, unknown>) {

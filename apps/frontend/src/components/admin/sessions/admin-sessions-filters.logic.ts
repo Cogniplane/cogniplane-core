@@ -9,7 +9,6 @@ export type SessionsFilterState = {
   from: string; // ISO datetime or ""
   to: string; // ISO datetime or ""
   status: AdminSessionRow["status"] | "";
-  runtime: "codex" | "claude-code" | "";
   alert: AdminSessionAlertKind[];
 };
 
@@ -18,7 +17,6 @@ export const EMPTY_FILTER_STATE: SessionsFilterState = {
   from: "",
   to: "",
   status: "",
-  runtime: "",
   alert: []
 };
 
@@ -84,9 +82,6 @@ export function activeFilterChips(state: SessionsFilterState): string[] {
   const dateLabel = dateRangeLabel(state.from, state.to);
   if (dateLabel) chips.push(dateLabel);
   if (state.status) chips.push(`Status: ${state.status}`);
-  if (state.runtime) {
-    chips.push(`Runtime: ${state.runtime === "claude-code" ? "Claude Code" : "Codex"}`);
-  }
   if (state.alert.length === 1) {
     chips.push(`Alert: ${ALERT_LABEL[state.alert[0]]}`);
   } else if (state.alert.length > 1) {
@@ -117,7 +112,6 @@ export function filterStateToParams(state: SessionsFilterState): AdminSessionsLi
   if (state.from) params.from = state.from;
   if (state.to) params.to = state.to;
   if (state.status) params.status = state.status;
-  if (state.runtime) params.runtime = state.runtime;
   if (state.alert.length > 0) params.alert = state.alert;
   return params;
 }

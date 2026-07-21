@@ -10,11 +10,11 @@ import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
  * silently disabling the guard.
  *
  * Loopback (127.0.0.1 and ::1) is always admitted when an allowlist is
- * configured. Same-process callers (e.g. the backend's local Claude SDK
- * routing through /llm/anthropic) reach the proxy over loopback, and the
- * OS guarantees loopback peers cannot be spoofed from off-host. Without
- * this carve-out, enabling E2B_EGRESS_CIDRS would silently break the
- * local/regional fallback for the in-process Claude SDK.
+ * configured. Same-host callers reach the /mcp gateway over loopback (e.g.
+ * a local dev stack where the runtime and backend share a host), and the OS
+ * guarantees loopback peers cannot be spoofed from off-host. Without this
+ * carve-out, enabling E2B_EGRESS_CIDRS would silently break same-host
+ * gateway access.
  */
 export function parseCidrAllowlist(raw: string): BlockList | null {
   const entries = raw

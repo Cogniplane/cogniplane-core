@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { PiiFinding } from "./pii-provider.js";
@@ -59,12 +60,21 @@ export interface PiiArtifactSubjectReader {
  * scheduler worker cannot overwrite a completed status with our later update.
  */
 export class PiiArtifactScanEnqueuer {
+  // The synchronous path is only ever entered in `block` mode (see `enqueue`);
+  // every `modeApplied`/`mode` it stamps therefore reflects block mode. Named
+  // once here rather than hardcoded per call site so the invariant is explicit
+  // and the async handler's `modeApplied = job.mode` derivation has a mirror —
+  // a future mode reaching this path can't silently inherit a stale literal.
+  private static readonly SYNC_SCAN_MODE: PiiScanJobMode = "block";
+
   constructor(
     private readonly deps: {
       piiProtection: PiiProtectionService;
       piiScanRuns: PiiScanRunStore;
       piiScanJobs: PiiScanJobStore;
       artifacts: ArtifactStore;
+      /** Deletes the stored object bytes on a block so they don't persist. */
+      storage: Pick<ArtifactStorage, "delete">;
       subjectReader: PiiArtifactSubjectReader;
       auditEvents?: AuditEventStore;
       logger?: Pick<FastifyBaseLogger, "warn" | "error">;
@@ -153,6 +163,12 @@ export class PiiArtifactScanEnqueuer {
       { action: "block" }
     >
   ): Promise<PiiArtifactScanResult> {
+    // Purge the stored bytes BEFORE flipping to a terminal `blocked` state, so
+    // a terminal status never coexists with a silent orphan: if the delete
+    // fails we record it (objectDeleted:false + orphan audit) and the row's
+    // status is the honest signal that cleanup is incomplete.
+    const objectDeleted = await this.purgeBlockedObject(input, scanRunId);
+
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "blocked",
       providerType: decision.providerType,
@@ -166,21 +182,22 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "blocked",
-      modeApplied: "block",
+      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
       scanRunId,
       blockReason: decision.blockReason,
       findingsCount: decision.findings.length
     });
     await this.emitAudit(input, "pii_blocked", {
       scanRunId,
-      mode: "block",
+      mode: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
       subjectType: "artifact",
       subjectId: input.artifactId,
       source: input.source,
       findingsCount: decision.findings.length,
       providerType: decision.providerType,
       providerModel: decision.providerModel,
-      blockReason: decision.blockReason
+      blockReason: decision.blockReason,
+      objectDeleted
     });
     return {
       kind: "blocked",
@@ -188,6 +205,35 @@ export class PiiArtifactScanEnqueuer {
       blockReason: decision.blockReason,
       findings: decision.findings
     };
+  }
+
+  /**
+   * Best-effort delete of the stored object on a block. Returns whether the
+   * bytes were purged. Never throws — the block outcome must stand even if
+   * cleanup fails; a failure is escalated to a queryable audit event
+   * (`pii_block_object_orphaned`) so the residual orphan is discoverable.
+   */
+  private async purgeBlockedObject(
+    input: EnqueueArtifactPiiScanInput,
+    scanRunId: string
+  ): Promise<boolean> {
+    try {
+      await this.deps.storage.delete(input.storageKey);
+      return true;
+    } catch (error) {
+      this.deps.logger?.error?.(
+        { err: error, tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
+        "Failed to delete stored object for PII-blocked artifact"
+      );
+      await this.emitAudit(input, "pii_block_object_orphaned", {
+        scanRunId,
+        subjectType: "artifact",
+        subjectId: input.artifactId,
+        storageKey: input.storageKey,
+        source: input.source
+      });
+      return false;
+    }
   }
 
   private async handleAllowDecision(
@@ -210,7 +256,7 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "scanned",
-      modeApplied: "block",
+      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
       scanRunId,
       findingsCount
     });
@@ -297,7 +343,7 @@ export class PiiArtifactScanEnqueuer {
 
   private async emitAudit(
     input: EnqueueArtifactPiiScanInput,
-    eventType: "pii_blocked" | "pii_transformed" | "pii_reported",
+    eventType: "pii_blocked" | "pii_transformed" | "pii_reported" | "pii_block_object_orphaned",
     payload: Record<string, unknown>
   ): Promise<void> {
     if (!this.deps.auditEvents) return;
@@ -328,7 +374,7 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "failed",
-      modeApplied: "block",
+      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
       scanRunId,
       summaryText: errorMessage
     });

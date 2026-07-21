@@ -9,7 +9,6 @@ import type {
   RuntimeSkillDefinition
 } from "./admin-config-records.js";
 import type { McpServerStore } from "./mcp-server-store.js";
-import type { SessionRuntimeOverrideRecord } from "./session-runtime-override-store.js";
 import type { SkillConfigStore } from "./skills/skill-config-store.js";
 
 export function normalizeMcpServer(
@@ -47,78 +46,31 @@ function normalizeSkill(record: AdminSkillRecord): RuntimeSkillDefinition {
   };
 }
 
-/**
- * Narrows a tenant's resolved runtime policy by the per-session override
- * (when one exists). The override is treated as an *intersection*: it can
- * only remove tools/MCP servers from what the tenant already allows, never
- * add new ones. The runtime-provider, approval policy, and auto-approve flag
- * are full overrides — they replace the tenant value when present.
- *
- * Pure function: no I/O, fully covered by unit tests in the sibling
- * `.test.ts` file.
- */
-export function applySessionOverride(input: {
-  profile: ResolvedRuntimePolicy;
-  override: SessionRuntimeOverrideRecord | null;
-}): ResolvedRuntimePolicy {
-  const { profile, override } = input;
-  if (!override) return profile;
-
-  const enabledToolIds = override.enabledToolIds.length > 0
-    ? profile.enabledToolIds.filter((id) => override.enabledToolIds.includes(id))
-    : profile.enabledToolIds;
-  const enabledMcpServers = override.enabledMcpServerIds.length > 0
-    ? profile.enabledMcpServers.filter((id) => override.enabledMcpServerIds.includes(id))
-    : profile.enabledMcpServers;
-
-  return {
-    ...profile,
-    runtimeProvider: override.runtimeProvider ?? profile.runtimeProvider,
-    approvalPolicy: override.approvalPolicy,
-    autoApproveReadOnlyTools: override.autoApproveReadOnlyTools,
-    enabledToolIds,
-    enabledMcpServers
-  };
-}
-
-/**
- * Same intersection rule for the skill list. Returned as a separate helper
- * because skills are listed independently of the runtime policy.
- */
-export function filterSkillsByOverride(
-  skills: AdminSkillRecord[],
-  override: SessionRuntimeOverrideRecord | null
-): AdminSkillRecord[] {
-  if (!override || override.enabledSkillIds.length === 0) return skills;
-  return skills.filter((skill) => override.enabledSkillIds.includes(skill.skillId));
-}
-
 export async function compileRuntimeConfig(input: {
   tenantId: string;
   skills: SkillConfigStore;
   mcpServers: McpServerStore;
   runtimePolicy: ResolvedRuntimePolicy;
   isBetaTester?: boolean;
-  sessionOverride?: SessionRuntimeOverrideRecord | null;
 }): Promise<RuntimeConfigBundle> {
   const isBetaTester = input.isBetaTester ?? true;
-  const sessionOverride = input.sessionOverride ?? null;
-  const profile = applySessionOverride({
-    profile: input.runtimePolicy,
-    override: sessionOverride
-  });
+  const profile = input.runtimePolicy;
 
   const [allSkills, allMcpServers] = await Promise.all([
     input.skills.listSkills(input.tenantId, false, isBetaTester),
     input.mcpServers.listMcpServers(input.tenantId, false, isBetaTester)
   ]);
 
-  const enabledSkills = filterSkillsByOverride(allSkills, sessionOverride).map((skill) =>
-    normalizeSkill(skill)
-  );
-  const enabledMcpServers = allMcpServers
-    .filter((server) => profile.enabledMcpServers.includes(server.serverId))
-    .map((server) => normalizeMcpServer(server));
+  const enabledSkills = allSkills.map((skill) => normalizeSkill(skill));
+  const enabledMcpServerIds = new Set<string>();
+  const enabledMcpServers = allMcpServers.flatMap((server) => {
+    if (!profile.enabledMcpServers.includes(server.serverId) || enabledMcpServerIds.has(server.serverId)) {
+      return [];
+    }
+
+    enabledMcpServerIds.add(server.serverId);
+    return [normalizeMcpServer(server)];
+  });
 
   const sources = {
     runtimePolicy: {

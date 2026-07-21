@@ -8,22 +8,24 @@ The list below is generated from `pnpm licenses list --prod` on the published lo
 
 | License | Count | Notes |
 |---|---:|---|
-| MIT | 316 | Permissive; attribution preserved in upstream `LICENSE` files |
-| Apache-2.0 | 100 | Permissive with patent grant; see explicit list below |
-| ISC | 20 | Permissive; equivalent to simplified BSD |
+| MIT | 470 | Permissive; attribution preserved in upstream `LICENSE` files |
+| Apache-2.0 | 48 | Permissive with patent grant; see explicit list below |
+| ISC | 34 | Permissive; equivalent to simplified BSD |
 | BlueOak-1.0.0 | 11 | Permissive (Blue Oak Council model license) |
-| BSD-3-Clause | 7 | Permissive |
+| BSD-3-Clause | 8 | Permissive |
+| MPL-2.0 | 2 | File-level weak copyleft, used unmodified (`lightningcss` + native binary) |
 | BSD-2-Clause | 1 | Permissive |
 | 0BSD | 1 | Public-domain-equivalent |
 | CC0-1.0 | 1 | Public-domain-equivalent |
+| Unlicense | 1 | Public-domain-equivalent (`fast-sha256`) |
+| MIT AND ISC | 1 | Both permissive licenses apply (`victory-vendor`) |
 | Apache-2.0 AND BSD-3-Clause | 1 | Both apply (`@bufbuild/protobuf`) |
 | MIT AND Zlib | 1 | Both apply (`pako`) |
 | MIT OR GPL-3.0-or-later | 1 | Cogniplane elects MIT (`jszip`) |
 | LGPL-3.0-or-later | 1 | Native binary, dynamic-link only (`@img/sharp-libvips-linux-x64`) |
 | CC-BY-4.0 | 1 | Attribution-required (`caniuse-lite`, devtime data) |
-| Proprietary (Anthropic) | 2 | `@anthropic-ai/claude-agent-sdk` + linux-x64 native binary |
 
-In addition, the unified E2B sandbox template installs the [`@openai/codex`](https://github.com/openai/codex) CLI (Apache-2.0) at template-build time. It is not in `pnpm-lock.yaml` because it's installed via `npm install -g` inside the sandbox image, not as a workspace dependency. It is included in the redistribution surface and listed below.
+In addition, the E2B sandbox template (`docker/template.ts`) installs only operating-system packages (Debian, via `apt-get`) and a pinned set of Python libraries (pandas, openpyxl, matplotlib, jinja2) at template-build time. These are not in `pnpm-lock.yaml` because they're installed inside the sandbox image, not as workspace dependencies; each is governed by its own upstream open-source license. No agent CLIs, SDKs, or proprietary software is installed in the template.
 
 ## Apache License, Version 2.0
 
@@ -34,59 +36,35 @@ The full text of Apache-2.0 is available at <https://www.apache.org/licenses/LIC
 Apache-2.0 dependencies (workspace `--prod`):
 
 ```
-@aws-crypto/crc32                    @smithy/eventstream-serde-browser
-@aws-crypto/crc32c                   @smithy/eventstream-serde-config-resolver
-@aws-crypto/sha1-browser             @smithy/eventstream-serde-node
-@aws-crypto/sha256-browser           @smithy/eventstream-serde-universal
-@aws-crypto/sha256-js                @smithy/fetch-http-handler
-@aws-crypto/supports-web-crypto      @smithy/hash-blob-browser
-@aws-crypto/util                     @smithy/hash-node
-@aws-sdk/client-s3                   @smithy/hash-stream-node
-@aws-sdk/core                        @smithy/invalid-dependency
-@aws-sdk/crc64-nvme                  @smithy/is-array-buffer
-@aws-sdk/credential-provider-env     @smithy/md5-js
-@aws-sdk/credential-provider-http    @smithy/middleware-content-length
-@aws-sdk/credential-provider-ini     @smithy/middleware-endpoint
-@aws-sdk/credential-provider-login   @smithy/middleware-retry
-@aws-sdk/credential-provider-node    @smithy/middleware-serde
-@aws-sdk/credential-provider-process @smithy/middleware-stack
-@aws-sdk/credential-provider-sso     @smithy/node-config-provider
-@aws-sdk/credential-provider-web-identity   @smithy/node-http-handler
-@aws-sdk/lib-storage                 @smithy/property-provider
-@aws-sdk/middleware-bucket-endpoint  @smithy/protocol-http
-@aws-sdk/middleware-expect-continue  @smithy/querystring-builder
-@aws-sdk/middleware-flexible-checksums  @smithy/querystring-parser
-@aws-sdk/middleware-host-header      @smithy/service-error-classification
-@aws-sdk/middleware-location-constraint  @smithy/shared-ini-file-loader
-@aws-sdk/middleware-logger           @smithy/signature-v4
-@aws-sdk/middleware-recursion-detection  @smithy/smithy-client
-@aws-sdk/middleware-sdk-s3           @smithy/types
-@aws-sdk/middleware-ssec             @smithy/url-parser
-@aws-sdk/middleware-user-agent       @smithy/util-base64
-@aws-sdk/nested-clients              @smithy/util-body-length-browser
-@aws-sdk/region-config-resolver      @smithy/util-body-length-node
-@aws-sdk/signature-v4-multi-region   @smithy/util-buffer-from
-@aws-sdk/token-providers             @smithy/util-config-provider
-@aws-sdk/types                       @smithy/util-defaults-mode-browser
-@aws-sdk/util-arn-parser             @smithy/util-defaults-mode-node
-@aws-sdk/util-endpoints              @smithy/util-endpoints
-@aws-sdk/util-locate-window          @smithy/util-hex-encoding
-@aws-sdk/util-user-agent-browser     @smithy/util-middleware
-@aws-sdk/util-user-agent-node        @smithy/util-retry
-@aws-sdk/xml-builder                 @smithy/util-stream
-@aws/lambda-invoke-store             @smithy/util-uri-escape
-@connectrpc/connect                  @smithy/util-utf8
-@connectrpc/connect-web              @smithy/util-waiter
-@img/sharp-linux-x64                 @smithy/uuid
-@smithy/chunked-blob-reader          @swc/helpers
-@smithy/chunked-blob-reader-native   baseline-browser-mapping
-@smithy/config-resolver              cluster-key-slot
-@smithy/core                         denque
-@smithy/credential-provider-imds     detect-libc
-@smithy/eventstream-codec            sharp
+@aws-crypto/crc32                        @aws-sdk/types
+@aws-crypto/crc32c                       @aws-sdk/util-locate-window
+@aws-crypto/sha1-browser                 @aws-sdk/xml-builder
+@aws-crypto/sha256-browser               @aws/lambda-invoke-store
+@aws-crypto/sha256-js                    @connectrpc/connect
+@aws-crypto/supports-web-crypto          @connectrpc/connect-web
+@aws-crypto/util                         @img/sharp-linux-x64
+@aws-sdk/checksums                       @smithy/core
+@aws-sdk/client-s3                       @smithy/credential-provider-imds
+@aws-sdk/core                            @smithy/fetch-http-handler
+@aws-sdk/credential-provider-env         @smithy/is-array-buffer
+@aws-sdk/credential-provider-http        @smithy/node-http-handler
+@aws-sdk/credential-provider-ini         @smithy/signature-v4
+@aws-sdk/credential-provider-login       @smithy/types
+@aws-sdk/credential-provider-node        @smithy/util-buffer-from
+@aws-sdk/credential-provider-process     @smithy/util-utf8
+@aws-sdk/credential-provider-sso         @swc/helpers
+@aws-sdk/credential-provider-web-identity  baseline-browser-mapping
+@aws-sdk/lib-storage                     class-variance-authority
+@aws-sdk/middleware-flexible-checksums   cluster-key-slot
+@aws-sdk/middleware-sdk-s3               denque
+@aws-sdk/nested-clients                  detect-libc
+@aws-sdk/signature-v4-multi-region       openai
+@aws-sdk/token-providers                 sharp
 ```
 
-The `@openai/codex` CLI (Apache-2.0) installed inside the E2B sandbox template is also covered here. Source and license: <https://github.com/openai/codex>.
+## MPL-2.0: `lightningcss`
+
+The frontend build toolchain depends on `lightningcss` and its prebuilt native binary `lightningcss-linux-x64-gnu`, both licensed under the **Mozilla Public License 2.0**. MPL-2.0 is a file-level weak copyleft: its obligations attach to the MPL-licensed source files themselves, not to the larger work. Cogniplane Core uses lightningcss unmodified as a build-time CSS transformer; no MPL-licensed file is modified or redistributed in changed form. Upstream: <https://github.com/parcel-bundler/lightningcss>. MPL-2.0 text: <https://www.mozilla.org/en-US/MPL/2.0/>.
 
 ## Dual Apache-2.0 AND BSD-3-Clause: `@bufbuild/protobuf`
 
@@ -120,26 +98,9 @@ Attribution: caniuse-lite, © Ben Briggs and contributors, distributed under [CC
 
 `caniuse-lite` is a build-time dependency. Its data is not redistributed by Cogniplane Core's runtime artifacts; it informs which browser polyfills the frontend bundler emits.
 
-## Proprietary: Anthropic Agent SDK
+## Permissive bulk: MIT, ISC, BlueOak-1.0.0, BSD-2/3-Clause, 0BSD, CC0-1.0, Unlicense
 
-The Claude runtime depends on:
-
-- `@anthropic-ai/claude-agent-sdk` (TypeScript SDK)
-- `@anthropic-ai/claude-agent-sdk-linux-x64` (native CLI binary)
-
-Both are published by Anthropic PBC and are **not open-source**. They are governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms), which apply to anyone using Cogniplane Core's Claude runtime.
-
-Operational consequences for self-hosters and commercial licensees:
-
-- A paid Anthropic API key from <https://console.anthropic.com> is required. Consumer subscriptions (Free/Pro/Max) and OAuth tokens from the consumer apps are **not supported** by the Agent SDK.
-- The redistributor (Cogniplane Core) does not relicense the Agent SDK. Each operator and tenant uses the SDK under their own Anthropic account, subject to Anthropic's terms.
-- The Codex runtime (`@openai/codex`, Apache-2.0) is fully open-source and remains the default. The Claude runtime is opt-in.
-
-Source for the SDK (binary published, source publicly browsable): <https://github.com/anthropics/claude-agent-sdk-typescript>.
-
-## Permissive bulk: MIT, ISC, BlueOak-1.0.0, BSD-2/3-Clause, 0BSD, CC0-1.0
-
-The remaining ~360 production dependencies are under permissive licenses (MIT, ISC, BlueOak-1.0.0, BSD-2-Clause, BSD-3-Clause, 0BSD, CC0-1.0). Each upstream package's `LICENSE` file is installed by pnpm into `node_modules/<pkg>/` and preserved in any deployment artifact that includes those modules. Cogniplane Core does not reproduce per-dependency notice text inline here because none of these licenses require centralized attribution beyond the per-package `LICENSE` files.
+The remaining ~530 production dependencies are under permissive or public-domain-equivalent licenses (MIT, ISC, BlueOak-1.0.0, BSD-2-Clause, BSD-3-Clause, 0BSD, CC0-1.0, Unlicense, and the dual-permissive `MIT AND ISC`). This includes the agent-runtime stack itself — `deepagents`, `langchain`, `@langchain/anthropic`, `@langchain/core`, `@langchain/langgraph`, `@langchain/langgraph-checkpoint-postgres`, `@langchain/mcp-adapters`, and `@langchain/openai` are all MIT-licensed. Each upstream package's `LICENSE` file is installed by pnpm into `node_modules/<pkg>/` and preserved in any deployment artifact that includes those modules. Cogniplane Core does not reproduce per-dependency notice text inline here because none of these licenses require centralized attribution beyond the per-package `LICENSE` files.
 
 For an exact, version-pinned list at any point in time, run:
 

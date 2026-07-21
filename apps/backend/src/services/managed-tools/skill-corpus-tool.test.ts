@@ -30,18 +30,20 @@ function ctx(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContex
 // test can assert whether the activation query ran at all.
 function makeFakeDb() {
   const queries: string[] = [];
+  const params: unknown[][] = [];
   const db = {
     async connect() {
       return {
-        query: async (sql: string) => {
+        query: async (sql: string, values?: unknown[]) => {
           queries.push(sql);
+          params.push(values ?? []);
           return { rows: [] };
         },
         release() {}
       };
     }
   } as unknown as Pool;
-  return { db, queries };
+  return { db, queries, params };
 }
 
 const fakeDb = makeFakeDb().db;
@@ -133,9 +135,27 @@ test("read_skill_corpus honors an explicit sessionCount: 0 (no activation query)
   })) as Record<string, unknown>;
 
   expect(result.includedSessionCount).toBe(0);
-  // With sessionCount: 0 the corpus builder must not query resource_activations
-  // (the old `|| 50` bug coerced 0 → 50 and pulled in history).
-  expect(queries.some((sql) => sql.includes("resource_activations"))).toBe(false);
+  // With sessionCount: 0 the corpus builder short-circuits and runs NO query
+  // (the old `|| 50` bug coerced 0 → 50 and pulled in history). Asserting the
+  // query count is refactor-proof vs. pinning a specific table name.
+  expect(queries.length).toBe(0);
+});
+
+test("read_skill_corpus scopes the session-discovery query to the calling user", async () => {
+  // Security: without a user_id predicate the corpus renders other tenant
+  // users' session ids/titles/timestamps (titles summarize message content).
+  const { db, queries, params } = makeFakeDb();
+  const def = tool(deps(oneSkill, { db }));
+
+  await def.handler({
+    context: ctx({ userId: "u" }),
+    arguments: { toolContextId: "ctx-1", skillId: "write-artifact" }
+  });
+
+  const selectIndex = queries.findIndex((q) => q.includes("resource_activations"));
+  expect(selectIndex).toBeGreaterThanOrEqual(0);
+  expect(queries[selectIndex]).toContain("s.user_id = $4");
+  expect(params[selectIndex][3]).toBe("u");
 });
 
 test("read_skill_corpus fails closed when PII protection blocks the corpus", async () => {

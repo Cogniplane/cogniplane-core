@@ -18,7 +18,8 @@ export const AdminSessionAlertSchema = z.object({
 }).passthrough();
 export type AdminSessionAlert = z.infer<typeof AdminSessionAlertSchema>;
 
-const RuntimeProviderNullableSchema = z.enum(["codex", "claude-code"]).nullable();
+// Null when the session never started a runtime.
+const RuntimeProviderNullableSchema = z.literal("deep-agents").nullable();
 
 export const AdminSessionRowSchema = z.object({
   sessionId: z.string(),
@@ -191,7 +192,6 @@ export type AdminSessionsListParams = {
   from?: string;
   to?: string;
   status?: AdminSessionRow["status"];
-  runtime?: "codex" | "claude-code";
   alert?: AdminSessionAlertKind[];
   cursor?: string;
   limit?: number;

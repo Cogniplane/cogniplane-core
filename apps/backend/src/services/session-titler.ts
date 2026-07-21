@@ -1,5 +1,5 @@
-import type { RuntimeProvider } from "./admin-config-records.js";
 import type { TokenUsageRecord } from "./message-store.js";
+import type { UtilityLlmClient } from "./utility-llm-client.js";
 
 export type SessionTitlerResult = {
   title: string;
@@ -9,12 +9,10 @@ export type SessionTitlerResult = {
 
 export type SessionTitlerKeys = {
   anthropicApiKey?: string | null;
-  openaiApiKey?: string | null;
 };
 
 export type SessionTitlerConfig = {
   claudeModel: string;
-  codexModel: string;
   timeoutMs: number;
 };
 
@@ -107,77 +105,33 @@ async function callAnthropic(
   }
 }
 
-async function callOpenAI(
-  apiKey: string,
-  model: string,
-  firstMessage: string,
-  timeoutMs: number
-): Promise<SessionTitlerResult | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: USER_PROMPT_PREFIX + truncatePrompt(firstMessage) }
-        ]
-      })
-    });
-    if (!response.ok) return null;
-    const body = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      usage?: {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        prompt_tokens_details?: { cached_tokens?: number };
-      };
-    };
-    const raw = body.choices?.[0]?.message?.content ?? "";
-    const title = sanitizeTitle(raw);
-    if (!title) return null;
-    const inputTokens = Number(body.usage?.prompt_tokens ?? 0);
-    const cachedInputTokens = Number(body.usage?.prompt_tokens_details?.cached_tokens ?? 0);
-    const outputTokens = Number(body.usage?.completion_tokens ?? 0);
-    const tokenUsage: TokenUsageRecord = {
-      inputTokens,
-      cachedInputTokens,
-      outputTokens,
-      reasoningOutputTokens: 0,
-      totalTokens: inputTokens + outputTokens
-    };
-    return { title, tokenUsage, modelName: model };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export async function generateSessionTitle(input: {
-  runtimeProvider: RuntimeProvider;
   firstMessage: string;
   keys: SessionTitlerKeys;
   config: SessionTitlerConfig;
+  /**
+   * Optional operator-run local endpoint (UTILITY_LLM_*). Tried FIRST so the
+   * raw first message stays in-perimeter and titling works without provider
+   * keys; any failure falls through to the provider APIs below.
+   */
+  utilityClient?: UtilityLlmClient;
 }): Promise<SessionTitlerResult | null> {
   const firstMessage = input.firstMessage.trim();
   if (!firstMessage) return null;
 
-  if (input.runtimeProvider === "claude-code") {
-    const key = input.keys.anthropicApiKey?.trim();
-    if (!key) return null;
-    return callAnthropic(key, input.config.claudeModel, firstMessage, input.config.timeoutMs);
+  if (input.utilityClient) {
+    const local = await input.utilityClient.completeText({
+      system: SYSTEM_PROMPT,
+      user: USER_PROMPT_PREFIX + truncatePrompt(firstMessage),
+      maxOutputTokens: MAX_OUTPUT_TOKENS
+    });
+    const title = local ? sanitizeTitle(local.text) : null;
+    if (local && title) {
+      return { title, tokenUsage: local.tokenUsage, modelName: local.modelName };
+    }
   }
 
-  const key = input.keys.openaiApiKey?.trim();
+  const key = input.keys.anthropicApiKey?.trim();
   if (!key) return null;
-  return callOpenAI(key, input.config.codexModel, firstMessage, input.config.timeoutMs);
+  return callAnthropic(key, input.config.claudeModel, firstMessage, input.config.timeoutMs);
 }

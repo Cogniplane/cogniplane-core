@@ -6,13 +6,10 @@ import {
   buildDraft,
   defaultGranularFlags,
   formatRelativeTime,
-  orderProvidersWithDefaultFirst,
   toApprovalPolicy,
   toApprovalPolicyKind,
   toggleInArray,
-  toggleRuntimeProviderInDraft,
-  toGranularFlags,
-  type FormDraft
+  toGranularFlags
 } from "./tenant-settings-form.logic";
 
 const baseSettings = {
@@ -20,8 +17,6 @@ const baseSettings = {
   configHash: "hash-1",
   version: 1,
   updatedAt: "2026-05-09T12:00:00Z",
-  runtimeProvider: "codex",
-  enabledRuntimeProviders: ["codex"],
   showEffortSelector: false,
   webSearchMode: "cached",
   approvalPolicy: "never",
@@ -83,26 +78,6 @@ describe("toApprovalPolicyKind / toGranularFlags / toApprovalPolicy", () => {
 });
 
 describe("buildDraft", () => {
-  test("falls back to codex when runtimeProvider is missing", () => {
-    const draft = buildDraft({
-      ...baseSettings,
-      runtimeProvider: undefined,
-      enabledRuntimeProviders: []
-    } as unknown as TenantSettings);
-    expect(draft.runtimeProvider).toBe("codex");
-    expect(draft.enabledRuntimeProviders).toEqual(["codex"]);
-  });
-
-  test("preserves explicit enabledRuntimeProviders", () => {
-    const draft = buildDraft({
-      ...baseSettings,
-      runtimeProvider: "claude-code",
-      enabledRuntimeProviders: ["codex", "claude-code"]
-    });
-    expect(draft.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-    expect(draft.runtimeProvider).toBe("claude-code");
-  });
-
   test("clones tool/MCP id arrays so the original is not mutated", () => {
     const settings = {
       ...baseSettings,
@@ -139,61 +114,6 @@ describe("toggleInArray", () => {
 
   test("removes when disabling", () => {
     expect(toggleInArray(["a", "b"], "a", false)).toEqual(["b"]);
-  });
-});
-
-describe("toggleRuntimeProviderInDraft", () => {
-  const draft: FormDraft = {
-    runtimeProvider: "codex",
-    enabledRuntimeProviders: ["codex"],
-    showEffortSelector: false,
-    webSearchMode: "disabled",
-    approvalPolicyKind: "never",
-    granularFlags: defaultGranularFlags,
-    approvalReviewer: "user",
-    allowCommandExecution: false,
-    allowUserTokenForwarding: false,
-    autoApproveReadOnlyTools: true,
-    policyEnforcementMode: "monitor",
-    developerInstructions: "",
-    enabledToolIds: [],
-    enabledMcpServerIds: []
-  };
-
-  test("enabling adds the provider and dedupes", () => {
-    const next = toggleRuntimeProviderInDraft(draft, "claude-code", true);
-    expect(next.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-    expect(next.runtimeProvider).toBe("codex");
-  });
-
-  test("disabling the current default falls back to the first remaining provider", () => {
-    const both = toggleRuntimeProviderInDraft(draft, "claude-code", true);
-    const without = toggleRuntimeProviderInDraft(both, "codex", false);
-    expect(without.enabledRuntimeProviders).toEqual(["claude-code"]);
-    expect(without.runtimeProvider).toBe("claude-code");
-  });
-
-  test("disabling a non-default provider preserves the default", () => {
-    const both = toggleRuntimeProviderInDraft(draft, "claude-code", true);
-    const without = toggleRuntimeProviderInDraft(both, "claude-code", false);
-    expect(without.runtimeProvider).toBe("codex");
-  });
-});
-
-describe("orderProvidersWithDefaultFirst", () => {
-  test("places the preferred default at index 0", () => {
-    expect(orderProvidersWithDefaultFirst(["codex", "claude-code"], "claude-code")).toEqual([
-      "claude-code",
-      "codex"
-    ]);
-  });
-
-  test("falls back to the first enabled provider when preferred is not enabled", () => {
-    expect(orderProvidersWithDefaultFirst(["claude-code"], "codex")).toEqual(["claude-code"]);
-  });
-
-  test("returns empty for empty input", () => {
-    expect(orderProvidersWithDefaultFirst([], "codex")).toEqual([]);
   });
 });
 

@@ -13,7 +13,6 @@ apps/frontend/.wrangler/
 apps/frontend/.env.production
 apps/backend/dist
 packages/*/dist
-schemas/codex/ts/
 *.tsbuildinfo
 .worktrees/
 *:Zone.Identifier

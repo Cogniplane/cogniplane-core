@@ -2,33 +2,90 @@ import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
 
-import { EFFORT_LEVELS } from "../primitives.js";
+import { EFFORT_LEVELS, MODEL_PROVIDERS } from "../primitives.js";
 
-const RuntimeProviderSchema = z.enum(["codex", "claude-code"]);
+// The public LLM provider behind a model id. See MODEL_PROVIDER_META for how
+// each maps to a LangChain initChatModel prefix / base URL.
+const ModelProviderSchema = z.enum(MODEL_PROVIDERS);
 const EffortLevelSchema = z.enum(EFFORT_LEVELS);
-
-const ProviderEnumSchema = RuntimeProviderSchema;
 
 export const ModelSchema = z.object({
   id: z.string(),
   displayName: z.string(),
   description: z.string(),
   isDefault: z.boolean(),
-  provider: RuntimeProviderSchema,
+  provider: ModelProviderSchema,
   supportedEfforts: z.array(EffortLevelSchema),
   defaultEffort: EffortLevelSchema.nullable(),
   // Max input context in tokens, used by the composer's context-window meter.
-  contextWindow: z.number().int().positive()
+  contextWindow: z.number().int().positive(),
+  // "custom" = admin-added (tenant_custom_models); absent/"builtin" = the
+  // static platform catalog. Only the admin surfaces care about this.
+  source: z.enum(["builtin", "custom"]).optional()
 }).passthrough();
 export type Model = z.infer<typeof ModelSchema>;
 
 export const ModelsListResponseSchema = z.object({
   models: z.array(ModelSchema),
-  enabledRuntimeProviders: z.array(ProviderEnumSchema),
-  defaultRuntimeProvider: ProviderEnumSchema,
   showEffortSelector: z.boolean()
 }).passthrough();
 export type ModelsListResponse = z.infer<typeof ModelsListResponseSchema>;
+
+// GET /admin/models — the FULL model catalog (unfiltered by key presence or
+// tenant availability settings) plus per-provider key-source visibility, so
+// the admin UI can show exactly why a provider's models are or aren't
+// selectable instead of leaving admins to infer it from key presence.
+export const AdminProviderStatusSchema = z.object({
+  id: ModelProviderSchema,
+  label: z.string(),
+  // Where the effective key for this provider comes from: a tenant-stored key
+  // ("tenant"), the platform env fallback ("platform"), or nowhere ("none").
+  keySource: z.enum(["tenant", "platform", "none"])
+}).passthrough();
+export type AdminProviderStatus = z.infer<typeof AdminProviderStatusSchema>;
+
+export const AdminModelCatalogResponseSchema = z.object({
+  models: z.array(ModelSchema),
+  providers: z.array(AdminProviderStatusSchema)
+}).passthrough();
+export type AdminModelCatalogResponse = z.infer<typeof AdminModelCatalogResponseSchema>;
+
+// ── Admin-managed custom models ──────────────────────────────────────────────
+//
+// POST /admin/custom-models. For provider "openrouter" the backend validates
+// the slug against OpenRouter's public models API and auto-fills any omitted
+// displayName/description/contextWindow; for other providers displayName and
+// contextWindow are required (there is no key-free lookup to fill them).
+export const CustomModelCreateRequestSchema = z.object({
+  provider: ModelProviderSchema,
+  // The bare vendor model id ("moonshotai/kimi-k3", "gpt-6-preview"). The
+  // backend derives the catalog id as "<provider>/<vendorModelId>".
+  vendorModelId: z.string().trim().min(1).max(150),
+  displayName: z.string().trim().min(1).max(120).optional(),
+  description: z.string().trim().max(500).optional(),
+  contextWindow: z.number().int().min(1_000).max(100_000_000).optional()
+});
+export type CustomModelCreateRequest = z.infer<typeof CustomModelCreateRequestSchema>;
+
+export const CustomModelEnvelopeSchema = z.object({
+  model: ModelSchema
+}).passthrough();
+export type CustomModelEnvelope = z.infer<typeof CustomModelEnvelopeSchema>;
+
+// GET /admin/openrouter-models — slim, server-proxied slice of OpenRouter's
+// public catalog for the admin "add model" picker.
+export const OpenRouterModelOptionSchema = z.object({
+  // OpenRouter slug ("moonshotai/kimi-k3"), i.e. the vendorModelId to submit.
+  id: z.string(),
+  name: z.string(),
+  contextLength: z.number().int().positive().nullable()
+}).passthrough();
+export type OpenRouterModelOption = z.infer<typeof OpenRouterModelOptionSchema>;
+
+export const OpenRouterModelsResponseSchema = z.object({
+  models: z.array(OpenRouterModelOptionSchema)
+}).passthrough();
+export type OpenRouterModelsResponse = z.infer<typeof OpenRouterModelsResponseSchema>;
 
 export const UserSettingsSectionSchema = z.object({
   sectionKey: z.enum(["scheduled_jobs", "github", "skills", "mcp", "model"]),

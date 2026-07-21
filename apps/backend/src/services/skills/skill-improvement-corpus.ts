@@ -304,6 +304,7 @@ export async function gatherSkillCorpus(
     ? []
     : await fetchInvokedSessionIds(deps.db, {
         tenantId: input.tenantId,
+        userId: input.userId,
         skillId: input.skill.skillId,
         limit: sessionLimit
       });
@@ -311,6 +312,10 @@ export async function gatherSkillCorpus(
   const sessions: CorpusSessionInput[] = [];
   for (const row of sessionIds) {
     const messages = await deps.loadMessagesForSession(input.tenantId, row.sessionId, input.userId);
+    // Defense in depth: discovery is already caller-scoped, but never render a
+    // session the caller has no visible messages in — its id/title/timestamp
+    // alone can leak the subject of someone else's private session.
+    if (messages.length === 0) continue;
     sessions.push({
       sessionId: row.sessionId,
       sessionName: row.sessionName,
@@ -382,10 +387,16 @@ type InvokedSessionRow = {
  * offered.
  *
  * Sessions are returned newest-first by the most recent matching activation.
+ *
+ * Caller-scoped: only the requesting user's own sessions are eligible. The
+ * corpus renders session id + auto-generated title + activity timestamp for
+ * every discovered session, and titles summarize message content — so without
+ * the `user_id` predicate a same-tenant user could enumerate other users'
+ * private session subjects. (RLS scopes tenants, not users.)
  */
 async function fetchInvokedSessionIds(
   db: Pool,
-  input: { tenantId: string; skillId: string; limit: number }
+  input: { tenantId: string; userId: string; skillId: string; limit: number }
 ): Promise<InvokedSessionRow[]> {
   return withTenantScope(db, input.tenantId, async (client) => {
     const result = await client.query(
@@ -409,10 +420,11 @@ async function fetchInvokedSessionIds(
         FROM per_session
         JOIN sessions s ON s.session_id = per_session.session_id AND s.tenant_id = $1
         WHERE s.purpose = 'normal'  -- never feed improver sessions back into themselves
+          AND s.user_id = $4
         ORDER BY per_session.had_invoked DESC, per_session.last_occurred_at DESC
         LIMIT $3
       `,
-      [input.tenantId, input.skillId, input.limit]
+      [input.tenantId, input.skillId, input.limit, input.userId]
     );
 
     return result.rows.map((row) => ({

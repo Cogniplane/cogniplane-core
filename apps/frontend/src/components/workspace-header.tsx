@@ -101,7 +101,7 @@ export function WorkspaceHeader(props: {
   const initials = avatarInitials(user?.displayName, user?.email);
 
   return (
-    <header className="flex items-center gap-4 border-b border-outline-variant bg-surface-container-lowest px-4 py-3">
+    <header className="flex min-h-14 items-center gap-2 border-b border-outline-variant bg-surface-container-lowest px-2 py-2 sm:gap-4 sm:px-4">
       <div className="flex items-center gap-2">
         {props.onToggleSidebar ? (
           <Button
@@ -120,7 +120,7 @@ export function WorkspaceHeader(props: {
             aria-label={props.statusLabel}
           >
             <span aria-hidden="true" className="size-1.5 rounded-full bg-success" />
-            <span>{props.statusLabel}</span>
+            <span className="hidden sm:inline">{props.statusLabel}</span>
           </div>
         ) : null}
       </div>

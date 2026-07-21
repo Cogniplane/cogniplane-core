@@ -103,7 +103,13 @@ export async function enforcePolicyCenter(
   toolName: string,
   serverId: string,
   facts: PolicyToolFacts,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  // Policy Center `category` the rule engine matches on. For managed tools this
+  // is the tool's bound domain (github/notion/session), NOT the URL serverId —
+  // so a `categories` rule can't be dodged by calling the tool through another
+  // enabled managed server's URL. Defaults to serverId for proxy/forwarded
+  // tools, which have no domain binding.
+  category: string = serverId
 ): Promise<void> {
   const severity = deriveActionSeverity(toolName, facts.readOnly);
   // Turn context is snapshotted into the tool-execution context at creation time
@@ -119,8 +125,9 @@ export async function enforcePolicyCenter(
     userId: context.userId,
     runtimeId: context.runtimeId,
     toolName,
-    // The MCP server the tool is hosted on, recorded as `category` (== serverId).
-    category: serverId,
+    // For managed tools this is the tool's bound domain; for proxy tools it
+    // defaults to the serverId. Recorded as the policy `category`.
+    category,
     severity,
     serverId,
     turnContext,

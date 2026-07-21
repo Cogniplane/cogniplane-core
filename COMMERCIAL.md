@@ -33,9 +33,9 @@ The code itself is identical — switching to the commercial license doesn't for
 
 ## Third-party terms that flow through
 
-Cogniplane Core bundles the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) provided by Anthropic PBC. Our commercial license governs Cogniplane's code only; the Claude Agent SDK is governed by **Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms)**. Customer's use of the Claude runtime is additionally subject to those upstream terms. Customer is responsible for maintaining its own Anthropic account and API key — consumer subscriptions (Free/Pro/Max) are not supported by the Agent SDK.
+Cogniplane Core's agent runtime calls the Anthropic API. Our commercial license governs Cogniplane's code only; Customer's use of the Anthropic API is governed by **Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms)**. Customer is responsible for maintaining its own Anthropic account and API key — consumer subscriptions (Free/Pro/Max) are not supported.
 
-The same flow-through applies to the other third-party components Cogniplane Core depends on (Codex CLI under Apache-2.0, sharp-libvips under LGPL-3.0, and the rest of the dependency tree). The commercial license does not relicense those components; their upstream terms continue to apply. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full attribution and license inventory.
+The same flow-through applies to the third-party components Cogniplane Core depends on (the LangChain/deepagents stack under MIT, sharp-libvips under LGPL-3.0, and the rest of the dependency tree). The commercial license does not relicense those components; their upstream terms continue to apply. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the full attribution and license inventory.
 
 ## How to get one
 

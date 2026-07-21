@@ -14,6 +14,20 @@ import type {
 } from "./pii-provider.js";
 import { PII_ENTITY_TYPES } from "./pii-policy.js";
 
+/**
+ * Which HTTP dialect the endpoint speaks.
+ * - `openai`: POST `<baseUrl>/chat/completions`, body uses `response_format`
+ *   and top-level `temperature`, reply at `choices[0].message.content`. Works
+ *   for OpenRouter, vLLM, and Ollama's OpenAI-compat `/v1` layer.
+ * - `ollama`: POST `<baseUrl>/api/chat`, body uses `format:"json"`,
+ *   `options.temperature`, and (when `disableThinking`) a top-level
+ *   `think:false` — reply at `message.content`. This is the ONLY path that
+ *   honors `think:false`; Ollama's `/v1` compat layer silently ignores it.
+ *   `disableThinking` on a reasoning-tuned Gemma-4 GGUF cut latency ~40%
+ *   (14s → 8.3s) with no loss of detection recall on the homelab GTX 1070.
+ */
+export type PiiWireFormat = "openai" | "ollama";
+
 export interface OpenAiCompatiblePiiProviderOptions {
   baseUrl: string;
   apiKey: string;
@@ -28,6 +42,14 @@ export interface OpenAiCompatiblePiiProviderOptions {
   extraHeaders?: Record<string, string>;
   /** When provided, calls are gated by the breaker and outcomes recorded. */
   breaker?: PiiCircuitBreaker;
+  /** HTTP dialect to speak. Defaults to `openai`. */
+  wireFormat?: PiiWireFormat;
+  /**
+   * Only meaningful for `wireFormat:"ollama"`. Sends `think:false` so
+   * reasoning-tuned models skip the thought channel. Ignored for `openai`
+   * (that layer has no such control — use a non-reasoning model instead).
+   */
+  disableThinking?: boolean;
 }
 
 interface ChatMessage {
@@ -35,18 +57,32 @@ interface ChatMessage {
   content: string;
 }
 
-interface ChatRequest {
+interface OpenAiChatRequest {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
   response_format?: { type: "json_object" };
 }
 
-interface ChatResponse {
+interface OllamaChatRequest {
+  model: string;
+  messages: ChatMessage[];
+  stream: false;
+  format: "json";
+  think?: boolean;
+  options?: { temperature?: number };
+}
+
+interface OpenAiChatResponse {
   choices?: Array<{
     message?: { content?: string | null };
   }>;
   error?: { message?: string; code?: string | number };
+}
+
+interface OllamaChatResponse {
+  message?: { content?: string | null };
+  error?: string;
 }
 
 interface RawFinding {
@@ -99,6 +135,8 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
   private readonly fetchImpl: typeof fetch;
   private readonly extraHeaders?: Record<string, string>;
   private readonly breaker?: PiiCircuitBreaker;
+  private readonly wireFormat: PiiWireFormat;
+  private readonly disableThinking: boolean;
 
   constructor(options: OpenAiCompatiblePiiProviderOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
@@ -108,6 +146,8 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
     this.fetchImpl = options.fetch ?? fetch;
     this.extraHeaders = options.extraHeaders;
     this.breaker = options.breaker;
+    this.wireFormat = options.wireFormat ?? "openai";
+    this.disableThinking = options.disableThinking ?? false;
   }
 
   async detectText(
@@ -292,16 +332,34 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
       ...this.extraHeaders
     };
 
-    const body: ChatRequest = {
-      model,
-      messages,
-      temperature: 0,
-      response_format: { type: "json_object" }
-    };
+    // Wire-format split: `openai` hits /chat/completions with response_format;
+    // `ollama` hits /api/chat and can carry `think:false`. Everything else
+    // (prompts, normalization, breaker) is shared above/below this method.
+    const isOllama = this.wireFormat === "ollama";
+    const url = isOllama
+      ? `${this.baseUrl}/api/chat`
+      : `${this.baseUrl}/chat/completions`;
+    const body: OpenAiChatRequest | OllamaChatRequest = isOllama
+      ? {
+          model,
+          messages,
+          stream: false,
+          format: "json",
+          // Only emit `think` when disabling — omitting it leaves the model's
+          // default behavior intact for models that don't support the flag.
+          ...(this.disableThinking ? { think: false } : {}),
+          options: { temperature: 0 }
+        }
+      : {
+          model,
+          messages,
+          temperature: 0,
+          response_format: { type: "json_object" }
+        };
 
     let response: Response;
     try {
-      response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+      response = await this.fetchImpl(url, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
@@ -330,15 +388,24 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
       );
     }
 
-    const payload = (await response.json()) as ChatResponse;
-    if (payload.error) {
-      throw new OpenAiCompatiblePiiProviderError(
-        "provider_error",
-        payload.error.message ?? "PII model endpoint returned an error"
-      );
+    let content: string | null | undefined;
+    if (isOllama) {
+      const payload = (await response.json()) as OllamaChatResponse;
+      if (payload.error) {
+        throw new OpenAiCompatiblePiiProviderError("provider_error", payload.error);
+      }
+      content = payload.message?.content;
+    } else {
+      const payload = (await response.json()) as OpenAiChatResponse;
+      if (payload.error) {
+        throw new OpenAiCompatiblePiiProviderError(
+          "provider_error",
+          payload.error.message ?? "PII model endpoint returned an error"
+        );
+      }
+      content = payload.choices?.[0]?.message?.content;
     }
 
-    const content = payload.choices?.[0]?.message?.content;
     if (!content) {
       throw new OpenAiCompatiblePiiProviderError("empty_response", "PII model endpoint returned no message content");
     }

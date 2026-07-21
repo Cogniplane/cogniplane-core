@@ -11,7 +11,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { ensureUser } from "../lib/db.js";
 import { apiError, getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
-import { artifactIdParams, messageIdParams, sessionIdParams } from "../lib/route-schemas.js";
+import { artifactIdParams, sessionIdParams } from "../lib/route-schemas.js";
 import { ALLOWED_ARTIFACT_MIME_TYPES } from "../lib/allowed-mime-types.js";
 import { PERMANENT_PII_ERROR_CODES } from "../services/pii/pii-scan-job-handler.js";
 
@@ -24,9 +24,6 @@ const uploadFieldsSchema = z.object({
   name: z.string().trim().min(1).max(255).optional()
 });
 
-const createMessageArtifactSchema = z.object({
-  name: z.string().trim().min(1).max(255).optional()
-});
 
 function getUploadFields(
   file: Awaited<ReturnType<import("fastify").FastifyRequest["file"]>>
@@ -63,7 +60,6 @@ function contentDispositionFileName(fileName: string): string {
 export function buildArtifactRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
-    messages: deps.messages,
     artifacts: deps.artifacts,
     auditEvents: deps.auditEvents,
     storage: deps.artifactStorage,
@@ -290,90 +286,6 @@ export async function registerArtifactRoutes(
         return apiError(scanResult.errorCode, scanResult.errorMessage);
       }
     }
-
-    reply.code(201);
-    return { artifact };
-  });
-
-  app.post("/messages/:messageId/artifact", async (request, reply) => {
-    const paramsResult = parseRequestInput(reply, messageIdParams, request.params);
-    if (!paramsResult.ok) {
-      return paramsResult.response;
-    }
-
-    const bodyResult = parseRequestInput(reply, createMessageArtifactSchema, request.body ?? {});
-    if (!bodyResult.ok) {
-      return bodyResult.response;
-    }
-
-    const { userId, tenantId } = request.auth;
-
-    const rateLimitError = await stores.limits.consumeRateLimit({
-      resource: "artifact_create",
-      userId,
-      tenantId
-    });
-    if (rateLimitError) {
-      reply.code(429);
-      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
-      return rateLimitError;
-    }
-
-    const message = await stores.messages.getOwned(tenantId, paramsResult.value.messageId, userId);
-    if (!message) {
-      reply.code(404);
-      return notFoundError("message_not_found");
-    }
-
-    const session = await stores.sessions.getOwned(tenantId, message.sessionId, userId);
-    if (!session || session.status !== "active") {
-      reply.code(404);
-      return notFoundError("session_not_found");
-    }
-
-    const name =
-      bodyResult.value.name ??
-      `${message.role === "assistant" ? "assistant" : "message"}-${message.messageId}.md`;
-    const stored = await stores.storage.put({
-      storageKey: buildStorageKey({
-        userId,
-        sessionId: message.sessionId,
-        artifactName: name
-      }),
-      stream: Readable.from([message.content])
-    });
-
-    const artifact = await stores.artifacts.create({
-      tenantId,
-      artifactType: "generated",
-      sessionId: message.sessionId,
-      userId,
-      artifactName: name,
-      mimeType: "text/markdown",
-      storageBackend: stored.storageBackend,
-      storageKey: stored.storageKey,
-      fileSizeBytes: stored.fileSizeBytes,
-      checksumSha256: stored.checksumSha256,
-      status: "ready",
-      createdByType: "system",
-      createdByRef: message.messageId,
-      detail: {
-        sourceRole: message.role,
-        sourceMessageId: message.messageId
-      }
-    });
-
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: message.sessionId,
-      userId,
-      type: "artifact_generated",
-      payload: {
-        artifactId: artifact.artifactId,
-        sourceMessageId: message.messageId,
-        artifactName: artifact.artifactName
-      }
-    });
 
     reply.code(201);
     return { artifact };

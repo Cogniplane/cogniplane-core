@@ -70,20 +70,19 @@ class InMemoryTenantSettingsDatabase {
 
       this.row = {
         tenant_id: String(params[0]),
-        enabled_runtime_providers: JSON.parse(String(params[1])) as string[],
-        show_effort_selector: Boolean(params[2]),
-        web_search_mode: String(params[3]),
-        approval_policy: String(params[4]),
-        approval_reviewer: String(params[5]),
-        allow_command_execution: Boolean(params[6]),
-        allow_user_token_forwarding: Boolean(params[7]),
-        auto_approve_read_only_tools: Boolean(params[8]),
-        policy_enforcement_mode: String(params[9]),
-        developer_instructions: params[10] == null ? null : String(params[10]),
-        enabled_tool_ids: JSON.parse(String(params[11])) as string[],
-        enabled_mcp_server_ids: JSON.parse(String(params[12])) as string[],
+        show_effort_selector: Boolean(params[1]),
+        web_search_mode: String(params[2]),
+        approval_policy: String(params[3]),
+        approval_reviewer: String(params[4]),
+        allow_command_execution: Boolean(params[5]),
+        allow_user_token_forwarding: Boolean(params[6]),
+        auto_approve_read_only_tools: Boolean(params[7]),
+        policy_enforcement_mode: String(params[8]),
+        developer_instructions: params[9] == null ? null : String(params[9]),
+        enabled_tool_ids: JSON.parse(String(params[10])) as string[],
+        enabled_mcp_server_ids: JSON.parse(String(params[11])) as string[],
         version: previousVersion + 1,
-        config_hash: String(params[13]),
+        config_hash: String(params[12]),
         updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
       };
 
@@ -116,7 +115,6 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
   });
 
   expect(updated.approvalPolicy).toBe("never");
-  expect(updated.enabledRuntimeProviders).toEqual(["codex"]);
   expect(updated.showEffortSelector).toBe(false);
   expect(updated.webSearchMode).toBe("live");
   expect(updated.approvalReviewer).toBe("guardian_subagent");
@@ -163,7 +161,6 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
   });
 
   expect(created.approvalPolicy).toBe("on-request");
-  expect(created.enabledRuntimeProviders).toEqual(["codex"]);
   expect(created.showEffortSelector).toBe(false);
   expect(created.webSearchMode).toBe("disabled");
   expect(created.approvalReviewer).toBe("user");
@@ -178,29 +175,13 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
         "list_artifacts",
         "read_text_artifact",
         "read_skill_corpus",
-        "write_artifact"
+        "write_artifact",
+        "memory_search",
+        "memory_save",
+        "memory_delete"
       ]);
   expect(created.enabledMcpServerIds).toEqual(["managed-session-context"]);
   expect(created.version).toBe(1);
-});
-
-test("TenantSettingsStore.upsert derives the default provider from the first enabled provider", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-
-  const created = await store.upsert("tenant-3", {
-    enabledRuntimeProviders: ["claude-code", "codex"]
-  });
-
-  expect(created.runtimeProvider).toBe("claude-code");
-  expect(created.enabledRuntimeProviders).toEqual(["claude-code", "codex"]);
-
-  const updated = await store.upsert("tenant-3", {
-    enabledRuntimeProviders: ["codex"]
-  });
-
-  expect(updated.runtimeProvider).toBe("codex");
-  expect(updated.enabledRuntimeProviders).toEqual(["codex"]);
 });
 
 test("TenantSettingsStore.get returns null when no row exists", async () => {
@@ -208,32 +189,6 @@ test("TenantSettingsStore.get returns null when no row exists", async () => {
   const store = new TenantSettingsStore(db as unknown as Pool);
   const result = await store.get("tenant-missing");
   expect(result).toBe(null);
-});
-
-test("TenantSettingsStore.upsert rejects empty enabledRuntimeProviders", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  await expect(() => store.upsert("tenant-x", { enabledRuntimeProviders: [] })).rejects.toThrow(/At least one runtime provider/);
-});
-
-test("TenantSettingsStore.upsert rejects providers list with only unknown values", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  await expect(() =>
-        store.upsert("tenant-y", {
-          enabledRuntimeProviders: ["does-not-exist" as never]
-        })).rejects.toThrow(/At least one runtime provider/);
-});
-
-test("TenantSettingsStore.upsert deduplicates and normalizes providers", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const result = await store.upsert("tenant-norm", {
-    enabledRuntimeProviders: ["codex", "claude-code", "codex"] as never
-  });
-  // Dupes dropped; original order preserved
-  expect(result.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-  expect(result.runtimeProvider).toBe("codex");
 });
 
 test("TenantSettingsStore.upsert persists showEffortSelector", async () => {

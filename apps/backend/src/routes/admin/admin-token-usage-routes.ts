@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import { withTenantScope } from "../../lib/db.js";
+import { apiError } from "../../lib/http-errors.js";
 import { withAdmin } from "./admin-route-helpers.js";
 
 function toIsoDate(value: unknown): string {
@@ -66,7 +67,7 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
       const parsed = querySchema.safeParse(request.query);
       if (!parsed.success) {
         reply.code(400);
-        return { error: "invalid_query" };
+        return apiError("invalid_query", "The token-usage query parameters are invalid.");
       }
 
       const { days } = parsed.data;

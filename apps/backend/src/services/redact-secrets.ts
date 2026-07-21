@@ -17,6 +17,10 @@ const OPENAI_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{20,}/g;
 const AWS_ACCESS_KEY_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g;
 const SLACK_TOKEN_PATTERN = /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g;
 const GOOGLE_API_KEY_PATTERN = /\bAIza[0-9A-Za-z_-]{35}\b/g;
+// Z.AI (Zhipu / GLM) keys: a hex key-id, a dot, then an alphanumeric secret
+// (e.g. `1a2b...def.AbCd1234EfGh5678`). No distinctive prefix, so anchor on the
+// `{hex}.{alnum}` shape with a long-enough id to avoid matching ordinary text.
+const ZAI_API_KEY_PATTERN = /\b[0-9a-f]{20,}\.[A-Za-z0-9]{12,}\b/g;
 const RUNTIME_TOKEN_PATTERN = /\brt_[A-Za-z0-9._-]+\b/g;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const STRIPE_KEY_PATTERN = /\b(?:(?:sk|rk)_(?:live|test)|whsec)_[A-Za-z0-9]{16,}\b/g;
@@ -44,6 +48,7 @@ function redactInlineSecrets(value: string): string {
     .replace(AWS_ACCESS_KEY_PATTERN, "[REDACTED]")
     .replace(SLACK_TOKEN_PATTERN, "[REDACTED]")
     .replace(GOOGLE_API_KEY_PATTERN, "[REDACTED]")
+    .replace(ZAI_API_KEY_PATTERN, "[REDACTED]")
     .replace(RUNTIME_TOKEN_PATTERN, "[REDACTED]")
     .replace(JWT_PATTERN, "[REDACTED]")
     .replace(STRIPE_KEY_PATTERN, "[REDACTED]")

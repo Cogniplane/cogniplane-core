@@ -9,8 +9,6 @@ import { TenantSettingsForm } from "./tenant-settings-form";
 function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
   return {
     tenantId: "t-1",
-    runtimeProvider: "codex",
-    enabledRuntimeProviders: ["codex"],
     showEffortSelector: false,
     webSearchMode: "disabled",
     approvalPolicy: "never",
@@ -41,8 +39,7 @@ function renderForm(
       onSave={onSave}
       managedTools={[]}
       mcpServers={[]}
-      openaiKeyConfigured={true}
-      anthropicKeyConfigured={false}
+      anthropicKeyConfigured={true}
       isOwner={isOwner}
     />
   );
@@ -71,7 +68,6 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
         isOwner={true}
       />
@@ -91,7 +87,6 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
         isOwner={true}
       />
@@ -121,7 +116,6 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
         isOwner={true}
       />
@@ -145,7 +139,6 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        openaiKeyConfigured={true}
         anthropicKeyConfigured={false}
         isOwner={true}
       />

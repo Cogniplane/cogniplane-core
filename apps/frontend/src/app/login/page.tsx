@@ -26,8 +26,13 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-6">
-      <div className="w-full max-w-md rounded-2xl border border-outline-variant bg-surface p-10 shadow-sm">
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-6">
+      {/* Soft brand glow so the login screen reads as Cogniplane, not a generic form. */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute -top-40 left-1/2 h-[420px] w-[720px] -translate-x-1/2 rounded-full bg-brand-surface blur-3xl"
+      />
+      <div className="page-enter relative w-full max-w-md rounded-2xl border border-outline-variant bg-surface-container-lowest p-10 shadow-lg">
         <div className="mb-6 flex flex-col items-start gap-4 sm:flex-row sm:items-center">
           <div
             className="flex size-[84px] flex-none items-center justify-center rounded-3xl bg-surface-bright shadow-[inset_0_0_0_1px_var(--color-outline-variant)]"

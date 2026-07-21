@@ -12,33 +12,37 @@ import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 // SCHEDULER_ENABLED=false. The original `if (!SCHEDULER_ENABLED) return null`
 // silently starved the PII queue — these tests lock that fix in.
 
+type SchedulerWorkerInput = Parameters<typeof buildSchedulerWorker>[1];
+
 function makeInput(overrides?: {
   piiScanJobs?: PiiScanJobStore;
   piiScanJobHandler?: PiiScanJobHandler;
 }) {
   // Only `userSettings.listDueJobs` is exercised by tick(); everything else is
-  // a never-called stub typed loosely so the test stays focused on the
-  // create/skip + scheduling-gate decision rather than the turn machinery.
+  // a never-called stub. We type the whole `input` as the worker's actual
+  // parameter so a signature change (e.g. a dropped/renamed dependency) fails
+  // this build instead of compiling behind an `as any` cast — the stale
+  // `defaultAdapter`/`runtimeAdapters`-map/per-provider-getter shape that this
+  // fixture used to carry (retired with the deep-agents provider collapse) can
+  // no longer sneak through.
   const listDueJobs = vi.fn(async () => []);
-  const input = {
+  const stub = <T>() => ({}) as T;
+  const input: SchedulerWorkerInput = {
     userSettings: {
       listDueJobs,
       disableJob: vi.fn(async () => {}),
       sweepStaleJobRuns: vi.fn(async () => [])
-    },
-    sessions: {},
-    messages: {},
-    toolContexts: {},
-    defaultAdapter: {},
-    runtimeAdapters: {},
-    dynamicConfig: {},
-    getTenantAnthropicApiKey: vi.fn(async () => null),
-    getTenantOpenaiApiKey: vi.fn(async () => null),
-    auditEvents: {},
+    } as unknown as SchedulerWorkerInput["userSettings"],
+    sessions: stub<SchedulerWorkerInput["sessions"]>(),
+    messages: stub<SchedulerWorkerInput["messages"]>(),
+    toolContexts: stub<SchedulerWorkerInput["toolContexts"]>(),
+    runtimeAdapter: stub<SchedulerWorkerInput["runtimeAdapter"]>(),
+    dynamicConfig: stub<SchedulerWorkerInput["dynamicConfig"]>(),
+    providerCredentials: stub<SchedulerWorkerInput["providerCredentials"]>(),
+    auditEvents: stub<SchedulerWorkerInput["auditEvents"]>(),
     logger: createSilentLogger(),
     ...overrides
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any;
+  };
   return { input, listDueJobs };
 }
 

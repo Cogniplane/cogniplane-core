@@ -30,7 +30,7 @@ export function AdminIntegrationsList() {
     : null;
 
   return (
-    <section id="integrations" className="flex flex-col gap-4">
+    <section id="integrations" className="flex flex-col gap-4 pt-5">
       <div>
         <p className={SECTION_LABEL}>Connected services</p>
         <h3 className="text-lg font-semibold text-on-surface">Integrations</h3>

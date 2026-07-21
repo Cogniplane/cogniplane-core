@@ -1,4 +1,4 @@
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
@@ -25,6 +25,17 @@ export interface ArtifactStorage {
   readonly backend: "local" | "bucket";
   put(input: { storageKey: string; stream: Readable }): Promise<StoredArtifact>;
   openReadStream(storageKey: string): Promise<ArtifactReadHandle>;
+  /**
+   * Removes the stored object. Idempotent: a missing key is a no-op, not an
+   * error, so re-runs are safe. Used to purge bytes that must not persist — a
+   * PII block-mode upload writes the object before the scan runs, so on a block
+   * decision the bytes are deleted to honor the "content never lands" promise.
+   *
+   * NOTE: on a versioning-enabled bucket this deletes the current version (adds
+   * a delete marker); noncurrent versions are handled out-of-band by a bucket
+   * lifecycle rule — see the follow-up bead on artifact-bucket versioning.
+   */
+  delete(storageKey: string): Promise<void>;
 }
 
 type BucketClient = Pick<S3Client, "send">;
@@ -121,6 +132,13 @@ export class LocalArtifactStorage implements ArtifactStorage {
       fileSizeBytes: info.size
     };
   }
+
+  async delete(storageKey: string): Promise<void> {
+    const targetPath = resolveStoragePath(this.root, storageKey);
+    // force: a missing file is a no-op, so a re-run (or a never-persisted key)
+    // doesn't throw.
+    await rm(targetPath, { force: true });
+  }
 }
 
 export class BucketArtifactStorage implements ArtifactStorage {
@@ -174,6 +192,19 @@ export class BucketArtifactStorage implements ArtifactStorage {
       stream: toNodeReadableStream(response.Body),
       fileSizeBytes: Number(response.ContentLength ?? 0)
     };
+  }
+
+  async delete(storageKey: string): Promise<void> {
+    // Same key resolution as put()/openReadStream() so the prefix is applied
+    // exactly once — a prefix mismatch here would silently delete the wrong key
+    // (S3 delete succeeds on a nonexistent key), leaving the real object behind.
+    const key = resolveBucketKey(this.deps.keyPrefix ?? "", storageKey);
+    await this.deps.client.send(
+      new DeleteObjectCommand({
+        Bucket: this.deps.bucketName,
+        Key: key
+      })
+    );
   }
 }
 

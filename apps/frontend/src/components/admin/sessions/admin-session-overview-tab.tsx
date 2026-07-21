@@ -38,12 +38,6 @@ function Field(props: { label: string; value: string | number | null }) {
   );
 }
 
-function runtimeLabel(provider: AdminSessionDetailOverview["runtimeProvider"]): string {
-  if (provider === "claude-code") return "Claude Code";
-  if (provider === "codex") return "Codex";
-  return "—";
-}
-
 export function AdminSessionOverviewTab(props: { overview: AdminSessionDetailOverview }) {
   const { overview } = props;
   const userValue = overview.userEmail
@@ -59,7 +53,6 @@ export function AdminSessionOverviewTab(props: { overview: AdminSessionDetailOve
       <Field label="Session ID" value={overview.sessionId} />
       <Field label="Session name" value={overview.sessionName || "—"} />
       <Field label="Status" value={overview.status} />
-      <Field label="Runtime provider" value={runtimeLabel(overview.runtimeProvider)} />
       <Field label="Started" value={formatTimestamp(overview.createdAt)} />
       <Field label="Last activity" value={formatTimestamp(overview.lastActivityAt)} />
       <Field label="Message count" value={overview.messageCount} />

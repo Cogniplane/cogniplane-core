@@ -9,6 +9,20 @@ How to update this file:
 4. Each bullet should be understandable to someone who didn't read the code or PRs.
 5. Skip low-signal internal cleanup unless it matters to the audience.
 
+## 2026-07-04
+
+Changed
+
+- **Deep Agents (LangChain deepagentsjs) is now the sole runtime provider.** The Codex (`codex app-server`) and Claude-Code (Agent SDK + in-sandbox harness) runtimes were retired end-to-end. The agent loop runs in-process in the Fastify backend; the E2B sandbox is a slim, lazily-created code-execution box (Python data stack, no agent CLIs). The `RuntimeEvent` SSE contract, approval routes, scheduler, and frontend timeline are unchanged.
+- Conversations are checkpointed durably in Postgres (LangGraph PostgresSaver, dedicated `deep_agents` schema) — session threads survive backend restarts; deleting a session purges its thread.
+- Human-in-the-loop approvals are LangGraph interrupt-based: gated tools pause the graph before execution and checkpoint; decisions resume it (keyed per interrupt id so concurrent subagent approvals route correctly). Policy Center gateway approvals are unchanged.
+- The provider dimension is gone: no `runtimeProvider` tenant setting, no `OPENAI_API_KEY`, a single `E2B_TEMPLATE_ID`, and model selection over `deepagents/<anthropic-model>` ids. Migrations were re-squashed (`001_init.sql` + `002_seed_system_data.sql`) against a recreated database.
+- Skills are compiled into the agent system prompt at session start (`## Skill:` sections) instead of being materialized as workspace files.
+
+Docs
+
+- CLAUDE.md, README, ARCHITECTURE, SECURITY_FEATURES, DECISIONS (new Decision 12), LEARNINGS, BLIND_SPOTS, and the public-mirror docs rewritten for the deep-agents-only architecture; the Codex/runtime-selection guides were removed.
+
 ## 2026-05-31
 
 Changed

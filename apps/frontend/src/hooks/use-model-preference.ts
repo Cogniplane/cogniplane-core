@@ -4,7 +4,10 @@ import { useCallback, useEffect, useState } from "react";
 import type { Model } from "@cogniplane/shared-types";
 
 const STORAGE_KEY = "cogniplane:model";
-const DEFAULT_MODEL = "gpt-5.4-mini";
+// Catalog ids are namespaced "<catalog>/<vendorModel>". This is the pre-fetch
+// placeholder only; once /models resolves, the effect below auto-corrects to
+// the server's actual default (isDefault) if this id isn't in the list.
+const DEFAULT_MODEL = "deepagents/claude-sonnet-5";
 
 export function useModelPreference(filteredModels?: Model[]) {
   const [model, setModelState] = useState<string>(() => {

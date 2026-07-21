@@ -24,15 +24,22 @@ export function ConsoleNavigation(input: {
             <Link
               key={item.id}
               href={`${basePath}/${item.id}`}
-              className={`flex items-center justify-between rounded-md px-3 py-2 text-sm transition-colors ${
+              aria-current={isActive ? "page" : undefined}
+              className={`relative flex items-center justify-between rounded-md px-3 py-2 text-sm transition-colors ${
                 isActive
-                  ? "bg-surface-container font-medium text-on-surface"
+                  ? "bg-brand-surface font-medium text-brand-strong before:absolute before:inset-y-1.5 before:left-0 before:w-0.5 before:rounded-full before:bg-brand before:animate-accent-grow"
                   : "text-on-surface-variant hover:bg-surface-container hover:text-on-surface"
               }`}
             >
               <span>{item.label}</span>
               {typeof item.count === "number" ? (
-                <span className="text-xs text-on-surface-faint">{item.count}</span>
+                <span
+                  className={`rounded-full px-1.5 text-xs tabular-nums ${
+                    isActive ? "bg-brand-surface text-brand-strong" : "bg-surface-container text-on-surface-faint"
+                  }`}
+                >
+                  {item.count}
+                </span>
               ) : null}
             </Link>
           );

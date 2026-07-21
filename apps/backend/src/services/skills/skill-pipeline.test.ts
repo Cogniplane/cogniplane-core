@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { test, expect, onTestFinished } from "vitest";
 
 import type {
@@ -9,10 +9,7 @@ import type {
   ResolvedRuntimePolicy
 } from "../admin-config-records.js";
 import { compileRuntimeConfig } from "../dynamic-config-runtime-compiler.js";
-import { createRuntimeWorkspace } from "../runtime/runtime-workspace.js";
-import { LocalSkillBundleStorage } from "./skill-bundle-storage.js";
 import { importSkillBundleFromInline } from "./skill-import-service.js";
-import { createTestConfig } from "../../test-helpers/test-config.js";
 
 const TENANT_ID = "tenant-pipeline";
 const SKILL_ID = "pipeline-test";
@@ -25,7 +22,6 @@ function buildResolvedProfile(): ResolvedRuntimePolicy {
     id: "test-profile",
     label: "Test profile",
     description: null,
-    runtimeProvider: "codex",
     approvalPolicy: "on-request",
     approvalReviewer: "user",
     sandboxMode: "workspace-write",
@@ -151,29 +147,8 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
   expect(runtimeConfig.skills.length).toBe(1);
   expect(runtimeConfig.skills[0]?.id).toBe(SKILL_ID);
 
-  // Step 3: materialize the workspace and assert the rendered SKILL.md still
-  // carries the original instructions.
-  const workspace = await createRuntimeWorkspace(
-    {
-      ...createTestConfig(),
-      RUNTIME_WORKSPACE_ROOT: path.join(root, "workspaces")
-    },
-    {
-      sessionId: "44444444-4444-4444-4444-444444444444",
-      tenantId: TENANT_ID,
-      userId: "test-user",
-      runtimeId: "runtime-pipeline",
-      runtimeConfig,
-      skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "bundle-cache"))
-    }
-  );
-
-  const renderedSkillPath = path.join(
-    workspace.manifest.config.skillsPath,
-    SKILL_ID,
-    "SKILL.md"
-  );
-  const rendered = await readFile(renderedSkillPath, "utf8");
-  expect(rendered).toMatch(/pipeline confirmed/);
-  expect(rendered).toMatch(new RegExp(SKILL_ID));
+  // Step 3: the compiled bundle is what the Deep Agents adapter turns into
+  // the /skills/ library (buildSkillsLibraryFiles generates SKILL.md from
+  // these fields) — assert the instructions survive compilation verbatim.
+  expect(runtimeConfig.skills[0]?.instructions).toMatch(/pipeline confirmed/);
 });

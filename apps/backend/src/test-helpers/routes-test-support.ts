@@ -16,9 +16,8 @@ import type { ArtifactDetail, ArtifactDownloadTokenRecord, ArtifactPiiDetail, Ar
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { RequestLimits } from "../services/request-limits.js";
 import { FakeDatabase } from "./fake-database.js";
-import { ActiveTurnMessageMap } from "../services/active-turn-message-map.js";
 import { InMemoryAuditEventStore } from "./in-memory-audit-events.js";
-import { phase4RuntimePolicy } from "./phase4-runtime-policy.js";
+import { testRuntimePolicy } from "./test-runtime-policy.js";
 import { createTestConfig } from "./test-config.js";
 import { registerApprovalRoutes, type ApprovalRouteStores } from "../routes/approvals.js";
 import { registerArtifactRoutes, type ArtifactRouteStores } from "../routes/artifacts.js";
@@ -380,7 +379,7 @@ class FakeRuntimeManager {
   hasActiveTurn(sessionId: string): boolean { return this.busySessions.has(sessionId); }
   hasSession(_sessionId: string): boolean { return false; }
   async createSession(input: { sessionId: string; userId: string }) {
-    return { sessionId: input.sessionId, runtimeId: `runtime-${input.sessionId}`, runtimePolicy: phase4RuntimePolicy };
+    return { sessionId: input.sessionId, runtimeId: `runtime-${input.sessionId}`, runtimePolicy: testRuntimePolicy };
   }
   async getRuntimePolicyId(_tenantId: string): Promise<string> { return "tenant-settings:test-tenant"; }
   async *runMessage(session: { sessionId: string; runtimeId: string }, input: {
@@ -588,8 +587,6 @@ export async function createTestApp(
   configOverrides: Partial<AppConfig> & {
     proxyUpstreamUrl?: string;
     pii?: TestAppPiiOptions;
-    tenantRuntimeProvider?: "codex" | "claude-code";
-    enabledRuntimeProviders?: Array<"codex" | "claude-code">;
     showEffortSelector?: boolean;
     // Override the Policy Center gate at the MCP route. Defaults to a no-rules
     // stub (every action allows). Pass a real PolicyService (+ optional approval
@@ -610,8 +607,6 @@ export async function createTestApp(
   const {
     proxyUpstreamUrl,
     pii,
-    tenantRuntimeProvider,
-    enabledRuntimeProviders,
     showEffortSelector,
     policyService: policyServiceOverride,
     requestPolicyApproval: requestPolicyApprovalOverride,
@@ -647,46 +642,44 @@ export async function createTestApp(
       role: isAdmin ? ("owner" as const) : ("member" as const)
     };
   });
-  await registerHealthRoutes(app, { codexRuntimeManager: runtimeManager as unknown as HealthRouteStores["codexRuntimeManager"] });
+  await registerHealthRoutes(app, { deepAgentsAdapter: runtimeManager as unknown as HealthRouteStores["deepAgentsAdapter"] });
+  const fakeDynamicConfig = {
+    async getOrCreateTenantSettings() {
+      return {
+        tenantId: "test-tenant",
+        showEffortSelector: showEffortSelector ?? false,
+        approvalPolicy: "on-request" as const,
+        approvalReviewer: "user" as const,
+        allowCommandExecution: false,
+        allowUserTokenForwarding: true,
+        autoApproveReadOnlyTools: true,
+        developerInstructions: null,
+        enabledToolIds: [
+          "managed-session-context",
+          "session_context",
+          "list_artifacts",
+          "read_text_artifact",
+          "write_artifact"
+        ],
+        enabledMcpServerIds: ["managed-session-context"],
+        enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"] as const,
+        enabledModelIds: null,
+        modelDefaultEfforts: {},
+        version: 1,
+        configHash: "test-hash",
+        updatedAt: new Date().toISOString()
+      };
+    }
+  };
   await registerModelRoutes(app, {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        const runtimeProvider = tenantRuntimeProvider ?? "codex";
-        return {
-          tenantId: "test-tenant",
-          runtimeProvider,
-          enabledRuntimeProviders: enabledRuntimeProviders ?? [runtimeProvider],
-          showEffortSelector: showEffortSelector ?? false,
-          approvalPolicy: "on-request" as const,
-          approvalReviewer: "user" as const,
-          allowCommandExecution: false,
-          allowUserTokenForwarding: true,
-          autoApproveReadOnlyTools: true,
-          developerInstructions: null,
-          enabledToolIds: [
-            "managed-session-context",
-            "session_context",
-            "list_artifacts",
-            "read_text_artifact",
-            "write_artifact"
-          ],
-          enabledMcpServerIds: ["managed-session-context"],
-          version: 1,
-          configHash: "test-hash",
-          updatedAt: new Date().toISOString()
-        };
-      }
-    },
-    runtimeAdapters: {
-      "claude-code": {}
-    },
-    hasAnthropicApiKey: async () => true,
-    hasOpenaiApiKey: async () => true
+    dynamicConfig: fakeDynamicConfig,
+    runtimeAdapter: runtimeManager,
+    configuredProviders: async () => new Set(["anthropic"])
   } as unknown as ModelRouteStores);
   await registerSessionRoutes(app, {
     sessions,
     messages,
-    defaultAdapter: runtimeManager,
+    runtimeAdapter: runtimeManager,
     limits
   } as unknown as SessionRouteStores);
   await registerArtifactRoutes(app, {
@@ -698,7 +691,6 @@ export async function createTestApp(
     processor: artifactProcessor,
     limits
   } as unknown as ArtifactRouteStores);
-  const activeTurnMessageMap = new ActiveTurnMessageMap();
   await registerMessageRoutes(app, {
     sessions,
     artifacts,
@@ -707,14 +699,14 @@ export async function createTestApp(
     limits,
     messages,
     toolContexts,
-    runtimeAdapters: { codex: runtimeManager },
-    activeTurnMessageMap,
+    runtimeAdapter: runtimeManager,
+    dynamicConfig: fakeDynamicConfig,
     ...(pii?.piiProtection ? { piiProtection: pii.piiProtection as never } : {}),
     ...(pii?.piiScanRuns ? { piiScanRuns: pii.piiScanRuns as never } : {})
   } as unknown as MessageRouteStores);
   await registerApprovalRoutes(app, {
     approvals,
-    runtimeAdapters: { codex: runtimeManager }
+    runtimeAdapter: runtimeManager
   } as unknown as ApprovalRouteStores);
   const { factoryRegistry: managedToolFactoryRegistry, catalog: managedToolCatalog } =
     makeTestManagedToolRegistries();
@@ -779,7 +771,7 @@ export async function createTestToolContext(
     runtimePolicyId: overrides.runtimePolicyId ?? "tenant-settings:test-tenant",
     messageId: overrides.messageId ?? null,
     credentialEnvelope: overrides.credentialEnvelope,
-    metadata: { runtimePolicy: phase4RuntimePolicy, ...(overrides.metadata ?? {}) },
+    metadata: { runtimePolicy: testRuntimePolicy, ...(overrides.metadata ?? {}) },
     ttlMs: overrides.ttlMs ?? 60_000
   });
 }

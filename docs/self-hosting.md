@@ -18,7 +18,7 @@ Three runtime components plus their dependencies:
                                           +--> WorkOS (SSO)
 ```
 
-The agent runtimes — Codex and Claude — run **inside the E2B sandboxes**, not on the backend host. The backend brokers JSON-RPC over stdio for Codex and over a Node harness for Claude, normalizes events, and writes to Postgres.
+The agent's shell and file tools execute **inside the E2B sandboxes**, not on the backend host. The agent loop itself runs in the backend, which streams events over SSE and writes to Postgres.
 
 ## Required infrastructure
 
@@ -33,25 +33,19 @@ The agent runtimes — Codex and Claude — run **inside the E2B sandboxes**, no
 
 ## Build the E2B sandbox template
 
-The backend boots without `E2B_API_KEY` — it just falls back to in-process runtime mode, which is **not** production-safe (no sandboxing). Production wants `RUNTIME_BACKEND=e2b` and `CLAUDE_RUNTIME_BACKEND=e2b`.
+The agent's shell and file tools execute inside per-session E2B sandboxes — there is no in-process execution mode, so `E2B_API_KEY` and `E2B_TEMPLATE_ID` are required at boot, unconditionally.
 
-The unified template hosts both Codex and Claude:
+Build the code-execution template in your own E2B account:
 
 ```bash
-E2B_API_KEY=e2b_xxx make e2b-build-codex
+E2B_API_KEY=e2b_xxx make e2b-build
 ```
 
-This runs `docker/build.prod.ts`, which calls the v2 E2B Template SDK to build an `agent-runtime-dev` template. It installs:
+This runs `docker/build.ts`, which calls the v2 E2B Template SDK to build a `deep-agents-runtime-dev` template — a deliberately slim code-execution box (Python with pandas/openpyxl/matplotlib on the stock e2b base image; the agent loop itself runs in the backend, not in the sandbox).
 
-- `@openai/codex` CLI at the version pinned in `apps/backend/src/codex-release.json`
-- `@anthropic-ai/claude-agent-sdk` at the matching pinned version
-- `docker/sandbox-agent/sandbox-agent.mjs` (the Claude harness) at `/opt/cogniplane/sandbox-agent.mjs`
+Building with the existing template name updates it in place, preserving the template id. Note the template id printed at the end — set it as `E2B_TEMPLATE_ID`.
 
-Building with the existing template name updates it in place, preserving the template id. Note the template id printed at the end — you'll set it as `E2B_TEMPLATE_ID`.
-
-The default value in `codex-release.json.e2bTemplateId` is the placeholder `replace-with-your-template-id` — the backend refuses to start with `RUNTIME_BACKEND=e2b` (or `CLAUDE_RUNTIME_BACKEND=e2b`) until you provide a real template id, either by setting the env var directly or by committing the JSON change that `make e2b-build-codex` produces.
-
-**Bumping versions later:** edit `apps/backend/src/codex-release.json` (`codexVersion` or `claudeAgentSdkVersion`), update `apps/backend/package.json` to match if you bumped the Claude SDK, and rebuild the template. The drift test (`apps/backend/src/codex-release.test.ts`) will fail in CI if these get out of sync.
+The built-in default for `E2B_TEMPLATE_ID` is the placeholder `replace-with-your-template-id` — the backend refuses to start until you provide a real template id via the env var.
 
 ## Backend environment
 
@@ -122,35 +116,33 @@ Skill bundles are content-addressed: the same bundle hash always points at the s
 ### Runtime sandboxing
 
 ```bash
-RUNTIME_BACKEND=e2b
-CLAUDE_RUNTIME_BACKEND=e2b
 E2B_API_KEY=<from e2b.dev>
 E2B_TEMPLATE_ID=<from your template build>
 
-# RUNTIME_GATEWAY_BASE_URL is the URL the sandbox dials back to for /mcp.
-# Must be reachable from inside the E2B sandbox — meaning, publicly resolvable.
+# RUNTIME_GATEWAY_BASE_URL is the URL the runtime's MCP client dials for /mcp.
+# The agent loop (and its MCP client) run in the backend process itself, so
+# this must be reachable from the backend — the default http://localhost:3001
+# works for a single-host deployment.
 RUNTIME_GATEWAY_BASE_URL=https://your-backend-host
 ```
 
-`RUNTIME_GATEWAY_BASE_URL` is the most common misconfiguration. The sandbox runs in E2B's infrastructure, not yours — `localhost` and VPC-internal addresses won't resolve. Your backend needs a publicly-reachable URL for the runtime to call back into.
+Note: the backend logs a boot warning when `RUNTIME_GATEWAY_BASE_URL` points at localhost. For multi-instance deployments, point it at a URL that always resolves to a healthy backend (the load balancer).
 
-### Model provider keys (Anthropic, OpenAI)
+### Model provider key (Anthropic)
 
 ```bash
 # Server-level fallback — used when no per-tenant key is configured.
-ANTHROPIC_API_KEY=<from console.anthropic.com>   # Optional. Enables Claude runtime.
-OPENAI_API_KEY=<from platform.openai.com>        # Optional. Enables Codex runtime.
-CLAUDE_CODE_MODEL=sonnet                          # Default Claude model
+ANTHROPIC_API_KEY=<from console.anthropic.com>
 ```
 
-Two paths are supported and you should pick the right one for your deployment shape:
+The Deep Agents runtime calls the Anthropic API (via LangChain's `@langchain/anthropic`); an Anthropic key is required for any agent turn to run. Two paths are supported and you should pick the right one for your deployment shape:
 
 - **Per-tenant keys** (preferred for multi-tenant production). Saved via the admin UI in org settings, encrypted at rest with `DATA_ENCRYPTION_SECRET`, scoped per tenant. Each tenant uses its own billing account; the key never appears in environment variables or process listings. This is the default path for SaaS-style deployments where you don't want one Anthropic invoice covering every tenant.
 - **Server-level env-var fallback**. Used when no per-tenant key is set. Right for single-tenant or solo-operator self-hosters where one Anthropic account covers everything.
 
-The runtime resolves the key for a turn as: per-tenant key → env-var fallback → null. If both resolve to null, the affected runtime (Claude or Codex) is not registered for that tenant.
+The runtime resolves the key for a turn as: per-tenant key → env-var fallback → null. If both resolve to null, `/models` returns an empty list — the "configure a key" state — and no turn can run for that tenant.
 
-**Anthropic Commercial Terms apply.** The Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) is bundled with Cogniplane Core but is governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms), not by Cogniplane Core's AGPL license. The SDK requires a paid API key from `console.anthropic.com` — **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used. Each tenant (or operator, for the env-var path) is responsible for maintaining their own Anthropic account and complying with Anthropic's terms.
+**Anthropic Commercial Terms apply.** Cogniplane Core does not bundle any Anthropic SDK binary — the platform calls the Anthropic API directly through LangChain — but API use is governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms), not by Cogniplane Core's AGPL license. A paid API key from `console.anthropic.com` is required — **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used. Each tenant (or operator, for the env-var path) is responsible for maintaining their own Anthropic account and complying with Anthropic's terms.
 
 ### Optional: PII detection
 
@@ -168,11 +160,10 @@ PII detection is opt-in. The pipeline targets any OpenAI-compatible `/chat/compl
 
 ```bash
 SCHEDULER_ENABLED=true
-SCHEDULER_MAX_CONCURRENT_JOBS=10
-SCHEDULER_JOB_TIMEOUT_MS=900000             # 15 min hard cap per job
+SCHEDULER_MAX_CONCURRENT_JOBS=2             # Default 2; raise with instance size
+SCHEDULER_JOB_TIMEOUT_MS=300000             # 5 min hard cap per job (default)
 SCHEDULER_POLL_INTERVAL_MS=30000
-
-SKILL_JUDGE_WORKER_ENABLED=false            # Off by default; per-tenant config is the second gate
+SCHEDULER_MAX_CONSECUTIVE_FAILURES=5        # Poison-job guard: auto-disable after N straight failures
 ```
 
 The scheduler claims due jobs atomically (`FOR UPDATE SKIP LOCKED`) so it's safe to run multiple backend instances; only one will pick up any given job.
@@ -206,7 +197,7 @@ Before you point real users at it:
 - [ ] **`REDIS_URL` is configured.** Without it, refresh-token reuse detection is broken.
 - [ ] **TLS in front of the backend.** HSTS is sent on every response (2-year preload); serving HTTPS is required for it to make sense.
 - [ ] **Object storage bucket has restrictive ACLs.** The artifact download flow always issues short-lived presigned URLs — there's no reason for any object in your bucket to be public.
-- [ ] **`E2B_TEMPLATE_ID` matches what `make e2b-build-codex` produced.** The drift test (`apps/backend/src/codex-release.test.ts`) catches this in CI; verify locally if you skipped CI.
+- [ ] **`E2B_TEMPLATE_ID` matches what `make e2b-build` produced.** The backend fails fast on the placeholder default, but it cannot detect a stale-but-real id — verify after every template rebuild under a new name.
 - [ ] **Database backups configured.** Postgres is the only durable state — sessions, messages, audit events, integrations all live there. Treat it like the production database it is.
 - [ ] **Log retention policy set.** Tool events (`tool_events`) and audit events (`audit_events`) accumulate. Decide your retention before they fill the disk.
 - [ ] **At least one user is `owner` of each tenant.** First-member owner promotion is automatic on the first WorkOS callback, but verify it actually happened.
@@ -219,9 +210,9 @@ The backend is stateless modulo Redis and Postgres. Run multiple instances behin
 
 - Holds in-memory rate limits/quotas only when Redis isn't configured (so configure Redis for multi-instance).
 - Runs its own scheduler poll loop, but `FOR UPDATE SKIP LOCKED` makes job claiming safe across instances.
-- Has its own `runtime_sessions` map for active sandboxes. There's no shared sandbox pool — sandboxes are per-instance per-session.
+- Holds its active agent sessions (and their lazy E2B sandboxes) in process memory. There's no shared sandbox pool — sessions are per-instance.
 
-What this means: a session's runtime sandbox lives on whichever backend instance accepted the first message of that session. Subsequent messages on the same session need to land on the same instance, OR the new instance has to spin up a fresh sandbox and resume the runtime via `runtime_sessions`. Sticky sessions (load-balancer level) is the simplest path; resume-via-DB works but adds a cold-start hit on instance failover.
+What this means: a session's live runtime state lives on whichever backend instance accepted the first message of that session. Subsequent messages on the same session need to land on the same instance, OR the new instance rebuilds the session — conversation history resumes from the Postgres checkpointer (the LangGraph thread is durable), while workspace files start from a fresh sandbox. Sticky sessions (load-balancer level) is the simplest path; failover works but adds a cold-start hit and loses un-captured sandbox files.
 
 ### Rotating secrets
 
@@ -231,16 +222,11 @@ What this means: a session's runtime sandbox lives on whichever backend instance
 
 ### Bumping pinned versions
 
-`apps/backend/src/codex-release.json` pins three things: `codexVersion`, `claudeAgentSdkVersion`, `e2bTemplateId`. Bumping is:
+The sandbox template's package pins (Python data-stack versions) live directly in `docker/template.ts`. Bumping is:
 
-1. Edit `codex-release.json` (and `apps/backend/package.json` for the Claude SDK).
-2. Run `make e2b-build-codex` to rebuild the template.
-3. The template id in `codex-release.json` may have updated — commit it.
-4. Update `E2B_TEMPLATE_ID` in your deployment environment to match.
-5. Run `pnpm codex:release:check` to confirm the drift test passes.
-6. Deploy.
-
-The drift test (`codex-release.test.ts`) asserts `E2B_TEMPLATE_ID` matches the JSON and that the sandbox-agent harness file exists. CI runs it on every PR.
+1. Edit the pins in `docker/template.ts`.
+2. Run `make e2b-build` to rebuild the template. Building under the same template name updates it in place, so `E2B_TEMPLATE_ID` does not change.
+3. Deploy (running sandboxes keep their old image; new sessions pick up the rebuilt template).
 
 ### Monitoring
 
@@ -254,13 +240,13 @@ What's worth alerting on:
 - `runtime_sessions` rows in unexpected states (long-running, crashed-but-not-cleaned).
 - `scheduled_jobs` failure rate — usually means a tenant's scheduled prompt is broken.
 
-Cost tracking: per-turn `usage` is persisted on `messages` (`token_input`, `token_output`, model, estimated cost). `SELECT SUM(estimated_cost) FROM messages WHERE created_at > now() - interval '1 day'` is a starting point for daily spend.
+Cost tracking: per-turn usage is persisted on `messages` (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, `model_name`, `cost_usd`). `SELECT SUM(cost_usd) FROM messages WHERE created_at > now() - interval '1 day'` is a starting point for daily spend.
 
 ## Where to go from here
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the system you just deployed, in detail
 - [SECURITY_FEATURES.md](SECURITY_FEATURES.md) — full inventory of security controls; useful for security review questionnaires
 - [DECISIONS.md](DECISIONS.md) — why the architecture is shaped the way it is
-- [guides/runtime-selection.md](guides/runtime-selection.md) — choosing Codex vs Claude per tenant
+- [deepagentsjs API reference](https://reference.langchain.com/javascript/deepagents) — the library the agent runtime is built on
 - [guides/skill-bundle-decisions.md](guides/skill-bundle-decisions.md) — skill bundle storage and lifecycle
 - [COMMERCIAL.md](../COMMERCIAL.md) — commercial license terms if AGPL doesn't fit your distribution model

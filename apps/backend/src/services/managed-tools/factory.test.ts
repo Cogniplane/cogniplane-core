@@ -15,6 +15,7 @@ const createManagedToolDefinitions = sharedFactoryRegistry.createDefinitions.bin
 import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { GithubRuntimeCredentials } from "../integrations/github/github-connection-service.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
+import type { ManagedToolDefinition } from "./types.js";
 
 // ── In-memory fakes ──────────────────────────────────────────────────────────
 
@@ -442,4 +443,43 @@ test("ManagedToolFactoryRegistry rejects duplicate factory keys", () => {
   expect(() => registry.register("session", noop)).toThrow(
     /already registered: session/
   );
+});
+
+// ── Policy Center category stamping ───────────────────────────────────────────
+// createDefinitions stamps each produced tool's `category` to its factory domain
+// key so the MCP gateway binds it to the right Policy Center category (consumed
+// at routes/mcp.ts as `tool.category ?? serverId`). This is a security-relevant
+// contract: a `categories` rule scoped to "github" must match github_read_file
+// regardless of which managed-server URL the call arrived through.
+
+test("createDefinitions stamps the factory domain key as the tool category", () => {
+  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+
+  const githubReadFile = tools.find((t) => t.name === "github_read_file")!;
+  expect(githubReadFile.category).toBe("github");
+
+  const sessionContext = tools.find((t) => t.name === "session_context")!;
+  expect(sessionContext.category).toBe("session");
+});
+
+test("createDefinitions preserves a category a factory set on its own definition", () => {
+  const registry = new ManagedToolFactoryRegistry();
+  const stubTool = (name: string, category?: string): ManagedToolDefinition => ({
+    name,
+    description: name,
+    readOnly: true,
+    inputSchema: {},
+    category,
+    handler: async () => ({})
+  });
+
+  // Registered under domain key "github", but the factory pins its own category.
+  registry.register("github", () => [stubTool("github_explicit", "custom-domain")]);
+  // A sibling def with no category falls back to the domain key.
+  registry.register("session", () => [stubTool("session_default")]);
+
+  const defs = registry.createDefinitions(makeDeps() as unknown as Parameters<typeof registry.createDefinitions>[0]);
+
+  expect(defs.find((d) => d.name === "github_explicit")!.category).toBe("custom-domain");
+  expect(defs.find((d) => d.name === "session_default")!.category).toBe("session");
 });

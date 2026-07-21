@@ -43,7 +43,7 @@ export function ConsolePageHeader(props: {
   return (
     <header className="flex items-start justify-between gap-4 border-b border-outline-variant bg-surface-container-lowest px-6 py-5">
       <div>
-        <p className="text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint">
+        <p className="text-[0.62rem] font-bold uppercase tracking-[0.14em] text-brand">
           {props.eyebrow}
         </p>
         <h1 className="text-2xl font-semibold tracking-tight text-on-surface">{props.title}</h1>

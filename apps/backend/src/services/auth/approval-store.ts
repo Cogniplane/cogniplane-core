@@ -2,7 +2,7 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
-export type ApprovalKind = "command_execution" | "file_change" | "permissions";
+export type ApprovalKind = "command_execution" | "file_change" | "permissions" | "mcp_tool";
 
 export type ApprovalRecord = {
   approvalId: string;
@@ -38,7 +38,9 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
     requestMethod: String(row.request_method),
     requestId: String(row.request_id),
     kind:
-      row.kind === "file_change" || row.kind === "permissions" ? row.kind : "command_execution",
+      row.kind === "file_change" || row.kind === "permissions" || row.kind === "mcp_tool"
+        ? row.kind
+        : "command_execution",
     title: String(row.title),
     summary: String(row.summary),
     status:

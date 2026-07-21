@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { AdminSessionsListResponseSchema } from "@cogniplane/shared-types";
 
 import { withTenantScope } from "../../lib/db.js";
+import { apiError } from "../../lib/http-errors.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
 import { serialize } from "../../lib/serialize-response.js";
 import {
@@ -22,7 +23,7 @@ export type AdminSessionRow = {
   createdAt: string;
   lastActivityAt: string;
   messageCount: number;
-  runtimeProvider: "codex" | "claude-code" | null;
+  runtimeProvider: "deep-agents" | null;
   modelName: string | null;
   status: "active" | "completed" | "errored";
   alerts: AdminSessionAlert[];
@@ -65,12 +66,12 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
         return parsed.response;
       }
 
-      const { userId, from, to, status, runtime, alert, cursor, limit } = parsed.value;
+      const { userId, from, to, status, alert, cursor, limit } = parsed.value;
 
       const cursorPayload = cursor ? decodeCursor(cursor) : null;
       if (cursor && !cursorPayload) {
         reply.code(400);
-        return { error: "invalid_cursor" };
+        return apiError("invalid_cursor", "The pagination cursor is malformed.");
       }
 
       const { tenantId } = request.auth;
@@ -123,47 +124,46 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
                 OR ($5 = 'errored' AND COALESCE(m.has_error, FALSE))
                 OR ($5 = 'active'  AND NOT COALESCE(m.has_error, FALSE))
               )
-              AND ($6::text        IS NULL OR rs.runtime_provider = $6)
               AND (
-                $7::timestamptz IS NULL
+                $6::timestamptz IS NULL
                 OR (COALESCE(m.last_activity_at, s.created_at), s.session_id)
-                   < ($7::timestamptz, $8::text)
+                   < ($6::timestamptz, $7::text)
               )
               AND (
-                COALESCE(array_length($10::text[], 1), 0) = 0
+                COALESCE(array_length($9::text[], 1), 0) = 0
                 OR (
-                  ('pii-blocked' = ANY($10::text[]) AND EXISTS (
+                  ('pii-blocked' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM pii_scan_runs psr
                     WHERE psr.tenant_id = $1
                       AND psr.source_session_id = s.session_id
                       AND psr.status = 'blocked'
                   ))
-                  OR ('pii-transformed' = ANY($10::text[]) AND EXISTS (
+                  OR ('pii-transformed' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM pii_scan_runs psr
                     WHERE psr.tenant_id = $1
                       AND psr.source_session_id = s.session_id
                       AND psr.status = 'transformed'
                   ))
-                  OR ('pii-detected' = ANY($10::text[]) AND EXISTS (
+                  OR ('pii-detected' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM pii_scan_runs psr
                     WHERE psr.tenant_id = $1
                       AND psr.source_session_id = s.session_id
                       AND psr.status = 'completed'
                       AND jsonb_array_length(psr.findings_json) > 0
                   ))
-                  OR ('approval-rejected' = ANY($10::text[]) AND EXISTS (
+                  OR ('approval-rejected' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM approvals a
                     WHERE a.tenant_id = $1
                       AND a.session_id = s.session_id
                       AND a.status = 'rejected'
                   ))
-                  OR ('approval-pending' = ANY($10::text[]) AND EXISTS (
+                  OR ('approval-pending' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM approvals a
                     WHERE a.tenant_id = $1
                       AND a.session_id = s.session_id
                       AND a.status = 'pending'
                   ))
-                  OR ('errored' = ANY($10::text[]) AND EXISTS (
+                  OR ('errored' = ANY($9::text[]) AND EXISTS (
                     SELECT 1 FROM messages me
                     WHERE me.tenant_id = $1
                       AND me.session_id = s.session_id
@@ -172,7 +172,7 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
                 )
               )
             ORDER BY last_activity_at DESC, s.session_id DESC
-            LIMIT $9
+            LIMIT $8
           `,
           [
             tenantId,
@@ -180,7 +180,6 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
             from ?? null,
             to ?? null,
             status ?? null,
-            runtime ?? null,
             cursorPayload?.lastActivityAt ?? null,
             cursorPayload?.sessionId ?? null,
             limit + 1,

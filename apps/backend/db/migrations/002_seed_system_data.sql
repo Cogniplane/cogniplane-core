@@ -61,7 +61,7 @@ INSERT INTO admin_skill_revisions (
 SELECT
   'system', 'write-artifact', 1,
   'seed', 'built-in',
-  NULL, NULL, md5('write-artifact:instructions:v3'),
+  NULL, NULL, md5('write-artifact:instructions:v4'),
   'validated', '[]'::jsonb,
   'active', NULL,
   jsonb_build_object(
@@ -94,13 +94,6 @@ Skip it for:
 - Build artifacts produced as a side effect of running a task
 
 If you are unsure whether a file is a deliverable, save it as an artifact.
-
-### Tool name by runtime
-
-- **Claude Code runtime**: the tool is exposed as
-  `mcp__managed-session-context__write_artifact`. Call it by that fully
-  qualified name.
-- **Codex runtime**: call it as `write_artifact`.
 
 ### Parameters
 

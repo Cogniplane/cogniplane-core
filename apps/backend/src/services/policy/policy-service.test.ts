@@ -124,6 +124,23 @@ describe("PolicyService.gateAction — non-gating outcomes", () => {
     expect(events[0].type).toBe("policy.decision.recorded");
   });
 
+  it("redacts secrets from the actionSnapshot before persisting evidence", async () => {
+    // recordEvidence runs redactSecrets() over the merged snapshot (incl. the
+    // caller's actionSnapshot) — a security boundary. A secret-shaped value must
+    // be scrubbed in the persisted evidence row.
+    const { service, records } = buildService([
+      makeRule({ ruleId: "pol_1", effect: "allow", conditions: { categories: ["github"] } })
+    ]);
+
+    await service.gateAction(
+      gateInput({ actionSnapshot: { authorization: "Bearer sk-super-secret-token" } })
+    );
+
+    expect(records).toHaveLength(1);
+    const snapshot = records[0].actionSnapshot as Record<string, unknown>;
+    expect(JSON.stringify(snapshot)).not.toContain("sk-super-secret-token");
+  });
+
   it("monitor mode never gates a block — records a would-have decision", async () => {
     const { service, records } = buildService([
       makeRule({ ruleId: "pol_1", effect: "block", conditions: { categories: ["github"] } })
@@ -134,6 +151,31 @@ describe("PolicyService.gateAction — non-gating outcomes", () => {
     expect(result.evaluation.outcome).toBe("block");
     expect(records).toHaveLength(1);
     expect(records[0].outcome).toBe("block");
+    expect(records[0].enforced).toBe(false);
+  });
+
+  it("monitor mode never routes a require_approval — proceeds and never holds the gateway", async () => {
+    // Under monitor, enforced=false, so a require_approval match must take the
+    // non-enforced early return: proceed WITHOUT routing an approval (which would
+    // hold the gateway's HTTP response open until the TTL) and record evidence
+    // with enforced=false. A regression routing under monitor would wedge the
+    // gateway on a would-have decision.
+    const { service, records } = buildService([
+      makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: { categories: ["github"] } })
+    ]);
+    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "approve");
+
+    const result = await service.gateAction(
+      gateInput({ enforcementMode: "monitor", approvalRouter: router })
+    );
+
+    expect(result.enforced).toBe(false);
+    expect(result.evaluation.outcome).toBe("require_approval");
+    // The approval router was never called — no gateway hold under monitor.
+    expect(router).not.toHaveBeenCalled();
+    // Evidence recorded as a would-have decision.
+    expect(records).toHaveLength(1);
+    expect(records[0].outcome).toBe("require_approval");
     expect(records[0].enforced).toBe(false);
   });
 });

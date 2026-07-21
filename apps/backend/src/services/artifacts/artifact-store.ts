@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { uuidv7 } from "../../lib/uuid.js";
 
-import { type Pool, withTenantScope } from "../../lib/db.js";
+import { escapeLikePattern, type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type ArtifactPiiDetail = {
@@ -324,10 +324,6 @@ function computeFilterFingerprint(opts: ArtifactListOptions): string {
   return Buffer.from(JSON.stringify(norm), "utf8").toString("base64url");
 }
 
-function escapeLike(value: string): string {
-  // Escape LIKE wildcards so a user's literal % or _ doesn't widen the match.
-  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
-}
 
 // SQL clauses for one mime class. MUST mirror classifyMimeClass() in
 // @cogniplane/shared-types exactly: code = an explicit allowlist; text =
@@ -342,7 +338,7 @@ const CODE_MIME_TYPES = [
   "text/html"
 ];
 
-function mimeClassSqlClauses(cls: ArtifactMimeClass, values: unknown[]): string[] {
+export function mimeClassSqlClauses(cls: ArtifactMimeClass, values: unknown[]): string[] {
   switch (cls) {
     case "image":
       return ["mime_type ILIKE 'image/%'"];
@@ -487,7 +483,7 @@ export class ArtifactStore {
     ];
 
     if (opts.q) {
-      values.push(`%${escapeLike(opts.q)}%`);
+      values.push(`%${escapeLikePattern(opts.q)}%`);
       conditions.push(`artifact_name ILIKE $${values.length}`);
     }
     if (opts.artifactType && opts.artifactType.length > 0) {

@@ -37,8 +37,12 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
+        {/* suppressHydrationWarning: browsers empty the `nonce` content attribute
+            after parsing (spec nonce-hiding), so the DOM always reads "" at
+            hydration while React's output has the real value. The script has
+            already run by then; the mismatch is expected and harmless. */}
         {/* eslint-disable-next-line @next/next/no-sync-scripts */}
-        <script src="/theme-init.js" nonce={nonce} />
+        <script src="/theme-init.js" nonce={nonce} suppressHydrationWarning />
       </head>
       <body className={`${manrope.variable} ${inter.variable}`}>
         <OverlayBootstrap />

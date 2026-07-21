@@ -1,6 +1,7 @@
 import { type ManagedToolCatalog, type ManagedToolCatalogEntry } from "./catalog.js";
 import { type ManagedToolFactoryRegistry } from "./factory.js";
 import { createGithubTools, GITHUB_TOOL_CATALOG } from "./github-tools.js";
+import { createMemoryTools, MEMORY_TOOL_CATALOG } from "./memory-tools.js";
 import { createNotionTools, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
 import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
@@ -39,6 +40,7 @@ export function registerBuiltinManagedTools(
   catalog.register(asCatalogEntries(SESSION_TOOL_CATALOG, true));
   catalog.register(asCatalogEntries(SKILL_CORPUS_TOOL_CATALOG, true));
   catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true));
+  catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true));
 
   // tenantConfigurable=false: integration-owned tools, gated by the
   // integrations system (tenant_integrations toggles + readiness).
@@ -50,4 +52,5 @@ export function registerBuiltinManagedTools(
   factoryRegistry.register("github", createGithubTools);
   factoryRegistry.register("notion", createNotionTools);
   factoryRegistry.register("write-artifact", createWriteArtifactTool);
+  factoryRegistry.register("memory", createMemoryTools);
 }

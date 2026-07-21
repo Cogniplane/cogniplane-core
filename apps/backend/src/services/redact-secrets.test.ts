@@ -154,7 +154,8 @@ test.each([
     "sendgrid",
     `SG.${"g".repeat(22)}.${"h".repeat(43)}`,
     "token [REDACTED] done"
-  ]
+  ],
+  ["zai", `${"a1b2c3d4".repeat(4)}.${"Xy9z".repeat(4)}`, "token [REDACTED] done"]
 ])("redactSecrets redacts %s credentials in plain text", (_name, credential, expected) => {
   expect(redactSecrets(`token ${credential} done`)).toBe(expected);
 });

@@ -6,7 +6,6 @@ import JSZip from "jszip";
 
 import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
 import { handleAppError } from "../../app.js";
-import codexRelease from "../../codex-release.json" with { type: "json" };
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
@@ -119,8 +118,6 @@ class InMemoryAdminConfig {
 
   tenantSettings = {
     tenantId: "admin-tenant",
-    runtimeProvider: "codex" as const,
-    enabledRuntimeProviders: ["codex"] as const,
     showEffortSelector: false,
     webSearchMode: "disabled" as const,
     approvalPolicy: "on-request" as const,
@@ -138,6 +135,9 @@ class InMemoryAdminConfig {
       "write_artifact"
     ],
     enabledMcpServerIds: ["managed-session-context"],
+    enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
+    enabledModelIds: null as string[] | null,
+    modelDefaultEfforts: {} as Record<string, string>,
     version: 1,
     configHash: "hash-tenant-settings",
     updatedAt: new Date().toISOString()
@@ -435,7 +435,10 @@ class InMemoryAdminConfig {
     };
   }
 
+  lastUpdateInput: Record<string, unknown> | null = null;
+
   async updateTenantSettings(_tenantId: string, input: Record<string, unknown>) {
+    this.lastUpdateInput = input;
     this.tenantSettings = {
       ...this.tenantSettings,
       tenantId: _tenantId,
@@ -451,7 +454,11 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
   const adminConfig = new InMemoryAdminConfig();
   const auditEvents = new InMemoryAuditEventStore();
   const app = Fastify();
-  const testConfig = createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" });
+  const testConfig = createTestConfig({
+    LOCAL_DEV_USER_ID: "admin-user",
+    ANTHROPIC_API_KEY: "sk-ant-test",
+    OPENAI_API_KEY: "sk-openai-test"
+  });
 
   const manifestMetadata: RuntimeManifest = {
     manifestVersion: "cogniplane.runtime-manifest.v1",
@@ -461,37 +468,31 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
     userId: "admin-user",
     generatedAt: new Date().toISOString(),
     workspacePath: "/tmp/session-1",
-    codex: {
-      binaryPath: "codex",
-      version: codexRelease.codexVersion,
-      schemaVersion: codexRelease.schemaVersion,
-      model: "gpt-5.4"
-    },
     runtimePolicy: {
-      id: "phase4-tools",
+      id: "test-tools",
       version: 2,
-      hash: "hash-phase4-tools",
+      hash: "hash-test-tools",
       approvalPolicy: "on-request",
       sandboxMode: "workspace-write",
       networkMode: "restricted",
       allowCommandExecution: true,
       allowUserTokenForwarding: true,
       autoApproveReadOnlyTools: true,
+      webSearchMode: "disabled",
       enabledToolIds: []
     },
     skills: [],
     mcpServers: [],
     configSources: {
       runtimePolicy: {
-        id: "phase4-tools",
+        id: "test-tools",
         version: 2,
-        hash: "hash-phase4-tools"
+        hash: "hash-test-tools"
       },
       skills: [],
       mcpServers: []
     },
     config: {
-      codexTomlPath: "/tmp/session-1/codex.toml",
       skillsPath: "/tmp/session-1/.codex/skills",
       customSkillsEnabled: false,
       customMcpServersEnabled: false
@@ -522,8 +523,8 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
             userId: "admin-user",
             runtimeId: "runtime-1",
             workspacePath: "/tmp/session-1",
-            codexVersion: testConfig.CODEX_VERSION,
-            codexSchemaVersion: testConfig.CODEX_SCHEMA_VERSION,
+            runtimeVersion: "1.0.0",
+            runtimeSchemaVersion: "v1",
             manifestPath: "/tmp/session-1/.framework/runtime-manifest.json",
             manifestMetadata,
             healthStatus: "healthy",
@@ -532,9 +533,9 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
             terminatedAt: null,
             lifecycleMetadata: {},
             status: "active",
-            // Production rows always populate this column ("codex" / "claude-code" /
-            // null). The fake must too — the response schema requires the key to be
-            // present even when the value is null.
+            // Production rows populate this column ("deep-agents" or null). The
+            // fake must too — the response schema requires the key to be present
+            // even when the value is null.
             runtimeProvider: null,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
@@ -542,8 +543,8 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
         ];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return ["session-1"];
       }
     },
@@ -581,7 +582,7 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
     url: "/admin/runtime-sessions"
   });
   expect(runtimeSessionsResponse.statusCode).toBe(200);
-  expect(runtimeSessionsResponse.json().runtimeSessions[0].configSummary.runtimePolicy.id).toBe("phase4-tools");
+  expect(runtimeSessionsResponse.json().runtimeSessions[0].configSummary.runtimePolicy.id).toBe("test-tools");
 
   const rolloutResponse = await app.inject({
     method: "POST",
@@ -593,6 +594,17 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
   expect(rolloutResponse.statusCode).toBe(200);
   expect(rolloutResponse.json().affectedSessionIds).toEqual(["session-1"]);
   expect(auditEvents.events.length).toBe(2);
+
+  const runtimeConfigResponse = await app.inject({
+    method: "GET",
+    url: "/admin/runtime-config"
+  });
+  expect(runtimeConfigResponse.statusCode).toBe(200);
+  expect(runtimeConfigResponse.json().e2bTemplateId).toBe(testConfig.E2B_TEMPLATE_ID);
+  // Per-provider platform-key report (R29): both configured keys are listed,
+  // and the legacy anthropic flag still tracks the anthropic entry.
+  expect(runtimeConfigResponse.json().platformProviders).toEqual(["anthropic", "openai"]);
+  expect(runtimeConfigResponse.json().anthropicKeyConfigured).toBe(true);
 
   await app.close();
 });
@@ -619,8 +631,8 @@ test("admin routes reject non-admin callers", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -667,8 +679,13 @@ test("admin tenant settings updates are audited", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
+        return [];
+      }
+    },
+    runtimeAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -693,8 +710,6 @@ test("admin tenant settings updates are audited", async () => {
   expect(response.statusCode).toBe(200);
   expect(auditEvents.events.at(-1)?.type).toBe("admin.tenant_settings.updated");
   expect(auditEvents.events.at(-1)?.payload).toEqual({
-        runtimeProvider: "codex",
-        enabledRuntimeProviders: ["codex"],
         showEffortSelector: false,
         webSearchMode: "disabled",
         approvalPolicy: "on-request",
@@ -706,6 +721,9 @@ test("admin tenant settings updates are audited", async () => {
         developerInstructions: null,
         enabledToolIds: ["managed-session-context", "write_artifact"],
         enabledMcpServerIds: ["managed-session-context"],
+        enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
+        enabledModelIds: null,
+        modelDefaultEfforts: {},
         invalidatedSessionIds: [],
         version: 2,
         configHash: "hash-tenant-settings"
@@ -736,6 +754,12 @@ test("admin tenant settings updates are audited", async () => {
   });
   expect(adminUpdate.statusCode).toBe(200);
   expect(adminConfig.tenantSettings.showEffortSelector).toBe(true);
+  // The strip actually removes the owner-only keys from the persisted input (not
+  // merely that the value happened to match) — so an admin's stale form can never
+  // overwrite an owner decision even if it re-submits a now-divergent value.
+  expect(adminConfig.lastUpdateInput).not.toHaveProperty("allowCommandExecution");
+  expect(adminConfig.lastUpdateInput).not.toHaveProperty("allowUserTokenForwarding");
+  expect(adminConfig.lastUpdateInput).toHaveProperty("showEffortSelector", true);
 
   await app.close();
 });
@@ -764,23 +788,15 @@ test("admin tenant settings refresh active runtimes after update", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
-    runtimeAdapters: {
-      codex: {
-        async invalidateTenantRuntimes(tenantId: string) {
-          invalidatedTenants.push(tenantId);
-          return ["session-a"];
-        }
-      },
-      "claude-code": {
-        async invalidateTenantRuntimes(tenantId: string) {
-          invalidatedTenants.push(tenantId);
-          return ["session-b"];
-        }
+    runtimeAdapter: {
+      async invalidateTenantRuntimes(tenantId: string) {
+        invalidatedTenants.push(tenantId);
+        return ["session-a"];
       }
     } as never,
     tenantMembers: {
@@ -799,10 +815,10 @@ test("admin tenant settings refresh active runtimes after update", async () => {
   });
 
   expect(response.statusCode).toBe(200);
-  expect(invalidatedTenants).toEqual(["admin-tenant", "admin-tenant"]);
+  expect(invalidatedTenants).toEqual(["admin-tenant"]);
   expect(auditEvents.events.at(-1)?.payload).toMatchObject({
     policyEnforcementMode: "enforce",
-    invalidatedSessionIds: ["session-a", "session-b"]
+    invalidatedSessionIds: ["session-a"]
   });
 
   await app.close();
@@ -831,16 +847,14 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
-    runtimeAdapters: {
-      codex: {
-        async invalidateTenantRuntimes() {
-          throw new Error("codex refresh failed");
-        }
+    runtimeAdapter: {
+      async invalidateTenantRuntimes() {
+        throw new Error("runtime refresh failed");
       }
     } as never,
     tenantMembers: {
@@ -887,8 +901,8 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -941,8 +955,8 @@ test("admin routes require serverId when creating an MCP server", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -994,8 +1008,8 @@ test("admin routes return structured errors for referenced MCP disables", async 
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1047,8 +1061,8 @@ test("admin mutations surface AdminConfigError messages but keep internal errors
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1107,8 +1121,8 @@ test("admin routes import a skill bundle zip", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1180,8 +1194,8 @@ test("admin zip import returns 413 with a fixed message when the upload exceeds 
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1253,8 +1267,8 @@ test("admin zip import returns 400 (not 500) for a malformed zip upload", async 
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1317,8 +1331,8 @@ test("admin routes import a skill bundle from GitHub", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1369,8 +1383,8 @@ test("admin routes list and activate skill revisions", async () => {
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },
@@ -1428,8 +1442,8 @@ test("admin routes run skill revision cleanup and audit the result", async () =>
         return [];
       }
     },
-    codexRuntimeManager: {
-      async refreshIdleRuntimes() {
+    deepAgentsAdapter: {
+      async invalidateTenantRuntimes() {
         return [];
       }
     },

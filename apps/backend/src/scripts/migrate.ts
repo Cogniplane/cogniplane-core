@@ -5,6 +5,10 @@ import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
 
 import { applyMigrations } from "./migrate-lib.js";
+import {
+  DEEP_AGENTS_CHECKPOINT_SCHEMA,
+  setupDeepAgentsCheckpointer
+} from "../services/deep-agents/deep-agents-checkpointer.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const migrationsDir = path.resolve(dirname, "../../db/migrations");
@@ -59,6 +63,12 @@ function escapeAppUserPassword(password: string): string {
 async function run() {
   await applyMigrations(db, migrationsDir);
 
+  // Deep Agents checkpointer DDL (schema + tables + the library's internal
+  // migrations). Runs here — superuser, alongside the SQL migrations — so the
+  // backend never executes DDL at serve time. Idempotent by construction.
+  await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
+  console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
+
   // Ensure app_user exists with the correct password from DATABASE_URL. The
   // role may be absent if migrations were previously applied without it (the
   // old 19-migration sequence); this block is idempotent and safe to re-run.
@@ -88,6 +98,17 @@ async function run() {
       await client.query(`GRANT USAGE ON SCHEMA public TO app_user`);
       await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user`);
       await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user`);
+      // The runtime Deep Agents checkpointer connects as app_user; its tables
+      // live in a dedicated schema (created above, superuser-owned). No RLS
+      // here — tenant→thread ownership is enforced at the app layer (see
+      // services/deep-agents/deep-agents-checkpointer.ts).
+      await client.query(`GRANT USAGE ON SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`);
+      await client.query(
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`
+      );
+      await client.query(
+        `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`
+      );
     } finally {
       client.release();
     }

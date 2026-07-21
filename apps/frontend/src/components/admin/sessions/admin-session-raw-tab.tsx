@@ -6,10 +6,7 @@ import type { AdminSessionDetailMessage } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { formatTimestamp } from "../../../lib/time-format";
 import { PILL_GRAY, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
-
-function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 10)}…` : id;
-}
+import { shortId } from "../../../lib/admin-pii-utils";
 
 export function AdminSessionRawTab(props: { messages: AdminSessionDetailMessage[] }) {
   const [copied, setCopied] = useState(false);

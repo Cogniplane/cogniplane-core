@@ -9,8 +9,11 @@ const SECRET = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 
 type Row = {
   tenant_id: string;
-  openai_api_key_encrypted: string | null;
   anthropic_api_key_encrypted: string | null;
+  openai_api_key_encrypted: string | null;
+  google_api_key_encrypted: string | null;
+  openrouter_api_key_encrypted: string | null;
+  zai_api_key_encrypted: string | null;
   skill_marketplace_manifest_url: string | null;
   pii_protection: unknown;
   updated_at: string;
@@ -37,20 +40,15 @@ class FakeOrgSettingsDb {
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
 
-    if (text.startsWith("SELECT openai_api_key_encrypted")) {
+    // readEncryptedKey: `SELECT <column> AS value FROM ...` for any provider
+    // column.
+    const keyColMatch = /^SELECT (\w+_api_key_encrypted) AS value/.exec(text);
+    if (keyColMatch) {
+      const column = keyColMatch[1] as keyof Row;
       const tenantId = String(values[0]);
       const row = this.rows.get(tenantId);
       return {
-        rows: row ? [{ value: row.openai_api_key_encrypted }] : [],
-        rowCount: row ? 1 : 0
-      };
-    }
-
-    if (text.startsWith("SELECT anthropic_api_key_encrypted")) {
-      const tenantId = String(values[0]);
-      const row = this.rows.get(tenantId);
-      return {
-        rows: row ? [{ value: row.anthropic_api_key_encrypted }] : [],
+        rows: row ? [{ value: row[column] ?? null }] : [],
         rowCount: row ? 1 : 0
       };
     }
@@ -61,8 +59,11 @@ class FakeOrgSettingsDb {
       const existing = this.rows.get(tenantId);
       const next: Row = existing ?? {
         tenant_id: tenantId,
-        openai_api_key_encrypted: null,
         anthropic_api_key_encrypted: null,
+        openai_api_key_encrypted: null,
+        google_api_key_encrypted: null,
+        openrouter_api_key_encrypted: null,
+        zai_api_key_encrypted: null,
         skill_marketplace_manifest_url: null,
         pii_protection: null,
         updated_at: new Date().toISOString()
@@ -108,55 +109,66 @@ test("get returns defaults when no row exists", async () => {
   const { store } = makeStore();
   const record = await store.get("tenant-1");
   expect(record.tenantId).toBe("tenant-1");
-  expect(record.hasOpenaiApiKey).toBe(false);
   expect(record.hasAnthropicApiKey).toBe(false);
   expect(record.skillMarketplaceManifestUrl).toBe(null);
   expect(record.piiProtection).toEqual(DEFAULT_PII_PROTECTION);
 });
 
-test("setApiKeys encrypts before persisting and round-trips on read", async () => {
+test("setApiKey encrypts before persisting and round-trips on read", async () => {
   const { db, store } = makeStore();
-  await store.setApiKeys("tenant-1", {
-    openaiApiKey: "sk-openai-secret",
-    anthropicApiKey: "sk-ant-secret"
-  });
+  await store.setApiKey("tenant-1", "anthropic", "sk-ant-secret");
 
-  // Stored values are not the plaintext.
+  // Stored value is not the plaintext...
   const row = db.rows.get("tenant-1")!;
-  expect(row.openai_api_key_encrypted).not.toBe("sk-openai-secret");
   expect(row.anthropic_api_key_encrypted).not.toBe("sk-ant-secret");
   // ...but the encryption round-trips through the same secret.
-  expect(decrypt(row.openai_api_key_encrypted!, SECRET)).toBe("sk-openai-secret");
+  expect(decrypt(row.anthropic_api_key_encrypted!, SECRET)).toBe("sk-ant-secret");
 
-  // Public getters surface the original plaintext.
-  expect(await store.getDecryptedOpenaiApiKey("tenant-1")).toBe("sk-openai-secret");
-  expect(await store.getDecryptedAnthropicApiKey("tenant-1")).toBe("sk-ant-secret");
+  // Public getter surfaces the original plaintext.
+  expect(await store.getDecryptedApiKey("tenant-1", "anthropic")).toBe("sk-ant-secret");
 
   const record = await store.get("tenant-1");
-  expect(record.hasOpenaiApiKey).toBe(true);
   expect(record.hasAnthropicApiKey).toBe(true);
 });
 
-test("setApiKeys with explicit null clears the column", async () => {
+test("setApiKey persists per-provider keys independently and surfaces the presence map", async () => {
   const { store } = makeStore();
-  await store.setApiKeys("tenant-1", { openaiApiKey: "sk-original" });
-  expect(await store.getDecryptedOpenaiApiKey("tenant-1")).toBe("sk-original");
+  await store.setApiKey("tenant-1", "openai", "sk-openai");
+  await store.setApiKey("tenant-1", "openrouter", "sk-or-key");
 
-  await store.setApiKeys("tenant-1", { openaiApiKey: null });
-  expect(await store.getDecryptedOpenaiApiKey("tenant-1")).toBe(null);
+  expect(await store.getDecryptedApiKey("tenant-1", "openai")).toBe("sk-openai");
+  expect(await store.getDecryptedApiKey("tenant-1", "openrouter")).toBe("sk-or-key");
+  expect(await store.getDecryptedApiKey("tenant-1", "anthropic")).toBe(null);
+
+  const record = await store.get("tenant-1");
+  expect(record.providerKeys).toEqual({
+    anthropic: false,
+    openai: true,
+    google: false,
+    openrouter: true,
+    zai: false
+  });
+  // Legacy alias still tracks anthropic.
+  expect(record.hasAnthropicApiKey).toBe(false);
 });
 
-test("setApiKeys leaves untouched fields alone", async () => {
+test("setApiKey with null clears just that provider", async () => {
   const { store } = makeStore();
-  await store.setApiKeys("tenant-1", {
-    openaiApiKey: "sk-openai",
-    anthropicApiKey: "sk-anthropic"
-  });
+  await store.setApiKey("tenant-1", "google", "AIza-google");
+  await store.setApiKey("tenant-1", "anthropic", "sk-ant");
+  await store.setApiKey("tenant-1", "google", null);
 
-  // Update only openai; anthropic must not be cleared.
-  await store.setApiKeys("tenant-1", { openaiApiKey: "sk-openai-rotated" });
-  expect(await store.getDecryptedOpenaiApiKey("tenant-1")).toBe("sk-openai-rotated");
-  expect(await store.getDecryptedAnthropicApiKey("tenant-1")).toBe("sk-anthropic");
+  expect(await store.getDecryptedApiKey("tenant-1", "google")).toBe(null);
+  expect(await store.getDecryptedApiKey("tenant-1", "anthropic")).toBe("sk-ant");
+});
+
+test("setApiKey leaves untouched fields alone", async () => {
+  const { store } = makeStore();
+  await store.setApiKey("tenant-1", "anthropic", "sk-anthropic");
+
+  // A marketplace-url update must not clear the key.
+  await store.setMarketplaceUrl("tenant-1", "https://example.com/manifest.json");
+  expect(await store.getDecryptedApiKey("tenant-1", "anthropic")).toBe("sk-anthropic");
 });
 
 test("setMarketplaceUrl persists the value and a subsequent setPiiProtection does not clear it", async () => {

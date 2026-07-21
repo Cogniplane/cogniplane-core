@@ -51,6 +51,8 @@ export function buildPiiServices(input: {
         apiKey: config.PII_LLM_API_KEY,
         model: config.PII_LLM_MODEL,
         timeoutMs: config.PII_PROVIDER_TIMEOUT_MS,
+        wireFormat: config.PII_LLM_WIRE_FORMAT,
+        disableThinking: config.PII_LLM_DISABLE_THINKING,
         breaker: piiCircuitBreaker
       })
     : undefined;
@@ -89,6 +91,7 @@ export function buildPiiServices(input: {
     piiScanJobs: stores.piiScanJobs,
     messages: stores.messages,
     artifacts: stores.artifacts,
+    storage: artifactStorage,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
     logger
@@ -99,6 +102,7 @@ export function buildPiiServices(input: {
     piiScanRuns: stores.piiScanRuns,
     piiScanJobs: stores.piiScanJobs,
     artifacts: stores.artifacts,
+    storage: artifactStorage,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
     logger

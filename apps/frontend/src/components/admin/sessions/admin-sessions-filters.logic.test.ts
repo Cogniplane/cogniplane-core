@@ -66,12 +66,6 @@ describe("activeFilterChips", () => {
     expect(multi).toContain("Alerts: 2");
   });
 
-  test("renames runtime values to user-facing labels", () => {
-    const codex = activeFilterChips({ ...EMPTY_FILTER_STATE, runtime: "codex" });
-    expect(codex).toContain("Runtime: Codex");
-    const claude = activeFilterChips({ ...EMPTY_FILTER_STATE, runtime: "claude-code" });
-    expect(claude).toContain("Runtime: Claude Code");
-  });
 });
 
 describe("isoToDateInput / dateInputToIso", () => {
@@ -98,7 +92,6 @@ describe("filterStateToParams", () => {
       from: "2026-05-01T00:00:00Z",
       to: "2026-05-09T23:59:59Z",
       status: "active",
-      runtime: "codex",
       alert: ["pii-blocked", "errored"]
     });
     expect(params).toEqual({
@@ -106,7 +99,6 @@ describe("filterStateToParams", () => {
       from: "2026-05-01T00:00:00Z",
       to: "2026-05-09T23:59:59Z",
       status: "active",
-      runtime: "codex",
       alert: ["pii-blocked", "errored"]
     });
   });

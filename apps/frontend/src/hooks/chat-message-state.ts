@@ -15,6 +15,7 @@ export function buildOptimisticMessage(input: {
     status: input.status,
     content: input.content,
     reasoningContent: "",
+    reasoningSegments: null,
     planContent: "",
     toolResults: [],
     tokenUsage: null,

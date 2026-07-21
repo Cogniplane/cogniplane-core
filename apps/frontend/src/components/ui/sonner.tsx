@@ -1,3 +1,5 @@
+"use client"
+
 import {
   CircleCheckIcon,
   InfoIcon,
@@ -5,15 +7,41 @@ import {
   OctagonXIcon,
   TriangleAlertIcon,
 } from "lucide-react"
-import { useTheme } from "next-themes"
+import { useEffect, useState } from "react"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
 
+const readDocumentTheme = (): "light" | "dark" =>
+  typeof document !== "undefined" &&
+  document.documentElement.getAttribute("data-theme") === "dark"
+    ? "dark"
+    : "light"
+
+// The app tracks its theme via a `data-theme="dark"` attribute on <html>
+// (theme-toggle.tsx + theme-init.js + localStorage) rather than next-themes,
+// so read that attribute directly and follow toggles via a MutationObserver.
+function useDocumentTheme(): "light" | "dark" {
+  const [theme, setTheme] = useState<"light" | "dark">(readDocumentTheme)
+
+  useEffect(() => {
+    // Lazy init already read the mount value; the observer only needs to track
+    // subsequent toggles.
+    const observer = new MutationObserver(() => setTheme(readDocumentTheme()))
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    })
+    return () => observer.disconnect()
+  }, [])
+
+  return theme
+}
+
 const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme()
+  const theme = useDocumentTheme()
 
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
+      theme={theme}
       className="toaster group"
       icons={{
         success: <CircleCheckIcon className="size-4" />,

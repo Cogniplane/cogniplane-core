@@ -86,13 +86,9 @@ describe("tryAuthenticateRuntimeToken — path gating", () => {
 });
 
 describe("tryAuthenticateRuntimeToken — success populates request.auth", () => {
-  test.each([
-    ["/mcp/server-1"],
-    ["/llm/anthropic/v1/messages"],
-    ["/llm/openai/v1/responses"]
-  ])("Bearer rt_ token authenticates on %s", (url) => {
+  test("Bearer rt_ token authenticates on /mcp/", () => {
     const request = fakeRequest({
-      url,
+      url: "/mcp/server-1",
       headers: { authorization: `Bearer ${validToken()}` }
     });
 
@@ -132,7 +128,7 @@ describe("tryAuthenticateRuntimeToken — credential precedence", () => {
     const headerToken = validToken({ sid: "s", tid: "tenant-HEADER", uid: "u", rid: "r" });
     const otherToken = validToken({ sid: "s", tid: "tenant-OTHER", uid: "u", rid: "r" });
     const request = fakeRequest({
-      url: `/llm/anthropic/v1/messages?token=${otherToken}`,
+      url: `/mcp/server-1?token=${otherToken}`,
       headers: {
         authorization: `Bearer ${headerToken}`,
         "x-api-key": otherToken
@@ -142,36 +138,6 @@ describe("tryAuthenticateRuntimeToken — credential precedence", () => {
     expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
     // The header token's tenant must be the one that lands in auth.
     expect(request.auth?.tenantId).toBe("tenant-HEADER");
-  });
-
-  test("x-api-key rt_ is accepted for /llm/anthropic/", () => {
-    const request = fakeRequest({
-      url: "/llm/anthropic/v1/messages",
-      headers: { "x-api-key": validToken() }
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
-    expect(request.auth?.tenantId).toBe(CLAIMS.tid);
-  });
-
-  test("x-api-key as a string[] (multi-valued header) uses the first value for /llm/anthropic/", () => {
-    const request = fakeRequest({
-      url: "/llm/anthropic/v1/messages",
-      headers: { "x-api-key": [validToken(), "rt_decoy"] }
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
-    expect(request.auth?.userId).toBe(CLAIMS.uid);
-  });
-
-  test("x-api-key rt_ is IGNORED for /llm/openai/ (only Authorization/query honored there)", () => {
-    const request = fakeRequest({
-      url: "/llm/openai/v1/responses",
-      headers: { "x-api-key": validToken() }
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
-    expect(request.auth).toBeUndefined();
   });
 
   test("x-api-key rt_ is IGNORED for /mcp/ (only Authorization honored there)", () => {
@@ -205,12 +171,10 @@ describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
     expect(request.auth).toBeUndefined();
   });
 
-  test("x-api-key with an OpenAI-style sk- key is ignored on /llm/anthropic/", () => {
+  test("a non-runtime route returns false so normal auth continues", () => {
     const request = fakeRequest({
-      url: "/llm/anthropic/v1/messages",
-      // Non-rt_ placeholder: only the missing "rt_" prefix matters here. Kept
-      // low-entropy so secret scanners don't flag this fake fixture.
-      headers: { "x-api-key": "sk-not-a-real-key" }
+      url: "/messages",
+      headers: { authorization: `Bearer ${validToken()}` }
     });
 
     expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
@@ -269,12 +233,17 @@ describe("tryAuthenticateRuntimeToken — rejected tokens", () => {
       "a-completely-different-secret-at-least-32-chars!!"
     );
 
+    // Use the /mcp/ + Bearer path so the token actually reaches
+    // verifyRuntimeToken — this exercises signature rejection, not path gating.
     const request = fakeRequest({
-      url: "/llm/anthropic/v1/messages",
-      headers: { "x-api-key": foreign }
+      url: "/mcp/server-1",
+      headers: { authorization: `Bearer ${foreign}` }
     });
+    const warnSpy = vi.spyOn(request.log, "warn");
 
     expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
     expect(request.auth).toBeUndefined();
+    // Rejected at the verification step (invalid signature), which warns.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 });

@@ -17,8 +17,6 @@ export type GranularFlags = {
 };
 
 export type FormDraft = {
-  runtimeProvider: "codex" | "claude-code";
-  enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicyKind: ApprovalPolicyKind;
@@ -77,10 +75,6 @@ export function toApprovalPolicy(kind: ApprovalPolicyKind, flags: GranularFlags)
 
 export function buildDraft(settings: TenantSettings): FormDraft {
   return {
-    runtimeProvider: settings.runtimeProvider ?? "codex",
-    enabledRuntimeProviders: settings.enabledRuntimeProviders?.length
-      ? settings.enabledRuntimeProviders
-      : [settings.runtimeProvider ?? "codex"],
     showEffortSelector: settings.showEffortSelector ?? false,
     webSearchMode: settings.webSearchMode ?? "disabled",
     approvalPolicyKind: toApprovalPolicyKind(settings.approvalPolicy),
@@ -102,43 +96,6 @@ export function toggleInArray(values: string[], id: string, enabled: boolean): s
     return values.includes(id) ? values : [...values, id];
   }
   return values.filter((entry) => entry !== id);
-}
-
-/**
- * Compute the next state when the user toggles a runtime provider checkbox.
- * Keeps the default provider valid by falling back to the first remaining
- * enabled provider when the previous default is unchecked.
- */
-export function toggleRuntimeProviderInDraft(
-  current: FormDraft,
-  provider: "codex" | "claude-code",
-  enabled: boolean
-): FormDraft {
-  const nextEnabled = enabled
-    ? [...current.enabledRuntimeProviders, provider]
-    : current.enabledRuntimeProviders.filter((entry) => entry !== provider);
-  const deduped = Array.from(new Set(nextEnabled));
-  return {
-    ...current,
-    enabledRuntimeProviders: deduped,
-    runtimeProvider: deduped.includes(current.runtimeProvider)
-      ? current.runtimeProvider
-      : (deduped[0] ?? current.runtimeProvider)
-  };
-}
-
-/**
- * Order the enabled runtime providers so the chosen default sits at index 0.
- * The backend reads index 0 as the default; the form has an explicit default
- * select but persists it as ordering.
- */
-export function orderProvidersWithDefaultFirst(
-  enabled: Array<"codex" | "claude-code">,
-  preferredDefault: "codex" | "claude-code"
-): Array<"codex" | "claude-code"> {
-  if (enabled.length === 0) return enabled;
-  const defaultProvider = enabled.includes(preferredDefault) ? preferredDefault : enabled[0]!;
-  return [defaultProvider, ...enabled.filter((entry) => entry !== defaultProvider)];
 }
 
 /** Casual relative-time formatter for the "Updated …" pill. */

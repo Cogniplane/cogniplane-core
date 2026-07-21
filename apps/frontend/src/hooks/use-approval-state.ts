@@ -4,7 +4,7 @@ import { useCallback, useState } from "react";
 
 import { resolveApproval } from "../lib/session-api";
 import type { Approval } from "@cogniplane/shared-types";
-import type { ApprovalDecision, InFlightApprovalDecision } from "../components/timeline.logic";
+import type { ApprovalDecision, InFlightApprovalDecision } from "../components/chat-cards/chat-cards.types";
 
 // Approval expiry has no dedicated SSE event — the backend encodes it in the
 // noticeId of a `framework:runtime_notice` (native coordinator and Policy

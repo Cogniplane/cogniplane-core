@@ -7,17 +7,19 @@ import {
   deleteTenantMicrosoftConfig,
   getTenantDetails,
   saveTenantMicrosoftConfig,
-  updateTenantAnthropicKey,
-  updateTenantOpenAiKey,
+  updateTenantProviderKey,
   updateTenantPiiProtection
 } from "../lib/admin-api";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
-import type { PiiProtectionSettings } from "@cogniplane/shared-types";
+import type { ModelProvider, PiiProtectionSettings } from "@cogniplane/shared-types";
+import { MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 
+// Per-provider save keys are `save-<provider>-key` so they line up with
+// providerKeyBusyKey() in admin-organization-card.tsx.
+type ProviderMutationKey = `save-${ModelProvider}-key`;
 type MutationKey =
-  | "save-api-key"
-  | "save-anthropic-key"
+  | ProviderMutationKey
   | "microsoft-save"
   | "microsoft-remove"
   | "save-pii-protection";
@@ -75,25 +77,25 @@ export function useAdminOrganizationData() {
     error: mutationError ?? tenantLoadError,
     successMessage,
     successKey,
-    handleSaveApiKey: async (openaiApiKey: string) => {
-      await run(
-        { key: "save-api-key", successMessage: "OpenAI API key saved.", errorFallback: "Failed to save API key." },
-        async () => {
-          await updateTenantOpenAiKey({ openaiApiKey });
-          await invalidateTenant();
-        }
-      );
-    },
-    handleSaveAnthropicKey: async (anthropicApiKey: string) => {
+    handleSaveProviderKey: async (provider: ModelProvider, apiKey: string) => {
+      const label = MODEL_PROVIDER_META[provider].label;
+      // An empty key is the removal path (the backend clears the stored key).
+      const removing = apiKey.trim() === "";
       await run(
         {
-          key: "save-anthropic-key",
-          successMessage: "Anthropic API key saved.",
-          errorFallback: "Failed to save Anthropic API key."
+          key: `save-${provider}-key`,
+          successMessage: removing
+            ? `${label} API key removed.`
+            : `${label} API key saved.`,
+          errorFallback: removing
+            ? `Failed to remove ${label} API key.`
+            : `Failed to save ${label} API key.`
         },
         async () => {
-          await updateTenantAnthropicKey({ anthropicApiKey });
+          await updateTenantProviderKey({ provider, apiKey });
           await invalidateTenant();
+          // Key presence feeds the admin model catalog's key-source pills.
+          await queryClient.invalidateQueries({ queryKey: queryKeys.admin.modelCatalog() });
         }
       );
     },

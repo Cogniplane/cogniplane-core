@@ -17,7 +17,7 @@ function makeModel(overrides: Partial<Model> = {}): Model {
     displayName: "Model 1",
     description: "",
     isDefault: true,
-    provider: "codex",
+    provider: "anthropic",
     supportedEfforts: ["low", "medium", "high"],
     defaultEffort: "medium",
     contextWindow: 200_000,

@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactPiiDetail, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { MessagePiiDetail, MessageStore } from "../message-store.js";
@@ -32,6 +33,8 @@ export type PiiScanJobHandlerDeps = {
   piiScanJobs: PiiScanJobStore;
   messages: MessageStore;
   artifacts: ArtifactStore;
+  /** Deletes stored object bytes on a block so they don't persist. */
+  storage: Pick<ArtifactStorage, "delete">;
   subjectReader: PiiScanSubjectReader;
   auditEvents?: AuditEventStore;
   logger: FastifyBaseLogger;
@@ -151,6 +154,11 @@ export class PiiScanJobHandler {
     }
 
     if (decision.action === "block") {
+      // Purge stored bytes BEFORE the terminal status flip (same ordering as the
+      // sync enqueuer) so a `blocked` row never coexists with a silent orphan.
+      // Artifacts only — messages have no stored object.
+      const objectDeleted = await this.purgeBlockedObject(job);
+
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "blocked",
         actionTaken: "block",
@@ -173,7 +181,8 @@ export class PiiScanJobHandler {
         findingsCount: decision.findings.length,
         providerType: decision.providerType,
         providerModel: decision.providerModel,
-        blockReason: decision.blockReason
+        blockReason: decision.blockReason,
+        objectDeleted
       });
       return;
     }
@@ -205,9 +214,45 @@ export class PiiScanJobHandler {
     });
   }
 
+  /**
+   * Best-effort delete of an artifact's stored bytes on a block. Re-fetches the
+   * CURRENT backend + key via ArtifactStore.get rather than trusting the job's
+   * frozen payload: a re-upload/migration could have changed the key or backend,
+   * and a missing/already-deleted row means there's nothing to purge (idempotent
+   * re-run). Returns undefined for messages (no object) or when the row is gone,
+   * true on delete, false on a delete failure (escalated to a queryable audit).
+   */
+  private async purgeBlockedObject(job: PiiScanJobRecord): Promise<boolean | undefined> {
+    if (job.subjectType !== "artifact") return undefined;
+
+    const artifact = await this.deps.artifacts.get(job.tenantId, job.subjectId);
+    if (!artifact || artifact.status === "deleted") return undefined;
+
+    try {
+      await this.deps.storage.delete(artifact.storageKey);
+      return true;
+    } catch (error) {
+      this.deps.logger.error(
+        { err: error, tenantId: job.tenantId, artifactId: job.subjectId, jobId: job.jobId },
+        "Failed to delete stored object for PII-blocked artifact"
+      );
+      await this.emitAudit(job, "pii_block_object_orphaned", {
+        scanRunId: job.scanRunId,
+        subjectType: "artifact",
+        subjectId: job.subjectId,
+        storageKey: artifact.storageKey
+      });
+      return false;
+    }
+  }
+
   private async emitAudit(
     job: PiiScanJobRecord,
-    eventType: "pii_blocked" | "pii_transformed" | "pii_reported",
+    eventType:
+      | "pii_blocked"
+      | "pii_transformed"
+      | "pii_reported"
+      | "pii_block_object_orphaned",
     payload: Record<string, unknown>
   ): Promise<void> {
     if (!this.deps.auditEvents) return;

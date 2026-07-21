@@ -1,3 +1,6 @@
+import type { ModelProvider } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
+
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { decrypt, encrypt } from "../lib/crypto-utils.js";
 
@@ -7,10 +10,24 @@ import {
   type PiiProtectionSettings
 } from "./pii/pii-policy.js";
 
+/** Public provider id → its encrypted-key column on tenant_org_settings. */
+const PROVIDER_KEY_COLUMNS = {
+  anthropic: "anthropic_api_key_encrypted",
+  openai: "openai_api_key_encrypted",
+  google: "google_api_key_encrypted",
+  openrouter: "openrouter_api_key_encrypted",
+  zai: "zai_api_key_encrypted"
+} as const satisfies Record<ModelProvider, string>;
+
+type ProviderKeyColumn = (typeof PROVIDER_KEY_COLUMNS)[ModelProvider];
+
 export type TenantOrgSettingsRecord = {
   tenantId: string;
-  hasOpenaiApiKey: boolean;
+  /** Retained for callers that only care about Anthropic; equals
+   *  providerKeys.anthropic. */
   hasAnthropicApiKey: boolean;
+  /** Per-provider key-presence map (never the keys themselves). */
+  providerKeys: Record<ModelProvider, boolean>;
   skillMarketplaceManifestUrl: string | null;
   piiProtection: PiiProtectionSettings;
   updatedAt: string;
@@ -18,18 +35,36 @@ export type TenantOrgSettingsRecord = {
 
 type Row = {
   tenant_id: string;
-  openai_api_key_encrypted: string | null;
   anthropic_api_key_encrypted: string | null;
+  openai_api_key_encrypted: string | null;
+  google_api_key_encrypted: string | null;
+  openrouter_api_key_encrypted: string | null;
+  zai_api_key_encrypted: string | null;
   skill_marketplace_manifest_url: string | null;
   pii_protection: unknown;
   updated_at: string | Date;
 };
 
+function providerKeysFromRow(row: Row): Record<ModelProvider, boolean> {
+  const map = {} as Record<ModelProvider, boolean>;
+  for (const provider of MODEL_PROVIDERS) {
+    map[provider] = Boolean(row[PROVIDER_KEY_COLUMNS[provider]]);
+  }
+  return map;
+}
+
+function emptyProviderKeys(): Record<ModelProvider, boolean> {
+  const map = {} as Record<ModelProvider, boolean>;
+  for (const provider of MODEL_PROVIDERS) map[provider] = false;
+  return map;
+}
+
 function mapRow(row: Row): TenantOrgSettingsRecord {
+  const providerKeys = providerKeysFromRow(row);
   return {
     tenantId: row.tenant_id,
-    hasOpenaiApiKey: Boolean(row.openai_api_key_encrypted),
-    hasAnthropicApiKey: Boolean(row.anthropic_api_key_encrypted),
+    hasAnthropicApiKey: providerKeys.anthropic,
+    providerKeys,
     skillMarketplaceManifestUrl: row.skill_marketplace_manifest_url,
     piiProtection: row.pii_protection == null
       ? DEFAULT_PII_PROTECTION
@@ -40,8 +75,8 @@ function mapRow(row: Row): TenantOrgSettingsRecord {
 
 const EMPTY_RECORD = (tenantId: string): TenantOrgSettingsRecord => ({
   tenantId,
-  hasOpenaiApiKey: false,
   hasAnthropicApiKey: false,
+  providerKeys: emptyProviderKeys(),
   skillMarketplaceManifestUrl: null,
   piiProtection: DEFAULT_PII_PROTECTION,
   updatedAt: new Date(0).toISOString()
@@ -53,7 +88,9 @@ export class TenantOrgSettingsStore {
   async get(tenantId: string): Promise<TenantOrgSettingsRecord> {
     const result = await withTenantScope(this.db, tenantId, (client) =>
       client.query<Row>(
-        `SELECT tenant_id, openai_api_key_encrypted, anthropic_api_key_encrypted,
+        `SELECT tenant_id, anthropic_api_key_encrypted, openai_api_key_encrypted,
+                google_api_key_encrypted, openrouter_api_key_encrypted,
+                zai_api_key_encrypted,
                 skill_marketplace_manifest_url, pii_protection, updated_at
          FROM tenant_org_settings WHERE tenant_id = $1 LIMIT 1`,
         [tenantId]
@@ -62,32 +99,20 @@ export class TenantOrgSettingsStore {
     return result.rows[0] ? mapRow(result.rows[0]) : EMPTY_RECORD(tenantId);
   }
 
-  async getDecryptedOpenaiApiKey(tenantId: string): Promise<string | null> {
-    const encrypted = await this.readEncryptedKey(tenantId, "openai_api_key_encrypted");
+  /** Decrypted tenant key for a specific provider (null if unset). */
+  async getDecryptedApiKey(tenantId: string, provider: ModelProvider): Promise<string | null> {
+    const encrypted = await this.readEncryptedKey(tenantId, PROVIDER_KEY_COLUMNS[provider]);
     return encrypted ? decrypt(encrypted, this.secret) : null;
   }
 
-  async getDecryptedAnthropicApiKey(tenantId: string): Promise<string | null> {
-    const encrypted = await this.readEncryptedKey(tenantId, "anthropic_api_key_encrypted");
-    return encrypted ? decrypt(encrypted, this.secret) : null;
-  }
-
-  async setApiKeys(
-    tenantId: string,
-    input: { openaiApiKey?: string | null; anthropicApiKey?: string | null }
-  ): Promise<void> {
-    const updates: string[] = [];
-    const values: unknown[] = [tenantId];
-    if (input.openaiApiKey !== undefined) {
-      updates.push(`openai_api_key_encrypted = $${values.length + 1}`);
-      values.push(input.openaiApiKey ? encrypt(input.openaiApiKey, this.secret) : null);
-    }
-    if (input.anthropicApiKey !== undefined) {
-      updates.push(`anthropic_api_key_encrypted = $${values.length + 1}`);
-      values.push(input.anthropicApiKey ? encrypt(input.anthropicApiKey, this.secret) : null);
-    }
-    if (updates.length === 0) return;
-    await this.upsert(tenantId, updates, values);
+  /** Set (or clear, when null) one provider's API key. */
+  async setApiKey(tenantId: string, provider: ModelProvider, apiKey: string | null): Promise<void> {
+    const column = PROVIDER_KEY_COLUMNS[provider];
+    await this.upsert(
+      tenantId,
+      [`${column} = $2`],
+      [tenantId, apiKey ? encrypt(apiKey, this.secret) : null]
+    );
   }
 
   async setMarketplaceUrl(tenantId: string, url: string | null): Promise<void> {
@@ -100,7 +125,7 @@ export class TenantOrgSettingsStore {
 
   private async readEncryptedKey(
     tenantId: string,
-    column: "openai_api_key_encrypted" | "anthropic_api_key_encrypted"
+    column: ProviderKeyColumn
   ): Promise<string | null> {
     const result = await withTenantScope(this.db, tenantId, (client) =>
       client.query<{ value: string | null }>(

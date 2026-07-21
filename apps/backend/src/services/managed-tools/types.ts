@@ -12,6 +12,17 @@ export type ManagedToolDefinition = {
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   handler: ManagedToolHandler;
+  /**
+   * Domain the tool belongs to (e.g. "github", "notion", "session"), stamped by
+   * the factory registry from the factory's registration key. Used as the
+   * Policy Center `category` so a `categories` rule matches the tool's TRUE
+   * domain regardless of which managed-server URL the call arrived through —
+   * otherwise a caller could route `github_write_file` via a different enabled
+   * managed server's URL to dodge a github-scoped rule. Populated by
+   * ManagedToolFactoryRegistry.createDefinitions; absent only for tools built
+   * outside the registry (tests).
+   */
+  category?: string;
 };
 
 // ── Schema primitives ─────────────────────────────────────────────────────────

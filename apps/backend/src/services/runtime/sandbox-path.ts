@@ -3,8 +3,8 @@ import path from "node:path";
 /**
  * Resolve `filePath` against a posix sandbox workspace and reject anything that
  * escapes the root — prevents path-traversal into host paths shared by the
- * sandbox. Shared by the Codex and Claude runtime adapters so there is one
- * security-critical traversal guard, not two.
+ * sandbox. Shared by every sandbox-path consumer (today: the deep-agents E2B
+ * backend) so there is one security-critical traversal guard, not several.
  *
  * POSIX semantics regardless of the backend's OS (sandbox paths are always
  * Linux). `path.posix.resolve` treats an absolute `filePath` as a reset, so

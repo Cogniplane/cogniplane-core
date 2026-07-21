@@ -26,7 +26,13 @@ function buildDeps(overrides: {
   const completedCalls: Array<{ tenantId: string; jobId: string }> = [];
   const failureCalls: Array<{ tenantId: string; jobId: string; error: string; permanent: boolean }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
+  const deleteCalls: string[] = [];
   let failureReturn: { status: "queued" | "failed" } | null = { status: "queued" };
+  // Artifact row the handler re-fetches to find the current storage key. Tests
+  // override `artifactGet` to model a missing/deleted row or a diverging key.
+  let artifactGet: (() => { storageBackend: "local" | "bucket"; storageKey: string; status: string } | null) =
+    () => ({ storageBackend: "local", storageKey: "users/user-1/session-1/art-1.txt", status: "ready" });
+  let storageDeleteThrows: Error | null = null;
 
   const piiProtection = {
     async evaluateText() {
@@ -107,6 +113,15 @@ function buildDeps(overrides: {
       artifacts: {
         async setPiiDetail(tenantId: string, artifactId: string, pii: Record<string, unknown>) {
           artifactPiiCalls.push({ tenantId, artifactId, pii });
+        },
+        async get() {
+          return artifactGet();
+        }
+      },
+      storage: {
+        async delete(storageKey: string) {
+          if (storageDeleteThrows) throw storageDeleteThrows;
+          deleteCalls.push(storageKey);
         }
       },
       subjectReader: reader,
@@ -127,8 +142,15 @@ function buildDeps(overrides: {
     completedCalls,
     failureCalls,
     auditCalls,
+    deleteCalls,
     setFailureReturn: (value: { status: "queued" | "failed" } | null) => {
       failureReturn = value;
+    },
+    setArtifactGet: (value: typeof artifactGet) => {
+      artifactGet = value;
+    },
+    setStorageDeleteThrows: (value: Error | null) => {
+      storageDeleteThrows = value;
     }
   };
 }
@@ -290,6 +312,58 @@ test("PiiScanJobHandler emits pii_blocked audit event for block decisions", asyn
   expect(auditCalls[0].type).toBe("pii_blocked");
   const payload = auditCalls[0].payload as Record<string, unknown>;
   expect(payload.blockReason).toBe("email");
+  expect(payload.objectDeleted).toBe(true);
+});
+
+const blockDecision = {
+  action: "block" as const,
+  findings: [],
+  providerType: "openai-compatible",
+  providerModel: "m",
+  blockReason: "email"
+};
+
+test("PiiScanJobHandler deletes the CURRENT stored key on block (re-fetch, not payload)", async () => {
+  const { deps, deleteCalls, setArtifactGet } = buildDeps({ decision: blockDecision });
+  // The row's current key differs from what the job payload froze at enqueue —
+  // the store's key must win.
+  setArtifactGet(() => ({ storageBackend: "bucket", storageKey: "current/rotated-key.txt", status: "ready" }));
+  const handler = new PiiScanJobHandler(deps);
+  await handler.execute(sampleJob({ payload: { subjectKind: "upload", storageKey: "stale/old-key.txt" } }));
+  expect(deleteCalls).toEqual(["current/rotated-key.txt"]);
+});
+
+test("PiiScanJobHandler skips delete when the artifact row is missing (idempotent re-run)", async () => {
+  const { deps, deleteCalls, setArtifactGet } = buildDeps({ decision: blockDecision });
+  setArtifactGet(() => null);
+  const handler = new PiiScanJobHandler(deps);
+  await handler.execute(sampleJob());
+  expect(deleteCalls).toEqual([]);
+});
+
+test("PiiScanJobHandler does not delete an object for a message block", async () => {
+  const { deps, deleteCalls } = buildDeps({ decision: blockDecision });
+  const handler = new PiiScanJobHandler(deps);
+  await handler.execute(sampleJob({ subjectType: "message", subjectId: "msg-1" }));
+  expect(deleteCalls).toEqual([]);
+});
+
+test("PiiScanJobHandler blocks anyway and audits the orphan when delete fails", async () => {
+  const { deps, auditCalls, updateCalls, setStorageDeleteThrows } = buildDeps({
+    decision: blockDecision,
+    withAuditEvents: true
+  });
+  setStorageDeleteThrows(new Error("s3 down"));
+  const handler = new PiiScanJobHandler(deps);
+  await handler.execute(sampleJob());
+
+  // The block still lands: scan run flipped to blocked.
+  expect(updateCalls.some((c) => c.patch.status === "blocked")).toBe(true);
+  // The orphan is queryable, and the pii_blocked payload records objectDeleted:false.
+  const orphan = auditCalls.find((a) => a.type === "pii_block_object_orphaned");
+  expect(orphan).toBeTruthy();
+  const blocked = auditCalls.find((a) => a.type === "pii_blocked");
+  expect((blocked!.payload as Record<string, unknown>).objectDeleted).toBe(false);
 });
 
 test("PiiScanJobHandler skips audit emission when sourceUserId is null", async () => {

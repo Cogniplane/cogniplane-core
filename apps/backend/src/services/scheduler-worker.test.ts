@@ -20,7 +20,6 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
     runtimePolicy: {
       id: "default-profile",
       label: "Default",
-      runtimeProvider: "codex" as const,
       approvalPolicy: "never",
       sandboxMode: "workspace-write",
       networkMode: "restricted",
@@ -99,7 +98,7 @@ function createFakeDeps(options?: {
     session: RuntimeSessionRef,
     input: { prompt: string }
   ) => AsyncIterable<RuntimeEvent>;
-  /** Token usage the LLM proxy is pretended to have persisted on the assistant row. */
+  /** Token usage the runtime adapter is pretended to have persisted on the assistant row. */
   assistantTokenUsage?: { inputTokens: number; outputTokens: number };
   /** Override per-tenant runtime resolution (e.g. to fail it or to hand back
    * a different adapter per tenant). Defaults to resolving the shared fake
@@ -129,7 +128,7 @@ function createFakeDeps(options?: {
   let claimIndex = 0;
   let runtimeCallIndex = 0;
 
-  const sessionsCreated: Array<{ userId: string; sessionName: string }> = [];
+  const sessionsCreated: Array<{ userId: string; sessionName: string; options?: { purpose?: string } }> = [];
   const claimsCalled: Array<{ tenantId: string; jobId: string; nextRunAt: string | null }> = [];
   const jobRunsCreated: Array<{ runId: string; jobId: string; userId: string; sessionId: string | null }> = [];
   const jobRunsCompleted: Array<{
@@ -180,7 +179,7 @@ function createFakeDeps(options?: {
   // The adapter `resolveRuntime` hands back by default — what the worker
   // dispatches createSession/runMessage/abortSession to after resolution.
   const runtimeAdapter = {
-    id: "codex",
+    id: "deep-agents",
     hasActiveTurn: () => false,
     createSession: async (input) => {
       runtimeSessionsCreated.push(input);
@@ -264,8 +263,13 @@ function createFakeDeps(options?: {
       }
     },
     sessions: {
-      create: async (_tenantId: string, userId: string, sessionName: string): Promise<SessionRecord> => {
-        sessionsCreated.push({ userId, sessionName });
+      create: async (
+        _tenantId: string,
+        userId: string,
+        sessionName: string,
+        options?: { purpose?: string }
+      ): Promise<SessionRecord> => {
+        sessionsCreated.push({ userId, sessionName, options });
         const sessionId = `session-${sessionsCreated.length}`;
         return {
           sessionId,
@@ -342,8 +346,7 @@ function createFakeDeps(options?: {
       return {
         kind: "ok",
         adapter: runtimeAdapter,
-        provider: "codex",
-        modelId: "codex-default-model"
+        modelId: "default-model"
       };
     },
     auditEvents: {
@@ -407,6 +410,9 @@ describe("SchedulerWorker", () => {
     expect(sessionsCreated.length).toBe(1);
     expect(sessionsCreated[0].sessionName).toBe("[Scheduled] Daily report");
     expect(sessionsCreated[0].userId).toBe("user-1");
+    // The session is stamped purpose:'scheduled' (drives chat-sidebar filtering +
+    // corpus exclusion) — a dropped 4th arg would silently create a normal session.
+    expect(sessionsCreated[0].options?.purpose).toBe("scheduled");
 
     expect(jobRunsCreated.length).toBe(1);
     expect(jobRunsCreated[0].jobId).toBe("job-1");
@@ -437,8 +443,8 @@ describe("SchedulerWorker", () => {
     // the adapter `resolveRuntime` picks for its tenant (the same resolution
     // the interactive /messages path performs).
     const jobs = [
-      makeFakeJob({ jobId: "job-codex", tenantId: "tenant-codex" }),
-      makeFakeJob({ jobId: "job-claude", tenantId: "tenant-claude" })
+      makeFakeJob({ jobId: "job-a", tenantId: "tenant-a" }),
+      makeFakeJob({ jobId: "job-b", tenantId: "tenant-b" })
     ];
 
     const completedEvents: RuntimeEvent[] = [
@@ -461,24 +467,24 @@ describe("SchedulerWorker", () => {
         abortSession: async () => {}
       }) as unknown as RuntimeAdapter;
 
-    const codexCalls: string[] = [];
-    const claudeCalls: string[] = [];
-    const codexAdapter = makeAdapter("codex", codexCalls);
-    const claudeAdapter = makeAdapter("claude-code", claudeCalls);
+    const callsA: string[] = [];
+    const callsB: string[] = [];
+    const adapterA = makeAdapter("deep-agents", callsA);
+    const adapterB = makeAdapter("deep-agents", callsB);
 
     const { deps, resolveRuntimeCalls, jobRunsCompleted } = createFakeDeps({
       dueJobs: jobs,
       resolveRuntimeImpl: async (tenantId) =>
-        tenantId === "tenant-claude"
-          ? { kind: "ok", adapter: claudeAdapter, provider: "claude-code", modelId: "claude-model" }
-          : { kind: "ok", adapter: codexAdapter, provider: "codex", modelId: "codex-model" }
+        tenantId === "tenant-b"
+          ? { kind: "ok", adapter: adapterB, modelId: "model-b" }
+          : { kind: "ok", adapter: adapterA, modelId: "model-a" }
     });
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
     await worker.tick();
 
-    expect(resolveRuntimeCalls.sort()).toEqual(["tenant-claude", "tenant-codex"]);
-    expect(codexCalls.length).toBe(1);
-    expect(claudeCalls.length).toBe(1);
+    expect(resolveRuntimeCalls.sort()).toEqual(["tenant-a", "tenant-b"]);
+    expect(callsA.length).toBe(1);
+    expect(callsB.length).toBe(1);
     expect(jobRunsCompleted.length).toBe(2);
     expect(jobRunsCompleted.every((run) => run.status === "completed")).toBe(true);
   });
@@ -490,7 +496,7 @@ describe("SchedulerWorker", () => {
     await worker.tick();
 
     expect(runMessageCalls.length).toBe(1);
-    expect(runMessageCalls[0].model).toBe("codex-default-model");
+    expect(runMessageCalls[0].model).toBe("default-model");
   });
 
   test("tick records a failed run when runtime resolution fails, without touching any runtime", async () => {
@@ -500,7 +506,7 @@ describe("SchedulerWorker", () => {
         dueJobs: [job],
         resolveRuntimeImpl: async () => ({
           kind: "error",
-          message: "The Claude Code runtime adapter is not available on this server."
+          message: "The runtime adapter is not available on this server."
         })
       });
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
@@ -510,7 +516,7 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCreated.length).toBe(1);
     expect(jobRunsCompleted.length).toBe(1);
     expect(jobRunsCompleted[0].status).toBe("failed");
-    expect(jobRunsCompleted[0].errorMessage).toMatch(/Claude Code runtime adapter is not available/);
+    expect(jobRunsCompleted[0].errorMessage).toMatch(/runtime adapter is not available/);
 
     // No runtime session, no message rows (resolution happens before them),
     // and the poison counter sees a failure.
@@ -720,8 +726,10 @@ describe("SchedulerWorker", () => {
     await worker.tick();
 
     expect(sweepStaleJobRunsCalls.length).toBe(1);
-    // 60_000 (timeout) + 5_000 (grace) + 60_000 (buffer)
-    expect(sweepStaleJobRunsCalls[0].olderThanMs).toBe(125_000);
+    // The sweep cutoff must exceed timeout + grace so an in-flight (not-yet-stale)
+    // run is never swept — the exact buffer value can be retuned without breaking
+    // this invariant. (jobTimeoutMs 60_000 + abortSettleGraceMs 5_000.)
+    expect(sweepStaleJobRunsCalls[0].olderThanMs).toBeGreaterThan(60_000 + 5_000);
 
     const orphanAudit = auditEvents.find(
       (e) => e.type === "scheduler.job.run.failed" && e.payload.reason === "orphaned_on_sweep"

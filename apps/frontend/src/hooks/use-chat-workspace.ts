@@ -3,33 +3,25 @@
 import { useEffect } from "react";
 
 import { useApprovalState } from "./use-approval-state";
-import { useChatMessageStreaming } from "./use-chat-message-streaming";
 import { useSessionData } from "./use-session-data";
 import { useWorkspaceArtifacts } from "./use-workspace-artifacts";
 
 export function useChatWorkspace(input: {
   selectedSessionId: string | null;
   onError: (message: string) => void;
-  model: string;
-  effort?: import("@cogniplane/shared-types").EffortLevel;
 }) {
-  const { selectedSessionId, onError, model, effort } = input;
+  const { selectedSessionId, onError } = input;
 
-  const {
-    pendingApprovals,
-    approvalDecision,
-    replacePendingApprovals,
-    registerPendingApproval,
-    removePendingApproval,
-    handleApprovalDecision
-  } = useApprovalState({ onError });
+  // Live approvals now come from the AG-UI stream (useAguiCustomEvents inside
+  // CopilotChatHost); this REST snapshot only seeds pendingApprovals at load and
+  // on refresh for cross-session attention. replacePendingApprovals is the only
+  // mutator still wired (via useSessionData).
+  const { pendingApprovals, replacePendingApprovals } = useApprovalState({ onError });
 
   const {
     messages,
-    setMessages,
     artifacts,
     refreshSessionData,
-    invalidateInFlightSessionRefreshes,
     isSessionDataReady
   } = useSessionData({
     selectedSessionId,
@@ -44,19 +36,6 @@ export function useChatWorkspace(input: {
     refreshSessionData
   });
 
-  const { isSending, streamingSessionId, sendMessage, stopStreaming, retryLastMessage, mcpServerErrors, dismissMcpServerError, runtimeNotices } = useChatMessageStreaming({
-    selectedSessionId,
-    visibleSelectedArtifactIds: artifactState.visibleSelectedArtifactIds,
-    onError,
-    setMessages,
-    registerPendingApproval,
-    removePendingApproval,
-    refreshSessionData,
-    invalidateInFlightSessionRefreshes,
-    model,
-    effort
-  });
-
   const { resetSelection } = artifactState;
 
   useEffect(() => {
@@ -67,17 +46,7 @@ export function useChatWorkspace(input: {
     messages,
     artifacts,
     pendingApprovals,
-    approvalDecision,
-    handleApprovalDecision,
     artifactState,
-    isSending,
-    streamingSessionId,
-    sendMessage,
-    stopStreaming,
-    retryLastMessage,
-    mcpServerErrors,
-    dismissMcpServerError,
-    runtimeNotices,
     refreshSessionData,
     isSessionDataReady
   };

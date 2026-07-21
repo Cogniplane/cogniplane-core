@@ -7,9 +7,11 @@ import { ActivationTracker } from "./activation-tracker.js";
 import { AuditEventStore } from "./audit-event-store.js";
 import { PlatformEventStore } from "./platform-event-store.js";
 import { TenantSettingsStore } from "./tenant-settings-store.js";
+import { CustomModelStore } from "./custom-model-store.js";
 import { GithubConnectionStore } from "./integrations/github/github-connection-store.js";
 import { IntegrationStateStore } from "./integrations/integration-state-store.js";
 import { NotionConnectionStore } from "./integrations/notion/notion-connection-store.js";
+import { MemoryStore } from "./memory-store.js";
 import { MessageStore } from "./message-store.js";
 import { McpServerStore } from "./mcp-server-store.js";
 import { PiiAnalyticsStore } from "./pii/pii-analytics-store.js";
@@ -19,7 +21,6 @@ import { PolicyRuleStore } from "./policy/policy-rule-store.js";
 import { PolicyDecisionStore } from "./policy/policy-decision-store.js";
 import { ActiveTurnsRegistry } from "./active-turns-registry.js";
 import { RuntimeSessionStore } from "./runtime/runtime-session-store.js";
-import { SessionRuntimeOverrideStore } from "./session-runtime-override-store.js";
 import { SessionStore } from "./session-store.js";
 import { SkillConfigStore } from "./skills/skill-config-store.js";
 import { SkillRevisionStore } from "./skills/skill-revision-store.js";
@@ -31,6 +32,7 @@ import { UserSettingsStore } from "./user-settings-store.js";
 export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, logger: FastifyBaseLogger) {
   const sessions = new SessionStore(db);
   const messages = new MessageStore(db);
+  const memories = new MemoryStore(db);
   const activeTurns = new ActiveTurnsRegistry();
   const artifacts = new ArtifactStore(db, privilegedDb);
   const piiScanRuns = new PiiScanRunStore(db);
@@ -41,7 +43,7 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
   const skillRevisions = new SkillRevisionStore(db, skills);
   const mcpServers = new McpServerStore(db);
   const tenantSettings = new TenantSettingsStore(db);
-  const sessionRuntimeOverrides = new SessionRuntimeOverrideStore(db);
+  const customModels = new CustomModelStore(db);
   const userSettings = new UserSettingsStore(db, schedulerDb);
   const tenantMembers = new TenantMemberStore(db);
   const githubConnections = new GithubConnectionStore(db);
@@ -59,6 +61,7 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
   return {
     sessions,
     messages,
+    memories,
     activeTurns,
     artifacts,
     piiScanRuns,
@@ -69,7 +72,7 @@ export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, log
     skillRevisions,
     mcpServers,
     tenantSettings,
-    sessionRuntimeOverrides,
+    customModels,
     userSettings,
     tenantMembers,
     githubConnections,

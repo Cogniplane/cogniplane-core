@@ -1,6 +1,9 @@
 import type { FastifyBaseLogger } from "fastify";
 
+import type { ModelProvider } from "@cogniplane/shared-types";
+
 import type { AppConfig } from "../config.js";
+import { buildProviderCredentials } from "./runtime/provider-credentials.js";
 import type { Pool } from "../lib/db.js";
 import { getRedis } from "../lib/redis.js";
 import { ArtifactProcessor } from "./artifacts/artifact-processor.js";
@@ -39,8 +42,7 @@ export function buildBootstrapServices(input: {
       skills: stores.skills,
       skillRevisions: stores.skillRevisions,
       mcpServers: stores.mcpServers,
-      tenantSettings: stores.tenantSettings,
-      sessionRuntimeOverrides: stores.sessionRuntimeOverrides
+      tenantSettings: stores.tenantSettings
     },
     skillBundleStorage,
     managedToolCatalog
@@ -74,9 +76,18 @@ export function buildBootstrapServices(input: {
   );
 
   const getTenantAnthropicApiKey = (tenantId: string): Promise<string | null> =>
-    tenantOrgSettingsPrivileged.getDecryptedAnthropicApiKey(tenantId);
-  const getTenantOpenaiApiKey = (tenantId: string): Promise<string | null> =>
-    tenantOrgSettingsPrivileged.getDecryptedOpenaiApiKey(tenantId);
+    tenantOrgSettingsPrivileged.getDecryptedApiKey(tenantId, "anthropic");
+  // Provider-aware tenant key lookup (privileged — bypasses RLS like the
+  // Anthropic-only lookup above). Feeds the ProviderCredentials resolver used
+  // by the runtime and the presence checkers.
+  const getTenantProviderKey = (
+    tenantId: string,
+    provider: ModelProvider
+  ): Promise<string | null> => tenantOrgSettingsPrivileged.getDecryptedApiKey(tenantId, provider);
+  const providerCredentials = buildProviderCredentials({
+    config,
+    getTenantProviderKey
+  });
 
   return {
     skillBundleStorage,
@@ -89,7 +100,8 @@ export function buildBootstrapServices(input: {
     tenantOrgSettings,
     tenantOrgSettingsPrivileged,
     getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey
+    getTenantProviderKey,
+    providerCredentials
   };
 }
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import dynamic from "next/dynamic";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -18,10 +19,17 @@ import { SessionSidebar } from "./session-sidebar";
 import { ArtifactPanel } from "./artifact-panel";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { FileSourcePicker } from "./file-source-picker";
-import { McpServerErrorBanner } from "./mcp-server-error-banner";
-import { MessageList } from "./message-list";
-import { Composer } from "./composer";
 import { WorkspaceHeader } from "./workspace-header";
+
+// CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
+// live HttpAgent in the browser — it never needs to server-render). Loading it
+// statically pulls the entire CopilotKit tree into the OpenNext server bundle,
+// which blew past Cloudflare's Worker size limit. `ssr: false` keeps it in the
+// client chunks (served as CF assets, not counted against the Worker size).
+const CopilotChatHost = dynamic(
+  () => import("./copilot-chat-host").then((m) => m.CopilotChatHost),
+  { ssr: false }
+);
 import {
   ARTIFACT_PANE_WIDTH,
   clampArtifactPaneWidth,
@@ -30,10 +38,11 @@ import {
   deriveStreamingSessionIds,
   formatSessionForClipboard,
   latestContextTokens,
-  messagesContainHistory,
-  modelFallbackForProvider,
+  planStateFromMessages,
   readStoredArtifactPaneWidth,
-  sortDisplayModels
+  sessionCostUsd,
+  toAguiInitialMessages,
+  toolStatusesFromMessages
 } from "./chat-shell.logic";
 
 export function ChatShell() {
@@ -50,26 +59,61 @@ export function ChatShell() {
   // Fall back to the same defaults the four useStates used before so first-paint
   // (pre-fetch) and post-fetch shapes stay identical for the downstream effects.
   const allModels = modelsQuery.data?.models ?? [];
-  const enabledRuntimeProviders = modelsQuery.data?.enabledRuntimeProviders ?? ["codex"];
-  const defaultRuntimeProvider = modelsQuery.data?.defaultRuntimeProvider ?? "codex";
   const showEffortSelector = modelsQuery.data?.showEffortSelector ?? false;
+  // An empty models list after a successful fetch means no provider key is
+  // configured — render the "configure a model provider key" empty state.
   const noProvidersAvailable =
-    Boolean(user) && !modelsQuery.isLoading && enabledRuntimeProviders.length === 0;
+    Boolean(user) && modelsQuery.data !== undefined && allModels.length === 0;
   const [isArtifactPaneOpen, setIsArtifactPaneOpen] = useState(true);
   const [activeFileSourceId, setActiveFileSourceId] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [artifactPaneWidth, setArtifactPaneWidth] = useState<number>(ARTIFACT_PANE_WIDTH.default);
+  // Grid-column transitions ease the pane open/closed, but the same transition
+  // would rubber-band live drag-resizing — suppress it while a drag is active.
+  const [isResizingPane, setIsResizingPane] = useState(false);
+  // Live signals lifted from CopilotChatHost (the AG-UI stream) for the active
+  // session — the shell renders the sidebar/header but the running/approval
+  // state lives inside the host's agent subscription.
+  const [liveIsRunning, setLiveIsRunning] = useState(false);
+  const [liveApprovalCount, setLiveApprovalCount] = useState(0);
 
-  const displayModels = sortDisplayModels(allModels, enabledRuntimeProviders, defaultRuntimeProvider);
-  const fallbackModels = displayModels.length > 0 ? displayModels : allModels;
+  const selectSession = useCallback(
+    (sessionId: string) => {
+      sessionList.selectSession(sessionId);
+      if (window.matchMedia("(max-width: 767px)").matches) setIsSidebarOpen(false);
+    },
+    [sessionList]
+  );
 
-  const { model, setModel } = useModelPreference(fallbackModels);
-  const selectedProvider = displayModels.find((entry) => entry.id === model)?.provider
-    ?? fallbackModels.find((entry) => entry.id === model)?.provider
-    ?? defaultRuntimeProvider;
-  const selectedModel = displayModels.find((entry) => entry.id === model)
-    ?? fallbackModels.find((entry) => entry.id === model)
-    ?? null;
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const applyMobileLayout = (isMobile: boolean) => {
+      if (isMobile) {
+        setIsSidebarOpen(false);
+        setIsArtifactPaneOpen(false);
+      }
+    };
+    applyMobileLayout(media.matches);
+    const onChange = (event: MediaQueryListEvent) => applyMobileLayout(event.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    if (!isSidebarOpen && !isArtifactPaneOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (window.matchMedia("(max-width: 767px)").matches) {
+        setIsSidebarOpen(false);
+        setIsArtifactPaneOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isArtifactPaneOpen, isSidebarOpen]);
+
+  const { model, setModel } = useModelPreference(allModels);
+  const selectedModel = allModels.find((entry) => entry.id === model) ?? null;
   const { effort, setEffort } = useEffortPreference(
     selectedModel,
     showEffortSelector,
@@ -101,16 +145,9 @@ export function ChatShell() {
     setSessionListError(`Could not load the model list: ${reason}`);
   }, [modelsQuery.error, setSessionListError]);
 
-  const onError = useCallback(
-    (message: string) => setSessionListError(message),
-    [setSessionListError]
-  );
-
   const chatWorkspace = useChatWorkspace({
     selectedSessionId: sessionList.selectedSessionId,
-    model,
-    effort: effort ?? undefined,
-    onError
+    onError: setSessionListError
   });
 
   const { messages } = chatWorkspace;
@@ -128,11 +165,16 @@ export function ChatShell() {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveFileSourceId(null);
     }
+    // The host remounts per session (keyed), but its mount won't push these back
+    // to zero — clear the lifted live signals so a prior session's running /
+    // approval state doesn't bleed into the newly selected one.
+    setLiveIsRunning(false);
+    setLiveApprovalCount(0);
   }, [sessionList.selectedSessionId]);
 
   const fileSources = useFileSources({
     selectedSessionId: sessionList.selectedSessionId,
-    onError,
+    onError: setSessionListError,
     onRefreshArtifacts: async () => {
       if (!sessionList.selectedSessionId) return;
       await chatWorkspace.refreshSessionData(sessionList.selectedSessionId);
@@ -150,61 +192,124 @@ export function ChatShell() {
     };
 
     const handlePointerUp = () => {
+      setIsResizingPane(false);
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
 
+    setIsResizingPane(true);
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp, { once: true });
     event.currentTarget.setPointerCapture?.(event.pointerId);
   }, []);
 
+  // Approvals pending on the ACTIVE session come live from the AG-UI stream
+  // (liveApprovalCount); the REST snapshot (pendingApprovals) still covers other
+  // sessions' approvals seen at load/refresh. OR them so the active session
+  // lights up immediately on approval_required, without regressing cross-session
+  // attention.
+  const activeSessionApprovalCount = Math.max(
+    liveApprovalCount,
+    chatWorkspace.pendingApprovals.length
+  );
+
   const attentionSessionIds = useMemo(
     () => deriveAttentionSessionIds(
       sessionList.sessions,
       sessionList.selectedSessionId,
-      chatWorkspace.pendingApprovals.length
+      activeSessionApprovalCount
     ),
-    [sessionList.sessions, sessionList.selectedSessionId, chatWorkspace.pendingApprovals]
+    [sessionList.sessions, sessionList.selectedSessionId, activeSessionApprovalCount]
   );
 
+  // Only the selected session has a live host, so it's the only one that can be
+  // streaming — map the lifted boolean onto its id (the faithful replacement for
+  // the retired SSE streamingSessionId).
   const streamingSessionIds = useMemo(
-    () => deriveStreamingSessionIds(sessionList.sessions, chatWorkspace.streamingSessionId),
-    [sessionList.sessions, chatWorkspace.streamingSessionId]
+    () =>
+      deriveStreamingSessionIds(
+        sessionList.sessions,
+        liveIsRunning ? sessionList.selectedSessionId : null
+      ),
+    [sessionList.sessions, liveIsRunning, sessionList.selectedSessionId]
   );
 
-  const hasConversationHistory = messagesContainHistory(chatWorkspace.messages);
   const contextTokens = latestContextTokens(chatWorkspace.messages);
   const contextWindow = contextWindowForModel(selectedModel);
+  const sessionCost = sessionCostUsd(chatWorkspace.messages);
+  // Seed the CopilotChat transcript with persisted history. Recomputed on
+  // message change, but CopilotChatHost only reads it at mount (agent
+  // construction), so post-turn refreshes don't reconstruct the live agent.
+  const initialMessages = useMemo(
+    () => toAguiInitialMessages(chatWorkspace.messages),
+    [chatWorkspace.messages]
+  );
+  // Plan pane rides agent state, not messages; seed it from persisted plan
+  // markdown so reload restores it (CopilotChatHost reads both only at mount).
+  const initialState = useMemo(
+    () => planStateFromMessages(chatWorkspace.messages),
+    [chatWorkspace.messages]
+  );
+  // Failed/declined tool calls the native card can't render as failures; seeded
+  // into the tool-status side-channel so a reloaded session shows them. Unlike
+  // initialMessages, the hook re-seeds this on session re-key.
+  const initialToolStatuses = useMemo(
+    () => toolStatusesFromMessages(chatWorkspace.messages),
+    [chatWorkspace.messages]
+  );
 
-  const sidebarColClass = isSidebarOpen ? "grid-cols-[280px_minmax(0,1fr)]" : "grid-cols-[0_minmax(0,1fr)]";
-  const showArtifactPane = Boolean(sessionList.selectedSession) && isArtifactPaneOpen;
+  const sidebarColClass = isSidebarOpen
+    ? "md:grid-cols-[280px_minmax(0,1fr)]"
+    : "md:grid-cols-[0_minmax(0,1fr)]";
+  const hasSession = Boolean(sessionList.selectedSession);
+  const showArtifactPane = hasSession && isArtifactPaneOpen;
+  // The resizer + pane stay mounted (at zero-width tracks) while a session is
+  // selected so toggling the pane animates instead of unmounting abruptly.
+  const chatColClass = !hasSession
+    ? "md:grid-cols-[minmax(0,1fr)]"
+    : showArtifactPane
+      ? "md:grid-cols-[minmax(0,1fr)_4px_var(--artifact-pane-width)]"
+      : "md:grid-cols-[minmax(0,1fr)_0px_0px]";
 
   return (
-    <div className={`grid h-screen transition-[grid-template-columns] duration-200 ${sidebarColClass}`}>
-      <SessionSidebar
-        sessions={sessionList.sessions}
-        selectedSessionId={sessionList.selectedSessionId}
-        isLoadingSessions={sessionList.isLoadingSessions}
-        busySessionId={sessionList.busySessionId}
-        streamingSessionIds={streamingSessionIds}
-        errorSessionId={sessionList.error ? sessionList.selectedSessionId : null}
-        renameSessionId={sessionList.renameSessionId}
-        renameDraft={sessionList.renameDraft}
-        pinnedSessionIds={sessionList.pinnedSessionIds}
-        attentionSessionIds={attentionSessionIds}
-        onSelectSession={sessionList.selectSession}
-        onCreateSession={sessionList.createSession}
-        onStartRename={sessionList.startRename}
-        onCancelRename={sessionList.cancelRename}
-        onConfirmRename={sessionList.confirmRename}
-        onRenameDraftChange={sessionList.setRenameDraft}
-        onDeleteSession={sessionList.deleteSession}
-        onTogglePinSession={sessionList.togglePinSession}
-        pendingDeleteSessionId={sessionList.pendingDeleteSessionId}
-        onConfirmDelete={sessionList.confirmDelete}
-        onCancelDelete={sessionList.cancelDelete}
-      />
+    <div className={`relative grid h-dvh grid-cols-1 overflow-hidden transition-[grid-template-columns] duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none ${sidebarColClass}`}>
+      {isSidebarOpen ? (
+        <button
+          type="button"
+          aria-label="Close session sidebar"
+          className="fixed inset-0 z-[var(--z-modal-backdrop)] bg-primary/25 backdrop-blur-[2px] md:hidden"
+          onClick={() => setIsSidebarOpen(false)}
+        />
+      ) : null}
+      <div
+        className={`fixed inset-y-0 left-0 z-[var(--z-modal)] w-[min(86vw,280px)] overflow-hidden shadow-lg transition-transform duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none md:static md:z-auto md:w-auto md:shadow-none ${
+          isSidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+        }`}
+      >
+        <SessionSidebar
+          sessions={sessionList.sessions}
+          selectedSessionId={sessionList.selectedSessionId}
+          isLoadingSessions={sessionList.isLoadingSessions}
+          busySessionId={sessionList.busySessionId}
+          streamingSessionIds={streamingSessionIds}
+          errorSessionId={sessionList.error ? sessionList.selectedSessionId : null}
+          renameSessionId={sessionList.renameSessionId}
+          renameDraft={sessionList.renameDraft}
+          pinnedSessionIds={sessionList.pinnedSessionIds}
+          attentionSessionIds={attentionSessionIds}
+          onSelectSession={selectSession}
+          onCreateSession={sessionList.createSession}
+          onStartRename={sessionList.startRename}
+          onCancelRename={sessionList.cancelRename}
+          onConfirmRename={sessionList.confirmRename}
+          onRenameDraftChange={sessionList.setRenameDraft}
+          onDeleteSession={sessionList.deleteSession}
+          onTogglePinSession={sessionList.togglePinSession}
+          pendingDeleteSessionId={sessionList.pendingDeleteSessionId}
+          onConfirmDelete={sessionList.confirmDelete}
+          onCancelDelete={sessionList.cancelDelete}
+        />
+      </div>
 
       <main className="flex min-h-0 min-w-0 flex-col">
         <WorkspaceHeader
@@ -225,28 +330,23 @@ export function ChatShell() {
               ? (next) => sessionList.renameSessionDirect(sessionList.selectedSession!.sessionId, next)
               : undefined
           }
-          hasPendingApprovals={chatWorkspace.pendingApprovals.length > 0}
+          hasPendingApprovals={activeSessionApprovalCount > 0}
         />
 
         <div
           ref={chatMainRef}
-          className={`grid min-h-0 min-w-0 flex-1 ${
-            showArtifactPane
-              ? "grid-cols-[minmax(0,1fr)_4px_var(--artifact-pane-width)]"
-              : "grid-cols-[minmax(0,1fr)]"
-          }`}
+          className={`grid min-h-0 min-w-0 flex-1 grid-cols-[minmax(0,1fr)] ${
+            isResizingPane
+              ? ""
+              : "transition-[grid-template-columns] duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none"
+          } ${chatColClass}`}
           style={
-            showArtifactPane
+            hasSession
               ? ({ ["--artifact-pane-width" as string]: `${artifactPaneWidth}px` } as CSSProperties)
               : undefined
           }
         >
           <div className="flex min-h-0 min-w-0 flex-col">
-            <McpServerErrorBanner
-              errors={chatWorkspace.mcpServerErrors}
-              onDismiss={(name) => chatWorkspace.dismissMcpServerError(name)}
-            />
-
             {noProvidersAvailable ? (
               <section className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-surface px-6 py-4">
                 <div className="mx-auto flex w-[min(640px,100%)] flex-col items-center gap-4 rounded-xl border border-outline-variant bg-surface-container-lowest px-8 py-12 text-center shadow-sm">
@@ -265,57 +365,64 @@ export function ChatShell() {
                   </a>
                 </div>
               </section>
-            ) : (
-              <>
-                <MessageList
-                  messages={chatWorkspace.messages}
-                  pendingApprovals={chatWorkspace.pendingApprovals}
-                  approvalDecision={chatWorkspace.approvalDecision}
-                  mcpServerEvents={chatWorkspace.mcpServerErrors}
-                  runtimeNotices={chatWorkspace.runtimeNotices}
-                  onApprovalDecision={(id, decision) => void chatWorkspace.handleApprovalDecision(id, decision)}
-                  onPreviewArtifact={(id) => void chatWorkspace.artifactState.openPreview(id)}
-                  onRetry={chatWorkspace.retryLastMessage}
-                  onSend={(text) => void chatWorkspace.sendMessage(text)}
-                  ref={messagesRef}
-                  selectedSessionId={sessionList.selectedSessionId}
-                />
-
-                <Composer
-              selectedSessionId={sessionList.selectedSessionId}
-              isSending={chatWorkspace.isSending}
-              error={sessionList.error}
-              onSend={(text) => void chatWorkspace.sendMessage(text)}
-              onStop={() => void chatWorkspace.stopStreaming()}
-              provider={selectedProvider}
-              enabledProviders={enabledRuntimeProviders}
-              model={model}
-              effort={effort}
-              models={displayModels}
-              showEffortSelector={showEffortSelector}
-              hasConversationHistory={hasConversationHistory}
-              contextTokens={contextTokens}
-              contextWindow={contextWindow}
-              onProviderChange={(provider) => {
-                const nextModel = modelFallbackForProvider(provider, displayModels, model);
-                if (nextModel) setModel(nextModel);
-              }}
-              onModelChange={setModel}
-              onEffortChange={setEffort}
-            />
-              </>
-            )}
+            ) : sessionList.selectedSessionId && chatWorkspace.isSessionDataReady ? (
+              <CopilotChatHost
+                // Key on session so switching sessions remounts the host with
+                // that session's history seeded at construction.
+                key={sessionList.selectedSessionId}
+                sessionId={sessionList.selectedSessionId}
+                model={model}
+                effort={effort}
+                models={allModels}
+                showEffortSelector={showEffortSelector}
+                contextTokens={contextTokens}
+                contextWindow={contextWindow}
+                sessionCostUsd={sessionCost}
+                initialMessages={initialMessages}
+                initialState={initialState}
+                initialToolStatuses={initialToolStatuses}
+                artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
+                onModelChange={setModel}
+                onEffortChange={setEffort}
+                onTurnSettled={() => {
+                  // CopilotKit owns the live stream, so persisted state (token
+                  // usage, cost) only lands via a REST reload once a turn ends.
+                  if (sessionList.selectedSessionId) {
+                    void chatWorkspace.refreshSessionData(sessionList.selectedSessionId);
+                  }
+                }}
+                onRunningChange={setLiveIsRunning}
+                onPendingApprovalsChange={setLiveApprovalCount}
+              />
+            ) : null}
           </div>
 
-          {showArtifactPane ? (
+          {hasSession ? (
             <>
+              {showArtifactPane ? (
+                <button
+                  type="button"
+                  aria-label="Close artifacts panel"
+                  className="fixed inset-0 z-[var(--z-modal-backdrop)] bg-primary/25 backdrop-blur-[2px] md:hidden"
+                  onClick={() => setIsArtifactPaneOpen(false)}
+                />
+              ) : null}
               <button
                 aria-label="Resize context panel"
-                className="group relative w-1 cursor-col-resize bg-transparent transition-colors hover:bg-outline-variant focus-visible:bg-primary-mid focus-visible:outline-none"
+                aria-hidden={!showArtifactPane}
+                tabIndex={showArtifactPane ? undefined : -1}
+                className="group relative hidden w-full cursor-col-resize bg-transparent transition-colors hover:bg-outline-variant focus-visible:bg-primary-mid focus-visible:outline-none md:block"
                 onPointerDown={startArtifactPaneResize}
                 type="button"
               />
-              <aside className="flex min-h-0 min-w-0 flex-col bg-surface-container-low">
+              <aside
+                // inert removes the collapsed pane from tab order + a11y tree
+                // while it stays mounted for the width animation.
+                inert={!showArtifactPane}
+                className={`fixed inset-y-0 right-0 z-[var(--z-modal)] flex w-[min(92vw,420px)] min-w-0 flex-col overflow-hidden bg-surface-container-low shadow-lg transition-transform duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none md:static md:z-auto md:w-auto md:shadow-none ${
+                  showArtifactPane ? "translate-x-0" : "translate-x-full md:translate-x-0"
+                }`}
+              >
                 <ArtifactPanel
                   artifacts={chatWorkspace.artifacts}
                   visibleSelectedArtifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}

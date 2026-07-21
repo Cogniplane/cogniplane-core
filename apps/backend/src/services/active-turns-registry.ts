@@ -4,7 +4,13 @@
 // Single-process scope by design: if we ever scale horizontally, swap this
 // for a DB-backed flag (a `sessions.current_turn_started_at` column works).
 
-const STALE_AFTER_MS = 15 * 60 * 1000;
+// Must exceed the longest turn the platform allows (RUNTIME_TURN_TIMEOUT_MS,
+// default 20 min, itself capped below E2B_SANDBOX_TIMEOUT_MS). A staleness
+// window shorter than the turn ceiling would stale-evict a *live* turn from
+// snapshot(), letting a concurrent request pass the busy check and start a
+// second turn on the same session. 35 min sits above the 30-min sandbox
+// ceiling so no live turn is ever evicted while it can still be running.
+const DEFAULT_STALE_AFTER_MS = 35 * 60 * 1000;
 
 type Entry = {
   startedAt: number;
@@ -12,6 +18,11 @@ type Entry = {
 
 export class ActiveTurnsRegistry {
   private readonly entries = new Map<string, Entry>();
+  private readonly staleAfterMs: number;
+
+  constructor(staleAfterMs: number = DEFAULT_STALE_AFTER_MS) {
+    this.staleAfterMs = staleAfterMs;
+  }
 
   mark(sessionId: string): void {
     this.entries.set(sessionId, { startedAt: Date.now() });
@@ -31,7 +42,7 @@ export class ActiveTurnsRegistry {
     const now = Date.now();
     const live = new Set<string>();
     for (const [sessionId, entry] of this.entries) {
-      if (now - entry.startedAt > STALE_AFTER_MS) {
+      if (now - entry.startedAt > this.staleAfterMs) {
         this.entries.delete(sessionId);
         continue;
       }

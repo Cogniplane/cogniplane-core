@@ -21,8 +21,8 @@ type ActivationContext = {
  * Records `resource_activations` rows for skills, MCP servers, and
  * integrations. Three event types:
  *   - `materialized`: the resource was made available to the agent this turn
- *     (e.g. SKILL.md written into the workspace, MCP server listed in
- *     `codex.toml`).
+ *     (e.g. skill instructions injected into the system prompt, MCP server
+ *     wired into the agent loop's tool set).
  *   - `invoked`: the agent actually used it (tool call routed to that
  *     resource, MCP server received a JSON-RPC call, etc.).
  *   - `failed`: tool/MCP call attempted and errored.

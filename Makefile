@@ -3,7 +3,7 @@ SHELL := /bin/bash
 PNPM := corepack pnpm
 COMPOSE := docker compose
 
-.PHONY: help install build lint test typecheck dev start db-up db-down db-logs migrate seed-dev-data compose-up compose-down compose-logs smoke clean build-sandbox-agent e2b-build e2b-build-codex e2b-build-all license-check
+.PHONY: help install build lint test typecheck dev start db-up db-down db-logs migrate seed-dev-data compose-up compose-down compose-logs smoke clean e2b-build license-check
 
 help:
 	@echo "Available targets:"
@@ -24,10 +24,7 @@ help:
 	@echo "  dev                  Start Postgres, run migrations, then start the frontend and backend in dev mode"
 	@echo "  start                Start PostgreSQL, run migrations, then start dev servers"
 	@echo "  clean                Remove local build outputs"
-	@echo "  build-sandbox-agent  Verify the in-sandbox Claude harness exists"
-	@echo "  e2b-build            Build and publish the unified agent-runtime E2B template (hosts Codex + Claude)"
-	@echo "  e2b-build-codex      Alias for e2b-build"
-	@echo "  e2b-build-all        Alias for e2b-build"
+	@echo "  e2b-build            Build the Deep Agents code-execution E2B template"
 
 install:
 	$(PNPM) install
@@ -86,20 +83,11 @@ start:
 # silently if it does not exist.
 -include Makefile.local
 
-# The sandbox-agent harness is a hand-written .mjs file at
-# docker/sandbox-agent/sandbox-agent.mjs. No bundling is needed; the Claude
-# SDK is installed globally inside the template and resolved via NODE_PATH.
-build-sandbox-agent:
-	@test -f docker/sandbox-agent/sandbox-agent.mjs || (echo "ERROR: docker/sandbox-agent/sandbox-agent.mjs is missing" >&2; exit 1)
-	@echo "sandbox-agent.mjs ready"
-
-# Builds the unified agent-runtime E2B template using the v2 Template SDK
-# (docker/template.ts + docker/build.prod.ts).
-e2b-build: build-sandbox-agent
-	cd docker && npx tsx build.prod.ts
-
-e2b-build-codex: e2b-build
-e2b-build-all: e2b-build
+# Builds the Deep Agents code-execution E2B template (docker/template.ts +
+# docker/build.ts) using the v2 Template SDK. Wire the printed id via
+# E2B_TEMPLATE_ID.
+e2b-build:
+	cd docker && npx tsx build.ts
 
 license-check:
 	npx tsx scripts/license-check.ts

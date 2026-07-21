@@ -9,19 +9,3 @@ export function requireRole(request: FastifyRequest, reply: FastifyReply, ...rol
   }
   return true;
 }
-
-export function isElevatedRole(role: Role): boolean {
-  return role === "owner" || role === "admin";
-}
-
-export function canManageTenant(role: Role): boolean {
-  return role === "owner";
-}
-
-export function canManageMembers(role: Role): boolean {
-  return isElevatedRole(role);
-}
-
-export function canAccessAdmin(role: Role): boolean {
-  return isElevatedRole(role);
-}

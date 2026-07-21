@@ -14,6 +14,7 @@ import {
   ViewToggle
 } from "./token-usage-chart-primitives";
 import { HINT, SECTION_LABEL, TOKEN_USAGE_COL_GRID as COL_GRID } from "../lib/ui-tokens";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
@@ -100,12 +101,7 @@ export function TokenUsageSection() {
   const totals = usage?.totals;
 
   return (
-    <section id="token-usage" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Observability</p>
-        <h3 className="text-lg font-semibold text-on-surface">Token usage</h3>
-      </div>
-
+    <section id="token-usage" className="flex flex-col gap-5 pt-5">
       {available ? (
         <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
           <DayRangePicker value={days} onChange={setDays} />
@@ -115,6 +111,8 @@ export function TokenUsageSection() {
       ) : null}
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
+
+      {available && !totals && loading ? <TokenUsageSkeleton /> : null}
 
       {available && totals ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -201,6 +199,25 @@ export function TokenUsageSection() {
         </div>
       ) : null}
     </section>
+  );
+}
+
+function TokenUsageSkeleton() {
+  return (
+    <>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }, (_, i) => (
+          <div key={i} className={STAT_CARD}>
+            <Skeleton className="h-3 w-24" />
+            <Skeleton className="mt-3 h-7 w-16" />
+            <Skeleton className="mt-2 h-3 w-32" />
+          </div>
+        ))}
+      </div>
+      <div className={`${STAT_CARD} p-5`}>
+        <Skeleton className="h-[200px] w-full" />
+      </div>
+    </>
   );
 }
 

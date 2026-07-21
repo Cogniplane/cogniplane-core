@@ -34,7 +34,7 @@ function makeFakeDb(
       // DB would honor that LIMIT, so the fake slices the fixture to match. This
       // makes items.length a behavioral proxy for the limit+1 fetch.
       if (text.includes("FROM sessions s")) {
-        const limitParam = Number((values ?? [])[8]);
+        const limitParam = Number((values ?? [])[7]);
         const limited =
           Number.isFinite(limitParam) && limitParam > 0
             ? sessionRows.slice(0, limitParam)
@@ -123,7 +123,7 @@ test("admin sessions list — maps row fields to camelCase response shape", asyn
         admin_status: "active",
         last_activity_at: lastActivity,
         message_count: 7,
-        runtime_provider: "codex",
+        runtime_provider: "deep-agents",
         last_model_name: "gpt-5.1"
       }
     ]
@@ -140,7 +140,7 @@ test("admin sessions list — maps row fields to camelCase response shape", asyn
         createdAt: created.toISOString(),
         lastActivityAt: lastActivity.toISOString(),
         messageCount: 7,
-        runtimeProvider: "codex",
+        runtimeProvider: "deep-agents",
         modelName: "gpt-5.1",
         status: "active",
         alerts: [],
@@ -164,7 +164,7 @@ test("admin sessions list — populates skillsUsedCount and mcpServersUsedCount 
         admin_status: "active",
         last_activity_at: lastActivity,
         message_count: 1,
-        runtime_provider: "codex",
+        runtime_provider: "deep-agents",
         last_model_name: null
       },
       {
@@ -175,7 +175,7 @@ test("admin sessions list — populates skillsUsedCount and mcpServersUsedCount 
         admin_status: "active",
         last_activity_at: lastActivity,
         message_count: 1,
-        runtime_provider: "codex",
+        runtime_provider: "deep-agents",
         last_model_name: null
       }
     ],
@@ -220,12 +220,12 @@ test("admin sessions list — paginates and emits nextCursor when more rows than
       admin_status: "active",
       last_activity_at: new Date(baseTime + offsetMs + 1000),
       message_count: 1,
-      runtime_provider: "codex",
+      runtime_provider: "deep-agents",
       last_model_name: null
     });
   }
 
-  const { app, capturedQueries } = await buildApp({ isAdmin: true, rows });
+  const { app } = await buildApp({ isAdmin: true, rows });
   const res = await app.inject({ method: "GET", url: "/admin/sessions?limit=50" });
   expect(res.statusCode).toBe(200);
   const body = res.json();
@@ -235,12 +235,9 @@ test("admin sessions list — paginates and emits nextCursor when more rows than
   expect(body.items.length).toBe(50);
   expect(body.nextCursor).not.toBe(null);
 
-  // The LIMIT bind is the only observable signal that the route requested
-  // limit+1 rather than limit; the fake's slice above turns it into the
-  // items.length assertion, but we also confirm the bound value carries the +1.
-  const selectQuery = capturedQueries.find((q) => q.text.includes("FROM sessions s"));
-  expect(selectQuery).toBeTruthy();
-  expect(selectQuery!.values).toContain(51);
+  // The `items.length === 50` + `nextCursor !== null` assertions above already
+  // prove the over-fetch-by-one has-more behavior end-to-end; pinning the literal
+  // LIMIT bind (51) only added mechanism-fragility, so it's dropped.
   await app.close();
 });
 
@@ -309,7 +306,7 @@ test("admin sessions list — passes filters through to SQL parameters", async (
   const { app, capturedQueries } = await buildApp({ isAdmin: true, rows: [] });
   await app.inject({
     method: "GET",
-    url: "/admin/sessions?userId=u-1&from=2026-04-01T00:00:00Z&to=2026-04-30T23:59:59Z&status=errored&runtime=claude-code"
+    url: "/admin/sessions?userId=u-1&from=2026-04-01T00:00:00Z&to=2026-04-30T23:59:59Z&status=errored"
   });
   const selectQuery = capturedQueries.find((q) => q.text.includes("FROM sessions s"));
   expect(selectQuery).toBeTruthy();
@@ -320,7 +317,6 @@ test("admin sessions list — passes filters through to SQL parameters", async (
   expect(selectQuery!.values).toContain("2026-04-01T00:00:00Z");
   expect(selectQuery!.values).toContain("2026-04-30T23:59:59Z");
   expect(selectQuery!.values).toContain("errored");
-  expect(selectQuery!.values).toContain("claude-code");
   await app.close();
 });
 
@@ -344,7 +340,7 @@ test("admin sessions list — populates alerts from the derivation service", asy
         admin_status: "active",
         last_activity_at: lastActivity,
         message_count: 3,
-        runtime_provider: "codex",
+        runtime_provider: "deep-agents",
         last_model_name: null
       }
     ],

@@ -4,7 +4,6 @@ import type { PolicyTurnContext } from "@cogniplane/shared-types";
 import type { RuntimeEvent, RuntimeReasoningEffort, RuntimeSessionRef, RuntimeUserInput } from "../runtime-contracts.js";
 import { extractToolResultPayload, runtimeEventToSSEFrame, sseFrame } from "../runtime-contracts.js";
 
-import type { ActiveTurnMessageMap } from "./active-turn-message-map.js";
 import type { ActiveTurnsRegistry } from "./active-turns-registry.js";
 import type { ArtifactRecord } from "./artifacts/artifact-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
@@ -25,8 +24,11 @@ type ToolResultPersistPayload = ReturnType<typeof extractToolResultPayload>;
 // internal hostnames, or stack detail can't reach the client — or get
 // persisted as the assistant row's content. The full error is always logged
 // server-side at the call site.
-function clientSafeFailureMessage(error: unknown): string {
-  const status = (error as { statusCode?: unknown } | null | undefined)?.statusCode;
+export function clientSafeFailureMessage(error: unknown): string {
+  // Anthropic/OpenAI SDK errors (and LangChain's re-throws) carry `.status`;
+  // some app-thrown errors use `.statusCode`. Accept either as the 4xx signal.
+  const raw = error as { statusCode?: unknown; status?: unknown } | null | undefined;
+  const status = typeof raw?.statusCode === "number" ? raw.statusCode : raw?.status;
   if (typeof status === "number" && status >= 400 && status < 500 && error instanceof Error) {
     return error.message;
   }
@@ -112,20 +114,20 @@ export type StreamAssistantReplyInput = {
    */
   activeTurns?: ActiveTurnsRegistry;
   /**
-   * Required for the LLM proxy to attribute upstream token usage to the
-   * right assistant message. The writer registers
-   * (sessionId, runtimeId) → assistantMessageId at turn start and clears
-   * it in `finally`. The proxy reads from the same map on each upstream
-   * request keyed off the rt_*'s sid+rid claims.
-   */
-  activeTurnMessageMap: ActiveTurnMessageMap;
-  /**
    * Whether this is an interactive or scheduled (unattended) turn. Snapshotted
    * into the tool-execution context so the Policy Center `turnContexts` condition
    * dimension can be matched at the MCP gateway without a hot-path DB lookup.
    * Omitted → recorded as unknown (the dimension acts as "no constraint").
    */
   turnContext?: PolicyTurnContext;
+  /**
+   * Lifetime of the per-turn tool-execution context (ms). MUST outlive the
+   * longest turn the platform allows, otherwise a long-running turn loses all
+   * managed MCP tool access mid-flight (the gateway filters expired contexts).
+   * Threaded from `TOOL_CONTEXT_TTL_MS`, which config validation pins above
+   * `RUNTIME_TURN_TIMEOUT_MS`. Defaults conservatively if omitted (test harness).
+   */
+  toolContextTtlMs?: number;
 };
 
 /**
@@ -187,7 +189,7 @@ type TurnContext = {
 
 // Minimal slice of `http.ServerResponse` we rely on. Declared structurally so
 // the test fake doesn't have to satisfy the full Node typing.
-type RawSseResponse = {
+export type RawSseResponse = {
   write(chunk: string): boolean;
   end(): void;
   once?(event: "drain", listener: () => void): unknown;
@@ -204,7 +206,7 @@ type RawSseResponse = {
  * `close` event; callers check it (via `isClosed`) to short-circuit further
  * work and to cancel the runtime turn.
  */
-class SseWriter {
+export class SseWriter {
   private closed = false;
   private readonly onCloseCallbacks = new Set<() => void>();
 
@@ -366,10 +368,11 @@ async function persistResponseCompleted(
   const finalStatus = event.interrupted ? "interrupted" : "completed";
   await ctx.persistAssistantStatus(finalStatus, ctx.streamingContent.assistant);
   await persistStreamingAuxContent(ctx);
-  // Token usage + cost are persisted by the LLM proxy (single source of
-  // truth — sandboxes can't under-report). The frontend reads cost_usd
-  // from the messages row on the next fetch. Live SSE no longer carries
-  // tokenUsage / costUsd in response.completed.
+  // Token usage + cost are persisted by the in-process runtime adapter from
+  // the model stream's usage_metadata (the sandbox is never on the model-call
+  // path, so it can't under-report). The frontend reads cost_usd from the
+  // messages row on the next fetch. Live SSE no longer carries tokenUsage /
+  // costUsd in response.completed.
   return { break: true };
 }
 
@@ -495,11 +498,19 @@ async function runRuntimeTurn(
   input: StreamAssistantReplyInput,
   ctx: TurnContext
 ): Promise<void> {
+  // Turn-latency instrumentation (Phase 0 startup-latency evaluation).
+  // `sessionEnsureMs` covers createSession — the full sandbox bootstrap on a
+  // cold start, ~0 on a warm reuse. First-event / first-text-delta offsets are
+  // measured from when the runtime turn starts streaming. One
+  // `turn_latency_timing` log line per turn; aggregated by
+  // scripts/analyze-startup-latency.mjs.
+  const turnStartedAtMs = performance.now();
   const runtimeSession = await input.runtimeAdapter.createSession({
     tenantId: input.tenantId,
     sessionId: input.sessionId,
     userId: input.userId
   });
+  const sessionEnsureMs = Math.round(performance.now() - turnStartedAtMs);
 
   const toolContext = await input.toolContexts.create({
     tenantId: input.tenantId,
@@ -514,7 +525,10 @@ async function runRuntimeTurn(
       // Policy Center turn-context snapshot (read at the MCP gateway).
       ...(input.turnContext ? { turnContext: input.turnContext } : {})
     },
-    ttlMs: 15 * 60 * 1000
+    // Must outlive the whole turn — a shorter TTL silently revokes managed MCP
+    // tool access mid-turn. Config pins TOOL_CONTEXT_TTL_MS above the turn
+    // watchdog; the fallback matches the previous default for the test harness.
+    ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000
   });
 
   // Mutable state populated by onBeforeTurn (runs after any transparent
@@ -550,16 +564,6 @@ async function runRuntimeTurn(
         turnState.cleanup.push(...prepared.cleanup);
       }
     : undefined;
-
-  // Register the active turn so the LLM proxy can charge upstream token
-  // usage to this assistant message. The proxy looks up by sid+rid from
-  // the rt_*'s claims; this is the single producer of that mapping.
-  input.activeTurnMessageMap.set(
-    input.sessionId,
-    runtimeSession.runtimeId,
-    ctx.assistantMessageId,
-    input.modelName
-  );
 
   // Client disconnect mid-stream: cancel the runtime turn so it stops
   // generating (no more billable tokens, no more DB writes for output nobody
@@ -600,6 +604,9 @@ async function runRuntimeTurn(
     if (ctx.writer.isClosed) {
       abandoned = true;
     } else {
+    const generateStartMs = performance.now();
+    let firstEventMs: number | null = null;
+    let firstTextDeltaMs: number | null = null;
     for await (const event of input.runtimeAdapter.runMessage(runtimeSession, {
       prompt: input.prompt,
       runtimePolicyId: runtimeSession.runtimePolicy.id,
@@ -610,6 +617,12 @@ async function runRuntimeTurn(
       onBeforeTurn,
       get userInputs() { return turnState.userInputs; }
     })) {
+      if (firstEventMs === null) {
+        firstEventMs = Math.round(performance.now() - generateStartMs);
+      }
+      if (firstTextDeltaMs === null && event.type === "response.output_text.delta") {
+        firstTextDeltaMs = Math.round(performance.now() - generateStartMs);
+      }
       // Stop draining the runtime once the browser is gone — the interrupt
       // fired above will land a terminal frame on the runtime side; here we
       // just stop persisting/writing for a connection no one is reading.
@@ -617,11 +630,53 @@ async function runRuntimeTurn(
         abandoned = true;
         break;
       }
-      const shouldBreak = await handleStreamEvent(ctx, event);
+      let shouldBreak: boolean;
+      try {
+        shouldBreak = await handleStreamEvent(ctx, event);
+      } catch (err) {
+        // Per-event persistence (or frame write) threw — e.g. a transient DB
+        // failure. The exception is about to unwind to the outer catch, which
+        // emits the terminal frame, but the in-process runtime turn is still
+        // live and would keep generating into an unbounded queue nobody drains,
+        // burning tokens for output that will never be persisted. Cancel it on
+        // the way out, mirroring the client-disconnect path.
+        if (!interruptedByDisconnect) {
+          interruptedByDisconnect = true;
+          void Promise.resolve(
+            input.runtimeAdapter.interruptTurn?.({
+              tenantId: input.tenantId,
+              sessionId: input.sessionId,
+              userId: input.userId
+            })
+          ).catch((interruptErr) => {
+            input.logger?.warn(
+              { err: interruptErr, sessionId: input.sessionId },
+              "failed to cancel runtime turn after per-event persistence failure"
+            );
+          });
+        }
+        throw err;
+      }
       if (shouldBreak) {
         break;
       }
     }
+    input.logger?.info(
+      {
+        sessionId: input.sessionId,
+        runtimeId: runtimeSession.runtimeId,
+        sessionEnsureMs,
+        firstEventMs,
+        firstTextDeltaMs,
+        // Full request→token latency: turn start (incl. session bootstrap and
+        // tool-context setup) through the first assistant text delta.
+        requestToFirstTextDeltaMs:
+          firstTextDeltaMs === null
+            ? null
+            : Math.round(generateStartMs - turnStartedAtMs) + firstTextDeltaMs
+      },
+      "turn_latency_timing"
+    );
     }
     if (abandoned && !ctx.completed) {
       // Client disconnected mid-turn. Persist whatever streamed so far under
@@ -636,7 +691,6 @@ async function runRuntimeTurn(
     // The turn has reached a terminal state: any subsequent `close` (e.g. from
     // our own `writer.end()`) must NOT be treated as a client disconnect.
     turnSettled = true;
-    input.activeTurnMessageMap.clear(input.sessionId, runtimeSession.runtimeId);
     if (turnState.cleanup.length) {
       // Cleanup callbacks are best-effort (temp-file removal etc.) and log
       // their own failures where it matters; a rejection here must never mask

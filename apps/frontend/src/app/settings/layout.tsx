@@ -45,7 +45,7 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
           basePath="/settings"
         />
 
-        <div className="min-w-0 px-4 pb-10 pt-4 md:px-8 md:pt-6">
+        <div className="mx-auto w-full min-w-0 max-w-6xl px-4 pb-10 pt-4 md:px-8 md:pt-6">
           <ConsolePageHeader
             eyebrow="Settings"
             title={activeSection?.title ?? activeSection?.label ?? "User preferences"}

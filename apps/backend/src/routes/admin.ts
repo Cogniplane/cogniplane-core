@@ -1,8 +1,12 @@
 import type { FastifyInstance } from "fastify";
 
+import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
+import type { ModelProvider } from "@cogniplane/shared-types";
+
 import { registerAdminArtifactRoutes } from "./admin/admin-artifact-routes.js";
 import { registerAdminIntegrationsRoutes } from "./admin/admin-integrations-routes.js";
 import { registerAdminMcpServerRoutes } from "./admin/admin-mcp-server-routes.js";
+import { registerAdminModelRoutes } from "./admin/admin-model-routes.js";
 import { registerAdminPiiRoutes } from "./admin/admin-pii-routes.js";
 import { registerAdminPolicyRoutes } from "./admin/admin-policy-routes.js";
 import { registerAdminRuntimeRoutes } from "./admin/admin-runtime-routes.js";
@@ -14,6 +18,7 @@ import { registerAdminTokenUsageRoutes } from "./admin/admin-token-usage-routes.
 import { registerAdminUserRoutes } from "./admin/admin-user-routes.js";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
+import { buildOpenRouterCatalogFetcher } from "../services/openrouter-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Route registration
@@ -31,6 +36,22 @@ export function buildAdminRouteStores(
     }
   };
 
+  // Per-provider key source for GET /admin/models: a tenant-stored key wins
+  // over the platform env fallback, matching credential resolution order.
+  const providerKeySources = async (tenantId: string) => {
+    const orgSettings = await deps.tenantOrgSettings.get(tenantId);
+    return Object.fromEntries(
+      MODEL_PROVIDERS.map((provider) => [
+        provider,
+        orgSettings.providerKeys[provider]
+          ? "tenant"
+          : deps.providerCredentials.platformProviders.has(provider)
+            ? "platform"
+            : "none"
+      ])
+    ) as Record<ModelProvider, "tenant" | "platform" | "none">;
+  };
+
   return {
     config: extras.config,
     dynamicConfig: deps.dynamicConfig,
@@ -38,13 +59,18 @@ export function buildAdminRouteStores(
     auditEvents: deps.auditEvents,
     skillBundleStorage: deps.skillBundleStorage,
     runtimeSessions: deps.runtimeSessions,
-    codexRuntimeManager: deps.codexRuntimeManager,
-    runtimeAdapters: deps.runtimeAdapters,
+    deepAgentsAdapter: deps.deepAgentsAdapter,
+    runtimeAdapter: deps.runtimeAdapter,
     tenantMembers: deps.tenantMembers,
     githubConnections: deps.githubConnectionService,
     integrationRegistry: deps.integrationRegistry,
     integrationStates: deps.integrationStates,
     tenantSettings,
+    providerKeySources,
+    customModels: deps.customModels,
+    // One process-wide cached fetcher: the OpenRouter catalog is global, not
+    // tenant-scoped, so all tenants share the cache.
+    fetchOpenRouterCatalog: buildOpenRouterCatalogFetcher(),
     activations: deps.activationTracker,
     piiCircuitBreaker: deps.piiCircuitBreaker,
     piiProtection: deps.piiProtection,
@@ -83,7 +109,7 @@ export async function registerAdminRoutes(
   await registerAdminRuntimeRoutes(app, {
     auditEvents: stores.auditEvents,
     runtimeSessions: stores.runtimeSessions,
-    codexRuntimeManager: stores.codexRuntimeManager
+    deepAgentsAdapter: stores.deepAgentsAdapter
   });
   if (stores.piiCircuitBreaker) {
     await registerAdminPiiRoutes(app, {
@@ -97,7 +123,23 @@ export async function registerAdminRoutes(
     dynamicConfig: stores.dynamicConfig,
     auditEvents: stores.auditEvents,
     managedToolCatalog: stores.managedToolCatalog,
-    runtimeAdapters: stores.runtimeAdapters
+    runtimeAdapter: stores.runtimeAdapter,
+    // Custom models never advertise reasoning efforts (see CustomModelStore).
+    // Guarded: test wirings pass partial store literals without customModels.
+    listCustomModels: stores.customModels
+      ? async (tenantId) =>
+          (await stores.customModels.list(tenantId)).map((record) => ({
+            id: record.modelId,
+            supportedEfforts: []
+          }))
+      : undefined
+  });
+  await registerAdminModelRoutes(app, {
+    customModels: stores.customModels,
+    dynamicConfig: stores.dynamicConfig,
+    auditEvents: stores.auditEvents,
+    providerKeySources: stores.providerKeySources,
+    fetchOpenRouterCatalog: stores.fetchOpenRouterCatalog
   });
   await registerAdminPolicyRoutes(app, {
     policyRules: stores.policyRules,
@@ -110,7 +152,7 @@ export async function registerAdminRoutes(
     integrationRegistry: stores.integrationRegistry,
     integrationStates: stores.integrationStates,
     auditEvents: stores.auditEvents,
-    runtimeAdapters: stores.runtimeAdapters
+    runtimeAdapter: stores.runtimeAdapter
   });
 
   await registerAdminMcpServerRoutes(app, {

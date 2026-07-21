@@ -8,45 +8,28 @@ import { sanitizeUrl } from "./sanitize-url.js";
  * Attempts to authenticate a request using a runtime token (rt_*).
  *
  * Runtime tokens are session-scoped, HMAC-signed tokens generated per
- * runtime session. They allow code running inside an E2B sandbox to call
- * back to the backend without holding a user JWT, and to authenticate
- * LLM calls through the /llm/anthropic and /llm/openai proxies without
- * ever seeing the real ANTHROPIC_API_KEY / OPENAI_API_KEY.
+ * runtime session. They allow the runtime's MCP client to call back to
+ * the backend's /mcp gateway without holding a user JWT.
  *
- * Only applies to `/mcp/`, `/llm/anthropic/`, and `/llm/openai/` routes
- * — returns false for all other paths so normal auth continues.
+ * Only applies to `/mcp/` routes — returns false for all other paths so
+ * normal auth continues.
  */
 export function tryAuthenticateRuntimeToken(
   request: FastifyRequest,
   config: AppConfig
 ): boolean {
   const isMcp = request.url.startsWith("/mcp/");
-  const isLlmAnthropic = request.url.startsWith("/llm/anthropic/");
-  const isLlmOpenai = request.url.startsWith("/llm/openai/");
-  if (!isMcp && !isLlmAnthropic && !isLlmOpenai) {
+  if (!isMcp) {
     return false;
   }
 
-  // Token transport varies by caller:
-  //  - MCP (Codex + Claude): `Authorization: Bearer rt_...` — Codex's
-  //    `[mcp_servers.*.http_headers]` and the Claude SDK's `mcpServers`
-  //    option both send it on every request, including initialize.
-  //  - LLM/anthropic (Claude Agent SDK): the SDK sends `x-api-key` with
-  //    whatever string we put in env.ANTHROPIC_API_KEY. For the proxy we
-  //    put the rt_* token there. Some SDK code paths also accept
-  //    `Authorization: Bearer`, so we keep that as a fallback.
-  //  - LLM/openai (Codex CLI): Codex follows the OpenAI SDK convention
-  //    and sends `Authorization: Bearer <key>`. The key comes from
-  //    ~/.codex/auth.json (written by `codex login --with-api-key`).
+  // MCP sends `Authorization: Bearer rt_...` on every request, including
+  // initialize.
   const authHeader = request.headers.authorization;
-  const xApiKeyRaw = request.headers["x-api-key"];
-  const xApiKey = Array.isArray(xApiKeyRaw) ? xApiKeyRaw[0] : xApiKeyRaw;
   let token: string | undefined;
 
   if (authHeader?.startsWith("Bearer rt_")) {
     token = authHeader.slice(7); // strip "Bearer "
-  } else if (isLlmAnthropic && typeof xApiKey === "string" && xApiKey.startsWith("rt_")) {
-    token = xApiKey;
   }
 
   if (!token) {

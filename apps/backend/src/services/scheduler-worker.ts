@@ -8,22 +8,25 @@ import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
-import type { RuntimeAdapter } from "../runtime-contracts.js";
-import type { RuntimeProvider } from "./admin-config-records.js";
+import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore } from "./session-store.js";
 import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
 
 /**
  * Per-job runtime resolution, mirroring the interactive /messages path
- * (`resolveRuntimeProviderAndModel`): the tenant's `runtimeProvider` setting
- * picks the adapter and default model so a scheduled turn runs on the same
- * runtime a user-initiated turn would. `kind: "error"` carries the
- * human-readable reason (provider disabled, adapter unavailable, missing API
- * key) — the run is recorded as failed rather than silently falling back to
- * Codex.
+ * (`resolveRuntimeModel`): validates key presence and picks the default model
+ * so a scheduled turn runs exactly as a user-initiated turn would.
+ * `kind: "error"` carries the human-readable reason (adapter unavailable,
+ * missing API key) — the run is recorded as failed.
  */
 export type SchedulerRuntimeResolution =
-  | { kind: "ok"; adapter: RuntimeAdapter; provider: RuntimeProvider; modelId: string | null }
+  | {
+      kind: "ok";
+      adapter: RuntimeAdapter;
+      modelId: string | null;
+      /** Tenant default-effort override for the resolved model (if any). */
+      effort?: RuntimeReasoningEffort;
+    }
   | { kind: "error"; message: string };
 
 export type SchedulerWorkerDeps = {
@@ -327,6 +330,23 @@ export class SchedulerWorker {
       return;
     }
 
+    // Recover jobs stranded in `claimed` by a crashed worker before claiming new
+    // ones — symmetric with sweepStaleJobRuns for scheduled runs. Same cutoff as
+    // that sweep (job timeout + settle grace + buffer) so a job that is merely
+    // still running is never yanked out from under its handler.
+    const staleAfterMs =
+      this.options.jobTimeoutMs +
+      (this.options.abortSettleGraceMs ?? ABORT_SETTLE_GRACE_MS) +
+      STALE_RUN_SWEEP_BUFFER_MS;
+    try {
+      const swept = await piiScanJobs.sweepStaleClaims(staleAfterMs);
+      if (swept > 0) {
+        this.deps.logger.warn({ swept }, "Recovered PII scan jobs orphaned by a crash/restart");
+      }
+    } catch (error) {
+      this.deps.logger.error({ error }, "Failed to sweep stale PII scan job claims");
+    }
+
     const limit = this.options.maxConcurrentPiiJobs ?? this.options.maxConcurrentJobs;
     const available = limit - this.activePiiCount;
     if (available <= 0) {
@@ -531,7 +551,10 @@ export class SchedulerWorker {
         // as interactive turns so the MCP gateway can enforce enabled tools and
         // servers for scheduled tool calls.
         metadata: { runtimePolicy: runtimeSession.runtimePolicy, turnContext: "scheduled" },
-        ttlMs: this.options.jobTimeoutMs
+        // Outlive the job watchdog by a margin — a context TTL equal to the
+        // timeout would let a tool call near the deadline race context expiry
+        // and fail with -32000 instead of running to the watchdog.
+        ttlMs: this.options.jobTimeoutMs + 60 * 1000
       });
 
       const stream = runtime.runMessage(runtimeSession, {
@@ -539,7 +562,8 @@ export class SchedulerWorker {
         runtimePolicyId,
         toolContextId: toolContext.toolContextId,
         assistantMessageId: assistantMessage.messageId,
-        model: resolution.modelId ?? undefined
+        model: resolution.modelId ?? undefined,
+        effort: resolution.effort
       });
 
       for await (const event of stream) {
@@ -559,10 +583,10 @@ export class SchedulerWorker {
         responseText
       );
 
-      // Recover REAL token usage. RuntimeEvents carry no usage — the LLM proxy
-      // persists it onto the assistant message row mid-turn — so re-read the
-      // row instead of recording 0 (the old behavior lied to the job-run ledger
-      // that backs the scheduler's separate usage accounting).
+      // Recover REAL token usage. RuntimeEvents carry no usage — the in-process
+      // runtime adapter persists it onto the assistant message row mid-turn —
+      // so re-read the row instead of recording 0 (the old behavior lied to the
+      // job-run ledger that backs the scheduler's separate usage accounting).
       try {
         const persisted = await this.deps.messages.getOwned(
           job.tenantId,

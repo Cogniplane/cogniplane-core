@@ -106,9 +106,13 @@ function SafeMarkdownImpl({ children }: { children: string }) {
   return (
     <>
       <Suspense fallback={<span className="whitespace-pre-wrap">{children}</span>}>
-        <ReactMarkdown allowedElements={ALLOWED_ELEMENTS} unwrapDisallowed components={components}>
-          {children}
-        </ReactMarkdown>
+        {/* .md-body picks up the shared rendered-markdown rules in globals.css
+            (tables, blockquotes, links) that react-markdown emits unstyled. */}
+        <div className="md-body">
+          <ReactMarkdown allowedElements={ALLOWED_ELEMENTS} unwrapDisallowed components={components}>
+            {children}
+          </ReactMarkdown>
+        </div>
       </Suspense>
       {zoomed ? (
         <ImageLightbox src={zoomed.src} alt={zoomed.alt} onClose={() => setZoomed(null)} />

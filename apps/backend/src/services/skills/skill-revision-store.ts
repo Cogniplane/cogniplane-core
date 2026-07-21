@@ -199,6 +199,28 @@ export class SkillRevisionStore {
         [input.skillId, tenantId]
       );
 
+      // System skill IDs are reserved. Continue to support a pre-existing
+      // tenant-owned row with the same ID, but do not create any new collision.
+      if (!existing.rows[0] && tenantId !== "system") {
+        const systemSkill = await client.query(
+          `
+            SELECT 1
+            FROM admin_skills
+            WHERE skill_id = $1
+              AND tenant_id = 'system'
+            LIMIT 1
+          `,
+          [input.skillId]
+        );
+
+        if (systemSkill.rows[0]) {
+          throw new AdminConfigError(
+            `Skill "${input.skillId}" is a system-provided skill and cannot be imported. ` +
+              "Create a copy under a different skill id to customize it."
+          );
+        }
+      }
+
       if (!existing.rows[0]) {
         await client.query(
           `

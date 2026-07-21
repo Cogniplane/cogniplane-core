@@ -3,7 +3,6 @@ import type {
   ApprovalPolicy,
   ApprovalReviewer,
   PolicyEnforcementMode,
-  RuntimeProvider,
   WebSearchMode,
 } from "@cogniplane/shared-types";
 
@@ -11,15 +10,8 @@ export type {
   GranularApprovalPolicy,
   ApprovalPolicy,
   ApprovalReviewer,
-  RuntimeProvider,
   WebSearchMode,
 };
-
-// The platform-default runtime provider, used when a tenant hasn't selected one
-// (mirrors the `runtimeProvider` fallback at the tenant-settings default below).
-// Centralised so the "default adapter" is `runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]`
-// rather than a separate `runtimeManager` field.
-export const DEFAULT_RUNTIME_PROVIDER: RuntimeProvider = "codex";
 
 export type AdminSkillRecord = {
   skillId: string;
@@ -128,7 +120,6 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
     id: `tenant-settings:${settings.tenantId}`,
     label: "Tenant Settings",
     description: null,
-    runtimeProvider: settings.runtimeProvider,
     webSearchMode: settings.webSearchMode,
     approvalPolicy: settings.approvalPolicy,
     approvalReviewer: settings.approvalReviewer,
@@ -163,7 +154,7 @@ function parseSnapshotApprovalPolicy(value: unknown): ApprovalPolicy {
  * (e.g. `mapJudgmentRow`): each field is coerced to its declared type with
  * a safe fallback so a single bad row can't crash an entire turn. Unknown
  * enum values land on the conservative default (`approvalReviewer: "user"`,
- * `runtimeProvider: "codex"`, `approvalPolicy: "never"`).
+ * `approvalPolicy: "never"`).
  *
  * `sandboxMode` and `networkMode` are single-valued literal types on
  * `ResolvedRuntimePolicy` today (`"workspace-write"` and `"restricted"`).
@@ -192,7 +183,6 @@ export function parseRuntimePolicySnapshot(
     id: String(profile.id),
     label: String(profile.label ?? profile.id),
     description: profile.description ? String(profile.description) : null,
-    runtimeProvider: (profile.runtimeProvider === "claude-code" ? "claude-code" : DEFAULT_RUNTIME_PROVIDER) as RuntimeProvider,
     webSearchMode: (profile.webSearchMode === "cached" || profile.webSearchMode === "live"
       ? profile.webSearchMode
       : "disabled") as WebSearchMode,
@@ -247,7 +237,6 @@ export type ResolvedRuntimePolicy = {
   id: string;
   label: string;
   description: string | null;
-  runtimeProvider: RuntimeProvider;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: ApprovalReviewer;

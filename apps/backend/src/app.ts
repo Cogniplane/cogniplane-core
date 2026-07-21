@@ -6,7 +6,6 @@ import multipart from "@fastify/multipart";
 
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
-import { DEFAULT_RUNTIME_PROVIDER } from "./services/admin-config-records.js";
 import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
@@ -241,11 +240,10 @@ export async function buildApp() {
     sessions: deps.sessions,
     messages: deps.messages,
     toolContexts: deps.toolContexts,
-    defaultAdapter: deps.runtimeAdapters[DEFAULT_RUNTIME_PROVIDER]!,
-    runtimeAdapters: deps.runtimeAdapters,
+    runtimeAdapter: deps.runtimeAdapter,
     dynamicConfig: deps.dynamicConfig,
-    getTenantAnthropicApiKey: deps.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: deps.getTenantOpenaiApiKey,
+    customModels: deps.customModels,
+    providerCredentials: deps.providerCredentials,
     auditEvents: deps.auditEvents,
     piiScanJobs: deps.piiScanJobs,
     piiScanJobHandler: deps.piiScanJobHandler,
@@ -257,7 +255,7 @@ export async function buildApp() {
     config,
     limits: deps.limits,
     policyService: deps.policyService,
-    runtimeAdapters: deps.runtimeAdapters,
+    runtimeAdapter: deps.runtimeAdapter,
     privilegedDb,
     schedulerWorker,
     // Cross-tenant stale-approval recovery needs a BYPASSRLS pool; reuse the

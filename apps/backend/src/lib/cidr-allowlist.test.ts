@@ -35,9 +35,8 @@ describe("parseCidrAllowlist", () => {
   });
 
   test("always admits loopback when an allowlist is configured", () => {
-    // Without this carve-out, the same-process backend caller (e.g. local
-    // Claude SDK routing through /llm/anthropic) would be rejected the
-    // moment E2B_EGRESS_CIDRS is set in production.
+    // Without this carve-out, a same-host caller reaching the /mcp gateway
+    // over loopback would be rejected the moment E2B_EGRESS_CIDRS is set.
     const list = parseCidrAllowlist("203.0.113.0/24")!;
     expect(cidrAllowlistAllows(list, "127.0.0.1")).toBe(true);
     expect(cidrAllowlistAllows(list, "::1")).toBe(true);

@@ -82,11 +82,11 @@ test("AuditEventStore.create leaves payloads with no secrets unchanged", async (
     sessionId: "sess-1",
     userId: "user-1",
     type: "session.created",
-    payload: { provider: "codex", model: "gpt-5", messageCount: 0 }
+    payload: { provider: "deep-agents", model: "deepagents/claude-sonnet-5", messageCount: 0 }
   });
 
   const insert = queries.find((q) => q.text.includes("INSERT INTO audit_events"));
   expect(insert).toBeDefined();
   const payload = JSON.parse(insert!.values[5] as string);
-  expect(payload).toEqual({ provider: "codex", model: "gpt-5", messageCount: 0 });
+  expect(payload).toEqual({ provider: "deep-agents", model: "deepagents/claude-sonnet-5", messageCount: 0 });
 });

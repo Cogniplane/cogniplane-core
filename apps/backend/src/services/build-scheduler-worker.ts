@@ -2,14 +2,16 @@ import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "../config.js";
 import type { RuntimeAdapter } from "../runtime-contracts.js";
-import type { RuntimeProvider } from "./admin-config-records.js";
 import type { AuditEventStore } from "./audit-event-store.js";
 import type { DynamicConfigService } from "./dynamic-config-service.js";
+import { toAvailableModel, type CustomModelStore } from "./custom-model-store.js";
+import { AVAILABLE_MODELS } from "../domain/models.js";
 import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { buildApiKeyPresenceCheckers } from "./runtime/api-key-presence.js";
-import { resolveRuntimeProviderAndModel } from "./runtime/runtime-provider-resolver.js";
+import type { ProviderCredentials } from "./runtime/provider-credentials.js";
+import { resolveRuntimeModel } from "./runtime/runtime-model-resolver.js";
 import { SchedulerWorker, type SchedulerRuntimeResolution } from "./scheduler-worker.js";
 import type { SessionStore } from "./session-store.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
@@ -22,11 +24,10 @@ export function buildSchedulerWorker(
     sessions: SessionStore;
     messages: MessageStore;
     toolContexts: ToolExecutionContextStore;
-    defaultAdapter: RuntimeAdapter;
-    runtimeAdapters: Partial<Record<RuntimeProvider, RuntimeAdapter>>;
+    runtimeAdapter: RuntimeAdapter;
     dynamicConfig: DynamicConfigService;
-    getTenantAnthropicApiKey: (tenantId: string) => Promise<string | null>;
-    getTenantOpenaiApiKey: (tenantId: string) => Promise<string | null>;
+    customModels: CustomModelStore;
+    providerCredentials: ProviderCredentials;
     auditEvents: AuditEventStore;
     piiScanJobs?: PiiScanJobStore;
     piiScanJobHandler?: PiiScanJobHandler;
@@ -51,23 +52,28 @@ export function buildSchedulerWorker(
     return null;
   }
 
-  const { hasAnthropicApiKey, hasOpenaiApiKey } = buildApiKeyPresenceCheckers({
-    config,
-    getTenantAnthropicApiKey: input.getTenantAnthropicApiKey,
-    getTenantOpenaiApiKey: input.getTenantOpenaiApiKey
+  const { hasProviderKey } = buildApiKeyPresenceCheckers({
+    credentials: input.providerCredentials
   });
 
   const resolveRuntime = async (tenantId: string): Promise<SchedulerRuntimeResolution> => {
-    const resolution = await resolveRuntimeProviderAndModel({
+    const resolution = await resolveRuntimeModel({
       tenantId,
+      // Scheduled jobs use the tenant's default model; the resolver gates on
+      // that model's provider (not Anthropic specifically).
       requestedModel: undefined,
       requestedEffort: undefined,
-      defaultAdapter: input.defaultAdapter,
+      runtimeAdapter: input.runtimeAdapter,
       stores: {
-        dynamicConfig: input.dynamicConfig,
-        runtimeAdapters: input.runtimeAdapters,
-        hasAnthropicApiKey,
-        hasOpenaiApiKey
+        hasProviderKey,
+        // Scheduled turns honor the same admin-controlled model availability
+        // and default-effort overrides as interactive ones.
+        getModelAvailability: (tenantId) =>
+          input.dynamicConfig.getOrCreateTenantSettings(tenantId),
+        listModels: async (tenantId) => [
+          ...AVAILABLE_MODELS,
+          ...(await input.customModels.list(tenantId)).map(toAvailableModel)
+        ]
       }
     });
 
@@ -84,8 +90,8 @@ export function buildSchedulerWorker(
     return {
       kind: "ok",
       adapter: resolution.runtimeAdapter,
-      provider: resolution.provider,
-      modelId: resolution.selectedModel?.id ?? null
+      modelId: resolution.selectedModel?.id ?? null,
+      effort: resolution.selectedEffort
     };
   };
 

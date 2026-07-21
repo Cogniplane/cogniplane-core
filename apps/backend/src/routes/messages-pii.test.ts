@@ -82,6 +82,79 @@ test("POST /messages in block mode persists a system message and does not dispat
   expect(!persisted.some((message) => message.role === "user")).toBeTruthy();
 });
 
+test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client can parse (not RuntimeEvent frames)", async () => {
+  const { app, messages, runtimeManager } = await createTestApp({
+    AGUI_WIRE: true,
+    pii: {
+      piiProtection: {
+        async evaluateText() {
+          return {
+            action: "block",
+            findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
+            blockReason: "email",
+            providerType: "openai-compatible",
+            providerModel: "google/gemini-2.5-flash"
+          };
+        }
+      },
+      piiScanRuns: {
+        async create() {
+          return { scanRunId: "scan-blk-agui" };
+        }
+      }
+    }
+  });
+  onTestFinished(async () => { await app.close(); });
+
+  const sessionId = await createSessionFor(app);
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/messages?format=agui",
+    headers: { "x-user-id": "platform-user" },
+    payload: { sessionId, text: "my email is user@example.com" }
+  });
+
+  expect(response.statusCode).toBe(200);
+
+  // AG-UI frames are `data: <json>` with NO `event:` line (parseSseEvents can't
+  // read them), so parse the raw data frames and assert on their `type`.
+  const frames = response.payload
+    .trim()
+    .split("\n\n")
+    .filter(Boolean)
+    .map((chunk) => {
+      const dataLine = chunk.split("\n").find((line) => line.startsWith("data: "));
+      return dataLine ? (JSON.parse(dataLine.slice("data: ".length)) as Record<string, unknown>) : null;
+    })
+    .filter((f): f is Record<string, unknown> => f !== null);
+
+  const types = frames.map((f) => f.type);
+  // A valid, minimal AG-UI run the CopilotKit HttpAgent's EventSchemas.parse accepts.
+  expect(types).toEqual([
+    "RUN_STARTED",
+    "TEXT_MESSAGE_START",
+    "TEXT_MESSAGE_CONTENT",
+    "TEXT_MESSAGE_END",
+    "RUN_FINISHED"
+  ]);
+  // The block copy rides the text message so it renders live.
+  const content = frames.find((f) => f.type === "TEXT_MESSAGE_CONTENT");
+  expect(content?.delta).toBe("Message blocked by organization policy.");
+  // threadId === sessionId (matches the AG-UI writer/driver contract).
+  const started = frames.find((f) => f.type === "RUN_STARTED");
+  expect(started?.threadId).toBe(sessionId);
+  // No RuntimeEvent block frames leaked onto the AG-UI wire.
+  expect(types).not.toContain("framework:message_blocked");
+  expect(types).not.toContain("response.completed");
+
+  // The block still short-circuits the runtime and persists the system message.
+  expect(runtimeManager.runMessageInputs.length).toBe(0);
+  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  expect(persisted.some((m) => m.role === "system")).toBe(true);
+  expect(persisted.some((m) => m.role === "user")).toBe(false);
+});
+
 test("POST /messages in transform mode emits runtime.user_message_replaced and sends transformed prompt to runtime", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {

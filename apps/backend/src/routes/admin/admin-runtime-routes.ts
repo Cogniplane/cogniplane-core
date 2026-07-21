@@ -1,50 +1,32 @@
 import { parseRequestInput } from "../../lib/route-validation.js";
-import { access } from "node:fs/promises";
-import { lookup } from "node:dns/promises";
-import os from "node:os";
-import path from "node:path";
 
 import type { FastifyInstance } from "fastify";
 
 import {
   AdminRuntimeConfigSchema,
   AdminRuntimeHealthResponseSchema,
-  RuntimeOpenAiDiagnosticSchema,
+  MODEL_PROVIDERS,
+  MODEL_PROVIDER_META,
   RuntimeSessionsListResponseSchema
 } from "@cogniplane/shared-types";
 
 import { serialize } from "../../lib/serialize-response.js";
 import { summarizeRuntimeConfig } from "../../domain/runtime-manifest.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
+import type { DeepAgentsRuntimeAdapter } from "../../services/deep-agents/deep-agents-runtime-adapter.js";
 import type { RuntimeSessionStore } from "../../services/runtime/runtime-session-store.js";
-import type { CodexRuntimeManager } from "../../services/runtime-manager.js";
 import { rolloutBodySchema } from "./admin-route-schemas.js";
 import {
   createAdminAuditEvent,
   withAdmin
 } from "./admin-route-helpers.js";
 
-/**
- * Extracts the `mode` field from a session's `lifecycleMetadata` JSONB. Only
- * the Claude adapter currently writes this (values: "local" | "e2b"); Codex
- * sessions have no mode distinction, so we return null for them. Returning
- * null (not undefined) lets the UI render a neutral "—" placeholder instead
- * of branching on "field exists."
- */
-export function extractLifecycleMode(
-  lifecycleMetadata: Record<string, unknown>
-): "local" | "e2b" | null {
-  const raw = lifecycleMetadata.mode;
-  if (raw === "local" || raw === "e2b") return raw;
-  return null;
-}
-
 export async function registerAdminRuntimeRoutes(
   app: FastifyInstance,
   stores: {
     auditEvents: AuditEventStore;
     runtimeSessions: RuntimeSessionStore;
-    codexRuntimeManager: CodexRuntimeManager;
+    deepAgentsAdapter: DeepAgentsRuntimeAdapter;
   }
 ): Promise<void> {
   app.get("/admin/runtime-sessions", withAdmin(app, async (request) => {
@@ -52,23 +34,19 @@ export async function registerAdminRuntimeRoutes(
     return serialize(RuntimeSessionsListResponseSchema, {
       runtimeSessions: runtimeSessions.map((runtimeSession) => ({
         ...runtimeSession,
-        configSummary: summarizeRuntimeConfig(runtimeSession.manifestMetadata),
-        // `runtimeProvider` already comes through the spread from the store
-        // column `runtime_sessions.runtime_provider` — don't override it,
-        // that column is authoritative for both Codex and Claude rows.
-        // Only surface `mode` from lifecycleMetadata since the store has no
-        // typed column for the local-vs-e2b distinction yet.
-        mode: extractLifecycleMode(runtimeSession.lifecycleMetadata)
+        configSummary: summarizeRuntimeConfig(runtimeSession.manifestMetadata)
+        // `runtimeProvider` comes through the spread from the store column
+        // `runtime_sessions.runtime_provider`.
       }))
     });
   }));
 
-  // Live in-memory Codex process detail (pid, port, liveness, active turn),
+  // Live in-memory session-runtime detail (active turn, last activity),
   // scoped to the caller's tenant. This is the relocated detail that the
   // unauthenticated /health endpoint used to expose for every tenant.
   app.get("/admin/runtime-health", withAdmin(app, async (request) => {
     return serialize(AdminRuntimeHealthResponseSchema, {
-      runtimes: stores.codexRuntimeManager.getRuntimeHealthDetail(request.auth.tenantId)
+      runtimes: stores.deepAgentsAdapter.getRuntimeHealthDetail(request.auth.tenantId)
     });
   }));
 
@@ -77,54 +55,16 @@ export async function registerAdminRuntimeRoutes(
   // across the fleet. Intentionally small — add new fields here lazily as
   // the UI needs them.
   app.get("/admin/runtime-config", withAdmin(app, async () => {
+    // Report every provider with a platform-level env key, not just Anthropic —
+    // an OpenAI/Google/Z.AI-only deployment would otherwise read "missing" while
+    // working fine. Same key-presence rule as buildProviderCredentials.
+    const platformProviders = MODEL_PROVIDERS.filter((provider) =>
+      Boolean(app.config[MODEL_PROVIDER_META[provider].envKey]?.trim())
+    );
     return serialize(AdminRuntimeConfigSchema, {
       e2bTemplateId: app.config.E2B_TEMPLATE_ID,
-      codexModel: app.config.CODEX_MODEL,
-      claudeModel: app.config.CLAUDE_CODE_MODEL,
-      anthropicKeyConfigured: Boolean(app.config.ANTHROPIC_API_KEY),
-      openaiKeyConfigured: Boolean(app.config.OPENAI_API_KEY)
-    });
-  }));
-
-  app.get("/admin/runtime/openai-diagnostic", withAdmin(app, async () => {
-    const home = os.homedir();
-    const codexDir = path.join(home, ".codex");
-    const authFile = path.join(codexDir, "auth.json");
-    const configFile = path.join(codexDir, "config.toml");
-
-    const model = app.config.CODEX_MODEL;
-    const openAiApiKey = app.config.OPENAI_API_KEY;
-
-    const [authFilePresent, configFilePresent, dnsResult, unauthenticatedProbe, authenticatedProbe, responsesNonStreaming, responsesStreaming] =
-      await Promise.all([
-        fileExists(authFile),
-        fileExists(configFile),
-        resolveDns(),
-        probeOpenAi(),
-        openAiApiKey ? probeOpenAi(openAiApiKey) : Promise.resolve({ skipped: true as const }),
-        openAiApiKey
-          ? probeOpenAiResponses({ apiKey: openAiApiKey, model, stream: false })
-          : Promise.resolve({ skipped: true as const }),
-        openAiApiKey
-          ? probeOpenAiResponses({ apiKey: openAiApiKey, model, stream: true })
-          : Promise.resolve({ skipped: true as const })
-      ]);
-
-    return serialize(RuntimeOpenAiDiagnosticSchema, {
-      checkedAt: new Date().toISOString(),
-      home,
-      codexAuth: {
-        openAiApiKeyPresent: Boolean(openAiApiKey),
-        authFilePresent,
-        configFilePresent
-      },
-      dns: dnsResult,
-      probes: {
-        unauthenticated: unauthenticatedProbe,
-        authenticated: authenticatedProbe,
-        responsesNonStreaming,
-        responsesStreaming
-      }
+      anthropicKeyConfigured: platformProviders.includes("anthropic"),
+      platformProviders
     });
   }));
 
@@ -134,9 +74,16 @@ export async function registerAdminRuntimeRoutes(
       return parsed.response;
     }
 
-    const affectedSessionIds = await stores.codexRuntimeManager.refreshIdleRuntimes(
+    // Both rollout actions collapse to the same deep-agents operation:
+    // tear down the tenant's IDLE session runtimes so the next turn rebuilds
+    // them against fresh config. Sessions with an active turn are skipped —
+    // the actions are labeled "idle" and must not interrupt running
+    // conversations. (The Codex-era distinction between draining and
+    // refreshing separate processes no longer applies — turns hold no
+    // long-lived process.)
+    const affectedSessionIds = await stores.deepAgentsAdapter.invalidateTenantRuntimes(
       request.auth.tenantId,
-      parsed.value.action
+      { idleOnly: true }
     );
     await createAdminAuditEvent(stores.auditEvents, {
       tenantId: request.auth.tenantId,
@@ -155,145 +102,4 @@ export async function registerAdminRuntimeRoutes(
       affectedSessionIds
     };
   }));
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function resolveDns(): Promise<
-  | { ok: true; addresses: Array<{ address: string; family: number }> }
-  | { ok: false; error: string }
-> {
-  try {
-    const addresses = await lookup("api.openai.com", { all: true });
-    return {
-      ok: true,
-      addresses: addresses.map((entry) => ({
-        address: entry.address,
-        family: entry.family
-      }))
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-async function probeOpenAi(apiKey?: string): Promise<
-  | { skipped: true }
-  | { ok: true; status: number; statusText: string }
-  | { ok: false; error: string }
-> {
-  try {
-    const response = await fetch("https://api.openai.com/v1/models", {
-      method: "GET",
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
-      signal: AbortSignal.timeout(10_000)
-    });
-
-    return {
-      ok: true,
-      status: response.status,
-      statusText: response.statusText
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
-}
-
-async function probeOpenAiResponses(input: {
-  apiKey: string;
-  model: string;
-  stream: boolean;
-}): Promise<
-  | { skipped: true }
-  | {
-      ok: true;
-      status: number;
-      statusText: string;
-      stream: boolean;
-      firstChunkBytes: number | null;
-      completedStream: boolean | null;
-      totalChunkBytes: number | null;
-    }
-  | { ok: false; stream: boolean; error: string }
-> {
-  try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${input.apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: input.model,
-        input: "Reply with exactly the word OK.",
-        stream: input.stream,
-        max_output_tokens: 16
-      }),
-      signal: AbortSignal.timeout(20_000)
-    });
-
-    let firstChunkBytes: number | null = null;
-    let completedStream: boolean | null = null;
-    let totalChunkBytes: number | null = null;
-    if (input.stream && response.body) {
-      const reader = response.body.getReader();
-      let total = 0;
-      let first = true;
-
-      try {
-        while (true) {
-          const chunk = await reader.read();
-          if (chunk.done) {
-            completedStream = true;
-            break;
-          }
-
-          const size = chunk.value?.byteLength ?? 0;
-          total += size;
-          if (first) {
-            firstChunkBytes = size;
-            first = false;
-          }
-        }
-      } catch (error) {
-        return {
-          ok: false,
-          stream: input.stream,
-          error: error instanceof Error ? error.message : String(error)
-        };
-      } finally {
-        totalChunkBytes = total;
-        await reader.cancel().catch(() => {});
-      }
-    }
-
-    return {
-      ok: true,
-      status: response.status,
-      statusText: response.statusText,
-      stream: input.stream,
-      firstChunkBytes,
-      completedStream,
-      totalChunkBytes
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      stream: input.stream,
-      error: error instanceof Error ? error.message : String(error)
-    };
-  }
 }

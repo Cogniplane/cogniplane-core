@@ -3,47 +3,11 @@ import { test, expect, describe } from "vitest";
 import type { FastifyReply, FastifyRequest } from "fastify";
 
 import {
-  canAccessAdmin,
-  canManageMembers,
-  canManageTenant,
-  isElevatedRole,
   requireRole,
   type Role
 } from "./rbac.js";
 
 const ROLES: Role[] = ["owner", "admin", "member"];
-
-describe("isElevatedRole", () => {
-  test("owner and admin are elevated; member is not", () => {
-    expect(isElevatedRole("owner")).toBe(true);
-    expect(isElevatedRole("admin")).toBe(true);
-    expect(isElevatedRole("member")).toBe(false);
-  });
-});
-
-describe("canManageTenant", () => {
-  test("owner can manage; admin and member cannot", () => {
-    expect(canManageTenant("owner")).toBe(true);
-    expect(canManageTenant("admin")).toBe(false);
-    expect(canManageTenant("member")).toBe(false);
-  });
-});
-
-describe("canManageMembers", () => {
-  test("owner and admin can manage members; member cannot", () => {
-    expect(canManageMembers("owner")).toBe(true);
-    expect(canManageMembers("admin")).toBe(true);
-    expect(canManageMembers("member")).toBe(false);
-  });
-});
-
-describe("canAccessAdmin", () => {
-  test("owner and admin can access admin; member cannot", () => {
-    expect(canAccessAdmin("owner")).toBe(true);
-    expect(canAccessAdmin("admin")).toBe(true);
-    expect(canAccessAdmin("member")).toBe(false);
-  });
-});
 
 describe("requireRole", () => {
   function fakeReply(): FastifyReply & { _status?: number; _payload?: unknown } {

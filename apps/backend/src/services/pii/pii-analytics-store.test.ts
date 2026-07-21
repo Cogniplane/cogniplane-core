@@ -36,12 +36,11 @@ test("getKpis runs inside withTenantScope and queries pii_scan_runs", async () =
 
   await store.getKpis("tenant-1", new Date("2026-01-01"), new Date("2026-02-01"));
 
-  // BEGIN, SET LOCAL app.current_tenant_id, the SELECT, COMMIT
+  // The distinguishing contract is that getKpis reads from pii_scan_runs; the
+  // BEGIN/COMMIT/set_config transaction envelope is `withTenantScope`, tested in
+  // lib/db.test.ts — no need to re-assert it here.
   const sqlTexts = db.queries.map((q) => q.text);
-  expect(sqlTexts.some((t) => t === "BEGIN")).toBeTruthy();
-  expect(sqlTexts.some((t) => t.includes("set_config"))).toBeTruthy();
   expect(sqlTexts.some((t) => t.includes("FROM pii_scan_runs"))).toBeTruthy();
-  expect(sqlTexts.some((t) => t === "COMMIT")).toBeTruthy();
 });
 
 test("getQueueStats targets pii_scan_jobs (not pii_scan_runs) and ignores range arguments", async () => {

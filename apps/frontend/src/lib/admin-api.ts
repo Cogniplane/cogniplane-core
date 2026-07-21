@@ -1,6 +1,9 @@
 import {
   AdminManagedToolsListResponseSchema,
   AdminMcpServerEnvelopeSchema,
+  AdminModelCatalogResponseSchema,
+  CustomModelEnvelopeSchema,
+  OpenRouterModelsResponseSchema,
   AdminMcpServersListResponseSchema,
   AdminRuntimeConfigSchema,
   AdminSessionDetailResponseSchema,
@@ -21,17 +24,15 @@ import {
   PolicyRuleEnvelopeSchema,
   PolicyRulesListResponseSchema,
   PolicySimulateResponseSchema,
-  RuntimeOpenAiDiagnosticSchema,
   RuntimeRolloutResponseSchema,
   RuntimeSessionsListResponseSchema,
   SkillImportResponseSchema,
   SkillMarketplaceResponseSchema,
   SkillRevisionFileResponseSchema,
   SkillRevisionsListResponseSchema,
-  TenantAnthropicKeyUpdateResponseSchema,
+  TenantProviderKeyUpdateResponseSchema,
   TenantMarketplaceManifestUrlUpdateResponseSchema,
   TenantOkResponseSchema,
-  TenantOpenAiKeyUpdateResponseSchema,
   TenantPiiProtectionUpdateResponseSchema,
   TenantSettingsEnvelopeSchema
 } from "@cogniplane/shared-types";
@@ -68,12 +69,16 @@ import type {
   PolicyRulePatch,
   PolicySimulateRequest,
   PolicySimulateResponse,
-  RuntimeOpenAiDiagnostic,
   RuntimeSessionSummary,
   SkillImportResponse,
   SkillMarketplaceCatalog,
   SkillRevision,
   SkillRevisionFilePreview,
+  AdminModelCatalogResponse,
+  CustomModelCreateRequest,
+  EffortLevel,
+  Model,
+  OpenRouterModelOption,
   TenantDetails,
   TenantSettings,
   WebSearchMode
@@ -83,6 +88,8 @@ export type {
   AdminManagedTool,
   SkillRevisionFilePreview
 } from "@cogniplane/shared-types";
+
+import type { ModelProvider } from "@cogniplane/shared-types";
 
 type TenantGithubSettings = TenantDetails["settings"]["github"];
 type TenantMicrosoftOAuthSettings = TenantDetails["settings"]["microsoftOAuth"];
@@ -95,8 +102,8 @@ type TenantDetailsResponse = {
   createdAt: string;
   updatedAt: string;
   settings?: {
-    openaiApiKeyConfigured?: boolean;
     anthropicApiKeyConfigured?: boolean;
+    providerKeys?: Partial<Record<ModelProvider, boolean>>;
     skillMarketplaceManifestUrl?: string | null;
     piiProtection?: PiiProtectionSettings;
     github?: Partial<TenantGithubSettings>;
@@ -147,8 +154,16 @@ function normalizeTenantDetails(tenant: TenantDetailsResponse): TenantDetails {
     updatedAt: tenant.updatedAt,
     settings: {
       ...settings,
-      openaiApiKeyConfigured: Boolean(settings.openaiApiKeyConfigured),
       anthropicApiKeyConfigured: Boolean(settings.anthropicApiKeyConfigured),
+      providerKeys: {
+        anthropic: Boolean(
+          settings.providerKeys?.anthropic ?? settings.anthropicApiKeyConfigured
+        ),
+        openai: Boolean(settings.providerKeys?.openai),
+        google: Boolean(settings.providerKeys?.google),
+        openrouter: Boolean(settings.providerKeys?.openrouter),
+        zai: Boolean(settings.providerKeys?.zai)
+      },
       skillMarketplaceManifestUrl:
         typeof settings.skillMarketplaceManifestUrl === "string"
           ? settings.skillMarketplaceManifestUrl
@@ -343,7 +358,6 @@ export async function listAdminSessions(
   if (params.from) search.set("from", params.from);
   if (params.to) search.set("to", params.to);
   if (params.status) search.set("status", params.status);
-  if (params.runtime) search.set("runtime", params.runtime);
   if (params.alert && params.alert.length > 0) {
     search.set("alert", params.alert.join(","));
   }
@@ -394,8 +408,50 @@ export async function getTenantSettings(): Promise<TenantSettings> {
   return parseResponse(TenantSettingsEnvelopeSchema, raw, "GET /admin/tenant-settings").settings;
 }
 
+/** Full model catalog + per-provider key sources (admin-only, unfiltered). */
+export async function getAdminModelCatalog(): Promise<AdminModelCatalogResponse> {
+  const raw = await request<unknown>("/admin/models");
+  return parseResponse(AdminModelCatalogResponseSchema, raw, "GET /admin/models");
+}
+
+/** Slim OpenRouter catalog for the custom-model picker (server-proxied). */
+export async function getOpenRouterModels(): Promise<OpenRouterModelOption[]> {
+  const raw = await request<unknown>("/admin/openrouter-models");
+  return parseResponse(OpenRouterModelsResponseSchema, raw, "GET /admin/openrouter-models").models;
+}
+
+export async function createCustomModel(input: CustomModelCreateRequest): Promise<Model> {
+  const raw = await request<unknown>("/admin/custom-models", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(CustomModelEnvelopeSchema, raw, "POST /admin/custom-models").model;
+}
+
+export async function deleteCustomModel(modelId: string): Promise<void> {
+  await request<unknown>(`/admin/custom-models?modelId=${encodeURIComponent(modelId)}`, {
+    method: "DELETE"
+  });
+}
+
+/**
+ * Partial tenant-settings update carrying only the model-availability fields.
+ * The backend upsert leaves absent fields untouched, so this cannot stomp
+ * concurrent edits to the broader Agent Settings form.
+ */
+export async function updateTenantModelAvailability(input: {
+  enabledProviders?: ModelProvider[];
+  enabledModelIds?: string[] | null;
+  modelDefaultEfforts?: Record<string, EffortLevel>;
+}): Promise<TenantSettings> {
+  const raw = await request<unknown>("/admin/tenant-settings", {
+    method: "PUT",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(TenantSettingsEnvelopeSchema, raw, "PUT /admin/tenant-settings").settings;
+}
+
 export async function updateTenantAgentSettings(input: {
-  enabledRuntimeProviders: Array<"codex" | "claude-code">;
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
@@ -429,15 +485,6 @@ export async function rolloutRuntimeSessions(action: "drain_idle" | "refresh_idl
   return parseResponse(RuntimeRolloutResponseSchema, raw, "POST /admin/runtime-sessions/rollout");
 }
 
-export async function runRuntimeOpenAiDiagnostic(): Promise<RuntimeOpenAiDiagnostic> {
-  const raw = await request<unknown>("/admin/runtime/openai-diagnostic");
-  return parseResponse(
-    RuntimeOpenAiDiagnosticSchema,
-    raw,
-    "GET /admin/runtime/openai-diagnostic"
-  );
-}
-
 export async function getRuntimeConfig(): Promise<AdminRuntimeConfig> {
   const raw = await request<unknown>("/admin/runtime-config");
   return parseResponse(AdminRuntimeConfigSchema, raw, "GET /admin/runtime-config");
@@ -452,23 +499,19 @@ export async function getTenantDetails(): Promise<TenantDetails> {
   return normalizeTenantDetails(raw);
 }
 
-export async function updateTenantOpenAiKey(input: { openaiApiKey: string }) {
-  const raw = await request<unknown>("/tenant/settings", {
-    method: "PUT",
-    body: JSON.stringify(input)
-  });
-  return parseResponse(TenantOpenAiKeyUpdateResponseSchema, raw, "PUT /tenant/settings (openai)");
-}
-
-export async function updateTenantAnthropicKey(input: { anthropicApiKey: string }) {
+export async function updateTenantProviderKey(input: {
+  provider: ModelProvider;
+  // Empty string clears the provider's stored key (off-boarding / revocation).
+  apiKey: string;
+}) {
   const raw = await request<unknown>("/tenant/settings", {
     method: "PUT",
     body: JSON.stringify(input)
   });
   return parseResponse(
-    TenantAnthropicKeyUpdateResponseSchema,
+    TenantProviderKeyUpdateResponseSchema,
     raw,
-    "PUT /tenant/settings (anthropic)"
+    `PUT /tenant/settings (${input.provider})`
   );
 }
 

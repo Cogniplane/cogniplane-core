@@ -38,7 +38,6 @@ import {
   type TenantSettingsInput,
   type TenantSettingsRecord
 } from "./tenant-settings-store.js";
-import type { SessionRuntimeOverrideStore } from "./session-runtime-override-store.js";
 import type { ManagedToolCatalog } from "./managed-tools/catalog.js";
 
 export { parseGitHubSkillSource } from "./skills/skill-import-service.js";
@@ -54,10 +53,6 @@ type DynamicConfigStores = {
   skillRevisions: SkillRevisionStore;
   mcpServers: McpServerStore;
   tenantSettings: TenantSettingsStore;
-  // Optional: when absent, compileRuntimeConfig never narrows the resolved
-  // runtime policy. Wired in by app-dependencies.ts; left out by the
-  // narrower test-helpers that only need skills + MCP servers.
-  sessionRuntimeOverrides?: SessionRuntimeOverrideStore;
 };
 
 /**
@@ -117,19 +112,18 @@ export class DynamicConfigService {
   async compileRuntimeConfig(
     tenantId: string,
     isBetaTester = true,
-    sessionId?: string | null
+    // Retained for call-site compatibility (the session id is still threaded
+    // through by the runtime adapter) but no longer narrows the config — the
+    // per-session override path was retired with the skill-improvement flow.
+    _sessionId?: string | null
   ): Promise<RuntimeConfigBundle> {
     const runtimePolicy = await this.getRuntimePolicy(tenantId);
-    const sessionOverride = sessionId && this.stores.sessionRuntimeOverrides
-      ? await this.stores.sessionRuntimeOverrides.get(tenantId, sessionId)
-      : null;
     return compileRuntimeConfigBundle({
       tenantId,
       skills: this.stores.skills,
       mcpServers: this.stores.mcpServers,
       runtimePolicy,
-      isBetaTester,
-      sessionOverride
+      isBetaTester
     });
   }
 

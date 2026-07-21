@@ -1,13 +1,13 @@
 // MCP gateway.
 //
-// Handles JSON-RPC 2.0 traffic from runtimes (Codex and Claude SDK) and
+// Handles JSON-RPC 2.0 traffic from the agent runtime's MCP client and
 // dispatches to managed tools or proxies to upstream servers.
 //
 // Per-turn `toolContextId` resolution has three fallbacks — args, URL query
 // param, and session-scoped lookup via the runtime token's `sid` claim.
-// Different runtimes hit different paths: Codex injects the id into args; the
-// in-sandbox Claude harness relies on the session-scoped lookup. The URL
-// query-param path is a defensive fallback some transports use. All three
+// The deep-agents loop injects the id into args at call time; the URL
+// query-param path is a defensive fallback some transports use, and the
+// session-scoped lookup covers a runtime that omits the argument. All three
 // must keep working — don't collapse them into one path.
 
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
@@ -46,6 +46,7 @@ import {
 } from "../services/mcp/policy-gate.js";
 import { resolveBoundToolContext } from "../services/mcp/tool-context-binder.js";
 import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
+import { redactSecrets } from "../services/redact-secrets.js";
 
 const rpcRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
@@ -89,6 +90,7 @@ export function buildMcpRouteStores(
     dynamicConfig: deps.dynamicConfig,
     sessions: deps.sessions,
     messages: deps.messages,
+    memories: deps.memories,
     artifacts: deps.artifacts,
     storage: deps.artifactStorage,
     auditEvents: deps.auditEvents,
@@ -118,6 +120,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     dynamicConfig: stores.dynamicConfig,
     sessions: stores.sessions,
     messages: stores.messages,
+    memories: stores.memories,
     artifacts: stores.artifacts,
     storage: stores.storage,
     auditEvents: stores.auditEvents,
@@ -324,19 +327,17 @@ async function handleToolsList(input: {
   if (server.mode === "managed") {
     // NOTE: we intentionally do NOT advertise `outputSchema` here.
     // Our managed tool outputs use a top-level `{ oneOf: [...] }`
-    // discriminator (success vs. error), which the Claude Agent SDK's
-    // bundled MCP client rejects during tools/list validation —
-    // every tool in the response is then silently dropped from the
-    // model's tool list (empty `tools[]` in mcpServerStatus and no
-    // `mcp__managed-session-context__*` entries in system/init).
+    // discriminator (success vs. error), which strict MCP clients reject
+    // during tools/list validation — the retired Claude Agent SDK client
+    // silently dropped every tool in the response when it saw it.
     // `outputSchema` is optional per MCP spec; callers get the same
     // structured data via the `content` array on tool calls.
     // `annotations.readOnlyHint` is the standard MCP tool annotation (distinct
-    // from the `outputSchema` field warned about above — annotations do not
-    // trip the SDK's tools/list validation drop). Codex 0.134.0+ runs tools
-    // that advertise `readOnlyHint: true` concurrently instead of serially, so
-    // a read-heavy turn (session_context / list_artifacts / read_text_artifact)
-    // fans those reads out in parallel.
+    // from the `outputSchema` field warned about above — annotations are
+    // harmless to validation) and lets clients run read-only tools
+    // concurrently instead of serially, so a read-heavy turn
+    // (session_context / list_artifacts / read_text_artifact) can fan those
+    // reads out in parallel.
     return ok(rpc.id, {
       tools: managedToolsForRequest!.map((tool) => ({
         name: tool.name,
@@ -459,6 +460,18 @@ async function handleToolsCall(input: {
     response
   });
 
+  // Strip credentials from a successful tool result at the gateway boundary,
+  // BEFORE it reaches the runtime. The transcript/tool-result stores already
+  // run redactSecrets(), but the LangGraph result is separately persisted into
+  // the durable checkpointer as a ToolMessage and restored into model context
+  // on later turns — a path the store-layer redaction never touches. Redacting
+  // here covers both: a managed tool echoing a token or a proxy upstream
+  // returning auth material can't land a live credential in checkpoint state.
+  // Errors carry only a message (already generic) and are left untouched.
+  if (response.error === undefined && response.result !== undefined) {
+    return { ...response, result: redactSecrets(response.result) };
+  }
+
   return response;
 }
 
@@ -510,7 +523,8 @@ async function recordToolCallTelemetry(input: {
  * the runtime token's identity.
  *
  * Resolution order:
- *   1. toolContextId in the RPC args (primary path — Codex, Claude SDK).
+ *   1. toolContextId in the RPC args (primary path — injected at call time
+ *      by the deep-agents loop).
  *   2. toolContextId in the MCP URL query string.
  *   3. Active session fallback — look up the latest non-expired context for the
  *      sessionId carried by the runtime token. Resilience path when a runtime
@@ -571,20 +585,30 @@ async function handleManagedToolCall(
   try {
     const runtimePolicy = requireMcpServerAllowed(serverId, context);
     requireManagedToolAllowed(tool.name, runtimePolicy);
-    // Approval for managed tool calls is NOT enforced here. Claude gates every
-    // tool call (including MCP) through canUseTool inside the sandbox, where
+    // Native approval for managed tool calls is NOT enforced here. The
+    // deep-agents HITL interceptor gates every tool call (including MCP)
+    // in-process before the HTTP request is made, where
     // autoApproveReadOnlyTools decides whether read-only tools skip the prompt
-    // — by the time the HTTP call arrives the approval already happened. For
-    // Codex, Policy Center (below) is the control plane for gating MCP calls;
-    // its require_approval rules pause right here at the gateway.
+    // — by the time the call arrives the native approval already happened.
+    // Policy Center (below) is the gateway-side control plane; its
+    // require_approval rules pause right here.
     //
     // Policy Center gate — records a decision and, in enforce mode, may pause for
     // human approval (require_approval) or throw PolicyBlockedError (block /
     // approval denied — surfaced as a distinct RPC error below). Severity is
     // derived from the managed tool's readOnly flag.
-    await enforcePolicyCenter(policyGate, context, tool.name, serverId, {
-      readOnly: tool.readOnly
-    }, args);
+    await enforcePolicyCenter(
+      policyGate,
+      context,
+      tool.name,
+      serverId,
+      { readOnly: tool.readOnly },
+      args,
+      // Category is the tool's bound domain, not the URL serverId — so a
+      // `categories` policy rule matches the tool's true domain even if the
+      // call arrived through a different enabled managed server's URL.
+      tool.category ?? serverId
+    );
     const result = await tool.handler({
       context,
       arguments: args

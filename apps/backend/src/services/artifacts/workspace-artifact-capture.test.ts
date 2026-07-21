@@ -167,10 +167,16 @@ describe("captureWorkspaceArtifacts", () => {
     await mkdir(path.join(ws, "artifacts"));
     await mkdir(path.join(ws, ".framework"));
     await mkdir(path.join(ws, ".git"));
+    // deepagents runtime internals: summarization offload + tool-result
+    // eviction files must never surface as user artifacts (bead g2ua).
+    await mkdir(path.join(ws, "conversation_history"));
+    await mkdir(path.join(ws, "large_tool_results"));
     await writeFile(path.join(ws, ".codex", "skip.md"), "skip");
     await writeFile(path.join(ws, "node_modules", "skip.js"), "x");
     await writeFile(path.join(ws, "artifacts", "skip.txt"), "x");
     await writeFile(path.join(ws, ".framework", "skip.json"), "{}");
+    await writeFile(path.join(ws, "conversation_history", "sess-1.md"), "## Summarized at ...");
+    await writeFile(path.join(ws, "large_tool_results", "call-1.txt"), "evicted");
     await writeFile(path.join(ws, ".hidden.md"), "skip");
     await writeFile(path.join(ws, "AGENTS.md"), "skip");
     await writeFile(path.join(ws, "real.md"), "keep");

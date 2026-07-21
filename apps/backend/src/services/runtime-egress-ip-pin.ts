@@ -1,6 +1,6 @@
-// Per-runtime egress IP pinning for the LLM proxy.
+// Per-runtime egress IP pinning for the /mcp gateway.
 //
-// The CIDR allowlist (E2B_EGRESS_CIDRS) restricts incoming /llm/* calls
+// The CIDR allowlist (E2B_EGRESS_CIDRS) restricts incoming /mcp/* calls
 // to the sandbox provider's documented NAT range. That narrows a leaked
 // rt_* token's blast radius from "anywhere on the internet" to "anyone
 // running code inside E2B." Pinning narrows further: the first observed

@@ -39,20 +39,26 @@ function makeFakeOrgSettingsStore(initial: Partial<FakeOrgSettingsState> = {}): 
         tenantId: _tenantId,
         hasOpenaiApiKey: Boolean(state.openaiApiKey),
         hasAnthropicApiKey: Boolean(state.anthropicApiKey),
+        providerKeys: {
+          anthropic: Boolean(state.anthropicApiKey),
+          openai: Boolean(state.openaiApiKey),
+          google: false,
+          openrouter: false,
+          zai: false
+        },
         skillMarketplaceManifestUrl: state.marketplaceUrl,
         piiProtection: state.pii ?? DEFAULT_PII_PROTECTION,
         updatedAt: new Date().toISOString()
       };
     },
-    async getDecryptedOpenaiApiKey() {
-      return state.openaiApiKey;
+    async getDecryptedApiKey(_tenantId: string, provider: string) {
+      if (provider === "openai") return state.openaiApiKey;
+      if (provider === "anthropic") return state.anthropicApiKey;
+      return null;
     },
-    async getDecryptedAnthropicApiKey() {
-      return state.anthropicApiKey;
-    },
-    async setApiKeys(_tenantId: string, input: { openaiApiKey?: string | null; anthropicApiKey?: string | null }) {
-      if (input.openaiApiKey !== undefined) state.openaiApiKey = input.openaiApiKey;
-      if (input.anthropicApiKey !== undefined) state.anthropicApiKey = input.anthropicApiKey;
+    async setApiKey(_tenantId: string, provider: string, apiKey: string | null) {
+      if (provider === "openai") state.openaiApiKey = apiKey;
+      else if (provider === "anthropic") state.anthropicApiKey = apiKey;
     },
     async setMarketplaceUrl(_tenantId: string, url: string | null) {
       state.marketplaceUrl = url;
@@ -534,6 +540,49 @@ test("PUT member role: unknown member returns 404 member_not_found and never iss
 });
 
 // ---------------------------------------------------------------------------
+// PUT /tenant/settings (provider key set/clear)
+// ---------------------------------------------------------------------------
+
+test("provider key: a non-empty apiKey is stored for the selected provider", async () => {
+  const { store, state } = makeFakeOrgSettingsStore();
+  const db = makeTenantsDb();
+  const app = makeOrgSettingsApp();
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/settings",
+    payload: { provider: "openai", apiKey: "sk-openai-new" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json().ok).toBe(true);
+  expect(state.openaiApiKey).toBe("sk-openai-new");
+});
+
+test("provider key: an empty apiKey CLEARS the selected provider's key (R11)", async () => {
+  const { store, state } = makeFakeOrgSettingsStore({ anthropicApiKey: "sk-ant-existing" });
+  const db = makeTenantsDb();
+  const app = makeOrgSettingsApp();
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/settings",
+    payload: { provider: "anthropic", apiKey: "" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json().ok).toBe(true);
+  // The stored key is revoked, not left in place.
+  expect(state.anthropicApiKey).toBe(null);
+  expect(response.json().anthropicApiKeyConfigured).toBe(false);
+});
+
 // PUT /tenant/settings/marketplace
 // ---------------------------------------------------------------------------
 

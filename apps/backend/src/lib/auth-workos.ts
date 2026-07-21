@@ -40,19 +40,7 @@ export function workosAuth(config: AppConfig, tenantMembers: Pick<TenantMemberSt
       return;
     }
 
-    // Codex 0.120+ probes .well-known/oauth-authorization-server before connecting
-    // to MCP servers. Return 404 (not 401) so Codex skips OAuth and falls back to
-    // the static Bearer token from codex.toml / config.toml. Match against the
-    // path component only, with startsWith — RFC 8615 places .well-known at the
-    // root, and substring matching would 404 any URL whose query string happens
-    // to contain "/.well-known/".
-    const requestPath = request.url.split("?", 1)[0]!;
-    if (requestPath.startsWith("/.well-known/")) {
-      reply.code(404).send({ error: "not_found" });
-      return;
-    }
-
-    // Runtime token authentication for MCP routes (Codex CLI → backend gateway)
+    // Runtime token authentication for MCP routes (sandbox → backend gateway)
     if (tryAuthenticateRuntimeToken(request, config)) {
       return;
     }

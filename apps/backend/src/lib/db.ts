@@ -48,6 +48,12 @@ export async function withTenantScope<T>(
   }
 }
 
+// Escape LIKE/ILIKE wildcards (%, _, \) so a user-supplied query is always
+// matched literally when interpolated into a bound `%...%` pattern.
+export function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
 export async function ensureUser(db: Pool, userId: string): Promise<void> {
   await db.query(
     `

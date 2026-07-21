@@ -4,7 +4,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 
 export function buildHealthRouteStores(deps: AppDependencies) {
   return {
-    codexRuntimeManager: deps.codexRuntimeManager
+    deepAgentsAdapter: deps.deepAgentsAdapter
   };
 }
 
@@ -21,6 +21,6 @@ export async function registerHealthRoutes(
       sha: process.env.BUILD_SHA ?? "dev",
       buildDate: process.env.BUILD_DATE ?? ""
     },
-    runtimes: stores.codexRuntimeManager.getHealthSnapshot()
+    runtimes: stores.deepAgentsAdapter.getHealthSnapshot()
   }));
 }

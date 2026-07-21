@@ -2,9 +2,9 @@
 //
 // Integration connection services (`github-`/`microsoft-`/`notion-connection-service.ts`)
 // must invalidate live runtimes when a user (re)connects or disconnects a provider.
-// Importing `CodexRuntimeManager` directly creates a cycle through `runtime-workspace`
-// and the managed-tool catalog. This narrowed interface captures only the structural
-// shape integrations need; the real `CodexRuntimeManager` already implements it.
+// Importing `DeepAgentsRuntimeAdapter` directly would create a cycle through the
+// managed-tool catalog. This narrowed interface captures only the structural
+// shape integrations need; the real adapter already implements it.
 
 export interface RuntimeInvalidator {
   // Restart any running session whose runtime needs to refresh credentials

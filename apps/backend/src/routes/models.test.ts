@@ -1,436 +1,36 @@
 import Fastify from "fastify";
-import { test, afterEach, expect } from "vitest";
+import { test, expect } from "vitest";
 
-import type { AvailableModel } from "../domain/models.js";
+import type { EffortLevel, ModelProvider } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
+
 import type { RuntimeAdapter } from "../runtime-contracts.js";
-import { createFakeFetch, type FakeFetch } from "../test-helpers/fake-fetch.js";
 
-import {
-  enrichClaudeModelsFromAnthropic,
-  registerModelRoutes,
-  resolveAvailableRuntimeProviders,
-  type ModelRouteStores
-} from "./models.js";
-import { createAnthropicCapabilitiesCache } from "./models-anthropic-cache.js";
+import { registerModelRoutes, type ModelRouteStores } from "./models.js";
 
 const stubAdapter = { hasActiveTurn: () => false } as unknown as RuntimeAdapter;
 
-let fake: FakeFetch | null = null;
-afterEach(() => {
-  fake?.restore();
-  fake = null;
-});
+function settingsWith(overrides: Record<string, unknown> = {}) {
+  return {
+    showEffortSelector: false,
+    enabledProviders: [...MODEL_PROVIDERS],
+    enabledModelIds: null,
+    modelDefaultEfforts: {},
+    ...overrides
+  } as never;
+}
 
 function makeStores(overrides: Partial<ModelRouteStores> = {}): ModelRouteStores {
   return {
     dynamicConfig: {
       async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
+        return settingsWith();
       }
     },
+    runtimeAdapter: stubAdapter,
     ...overrides
-  };
+  } as ModelRouteStores;
 }
-
-// resolveAvailableRuntimeProviders
-
-test("resolveAvailableRuntimeProviders: returns just codex when only codex is enabled", async () => {
-  const result = await resolveAvailableRuntimeProviders(makeStores(), "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex"]);
-  expect(result.defaultRuntimeProvider).toBe("codex");
-});
-
-test("resolveAvailableRuntimeProviders: drops codex when no openai key", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    hasOpenaiApiKey: async () => false
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual([]);
-});
-
-test("resolveAvailableRuntimeProviders: returns empty list when neither key is set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasOpenaiApiKey: async () => false,
-    hasAnthropicApiKey: async () => false
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual([]);
-});
-
-test("resolveAvailableRuntimeProviders: returns codex only when only OPENAI key is set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasOpenaiApiKey: async () => true,
-    hasAnthropicApiKey: async () => false
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex"]);
-  expect(result.defaultRuntimeProvider).toBe("codex");
-});
-
-test("resolveAvailableRuntimeProviders: returns claude-code only when only ANTHROPIC key is set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasOpenaiApiKey: async () => false,
-    hasAnthropicApiKey: async () => true
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["claude-code"]);
-  expect(result.defaultRuntimeProvider).toBe("claude-code");
-});
-
-test("resolveAvailableRuntimeProviders: includes both providers when both keys are set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "claude-code",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasOpenaiApiKey: async () => true,
-    hasAnthropicApiKey: async () => true
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-  expect(result.defaultRuntimeProvider).toBe("claude-code");
-});
-
-test("resolveAvailableRuntimeProviders: drops claude-code when adapter not configured", async () => {
-  const stores = makeStores({
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "claude-code",
-          showEffortSelector: true
-        } as never;
-      }
-    }
-    // no runtimeAdapters
-  });
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex"]);
-  expect(result.defaultRuntimeProvider).toBe("codex");
-  expect(result.showEffortSelector).toBe(true);
-});
-
-test("resolveAvailableRuntimeProviders: drops claude-code when no anthropic key", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "claude-code",
-          showEffortSelector: true
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasAnthropicApiKey: async () => false
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex"]);
-});
-
-test("resolveAvailableRuntimeProviders: includes claude-code when adapter+key present", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["codex", "claude-code"],
-          runtimeProvider: "claude-code",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasAnthropicApiKey: async () => true
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
-  expect(result.defaultRuntimeProvider).toBe("claude-code");
-});
-
-test("resolveAvailableRuntimeProviders: when nothing enables, returns empty providers", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["claude-code"],
-          runtimeProvider: "claude-code",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: {},
-    hasAnthropicApiKey: async () => false
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.enabledRuntimeProviders).toEqual([]);
-  // Schema requires non-null; falls back to settings.runtimeProvider as a structural placeholder
-  expect(result.defaultRuntimeProvider).toBe("claude-code");
-});
-
-test("resolveAvailableRuntimeProviders: keeps default if it's still in the enabled list", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        return {
-          enabledRuntimeProviders: ["claude-code", "codex"],
-          runtimeProvider: "codex",
-          showEffortSelector: false
-        } as never;
-      }
-    },
-    runtimeAdapters: { "claude-code": {} },
-    hasAnthropicApiKey: async () => true
-  };
-  const result = await resolveAvailableRuntimeProviders(stores, "t");
-  expect(result.defaultRuntimeProvider).toBe("codex");
-});
-
-// enrichClaudeModelsFromAnthropic
-
-const claudeModel: AvailableModel = {
-  id: "claude-sonnet",
-  label: "Sonnet",
-  provider: "claude-code",
-  supportedEfforts: [],
-  defaultEffort: null
-};
-
-const codexModel: AvailableModel = {
-  id: "gpt-5",
-  label: "GPT 5",
-  provider: "codex",
-  supportedEfforts: [],
-  defaultEffort: null
-};
-
-test("enrichClaudeModelsFromAnthropic: returns models unchanged when no claude-code models present", async () => {
-  const stores = makeStores();
-  const result = await enrichClaudeModelsFromAnthropic("t", [codexModel], stores, 100);
-  expect(result).toEqual([codexModel]);
-});
-
-test("enrichClaudeModelsFromAnthropic: returns models unchanged when no API key getter", async () => {
-  const stores = makeStores(); // no getAnthropicApiKey
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result).toEqual([claudeModel]);
-});
-
-test("enrichClaudeModelsFromAnthropic: returns models unchanged when API key empty", async () => {
-  const stores = makeStores({
-    getAnthropicApiKey: async () => "  "
-  });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result).toEqual([claudeModel]);
-});
-
-test("enrichClaudeModelsFromAnthropic: returns unchanged when Anthropic API responds non-2xx", async () => {
-  fake = createFakeFetch(() => new Response("err", { status: 500 }));
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result).toEqual([claudeModel]);
-});
-
-test("enrichClaudeModelsFromAnthropic: returns unchanged when fetch rejects (timeout/network)", async () => {
-  fake = createFakeFetch(() => {
-    throw new Error("net");
-  });
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result).toEqual([claudeModel]);
-});
-
-test("enrichClaudeModelsFromAnthropic: cache reuses the upstream result on a second call within TTL", async () => {
-  fake = createFakeFetch(
-    () =>
-      new Response(
-        JSON.stringify({
-          data: [
-            {
-              id: "claude-sonnet",
-              capabilities: {
-                effort: { supported: true, high: { supported: true } }
-              }
-            }
-          ]
-        }),
-        { status: 200 }
-      )
-  );
-
-  const cache = createAnthropicCapabilitiesCache({
-    successTtlMs: 60_000,
-    negativeTtlMs: 1_000
-  });
-  const stores = makeStores({
-    getAnthropicApiKey: async () => "k",
-    anthropicCapabilitiesCache: cache
-  });
-
-  const first = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  const second = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-
-  expect(fake.calls.length).toBe(1);
-  expect(first[0].supportedEfforts).toEqual(["high"]);
-  expect(second[0].supportedEfforts).toEqual(["high"]);
-});
-
-test("enrichClaudeModelsFromAnthropic: maps supportedEfforts and defaultEffort='high' when present", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({
-        data: [
-          {
-            id: "claude-sonnet",
-            capabilities: {
-              effort: {
-                supported: true,
-                low: { supported: true },
-                medium: { supported: true },
-                high: { supported: true },
-                xhigh: { supported: false }
-              }
-            }
-          }
-        ]
-      }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result[0].supportedEfforts).toEqual(["low", "medium", "high"]);
-  expect(result[0].defaultEffort).toBe("high");
-});
-
-test("enrichClaudeModelsFromAnthropic: defaultEffort falls back to first supported when no 'high'", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({
-        data: [
-          {
-            id: "claude-sonnet",
-            capabilities: {
-              effort: { supported: true, low: { supported: true } }
-            }
-          }
-        ]
-      }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result[0].defaultEffort).toBe("low");
-});
-
-test("enrichClaudeModelsFromAnthropic: model with effort.supported=false maps to empty arrays", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({
-        data: [
-          { id: "claude-sonnet", capabilities: { effort: { supported: false } } }
-        ]
-      }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result[0].supportedEfforts).toEqual([]);
-  expect(result[0].defaultEffort).toBe(null);
-});
-
-test("enrichClaudeModelsFromAnthropic: skips models the API does not return", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({ data: [{ id: "claude-other", capabilities: { effort: { supported: false } } }] }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  // claude-sonnet not in response → returned unchanged
-  expect(result[0]).toEqual(claudeModel);
-});
-
-test("enrichClaudeModelsFromAnthropic: codex models in the same list are not modified", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({
-        data: [
-          {
-            id: "claude-sonnet",
-            capabilities: { effort: { supported: true, high: { supported: true } } }
-          }
-        ]
-      }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel, codexModel], stores, 100);
-  expect(result[1]).toBe(codexModel);
-  expect(result[0].supportedEfforts).toEqual(["high"]);
-});
-
-test("enrichClaudeModelsFromAnthropic: skips models with no id in the API response", async () => {
-  globalThis.fetch = (async () =>
-    new Response(
-      JSON.stringify({
-        data: [{ capabilities: { effort: { supported: true } } }]
-      }),
-      { status: 200 }
-    )) as typeof fetch;
-  const stores = makeStores({ getAnthropicApiKey: async () => "k" });
-  const result = await enrichClaudeModelsFromAnthropic("t", [claudeModel], stores, 100);
-  expect(result[0]).toEqual(claudeModel);
-});
-
-// /models route — fallback path symmetry (M13 fix)
 
 async function makeModelsApp(stores: ModelRouteStores) {
   const app = Fastify();
@@ -446,70 +46,182 @@ async function makeModelsApp(stores: ModelRouteStores) {
   return app;
 }
 
-test("/models fallback (tenant lookup throws): includes Claude when ANTHROPIC_API_KEY is set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        throw new Error("postgres unreachable");
-      }
-    },
-    runtimeAdapters: { "claude-code": stubAdapter as never },
-    hasOpenaiApiKey: async () => false,
-    hasAnthropicApiKey: async () => true
-  };
-  const app = await makeModelsApp(stores);
+const configured = (...providers: ModelProvider[]) =>
+  async () => new Set<ModelProvider>(providers);
+
+test("/models lists only Anthropic models when only the Anthropic key is present", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      configuredProviders: configured("anthropic")
+    })
+  );
   try {
     const response = await app.inject({ method: "GET", url: "/models" });
     expect(response.statusCode).toBe(200);
     const body = response.json();
-    expect(body.enabledRuntimeProviders).toEqual(["claude-code"]);
-    expect(body.defaultRuntimeProvider).toBe("claude-code");
-    expect(body.models.every((m: { provider: string }) => m.provider === "claude-code")).toBe(true);
+    expect(body.models.length).toBeGreaterThan(0);
+    expect(body.models.every((m: { provider: string }) => m.provider === "anthropic")).toBe(true);
   } finally {
     await app.close();
   }
 });
 
-test("/models fallback: returns empty providers when neither key is set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        throw new Error("postgres unreachable");
-      }
-    },
-    runtimeAdapters: { "claude-code": stubAdapter as never },
-    hasOpenaiApiKey: async () => false,
-    hasAnthropicApiKey: async () => false
-  };
-  const app = await makeModelsApp(stores);
+test("/models lists a provider's models when only that provider is configured", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      configuredProviders: configured("openai")
+    })
+  );
   try {
     const response = await app.inject({ method: "GET", url: "/models" });
-    expect(response.statusCode).toBe(200);
     const body = response.json();
-    expect(body.enabledRuntimeProviders).toEqual([]);
-    expect(body.models).toEqual([]);
+    expect(body.models.length).toBeGreaterThan(0);
+    expect(body.models.every((m: { provider: string }) => m.provider === "openai")).toBe(true);
   } finally {
     await app.close();
   }
 });
 
-test("/models fallback: includes both providers when both keys are set", async () => {
-  const stores: ModelRouteStores = {
-    dynamicConfig: {
-      async getOrCreateTenantSettings() {
-        throw new Error("postgres unreachable");
-      }
-    },
-    runtimeAdapters: { "claude-code": stubAdapter as never },
-    hasOpenaiApiKey: async () => true,
-    hasAnthropicApiKey: async () => true
-  };
-  const app = await makeModelsApp(stores);
+test("/models returns an empty list when no provider key is available", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      configuredProviders: configured()
+    })
+  );
   try {
     const response = await app.inject({ method: "GET", url: "/models" });
     expect(response.statusCode).toBe(200);
+    expect(response.json().models).toEqual([]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models surfaces showEffortSelector from tenant settings", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith({ showEffortSelector: true });
+        }
+      },
+      configuredProviders: configured("anthropic")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.json().showEffortSelector).toBe(true);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models hides models of a disabled provider even when its key is configured", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith({ enabledProviders: ["openai"] });
+        }
+      },
+      configuredProviders: configured("anthropic", "openai")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
     const body = response.json();
-    expect(body.enabledRuntimeProviders).toEqual(["codex", "claude-code"]);
+    expect(body.models.length).toBeGreaterThan(0);
+    expect(body.models.every((m: { provider: string }) => m.provider === "openai")).toBe(true);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models applies the enabledModelIds allowlist", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith({ enabledModelIds: ["deepagents/claude-sonnet-5"] });
+        }
+      },
+      configuredProviders: configured("anthropic", "openai")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    const body = response.json();
+    expect(body.models.map((m: { id: string }) => m.id)).toEqual(["deepagents/claude-sonnet-5"]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models overrides defaultEffort from tenant modelDefaultEfforts", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith({
+            modelDefaultEfforts: { "deepagents/claude-sonnet-5": "high" satisfies EffortLevel }
+          });
+        }
+      },
+      configuredProviders: configured("anthropic")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    const sonnet = response
+      .json()
+      .models.find((m: { id: string }) => m.id === "deepagents/claude-sonnet-5");
+    expect(sonnet.defaultEffort).toBe("high");
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models ignores a defaultEffort override the model does not support", async () => {
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          // Haiku 4.5 only supports "none"; a stale "high" override is ignored.
+          return settingsWith({
+            modelDefaultEfforts: { "deepagents/claude-haiku-4-5": "high" satisfies EffortLevel }
+          });
+        }
+      },
+      configuredProviders: configured("anthropic")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    const haiku = response
+      .json()
+      .models.find((m: { id: string }) => m.id === "deepagents/claude-haiku-4-5");
+    expect(haiku.defaultEffort).toBe("none");
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models fails closed when the tenant settings lookup throws", async () => {
+  // Availability is an admin policy control now — degrading to "all models"
+  // on a settings failure would silently ignore admin restrictions.
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          throw new Error("postgres unreachable");
+        }
+      },
+      configuredProviders: configured("anthropic")
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.statusCode).toBe(500);
   } finally {
     await app.close();
   }

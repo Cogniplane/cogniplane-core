@@ -48,6 +48,16 @@
   --color-accent:                  #d6dfe5;
   --color-accent-soft:             rgba(61, 90, 153, 0.1);
 
+  /* Brand teal — pulled from the Cogniplane logo frame gradient (#2c9ba0 →
+     #358f91). This is the "pop" accent: active nav, selected controls, focus
+     rings, links, and small emphasis moments. Ink (--color-primary) stays the
+     workhorse for primary buttons so the surface keeps its serious tone. */
+  --color-brand:                   #1f7e86;
+  --color-brand-strong:            #17646b;
+  --color-on-brand:                #ffffff;
+  --color-brand-surface:           rgba(44, 155, 160, 0.12);
+  --color-brand-border:            rgba(44, 155, 160, 0.38);
+
   /* Brand-blue text/pill color. Distinct from --color-accent, which is
      reserved for shadcn's hover-surface semantics (Menu/Select/Dropdown).
      Use text-info / bg-info-surface for "info" pills, "blue" status, and
@@ -72,17 +82,30 @@
   --color-destructive-foreground:  #ffffff;
   --color-border:                  rgba(169, 180, 185, 0.15);
   --color-input:                   rgba(169, 180, 185, 0.15);
-  --color-ring:                    #3d5a99;
+  --color-ring:                    #1f7e86;
 
   --shadow-sm: 0 2px 8px rgba(42, 52, 57, 0.06);
   --shadow-md: 0 4px 24px rgba(42, 52, 57, 0.08);
   --shadow-lg: 0 8px 40px rgba(42, 52, 57, 0.10);
+
+  /* Motion. One easing + a small duration scale so every animation in the
+     app decelerates the same way ("standard" ease-out curve). */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --animate-accent-grow: accent-grow 200ms var(--ease-standard);
 
   --radius-sm:   0.25rem;
   --radius-md:   0.5rem;
   --radius-lg:   0.75rem;
   --radius-xl:   1rem;
   --radius-full: 9999px;
+
+  /* Named stacking order keeps drawers, dialogs, and transient UI predictable. */
+  --z-dropdown: 20;
+  --z-sticky: 30;
+  --z-modal-backdrop: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+  --z-tooltip: 70;
 
   /* Categorical chart palette (light). Drawn from the editorial token set so
      dashboard charts read as part of the app theme rather than a bolted-on
@@ -131,6 +154,13 @@
   --color-accent:                  #2d3946;
   --color-accent-soft:             rgba(140, 184, 255, 0.16);
 
+  /* Brand teal (dark) — lifted for contrast on dark surfaces. */
+  --color-brand:                   #56c6cd;
+  --color-brand-strong:            #8adde2;
+  --color-on-brand:                #06282b;
+  --color-brand-surface:           rgba(86, 198, 205, 0.14);
+  --color-brand-border:            rgba(86, 198, 205, 0.42);
+
   --color-info:                    #8cb8ff;
   --color-info-surface:            rgba(140, 184, 255, 0.16);
 
@@ -149,7 +179,7 @@
   --color-destructive-foreground:  #0f141b;
   --color-border:                  rgba(177, 188, 203, 0.16);
   --color-input:                   rgba(177, 188, 203, 0.16);
-  --color-ring:                    #8cb8ff;
+  --color-ring:                    #56c6cd;
 
   --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.16);
   --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.2);
@@ -199,4 +229,198 @@ a {
 textarea, input, select {
   font: inherit;
   color: inherit;
+}
+
+/* ============================================================
+   COPILOTKIT THEME BRIDGE
+   The <CopilotChat> library ships its own `--copilot-kit-*`
+   palette scoped to :root and flips dark mode via its OWN class,
+   which our app (driven by [data-theme="dark"]) never sets — so
+   left alone it renders its light palette (stark-white bubbles,
+   near-black text) on our dark surfaces. Remap every CK variable
+   onto our editorial tokens; because those tokens already swap
+   under [data-theme="dark"], CopilotKit follows both themes for
+   free. Keep in sync with the CK var list if the SDK is bumped.
+
+   `:root:root` raises specificity above CopilotKit's plain `:root`
+   so these win regardless of stylesheet load order — the CK CSS is
+   imported inside copilot-chat-host.tsx and may emit after globals.
+   ============================================================ */
+:root:root {
+  /* primary drives the USER message bubble (and send button). Full ink was
+     too aggressive against the light surface, so use the softer container
+     tone with its matching on-color instead of primary/on-primary. */
+  --copilot-kit-primary-color:            var(--color-primary-container);
+  --copilot-kit-contrast-color:           var(--color-on-primary-container);
+  --copilot-kit-background-color:         var(--color-surface);
+  --copilot-kit-input-background-color:   var(--color-surface-container-low);
+  --copilot-kit-secondary-color:          var(--color-surface-container);
+  --copilot-kit-secondary-contrast-color: var(--color-on-surface);
+  --copilot-kit-separator-color:          var(--color-outline-variant);
+  --copilot-kit-muted-color:              var(--color-on-surface-faint);
+}
+
+/* Drop CopilotKit's "Powered by CopilotKit" footer branding. The tag has no
+   disable prop on <CopilotChat> in this SDK version, and CopilotKit's own
+   stylesheet (@copilotkit/react-ui/styles.css) re-asserts it with
+   `.poweredBy { display: block !important; visibility: visible !important }`.
+   A plain `.poweredBy { ... !important }` rule ties that on specificity and
+   loses on load order (their CSS is imported by the chat host, after this
+   file), so double the class to outrank it — with equal !important flags,
+   higher specificity wins regardless of order. */
+.poweredBy.poweredBy,
+.poweredBy.poweredBy * {
+  display: none !important;
+  visibility: hidden !important;
+}
+/* The unclassed wrapper div immediately preceding the input's send area — no
+   stable hook, so collapse it via its only child being gone above; this rule is
+   a belt-and-suspenders height kill in case the wrapper keeps padding. */
+.poweredByContainer {
+  padding-bottom: 0 !important;
+}
+
+/* ============================================================
+   RENDERED MARKDOWN
+   Shared typography for model-generated markdown. Two consumers:
+   `.md-body` wraps every <SafeMarkdown> render (plan pane, admin
+   chat replay, artifact preview, skill files); `.chat-markdown`
+   scopes the same rules to CopilotChat's built-in renderer, which
+   ships tables/blockquotes with no styling at all — without this,
+   agent tables collapse into unreadable run-together columns.
+   ============================================================ */
+.md-body table,
+.chat-markdown table {
+  width: 100%;
+  margin: 0.75rem 0;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--color-outline-variant);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.md-body th,
+.chat-markdown th {
+  background: var(--color-surface-container-low);
+  color: var(--color-on-surface);
+  font-weight: 600;
+  text-align: left;
+}
+
+.md-body th,
+.md-body td,
+.chat-markdown th,
+.chat-markdown td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-outline-variant);
+  vertical-align: top;
+}
+
+.md-body tbody tr:last-child td,
+.chat-markdown tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.md-body tbody tr:nth-child(even) td,
+.chat-markdown tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--color-surface-container-low) 45%, transparent);
+}
+
+.md-body blockquote,
+.chat-markdown blockquote {
+  margin: 0.75rem 0;
+  padding: 0.25rem 1rem;
+  border-left: 3px solid var(--color-brand-border);
+  color: var(--color-on-surface-variant);
+}
+
+.md-body hr,
+.chat-markdown hr {
+  border: none;
+  border-top: 1px solid var(--color-outline-variant);
+  margin: 1rem 0;
+}
+
+.md-body a,
+.chat-markdown a {
+  color: var(--color-brand);
+  text-decoration: underline;
+  text-decoration-color: var(--color-brand-border);
+  text-underline-offset: 3px;
+}
+
+.md-body code:not(pre code),
+.chat-markdown code:not(pre code) {
+  background: var(--color-surface-container);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.35em;
+  font-size: 0.85em;
+}
+
+/* ============================================================
+   MOTION
+   Small, decelerating movements only — enough to feel alive,
+   never enough to draw attention to itself. Everything here is
+   killed under prefers-reduced-motion.
+   ============================================================ */
+
+@keyframes accent-grow {
+  from { transform: scaleY(0); }
+  to   { transform: scaleY(1); }
+}
+
+@keyframes page-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes card-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Section content entrance — applied by the admin/settings/artifacts
+   template.tsx wrappers, so it replays on every route change while the
+   layout chrome (sidebar, header) stays put. */
+.page-enter {
+  animation: page-enter 240ms var(--ease-standard) both;
+}
+
+/* Entrance for in-chat event cards (approvals, tool calls). */
+.card-enter {
+  animation: card-enter 200ms var(--ease-standard) both;
+}
+
+/* Hover affordance for CLICKABLE cards/rows only — a lift implies the
+   whole surface is a target, so never put this on static tiles. */
+.hover-lift {
+  transition:
+    transform 150ms var(--ease-standard),
+    box-shadow 150ms var(--ease-standard),
+    border-color 150ms var(--ease-standard);
+}
+.hover-lift:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+.hover-lift:active {
+  transform: translateY(0);
+  box-shadow: var(--shadow-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-enter,
+  .card-enter,
+  .before\:animate-accent-grow::before {
+    animation: none !important;
+  }
+  .hover-lift,
+  .hover-lift:hover,
+  .hover-lift:active {
+    transition: none;
+    transform: none;
+  }
 }

@@ -71,14 +71,6 @@ export async function uploadArtifact(input: {
   return parseResponse(ArtifactEnvelopeSchema, raw, "POST /artifacts").artifact;
 }
 
-export async function createMessageArtifact(messageId: string, name?: string): Promise<Artifact> {
-  const raw = await request<unknown>(`/messages/${messageId}/artifact`, {
-    method: "POST",
-    body: JSON.stringify(name ? { name } : {})
-  });
-  return parseResponse(ArtifactEnvelopeSchema, raw, "POST /messages/:id/artifact").artifact;
-}
-
 export async function createArtifactDownload(artifactId: string): Promise<DownloadHandle> {
   const raw = await request<unknown>(`/artifacts/${artifactId}/download-token`, {
     method: "POST"
