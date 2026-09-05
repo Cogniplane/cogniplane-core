@@ -4,6 +4,12 @@ import type { AdminSkillRecord, AdminSkillRevisionRecord } from "../admin-config
 
 import { cleanupInactiveSkillRevisions } from "./skill-revision-cleanup-service.js";
 
+type CleanupInput = Parameters<typeof cleanupInactiveSkillRevisions>[0];
+type CapturedStores = Pick<CleanupInput, "skills" | "skillRevisions" | "skillBundleStorage"> & {
+  deletedRevisions: number[];
+  deletedBundles: string[];
+};
+
 function rev(o: Partial<AdminSkillRevisionRecord>): AdminSkillRevisionRecord {
   return {
     skillRevisionId: 1,
@@ -31,23 +37,33 @@ function rev(o: Partial<AdminSkillRevisionRecord>): AdminSkillRevisionRecord {
 function skill(o: Partial<AdminSkillRecord>): AdminSkillRecord {
   return {
     skillId: "sk1",
-    tenantId: "t",
     skillName: "Skill",
     description: null,
-    bundleRootPath: null,
+    instructions: "Instructions",
+    version: 1,
+    contentHash: "hash",
+    enabled: true,
+    isPublished: false,
+    createdBy: "u",
     activeRevisionId: 1,
+    activeSourceType: "github",
+    activeBundleName: "sk1",
+    activeBundleStorageUri: "s3://bkt/sk1/v1",
+    activeBundleHash: "h",
+    activeValidationStatus: "valid",
+    activeReviewStatus: "approved",
     createdAt: "now",
     updatedAt: "now",
-    enabled: true,
-    ...(o as never)
+    isInherited: false,
+    ...o
   };
 }
 
 const config = {
   SKILL_BUNDLE_RETENTION_DAYS: 30
-} as never;
+} satisfies CleanupInput["config"];
 
-function captureStores() {
+function captureStores(): CapturedStores {
   const deletedRevisions: number[] = [];
   const deletedBundles: string[] = [];
   return {

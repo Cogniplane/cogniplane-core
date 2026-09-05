@@ -357,6 +357,14 @@ export class UserSettingsStore {
         WHERE enabled = TRUE
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
+          -- The job's owner must still be a member of the tenant. Member
+          -- removal disables their jobs directly; this is the standing guard
+          -- for rows that predate that fix or that a failed removal missed.
+          AND EXISTS (
+            SELECT 1 FROM tenant_memberships m
+            WHERE m.tenant_id = scheduled_jobs.tenant_id
+              AND m.user_id = scheduled_jobs.user_id
+          )
         ORDER BY next_run_at ASC
         LIMIT $1
       `,
@@ -390,6 +398,15 @@ export class UserSettingsStore {
           AND enabled = TRUE
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
+          -- Also checked here, not just in listDueJobs: that query is a
+          -- pre-filter run once per tick, while this UPDATE is the atomic gate.
+          -- A tick that listed a job just before its owner was removed would
+          -- otherwise still claim and execute it.
+          AND EXISTS (
+            SELECT 1 FROM tenant_memberships m
+            WHERE m.tenant_id = scheduled_jobs.tenant_id
+              AND m.user_id = scheduled_jobs.user_id
+          )
         RETURNING *
       `,
       [tenantId, jobId, nextRunAt]

@@ -19,15 +19,15 @@ import type { ManagedToolDefinition } from "./types.js";
 // without leaking its type surface into core.
 export type ManagedToolFactoryDeps = {
   db: Pool;
-  dynamicConfig: DynamicConfigService;
-  sessions: SessionStore;
-  messages: MessageStore;
-  memories: MemoryStore;
-  artifacts: ArtifactStore;
-  storage: ArtifactStorage;
-  auditEvents: AuditEventStore;
-  githubConnections: GithubConnectionService;
-  notionConnections: NotionConnectionService;
+  dynamicConfig: Pick<DynamicConfigService, "listSkills">;
+  sessions: Pick<SessionStore, "getOwned">;
+  messages: Pick<MessageStore, "listBySession">;
+  memories: Pick<MemoryStore, "search" | "save" | "remove">;
+  artifacts: Pick<ArtifactStore, "create" | "getOwned" | "listBySession" | "findLatestReadableDerived">;
+  storage: Pick<ArtifactStorage, "put" | "openReadStream">;
+  auditEvents: Pick<AuditEventStore, "create">;
+  githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
+  notionConnections: Pick<NotionConnectionService, "getRuntimeCredentials">;
   /** Optional — forwarded to tools that aggregate cross-session content. */
   piiProtection?: PiiProtectionService;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;

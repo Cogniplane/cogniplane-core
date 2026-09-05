@@ -93,10 +93,11 @@ function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSumm
 export class GithubConnectionService {
   constructor(
     private readonly config: AppConfig,
-    private readonly store: GithubConnectionStore,
-    private readonly auditEvents?: AuditEventStore,
+    private readonly store: Pick<GithubConnectionStore, "get" | "upsert" | "delete" | "markTokenUsed">,
+    private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
-    private readonly oauthStates = new IntegrationOAuthStateStore()
+    private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
+      new IntegrationOAuthStateStore()
   ) {}
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<GithubConnectionStatus> {
@@ -223,6 +224,16 @@ export class GithubConnectionService {
         reason: "github_authorization_failed"
       });
     }
+  }
+
+  /**
+   * `IntegrationConnectionProbe.deleteConnection`. Member removal calls this
+   * through the registry; it is `disconnect` under the name the probe declares,
+   * so revoking on removal writes the same audit event and runtime
+   * invalidation as a user-initiated disconnect.
+   */
+  async deleteConnection(tenantId: string, userId: string): Promise<boolean> {
+    return this.disconnect(tenantId, userId);
   }
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {

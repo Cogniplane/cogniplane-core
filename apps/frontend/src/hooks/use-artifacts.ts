@@ -7,8 +7,6 @@ import type { Artifact } from "@cogniplane/shared-types";
 import { isArtifactEligibleForChatContext } from "../lib/artifact-eligibility";
 import { useArtifactActions } from "./use-artifact-actions";
 
-type ArtifactSelectionMode = "auto" | "manual";
-
 function compareArtifactsByRecency(left: Artifact, right: Artifact): number {
   return (
     new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
@@ -25,15 +23,6 @@ function getAutoScopedArtifactIds(artifacts: Artifact[]): string[] {
   return [];
 }
 
-function retainSelectedArtifactIds(
-  currentArtifactIds: string[],
-  nextArtifacts: Artifact[],
-): string[] {
-  return currentArtifactIds.filter((artifactId) =>
-    nextArtifacts.some((artifact) => artifact.artifactId === artifactId),
-  );
-}
-
 export function useArtifacts(input: {
   selectedSessionId: string | null;
   artifacts: Artifact[];
@@ -42,9 +31,23 @@ export function useArtifacts(input: {
 }) {
   const { selectedSessionId, artifacts, onError, onRefresh } = input;
 
-  const [artifactSelectionMode, setArtifactSelectionMode] =
-    useState<ArtifactSelectionMode>("auto");
-  const [selectedArtifactIds, setSelectedArtifactIds] = useState<string[]>([]);
+  const [selectionSessionId, setSelectionSessionId] = useState(selectedSessionId);
+  const [previousArtifacts, setPreviousArtifacts] = useState(artifacts);
+  // null means automatic selection; [] is an explicit choice to use no files.
+  const [manualSelectedIds, setManualSelectedIds] = useState<string[] | null>(null);
+  if (selectionSessionId !== selectedSessionId) {
+    setSelectionSessionId(selectedSessionId);
+    setPreviousArtifacts(artifacts);
+    setManualSelectedIds(null);
+  } else if (previousArtifacts !== artifacts) {
+    // Imports can select an ID before the refreshed inventory reaches this hook.
+    setPreviousArtifacts(artifacts);
+    if (manualSelectedIds !== null) {
+      const presentIds = new Set(artifacts.map((artifact) => artifact.artifactId));
+      const retained = manualSelectedIds.filter((id) => presentIds.has(id));
+      if (retained.length !== manualSelectedIds.length) setManualSelectedIds(retained);
+    }
+  }
   const [isUploadingArtifact, setIsUploadingArtifact] = useState(false);
 
   // Preview + download are shared with the artifact browser. The chat call
@@ -53,56 +56,33 @@ export function useArtifacts(input: {
   const actions = useArtifactActions({ onError, artifacts });
 
   const visibleSelectedArtifactIds = useMemo(() => {
-    const candidateIds =
-      artifactSelectionMode === "manual"
-        ? selectedArtifactIds
-        : getAutoScopedArtifactIds(artifacts);
+    const candidateIds = manualSelectedIds ?? getAutoScopedArtifactIds(artifacts);
     // Always gate the final list on eligibility so that a freshly flagged
     // (pending/blocked) artifact cannot leak into the message request even if
     // the user had previously selected it in manual mode.
-    const eligibleById = new Map(
+    const eligibleById = new Set(
       artifacts
         .filter(isArtifactEligibleForChatContext)
-        .map((artifact) => [artifact.artifactId, artifact])
+        .map((artifact) => artifact.artifactId)
     );
     return candidateIds.filter((id) => eligibleById.has(id));
-  }, [artifactSelectionMode, selectedArtifactIds, artifacts]);
-
-  const resetSelection = useCallback(() => {
-    setArtifactSelectionMode("auto");
-    setSelectedArtifactIds([]);
-  }, []);
-
-  const updateArtifactSelection = useCallback((nextArtifacts: Artifact[]) => {
-    if (artifactSelectionMode === "manual") {
-      setSelectedArtifactIds((current) =>
-        retainSelectedArtifactIds(current, nextArtifacts),
-      );
-    } else {
-      setSelectedArtifactIds(getAutoScopedArtifactIds(nextArtifacts));
-    }
-  }, [artifactSelectionMode]);
+  }, [manualSelectedIds, artifacts]);
 
   const toggleArtifactSelection = useCallback((artifactId: string) => {
-    const base =
-      artifactSelectionMode === "manual"
-        ? selectedArtifactIds
-        : getAutoScopedArtifactIds(artifacts);
-
-    setArtifactSelectionMode("manual");
-    setSelectedArtifactIds(
-      base.includes(artifactId)
+    setManualSelectedIds((current) => {
+      const base = current ?? getAutoScopedArtifactIds(artifacts);
+      return base.includes(artifactId)
         ? base.filter((id) => id !== artifactId)
-        : [...base, artifactId],
-    );
-  }, [artifactSelectionMode, artifacts, selectedArtifactIds]);
+        : [...base, artifactId];
+    });
+  }, [artifacts]);
 
   const selectArtifact = useCallback((artifactId: string) => {
-    setArtifactSelectionMode("manual");
-    setSelectedArtifactIds((current) =>
-      current.includes(artifactId) ? current : [...current, artifactId]
-    );
-  }, []);
+    setManualSelectedIds((current) => {
+      const base = current ?? getAutoScopedArtifactIds(artifacts);
+      return base.includes(artifactId) ? base : [...base, artifactId];
+    });
+  }, [artifacts]);
 
   const handleUploadArtifact = useCallback(async (file: File | null) => {
     if (!file || !selectedSessionId) return;
@@ -118,12 +98,8 @@ export function useArtifacts(input: {
   }, [onError, onRefresh, selectedSessionId]);
 
   return {
-    artifactSelectionMode,
-    selectedArtifactIds,
     visibleSelectedArtifactIds,
     isUploadingArtifact,
-    resetSelection,
-    updateArtifactSelection,
     toggleArtifactSelection,
     selectArtifact,
     handleUploadArtifact,

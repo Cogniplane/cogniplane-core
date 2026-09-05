@@ -1,5 +1,7 @@
 const apiUrl = process.env.COGNIPLANE_API_URL ?? "http://localhost:3001";
 const userId = process.env.COGNIPLANE_USER_ID ?? "local-dev-user";
+// Matches the compose default; the backend rejects identity headers without it.
+const devAuthKey = process.env.DEV_HEADERS_AUTH_KEY ?? "local-dev-headers-auth-key";
 const expectedText = process.env.COGNIPLANE_EXPECTED_TEXT ?? "COGNIPLANE_SMOKE_TEST_OK";
 const prompt =
   process.env.COGNIPLANE_PROMPT ?? `Respond with exactly this text and nothing else: ${expectedText}`;
@@ -13,6 +15,7 @@ function assert(condition, message) {
 async function request(path, init = {}) {
   const headers = {
     "x-user-id": userId,
+    "x-dev-auth-key": devAuthKey,
     ...(init.headers ?? {})
   };
 
@@ -58,22 +61,20 @@ async function readSse(response) {
     buffer = frames.pop() ?? "";
 
     for (const frame of frames) {
-      const eventLine = frame.split("\n").find((line) => line.startsWith("event: "));
       const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
 
-      if (!eventLine || !dataLine) {
+      if (!dataLine) {
         continue;
       }
 
-      const event = eventLine.slice(7);
       const payload = JSON.parse(dataLine.slice(6));
 
-      if (event === "response.output_text.delta" && typeof payload.delta === "string") {
+      if (payload.type === "TEXT_MESSAGE_CONTENT" && typeof payload.delta === "string") {
         assistantText += payload.delta;
       }
 
-      if (event === "response.failed") {
-        const message = payload.error?.message ?? "Assistant response failed";
+      if (payload.type === "RUN_ERROR") {
+        const message = payload.message ?? "Assistant response failed";
         if (message.includes("Reconnecting...")) {
           throw new Error(
             `${message}. If you are running the backend in Docker, export OPENAI_API_KEY before starting the stack to avoid ChatGPT-session reconnect failures inside the container.`
@@ -83,8 +84,8 @@ async function readSse(response) {
         throw new Error(message);
       }
 
-      if (event === "response.completed") {
-        completedStatus = payload.response?.status ?? null;
+      if (payload.type === "RUN_FINISHED") {
+        completedStatus = "completed";
       }
     }
   }
@@ -111,7 +112,8 @@ async function main() {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-user-id": userId
+        "x-user-id": userId,
+        "x-dev-auth-key": devAuthKey
       },
       body: JSON.stringify({
         sessionId,

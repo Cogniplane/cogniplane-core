@@ -4,7 +4,7 @@
  * durations so callers can emit ONE structured summary log line per session
  * start — see the `session_startup_timing` line in
  * deep-agents-runtime-adapter.ts, and the
- * `turn_latency_timing` line in sse-stream-writer.ts. Extraction/aggregation:
+ * `turn_latency_timing` line in sse-stream-writer-agui.ts. Extraction/aggregation:
  * scripts/analyze-startup-latency.mjs.
  */
 export type StartupStageTimings = Record<string, number>;

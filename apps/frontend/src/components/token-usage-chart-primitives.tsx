@@ -2,8 +2,10 @@
 
 import { Bar, BarChart as RechartsBarChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
-import { DAY_OPTIONS, fmtAxisShort, formatBarLabel, type Days } from "./token-usage-chart-primitives.logic";
+import { DAY_OPTIONS, fmtAxisShort, fmtCost, fmtTokens, formatBarLabel, type Days } from "./token-usage-chart-primitives.logic";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { SECTION_LABEL, TOKEN_USAGE_COL_GRID } from "../lib/ui-tokens";
 import {
   ChartContainer,
   ChartLegend,
@@ -89,6 +91,155 @@ export function HBar({ value, max, color }: { value: number; max: number; color:
         className="h-full rounded-sm transition-[width] duration-[400ms] ease-out"
         style={{ width: `${pct}%`, background: color }}
       />
+    </div>
+  );
+}
+
+const REPORT_CARD =
+  "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
+
+export function ReportStatCard(props: { label: string; value: string; detail: string }) {
+  return (
+    <article className={REPORT_CARD}>
+      <p className={SECTION_LABEL}>{props.label}</p>
+      <strong className="mt-2 block text-2xl font-bold tracking-tight text-on-surface tabular-nums">
+        {props.value}
+      </strong>
+      <p className="mt-1 text-xs text-on-surface-variant">{props.detail}</p>
+    </article>
+  );
+}
+
+export function TokenUsageSummary({
+  totals,
+  days
+}: {
+  totals: {
+    totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number;
+    messageCount: number;
+  };
+  days: Days;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <ReportStatCard
+        label="Total tokens"
+        value={fmtTokens(totals.totalTokens)}
+        detail={`In the last ${days} days`}
+      />
+      <ReportStatCard
+        label="Input tokens"
+        value={fmtTokens(totals.inputTokens)}
+        detail="Prompt + context"
+      />
+      <ReportStatCard
+        label="Output tokens"
+        value={fmtTokens(totals.outputTokens)}
+        detail="Generated text"
+      />
+      <ReportStatCard
+        label="Est. cost"
+        value={fmtCost(totals.costUsd)}
+        detail={`${totals.messageCount} messages`}
+      />
+    </div>
+  );
+}
+
+export function TokenUsageSkeleton() {
+  return (
+    <>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {Array.from({ length: 4 }, (_, i) => (
+          <div key={i} className={REPORT_CARD} data-testid="token-usage-stat-skeleton">
+            <Skeleton className="h-3 w-24" />
+            <Skeleton className="mt-3 h-7 w-16" />
+            <Skeleton className="mt-2 h-3 w-32" />
+          </div>
+        ))}
+      </div>
+      <div className={`${REPORT_CARD} p-5`}>
+        <Skeleton className="h-[200px] w-full" />
+      </div>
+    </>
+  );
+}
+
+export type TokenBreakdownRow = {
+  key: string;
+  label: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+};
+
+export function TokenBreakdown({
+  rows,
+  barColor,
+  chartPrimaryColor,
+  chartSecondaryColor,
+  firstColumnLabel
+}: {
+  rows: TokenBreakdownRow[];
+  barColor: string;
+  chartPrimaryColor: string;
+  chartSecondaryColor: string;
+  firstColumnLabel: "User" | "Model";
+}) {
+  const maxTokens = Math.max(...rows.map((row) => row.totalTokens), 1);
+  return (
+    <div className="flex flex-col">
+      <div
+        className={`${TOKEN_USAGE_COL_GRID} border-b border-outline-variant py-1.5 text-[0.7rem] font-bold uppercase tracking-wider text-on-surface-faint`}
+      >
+        <span>{firstColumnLabel}</span>
+        <span className="text-right">Input</span>
+        <span className="text-right">Output</span>
+        <span className="text-right">Total</span>
+        <span className="text-right">Cost</span>
+      </div>
+      {rows.map((row) => (
+        <div
+          key={row.key}
+          className={`${TOKEN_USAGE_COL_GRID} items-center border-b border-outline-variant py-2.5 text-sm`}
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            <HBar value={row.totalTokens} max={maxTokens} color={barColor} />
+            <span className="max-w-[180px] flex-shrink-0 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[0.82rem] text-on-surface-variant">
+              {row.label}
+            </span>
+          </div>
+          <span className="text-right text-[0.82rem] text-on-surface-variant">
+            {fmtTokens(row.inputTokens)}
+          </span>
+          <span className="text-right text-[0.82rem] text-on-surface-variant">
+            {fmtTokens(row.outputTokens)}
+          </span>
+          <span className="text-right font-semibold">
+            {fmtTokens(row.totalTokens)}
+          </span>
+          <span className="text-right text-[0.82rem] text-on-surface-variant">
+            {fmtCost(row.costUsd)}
+          </span>
+        </div>
+      ))}
+      <div className="pt-5">
+        <BarChart
+          data={rows.map((row) => ({
+            label: row.label,
+            inputSeries: row.inputTokens,
+            outputSeries: row.outputTokens
+          }))}
+          primaryColor={chartPrimaryColor}
+          secondaryColor={chartSecondaryColor}
+          primaryLabel="Input tokens"
+          secondaryLabel="Output tokens"
+        />
+      </div>
     </div>
   );
 }

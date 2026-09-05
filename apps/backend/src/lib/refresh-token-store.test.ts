@@ -6,6 +6,7 @@ import {
   consumeRefreshJti,
   REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS,
   issueRefreshJti,
+  restoreRefreshJti,
   revokeRefreshFamily,
   waitForRefreshRotation
 } from "./refresh-token-store.js";
@@ -237,4 +238,75 @@ test("rotation chain: issue → consume → issue (same family) → consume succ
   redis.store.delete("refresh_rotation:j1");
   const replay = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
   expect(replay.status).toBe("reuse_detected");
+});
+
+// restoreRefreshJti — the recovery path for a rotation that claimed the jti and
+// then failed. Without it, the caller's retry either waits out the grace marker
+// or, once that expires, looks like a replay and revokes the whole family.
+//
+// NOTE: the fake is a hand-written mirror of the Lua, so these tests pin the
+// mirror's behaviour, not Redis's. Breaking the real script without breaking
+// the mirror would not fail here — change both together.
+
+test("restoreRefreshJti puts a claimed jti back so the next attempt succeeds", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+
+  const claim = await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  expect(claim.status).toBe("ok");
+  // The claim consumed the jti and left a pending marker.
+  expect(redis.store.get("refresh_jti:j1")).toBeUndefined();
+  expect(redis.store.get("refresh_rotation:j1")).toMatch(/^pending:/);
+
+  expect(await restoreRefreshJti(redis, { jti: "j1", familyId: "f1" })).toBe(true);
+
+  // Back to the pre-claim state: the jti is live and the marker is gone, so a
+  // retry is an ordinary rotation rather than a replay.
+  expect(redis.store.get("refresh_jti:j1")).toBe("f1");
+  expect(redis.store.get("refresh_rotation:j1")).toBeUndefined();
+  expect((await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" })).status).toBe("ok");
+});
+
+test("restoreRefreshJti carries over the family's remaining lifetime, never a fresh one", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+
+  // Simulate time passing: the family key is most of the way through its TTL.
+  redis.ttlMs.set("refresh_family:f1", 5_000);
+
+  await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  await restoreRefreshJti(redis, { jti: "j1", familyId: "f1" });
+
+  // The restored token expires when the original would have. Reusing the
+  // configured TTL here would hand the caller a brand-new lifetime on every
+  // failed rotation — an indefinite extension for anyone who can make the
+  // rotation fail.
+  expect(redis.ttlMs.get("refresh_jti:j1")).toBe(5_000);
+});
+
+test("restoreRefreshJti declines once the rotation has completed", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  await completeRefreshRotation(redis, {
+    jti: "j1",
+    result: { accessToken: "at", refreshToken: "rt" }
+  });
+
+  // The rotation did succeed; restoring would revive a spent token and destroy
+  // the cached result that concurrent callers are waiting on.
+  expect(await restoreRefreshJti(redis, { jti: "j1", familyId: "f1" })).toBe(false);
+  expect(redis.store.get("refresh_jti:j1")).toBeUndefined();
+  expect(redis.store.get("refresh_rotation:j1")).toMatch(/^complete:/);
+});
+
+test("restoreRefreshJti declines when the family has been revoked", async () => {
+  const redis = makeFakeRedis();
+  await issueRefreshJti(redis, { jti: "j1", familyId: "f1", ttlSeconds: TTL });
+  await consumeRefreshJti(redis, { jti: "j1", familyId: "f1" });
+  await revokeRefreshFamily(redis, { familyId: "f1", ttlSeconds: TTL });
+
+  // Revocation is the theft response; a restore must never undo it.
+  expect(await restoreRefreshJti(redis, { jti: "j1", familyId: "f1" })).toBe(false);
+  expect(redis.store.get("refresh_jti:j1")).toBeUndefined();
 });

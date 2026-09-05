@@ -1,14 +1,10 @@
-import type { ModelProvider } from "@cogniplane/shared-types";
-import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
+import type { ModelProvider, PiiProtectionSettings } from "@cogniplane/shared-types";
+import { DEFAULT_PII_PROTECTION, MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { decrypt, encrypt } from "../lib/crypto-utils.js";
 
-import {
-  DEFAULT_PII_PROTECTION,
-  parsePiiProtection,
-  type PiiProtectionSettings
-} from "./pii/pii-policy.js";
+import { parsePiiProtection } from "./pii/pii-policy.js";
 
 /** Public provider id → its encrypted-key column on tenant_org_settings. */
 const PROVIDER_KEY_COLUMNS = {
@@ -23,9 +19,6 @@ type ProviderKeyColumn = (typeof PROVIDER_KEY_COLUMNS)[ModelProvider];
 
 export type TenantOrgSettingsRecord = {
   tenantId: string;
-  /** Retained for callers that only care about Anthropic; equals
-   *  providerKeys.anthropic. */
-  hasAnthropicApiKey: boolean;
   /** Per-provider key-presence map (never the keys themselves). */
   providerKeys: Record<ModelProvider, boolean>;
   skillMarketplaceManifestUrl: string | null;
@@ -63,7 +56,6 @@ function mapRow(row: Row): TenantOrgSettingsRecord {
   const providerKeys = providerKeysFromRow(row);
   return {
     tenantId: row.tenant_id,
-    hasAnthropicApiKey: providerKeys.anthropic,
     providerKeys,
     skillMarketplaceManifestUrl: row.skill_marketplace_manifest_url,
     piiProtection: row.pii_protection == null
@@ -75,7 +67,6 @@ function mapRow(row: Row): TenantOrgSettingsRecord {
 
 const EMPTY_RECORD = (tenantId: string): TenantOrgSettingsRecord => ({
   tenantId,
-  hasAnthropicApiKey: false,
   providerKeys: emptyProviderKeys(),
   skillMarketplaceManifestUrl: null,
   piiProtection: DEFAULT_PII_PROTECTION,

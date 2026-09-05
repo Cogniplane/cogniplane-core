@@ -37,7 +37,6 @@ export const TenantSettingsSchema = z.object({
   // require_approval is actor confirmation by the initiating user.
   approvalReviewer: ApprovalReviewerSchema,
   allowCommandExecution: z.boolean(),
-  allowUserTokenForwarding: z.boolean(),
   autoApproveReadOnlyTools: z.boolean(),
   // Tenant-level Policy Center switch. monitor: rules are evaluated and decisions
   // recorded, but no action is gated. enforce: matching block/require_approval
@@ -88,9 +87,6 @@ export const TenantDetailsSchema = z.object({
   ssoProvider: z.string().nullable(),
   plan: z.string(),
   settings: z.object({
-    // Retained for backward compat with older clients; equals
-    // providerKeys.anthropic.
-    anthropicApiKeyConfigured: z.boolean(),
     // Per-provider key-presence map (booleans only — the keys themselves are
     // never returned). Keyed by public ModelProvider id.
     providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean()),
@@ -113,15 +109,19 @@ export type TenantDetails = z.infer<typeof TenantDetailsSchema>;
 // Each settings PUT returns `{ ok, ... }` with the relevant flag echoed back.
 // Shared so frontend and backend agree on the wire shape.
 
-// PUT /tenant/settings response for a provider-key set/clear. The request body
-// (`{ provider?, apiKey? }`) is validated server-side by apiKeysSchema; an
-// empty/absent apiKey clears the selected provider's key.
+// Require both fields so partial or obsolete requests cannot revoke a key.
+// Strict requests reject obsolete fields; passthrough responses tolerate server additions.
+export const TenantProviderKeyUpdateRequestSchema = z.object({
+  provider: z.enum(MODEL_PROVIDERS),
+  // An empty string clears the selected provider's stored key.
+  apiKey: z.string().max(512)
+}).strict();
+export type TenantProviderKeyUpdateRequest = z.infer<typeof TenantProviderKeyUpdateRequestSchema>;
+
 export const TenantProviderKeyUpdateResponseSchema = z.object({
   ok: z.boolean(),
   // Full refreshed presence map so the client updates every provider chip.
-  providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean()),
-  // Backward-compat echo for older clients that only read this field.
-  anthropicApiKeyConfigured: z.boolean()
+  providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean())
 }).passthrough();
 export type TenantProviderKeyUpdateResponse = z.infer<typeof TenantProviderKeyUpdateResponseSchema>;
 

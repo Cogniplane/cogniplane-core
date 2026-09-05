@@ -85,7 +85,7 @@ function baseInput(overrides: Partial<PolicyDecisionInput> = {}): PolicyDecision
     runtimeId: "rt-1",
     toolName: "write_artifact",
     toolCategory: "managed-session-context",
-    severity: "write",
+    severity: "file_change",
     serverId: "managed-session-context",
     matchedRuleId: "pol_1",
     outcome: "allow",
@@ -108,7 +108,7 @@ test("record persists a decision and returns the mapped row", async () => {
   expect(decision.toolName).toBe("write_artifact");
   expect(decision.outcome).toBe("allow");
   expect(decision.enforced).toBe(true);
-  expect(decision.severity).toBe("write");
+  expect(decision.severity).toBe("file_change");
 });
 
 test("list returns decisions with total and paging metadata", async () => {
@@ -157,7 +157,7 @@ test("list builds filter predicates for outcomes, tool names and severities", as
   await store.list("t1", {
     outcomes: ["block"],
     toolNames: ["write_artifact"],
-    severities: ["write"],
+    severities: ["file_change"],
     enforced: true,
     sessionId: "sess-1"
   });

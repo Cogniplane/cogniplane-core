@@ -7,7 +7,6 @@ export const testRuntimePolicy = {
   sandboxMode: "workspace-write" as const,
   networkMode: "restricted" as const,
   allowCommandExecution: false,
-  allowUserTokenForwarding: true,
   autoApproveReadOnlyTools: true,
   policyEnforcementMode: "monitor" as const,
   developerInstructions: null,

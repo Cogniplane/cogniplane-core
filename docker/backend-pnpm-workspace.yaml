@@ -1,0 +1,4 @@
+packages:
+  - apps/backend
+  - packages/shared-types
+  - private/sharepoint-overlay-backend

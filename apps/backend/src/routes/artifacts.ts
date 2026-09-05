@@ -8,6 +8,13 @@ import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
 import type { FastifyInstance } from "fastify";
 
 import type { AppDependencies } from "../app-dependencies.js";
+import type { SessionStore } from "../services/session-store.js";
+import type { ArtifactStore } from "../services/artifacts/artifact-store.js";
+import type { ArtifactStorage } from "../services/artifacts/artifact-storage.js";
+import type { ArtifactProcessor } from "../services/artifacts/artifact-processor.js";
+import type { AuditEventStore } from "../services/audit-event-store.js";
+import type { PiiArtifactScanEnqueuer } from "../services/pii/pii-artifact-scan-enqueuer.js";
+import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { ensureUser } from "../lib/db.js";
 import { apiError, getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
@@ -69,7 +76,24 @@ export function buildArtifactRouteStores(deps: AppDependencies) {
   };
 }
 
-export type ArtifactRouteStores = ReturnType<typeof buildArtifactRouteStores>;
+export type ArtifactRouteStores = {
+  sessions: Pick<SessionStore, "getOwned">;
+  artifacts: Pick<
+    ArtifactStore,
+    | "listForUser"
+    | "listBySession"
+    | "create"
+    | "getOwned"
+    | "createDownloadToken"
+    | "peekDownloadToken"
+    | "consumeDownloadToken"
+  >;
+  auditEvents: Pick<AuditEventStore, "create">;
+  storage: Pick<ArtifactStorage, "put" | "openReadStream">;
+  processor: Pick<ArtifactProcessor, "extractArtifactText">;
+  piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "enqueue">;
+  limits: Pick<RequestLimitsInterface, "consumeRateLimit">;
+};
 
 export async function registerArtifactRoutes(
   app: FastifyInstance,

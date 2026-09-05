@@ -92,7 +92,6 @@ export type AdminMcpServerRecord = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string | null;
-  headersAllowlist: string[];
   version: number;
   configHash: string;
   enabled: boolean;
@@ -126,7 +125,6 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
     sandboxMode: "workspace-write",
     networkMode: "restricted",
     allowCommandExecution: settings.allowCommandExecution,
-    allowUserTokenForwarding: settings.allowUserTokenForwarding,
     autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
     policyEnforcementMode: settings.policyEnforcementMode,
     developerInstructions: settings.developerInstructions,
@@ -191,7 +189,6 @@ export function parseRuntimePolicySnapshot(
     sandboxMode: "workspace-write",
     networkMode: "restricted",
     allowCommandExecution: Boolean(profile.allowCommandExecution),
-    allowUserTokenForwarding: Boolean(profile.allowUserTokenForwarding),
     autoApproveReadOnlyTools: Boolean(profile.autoApproveReadOnlyTools),
     // Default a missing/stale snapshot to "monitor" — fail-safe (never gate
     // unexpectedly) if a context predates this field.
@@ -228,7 +225,6 @@ export type McpServerRegistration = {
   routePath: string;
   upstreamUrl: string | null;
   transportKind: "http";
-  headersAllowlist: string[];
   version: number;
   hash: string;
 };
@@ -243,7 +239,6 @@ export type ResolvedRuntimePolicy = {
   sandboxMode: "workspace-write";
   networkMode: "restricted";
   allowCommandExecution: boolean;
-  allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
   /**
    * Tenant-level Policy Center switch. "monitor": rules are evaluated and

@@ -6,7 +6,7 @@ import {
 } from "./github/github-oauth-routes.js";
 import {
   registerIntegration,
-  setIntegrationRuntimeWiring,
+  type IntegrationRegistry,
   type IntegrationConnectionProbe,
   type IntegrationOAuthRoutes
 } from "./integration-registry.js";
@@ -17,26 +17,7 @@ import {
 } from "./notion/notion-oauth-routes.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
 
-// Bootstrap module — registers the integrations that ship with core OSS
-// (GitHub, Notion, plus the coming-soon stubs). Optional overlays register
-// themselves through their own bootstrap.
-//
-// Two-phase API on purpose:
-//
-//   1. `registerBuiltinIntegrations()` — registers the *static* descriptor
-//      data (id, name, read/write tool ids, configFields, platformStatus,
-//      OAuth callback paths). Idempotent: safe to call from multiple test
-//      files at module load time. Descriptors are uniqued by id.
-//
-//   2. `attachBuiltinIntegrationRuntime({ probes, oauth })` — attaches or
-//      replaces the per-app live wiring (connection probes + OAuth route
-//      handlers). Re-runnable: every fresh `buildAppDependencies()` call
-//      should re-attach so a second Fastify app in the same process gets
-//      its own connection service captured, not the previous app's.
-//
-// The earlier single-phase design had a first-wins-permanent guard that
-// silently dropped probes/OAuth handlers if any caller (typically a test)
-// had already initialized the registry without them.
+// The catalog contains static descriptors. Each app attaches its own live hooks.
 
 export type BuiltinIntegrationProbes = {
   notion?: IntegrationConnectionProbe;
@@ -44,8 +25,8 @@ export type BuiltinIntegrationProbes = {
 };
 
 export type BuiltinIntegrationOAuthCallbacks = {
-  notion?: NotionConnectionService;
-  github?: GithubConnectionService;
+  notion?: Pick<NotionConnectionService, "completeAuthorization">;
+  github?: Pick<GithubConnectionService, "completeAuthorization">;
 };
 
 export type AttachBuiltinIntegrationRuntimeOptions = {
@@ -67,27 +48,24 @@ export function registerBuiltinIntegrations(): void {
 }
 
 export function attachBuiltinIntegrationRuntime(
+  registry: IntegrationRegistry,
   options: AttachBuiltinIntegrationRuntimeOptions = {}
 ): void {
-  // Lazily ensure descriptors exist; callers that forgot to call
-  // `registerBuiltinIntegrations()` first still get a working registry.
-  registerBuiltinIntegrations();
-
   const probes = options.probes ?? {};
   const oauth = options.oauth ?? {};
 
-  setIntegrationRuntimeWiring("notion", {
+  registry.setRuntimeWiring("notion", {
     connectionProbe: probes.notion,
     oauthRoutes: buildNotionOAuthRoutes(oauth.notion, options.limits)
   });
-  setIntegrationRuntimeWiring("github", {
+  registry.setRuntimeWiring("github", {
     connectionProbe: probes.github,
     oauthRoutes: buildGithubOAuthRoutes(oauth.github, options.limits)
   });
 }
 
 function buildNotionOAuthRoutes(
-  callbackHandler: NotionConnectionService | undefined,
+  callbackHandler: Pick<NotionConnectionService, "completeAuthorization"> | undefined,
   limits?: RequestLimitsInterface
 ): IntegrationOAuthRoutes {
   return {
@@ -99,7 +77,7 @@ function buildNotionOAuthRoutes(
 }
 
 function buildGithubOAuthRoutes(
-  callbackHandler: GithubConnectionService | undefined,
+  callbackHandler: Pick<GithubConnectionService, "completeAuthorization"> | undefined,
   limits?: RequestLimitsInterface
 ): IntegrationOAuthRoutes {
   return {
@@ -138,7 +116,7 @@ function registerNotionDescriptor(): void {
     // `attachBuiltinIntegrationRuntime`. The OAuth route paths are
     // stamped on now so the auth middleware allowlist is correct even
     // before any handler is bound.
-    oauthRoutes: buildNotionOAuthRoutes(undefined)
+    oauthCallbackPaths: NOTION_OAUTH_CALLBACK_PATHS
   });
 }
 
@@ -166,7 +144,7 @@ function registerGithubDescriptor(): void {
             message:
               "Set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, and GITHUB_OAUTH_REDIRECT_URI in the backend environment to enable GitHub."
           },
-    oauthRoutes: buildGithubOAuthRoutes(undefined)
+    oauthCallbackPaths: GITHUB_OAUTH_CALLBACK_PATHS
   });
 }
 

@@ -119,6 +119,20 @@ export const ScheduledJobSchema = z.object({
 }).passthrough();
 export type ScheduledJob = z.infer<typeof ScheduledJobSchema>;
 
+export const ScheduledJobRequestSchema = z.object({
+  jobName: z.string().trim().min(1).max(120),
+  description: z.string().trim().max(500).nullable().optional(),
+  cronExpression: z.string().trim().min(1).max(120),
+  timeZone: z.string().trim().min(1).max(100),
+  targetType: z.enum(["prompt", "skill"]).default("prompt"),
+  targetRef: z.string().trim().min(1).max(120).nullable().optional(),
+  input: z.object({
+    prompt: z.string().trim().min(1).max(4_000)
+  }),
+  enabled: z.boolean().default(true)
+});
+export type ScheduledJobRequest = z.input<typeof ScheduledJobRequestSchema>;
+
 export const ScheduledJobsListResponseSchema = z.object({
   scheduledJobs: z.array(ScheduledJobSchema)
 }).passthrough();

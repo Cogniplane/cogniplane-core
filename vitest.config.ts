@@ -4,11 +4,14 @@ import { defineConfig } from "vitest/config";
 // whole monorepo in one Vitest invocation. Per-package configs in
 // `apps/backend/vitest.config.ts` and `apps/frontend/vitest.config.ts` carry
 // the runtime-environment specifics (node vs. jsdom). The inline `scripts`
-// project covers test files under `scripts/`.
+// project covers test files under `scripts/`. The backend-integration project
+// needs a real Postgres and skips itself when INTEGRATION_DATABASE_URL is
+// unset, so this stays runnable with nothing installed.
 export default defineConfig({
   test: {
     projects: [
       "apps/backend/vitest.config.ts",
+      "apps/backend/vitest.integration.config.ts",
       "apps/frontend/vitest.config.ts",
       {
         test: {

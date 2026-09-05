@@ -6,9 +6,13 @@
  */
 
 export function isoTimestamp(value: unknown): string {
-  return new Date(String(value)).toISOString();
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" || typeof value === "number") {
+    return new Date(value).toISOString();
+  }
+  throw new TypeError("Expected a Date, timestamp string, or epoch milliseconds");
 }
 
 export function isoTimestampOrNull(value: unknown): string | null {
-  return value ? new Date(String(value)).toISOString() : null;
+  return value == null ? null : isoTimestamp(value);
 }

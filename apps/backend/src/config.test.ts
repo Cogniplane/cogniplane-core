@@ -175,16 +175,50 @@ test("loadConfig rejects network-exposed listeners in dev-headers mode", () => {
 
 test("loadConfig allows dev-headers on a non-loopback listener only when the container opt-in is set", () => {
   // Without the opt-in, the guard still throws (covered above). With it, boot
-  // succeeds — the operator has acknowledged the host firewall is the boundary.
-  expect(loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1" })).API_HOST).toBe(
+  // succeeds — but only alongside a shared secret, because the network guard is
+  // the thing being removed.
+  const optIn = { API_HOST: "0.0.0.0", DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret" };
+  expect(loadConfig(devConfig({ ...optIn, COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1" })).API_HOST).toBe(
     "0.0.0.0"
   );
-  expect(loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "true" })).API_HOST).toBe(
+  expect(loadConfig(devConfig({ ...optIn, COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "true" })).API_HOST).toBe(
     "0.0.0.0"
   );
   // Unknown / falsy values must NOT bypass the guard.
-  expect(() => loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "no" }))).toThrow(
+  expect(() => loadConfig(devConfig({ ...optIn, COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "no" }))).toThrow(
     /API_HOST must be a loopback address/
+  );
+});
+
+test("loadConfig refuses the non-loopback opt-in without a shared secret", () => {
+  // Dropping the bind guard with no request-level guard is unauthenticated
+  // cross-tenant impersonation for anything that can reach the port.
+  expect(() =>
+    loadConfig(devConfig({ API_HOST: "0.0.0.0", COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1" }))
+  ).toThrow(/DEV_HEADERS_AUTH_KEY .* is required/);
+  expect(() =>
+    loadConfig(
+      devConfig({
+        API_HOST: "0.0.0.0",
+        COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1",
+        DEV_HEADERS_AUTH_KEY: "too-short"
+      })
+    )
+  ).toThrow();
+});
+
+test("loadConfig accepts versioned/platform pdftotext names, rejects unrelated binaries", () => {
+  expect(loadConfig(devConfig({ PDFTOTEXT_BINARY_PATH: "/usr/bin/pdftotext" })).PDFTOTEXT_BINARY_PATH).toBe(
+    "/usr/bin/pdftotext"
+  );
+  expect(loadConfig(devConfig({ PDFTOTEXT_BINARY_PATH: "/opt/poppler/pdftotext-24.02" })).PDFTOTEXT_BINARY_PATH).toBe(
+    "/opt/poppler/pdftotext-24.02"
+  );
+  expect(loadConfig(devConfig({ PDFTOTEXT_BINARY_PATH: "/tools/pdftotext.exe" })).PDFTOTEXT_BINARY_PATH).toBe(
+    "/tools/pdftotext.exe"
+  );
+  expect(() => loadConfig(devConfig({ PDFTOTEXT_BINARY_PATH: "/usr/bin/evil-script" }))).toThrow(
+    /must point at a pdftotext binary/
   );
 });
 
@@ -228,11 +262,50 @@ test("loadConfig accepts a real E2B template", () => {
   const config = loadConfig({
     E2B_API_KEY: "e2b-test-key",
     E2B_TEMPLATE_ID: "real-tpl-abc123",
-    RUNTIME_GATEWAY_BASE_URL: "https://api.example.com"
+    RUNTIME_GATEWAY_BASE_URL: "http://127.0.0.1:3001"
   });
 
   expect(config.E2B_API_KEY).toBe("e2b-test-key");
   expect(config.E2B_TEMPLATE_ID).toBe("real-tpl-abc123");
+});
+
+test("loadConfig rejects non-loopback RUNTIME_GATEWAY_BASE_URL", () => {
+  expect(() =>
+    loadConfig({
+      E2B_API_KEY: "e2b-test-key",
+      E2B_TEMPLATE_ID: "real-tpl-abc123",
+      RUNTIME_GATEWAY_BASE_URL: "https://api.example.com"
+    })
+  ).toThrow(/RUNTIME_GATEWAY_BASE_URL must resolve to a loopback address/);
+});
+
+test("loadConfig accepts localhost and [::1] loopback RUNTIME_GATEWAY_BASE_URL", () => {
+  const cfgLocalhost = loadConfig({
+    E2B_API_KEY: "e2b-test-key",
+    E2B_TEMPLATE_ID: "real-tpl-abc123",
+    RUNTIME_GATEWAY_BASE_URL: "http://localhost:3001"
+  });
+  expect(cfgLocalhost.RUNTIME_GATEWAY_BASE_URL).toBe("http://localhost:3001");
+
+  const cfgIpv6 = loadConfig({
+    E2B_API_KEY: "e2b-test-key",
+    E2B_TEMPLATE_ID: "real-tpl-abc123",
+    RUNTIME_GATEWAY_BASE_URL: "http://[::1]:3001"
+  });
+  expect(cfgIpv6.RUNTIME_GATEWAY_BASE_URL).toBe("http://[::1]:3001");
+});
+
+test("loadConfig skipRuntimeChecks bypasses RUNTIME_GATEWAY_BASE_URL loopback validation", () => {
+  const config = loadConfig(
+    {
+      E2B_API_KEY: undefined,
+      E2B_TEMPLATE_ID: undefined,
+      RUNTIME_GATEWAY_BASE_URL: "https://api.example.com"
+    },
+    undefined,
+    { skipRuntimeChecks: true }
+  );
+  expect(config.RUNTIME_GATEWAY_BASE_URL).toBe("https://api.example.com");
 });
 
 test("loadConfig refuses the placeholder E2B_TEMPLATE_ID default", () => {
@@ -240,7 +313,7 @@ test("loadConfig refuses the placeholder E2B_TEMPLATE_ID default", () => {
     loadConfig({
       E2B_API_KEY: "e2b-test-key",
       E2B_TEMPLATE_ID: "replace-with-your-template-id",
-      RUNTIME_GATEWAY_BASE_URL: "https://api.example.com"
+      RUNTIME_GATEWAY_BASE_URL: "http://127.0.0.1:3001"
     })
   ).toThrow(/E2B_TEMPLATE_ID is not configured/);
 });
@@ -386,7 +459,53 @@ test("loadConfig rejects a turn timeout at or above the sandbox lifetime", () =>
   ).toThrow(/RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS/);
 });
 
-test("loadConfig accepts a disabled turn watchdog (0) regardless of the other timeouts", () => {
-  const config = loadConfig(devConfig({ RUNTIME_TURN_TIMEOUT_MS: "0" }));
+test("loadConfig rejects a tool-context TTL that cannot absorb one paused approval", () => {
+  // The turn watchdog PAUSES while a human decides an approval, so a turn's
+  // wall-clock ceiling is RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS.
+  // The tool-context TTL does not pause. 25 min of context against a 20-min
+  // watchdog + 10-min approval expires the context mid-turn — and it is the
+  // combination the old watchdog-only check accepted.
+  expect(() =>
+    loadConfig(
+      devConfig({
+        RUNTIME_TURN_TIMEOUT_MS: "1200000",
+        APPROVAL_REQUEST_TTL_MS: "600000",
+        TOOL_CONTEXT_TTL_MS: "1500000"
+      })
+    )
+  ).toThrow(/TOOL_CONTEXT_TTL_MS .* must exceed RUNTIME_TURN_TIMEOUT_MS \+ APPROVAL_REQUEST_TTL_MS/);
+});
+
+test("loadConfig accepts a tool-context TTL above the turn + approval sum", () => {
+  const config = loadConfig(
+    devConfig({
+      RUNTIME_TURN_TIMEOUT_MS: "1200000",
+      APPROVAL_REQUEST_TTL_MS: "600000",
+      TOOL_CONTEXT_TTL_MS: "2100000"
+    })
+  );
+  expect(config.TOOL_CONTEXT_TTL_MS).toBe(2_100_000);
+});
+
+test("the shipped defaults satisfy their own timing invariants", () => {
+  // Guards against raising one default and leaving the others behind: the
+  // no-override load must not throw, and the wall-clock ordering must hold.
+  const config = loadConfig(devConfig({}));
+  expect(config.TOOL_CONTEXT_TTL_MS).toBeGreaterThan(
+    config.RUNTIME_TURN_TIMEOUT_MS + config.APPROVAL_REQUEST_TTL_MS
+  );
+  expect(config.RUNTIME_TURN_TIMEOUT_MS).toBeLessThan(config.E2B_SANDBOX_TIMEOUT_MS);
+});
+
+test("loadConfig warns that a disabled turn watchdog (0) leaves the context TTL unenforceable", () => {
+  // With no watchdog a turn has NO ceiling, so no finite TOOL_CONTEXT_TTL_MS
+  // can be validated against it — there is no correct number to require. The
+  // config is accepted (0 is a documented escape hatch) but must say out loud
+  // that a long turn can still lose managed MCP tool access mid-flight.
+  const warnings: Array<{ msg: string }> = [];
+  const config = loadConfig(devConfig({ RUNTIME_TURN_TIMEOUT_MS: "0" }), {
+    warn: (_meta: object, msg: string) => warnings.push({ msg })
+  } as never);
   expect(config.RUNTIME_TURN_TIMEOUT_MS).toBe(0);
+  expect(warnings.some((w) => w.msg.includes("disables the turn watchdog"))).toBe(true);
 });

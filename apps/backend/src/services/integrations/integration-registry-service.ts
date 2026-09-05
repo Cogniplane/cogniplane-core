@@ -1,7 +1,7 @@
 import type { AppConfig } from "../../config.js";
 import {
   getIntegrationDescriptor,
-  listIntegrationDescriptors,
+  IntegrationRegistry,
   type IntegrationConnectionProbe,
   type IntegrationDescriptor,
   type IntegrationConfigField,
@@ -97,24 +97,13 @@ function hasRequiredConfig(
 export class IntegrationRegistryService {
   constructor(
     private readonly config: AppConfig,
-    private readonly stateStore: IntegrationStateStore,
-    private readonly probeOverrides: IntegrationConnectionProbes = {}
+    private readonly stateStore: Pick<IntegrationStateStore, "get" | "list">,
+    private readonly probeOverrides: IntegrationConnectionProbes = {},
+    private readonly descriptors: IntegrationRegistry = new IntegrationRegistry()
   ) {}
 
   private resolveProbe(descriptor: IntegrationDescriptor): IntegrationConnectionProbe | null {
     return this.probeOverrides[descriptor.id] ?? descriptor.connectionProbe ?? null;
-  }
-
-  listDescriptors(): readonly IntegrationDescriptor[] {
-    return listIntegrationDescriptors();
-  }
-
-  // True when the tenant has an explicit row in tenant_integrations for the
-  // given integration — the new admin page is authoritative for that tenant
-  // and any legacy ad-hoc tool injections elsewhere should defer to it.
-  async hasIntegrationState(tenantId: string, integrationId: string): Promise<boolean> {
-    const state = await this.stateStore.get(tenantId, integrationId);
-    return state !== null;
   }
 
   // Public readiness check used by both the admin GET list and PUT validation.
@@ -125,7 +114,7 @@ export class IntegrationRegistryService {
     integrationId: string,
     prospectiveConfig?: Record<string, unknown>
   ): Promise<boolean> {
-    const descriptor = getIntegrationDescriptor(integrationId);
+    const descriptor = this.descriptors.get(integrationId);
     if (!descriptor) return false;
     let config = prospectiveConfig;
     if (config === undefined) {
@@ -140,7 +129,7 @@ export class IntegrationRegistryService {
     const stateById = new Map<string, IntegrationStateRecord>();
     for (const state of states) stateById.set(state.integrationId, state);
 
-    return listIntegrationDescriptors().map((descriptor) => {
+    return this.descriptors.list().map((descriptor) => {
       const state = stateById.get(descriptor.id);
       const config = state?.config ?? {};
       const platform = getPlatformStatus(descriptor.id, this.config);
@@ -181,7 +170,7 @@ export class IntegrationRegistryService {
     const stateById = new Map<string, IntegrationStateRecord>();
     for (const state of states) stateById.set(state.integrationId, state);
 
-    return listIntegrationDescriptors()
+    return this.descriptors.list()
       .filter((descriptor) => descriptor.status === "available")
       .map((descriptor) => {
         const state = stateById.get(descriptor.id);
@@ -208,7 +197,7 @@ export class IntegrationRegistryService {
     const collected: string[] = [];
     for (const state of states) {
       if (!state.readsEnabled && !state.writesEnabled) continue;
-      const descriptor = getIntegrationDescriptor(state.integrationId);
+      const descriptor = this.descriptors.get(state.integrationId);
       if (!descriptor || descriptor.status !== "available") continue;
 
       const probe = this.resolveProbe(descriptor);

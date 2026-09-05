@@ -1,7 +1,8 @@
 name: CI
 
-# Lint, typecheck, and unit tests for every PR and every push to main.
-# License compatibility is gated separately by license-check.yml.
+# Lint, typecheck, unit tests, full-source coverage, and the Postgres-backed RLS
+# suite for every PR and every push to main.
+# License compatibility is checked in the main CI job below.
 # CLA signing is gated separately by cla.yml.
 
 on:
@@ -62,10 +63,14 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      - name: License check
+        run: pnpm license:check
+
       # shared-types and frontend: full type check.
-      # backend: split into two cheap gates because the full type check exceeds
-      # available memory on free GitHub runners. The private CI is the
-      # authoritative semantic-type gate for the backend.
+      # backend production: split into two cheap gates because the full type
+      # check exceeds available memory on free GitHub runners. Backend tests
+      # still get a semantic TypeScript pass from their own entry points below.
+      # The private CI remains the authoritative whole-production semantic gate.
       #   - tsc --noCheck: parse + syntax (no semantic diagnostics)
       #   - dpdm:          import resolution (catches TS2307-style breakage)
       - name: Typecheck (shared-types + frontend)
@@ -90,5 +95,96 @@ jobs:
         env:
           NODE_OPTIONS: --max-old-space-size=2048
 
+      - name: Backend test typecheck
+        run: pnpm --filter @cogniplane/backend typecheck:test
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Script typecheck
+        run: pnpm typecheck:scripts
+
       - name: Tests
         run: pnpm test:all
+
+      # Default coverage counts all production source files. Imported-module
+      # coverage retains the former measurement for comparison, but it cannot
+      # act as a gate because removing an import changes its denominator.
+      - name: Backend full-source coverage
+        run: pnpm test:coverage
+
+      - name: Frontend full-source coverage
+        run: pnpm test:coverage:frontend
+
+      - name: Backend imported-module coverage trend
+        continue-on-error: true
+        run: pnpm test:coverage:imported
+
+      - name: Frontend imported-module coverage trend
+        continue-on-error: true
+        run: pnpm test:coverage:frontend:imported
+
+  integration:
+    name: Integration (Postgres RLS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Executes the Row-Level Security policies against a real Postgres. RLS is
+    # the tenant-isolation boundary for every request path, and the unit suite
+    # cannot exercise it: the in-memory pool fake answers
+    # BEGIN/COMMIT/set_config well enough that `withTenantScope` works against
+    # it, so a table with no ENABLE ROW LEVEL SECURITY, a policy naming the
+    # wrong GUC, or a store method skipping `withTenantScope` on a tested path all pass
+    # unit tests silently.
+    #
+    # If you self-host Cogniplane, this is the job to keep green: it is the one
+    # that proves one tenant cannot read another's rows in YOUR deployment's
+    # schema.
+    #
+    # What it does NOT prove: it catches a missing `withTenantScope` only in the
+    # store methods it explicitly tests, not in arbitrary new code, and its
+    # row-visibility cases cover eight tables rather than every tenant table.
+    # See the header of rls-isolation.integration.test.ts.
+    services:
+      postgres:
+        # Matches compose.yaml. The suite reads pg_class/pg_policies and uses
+        # DROP DATABASE ... WITH (FORCE), so the major version matters.
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # A SUPERUSER connection to the server, not to a fixed database: the suite
+      # creates a throwaway database per run, migrates it, creates `app_user`
+      # through the same code path `pnpm db:migrate` uses, and drops it in
+      # teardown. Without INTEGRATION_DATABASE_URL the whole project skips,
+      # which is what keeps `pnpm test:all` green on a machine with no Postgres.
+      - name: Integration tests
+        run: pnpm test:integration
+        env:
+          INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres

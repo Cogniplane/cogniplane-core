@@ -1,5 +1,4 @@
-
-import type { FastifyBaseLogger } from "fastify";
+import { EventType } from "@ag-ui/client";
 import { uuidv7 } from "../lib/uuid.js";
 
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
@@ -10,6 +9,7 @@ import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore } from "./session-store.js";
+import { clientSafeFailureMessage } from "./sse-writer.js";
 import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
 
 /**
@@ -22,7 +22,7 @@ import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-stor
 export type SchedulerRuntimeResolution =
   | {
       kind: "ok";
-      adapter: RuntimeAdapter;
+      adapter: SchedulerRuntimeAdapter;
       modelId: string | null;
       /** Tenant default-effort override for the resolved model (if any). */
       effort?: RuntimeReasoningEffort;
@@ -30,12 +30,20 @@ export type SchedulerRuntimeResolution =
   | { kind: "error"; message: string };
 
 export type SchedulerWorkerDeps = {
-  settings: UserSettingsStore;
-  sessions: SessionStore;
-  messages: MessageStore;
-  toolContexts: ToolExecutionContextStore;
+  settings: Pick<
+    UserSettingsStore,
+    | "listDueJobs"
+    | "claimJob"
+    | "createJobRun"
+    | "completeJobRun"
+    | "recordJobRunOutcome"
+    | "sweepStaleJobRuns"
+  >;
+  sessions: Pick<SessionStore, "create">;
+  messages: Pick<MessageStore, "create" | "getOwned" | "updateContent">;
+  toolContexts: Pick<ToolExecutionContextStore, "create">;
   resolveRuntime: (tenantId: string) => Promise<SchedulerRuntimeResolution>;
-  auditEvents: AuditEventStore;
+  auditEvents: Pick<AuditEventStore, "create">;
   /**
    * Optional PII scan subsystem. When both are provided, each worker tick also
    * drains up to `maxConcurrentPiiJobs` queued `pii_scan_jobs` in parallel with
@@ -45,8 +53,8 @@ export type SchedulerWorkerDeps = {
    * are left undefined and the drain no-ops. Kept optional so bootstrap paths
    * and tests that don't care about PII don't have to wire it.
    */
-  piiScanJobs?: PiiScanJobStore;
-  piiScanJobHandler?: PiiScanJobHandler;
+  piiScanJobs?: Pick<PiiScanJobStore, "claimDueJobs" | "sweepStaleClaims">;
+  piiScanJobHandler?: Pick<PiiScanJobHandler, "execute">;
   /**
    * Disables a job (sets enabled = FALSE) so it permanently leaves the
    * `listDueJobs` query. Used for poison jobs whose cron is invalid or which
@@ -56,8 +64,16 @@ export type SchedulerWorkerDeps = {
    * (next_run_at = NULL) and still emits the audit trail.
    */
   disableJob?: (input: { tenantId: string; jobId: string }) => Promise<void>;
-  logger: FastifyBaseLogger;
+  logger: {
+    error(payload: unknown, message: string): void;
+    warn(payload: unknown, message: string): void;
+  };
 };
+
+export type SchedulerRuntimeAdapter = Pick<
+  RuntimeAdapter,
+  "id" | "createSession" | "runMessageAGUI" | "abortSession" | "purgeSessionData"
+>;
 
 export type SchedulerWorkerOptions = {
   /**
@@ -91,7 +107,7 @@ export type SchedulerWorkerOptions = {
  */
 type ScheduledTurnHandle = {
   sessionId: string | null;
-  adapter: RuntimeAdapter | null;
+  adapter: SchedulerRuntimeAdapter | null;
   timedOut: boolean;
 };
 
@@ -392,10 +408,8 @@ export class SchedulerWorker {
   }
 
   private async executeJobWithTimeout(job: ScheduledJobRecord): Promise<void> {
-    // `executeJob` owns the run-record lifecycle (createJobRun →
-    // completeJobRun). On timeout we abort the runtime session, which makes
-    // `requestRuntimeShutdown` push a synthetic `response.failed` into the turn
-    // queue and end it — that unblocks the `for await` loop inside `executeJob`,
+    // `executeJob` owns the run-record lifecycle. On timeout we abort the
+    // runtime session. That ends the AG-UI turn and unblocks the `for await` loop,
     // so the same promise settles with status="failed" and records the outcome.
     // We therefore never need to invent a second completeJobRun here.
     const turn: ScheduledTurnHandle = { sessionId: null, adapter: null, timedOut: false };
@@ -437,9 +451,8 @@ export class SchedulerWorker {
           }
         }
 
-        // Aborting pushes a terminal `response.failed` into the turn queue and
-        // ends it, so `executeJob` normally resolves and records a failed
-        // outcome. Bound the wait so a turn that never settles (no session was
+        // Aborting ends the AG-UI turn. `executeJob` then records a failed outcome.
+        // Bound the wait so a turn that never settles (no session was
         // created yet, or the runtime ignored the abort) can't pin this slot
         // forever — after the grace we return and let the slot free.
         const graceMs = this.options.abortSettleGraceMs ?? ABORT_SETTLE_GRACE_MS;
@@ -506,7 +519,14 @@ export class SchedulerWorker {
       // before the message rows so it leaves no dangling pending assistant.
       const resolution = await this.deps.resolveRuntime(job.tenantId);
       if (resolution.kind === "error") {
-        throw new Error(`Runtime provider resolution failed: ${resolution.message}`);
+        // 400 (statusCode) so clientSafeFailureMessage passes this through to
+        // the job owner. The resolver's message is written for a user
+        // ("configure a model provider key"), unlike the SDK and driver errors
+        // that reach the same catch and are deliberately collapsed there.
+        throw Object.assign(
+          new Error(`Runtime provider resolution failed: ${resolution.message}`),
+          { statusCode: 400 }
+        );
       }
       const runtime = resolution.adapter;
       // Expose the adapter so the timeout watchdog aborts via the owning runtime.
@@ -538,13 +558,12 @@ export class SchedulerWorker {
         userId: job.userId
       });
 
-      const runtimePolicyId = runtimeSession.runtimePolicy.id;
       const toolContext = await this.deps.toolContexts.create({
         tenantId: job.tenantId,
         sessionId,
         userId: job.userId,
         runtimeId: runtimeSession.runtimeId,
-        runtimePolicyId,
+        runtimePolicyId: runtimeSession.runtimePolicy.id,
         messageId: assistantMessage.messageId,
         // Mark this as an unattended turn so a Policy Center rule can gate
         // scheduled actions more strictly. Keep the same runtimePolicy snapshot
@@ -557,21 +576,22 @@ export class SchedulerWorker {
         ttlMs: this.options.jobTimeoutMs + 60 * 1000
       });
 
-      const stream = runtime.runMessage(runtimeSession, {
+      const stream = runtime.runMessageAGUI(runtimeSession, {
         prompt,
-        runtimePolicyId,
         toolContextId: toolContext.toolContextId,
+        turnContext: "scheduled",
         assistantMessageId: assistantMessage.messageId,
         model: resolution.modelId ?? undefined,
         effort: resolution.effort
       });
 
       for await (const event of stream) {
-        if (event.type === "response.output_text.delta") {
+        if (event.type === EventType.TEXT_MESSAGE_CONTENT) {
           responseText += event.delta;
-        } else if (event.type === "response.failed") {
+        } else if (event.type === EventType.RUN_ERROR) {
           status = "failed";
-          errorMessage = event.message;
+          errorMessage =
+            typeof event.message === "string" ? event.message : "The assistant run failed.";
         }
       }
 
@@ -583,7 +603,7 @@ export class SchedulerWorker {
         responseText
       );
 
-      // Recover REAL token usage. RuntimeEvents carry no usage — the in-process
+      // Recover real token usage. AG-UI events carry no usage. The in-process
       // runtime adapter persists it onto the assistant message row mid-turn —
       // so re-read the row instead of recording 0 (the old behavior lied to the
       // job-run ledger that backs the scheduler's separate usage accounting).
@@ -605,7 +625,15 @@ export class SchedulerWorker {
       }
     } catch (error) {
       status = "failed";
-      errorMessage = error instanceof Error ? error.message : String(error);
+      // Classify before persisting. `errorMessage` is written to
+      // scheduled_job_runs, put into the scheduler.job.run.failed audit
+      // payload, and returned to the job owner by
+      // GET /me/scheduled-jobs/:jobId/runs — so a raw exception puts Postgres
+      // connection strings, E2B sandbox ids and internal hostnames in front of
+      // a user. The interactive path already classifies through the same
+      // helper; this path did not. The full error still reaches the logger
+      // line below, which is where an operator should read it.
+      errorMessage = clientSafeFailureMessage(error);
       this.deps.logger.error({ error, jobId: job.jobId }, "Scheduled job execution failed");
     }
 
@@ -615,6 +643,8 @@ export class SchedulerWorker {
       status = "failed";
       errorMessage = `Scheduled job timed out after ${this.options.jobTimeoutMs}ms`;
     }
+
+    await this.reclaimScheduledSession(job, sessionId, turn.adapter);
 
     const durationMs = Date.now() - startTime;
     const summary = responseText.length > 0 ? responseText.slice(0, 500) : null;
@@ -629,6 +659,72 @@ export class SchedulerWorker {
       inputTokens,
       outputTokens
     });
+  }
+
+  /**
+   * Release the per-run runtime and its checkpointer thread.
+   *
+   * Each firing creates a fresh session (see executeJob), and nothing else ever
+   * reclaims it: `abortSession` was previously only reached on the timeout path,
+   * so a completed run left a warm runtime — and a live E2B sandbox, if the job
+   * touched files — parked until RUNTIME_IDLE_TIMEOUT_MS, and left a LangGraph
+   * thread in the `deep_agents` schema forever. A scheduled session is never
+   * resumed (a new one is created next tick), so that thread is pure garbage;
+   * `purgeSessionData` is normally only called from the session DELETE route.
+   *
+   * The `sessions` / `messages` rows are deliberately KEPT: `scheduled_job_runs`
+   * references the session id and the run-detail UI reads the transcript. Their
+   * one-row-per-run growth is inherent to the feature and needs a retention
+   * policy, not a teardown here.
+   *
+   * Best-effort throughout — reclamation must never change a run's recorded
+   * outcome.
+   *
+   * The abort runs UNCONDITIONALLY, including after a watchdog timeout. It is
+   * tempting to skip it when `turn.timedOut` is set, since executeJobWithTimeout
+   * aborts on that path — but "timed out" does not imply "aborted": the watchdog
+   * only aborts `if (turn.sessionId && turn.adapter)`, and `turn.adapter` is
+   * assigned by the racing executeJob, so a timeout that fires before runtime
+   * resolution aborts nothing. Its abortSession can also throw. Either way the
+   * skip would drop the ONLY abort and leave the runtime (and its E2B sandbox)
+   * alive, then purge the thread underneath a graph still writing checkpoints.
+   * abortSession is idempotent — it no-ops on a session id it no longer holds —
+   * so the redundant call on the happy timeout path costs a map lookup.
+   */
+  private async reclaimScheduledSession(
+    job: ScheduledJobRecord,
+    sessionId: string | null,
+    adapter: SchedulerRuntimeAdapter | null
+  ): Promise<void> {
+    if (!sessionId || !adapter) return;
+    const scope = { tenantId: job.tenantId, sessionId, userId: job.userId };
+
+    // Ordered before the purge: tearing the thread down while the graph can
+    // still write would race checkpoint writes against the delete.
+    try {
+      await adapter.abortSession(scope);
+    } catch (error) {
+      // The abort is a PRECONDITION of the purge, not a best-effort step beside
+      // it. If it failed we cannot assume the graph has stopped, so deleting its
+      // thread now would corrupt a run that is still writing. Bail out and leave
+      // the thread: idle teardown still reclaims the runtime, and an orphaned
+      // checkpointer thread is a bounded storage leak — strictly the better of
+      // the two failures.
+      this.deps.logger.warn(
+        { error, jobId: job.jobId, sessionId },
+        "Failed to release scheduled-run runtime; skipping thread purge and falling back to idle teardown"
+      );
+      return;
+    }
+
+    try {
+      await adapter.purgeSessionData(scope);
+    } catch (error) {
+      this.deps.logger.warn(
+        { error, jobId: job.jobId, sessionId },
+        "Failed to purge scheduled-run checkpointer thread"
+      );
+    }
   }
 
   private async recordJobOutcome(

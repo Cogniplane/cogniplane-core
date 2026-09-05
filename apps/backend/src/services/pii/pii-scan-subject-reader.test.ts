@@ -5,7 +5,6 @@ import { test, expect } from "vitest";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { Pool } from "../../lib/db.js";
-import type { MessageStore } from "../message-store.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import { DatabasePiiScanSubjectReader } from "./pii-scan-subject-reader.js";
 
@@ -37,14 +36,13 @@ function buildReader(opts: {
           return realDestroy(...(args as []));
         }) as typeof stream.destroy;
       }
-      return { stream } as Awaited<ReturnType<ArtifactStorage["openReadStream"]>>;
+      return { stream, fileSizeBytes: chunks.reduce((total, chunk) => total + chunk.length, 0) };
     }
   };
   return new DatabasePiiScanSubjectReader({
     db: {} as Pool,
-    messages: {} as MessageStore,
-    artifacts: artifacts as ArtifactStore,
-    storage: storage as ArtifactStorage,
+    artifacts,
+    storage,
     maxBytes: opts.maxBytes
   });
 }

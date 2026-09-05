@@ -1,15 +1,34 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Coverage thresholds source of truth. apps/backend/vitest.config.ts reads this file at startup so Vitest enforces in-process; out-of-process CI tooling can enforce against the same numbers. Baseline note: the previous floor (86.25 / 80.15 / 80.03) was measured by `tsx --test --experimental-test-coverage` and overstated coverage because that tool only counted files actually loaded by tests. The 2026-05-09 v8 measurement was 74.96/67.20/74.96 (lines/branches/functions). After the 2026-05-30 test-suite review round (security/recovery coverage: auth-runtime-token path-gating, crypto-utils GCM tamper, db withTenantScope RLS, skill-import SSRF/zip-slip, tenant privilege guards, codex-turn-orchestrator + claude-turn-executor recovery, refresh-token TTL, interruptTurn/resolveApproval) the v8 measurement is 77.99/70.73/73.27 (lines/branches/functions). Thresholds set ~2 points below measurement to give the suite headroom for unrelated edits; ratchet upward as gaps close.",
+  "$comment": "Coverage floors shared by the backend and frontend Vitest configs. Default coverage counts every eligible production source file, including files no test imports. Each config documents its narrow framework and test-infrastructure exclusions next to coverage.exclude.",
+  "backendComment": "Full-source baseline measured 2026-09-04 after the first cleanup tranche: 81.94 lines, 74.29 branches, 78.17 functions. The floors leave about two percentage points for unrelated edits.",
   "thresholds": {
+    "lines": 80,
+    "branches": 72,
+    "functions": 76
+  },
+  "backendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 82.51 lines, 74.53 branches, 78.60 functions. These legacy floors measure only modules loaded by tests. CI reports this scope as a nonblocking trend because adding or removing an import changes its denominator.",
+  "importedThresholds": {
     "lines": 75,
     "branches": 68,
     "functions": 73
   },
+  "frontendComment": "Full-source baseline measured 2026-09-04: 31.31 lines, 26.58 branches, 21.33 functions. The only framework exclusions are the root Next.js layout and route templates documented in apps/frontend/vitest.config.ts.",
+  "frontendThresholds": {
+    "lines": 29,
+    "branches": 24,
+    "functions": 19
+  },
+  "frontendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 71.63 lines, 70.70 branches, 57.16 functions. CI reports this scope as a nonblocking trend.",
+  "frontendImportedThresholds": {
+    "lines": 69,
+    "branches": 69,
+    "functions": 54
+  },
   "enforcement": {
-    "command": "pnpm --filter @cogniplane/backend exec vitest run --coverage",
+    "command": "pnpm test:coverage && pnpm test:coverage:frontend",
     "blockPRCreation": true,
     "blockTaskCompletion": true,
-    "description": "Out-of-process CI tooling that consumes this file should check coverage against these thresholds before allowing a task or PR to land. Vitest also enforces these thresholds in-process via apps/backend/vitest.config.ts."
+    "description": "The default commands enforce full-source floors. The explicit :imported commands retain the former import-graph measurements for diagnostics only."
   }
 }

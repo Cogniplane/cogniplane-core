@@ -33,7 +33,7 @@ export function isTextReadableArtifact(mimeType: string): boolean {
  * Open a stored artifact and read a text excerpt up to `maxChars` characters.
  */
 export async function readArtifactExcerpt(
-  storage: ArtifactStorage,
+  storage: Pick<ArtifactStorage, "openReadStream">,
   storageKey: string,
   maxChars: number
 ): Promise<string> {

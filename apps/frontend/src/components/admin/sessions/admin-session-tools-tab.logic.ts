@@ -24,7 +24,7 @@ export type UnifiedRow =
     };
 
 /**
- * Merge tool events (Codex turn-loop signals) and message tool results
+ * Merge tool events (runtime lifecycle signals) and message tool results
  * (per-message redacted payloads) into a single time-ordered list. Two
  * sources, one timeline. Sort by createdAt ascending so the operator
  * reads top-down chronologically.
@@ -59,15 +59,6 @@ export function buildToolRows(
   ];
   rows.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   return rows;
-}
-
-/** Format an ISO timestamp for the tool row header. */
-export function formatToolTimestamp(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString();
-  } catch {
-    return iso;
-  }
 }
 
 /** Pretty-print a duration in ms — sub-second as "Xms", else "X.XXs". */

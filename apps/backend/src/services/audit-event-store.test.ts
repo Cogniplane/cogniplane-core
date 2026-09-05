@@ -30,7 +30,7 @@ test("AuditEventStore.create redacts Bearer tokens inside payload before persist
     tenantId: "tenant-1",
     sessionId: "sess-1",
     userId: "user-1",
-    type: "tool.failed",
+    type: "scheduler.job.run.failed",
     payload: {
       error: { message: "upstream returned: Authorization: Bearer top-secret-token" }
     }
@@ -53,7 +53,7 @@ test("AuditEventStore.create redacts secret-keyed fields recursively", async () 
     tenantId: "tenant-1",
     sessionId: null,
     userId: "user-1",
-    type: "integration.connected",
+    type: "user.github.connected",
     payload: {
       provider: "github",
       headers: { authorization: "Bearer raw-token", "x-trace-id": "trace-123" },
@@ -81,7 +81,7 @@ test("AuditEventStore.create leaves payloads with no secrets unchanged", async (
     tenantId: "tenant-1",
     sessionId: "sess-1",
     userId: "user-1",
-    type: "session.created",
+    type: "scheduler.job.run.completed",
     payload: { provider: "deep-agents", model: "deepagents/claude-sonnet-5", messageCount: 0 }
   });
 

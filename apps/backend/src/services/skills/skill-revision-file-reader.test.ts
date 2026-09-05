@@ -108,7 +108,7 @@ test("bundle skill: extracts and reads a manifested file as utf8", async () => {
     requestedPath: "scripts/tool.py",
     skillBundleStorage: {
       async materializeBundle() {
-        return { localPath: tmpRoot } as never;
+        return { localPath: tmpRoot };
       }
     }
   });
@@ -131,7 +131,7 @@ test("bundle skill: returns not_found when the requested path is not in the mani
       metadata: { files: [{ path: "SKILL.md" }] }
     }),
     requestedPath: "SECRET.md", // not in manifest
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("not_found");
 });
@@ -160,7 +160,7 @@ test("bundle skill: refuses path traversal even if the manifest claims it", asyn
       metadata: { files: [{ path: "../etc/passwd" }] }
     }),
     requestedPath: "../etc/passwd",
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("not_found");
 });
@@ -188,7 +188,7 @@ test("bundle skill: returns not_found when the file is missing on disk", async (
       metadata: { files: [{ path: "SKILL.md" }] }
     }),
     requestedPath: "SKILL.md",
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("not_found");
 });
@@ -204,7 +204,7 @@ test("bundle skill: returns not_found when the manifested 'file' is actually a d
       metadata: { files: [{ path: "is-a-dir" }] }
     }),
     requestedPath: "is-a-dir",
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("not_found");
 });
@@ -221,7 +221,7 @@ test("bundle skill: returns too_large when file exceeds the limit", async () => 
     }),
     requestedPath: "big.md",
     limitBytes: 100,
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("too_large");
   if (result.kind === "too_large") {
@@ -245,7 +245,7 @@ test("bundle skill: image file is returned as base64 with image/* contentType", 
       metadata: { files: [{ path: "icon.png" }] }
     }),
     requestedPath: "icon.png",
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") {
@@ -266,7 +266,7 @@ test("bundle skill: a binary blob with NUL byte is returned as base64 with octet
       metadata: { files: [{ path: "blob.dat" }] }
     }),
     requestedPath: "blob.dat",
-    skillBundleStorage: { async materializeBundle() { return { localPath: dir } as never; } }
+    skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
   });
   expect(result.kind).toBe("ok");
   if (result.kind === "ok") {

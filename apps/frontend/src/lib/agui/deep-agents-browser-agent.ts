@@ -12,11 +12,11 @@
 //   1. `requestInit` — emit our body shape (deriving `text` from the latest user
 //      message AG-UI hands us), instead of the default `JSON.stringify(input)`.
 //   2. the `fetch` fn — reuse the app's auth (dev-headers or JWT + 401 refresh)
-//      via `createApiHeaders`/`refreshAccessToken`, so no auth logic is dupliated.
+//      via `createApiHeaders`/`refreshAccessToken`, so auth logic stays centralized.
 //
 // The AG-UI `threadId` IS our session id (matches the backend, where thread_id
-// === sessionId). Version note: CopilotKit 1.62 bundles @ag-ui/client@0.0.57 +
-// rxjs@7.8.1 — the same pins the backend uses — so there is no Observable
+// === sessionId). Version note: CopilotKit 1.70.1 bundles @ag-ui/client@0.0.59 +
+// rxjs@7.8.1 — the same versions the backend uses — so there is no Observable
 // type-identity skew between this agent and CopilotKit's runtime.
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -5,7 +5,7 @@ import { UtilityLlmClient } from "./utility-llm-client.js";
 
 type FetchCall = { url: string; init: RequestInit };
 
-function mockFetch(responses: Array<Partial<Response> & { json: unknown; ok?: boolean }>) {
+function mockFetch(responses: Array<{ json: unknown; ok?: boolean }>) {
   const calls: FetchCall[] = [];
   let index = 0;
   const originalFetch = globalThis.fetch;

@@ -127,6 +127,20 @@ export class ApprovalStore {
     });
   }
 
+  async get(tenantId: string, approvalId: string, userId: string): Promise<ApprovalRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          SELECT *
+          FROM approvals
+          WHERE tenant_id = $1 AND approval_id = $2 AND user_id = $3
+        `,
+        [tenantId, approvalId, userId]
+      );
+      return result.rows[0] ? mapApproval(result.rows[0]) : null;
+    });
+  }
+
   async resolve(
     tenantId: string,
     approvalId: string,

@@ -18,7 +18,6 @@ export type TenantSettingsInput = {
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
-  allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
   policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string | null;

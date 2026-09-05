@@ -22,7 +22,6 @@ const baseSettings = {
   approvalPolicy: "never",
   approvalReviewer: "user",
   allowCommandExecution: false,
-  allowUserTokenForwarding: false,
   autoApproveReadOnlyTools: true,
   policyEnforcementMode: "monitor",
   developerInstructions: null,

@@ -1,3 +1,4 @@
+import type { fetch as undiciFetch } from "undici";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
@@ -10,10 +11,22 @@ const CANONICAL_IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 // "Numeric-shaped" hostnames: digits, dots, and `x`/`X` only. A real DNS name
 // has at least one alpha character that isn't `x`. If a hostname is numeric-
 // shaped but doesn't match canonical IPv4, the OS resolver may still interpret
-// it as an IP via legacy formats (octal `0177.0.0.1`, hex `0x7f.0.0.1`,
+// it as an IP via legacy formats (octal `0177.0.0.1`,
 // 32-bit integer `2130706433`, 2- or 3-segment forms `127.1` / `127.0.1`).
 // Any of those would let an admin bypass the SSRF guard, so fail closed.
 const NUMERIC_SHAPED = /^[0-9.xX]+$/;
+
+// Hex-encoded IPv4, which `NUMERIC_SHAPED` alone does NOT catch: it permits
+// the `x` but not the digits `a`-`f`, so `0xA9FEA9FE` fell through to "public"
+// and resolved to 169.254.169.254 — cloud instance metadata.
+//
+// Match on the `0x` PREFIX rather than on hex characters generally. That is
+// exactly the resolver's own rule, confirmed by probing it: a component
+// starting `0x` is parsed as a number (`0xA9FEA9FE`, `0X7F000001`,
+// `0x7f.0.0.1`, `0xff.0xff.0xff.0xfe`, `0x7f.1` all resolve), while a bare hex
+// word is an ordinary hostname (`cafe`, `dead`, `face`, `ffff` do not). A
+// blanket `[0-9a-fA-F.]+` test would block those legitimate names.
+const HEX_IP_SHAPED = /^(?:0[xX][0-9a-fA-F]*)(?:\.(?:0[xX])?[0-9a-fA-F]*)*$/;
 
 // Classifies a canonical dotted-decimal IPv4 string. Returns `true` for
 // private/reserved ranges, `false` for public. Used both for bare IPv4 hosts
@@ -111,9 +124,10 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
   }
 
   // Numeric-shaped but not a valid IPv4 → unusual format the resolver may still
-  // treat as an IP (octal `0177.0.0.1`, hex `0x7f.0.0.1`, 32-bit integer,
-  // 2-/3-segment short forms). Block it.
-  if (NUMERIC_SHAPED.test(host)) {
+  // treat as an IP (octal `0177.0.0.1`, 32-bit integer, 2-/3-segment short
+  // forms). Block it. `HEX_IP_SHAPED` covers the `0x`-prefixed forms, which
+  // NUMERIC_SHAPED cannot express.
+  if (NUMERIC_SHAPED.test(host) || HEX_IP_SHAPED.test(host)) {
     return true;
   }
 
@@ -159,18 +173,32 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
 
 /**
  * Custom DNS lookup hook for the SSRF-safe undici agent. Resolves all A/AAAA
- * records for the host, refuses if ANY of them is private/reserved (defends
- * against multi-record `(public, private)` rebinding tricks), then pins the
- * connection to the first validated address.
+ * records for the host, refuses the whole lookup if ANY of them is
+ * private/reserved (defends against multi-record `(public, private)` rebinding
+ * tricks), and otherwise hands back that validated snapshot for Node to
+ * connect from.
  *
  * The error message intentionally does not include the resolved IP — surfacing
  * an internal IP in error responses would itself be a small information leak
  * to the attacker who provoked the failure.
  */
+export type LookupAddress = { address: string; family: number };
+
+/**
+ * undici invokes this hook with `{ hints, all: true }`, and Node's contract for
+ * `all: true` is that the callback receives an ARRAY of `{address, family}` —
+ * NOT the `(err, address, family)` triple used by the single-address form.
+ *
+ * This is load-bearing, not a detail. Passing the triple makes undici read an
+ * address off an array it never received and fail every connection with
+ * "Invalid IP address: undefined" — which looks like the guard refusing a host
+ * while actually being the guard not running at all. Any change here must be
+ * verified against the installed undici, through a real request, not against
+ * this function alone.
+ */
 type LookupCallback = (
   err: NodeJS.ErrnoException | null,
-  address: string,
-  family: number
+  addresses?: LookupAddress[]
 ) => void;
 
 export async function ssrfSafeLookup(
@@ -181,7 +209,7 @@ export async function ssrfSafeLookup(
   try {
     const records = await dnsLookup(hostname, { all: true, verbatim: true });
     if (records.length === 0) {
-      callback(new Error("DNS lookup returned no records.") as NodeJS.ErrnoException, "", 0);
+      callback(new Error("DNS lookup returned no records.") as NodeJS.ErrnoException);
       return;
     }
     for (const record of records) {
@@ -189,17 +217,30 @@ export async function ssrfSafeLookup(
         callback(
           new Error(
             "Refusing to connect: hostname resolves to a private or reserved address."
-          ) as NodeJS.ErrnoException,
-          "",
-          0
+          ) as NodeJS.ErrnoException
         );
         return;
       }
     }
-    const first = records[0]!;
-    callback(null, first.address, first.family);
+    // Hand back the WHOLE validated snapshot, not just the first record.
+    //
+    // What closes the rebinding window is the loop above: the lookup is
+    // refused outright if ANY resolved record is private or reserved, and the
+    // addresses returned here are exactly the ones that passed. Node connects
+    // from this array without resolving again — verified: with two records it
+    // failed over from an unreachable address to a live one after a SINGLE
+    // lookup call — so no unvalidated address can enter at connect time.
+    //
+    // Returning only records[0] was therefore not a security measure, just a
+    // needless loss of failover: a dual-stack or multi-homed upstream whose
+    // first record happens to be down would fail even though a validated,
+    // reachable address was available.
+    callback(
+      null,
+      records.map((record) => ({ address: record.address, family: record.family }))
+    );
   } catch (err) {
-    callback(err as NodeJS.ErrnoException, "", 0);
+    callback(err as NodeJS.ErrnoException);
   }
 }
 
@@ -215,15 +256,32 @@ export async function ssrfSafeLookup(
  * pinning, an attacker can serve a public IP at validation time and flip to
  * 127.0.0.1 / 169.254.169.254 at connect time.
  *
- * Trade-off: the override breaks undici's default Happy Eyeballs (which would
- * try every resolved address on connect failure). For the rare admin-driven
- * fetches this guard protects, that is an acceptable availability cost.
+ * The hook returns every record that passed validation, so Node's own
+ * address failover still works — the guard costs no availability. Note this
+ * agent is on the hot path for EVERY forwarded MCP tool call, not only
+ * occasional admin actions, so that matters.
  */
 export const ssrfSafeAgent = new Agent({
   connect: {
     lookup: ssrfSafeLookup as never
   }
 });
+
+/**
+ * `ssrfSafeAgent` only takes effect on a fetch that honours the `dispatcher`
+ * option — Node's global fetch silently ignores it as of undici v8, which would
+ * disable DNS pinning without any visible failure. Call sites accept an
+ * injectable fetch (for tests), so enforce the invariant instead of documenting
+ * it: passing the global fetch is a wiring bug, not a fallback.
+ */
+export function assertDispatcherAwareFetch(fetchImpl: typeof undiciFetch): void {
+  if (Object.is(fetchImpl, globalThis.fetch)) {
+    throw new Error(
+      "SSRF-protected fetch must use undici's fetch: Node's global fetch ignores the `dispatcher` option, " +
+        "which silently disables DNS pinning."
+    );
+  }
+}
 
 export const httpsUrlSchema = z
   .string()
@@ -240,4 +298,65 @@ export const httpsUrlSchema = z
       }
     },
     { message: "URL must not point to a private or reserved IP address" }
+  )
+  // Reject `https://user:pass@host/...` at write time. A credential embedded
+  // here is stored in plaintext (mcp_servers.upstream_url is not an encrypted
+  // column), returned to the admin UI on every read, and travels into any log
+  // record naming the URL. Refusing it at the boundary is the only place the
+  // fix holds for every downstream consumer at once — `logSafeUrl` covers the
+  // log path, but nothing can un-store a credential already persisted.
+  .refine(
+    (url) => {
+      try {
+        const parsed = new URL(url);
+        return parsed.username === "" && parsed.password === "";
+      } catch {
+        return false;
+      }
+    },
+    { message: "URL must not embed credentials (user:password@)" }
   );
+
+/**
+ * Reduce an outbound URL to origin + pathname for logging.
+ *
+ * Distinct from `sanitize-url.ts`, and the two are not interchangeable.
+ * `sanitizeUrl` redacts a known list of parameter NAMES, which works for our
+ * own inbound request paths because we own the names. This function is for
+ * third-party URLs an admin configured — an MCP proxy upstream, a marketplace
+ * manifest — where the query-parameter name is the vendor's choice and no
+ * allowlist can anticipate it. So drop the query entirely rather than trying
+ * to classify it, and drop userinfo as belt-and-braces for any URL stored
+ * before the schema above started rejecting it.
+ *
+ * Returns the fixed string `"[unparseable url]"` rather than falling back to
+ * the raw input: a value that failed `new URL()` is exactly the value least
+ * safe to log verbatim. Non-http(s) schemes get the same treatment — `origin`
+ * is the string "null" for them, so a `mailto:` or `data:` value would
+ * otherwise concatenate into a misleading (and potentially secret-bearing)
+ * line rather than failing cleanly.
+ *
+ * The pathname is dropped too. It was kept at first, on the argument that the
+ * path is routing information and no MCP vendor authenticates with a path
+ * segment — but nothing in the write path enforces that: `httpsUrlSchema`
+ * constrains the scheme, host and userinfo and says nothing about the path, so
+ * `https://vendor.example/keys/<API_KEY>/rpc` is an accepted upstream whose key
+ * would be copied verbatim into the log on the first transport failure. A
+ * convention no code enforces is not a control.
+ *
+ * Route identity does not depend on the path: callers that need to tell two
+ * upstreams on one origin apart log the stable MCP `serverId` alongside this
+ * value, which identifies the route better than a path ever did and carries no
+ * secret.
+ */
+export function logSafeUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return "[unloggable url scheme]";
+    }
+    return parsed.origin;
+  } catch {
+    return "[unparseable url]";
+  }
+}

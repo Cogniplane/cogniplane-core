@@ -38,7 +38,7 @@ type Props = {
   onSave: (input: TenantSettingsInput) => Promise<boolean>;
   managedTools: AdminManagedTool[];
   mcpServers: AdminMcpServer[];
-  anthropicKeyConfigured: boolean;
+  hasAnthropicTenantKey: boolean;
   isOwner: boolean;
 };
 
@@ -82,12 +82,6 @@ const PERMISSION_DEFS = [
     label: "Allow command execution",
     hint: "Agent can run shell commands in the sandbox.",
     ownerOnly: true
-  },
-  {
-    key: "allowUserTokenForwarding" as const,
-    label: "Forward user tokens",
-    hint: "Pass user authentication tokens to MCP servers.",
-    ownerOnly: true
   }
 ];
 
@@ -127,7 +121,7 @@ export function TenantSettingsForm({
   onSave,
   managedTools,
   mcpServers,
-  anthropicKeyConfigured,
+  hasAnthropicTenantKey,
   isOwner
 }: Props) {
   const [draft, setDraft] = useState<FormDraft>(() => buildDraft(settings));
@@ -182,7 +176,6 @@ export function TenantSettingsForm({
       approvalPolicy: toApprovalPolicy(draft.approvalPolicyKind, draft.granularFlags),
       approvalReviewer: draft.approvalReviewer,
       allowCommandExecution: draft.allowCommandExecution,
-      allowUserTokenForwarding: draft.allowUserTokenForwarding,
       autoApproveReadOnlyTools: draft.autoApproveReadOnlyTools,
       policyEnforcementMode: draft.policyEnforcementMode,
       developerInstructions: draft.developerInstructions.trim() || null,
@@ -220,7 +213,7 @@ export function TenantSettingsForm({
           <RuntimeSection
             draft={draft}
             updateDraft={updateDraft}
-            anthropicKeyConfigured={anthropicKeyConfigured}
+            hasAnthropicTenantKey={hasAnthropicTenantKey}
           />
 
           <div className="border-t border-outline-variant" />
@@ -265,9 +258,9 @@ export function TenantSettingsForm({
 function RuntimeSection(props: {
   draft: FormDraft;
   updateDraft: UpdateDraft;
-  anthropicKeyConfigured: boolean;
+  hasAnthropicTenantKey: boolean;
 }) {
-  const { draft, updateDraft, anthropicKeyConfigured } = props;
+  const { draft, updateDraft, hasAnthropicTenantKey } = props;
 
   return (
     <div className="flex flex-col gap-3">
@@ -279,7 +272,7 @@ function RuntimeSection(props: {
         </p>
       </div>
 
-      {!anthropicKeyConfigured ? (
+      {!hasAnthropicTenantKey ? (
         <p className="text-sm text-danger">
           No Anthropic API key is configured — agent turns will fail. Add one in Organization
           settings.

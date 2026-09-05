@@ -1,5 +1,6 @@
 import { test, expect } from "vitest";
 
+import { createTestConfig } from "../test-helpers/test-config.js";
 import { RequestLimits } from "./request-limits.js";
 
 function makeConfig(overrides: {
@@ -8,7 +9,7 @@ function makeConfig(overrides: {
   userQuota?: number;
   tenantQuota?: number;
 } = {}) {
-  return RequestLimits.fromAppConfig({
+  return RequestLimits.fromAppConfig(createTestConfig({
     RATE_LIMIT_WINDOW_MS: 60_000,
     SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW: 10,
     SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW: 50,
@@ -16,7 +17,12 @@ function makeConfig(overrides: {
     MESSAGE_LIMIT_PER_TENANT_PER_WINDOW: overrides.tenantRateLimit ?? 20,
     TURN_QUOTA_PER_USER_PER_DAY: overrides.userQuota ?? 10,
     TURN_QUOTA_PER_TENANT_PER_DAY: overrides.tenantQuota ?? 50
-  });
+  }));
+}
+
+function requireLimit<T>(value: T | null): T {
+  if (value === null) throw new Error("Expected request to exceed a limit.");
+  return value;
 }
 
 test("consumeRateLimit allows requests under the limit", async () => {
@@ -31,8 +37,9 @@ test("consumeRateLimit rejects when user limit is reached", async () => {
   const limits = makeConfig({ userRateLimit: 2 });
   await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
   await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
-  const result = await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
-  expect(result !== null).toBeTruthy();
+  const result = requireLimit(
+    await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" })
+  );
   expect(result.scope).toBe("user");
   expect(result.limitType).toBe("rate_limit");
 });
@@ -48,15 +55,17 @@ test("consumeRateLimit rolls back counter when tenant limit is exceeded", async 
 
   // Second call: user would increment to 2 (under limit=10), tenant would
   // increment to 2 (over limit=1). Both should be rolled back.
-  const second = await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
-  expect(second !== null).toBeTruthy();
+  const second = requireLimit(
+    await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" })
+  );
   expect(second.scope).toBe("tenant");
 
   // After rollback, the user counter should still be at 1 (from the first allowed call),
   // so 9 more calls should be allowed before hitting the user limit.
   // But the tenant is still at 1, so the very next call will hit tenant again.
-  const third = await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
-  expect(third !== null).toBeTruthy();
+  const third = requireLimit(
+    await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" })
+  );
   expect(third.scope).toBe("tenant");
 });
 
@@ -91,8 +100,7 @@ test("consumeTurnQuota rejects when user quota is reached", async () => {
   const now = new Date("2026-01-15T12:00:00.000Z");
   await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
   await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
-  const result = await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
-  expect(result !== null).toBeTruthy();
+  const result = requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now }));
   expect(result.scope).toBe("user");
   expect(result.limitType).toBe("usage_quota");
 });
@@ -104,13 +112,11 @@ test("consumeTurnQuota rolls back counter when tenant quota is exceeded", async 
   const first = await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
   expect(first).toBe(null);
 
-  const second = await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
-  expect(second !== null).toBeTruthy();
+  const second = requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now }));
   expect(second.scope).toBe("tenant");
 
   // After rollback, tenant is still at 1 — next call also rejected.
-  const third = await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
-  expect(third !== null).toBeTruthy();
+  const third = requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now }));
   expect(third.scope).toBe("tenant");
 });
 

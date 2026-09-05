@@ -55,7 +55,6 @@ export class McpServerStore {
     mode: "managed" | "proxy";
     routePath: string;
     upstreamUrl: string | null;
-    headersAllowlist: string[];
     configHash: string;
     enabled: boolean;
     createdBy: string;
@@ -92,13 +91,12 @@ export class McpServerStore {
             mode,
             route_path,
             upstream_url,
-            headers_allowlist,
             version,
             config_hash,
             enabled,
             created_by
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 1, $10, $11, $12)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11)
           RETURNING *
         `,
         [
@@ -110,7 +108,6 @@ export class McpServerStore {
           input.mode,
           input.routePath,
           input.upstreamUrl,
-          JSON.stringify(input.headersAllowlist),
           input.configHash,
           input.enabled,
           input.createdBy
@@ -129,7 +126,6 @@ export class McpServerStore {
     mode: "managed" | "proxy";
     routePath: string;
     upstreamUrl: string | null;
-    headersAllowlist: string[];
     configHash: string;
     enabled: boolean;
   }): Promise<AdminMcpServerRecord | null> {
@@ -144,13 +140,12 @@ export class McpServerStore {
             mode = $5,
             route_path = $6,
             upstream_url = $7,
-            headers_allowlist = $8::jsonb,
-            config_hash = $9,
-            enabled = $10,
+            config_hash = $8,
+            enabled = $9,
             version = version + 1,
             updated_at = NOW()
           WHERE server_id = $1
-            AND tenant_id = $11
+            AND tenant_id = $10
           RETURNING *
         `,
         [
@@ -161,7 +156,6 @@ export class McpServerStore {
           input.mode,
           input.routePath,
           input.upstreamUrl,
-          JSON.stringify(input.headersAllowlist),
           input.configHash,
           input.enabled,
           tenantId

@@ -16,7 +16,10 @@ export function buildApprovalRouteStores(deps: AppDependencies) {
   };
 }
 
-export type ApprovalRouteStores = ReturnType<typeof buildApprovalRouteStores>;
+export type ApprovalRouteStores = {
+  approvals: Pick<AppDependencies["approvals"], "listPending">;
+  runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "resolveApproval">;
+};
 
 const RESOLVED_APPROVAL_TTL_MS = 5 * 60 * 1000;
 
@@ -107,8 +110,7 @@ export async function registerApprovalRoutes(
 
     const { decision, rememberForTurn } = bodyResult.value;
 
-    // Forward the decision to the runtime adapter (native approvals first,
-    // then its policy coordinator — see resolveApproval on the adapter).
+    // Forward the decision to the one checkpointed approval path.
     const result = await stores.runtimeAdapter.resolveApproval({
       tenantId: request.auth.tenantId,
       approvalId,

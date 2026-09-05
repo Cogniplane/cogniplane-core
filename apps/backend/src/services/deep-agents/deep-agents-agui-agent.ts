@@ -1,29 +1,6 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// Track B — DeepAgentsAGUIAgent (Path 2, slice 1)
-//
-// An @ag-ui/client `AbstractAgent` subclass that drives our EXISTING in-process
-// deepagents graph loop and emits AG-UI `BaseEvent`s. It reuses the live
-// pipeline wholesale:
-//
-//   streamEvents v2 --mapDeepAgentsEvent--> RuntimeEvent --runtimeEventToAGUI--> AG-UI
-//
-// The four Track-B invariants are preserved BY CONSTRUCTION because this class
-// sits above the graph closure + adapter loop where they actually live:
-//   1. toolContextId — set on the graph's shared ref via backend.setToolContext,
-//      read by the graph's beforeToolCall at dispatch (untouched here).
-//   2. tenant scope — the backend runs inside the adapter's withTenantScope;
-//      this class opens no side channel.
-//   3. dual approval — the native-HITL interrupt loop is reused verbatim
-//      (getPendingActions / awaitDecisions / buildResumeInput, keyed per
-//      interrupt id); Policy Center's gateway plane is wholly outside the graph.
-//   4. STATE_DELTA — write_todos surfaces as a native state patch via the
-//      translator instead of a bespoke markdown-diff event.
-//
-// Verified against @ag-ui/client@0.0.57: `run` returns rxjs `Observable`, and
-// interrupts surface via RUN_FINISHED{outcome:interrupt} — there is no dedicated
-// INTERRUPT event type, so a pending native interrupt is surfaced as a CUSTOM
-// `approval_required` event (unified with the Policy Center approval UX).
-// ─────────────────────────────────────────────────────────────────────────────
+// Drives the session graph through AG-UI events. Tool context is injected before
+// streaming; the backend owns approval persistence and keyed interrupt resumes.
+// The mapper emits tool attribution and native todo state updates.
 
 import { AbstractAgent, EventType, type BaseEvent, type RunAgentInput } from "@ag-ui/client";
 import { Observable } from "rxjs";
@@ -31,14 +8,10 @@ import { Observable } from "rxjs";
 import { uuidv7 } from "../../lib/uuid.js";
 import type { AGUITurnBackend } from "./deep-agents-agui-backend.js";
 import {
-  createDeepAgentsEventMapperState,
-  mapDeepAgentsEvent
-} from "./deep-agents-event-mapper.js";
-import {
-  createRuntimeToAGUIState,
-  flushOpenMessages,
-  runtimeEventToAGUI
-} from "./runtime-event-to-agui.js";
+  createStreamEventsToAGUIState,
+  flushOpenAGUIMessages,
+  streamEventsToAGUI
+} from "./stream-events-to-agui.js";
 
 export interface DeepAgentsAGUIAgentConfig {
   backend: AGUITurnBackend;
@@ -71,8 +44,7 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
 
       void (async () => {
         const runId = input.runId ?? uuidv7();
-        const mapperState = createDeepAgentsEventMapperState(runId);
-        const aguiState = createRuntimeToAGUIState();
+        const mapperState = createStreamEventsToAGUIState();
         const mapperOptions = {
           mcpToolNames: this.backend.mcpToolNames,
           mcpToolServers: this.backend.mcpToolServers
@@ -90,11 +62,9 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
           for (;;) {
             for await (const raw of this.backend.streamTurn(streamInput)) {
               if (cancelled) return;
-              for (const re of mapDeepAgentsEvent(mapperState, raw, mapperOptions)) {
-                for (const ev of runtimeEventToAGUI(aguiState, re)) emit(ev);
-              }
+              for (const event of streamEventsToAGUI(mapperState, raw, mapperOptions)) emit(event);
             }
-            for (const ev of flushOpenMessages(aguiState)) emit(ev);
+            for (const event of flushOpenAGUIMessages(mapperState)) emit(event);
 
             const actions = await this.backend.getPendingActions();
             if (actions.length === 0) break;
@@ -120,7 +90,7 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
             // its RUN_FINISHED guard — an unclosed REASONING message slips past
             // it — but an unclosed message of either kind leaves the UI card
             // stuck open, so flush both regardless of what the verifier checks.
-            for (const ev of flushOpenMessages(aguiState)) emit(ev);
+            for (const event of flushOpenAGUIMessages(mapperState)) emit(event);
             subscriber.error(err);
           }
         }

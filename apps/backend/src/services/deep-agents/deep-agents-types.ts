@@ -1,8 +1,11 @@
-import type { ModelProvider } from "@cogniplane/shared-types";
+import type { ModelProvider, PolicyEnforcementMode, PolicyTurnContext } from "@cogniplane/shared-types";
+import type { BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
-import type { RuntimeEvent, RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import type { SkillsLibraryFiles } from "./deep-agents-skills-library.js";
+import type { PolicyService } from "../policy/policy-service.js";
+import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
 
 /**
  * One pending HITL action extracted from a LangGraph interrupt: the tool the
@@ -20,6 +23,8 @@ export type DeepAgentsPendingAction = {
   name: string;
   args: Record<string, unknown>;
   description?: string;
+  /** Present when this HITL action also satisfies a Policy Center rule. */
+  policyApproval?: PolicyApprovalProof;
 };
 
 /**
@@ -60,14 +65,14 @@ export type DeepAgentsSessionRuntime = {
    * the turn ran to completion). Order matters: resume decisions must be
    * returned in the same order via {@link buildResumeInput}.
    */
-  getPendingActions?(threadId: string): Promise<DeepAgentsPendingAction[]>;
+  getPendingActions(threadId: string): Promise<DeepAgentsPendingAction[]>;
   /**
    * Builds the opaque resume payload for `streamEvents` after decisions.
    * `actions` is the same array `getPendingActions` returned (decision at
    * index i answers actions[i]); the implementation groups decisions per
    * interrupt id so concurrent interrupts each receive their own decisions.
    */
-  buildResumeInput?(
+  buildResumeInput(
     actions: DeepAgentsPendingAction[],
     decisions: Array<{ type: "approve" } | { type: "reject"; message?: string }>
   ): unknown;
@@ -76,13 +81,13 @@ export type DeepAgentsSessionRuntime = {
    * mapper to render MCP cards and by approval-kind classification. Empty
    * until the first agent compile loads them.
    */
-  getMcpToolNames?(): ReadonlySet<string>;
+  getMcpToolNames(): ReadonlySet<string>;
   /**
    * Tool name → gateway server id for MCP tools, recorded at load time (the
    * adapter library carries no server attribution on the tool or in stream
    * metadata). Used by the event mapper to label MCP cards.
    */
-  getMcpToolServers?(): ReadonlyMap<string, string>;
+  getMcpToolServers(): ReadonlyMap<string, string>;
   /**
    * Workspace file ops backing the adapter's readRuntimeFile /
    * statRuntimeFile / writeRuntimeFile (write_artifact + per-turn artifact
@@ -94,6 +99,12 @@ export type DeepAgentsSessionRuntime = {
   readFileBytes?(filePath: string): Promise<Uint8Array>;
   statFile?(filePath: string): Promise<{ sizeBytes: number }>;
   writeFileBytes?(filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<string>;
+  /**
+   * Pushes the sandbox lifetime cap back to its full window, turning it from
+   * an absolute deadline into an idle timeout. Called at turn start. A no-op
+   * when the sandbox has not been created yet, so it does not break laziness.
+   */
+  extendSandboxTimeout?(): Promise<void>;
   /** Releases any resources held for the session (checkpointer, sandbox, …). */
   dispose(): Promise<void>;
 };
@@ -156,6 +167,13 @@ export type DeepAgentsRuntimeFactory = (init: {
   /** E2B wiring for the lazy code-execution sandbox; null disables execute. */
   e2b: DeepAgentsE2bOptions | null;
   /**
+   * Called when a gone sandbox was transparently replaced — every file the
+   * agent wrote and every synced artifact is gone at that point. The adapter
+   * turns it into a runtime notice so the loss is visible rather than
+   * surfacing to the model as an unexplained file_not_found.
+   */
+  onSandboxRecreated?: (info: { previousSandboxId: string | null }) => void;
+  /**
    * Shared durable checkpointer (PostgresSaver). When absent, the factory
    * falls back to a per-session in-memory saver — conversation state then
    * dies with the process (unit tests, degraded dev).
@@ -166,13 +184,29 @@ export type DeepAgentsRuntimeFactory = (init: {
    * connects a MultiServerMCPClient with the Bearer runtime token and exposes
    * the tools to the agent.
    */
-  mcpServers?: Array<{ id: string; url: string; authorization: string }>;
+  mcpServers?: Array<{
+    id: string;
+    mode: "managed" | "proxy";
+    url: string;
+    authorization: string;
+  }>;
   /**
    * Per-turn tool-context id, read at tool-call time and injected into
    * managed MCP tool inputs (the gateway resolves it against
    * ToolExecutionContextStore). The adapter updates `current` at turn start.
    */
   toolContextRef?: { current: string | null };
+  /** Per-turn Policy Center facts used by the dynamic MCP approval predicate. */
+  policyContextRef?: {
+    current: {
+      toolContextId: string;
+      turnContext: PolicyTurnContext;
+      enforcementMode: PolicyEnforcementMode;
+    } | null;
+  };
+  policyService?: Pick<PolicyService, "evaluate">;
+  /** Managed-tool facts needed before the gateway call is made. */
+  managedToolFacts?: Record<string, { readOnly: boolean; category: string | null }>;
   /**
    * Native approval gating derived from tenant settings. `gate` false =
    * approvalPolicy "never" (no interrupts at all). Read-only tool names are
@@ -207,18 +241,30 @@ export type DeepAgentsSessionState = {
   /** Aborts the in-flight turn only (Stop button). Set at turn start. */
   activeTurnInterrupt: { current: (() => Promise<void>) | null };
   /** Push hook for out-of-band framework events (Policy Center approvals). */
-  activeTurnPush: { current: ((event: RuntimeEvent) => void) | null };
+  activeTurnPush: { current: ((event: BaseEvent) => void) | null };
   /**
-   * Lets a Policy Center approval (held at the MCP gateway, outside the graph's
-   * native-approval loop) pause the active turn's RUNTIME_TURN_TIMEOUT_MS
-   * watchdog while a human decides — mirroring how the native `awaitDecisions`
-   * path disarms it. Ref-counted so concurrent approvals (parallel subagents)
-   * only re-arm once the last one settles. Set by the active turn; null when no
-   * turn is running (then policy approvals just don't touch a watchdog).
+   * responseId of the turn currently streaming, for out-of-band events raised
+   * from below the turn loop (a sandbox replaced mid-turn) that must address
+   * the live response. Null when no turn is running.
    */
-  activeTurnWatchdog: { current: { pause: () => void; resume: () => void } | null };
+  activeTurnResponseId: { current: string | null };
+  /**
+   * Out-of-band framework events raised after a turn was claimed but BEFORE its
+   * push hook exists. `onBeforeTurn` (artifact workspace sync) runs in that
+   * window and is the likeliest thing to touch an expired sandbox, so notices
+   * from there would otherwise be dropped exactly when they matter most.
+   * Drained into the stream as soon as the hook is installed.
+   */
+  pendingTurnEvents: BaseEvent[];
   /** Per-turn toolContextId, read by MCP tool wrappers at call time. */
   toolContextRef: { current: string | null };
+  policyContextRef: {
+    current: {
+      toolContextId: string;
+      turnContext: PolicyTurnContext;
+      enforcementMode: PolicyEnforcementMode;
+    } | null;
+  };
   /**
    * Remember-keys the user approved with "remember for this turn". A key is the
    * approval kind for built-in kinds, but is scoped to the individual tool name

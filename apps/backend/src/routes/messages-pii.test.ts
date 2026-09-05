@@ -1,7 +1,16 @@
 import { test, expect, onTestFinished } from "vitest";
+import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
-import { createTestApp, parseSseEvents } from "../test-helpers/routes-test-support.js";
+import { createTestApp } from "../test-helpers/routes-test-support.js";
+
+function parseAguiEvents(payload: string): BaseEvent[] {
+  return payload
+    .split("\n\n")
+    .map((chunk) => chunk.split("\n").find((line) => line.startsWith("data: ")))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice("data: ".length)) as BaseEvent);
+}
 
 type CreatedSession = { sessionId: string };
 
@@ -54,22 +63,16 @@ test("POST /messages in block mode persists a system message and does not dispat
   });
 
   expect(response.statusCode).toBe(200);
-  const events = parseSseEvents(response.payload);
-  const blockedEvent = events.find((entry) => entry.event === "framework:message_blocked");
-  expect(blockedEvent).toBeTruthy();
-  expect(blockedEvent?.data.reason).toBe("pii_block");
-  expect(blockedEvent?.data.block_reason).toBe("email");
-  expect(blockedEvent?.data.scan_run_id).toBe("scan-blk-1");
-  expect(blockedEvent?.data.message).toBe("Message blocked by organization policy.");
-  const terminal = events.find((entry) => entry.event === "response.completed");
-  expect(terminal).toBeTruthy();
-  expect((terminal?.data.response as Record<string, unknown>).status).toBe("blocked");
+  const events = parseAguiEvents(response.payload);
+  const blockedEvent = events.find((event) => event.type === EventType.TEXT_MESSAGE_CONTENT);
+  expect(blockedEvent).toMatchObject({ delta: "Message blocked by organization policy." });
+  expect(events.at(-1)?.type).toBe(EventType.RUN_FINISHED);
 
   expect(runtimeManager.runMessageInputs.length).toBe(0);
   expect(scanCreateInputs.length).toBe(1);
   expect((scanCreateInputs[0] as { mode: string }).mode).toBe("block");
 
-  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   expect(persisted.length).toBe(1);
   const systemMessage = persisted[0];
   expect(systemMessage.role).toBe("system");
@@ -82,9 +85,8 @@ test("POST /messages in block mode persists a system message and does not dispat
   expect(!persisted.some((message) => message.role === "user")).toBeTruthy();
 });
 
-test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client can parse (not RuntimeEvent frames)", async () => {
+test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client can parse", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
-    AGUI_WIRE: true,
     pii: {
       piiProtection: {
         async evaluateText() {
@@ -117,8 +119,7 @@ test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client
 
   expect(response.statusCode).toBe(200);
 
-  // AG-UI frames are `data: <json>` with NO `event:` line (parseSseEvents can't
-  // read them), so parse the raw data frames and assert on their `type`.
+  // AG-UI uses data-only SSE frames. Parse each payload and assert its `type`.
   const frames = response.payload
     .trim()
     .split("\n\n")
@@ -144,18 +145,14 @@ test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client
   // threadId === sessionId (matches the AG-UI writer/driver contract).
   const started = frames.find((f) => f.type === "RUN_STARTED");
   expect(started?.threadId).toBe(sessionId);
-  // No RuntimeEvent block frames leaked onto the AG-UI wire.
-  expect(types).not.toContain("framework:message_blocked");
-  expect(types).not.toContain("response.completed");
-
   // The block still short-circuits the runtime and persists the system message.
   expect(runtimeManager.runMessageInputs.length).toBe(0);
-  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   expect(persisted.some((m) => m.role === "system")).toBe(true);
   expect(persisted.some((m) => m.role === "user")).toBe(false);
 });
 
-test("POST /messages in transform mode emits runtime.user_message_replaced and sends transformed prompt to runtime", async () => {
+test("POST /messages in transform mode emits user_message_replaced and sends transformed prompt to runtime", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
       piiProtection: {
@@ -199,17 +196,19 @@ test("POST /messages in transform mode emits runtime.user_message_replaced and s
   });
 
   expect(response.statusCode).toBe(200);
-  const events = parseSseEvents(response.payload);
-  expect(events[0].event).toBe("runtime.user_message_replaced");
-  expect(events[0].data.text).toBe("my email is [REDACTED:email]");
-  expect(events[0].data.scan_run_id).toBe("scan-tfx-1");
-  expect(typeof events[0].data.message_id === "string" && (events[0].data.message_id as string).length > 0).toBeTruthy();
+  const events = parseAguiEvents(response.payload);
+  const replacement = events.find(
+    (event) => event.type === EventType.CUSTOM && event.name === "user_message_replaced"
+  ) as BaseEvent & { value: { messageId: string; text: string; scanRunId: string } };
+  expect(replacement.value.text).toBe("my email is [REDACTED:email]");
+  expect(replacement.value.scanRunId).toBe("scan-tfx-1");
+  expect(replacement.value.messageId.length).toBeGreaterThan(0);
 
   // Runtime must see the transformed prompt, not the raw one.
   expect(runtimeManager.runMessageInputs.length).toBe(1);
   expect(runtimeManager.runMessageInputs[0].prompt).toBe("my email is [REDACTED:email]");
 
-  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   const userMessage = persisted.find((message) => message.role === "user");
   expect(userMessage).toBeTruthy();
   expect(userMessage?.content).toBe("my email is [REDACTED:email]");
@@ -266,7 +265,7 @@ test("POST /messages in detect mode persists raw user message with report metada
   // detect mode is non-blocking; the runtime must have received the raw prompt.
   expect(runtimeManager.runMessageInputs[0]?.prompt).toBe("my email is user@example.com");
 
-  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   const userMessage = persisted.find((message) => message.role === "user");
   expect(userMessage).toBeTruthy();
   expect(userMessage?.content).toBe("my email is user@example.com");
@@ -311,7 +310,7 @@ test("POST /messages returns HTTP 503 pii_provider_unavailable when provider fai
   expect(body.error).toBe("pii_provider_unavailable");
 
   expect(runtimeManager.runMessageInputs.length).toBe(0);
-  const persisted = await messages.listBySession("test-tenant", sessionId, "platform-user");
+  const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   expect(persisted.length).toBe(0);
 });
 
@@ -411,8 +410,14 @@ test("POST /messages consumes a rate-limit token but no turn quota for a PII-blo
   });
 
   expect(response.statusCode).toBe(200);
-  const events = parseSseEvents(response.payload);
-  expect(events.some((entry) => entry.event === "framework:message_blocked")).toBe(true);
+  const events = parseAguiEvents(response.payload);
+  expect(
+    events.some(
+      (event) =>
+        event.type === EventType.TEXT_MESSAGE_CONTENT &&
+        event.delta === "Message blocked by organization policy."
+    )
+  ).toBe(true);
   // Probing the PII filter costs a rate-limit token per attempt, but a
   // blocked turn was never dispatched and must not spend daily quota.
   expect(messageRateLimitCalls).toBe(1);
@@ -428,6 +433,7 @@ test("POST /messages does not call the PII provider when the rate limit is exhau
           evaluateCalls += 1;
           return {
             action: "allow",
+            reason: "no_findings",
             findings: [],
             providerType: "openai-compatible",
             providerModel: "google/gemini-2.5-flash"
@@ -447,7 +453,16 @@ test("POST /messages does not call the PII provider when the rate limit is exhau
 
   limits.consumeRateLimit = async (input) =>
     input.resource === "message_turn"
-      ? { error: "rate_limited", message: "Too many requests.", retryAfterMs: 1000 }
+      ? {
+          error: "limit_exceeded",
+          limitType: "rate_limit",
+          resource: "message_turn",
+          scope: "user",
+          limit: 1,
+          retryAfterMs: 1000,
+          resetAt: new Date(Date.now() + 1000).toISOString(),
+          message: "Too many requests."
+        }
       : null;
 
   const response = await app.inject({

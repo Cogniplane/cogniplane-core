@@ -116,7 +116,7 @@ test("deriveSessionAlerts — merges multiple badge kinds on the same session in
   });
   const result = await deriveSessionAlerts(client, "tenant-a", ["s1"]);
   const badges = result.get("s1");
-  expect(badges).toBeTruthy();
+  if (!badges) throw new Error("Expected alert badges for session s1.");
   // Canonical order: pii-blocked < pii-detected < approval-pending < errored
   expect(badges.map((b) => b.kind)).toEqual(["pii-blocked", "pii-detected", "approval-pending", "errored"]);
 });

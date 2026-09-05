@@ -10,8 +10,14 @@ export type PiiHandlerInput = {
 };
 
 export type PiiHandlerStores = {
-  piiScanRuns: PiiScanRunStore | undefined;
-  auditEvents?: AuditEventStore;
+  piiScanRuns:
+    | {
+        create(
+          input: Parameters<PiiScanRunStore["create"]>[0]
+        ): Promise<{ scanRunId: string }>;
+      }
+    | undefined;
+  auditEvents?: Pick<AuditEventStore, "create">;
 };
 
 export type PiiHandlerOutcome =

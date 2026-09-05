@@ -29,7 +29,7 @@ const INSTALL_PYTHON_PACKAGES =
 const PREPARE_USER_WORKSPACE = 'mkdir -p /home/user/workspace && chown user:user /home/user/workspace';
 
 export const template = Template()
-  .fromImage('e2bdev/base:latest')
+  .fromImage('e2bdev/base@sha256:4a369f01a820fe5e65f53c2c5727a78899daf86f0541b721097f289559c8b73f')
   .setUser('root')
   .setWorkdir('/')
   .runCmd(INSTALL_APT_BASE)

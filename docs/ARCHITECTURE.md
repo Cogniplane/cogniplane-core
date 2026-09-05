@@ -40,8 +40,8 @@ docs/                    # Architecture, decisions, security features, guides
 ### Backend module map
 
 - `routes/` — HTTP entrypoints. Hot path: `messages.ts`, `mcp.ts`, `approvals.ts`. Admin: `routes/admin/admin-*.ts`. Auth: `auth.ts`. Health, models, sessions, settings, artifacts, tenant.
-- `services/deep-agents/` — the runtime: `deep-agents-runtime-adapter.ts` (RuntimeAdapter), `deep-agents-graph.ts` (agent construction), `deep-agents-e2b-backend.ts` (lazy sandbox backend), `deep-agents-checkpointer.ts` (durable state), `deep-agents-event-mapper.ts` (LangGraph → `RuntimeEvent`).
-- `services/runtime/` — runtime-adjacent lifecycle: `runtime-model-resolver.ts`, `provider-credentials.ts`, `runtime-session-store.ts`, `idle-teardown.ts`, `policy-approval-coordinator.ts`, `stale-approval-sweeper.ts`, `e2b-sandbox.ts`.
+- `services/deep-agents/` — the runtime: `deep-agents-runtime-adapter.ts` (RuntimeAdapter), `deep-agents-graph.ts` (agent construction), `deep-agents-e2b-backend.ts` (lazy sandbox backend), `deep-agents-checkpointer.ts` (durable state), `stream-events-to-agui.ts` (LangGraph to AG-UI).
+- `services/runtime/` — runtime-adjacent lifecycle: `runtime-model-resolver.ts`, `provider-credentials.ts`, `runtime-session-store.ts`, `idle-teardown.ts`, `stale-approval-sweeper.ts`, `e2b-sandbox.ts`.
 - `services/dynamic-config-*` — compile admin config from Postgres into the per-turn runtime-policy snapshot.
 - `services/managed-tools/` — first-party tool implementations (session tools, `write_artifact`, memory tools, skill-corpus tool, GitHub, Notion).
 - `services/managed-tools/factory.ts`, `services/managed-tools/catalog.ts` (+ `register-builtin-managed-tools.ts`), `services/redact-secrets.ts` — managed-tool dispatch (factory wires deps; catalog enumerates the allowlist) + audit redaction.
@@ -74,13 +74,13 @@ sequenceDiagram
     A->>A: Resolve model via resolveRuntimeModel
     A->>DA: Create per-turn ToolExecutionContext (TTL)
     DA->>PG: Persist toolContextId
-    A->>DA: runMessage(prompt, toolContextId)
-    DA-->>A: AsyncIterable<RuntimeEvent>
+    A->>DA: runMessageAGUI(prompt, toolContextId)
+    DA-->>A: AsyncIterable<BaseEvent>
 
     loop Streaming (LangGraph streamEvents v2)
         DA->>DA: Agent loop calls the Anthropic API
-        DA-->>A: Normalized RuntimeEvent
-        A-->>F: SSE (response.* / framework:*)
+        DA-->>A: AG-UI BaseEvent
+        A-->>F: AG-UI over SSE
         F-->>B: Render incremental state
     end
 
@@ -97,16 +97,16 @@ sequenceDiagram
 
     DA-->>A: turn complete (usage from stream usage_metadata)
     A->>PG: Persist message, tool events, usage
-    A-->>F: response.completed
+    A-->>F: RUN_FINISHED
 ```
 
-`POST /messages` (`routes/messages.ts`) validates input, resolves the model via `resolveRuntimeModel` (`services/runtime/runtime-model-resolver.ts` — models come from `AVAILABLE_MODELS` in `domain/models.ts`, ids namespaced `deepagents/<anthropic-model>`; unknown ids get a 400), then hijacks the raw socket, sets SSE headers, and delegates to `streamAssistantReply` (`services/sse-stream-writer.ts`). `streamAssistantReply` builds a `ToolExecutionContext` and calls `runtimeAdapter.runMessage`. There is a **single** `runtimeAdapter` — no provider map and no provider resolution step.
+`POST /messages` (`routes/messages.ts`) validates input, resolves the model via `resolveRuntimeModel`, then hijacks the raw socket, sets SSE headers, and delegates to `streamAssistantReplyAGUI` (`services/sse-stream-writer-agui.ts`). The writer builds a `ToolExecutionContext` and calls `runtimeAdapter.runMessageAGUI`. There is a single runtime adapter, with no provider map or provider-resolution step.
 
 ## Runtime Architecture
 
 ### Single-runtime model
 
-`DeepAgentsRuntimeAdapter` (`services/deep-agents/deep-agents-runtime-adapter.ts`) implements the `RuntimeAdapter` contract. It lazily builds a per-session deepagentsjs agent (`createDeepAgent`) and runs each turn as a LangGraph `streamEvents` (v2) stream inside the backend process, returning an `AsyncIterable<RuntimeEvent>`. `deep-agents-event-mapper.ts` normalizes the stream envelopes to the `RuntimeEvent` wire shapes the frontend consumes.
+`DeepAgentsRuntimeAdapter` (`services/deep-agents/deep-agents-runtime-adapter.ts`) implements the `RuntimeAdapter` contract. It lazily builds a per-session deepagentsjs agent (`createDeepAgent`) and runs each turn as a LangGraph `streamEvents` v2 stream inside the backend process. `stream-events-to-agui.ts` maps those envelopes directly to AG-UI `BaseEvent` values consumed by the browser and scheduler.
 
 Agent construction lives in `deep-agents-graph.ts`:
 - **Model** — multi-provider `initChatModel` via `resolveModelConstruction` (maps a catalog id to `<initPrefix>:<vendorModel>` + base URL per `MODEL_PROVIDER_META`): Anthropic, OpenAI, Google (`google-genai`), OpenRouter and Z.AI (both via the OpenAI client with a custom base URL). The key is resolved per-provider for the selected model (`provider-credentials.ts`): the tenant's stored key first, then the platform env fallback. Reasoning effort is baked in per provider by `applyReasoningEffort`. The in-process loop calls each provider's API directly. Token usage is captured from stream `usage_metadata` and persisted per turn.
@@ -197,25 +197,25 @@ Rules:
 
 ## Approval Flow
 
-Native runtime approvals and Policy Center approvals share the same frontend event shape and decision route, but they are separate control planes.
+Native runtime approvals and Policy Center approvals share one checkpointed graph interrupt, frontend event shape, approval row, and decision route.
 
-**Native HITL approvals are LangGraph interrupt-based.** `tenant_settings.approval_policy` (`"never"` bypasses gating) drives an `interruptOn` map built in `deep-agents-graph.ts`: all MCP gateway tools (minus read-only ones when `auto_approve_read_only_tools` is on) plus the mutating built-ins (`execute`, `write_file`, `edit_file`), plus the read-only built-ins when the read-only bypass is off. An interrupt pauses the graph **before** tool execution and checkpoints; the adapter detects pending interrupts after the stream ends, persists an approval row, emits `framework:approval_required`, and resumes the graph with a `Command` once decided. Resume is keyed **per interrupt id**, so concurrent interrupts (parallel `task` subagents each hitting a gated tool) get their own decisions.
+**Native HITL approvals are LangGraph interrupt-based.** `tenant_settings.approval_policy` (`"never"` bypasses gating) drives an `interruptOn` map built in `deep-agents-graph.ts`: all MCP gateway tools (minus read-only ones when `auto_approve_read_only_tools` is on) plus the mutating built-ins (`execute`, `write_file`, `edit_file`), plus the read-only built-ins when the read-only bypass is off. An interrupt pauses the graph **before** tool execution and checkpoints; the adapter detects pending interrupts after the stream ends, persists an approval row, emits an AG-UI `CUSTOM` event named `approval_required`, and resumes the graph with a `Command` once decided. Resume is keyed **per interrupt id**, so concurrent interrupts (parallel `task` subagents each hitting a gated tool) get their own decisions.
 
-The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which resumes the paused graph. The adapter's `resolveApproval` consults its Policy Center coordinator after a native-approval miss (see below).
+The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which persists the decision and resumes the paused graph.
 
-Policy Center can also return `require_approval` for an MCP tool call. In that path, the MCP gateway holds the JSON-RPC response open, stores an approval row through the adapter's `PolicyApprovalCoordinator` (`services/runtime/policy-approval-coordinator.ts`), emits the same `framework:approval_required` event, then proceeds or denies based on the decision. If no active turn can receive a prompt (for example an unattended scheduled run), the tool call is denied.
+Policy Center `require_approval` is folded into the runtime's checkpointed graph interrupt. Once approved, the runtime injects a deterministic `policyApprovalId`; the gateway proceeds only when the row matches the same session, user, tool, server, tool context, and canonical argument hash. This keeps the gateway fail-closed without a held HTTP response or second coordinator, and scheduled turns use the same durable interrupt.
 
 MCP elicitation is not a separate confirmation plane in Cogniplane: authorization and human confirmation are enforced at the Cogniplane MCP gateway through native HITL and Policy Center. Configured upstream MCP tools must not rely on elicitation as their only guardrail.
 
 ### TTL and expiry
 
-Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry the DB row moves to `status='expired'`, an `approval.expired` audit event is written, a `framework:runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt, and the paused graph is resumed with a reject. Rows also carry a DB-level `expires_at`, so a process death still lets the startup sweep (`services/runtime/stale-approval-sweeper.ts`) recover them.
+Pending approvals carry a wall-clock TTL (`APPROVAL_REQUEST_TTL_MS`, default 10 min). On expiry the DB row moves to `status='expired'`, an `approval.expired` audit event is written, an AG-UI `CUSTOM` event named `runtime_notice` (level `warning`, `noticeId = approval-expired:<approvalId>`) is pushed to the active turn so the frontend can clear the prompt, and the paused graph is resumed with a reject. Rows also carry a DB-level `expires_at`, so a process death still lets the startup sweep (`services/runtime/stale-approval-sweeper.ts`) recover them.
 
 ## Policy Center
 
 Policy Center is a tenant-scoped rule layer evaluated at the MCP gateway before a managed or proxy tool action is executed. Rules are evaluated in ascending `priority` order (ties broken by rule id); the admin UI rewrites priorities via drag-and-drop reordering. Each rule has a simple `condition -> effect` shape.
 
-Effects are `allow`, `require_approval`, and `block`. Conditions have four active dimensions: `toolNames`, `categories` (the MCP server id), `severities` (`read_only`, `file_change`, `command_execution`), and `turnContexts` (`interactive`, `scheduled`). Dimensions are AND-ed together; multiple values inside a dimension are OR-ed; an omitted dimension matches anything.
+Effects are `allow`, `require_approval`, and `block`. Conditions have four active dimensions: `toolNames`, `categories` (the managed-tool domain or proxy MCP server id), `severities` (`read_only`, `file_change`; the legacy `command_execution` value is still accepted but never matches an action), and `turnContexts` (`interactive`, `scheduled`). Dimensions are AND-ed together; multiple values inside a dimension are OR-ed; an omitted dimension matches anything.
 
 `tenant_settings.policy_enforcement_mode` is the tenant-level switch. `monitor` evaluates rules and writes `policy_decision` evidence for matches without gating execution; `enforce` applies gating effects. The mode is compiled into the runtime-policy snapshot on the per-turn `ToolExecutionContext`, so the hot path does not read tenant settings from Postgres. Only matched rules write `policy_decision` rows.
 
@@ -223,7 +223,7 @@ Effects are `allow`, `require_approval`, and `block`. Conditions have four activ
 
 `tenant_settings` is one row per tenant — the single source of truth for runtime policy. The `system` tenant's row acts as the platform default; effective config merges the tenant row over the system row.
 
-Owners exclusively control `allowCommandExecution` and `allowUserTokenForwarding`. Admins may update the remaining Agent Settings, but unchanged copies of those owner-only fields are removed from admin writes to prevent stale forms from overwriting an owner decision.
+Owners exclusively control `allowCommandExecution`. Admins may update the remaining Agent Settings, but unchanged copies of that owner-only field are removed from admin writes to prevent stale forms from overwriting an owner decision.
 
 | Field | Purpose |
 |---|---|
@@ -234,7 +234,6 @@ Owners exclusively control `allowCommandExecution` and `allowUserTokenForwarding
 | `auto_approve_read_only_tools` | Bypass approval for read-only tools |
 | `policy_enforcement_mode` | Policy Center mode: `"monitor"` or `"enforce"` |
 | `allow_command_execution` | Gate on shell/exec tools — when off, no sandbox is attached at all |
-| `allow_user_token_forwarding` | Allow propagating the user's OAuth token to enterprise MCP servers |
 | `developer_instructions` | Extra system prompt content per tenant |
 | `web_search_mode` | Web search availability for the agent |
 | `show_effort_selector` | Frontend feature flag |
@@ -331,34 +330,13 @@ member → create and use sessions
 
 `requireRole(request, ...roles)` is called at the start of elevated routes.
 
-## Streaming Contract
+## Streaming contract
 
-The backend emits OpenAI Responses API-style SSE events plus a small set of `framework:*` extension events for concepts that don't map cleanly.
+`POST /messages` streams native AG-UI `BaseEvent` values as data-only SSE frames. The backend does not emit separate `event:` lines or the retired `response.*` and `framework:*` envelopes.
 
-Core standard events:
+The stream uses native AG-UI lifecycle, text, reasoning, tool-call, tool-result, and state-delta events. Cogniplane-specific approval, runtime-notice, tool metadata, tool status, and UI-resource payloads use AG-UI `CUSTOM` events. `write_todos` updates `/plan` through `STATE_DELTA`.
 
-- `response.created`
-- `response.in_progress`
-- `response.output_item.added`
-- `response.content_part.added`
-- `response.output_text.delta`
-- `response.output_text.done`
-- `response.content_part.done`
-- `response.function_call_arguments.delta`
-- `response.function_call_arguments.done`
-- `response.output_item.done`
-- `response.completed`
-- `response.failed`
-
-Framework extensions (named with `framework:` prefix per OpenResponses extension conventions):
-
-- `framework:approval_required`
-- `framework:runtime_notice` — non-fatal status messages (e.g. approval-expired)
-- `framework:mcp_server_status`
-- `framework:plan.delta` — plan pane updates (`write_todos`)
-- `framework:reasoning_text.delta` / `framework:reasoning_summary.delta` / `framework:reasoning_summary.replace`
-
-Exact event names and payload shapes are defined by `RuntimeEvent` in `apps/backend/src/runtime-contracts.ts`, not by hand-maintained markdown.
+Active stream event names and payload shapes follow AG-UI `BaseEvent` schemas from `@ag-ui/client`, not hand-maintained markdown.
 
 ### Concurrency
 
@@ -486,7 +464,7 @@ MIGRATION_DATABASE_URL           # Superuser DSN; bypasses RLS for migrations + 
 
 ## Historical note: retired dual-runtime architecture
 
-Earlier versions of Cogniplane ran two sandbox-hosted runtimes — OpenAI's `codex app-server` and the Claude Agent SDK driven by an in-sandbox harness — selected per tenant, with rendered workspace config (`codex.toml`, `CLAUDE.md`, `.mcp.json`, per-skill `SKILL.md` files) and a shared E2B template hosting both. That architecture was fully removed in favor of the in-process [deepagentsjs](https://reference.langchain.com/javascript/deepagents) runtime; the SSE streaming contract and the MCP gateway/Policy Center control planes were carried forward unchanged.
+Earlier versions of Cogniplane ran two sandbox-hosted runtimes. OpenAI's `codex app-server` and an in-sandbox Claude Agent SDK harness shared an E2B template and rendered workspace config. That architecture and its custom SSE envelopes are gone. The current in-process [deepagentsjs](https://reference.langchain.com/javascript/deepagents) runtime streams AG-UI over data-only SSE frames.
 
 ## Pointers
 

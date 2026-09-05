@@ -269,42 +269,4 @@ export class PiiScanRunStore {
       return mapRow(result.rows[0] as Record<string, unknown>);
     });
   }
-
-  async listForSubject(
-    tenantId: string,
-    subjectType: PiiScanSubjectType,
-    subjectId: string,
-    limit = 50
-  ): Promise<PiiScanRunRecord[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const result = await client.query(
-        `
-          SELECT
-            tenant_id,
-            scan_run_id,
-            subject_type,
-            subject_id,
-            source_session_id,
-            source_user_id,
-            mode,
-            provider_type,
-            provider_model,
-            status,
-            findings_json,
-            summary_text,
-            action_taken,
-            error_message,
-            created_at,
-            updated_at,
-            completed_at
-          FROM pii_scan_runs
-          WHERE tenant_id = $1 AND subject_type = $2 AND subject_id = $3
-          ORDER BY created_at DESC
-          LIMIT $4
-        `,
-        [tenantId, subjectType, subjectId, limit]
-      );
-      return result.rows.map((row) => mapRow(row as Record<string, unknown>));
-    });
-  }
 }

@@ -16,8 +16,8 @@ import type {
   DownloadHandle
 } from "@cogniplane/shared-types";
 
-export async function listArtifacts(sessionId: string): Promise<Artifact[]> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/artifacts`);
+export async function listArtifacts(sessionId: string, signal?: AbortSignal): Promise<Artifact[]> {
+  const raw = await request<unknown>(`/sessions/${sessionId}/artifacts`, { signal });
   return parseResponse(ArtifactsListResponseSchema, raw, "GET /sessions/:id/artifacts").artifacts;
 }
 

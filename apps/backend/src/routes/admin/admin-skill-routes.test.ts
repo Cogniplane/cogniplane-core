@@ -6,7 +6,10 @@ import { test, expect, onTestFinished } from "vitest";
 import Fastify from "fastify";
 
 import { GithubConnectionNotConfiguredError } from "../../services/integrations/github/github-connection-service.js";
-import { registerAdminSkillRoutes } from "./admin-skill-routes.js";
+import {
+  registerAdminSkillRoutes,
+  type AdminSkillRouteStores
+} from "./admin-skill-routes.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
@@ -46,7 +49,8 @@ function makeSkillRecord(overrides: Partial<{
     activeBundleStorageUri: null,
     activeBundleHash: null,
     activeValidationStatus: null,
-    activeReviewStatus: null
+    activeReviewStatus: null,
+    isInherited: false
   };
 }
 
@@ -85,7 +89,9 @@ type GithubImportInput = {
   githubToken?: string;
 };
 
-function createFakeDynamicConfig(onGithubImport?: (input: GithubImportInput) => void) {
+function createFakeDynamicConfig(
+  onGithubImport?: (input: GithubImportInput) => void
+): AdminSkillRouteStores["dynamicConfig"] {
   return {
     async listSkills(_tenantId: string) {
       return [];
@@ -102,6 +108,13 @@ function createFakeDynamicConfig(onGithubImport?: (input: GithubImportInput) => 
     async importSkillBundleFromGithub(_tenantId: string, input: GithubImportInput) {
       onGithubImport?.(input);
       return { skill: makeSkillRecord(), revision: makeRevisionRecord("test-skill"), previousActiveRevisionId: null };
+    },
+    async importSkillBundleFromInline(_tenantId: string, _input: unknown) {
+      return {
+        skill: makeSkillRecord(),
+        revision: makeRevisionRecord("test-skill"),
+        previousActiveRevisionId: null
+      };
     },
     async listSkillRevisions(_tenantId: string, _skillId: string) {
       return [];
@@ -347,14 +360,15 @@ async function buildAppWithRevisionFixture() {
     };
   });
 
-  const dynamicConfig = createFakeDynamicConfig();
-  (dynamicConfig as unknown as { getSkillRevision: typeof dynamicConfig.getSkillRevision }).getSkillRevision =
-    async (_tenantId: string, skillId: string, revisionId: number) => {
+  const dynamicConfig: AdminSkillRouteStores["dynamicConfig"] = {
+    ...createFakeDynamicConfig(),
+    async getSkillRevision(_tenantId: string, skillId: string, revisionId: number) {
       if (skillId === revision.skillId && revisionId === revision.skillRevisionId) {
         return revision;
       }
       return null;
-    };
+    }
+  };
 
   await registerAdminSkillRoutes(app, {
     dynamicConfig,

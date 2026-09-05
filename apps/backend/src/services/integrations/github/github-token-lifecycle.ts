@@ -53,7 +53,7 @@ export function isTokenExpired(value: string | null): boolean {
  */
 export async function refreshAndPersistAccessToken(
   config: AppConfig,
-  store: GithubConnectionStore,
+  store: Pick<GithubConnectionStore, "upsert">,
   record: GithubConnectionRecord
 ): Promise<GithubConnectionRecord> {
   if (!record.refreshTokenEncrypted) {

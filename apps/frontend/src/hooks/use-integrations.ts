@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   deleteIntegrationConfig,
@@ -18,6 +18,21 @@ export function useAdminIntegrations() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [flashMessage, setFlashMessage] = useState<string | null>(null);
+  // One handle for the flash timer. Back-to-back saves would otherwise let the
+  // first mutation's timer erase the second one's message, and an unmount
+  // mid-flash would set state on a gone component.
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flash = useCallback((message: string) => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    setFlashMessage(message);
+    flashTimerRef.current = setTimeout(() => setFlashMessage(null), 1800);
+  }, []);
+  useEffect(
+    () => () => {
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    },
+    []
+  );
 
   const listQuery = useQuery({
     queryKey: queryKeys.admin.integrations(),
@@ -28,9 +43,12 @@ export function useAdminIntegrations() {
     mutationFn: async (args: { integrationId: string; input: UpdateIntegrationInput }) => {
       return updateIntegration(args.integrationId, args.input);
     },
-    onMutate: ({ integrationId, input }) => {
+    onMutate: async ({ integrationId, input }) => {
       setActiveId(integrationId);
       setMutationError(null);
+      // A list fetch already in flight would land after this write and clobber
+      // the optimistic row; cancel it before taking the snapshot.
+      await queryClient.cancelQueries({ queryKey: queryKeys.admin.integrations() });
       // Optimistic update for toggle flips (skip when config is being saved —
       // the response carries the authoritative `hasConfig` / `configSummary`).
       if (input.config) return { previous: null };
@@ -73,8 +91,7 @@ export function useAdminIntegrations() {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.settings.integrationsAvailability()
       });
-      setFlashMessage("Saved.");
-      setTimeout(() => setFlashMessage(null), 1800);
+      flash("Saved.");
     },
     onSettled: () => {
       setActiveId(null);
@@ -103,8 +120,7 @@ export function useAdminIntegrations() {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.settings.integrationsAvailability()
       });
-      setFlashMessage("Configuration cleared.");
-      setTimeout(() => setFlashMessage(null), 1800);
+      flash("Configuration cleared.");
     },
     onSettled: () => setActiveId(null)
   });

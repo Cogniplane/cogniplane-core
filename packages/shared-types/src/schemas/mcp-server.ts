@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { IsoDateSchema } from "./_helpers.js";
+import { AdminIdSchema, IsoDateSchema } from "./_helpers.js";
 
 export const AdminMcpServerSchema = z.object({
   serverId: z.string(),
@@ -10,7 +10,6 @@ export const AdminMcpServerSchema = z.object({
   mode: z.enum(["managed", "proxy"]),
   routePath: z.string(),
   upstreamUrl: z.string().nullable(),
-  headersAllowlist: z.array(z.string()),
   version: z.number(),
   configHash: z.string(),
   enabled: z.boolean(),
@@ -22,6 +21,29 @@ export const AdminMcpServerSchema = z.object({
   materializedSessions30d: z.number().optional()
 }).passthrough();
 export type AdminMcpServer = z.infer<typeof AdminMcpServerSchema>;
+
+const AdminMcpServerMutationFields = {
+  serverName: z.string().trim().min(1).max(120),
+  description: z.string().trim().max(500).nullable().optional(),
+  transportKind: z.literal("http").default("http"),
+  mode: z.enum(["managed", "proxy"]),
+  routePath: z.string().trim().min(1).max(200),
+  // Backend routes additionally enforce HTTPS and reject unsafe hosts and credentials.
+  upstreamUrl: z.string().url().nullable().optional(),
+  enabled: z.boolean().default(true)
+};
+
+export const AdminMcpServerCreateRequestSchema = z.object({
+  serverId: AdminIdSchema,
+  ...AdminMcpServerMutationFields
+});
+export type AdminMcpServerCreateRequest = z.input<typeof AdminMcpServerCreateRequestSchema>;
+
+export const AdminMcpServerUpdateRequestSchema = z.object({
+  serverId: AdminIdSchema.optional(),
+  ...AdminMcpServerMutationFields
+});
+export type AdminMcpServerUpdateRequest = z.input<typeof AdminMcpServerUpdateRequestSchema>;
 
 export const AdminMcpServersListResponseSchema = z.object({
   mcpServers: z.array(AdminMcpServerSchema)

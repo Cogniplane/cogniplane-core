@@ -1,7 +1,7 @@
 import { test, expect } from "vitest";
+import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import { Aes256GcmFindingEncryptor } from "./pii-finding-encryption.js";
-import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "./pii-policy.js";
 import {
   PiiProtectionService,
   PiiProtectionServiceError,
@@ -705,8 +705,7 @@ test("rawRetention='reversible_encrypted' encrypts finding values with the confi
       // Value is the ciphertext envelope, not plaintext, not empty.
       expect(finding.value.startsWith("enc:v1:")).toBeTruthy();
       expect(finding.value).not.toBe("user@example.com");
-      // And the service can round-trip it back to plaintext for an admin reveal.
-      expect(service.decryptFindingValue(finding.value, "t1")).toBe("user@example.com");
+      expect(encryptor.decryptValue(finding.value, "t1")).toBe("user@example.com");
     }
   }
 });
@@ -727,18 +726,6 @@ test("rawRetention='reversible_encrypted' throws pii_kek_missing when no encrypt
       subject: CHAT
     })
     .catch((e: unknown) => e);
-  expect(err instanceof PiiProtectionServiceError).toBeTruthy();
-  expect((err as PiiProtectionServiceError).code).toBe("pii_kek_missing");
-});
-
-test("decryptFindingValue throws pii_kek_missing when no encryptor is configured", () => {
-  const service = new PiiProtectionService({
-    policyReader: stubReader(buildSettings({ enabled: true })),
-    ruleDetector: new RuleBasedPiiDetector(),
-    timeoutMs: 5000
-  });
-  let err: unknown;
-  try { service.decryptFindingValue("enc:v1:any:thing:here", "t1"); } catch (e) { err = e; }
   expect(err instanceof PiiProtectionServiceError).toBeTruthy();
   expect((err as PiiProtectionServiceError).code).toBe("pii_kek_missing");
 });

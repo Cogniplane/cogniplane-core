@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { PolicyEnforcementMode, PolicyRule } from "@cogniplane/shared-types";
 
-import type { PolicyApprovalDisposition } from "../../runtime-contracts.js";
 import {
   PolicyService,
   PolicyBlockedError,
@@ -154,25 +153,16 @@ describe("PolicyService.gateAction — non-gating outcomes", () => {
     expect(records[0].enforced).toBe(false);
   });
 
-  it("monitor mode never routes a require_approval — proceeds and never holds the gateway", async () => {
-    // Under monitor, enforced=false, so a require_approval match must take the
-    // non-enforced early return: proceed WITHOUT routing an approval (which would
-    // hold the gateway's HTTP response open until the TTL) and record evidence
-    // with enforced=false. A regression routing under monitor would wedge the
-    // gateway on a would-have decision.
+  it("monitor mode records require_approval without requiring proof", async () => {
     const { service, records } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: { categories: ["github"] } })
     ]);
-    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "approve");
-
     const result = await service.gateAction(
-      gateInput({ enforcementMode: "monitor", approvalRouter: router })
+      gateInput({ enforcementMode: "monitor" })
     );
 
     expect(result.enforced).toBe(false);
     expect(result.evaluation.outcome).toBe("require_approval");
-    // The approval router was never called — no gateway hold under monitor.
-    expect(router).not.toHaveBeenCalled();
     // Evidence recorded as a would-have decision.
     expect(records).toHaveLength(1);
     expect(records[0].outcome).toBe("require_approval");
@@ -215,13 +205,11 @@ describe("PolicyService.gateAction — enforce-mode block", () => {
 });
 
 describe("PolicyService.gateAction — enforce-mode require_approval", () => {
-  it("routes an approval and proceeds when approved", async () => {
+  it("proceeds when the gateway verified an approved graph action", async () => {
     const { service, records } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {} })
     ]);
-    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "approve");
-    const result = await service.gateAction(gateInput({ approvalRouter: router }));
-    expect(router).toHaveBeenCalledTimes(1);
+    const result = await service.gateAction(gateInput({ approvalDisposition: "approve" }));
     expect(result.enforced).toBe(true);
     expect(records[0].outcome).toBe("require_approval");
     expect((records[0].actionSnapshot as Record<string, unknown>).approvalDisposition).toBe("approve");
@@ -231,9 +219,8 @@ describe("PolicyService.gateAction — enforce-mode require_approval", () => {
     const { service } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {} })
     ]);
-    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "reject");
     await expect(
-      service.gateAction(gateInput({ approvalRouter: router }))
+      service.gateAction(gateInput({ approvalDisposition: "reject" }))
     ).rejects.toBeInstanceOf(PolicyBlockedError);
   });
 
@@ -241,44 +228,34 @@ describe("PolicyService.gateAction — enforce-mode require_approval", () => {
     const { service } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
     ]);
-    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "expired");
-    await service.gateAction(gateInput({ approvalRouter: router })).catch((err: unknown) => {
+    await service.gateAction(gateInput({ approvalDisposition: "expired" })).catch((err: unknown) => {
       expect((err as PolicyBlockedError).explanation).toContain("expired");
     });
   });
 
-  it("denies immediately on a scheduled turn without routing an approval", async () => {
-    // A scheduled turn has no human to decide: the prompt would be delivered to
-    // the scheduler's event consumer and the gateway would hold its response
-    // until the approval TTL — past the scheduler's job timeout. The router
-    // must never be called; the action denies at once with a clear explanation
-    // and recorded evidence.
-    const { service, records, warnings } = buildService([
+  it("denies a scheduled turn before waiting for approval", async () => {
+    const { service, records } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
     ]);
-    const router = vi.fn(async (): Promise<PolicyApprovalDisposition> => "approve");
-
-    const error = await service
-      .gateAction(gateInput({ turnContext: "scheduled", approvalRouter: router }))
-      .then(() => null)
-      .catch((err: unknown) => err);
-
-    expect(error).toBeInstanceOf(PolicyBlockedError);
-    expect((error as PolicyBlockedError).explanation).toContain("scheduled runs");
-    expect(router).not.toHaveBeenCalled();
+    await service
+      .gateAction(gateInput({ turnContext: "scheduled", approvalDisposition: "approve" }))
+      .catch((err: unknown) => {
+        expect(err).toBeInstanceOf(PolicyBlockedError);
+        expect((err as PolicyBlockedError).explanation).toContain(
+          "Approval is not available on scheduled runs"
+        );
+      });
     expect(records[0].outcome).toBe("require_approval");
     expect((records[0].actionSnapshot as Record<string, unknown>).approvalDisposition).toBe("reject");
-    expect(warnings.some((w) => w.msg.includes("scheduled turn"))).toBe(true);
   });
 
-  it("degrades to a deny when no approval router is available", async () => {
-    const { service, warnings } = buildService([
+  it("denies when no verified graph approval is supplied", async () => {
+    const { service } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {} })
     ]);
-    await expect(service.gateAction(gateInput({ approvalRouter: undefined }))).rejects.toBeInstanceOf(
+    await expect(service.gateAction(gateInput())).rejects.toBeInstanceOf(
       PolicyBlockedError
     );
-    expect(warnings.some((w) => w.msg.includes("no approval router"))).toBe(true);
   });
 });
 

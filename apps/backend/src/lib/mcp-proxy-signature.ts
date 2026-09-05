@@ -17,8 +17,17 @@
 // Canonical string (newline-separated to avoid delimiter collisions):
 //   `${userId}\n${sessionId}\n${runtimeId}\n${timestamp}`
 //
-// Secret: AppConfig.DATA_ENCRYPTION_SECRET. Upstreams that verify must hold
-// the same value (deployment-time concern).
+// Secret: NOT the deployment root secret. This key is derived from
+// DATA_ENCRYPTION_SECRET via HKDF under a signature-specific label
+// (lib/derived-secrets.ts `proxySignatureSecret`), or set outright by the
+// operator with MCP_UPSTREAM_SIGNING_SECRET.
+//
+// That distinction is the point. A verifying upstream must hold the same value
+// we sign with, and it is a third party. Handing it the root secret would also
+// hand it the ability to mint `rt_*` gateway tokens for any tenant and to
+// decrypt every stored OAuth token and provider key. The derived key permits
+// neither: the root cannot be recovered from it. Share this value with an
+// upstream; never share the root.
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 

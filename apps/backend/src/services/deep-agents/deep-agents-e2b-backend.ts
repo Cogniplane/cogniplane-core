@@ -56,6 +56,14 @@ export type E2bDeepAgentsSandboxOptions = {
   sessionId: string;
   runtimeId: string;
   logger: FastifyBaseLogger;
+  /**
+   * Called when a gone sandbox is transparently replaced by a fresh one — the
+   * point at which every agent-written file and every synced artifact in the
+   * workspace is lost. Without this the model just sees `file_not_found` on
+   * work it did itself and has no way to know why. The adapter turns it into
+   * a runtime notice on the active turn.
+   */
+  onSandboxRecreated?: (info: { previousSandboxId: string | null }) => void;
   /** Test-only injection of the (dynamically imported) Sandbox class. */
   loadSandboxClass?: typeof loadE2bSandboxClass;
 };
@@ -81,9 +89,10 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
 
   /**
    * Run an operation against the memoized sandbox, transparently recreating it
-   * once if the sandbox has gone away. E2B sandboxes have a hard lifetime cap
-   * (`sandboxTimeoutMs`, never extended on activity), so a long session
-   * eventually outlives its sandbox; past that every SDK call throws
+   * once if the sandbox has gone away. E2B sandboxes have a lifetime cap
+   * (`sandboxTimeoutMs`) which extendTimeout() pushes back at each turn start,
+   * making it an idle timeout — but a session idle past the cap, or one whose
+   * extension call failed, still outlives its sandbox; past that every SDK call throws
    * SandboxNotFoundError. Without recovery the memo would stay poisoned and
    * shell/file tools + artifact sync would be dead for the rest of the session.
    * On a sandbox-gone error we drop the memo and create a fresh sandbox — the
@@ -103,7 +112,11 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     // the error instead of replaying this command.
     retryOnSandboxGone = true
   ): Promise<T> {
-    const sandbox = await this.getSandbox();
+    // Capture the promise this call is bound to, so a concurrent op that
+    // already replaced the sandbox is detected below instead of having its
+    // replacement discarded.
+    const boundPromise = this.getSandbox();
+    const sandbox = await boundPromise;
     try {
       return await op(sandbox);
     } catch (err: unknown) {
@@ -119,9 +132,27 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
             ? "Deep Agents E2B sandbox gone; recreating and retrying"
             : "Deep Agents E2B sandbox gone mid-execute; not replaying the command"
         );
-        this.sandboxPromise = null;
-        this.sandboxId = null;
+        // Only the FIRST caller to observe this sandbox's death replaces it.
+        // Concurrent ops against the same dead sandbox all land here; without
+        // this guard the second would discard the first's fresh sandbox, start
+        // a third, fire a duplicate notice, and split writes across two
+        // sandboxes while the memo kept only one. `sandboxPromise` having
+        // already moved on is the marker that someone else did the work.
+        const weReplaceIt = this.sandboxPromise === boundPromise;
+        if (weReplaceIt) {
+          // Read the id of the sandbox THIS call was bound to, not the mutable
+          // field, which a concurrent replacement may already have moved.
+          const previousSandboxId = this.sandboxId;
+          this.sandboxPromise = null;
+          this.sandboxId = null;
+          // Fire for BOTH branches: the workspace is equally gone whether or
+          // not we replay this particular op — the non-retry branch just
+          // declines to re-run a side-effecting command, and the next call gets
+          // the fresh sandbox either way.
+          this.notifyRecreated(previousSandboxId);
+        }
         if (retryOnSandboxGone) {
+          // Whoever won the replacement, getSandbox() now yields the live one.
           const fresh = await this.getSandbox();
           return op(fresh);
         }
@@ -398,6 +429,48 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   }
 
   /** Kill the sandbox if one was ever created. Idempotent. */
+  private notifyRecreated(previousSandboxId: string | null): void {
+    if (!this.options.onSandboxRecreated) return;
+    try {
+      this.options.onSandboxRecreated({ previousSandboxId });
+    } catch (err: unknown) {
+      // A failing notice must never turn into a failed tool call.
+      this.options.logger.warn(
+        { err, sessionId: this.options.sessionId },
+        "Deep Agents sandbox-recreated notice failed"
+      );
+    }
+  }
+
+  /**
+   * Push the sandbox's lifetime cap back out to the full `sandboxTimeoutMs`,
+   * making it an IDLE timeout instead of an absolute one. Called at each turn
+   * start.
+   *
+   * Without this the cap runs from first tool use of the session and is never
+   * touched again, so a session that stays active past it loses its whole
+   * workspace mid-turn — every agent-written file and every synced artifact —
+   * and the model only sees `file_not_found`.
+   *
+   * Deliberately a no-op when the sandbox has not been created: extending
+   * would force creation and destroy the laziness that keeps chat-only
+   * sessions free. Failures are swallowed — a turn must not fail because the
+   * lifetime could not be extended, and if the sandbox is already gone,
+   * withSandbox recovers on the next op.
+   */
+  async extendTimeout(): Promise<void> {
+    if (this.killed || !this.sandboxPromise) return;
+    try {
+      const sandbox = await this.sandboxPromise;
+      await sandbox.setTimeout(this.options.sandboxTimeoutMs);
+    } catch (err: unknown) {
+      this.options.logger.warn(
+        { err, sessionId: this.options.sessionId, sandboxId: this.sandboxId },
+        "Failed to extend Deep Agents E2B sandbox lifetime; it may expire mid-turn"
+      );
+    }
+  }
+
   async kill(): Promise<void> {
     this.killed = true;
     const pending = this.sandboxPromise;

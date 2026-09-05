@@ -8,10 +8,16 @@ import type { SkillRevisionCleanupReport } from "../admin-config-records.js";
 
 export async function cleanupInactiveSkillRevisions(input: {
   tenantId: string;
-  config: AppConfig;
-  skills: SkillConfigStore;
-  skillRevisions: SkillRevisionStore;
-  skillBundleStorage: SkillBundleStorage;
+  config: Pick<AppConfig, "SKILL_BUNDLE_RETENTION_DAYS">;
+  skills: Pick<SkillConfigStore, "listSkills">;
+  skillRevisions: Pick<
+    SkillRevisionStore,
+    | "listAllSkillRevisions"
+    | "listActiveRuntimeSkillReferences"
+    | "deleteSkillRevision"
+    | "countSkillRevisionsByBundleStorageUri"
+  >;
+  skillBundleStorage: Pick<SkillBundleStorage, "deleteBundle">;
   dryRun?: boolean;
 }): Promise<SkillRevisionCleanupReport> {
   const dryRun = input.dryRun ?? false;

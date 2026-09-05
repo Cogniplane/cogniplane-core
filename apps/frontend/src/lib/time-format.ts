@@ -31,11 +31,3 @@ export function formatMediumDateTime(iso: string | null | undefined, fallback: s
     timeStyle: "short"
   }).format(date);
 }
-
-/** HH:MM stamp on chat bubbles (message list + timeline rows). */
-export function formatMessageTimestamp(iso: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(new Date(iso));
-}

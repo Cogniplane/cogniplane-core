@@ -3,12 +3,13 @@ import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { MessageStore } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import { gatherSkillCorpus } from "../skills/skill-improvement-corpus.js";
+import { ToolCallError } from "../../lib/tool-call-error.js";
 import { allRequiredObjectSchema, type ManagedToolDefinition } from "./types.js";
 
 type SkillCorpusToolDeps = {
   db: Pool;
-  dynamicConfig: DynamicConfigService;
-  messages: MessageStore;
+  dynamicConfig: Pick<DynamicConfigService, "listSkills">;
+  messages: Pick<MessageStore, "listBySession">;
   /**
    * Optional PII gate forwarded to `gatherSkillCorpus`. When present, the
    * assembled corpus is evaluated fail-closed before being returned — a
@@ -60,14 +61,14 @@ export function createSkillCorpusTool(deps: SkillCorpusToolDeps): ManagedToolDef
       }),
       handler: async ({ context, arguments: args }) => {
         const skillId = String(args.skillId ?? "");
-        if (!skillId) throw new Error("skillId is required.");
+        if (!skillId) throw new ToolCallError("skillId is required.");
 
         // Tenant-scoped skill lookup. `listSkills(tenantId, true)` returns
         // active + inherited skills; the corpus reads the active revision's
         // instructions, so a skill with no activatable revision is rejected.
         const skills = await deps.dynamicConfig.listSkills(context.tenantId, true);
         const skill = skills.find((s) => s.skillId === skillId);
-        if (!skill) throw new Error(`Skill "${skillId}" not found.`);
+        if (!skill) throw new ToolCallError(`Skill "${skillId}" not found.`);
 
         // Preserve an explicit `sessionCount: 0` (return only the current
         // SKILL.md / empty corpus). A bare `|| 50` would coerce 0 → 50.
@@ -78,8 +79,10 @@ export function createSkillCorpusTool(deps: SkillCorpusToolDeps): ManagedToolDef
         const corpus = await gatherSkillCorpus(
           {
             db: deps.db,
-            loadMessagesForSession: (tenantId, sessionId, userId) =>
-              deps.messages.listBySession(tenantId, sessionId, userId),
+            // Fans out over up to 200 sessions, so the store's read caps
+            // (newest-N + truncated tool text) matter most here.
+            loadMessagesForSession: async (tenantId, sessionId, userId) =>
+              (await deps.messages.listBySession(tenantId, sessionId, userId)).messages,
             piiProtection: deps.piiProtection
           },
           {

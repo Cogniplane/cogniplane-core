@@ -460,6 +460,60 @@ test("callChat surfaces HTTP errors with a bounded message", async () => {
   expect((error as OpenAiCompatiblePiiProviderError).code).toBe("http_error");
 });
 
+test("callChat never puts a 4xx response body in the error message", async () => {
+  // R45. The message is persisted to pii_scan_jobs.error_message and shown to
+  // admins through the analytics error rollup. OpenAI-compatible gateways
+  // commonly echo the offending request back in a 4xx body — which here is the
+  // text under scan — so retaining it defeats rawRetention='never'.
+  const scannedText = "Jane Doe, SSN 123-45-6789, jane@example.test";
+  const fetchImpl = buildFakeFetch({
+    status: 400,
+    responseBodyText: JSON.stringify({
+      error: {
+        message: `Invalid request. Input was: ${scannedText}`,
+        type: "invalid_request_error",
+        code: "context_length_exceeded"
+      }
+    })
+  });
+
+  const provider = buildProvider(fetchImpl);
+  const error = await provider
+    .detectText({ text: scannedText, entityTypes: ["email"] })
+    .catch((e: unknown) => e);
+
+  expect(error instanceof OpenAiCompatiblePiiProviderError).toBeTruthy();
+  const message = (error as Error).message;
+
+  // The status and the vendor's error CODE survive — that is what an operator
+  // needs to fix the configuration.
+  expect(message).toContain("400");
+  expect(message).toContain("context_length_exceeded");
+
+  // The echoed request does not.
+  expect(message).not.toContain(scannedText);
+  expect(message).not.toContain("123-45-6789");
+  expect(message).not.toContain("jane@example.test");
+  expect(message).not.toContain("Invalid request. Input was");
+});
+
+test("callChat omits a code when the 4xx body carries none", async () => {
+  // A plain-text or unrecognised body contributes nothing at all, rather than
+  // a truncated slice of it.
+  const fetchImpl = buildFakeFetch({
+    status: 413,
+    responseBodyText: "<html>Payload Too Large: Jane Doe, SSN 123-45-6789</html>"
+  });
+
+  const provider = buildProvider(fetchImpl);
+  const error = await provider.detectText({ text: "hi", entityTypes: ["email"] }).catch((e: unknown) => e);
+  const message = (error as Error).message;
+
+  expect(message).toContain("413");
+  expect(message).not.toContain("123-45-6789");
+  expect(message).not.toContain("Payload Too Large");
+});
+
 test("callChat throws invalid_json when model output is not parseable", async () => {
   const fetchImpl = buildFakeFetch({
     responsePayload: {

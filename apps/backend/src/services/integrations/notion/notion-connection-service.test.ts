@@ -68,6 +68,11 @@ const NOTION_OAUTH_OVERRIDES = {
   NOTION_OAUTH_REDIRECT_URI: "http://localhost:3001/integrations/notion/callback"
 };
 
+function requireValue<T>(value: T | null | undefined, label: string): T {
+  if (value == null) throw new Error(`Expected ${label}.`);
+  return value;
+}
+
 test("getConnectionStatus returns configured: false when env vars are missing", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const store = new InMemoryNotionConnectionStore();
@@ -128,8 +133,8 @@ test("completeAuthorization exchanges code and stores connection", async () => {
     if (url === "https://api.notion.com/v1/oauth/token") {
       // Verify Basic auth header is present
       const headers = new Headers(init?.headers as HeadersInit | undefined);
-      const authHeader = headers.get("Authorization");
-      expect(authHeader?.startsWith("Basic ")).toBeTruthy();
+      const authHeader = requireValue(headers.get("Authorization"), "Authorization header");
+      expect(authHeader.startsWith("Basic ")).toBeTruthy();
       const decoded = Buffer.from(authHeader.slice("Basic ".length), "base64").toString("utf8");
       expect(decoded).toBe("test-notion-client-id:test-notion-client-secret");
 
@@ -164,13 +169,13 @@ test("completeAuthorization exchanges code and stores connection", async () => {
       state: validStateJwt
     });
     expect(redirectUrl).toMatch(/notionAuth=connected/);
-    expect(store.record).toBeTruthy();
-    expect(store.record.notionUserId).toBe("notion-user-1");
-    expect(store.record.notionWorkspaceId).toBe("ws-xyz");
-    expect(store.record.notionWorkspaceName).toBe("Test Workspace");
-    expect(store.record.notionOwnerEmail).toBe("test@example.com");
-    expect(store.record.notionOwnerName).toBe("Test User");
-    expect(decrypt(store.record.accessTokenEncrypted, config.DATA_ENCRYPTION_SECRET)).toBe("secret_notion_access_token");
+    const record = requireValue(store.record, "stored Notion connection");
+    expect(record.notionUserId).toBe("notion-user-1");
+    expect(record.notionWorkspaceId).toBe("ws-xyz");
+    expect(record.notionWorkspaceName).toBe("Test Workspace");
+    expect(record.notionOwnerEmail).toBe("test@example.com");
+    expect(record.notionOwnerName).toBe("Test User");
+    expect(decrypt(record.accessTokenEncrypted, config.DATA_ENCRYPTION_SECRET)).toBe("secret_notion_access_token");
     expect(auditEvents.events[0]?.type).toBe("user.notion.connected");
     expect(runtimeManager.invalidations).toEqual([
             { tenantId: "tenant-1", userId: "user-1", integrationId: "notion" }
@@ -352,8 +357,10 @@ test("getRuntimeCredentials returns decrypted token and marks token used", async
     updatedAt: new Date().toISOString()
   };
 
-  const creds = await service.getRuntimeCredentials("tenant-1", "user-1");
-  expect(creds).toBeTruthy();
+  const creds = requireValue(
+    await service.getRuntimeCredentials("tenant-1", "user-1"),
+    "Notion runtime credentials"
+  );
   expect(creds.notionUserId).toBe("notion-user-1");
   expect(creds.workspaceId).toBe("ws-xyz");
   expect(creds.token).toBe("secret_notion_access_token");

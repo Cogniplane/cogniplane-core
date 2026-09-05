@@ -12,7 +12,7 @@ export const GITHUB_OAUTH_CALLBACK_PATHS = ["/auth/github/user/callback"] as con
 
 export function registerGithubOAuthRoutes(
   app: FastifyInstance,
-  connections: GithubConnectionService,
+  connections: Pick<GithubConnectionService, "completeAuthorization">,
   limits?: RequestLimitsInterface
 ): void {
   app.get("/auth/github/user/callback", async (request, reply) => {

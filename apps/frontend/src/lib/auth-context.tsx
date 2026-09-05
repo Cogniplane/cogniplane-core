@@ -62,43 +62,84 @@ function clearSessionHintCookie(): void {
   document.cookie = `${SESSION_HINT_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax`;
 }
 
+// A 403 from /auth/refresh is not by itself proof that the session is gone.
+// The route rejects a cross-origin POST with `csrf_origin_mismatch` before it
+// ever looks at the refresh cookie (auth.ts, passesCsrfOriginCheck), while a
+// user removed from the tenant gets `not_a_member` at the same status. Only the
+// second means the session is over.
+const REFRESH_KEEPS_SESSION_CODES = new Set(["csrf_origin_mismatch"]);
+
+async function readErrorCode(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    return typeof body?.error === "string" ? body.error : null;
+  } catch {
+    return null;
+  }
+}
+
+// Whether a failed /auth/refresh means the session is really gone. A 5xx, a
+// network drop or a timeout must leave the user signed in: AuthGuard redirects
+// to /login the moment `user` goes null, so treating a gateway hiccup as a
+// revocation signs people out mid-session. A 403 with no readable code (an
+// intermediary rejecting the request, say) still counts as revoked — a 403 is
+// an authorization refusal, and leaving a genuinely revoked session on screen
+// is the worse of the two mistakes.
+async function isSessionRevoked(response: Response): Promise<boolean> {
+  if (response.status === 401) return true;
+  if (response.status !== 403) return false;
+  const code = await readErrorCode(response);
+  return code === null || !REFRESH_KEEPS_SESSION_CODES.has(code);
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [accessToken, setAccessTokenState] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+
+  const clearSession = useCallback(() => {
+    setAccessTokenState(null);
+    setApiClientToken(null);
+    setUser(null);
+    clearSessionHintCookie();
+  }, []);
 
   const refreshToken = useCallback(async (): Promise<string | null> => {
     // In dev-headers mode there is no token — the backend reads identity from
     // X-Dev-User-Id / X-Dev-Tenant-Id headers injected by the API client.
     if (DEV_USER_ID) return null;
 
+    let response: Response;
     try {
-      const response = await fetch(`${API_URL}/auth/refresh`, {
+      response = await fetch(`${API_URL}/auth/refresh`, {
         method: "POST",
         credentials: "include"
       });
-
-      if (!response.ok) {
-        setAccessTokenState(null);
-        setApiClientToken(null);
-        setUser(null);
-        clearSessionHintCookie();
-        return null;
-      }
-
-      const data = (await response.json()) as { accessToken: string };
-      setAccessTokenState(data.accessToken);
-      setApiClientToken(data.accessToken);
-      setSessionHintCookie();
-      return data.accessToken;
     } catch {
-      setAccessTokenState(null);
-      setApiClientToken(null);
-      setUser(null);
-      clearSessionHintCookie();
+      // The network is down, not the session. Keep what we have.
       return null;
     }
-  }, []);
+
+    if (!response.ok) {
+      if (await isSessionRevoked(response)) clearSession();
+      return null;
+    }
+
+    // A malformed 200 would otherwise install `undefined` as the access token,
+    // and every later request would send `Bearer undefined`.
+    let accessToken: unknown;
+    try {
+      accessToken = ((await response.json()) as { accessToken?: unknown })?.accessToken;
+    } catch {
+      return null;
+    }
+    if (typeof accessToken !== "string" || accessToken.length === 0) return null;
+
+    setAccessTokenState(accessToken);
+    setApiClientToken(accessToken);
+    setSessionHintCookie();
+    return accessToken;
+  }, [clearSession]);
 
   const fetchMe = useCallback(
     async (token: string): Promise<boolean> => {
@@ -188,7 +229,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         `${API_URL}/auth/login?${params.toString()}`,
         { credentials: "include" }
       );
-      const data = (await response.json()) as { url: string };
+      if (!response.ok) {
+        throw new Error(`Sign-in is unavailable right now (${response.status}).`);
+      }
+
+      // A 502 from the gateway sends back an HTML error page, not JSON. Parsing
+      // it unguarded surfaces an opaque SyntaxError, and reading `.url` off the
+      // result navigated the browser to "/undefined".
+      let data: { url?: unknown };
+      try {
+        data = (await response.json()) as { url?: unknown };
+      } catch {
+        throw new Error("Sign-in is unavailable right now.");
+      }
+      if (typeof data.url !== "string" || data.url.length === 0) {
+        throw new Error("Sign-in is unavailable right now.");
+      }
       window.location.href = data.url;
     },
     []
@@ -199,12 +255,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       method: "POST",
       credentials: "include"
     });
-    setAccessTokenState(null);
-    setApiClientToken(null);
-    setUser(null);
-    clearSessionHintCookie();
+    clearSession();
+    // A hard document load, deliberately, not router.push("/login").
+    // clearSession only drops React state and the in-memory API-client token;
+    // a client-side navigation keeps the same JS context alive, so any module
+    // singleton or cached query holding the old identity would survive into
+    // the next sign-in. Reloading the document is what guarantees the tab
+    // starts from nothing.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- full reload drops in-memory auth state, see above
     window.location.href = "/login";
-  }, []);
+  }, [clearSession]);
 
   const value = useMemo(
     () => ({ user, accessToken, isLoading, login, logout, refreshToken, completeLogin }),

@@ -1,4 +1,4 @@
-import type { PiiEntityType } from "./pii-policy.js";
+import type { PiiEntityType } from "@cogniplane/shared-types";
 import type { PiiFinding } from "./pii-provider.js";
 
 interface RuleDefinition {

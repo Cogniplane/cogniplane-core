@@ -39,6 +39,12 @@ export type IntegrationConfigField = {
 // can omit the probe entirely.
 export type IntegrationConnectionProbe = {
   hasConnection(tenantId: string, userId: string): Promise<boolean>;
+  // Revokes this user's stored connection when they lose access to the tenant
+  // (member removal). Declared on the probe so removing a member reaches every
+  // registered integration — including a private overlay's — without core
+  // holding a hardcoded list of connection tables. Returns true when a
+  // connection existed and was deleted.
+  deleteConnection?(tenantId: string, userId: string): Promise<boolean>;
 };
 
 export type IntegrationPlatformStatus = {
@@ -81,16 +87,18 @@ export type IntegrationDescriptor = {
   // a private overlay without dragging the connection service into core.
   connectionProbe?: IntegrationConnectionProbe;
   platformStatus?: (config: AppConfig) => IntegrationPlatformStatus;
+  oauthCallbackPaths?: readonly string[];
   oauthRoutes?: IntegrationOAuthRoutes;
 };
 
-const registry = new Map<string, IntegrationDescriptor>();
+type IntegrationCatalogDescriptor = Omit<IntegrationDescriptor, "connectionProbe" | "oauthRoutes">;
+const registry = new Map<string, IntegrationCatalogDescriptor>();
 
-export function registerIntegration(descriptor: IntegrationDescriptor): void {
+export function registerIntegration(descriptor: IntegrationCatalogDescriptor): void {
   if (registry.has(descriptor.id)) {
     throw new Error(`Integration already registered: ${descriptor.id}`);
   }
-  registry.set(descriptor.id, descriptor);
+  registry.set(descriptor.id, Object.freeze(descriptor));
 }
 
 export function getIntegrationDescriptor(integrationId: string): IntegrationDescriptor | null {
@@ -101,32 +109,39 @@ export function listIntegrationDescriptors(): readonly IntegrationDescriptor[] {
   return Array.from(registry.values());
 }
 
-// Replace the live wiring (connection probe + OAuth routes) on an already-
-// registered descriptor. Used by the bootstrap module to attach per-app
-// hooks after the static descriptor data has been registered, and to
-// re-attach hooks when a fresh `buildAppDependencies()` runs (e.g. tests
-// that build multiple Fastify apps in one process). The static fields
-// (id/name/readToolIds/...) are not touched.
-export type IntegrationRuntimeWiring = Pick<
-  IntegrationDescriptor,
-  "connectionProbe" | "oauthRoutes"
->;
+/** Live integration hooks belong to one application, never the static catalog. */
+export class IntegrationRegistry {
+  private readonly entries: Map<string, IntegrationDescriptor>;
 
-export function setIntegrationRuntimeWiring(
-  integrationId: string,
-  wiring: IntegrationRuntimeWiring
-): void {
-  const existing = registry.get(integrationId);
-  if (!existing) {
-    throw new Error(
-      `Cannot attach runtime wiring to unregistered integration: ${integrationId}`
-    );
+  constructor(descriptors: readonly IntegrationDescriptor[] = listIntegrationDescriptors()) {
+    this.entries = new Map(descriptors.map((descriptor) => [descriptor.id, descriptor]));
   }
-  registry.set(integrationId, {
-    ...existing,
-    connectionProbe: wiring.connectionProbe,
-    oauthRoutes: wiring.oauthRoutes
-  });
+
+  register(descriptor: IntegrationDescriptor): void {
+    if (this.entries.has(descriptor.id)) throw new Error(`Integration already registered: ${descriptor.id}`);
+    this.entries.set(descriptor.id, descriptor);
+  }
+
+  get(integrationId: string): IntegrationDescriptor | null {
+    return this.entries.get(integrationId) ?? null;
+  }
+
+  list(): readonly IntegrationDescriptor[] {
+    return [...this.entries.values()];
+  }
+
+  setRuntimeWiring(
+    integrationId: string,
+    wiring: Pick<IntegrationDescriptor, "connectionProbe" | "oauthRoutes">
+  ): void {
+    const existing = this.entries.get(integrationId);
+    if (!existing) throw new Error(`Cannot attach runtime wiring to unregistered integration: ${integrationId}`);
+    this.entries.set(integrationId, { ...existing, ...wiring });
+  }
+
+  oauthCallbackPaths(): readonly string[] {
+    return this.list().flatMap((descriptor) => descriptor.oauthRoutes?.paths ?? descriptor.oauthCallbackPaths ?? []);
+  }
 }
 
 // Aggregated OAuth callback paths across every registered integration.
@@ -135,8 +150,7 @@ export function setIntegrationRuntimeWiring(
 export function listIntegrationOAuthCallbackPaths(): readonly string[] {
   const paths: string[] = [];
   for (const descriptor of registry.values()) {
-    if (!descriptor.oauthRoutes) continue;
-    for (const path of descriptor.oauthRoutes.paths) paths.push(path);
+    for (const path of descriptor.oauthCallbackPaths ?? []) paths.push(path);
   }
   return paths;
 }

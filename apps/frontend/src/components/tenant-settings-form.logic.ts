@@ -23,7 +23,6 @@ export type FormDraft = {
   granularFlags: GranularFlags;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
-  allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
   policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string;
@@ -81,7 +80,6 @@ export function buildDraft(settings: TenantSettings): FormDraft {
     granularFlags: toGranularFlags(settings.approvalPolicy),
     approvalReviewer: settings.approvalReviewer,
     allowCommandExecution: settings.allowCommandExecution,
-    allowUserTokenForwarding: settings.allowUserTokenForwarding,
     autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
     policyEnforcementMode: settings.policyEnforcementMode,
     developerInstructions: settings.developerInstructions ?? "",

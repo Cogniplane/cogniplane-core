@@ -13,7 +13,7 @@ describe("SafeMarkdown links", () => {
     render(<SafeMarkdown>{"[Vendor docs](https://vendor.example/docs)"}</SafeMarkdown>);
 
     // react-markdown is lazy-loaded, so the link appears after the chunk resolves.
-    const link = await screen.findByRole("link", { name: /Vendor docs/ });
+    const link = await screen.findByRole("link", { name: /Vendor docs/ }, { timeout: 5_000 });
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     expect(link.textContent).toContain("[external: vendor.example]");
@@ -34,5 +34,15 @@ describe("SafeMarkdown links", () => {
     const link = await screen.findByRole("link", { name: "Settings" });
     expect(link.hasAttribute("target")).toBe(false);
     expect(link.hasAttribute("rel")).toBe(false);
+  });
+});
+
+describe("SafeMarkdown images", () => {
+  it("routes markdown images through the shared renderer", async () => {
+    render(<SafeMarkdown>{"![leak](https://attacker.example/pixel.png)"}</SafeMarkdown>);
+
+    const link = await screen.findByRole("link");
+    expect(link.getAttribute("href")).toBe("https://attacker.example/pixel.png");
+    expect(screen.queryByRole("img")).toBeNull();
   });
 });

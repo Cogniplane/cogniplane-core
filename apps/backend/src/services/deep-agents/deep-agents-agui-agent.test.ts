@@ -1,6 +1,6 @@
 // Track B AG-UI spike/slice-1 — proves the four handoff invariants hold when an
 // @ag-ui/client AbstractAgent subclass drives the REAL mapper pipeline
-// (streamEvents v2 → mapDeepAgentsEvent → runtimeEventToAGUI) through the
+// (streamEvents v2 to AG-UI) through the
 // AGUITurnBackend seam. No infra: a fake backend stands in for the live adapter.
 
 import { EventSchemas, EventType, type BaseEvent } from "@ag-ui/client";

@@ -1,17 +1,19 @@
-FROM node:24-trixie-slim
+FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9
 
 # NEXT_PUBLIC_* values are baked into the client bundle by `next build`, so
 # they MUST be set as ENV before the build step. Compose passes them as
 # build args; nothing about them is secret.
 ARG NEXT_PUBLIC_API_URL=http://localhost:3001
-ARG NEXT_PUBLIC_DEV_USER_ID=local-dev-user
-ARG NEXT_PUBLIC_DEV_TENANT_ID=local-dev-tenant
+ARG NEXT_PUBLIC_DEV_USER_ID=""
+ARG NEXT_PUBLIC_DEV_TENANT_ID=""
+ARG NEXT_PUBLIC_DEV_AUTH_KEY=""
+ARG COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD=""
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_DEV_USER_ID=$NEXT_PUBLIC_DEV_USER_ID
 ENV NEXT_PUBLIC_DEV_TENANT_ID=$NEXT_PUBLIC_DEV_TENANT_ID
-# Acknowledge that this stack ships dev-headers auth in a production build.
-# See next.config.ts for the rationale and the corresponding guard.
-ENV COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD=1
+ENV NEXT_PUBLIC_DEV_AUTH_KEY=$NEXT_PUBLIC_DEV_AUTH_KEY
+ENV COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD=$COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD
+ENV NEXT_TELEMETRY_DISABLED=1
 
 WORKDIR /app
 
@@ -36,10 +38,9 @@ RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build
 
-RUN groupadd -g 1001 appgroup && useradd -u 1001 -g appgroup -m -s /bin/bash appuser \
-  && chown -R appuser:appgroup /app
-
-USER appuser
+# The official Node image already provides an unprivileged uid 1000 user.
+# Build artifacts are world-readable, so no recursive ownership pass is needed.
+USER node
 
 EXPOSE 3000
 
@@ -47,4 +48,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
 
-CMD ["pnpm", "--filter", "@cogniplane/frontend", "exec", "next", "start", "--hostname", "0.0.0.0", "--port", "3000"]
+CMD ["node", "apps/frontend/node_modules/next/dist/bin/next", "start", "apps/frontend", "--hostname", "0.0.0.0", "--port", "3000"]

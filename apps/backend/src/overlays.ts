@@ -9,6 +9,8 @@
 // it with the supplied input, and have `attachRoutes` register its routes
 // against the host Fastify app.
 
+import type { IntegrationRegistry } from "./services/integrations/integration-registry.js";
+
 import type { FastifyInstance } from "fastify";
 
 import type { AppConfig } from "./config.js";
@@ -34,6 +36,7 @@ export type AttachOverlaysInput = {
     sessions: SessionStore;
   };
   piiScanEnqueuer: PiiArtifactScanEnqueuer;
+  integrationDescriptors: IntegrationRegistry;
   runtimeInvalidator: RuntimeInvalidator;
   managedToolCatalog: ManagedToolCatalog;
   managedToolFactoryRegistry: ManagedToolFactoryRegistry;

@@ -53,7 +53,6 @@ export type RuntimeManifest = {
     sandboxMode: string;
     networkMode: string;
     allowCommandExecution: boolean;
-    allowUserTokenForwarding: boolean;
     autoApproveReadOnlyTools: boolean;
     webSearchMode: string;
     enabledToolIds: string[];

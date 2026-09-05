@@ -38,6 +38,7 @@ function makeInput(overrides?: {
     toolContexts: stub<SchedulerWorkerInput["toolContexts"]>(),
     runtimeAdapter: stub<SchedulerWorkerInput["runtimeAdapter"]>(),
     dynamicConfig: stub<SchedulerWorkerInput["dynamicConfig"]>(),
+    customModels: stub<SchedulerWorkerInput["customModels"]>(),
     providerCredentials: stub<SchedulerWorkerInput["providerCredentials"]>(),
     auditEvents: stub<SchedulerWorkerInput["auditEvents"]>(),
     logger: createSilentLogger(),

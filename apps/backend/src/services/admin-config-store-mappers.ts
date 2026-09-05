@@ -154,7 +154,6 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
     mode: assertEnum(row.mode, ["managed", "proxy"], "MCP server mode"),
     routePath: String(row.route_path),
     upstreamUrl: row.upstream_url ? String(row.upstream_url) : null,
-    headersAllowlist: toStringArray(row.headers_allowlist),
     version: Number(row.version),
     configHash: String(row.config_hash),
     enabled: Boolean(row.enabled),

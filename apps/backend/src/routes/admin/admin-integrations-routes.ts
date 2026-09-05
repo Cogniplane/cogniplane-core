@@ -28,10 +28,13 @@ import {
 
 export type AdminIntegrationsRouteStores = {
   config: AppConfig;
-  integrationRegistry: IntegrationRegistryService;
-  integrationStates: IntegrationStateStore;
-  auditEvents: AuditEventStore;
-  runtimeAdapter: RuntimeAdapter;
+  integrationRegistry: Pick<
+    IntegrationRegistryService,
+    "getIntegrationsForAdmin" | "isReadyToEnable"
+  >;
+  integrationStates: Pick<IntegrationStateStore, "get" | "upsert" | "clearConfig">;
+  auditEvents: Pick<AuditEventStore, "create">;
+  runtimeAdapter: Pick<RuntimeAdapter, "invalidateTenantRuntimes">;
 };
 
 const integrationIdParamsSchema = z.object({

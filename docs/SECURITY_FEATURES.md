@@ -150,11 +150,11 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 ## 6. Human-in-the-Loop Approvals
 
 ### 6.1 Runtime approval-policy gating
-- `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions. When a request needs review, the frontend receives `framework:approval_required`; the user resolves it via `POST /approvals/:approvalId/decision`.
+- `tenant_settings.approval_policy` gates runtime-native shell/file/permission actions. When a request needs review, the frontend receives an AG-UI `CUSTOM` event named `approval_required`; the user resolves it via `POST /approvals/:approvalId/decision`.
 - File: `apps/backend/src/routes/approvals.ts`.
 
 ### 6.2 Interrupt-based native HITL
-- Gated tools (all MCP gateway tools plus the mutating built-ins `execute`/`write_file`/`edit_file`) pause the LangGraph run **before execution** via `interruptOn` and checkpoint. The adapter persists an `approvals` row, emits `framework:approval_required`, and resumes the graph with the decision.
+- Gated tools (all MCP gateway tools plus the mutating built-ins `execute`/`write_file`/`edit_file`) pause the LangGraph run **before execution** via `interruptOn` and checkpoint. The adapter persists an `approvals` row, emits an AG-UI `CUSTOM` event named `approval_required`, and resumes the graph with the decision.
 - Resume is **keyed per interrupt id**, so concurrent interrupts (parallel subagents each hitting a gated tool) cannot mis-route decisions.
 - Files: `apps/backend/src/services/deep-agents/deep-agents-graph.ts`, `apps/backend/src/services/deep-agents/deep-agents-runtime-adapter.ts`.
 
@@ -163,14 +163,15 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 6.4 Wall-clock TTL on pending approvals
 - **TTL:** `APPROVAL_REQUEST_TTL_MS` (default 10 min).
-- **On expiry:** the paused graph is resumed with a reject, `status='expired'` in DB, `approval.expired` audit event, `framework:runtime_notice` SSE (`noticeId = approval-expired:<id>`).
+- **On expiry:** the paused graph is resumed with a reject, `status='expired'` in DB, an `approval.expired` audit event is written, and an AG-UI `CUSTOM` event named `runtime_notice` is emitted (`noticeId = approval-expired:<id>`).
 - **Crash recovery:** the row carries a DB-level `expires_at`, so a process death that kills the in-memory timer still lets the startup sweep expire stuck `pending` rows.
 - Files: `apps/backend/src/services/runtime/approval-cleanup.ts`, `apps/backend/src/services/runtime/stale-approval-sweeper.ts`.
 
 ### 6.5 Policy Center approvals
-- Policy Center rules can return `require_approval` for MCP tool calls. The MCP gateway holds the JSON-RPC response open, persists an `approvals` row through the policy approval coordinator, emits the same `framework:approval_required` SSE event, then proceeds or denies based on the decision.
-- No active turn means no safe human prompt path, so unattended policy approvals fail closed.
-- Files: `apps/backend/src/routes/mcp.ts`, `apps/backend/src/services/policy/*`.
+- Policy Center rules can return `require_approval` for MCP tool calls. Policy Center and native approval share one checkpointed graph interrupt and one `approvals` row.
+- The runtime attaches a call-bound proof. The gateway accepts it only when the approved row matches the session, user, tool, server, tool context, and canonical argument hash; missing or mismatched proof is denied.
+- Scheduled turns use the same durable pause, and checkpoint replay preserves the original proof across process restart.
+- Files: `apps/backend/src/routes/mcp.ts`, `apps/backend/src/services/deep-agents/deep-agents-graph.ts`, `apps/backend/src/services/policy/*`.
 
 ---
 
@@ -449,14 +450,13 @@ Per-tenant settings in `tenant_settings` (one row per tenant; `system` row is pl
 | `auto_approve_read_only_tools` | Skip native prompts for read-only tools |
 | `policy_enforcement_mode` | Policy Center tenant mode: `monitor` records matched decisions; `enforce` gates matched actions |
 | `allow_command_execution` | Permit shell-command tool calls |
-| `allow_user_token_forwarding` | Permit forwarding user OAuth tokens to integration tools |
 | `enabled_tool_ids` | Allowlist of managed tools available to the runtime |
 | `enabled_mcp_server_ids` | Allowlist of MCP servers wired into the workspace |
 | `developer_instructions` | Per-tenant system-prompt overlay |
 
 File: `apps/backend/src/services/tenant-settings-store.ts`.
 
-Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. Active dimensions are `toolNames`, `categories` (MCP server id), `severities`, and `turnContexts`; effects are `allow`, `require_approval`, and `block`. Only matched rules write `policy_decision` evidence rows.
+Policy Center rules live in `policy_rule` and are evaluated before and at the MCP gateway. Active dimensions are `toolNames`, `categories` (managed-tool domain or proxy MCP server id), `severities`, and `turnContexts`; effects are `allow`, `require_approval`, and `block`. Only matched rules write `policy_decision` evidence rows.
 
 ---
 
@@ -547,7 +547,7 @@ Policy Center rules live in `policy_rule` and are evaluated at the MCP gateway. 
 | MCP proxy signature | `apps/backend/src/lib/mcp-proxy-signature.ts` |
 | MCP gateway | `apps/backend/src/routes/mcp.ts` |
 | Native HITL (interrupts + approval loop) | `apps/backend/src/services/deep-agents/deep-agents-runtime-adapter.ts`, `apps/backend/src/services/deep-agents/deep-agents-graph.ts` |
-| Policy approval coordinator (gateway) | `apps/backend/src/services/runtime/policy-approval-coordinator.ts` |
+| Policy approval proof | `apps/backend/src/services/policy/policy-approval-proof.ts` |
 | Rate limits / quotas | `apps/backend/src/services/request-limits.ts` |
 | Security headers | `apps/backend/src/lib/security-headers.ts` |
 | CORS | `apps/backend/src/lib/cors.ts` |

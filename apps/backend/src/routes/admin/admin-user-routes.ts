@@ -26,8 +26,8 @@ const setBetaTesterBodySchema = z.object({
 export async function registerAdminUserRoutes(
   app: FastifyInstance,
   stores: {
-    tenantMembers: TenantMemberStore;
-    auditEvents: AuditEventStore;
+    tenantMembers: Pick<TenantMemberStore, "listTenantMembers" | "setUserBetaTester">;
+    auditEvents: Pick<AuditEventStore, "create">;
   }
 ): Promise<void> {
   app.get("/admin/users", withAdmin(app, async (request) => {

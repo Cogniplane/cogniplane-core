@@ -31,18 +31,22 @@ import {
   SkillRevisionFileResponseSchema,
   SkillRevisionsListResponseSchema,
   TenantProviderKeyUpdateResponseSchema,
+  type TenantProviderKeyUpdateRequest,
   TenantMarketplaceManifestUrlUpdateResponseSchema,
+  TenantDetailsSchema,
   TenantOkResponseSchema,
   TenantPiiProtectionUpdateResponseSchema,
   TenantSettingsEnvelopeSchema
 } from "@cogniplane/shared-types";
 
 import { buildMetricsQuery } from "./admin-pii-utils";
-import { request } from "./api-client";
+import { request, requestOptionalOn404 } from "./api-client";
 import { parseResponse } from "./validate-response";
 
 import type {
   AdminMcpServer,
+  AdminMcpServerCreateRequest,
+  AdminMcpServerUpdateRequest,
   AdminRuntimeConfig,
   AdminSessionDetailResponse,
   AdminSessionsListParams,
@@ -90,96 +94,6 @@ export type {
 } from "@cogniplane/shared-types";
 
 import type { ModelProvider } from "@cogniplane/shared-types";
-
-type TenantGithubSettings = TenantDetails["settings"]["github"];
-type TenantMicrosoftOAuthSettings = TenantDetails["settings"]["microsoftOAuth"];
-type TenantDetailsResponse = {
-  tenantId: string;
-  tenantName: string;
-  slug: string;
-  ssoProvider: string | null;
-  plan: string;
-  createdAt: string;
-  updatedAt: string;
-  settings?: {
-    anthropicApiKeyConfigured?: boolean;
-    providerKeys?: Partial<Record<ModelProvider, boolean>>;
-    skillMarketplaceManifestUrl?: string | null;
-    piiProtection?: PiiProtectionSettings;
-    github?: Partial<TenantGithubSettings>;
-    microsoftOAuth?: Partial<TenantMicrosoftOAuthSettings>;
-    [key: string]: unknown;
-  };
-};
-
-const DEFAULT_PII_PROTECTION: PiiProtectionSettings = {
-  enabled: false,
-  mode: "off",
-  rawRetention: "never",
-  provider: { type: "openai-compatible", model: "" },
-  scopes: { chatPrompts: true, uploads: true, microsoftImports: true },
-  actions: { reportToAdmins: true },
-  detectors: {
-    useRulesFirst: true,
-    entityTypes: ["email", "phone", "person_name", "address", "financial", "government_id"]
-  }
-};
-
-const DEFAULT_TENANT_GITHUB_SETTINGS: TenantGithubSettings = {
-  configured: false
-};
-
-const DEFAULT_TENANT_MICROSOFT_OAUTH_SETTINGS: TenantMicrosoftOAuthSettings = {
-  configured: false
-};
-
-function normalizeTenantDetails(tenant: TenantDetailsResponse): TenantDetails {
-  const settings = tenant.settings ?? {};
-  const github =
-    settings.github && typeof settings.github === "object"
-      ? settings.github
-      : {};
-  const microsoftOAuth =
-    settings.microsoftOAuth && typeof settings.microsoftOAuth === "object"
-      ? settings.microsoftOAuth
-      : {};
-
-  return {
-    tenantId: tenant.tenantId,
-    tenantName: tenant.tenantName,
-    slug: tenant.slug,
-    ssoProvider: tenant.ssoProvider,
-    plan: tenant.plan,
-    createdAt: tenant.createdAt,
-    updatedAt: tenant.updatedAt,
-    settings: {
-      ...settings,
-      anthropicApiKeyConfigured: Boolean(settings.anthropicApiKeyConfigured),
-      providerKeys: {
-        anthropic: Boolean(
-          settings.providerKeys?.anthropic ?? settings.anthropicApiKeyConfigured
-        ),
-        openai: Boolean(settings.providerKeys?.openai),
-        google: Boolean(settings.providerKeys?.google),
-        openrouter: Boolean(settings.providerKeys?.openrouter),
-        zai: Boolean(settings.providerKeys?.zai)
-      },
-      skillMarketplaceManifestUrl:
-        typeof settings.skillMarketplaceManifestUrl === "string"
-          ? settings.skillMarketplaceManifestUrl
-          : null,
-      piiProtection: settings.piiProtection ?? DEFAULT_PII_PROTECTION,
-      github: {
-        ...DEFAULT_TENANT_GITHUB_SETTINGS,
-        ...github
-      },
-      microsoftOAuth: {
-        ...DEFAULT_TENANT_MICROSOFT_OAUTH_SETTINGS,
-        ...microsoftOAuth
-      }
-    }
-  };
-}
 
 export async function listAdminSkills(): Promise<AdminSkill[]> {
   const raw = await request<unknown>("/admin/skills");
@@ -294,17 +208,9 @@ export async function listAdminManagedTools() {
   return parseResponse(AdminManagedToolsListResponseSchema, raw, "GET /admin/managed-tools").tools;
 }
 
-export async function createAdminMcpServer(input: {
-  serverId: string;
-  serverName: string;
-  description?: string | null;
-  transportKind?: "http";
-  mode: "managed" | "proxy";
-  routePath: string;
-  upstreamUrl?: string | null;
-  headersAllowlist?: string[];
-  enabled?: boolean;
-}): Promise<AdminMcpServer> {
+export async function createAdminMcpServer(
+  input: AdminMcpServerCreateRequest
+): Promise<AdminMcpServer> {
   const raw = await request<unknown>("/admin/mcp-servers", {
     method: "POST",
     body: JSON.stringify(input)
@@ -314,16 +220,7 @@ export async function createAdminMcpServer(input: {
 
 export async function updateAdminMcpServer(
   serverId: string,
-  input: {
-    serverName: string;
-    description?: string | null;
-    transportKind?: "http";
-    mode: "managed" | "proxy";
-    routePath: string;
-    upstreamUrl?: string | null;
-    headersAllowlist?: string[];
-    enabled?: boolean;
-  }
+  input: AdminMcpServerUpdateRequest
 ): Promise<AdminMcpServer> {
   const raw = await request<unknown>(`/admin/mcp-servers/${serverId}`, {
     method: "PUT",
@@ -457,7 +354,6 @@ export async function updateTenantAgentSettings(input: {
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: "user" | "guardian_subagent";
   allowCommandExecution: boolean;
-  allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
   policyEnforcementMode: PolicyEnforcementMode;
   developerInstructions: string | null;
@@ -491,19 +387,11 @@ export async function getRuntimeConfig(): Promise<AdminRuntimeConfig> {
 }
 
 export async function getTenantDetails(): Promise<TenantDetails> {
-  // The /tenant route returns the raw permissive shape; normalize to fill in
-  // default sub-objects before validating against the canonical TenantDetails
-  // schema. Validation acts as a safety net on the normalize() output rather
-  // than the raw response, since the raw shape is intentionally looser.
-  const raw = await request<TenantDetailsResponse>("/tenant");
-  return normalizeTenantDetails(raw);
+  const raw = await request<unknown>("/tenant");
+  return parseResponse(TenantDetailsSchema, raw, "GET /tenant");
 }
 
-export async function updateTenantProviderKey(input: {
-  provider: ModelProvider;
-  // Empty string clears the provider's stored key (off-boarding / revocation).
-  apiKey: string;
-}) {
+export async function updateTenantProviderKey(input: TenantProviderKeyUpdateRequest) {
   const raw = await request<unknown>("/tenant/settings", {
     method: "PUT",
     body: JSON.stringify(input)
@@ -565,15 +453,8 @@ export async function getPiiProviderStatus(): Promise<PiiProviderStatus | null> 
   // 404 means the breaker isn't wired (PII_BREAKER_ENABLED=false). Treat
   // that as "no status to show" rather than an error so the UI can hide
   // the indicator instead of bleeding red.
-  try {
-    const raw = await request<unknown>("/admin/pii/provider-status");
-    return parseResponse(PiiProviderStatusSchema, raw, "GET /admin/pii/provider-status");
-  } catch (error) {
-    if (error instanceof Error && /404/.test(error.message)) {
-      return null;
-    }
-    throw error;
-  }
+  const raw = await requestOptionalOn404<unknown>("/admin/pii/provider-status");
+  return raw === undefined ? null : parseResponse(PiiProviderStatusSchema, raw, "GET /admin/pii/provider-status");
 }
 
 export async function getAdminPiiMetrics(input: {
@@ -582,15 +463,8 @@ export async function getAdminPiiMetrics(input: {
   to?: string;
 }): Promise<PiiActivityMetrics | null> {
   const params = buildMetricsQuery(input.range, input.from, input.to);
-  try {
-    const raw = await request<unknown>(`/admin/pii/metrics?${params.toString()}`);
-    return parseResponse(PiiActivityMetricsSchema, raw, "GET /admin/pii/metrics");
-  } catch (error) {
-    if (error instanceof Error && /404/.test(error.message)) {
-      return null;
-    }
-    throw error;
-  }
+  const raw = await requestOptionalOn404<unknown>(`/admin/pii/metrics?${params.toString()}`);
+  return raw === undefined ? null : parseResponse(PiiActivityMetricsSchema, raw, "GET /admin/pii/metrics");
 }
 
 export async function getAdminPiiTop(input: {
@@ -603,13 +477,8 @@ export async function getAdminPiiTop(input: {
   const params = buildMetricsQuery(input.range, input.from, input.to);
   params.set("groupBy", input.groupBy);
   if (input.limit !== undefined) params.set("limit", String(input.limit));
-  try {
-    const raw = await request<unknown>(`/admin/pii/top?${params.toString()}`);
-    return parseResponse(PiiTopResponseSchema, raw, "GET /admin/pii/top");
-  } catch (error) {
-    if (error instanceof Error && /404/.test(error.message)) return null;
-    throw error;
-  }
+  const raw = await requestOptionalOn404<unknown>(`/admin/pii/top?${params.toString()}`);
+  return raw === undefined ? null : parseResponse(PiiTopResponseSchema, raw, "GET /admin/pii/top");
 }
 
 export async function getAdminPiiJobsStats(input: {
@@ -618,13 +487,8 @@ export async function getAdminPiiJobsStats(input: {
   to?: string;
 }): Promise<PiiJobsStatsResponse | null> {
   const params = buildMetricsQuery(input.range, input.from, input.to);
-  try {
-    const raw = await request<unknown>(`/admin/pii/jobs/stats?${params.toString()}`);
-    return parseResponse(PiiJobsStatsResponseSchema, raw, "GET /admin/pii/jobs/stats");
-  } catch (error) {
-    if (error instanceof Error && /404/.test(error.message)) return null;
-    throw error;
-  }
+  const raw = await requestOptionalOn404<unknown>(`/admin/pii/jobs/stats?${params.toString()}`);
+  return raw === undefined ? null : parseResponse(PiiJobsStatsResponseSchema, raw, "GET /admin/pii/jobs/stats");
 }
 
 export async function getAdminPiiRecent(input: {
@@ -639,13 +503,8 @@ export async function getAdminPiiRecent(input: {
     params.set("actions", input.actions.join(","));
   }
   if (input.limit !== undefined) params.set("limit", String(input.limit));
-  try {
-    const raw = await request<unknown>(`/admin/pii/recent?${params.toString()}`);
-    return parseResponse(PiiRecentResponseSchema, raw, "GET /admin/pii/recent");
-  } catch (error) {
-    if (error instanceof Error && /404/.test(error.message)) return null;
-    throw error;
-  }
+  const raw = await requestOptionalOn404<unknown>(`/admin/pii/recent?${params.toString()}`);
+  return raw === undefined ? null : parseResponse(PiiRecentResponseSchema, raw, "GET /admin/pii/recent");
 }
 
 

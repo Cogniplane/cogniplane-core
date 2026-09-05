@@ -1,3 +1,4 @@
+import { Response, type fetch as undiciFetch } from "undici";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -14,7 +15,7 @@ import { DynamicConfigService, parseGitHubSkillSource } from "./dynamic-config-s
 import { ManagedToolCatalog } from "./managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "./managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "./managed-tools/register-builtin-managed-tools.js";
-import { LocalSkillBundleStorage, type SkillBundleStorage } from "./skills/skill-bundle-storage.js";
+import { LocalSkillBundleStorage } from "./skills/skill-bundle-storage.js";
 
 function makeManagedToolCatalog(): ManagedToolCatalog {
   const catalog = new ManagedToolCatalog();
@@ -25,7 +26,113 @@ function makeManagedToolCatalog(): ManagedToolCatalog {
 type CapturedImport = {
   skillId: string;
   sourceType: string;
-  bundleStorageUri: string;
+  bundleStorageUri: string | null;
+};
+
+type DynamicConfigStores = ConstructorParameters<typeof DynamicConfigService>[1];
+type DynamicConfigStoreOverrides = {
+  [StoreName in keyof DynamicConfigStores]?: Partial<DynamicConfigStores[StoreName]>;
+};
+type ImportSkillBundleInput = Parameters<DynamicConfigStores["skillRevisions"]["importSkillBundle"]>[1];
+type DynamicConfigSkillBundleStorage = ConstructorParameters<typeof DynamicConfigService>[2];
+
+function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigStores {
+  return {
+    skills: {
+      async listSkills() { return []; },
+      async disableSkill() { return null; },
+      async getSkillOwnerTenantId() { return null; },
+      async setSkillPublished() { return null; },
+      ...overrides.skills
+    },
+    skillRevisions: {
+      async listSkillRevisions() { return []; },
+      async getSkillRevision() { return null; },
+      async activateSkillRevision() { return null; },
+      async listAllSkillRevisions() { return []; },
+      async listActiveRuntimeSkillReferences() { return []; },
+      async deleteSkillRevision() { return null; },
+      async countSkillRevisionsByBundleStorageUri() { return 0; },
+      async importSkillBundle() {
+        throw new Error("importSkillBundle should not be called");
+      },
+      ...overrides.skillRevisions
+    },
+    mcpServers: {
+      async listMcpServers() { return []; },
+      async getMcpServer() { return null; },
+      async createMcpServer() { throw new Error("createMcpServer should not be called"); },
+      async updateMcpServer() { throw new Error("updateMcpServer should not be called"); },
+      async disableMcpServer() { return null; },
+      async setMcpServerPublished() { return null; },
+      ...overrides.mcpServers
+    },
+    tenantSettings: {
+      async get() { return null; },
+      async upsert() { throw new Error("upsert should not be called"); },
+      ...overrides.tenantSettings
+    }
+  };
+}
+
+function makeImportedSkillBundle(
+  input: ImportSkillBundleInput,
+  revisionNumber: number,
+  bundleStorageUri: string | null
+): ImportedSkillBundleRecord {
+  const createdAt = new Date().toISOString();
+  return {
+    skill: {
+      skillId: input.skillId,
+      skillName: input.skillName,
+      description: input.description,
+      instructions: input.instructions,
+      version: 0,
+      contentHash: input.bundleHash,
+      enabled: false,
+      isPublished: false,
+      createdBy: input.createdBy,
+      createdAt,
+      updatedAt: createdAt,
+      activeRevisionId: null,
+      activeSourceType: null,
+      activeBundleName: null,
+      activeBundleStorageUri: null,
+      activeBundleHash: null,
+      activeValidationStatus: null,
+      activeReviewStatus: null,
+      isInherited: false
+    },
+    revision: {
+      skillRevisionId: revisionNumber,
+      skillId: input.skillId,
+      revisionNumber,
+      sourceType: input.sourceType,
+      sourceLabel: input.sourceLabel,
+      bundleName: input.bundleName,
+      bundleStorageUri,
+      bundleHash: input.bundleHash,
+      validationStatus: input.validationStatus,
+      validationMessages: input.validationMessages,
+      reviewStatus: "pending_review",
+      reviewNotes: null,
+      metadata: input.metadata,
+      createdBy: input.createdBy,
+      createdAt,
+      reviewedBy: null,
+      reviewedAt: null,
+      activatedAt: null
+    }
+  };
+}
+
+const unusedSkillBundleStorage: DynamicConfigSkillBundleStorage = {
+  async storeBundle() {
+    throw new Error("storeBundle should not be called");
+  },
+  async deleteBundle() {
+    throw new Error("deleteBundle should not be called");
+  }
 };
 
 test("parseGitHubSkillSource supports tree URLs and validates subdirectories", () => {
@@ -79,83 +186,19 @@ test("DynamicConfigService imports a public GitHub skill bundle", async () => {
   const capturedImports: CapturedImport[] = [];
   const service = new DynamicConfigService(
     createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache") }),
-    {
+    makeStores({
       skillRevisions: {
-        async listSkillRevisions() { return []; },
-        async getSkillRevision() { return null; },
-        async activateSkillRevision() { return null; },
-        async listAllSkillRevisions() { return []; },
-        async listActiveRuntimeSkillReferences(_tenantId: string) { return []; },
-        async deleteSkillRevision() { return null; },
-        async countSkillRevisionsByBundleStorageUri() { return 0; },
-        async importSkillBundle(_tenantId: string, input: {
-          skillId: string;
-          skillName: string;
-          description: string;
-          instructions: string;
-          sourceType: string;
-          sourceLabel: string;
-          bundleName: string;
-          bundleHash: string;
-          validationStatus: string;
-          validationMessages: Array<Record<string, unknown>>;
-          metadata: Record<string, unknown>;
-          createdBy: string;
-          storeBundle: (input: { revisionNumber: number }) => Promise<{ storageUri: string | null }>;
-        }) {
+        async importSkillBundle(_tenantId, input) {
           const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
           capturedImports.push({
             skillId: input.skillId,
             sourceType: input.sourceType,
             bundleStorageUri: storageUri
           });
-          return {
-            skill: {
-              skillId: input.skillId,
-              skillName: input.skillName,
-              description: input.description,
-              instructions: input.instructions,
-              version: 0,
-              contentHash: input.bundleHash,
-              enabled: false,
-              createdBy: input.createdBy,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-              activeRevisionId: null,
-              activeSourceType: null,
-              activeBundleName: null,
-              activeBundleStorageUri: null,
-              activeBundleHash: null,
-              activeValidationStatus: null,
-              activeReviewStatus: null
-            },
-            revision: {
-              skillRevisionId: 1,
-              skillId: input.skillId,
-              revisionNumber: 1,
-              sourceType: input.sourceType,
-              sourceLabel: input.sourceLabel,
-              bundleName: input.bundleName,
-              bundleStorageUri: storageUri,
-              bundleHash: input.bundleHash,
-              validationStatus: input.validationStatus,
-              validationMessages: [],
-              reviewStatus: "pending_review",
-              reviewNotes: null,
-              metadata: input.metadata,
-              createdBy: input.createdBy,
-              createdAt: new Date().toISOString(),
-              reviewedBy: null,
-              reviewedAt: null,
-              activatedAt: null
-            }
-          } as ImportedSkillBundleRecord;
+          return makeImportedSkillBundle(input, 1, storageUri);
         }
-      },
-      skills: {} as never,
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+      }
+    }),
     storage,
     makeManagedToolCatalog(),
     (async (url: string | URL) => {
@@ -175,7 +218,7 @@ test("DynamicConfigService imports a public GitHub skill bundle", async () => {
       }
 
       throw new Error(`Unexpected fetch URL: ${value}`);
-    }) as typeof fetch
+    }) as typeof undiciFetch
   );
 
   const imported = await service.importSkillBundleFromGithub("test-tenant", {
@@ -203,23 +246,7 @@ test("DynamicConfigService rejects oversized zip uploads before extraction", asy
       SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache"),
       ARTIFACT_MAX_UPLOAD_BYTES: 8
     }),
-    {
-      skillRevisions: {
-        async listSkillRevisions() { return []; },
-        async getSkillRevision() { return null; },
-        async activateSkillRevision() { return null; },
-        async listAllSkillRevisions() { return []; },
-        async listActiveRuntimeSkillReferences(_tenantId: string) { return []; },
-        async deleteSkillRevision() { return null; },
-        async countSkillRevisionsByBundleStorageUri() { return 0; },
-        async importSkillBundle() {
-          throw new Error("importSkillBundle should not be called");
-        }
-      },
-      skills: {} as never,
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+    makeStores(),
     new LocalSkillBundleStorage(path.join(root, "cache")),
     makeManagedToolCatalog()
   );
@@ -257,84 +284,19 @@ test("DynamicConfigService imports zip bundles from nested archive wrappers", as
   const capturedImports: CapturedImport[] = [];
   const service = new DynamicConfigService(
     createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache") }),
-    {
+    makeStores({
       skillRevisions: {
-        async listSkillRevisions() { return []; },
-        async getSkillRevision() { return null; },
-        async activateSkillRevision() { return null; },
-        async listAllSkillRevisions() { return []; },
-        async listActiveRuntimeSkillReferences(_tenantId: string) { return []; },
-        async deleteSkillRevision() { return null; },
-        async countSkillRevisionsByBundleStorageUri() { return 0; },
-        async importSkillBundle(_tenantId: string, input: {
-          skillId: string;
-          skillName: string;
-          description: string;
-          instructions: string;
-          sourceType: string;
-          sourceLabel: string;
-          bundleName: string;
-          bundleHash: string;
-          validationStatus: string;
-          validationMessages: Array<Record<string, unknown>>;
-          metadata: Record<string, unknown>;
-          createdBy: string;
-          storeBundle: (input: { revisionNumber: number }) => Promise<{ storageUri: string | null }>;
-        }) {
+        async importSkillBundle(_tenantId, input) {
           const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
           capturedImports.push({
             skillId: input.skillId,
             sourceType: input.sourceType,
             bundleStorageUri: storageUri
           });
-
-          return {
-            skill: {
-              skillId: input.skillId,
-              skillName: input.skillName,
-              description: input.description,
-              instructions: input.instructions,
-              version: 0,
-              contentHash: input.bundleHash,
-              enabled: false,
-              createdBy: input.createdBy,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-              activeRevisionId: null,
-              activeSourceType: null,
-              activeBundleName: null,
-              activeBundleStorageUri: null,
-              activeBundleHash: null,
-              activeValidationStatus: null,
-              activeReviewStatus: null
-            },
-            revision: {
-              skillRevisionId: 1,
-              skillId: input.skillId,
-              revisionNumber: 1,
-              sourceType: input.sourceType,
-              sourceLabel: input.sourceLabel,
-              bundleName: input.bundleName,
-              bundleStorageUri: storageUri,
-              bundleHash: input.bundleHash,
-              validationStatus: input.validationStatus,
-              validationMessages: [],
-              reviewStatus: "pending_review",
-              reviewNotes: null,
-              metadata: input.metadata,
-              createdBy: input.createdBy,
-              createdAt: new Date().toISOString(),
-              reviewedBy: null,
-              reviewedAt: null,
-              activatedAt: null
-            }
-          } as ImportedSkillBundleRecord;
+          return makeImportedSkillBundle(input, 1, storageUri);
         }
-      },
-      skills: {} as never,
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+      }
+    }),
     new LocalSkillBundleStorage(path.join(root, "cache")),
     makeManagedToolCatalog()
   );
@@ -359,27 +321,13 @@ test("DynamicConfigService rejects inline edits of inherited (system) skills fro
 
   const service = new DynamicConfigService(
     createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache") }),
-    {
-      skillRevisions: {
-        async listSkillRevisions() { return []; },
-        async getSkillRevision() { return null; },
-        async activateSkillRevision() { return null; },
-        async listAllSkillRevisions() { return []; },
-        async listActiveRuntimeSkillReferences(_tenantId: string) { return []; },
-        async deleteSkillRevision() { return null; },
-        async countSkillRevisionsByBundleStorageUri() { return 0; },
-        async importSkillBundle() {
-          throw new Error("importSkillBundle should not be called for inherited skills");
-        }
-      },
+    makeStores({
       skills: {
-        async getSkillOwnerTenantId(_tenantId: string, _skillId: string) {
+        async getSkillOwnerTenantId() {
           return "system";
         }
-      } as never,
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+      }
+    }),
     new LocalSkillBundleStorage(path.join(root, "cache")),
     makeManagedToolCatalog()
   );
@@ -402,32 +350,20 @@ test("DynamicConfigService allows inline edits when the tenant owns the skill", 
   let importCalled = false;
   const service = new DynamicConfigService(
     createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache") }),
-    {
+    makeStores({
       skillRevisions: {
-        async listSkillRevisions() { return []; },
-        async getSkillRevision() { return null; },
-        async activateSkillRevision() { return null; },
-        async listAllSkillRevisions() { return []; },
-        async listActiveRuntimeSkillReferences(_tenantId: string) { return []; },
-        async deleteSkillRevision() { return null; },
-        async countSkillRevisionsByBundleStorageUri() { return 0; },
-        async importSkillBundle(_tenantId: string, input: { skillId: string; storeBundle: (i: { revisionNumber: number }) => Promise<{ storageUri: string | null }> }) {
+        async importSkillBundle(_tenantId, input) {
           importCalled = true;
-          await input.storeBundle({ revisionNumber: 2 });
-          return {
-            skill: { skillId: input.skillId } as never,
-            revision: { skillRevisionId: 2, sourceType: "inline" } as never
-          } as ImportedSkillBundleRecord;
+          const { storageUri } = await input.storeBundle({ revisionNumber: 2 });
+          return makeImportedSkillBundle(input, 2, storageUri);
         }
       },
       skills: {
-        async getSkillOwnerTenantId(tenantId: string, _skillId: string) {
+        async getSkillOwnerTenantId(tenantId) {
           return tenantId;
         }
-      } as never,
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+      }
+    }),
     new LocalSkillBundleStorage(path.join(root, "cache")),
     makeManagedToolCatalog()
   );
@@ -456,7 +392,7 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
       SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache"),
       SKILL_BUNDLE_RETENTION_DAYS: 30
     }),
-    {
+    makeStores({
       skills: {
         async listSkills() {
           return [
@@ -478,13 +414,11 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
               activeBundleStorageUri: `file://${path.join(root, "cache", "pdf-processing", "hash-active")}`,
               activeBundleHash: "hash-active",
               activeValidationStatus: "validated",
-              activeReviewStatus: "active"
+              activeReviewStatus: "active",
+              isInherited: false
             }
           ];
-        },
-        async getSkill() { return null; },
-        async disableSkill() { return null; },
-        async setSkillPublished() { return null; }
+        }
       },
       skillRevisions: {
         async listSkillRevisions() { return []; },
@@ -566,10 +500,8 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
         async importSkillBundle() {
           throw new Error("importSkillBundle should not be called");
         }
-      },
-      mcpServers: {} as never,
-      tenantSettings: { async get() { return null; }, async upsert() { return {} as never; } }
-    },
+      }
+    }),
     {
       async storeBundle() {
         throw new Error("storeBundle should not be called");
@@ -577,7 +509,7 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
       async deleteBundle(bundlePath: string) {
         deletedBundles.push(bundlePath);
       }
-    } as unknown as SkillBundleStorage,
+    },
     makeManagedToolCatalog()
   );
 
@@ -593,25 +525,20 @@ test("DynamicConfigService blocks disabling default MCP servers before tenant se
   let disableCalls = 0;
   const service = new DynamicConfigService(
     createTestConfig(),
-    {
-      skills: {} as never,
-      skillRevisions: {} as never,
+    makeStores({
       mcpServers: {
         async disableMcpServer() {
           disableCalls += 1;
           return null;
         }
-      } as never,
+      },
       tenantSettings: {
         async get() {
           return null;
-        },
-        async upsert() {
-          throw new Error("upsert should not be called");
         }
       }
-    },
-    {} as SkillBundleStorage,
+    }),
+    unusedSkillBundleStorage,
     makeManagedToolCatalog()
   );
 
@@ -623,9 +550,7 @@ test("DynamicConfigService rejects unknown tenant tool IDs before persisting set
   let upsertCalls = 0;
   const service = new DynamicConfigService(
     createTestConfig(),
-    {
-      skills: {} as never,
-      skillRevisions: {} as never,
+    makeStores({
       mcpServers: {
         async listMcpServers() {
           return [
@@ -637,7 +562,6 @@ test("DynamicConfigService rejects unknown tenant tool IDs before persisting set
               mode: "proxy" as const,
               routePath: "/mcp/trusted-echo",
               upstreamUrl: "https://example.com/mcp",
-              headersAllowlist: [],
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -648,18 +572,15 @@ test("DynamicConfigService rejects unknown tenant tool IDs before persisting set
             }
           ];
         }
-      } as never,
+      },
       tenantSettings: {
-        async get() {
-          return null;
-        },
         async upsert() {
           upsertCalls += 1;
           throw new Error("upsert should not be called");
         }
       }
-    },
-    {} as SkillBundleStorage,
+    }),
+    unusedSkillBundleStorage,
     makeManagedToolCatalog()
   );
 
@@ -674,9 +595,7 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
   let upsertCalls = 0;
   const service = new DynamicConfigService(
     createTestConfig(),
-    {
-      skills: {} as never,
-      skillRevisions: {} as never,
+    makeStores({
       mcpServers: {
         async listMcpServers() {
           return [
@@ -688,7 +607,6 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
               mode: "proxy" as const,
               routePath: "/mcp/trusted-echo",
               upstreamUrl: "https://example.com/mcp",
-              headersAllowlist: [],
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -699,18 +617,15 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
             }
           ];
         }
-      } as never,
+      },
       tenantSettings: {
-        async get() {
-          return null;
-        },
         async upsert() {
           upsertCalls += 1;
           throw new Error("upsert should not be called");
         }
       }
-    },
-    {} as SkillBundleStorage,
+    }),
+    unusedSkillBundleStorage,
     makeManagedToolCatalog()
   );
 

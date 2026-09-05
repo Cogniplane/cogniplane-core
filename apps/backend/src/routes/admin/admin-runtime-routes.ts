@@ -24,9 +24,12 @@ import {
 export async function registerAdminRuntimeRoutes(
   app: FastifyInstance,
   stores: {
-    auditEvents: AuditEventStore;
-    runtimeSessions: RuntimeSessionStore;
-    deepAgentsAdapter: DeepAgentsRuntimeAdapter;
+    auditEvents: Pick<AuditEventStore, "create">;
+    runtimeSessions: Pick<RuntimeSessionStore, "listRecent">;
+    deepAgentsAdapter: Pick<
+      DeepAgentsRuntimeAdapter,
+      "getRuntimeHealthDetail" | "invalidateTenantRuntimes"
+    >;
   }
 ): Promise<void> {
   app.get("/admin/runtime-sessions", withAdmin(app, async (request) => {
@@ -63,7 +66,6 @@ export async function registerAdminRuntimeRoutes(
     );
     return serialize(AdminRuntimeConfigSchema, {
       e2bTemplateId: app.config.E2B_TEMPLATE_ID,
-      anthropicKeyConfigured: platformProviders.includes("anthropic"),
       platformProviders
     });
   }));

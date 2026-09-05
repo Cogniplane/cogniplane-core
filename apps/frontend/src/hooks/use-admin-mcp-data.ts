@@ -20,7 +20,6 @@ type SubmitInput = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string | null;
-  headersAllowlist: string[];
   enabled: boolean;
 };
 

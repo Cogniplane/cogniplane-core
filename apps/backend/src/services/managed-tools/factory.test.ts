@@ -1,9 +1,10 @@
 import { Readable } from "node:stream";
 import { test, expect } from "vitest";
 
+import { Pool } from "../../lib/db.js";
 import { createFakeFetch } from "../../test-helpers/fake-fetch.js";
 import { ManagedToolCatalog } from "./catalog.js";
-import { ManagedToolFactoryRegistry } from "./factory.js";
+import { ManagedToolFactoryRegistry, type ManagedToolFactoryDeps } from "./factory.js";
 import { registerBuiltinManagedTools } from "./register-builtin-managed-tools.js";
 
 const sharedCatalog = new ManagedToolCatalog();
@@ -68,16 +69,28 @@ function makeArtifactStore(): Pick<ArtifactStore, "create" | "getOwned" | "listB
   return {
     created: records,
     async create(input) {
-      const record = {
-        ...input,
+      const record: ArtifactRecord = {
         artifactId: `artifact-${++counter}`,
         id: counter,
+        sessionId: input.sessionId,
+        userId: input.userId,
+        artifactType: input.artifactType,
+        sourceArtifactId: input.sourceArtifactId ?? null,
+        artifactName: input.artifactName,
+        mimeType: input.mimeType,
+        storageBackend: input.storageBackend,
+        storageKey: input.storageKey,
+        fileSizeBytes: input.fileSizeBytes,
+        checksumSha256: input.checksumSha256,
+        status: input.status,
+        createdByType: input.createdByType,
+        createdByRef: input.createdByRef ?? null,
+        detail: input.detail ?? {},
         createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        sourceArtifactId: null
+        updatedAt: new Date().toISOString()
       };
-      records.push(record as Record<string, unknown>);
-      return record as unknown as ArtifactRecord;
+      records.push({ ...record });
+      return record;
     },
     async getOwned(_tenantId: string, _artifactId: string, _userId: string) { return null; },
     async listBySession(_tenantId: string, _sessionId: string, _userId: string) { return []; },
@@ -101,7 +114,7 @@ function makeSessionStore() {
 }
 
 function makeMessageStore() {
-  return { async listBySession() { return []; } };
+  return { async listBySession() { return { messages: [], hasMore: false }; } };
 }
 
 function makeAuditEventStore() {
@@ -120,16 +133,27 @@ function makeNotionConnections() {
   };
 }
 
+const unusedDb = new Pool();
+
 function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
   return {
+    db: unusedDb,
+    dynamicConfig: {
+      async listSkills() { return []; }
+    },
     sessions: makeSessionStore(),
     messages: makeMessageStore(),
+    memories: {
+      async search() { return []; },
+      async save() { throw new Error("memory save should not be called"); },
+      async remove() { return false; }
+    },
     artifacts: makeArtifactStore(),
     storage: new InMemoryStorage(),
     auditEvents: makeAuditEventStore(),
     githubConnections: makeGithubConnections(githubCreds),
     notionConnections: makeNotionConnections()
-  };
+  } satisfies ManagedToolFactoryDeps;
 }
 
 function makeValidCreds(overrides: Partial<GithubRuntimeCredentials> = {}): GithubRuntimeCredentials {
@@ -138,9 +162,19 @@ function makeValidCreds(overrides: Partial<GithubRuntimeCredentials> = {}): Gith
     name: "The Octocat",
     email: "octocat@github.com",
     token: "ghu_test_token",
-    source: "user",
     ...overrides
   };
+}
+
+function requireRecordField(
+  record: Record<string, unknown> | null,
+  field: string
+): Record<string, unknown> {
+  const value = record?.[field];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Expected ${field} to be an object.`);
+  }
+  return Object.fromEntries(Object.entries(value));
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -157,7 +191,7 @@ test("github_read_file — returns file content when credentials valid", async (
     content: Buffer.from("hello world", "utf-8").toString("base64") + "\n"
   };
 
-  const fake = createFakeFetch(() => ({ ok: true, json: async () => fileData } as unknown as Response));
+  const fake = createFakeFetch(() => Response.json(fileData));
 
   try {
     const result = await tool.handler({
@@ -197,9 +231,7 @@ test("github_read_file — returns error on GitHub API 404", async () => {
   const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
   const tool = tools.find((t) => t.name === "github_read_file")!;
 
-  const fake = createFakeFetch(
-    () => ({ ok: false, status: 404, json: async () => ({ message: "Not Found" }) } as unknown as Response)
-  );
+  const fake = createFakeFetch(() => Response.json({ message: "Not Found" }, { status: 404 }));
 
   try {
     const result = await tool.handler({
@@ -224,7 +256,7 @@ test("github_write_file — returns commit info on success; uses creds.name/emai
 
   const fake = createFakeFetch((_url, init) => {
     capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return { ok: true, json: async () => responseData } as unknown as Response;
+    return Response.json(responseData);
   });
 
   try {
@@ -241,7 +273,7 @@ test("github_write_file — returns commit info on success; uses creds.name/emai
     });
     expect(result["sha"]).toBe("def456");
     expect(result["commitSha"]).toBe("ghi789");
-    const committer = capturedBody?.["committer"] as Record<string, string>;
+    const committer = requireRecordField(capturedBody, "committer");
     expect(committer["name"]).toBe("The Octocat");
     expect(committer["email"]).toBe("octocat@github.com");
   } finally {
@@ -261,7 +293,7 @@ test("github_write_file — falls back to login@users.noreply.github.com when em
 
   const fake = createFakeFetch((_url, init) => {
     capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-    return { ok: true, json: async () => responseData } as unknown as Response;
+    return Response.json(responseData);
   });
 
   try {
@@ -276,7 +308,7 @@ test("github_write_file — falls back to login@users.noreply.github.com when em
         message: "add x"
       }
     });
-    const committer = capturedBody?.["committer"] as Record<string, string>;
+    const committer = requireRecordField(capturedBody, "committer");
     expect(committer["email"]).toBe("octocat@users.noreply.github.com");
   } finally {
     fake.restore();
@@ -297,7 +329,7 @@ test("github_create_pr — returns PR number and URL on success", async () => {
     draft: false
   };
 
-  const fake = createFakeFetch(() => ({ ok: true, json: async () => responseData } as unknown as Response));
+  const fake = createFakeFetch(() => Response.json(responseData));
 
   try {
     const result = await tool.handler({
@@ -478,7 +510,7 @@ test("createDefinitions preserves a category a factory set on its own definition
   // A sibling def with no category falls back to the domain key.
   registry.register("session", () => [stubTool("session_default")]);
 
-  const defs = registry.createDefinitions(makeDeps() as unknown as Parameters<typeof registry.createDefinitions>[0]);
+  const defs = registry.createDefinitions(makeDeps());
 
   expect(defs.find((d) => d.name === "github_explicit")!.category).toBe("custom-domain");
   expect(defs.find((d) => d.name === "session_default")!.category).toBe("session");

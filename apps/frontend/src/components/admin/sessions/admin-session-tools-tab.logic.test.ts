@@ -7,8 +7,7 @@ import type {
 
 import {
   buildToolRows,
-  formatToolDuration,
-  formatToolTimestamp
+  formatToolDuration
 } from "./admin-session-tools-tab.logic";
 
 function makeEvent(
@@ -96,17 +95,5 @@ describe("formatToolDuration", () => {
   test("≥1s renders as two-decimal seconds", () => {
     expect(formatToolDuration(1000)).toBe("1.00s");
     expect(formatToolDuration(2345)).toBe("2.35s");
-  });
-});
-
-describe("formatToolTimestamp", () => {
-  test("renders something for valid ISO", () => {
-    expect(formatToolTimestamp("2026-05-09T12:00:00Z")).toMatch(/\d/);
-  });
-
-  test("returns input verbatim when not a valid date", () => {
-    // toLocaleString on Invalid Date returns "Invalid Date" rather than throwing,
-    // so the helper never hits the catch — just confirm no exception.
-    expect(() => formatToolTimestamp("not-a-date")).not.toThrow();
   });
 });

@@ -60,7 +60,9 @@ export function arraySchema(items: Record<string, unknown>): Record<string, unkn
 }
 
 export function withManagedToolErrorSchema(successSchema: Record<string, unknown>): Record<string, unknown> {
-  return { oneOf: [successSchema, managedToolErrorOutputSchema] };
+  // MCP outputSchema requires an object root. Keep `type` beside `oneOf` or
+  // strict clients may reject the entire tools/list response.
+  return { type: "object", oneOf: [successSchema, managedToolErrorOutputSchema] };
 }
 
 // ── Shared HTTP helper ────────────────────────────────────────────────────────

@@ -1,0 +1,21 @@
+-- Drop the dead session_runtime_overrides table (code-review R12).
+--
+-- RENUMBERED from 005 → 010: it shared the `005_` prefix with
+-- 005_tool_result_ui_resources.sql. Migrations are tracked by full FILENAME
+-- (see migrate-lib.ts), so both applied correctly, but a duplicate version
+-- number breaks the ordering assumption anyone reading this directory makes —
+-- and applyMigrations now rejects duplicate prefixes outright. A DB that
+-- already ran the 005-named file re-applies this one harmlessly (the DROP is
+-- IF EXISTS) and ends up with both names recorded in schema_migrations.
+--
+-- The per-session runtime override was written only by the skill-improvement
+-- session flow, which was removed in the runtime collapse (Codex/Claude-Code
+-- retirement). Since then nothing writes the table and the config compiler's
+-- read path always resolved to null, so the override merge was inert. The
+-- backend store, read path, and compiler merge logic are removed in the same
+-- change; this migration drops the now-orphaned table.
+--
+-- CASCADE also removes the FK constraints, primary key, and RLS policy defined
+-- alongside the table in 001_init.sql. IF EXISTS keeps this safe to re-apply.
+
+DROP TABLE IF EXISTS public.session_runtime_overrides CASCADE;

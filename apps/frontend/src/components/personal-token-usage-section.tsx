@@ -1,19 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
-import { fetchPersonalTokenUsage, type PersonalTokenUsageSeries } from "../lib/settings-api";
+import { fetchPersonalTokenUsage } from "../lib/settings-api";
+import { queryKeys } from "../lib/query-keys";
 import {
   BarChart,
   DayRangePicker,
-  fmtCost,
-  fmtTokens,
-  HBar,
   type Days,
+  TokenBreakdown,
+  TokenUsageSkeleton,
+  TokenUsageSummary,
   ViewToggle
 } from "./token-usage-chart-primitives";
-import { HINT, SECTION_LABEL, TOKEN_USAGE_COL_GRID as COL_GRID } from "../lib/ui-tokens";
-import { Skeleton } from "@/components/ui/skeleton";
+import { HINT } from "../lib/ui-tokens";
 
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
@@ -28,28 +29,13 @@ const VIEW_OPTIONS: Array<{ id: View; label: string }> = [
 export function PersonalTokenUsageSection() {
   const [days, setDays] = useState<Days>(30);
   const [view, setView] = useState<View>("day");
-  const [usage, setUsage] = useState<PersonalTokenUsageSeries | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const load = useCallback(async (d: Days) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await fetchPersonalTokenUsage(d);
-      setUsage(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load token usage.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    // load() flips setLoading before awaiting; the cascading render is intentional.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load(days);
-  }, [days, load]);
+  const query = useQuery({
+    queryKey: queryKeys.settings.tokenUsage(days),
+    queryFn: () => fetchPersonalTokenUsage(days),
+    placeholderData: keepPreviousData
+  });
+  const usage = query.data;
+  const error = query.error instanceof Error ? query.error.message : query.error ? "Failed to load token usage." : null;
 
   const dailyBars = useMemo(
     () =>
@@ -61,21 +47,6 @@ export function PersonalTokenUsageSection() {
     [usage]
   );
 
-  const modelBars = useMemo(
-    () =>
-      (usage?.byModel ?? []).map((m) => ({
-        label: m.modelName,
-        inputSeries: m.inputTokens,
-        outputSeries: m.outputTokens
-      })),
-    [usage]
-  );
-
-  const maxModelTokens = useMemo(
-    () => Math.max(...(usage?.byModel ?? []).map((m) => m.totalTokens), 1),
-    [usage]
-  );
-
   const totals = usage?.totals;
 
   return (
@@ -83,39 +54,18 @@ export function PersonalTokenUsageSection() {
       <div className="flex flex-wrap items-center gap-3 pb-1">
         <DayRangePicker value={days} onChange={setDays} />
         <ViewToggle options={VIEW_OPTIONS} value={view} onChange={setView} />
-        {loading ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
+        {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
       </div>
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
 
-      {!totals && loading ? <PersonalUsageSkeleton /> : null}
+      {!totals && query.isPending ? <TokenUsageSkeleton /> : null}
 
       {totals ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            label="Total tokens"
-            value={fmtTokens(totals.totalTokens)}
-            detail={`In the last ${days} days`}
-          />
-          <StatCard
-            label="Input tokens"
-            value={fmtTokens(totals.inputTokens)}
-            detail="Prompt + context"
-          />
-          <StatCard
-            label="Output tokens"
-            value={fmtTokens(totals.outputTokens)}
-            detail="Generated text"
-          />
-          <StatCard
-            label="Est. cost"
-            value={fmtCost(totals.costUsd)}
-            detail={`${totals.messageCount} messages`}
-          />
-        </div>
+        <TokenUsageSummary totals={totals} days={days} />
       ) : null}
 
-      {usage && !loading ? (
+      {usage && !query.isFetching ? (
         <div className={`${STAT_CARD} overflow-hidden p-5`}>
           {view === "day" ? (
             dailyBars.length === 0 ? (
@@ -135,90 +85,24 @@ export function PersonalTokenUsageSection() {
             usage.byModel.length === 0 ? (
               <p className={HINT}>No model data in this period.</p>
             ) : (
-              <div className="flex flex-col">
-                <div
-                  className={`${COL_GRID} border-b border-outline-variant py-1.5 text-[0.7rem] font-bold uppercase tracking-wider text-on-surface-faint`}
-                >
-                  <span>Model</span>
-                  <span className="text-right">Input</span>
-                  <span className="text-right">Output</span>
-                  <span className="text-right">Total</span>
-                  <span className="text-right">Cost</span>
-                </div>
-
-                {usage.byModel.map((m) => (
-                  <div
-                    key={m.modelName}
-                    className={`${COL_GRID} items-center border-b border-outline-variant py-2.5 text-sm`}
-                  >
-                    <div className="flex min-w-0 items-center gap-2.5">
-                      <HBar
-                        value={m.totalTokens}
-                        max={maxModelTokens}
-                        color="var(--color-warning)"
-                      />
-                      <span className="max-w-[180px] flex-shrink-0 overflow-hidden font-mono text-[0.82rem] text-ellipsis whitespace-nowrap text-on-surface-variant">
-                        {m.modelName}
-                      </span>
-                    </div>
-                    <span className="text-right text-[0.82rem] text-on-surface-variant">
-                      {fmtTokens(m.inputTokens)}
-                    </span>
-                    <span className="text-right text-[0.82rem] text-on-surface-variant">
-                      {fmtTokens(m.outputTokens)}
-                    </span>
-                    <span className="text-right font-semibold">{fmtTokens(m.totalTokens)}</span>
-                    <span className="text-right text-[0.82rem] text-on-surface-variant">
-                      {fmtCost(m.costUsd)}
-                    </span>
-                  </div>
-                ))}
-
-                <div className="pt-5">
-                  <BarChart
-                    data={modelBars}
-                    primaryColor="var(--color-warning)"
-                    secondaryColor="var(--color-success)"
-                    primaryLabel="Input tokens"
-                    secondaryLabel="Output tokens"
-                  />
-                </div>
-              </div>
+              <TokenBreakdown
+                rows={usage.byModel.map((m) => ({
+                  key: m.modelName,
+                  label: m.modelName,
+                  inputTokens: m.inputTokens,
+                  outputTokens: m.outputTokens,
+                  totalTokens: m.totalTokens,
+                  costUsd: m.costUsd
+                }))}
+                barColor="var(--color-warning)"
+                chartPrimaryColor="var(--color-warning)"
+                chartSecondaryColor="var(--color-success)"
+                firstColumnLabel="Model"
+              />
             )
           ) : null}
         </div>
       ) : null}
     </section>
-  );
-}
-
-function PersonalUsageSkeleton() {
-  return (
-    <>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }, (_, i) => (
-          <div key={i} className={STAT_CARD}>
-            <Skeleton className="h-3 w-24" />
-            <Skeleton className="mt-3 h-7 w-16" />
-            <Skeleton className="mt-2 h-3 w-32" />
-          </div>
-        ))}
-      </div>
-      <div className={`${STAT_CARD} p-5`}>
-        <Skeleton className="h-[200px] w-full" />
-      </div>
-    </>
-  );
-}
-
-function StatCard(props: { label: string; value: string; detail: string }) {
-  return (
-    <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>{props.label}</p>
-      <strong className="mt-2 block text-2xl font-bold tracking-tight text-on-surface tabular-nums">
-        {props.value}
-      </strong>
-      <p className="mt-1 text-xs text-on-surface-variant">{props.detail}</p>
-    </article>
   );
 }

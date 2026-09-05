@@ -1,21 +1,12 @@
 import { test, expect } from "vitest";
 
-import {
-  canActivateRevision,
-  isBundleBackedSkill
-} from "./skill-lifecycle.js";
+import { canActivateRevision } from "./skill-lifecycle.js";
 import { getCleanupDecision, getLatestRevisionIds } from "./skill-cleanup-policy.js";
 
 test("canActivateRevision allows supported validation states", () => {
   expect(canActivateRevision("validated")).toBe(true);
   expect(canActivateRevision("validated_with_warnings")).toBe(true);
   expect(canActivateRevision("rejected")).toBe(false);
-});
-
-test("isBundleBackedSkill distinguishes configured and missing sources", () => {
-  expect(isBundleBackedSkill({ sourceType: "github" })).toBe(true);
-  expect(isBundleBackedSkill({ sourceType: "zip" })).toBe(true);
-  expect(isBundleBackedSkill({ sourceType: null })).toBe(false);
 });
 
 test("getLatestRevisionIds returns the newest revision per skill", () => {

@@ -24,7 +24,6 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
       sandboxMode: "workspace-write",
       networkMode: "restricted",
       allowCommandExecution: true,
-      allowUserTokenForwarding: false,
       autoApproveReadOnlyTools: true,
       policyEnforcementMode: "enforce",
       developerInstructions: "do the thing",
@@ -46,7 +45,6 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
     sandboxMode: "workspace-write",
     networkMode: "restricted",
     allowCommandExecution: true,
-    allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "enforce",
     developerInstructions: "do the thing",
@@ -112,7 +110,6 @@ test("parseRuntimePolicySnapshot fills sensible defaults for missing optional fi
   expect(result.description).toBeNull();
   expect(result.developerInstructions).toBeNull();
   expect(result.allowCommandExecution).toBe(false);
-  expect(result.allowUserTokenForwarding).toBe(false);
   expect(result.autoApproveReadOnlyTools).toBe(false);
   expect(result.webSearchMode).toBe("disabled");
   expect(result.enabledToolIds).toEqual([]);

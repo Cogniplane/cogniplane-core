@@ -2,6 +2,7 @@ import type { FastifyRequest } from "fastify";
 
 import type { AppConfig } from "../config.js";
 import { verifyRuntimeToken } from "../services/auth/runtime-token.js";
+import { runtimeTokenSecret } from "./derived-secrets.js";
 import { sanitizeUrl } from "./sanitize-url.js";
 
 /**
@@ -35,7 +36,7 @@ export function tryAuthenticateRuntimeToken(
   if (!token) {
     return false;
   }
-  const result = verifyRuntimeToken(token, config.DATA_ENCRYPTION_SECRET);
+  const result = verifyRuntimeToken(token, runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET));
   if (result.kind === "expired") {
     request.log.warn(
       { url: sanitizeUrl(request.url), method: request.method, reason: "runtime_token_expired" },

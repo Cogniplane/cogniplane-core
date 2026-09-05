@@ -9,15 +9,14 @@
 //
 // Text/tool-calls/reasoning render natively; the custom AG-UI events (approvals,
 // notices, MCP status) render via useAguiCustomEvents, and tool cards + the plan
-// pane via CopilotRenderSlots. KNOWN GAP: the old composer's model/effort pickers
-// and context-window meter are not yet re-homed here.
+// pane via CopilotRenderSlots.
 
 import { CopilotKit } from "@copilotkit/react-core";
-import { CopilotChat } from "@copilotkit/react-ui";
+import { CopilotChat, type ComponentsMap } from "@copilotkit/react-ui";
 import "@copilotkit/react-ui/styles.css";
 import { useEffect, useMemo, useRef } from "react";
 import type { Message as AGUIMessage, State as AGUIState } from "@ag-ui/client";
-import type { EffortLevel, Model } from "@cogniplane/shared-types";
+import type { Approval, EffortLevel, Model } from "@cogniplane/shared-types";
 
 import { DeepAgentsBrowserAgent } from "../lib/agui/deep-agents-browser-agent";
 import { useAguiCustomEvents } from "../lib/agui/use-agui-custom-events";
@@ -25,6 +24,7 @@ import { CopilotRenderSlots } from "./copilot-render-slots";
 import { ModelEffortSelector } from "./model-effort-selector";
 import { ContextWindowMeter } from "./context-window-meter";
 import { ApprovalRowView } from "./chat-cards/approval-row";
+import { MarkdownImage } from "./markdown-image";
 import type { ToolStatusRow } from "./chat-cards/chat-cards.types";
 import {
   McpServerStatusRowView,
@@ -34,33 +34,19 @@ import {
 
 const AGENT_NAME = "deepAgents";
 
-export function CopilotChatHost({
-  sessionId,
-  model,
-  effort,
-  models,
-  showEffortSelector,
-  contextTokens,
-  contextWindow,
-  sessionCostUsd,
-  initialMessages,
-  initialState,
-  initialToolStatuses,
-  artifactIds,
-  onModelChange,
-  onEffortChange,
-  onTurnSettled,
-  onRunningChange,
-  onPendingApprovalsChange
-}: {
-  sessionId: string;
-  model?: string;
-  effort: EffortLevel | null;
-  models: Model[];
-  showEffortSelector: boolean;
-  contextTokens: number;
-  contextWindow: number;
-  sessionCostUsd: number;
+// CopilotKit sanitizes assistant markdown with rehype's default schema, which
+// permits <img> — so an agent-authored image tag reaches the DOM and the CSP
+// blocks the fetch, leaving a broken icon. Route it through the same renderer
+// SafeMarkdown uses: trusted hosts render, everything else becomes a
+// click-through link. ComponentsMap types its entries as React.FC over a
+// children-carrying prop bag rather than react-markdown's Components, so the
+// cast lives here, at the boundary, and not inside markdown-image.tsx.
+const MARKDOWN_TAG_RENDERERS: ComponentsMap = {
+  img: MarkdownImage as ComponentsMap[string]
+};
+
+export type ChatSessionModel = {
+  id: string;
   /** Persisted history to seed the transcript with; snapshotted at mount. */
   initialMessages: AGUIMessage[];
   /** Persisted agent state to seed at mount (the plan pane); snapshotted too. */
@@ -68,16 +54,42 @@ export function CopilotChatHost({
   /** Failed/declined tool-status rows reconstructed from history so a reloaded
    *  session renders tool failures the native card can't show. */
   initialToolStatuses: ToolStatusRow[];
-  /** Artifacts the user has checkboxed; read live at send time via a ref. */
-  artifactIds: string[];
+  /** Pending REST approvals seed the live owner when this session opens. */
+  initialApprovals: Approval[];
+};
+
+export type ChatModelSelection = {
+  model?: string;
+  effort: EffortLevel | null;
+  models: Model[];
+  showEffortSelector: boolean;
   onModelChange: (modelId: string) => void;
   onEffortChange: (effort: EffortLevel) => void;
+};
+
+export type ChatUsageModel = {
+  contextTokens: number;
+  contextWindow: number;
+  sessionCostUsd: number;
+};
+
+export type ChatEventHandlers = {
   onTurnSettled?: () => void;
-  /** Live turn-running signal lifted to the shell for the sidebar streaming dot. */
   onRunningChange?: (isRunning: boolean) => void;
-  /** Live pending-approval count lifted to the shell for the attention dot. */
   onPendingApprovalsChange?: (count: number) => void;
+};
+
+export function CopilotChatHost({ session, modelSelection, usage, artifactIds, events }: {
+  session: ChatSessionModel;
+  modelSelection: ChatModelSelection;
+  usage: ChatUsageModel;
+  /** Artifacts the user has checkboxed; read live at send time via a ref. */
+  artifactIds: string[];
+  events: ChatEventHandlers;
 }) {
+  const { id: sessionId, initialMessages, initialState, initialToolStatuses, initialApprovals } = session;
+  const { model, effort, models, showEffortSelector, onModelChange, onEffortChange } = modelSelection;
+  const { onTurnSettled, onRunningChange, onPendingApprovalsChange } = events;
   // Per-turn inputs (model, effort, checkboxed artifact ids) are held in refs the
   // agent reads at send time, so a change between turns is picked up WITHOUT
   // re-keying the agent. Re-keying would rebind CopilotKit to a fresh agent and
@@ -95,7 +107,7 @@ export function CopilotChatHost({
 
   // `initialMessages`/`initialState` seed the transcript + plan pane at
   // construction; they are intentionally NOT deps — the parent gates this mount
-  // on `readySessionId === sessionId`, so
+  // on `isSessionDataReady`, so
   // the first (and only) construction already carries this session's history, and
   // a post-turn refresh must not reconstruct the agent and drop live state. The
   // getters read their refs lazily at send time, not during render, so they are
@@ -130,7 +142,7 @@ export function CopilotChatHost({
   // Slice B: the CUSTOM AG-UI events CopilotChat doesn't render natively. We
   // subscribe to the same agent instance CopilotKit runs and drive local state.
   const { approvals, notices, mcpStatuses, toolStatuses, isRunning, onApprovalDecision } =
-    useAguiCustomEvents(agent, onTurnSettled, initialToolStatuses);
+    useAguiCustomEvents(agent, onTurnSettled, initialToolStatuses, initialApprovals);
 
   // Lift the live turn-running + pending-approval signals to the shell so the
   // sidebar streaming dot and header attention dot track the AG-UI stream in
@@ -167,9 +179,9 @@ export function CopilotChatHost({
             onEffortChange={onEffortChange}
           />
           <ContextWindowMeter
-            usedTokens={contextTokens}
-            contextWindow={contextWindow}
-            costUsd={sessionCostUsd}
+            usedTokens={usage.contextTokens}
+            contextWindow={usage.contextWindow}
+            costUsd={usage.sessionCostUsd}
           />
         </div>
         {(approvals.length > 0 ||
@@ -196,6 +208,7 @@ export function CopilotChatHost({
           // <table>/<blockquote> tags; the shared rules in globals.css style them.
           className="chat-markdown flex min-h-0 flex-1 flex-col"
           labels={{ title: "Cogniplane", initial: "Ask me anything." }}
+          markdownTagRenderers={MARKDOWN_TAG_RENDERERS}
         />
       </div>
     </CopilotKit>

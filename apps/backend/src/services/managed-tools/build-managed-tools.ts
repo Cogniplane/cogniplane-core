@@ -12,5 +12,3 @@ export function buildManagedToolRegistries() {
   registerBuiltinManagedTools(managedToolCatalog, managedToolFactoryRegistry);
   return { managedToolCatalog, managedToolFactoryRegistry };
 }
-
-export type ManagedToolRegistries = ReturnType<typeof buildManagedToolRegistries>;

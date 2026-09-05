@@ -12,18 +12,20 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
  * `Authorization: Bearer rt_...` header on every MCP gateway request.
  *
  * Production callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`
- * to bound the leak window if a workspace file or sandbox snapshot is
- * captured. Default TTL is 24 hours (see RUNTIME_TOKEN_TTL_MS in config.ts for
- * the rationale: the token is minted once and must outlive the longest realistic
- * session); operators can shorten via the env var. Verification still tolerates
- * absence of `exp` so older in-flight tokens keep working through a deploy.
+ * to bound the leak window if backend process memory or internal request
+ * diagnostics are captured. Default TTL is 24 hours (see RUNTIME_TOKEN_TTL_MS
+ * in config.ts for the rationale: the token is minted once and must outlive the
+ * longest realistic session); operators can shorten via the env var.
+ * Verification still tolerates absence of `exp` so older in-flight tokens keep
+ * working through a deploy.
  *
  * The token is a bearer credential valid until `exp` — there is no revocation
  * deny-list. The leak window is bounded by two controls instead: the TTL, and
- * the per-runtime egress IP pin (runtime-egress-ip-pin.ts) enforced by the
- * MCP gateway, which refuses a leaked token replayed from any host other than
- * the sandbox that made the first call. Every minted token carries a unique
- * `jti` (token id) for audit/log correlation.
+ * the MCP gateway's loopback-only admission (services/mcp/gateway-admission.ts),
+ * which additionally requires the raw socket peer to be 127.0.0.1 or ::1, so a
+ * leaked token is useless to anyone who cannot already run code on the backend
+ * host. Every minted token carries a unique `jti` (token id) for audit/log
+ * correlation.
  */
 
 const TOKEN_PREFIX = "rt_";

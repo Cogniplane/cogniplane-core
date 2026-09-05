@@ -2,7 +2,7 @@ import { test, expect } from "vitest";
 
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 
-import { handlePiiDecision } from "./messages-pii-handler.js";
+import { handlePiiDecision, type PiiHandlerStores } from "./messages-pii-handler.js";
 
 const baseInput = {
   tenantId: "t",
@@ -11,14 +11,14 @@ const baseInput = {
   rawText: "raw"
 };
 
-function makeStores(opts: { capture?: unknown[]; throwOnCreate?: boolean } = {}) {
+function makeStores(opts: { capture?: unknown[]; throwOnCreate?: boolean } = {}): PiiHandlerStores {
   const capture = opts.capture ?? [];
   return {
     piiScanRuns: {
       async create(input: Record<string, unknown>) {
         if (opts.throwOnCreate) throw new Error("scan-run create failed");
         capture.push(input);
-        return { scanRunId: `run-${capture.length}` } as never;
+        return { scanRunId: `run-${capture.length}` };
       }
     }
   };
@@ -37,9 +37,7 @@ test("returns continue with raw text when decision is null", async () => {
 test("returns continue with raw text when decision.action === 'allow'", async () => {
   const allow: PiiDecision = {
     action: "allow",
-    providerType: "rule_based",
-    providerModel: null,
-    findings: []
+    reason: "no_findings"
   };
   const out = await handlePiiDecision(allow, baseInput, { piiScanRuns: undefined });
   expect(out.kind).toBe("continue");
@@ -262,9 +260,7 @@ test("allow action does NOT emit an audit event", async () => {
   const audit = makeAuditCapture();
   const allow: PiiDecision = {
     action: "allow",
-    providerType: "rule_based",
-    providerModel: null,
-    findings: []
+    reason: "no_findings"
   };
   await handlePiiDecision(allow, baseInput, {
     piiScanRuns: undefined,

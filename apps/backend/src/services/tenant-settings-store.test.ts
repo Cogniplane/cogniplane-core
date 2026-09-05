@@ -63,11 +63,6 @@ class InMemoryTenantSettingsDatabase {
     }
 
     if (sql.includes("INSERT INTO tenant_settings")) {
-      const previousVersion =
-        this.row && this.row.tenant_id === params[0]
-          ? Number(this.row.version)
-          : 0;
-
       this.row = {
         tenant_id: String(params[0]),
         show_effort_selector: Boolean(params[1]),
@@ -75,14 +70,17 @@ class InMemoryTenantSettingsDatabase {
         approval_policy: String(params[3]),
         approval_reviewer: String(params[4]),
         allow_command_execution: Boolean(params[5]),
-        allow_user_token_forwarding: Boolean(params[6]),
-        auto_approve_read_only_tools: Boolean(params[7]),
-        policy_enforcement_mode: String(params[8]),
-        developer_instructions: params[9] == null ? null : String(params[9]),
-        enabled_tool_ids: JSON.parse(String(params[10])) as string[],
-        enabled_mcp_server_ids: JSON.parse(String(params[11])) as string[],
-        version: previousVersion + 1,
-        config_hash: String(params[12]),
+        allow_user_token_forwarding: false,
+        auto_approve_read_only_tools: Boolean(params[6]),
+        policy_enforcement_mode: String(params[7]),
+        developer_instructions: params[8] == null ? null : String(params[8]),
+        enabled_tool_ids: JSON.parse(String(params[9])) as string[],
+        enabled_mcp_server_ids: JSON.parse(String(params[10])) as string[],
+        enabled_providers: JSON.parse(String(params[11])) as string[],
+        enabled_model_ids: params[12] == null ? null : (JSON.parse(String(params[12])) as string[]),
+        model_default_efforts: JSON.parse(String(params[13])) as Record<string, string>,
+        version: 1, // Database version increments are covered by the Postgres suite.
+        config_hash: String(params[14]),
         updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
       };
 
@@ -101,7 +99,6 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
     approvalPolicy: "never",
     approvalReviewer: "guardian_subagent",
     allowCommandExecution: true,
-    allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: false,
     policyEnforcementMode: "enforce",
     webSearchMode: "live",
@@ -119,13 +116,11 @@ test("TenantSettingsStore.upsert preserves existing values for partial updates",
   expect(updated.webSearchMode).toBe("live");
   expect(updated.approvalReviewer).toBe("guardian_subagent");
   expect(updated.allowCommandExecution).toBe(true);
-  expect(updated.allowUserTokenForwarding).toBe(false);
   expect(updated.autoApproveReadOnlyTools).toBe(false);
   expect(updated.policyEnforcementMode).toBe("enforce");
   expect(updated.developerInstructions).toBe("Updated instructions");
   expect(updated.enabledToolIds).toEqual(["custom-tool"]);
   expect(updated.enabledMcpServerIds).toEqual(["custom-server"]);
-  expect(updated.version).toBe(2);
 });
 
 test("TenantSettingsStore.upsert serializes concurrent partial updates without losing either write", async () => {
@@ -149,7 +144,6 @@ test("TenantSettingsStore.upsert serializes concurrent partial updates without l
   expect(final?.developerInstructions).toBe("from writer A");
   expect(final?.showEffortSelector).toBe(true);
   expect(final?.webSearchMode).toBe("live");
-  expect(final?.version).toBe(3);
 });
 
 test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async () => {
@@ -165,7 +159,6 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
   expect(created.webSearchMode).toBe("disabled");
   expect(created.approvalReviewer).toBe("user");
   expect(created.allowCommandExecution).toBe(false);
-  expect(created.allowUserTokenForwarding).toBe(true);
   expect(created.autoApproveReadOnlyTools).toBe(true);
   expect(created.policyEnforcementMode).toBe("monitor");
   expect(created.developerInstructions).toBe("Tenant-specific instructions");

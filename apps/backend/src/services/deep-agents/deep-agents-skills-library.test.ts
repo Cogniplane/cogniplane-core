@@ -1,3 +1,4 @@
+import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -13,16 +14,7 @@ import {
 } from "./deep-agents-skills-library.js";
 import type { RuntimeSkillDefinition } from "../admin-config-records.js";
 
-const fakeLog = {
-  info: vi.fn(),
-  error: vi.fn(),
-  warn: vi.fn(),
-  debug: vi.fn(),
-  trace: vi.fn(),
-  fatal: vi.fn(),
-  child: () => fakeLog,
-  level: "silent"
-} as unknown as import("fastify").FastifyBaseLogger;
+const fakeLog = createSilentLogger();
 
 function makeSkill(overrides: Partial<RuntimeSkillDefinition> = {}): RuntimeSkillDefinition {
   return {

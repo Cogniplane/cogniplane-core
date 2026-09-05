@@ -1,5 +1,5 @@
 import type { PiiCircuitBreaker } from "./pii-circuit-breaker.js";
-import type { PiiEntityType } from "./pii-policy.js";
+import { PII_ENTITY_TYPES, type PiiEntityType } from "@cogniplane/shared-types";
 import type {
   PiiArtifactScanResult,
   PiiDetectTextInput,
@@ -12,7 +12,6 @@ import type {
   PiiTransformResult,
   PiiTransformTextInput
 } from "./pii-provider.js";
-import { PII_ENTITY_TYPES } from "./pii-policy.js";
 
 /**
  * Which HTTP dialect the endpoint speaks.
@@ -125,6 +124,41 @@ const VALID_ENTITY_TYPES = new Set<PiiEntityType>(PII_ENTITY_TYPES);
  * served by vLLM (no third-party inference, no external query logs); in OSS
  * and dev it can point at OpenRouter or a local Ollama/vLLM.
  */
+/**
+ * The machine-readable error code from a failed PII-endpoint response, if the
+ * body is JSON that carries one. Returns "" otherwise.
+ *
+ * The raw body is deliberately NOT included. This message propagates into
+ * `pii_scan_jobs.error_message` and the admin-visible error rollup
+ * (`pii-analytics-store.ts`), and OpenAI-compatible gateways commonly echo the
+ * offending request back in a 4xx body — which here is the text under scan.
+ * Storing it would defeat `rawRetention='never'`: the one guarantee the PII
+ * pipeline makes is that scanned text is not retained, and a 400 from a
+ * misconfigured gateway must not be the hole in it.
+ *
+ * A vendor error code (`invalid_api_key`, `model_not_found`,
+ * `context_length_exceeded`) is a fixed identifier from the provider's own
+ * enum, not caller data, so it is safe — and it is the part an operator
+ * actually needs in order to fix the configuration.
+ */
+function formatUpstreamErrorCode(body: string): string {
+  if (!body) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return "";
+  }
+  const error = (parsed as { error?: unknown } | null)?.error;
+  if (typeof error !== "object" || error === null) return "";
+  const { code, type } = error as { code?: unknown; type?: unknown };
+  const identifier = typeof code === "string" ? code : typeof type === "string" ? type : null;
+  if (!identifier) return "";
+  // Bounded: "code" is an identifier by convention, but an upstream is free to
+  // put anything in that field.
+  return ` (${identifier.slice(0, 64)})`;
+}
+
 export class OpenAiCompatiblePiiProvider implements PiiProvider {
   readonly type = "openai-compatible";
 
@@ -384,7 +418,7 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
       const text = await response.text().catch(() => "");
       throw new OpenAiCompatiblePiiProviderError(
         "http_error",
-        `PII model endpoint returned ${response.status}: ${text.slice(0, 500)}`
+        `PII model endpoint returned ${response.status}${formatUpstreamErrorCode(text)}`
       );
     }
 

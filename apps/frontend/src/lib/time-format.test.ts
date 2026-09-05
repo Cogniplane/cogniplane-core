@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { formatMediumDateTime, formatMessageTimestamp, formatTimestamp } from "./time-format";
+import { formatMediumDateTime, formatTimestamp } from "./time-format";
 
 describe("formatTimestamp", () => {
   test("nullish returns em dash", () => {
@@ -38,13 +38,5 @@ describe("formatMediumDateTime", () => {
     const out = formatMediumDateTime("2026-04-30T12:00:00Z", "x");
     expect(out).toMatch(/2026/);
     expect(out).toMatch(/\d{1,2}:\d{2}/);
-  });
-});
-
-describe("formatMessageTimestamp", () => {
-  test("returns a formatted hh:mm string", () => {
-    const iso = "2026-05-09T14:35:00Z";
-    const result = formatMessageTimestamp(iso);
-    expect(result).toMatch(/\d{1,2}:\d{2}/);
   });
 });

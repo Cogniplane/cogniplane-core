@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
 
-import { MessageSchema } from "./message.js";
+import { MessagesListResponseSchema } from "./message.js";
 
 export const SessionSchema = z.object({
   sessionId: z.string(),
@@ -33,9 +33,12 @@ export const SessionEnvelopeSchema = z.object({
 
 export type SessionEnvelope = z.infer<typeof SessionEnvelopeSchema>;
 
-export const SessionMessagesResponseSchema = z.object({
-  session: SessionSchema,
-  messages: z.array(MessageSchema)
-}).passthrough();
+// The same payload MessagesListResponseSchema describes, plus the session
+// envelope. Extended rather than redeclared so `messages`/`hasMore` cannot drift
+// between the schema the backend serializes with and the one the frontend parses
+// with — that drift is what let `hasMore` reach the client untyped.
+export const SessionMessagesResponseSchema = MessagesListResponseSchema.extend({
+  session: SessionSchema
+});
 
 export type SessionMessagesResponse = z.infer<typeof SessionMessagesResponseSchema>;

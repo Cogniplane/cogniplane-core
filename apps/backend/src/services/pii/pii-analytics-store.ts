@@ -2,6 +2,13 @@
 // runs through `withTenantScope` so RLS gates the underlying tables —
 // `PiiScanRunStore` owns per-row CRUD; this store owns the dashboard
 // aggregations.
+//
+// Every query also carries an explicit `tenant_id` predicate. That is
+// redundant while the scope is in place, and deliberately so: this store
+// aggregates across whole tables, so a caller that reaches it without the
+// scope, or a regressed RLS policy, would silently return other tenants'
+// counts rather than raise. The predicate makes that failure return nothing
+// instead of leaking.
 
 import { type Pool, withTenantScope } from "../../lib/db.js";
 
@@ -92,9 +99,9 @@ export class PiiAnalyticsStore {
             COUNT(*) FILTER (WHERE status = 'transformed')::int AS transformed,
             COUNT(*) FILTER (WHERE status = 'failed')::int AS failed
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       const row = (result.rows[0] ?? {}) as Record<string, unknown>;
       return {
@@ -127,7 +134,7 @@ export class PiiAnalyticsStore {
               status,
               action_taken
             FROM pii_scan_runs
-            WHERE created_at >= $1 AND created_at < $2
+            WHERE tenant_id = $4 AND created_at >= $1 AND created_at < $2
           )
           SELECT
             b.bucket,
@@ -141,7 +148,7 @@ export class PiiAnalyticsStore {
           GROUP BY b.bucket
           ORDER BY b.bucket
         `,
-        [range.from, range.to, range.bucket]
+        [range.from, range.to, range.bucket, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -166,12 +173,12 @@ export class PiiAnalyticsStore {
             COUNT(*)::int          AS count
           FROM pii_scan_runs,
             LATERAL jsonb_array_elements(findings_json) AS finding
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
             AND finding->>'entityType' IS NOT NULL
           GROUP BY finding->>'entityType'
           ORDER BY count DESC, entity_type
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -192,7 +199,7 @@ export class PiiAnalyticsStore {
               COUNT(*) FILTER (WHERE finding->>'confidence' = 'low')::int    AS low
             FROM pii_scan_runs,
               LATERAL jsonb_array_elements(findings_json) AS finding
-            WHERE created_at >= $1 AND created_at < $2
+            WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
               AND finding->>'entityType' IS NOT NULL
             GROUP BY finding->>'entityType'
           )
@@ -204,7 +211,7 @@ export class PiiAnalyticsStore {
           FROM confidence_counts
           ORDER BY (high + medium + low) DESC, entity_type
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -224,11 +231,11 @@ export class PiiAnalyticsStore {
         `
           SELECT subject_type, COUNT(*)::int AS count
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
           GROUP BY subject_type
           ORDER BY subject_type
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -259,14 +266,14 @@ export class PiiAnalyticsStore {
             COUNT(*) FILTER (WHERE status = 'failed')::int        AS failed_count,
             MAX(created_at)                                       AS last_seen_at
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $4 AND created_at >= $1 AND created_at < $2
             AND source_user_id IS NOT NULL
             AND status NOT IN ('pending', 'processing')
           GROUP BY source_user_id
           ORDER BY findings_total DESC, last_seen_at DESC
           LIMIT $3
         `,
-        [from, to, limit]
+        [from, to, limit, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -304,14 +311,14 @@ export class PiiAnalyticsStore {
             COUNT(*) FILTER (WHERE status = 'failed')::int        AS failed_count,
             MAX(created_at)                                       AS last_activity_at
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $4 AND created_at >= $1 AND created_at < $2
             AND source_session_id IS NOT NULL
             AND status NOT IN ('pending', 'processing')
           GROUP BY source_session_id
           ORDER BY findings_total DESC, last_activity_at DESC
           LIMIT $3
         `,
-        [from, to, limit]
+        [from, to, limit, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -376,7 +383,7 @@ export class PiiAnalyticsStore {
                 LATERAL (SELECT f->>'entityType' AS entity_type) e
             ) AS entity_types
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $6 AND created_at >= $1 AND created_at < $2
             AND (
               action_taken = ANY($3::text[])
               OR ($4::boolean AND status = 'failed')
@@ -384,7 +391,7 @@ export class PiiAnalyticsStore {
           ORDER BY created_at DESC
           LIMIT $5
         `,
-        [from, to, actionTakenValues, includeFailed, limit]
+        [from, to, actionTakenValues, includeFailed, limit, tenantId]
       );
 
       return result.rows.map((raw) => {
@@ -437,7 +444,9 @@ export class PiiAnalyticsStore {
             MIN(created_at) FILTER (WHERE status = 'queued')  AS oldest_queued_at,
             COUNT(*) FILTER (WHERE attempts >= max_attempts)::int AS max_attempts_hit
           FROM pii_scan_jobs
-        `
+          WHERE tenant_id = $1
+        `,
+        [tenantId]
       );
       const row = (result.rows[0] ?? {}) as Record<string, unknown>;
       return {
@@ -478,13 +487,13 @@ export class PiiAnalyticsStore {
             ) AS p99_ms,
             COUNT(*)::int AS sample_count
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
             AND status IN ('completed', 'blocked', 'transformed')
             AND completed_at IS NOT NULL
           GROUP BY subject_type
           ORDER BY subject_type
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;
@@ -511,14 +520,14 @@ export class PiiAnalyticsStore {
             LEFT(error_message, 200) AS message,
             COUNT(*)::int            AS count
           FROM pii_scan_runs
-          WHERE created_at >= $1 AND created_at < $2
+          WHERE tenant_id = $3 AND created_at >= $1 AND created_at < $2
             AND status = 'failed'
             AND error_message IS NOT NULL
           GROUP BY LEFT(error_message, 200)
           ORDER BY count DESC, message
           LIMIT 5
         `,
-        [from, to]
+        [from, to, tenantId]
       );
       return result.rows.map((raw) => {
         const row = raw as Record<string, unknown>;

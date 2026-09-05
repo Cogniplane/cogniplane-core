@@ -1,8 +1,8 @@
 import { describe, test, beforeEach, expect } from "vitest";
 
-import type { FastifyBaseLogger } from "fastify";
+import { EventType, type BaseEvent } from "@ag-ui/client";
 
-import type { RuntimeAdapter, RuntimeEvent, RuntimeSessionRef } from "../runtime-contracts.js";
+import type { RuntimeSessionRef } from "../runtime-contracts.js";
 import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
@@ -10,6 +10,7 @@ import type { ScheduledJobRecord } from "./user-settings-store.js";
 import {
   SchedulerWorker,
   type SchedulerRuntimeResolution,
+  type SchedulerRuntimeAdapter,
   type SchedulerWorkerDeps
 } from "./scheduler-worker.js";
 
@@ -20,13 +21,16 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
     runtimePolicy: {
       id: "default-profile",
       label: "Default",
+      description: null,
+      webSearchMode: "disabled",
       approvalPolicy: "never",
+      approvalReviewer: "user",
       sandboxMode: "workspace-write",
       networkMode: "restricted",
       allowCommandExecution: true,
-      allowUserTokenForwarding: false,
       autoApproveReadOnlyTools: false,
       policyEnforcementMode: "monitor",
+      developerInstructions: null,
       enabledToolIds: [],
       enabledMcpServers: [],
       version: 1,
@@ -50,6 +54,7 @@ function makeFakeJob(overrides: Partial<ScheduledJobRecord> = {}): ScheduledJobR
     input: { prompt: "Generate the daily report" },
     settingsSnapshot: {},
     enabled: true,
+    consecutiveFailures: 0,
     lastRunAt: null,
     nextRunAt: "2026-01-01T09:00:00.000Z",
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -63,8 +68,8 @@ let messageIdCounter = 0;
 function makeFakeMessageRecord(
   sessionId: string,
   userId: string,
-  role: "user" | "assistant",
-  status: "pending" | "streaming" | "completed" | "error",
+  role: MessageRecord["role"],
+  status: MessageRecord["status"],
   content: string,
   overrides?: Partial<MessageRecord>
 ): MessageRecord {
@@ -78,11 +83,13 @@ function makeFakeMessageRecord(
     status,
     content,
     reasoningContent: "",
+    reasoningSegments: null,
     planContent: "",
     tokenUsage: null,
     modelName: null,
     costUsd: null,
     feedbackRating: null,
+    detail: {},
     toolResults: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -93,11 +100,11 @@ function makeFakeMessageRecord(
 function createFakeDeps(options?: {
   dueJobs?: ScheduledJobRecord[];
   claimReturns?: (ScheduledJobRecord | null)[];
-  runtimeEvents?: RuntimeEvent[][];
+  runtimeEvents?: BaseEvent[][];
   runMessageImpl?: (
     session: RuntimeSessionRef,
     input: { prompt: string }
-  ) => AsyncIterable<RuntimeEvent>;
+  ) => AsyncIterable<BaseEvent>;
   /** Token usage the runtime adapter is pretended to have persisted on the assistant row. */
   assistantTokenUsage?: { inputTokens: number; outputTokens: number };
   /** Override per-tenant runtime resolution (e.g. to fail it or to hand back
@@ -114,14 +121,21 @@ function createFakeDeps(options?: {
   }>;
   /** Make the stale-run sweep itself fail. */
   sweepStaleJobRunsError?: Error;
+  /** Delay runtime resolution so a short jobTimeoutMs fires BEFORE `turn.adapter`
+   *  is assigned — the watchdog then has no adapter to abort through. */
+  resolveRuntimeDelayMs?: number;
 }) {
   const dueJobs = options?.dueJobs ?? [];
   const claimReturns = options?.claimReturns ?? dueJobs.map((j) => j);
   const runtimeEventsPerCall = options?.runtimeEvents ?? [
     [
-      { type: "response.created", responseId: "resp-1" },
-      { type: "response.output_text.delta", responseId: "resp-1", delta: "Hello from scheduler" },
-      { type: "response.completed", responseId: "resp-1" }
+      { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+      {
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: "msg-1",
+        delta: "Hello from scheduler"
+      } as BaseEvent,
+      { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" } as BaseEvent
     ]
   ];
 
@@ -165,6 +179,7 @@ function createFakeDeps(options?: {
   const runtimeSessionsCreated: Array<{ sessionId: string; userId: string }> = [];
   const runMessageCalls: Array<{ sessionId: string; prompt: string; model?: string }> = [];
   const abortSessionCalls: Array<{ tenantId: string; sessionId: string; userId: string }> = [];
+  const purgeSessionDataCalls: Array<{ tenantId: string; sessionId: string; userId: string }> = [];
   const resolveRuntimeCalls: string[] = [];
   const auditEvents: Array<{
     sessionId: string | null;
@@ -177,15 +192,14 @@ function createFakeDeps(options?: {
   const sweepStaleJobRunsCalls: Array<{ olderThanMs: number; limit: number }> = [];
 
   // The adapter `resolveRuntime` hands back by default — what the worker
-  // dispatches createSession/runMessage/abortSession to after resolution.
-  const runtimeAdapter = {
+  // dispatches createSession/runMessageAGUI/abortSession to after resolution.
+  const runtimeAdapter: Extract<SchedulerRuntimeResolution, { kind: "ok" }>["adapter"] = {
     id: "deep-agents",
-    hasActiveTurn: () => false,
     createSession: async (input) => {
       runtimeSessionsCreated.push(input);
       return makeFakeSessionRef(input.sessionId);
     },
-    runMessage: function (_session, input) {
+    runMessageAGUI: function (_session, input) {
       runMessageCalls.push({ sessionId: _session.sessionId, prompt: input.prompt, model: input.model });
       if (options?.runMessageImpl) {
         return options.runMessageImpl(_session, { prompt: input.prompt });
@@ -200,8 +214,11 @@ function createFakeDeps(options?: {
     },
     abortSession: async (input) => {
       abortSessionCalls.push(input);
+    },
+    purgeSessionData: async (input) => {
+      purgeSessionDataCalls.push(input);
     }
-  } as RuntimeAdapter;
+  };
 
   const deps: SchedulerWorkerDeps = {
     settings: {
@@ -320,7 +337,7 @@ function createFakeDeps(options?: {
           runtimeId: input.runtimeId,
           runtimePolicyId: input.runtimePolicyId,
           messageId: input.messageId,
-          metadata: input.metadata,
+          metadata: input.metadata ?? {},
           ttlMs: input.ttlMs
         });
         return {
@@ -332,7 +349,7 @@ function createFakeDeps(options?: {
           runtimePolicyId: input.runtimePolicyId,
           messageId: input.messageId,
           credentialEnvelope: {},
-          metadata: input.metadata,
+          metadata: input.metadata ?? {},
           expiresAt: new Date(Date.now() + input.ttlMs).toISOString(),
           createdAt: new Date().toISOString()
         } satisfies ToolExecutionContext;
@@ -340,6 +357,9 @@ function createFakeDeps(options?: {
     },
     resolveRuntime: async (tenantId: string) => {
       resolveRuntimeCalls.push(tenantId);
+      if (options?.resolveRuntimeDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.resolveRuntimeDelayMs));
+      }
       if (options?.resolveRuntimeImpl) {
         return options.resolveRuntimeImpl(tenantId);
       }
@@ -355,14 +375,9 @@ function createFakeDeps(options?: {
       }
     },
     logger: {
-      info: () => {},
       warn: () => {},
-      error: () => {},
-      debug: () => {},
-      fatal: () => {},
-      trace: () => {},
-      child: () => ({ info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, fatal: () => {}, trace: () => {}, child: () => ({}) }) as unknown
-    } as unknown as FastifyBaseLogger
+      error: () => {}
+    }
   };
 
   return {
@@ -378,6 +393,7 @@ function createFakeDeps(options?: {
     runtimeSessionsCreated,
     runMessageCalls,
     abortSessionCalls,
+    purgeSessionDataCalls,
     resolveRuntimeCalls,
     sweepStaleJobRunsCalls,
     auditEvents,
@@ -434,7 +450,7 @@ describe("SchedulerWorker", () => {
     });
 
     const completedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.completed");
-    expect(completedAudit).toBeTruthy();
+    if (!completedAudit) throw new Error("Expected scheduler completion audit event.");
     expect(completedAudit.userId).toBe("user-1");
   });
 
@@ -447,16 +463,15 @@ describe("SchedulerWorker", () => {
       makeFakeJob({ jobId: "job-b", tenantId: "tenant-b" })
     ];
 
-    const completedEvents: RuntimeEvent[] = [
-      { type: "response.created", responseId: "resp-1" },
-      { type: "response.completed", responseId: "resp-1" }
+    const completedEvents: BaseEvent[] = [
+      { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+      { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" } as BaseEvent
     ];
-    const makeAdapter = (id: string, calls: string[]) =>
+    const makeAdapter = (id: string, calls: string[]): SchedulerRuntimeAdapter =>
       ({
         id,
-        hasActiveTurn: () => false,
         createSession: async (input: { sessionId: string }) => makeFakeSessionRef(input.sessionId),
-        runMessage: function (_session: RuntimeSessionRef) {
+        runMessageAGUI: function (_session: RuntimeSessionRef) {
           calls.push(_session.sessionId);
           return (async function* () {
             for (const event of completedEvents) {
@@ -464,8 +479,9 @@ describe("SchedulerWorker", () => {
             }
           })();
         },
-        abortSession: async () => {}
-      }) as unknown as RuntimeAdapter;
+        abortSession: async () => {},
+        purgeSessionData: async () => {}
+      });
 
     const callsA: string[] = [];
     const callsB: string[] = [];
@@ -499,6 +515,38 @@ describe("SchedulerWorker", () => {
     expect(runMessageCalls[0].model).toBe("default-model");
   });
 
+  test("an internal exception never reaches the job owner's run row or audit event", async () => {
+    // R8. errorMessage is written to scheduled_job_runs, put in the
+    // scheduler.job.run.failed audit payload, and returned to the job owner by
+    // GET /me/scheduled-jobs/:jobId/runs. It used to be `error.message` raw, so
+    // a pg or E2B failure put connection strings and sandbox ids in front of a
+    // user. The interactive path already classified; this one did not.
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
+      dueJobs: [job],
+      runMessageImpl: () => {
+        throw Object.assign(
+          new Error(
+            "connect ECONNREFUSED postgres://app_user:s3cr3t@10.0.4.17:5432/cogniplane, sandbox i7x9k2mq0zt4vabc"
+          ),
+          { statusCode: 500 }
+        );
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    await worker.tick();
+
+    expect(jobRunsCompleted.length).toBe(1);
+    expect(jobRunsCompleted[0].status).toBe("failed");
+    expect(jobRunsCompleted[0].errorMessage).toBe("The assistant run failed.");
+
+    // Nothing internal in the run row or the audit trail.
+    const serialized = JSON.stringify({ runs: jobRunsCompleted, audit: auditEvents });
+    expect(serialized).not.toContain("10.0.4.17");
+    expect(serialized).not.toContain("s3cr3t");
+    expect(serialized).not.toContain("i7x9k2mq0zt4vabc");
+  });
+
   test("tick records a failed run when runtime resolution fails, without touching any runtime", async () => {
     const job = makeFakeJob();
     const { deps, jobRunsCreated, jobRunsCompleted, runtimeSessionsCreated, messagesCreated, auditEvents, recordOutcomeCalls } =
@@ -526,11 +574,11 @@ describe("SchedulerWorker", () => {
     expect(auditEvents.find((e) => e.type === "scheduler.job.run.failed")).toBeTruthy();
   });
 
-  test("tick records failure when runtime yields response.failed", async () => {
+  test("tick records failure when runtime yields RUN_ERROR", async () => {
     const job = makeFakeJob();
-    const failedEvents: RuntimeEvent[] = [
-      { type: "response.created", responseId: "resp-1" },
-      { type: "response.failed", responseId: "resp-1", message: "Something went wrong" }
+    const failedEvents: BaseEvent[] = [
+      { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
+      { type: EventType.RUN_ERROR, message: "Something went wrong" }
     ];
     const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
       dueJobs: [job],
@@ -595,9 +643,9 @@ describe("SchedulerWorker", () => {
 
   test("tick auto-disables a job once it crosses maxConsecutiveFailures", async () => {
     const job = makeFakeJob();
-    const failedEvents: RuntimeEvent[] = [
-      { type: "response.created", responseId: "resp-1" },
-      { type: "response.failed", responseId: "resp-1", message: "boom" }
+    const failedEvents: BaseEvent[] = [
+      { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
+      { type: EventType.RUN_ERROR, message: "boom" }
     ];
     const { deps, auditEvents } = createFakeDeps({
       dueJobs: [job],
@@ -630,9 +678,9 @@ describe("SchedulerWorker", () => {
 
   test("tick does not disable a failing job before the threshold is reached", async () => {
     const job = makeFakeJob();
-    const failedEvents: RuntimeEvent[] = [
-      { type: "response.created", responseId: "resp-1" },
-      { type: "response.failed", responseId: "resp-1", message: "boom" }
+    const failedEvents: BaseEvent[] = [
+      { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
+      { type: EventType.RUN_ERROR, message: "boom" }
     ];
     const { deps, auditEvents } = createFakeDeps({
       dueJobs: [job],
@@ -678,7 +726,7 @@ describe("SchedulerWorker", () => {
 
     // The disable reason is carried on the audit event, not the disableJob call.
     const disabledAudit = auditEvents.find((e) => e.type === "scheduler.job.disabled");
-    expect(disabledAudit).toBeTruthy();
+    if (!disabledAudit) throw new Error("Expected invalid-cron disable audit event.");
     expect(disabledAudit.payload.reason).toBe("invalid_cron");
     expect(disabledAudit.payload.disabled).toBe(true);
   });
@@ -698,7 +746,7 @@ describe("SchedulerWorker", () => {
     expect(sessionsCreated.length).toBe(0);
 
     const disabledAudit = auditEvents.find((e) => e.type === "scheduler.job.disabled");
-    expect(disabledAudit).toBeTruthy();
+    if (!disabledAudit) throw new Error("Expected invalid-cron dormant audit event.");
     expect(disabledAudit.payload.disabled).toBe(false);
   });
 
@@ -779,11 +827,11 @@ describe("SchedulerWorker", () => {
       dueJobs: [job],
       runMessageImpl: async function* () {
         // Never yields a terminal event on its own — simulates a stuck turn.
-        // It only ends once the runtime is aborted (mirrors the real runtime,
-        // where requestRuntimeShutdown pushes response.failed and ends the queue).
-        yield { type: "response.created", responseId: "resp-1" } as RuntimeEvent;
+        // It only ends once the runtime is aborted, mirroring the real runtime's
+        // terminal RUN_ERROR and closed event queue.
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
         await streamReleased;
-        yield { type: "response.failed", responseId: "resp-1", message: "aborted" } as RuntimeEvent;
+        yield { type: EventType.RUN_ERROR, message: "aborted" } as BaseEvent;
       }
     });
 
@@ -798,9 +846,14 @@ describe("SchedulerWorker", () => {
 
     await worker.tick();
 
-    expect(abortSessionCalls.length).toBe(1);
-    expect(abortSessionCalls[0].sessionId).toBe("session-1");
-    expect(abortSessionCalls[0].userId).toBe("user-1");
+    // The watchdog aborts, and reclamation aborts again unconditionally (the
+    // second is a no-op on the real adapter). Asserting an exact count here
+    // would push the code back toward skipping reclamation's abort on
+    // `timedOut`, which is exactly the bug the two tests below cover — so assert
+    // the abort HAPPENED and targeted the right session instead.
+    expect(abortSessionCalls.length).toBeGreaterThanOrEqual(1);
+    expect(abortSessionCalls.every((c) => c.sessionId === "session-1")).toBe(true);
+    expect(abortSessionCalls.every((c) => c.userId === "user-1")).toBe(true);
 
     expect(jobRunsCompleted.length).toBe(1);
     expect(jobRunsCompleted[0].status).toBe("failed");
@@ -810,34 +863,158 @@ describe("SchedulerWorker", () => {
     expect(failedAudit).toBeTruthy();
   });
 
-  test("tick releases the slot after the abort grace even when the turn never settles", async () => {
+  // R2: `timedOut` must never be treated as proof the runtime was aborted.
+  // executeJobWithTimeout only aborts `if (turn.sessionId && turn.adapter)`, and
+  // its abortSession can throw — in both cases reclamation holds the only
+  // remaining chance to release the runtime and its E2B sandbox.
+
+  test("reclamation still aborts when the watchdog's own abort threw", async () => {
     const job = makeFakeJob();
 
-    // A turn that hangs forever and is NOT released by abort — models a runtime
-    // that ignores the abort. Without a bounded grace this would pin the slot.
-    const { deps, runtimeAdapter } = createFakeDeps({
+    let releaseStream: (() => void) | null = null;
+    const streamReleased = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+
+    const { deps, runtimeAdapter, abortSessionCalls } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: async function* () {
-        yield { type: "response.created", responseId: "resp-1" } as RuntimeEvent;
-        await new Promise<void>(() => {}); // never resolves
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        await streamReleased;
+        yield { type: EventType.RUN_ERROR, message: "aborted" } as BaseEvent;
       }
     });
-    runtimeAdapter.abortSession = async () => {
-      // Intentionally does NOT unblock the stream.
+
+    let attempts = 0;
+    runtimeAdapter.abortSession = async (input) => {
+      attempts += 1;
+      abortSessionCalls.push(input);
+      if (attempts === 1) {
+        // The watchdog's abort fails. It still unblocks the stream so the job
+        // settles, but the runtime was NOT released.
+        releaseStream?.();
+        throw new Error("abort failed");
+      }
     };
 
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 10 });
+    await worker.tick();
+
+    // A second attempt must follow the failed one, or the runtime leaks until
+    // the idle timeout and the thread is purged out from under a live graph.
+    expect(abortSessionCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("reclamation does NOT purge the thread when every abort attempt failed", async () => {
+    const job = makeFakeJob();
+
+    let releaseStream: (() => void) | null = null;
+    const streamReleased = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+
+    const { deps, runtimeAdapter, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({
+      dueJobs: [job],
+      runMessageImpl: async function* () {
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        await streamReleased;
+        yield { type: EventType.RUN_ERROR, message: "aborted" } as BaseEvent;
+      }
+    });
+
+    // Every abort fails, so we can never conclude the graph stopped.
+    runtimeAdapter.abortSession = async (input) => {
+      abortSessionCalls.push(input);
+      releaseStream?.();
+      throw new Error("abort failed");
+    };
+
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 10 });
+    await worker.tick();
+
+    expect(abortSessionCalls.length).toBeGreaterThanOrEqual(1);
+    // Purging here would delete the checkpointer thread beneath a graph that may
+    // still be writing. An orphaned thread is the cheaper failure.
+    expect(purgeSessionDataCalls.length).toBe(0);
+  });
+
+  test("reclamation purges the thread on the normal path, after a successful abort", async () => {
+    const job = makeFakeJob();
+    const { deps, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({ dueJobs: [job] });
+
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 5_000 });
+    await worker.tick();
+
+    expect(abortSessionCalls.length).toBe(1);
+    expect(purgeSessionDataCalls.length).toBe(1);
+    expect(purgeSessionDataCalls[0].sessionId).toBe("session-1");
+  });
+
+  test("reclamation aborts the runtime resolved after a watchdog timeout fired", async () => {
+    const job = makeFakeJob();
+
+    const { deps, runtimeAdapter, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({
+      dueJobs: [job],
+      // Resolve the runtime only AFTER the watchdog has already fired, so
+      // `turn.adapter` was still null when executeJobWithTimeout checked it and
+      // no abort happened there.
+      resolveRuntimeDelayMs: 40,
+      runMessageImpl: async function* () {
+        yield {
+          type: EventType.RUN_FINISHED,
+          threadId: "session-1",
+          runId: "resp-1"
+        } as BaseEvent;
+      }
+    });
+    runtimeAdapter.abortSession = async (input) => {
+      abortSessionCalls.push(input);
+    };
+
+    const worker = new SchedulerWorker(deps, {
+      maxConcurrentJobs: 1,
+      jobTimeoutMs: 10,
+      abortSettleGraceMs: 500
+    });
+    await worker.tick();
+
+    expect(abortSessionCalls.length).toBe(1);
+    expect(abortSessionCalls[0].sessionId).toBe("session-1");
+    expect(purgeSessionDataCalls.length).toBe(1);
+  });
+
+  test("tick releases the slot after the abort grace even when the turn never settles", async () => {
+    const firstJob = makeFakeJob();
+    const secondJob = makeFakeJob({ jobId: "job-2" });
+    const dueJobs = [firstJob];
+    let turnsStarted = 0;
+    const { deps, runtimeAdapter, claimsCalled, jobRunsCreated } = createFakeDeps({
+      dueJobs,
+      claimReturns: [firstJob, secondJob],
+      runMessageImpl: async function* () {
+        turnsStarted += 1;
+        if (turnsStarted === 1) {
+          yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+          await new Promise<void>(() => {});
+        }
+        yield { type: EventType.RUN_FINISHED, threadId: "session-2", runId: "resp-2" } as BaseEvent;
+      }
+    });
+    runtimeAdapter.abortSession = async () => {};
     const worker = new SchedulerWorker(deps, {
       maxConcurrentJobs: 1,
       jobTimeoutMs: 5,
       abortSettleGraceMs: 10
     });
 
-    // The assertion that matters: tick resolves (the slot frees) rather than
-    // hanging on the never-settling turn.
+    await worker.tick();
+    expect(turnsStarted).toBe(1);
+    dueJobs.splice(0, 1, secondJob);
     await worker.tick();
 
-    // Slot is free again, so a second tick can run.
-    await worker.tick();
+    expect(claimsCalled.map((claim) => claim.jobId)).toEqual(["job-1", "job-2"]);
+    expect(jobRunsCreated.map((run) => run.jobId)).toEqual(["job-1", "job-2"]);
+    expect(turnsStarted).toBe(2);
   });
 
   test("tick skips job when claim returns null", async () => {
@@ -864,16 +1041,16 @@ describe("SchedulerWorker", () => {
       claimReturns: [jobs[0], jobs[1], jobs[2]],
       runtimeEvents: [
         [
-          { type: "response.created", responseId: "resp-1" },
-          { type: "response.completed", responseId: "resp-1" }
+          { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+          { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" } as BaseEvent
         ],
         [
-          { type: "response.created", responseId: "resp-2" },
-          { type: "response.completed", responseId: "resp-2" }
+          { type: EventType.RUN_STARTED, threadId: "session-2", runId: "resp-2" } as BaseEvent,
+          { type: EventType.RUN_FINISHED, threadId: "session-2", runId: "resp-2" } as BaseEvent
         ],
         [
-          { type: "response.created", responseId: "resp-3" },
-          { type: "response.completed", responseId: "resp-3" }
+          { type: EventType.RUN_STARTED, threadId: "session-3", runId: "resp-3" } as BaseEvent,
+          { type: EventType.RUN_FINISHED, threadId: "session-3", runId: "resp-3" } as BaseEvent
         ]
       ]
     });
@@ -896,7 +1073,7 @@ describe("SchedulerWorker", () => {
     });
 
     // Stall the first claim so a second tick can overlap it.
-    let releaseClaim: (() => void) | null = null;
+    let releaseClaim = () => {};
     const claimGate = new Promise<void>((resolve) => {
       releaseClaim = resolve;
     });
@@ -915,7 +1092,7 @@ describe("SchedulerWorker", () => {
     // Let tick2 run to completion while tick1 is parked on the claim await —
     // it must see the reserved slot and admit nothing.
     await tick2;
-    releaseClaim?.();
+    releaseClaim();
     await tick1;
 
     expect(claimsCalled.map((c) => c.jobId)).toEqual(["job-1"]);
@@ -947,12 +1124,15 @@ describe("SchedulerWorker", () => {
       updatedAt: now
     });
 
-    let releaseClaim: (() => void) | null = null;
+    let releaseClaim = () => {};
     const claimGate = new Promise<void>((resolve) => {
       releaseClaim = resolve;
     });
     const claimCalls: number[] = [];
     deps.piiScanJobs = {
+      async sweepStaleClaims() {
+        return 0;
+      },
       async claimDueJobs(limit: number) {
         claimCalls.push(limit);
         if (claimCalls.length === 1) {
@@ -978,7 +1158,7 @@ describe("SchedulerWorker", () => {
     await tick2;
     expect(claimCalls).toEqual([2]);
 
-    releaseClaim?.();
+    releaseClaim();
     // tick1 never resolves (the handler hangs), but the claim has settled —
     // give the microtask queue a beat so the unused reservation is released.
     await new Promise((resolve) => setImmediate(resolve));
@@ -1019,6 +1199,9 @@ describe("SchedulerWorker", () => {
     const claimed: typeof piiJob[] = [];
     const executed: typeof piiJob[] = [];
     deps.piiScanJobs = {
+      async sweepStaleClaims() {
+        return 0;
+      },
       async claimDueJobs(limit: number) {
         claimed.push(piiJob);
         return claimed.slice(0, limit);
@@ -1069,6 +1252,9 @@ describe("SchedulerWorker", () => {
 
     const executed: typeof piiJob[] = [];
     deps.piiScanJobs = {
+      async sweepStaleClaims() {
+        return 0;
+      },
       async claimDueJobs(limit: number) {
         return [piiJob].slice(0, limit);
       }
@@ -1119,6 +1305,9 @@ describe("SchedulerWorker", () => {
     };
 
     deps.piiScanJobs = {
+      async sweepStaleClaims() {
+        return 0;
+      },
       async claimDueJobs() {
         return [piiJob];
       }

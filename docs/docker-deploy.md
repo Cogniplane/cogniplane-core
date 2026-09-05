@@ -38,6 +38,9 @@ make e2b-build          # note the template id it prints
 
 export E2B_TEMPLATE_ID=<id printed by the build>
 export ANTHROPIC_API_KEY=sk-ant-...
+export POSTGRES_PASSWORD=$(openssl rand -hex 32)
+export APP_USER_PASSWORD=$(openssl rand -hex 32)
+export DEV_HEADERS_AUTH_KEY=$(openssl rand -hex 32)
 
 docker compose up --build
 ```
@@ -68,7 +71,9 @@ The compose file forwards these env vars from the host:
 | `E2B_API_KEY` | **Required.** The runtime executes shell/file tools inside E2B sandboxes; the backend fails fast at boot without it. |
 | `E2B_TEMPLATE_ID` | **Required.** The template id printed by `make e2b-build`. The backend refuses to boot on the placeholder default. |
 | `ANTHROPIC_API_KEY` | Required for agent turns. Without it (and without a per-tenant key configured in the admin UI), `/models` returns an empty list and the model selector is empty. |
-| `APP_USER_PASSWORD` | Optional. Overrides the default `app_user` Postgres password. Defaults to `local-dev-app-user-password`. Don't set this unless you have a specific reason to. |
+| `POSTGRES_PASSWORD` | Optional on loopback. Overrides the local Postgres superuser password. |
+| `APP_USER_PASSWORD` | Optional on loopback. Overrides the local application database role password. |
+| `DEV_HEADERS_AUTH_KEY` | Optional on loopback. Overrides the shared browser/backend key used by dev-headers auth. Must contain at least 16 characters. |
 
 Drop any of these in a `.env` file at the repo root if you'd rather not export them in your shell:
 
@@ -76,9 +81,16 @@ Drop any of these in a `.env` file at the repo root if you'd rather not export t
 E2B_API_KEY=e2b_...
 E2B_TEMPLATE_ID=...
 ANTHROPIC_API_KEY=sk-ant-...
+POSTGRES_PASSWORD=<generated-value>
+APP_USER_PASSWORD=<different-generated-value>
+DEV_HEADERS_AUTH_KEY=<different-generated-value>
 ```
 
 Compose picks them up automatically.
+
+The committed local defaults only work with the loopback Postgres bind. An
+`exposure-guard` container refuses to start the stack on any other bind address
+until you override all three credentials.
 
 ## What's running where
 
@@ -122,18 +134,9 @@ This compose stack is for **trusted internal use** — your laptop, a dev VM, an
 
 If you want the hardened production posture, follow [self-hosting.md](self-hosting.md) instead.
 
-### Optional: harden the backend container
-
-If you want a stricter container posture, edit `compose.yaml` and add to the `backend` service:
-
-```yaml
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp:mode=1777,size=512m
-      - /home/appuser:mode=0755,uid=1001,gid=1001,size=1g
-```
+The Compose file runs the application containers with read-only root filesystems,
+drops their Linux capabilities, and sets CPU and memory limits. Postgres only
+publishes on loopback unless you explicitly change `POSTGRES_BIND_ADDR`.
 
 ## Troubleshooting
 
@@ -149,9 +152,14 @@ If you want a stricter container posture, edit `compose.yaml` and add to the `ba
 
 **Turns start but shell/file tools fail.** Check that `E2B_TEMPLATE_ID` matches a template that actually exists in the E2B account behind `E2B_API_KEY` (the backend can't detect a stale-but-real id at boot), and that outbound network access to E2B's API isn't blocked.
 
-**The first `docker compose up --build` is very slow.** The backend image installs `uv`, `bun`, the GitHub CLI, and Python 3 with `python-is-python3`, then runs `pnpm install` for the workspace. ~5–10 min on a cold cache; ~1 min on rebuild.
+**The first `docker compose up --build` is slow.** The builder installs the
+workspace dependencies before producing the backend bundle and frontend build.
+The backend runtime image contains only production dependencies and is about
+114 MB with the current lockfile.
 
-**`pnpm install` fails inside the build with `EBADENGINE`.** Your local Node version pinned by Docker (we use `node:24-trixie-slim`) is older than the workspace expects. Pull the latest base image: `docker compose build --pull`.
+**`pnpm install` fails inside the build with `EBADENGINE`.** The Dockerfiles pin
+Node 24.11.1. Update that immutable base reference together with the workspace's
+Node requirement, then rebuild.
 
 ## What's next
 

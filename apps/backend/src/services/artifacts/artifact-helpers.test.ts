@@ -55,8 +55,7 @@ test("readArtifactExcerpt: opens via storage and applies the budget", async () =
     async openReadStream() {
       return {
         stream: Readable.from([Buffer.from("once upon a time")]),
-        contentType: "text/plain",
-        sizeBytes: 16
+        fileSizeBytes: 16
       };
     }
   };

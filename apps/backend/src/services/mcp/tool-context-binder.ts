@@ -13,7 +13,7 @@ export async function resolveBoundToolContext(input: {
   urlToolContextId: string | null;
   sessionIdFromRuntimeToken: string;
   runtimeTokenClaims: RuntimeTokenClaims;
-  toolContexts: ToolExecutionContextStore;
+  toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">;
 }): Promise<{ context: ToolExecutionContext } | { error: RpcResponse }> {
   const { rpc, tenantId, args, urlToolContextId, sessionIdFromRuntimeToken, runtimeTokenClaims, toolContexts } = input;
   const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";

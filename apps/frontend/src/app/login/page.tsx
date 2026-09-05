@@ -11,18 +11,30 @@ export default function LoginPage() {
   const { login } = useAuth();
   const [ssoOrg, setSsoOrg] = useState("");
   const [isRedirecting, setIsRedirecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // `login()` navigates away on success, so this only ever returns on failure —
+  // and the button has to come back or the page is stuck on "Redirecting…".
+  const startLogin = async (options?: { organization?: string }) => {
+    setError(null);
+    setIsRedirecting(true);
+    try {
+      await login(options);
+    } catch (caught) {
+      setIsRedirecting(false);
+      setError(caught instanceof Error ? caught.message : "Sign-in is unavailable right now.");
+    }
+  };
 
   const handleEmailLogin = async (e: FormEvent) => {
     e.preventDefault();
-    setIsRedirecting(true);
-    await login();
+    await startLogin();
   };
 
   const handleSsoLogin = async (e: FormEvent) => {
     e.preventDefault();
     if (!ssoOrg.trim()) return;
-    setIsRedirecting(true);
-    await login({ organization: ssoOrg.trim() });
+    await startLogin({ organization: ssoOrg.trim() });
   };
 
   return (
@@ -50,6 +62,12 @@ export default function LoginPage() {
             <p className="mt-1 text-sm text-on-surface-variant">Sign in to your workspace</p>
           </div>
         </div>
+
+        {error ? (
+          <p role="alert" className="mb-4 text-sm text-danger">
+            {error}
+          </p>
+        ) : null}
 
         <form onSubmit={handleEmailLogin} className="flex flex-col gap-3">
           <Button type="submit" disabled={isRedirecting} className="w-full">

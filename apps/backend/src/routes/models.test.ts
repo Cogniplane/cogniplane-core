@@ -4,20 +4,31 @@ import { test, expect } from "vitest";
 import type { EffortLevel, ModelProvider } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
-import type { RuntimeAdapter } from "../runtime-contracts.js";
+import type { TenantSettingsRecord } from "../services/tenant-settings-store.js";
 
 import { registerModelRoutes, type ModelRouteStores } from "./models.js";
 
-const stubAdapter = { hasActiveTurn: () => false } as unknown as RuntimeAdapter;
-
-function settingsWith(overrides: Record<string, unknown> = {}) {
+function settingsWith(overrides: Partial<TenantSettingsRecord> = {}): TenantSettingsRecord {
   return {
+    tenantId: "t",
     showEffortSelector: false,
+    webSearchMode: "disabled",
+    approvalPolicy: "on-request",
+    approvalReviewer: "user",
+    allowCommandExecution: false,
+    autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor",
+    developerInstructions: null,
+    enabledToolIds: [],
+    enabledMcpServerIds: [],
     enabledProviders: [...MODEL_PROVIDERS],
     enabledModelIds: null,
     modelDefaultEfforts: {},
+    version: 1,
+    configHash: "test-config",
+    updatedAt: "2026-09-04T00:00:00.000Z",
     ...overrides
-  } as never;
+  };
 }
 
 function makeStores(overrides: Partial<ModelRouteStores> = {}): ModelRouteStores {
@@ -27,9 +38,9 @@ function makeStores(overrides: Partial<ModelRouteStores> = {}): ModelRouteStores
         return settingsWith();
       }
     },
-    runtimeAdapter: stubAdapter,
+    configuredProviders: configured(),
     ...overrides
-  } as ModelRouteStores;
+  };
 }
 
 async function makeModelsApp(stores: ModelRouteStores) {

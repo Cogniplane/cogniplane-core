@@ -1,11 +1,11 @@
 import { test, expect } from "vitest";
+import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import {
   PiiArtifactScanEnqueuer,
   type EnqueueArtifactPiiScanInput,
   type PiiArtifactSubjectReader
 } from "./pii-artifact-scan-enqueuer.js";
-import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "./pii-policy.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii-protection-service.js";
 
 function buildDeps(overrides: {
@@ -208,9 +208,9 @@ test("block mode evaluates synchronously and allows a clean artifact", async () 
   expect(artifactUpdateCalls.length).toBe(0);
 });
 
-const dirtyBlockDecision = {
-  action: "block" as const,
-  findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" as const }],
+const dirtyBlockDecision: PiiDecision = {
+  action: "block",
+  findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
   blockReason: "email",
   providerType: "openai-compatible",
   providerModel: "google/gemini-2.5-flash"
@@ -305,7 +305,7 @@ test("microsoft_import scope is checked, not uploads", async () => {
     settings: {
       enabled: true,
       mode: "block",
-      scopes: { uploads: false, microsoftImports: false }
+      scopes: { chatPrompts: false, uploads: false, microsoftImports: false }
     }
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(
@@ -319,7 +319,7 @@ test("microsoft_import scope enabled but uploads disabled still allows microsoft
     settings: {
       enabled: true,
       mode: "block",
-      scopes: { uploads: false, microsoftImports: true }
+      scopes: { chatPrompts: false, uploads: false, microsoftImports: true }
     }
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(

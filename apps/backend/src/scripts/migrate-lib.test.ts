@@ -6,7 +6,7 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../lib/db.js";
 
-import { applyMigrations } from "./migrate-lib.js";
+import { applyMigrations, assertUniqueVersionPrefixes } from "./migrate-lib.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const realMigrationsDir = path.resolve(dirname, "../../db/migrations");
@@ -49,6 +49,22 @@ class FakeMigrationPool {
     };
   }
 }
+
+test("assertUniqueVersionPrefixes rejects two migrations claiming the same version", () => {
+  expect(() =>
+    assertUniqueVersionPrefixes(["005_alpha.sql", "005_beta.sql"])
+  ).toThrow(/Duplicate migration version prefix "005".*005_alpha\.sql.*005_beta\.sql/s);
+
+  // Distinct prefixes, zero-padding differences, and unprefixed files are fine.
+  expect(() =>
+    assertUniqueVersionPrefixes(["001_a.sql", "010_b.sql", "README.md"])
+  ).not.toThrow();
+});
+
+test("the real migrations directory has no duplicate version prefixes", async () => {
+  const realFiles = (await readdir(realMigrationsDir)).filter((f) => f.endsWith(".sql")).sort();
+  expect(() => assertUniqueVersionPrefixes(realFiles)).not.toThrow();
+});
 
 test("applyMigrations runs the real migration files on a single held client, each in its own transaction", async () => {
   const pool = new FakeMigrationPool();

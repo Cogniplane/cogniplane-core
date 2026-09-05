@@ -1,14 +1,49 @@
-import { describe, it, vi, beforeEach, expect } from "vitest";
+import { DEFAULT_PII_PROTECTION } from "@cogniplane/shared-types";
+import { describe, it, vi, beforeEach, expect, expectTypeOf } from "vitest";
 
 import {
+  ApiError,
   request,
+  requestOptionalOn404,
   setAccessToken,
   setTokenRefresher,
   createApiHeaders,
   buildErrorMessage
 } from "./api-client";
+import {
+  createAdminMcpServer,
+  updateAdminMcpServer,
+  getRuntimeConfig,
+  getTenantDetails,
+  updateTenantProviderKey
+} from "./admin-api";
+import { createScheduledJob, updateScheduledJob } from "./settings-api";
 
 type FetchCall = { url: string; init: RequestInit | undefined };
+
+describe("shared API request types", () => {
+  it("keeps schema defaults optional for frontend callers", () => {
+    type ScheduledInput = Parameters<typeof createScheduledJob>[0];
+    type ScheduledUpdateInput = Parameters<typeof updateScheduledJob>[1];
+    const minimal = {
+      jobName: "Daily digest",
+      cronExpression: "0 9 * * *",
+      timeZone: "UTC",
+      input: { prompt: "Summarize changes." }
+    };
+
+    expectTypeOf(minimal).toMatchTypeOf<ScheduledInput>();
+    expectTypeOf(minimal).toMatchTypeOf<ScheduledUpdateInput>();
+  });
+
+  it("uses distinct MCP create and update inputs", () => {
+    type CreateInput = Parameters<typeof createAdminMcpServer>[0];
+    type UpdateInput = Parameters<typeof updateAdminMcpServer>[1];
+
+    expectTypeOf<CreateInput>().toMatchTypeOf<{ serverId: string }>();
+    expectTypeOf<Pick<UpdateInput, "serverId">>().toEqualTypeOf<{ serverId?: string }>();
+  });
+});
 
 function stubFetch(responders: Array<() => Response>): {
   calls: FetchCall[];
@@ -109,6 +144,77 @@ describe("request: 401 → refresh → retry", () => {
     expect(refreshed).toBe(false);
     expect(calls.length).toBe(1);
   });
+
+  it("throws an ApiError with structured request details", async () => {
+    const { fetch } = stubFetch([
+      () => jsonResponse(422, { error: "validation_error", message: "Invalid input" })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(request("/items", { method: "POST" })).rejects.toMatchObject({
+      name: "ApiError",
+      status: 422,
+      code: "validation_error",
+      method: "POST",
+      path: "/items",
+      message: "Invalid input"
+    });
+  });
+
+  it("throws an ApiError when the error response is not JSON", async () => {
+    const { fetch } = stubFetch([
+      () => new Response("<html>oops</html>", { status: 502 })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(request("/unavailable")).rejects.toMatchObject({
+      name: "ApiError",
+      status: 502,
+      message: "Request failed: 502"
+    });
+  });
+
+  it("throws an ApiError for a JSON null error body", async () => {
+    const { fetch } = stubFetch([() => jsonResponse(500, null)]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(request("/null-error")).rejects.toMatchObject({
+      name: "ApiError",
+      status: 500,
+      message: "Request failed: 500"
+    });
+  });
+});
+
+describe("requestOptionalOn404", () => {
+  it("returns null for an HTTP 404 even when the message has no status", async () => {
+    const { fetch } = stubFetch([() => jsonResponse(404, { message: "Route missing" })]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(requestOptionalOn404("/missing")).resolves.toBeUndefined();
+  });
+
+  it("preserves a successful JSON null response", async () => {
+    const { fetch } = stubFetch([() => jsonResponse(200, null)]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(requestOptionalOn404("/nullable")).resolves.toBeNull();
+  });
+
+  it("rethrows non-404 ApiErrors", async () => {
+    const { fetch } = stubFetch([() => jsonResponse(500, { message: "Route failed" })]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    const result = requestOptionalOn404("/broken");
+    await expect(result).rejects.toBeInstanceOf(ApiError);
+    await expect(result).rejects.toMatchObject({ status: 500 });
+  });
 });
 
 describe("createApiHeaders", () => {
@@ -182,5 +288,34 @@ describe("buildErrorMessage", () => {
     });
 
     await expect(buildErrorMessage(response)).resolves.toBe("Request failed: 502");
+  });
+});
+
+describe("provider contracts", () => {
+  it("reads tenant and runtime responses and updates keys without legacy aliases", async () => {
+    const providerKeys = { anthropic: true, openai: false, google: false, openrouter: false, zai: false };
+    const tenant = {
+      tenantId: "t-1", tenantName: "Test", slug: "test", ssoProvider: null, plan: "pro",
+      settings: {
+        providerKeys, skillMarketplaceManifestUrl: null,
+        piiProtection: DEFAULT_PII_PROTECTION,
+        github: { configured: false }, microsoftOAuth: { configured: false }
+      },
+      createdAt: "2026-09-04T00:00:00Z", updatedAt: "2026-09-04T00:00:00Z"
+    };
+    const runtime = { e2bTemplateId: "template", platformProviders: ["openai"] };
+    const fetch = vi.spyOn(global, "fetch")
+      .mockReset()
+      .mockResolvedValueOnce(jsonResponse(200, tenant))
+      .mockResolvedValueOnce(jsonResponse(200, runtime))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true, providerKeys }));
+    try {
+      expect((await getTenantDetails()).settings.providerKeys).toEqual(providerKeys);
+      expect(await getRuntimeConfig()).toEqual(runtime);
+      expect(await updateTenantProviderKey({ provider: "anthropic", apiKey: "" })).toEqual({ ok: true, providerKeys });
+      expect(JSON.parse(String(fetch.mock.calls[2][1]?.body))).toEqual({ provider: "anthropic", apiKey: "" });
+    } finally {
+      fetch.mockRestore();
+    }
   });
 });

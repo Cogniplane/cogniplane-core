@@ -29,7 +29,6 @@ export type TenantSettingsRecord = {
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: ApprovalReviewer;
   allowCommandExecution: boolean;
-  allowUserTokenForwarding: boolean;
   autoApproveReadOnlyTools: boolean;
   /** Tenant-level Policy Center switch (monitor → enforce). */
   policyEnforcementMode: PolicyEnforcementMode;
@@ -94,7 +93,6 @@ function mapRow(row: Record<string, unknown>): TenantSettingsRecord {
     approvalPolicy: parseApprovalPolicy(row.approval_policy),
     approvalReviewer: parseApprovalReviewer(row.approval_reviewer),
     allowCommandExecution: Boolean(row.allow_command_execution),
-    allowUserTokenForwarding: Boolean(row.allow_user_token_forwarding),
     autoApproveReadOnlyTools: Boolean(row.auto_approve_read_only_tools),
     policyEnforcementMode: parsePolicyEnforcementMode(row.policy_enforcement_mode),
     developerInstructions: row.developer_instructions ? String(row.developer_instructions) : null,
@@ -120,7 +118,6 @@ export type TenantSettingsInput = {
   approvalPolicy?: ApprovalPolicy;
   approvalReviewer?: ApprovalReviewer;
   allowCommandExecution?: boolean;
-  allowUserTokenForwarding?: boolean;
   autoApproveReadOnlyTools?: boolean;
   policyEnforcementMode?: PolicyEnforcementMode;
   developerInstructions?: string | null;
@@ -138,7 +135,6 @@ export function buildDefaultTenantSettingsInput(): Required<TenantSettingsInput>
     approvalPolicy: "on-request",
     approvalReviewer: "user",
     allowCommandExecution: false,
-    allowUserTokenForwarding: true,
     autoApproveReadOnlyTools: true,
     // Policy Center inert until deliberately armed — rules record decisions but
     // gate nothing until flipped to "enforce".
@@ -200,9 +196,6 @@ export class TenantSettingsStore {
       const resolvedCommandExec = Object.hasOwn(input, "allowCommandExecution")
         ? (input.allowCommandExecution ?? defaults.allowCommandExecution)
         : (existing?.allowCommandExecution ?? defaults.allowCommandExecution);
-      const resolvedTokenFwd = Object.hasOwn(input, "allowUserTokenForwarding")
-        ? (input.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding)
-        : (existing?.allowUserTokenForwarding ?? defaults.allowUserTokenForwarding);
       const resolvedReadOnly = Object.hasOwn(input, "autoApproveReadOnlyTools")
         ? (input.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools)
         : (existing?.autoApproveReadOnlyTools ?? defaults.autoApproveReadOnlyTools);
@@ -237,7 +230,6 @@ export class TenantSettingsStore {
         approvalPolicy: resolvedPolicy,
         approvalReviewer: resolvedReviewer,
         allowCommandExecution: resolvedCommandExec,
-        allowUserTokenForwarding: resolvedTokenFwd,
         autoApproveReadOnlyTools: resolvedReadOnly,
         policyEnforcementMode: resolvedPolicyEnforcementMode,
         developerInstructions: resolvedInstructions,
@@ -257,7 +249,6 @@ export class TenantSettingsStore {
             approval_policy,
             approval_reviewer,
             allow_command_execution,
-            allow_user_token_forwarding,
             auto_approve_read_only_tools,
             policy_enforcement_mode,
             developer_instructions,
@@ -270,14 +261,13 @@ export class TenantSettingsStore {
             config_hash,
             updated_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, 1, $16, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, 1, $15, NOW())
           ON CONFLICT (tenant_id) DO UPDATE SET
             show_effort_selector = EXCLUDED.show_effort_selector,
             web_search_mode = EXCLUDED.web_search_mode,
             approval_policy = EXCLUDED.approval_policy,
             approval_reviewer = EXCLUDED.approval_reviewer,
             allow_command_execution = EXCLUDED.allow_command_execution,
-            allow_user_token_forwarding = EXCLUDED.allow_user_token_forwarding,
             auto_approve_read_only_tools = EXCLUDED.auto_approve_read_only_tools,
             policy_enforcement_mode = EXCLUDED.policy_enforcement_mode,
             developer_instructions = EXCLUDED.developer_instructions,
@@ -298,7 +288,6 @@ export class TenantSettingsStore {
           serializeApprovalPolicy(resolvedPolicy),
           resolvedReviewer,
           resolvedCommandExec,
-          resolvedTokenFwd,
           resolvedReadOnly,
           resolvedPolicyEnforcementMode,
           resolvedInstructions,

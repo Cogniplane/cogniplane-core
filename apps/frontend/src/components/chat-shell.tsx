@@ -7,7 +7,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useSessionList } from "../hooks/use-session-list";
 import { useChatWorkspace } from "../hooks/use-chat-workspace";
-import { useAutoScroll } from "../hooks/use-auto-scroll";
 import { useEffortPreference } from "../hooks/use-effort-preference";
 import { useFileSources } from "../hooks/use-file-sources";
 import { useModelPreference } from "../hooks/use-model-preference";
@@ -31,33 +30,32 @@ const CopilotChatHost = dynamic(
   { ssr: false }
 );
 import {
-  ARTIFACT_PANE_WIDTH,
-  clampArtifactPaneWidth,
-  contextWindowForModel,
-  deriveAttentionSessionIds,
-  deriveStreamingSessionIds,
-  formatSessionForClipboard,
-  latestContextTokens,
   planStateFromMessages,
-  readStoredArtifactPaneWidth,
-  sessionCostUsd,
   toAguiInitialMessages,
   toolStatusesFromMessages
-} from "./chat-shell.logic";
+} from "./agui-transcript";
+import {
+  ARTIFACT_PANE_WIDTH,
+  clampArtifactPaneWidth,
+  readStoredArtifactPaneWidth
+} from "./artifact-pane-geometry";
+import { formatSessionForClipboard } from "./session-clipboard";
+import {
+  deriveAttentionSessionIds,
+  deriveStreamingSessionIds
+} from "./session-list-derivations";
+import { contextWindowForModel, latestContextTokens, sessionCostUsd } from "./session-usage";
 
 export function ChatShell() {
   const { isLoading: authIsLoading, user } = useAuth();
   const sessionList = useSessionList({ enabled: Boolean(user) });
   const { setError: setSessionListError } = sessionList;
-  const messagesRef = useRef<HTMLElement | null>(null);
   const chatMainRef = useRef<HTMLDivElement | null>(null);
   const modelsQuery = useQuery({
     queryKey: queryKeys.models.list(),
     queryFn: fetchModels,
     enabled: !authIsLoading && Boolean(user)
   });
-  // Fall back to the same defaults the four useStates used before so first-paint
-  // (pre-fetch) and post-fetch shapes stay identical for the downstream effects.
   const allModels = modelsQuery.data?.models ?? [];
   const showEffortSelector = modelsQuery.data?.showEffortSelector ?? false;
   // An empty models list after a successful fetch means no provider key is
@@ -76,6 +74,7 @@ export function ChatShell() {
   // state lives inside the host's agent subscription.
   const [liveIsRunning, setLiveIsRunning] = useState(false);
   const [liveApprovalCount, setLiveApprovalCount] = useState(0);
+  const [signalSessionId, setSignalSessionId] = useState(sessionList.selectedSessionId);
 
   const selectSession = useCallback(
     (sessionId: string) => {
@@ -150,9 +149,17 @@ export function ChatShell() {
     onError: setSessionListError
   });
 
-  const { messages } = chatWorkspace;
+  if (signalSessionId !== sessionList.selectedSessionId) {
+    // Seed from the persisted response so the attention indicator remains set
+    // during the remount, before the host publishes its live count. The host
+    // is gated on isSessionDataReady below, so this transient shell state is
+    // safe while the new session data loads.
+    setSignalSessionId(sessionList.selectedSessionId);
+    setLiveIsRunning(false);
+    setLiveApprovalCount(chatWorkspace.initialApprovals.length);
+  }
 
-  useAutoScroll(messagesRef, [messages], sessionList.selectedSessionId);
+  const { messages } = chatWorkspace;
 
   const formatSessionForClipboardCallback = useCallback(
     (): string | undefined => formatSessionForClipboard(messages),
@@ -165,11 +172,6 @@ export function ChatShell() {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveFileSourceId(null);
     }
-    // The host remounts per session (keyed), but its mount won't push these back
-    // to zero — clear the lifted live signals so a prior session's running /
-    // approval state doesn't bleed into the newly selected one.
-    setLiveIsRunning(false);
-    setLiveApprovalCount(0);
   }, [sessionList.selectedSessionId]);
 
   const fileSources = useFileSources({
@@ -203,23 +205,13 @@ export function ChatShell() {
     event.currentTarget.setPointerCapture?.(event.pointerId);
   }, []);
 
-  // Approvals pending on the ACTIVE session come live from the AG-UI stream
-  // (liveApprovalCount); the REST snapshot (pendingApprovals) still covers other
-  // sessions' approvals seen at load/refresh. OR them so the active session
-  // lights up immediately on approval_required, without regressing cross-session
-  // attention.
-  const activeSessionApprovalCount = Math.max(
-    liveApprovalCount,
-    chatWorkspace.pendingApprovals.length
-  );
-
   const attentionSessionIds = useMemo(
     () => deriveAttentionSessionIds(
       sessionList.sessions,
       sessionList.selectedSessionId,
-      activeSessionApprovalCount
+      liveApprovalCount
     ),
-    [sessionList.sessions, sessionList.selectedSessionId, activeSessionApprovalCount]
+    [sessionList.sessions, sessionList.selectedSessionId, liveApprovalCount]
   );
 
   // Only the selected session has a live host, so it's the only one that can be
@@ -287,27 +279,37 @@ export function ChatShell() {
         }`}
       >
         <SessionSidebar
-          sessions={sessionList.sessions}
-          selectedSessionId={sessionList.selectedSessionId}
-          isLoadingSessions={sessionList.isLoadingSessions}
-          busySessionId={sessionList.busySessionId}
-          streamingSessionIds={streamingSessionIds}
-          errorSessionId={sessionList.error ? sessionList.selectedSessionId : null}
-          renameSessionId={sessionList.renameSessionId}
-          renameDraft={sessionList.renameDraft}
-          pinnedSessionIds={sessionList.pinnedSessionIds}
-          attentionSessionIds={attentionSessionIds}
-          onSelectSession={selectSession}
-          onCreateSession={sessionList.createSession}
-          onStartRename={sessionList.startRename}
-          onCancelRename={sessionList.cancelRename}
-          onConfirmRename={sessionList.confirmRename}
-          onRenameDraftChange={sessionList.setRenameDraft}
-          onDeleteSession={sessionList.deleteSession}
-          onTogglePinSession={sessionList.togglePinSession}
-          pendingDeleteSessionId={sessionList.pendingDeleteSessionId}
-          onConfirmDelete={sessionList.confirmDelete}
-          onCancelDelete={sessionList.cancelDelete}
+          list={{
+            sessions: sessionList.sessions,
+            selectedId: sessionList.selectedSessionId,
+            isLoading: sessionList.isLoadingSessions,
+            streamingIds: streamingSessionIds,
+            errorId: sessionList.error ? sessionList.selectedSessionId : null,
+            attentionIds: attentionSessionIds,
+            onSelect: selectSession,
+            onCreate: sessionList.createSession
+          }}
+          rename={{
+            busyId: sessionList.busySessionId,
+            sessionId: sessionList.renameSessionId,
+            renameDraft: sessionList.renameDraft,
+            onStartRename: sessionList.startRename,
+            onCancelRename: sessionList.cancelRename,
+            onConfirmRename: sessionList.confirmRename,
+            onRenameDraftChange: sessionList.setRenameDraft
+          }}
+          deletion={{
+            busyId: sessionList.busySessionId,
+            pendingId: sessionList.pendingDeleteSessionId,
+            onRequest: sessionList.deleteSession,
+            onConfirmDelete: sessionList.confirmDelete,
+            onCancelDelete: sessionList.cancelDelete
+          }}
+          pinning={{
+            busyId: sessionList.busySessionId,
+            ids: sessionList.pinnedSessionIds,
+            onToggle: sessionList.togglePinSession
+          }}
         />
       </div>
 
@@ -330,7 +332,7 @@ export function ChatShell() {
               ? (next) => sessionList.renameSessionDirect(sessionList.selectedSession!.sessionId, next)
               : undefined
           }
-          hasPendingApprovals={activeSessionApprovalCount > 0}
+          hasPendingApprovals={liveApprovalCount > 0}
         />
 
         <div
@@ -353,47 +355,79 @@ export function ChatShell() {
                   <h2 className="text-xl font-semibold text-on-surface">
                     No model provider is available
                   </h2>
-                  <p className="max-w-md text-sm text-on-surface-variant">
-                    An administrator needs to add an API key and enable a runtime provider before
-                    you can start a conversation.
-                  </p>
-                  <a
-                    href="/admin/organization"
-                    className="inline-flex items-center rounded-md border border-outline-variant bg-surface px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container"
-                  >
-                    Open admin settings
-                  </a>
+                  {/* AuthGuard sends a member straight back here from
+                      /admin/organization, so offering them the link is a
+                      redirect loop. `noProvidersAvailable` does not narrow
+                      `user` for TypeScript, hence the optional chain. */}
+                  {user?.role === "admin" || user?.role === "owner" ? (
+                    <>
+                      <p className="max-w-md text-sm text-on-surface-variant">
+                        Add an API key and enable a runtime provider before you can start a
+                        conversation.
+                      </p>
+                      <a
+                        href="/admin/organization"
+                        className="inline-flex items-center rounded-md border border-outline-variant bg-surface px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container"
+                      >
+                        Open admin settings
+                      </a>
+                    </>
+                  ) : (
+                    <p className="max-w-md text-sm text-on-surface-variant">
+                      An administrator needs to add an API key and enable a runtime provider before
+                      you can start a conversation.
+                    </p>
+                  )}
                 </div>
               </section>
             ) : sessionList.selectedSessionId && chatWorkspace.isSessionDataReady ? (
+              <>
+              {/* The backend caps a transcript at its newest N messages. Say so
+                  explicitly — a clipped history is indistinguishable from a
+                  complete one, and there is no load-older flow to reach the rest. */}
+              {chatWorkspace.hasMoreMessages ? (
+                <div
+                  role="status"
+                  className="border-b border-outline-variant bg-surface-container-low px-6 py-2 text-center text-xs text-on-surface-variant"
+                >
+                  Older messages in this session aren&apos;t shown. The most recent history is
+                  displayed below.
+                </div>
+              ) : null}
               <CopilotChatHost
                 // Key on session so switching sessions remounts the host with
                 // that session's history seeded at construction.
                 key={sessionList.selectedSessionId}
-                sessionId={sessionList.selectedSessionId}
-                model={model}
-                effort={effort}
-                models={allModels}
-                showEffortSelector={showEffortSelector}
-                contextTokens={contextTokens}
-                contextWindow={contextWindow}
-                sessionCostUsd={sessionCost}
-                initialMessages={initialMessages}
-                initialState={initialState}
-                initialToolStatuses={initialToolStatuses}
-                artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
-                onModelChange={setModel}
-                onEffortChange={setEffort}
-                onTurnSettled={() => {
-                  // CopilotKit owns the live stream, so persisted state (token
-                  // usage, cost) only lands via a REST reload once a turn ends.
-                  if (sessionList.selectedSessionId) {
-                    void chatWorkspace.refreshSessionData(sessionList.selectedSessionId);
-                  }
+                session={{
+                  id: sessionList.selectedSessionId,
+                  initialMessages,
+                  initialState,
+                  initialToolStatuses,
+                  initialApprovals: chatWorkspace.initialApprovals
                 }}
-                onRunningChange={setLiveIsRunning}
-                onPendingApprovalsChange={setLiveApprovalCount}
+                modelSelection={{
+                  model,
+                  effort,
+                  models: allModels,
+                  showEffortSelector,
+                  onModelChange: setModel,
+                  onEffortChange: setEffort
+                }}
+                usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
+                artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
+                events={{
+                  onTurnSettled: () => {
+                    // CopilotKit owns the live stream, so persisted state (token
+                    // usage, cost) only lands via a REST reload once a turn ends.
+                    if (sessionList.selectedSessionId) {
+                      void chatWorkspace.refreshSessionData(sessionList.selectedSessionId);
+                    }
+                  },
+                  onRunningChange: setLiveIsRunning,
+                  onPendingApprovalsChange: setLiveApprovalCount
+                }}
               />
+              </>
             ) : null}
           </div>
 
@@ -424,19 +458,29 @@ export function ChatShell() {
                 }`}
               >
                 <ArtifactPanel
-                  artifacts={chatWorkspace.artifacts}
-                  visibleSelectedArtifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
-                  isUploadingArtifact={chatWorkspace.artifactState.isUploadingArtifact}
-                  downloadArtifactId={chatWorkspace.artifactState.downloadArtifactId}
-                  previewArtifactId={chatWorkspace.artifactState.previewArtifactId}
-                  isLoadingPreview={chatWorkspace.artifactState.isLoadingPreview}
-                  selectedSessionId={sessionList.selectedSessionId}
-                  onUpload={(file) => void chatWorkspace.artifactState.handleUploadArtifact(file)}
-                  onToggleSelection={chatWorkspace.artifactState.toggleArtifactSelection}
-                  onDownload={(id) => void chatWorkspace.artifactState.handleDownloadArtifact(id)}
-                  onPreview={(id) => void chatWorkspace.artifactState.openPreview(id)}
-                  fileSources={fileSources.sources}
-                  onOpenFileSource={(sourceId) => setActiveFileSourceId(sourceId)}
+                  inventory={{
+                    artifacts: chatWorkspace.artifacts
+                  }}
+                  selection={{
+                    visibleSelectedArtifactIds: chatWorkspace.artifactState.visibleSelectedArtifactIds,
+                    onToggle: chatWorkspace.artifactState.toggleArtifactSelection
+                  }}
+                  transfers={{
+                    isUploading: chatWorkspace.artifactState.isUploadingArtifact,
+                    downloadingId: chatWorkspace.artifactState.downloadArtifactId,
+                    onUpload: (file) => void chatWorkspace.artifactState.handleUploadArtifact(file),
+                    onDownload: (id) => void chatWorkspace.artifactState.handleDownloadArtifact(id)
+                  }}
+                  preview={{
+                    artifactId: chatWorkspace.artifactState.previewArtifactId,
+                    isLoading: chatWorkspace.artifactState.isLoadingPreview,
+                    onOpen: (id) => void chatWorkspace.artifactState.openPreview(id)
+                  }}
+                  sources={{
+                    sessionId: sessionList.selectedSessionId,
+                    items: fileSources.sources,
+                    onOpen: (sourceId) => setActiveFileSourceId(sourceId)
+                  }}
                 />
               </aside>
             </>

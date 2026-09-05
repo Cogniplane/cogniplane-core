@@ -20,10 +20,10 @@ import {
 } from "./admin-route-helpers.js";
 
 export type TenantSettingsRouteStores = {
-  dynamicConfig: DynamicConfigService;
-  auditEvents: AuditEventStore;
-  managedToolCatalog: ManagedToolCatalog;
-  runtimeAdapter: RuntimeAdapter;
+  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
+  auditEvents: Pick<AuditEventStore, "create">;
+  managedToolCatalog: Pick<ManagedToolCatalog, "listTenantConfigurable">;
+  runtimeAdapter: Pick<RuntimeAdapter, "invalidateTenantRuntimes">;
   /**
    * The tenant's admin-added custom models (id + supported efforts are all
    * this route needs). Merged with AVAILABLE_MODELS when validating
@@ -66,13 +66,48 @@ async function invalidateTenantRuntimes(
   }
 }
 
+/**
+ * Drops model ids the catalog no longer knows about from a tenant's saved
+ * availability settings.
+ *
+ * PUT validates enabledModelIds against the catalog and 400s on an unknown id.
+ * The admin form round-trips whatever GET returns, so a catalog removal (a
+ * retired vendor model, a deleted custom model) would otherwise wedge the
+ * page: the stale id no longer renders as a checkbox, yet it rides along on
+ * every save and is rejected. Filtering on read keeps the settings the admin
+ * can actually see and the settings they submit in agreement.
+ *
+ * An allowlist that filters down to empty becomes null ("all models") rather
+ * than [] ("no models"): every model the admin picked is gone, and locking the
+ * tenant out of the picker is a worse failure than widening it. modelDefaultEfforts
+ * needs no such pass — effectiveDefaultEffort already ignores unknown ids.
+ */
+export function pruneUnknownModelIds<T extends { enabledModelIds: string[] | null }>(
+  settings: T,
+  knownModelIds: ReadonlySet<string>
+): T {
+  if (settings.enabledModelIds === null) return settings;
+  const kept = settings.enabledModelIds.filter((id) => knownModelIds.has(id));
+  if (kept.length === settings.enabledModelIds.length) return settings;
+  return { ...settings, enabledModelIds: kept.length > 0 ? kept : null };
+}
+
 export async function registerAdminTenantSettingsRoutes(
   app: FastifyInstance,
   stores: TenantSettingsRouteStores
 ): Promise<void> {
   app.get("/admin/tenant-settings", withAdmin(app, async (request, _reply) => {
-    const settings = await stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId);
-    return serialize(TenantSettingsEnvelopeSchema, { settings });
+    const [settings, customModels] = await Promise.all([
+      stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId),
+      stores.listCustomModels ? stores.listCustomModels(request.auth.tenantId) : Promise.resolve([])
+    ]);
+    const knownModelIds = new Set([
+      ...AVAILABLE_MODELS.map((m) => m.id),
+      ...customModels.map((m) => m.id)
+    ]);
+    return serialize(TenantSettingsEnvelopeSchema, {
+      settings: pruneUnknownModelIds(settings, knownModelIds)
+    });
   }));
 
   app.get("/admin/managed-tools", withAdmin(app, async (_request, _reply) => {
@@ -134,10 +169,8 @@ export async function registerAdminTenantSettingsRoutes(
     if (request.auth.role !== "owner") {
       const current = await stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId);
       const sensitiveChanges =
-        (parseResult.data.allowCommandExecution !== undefined &&
-          parseResult.data.allowCommandExecution !== current.allowCommandExecution) ||
-        (parseResult.data.allowUserTokenForwarding !== undefined &&
-          parseResult.data.allowUserTokenForwarding !== current.allowUserTokenForwarding);
+        parseResult.data.allowCommandExecution !== undefined &&
+        parseResult.data.allowCommandExecution !== current.allowCommandExecution;
       if (sensitiveChanges) {
         return reply.status(403).send(apiError("owner_required_for_sensitive_settings"));
       }
@@ -147,7 +180,6 @@ export async function registerAdminTenantSettingsRoutes(
       // concurrent owner decision.
       const {
         allowCommandExecution: _allowCommandExecution,
-        allowUserTokenForwarding: _allowUserTokenForwarding,
         ...adminUpdateInput
       } = parseResult.data;
       updateInput = adminUpdateInput;
@@ -173,7 +205,6 @@ export async function registerAdminTenantSettingsRoutes(
           approvalPolicy: settings.approvalPolicy,
           approvalReviewer: settings.approvalReviewer,
           allowCommandExecution: settings.allowCommandExecution,
-          allowUserTokenForwarding: settings.allowUserTokenForwarding,
           autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
           policyEnforcementMode: settings.policyEnforcementMode,
           developerInstructions: settings.developerInstructions,

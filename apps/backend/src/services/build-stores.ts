@@ -19,7 +19,7 @@ import { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "./pii/pii-scan-run-store.js";
 import { PolicyRuleStore } from "./policy/policy-rule-store.js";
 import { PolicyDecisionStore } from "./policy/policy-decision-store.js";
-import { ActiveTurnsRegistry } from "./active-turns-registry.js";
+import { ActiveTurnsRegistry, deriveStaleAfterMs } from "./active-turns-registry.js";
 import { RuntimeSessionStore } from "./runtime/runtime-session-store.js";
 import { SessionStore } from "./session-store.js";
 import { SkillConfigStore } from "./skills/skill-config-store.js";
@@ -29,11 +29,20 @@ import { ToolExecutionContextStore } from "./auth/tool-execution-context-store.j
 import { TenantMemberStore } from "./tenant-member-store.js";
 import { UserSettingsStore } from "./user-settings-store.js";
 
-export function buildStores(db: Pool, schedulerDb: Pool, privilegedDb: Pool, logger: FastifyBaseLogger) {
+export function buildStores(
+  db: Pool,
+  schedulerDb: Pool,
+  privilegedDb: Pool,
+  logger: FastifyBaseLogger,
+  // Only the two timers the active-turn stale window derives from. Kept as a
+  // structural subset rather than the whole AppConfig so the store builder
+  // stays trivially constructible in tests.
+  timers?: { E2B_SANDBOX_TIMEOUT_MS: number; TOOL_CONTEXT_TTL_MS: number }
+) {
   const sessions = new SessionStore(db);
   const messages = new MessageStore(db);
   const memories = new MemoryStore(db);
-  const activeTurns = new ActiveTurnsRegistry();
+  const activeTurns = new ActiveTurnsRegistry(timers ? deriveStaleAfterMs(timers) : undefined);
   const artifacts = new ArtifactStore(db, privilegedDb);
   const piiScanRuns = new PiiScanRunStore(db);
   const piiScanJobs = new PiiScanJobStore(db, schedulerDb);

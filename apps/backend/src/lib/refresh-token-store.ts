@@ -90,6 +90,41 @@ const CLAIM_REFRESH_ROTATION = `
   return {4}
 `;
 
+// Undo a claim whose rotation never completed.
+//
+// The claim is not the end of /auth/refresh: the handler still reads the
+// membership and mints tokens. If any of that throws, the jti is already
+// consumed — the client's next attempt then either waits out the grace marker
+// (503) or, once it expires, looks like a replay and revokes the whole family.
+// Restoring puts the caller back exactly where it started.
+//
+// Three guards make this safe to call on any failure path:
+//   1. Only a `pending:` marker is cleared. A `complete:` marker means the
+//      rotation actually finished, so its cached result must survive.
+//   2. The family must still be active — never resurrect a jti into a revoked
+//      family.
+//   3. The restored TTL is copied from the family key rather than passed in.
+//      Issue sets both keys with the same expiry at the same instant and the
+//      claim never rewrites the family TTL, so this is the original remaining
+//      lifetime. A caller-supplied TTL would silently extend the token.
+const RESTORE_REFRESH_JTI = `
+  -- refresh-token-restore-v1
+  local marker = redis.call('GET', KEYS[3])
+  if marker and string.sub(marker, 1, string.len(ARGV[2])) ~= ARGV[2] then
+    return 0
+  end
+  if redis.call('GET', KEYS[2]) ~= ARGV[3] then
+    return 0
+  end
+  local ttl = redis.call('PTTL', KEYS[2])
+  if not ttl or ttl <= 0 then
+    return 0
+  end
+  redis.call('DEL', KEYS[3])
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ttl)
+  return 1
+`;
+
 // Subset of ioredis we need. Defined locally so tests can stub with a Map.
 export type RefreshTokenRedis = {
   get(key: string): Promise<string | null>;
@@ -195,6 +230,29 @@ export async function consumeRefreshJti(
   }
   if (status === 5) return { status: "absolute_expired" };
   return { status: "not_found" };
+}
+
+/**
+ * Reverses a claim whose rotation never completed. Returns true when the jti
+ * was restored, false when the restore was declined (rotation already
+ * completed, family revoked or expired) — a false is not an error.
+ */
+export async function restoreRefreshJti(
+  redis: RefreshTokenRedis,
+  input: { jti: string; familyId: string }
+): Promise<boolean> {
+  const restored = (await redis.eval(
+    RESTORE_REFRESH_JTI,
+    3,
+    jtiKey(input.jti),
+    familyKey(input.familyId),
+    rotationKey(input.jti),
+    input.familyId,
+    ROTATION_PENDING_PREFIX,
+    FAMILY_ACTIVE
+  )) as number;
+
+  return restored === 1;
 }
 
 export async function completeRefreshRotation(

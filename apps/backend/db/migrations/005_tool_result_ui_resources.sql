@@ -1,4 +1,4 @@
--- MCP Apps slice 2: persist tool-result UI resources (AgenticEntrepriseFramework CopilotKit).
+-- MCP Apps slice 2: persist tool-result UI resources (CopilotKit).
 --
 -- Slice 1 carried MCP-UI `ui://` resource blocks on the live SSE payload only,
 -- so they vanished on session reload. Store them alongside the tool result as

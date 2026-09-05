@@ -37,7 +37,14 @@ export function buildSessionRouteStores(deps: AppDependencies) {
   };
 }
 
-export type SessionRouteStores = ReturnType<typeof buildSessionRouteStores>;
+export type SessionRouteStores = {
+  sessions: Pick<AppDependencies["sessions"], "list" | "create" | "rename" | "getOwned" | "remove">;
+  messages: Pick<AppDependencies["messages"], "listBySession">;
+  runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "id" | "hasActiveTurn" | "abortSession" | "purgeSessionData" | "interruptTurn">;
+  limits: AppDependencies["limits"];
+  activeTurns: AppDependencies["activeTurns"];
+  auditEvents: Pick<AppDependencies["auditEvents"], "create">;
+};
 
 export async function registerSessionRoutes(
   app: FastifyInstance,
@@ -245,9 +252,15 @@ export async function registerSessionRoutes(
       return notFoundError("session_not_found");
     }
 
+    // Bounded read: newest-N messages with tool text truncated in the
+    // projection (see MessageStore.listBySession). `hasMore` tells the client
+    // older turns were withheld rather than silently dropping them.
+    const { messages, hasMore } = await stores.messages.listBySession(tenantId, sessionId, userId);
+
     return serialize(SessionMessagesResponseSchema, {
       session,
-      messages: await stores.messages.listBySession(tenantId, sessionId, userId)
+      messages,
+      hasMore
     });
   });
 }

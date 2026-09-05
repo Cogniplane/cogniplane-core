@@ -32,6 +32,20 @@ export const POLICY_ENFORCEMENT_MODES = ["monitor", "enforce"] as const;
 export const PolicyEnforcementModeSchema = z.enum(POLICY_ENFORCEMENT_MODES);
 export type PolicyEnforcementMode = (typeof POLICY_ENFORCEMENT_MODES)[number];
 
+// Severity of a proposed tool action, as the gateway derives it.
+//
+// The gateway derives severity from one boolean — the tool's read/write flag
+// (`ManagedToolDefinition.readOnly` for managed tools, the upstream
+// `annotations.readOnlyHint` learned from `tools/list` for proxy tools). So
+// `deriveActionSeverity` only ever returns `read_only` or `file_change`, and a
+// rule that conditions on `command_execution` MATCHES NOTHING today.
+//
+// `command_execution` is retained for two reasons: existing `policy_rule` and
+// `policy_decision` rows may already carry it (decision listings filter on it),
+// and the shell built-in it describes is gated by the runtime's own native HITL
+// interrupt (`RuntimeApprovalKind`), which never reaches the MCP gateway.
+// Giving Policy Center a real command-execution signal needs a new severity
+// source, not a new enum value — see the admin UI note beside this list.
 export const POLICY_SEVERITIES = ["read_only", "file_change", "command_execution"] as const;
 export const PolicySeveritySchema = z.enum(POLICY_SEVERITIES);
 export type PolicySeverity = (typeof POLICY_SEVERITIES)[number];
@@ -51,7 +65,8 @@ export type PolicyTurnContext = (typeof POLICY_TURN_CONTEXTS)[number];
 //   toolNames    — the tool being called (e.g. github_write_file)
 //   categories   — the MCP server id the tool is hosted on (one connector per
 //                  server today, so this == serverId)
-//   severities   — read_only / file_change / command_execution
+//   severities   — read_only / file_change (command_execution is accepted but
+//                  never matches — see POLICY_SEVERITIES above)
 //   turnContexts — interactive vs scheduled/unattended
 //
 // One field map, two schemas. The STORED/read shape is `.passthrough()` so a

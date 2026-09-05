@@ -20,15 +20,38 @@ type QuotaConfig = {
   dailyTurnQuota: Record<LimitScope, number>;
 };
 
-// Atomically increment a counter and set TTL on first creation.
-// Returns the new count. Uses a Lua script to avoid INCR + PEXPIRE race
-// where a crash between the two commands leaves a key with no expiry.
+// Atomically increment a counter and set its window TTL. Returns the new
+// count. One Lua script rather than INCR + PEXPIRE so a crash between the two
+// cannot leave a key with no expiry.
+//
+// Set the window TTL whenever the key has none, not only when the counter
+// happens to be 1. A rollback can leave the key at 0 with its TTL intact; the
+// next INCR then returns 1 again, and keying the PEXPIRE off that value would
+// restart the window from that moment — so every rejected-and-retried burst
+// would extend the subject's window indefinitely. Keying off PTTL == -1 also
+// means any key that somehow lost its expiry self-heals on its next INCR.
 const INCR_WITH_EXPIRY = `
+  -- request-limit-incr-v1
   local current = redis.call('INCR', KEYS[1])
-  if current == 1 then
+  if redis.call('PTTL', KEYS[1]) < 0 then
     redis.call('PEXPIRE', KEYS[1], ARGV[1])
   end
   return current
+`;
+
+// Undo one speculative INCR without ever creating the key.
+//
+// A bare DECR is not safe here: if the window expired between this request's
+// INCR and its rollback, DECR recreates the key at -1 with NO TTL. That key
+// never expires and every later check reads a negative count, so the subject
+// is exempt from the limit from then on. Decrementing only an existing key
+// keeps the rollback from resurrecting one.
+const DECR_IF_EXISTS = `
+  -- request-limit-decr-v1
+  if redis.call('EXISTS', KEYS[1]) == 1 then
+    return redis.call('DECR', KEYS[1])
+  end
+  return 0
 `;
 
 export class RedisRequestLimits implements RequestLimitsInterface {
@@ -71,7 +94,7 @@ export class RedisRequestLimits implements RequestLimitsInterface {
       if (newCount > limit) {
         // Rollback all incremented keys
         for (const k of incremented) {
-          await this.redis.decr(k);
+          await this.redis.eval(DECR_IF_EXISTS, 1, k);
         }
         const ttl = await this.redis.pttl(key);
         const retryAfterMs = ttl > 0 ? ttl : 0;
@@ -118,7 +141,7 @@ export class RedisRequestLimits implements RequestLimitsInterface {
 
       if (newCount > limit) {
         for (const k of incrementedQuota) {
-          await this.redis.decr(k);
+          await this.redis.eval(DECR_IF_EXISTS, 1, k);
         }
         return {
           error: "limit_exceeded",

@@ -1,16 +1,10 @@
-// Regression test for the two-phase bootstrap split.
-//
-// Before the split, `registerBuiltinIntegrations` had a first-wins guard:
-// once any caller initialized the registry without probes/OAuth handlers,
-// later `buildAppDependencies()` calls couldn't attach them and integrations
-// would expose tools without verifying user OAuth connections, while OAuth
-// callback routes silently no-op'd.
-//
-// The fix splits boot into descriptor registration (idempotent, static)
-// and runtime wiring attach (re-runnable). This test pins the new contract.
+import Fastify from "fastify";
+import { IntegrationRegistryService } from "./integration-registry-service.js";
+import { createTestConfig } from "../../test-helpers/test-config.js";
 import { test, expect } from "vitest";
 
 import {
+  IntegrationRegistry,
   __resetIntegrationRegistryForTesting,
   getIntegrationDescriptor,
   listIntegrationOAuthCallbackPaths
@@ -39,72 +33,74 @@ function fakeOAuthHandler(label: string) {
   };
 }
 
-test("attachBuiltinIntegrationRuntime overwrites wiring after a no-arg registration", () => {
+test("attaches app hooks without changing the static catalog", () => {
   __resetIntegrationRegistryForTesting();
   __resetBuiltinIntegrationsRegistrationForTesting();
 
-  // First caller (think: a test file that calls `registerBuiltinIntegrations()`
-  // at module load time). No probes, no OAuth handlers — descriptors land
-  // with stub no-op wiring.
+  // Registering the static catalog must not capture app services.
   registerBuiltinIntegrations();
+  const registry = new IntegrationRegistry();
 
   const githubBefore = getIntegrationDescriptor("github");
-  expect(githubBefore).toBeTruthy();
+  if (!githubBefore) throw new Error("Expected GitHub integration descriptor.");
   expect(githubBefore.connectionProbe).toBe(undefined);
-  expect(githubBefore.oauthRoutes).toBeTruthy();
+  expect(githubBefore.oauthCallbackPaths).toContain("/auth/github/user/callback");
 
-  // Second caller (think: `buildAppDependencies()` running after the test
-  // module loaded). Real wiring must replace the stub.
+  // Live wiring attaches only to this app's registry.
   const probe = fakeProbe("github-probe");
   const oauth = fakeOAuthHandler("github-oauth");
-  attachBuiltinIntegrationRuntime({
+  attachBuiltinIntegrationRuntime(registry, {
     probes: { github: probe },
     oauth: { github: oauth }
   });
 
-  const githubAfter = getIntegrationDescriptor("github");
-  expect(githubAfter).toBeTruthy();
+  const githubAfter = registry.get("github");
+  if (!githubAfter) throw new Error("Expected rewired GitHub integration descriptor.");
   expect(githubAfter.connectionProbe).toBe(probe);
 
-  // The OAuth route's `register` callback now closes over the live handler.
-  // We can't easily assert that without a Fastify app, but the callback
-  // paths should still be exposed for the public-path allowlist.
   const callbackPaths = listIntegrationOAuthCallbackPaths();
   expect(callbackPaths.includes("/auth/github/user/callback")).toBeTruthy();
   expect(callbackPaths.includes("/auth/github/install/callback")).toBeFalsy();
   expect(callbackPaths.includes("/integrations/notion/callback")).toBeTruthy();
 });
 
-test("attachBuiltinIntegrationRuntime is idempotent and replaces stale wiring on re-attach", () => {
-  __resetIntegrationRegistryForTesting();
-  __resetBuiltinIntegrationsRegistrationForTesting();
-
+test("independent apps retain their own probes and OAuth handlers", async () => {
   registerBuiltinIntegrations();
-
-  const firstAppProbe = fakeProbe("first-app-notion");
-  attachBuiltinIntegrationRuntime({
-    probes: { notion: firstAppProbe },
-    oauth: {}
+  const firstRegistry = new IntegrationRegistry();
+  const secondRegistry = new IntegrationRegistry();
+  attachBuiltinIntegrationRuntime(firstRegistry, {
+    probes: { github: { async hasConnection() { return true; } } },
+    oauth: { github: fakeOAuthHandler("first") }
   });
-  expect(getIntegrationDescriptor("notion")?.connectionProbe).toBe(firstAppProbe);
-
-  // A second `buildAppDependencies()` (e.g. another Fastify instance built
-  // in the same process) must replace the first app's captured probe so
-  // the second app doesn't keep poking the first app's connection service.
-  const secondAppProbe = fakeProbe("second-app-notion");
-  attachBuiltinIntegrationRuntime({
-    probes: { notion: secondAppProbe },
-    oauth: {}
+  attachBuiltinIntegrationRuntime(secondRegistry, {
+    probes: { github: { async hasConnection() { return false; } } },
+    oauth: { github: fakeOAuthHandler("second") }
   });
-  expect(getIntegrationDescriptor("notion")?.connectionProbe).toBe(secondAppProbe);
+  const state = {
+    tenantId: "tenant", integrationId: "github", readsEnabled: true, writesEnabled: false,
+    config: {}, createdAt: "2026-09-04T00:00:00.000Z", updatedAt: "2026-09-04T00:00:00.000Z", updatedBy: "user"
+  };
+  const store = { async get() { return state; }, async list() { return [state]; } };
+  const firstService = new IntegrationRegistryService(createTestConfig(), store, {}, firstRegistry);
+  const secondService = new IntegrationRegistryService(createTestConfig(), store, {}, secondRegistry);
+  expect(await firstService.resolveSessionToolIds("tenant", "user")).toEqual(["github_read_file"]);
+  expect(await secondService.resolveSessionToolIds("tenant", "user")).toEqual([]);
+  expect(await firstService.resolveSessionToolIds("tenant", "user")).toEqual(["github_read_file"]);
 
-  // Integrations the caller didn't pass a probe for get cleared. That's the
-  // safe default: a stale probe pointing at a torn-down app would be worse
-  // than no probe at all (and `IntegrationRegistryService.resolveSessionToolIds`
-  // treats "no probe" as "skip the integration's tools" only when the
-  // service-level override map is also empty, so the test below uses the
-  // override-aware path indirectly via the descriptor).
-  expect(getIntegrationDescriptor("github")?.connectionProbe).toBe(undefined);
+  const firstApp = Fastify();
+  const secondApp = Fastify();
+  try {
+    await firstRegistry.get("github")!.oauthRoutes!.register(firstApp);
+    await secondRegistry.get("github")!.oauthRoutes!.register(secondApp);
+    const firstResponse = await firstApp.inject({ url: "/auth/github/user/callback?code=c&state=s" });
+    const secondResponse = await secondApp.inject({ url: "/auth/github/user/callback?code=c&state=s" });
+    expect(firstResponse.headers.location).toBe("/done?label=first");
+    expect(secondResponse.headers.location).toBe("/done?label=second");
+  } finally {
+    await Promise.all([firstApp.close(), secondApp.close()]);
+  }
+  // The process-wide catalog contains no app service references.
+  expect(getIntegrationDescriptor("github")?.connectionProbe).toBeUndefined();
 });
 
 test("registerBuiltinIntegrations is idempotent across repeated calls", () => {

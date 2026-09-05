@@ -8,7 +8,8 @@ import {
   ScheduledJobsListResponseSchema,
   UserSettingsSectionEnvelopeSchema,
   UserSettingsSectionsResponseSchema,
-  type PersonalTokenUsageSeries
+  type PersonalTokenUsageSeries,
+  type ScheduledJobRequest
 } from "@cogniplane/shared-types";
 
 import { request } from "./api-client";
@@ -85,18 +86,7 @@ export async function listScheduledJobs(): Promise<ScheduledJob[]> {
     .scheduledJobs;
 }
 
-export async function createScheduledJob(input: {
-  jobName: string;
-  description?: string | null;
-  cronExpression: string;
-  timeZone: string;
-  targetType?: "prompt" | "skill";
-  targetRef?: string | null;
-  input: {
-    prompt: string;
-  };
-  enabled?: boolean;
-}): Promise<ScheduledJob> {
+export async function createScheduledJob(input: ScheduledJobRequest): Promise<ScheduledJob> {
   const raw = await request<unknown>("/me/scheduled-jobs", {
     method: "POST",
     body: JSON.stringify(input)
@@ -106,18 +96,7 @@ export async function createScheduledJob(input: {
 
 export async function updateScheduledJob(
   jobId: string,
-  input: {
-    jobName: string;
-    description?: string | null;
-    cronExpression: string;
-    timeZone: string;
-    targetType?: "prompt" | "skill";
-    targetRef?: string | null;
-    input: {
-      prompt: string;
-    };
-    enabled?: boolean;
-  }
+  input: ScheduledJobRequest
 ): Promise<ScheduledJob> {
   const raw = await request<unknown>(`/me/scheduled-jobs/${jobId}`, {
     method: "PUT",

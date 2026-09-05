@@ -20,6 +20,7 @@ function makeMessage(overrides: Partial<MessageRecord> = {}): MessageRecord {
     status: "completed",
     content: "Please write me a fibonacci script.",
     reasoningContent: "",
+    reasoningSegments: null,
     planContent: "",
     tokenUsage: null,
     modelName: null,
@@ -83,6 +84,7 @@ test("formatCorpus renders a session with one user message and assistant tool ca
                 output: "ok: artifact saved",
                 exitCode: null,
                 durationMs: 12,
+                textOffset: null,
                 createdAt: "2026-04-25T10:00:05.000Z",
                 updatedAt: "2026-04-25T10:00:05.000Z"
               }
@@ -135,6 +137,7 @@ test("formatCorpus truncates long tool outputs and reports the count", () => {
                 output: longOutput,
                 exitCode: null,
                 durationMs: null,
+                textOffset: null,
                 createdAt: "2026-04-25T10:00:00.000Z",
                 updatedAt: "2026-04-25T10:00:00.000Z"
               }
@@ -277,6 +280,7 @@ test("formatCorpus tool input is excerpted to TOOL_INPUT_EXCERPT_BYTES (400)", (
                 output: "ok",
                 exitCode: null,
                 durationMs: null,
+                textOffset: null,
                 createdAt: "2026-04-25T10:00:00.000Z",
                 updatedAt: "2026-04-25T10:00:00.000Z"
               }

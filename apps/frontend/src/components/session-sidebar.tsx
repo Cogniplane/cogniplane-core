@@ -23,28 +23,46 @@ import {
 } from "@/components/ui/alert-dialog";
 import { formatCompactTime, groupSessions, initialsOf, totalGroupedCount } from "./session-sidebar.logic";
 
-export function SessionSidebar(props: {
+export type SessionSidebarListModel = {
   sessions: Session[];
-  selectedSessionId: string | null;
-  isLoadingSessions: boolean;
-  busySessionId: string | null;
-  streamingSessionIds: Set<string>;
-  errorSessionId: string | null;
-  renameSessionId: string | null;
+  selectedId: string | null;
+  isLoading: boolean;
+  streamingIds: Set<string>;
+  errorId: string | null;
+  attentionIds?: Set<string>;
+  onSelect: (sessionId: string) => void;
+  onCreate: () => void;
+};
+
+export type SessionSidebarRenameModel = {
+  busyId: string | null;
+  sessionId: string | null;
   renameDraft: string;
-  pinnedSessionIds: Set<string>;
-  attentionSessionIds?: Set<string>;
-  onSelectSession: (sessionId: string) => void;
-  onCreateSession: () => void;
   onStartRename: (session: Session) => void;
   onCancelRename: () => void;
   onConfirmRename: (sessionId: string) => void;
   onRenameDraftChange: (draft: string) => void;
-  onDeleteSession: (sessionId: string) => void;
-  onTogglePinSession: (sessionId: string) => void;
-  pendingDeleteSessionId: string | null;
+};
+
+export type SessionSidebarDeletionModel = {
+  busyId: string | null;
+  pendingId: string | null;
+  onRequest: (sessionId: string) => void;
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
+};
+
+export type SessionSidebarPinningModel = {
+  busyId: string | null;
+  ids: Set<string>;
+  onToggle: (sessionId: string) => void;
+};
+
+export function SessionSidebar({ list, rename, deletion, pinning }: {
+  list: SessionSidebarListModel;
+  rename: SessionSidebarRenameModel;
+  deletion: SessionSidebarDeletionModel;
+  pinning: SessionSidebarPinningModel;
 }) {
   const { user } = useAuth();
   const [query, setQuery] = useState("");
@@ -65,44 +83,47 @@ export function SessionSidebar(props: {
   const beDate = backendVersion?.buildDate.slice(0, 10);
 
   const groups = useMemo(
-    () => groupSessions(props.sessions, props.pinnedSessionIds, query),
-    [props.sessions, props.pinnedSessionIds, query]
+    () => groupSessions(list.sessions, pinning.ids, query),
+    [list.sessions, pinning.ids, query]
   );
 
   const hasResults = totalGroupedCount(groups) > 0;
-  const pendingDeleteSession = props.pendingDeleteSessionId
-    ? props.sessions.find((s) => s.sessionId === props.pendingDeleteSessionId)
+  const pendingDeleteSession = deletion.pendingId
+    ? list.sessions.find((s) => s.sessionId === deletion.pendingId)
     : null;
 
   const renderSessionRow = (session: Session) => {
-    const isActive = session.sessionId === props.selectedSessionId;
-    const isPinned = props.pinnedSessionIds.has(session.sessionId);
-    const isStreaming = props.streamingSessionIds.has(session.sessionId);
-    const needsAttention = props.attentionSessionIds?.has(session.sessionId) ?? false;
-    const hasError = props.errorSessionId === session.sessionId;
-    const busy = props.busySessionId === session.sessionId;
+    const isActive = session.sessionId === list.selectedId;
+    const isPinned = pinning.ids.has(session.sessionId);
+    const isStreaming = list.streamingIds.has(session.sessionId);
+    const needsAttention = list.attentionIds?.has(session.sessionId) ?? false;
+    const hasError = list.errorId === session.sessionId;
+    const busy =
+      rename.busyId === session.sessionId ||
+      deletion.busyId === session.sessionId ||
+      pinning.busyId === session.sessionId;
 
-    if (props.renameSessionId === session.sessionId) {
+    if (rename.sessionId === session.sessionId) {
       return (
         <form
           key={session.sessionId}
           className="flex items-center gap-2 px-3 py-2"
           onSubmit={(event) => {
             event.preventDefault();
-            props.onConfirmRename(session.sessionId);
+            rename.onConfirmRename(session.sessionId);
           }}
         >
           <Input
             autoFocus
             disabled={busy}
-            onChange={(event) => props.onRenameDraftChange(event.target.value)}
-            value={props.renameDraft}
+            onChange={(event) => rename.onRenameDraftChange(event.target.value)}
+            value={rename.renameDraft}
             className="h-7 flex-1 text-sm"
           />
-          <Button type="submit" size="xs" disabled={busy || !props.renameDraft.trim()}>
+          <Button type="submit" size="xs" disabled={busy || !rename.renameDraft.trim()}>
             Save
           </Button>
-          <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={props.onCancelRename}>
+          <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={rename.onCancelRename}>
             Cancel
           </Button>
         </form>
@@ -120,7 +141,7 @@ export function SessionSidebar(props: {
       >
         <button
           type="button"
-          onClick={() => props.onSelectSession(session.sessionId)}
+          onClick={() => list.onSelect(session.sessionId)}
           className="flex min-h-8 min-w-0 flex-1 items-center gap-2 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-brand/60 focus-visible:ring-offset-1"
         >
           <span
@@ -150,7 +171,7 @@ export function SessionSidebar(props: {
             aria-label={isPinned ? "Unpin session" : "Pin session"}
             aria-pressed={isPinned}
             disabled={busy}
-            onClick={() => props.onTogglePinSession(session.sessionId)}
+            onClick={() => pinning.onToggle(session.sessionId)}
           >
             <PinIcon className={isPinned ? "fill-current" : ""} />
           </Button>
@@ -160,7 +181,7 @@ export function SessionSidebar(props: {
             size="icon-xs"
             aria-label="Rename session"
             disabled={busy}
-            onClick={() => props.onStartRename(session)}
+            onClick={() => rename.onStartRename(session)}
           >
             <PencilIcon />
           </Button>
@@ -170,7 +191,7 @@ export function SessionSidebar(props: {
             size="icon-xs"
             aria-label="Delete session"
             disabled={busy}
-            onClick={() => props.onDeleteSession(session.sessionId)}
+            onClick={() => deletion.onRequest(session.sessionId)}
           >
             <Trash2Icon className="text-danger" />
           </Button>
@@ -180,7 +201,7 @@ export function SessionSidebar(props: {
   };
 
   return (
-    <aside className="flex min-h-0 flex-col overflow-hidden bg-surface-container-low">
+    <aside className="flex h-full min-h-0 flex-col overflow-hidden bg-surface-container-low">
       <div className="flex items-center gap-3 px-4 pt-4 pb-3">
         <Image src="/brand/cogniplane.svg" alt="Cogniplane logo" width={40} height={40} priority />
         <div className="min-w-0">
@@ -204,13 +225,13 @@ export function SessionSidebar(props: {
       </div>
 
       <div className="px-3 pb-2">
-        <Button type="button" className="w-full" onClick={props.onCreateSession}>
+        <Button type="button" className="w-full" onClick={list.onCreate}>
           New chat
         </Button>
       </div>
 
       <div className="flex-1 overflow-y-auto pb-2">
-        {props.isLoadingSessions && props.sessions.length === 0 ? (
+        {list.isLoading && list.sessions.length === 0 ? (
           <div className="flex flex-col gap-2 px-4 pt-3">
             {Array.from({ length: 6 }, (_, i) => (
               <div key={i} className="flex items-center gap-2" style={{ opacity: 1 - i * 0.14 }}>
@@ -241,9 +262,9 @@ export function SessionSidebar(props: {
           </SessionGroupSection>
         ) : null}
 
-        {!hasResults && !props.isLoadingSessions ? (
+        {!hasResults && !list.isLoading ? (
           <div className="mx-3 my-4 rounded-md bg-surface-container-lowest p-4 text-sm text-on-surface-variant">
-            {props.sessions.length ? (
+            {list.sessions.length ? (
               <>
                 <p className="font-medium text-on-surface">No matches</p>
                 <p>Try a different search.</p>
@@ -289,9 +310,9 @@ export function SessionSidebar(props: {
       </div>
 
       <AlertDialog
-        open={props.pendingDeleteSessionId != null}
+        open={deletion.pendingId != null}
         onOpenChange={(open) => {
-          if (!open) props.onCancelDelete();
+          if (!open) deletion.onCancelDelete();
         }}
       >
         <AlertDialogContent>
@@ -304,15 +325,15 @@ export function SessionSidebar(props: {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={props.busySessionId === props.pendingDeleteSessionId}>
+            <AlertDialogCancel disabled={deletion.busyId === deletion.pendingId}>
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              onClick={props.onConfirmDelete}
-              disabled={props.busySessionId === props.pendingDeleteSessionId}
+              onClick={deletion.onConfirmDelete}
+              disabled={deletion.busyId === deletion.pendingId}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {props.busySessionId === props.pendingDeleteSessionId ? "Deleting…" : "Delete"}
+              {deletion.busyId === deletion.pendingId ? "Deleting…" : "Delete"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

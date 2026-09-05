@@ -1,7 +1,7 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import multipart from "@fastify/multipart";
-import Fastify from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
 import JSZip from "jszip";
 
 import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
@@ -9,6 +9,10 @@ import { handleAppError } from "../../app.js";
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
+import type {
+  TenantSettingsInput,
+  TenantSettingsRecord
+} from "../../services/tenant-settings-store.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
@@ -47,7 +51,138 @@ function createMarketplaceStore(): AdminRouteStores["skillMarketplace"] {
   };
 }
 
-class InMemoryAdminConfig {
+function createSkillBundleStorage(): AdminRouteStores["skillBundleStorage"] {
+  return {
+    async materializeBundle() {
+      throw new Error("Unexpected skill bundle materialization");
+    }
+  };
+}
+
+type RequiredAdminTestRouteStore =
+  | "dynamicConfig"
+  | "skillMarketplace"
+  | "skillBundleStorage"
+  | "auditEvents"
+  | "runtimeSessions"
+  | "deepAgentsAdapter"
+  | "tenantMembers";
+
+type AdminTestRouteStores = Pick<AdminRouteStores, RequiredAdminTestRouteStore> &
+  Partial<
+    Omit<
+      AdminRouteStores,
+      | RequiredAdminTestRouteStore
+      | "piiCircuitBreaker"
+      | "piiProtection"
+      | "piiAnalytics"
+      | "platformEvents"
+    >
+  >;
+
+async function registerTestAdminRoutes(
+  app: FastifyInstance,
+  stores: AdminTestRouteStores
+): Promise<void> {
+  await registerAdminRoutes(app, {
+    config: createTestConfig({}),
+    managedToolCatalog: {
+      listTenantConfigurable() {
+        return [];
+      }
+    },
+    runtimeAdapter: {
+      async invalidateTenantRuntimes() {
+        return [];
+      }
+    },
+    customModels: {
+      async list() {
+        return [];
+      },
+      async create() {
+        throw new Error("Unexpected custom model creation");
+      },
+      async delete() {
+        return false;
+      }
+    },
+    async providerKeySources() {
+      return {
+        anthropic: "none",
+        openai: "none",
+        google: "none",
+        openrouter: "none",
+        zai: "none"
+      };
+    },
+    async fetchOpenRouterCatalog() {
+      return [];
+    },
+    policyRules: {
+      async list() {
+        return [];
+      },
+      async listForLint() {
+        return [];
+      },
+      async create() {
+        throw new Error("Unexpected policy rule creation");
+      },
+      async update() {
+        throw new Error("Unexpected policy rule update");
+      },
+      async delete() {
+        return false;
+      },
+      async reorder() {
+        return [];
+      }
+    },
+    policyDecisions: {
+      async get() {
+        return null;
+      },
+      async list() {
+        throw new Error("Unexpected policy decision listing");
+      }
+    },
+    policyService: {
+      async evaluate() {
+        throw new Error("Unexpected policy evaluation");
+      },
+      async invalidate() {}
+    },
+    integrationRegistry: {
+      async getIntegrationsForAdmin() {
+        return [];
+      },
+      async isReadyToEnable() {
+        return true;
+      }
+    },
+    integrationStates: {
+      async get() {
+        return null;
+      },
+      async upsert() {
+        throw new Error("Unexpected integration state update");
+      },
+      async clearConfig() {
+        throw new Error("Unexpected integration config clear");
+      }
+    },
+    ...stores,
+    piiCircuitBreaker: undefined,
+    piiProtection: undefined,
+    piiAnalytics: undefined,
+    platformEvents: undefined
+  });
+}
+
+type AdminDynamicConfig = AdminRouteStores["dynamicConfig"];
+
+class InMemoryAdminConfig implements AdminDynamicConfig {
   skills: Array<{
     skillId: string;
     skillName: string;
@@ -116,14 +251,13 @@ class InMemoryAdminConfig {
     }
   ];
 
-  tenantSettings = {
+  tenantSettings: TenantSettingsRecord = {
     tenantId: "admin-tenant",
     showEffortSelector: false,
     webSearchMode: "disabled" as const,
     approvalPolicy: "on-request" as const,
     approvalReviewer: "user" as const,
     allowCommandExecution: false,
-    allowUserTokenForwarding: true,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "monitor" as const,
     developerInstructions: null as string | null,
@@ -137,7 +271,7 @@ class InMemoryAdminConfig {
     enabledMcpServerIds: ["managed-session-context"],
     enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
     enabledModelIds: null as string[] | null,
-    modelDefaultEfforts: {} as Record<string, string>,
+    modelDefaultEfforts: {},
     version: 1,
     configHash: "hash-tenant-settings",
     updatedAt: new Date().toISOString()
@@ -207,6 +341,30 @@ class InMemoryAdminConfig {
       activatedAt: null
     };
     return { skill, revision, previousActiveRevisionId: 2 };
+  }
+
+  async importSkillBundleFromInline(_tenantId: string, input: {
+    skillId: string;
+    skillName: string;
+    description: string;
+    instructions: string;
+    actorUserId: string;
+  }) {
+    const imported = await this.importSkillBundleFromZip(_tenantId, {
+      archiveBuffer: Buffer.from(input.instructions),
+      originalFileName: `${input.skillId}.zip`,
+      actorUserId: input.actorUserId
+    });
+    return {
+      ...imported,
+      skill: {
+        ...imported.skill,
+        skillId: input.skillId,
+        skillName: input.skillName,
+        description: input.description,
+        instructions: input.instructions
+      }
+    };
   }
 
   async cleanupInactiveSkillRevisions(_tenantId: string, input: { dryRun?: boolean }) {
@@ -331,6 +489,7 @@ class InMemoryAdminConfig {
       version: 1,
       contentHash: "hash-pdf-processing-github",
       enabled: true,
+      isPublished: true,
       createdBy: input.actorUserId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -340,7 +499,8 @@ class InMemoryAdminConfig {
       activeBundleStorageUri: "file:///tmp/pdf-processing-github",
       activeBundleHash: "hash-pdf-processing-github",
       activeValidationStatus: "validated",
-      activeReviewStatus: "active"
+      activeReviewStatus: "active",
+      isInherited: false
     };
     const revision = {
       skillRevisionId: 3,
@@ -380,7 +540,6 @@ class InMemoryAdminConfig {
         mode: "proxy" as const,
         routePath: "/mcp/trusted-echo",
         upstreamUrl: "https://example.com/mcp",
-        headersAllowlist: [],
         version: 1,
         configHash: "hash-trusted-echo",
         enabled: true,
@@ -401,7 +560,6 @@ class InMemoryAdminConfig {
       mode: "managed" as const,
       routePath: "/mcp/unused",
       upstreamUrl: null,
-      headersAllowlist: [],
       version: 1,
       configHash: "unused",
       enabled: true,
@@ -437,7 +595,7 @@ class InMemoryAdminConfig {
 
   lastUpdateInput: Record<string, unknown> | null = null;
 
-  async updateTenantSettings(_tenantId: string, input: Record<string, unknown>) {
+  async updateTenantSettings(_tenantId: string, input: TenantSettingsInput) {
     this.lastUpdateInput = input;
     this.tenantSettings = {
       ...this.tenantSettings,
@@ -476,7 +634,6 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
       sandboxMode: "workspace-write",
       networkMode: "restricted",
       allowCommandExecution: true,
-      allowUserTokenForwarding: true,
       autoApproveReadOnlyTools: true,
       webSearchMode: "disabled",
       enabledToolIds: []
@@ -510,9 +667,10 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: adminConfig as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: adminConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -536,7 +694,7 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
             // Production rows populate this column ("deep-agents" or null). The
             // fake must too — the response schema requires the key to be present
             // even when the value is null.
-            runtimeProvider: null,
+            runtimeProvider: "deep-agents",
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
           }
@@ -544,6 +702,9 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return ["session-1"];
       }
@@ -601,10 +762,9 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
   });
   expect(runtimeConfigResponse.statusCode).toBe(200);
   expect(runtimeConfigResponse.json().e2bTemplateId).toBe(testConfig.E2B_TEMPLATE_ID);
-  // Per-provider platform-key report (R29): both configured keys are listed,
-  // and the legacy anthropic flag still tracks the anthropic entry.
+  // Report both configured providers without an Anthropic-only alias.
   expect(runtimeConfigResponse.json().platformProviders).toEqual(["anthropic", "openai"]);
-  expect(runtimeConfigResponse.json().anthropicKeyConfigured).toBe(true);
+  expect(runtimeConfigResponse.json()).not.toHaveProperty("anthropicKeyConfigured");
 
   await app.close();
 });
@@ -622,9 +782,10 @@ test("admin routes reject non-admin callers", async () => {
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -632,6 +793,9 @@ test("admin routes reject non-admin callers", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -654,6 +818,63 @@ test("admin routes reject non-admin callers", async () => {
   await app.close();
 });
 
+test("GET /admin/tenant-settings prunes model ids the catalog dropped, so the form can still save", async () => {
+  // The regression this guards: PUT rejects unknown model ids, and the admin
+  // form resubmits whatever GET handed it. Retiring a catalog model therefore
+  // used to wedge the page — the dead id no longer renders as a checkbox, yet
+  // it rode along on every save and came back as a 400.
+  const app = Fastify();
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = {
+      userId: "admin-user",
+      tenantId: "admin-tenant",
+      isAdmin: true,
+      role: "owner"
+    };
+  });
+
+  const adminConfig = new InMemoryAdminConfig();
+  adminConfig.tenantSettings = {
+    ...adminConfig.tenantSettings,
+    // One live model plus one retired in the 2026-09 catalog refresh.
+    enabledModelIds: ["deepagents/claude-sonnet-5", "openai/gpt-5.4"]
+  };
+
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: adminConfig,
+    skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
+    auditEvents: new InMemoryAuditEventStore(),
+    runtimeSessions: { async listRecent() { return []; } },
+    deepAgentsAdapter: {
+      getRuntimeHealthDetail() { return []; },
+      async invalidateTenantRuntimes() { return []; }
+    },
+    runtimeAdapter: { async invalidateTenantRuntimes() { return []; } },
+    tenantMembers: {
+      async listTenantMembers() { return []; },
+      async setUserBetaTester() { return null; }
+    }
+  });
+  await app.ready();
+
+  const read = await app.inject({ method: "GET", url: "/admin/tenant-settings" });
+  expect(read.statusCode).toBe(200);
+  expect(read.json().settings.enabledModelIds).toEqual(["deepagents/claude-sonnet-5"]);
+
+  // Feeding that response straight back must be accepted, not 400'd.
+  const save = await app.inject({
+    method: "PUT",
+    url: "/admin/tenant-settings",
+    payload: { enabledModelIds: read.json().settings.enabledModelIds }
+  });
+  expect(save.statusCode).toBe(200);
+
+  await app.close();
+});
+
 test("admin tenant settings updates are audited", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
@@ -670,9 +891,10 @@ test("admin tenant settings updates are audited", async () => {
 
   const auditEvents = new InMemoryAuditEventStore();
   const adminConfig = new InMemoryAdminConfig();
-  await registerAdminRoutes(app, {
-    dynamicConfig: adminConfig as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: adminConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -680,6 +902,9 @@ test("admin tenant settings updates are audited", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -715,7 +940,6 @@ test("admin tenant settings updates are audited", async () => {
         approvalPolicy: "on-request",
         approvalReviewer: "user",
         allowCommandExecution: true,
-        allowUserTokenForwarding: true,
         autoApproveReadOnlyTools: true,
         policyEnforcementMode: "enforce",
         developerInstructions: null,
@@ -734,8 +958,7 @@ test("admin tenant settings updates are audited", async () => {
     url: "/admin/tenant-settings",
     headers: { "x-test-role": "admin" },
     payload: {
-      allowCommandExecution: false,
-      allowUserTokenForwarding: true
+      allowCommandExecution: false
     }
   });
   expect(forbidden.statusCode).toBe(403);
@@ -748,8 +971,7 @@ test("admin tenant settings updates are audited", async () => {
     headers: { "x-test-role": "admin" },
     payload: {
       showEffortSelector: true,
-      allowCommandExecution: true,
-      allowUserTokenForwarding: true
+      allowCommandExecution: true
     }
   });
   expect(adminUpdate.statusCode).toBe(200);
@@ -758,7 +980,6 @@ test("admin tenant settings updates are audited", async () => {
   // merely that the value happened to match) — so an admin's stale form can never
   // overwrite an owner decision even if it re-submits a now-divergent value.
   expect(adminConfig.lastUpdateInput).not.toHaveProperty("allowCommandExecution");
-  expect(adminConfig.lastUpdateInput).not.toHaveProperty("allowUserTokenForwarding");
   expect(adminConfig.lastUpdateInput).toHaveProperty("showEffortSelector", true);
 
   await app.close();
@@ -779,9 +1000,10 @@ test("admin tenant settings refresh active runtimes after update", async () => {
 
   const invalidatedTenants: string[] = [];
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -789,6 +1011,9 @@ test("admin tenant settings refresh active runtimes after update", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -798,7 +1023,7 @@ test("admin tenant settings refresh active runtimes after update", async () => {
         invalidatedTenants.push(tenantId);
         return ["session-a"];
       }
-    } as never,
+    },
     tenantMembers: {
       async listTenantMembers() { return []; },
       async setUserBetaTester() { return null; }
@@ -838,9 +1063,10 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -848,6 +1074,9 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -856,7 +1085,7 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
       async invalidateTenantRuntimes() {
         throw new Error("runtime refresh failed");
       }
-    } as never,
+    },
     tenantMembers: {
       async listTenantMembers() { return []; },
       async setUserBetaTester() { return null; }
@@ -879,7 +1108,7 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
   await app.close();
 });
 
-test("admin routes reject mismatched CRUD body ids on update", async () => {
+test("MCP updates validate body IDs and pass defaulted fields to the store", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -892,9 +1121,12 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  const dynamicConfig = new InMemoryAdminConfig();
+  const updateMcpServer = vi.spyOn(dynamicConfig, "updateMcpServer");
+  await registerTestAdminRoutes(app, {
+    dynamicConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -902,6 +1134,9 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -930,10 +1165,27 @@ test("admin routes reject mismatched CRUD body ids on update", async () => {
         message: "serverId must match the route parameter."
       });
 
+  const matchingResponse = await app.inject({
+    method: "PUT",
+    url: "/admin/mcp-servers/trusted-echo",
+    payload: {
+      serverId: "trusted-echo",
+      serverName: "Trusted echo",
+      mode: "proxy",
+      routePath: "/mcp/trusted-echo"
+    }
+  });
+  expect(matchingResponse.statusCode).toBe(404);
+  expect(updateMcpServer).toHaveBeenCalledWith("admin-tenant", expect.objectContaining({
+    serverId: "trusted-echo",
+    transportKind: "http",
+    enabled: true
+  }));
+
   await app.close();
 });
 
-test("admin routes require serverId when creating an MCP server", async () => {
+test("MCP creates validate required IDs and pass defaulted fields to the store", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -946,9 +1198,12 @@ test("admin routes require serverId when creating an MCP server", async () => {
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  const dynamicConfig = new InMemoryAdminConfig();
+  const createMcpServer = vi.spyOn(dynamicConfig, "createMcpServer");
+  await registerTestAdminRoutes(app, {
+    dynamicConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -956,6 +1211,9 @@ test("admin routes require serverId when creating an MCP server", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -979,9 +1237,43 @@ test("admin routes require serverId when creating an MCP server", async () => {
 
   expect(response.statusCode).toBe(400);
   expect(response.json()).toEqual({
-    error: "invalid_config",
-    message: "serverId is required."
+    error: "invalid_request",
+    details: [{ path: "serverId", message: expect.any(String) }]
   });
+
+  const invalidIdResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverId: "Invalid ID",
+      serverName: "Trusted echo",
+      mode: "proxy",
+      routePath: "/mcp/trusted-echo"
+    }
+  });
+  expect(invalidIdResponse.statusCode).toBe(400);
+  expect(invalidIdResponse.json().error).toBe("invalid_request");
+
+  const defaultedResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverId: "defaulted-server",
+      serverName: "Defaulted server",
+      mode: "managed",
+      routePath: "/mcp/defaulted-server"
+    }
+  });
+  expect(defaultedResponse.statusCode).toBe(201);
+  expect(defaultedResponse.json().mcpServer).toMatchObject({
+    transportKind: "http",
+    enabled: true
+  });
+  expect(createMcpServer).toHaveBeenCalledWith("admin-tenant", expect.objectContaining({
+    serverId: "defaulted-server",
+    transportKind: "http",
+    enabled: true
+  }));
 
   await app.close();
 });
@@ -999,9 +1291,10 @@ test("admin routes return structured errors for referenced MCP disables", async 
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1009,6 +1302,9 @@ test("admin routes return structured errors for referenced MCP disables", async 
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1044,7 +1340,7 @@ test("admin mutations surface AdminConfigError messages but keep internal errors
     };
   });
 
-  const dynamicConfig = new InMemoryAdminConfig() as AdminRouteStores["dynamicConfig"];
+  const dynamicConfig = new InMemoryAdminConfig();
   dynamicConfig.disableMcpServer = async () => {
     throw new AdminConfigError('Cannot disable MCP server "trusted-echo" — it is referenced.');
   };
@@ -1052,9 +1348,10 @@ test("admin mutations surface AdminConfigError messages but keep internal errors
     throw new Error('duplicate key value violates constraint "pg_internal_detail"');
   };
 
-  await registerAdminRoutes(app, {
+  await registerTestAdminRoutes(app, {
     dynamicConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1062,6 +1359,9 @@ test("admin mutations surface AdminConfigError messages but keep internal errors
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1112,9 +1412,10 @@ test("admin routes import a skill bundle zip", async () => {
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1122,6 +1423,9 @@ test("admin routes import a skill bundle zip", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1185,9 +1489,10 @@ test("admin zip import returns 413 with a fixed message when the upload exceeds 
     };
   });
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1195,6 +1500,9 @@ test("admin zip import returns 413 with a fixed message when the upload exceeds 
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1258,9 +1566,10 @@ test("admin zip import returns 400 (not 500) for a malformed zip upload", async 
     throw new AdminConfigError("Uploaded file is not a valid zip archive.");
   };
 
-  await registerAdminRoutes(app, {
-    dynamicConfig: dynamicConfig as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig,
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents: new InMemoryAuditEventStore(),
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1268,6 +1577,9 @@ test("admin zip import returns 400 (not 500) for a malformed zip upload", async 
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1322,9 +1634,10 @@ test("admin routes import a skill bundle from GitHub", async () => {
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1332,6 +1645,9 @@ test("admin routes import a skill bundle from GitHub", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1374,9 +1690,10 @@ test("admin routes list and activate skill revisions", async () => {
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1384,6 +1701,9 @@ test("admin routes list and activate skill revisions", async () => {
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }
@@ -1433,9 +1753,10 @@ test("admin routes run skill revision cleanup and audit the result", async () =>
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig() as unknown as AdminRouteStores["dynamicConfig"],
+  await registerTestAdminRoutes(app, {
+    dynamicConfig: new InMemoryAdminConfig(),
     skillMarketplace: createMarketplaceStore(),
+    skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
@@ -1443,6 +1764,9 @@ test("admin routes run skill revision cleanup and audit the result", async () =>
       }
     },
     deepAgentsAdapter: {
+      getRuntimeHealthDetail() {
+        return [];
+      },
       async invalidateTenantRuntimes() {
         return [];
       }

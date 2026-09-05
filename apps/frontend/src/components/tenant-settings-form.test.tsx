@@ -14,7 +14,6 @@ function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
     approvalPolicy: "never",
     approvalReviewer: "user",
     allowCommandExecution: false,
-    allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "monitor",
     developerInstructions: null,
@@ -39,7 +38,7 @@ function renderForm(
       onSave={onSave}
       managedTools={[]}
       mcpServers={[]}
-      anthropicKeyConfigured={true}
+      hasAnthropicTenantKey={true}
       isOwner={isOwner}
     />
   );
@@ -68,7 +67,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        anthropicKeyConfigured={false}
+        hasAnthropicTenantKey={false}
         isOwner={true}
       />
     );
@@ -87,7 +86,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        anthropicKeyConfigured={false}
+        hasAnthropicTenantKey={false}
         isOwner={true}
       />
     );
@@ -116,7 +115,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        anthropicKeyConfigured={false}
+        hasAnthropicTenantKey={false}
         isOwner={true}
       />
     );
@@ -139,7 +138,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        anthropicKeyConfigured={false}
+        hasAnthropicTenantKey={false}
         isOwner={true}
       />
     );
@@ -151,8 +150,7 @@ describe("TenantSettingsForm resync", () => {
     renderForm(makeSettings(), vi.fn(async () => true), false);
 
     expect((screen.getByLabelText(/Allow command execution/) as HTMLInputElement).disabled).toBe(true);
-    expect((screen.getByLabelText(/Forward user tokens/) as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByLabelText(/Auto-approve read-only tools/) as HTMLInputElement).disabled).toBe(false);
-    expect(screen.getAllByText(/Owner role required/)).toHaveLength(2);
+    expect(screen.getAllByText(/Owner role required/)).toHaveLength(1);
   });
 });

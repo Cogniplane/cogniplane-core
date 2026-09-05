@@ -38,8 +38,7 @@ function makeStorage(textByKey: Record<string, string>): Pick<ArtifactStorage, "
       const body = textByKey[storageKey] ?? "";
       return {
         stream: Readable.from([Buffer.from(body, "utf8")]),
-        contentType: "text/plain",
-        sizeBytes: Buffer.byteLength(body)
+        fileSizeBytes: Buffer.byteLength(body)
       };
     }
   };
@@ -47,21 +46,13 @@ function makeStorage(textByKey: Record<string, string>): Pick<ArtifactStorage, "
 
 function makeProcessor(opts: {
   text?: (artifact: ArtifactRecord) => string | null | Promise<string | null>;
-  images?: (artifact: ArtifactRecord) => { paths: string[]; cleanup: () => Promise<void> } | Promise<{ paths: string[]; cleanup: () => Promise<void> }>;
   textThrows?: boolean;
-  imagesThrows?: boolean;
-}): Pick<ArtifactProcessor, "extractArtifactText" | "renderArtifactImages"> {
+}): Pick<ArtifactProcessor, "extractArtifactText"> {
   return {
     async extractArtifactText(artifact) {
       if (opts.textThrows) throw new Error("extract failed");
       const result = opts.text ? await opts.text(artifact) : null;
       return result ?? null;
-    },
-    async renderArtifactImages(artifact) {
-      if (opts.imagesThrows) throw new Error("render failed");
-      return opts.images
-        ? await opts.images(artifact)
-        : { paths: [], cleanup: async () => {} };
     }
   };
 }
@@ -75,7 +66,6 @@ test("returns no userInputs when there are no scoped artifacts", async () => {
   });
 
   expect(result.userInputs).toBe(undefined);
-  expect(result.cleanup).toEqual([]);
 });
 
 test("inlines text from a readable text artifact via the storage stream", async () => {
@@ -148,8 +138,7 @@ test("skips non-text non-PDF artifacts entirely (e.g. arbitrary binary)", async 
   });
 
   const processor = makeProcessor({
-    text: () => "should-not-be-called",
-    images: () => ({ paths: ["/should/not/be/called.png"], cleanup: async () => {} })
+    text: () => "should-not-be-called"
   });
 
   const result = await buildArtifactTurnInputs({
@@ -165,22 +154,15 @@ test("skips non-text non-PDF artifacts entirely (e.g. arbitrary binary)", async 
   expect(result.userInputs!.length).toBe(1);
 });
 
-test("PDF artifact: extracts text and attaches rendered page images", async () => {
+test("PDF artifact: extracts text and inlines it", async () => {
   const pdf = makeArtifact({
     artifactName: "deck.pdf",
     mimeType: "application/pdf",
     storageKey: "kpdf"
   });
 
-  const cleanupCalls: string[] = [];
   const processor = makeProcessor({
-    text: () => "PDF body text",
-    images: () => ({
-      paths: ["/tmp/p1.png", "/tmp/p2.png"],
-      cleanup: async () => {
-        cleanupCalls.push("cleaned");
-      }
-    })
+    text: () => "PDF body text"
   });
 
   const result = await buildArtifactTurnInputs({
@@ -190,55 +172,16 @@ test("PDF artifact: extracts text and attaches rendered page images", async () =
     storage: makeStorage({})
   });
 
-  // text + 2 images
-  expect(result.userInputs!.length).toBe(3);
+  expect(result.userInputs!.length).toBe(1);
   const text = (result.userInputs![0] as { text: string }).text;
   expect(text).toMatch(/Extracted on demand from PDF: deck\.pdf/);
   expect(text).toMatch(/PDF body text/);
-  expect(text).toMatch(/Attached 2 rendered PDF page image\(s\) from: deck\.pdf/);
-
-  // images come through as localImage inputs
-  expect(result.userInputs!.slice(1)).toEqual([
-          { type: "localImage", path: "/tmp/p1.png" },
-          { type: "localImage", path: "/tmp/p2.png" }
-        ]);
-
-  // cleanup is registered, not yet called
-  expect(cleanupCalls.length).toBe(0);
-  expect(result.cleanup.length).toBe(1);
-  await result.cleanup[0]();
-  expect(cleanupCalls).toEqual(["cleaned"]);
 });
 
-test("PDF artifact: text extraction failure is swallowed; images still attach", async () => {
+test("PDF artifact: text extraction failure is swallowed", async () => {
   const pdf = makeArtifact({ mimeType: "application/pdf", storageKey: "k5", artifactName: "x.pdf" });
   const processor = makeProcessor({
-    textThrows: true,
-    images: () => ({
-      paths: ["/tmp/img.png"],
-      cleanup: async () => {}
-    })
-  });
-
-  const result = await buildArtifactTurnInputs({
-    prompt: "p",
-    scopedArtifacts: [pdf],
-    artifactProcessor: processor,
-    storage: makeStorage({})
-  });
-
-  // 1 text prompt + 1 image
-  expect(result.userInputs!.length).toBe(2);
-  const text = (result.userInputs![0] as { text: string }).text;
-  expect(text).not.toMatch(/Artifact content: x\.pdf/);
-  expect(text).toMatch(/Attached 1 rendered PDF page image\(s\) from: x\.pdf/);
-});
-
-test("PDF artifact: image rendering failure leaves only the metadata prompt", async () => {
-  const pdf = makeArtifact({ mimeType: "application/pdf", storageKey: "k6", artifactName: "x.pdf" });
-  const processor = makeProcessor({
-    text: () => null, // no extracted text
-    imagesThrows: true
+    textThrows: true
   });
 
   const result = await buildArtifactTurnInputs({
@@ -249,7 +192,9 @@ test("PDF artifact: image rendering failure leaves only the metadata prompt", as
   });
 
   expect(result.userInputs!.length).toBe(1);
-  expect(result.cleanup.length).toBe(0);
+  const text = (result.userInputs![0] as { text: string }).text;
+  expect(text).not.toMatch(/Artifact content: x\.pdf/);
+  expect(text).toMatch(/Answer only from the visible artifact metadata/);
 });
 
 test("synced artifacts are referenced by workspace path and not re-read", async () => {
@@ -263,8 +208,7 @@ test("synced artifacts are referenced by workspace path and not re-read", async 
       calls.push(key);
       return {
         stream: Readable.from([Buffer.from("zz")]),
-        contentType: "text/plain",
-        sizeBytes: 2
+        fileSizeBytes: 2
       };
     }
   };
@@ -351,8 +295,7 @@ test("artifact text budget: earlier large artifacts exhaust the budget for later
         key === "ka" || key === "kb" || key === "kc" ? fill : "after-budget-token";
       return {
         stream: Readable.from([Buffer.from(body)]),
-        contentType: "text/plain",
-        sizeBytes: body.length
+        fileSizeBytes: body.length
       };
     }
   };
@@ -402,6 +345,6 @@ test("when inline blocks exist, the embedded-source guidance line is emitted (no
   });
 
   const text = (result.userInputs![0] as { text: string }).text;
-  expect(text).toMatch(/Use the embedded artifact text blocks and attached local images/);
+  expect(text).toMatch(/Use the embedded artifact text blocks as the primary source material/);
   expect(text).not.toMatch(/Answer only from the visible artifact metadata/);
 });

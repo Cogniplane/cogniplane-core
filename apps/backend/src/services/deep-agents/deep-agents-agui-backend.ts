@@ -1,20 +1,5 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// Track B — real AGUITurnBackend over DeepAgentsSessionRuntime (Path 2, slice 1)
-//
-// The seam the AG-UI driver consumes, implemented against the SAME session
-// runtime the live adapter uses (`state.runtime` + `state.threadId` +
-// `state.toolContextRef`). Everything deterministic (graph resolution, the
-// streamEvents pass, pending-interrupt detection, resume-input construction, MCP
-// attribution) lives here; the one genuinely adapter-coupled piece — awaiting a
-// human decision on the shared approval plane — is injected as `awaitDecisions`
-// so this backend stays unit-testable without the approval/HTTP machinery.
-//
-// This module does NOT touch the adapter's runMessage path — it is dormant until
-// a future slice wires the AG-UI agent into the live SSE route (behind a flag at
-// that point). Reuses the graph's toolContextRef injection and runs inside the
-// adapter's withTenantScope, so tenant isolation + toolContextId survive
-// unchanged (proven by the driver test).
-// ─────────────────────────────────────────────────────────────────────────────
+// Adapts a session graph to the AG-UI driver. Graph resolution and MCP metadata
+// stay session-scoped; the runtime adapter supplies the approval decision loop.
 
 import type { BaseEvent } from "@ag-ui/client";
 
@@ -72,6 +57,8 @@ export interface SessionAGUITurnBackendParams {
   /** Prompt text for the initial turn input. */
   promptText: string;
   signal?: AbortSignal;
+  /** Records availability after the graph and its tools have loaded. */
+  onGraphReady?: () => Promise<void>;
   /** Bridges to the shared approval plane (adapter-supplied in production). */
   awaitDecisions: (
     actions: DeepAgentsPendingAction[],
@@ -91,14 +78,17 @@ export function createSessionAGUITurnBackend(
   let graph: DeepAgentsGraph | null = null;
 
   const resolveGraph = async (): Promise<DeepAgentsGraph> => {
-    if (graph === null) graph = await runtime.getAgentForModel(modelId, effort ?? null);
+    if (graph === null) {
+      graph = await runtime.getAgentForModel(modelId, effort ?? null);
+      await params.onGraphReady?.();
+    }
     return graph;
   };
 
   return {
     threadId,
-    mcpToolNames: runtime.getMcpToolNames?.() ?? new Set<string>(),
-    mcpToolServers: runtime.getMcpToolServers?.() ?? new Map<string, string>(),
+    mcpToolNames: runtime.getMcpToolNames(),
+    mcpToolServers: runtime.getMcpToolServers(),
 
     setToolContext(toolContextId) {
       toolContextRef.current = toolContextId;
@@ -109,6 +99,10 @@ export function createSessionAGUITurnBackend(
     },
 
     async *streamTurn(input) {
+      // An already-aborted turn (a client that dropped during the pre-turn
+      // artifact sync) must not build a graph or resolve a provider key first —
+      // reject on the signal the same way an in-flight stream would.
+      signal?.throwIfAborted();
       const g = await resolveGraph();
       yield* g.streamEvents(input, {
         version: "v2",
@@ -118,15 +112,12 @@ export function createSessionAGUITurnBackend(
     },
 
     async getPendingActions() {
-      return (await runtime.getPendingActions?.(threadId)) ?? [];
+      return runtime.getPendingActions(threadId);
     },
 
     awaitDecisions: params.awaitDecisions,
 
     buildResumeInput(actions, decisions) {
-      if (!runtime.buildResumeInput) {
-        throw new Error("Session runtime does not support resume (no buildResumeInput).");
-      }
       return runtime.buildResumeInput(actions, decisions);
     }
   };

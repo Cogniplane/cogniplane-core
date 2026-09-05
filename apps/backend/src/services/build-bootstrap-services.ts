@@ -64,11 +64,8 @@ export function buildBootstrapServices(input: {
     storage: artifactStorage
   });
 
-  // Two TenantOrgSettingsStore instances are intentional: route-scoped reads
-  // and writes go through `db` so they're subject to RLS, but bootstrap-time
-  // reads (Anthropic key for `/models`, PII policy for the background scan
-  // worker, OpenAI key forwarded into the runtime manager) run outside any
-  // per-request tenant scope and need `privilegedDb` to bypass RLS.
+  // Request stores use the RLS pool. Provider-key resolution and background PII
+  // policy reads use the privileged pool because they run outside request scope.
   const tenantOrgSettings = new TenantOrgSettingsStore(db, config.DATA_ENCRYPTION_SECRET);
   const tenantOrgSettingsPrivileged = new TenantOrgSettingsStore(
     privilegedDb,
@@ -104,5 +101,3 @@ export function buildBootstrapServices(input: {
     providerCredentials
   };
 }
-
-export type BootstrapServices = ReturnType<typeof buildBootstrapServices>;

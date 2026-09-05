@@ -61,7 +61,7 @@ function deps(
     } as unknown as DynamicConfigService,
     messages: {
       async listBySession() {
-        return [];
+        return { messages: [], hasMore: false };
       }
     } as unknown as MessageStore,
     piiProtection: options.piiProtection

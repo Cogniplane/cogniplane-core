@@ -39,10 +39,15 @@ const envSchema = z.object({
   API_HOST: z.string().optional(),
   API_PORT: z.coerce.number().int().positive().default(3001),
   API_ORIGIN: z.string().url().default("http://localhost:3000"),
+  // Defaults to the RESTRICTED runtime role, not the superuser. The previous
+  // `postgres:postgres` default meant a missing env silently ran the whole app
+  // with RLS bypassed — the one guarantee multi-tenancy rests on. Migrations
+  // need superuser and get it from MIGRATION_DATABASE_URL (scripts/migrate.ts
+  // falls back to the local superuser DSN when that is unset).
   DATABASE_URL: z
     .string()
     .min(1)
-    .default("postgres://postgres:postgres@localhost:5432/cogniplane"),
+    .default("postgres://app_user:app_user_password@localhost:5432/cogniplane"),
   LOCAL_DEV_USER_ID: z.string().min(1).default("local-dev-user"),
   ADMIN_USER_IDS: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().trim().min(1).optional(),
@@ -57,31 +62,18 @@ const envSchema = z.object({
   // OpenAI-compatible API (base URL in MODEL_PROVIDER_META — the GLM Coding
   // Plan endpoint https://api.z.ai/api/coding/paas/v4 by default).
   ZAI_API_KEY: z.string().trim().min(1).optional(),
-  // Comma-separated CIDR allowlist for the /mcp gateway egress controls.
-  // `request.ip` is checked — which is only the true caller peer when
-  // TRUST_PROXY is set correctly for the deployment (see below). Dormant when
-  // empty (the default) — E2B does not publish egress ranges, so the
-  // per-runtime IP pin is the operative control: the first gateway/proxy call
-  // for a runtimeId records the peer IP and a leaked rt_* token replayed from
-  // any other host is refused for the rest of its TTL. Configure a CIDR list
-  // only when your deployment has a known egress range; all configured checks
-  // must pass in addition to the rt_* token's session-scoped HMAC claims.
-  E2B_EGRESS_CIDRS: z.string().trim().default(""),
   // Fastify `trustProxy` value. Controls how `request.ip` is resolved from
-  // `X-Forwarded-For`, which the /mcp gateway egress controls (CIDR allowlist
-  // + per-runtime IP pin) depend on to see the real sandbox peer rather than
-  // the load balancer.
-  //   - "1" (default): trust exactly one proxy hop — correct for the
-  //     documented ECS-behind-ALB topology where the ALB is the only hop and
-  //     the backend is reachable only through it. `request.ip` becomes the
-  //     address the ALB recorded for the client (the sandbox's egress IP),
-  //     ignoring any client-forged earlier XFF entries.
-  //   - "0" / "false": trust nothing — `request.ip` is the socket peer.
-  //     Use for direct-exposure deployments with no trusted proxy, otherwise
-  //     a client could spoof `X-Forwarded-For` to defeat the IP pin.
-  //   - a number N: trust N proxy hops (e.g. "2" for CDN-in-front-of-ALB).
-  //   - a comma-separated IP/CIDR list: trust those proxy addresses.
-  TRUST_PROXY: z.string().trim().default("1"),
+  // `X-Forwarded-For`.
+  //   - "false" (default): trust nothing — `request.ip` is the socket peer.
+  //     Correct for direct exposure.
+  //   - a comma-separated IP/CIDR list: trust those proxy addresses. This is
+  //     the right setting behind a proxy — e.g. an ALB's subnets.
+  //   - "true": trust every hop. Only when every network path to this server
+  //     is already trusted.
+  //
+  // Numeric hop counts ("1", "2") are REJECTED at boot. Fastify removed them
+  // as spoofable (GHSA-3m5p-2c4r-xxw2) and fails closed on them at runtime.
+  TRUST_PROXY: z.string().trim().default("false"),
   SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-4-5-20251001"),
   SESSION_TITLER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   // Optional operator-run endpoint for small background LLM jobs (session
@@ -134,15 +126,17 @@ const envSchema = z.object({
   // resolves on every managed/proxy tool call. The gateway filters out expired
   // contexts, so this MUST outlive the longest turn — otherwise a turn running
   // past the TTL loses all managed MCP tool access mid-flight (every call fails
-  // with -32000). Validation below pins it strictly above RUNTIME_TURN_TIMEOUT_MS
-  // (which itself already exceeds APPROVAL_REQUEST_TTL_MS). Default: 25 min, one
-  // margin above the 20-min turn watchdog.
-  TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(25 * 60 * 1000),
+  // with -32000).
+  //
+  // "Longest turn" is NOT RUNTIME_TURN_TIMEOUT_MS. This TTL is wall-clock, but
+  // the turn watchdog is not: it is paused for the whole time a human spends on
+  // an approval (the checkpointed HITL loop disarms it around awaitDecisions). So a turn
+  // that consumes its entire watchdog budget AND stalls on one approval lasts
+  // RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS in wall-clock, which is
+  // what the validation below requires this to exceed. Default: 35 min, one
+  // margin above the 20-min watchdog plus a 10-min approval.
+  TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(35 * 60 * 1000),
   APPROVAL_REQUEST_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
-  // Fraction of APPROVAL_REQUEST_TTL_MS after which a one-shot "still pending"
-  // reminder is pushed to the active turn for a Policy Center–routed approval.
-  // 0 (or >= 1) disables reminders. Default: halfway through the TTL window.
-  POLICY_APPROVAL_REMINDER_FRACTION: z.coerce.number().min(0).max(1).default(0.5),
   ARTIFACT_STORAGE_BACKEND: z.enum(["local", "bucket"]).default("local"),
   ARTIFACT_STORAGE_ROOT: z.string().min(1).default(defaultArtifactStorageRoot),
   SKILL_BUNDLE_STORAGE_ROOT: z.string().min(1).default(defaultSkillBundleStorageRoot),
@@ -172,7 +166,17 @@ const envSchema = z.object({
   SKILL_BUNDLE_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
   SKILL_MARKETPLACE_MANIFEST_URL: z.string().url().optional(),
   SKILL_MARKETPLACE_CACHE_TTL_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
-  PDFTOTEXT_BINARY_PATH: z.string().min(1).default("pdftotext"),
+  // Exec'd (via execFile, fixed argv) against attacker-influenced PDFs. Pin the
+  // basename so a typo or a stale env cannot point the PDF path at an arbitrary
+  // script; the directory stays free for a non-standard install location.
+  PDFTOTEXT_BINARY_PATH: z
+    .string()
+    .min(1)
+    .default("pdftotext")
+    .refine((value) => /^pdftotext([.-]|$)/.test(path.basename(value)), {
+      message:
+        "PDFTOTEXT_BINARY_PATH must point at a pdftotext binary (e.g. pdftotext, pdftotext.exe, pdftotext-24.02)"
+    }),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(10),
   SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(50),
@@ -181,10 +185,6 @@ const envSchema = z.object({
   // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
   ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
-  // Reserved for programmatic artifact creation (the `artifact_create` rate-limit
-  // resource). No route currently consumes it; kept as a dormant limit knob.
-  ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(30),
-  ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(150),
   // Scheduled-job creation (POST /me/scheduled-jobs) — each job later runs as a
   // synthetic turn that does NOT draw down the interactive turn quota, so it is
   // throttled at creation time here.
@@ -199,6 +199,16 @@ const envSchema = z.object({
   // and tenant subject) to throttle probing of forged state values.
   OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // Admin routes run the heaviest aggregate queries in the app and were
+  // previously unlimited — a compromised admin account could hammer them.
+  // Generous enough for normal dashboard use (many panels load in parallel).
+  ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(300),
+  ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(1000),
+  // GET /auth/organizations makes one WorkOS API call per membership. Left
+  // unlimited, an authenticated user can amplify backend→WorkOS traffic until
+  // WorkOS throttles the whole deployment.
+  AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
   SCHEDULER_ENABLED: booleanFromEnvSchema.default(true),
@@ -217,16 +227,30 @@ const envSchema = z.object({
   // share a single budget. The worker's PII drain runs whenever the async PII
   // path is wired, even when SCHEDULER_ENABLED=false.
   PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
-  // Route a turn through the AG-UI agent (DeepAgentsAGUIAgent) and stream AG-UI
-  // BaseEvents on `POST /messages?format=agui`. The CopilotKit frontend is now
-  // the default chat UI and always requests `?format=agui`, so this defaults ON;
-  // the guard remains only as an operator kill-switch (`AGUI_WIRE=false`).
-  AGUI_WIRE: booleanFromEnvSchema.default(true),
   AUTH_MODE: z.enum(["workos", "dev-headers"]).default("dev-headers"),
   // Docker port publishing needs 0.0.0.0 *inside* the container, which the
   // dev-headers loopback guard below rejects; this is the operator opt-in.
   COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: booleanFromEnvSchema.default(false),
+  // Shared secret required on every dev-headers request once the non-loopback
+  // opt-in is set. Without it the only thing standing between a reachable port
+  // and full cross-tenant impersonation is the assumed network boundary.
+  DEV_HEADERS_AUTH_KEY: z.string().trim().min(16).optional(),
   DATA_ENCRYPTION_SECRET: z.string().min(32).default(DEFAULT_DATA_ENCRYPTION_SECRET),
+  // Overrides the HKDF-derived signing key for the `X-Framework-Signature`
+  // header sent to proxy MCP upstreams (lib/derived-secrets.ts). This is the
+  // one key a third party legitimately holds — a verifying upstream must have
+  // the same value — so it needs to be rotatable independently of the root
+  // secret that protects stored credentials. Unset falls back to the derived
+  // value, which is safe to share because the root cannot be recovered from it.
+  MCP_UPSTREAM_SIGNING_SECRET: z.string().trim().min(32).optional(),
+  // Per-hop wall-clock budget for a proxy MCP upstream call. An upstream with
+  // no timeout can hold a turn open until the turn watchdog fires; 30s is well
+  // inside a tool call's useful latency and well under RUNTIME_TURN_TIMEOUT_MS.
+  MCP_UPSTREAM_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  // Cap on a proxy MCP upstream response body. Read incrementally and aborted
+  // past the cap, so a hostile or broken upstream cannot OOM the shared
+  // backend with a multi-GB body. JSON-RPC tool results are kilobytes.
+  MCP_UPSTREAM_MAX_RESPONSE_BYTES: z.coerce.number().int().positive().default(4 * 1024 * 1024),
   WORKOS_API_KEY: z.string().trim().min(1).optional(),
   WORKOS_CLIENT_ID: z.string().trim().min(1).optional(),
   WORKOS_REDIRECT_URI: z.string().url().optional(),
@@ -460,14 +484,48 @@ export function loadConfig(
         "RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS — at or above it the sandbox dies before the watchdog can recover the turn."
       );
     }
-    // The per-turn tool-execution context must outlive the whole turn, or a
-    // long turn loses managed MCP tool access mid-flight when the context
-    // expires at the gateway. Keep it strictly above the turn watchdog.
-    if (parsed.TOOL_CONTEXT_TTL_MS <= parsed.RUNTIME_TURN_TIMEOUT_MS) {
+    // The per-turn tool-execution context must outlive the whole turn in WALL
+    // CLOCK, or a long turn loses managed MCP tool access mid-flight when the
+    // context expires at the gateway.
+    //
+    // The bound is the watchdog budget PLUS one approval TTL, not the watchdog
+    // alone: the watchdog is paused while a human decides an approval (native
+    // HITL disarms it around awaitDecisions), so a turn can burn its full watchdog budget and
+    // still sit through an entire APPROVAL_REQUEST_TTL_MS on top. This TTL is
+    // wall-clock and does not pause, so comparing it to the watchdog alone
+    // accepts configurations that expire the context mid-turn.
+    //
+    // KNOWN RESIDUAL LIMIT — this covers ONE approval, not N. The approval
+    // round loop is unbounded (`for (;;)` in runTurn), so a turn's wall-clock
+    // length is really `working budget + N x APPROVAL_REQUEST_TTL_MS`. No
+    // finite value here can bound that, so a turn that stalls on many
+    // consecutive approvals can still outlive its tool context. The watchdog
+    // fix caps WORKING time exactly; only human deciding time is unbounded.
+    // The real fix is to refresh the context TTL at each approval round (or
+    // adopt the TurnBudget object) rather than trying to out-size it — filed
+    // as a follow-up bead. This check remains the right floor: it rules out
+    // the configurations that break on a SINGLE approval, which is the common
+    // case and was previously accepted.
+    const maxTurnWallClockMs = parsed.RUNTIME_TURN_TIMEOUT_MS + parsed.APPROVAL_REQUEST_TTL_MS;
+    if (parsed.TOOL_CONTEXT_TTL_MS <= maxTurnWallClockMs) {
       throw new Error(
-        "TOOL_CONTEXT_TTL_MS must exceed RUNTIME_TURN_TIMEOUT_MS — otherwise a turn running past the context TTL loses all managed MCP tool access mid-turn."
+        `TOOL_CONTEXT_TTL_MS (${parsed.TOOL_CONTEXT_TTL_MS}) must exceed RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS (${maxTurnWallClockMs}) — the turn watchdog is paused while an approval is pending, so a turn's wall-clock ceiling is the sum, and a turn running past the context TTL loses all managed MCP tool access mid-turn.`
       );
     }
+  } else {
+    // RUNTIME_TURN_TIMEOUT_MS=0 disables the watchdog, so a turn has NO ceiling
+    // and no finite TOOL_CONTEXT_TTL_MS can be validated against it — there is
+    // no correct number to require here. A turn that outlives the context TTL
+    // still loses managed MCP tool access mid-flight; that is the accepted
+    // consequence of turning the watchdog off, not an oversight. The schema
+    // field documents 0 as a deliberate escape hatch (wedged-turn recovery is
+    // then manual), so warn rather than reject.
+    logger.warn(
+      { toolContextTtlMs: parsed.TOOL_CONTEXT_TTL_MS },
+      "RUNTIME_TURN_TIMEOUT_MS=0 disables the turn watchdog: turns have no ceiling, so a turn " +
+        "running past TOOL_CONTEXT_TTL_MS loses managed MCP tool access mid-turn, and a wedged " +
+        "turn pins its session busy until the sandbox dies."
+    );
   }
 
   if (parsed.AUTH_MODE === "workos") {
@@ -536,6 +594,30 @@ export function loadConfig(
       `API_HOST must be a loopback address [127.0.0.1, ::1, localhost] when AUTH_MODE=dev-headers ` +
         `(got API_HOST=${JSON.stringify(parsed.API_HOST)}). Use AUTH_MODE=workos before exposing the backend on a network interface, ` +
         `or set COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1 if the backend runs inside a container whose host firewall is the real trust boundary.`
+    );
+  }
+  // The opt-in removes the network guard, so the request-level guard becomes
+  // mandatory: without a shared secret, dev-headers on a reachable interface is
+  // unauthenticated cross-tenant impersonation.
+  if (
+    parsed.AUTH_MODE === "dev-headers" &&
+    parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK &&
+    !parsed.DEV_HEADERS_AUTH_KEY
+  ) {
+    throw new Error(
+      "DEV_HEADERS_AUTH_KEY (>=16 chars) is required when COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1. " +
+        "Clients must then send it as the X-Dev-Auth-Key header on every request."
+    );
+  }
+  // The compose stack ships this default so `docker compose up` works out of
+  // the box behind a 127.0.0.1 port bind. It is committed to the (public)
+  // repo, so as a secret it is worthless.
+  if (parsed.DEV_HEADERS_AUTH_KEY === "local-dev-headers-auth-key") {
+    logger.warn(
+      { authMode: parsed.AUTH_MODE },
+      "DEV_HEADERS_AUTH_KEY is the committed compose default. It is public knowledge and provides " +
+        "no protection — anyone who can reach the port can impersonate any user. Keep the port bound " +
+        "to 127.0.0.1, or set a unique key before exposing it."
     );
   }
   if (parsed.AUTH_MODE === "dev-headers" && parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK) {
@@ -618,6 +700,13 @@ export function loadConfig(
     if (parsed.PII_PROVIDER_ENABLED && !parsed.PII_LLM_API_KEY) {
       throw new Error(
         "PII_LLM_API_KEY is required when PII_PROVIDER_ENABLED=true."
+      );
+    }
+    const gatewayHostname = new URL(parsed.RUNTIME_GATEWAY_BASE_URL).hostname.toLowerCase();
+    const LOOPBACK_GATEWAY_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+    if (!LOOPBACK_GATEWAY_HOSTS.has(gatewayHostname)) {
+      throw new Error(
+        `RUNTIME_GATEWAY_BASE_URL must resolve to a loopback address [localhost, 127.0.0.1, [::1]] (got ${JSON.stringify(parsed.RUNTIME_GATEWAY_BASE_URL)}). The MCP gateway only accepts local runtime traffic.`
       );
     }
   }

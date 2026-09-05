@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   type ColumnDef,
   type SortingState,
@@ -11,9 +12,11 @@ import {
 } from "@tanstack/react-table";
 import { ChevronDown, ChevronUp, ChevronsUpDown } from "lucide-react";
 
-import { fetchMessageFeedback, type MessageFeedbackStats } from "../lib/message-feedback-api";
+import { fetchMessageFeedback } from "../lib/message-feedback-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
+import { queryKeys } from "../lib/query-keys";
 import { DayRangePicker, type Days } from "./token-usage-chart-primitives";
+import { ReportStatCard } from "./token-usage-chart-primitives";
 import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
 const STAT_CARD =
@@ -21,39 +24,16 @@ const STAT_CARD =
 
 export function MessageFeedbackSection() {
   const [days, setDays] = useState<Days>(30);
-  const [stats, setStats] = useState<MessageFeedbackStats | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [available, setAvailable] = useState(true);
-
-  const load = useCallback(async (d: Days) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await fetchMessageFeedback(d);
-      setAvailable(true);
-      setStats(data);
-    } catch (e) {
-      setAvailable(!isRouteNotFoundError(e, "GET", "/admin/message-feedback"));
-      setStats(null);
-      setError(
-        toRouteUnavailableMessage(e, {
-          method: "GET",
-          pathPrefix: "/admin/message-feedback",
-          featureName: "Message feedback reporting",
-          fallback: "Failed to load feedback data."
-        })
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    // load() flips setLoading before awaiting; the cascading render is intentional.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load(days);
-  }, [days, load]);
+  const query = useQuery({
+    queryKey: queryKeys.admin.messageFeedback(days),
+    queryFn: () => fetchMessageFeedback(days),
+    placeholderData: keepPreviousData
+  });
+  const stats = query.data;
+  const available = !isRouteNotFoundError(query.error, "GET", "/admin/message-feedback");
+  const error = query.error
+    ? toRouteUnavailableMessage(query.error, { method: "GET", pathPrefix: "/admin/message-feedback", featureName: "Message feedback reporting", fallback: "Failed to load feedback data." })
+    : null;
 
   const totals = stats?.totals;
 
@@ -62,7 +42,7 @@ export function MessageFeedbackSection() {
       {available ? (
         <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
           <DayRangePicker value={days} onChange={setDays} />
-          {loading ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
+          {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
         </div>
       ) : null}
 
@@ -71,17 +51,17 @@ export function MessageFeedbackSection() {
       {available && totals ? (
         <>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <StatCard
+            <ReportStatCard
               label="Positive rate"
               value={totals.ratePercent != null ? `${totals.ratePercent}%` : "—"}
               detail={`${totals.total} rated responses`}
             />
-            <StatCard
+            <ReportStatCard
               label="Thumbs up"
               value={String(totals.thumbsUp)}
               detail="Positive feedback"
             />
-            <StatCard
+            <ReportStatCard
               label="Thumbs down"
               value={String(totals.thumbsDown)}
               detail="Negative feedback"
@@ -137,22 +117,10 @@ export function MessageFeedbackSection() {
         </>
       ) : null}
 
-      {available && !loading && !error && totals?.total === 0 ? (
+      {available && !query.isFetching && !error && totals?.total === 0 ? (
         <p className={HINT}>No feedback recorded in this period.</p>
       ) : null}
     </section>
-  );
-}
-
-function StatCard(props: { label: string; value: string; detail: string }) {
-  return (
-    <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>{props.label}</p>
-      <strong className="mt-2 block text-2xl font-bold tracking-tight text-on-surface tabular-nums">
-        {props.value}
-      </strong>
-      <p className="mt-1 text-xs text-on-surface-variant">{props.detail}</p>
-    </article>
   );
 }
 

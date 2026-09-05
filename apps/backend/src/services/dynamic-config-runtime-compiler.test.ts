@@ -36,7 +36,6 @@ const profile: ResolvedRuntimePolicy = {
   sandboxMode: "workspace-write",
   networkMode: "restricted",
   allowCommandExecution: false,
-  allowUserTokenForwarding: true,
   autoApproveReadOnlyTools: true,
   policyEnforcementMode: "monitor",
   developerInstructions: null,
@@ -51,7 +50,8 @@ test("compileRuntimeConfig propagates associatedToolIds onto each skill", async 
     tenantId: "tenant-1",
     skills: { listSkills: async () => [baseSkill] },
     mcpServers: { listMcpServers: async () => [] as AdminMcpServerRecord[] },
-    runtimePolicy: profile
+    runtimePolicy: profile,
+    isBetaTester: true
   });
 
   expect(bundle.skills.length).toBe(1);
@@ -65,7 +65,8 @@ test("compileRuntimeConfig defaults associatedToolIds to empty when missing", as
     tenantId: "tenant-1",
     skills: { listSkills: async () => [skillWithoutTools] },
     mcpServers: { listMcpServers: async () => [] as AdminMcpServerRecord[] },
-    runtimePolicy: profile
+    runtimePolicy: profile,
+    isBetaTester: true
   });
 
   expect(bundle.skills.length).toBe(1);
@@ -85,7 +86,6 @@ test("compileRuntimeConfig filters MCP servers to the tenant policy's enabled se
     mode: "managed",
     routePath: "/mcp/managed-session-context",
     upstreamUrl: null,
-    headersAllowlist: [],
     version: 1,
     configHash: "hash-mcp",
     enabled: true,
@@ -106,7 +106,8 @@ test("compileRuntimeConfig filters MCP servers to the tenant policy's enabled se
     tenantId: "tenant-1",
     skills: { listSkills: async () => [baseSkill] },
     mcpServers: { listMcpServers: async () => [enabledServer, disabledServer] },
-    runtimePolicy: tenantProfile
+    runtimePolicy: tenantProfile,
+    isBetaTester: true
   });
 
   // Only servers the tenant policy enables survive; skills are not narrowed.
@@ -127,7 +128,6 @@ test("compileRuntimeConfig keeps only one enabled MCP server per server ID", asy
     mode: "managed",
     routePath: "/mcp/tenant-context",
     upstreamUrl: null,
-    headersAllowlist: [],
     version: 2,
     configHash: "tenant-hash",
     enabled: true,
@@ -147,7 +147,8 @@ test("compileRuntimeConfig keeps only one enabled MCP server per server ID", asy
     tenantId: "tenant-1",
     skills: { listSkills: async () => [baseSkill] },
     mcpServers: { listMcpServers: async () => [firstServer, duplicateServer] },
-    runtimePolicy: tenantProfile
+    runtimePolicy: tenantProfile,
+    isBetaTester: true
   });
 
   expect(bundle.mcpServers).toHaveLength(1);

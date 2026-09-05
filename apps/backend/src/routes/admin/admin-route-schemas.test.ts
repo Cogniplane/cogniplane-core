@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
+import {
+  AdminMcpServerCreateRequestSchema,
+  AdminMcpServerUpdateRequestSchema
+} from "@cogniplane/shared-types";
 
 import {
-  mcpBodySchema,
+  mcpCreateBodySchema,
+  mcpUpdateBodySchema,
   githubImportBodySchema,
   tenantSettingsBodySchema
 } from "./admin-route-schemas.js";
@@ -11,6 +16,25 @@ const validBase = {
   mode: "proxy" as const,
   routePath: "/mcp/test"
 };
+
+describe.each([
+  ["create", AdminMcpServerCreateRequestSchema, mcpCreateBodySchema],
+  ["update", AdminMcpServerUpdateRequestSchema, mcpUpdateBodySchema]
+])("MCP %s URL validation", (_operation, sharedSchema, routeSchema) => {
+  it("validates URL syntax in the shared contract and enforces URL policy at the route", () => {
+    const body = { ...validBase, serverId: "test" };
+    expect(sharedSchema.safeParse({ ...body, upstreamUrl: "not a URL" }).success).toBe(false);
+    for (const upstreamUrl of [
+      "http://example.com/mcp",
+      "https://127.0.0.1/mcp",
+      "https://user:password@example.com/mcp"
+    ]) {
+      expect(sharedSchema.safeParse({ ...body, upstreamUrl }).success).toBe(true);
+      expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(false);
+    }
+    expect(routeSchema.safeParse({ ...body, upstreamUrl: "https://example.com/mcp" }).success).toBe(true);
+  });
+});
 
 describe("httpsUrlSchema — SSRF IP block list", () => {
   const blocked: Array<[string, string]> = [
@@ -33,13 +57,13 @@ describe("httpsUrlSchema — SSRF IP block list", () => {
 
   for (const [label, url] of blocked) {
     it(`rejects ${label}: ${url}`, () => {
-      const result = mcpBodySchema.safeParse({ ...validBase, upstreamUrl: url });
+      const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: url });
       expect(result.success).toBe(false);
     });
   }
 
   it("accepts a valid external HTTPS URL", () => {
-    const result = mcpBodySchema.safeParse({
+    const result = mcpUpdateBodySchema.safeParse({
       ...validBase,
       upstreamUrl: "https://api.example.com/mcp"
     });
@@ -47,12 +71,12 @@ describe("httpsUrlSchema — SSRF IP block list", () => {
   });
 
   it("accepts null upstreamUrl (optional field)", () => {
-    const result = mcpBodySchema.safeParse({ ...validBase, upstreamUrl: null });
+    const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: null });
     expect(result.success).toBe(true);
   });
 
   it("rejects http:// scheme", () => {
-    const result = mcpBodySchema.safeParse({
+    const result = mcpUpdateBodySchema.safeParse({
       ...validBase,
       upstreamUrl: "http://api.example.com/mcp"
     });
@@ -83,27 +107,43 @@ describe("httpsUrlSchema — IPv4 numeric-format bypass", () => {
 
   for (const [label, url] of bypassed) {
     it(`rejects ${label}: ${url}`, () => {
-      const result = mcpBodySchema.safeParse({ ...validBase, upstreamUrl: url });
+      const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: url });
       expect(result.success).toBe(false);
     });
   }
 
   it("rejects octets greater than 255", () => {
-    const result = mcpBodySchema.safeParse({ ...validBase, upstreamUrl: "https://999.0.0.1/" });
+    const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: "https://999.0.0.1/" });
     expect(result.success).toBe(false);
   });
 
   it("still accepts canonical external IPv4 addresses", () => {
-    const result = mcpBodySchema.safeParse({ ...validBase, upstreamUrl: "https://8.8.8.8/" });
+    const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: "https://8.8.8.8/" });
     expect(result.success).toBe(true);
   });
 
   it("still accepts normal hostnames containing the letter x", () => {
-    const result = mcpBodySchema.safeParse({
+    const result = mcpUpdateBodySchema.safeParse({
       ...validBase,
       upstreamUrl: "https://x.example.com/mcp"
     });
     expect(result.success).toBe(true);
+  });
+});
+
+describe("MCP request schemas", () => {
+  it("requires serverId for create but not update", () => {
+    expect(mcpCreateBodySchema.safeParse(validBase).success).toBe(false);
+    expect(mcpCreateBodySchema.safeParse({ ...validBase, serverId: "test" }).success).toBe(true);
+    expect(mcpUpdateBodySchema.safeParse(validBase).success).toBe(true);
+  });
+
+  it("applies transport and enabled defaults to both operations", () => {
+    const created = mcpCreateBodySchema.parse({ ...validBase, serverId: "test" });
+    const updated = mcpUpdateBodySchema.parse(validBase);
+
+    expect(created).toMatchObject({ transportKind: "http", enabled: true });
+    expect(updated).toMatchObject({ transportKind: "http", enabled: true });
   });
 });
 

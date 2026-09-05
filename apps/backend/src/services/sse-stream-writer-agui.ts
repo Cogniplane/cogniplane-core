@@ -1,25 +1,31 @@
+import { customEvent } from "./deep-agents/agui-events.js";
 // AG-UI SSE writer.
 //
-// The AG-UI counterpart to `streamAssistantReply`: drives one turn through the
-// adapter's `runMessageAGUI` (DeepAgentsAGUIAgent) and streams AG-UI
+// Drives one turn through the adapter's `runMessageAGUI` method and streams AG-UI
 // `BaseEvent`s as SSE `data:` frames — the format `@ag-ui/client`'s HttpAgent /
-// CopilotKit consume directly. Gated behind `AGUI_WIRE` + `?format=agui`.
+// CopilotKit consumes directly.
 //
-// Leaner than the RuntimeEvent writer (no provenance footer, no INCREMENTAL
-// persistence — CopilotKit renders the live turn from the wire), but it fully
-// persists the turn's transcript so a reload renders the same as live: it creates
-// the assistant row, and at turn end records assistant text + status, reasoning,
-// the plan pane, and every tool call/result — captured off the same event stream
-// via `AguiTurnAccumulator`. It also hands the row id to `runMessageAGUI` so the
-// adapter can attribute token usage + cost onto it. Reuses `SseWriter` for
-// backpressure + disconnect handling, and cancels the runtime turn on client
-// disconnect exactly as the RuntimeEvent path does.
+// The live turn renders in CopilotKit from the wire. This writer also persists the
+// turn's transcript so a reload renders the same as live: it creates the
+// assistant row, checkpoints the accumulated text at a coarse interval while the
+// turn runs, and at turn end records assistant text + status, reasoning, the plan
+// pane, and every tool call/result — captured off the same event stream via
+// `AguiTurnAccumulator`. It also hands the row id to `runMessageAGUI` so the
+// adapter can attribute token usage and cost to it. `SseWriter` handles
+// backpressure and disconnects. A disconnect cancels the runtime turn.
+//
+// The mid-turn checkpoints exist for the case no `finally` can cover: a SIGKILL
+// or a rolling deploy drops the process mid-turn, so nothing runs to close the
+// row out. Without them the row stays `pending` and empty forever. The
+// checkpoint bounds the loss to one interval, and `sweepStaleAssistantMessages`
+// (run at boot) flips whatever the crash left behind to `interrupted`.
 
 import type { FastifyBaseLogger, FastifyReply } from "fastify";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import type { PolicyTurnContext } from "@cogniplane/shared-types";
 
 import type { RuntimeReasoningEffort, RuntimeSessionRef, RuntimeUserInput } from "../runtime-contracts.js";
+import { uuidv7 } from "../lib/uuid.js";
 import type { ArtifactRecord } from "./artifacts/artifact-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 import type { ArtifactProcessor } from "./artifacts/artifact-processor.js";
@@ -27,12 +33,29 @@ import type { MessageStore } from "./message-store.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import { buildArtifactTurnInputs } from "./turn-input-builder.js";
 import { syncArtifactsToWorkspace } from "./artifacts/artifact-workspace-sync.js";
-import { SseWriter, clientSafeFailureMessage, type RawSseResponse } from "./sse-stream-writer.js";
+import { SseWriter, clientSafeFailureMessage, type RawSseResponse } from "./sse-writer.js";
 import { AguiTurnAccumulator } from "./agui-turn-accumulator.js";
-import { isAGUIInterruptedFinish } from "./deep-agents/runtime-event-to-agui.js";
+import { isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
 import { redactSecrets } from "./redact-secrets.js";
 
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
+
+// How often the in-progress assistant text is checkpointed to the row. Coarse on
+// purpose: this is crash insurance, not the render path (the client renders from
+// the wire), so one write every few seconds bounds the loss without putting a DB
+// round-trip on the token-delta path.
+const STREAMING_PERSIST_INTERVAL_MS = 3_000;
+
+// How long the turn will wait for an in-flight checkpoint before finishing
+// without it. The drain exists so a checkpoint cannot settle "streaming" after
+// the terminal status — but the checkpoint is a database write with no
+// cancellation, so an unbounded wait would trade one stuck row for a stuck
+// REQUEST: no terminal update, no writer.end(), and the route's turn slot held
+// until the pool gave up. Past this budget the turn finishes; the late
+// checkpoint may then land last, which is the failure the drain was avoiding —
+// but only when the database is already broken, and a stuck row is recoverable
+// by sweepStaleAssistantMessages while a wedged session is not.
+const CHECKPOINT_DRAIN_DEADLINE_MS = 2_000;
 
 // Tool `textOffset` and reasoning-segment `offset` index into the RAW assistant
 // text, but the persisted content is `redactSecrets(assistantText)` — which can
@@ -61,8 +84,8 @@ function makeOffsetRemap(rawText: string): (offset: number) => number {
 export type StreamAssistantReplyAGUIInput = {
   logger?: FastifyBaseLogger;
   reply: FastifyReply;
-  messages: MessageStore;
-  toolContexts: ToolExecutionContextStore;
+  messages: Pick<MessageStore, "create" | "updateContent" | "updateStreamingContent" | "upsertToolResult">;
+  toolContexts: Pick<ToolExecutionContextStore, "create">;
   runtimeAdapter: {
     createSession(input: {
       tenantId: string;
@@ -75,6 +98,7 @@ export type StreamAssistantReplyAGUIInput = {
         prompt: string;
         userInputs?: RuntimeUserInput[];
         toolContextId: string | null;
+        turnContext?: PolicyTurnContext;
         assistantMessageId?: string | null;
         model?: string;
         effort?: RuntimeReasoningEffort;
@@ -103,7 +127,7 @@ export type StreamAssistantReplyAGUIInput = {
   // (the AG-UI counterpart to the SSE path's scoping) so the turn can reference
   // them instead of silently dropping the selection.
   scopedArtifacts?: ArtifactRecord[];
-  artifactProcessor?: ArtifactProcessor;
+  artifactProcessor?: Pick<ArtifactProcessor, "extractArtifactText">;
   storage?: ArtifactStorage;
   selectedArtifactIds?: string[];
   // When the PII detector rewrote the user's message in transform mode, the
@@ -114,6 +138,10 @@ export type StreamAssistantReplyAGUIInput = {
   userMessageReplacement?: { messageId: string; text: string; scanRunId?: string };
   turnContext?: PolicyTurnContext;
   toolContextTtlMs?: number;
+  /** Overrides STREAMING_PERSIST_INTERVAL_MS. Tests only — production omits it. */
+  streamingPersistIntervalMs?: number;
+  /** Overrides CHECKPOINT_DRAIN_DEADLINE_MS. Tests only — production omits it. */
+  checkpointDrainDeadlineMs?: number;
 };
 
 // AG-UI's own EventEncoder emits `data: <json>\n\n` per event; match it.
@@ -131,10 +159,64 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
   // Populated once the assistant row is created; the catch/finally reference it
   // to persist the final status even when the turn fails partway.
   let assistantMessageId: string | null = null;
+  // Declared at function scope so the outer `finally` can always stop it, even
+  // when the turn threw before the streaming block installed it.
+  let checkpointTimer: ReturnType<typeof setInterval> | null = null;
+  let checkpointInFlight: Promise<void> | null = null;
+  /**
+   * Stops checkpointing and waits for any write already awaiting the DB. Must
+   * run before every terminal `updateContent`: a checkpoint that settles after
+   * the final status would write `"streaming"` over it and pin the row mid-turn
+   * — the exact state this whole mechanism exists to prevent.
+   */
+  const settleCheckpoints = async (): Promise<void> => {
+    if (checkpointTimer) clearInterval(checkpointTimer);
+    checkpointTimer = null;
+    if (!checkpointInFlight) return;
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(
+        resolve,
+        input.checkpointDrainDeadlineMs ?? CHECKPOINT_DRAIN_DEADLINE_MS
+      );
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([checkpointInFlight, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   // Captures assistant text + reasoning + plan + tool calls/results off the event
   // stream for end-of-turn persistence (reload parity). `assistantText` remains a
   // convenience alias read in the catch/failure paths.
   const turn = new AguiTurnAccumulator();
+  // AG-UI permits RUN_ERROR as the first event, but no event may follow it. Keep
+  // the replacement at function scope so a setup failure can emit a short,
+  // valid lifecycle: RUN_STARTED, replacement, RUN_ERROR.
+  let runStartedWritten = false;
+  let userMessageReplacementEvent = input.userMessageReplacement
+    ? customEvent("user_message_replaced", {
+          messageId: input.userMessageReplacement.messageId,
+          text: input.userMessageReplacement.text,
+          scanRunId: input.userMessageReplacement.scanRunId ?? null
+      })
+    : undefined;
+  const writePendingUserMessageReplacement = async (): Promise<void> => {
+    if (!userMessageReplacementEvent) return;
+    if (!runStartedWritten) {
+      await writer.write(
+        aguiFrame({
+          type: EventType.RUN_STARTED,
+          threadId: input.sessionId,
+          runId: assistantMessageId ?? uuidv7()
+        } as BaseEvent)
+      );
+      runStartedWritten = true;
+    }
+    await writer.write(aguiFrame(userMessageReplacementEvent));
+    userMessageReplacementEvent = undefined;
+  };
 
   try {
     // Create the assistant row up front so `runMessageAGUI` has an id to
@@ -148,23 +230,6 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       content: ""
     });
     assistantMessageId = assistant.messageId;
-
-    // PII transform: tell the client to swap its optimistic user bubble for the
-    // transformed text the backend actually persisted+sent. A CUSTOM event (not a
-    // standard AG-UI message) — the frontend's useAguiCustomEvents applies it.
-    if (input.userMessageReplacement) {
-      await writer.write(
-        aguiFrame({
-          type: EventType.CUSTOM,
-          name: "user_message_replaced",
-          value: {
-            messageId: input.userMessageReplacement.messageId,
-            text: input.userMessageReplacement.text,
-            scanRunId: input.userMessageReplacement.scanRunId ?? null
-          }
-        } as BaseEvent)
-      );
-    }
 
     const session = await input.runtimeAdapter.createSession({
       tenantId: input.tenantId,
@@ -187,14 +252,13 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000
     });
 
-    // Artifact scoping (mirrors the RuntimeEvent path's onBeforeTurn): downloads
+    // Artifact scoping: downloads
     // checkboxed artifacts into the sandbox workspace and builds the prompt
     // context block. Runs inside runMessageAGUI's onBeforeTurn so the sandbox is
     // guaranteed alive. `userInputs` (when built) REPLACE the raw prompt.
     const scopedArtifacts = input.scopedArtifacts ?? [];
-    const turnState: { userInputs?: RuntimeUserInput[]; cleanup: Array<() => Promise<void>> } = {
-      userInputs: undefined,
-      cleanup: []
+    const turnState: { userInputs?: RuntimeUserInput[] } = {
+      userInputs: undefined
     };
     const onBeforeTurn =
       scopedArtifacts.length &&
@@ -225,7 +289,6 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
               syncedArtifacts
             });
             turnState.userInputs = prepared.userInputs;
-            turnState.cleanup.push(...prepared.cleanup);
           }
         : undefined;
 
@@ -256,13 +319,59 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
     // stream — so the status must be derived from the events, not just the catch.
     let finalStatus: "completed" | "interrupted" | "error" = "completed";
     let errorMessage = "The assistant run failed.";
+
+    // Mid-turn checkpoint of the accumulated text. Driven by a TIMER, not by the
+    // event loop, and that is the point: it must keep running through a stretch
+    // where the turn emits nothing at all — most obviously a human sitting on an
+    // approval prompt, which can last APPROVAL_REQUEST_TTL_MS. An event-driven
+    // checkpoint would go silent for exactly the periods where the row most
+    // needs to look alive, and the stale-message sweeper reads `updated_at` to
+    // decide whether a row belongs to a live turn.
+    //
+    // Best-effort by design: this is insurance against a process death, so a
+    // transient DB failure must not end a turn the client is still reading. The
+    // write is unconditional (`updated_at` is the point even when the text has
+    // not moved) but rate-limited to one per interval.
+    const rowId = assistantMessageId;
+    const writeCheckpoint = async (): Promise<void> => {
+      try {
+        await input.messages.updateContent(
+          input.tenantId,
+          rowId,
+          input.userId,
+          "streaming",
+          turn.assistantText
+        );
+      } catch (err) {
+        input.logger?.warn(
+          { err, sessionId: input.sessionId, tenantId: input.tenantId },
+          "failed to checkpoint AG-UI assistant text mid-turn"
+        );
+      }
+    };
+    const checkpointStreamingText = (): void => {
+      // A write slower than the interval must not stack up behind the timer.
+      if (checkpointInFlight) return;
+      checkpointInFlight = writeCheckpoint().finally(() => {
+        checkpointInFlight = null;
+      });
+    };
     if (writer.isClosed) {
       finalStatus = "interrupted";
     } else {
+      // Started only on the branch that actually streams. On the already-closed
+      // branch there is no turn to checkpoint, and a live timer there would race
+      // the terminal write below with nothing to drain it.
+      checkpointTimer = setInterval(
+        checkpointStreamingText,
+        input.streamingPersistIntervalMs ?? STREAMING_PERSIST_INTERVAL_MS
+      );
+      checkpointTimer.unref?.();
       try {
         for await (const event of input.runtimeAdapter.runMessageAGUI(session, {
           prompt: input.prompt,
           toolContextId: toolContext.toolContextId,
+          turnContext: input.turnContext ?? "interactive",
           assistantMessageId,
           model: input.modelName,
           effort: input.effort,
@@ -293,22 +402,29 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
             if (finalStatus === "completed") finalStatus = "interrupted";
             break;
           }
+          // RUN_ERROR is terminal in AG-UI. If the adapter failed before its
+          // RUN_STARTED event, emit a synthetic start and the buffered PII
+          // replacement first so the client receives both a valid stream and
+          // the persisted user-text correction.
+          if (event.type === EventType.RUN_ERROR) {
+            await writePendingUserMessageReplacement();
+          }
           await writer.write(aguiFrame(event));
+          if (event.type === EventType.RUN_STARTED) {
+            runStartedWritten = true;
+            await writePendingUserMessageReplacement();
+          }
         }
       } finally {
         turnSettled = true;
-        if (turnState.cleanup.length) {
-          // Best-effort temp-file removal from buildArtifactTurnInputs; a
-          // rejection must never mask the turn's real outcome.
-          await Promise.allSettled(turnState.cleanup.map((fn) => fn()));
-        }
+        await settleCheckpoints();
       }
     }
 
     // Persist the final assistant text + status. Token usage + cost are written
     // separately by the adapter (keyed on assistantMessageId) — different
     // columns, so write order doesn't matter. On error, fall back to the failure
-    // message when no partial text streamed (mirrors the RuntimeEvent writer).
+    // message when no partial text streamed.
     await input.messages.updateContent(
       input.tenantId,
       assistantMessageId,
@@ -339,6 +455,10 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
     // (client-safe by convention); collapse internals to a generic message so
     // connection strings / stack detail never reach the client or the row.
     const failureMessage = clientSafeFailureMessage(error);
+    // A setup failure can happen before the runtime yields RUN_STARTED. Flush
+    // the buffered PII replacement inside a synthetic run before terminating
+    // it with RUN_ERROR. AG-UI rejects CUSTOM after a terminal error.
+    await writePendingUserMessageReplacement();
     // Terminal AG-UI error frame so the client stops waiting on an open stream.
     await writer.write(aguiFrame({ type: EventType.RUN_ERROR, message: failureMessage }));
     // Best-effort: mark the row failed so it doesn't linger as "pending". A
@@ -361,6 +481,13 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
     }
   } finally {
     clearInterval(heartbeat);
+    // Backstop for every path that did not reach the streaming block's own drain
+    // — a throw during setup, or one out of the terminal persistence below. No
+    // test pins it: the timer only exists inside that block, so by construction
+    // there is nothing left in flight by the time control gets here. Kept
+    // because that is a property of where the timer happens to be armed, and a
+    // drain at the last exit cannot be defeated by moving it.
+    await settleCheckpoints();
     writer.end();
   }
 }

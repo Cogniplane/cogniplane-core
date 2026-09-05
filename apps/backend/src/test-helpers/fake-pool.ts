@@ -7,7 +7,7 @@ export type QueryResult<Row extends QueryResultRow = QueryResultRow> = {
   rowCount: number;
 };
 
-type QueryHandler = (text: string, values: unknown[]) => QueryResult | Promise<QueryResult>;
+type QueryHandler = (text: string, values: unknown[]) => QueryResult;
 
 type Match = {
   pattern: RegExp | string;
@@ -67,7 +67,10 @@ export class FakePool {
       trimmed === "BEGIN" ||
       trimmed === "COMMIT" ||
       trimmed === "ROLLBACK" ||
-      trimmed.startsWith("SELECT set_config(")
+      trimmed.startsWith("SELECT set_config(") ||
+      // Advisory locks serialize writers; with a single fake connection there
+      // is nothing to serialize against, so acquiring one always succeeds.
+      trimmed.startsWith("SELECT pg_advisory_xact_lock(")
     ) {
       return { rows: [], rowCount: 0 };
     }
@@ -79,11 +82,6 @@ export class FakePool {
           : matcher.pattern.test(text);
       if (matches) {
         const result = matcher.handler(text, values);
-        if (result instanceof Promise) {
-          throw new Error(
-            "FakePool handlers must be synchronous; wrap async work outside dispatch."
-          );
-        }
         return result;
       }
     }

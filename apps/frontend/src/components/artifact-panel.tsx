@@ -192,28 +192,48 @@ function AddSourceMenu(props: {
   );
 }
 
-export function ArtifactPanel(props: {
+export type ArtifactInventoryModel = {
   artifacts: Artifact[];
+};
+
+export type ArtifactSelectionModel = {
   visibleSelectedArtifactIds: string[];
-  isUploadingArtifact: boolean;
-  downloadArtifactId: string | null;
-  previewArtifactId: string | null;
-  isLoadingPreview: boolean;
-  selectedSessionId: string | null;
+  onToggle: (artifactId: string) => void;
+};
+
+export type ArtifactTransferModel = {
+  isUploading: boolean;
+  downloadingId: string | null;
   onUpload: (file: File | null) => void;
-  onToggleSelection: (artifactId: string) => void;
   onDownload: (artifactId: string) => void;
-  onPreview: (artifactId: string) => void;
-  fileSources: FileSourceSummary[];
-  onOpenFileSource: (sourceId: string) => void;
+};
+
+export type ArtifactPreviewModel = {
+  artifactId: string | null;
+  isLoading: boolean;
+  onOpen: (artifactId: string) => void;
+};
+
+export type ArtifactSourcesModel = {
+  sessionId: string | null;
+  items: FileSourceSummary[];
+  onOpen: (sourceId: string) => void;
+};
+
+export function ArtifactPanel({ inventory, selection, transfers, preview, sources }: {
+  inventory: ArtifactInventoryModel;
+  selection: ArtifactSelectionModel;
+  transfers: ArtifactTransferModel;
+  preview: ArtifactPreviewModel;
+  sources: ArtifactSourcesModel;
 }) {
   const [tab, setTab] = useState<"context" | "artifacts">("context");
 
   const selectedIdSet = useMemo(
-    () => new Set(props.visibleSelectedArtifactIds),
-    [props.visibleSelectedArtifactIds]
+    () => new Set(selection.visibleSelectedArtifactIds),
+    [selection.visibleSelectedArtifactIds]
   );
-  const selectedArtifacts = props.artifacts.filter((artifact) =>
+  const selectedArtifacts = inventory.artifacts.filter((artifact) =>
     selectedIdSet.has(artifact.artifactId)
   );
 
@@ -230,7 +250,7 @@ export function ArtifactPanel(props: {
           <TabsTrigger value="artifacts" className="gap-2">
             Artifacts
             <span className="rounded bg-surface-container px-1.5 py-0.5 text-[0.62rem] font-semibold text-on-surface-faint">
-              {props.artifacts.length}
+              {inventory.artifacts.length}
             </span>
           </TabsTrigger>
         </TabsList>
@@ -246,12 +266,12 @@ export function ArtifactPanel(props: {
                   key={artifact.artifactId}
                   artifact={artifact}
                   isSelected
-                  downloadArtifactId={props.downloadArtifactId}
-                  isLoadingPreview={props.isLoadingPreview}
-                  previewArtifactId={props.previewArtifactId}
-                  onDownload={props.onDownload}
-                  onPreview={props.onPreview}
-                  onToggleSelection={props.onToggleSelection}
+                  downloadArtifactId={transfers.downloadingId}
+                  isLoadingPreview={preview.isLoading}
+                  previewArtifactId={preview.artifactId}
+                  onDownload={transfers.onDownload}
+                  onPreview={preview.onOpen}
+                  onToggleSelection={selection.onToggle}
                 />
               ))}
             </div>
@@ -265,29 +285,29 @@ export function ArtifactPanel(props: {
           )}
           <div className="mt-3 flex justify-end">
             <AddSourceMenu
-              fileSources={props.fileSources}
-              isUploadingArtifact={props.isUploadingArtifact}
-              onOpenSource={props.onOpenFileSource}
-              onUpload={props.onUpload}
-              selectedSessionId={props.selectedSessionId}
+              fileSources={sources.items}
+              isUploadingArtifact={transfers.isUploading}
+              onOpenSource={sources.onOpen}
+              onUpload={transfers.onUpload}
+              selectedSessionId={sources.sessionId}
             />
           </div>
         </TabsContent>
 
         <TabsContent value="artifacts" className="flex-1 overflow-y-auto px-4 py-3 data-[state=inactive]:hidden">
-          {props.artifacts.length ? (
+          {inventory.artifacts.length ? (
             <div className="flex flex-col gap-2">
-              {props.artifacts.map((artifact) => (
+              {inventory.artifacts.map((artifact) => (
                 <ArtifactRow
                   key={artifact.artifactId}
                   artifact={artifact}
                   isSelected={selectedIdSet.has(artifact.artifactId)}
-                  downloadArtifactId={props.downloadArtifactId}
-                  isLoadingPreview={props.isLoadingPreview}
-                  previewArtifactId={props.previewArtifactId}
-                  onDownload={props.onDownload}
-                  onPreview={props.onPreview}
-                  onToggleSelection={props.onToggleSelection}
+                  downloadArtifactId={transfers.downloadingId}
+                  isLoadingPreview={preview.isLoading}
+                  previewArtifactId={preview.artifactId}
+                  onDownload={transfers.onDownload}
+                  onPreview={preview.onOpen}
+                  onToggleSelection={selection.onToggle}
                 />
               ))}
             </div>

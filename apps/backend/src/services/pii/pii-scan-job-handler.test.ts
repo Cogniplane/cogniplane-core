@@ -1,11 +1,11 @@
 import { test, expect } from "vitest";
 
-import type { FastifyBaseLogger } from "fastify";
-
 import {
   PiiScanJobHandler,
+  type PiiScanJobHandlerDeps,
   type PiiScanSubjectReader
 } from "./pii-scan-job-handler.js";
+import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import type { PiiDecision } from "./pii-protection-service.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
@@ -27,14 +27,14 @@ function buildDeps(overrides: {
   const failureCalls: Array<{ tenantId: string; jobId: string; error: string; permanent: boolean }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
-  let failureReturn: { status: "queued" | "failed" } | null = { status: "queued" };
+  let failureReturn: { status: PiiScanJobRecord["status"] } | null = { status: "queued" };
   // Artifact row the handler re-fetches to find the current storage key. Tests
   // override `artifactGet` to model a missing/deleted row or a diverging key.
-  let artifactGet: (() => { storageBackend: "local" | "bucket"; storageKey: string; status: string } | null) =
+  let artifactGet: (() => Pick<ArtifactRecord, "storageBackend" | "storageKey" | "status"> | null) =
     () => ({ storageBackend: "local", storageKey: "users/user-1/session-1/art-1.txt", status: "ready" });
   let storageDeleteThrows: Error | null = null;
 
-  const piiProtection = {
+  const piiProtection: PiiScanJobHandlerDeps["piiProtection"] = {
     async evaluateText() {
       if (overrides.evaluateThrows) throw overrides.evaluateThrows;
       return overrides.decision ?? ({ action: "allow", reason: "disabled" } as PiiDecision);
@@ -67,22 +67,14 @@ function buildDeps(overrides: {
     }
   };
 
-  const logger = {
+  const logger: PiiScanJobHandlerDeps["logger"] = {
     error() {},
-    info() {},
-    warn() {},
-    debug() {},
-    trace() {},
-    fatal() {},
-    child() {
-      return logger;
-    },
-    level: "info"
-  } as unknown as FastifyBaseLogger;
+    warn() {}
+  };
 
   return {
     deps: {
-      piiProtection: piiProtection as unknown as ConstructorParameters<typeof PiiScanJobHandler>[0]["piiProtection"],
+      piiProtection,
       piiScanRuns: {
         async update(tenantId: string, scanRunId: string, patch: Record<string, unknown>) {
           updateCalls.push({ tenantId, scanRunId, patch });
@@ -100,9 +92,7 @@ function buildDeps(overrides: {
           options: { backoffMs?: number; permanent?: boolean } = {}
         ) {
           failureCalls.push({ tenantId, jobId, error, permanent: options.permanent ?? false });
-          return failureReturn as unknown as ReturnType<
-            ConstructorParameters<typeof PiiScanJobHandler>[0]["piiScanJobs"]["recordFailure"]
-          >;
+          return failureReturn;
         }
       },
       messages: {

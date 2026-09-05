@@ -1,5 +1,12 @@
 import { z } from "zod";
 
+export const AdminIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  .regex(/^[a-z0-9][a-z0-9-_]*$/);
+
 /**
  * Schema for ISO-8601 timestamp fields in API responses.
  *
@@ -20,6 +27,6 @@ import { z } from "zod";
  * names, tokens, …).
  */
 export const IsoDateSchema = z.union([
-  z.string(),
+  z.string().datetime({ offset: true }),
   z.date().transform((d) => d.toISOString())
 ]);

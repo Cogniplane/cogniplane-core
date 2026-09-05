@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
 
-import { applyMigrations } from "./migrate-lib.js";
+import { applyMigrations, ensureAppUserRole } from "./migrate-lib.js";
 import {
   DEEP_AGENTS_CHECKPOINT_SCHEMA,
   setupDeepAgentsCheckpointer
@@ -20,10 +20,16 @@ const migrationsDir = path.resolve(dirname, "../../db/migrations");
 // because E2B / PII / gateway env vars aren't present in the CI or deploy step
 // that runs `pnpm db:migrate` — those validations only matter when the backend
 // serves agent traffic.
+// DATABASE_URL defaults to the restricted `app_user` role, which cannot run
+// DDL or CREATE ROLE — so with no MIGRATION_DATABASE_URL, fall back to the
+// local superuser DSN rather than failing halfway through the first migration.
+const DEFAULT_LOCAL_SUPERUSER_URL = "postgres://postgres:postgres@localhost:5432/cogniplane";
 const config = loadConfig(process.env, undefined, { skipRuntimeChecks: true });
-const migrationConfig = process.env.MIGRATION_DATABASE_URL
-  ? { ...config, DATABASE_URL: process.env.MIGRATION_DATABASE_URL }
-  : config;
+const migrationConfig = {
+  ...config,
+  DATABASE_URL:
+    process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL ?? DEFAULT_LOCAL_SUPERUSER_URL
+};
 const db = createDatabase(migrationConfig);
 
 // Extract the app_user password from DATABASE_URL so we can set it on the
@@ -38,28 +44,6 @@ function extractPassword(databaseUrl: string): string | null {
   }
 }
 
-function hasControlCharacter(value: string): boolean {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    // C0 control chars (0x00-0x1F) and DEL (0x7F) cannot be safely
-    // interpolated into the migrations DO block.
-    if (code <= 0x1f || code === 0x7f) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function escapeAppUserPassword(password: string): string {
-  if (password.includes("$$") || hasControlCharacter(password)) {
-    throw new Error(
-      "APP_USER_PASSWORD contains characters that cannot be safely interpolated " +
-        "into the migrations DO block ($$ or control chars). Use a different password."
-    );
-  }
-  return password.replace(/'/g, "''");
-}
-
 async function run() {
   await applyMigrations(db, migrationsDir);
 
@@ -69,46 +53,13 @@ async function run() {
   await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
   console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
 
-  // Ensure app_user exists with the correct password from DATABASE_URL. The
-  // role may be absent if migrations were previously applied without it (the
-  // old 19-migration sequence); this block is idempotent and safe to re-run.
+  // Role + grants. Shared with the integration harness via migrate-lib so the
+  // two cannot drift — see ensureAppUserRole's header.
   const appUserPassword = process.env.APP_USER_PASSWORD || extractPassword(config.DATABASE_URL);
   if (appUserPassword) {
-    const escaped = escapeAppUserPassword(appUserPassword);
-    // CREATE/ALTER ROLE reject parameterized passwords; force ON so the
-    // single-quote-doubling in escapeAppUserPassword is interpreted correctly.
-    // Pin one connection: pool.query() checks out a connection per call, so a
-    // separate SET could land on a different connection than the DO block.
     const client = await db.connect();
     try {
-      await client.query("SET standard_conforming_strings = on");
-      await client.query(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_user') THEN
-            CREATE ROLE app_user LOGIN PASSWORD '${escaped}';
-          ELSE
-            ALTER ROLE app_user WITH LOGIN PASSWORD '${escaped}';
-          END IF;
-        END
-        $$
-      `);
-      // Re-apply grants every time — idempotent and required if the role was
-      // just created outside of the normal migration flow.
-      await client.query(`GRANT USAGE ON SCHEMA public TO app_user`);
-      await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user`);
-      await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user`);
-      // The runtime Deep Agents checkpointer connects as app_user; its tables
-      // live in a dedicated schema (created above, superuser-owned). No RLS
-      // here — tenant→thread ownership is enforced at the app layer (see
-      // services/deep-agents/deep-agents-checkpointer.ts).
-      await client.query(`GRANT USAGE ON SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`);
-      await client.query(
-        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`
-      );
-      await client.query(
-        `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO app_user`
-      );
+      await ensureAppUserRole(client, appUserPassword);
     } finally {
       client.release();
     }

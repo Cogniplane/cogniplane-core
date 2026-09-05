@@ -15,7 +15,7 @@ export type IntegrationEnablement = {
 };
 
 export async function loadIntegrationEnablement(
-  integrationStates: IntegrationStateStore,
+  integrationStates: Pick<IntegrationStateStore, "get">,
   config: AppConfig,
   tenantId: string,
   integrationId: string

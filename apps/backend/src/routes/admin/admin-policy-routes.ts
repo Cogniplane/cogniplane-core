@@ -36,10 +36,13 @@ import {
 } from "./admin-route-helpers.js";
 
 export type PolicyRouteStores = {
-  policyRules: PolicyRuleStore;
-  policyDecisions: PolicyDecisionStore;
-  policyService: PolicyService;
-  auditEvents: AuditEventStore;
+  policyRules: Pick<
+    PolicyRuleStore,
+    "create" | "delete" | "list" | "listForLint" | "reorder" | "update"
+  >;
+  policyDecisions: Pick<PolicyDecisionStore, "get" | "list">;
+  policyService: Pick<PolicyService, "evaluate" | "invalidate">;
+  auditEvents: Pick<AuditEventStore, "create">;
 };
 
 const ruleIdParamsSchema = z.object({ ruleId: z.string().min(1) });

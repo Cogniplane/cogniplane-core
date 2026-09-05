@@ -4,8 +4,11 @@ import Fastify from "fastify";
 import { handleAppError, parseTrustProxy } from "./app.js";
 
 describe("parseTrustProxy", () => {
-  test("defaults to a single trusted hop for the documented ALB topology", () => {
-    expect(parseTrustProxy("1")).toBe(1);
+  test("the shipped default trusts nothing", () => {
+    // The default moved from "1" to "false" when Fastify removed hop counts.
+    // Deployments behind a proxy set an IP/CIDR allowlist instead. Kept in
+    // sync with config.ts by the assertion below.
+    expect(parseTrustProxy("false")).toBe(false);
   });
 
   test("treats empty / false as untrusted (socket peer)", () => {
@@ -18,8 +21,14 @@ describe("parseTrustProxy", () => {
     expect(parseTrustProxy("true")).toBe(true);
   });
 
-  test("parses a hop count", () => {
-    expect(parseTrustProxy("2")).toBe(2);
+  test("rejects numeric hop counts rather than silently downgrading", () => {
+    // Fastify removed hop-count trust as spoofable (GHSA-3m5p-2c4r-xxw2) and
+    // fails closed on it. Accepting one here would leave request.ip resolving
+    // to the load balancer, quietly corrupting logs and per-IP rate limits.
+    // Fail loudly at boot instead.
+    expect(() => parseTrustProxy("1")).toThrow(/no longer supported/);
+    expect(() => parseTrustProxy("2")).toThrow(/GHSA-3m5p-2c4r-xxw2/);
+    expect(() => parseTrustProxy("0")).toThrow(/no longer supported/);
   });
 
   test("passes a CIDR/IP list through as a string", () => {
@@ -27,10 +36,11 @@ describe("parseTrustProxy", () => {
   });
 });
 
-test("trustProxy resolves request.ip from X-Forwarded-For when trusting one hop", async () => {
-  // With trustProxy=1 the rightmost XFF entry (appended by the trusted proxy)
-  // wins, so a client-forged leftmost entry cannot spoof request.ip.
-  const app = Fastify({ logger: false, trustProxy: parseTrustProxy("1") });
+test("trustProxy resolves request.ip from X-Forwarded-For for an allowlisted proxy", async () => {
+  // The CIDR allowlist is what replaced the removed hop count. The proxy is
+  // trusted by ADDRESS, so the entry it appended wins and request.ip is the
+  // real client.
+  const app = Fastify({ logger: false, trustProxy: parseTrustProxy("10.0.0.0/8") });
   app.get("/whoami", async (request) => ({ ip: request.ip }));
 
   const response = await app.inject({
@@ -40,6 +50,22 @@ test("trustProxy resolves request.ip from X-Forwarded-For when trusting one hop"
     headers: { "x-forwarded-for": "203.0.113.7" }
   });
   expect(response.json().ip).toBe("203.0.113.7");
+});
+
+test("trustProxy ignores X-Forwarded-For from a peer outside the allowlist", async () => {
+  // The property the hop count could NOT provide, and the reason Fastify
+  // removed it: a direct client that forges XFF is not believed, because its
+  // address is not in the allowlist. request.ip stays the socket peer.
+  const app = Fastify({ logger: false, trustProxy: parseTrustProxy("10.0.0.0/8") });
+  app.get("/whoami", async (request) => ({ ip: request.ip }));
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/whoami",
+    remoteAddress: "198.51.100.9",
+    headers: { "x-forwarded-for": "203.0.113.7" }
+  });
+  expect(response.json().ip).toBe("198.51.100.9");
 });
 
 function buildAppWithErrorHandler() {

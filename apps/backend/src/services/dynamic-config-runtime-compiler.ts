@@ -21,7 +21,6 @@ export function normalizeMcpServer(
     routePath: record.routePath,
     upstreamUrl: record.upstreamUrl,
     transportKind: "http",
-    headersAllowlist: record.headersAllowlist,
     version: record.version,
     hash: record.configHash
   };
@@ -48,12 +47,12 @@ function normalizeSkill(record: AdminSkillRecord): RuntimeSkillDefinition {
 
 export async function compileRuntimeConfig(input: {
   tenantId: string;
-  skills: SkillConfigStore;
-  mcpServers: McpServerStore;
+  skills: Pick<SkillConfigStore, "listSkills">;
+  mcpServers: Pick<McpServerStore, "listMcpServers">;
   runtimePolicy: ResolvedRuntimePolicy;
-  isBetaTester?: boolean;
+  isBetaTester: boolean;
 }): Promise<RuntimeConfigBundle> {
-  const isBetaTester = input.isBetaTester ?? true;
+  const isBetaTester = input.isBetaTester;
   const profile = input.runtimePolicy;
 
   const [allSkills, allMcpServers] = await Promise.all([

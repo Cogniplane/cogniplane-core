@@ -1,6 +1,5 @@
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
-import type { MessageStore } from "../message-store.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type { PiiScanArtifactInput } from "./pii-provider.js";
 import type { PiiScanSubjectReader } from "./pii-scan-job-handler.js";
@@ -18,9 +17,8 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
   constructor(
     private readonly deps: {
       db: Pool;
-      messages: MessageStore;
-      artifacts: ArtifactStore;
-      storage: ArtifactStorage;
+      artifacts: Pick<ArtifactStore, "get">;
+      storage: Pick<ArtifactStorage, "openReadStream">;
       /** Overrides the default 5 MiB read cap. */
       maxBytes?: number;
     }

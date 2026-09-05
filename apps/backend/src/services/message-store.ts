@@ -24,7 +24,7 @@ export type ToolResultRecord = {
   durationMs: number | null;
   // Character length of the assistant text accumulated when this tool call
   // started — lets a reload interleave the card back into the right spot in the
-  // turn's text. Null on legacy rows / the RuntimeEvent writer.
+  // turn's text. Null on legacy rows.
   textOffset: number | null;
   uiResources?: UiResource[];
   createdAt: string;
@@ -86,8 +86,8 @@ export type MessageRecord = {
   content: string;
   reasoningContent: string;
   // Reasoning bursts positioned by their offset into the assistant text, for
-  // reload interleaving (AG-UI turns). Null on legacy rows and RuntimeEvent
-  // turns — reload then falls back to the single `reasoningContent` block.
+  // reload interleaving (AG-UI turns). Null on legacy rows, where reload falls
+  // back to the single `reasoningContent` block.
   reasoningSegments: ReasoningSegmentRecord[] | null;
   planContent: string;
   tokenUsage: TokenUsageRecord | null;
@@ -214,6 +214,31 @@ export type UpsertToolResultInput = {
   uiResources?: UiResource[];
 };
 
+/**
+ * Append a truncation marker to tool input/output that the LIST projection cut
+ * short (see LIST_TOOL_TEXT_MAX_CHARS). Without the marker a clipped tool result
+ * is indistinguishable from a genuinely short one, which would mislead both the
+ * reader and any model fed this transcript. The pre-truncation lengths come from
+ * the query's `length()` columns.
+ */
+function markTruncatedToolText(
+  record: ToolResultRecord,
+  row: Record<string, unknown>,
+  maxChars: number
+): ToolResultRecord {
+  const mark = (value: string, fullLength: unknown): string => {
+    const total = typeof fullLength === "number" ? fullLength : Number(fullLength);
+    if (!Number.isFinite(total) || total <= maxChars) return value;
+    return `${value}\n\n[… truncated ${total - maxChars} characters; open the tool result for the full output]`;
+  };
+
+  return {
+    ...record,
+    input: mark(record.input, row.input_text_length),
+    output: mark(record.output, row.output_text_length)
+  };
+}
+
 function groupToolResults(toolResults: ToolResultRecord[]): Map<string, ToolResultRecord[]> {
   const grouped = new Map<string, ToolResultRecord[]>();
 
@@ -255,6 +280,35 @@ function ensureNonNullText(value: string | null | undefined): string {
 // the head of the text (where the signal usually is) and append a marker.
 export const MAX_TOOL_RESULT_TEXT_LENGTH = 1_000_000;
 export const MAX_MESSAGE_CONTENT_LENGTH = 1_000_000;
+
+// READ-side caps for listBySession. The storage caps above bound one row; these
+// bound a whole *response*, which is a different exposure: a transcript is
+// re-read in full on every session switch and after every turn (the frontend
+// refetches), and `read_skill_corpus` loads up to 200 transcripts in one tool
+// call. Without these, a session with a few hundred 1 MB tool results
+// serializes hundreds of MB into a single JSON body.
+//
+// - MESSAGE_LIST_DEFAULT_LIMIT keeps the NEWEST N messages (a transcript is read
+//   from the bottom). `hasMore` tells the caller older turns were withheld.
+// - LIST_TOOL_TEXT_MAX_CHARS truncates tool input/output in the LIST projection
+//   only. This is the dominant term by far, and no list consumer renders full
+//   tool text: the chat UI shows the card, and the admin tools tab reads through
+//   its own detail query. Truncation is marked so it never reads as real output.
+export const MESSAGE_LIST_DEFAULT_LIMIT = 500;
+export const LIST_TOOL_TEXT_MAX_CHARS = 32_000;
+
+export type ListBySessionOptions = {
+  /** Max messages returned, newest-first-selected then re-ordered ascending. */
+  limit?: number;
+  /** Per-field cap on tool input/output text in this projection. */
+  toolTextMaxChars?: number;
+};
+
+export type ListBySessionResult = {
+  messages: MessageRecord[];
+  /** True when older messages exist beyond `limit` and were withheld. */
+  hasMore: boolean;
+};
 
 // Single source of truth for the columns returned by message and tool-result
 // mutations — keeps the RETURNING clauses (and the shape mapMessage /
@@ -346,11 +400,36 @@ export class MessageStore {
     });
   }
 
-  async listBySession(tenantId: string, sessionId: string, userId: string): Promise<MessageRecord[]> {
+  /**
+   * Read a session transcript, bounded on both axes — see
+   * MESSAGE_LIST_DEFAULT_LIMIT / LIST_TOOL_TEXT_MAX_CHARS for why a read cap is
+   * needed on top of the write caps.
+   *
+   * Selection is newest-first (`ORDER BY ... DESC LIMIT n+1`) then re-ordered
+   * ascending for the caller, so a truncated transcript keeps the tail the user
+   * is actually looking at. `n+1` is fetched to detect `hasMore` without a
+   * second COUNT query.
+   *
+   * The tool-result query is scoped to the returned message ids rather than the
+   * whole session, so capping the messages also caps the tool rows. That makes
+   * it dependent on the first query, hence sequential — no loss, since
+   * node-postgres serializes queries on a single pooled client anyway.
+   */
+  async listBySession(
+    tenantId: string,
+    sessionId: string,
+    userId: string,
+    options: ListBySessionOptions = {}
+  ): Promise<ListBySessionResult> {
+    const limit = Math.max(1, Math.trunc(options.limit ?? MESSAGE_LIST_DEFAULT_LIMIT));
+    const toolTextMaxChars = Math.max(
+      1,
+      Math.trunc(options.toolTextMaxChars ?? LIST_TOOL_TEXT_MAX_CHARS)
+    );
+
     return withTenantScope(this.db, tenantId, async (client) => {
-      const [messageResult, toolResult] = await Promise.all([
-        client.query(
-          `
+      const messageResult = await client.query(
+        `
             SELECT id, message_id, session_id, user_id, role, status, content_text,
                    reasoning_content, reasoning_segments, plan_content,
                    input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
@@ -360,12 +439,25 @@ export class MessageStore {
             FROM messages
             WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
               AND COALESCE(detail_json->>'kind', '') <> 'session_titling'
-            ORDER BY created_at ASC, id ASC
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4
           `,
-          [tenantId, sessionId, userId]
-        ),
-        client.query(
-          `
+        [tenantId, sessionId, userId, limit + 1]
+      );
+
+      // The +1 probe row proves older messages exist; drop it before mapping.
+      const hasMore = messageResult.rows.length > limit;
+      const pageRows = hasMore ? messageResult.rows.slice(0, limit) : messageResult.rows;
+      // Selected newest-first above; the caller wants chronological order.
+      pageRows.reverse();
+      const messageIds = pageRows.map((row) => row.message_id as string);
+
+      // No messages → no tool results to fetch. Skip the round-trip (also keeps
+      // `= ANY($4)` off an empty array).
+      const toolRows = messageIds.length
+        ? (
+            await client.query(
+              `
             SELECT
               id,
               tool_result_id,
@@ -379,8 +471,12 @@ export class MessageStore {
               cwd,
               server_name,
               tool_name,
-              input_text,
-              output_text,
+              -- Truncated in SQL so the oversized bytes never leave Postgres.
+              -- length() is computed pre-truncation to build an honest marker.
+              left(input_text, $4) AS input_text,
+              length(input_text) AS input_text_length,
+              left(output_text, $4) AS output_text,
+              length(output_text) AS output_text_length,
               exit_code,
               duration_ms,
               text_offset,
@@ -389,21 +485,28 @@ export class MessageStore {
               updated_at
             FROM message_tool_results
             WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+              AND message_id = ANY($5::text[])
             ORDER BY created_at ASC, id ASC
           `,
-          [tenantId, sessionId, userId]
-        )
-      ]);
+              [tenantId, sessionId, userId, toolTextMaxChars, messageIds]
+            )
+          ).rows
+        : [];
 
-      const grouped = groupToolResults(toolResult.rows.map(mapToolResult));
+      const grouped = groupToolResults(
+        toolRows.map((row) => markTruncatedToolText(mapToolResult(row), row, toolTextMaxChars))
+      );
 
-      return messageResult.rows.map((row) => {
-        const message = mapMessage(row);
-        return {
-          ...message,
-          toolResults: grouped.get(message.messageId) ?? []
-        };
-      });
+      return {
+        messages: pageRows.map((row) => {
+          const message = mapMessage(row);
+          return {
+            ...message,
+            toolResults: grouped.get(message.messageId) ?? []
+          };
+        }),
+        hasMore
+      };
     });
   }
 
@@ -685,9 +788,7 @@ export class MessageStore {
         ensureNonNullText(input.cwd),
         ensureNonNullText(input.server),
         ensureNonNullText(input.toolName),
-        // Redact at the persistence boundary so no writer can bypass it. The
-        // RuntimeEvent path redacts upstream (redactToolResultPayload); the
-        // AG-UI path does not, and both funnel through here — an MCP tool that
+        // Redact at the persistence boundary so no writer can bypass it. An MCP tool that
         // echoes a Bearer header / PAT / ?token= URL must never reach durable
         // storage or the next turn's prompt context unredacted.
         truncateForStorage(redactSecrets(ensureNonNullText(input.input)), MAX_TOOL_RESULT_TEXT_LENGTH),
@@ -700,19 +801,6 @@ export class MessageStore {
     );
 
       return mapToolResult(upsertedToolResult.rows[0]);
-    });
-  }
-
-  // Refusal-fallback retraction: the runtime evicted tool events that were
-  // already persisted this turn. Hard-delete — the rows are superseded
-  // transcript content, not audit evidence (audit_events carries that).
-  async deleteToolResults(tenantId: string, toolResultIds: string[], userId: string): Promise<void> {
-    if (toolResultIds.length === 0) return;
-    await withTenantScope(this.db, tenantId, async (client) => {
-      await client.query(
-        `DELETE FROM message_tool_results WHERE tenant_id = $1 AND user_id = $2 AND tool_result_id = ANY($3)`,
-        [tenantId, userId, toolResultIds]
-      );
     });
   }
 
@@ -739,26 +827,48 @@ export class MessageStore {
     });
   }
 
-  async appendToolResultOutput(tenantId: string, toolResultId: string, userId: string, delta: string): Promise<ToolResultRecord | null> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      // Clamp the accumulated output to MAX_TOOL_RESULT_TEXT_LENGTH SQL-side so
-      // repeated streaming appends can't grow the column past the storage cap —
-      // tool stdout is untrusted (a misbehaving/malicious tool can emit GB-scale
-      // output), and unlike upsertToolResult this path never runs it through
-      // truncateForStorage. LEFT keeps the head, matching truncateForStorage; the
-      // terminal upsertToolResult re-applies the full truncation (with marker).
-      const appendedToolResult = await client.query(
-        `
-          UPDATE message_tool_results
-          SET output_text = LEFT(output_text || $4, $5), updated_at = NOW()
-          WHERE tenant_id = $1 AND tool_result_id = $2 AND user_id = $3
-          RETURNING
-            ${TOOL_RESULT_RETURNING_COLUMNS}
-        `,
-        [tenantId, toolResultId, userId, stripNulBytes(delta), MAX_TOOL_RESULT_TEXT_LENGTH]
-      );
+  /**
+   * Cross-tenant recovery for assistant rows abandoned mid-turn. A SIGKILL or a
+   * rolling deploy drops the process while a turn is streaming, so no `finally`
+   * runs to close the row out and it stays `pending`/`streaming` forever — the
+   * UI renders a spinner that never resolves and history shows a turn with no
+   * outcome. Rows older than `olderThanMs` cannot belong to a live turn (the
+   * caller passes the turn watchdog's ceiling), so flipping them to
+   * `interrupted` is safe.
+   *
+   * NOT tenant-scoped: this deliberately runs OUTSIDE `withTenantScope` because
+   * it spans every tenant in one statement, so it MUST be constructed on the
+   * privileged (BYPASSRLS) pool — on the RLS-scoped pool it silently matches
+   * nothing. `FOR UPDATE SKIP LOCKED` keeps concurrent sweeps and a live
+   * turn's own write from blocking each other.
+   */
+  async sweepStaleStreaming(
+    olderThanMs: number,
+    limit = 500
+  ): Promise<Array<{ tenantId: string; sessionId: string; messageId: string }>> {
+    const result = await this.db.query(
+      `
+        UPDATE messages
+        SET status = 'interrupted', updated_at = NOW()
+        WHERE message_id IN (
+          SELECT message_id
+          FROM messages
+          WHERE role = 'assistant'
+            AND status IN ('pending', 'streaming')
+            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          ORDER BY updated_at ASC
+          LIMIT $2
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING tenant_id, session_id, message_id
+      `,
+      [Math.max(0, Math.floor(olderThanMs)), limit]
+    );
 
-      return appendedToolResult.rows[0] ? mapToolResult(appendedToolResult.rows[0]) : null;
-    });
+    return result.rows.map((row: { tenant_id: string; session_id: string; message_id: string }) => ({
+      tenantId: row.tenant_id,
+      sessionId: row.session_id,
+      messageId: row.message_id
+    }));
   }
 }

@@ -1,3 +1,4 @@
+import { readPiiScanRunId } from "../../../lib/admin-session-pii-utils";
 import { summarizePiiRun } from "../../../lib/admin-session-pii-utils";
 import { shortId } from "../../../lib/admin-pii-utils";
 import type {
@@ -16,19 +17,6 @@ export type AlertItem = {
   jumpToMessageId: string | null;
 };
 
-/**
- * Pull the canonical scanRunId out of a message's detail_json, if present.
- * The message records its own scan via `detailJson.pii.scanRunId` — that's
- * the link we use to jump from a PII alert back to the originating message
- * even when the scan's subjectId predates the message.
- */
-export function readPiiScanRunId(detailJson: unknown): string | null {
-  if (!detailJson || typeof detailJson !== "object") return null;
-  const pii = (detailJson as Record<string, unknown>).pii;
-  if (!pii || typeof pii !== "object") return null;
-  const id = (pii as Record<string, unknown>).scanRunId;
-  return typeof id === "string" ? id : null;
-}
 
 export function buildPiiAlertItem(
   run: AdminSessionDetailPiiRun,

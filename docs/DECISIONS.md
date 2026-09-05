@@ -76,11 +76,13 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 ---
 
-## 8. User token handling for external MCP servers
+## 8. User token handling for external MCP servers (retired)
 
-**Decision:** Hybrid — first-party tools terminate inside the framework's managed broker; trusted external MCP servers may receive forwarded user tokens and own their own downstream auth.
+**Decision:** Originally hybrid — first-party tools terminated inside the framework's managed broker, while external MCP servers could receive forwarded user tokens.
 
-**Why:** Forces the framework to understand only its own tools' auth, while still enabling enterprise extensibility. The framework owns session-ownership validation, audit, and token provenance. The "framework brokers everything" alternative limits extensibility and forces us to embed every business auth model. The "no token forwarding" alternative breaks real enterprise delegation use cases.
+**Status:** Retired. User token forwarding and upstream header allowlists were removed in 2026-09 (R64). External tools integrate via service credentials or managed integrations rather than forwarding user tokens through the gateway.
+
+**Why:** User token forwarding and unrestricted header allowlists introduced ambient credential-forwarding and cache-isolation risks across proxy boundaries. First-party integrations and signed proxy headers provide cleaner audit and authorization boundaries.
 
 ---
 
@@ -96,14 +98,14 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 **Decision:** Keep `RuntimeAdapter` as the contract. Add a Claude adapter that uses `@anthropic-ai/claude-agent-sdk` `query()` (in-process locally; in-sandbox harness in E2B). Route per tenant via `tenantSettings.runtimeProvider`. **Shipped 2026-04-17.**
 
-**Why:** The contract (`createSession` / `runMessage` returning `AsyncIterable<RuntimeEvent>`) was already provider-neutral — adding Claude was an adapter-and-mapper job, not a platform rewrite. Tenants without an OpenAI contract get a path; single-vendor risk on pricing/availability/model-capability shrinks. Claude's extended-thinking is a real reasoning uplift.
+**Why:** The contract (`createSession` / `runMessage` returning a normalized event stream) was already provider-neutral. Adding Claude was an adapter-and-mapper job, not a platform rewrite. Tenants without an OpenAI contract gained a path, and single-vendor risk on pricing, availability, and model capability decreased. Claude's extended thinking provided a reasoning uplift.
 
 A "unified provider-abstraction layer" was rejected: it re-introduces the "rebuild orchestration in app code" problem that motivated thick runtimes in the first place, and uniform event models lose the specific semantics each runtime offers best.
 
 **Implementation rules that followed:**
 
 - Provider-native execution paths stay separate. Don't force Claude into the Codex app-server process model.
-- `RuntimeEvent` is the single internal type. Provider-specific event shapes never cross into the rest of the backend.
+- A normalized event union is the single internal type. Provider-specific event shapes never cross into the rest of the backend.
 - Approval bridging is provider-specific (Claude uses `canUseTool`; Codex uses JSON-RPC request interception). Both land in the same `ApprovalStore` and emit the same frontend events.
 - The MCP gateway, tool broker, audit, PII, and artifact pipelines are shared. No duplication of platform features.
 
@@ -126,13 +128,15 @@ A "unified provider-abstraction layer" was rejected: it re-introduces the "rebui
 
 ## 12. Runtime retirement — Deep Agents becomes the sole runtime
 
+**Status:** Amended 2026-09-04. The runtime retirement remains in force, but the compatibility-wire rule below was retired after the browser and scheduler converged on AG-UI.
+
 **Decision:** Retire both the Codex (`codex app-server`) and Claude-Code (Agent SDK + in-sandbox harness) runtimes. Deep Agents (LangChain [deepagentsjs](https://reference.langchain.com/javascript/deepagents)) is the only runtime provider, running the agent loop **in-process in the Fastify backend**, with a lazy per-session E2B sandbox used purely for code execution. **Shipped 2026-07 (beads quap.1–.5).**
 
 **Why:** The dual-runtime bet (Decision 10) bought optionality at the cost of doubled surface: two event mappers, two approval bridges, two workspace pipelines, a fat E2B template hosting two agent processes, and constant feature-drift discipline. Deep Agents delivers the "thick runtime" value of Decision 0 — planning, subagents, HITL interrupts, checkpointing — as a library we run in our own process: no runtime-version pinning against a vendor binary, no in-sandbox harness to keep alive, first-class LangGraph interrupts instead of held promises, and durable Postgres checkpointing so conversations survive restarts. Multi-model flexibility moved from the *runtime* dimension to the *model* dimension (`initChatModel`), which is where it belongs.
 
 **Implementation rules that followed:**
 
-- `RuntimeAdapter` and `RuntimeEvent` survive as contracts; the SSE writer, scheduler, approvals route, and frontend timeline were untouched by the retirement. The event mapper's wire shapes are a deliberate frontend contract — do not "modernize" them.
+- `RuntimeAdapter` survives as the runtime contract. LangGraph `streamEvents` envelopes map directly to AG-UI `BaseEvent` values for the browser and scheduler. Approval prompts and runtime notices also enter the active turn as AG-UI `CUSTOM` events.
 - The E2B template is a dumb code-execution box (Python data stack, no agent CLIs). The sandbox is lazy: chat-only sessions never create one, and `allowCommandExecution=false` attaches no sandbox at all.
 - Checkpointer tables live in their own `deep_agents` schema with app-layer (not RLS) tenant isolation — every entry point resolves the session through the RLS-scoped `sessions` table first.
 - The provider dimension is gone end-to-end: no `runtimeProvider` tenant setting, no OPENAI_API_KEY, one `E2B_TEMPLATE_ID`. The DB was nuked and migrations re-squashed rather than carrying compat shims.

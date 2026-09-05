@@ -7,7 +7,7 @@
 # Required env vars (export before `docker compose up`, or put in a .env file):
 #   E2B_API_KEY        — required at boot; the runtime executes inside E2B
 #   E2B_TEMPLATE_ID    — required at boot; run `make e2b-build` to create one
-#   ANTHROPIC_API_KEY  — required for any agent turn to work
+#   ANTHROPIC_API_KEY  — optional at boot; required for Anthropic model turns
 # E2B_API_KEY / E2B_TEMPLATE_ID are required for the backend to boot at all.
 #
 # After bring-up:
@@ -20,9 +20,40 @@
 #   - See docs/docker-deploy.md for the full walkthrough.
 
 services:
+  exposure-guard:
+    image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_BIND_ADDR: ${POSTGRES_BIND_ADDR:-127.0.0.1}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
+      DEV_HEADERS_AUTH_KEY: ${DEV_HEADERS_AUTH_KEY:-local-dev-headers-auth-key}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        case "$${POSTGRES_BIND_ADDR}" in
+          127.0.0.1|localhost|::1) exit 0 ;;
+        esac
+        if [ "$${POSTGRES_PASSWORD}" = postgres ] ||
+           [ "$${APP_USER_PASSWORD}" = local-dev-app-user-password ] ||
+           [ "$${DEV_HEADERS_AUTH_KEY}" = local-dev-headers-auth-key ]; then
+          echo "Refusing a non-loopback Postgres bind while local default credentials are active." >&2
+          exit 1
+        fi
+
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
     container_name: cogniplane-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
@@ -34,14 +65,22 @@ services:
       retries: 10
 
   postgres:
-    image: postgres:17
+    image: postgres:17.6@sha256:00bc86618629af00d2937fdc5a5d63db3ff8450acf52f0636ec813c7f4902929
     container_name: cogniplane-postgres
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.0
     environment:
       POSTGRES_DB: cogniplane
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      exposure-guard:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:5432:5432"
+      - "${POSTGRES_BIND_ADDR:-127.0.0.1}:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -55,8 +94,17 @@ services:
       context: .
       dockerfile: docker/backend.Dockerfile
     container_name: cogniplane-backend
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=1g
+      - /home/appuser:mode=0755,uid=1001,gid=1001,size=64m
+    mem_limit: 3g
+    cpus: 2.0
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,8 +124,12 @@ services:
       # 127.0.0.1 above, so the backend is reachable only from the host. To expose
       # it on a network, switch AUTH_MODE=workos (and drop this opt-in) first.
       COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1"
+      # Request-level guard the opt-in makes mandatory: identity headers are
+      # ignored unless the caller also presents this key. Override for anything
+      # beyond a laptop.
+      DEV_HEADERS_AUTH_KEY: ${DEV_HEADERS_AUTH_KEY:-local-dev-headers-auth-key}
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
-      MIGRATION_DATABASE_URL: postgres://postgres:postgres@postgres:5432/cogniplane
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/cogniplane
       APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
       LOCAL_DEV_USER_ID: local-dev-user
       REDIS_URL: redis://redis:6379
@@ -87,7 +139,7 @@ services:
       E2B_TEMPLATE_ID:
       ANTHROPIC_API_KEY:
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -105,7 +157,23 @@ services:
         NEXT_PUBLIC_API_URL: http://localhost:3001
         NEXT_PUBLIC_DEV_USER_ID: local-dev-user
         NEXT_PUBLIC_DEV_TENANT_ID: local-dev-tenant
+        NEXT_PUBLIC_DEV_AUTH_KEY: ${DEV_HEADERS_AUTH_KEY:-local-dev-headers-auth-key}
+        # This explicit opt-in is confined to the loopback-only local stack.
+        COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD: "1"
     container_name: cogniplane-frontend
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /home/node:mode=0755,uid=1000,gid=1000,size=64m
+      - /app/.wrangler:mode=0755,uid=1000,gid=1000,size=64m
+      - /app/apps/frontend/.next/cache:mode=0755,uid=1000,gid=1000,size=256m
+    mem_limit: 1g
+    cpus: 1.0
     depends_on:
       backend:
         condition: service_started

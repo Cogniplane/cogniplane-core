@@ -1,5 +1,6 @@
 import { test, expect } from "vitest";
 
+import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 
 import { createWriteArtifactTool, inferMimeType } from "./write-artifact.js";
@@ -23,60 +24,73 @@ function ctx(o: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
 
 function makeDeps(opts: {
   putReturns?: Partial<{ storageBackend: "local" | "bucket"; storageKey: string; fileSizeBytes: number; checksumSha256: string }>;
-  artifactReturns?: Record<string, unknown>;
+  artifactReturns?: Partial<ArtifactRecord>;
   putThrows?: boolean;
   readRuntimeFile?: (s: string, r: string, p: string) => Promise<Uint8Array>;
 } = {}) {
   const auditCalls: unknown[] = [];
   const artifactCalls: unknown[] = [];
   const storageCalls: Array<{ storageKey: string }> = [];
+  const deps: Parameters<typeof createWriteArtifactTool>[0] = {
+    artifacts: {
+      async create(input) {
+        artifactCalls.push(input);
+        const artifact: ArtifactRecord = {
+          id: 1,
+          artifactId: "a-1",
+          sessionId: input.sessionId,
+          userId: input.userId,
+          artifactType: input.artifactType,
+          sourceArtifactId: input.sourceArtifactId ?? null,
+          artifactName: input.artifactName,
+          mimeType: input.mimeType,
+          storageBackend: input.storageBackend,
+          storageKey: input.storageKey,
+          fileSizeBytes: input.fileSizeBytes,
+          checksumSha256: input.checksumSha256,
+          status: input.status,
+          createdByType: input.createdByType,
+          createdByRef: input.createdByRef ?? null,
+          detail: input.detail ?? {},
+          createdAt: "now",
+          updatedAt: "now",
+          ...opts.artifactReturns
+        };
+        return artifact;
+      }
+    },
+    storage: {
+      async put(input) {
+        storageCalls.push({ storageKey: input.storageKey });
+        if (opts.putThrows) throw new Error("storage put failed");
+        for await (const _ of input.stream) {
+          // Drain the stream so the buffer is consumed.
+        }
+        return {
+          storageBackend: opts.putReturns?.storageBackend ?? "local",
+          storageKey: opts.putReturns?.storageKey ?? input.storageKey,
+          fileSizeBytes: opts.putReturns?.fileSizeBytes ?? 4,
+          checksumSha256: opts.putReturns?.checksumSha256 ?? "stored-csum"
+        };
+      }
+    },
+    auditEvents: {
+      async create(input) {
+        auditCalls.push(input);
+      }
+    },
+    readRuntimeFile: opts.readRuntimeFile
+  };
   return {
     auditCalls,
     artifactCalls,
     storageCalls,
-    deps: {
-      artifacts: {
-        async create(input: Record<string, unknown>) {
-          artifactCalls.push(input);
-          return {
-            ...input,
-            artifactId: opts.artifactReturns?.artifactId ?? "a-1",
-            id: 1,
-            sourceArtifactId: null,
-            createdAt: "now",
-            updatedAt: "now",
-            ...(opts.artifactReturns ?? {})
-          } as never;
-        }
-      },
-      storage: {
-        async put(input: { storageKey: string; stream: NodeJS.ReadableStream }) {
-          storageCalls.push({ storageKey: input.storageKey });
-          if (opts.putThrows) throw new Error("storage put failed");
-          // Drain the stream so the buffer is consumed
-          for await (const _ of input.stream) {
-            /* drained */
-          }
-          return {
-            storageBackend: opts.putReturns?.storageBackend ?? "local",
-            storageKey: opts.putReturns?.storageKey ?? input.storageKey,
-            fileSizeBytes: opts.putReturns?.fileSizeBytes ?? 4,
-            checksumSha256: opts.putReturns?.checksumSha256 ?? "stored-csum"
-          };
-        }
-      },
-      auditEvents: {
-        async create(input: Record<string, unknown>) {
-          auditCalls.push(input);
-        }
-      },
-      readRuntimeFile: opts.readRuntimeFile
-    }
+    deps
   };
 }
 
 const tool = (deps: ReturnType<typeof makeDeps>["deps"]) =>
-  createWriteArtifactTool(deps as Parameters<typeof createWriteArtifactTool>[0]).find(
+  createWriteArtifactTool(deps).find(
     (x) => x.name === "write_artifact"
   )!;
 

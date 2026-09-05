@@ -140,27 +140,6 @@ export class SkillRevisionStore {
     return mapSkillRevision(insertedRevision.rows[0]);
   }
 
-  async createSkillRevision(tenantId: string, input: {
-    skillId: string;
-    revisionNumber: number;
-    sourceType: string;
-    sourceLabel: string | null;
-    bundleName: string | null;
-    bundleStorageUri: string | null;
-    bundleHash: string;
-    validationStatus: string;
-    validationMessages: Array<Record<string, unknown>>;
-    reviewStatus: string;
-    reviewNotes: string | null;
-    metadata: Record<string, unknown>;
-    createdBy: string;
-    reviewedBy: string | null;
-    reviewedAt: string | null;
-    activatedAt: string | null;
-  }): Promise<AdminSkillRevisionRecord> {
-    return withTenantScope(this.db, tenantId, (client) => this.insertSkillRevision(client, tenantId, input));
-  }
-
   async importSkillBundle(tenantId: string, input: {
     skillId: string;
     skillName: string;

@@ -5,11 +5,9 @@ initOpenNextCloudflareForDev();
 
 // Guard: setting NEXT_PUBLIC_DEV_USER_ID during a production build bakes
 // dev-headers auth (no JWT, no SSO) into the shipped client bundle. That's
-// the right default for Cloudflare Pages or any internet-exposed deploy,
-// but the OSS docker-compose path (compose.yaml + docker/frontend.Dockerfile)
-// intentionally ships dev-headers — the README and docker-deploy.md both
-// document that the stack is for trusted internal use only. Set
-// COGNIPLANE_ALLOW_DEV_AUTH_IN_PRODUCTION_BUILD=1 to opt out of the guard.
+// unsafe for any internet-exposed deploy. The Dockerfile leaves dev auth off
+// unless a caller passes both the dev identity and this explicit opt-in. The
+// loopback-only Compose stack does that for its documented local setup.
 if (
   process.env.NODE_ENV === "production" &&
   process.env.NEXT_PUBLIC_DEV_USER_ID &&

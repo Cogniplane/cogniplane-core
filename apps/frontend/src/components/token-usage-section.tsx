@@ -1,20 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
-import { fetchTokenUsage, type TokenUsageSeries } from "../lib/token-usage-api";
+import { fetchTokenUsage } from "../lib/token-usage-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
+import { queryKeys } from "../lib/query-keys";
 import {
   BarChart,
   DayRangePicker,
-  fmtCost,
-  fmtTokens,
-  HBar,
   type Days,
+  TokenBreakdown,
+  TokenUsageSkeleton,
+  TokenUsageSummary,
   ViewToggle
 } from "./token-usage-chart-primitives";
-import { HINT, SECTION_LABEL, TOKEN_USAGE_COL_GRID as COL_GRID } from "../lib/ui-tokens";
-import { Skeleton } from "@/components/ui/skeleton";
+import { HINT } from "../lib/ui-tokens";
 
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
@@ -34,39 +35,16 @@ const VIEW_OPTIONS: Array<{ id: View; label: string }> = [
 export function TokenUsageSection() {
   const [days, setDays] = useState<Days>(30);
   const [view, setView] = useState<View>("day");
-  const [usage, setUsage] = useState<TokenUsageSeries | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [available, setAvailable] = useState(true);
-
-  const load = useCallback(async (d: Days) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await fetchTokenUsage(d);
-      setAvailable(true);
-      setUsage(data);
-    } catch (e) {
-      setAvailable(!isRouteNotFoundError(e, "GET", "/admin/token-usage"));
-      setUsage(null);
-      setError(
-        toRouteUnavailableMessage(e, {
-          method: "GET",
-          pathPrefix: "/admin/token-usage",
-          featureName: "Token usage reporting",
-          fallback: "Failed to load token usage."
-        })
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    // load() flips setLoading before awaiting; the cascading render is intentional.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load(days);
-  }, [days, load]);
+  const query = useQuery({
+    queryKey: queryKeys.admin.tokenUsage(days),
+    queryFn: () => fetchTokenUsage(days),
+    placeholderData: keepPreviousData
+  });
+  const usage = query.data;
+  const available = !isRouteNotFoundError(query.error, "GET", "/admin/token-usage");
+  const error = query.error
+    ? toRouteUnavailableMessage(query.error, { method: "GET", pathPrefix: "/admin/token-usage", featureName: "Token usage reporting", fallback: "Failed to load token usage." })
+    : null;
 
   const dailyBars = useMemo(
     () =>
@@ -74,26 +52,6 @@ export function TokenUsageSection() {
         label: d.date,
         inputSeries: d.inputTokens,
         outputSeries: d.outputTokens
-      })),
-    [usage]
-  );
-
-  const userBars = useMemo(
-    () =>
-      (usage?.byUser ?? []).map((u) => ({
-        label: shortUserId(u.userId),
-        inputSeries: u.inputTokens,
-        outputSeries: u.outputTokens
-      })),
-    [usage]
-  );
-
-  const modelBars = useMemo(
-    () =>
-      (usage?.byModel ?? []).map((m) => ({
-        label: m.modelName,
-        inputSeries: m.inputTokens,
-        outputSeries: m.outputTokens
       })),
     [usage]
   );
@@ -106,40 +64,19 @@ export function TokenUsageSection() {
         <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
           <DayRangePicker value={days} onChange={setDays} />
           <ViewToggle options={VIEW_OPTIONS} value={view} onChange={setView} />
-          {loading ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
+          {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
         </div>
       ) : null}
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
 
-      {available && !totals && loading ? <TokenUsageSkeleton /> : null}
+      {available && !totals && query.isPending ? <TokenUsageSkeleton /> : null}
 
       {available && totals ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            label="Total tokens"
-            value={fmtTokens(totals.totalTokens)}
-            detail={`In the last ${days} days`}
-          />
-          <StatCard
-            label="Input tokens"
-            value={fmtTokens(totals.inputTokens)}
-            detail="Prompt + context"
-          />
-          <StatCard
-            label="Output tokens"
-            value={fmtTokens(totals.outputTokens)}
-            detail="Generated text"
-          />
-          <StatCard
-            label="Est. cost"
-            value={fmtCost(totals.costUsd)}
-            detail={`${totals.messageCount} messages`}
-          />
-        </div>
+        <TokenUsageSummary totals={totals} days={days} />
       ) : null}
 
-      {available && usage && !loading ? (
+      {available && usage && !query.isFetching ? (
         <div className={`${STAT_CARD} overflow-hidden p-5`}>
           {view === "day" ? (
             dailyBars.length === 0 ? (
@@ -159,7 +96,8 @@ export function TokenUsageSection() {
             usage.byUser.length === 0 ? (
               <p className={HINT}>No user data in this period.</p>
             ) : (
-              <BreakdownTable
+              <TokenBreakdown
+                firstColumnLabel="User"
                 rows={usage.byUser.map((u) => ({
                   key: u.userId,
                   label: shortUserId(u.userId),
@@ -169,7 +107,6 @@ export function TokenUsageSection() {
                   costUsd: u.costUsd
                 }))}
                 barColor="var(--chart-1)"
-                chartBars={userBars}
                 chartPrimaryColor="var(--chart-1)"
                 chartSecondaryColor="var(--chart-2)"
               />
@@ -180,7 +117,8 @@ export function TokenUsageSection() {
             usage.byModel.length === 0 ? (
               <p className={HINT}>No model data in this period.</p>
             ) : (
-              <BreakdownTable
+              <TokenBreakdown
+                firstColumnLabel="Model"
                 rows={usage.byModel.map((m) => ({
                   key: m.modelName,
                   label: m.modelName,
@@ -190,7 +128,6 @@ export function TokenUsageSection() {
                   costUsd: m.costUsd
                 }))}
                 barColor="var(--chart-3)"
-                chartBars={modelBars}
                 chartPrimaryColor="var(--chart-3)"
                 chartSecondaryColor="var(--chart-2)"
               />
@@ -199,112 +136,5 @@ export function TokenUsageSection() {
         </div>
       ) : null}
     </section>
-  );
-}
-
-function TokenUsageSkeleton() {
-  return (
-    <>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }, (_, i) => (
-          <div key={i} className={STAT_CARD}>
-            <Skeleton className="h-3 w-24" />
-            <Skeleton className="mt-3 h-7 w-16" />
-            <Skeleton className="mt-2 h-3 w-32" />
-          </div>
-        ))}
-      </div>
-      <div className={`${STAT_CARD} p-5`}>
-        <Skeleton className="h-[200px] w-full" />
-      </div>
-    </>
-  );
-}
-
-function StatCard(props: { label: string; value: string; detail: string }) {
-  return (
-    <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>{props.label}</p>
-      <strong className="mt-2 block text-2xl font-bold tracking-tight text-on-surface tabular-nums">
-        {props.value}
-      </strong>
-      <p className="mt-1 text-xs text-on-surface-variant">{props.detail}</p>
-    </article>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Shared breakdown table used for both user + model views
-// ---------------------------------------------------------------------------
-
-type BreakdownRow = {
-  key: string;
-  label: string;
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  costUsd: number;
-};
-
-function BreakdownTable({
-  rows,
-  barColor,
-  chartBars,
-  chartPrimaryColor,
-  chartSecondaryColor
-}: {
-  rows: BreakdownRow[];
-  barColor: string;
-  chartBars: Array<{ label: string; inputSeries: number; outputSeries: number }>;
-  chartPrimaryColor: string;
-  chartSecondaryColor: string;
-}) {
-  const maxTokens = Math.max(...rows.map((r) => r.totalTokens), 1);
-
-  return (
-    <div className="flex flex-col">
-      <div
-        className={`${COL_GRID} border-b border-outline-variant py-1.5 text-[0.7rem] font-bold uppercase tracking-wider text-on-surface-faint`}
-      >
-        <span>Name</span>
-        <span className="text-right">Input</span>
-        <span className="text-right">Output</span>
-        <span className="text-right">Total</span>
-        <span className="text-right">Cost</span>
-      </div>
-      {rows.map((r) => (
-        <div
-          key={r.key}
-          className={`${COL_GRID} items-center border-b border-outline-variant py-2.5 text-sm`}
-        >
-          <div className="flex min-w-0 items-center gap-2.5">
-            <HBar value={r.totalTokens} max={maxTokens} color={barColor} />
-            <span className="max-w-[180px] flex-shrink-0 overflow-hidden font-mono text-[0.78rem] text-ellipsis whitespace-nowrap text-on-surface-variant">
-              {r.label}
-            </span>
-          </div>
-          <span className="text-right text-[0.82rem] text-on-surface-variant">
-            {fmtTokens(r.inputTokens)}
-          </span>
-          <span className="text-right text-[0.82rem] text-on-surface-variant">
-            {fmtTokens(r.outputTokens)}
-          </span>
-          <span className="text-right font-semibold">{fmtTokens(r.totalTokens)}</span>
-          <span className="text-right text-[0.82rem] text-on-surface-variant">
-            {fmtCost(r.costUsd)}
-          </span>
-        </div>
-      ))}
-
-      <div className="pt-5">
-        <BarChart
-          data={chartBars}
-          primaryColor={chartPrimaryColor}
-          secondaryColor={chartSecondaryColor}
-          primaryLabel="Input tokens"
-          secondaryLabel="Output tokens"
-        />
-      </div>
-    </div>
   );
 }

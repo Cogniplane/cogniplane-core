@@ -1,6 +1,7 @@
 import { test, expect, describe, vi, afterEach, beforeEach } from "vitest";
 
 import { z } from "zod";
+import { SessionSchema } from "@cogniplane/shared-types";
 
 import { serialize } from "./serialize-response.js";
 
@@ -17,6 +18,26 @@ describe("serialize", () => {
     const schema = z.object({ id: z.string(), count: z.number() });
     expect(serialize(schema, { id: "x", count: 1 })).toEqual({ id: "x", count: 1 });
   });
+
+  test("shared response timestamps accept driver Dates and ISO offsets", () => {
+    const schema = SessionSchema.pick({ createdAt: true, updatedAt: true });
+    expect(serialize(schema, {
+      createdAt: new Date("2026-09-04T12:00:00.789Z"),
+      updatedAt: "2026-09-04T08:00:00.789-04:00"
+    })).toEqual({
+      createdAt: "2026-09-04T12:00:00.789Z",
+      updatedAt: "2026-09-04T08:00:00.789-04:00"
+    });
+  });
+
+  test.each(["", "not-a-date", "2026-09-04", "2026-02-30T12:00:00Z"])(
+    "shared timestamp contract rejects %s", (createdAt) => {
+      process.env.NODE_ENV = "production";
+      expect(() => serialize(SessionSchema.pick({ createdAt: true }), { createdAt })).toThrow(
+        /Response shape does not match contract/
+      );
+    }
+  );
 
   test("strips unknown keys (Zod default) without throwing", () => {
     const schema = z.object({ id: z.string() });

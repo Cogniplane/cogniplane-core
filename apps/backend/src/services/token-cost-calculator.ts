@@ -15,6 +15,26 @@ type ModelPricing = {
 };
 
 const PRICING: Record<string, ModelPricing> = {
+  "gpt-6-astra-pro": {
+    short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
+    long:  null
+  },
+  "gpt-6-astra": {
+    short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
+    long:  null
+  },
+  "gpt-5.6-sol": {
+    short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
+    long:  null
+  },
+  "gpt-5.6-terra": {
+    short: { input:  2.00, cachedInput: 0.20,  output: 12.00 },
+    long:  null
+  },
+  "gpt-5.6-luna": {
+    short: { input:  0.20, cachedInput: 0.02,  output:  1.20 },
+    long:  null
+  },
   "gpt-5.5": {
     short: { input:  5.00, cachedInput: 0.50,  output: 30.00 },
     long:  { input: 10.00, cachedInput: 1.00,  output: 45.00 }
@@ -40,6 +60,14 @@ const PRICING: Record<string, ModelPricing> = {
   // tokens (1.25x input in reality) are folded into `inputTokens` at the
   // mapper and billed at the regular input rate — small under-bill on that
   // bucket, not worth a dedicated pricing tier.
+  "claude-fable-5-1": {
+    short: { input: 10.00, cachedInput: 0.25,  output: 50.00 },
+    long:  null
+  },
+  "claude-opus-5": {
+    short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
+    long:  null
+  },
   "claude-fable-5": {
     short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
     long:  null
@@ -86,6 +114,14 @@ const PRICING: Record<string, ModelPricing> = {
   // Keys are the bare VENDOR model id (catalog id with its first namespace
   // segment stripped — inner slashes and the `:free` suffix preserved), which
   // is exactly what resolveModelConstruction().vendorModel yields.
+  "gemini-3.8-flash": {
+    short: { input: 0.75, cachedInput: 0.075,  output:  3.75 },
+    long:  null
+  },
+  "gemini-3.7-flash": {
+    short: { input: 0.75, cachedInput: 0.075,  output:  3.75 },
+    long:  null
+  },
   "gemini-3.5-flash": {
     short: { input: 1.50, cachedInput: 0.15,   output:  9.00 },
     long:  null
@@ -104,6 +140,38 @@ const PRICING: Record<string, ModelPricing> = {
   },
 
   // OpenRouter-served (paid). Free `:free` routes below bill at zero.
+  "z-ai/glm-5.3": {
+    short: { input: 1.40,  cachedInput: 0.14,   output: 4.40 },
+    long:  null
+  },
+  "tencent/hy3": {
+    short: { input: 0.132, cachedInput: 0.033,  output: 0.528 },
+    long:  null
+  },
+  "xiaomi/mimo-v2.5": {
+    short: { input: 0.14,  cachedInput: 0.0028, output: 0.28 },
+    long:  null
+  },
+  "xiaomi/mimo-v2.5-pro": {
+    short: { input: 0.435, cachedInput: 0.0036, output: 0.87 },
+    long:  null
+  },
+  "minimax/minimax-m3": {
+    short: { input: 0.30,  cachedInput: 0.06,   output: 1.20 },
+    long:  null
+  },
+  "nvidia/nemotron-3-ultra-550b-a55b": {
+    short: { input: 0.625, cachedInput: 0.1875, output: 3.125 },
+    long:  null
+  },
+  "stepfun/step-3.7-flash": {
+    short: { input: 0.20,  cachedInput: 0.04,   output: 1.15 },
+    long:  null
+  },
+  "qwen/qwen3.7-max": {
+    short: { input: 1.475, cachedInput: 0.295,  output: 4.425 },
+    long:  null
+  },
   "z-ai/glm-5.2": {
     short: { input: 0.9086, cachedInput: 0.1687, output: 2.8556 },
     long:  null
@@ -120,11 +188,29 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "openai/gpt-oss-120b:free": {
+  "google/gemma-4-31b-it:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "google/gemma-4-31b-it:free": {
+  "thinkingmachines/inkling:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "minimax/minimax-m3:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "nvidia/nemotron-3.5-lightning:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "z-ai/glm-5.2:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  // Retired free routes kept for billing history on past messages
+  // (both 404 on OpenRouter as of 2026-09-05).
+  "openai/gpt-oss-120b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
@@ -137,6 +223,14 @@ const PRICING: Record<string, ModelPricing> = {
   // not per-token, so these rates are OpenRouter's per-token GLM prices used
   // as the best available cost estimate — same values as the OpenRouter
   // z-ai/glm-5.2 row above.
+  "glm-5.3": {
+    short: { input: 1.40,  cachedInput: 0.14,   output: 4.40 },
+    long:  null
+  },
+  "glm-5.3-flash": {
+    short: { input: 0.075, cachedInput: 0.015,  output: 0.25 },
+    long:  null
+  },
   "glm-5.2": {
     short: { input: 0.9086, cachedInput: 0.1687, output: 2.8556 },
     long:  null

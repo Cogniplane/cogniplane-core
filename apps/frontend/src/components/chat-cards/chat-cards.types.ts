@@ -7,8 +7,7 @@ import type { Approval } from "@cogniplane/shared-types";
 // (approvals, MCP-server status, runtime notices, plan). They outlived the
 // activity-timeline UI removed in the Track B cutover — the timeline's row
 // taxonomy, buildTimeline, and grouping went with it. Fed from custom AG-UI
-// events (`use-agui-custom-events.ts`) and the streaming approval hook
-// (`use-approval-state.ts`).
+// events (`use-agui-custom-events.ts`).
 // ---------------------------------------------------------------------------
 
 export type RuntimeNoticeLevel = "info" | "warning" | "error";
@@ -23,13 +22,6 @@ export type ApprovalDecisionState = "pending" | "approving" | "rejecting";
 export type ApprovalDecision = {
   decision: "approve" | "reject";
   rememberForTurn?: boolean;
-};
-
-// The decision currently being submitted; `kind` tells the approval card which
-// button to mark as working.
-export type InFlightApprovalDecision = {
-  approvalId: string;
-  kind: "approve" | "reject";
 };
 
 export type PlanRow = {

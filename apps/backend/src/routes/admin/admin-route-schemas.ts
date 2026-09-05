@@ -1,20 +1,22 @@
 import { z } from "zod";
-import { EFFORT_LEVELS, MODEL_PROVIDERS, PolicyEnforcementModeSchema } from "@cogniplane/shared-types";
+import {
+  AdminMcpServerCreateRequestSchema,
+  AdminMcpServerUpdateRequestSchema,
+  EFFORT_LEVELS,
+  MODEL_PROVIDERS,
+  PolicyEnforcementModeSchema
+} from "@cogniplane/shared-types";
 
 import { httpsUrlSchema } from "../../lib/url-validation.js";
 
 import { adminIdSchema } from "./admin-route-helpers.js";
 
-export const mcpBodySchema = z.object({
-  serverId: adminIdSchema.optional(),
-  serverName: z.string().trim().min(1).max(120),
-  description: z.string().trim().max(500).nullable().optional(),
-  transportKind: z.literal("http").default("http"),
-  mode: z.enum(["managed", "proxy"]),
-  routePath: z.string().trim().min(1).max(200),
-  upstreamUrl: httpsUrlSchema.nullable().optional(),
-  headersAllowlist: z.array(z.string().trim().min(1).max(120)).default([]),
-  enabled: z.boolean().default(true)
+export const mcpCreateBodySchema = AdminMcpServerCreateRequestSchema.extend({
+  upstreamUrl: httpsUrlSchema.nullable().optional()
+});
+
+export const mcpUpdateBodySchema = AdminMcpServerUpdateRequestSchema.extend({
+  upstreamUrl: httpsUrlSchema.nullable().optional()
 });
 
 const granularApprovalPolicySchema = z.object({
@@ -33,7 +35,6 @@ export const tenantSettingsBodySchema = z.object({
   approvalPolicy: z.union([z.enum(["never", "on-request"]), granularApprovalPolicySchema]).optional(),
   approvalReviewer: z.enum(["user", "guardian_subagent"]).optional(),
   allowCommandExecution: z.boolean().optional(),
-  allowUserTokenForwarding: z.boolean().optional(),
   autoApproveReadOnlyTools: z.boolean().optional(),
   policyEnforcementMode: PolicyEnforcementModeSchema.optional(),
   developerInstructions: z.string().trim().max(4000).nullable().optional(),

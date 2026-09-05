@@ -5,21 +5,20 @@ import { isTextReadableArtifact, readArtifactExcerpt } from "./artifacts/artifac
 const MAX_ARTIFACT_BUDGET_CHARS = 18_000;
 const PER_ARTIFACT_EXCERPT_CHARS = 6_000;
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
-import { NO_OP_CLEANUP, type ArtifactProcessor } from "./artifacts/artifact-processor.js";
+import type { ArtifactProcessor } from "./artifacts/artifact-processor.js";
 import type { ArtifactRecord } from "./artifacts/artifact-store.js";
 import type { SyncedArtifact } from "./artifacts/artifact-workspace-sync.js";
 
 export type ArtifactTurnInput = {
   prompt: string;
   scopedArtifacts: ArtifactRecord[];
-  artifactProcessor: ArtifactProcessor;
-  storage: ArtifactStorage;
+  artifactProcessor: Pick<ArtifactProcessor, "extractArtifactText">;
+  storage: Pick<ArtifactStorage, "openReadStream">;
   syncedArtifacts?: SyncedArtifact[];
 };
 
 export type PreparedTurnInputs = {
   userInputs?: RuntimeUserInput[];
-  cleanup: Array<() => Promise<void>>;
 };
 
 function buildArtifactContentBlock(
@@ -43,8 +42,7 @@ export async function buildArtifactTurnInputs(
   const { prompt, scopedArtifacts, syncedArtifacts } = input;
   if (!scopedArtifacts.length) {
     return {
-      userInputs: undefined,
-      cleanup: []
+      userInputs: undefined
     };
   }
 
@@ -79,9 +77,6 @@ export async function buildArtifactTurnInputs(
   }
 
   const inlineArtifactBlocks: string[] = [];
-  const imageInputs: RuntimeUserInput[] = [];
-  const attachmentNotes: string[] = [];
-  const cleanup: Array<() => Promise<void>> = [];
   let remainingBudget = MAX_ARTIFACT_BUDGET_CHARS;
 
   for (const artifact of fallbackList) {
@@ -102,45 +97,22 @@ export async function buildArtifactTurnInputs(
       continue;
     }
 
-    if (artifact.mimeType !== "application/pdf") {
-      continue;
-    }
+    if (artifact.mimeType === "application/pdf" && remainingBudget > 0) {
+      const extractedTextResult = await input.artifactProcessor
+        .extractArtifactText(artifact)
+        .then((content) => content?.slice(0, excerptBudget) ?? "")
+        .catch(() => "");
 
-    const [extractedTextResult, renderedImages] = await Promise.all([
-      remainingBudget > 0
-        ? input.artifactProcessor
-            .extractArtifactText(artifact)
-            .then((content) => content?.slice(0, excerptBudget) ?? "")
-            .catch(() => "")
-        : Promise.resolve(""),
-      input.artifactProcessor.renderArtifactImages(artifact).catch(() => ({
-        paths: [],
-        cleanup: NO_OP_CLEANUP
-      }))
-    ]);
-
-    if (extractedTextResult.trim()) {
-      remainingBudget -= extractedTextResult.length;
-      inlineArtifactBlocks.push(
-        buildArtifactContentBlock(
-          artifact,
-          `- Extracted on demand from PDF: ${artifact.artifactName} (${artifact.mimeType})`,
-          extractedTextResult
-        )
-      );
-    }
-
-    if (renderedImages.paths.length) {
-      attachmentNotes.push(
-        `- Attached ${renderedImages.paths.length} rendered PDF page image(s) from: ${artifact.artifactName}`
-      );
-      cleanup.push(renderedImages.cleanup);
-      imageInputs.push(
-        ...renderedImages.paths.map((imagePath) => ({
-          type: "localImage" as const,
-          path: imagePath
-        }))
-      );
+      if (extractedTextResult.trim()) {
+        remainingBudget -= extractedTextResult.length;
+        inlineArtifactBlocks.push(
+          buildArtifactContentBlock(
+            artifact,
+            `- Extracted on demand from PDF: ${artifact.artifactName} (${artifact.mimeType})`,
+            extractedTextResult
+          )
+        );
+      }
     }
   }
 
@@ -170,13 +142,12 @@ export async function buildArtifactTurnInputs(
       promptLines.push(
         "- Uploaded session artifacts are not stored in the runtime workspace.",
         "- Do not use shell commands or workspace file search to locate uploaded artifacts.",
-        inlineArtifactBlocks.length || imageInputs.length
-          ? "- Use the embedded artifact text blocks and attached local images as the primary source material for this turn."
-          : "- Answer only from the visible artifact metadata if no readable text or rendered pages are attached in this turn.",
+        inlineArtifactBlocks.length
+          ? "- Use the embedded artifact text blocks as the primary source material for this turn."
+          : "- Answer only from the visible artifact metadata if no readable text is attached in this turn.",
       );
     }
 
-    promptLines.push(...attachmentNotes);
     if (inlineArtifactBlocks.length) {
       promptLines.push("");
       promptLines.push(...inlineArtifactBlocks);
@@ -194,9 +165,7 @@ export async function buildArtifactTurnInputs(
       {
         type: "text",
         text: promptText
-      },
-      ...imageInputs
-    ],
-    cleanup
+      }
+    ]
   };
 }

@@ -1,31 +1,26 @@
 // Sole runtime provider (bead im5e.1, then quap.4): the agent loop runs IN
 // the Fastify backend via deepagentsjs instead of inside an E2B sandbox
-// harness. This adapter drives the loop and exposes two turn shapes off the
-// same graph run: the legacy RuntimeEvent stream (runMessage, consumed by
-// sse-stream-writer / scheduler-worker) and the native AG-UI stream
-// (runMessageAGUI, consumed by sse-stream-writer-agui). The strategic
-// direction is convergence toward the AG-UI wire; the RuntimeEvent shape
-// remains for the paths not yet migrated.
+// harness. This adapter drives the loop and emits the AG-UI stream consumed by
+// both interactive requests and scheduled jobs.
 
+import type { ActivationTracker } from "../activation-tracker.js";
 import path from "node:path";
 
 import type { FastifyBaseLogger } from "fastify";
 
 import { uuidv7 } from "../../lib/uuid.js";
 import { AsyncQueue } from "../../lib/async-queue.js";
+import { runtimeTokenSecret } from "../../lib/derived-secrets.js";
 import {
   SessionBusyError,
-  type PolicyApprovalDisposition,
-  type PolicyApprovalRouteInput,
   type RuntimeAdapter,
   type RuntimeApprovalDecision,
   type RuntimeApprovalKind,
-  type RuntimeEvent,
   type RuntimeReasoningEffort,
   type RuntimeSessionRef,
   type RuntimeUserInput
 } from "../../runtime-contracts.js";
-import type { ModelProvider } from "@cogniplane/shared-types";
+import type { ModelProvider, PolicyTurnContext } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import { AVAILABLE_MODELS } from "../../domain/models.js";
@@ -39,7 +34,9 @@ import type { MemoryStore } from "../memory-store.js";
 import type { MessageStore, TokenUsageRecord } from "../message-store.js";
 import { calculateCostUsd } from "../token-cost-calculator.js";
 import type { PolicyService } from "../policy/policy-service.js";
+import { POLICY_APPROVAL_REQUEST_METHOD } from "../policy/policy-approval-proof.js";
 import type { RuntimeSessionStore } from "../runtime/runtime-session-store.js";
+import type { TenantMemberStore } from "../tenant-member-store.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "../auth/runtime-token.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
 import { redactSecrets } from "../redact-secrets.js";
@@ -48,8 +45,6 @@ import {
   clearIdleTimer,
   scheduleIdleTeardown
 } from "../runtime/idle-teardown.js";
-import type { PolicyApprovalCoordinator } from "../runtime/policy-approval-coordinator.js";
-import { createRuntimePolicyApprovals } from "../runtime/policy-approval-factory.js";
 import { createStageTimer } from "../runtime/startup-timing.js";
 import {
   buildMemorySectionLines,
@@ -58,17 +53,13 @@ import {
 import type { SkillBundleStorage } from "../skills/skill-bundle-storage.js";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
-import {
-  createDeepAgentsEventMapperState,
-  mapDeepAgentsEvent
-} from "./deep-agents-event-mapper.js";
 import { DeepAgentsAGUIAgent } from "./deep-agents-agui-agent.js";
 import { createSessionAGUITurnBackend, type AGUITurnBackend } from "./deep-agents-agui-backend.js";
 import {
   AGUI_INTERRUPTED_RESULT,
-  createRuntimeToAGUIState,
-  runtimeEventToAGUI
-} from "./runtime-event-to-agui.js";
+  approvalRequiredEvent,
+  runtimeNoticeEvent
+} from "./agui-events.js";
 import { createDeepAgentsSessionRuntime, resolveModelConstruction } from "./deep-agents-graph.js";
 import { buildSkillsLibraryFiles } from "./deep-agents-skills-library.js";
 import type {
@@ -82,10 +73,51 @@ import { E2B_WORKSPACE_BASE } from "../runtime/e2b-sandbox.js";
 const PROVIDER_ID = "deep-agents";
 
 /**
+ * How long a terminal event will wait for the turn's usage write.
+ *
+ * Usage is flushed BEFORE the terminal event so a refetch cannot beat it (the
+ * frontend refetches the message as soon as it sees `RUN_FINISHED`). That
+ * ordering must not become a dependency: the write has no
+ * cancellation of its own, so a stalled pool acquisition would otherwise hold
+ * the terminal event — and, behind it, the turn slot — for as long as the
+ * database took, with the turn watchdog powerless because it can only abort the
+ * graph. Past this budget the turn ends and the write finishes on its own; the
+ * refetch race comes back, which is a far smaller failure than a wedged session.
+ */
+export const USAGE_FLUSH_DEADLINE_MS = 5_000;
+
+/**
+ * Awaits `flush` for at most {@link USAGE_FLUSH_DEADLINE_MS}. The flush itself
+ * never rejects (persistTurnUsage swallows its own errors), so the race only
+ * ever bounds the wait.
+ */
+function withUsageFlushDeadline(flush: Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, USAGE_FLUSH_DEADLINE_MS);
+    timer.unref?.();
+  });
+  // Cleared on BOTH outcomes. `flushUsage` is called more than once per turn (a
+  // terminal branch, then the finally backstop), so a timer left pending on the
+  // common path — the flush winning — would accumulate one live handle per call
+  // per turn for the full deadline.
+  return Promise.race([flush, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
  * A native HITL approval awaiting a human decision. The interrupt itself is
  * checkpointed inside LangGraph; this entry only bridges the decision route
  * to the in-process turn loop that will resume the graph.
  */
+/**
+ * What one native approval round resolved to. `"unavailable"` is a fail-closed
+ * denial the human never made (the approval row could not be written), kept
+ * distinct from `"reject"` so the model is not told the user refused.
+ */
+type NativeApprovalOutcome = RuntimeApprovalDecision | "unavailable";
+
 type PendingDeepAgentsApproval = {
   sessionId: string;
   kind: RuntimeApprovalKind;
@@ -100,6 +132,7 @@ type PendingDeepAgentsApproval = {
   settle: (decision: RuntimeApprovalDecision) => void;
   /** The originating turn's remember-set instance (see autoApprovedKindsForTurn). */
   autoApprovedKinds: Set<string>;
+  requiresDurableProof: boolean;
 };
 
 export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
@@ -117,15 +150,15 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    * promise collapses concurrent calls onto one build.
    */
   private readonly pendingSessionCreations = new Map<string, Promise<RuntimeSessionRef>>();
-  private readonly policyApprovals: PolicyApprovalCoordinator;
 
   constructor(
     private readonly config: AppConfig,
-    private readonly dynamicConfig: DynamicConfigService,
+    private readonly dynamicConfig: Pick<DynamicConfigService, "compileRuntimeConfig">,
     private readonly log: FastifyBaseLogger,
     private readonly stores: {
       approvals: ApprovalStore;
       auditEvents: AuditEventStore;
+      activationTracker?: Pick<ActivationTracker, "recordMaterialization">;
       runtimeSessions?: RuntimeSessionStore;
       memories?: MemoryStore;
       policyService?: Pick<PolicyService, "evaluate">;
@@ -149,25 +182,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        * skills degrade to SKILL.md-only (unit tests, minimal wiring).
        */
       skillBundles?: Pick<SkillBundleStorage, "materializeBundle">;
+      tenantMembers: Pick<TenantMemberStore, "isUserBetaTester">;
     },
     private readonly providerCredentials?: ProviderCredentials,
     private readonly runtimeFactory: DeepAgentsRuntimeFactory = createDeepAgentsSessionRuntime,
     /** Read-only tool classification for autoApproveReadOnlyTools. Optional in unit tests. */
-    private readonly managedToolCatalog?: Pick<ManagedToolCatalog, "listReadOnlyIds">
-  ) {
-    this.policyApprovals = createRuntimePolicyApprovals({
-      config,
-      approvals: stores.approvals,
-      auditEvents: stores.auditEvents,
-      logger: log,
-      pushFrameworkEvent: (sessionId, event) => {
-        const push = this.sessions.get(sessionId)?.activeTurnPush.current;
-        if (!push) return false;
-        push(event);
-        return true;
-      }
-    });
-  }
+    private readonly managedToolCatalog?: Pick<ManagedToolCatalog, "listIds" | "listReadOnlyIds" | "get">
+  ) {}
 
   hasActiveTurn(sessionId: string): boolean {
     return this.activeTurns.has(sessionId);
@@ -222,9 +243,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const { tenantId, sessionId, userId } = input;
     const runtimeId = `deepagents-${uuidv7()}`;
     const startupTimer = createStageTimer();
+    const isBetaTester = await this.stores.tenantMembers.isUserBetaTester(tenantId, userId);
 
     const configBundle = await startupTimer.time("compileConfigMs", () =>
-      this.dynamicConfig.compileRuntimeConfig(tenantId, true, sessionId)
+      this.dynamicConfig.compileRuntimeConfig(tenantId, isBetaTester, sessionId)
     );
     const { runtimePolicy } = configBundle;
 
@@ -264,7 +286,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         rid: runtimeId,
         exp: runtimeTokenExpiry(this.config.RUNTIME_TOKEN_TTL_MS)
       },
-      this.config.DATA_ENCRYPTION_SECRET
+      runtimeTokenSecret(this.config.DATA_ENCRYPTION_SECRET)
     );
 
     // Phase 1 parity: recent long-term memories are injected into the system
@@ -319,10 +341,18 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const gatewayBase = this.config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "");
     const mcpServers = configBundle.mcpServers.map((server) => ({
       id: server.id,
+      mode: server.mode,
       url: new URL(server.routePath, gatewayBase + "/").toString(),
       authorization: `Bearer ${runtimeToken}`
     }));
     const toolContextRef: { current: string | null } = { current: null };
+    const policyContextRef: DeepAgentsSessionState["policyContextRef"] = { current: null };
+    const managedToolFacts = Object.fromEntries(
+      (this.managedToolCatalog?.listIds() ?? []).map((toolName) => {
+        const entry = this.managedToolCatalog?.get(toolName);
+        return [toolName, { readOnly: entry?.readOnly ?? false, category: entry?.category ?? null }];
+      })
+    );
     const runtime = this.runtimeFactory({
       tenantId,
       sessionId,
@@ -338,6 +368,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       workspacePath,
       mcpServers,
       toolContextRef,
+      policyContextRef,
+      policyService: this.stores.policyService,
+      managedToolFacts,
       approvals: {
         // approvalPolicy "never" bypasses native approvals entirely — same
         // meaning as the Claude turn frame's `bypass`.
@@ -362,6 +395,38 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS
             }
           : null,
+      // Surface a transparently replaced sandbox: at that moment every file
+      // the agent wrote and every artifact synced into the workspace is gone,
+      // and without a notice the model just meets file_not_found on its own
+      // work. Best-effort — no active turn means nowhere to show it.
+      onSandboxRecreated: ({ previousSandboxId }) => {
+        const sessionState = this.sessions.get(sessionId);
+        if (!sessionState) return;
+        const responseId = sessionState.activeTurnResponseId.current;
+        // No responseId means no turn has been claimed — nothing to address.
+        if (!responseId) return;
+        // The push hook may not exist yet: onBeforeTurn (artifact sync) runs
+        // before it is installed and is the likeliest caller to hit an expired
+        // sandbox. Buffer for the drain instead of dropping the notice.
+        const push =
+          sessionState.activeTurnPush.current ??
+          ((event: BaseEvent) => sessionState.pendingTurnEvents.push(event));
+        push(runtimeNoticeEvent({
+          // Keyed on the sandbox that was LOST, not the session: the frontend
+          // dedupes notices by noticeId, so a session-wide key would show only
+          // the first loss and silently swallow every later one. Each
+          // replacement is a distinct event the user has to see. Falls back to
+          // the responseId when the id is unknown (lost before creation
+          // completed), which still separates it per turn.
+          noticeId: `sandbox-recreated:${previousSandboxId ?? responseId}`,
+          level: "warning",
+          title: "Workspace reset",
+          message:
+            "The execution sandbox expired and was replaced. Files written earlier in this session, " +
+            "and artifacts synced into the workspace, are no longer on disk and need to be recreated.",
+          createdAt: new Date().toISOString()
+        }));
+      },
       checkpointer: this.stores.checkpointer,
       logger: this.log
     });
@@ -379,8 +444,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       idleTimer: null,
       activeTurnInterrupt: { current: null },
       activeTurnPush: { current: null },
-      activeTurnWatchdog: { current: null },
+      activeTurnResponseId: { current: null },
+      pendingTurnEvents: [],
       toolContextRef,
+      policyContextRef,
       autoApprovedKindsForTurn: new Set()
     };
     this.sessions.set(sessionId, state);
@@ -434,81 +501,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async *runMessage(
-    session: RuntimeSessionRef,
-    input: {
-      prompt: string;
-      userInputs?: RuntimeUserInput[];
-      runtimePolicyId: string;
-      toolContextId: string | null;
-      assistantMessageId?: string | null;
-      model?: string;
-      effort?: RuntimeReasoningEffort;
-      onBeforeTurn?: () => Promise<void>;
-    }
-  ): AsyncIterable<RuntimeEvent> {
-    const state = this.sessions.get(session.sessionId);
-    if (!state) {
-      throw new Error(`No Deep Agents session found for ${session.sessionId}`);
-    }
-
-    // Reserve the turn slot synchronously (no await between check and add) so
-    // a concurrent runMessage can't slip past during onBeforeTurn.
-    if (this.activeTurns.has(session.sessionId)) {
-      throw new SessionBusyError(session.sessionId);
-    }
-    this.activeTurns.add(session.sessionId);
-    state.lastActiveAt = new Date().toISOString();
-    this.clearIdleTimer(state);
-
-    if (input.onBeforeTurn) {
-      try {
-        await input.onBeforeTurn();
-      } catch (error) {
-        this.activeTurns.delete(session.sessionId);
-        this.scheduleIdleTeardown(state);
-        throw error;
-      }
-    }
-
-    const responseId = input.assistantMessageId ?? uuidv7();
-    const eventQueue = new AsyncQueue<RuntimeEvent>();
-    state.activeTurnPush.current = (event) => eventQueue.push(event);
-
-    const runTask = this.runTurn(state, eventQueue, responseId, input).finally(() => {
-      this.activeTurns.delete(session.sessionId);
-      state.activeTurnInterrupt.current = null;
-      state.activeTurnPush.current = null;
-      this.scheduleIdleTeardown(state);
-      eventQueue.end();
-    });
-
-    yield* eventQueue;
-    await runTask;
-  }
-
-  /**
-   * Track B spike (boundary b): drive one turn through `DeepAgentsAGUIAgent`
-   * and yield AG-UI `BaseEvent`s instead of `RuntimeEvent`s. Reuses the same
-   * session runtime, tenant scope, toolContextId ref, and native-approval plane
-   * as {@link runMessage} — only the emitted vocabulary differs. The driver
-   * owns the streamEvents + interrupt/resume loop; this method owns the turn
-   * slot, abort/interrupt wiring, and the `awaitDecisions` bridge into the
-   * shared approval plane (`collectApprovalDecisions`, re-emitted through the
-   * translator so the AG-UI approval prompt carries the real `approvalId`).
-   *
-   * Token usage + cumulative cost ARE persisted (see the streamTurn wrapper +
-   * persistTurnUsage in the finally), keyed on the writer-supplied
-   * assistantMessageId. The RUNTIME_TURN_TIMEOUT_MS watchdog is armed here too
-   * (disarmed while an approval prompt is pending), so a wedged turn releases
-   * the session slot instead of pinning it — parity with `runTurn`.
-   */
   async *runMessageAGUI(
     session: RuntimeSessionRef,
     input: {
       prompt: string;
       userInputs?: RuntimeUserInput[];
       toolContextId: string | null;
+      turnContext?: PolicyTurnContext;
       assistantMessageId?: string | null;
       model?: string;
       effort?: RuntimeReasoningEffort;
@@ -525,76 +524,123 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     this.activeTurns.add(session.sessionId);
     state.lastActiveAt = new Date().toISOString();
     this.clearIdleTimer(state);
-
-    // Artifact workspace sync + turn-input building runs here (after the slot is
-    // reserved, so the sandbox is alive), mirroring runMessage's onBeforeTurn.
-    if (input.onBeforeTurn) {
-      try {
-        await input.onBeforeTurn();
-      } catch (error) {
-        this.activeTurns.delete(session.sessionId);
-        this.scheduleIdleTeardown(state);
-        throw error;
-      }
+    // Push the sandbox lifetime back out before anything touches it (artifact
+    // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
+    // FIRST tool use and is never renewed, so an active session eventually
+    // crosses it mid-turn and silently loses its whole workspace. Extending at
+    // each turn start makes the cap idle-based instead. No-op (and no sandbox
+    // creation) when the session has never used one.
+    //
+    // Guarded rather than trusted: the slot is already reserved here, so an
+    // implementation that rejects would leak the session busy forever. The
+    // production sandbox swallows its own failures (an unextendable sandbox is
+    // recovered by withSandbox on the next op), but the interface does not
+    // promise that, and a failed extension must never cost a turn.
+    try {
+      await state.runtime.extendSandboxTimeout?.();
+    } catch (err) {
+      this.log.warn(
+        { err, sessionId: session.sessionId },
+        "Failed to extend the sandbox lifetime at turn start; continuing"
+      );
     }
 
-    // Artifact-scoped turns arrive with `userInputs` REPLACING the raw prompt
-    // (the artifact-context block embeds the prompt at its end); mirror runTurn.
-    const textInputs = (input.userInputs ?? []).filter(
-      (entry): entry is Extract<RuntimeUserInput, { type: "text" }> => entry.type === "text"
-    );
-    const promptText =
-      textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
-
+    // Claim the response id before artifact sync. A sandbox replacement during
+    // sync may emit a notice that needs the id before the push hook exists.
     const responseId = input.assistantMessageId ?? uuidv7();
-    const queue = new AsyncQueue<BaseEvent>();
-    // One translator state shared by the approval bridge and the Policy Center
-    // push hook — both only carry approval/notice events (no open text/reasoning
-    // messages), so they never contend over message ids.
-    const auxState = createRuntimeToAGUIState();
+    state.activeTurnResponseId.current = responseId;
+    state.pendingTurnEvents = [];
 
+    // Arm the interrupt BEFORE onBeforeTurn too. The slot is reserved from here
+    // on, so `interruptTurn` is reachable — but with no hook installed it
+    // answers `no_active_turn`, and the SSE writer latches that single attempt.
+    // A disconnect during artifact sync would then leave the turn to run its
+    // whole loop for a socket that is already gone.
     const turnAbort = new AbortController();
     const onSessionAbort = () => turnAbort.abort();
-    state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+    // An `abort` listener added to an already-aborted signal never fires, so a
+    // turn started on a session that was aborted between slot reservation and
+    // here would otherwise run unguarded — mirror the abort eagerly (parity with
+    // runTurn, which documents the same hazard).
+    if (state.abortController.signal.aborted) {
+      turnAbort.abort();
+    } else {
+      state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+    }
     // Stop button / client disconnect aborts THIS turn (interruptTurn reads this).
     state.activeTurnInterrupt.current = async () => {
       turnAbort.abort();
     };
 
-    const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
-      state,
-      turnAbort
-    );
-    // Policy Center gateway approvals push RuntimeEvents onto the active turn;
-    // translate them so they surface in the AG-UI stream too.
-    state.activeTurnPush.current = (event) => {
-      for (const ev of runtimeEventToAGUI(auxState, event)) queue.push(ev);
+    const releaseTurnSlot = () => {
+      state.abortController.signal.removeEventListener("abort", onSessionAbort);
+      this.activeTurns.delete(session.sessionId);
+      state.activeTurnInterrupt.current = null;
+      state.activeTurnResponseId.current = null;
+      state.pendingTurnEvents = [];
+      this.scheduleIdleTeardown(state);
     };
 
-    state.toolContextRef.current = input.toolContextId ?? null;
-    state.autoApprovedKindsForTurn = new Set();
-
-    // Images (e.g. rendered PDF pages from buildArtifactTurnInputs) are dropped —
-    // only text inputs feed promptText above. Surface the same notice runTurn
-    // emits so the user isn't misled by an artifact block that claims attached
-    // page images the runtime never received.
-    const hasImageInput = (input.userInputs ?? []).some(
-      (entry) => entry.type === "image" || entry.type === "localImage"
-    );
-    if (hasImageInput) {
-      for (const ev of runtimeEventToAGUI(auxState, {
-        type: "framework:runtime_notice",
-        responseId,
-        noticeId: `deepagents-image-unsupported:${responseId}`,
-        level: "warning",
-        title: "Images not supported",
-        message:
-          "The Deep Agents runtime does not support image attachments yet; the message text was sent without them.",
-        createdAt: new Date().toISOString()
-      })) {
-        queue.push(ev);
+    // Artifact workspace sync and turn-input building run after slot reservation.
+    if (input.onBeforeTurn) {
+      try {
+        await input.onBeforeTurn();
+      } catch (error) {
+        releaseTurnSlot();
+        throw error;
       }
     }
+
+    // An abort raised during onBeforeTurn (client disconnect, session teardown)
+    // is NOT short-circuited here: the run is still started so the stream leads
+    // with RUN_STARTED and then terminates through the subscription's abort
+    // branch with the interrupted RUN_FINISHED the writer needs to mark the row.
+    // `turnAbort.signal` is threaded into the backend, so the graph stream
+    // rejects immediately rather than doing any model work.
+
+    // Artifact-scoped turns arrive with `userInputs` REPLACING the raw prompt
+    // (the artifact-context block embeds the prompt at its end); mirror runTurn.
+    const textInputs = input.userInputs ?? [];
+    const promptText =
+      textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
+
+    const queue = new AsyncQueue<BaseEvent>();
+    const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
+      turnAbort
+    );
+    // Events raised BEFORE the agent run starts cannot go onto the queue:
+    // @ag-ui/client's verifier rejects any stream whose first event is not
+    // RUN_STARTED ("First event must be 'RUN_STARTED'"), and the agent emits
+    // that only once subscribed, ~100 lines below. So everything raised until
+    // then is held here and flushed right after the run's first event.
+    //
+    // The gate is on the SINK, not on individual call sites. Today nothing can
+    // actually reach the push hook in this window — the path from here to the
+    // subscription below contains no await, so no other task interleaves — and
+    // gating each known call site would be equivalent. It is written this way
+    // because that property is an accident of the current control flow: adding
+    // one await above the subscription would silently reopen the ordering bug,
+    // and a sink-level switch cannot be defeated that way.
+    const preRunEvents: BaseEvent[] = [];
+    let runStarted = false;
+    const emitAGUI = (ev: BaseEvent) => {
+      if (runStarted) queue.push(ev);
+      else preRunEvents.push(ev);
+    };
+    // Out-of-band runtime notices use the active turn's AG-UI sink.
+    state.activeTurnPush.current = emitAGUI;
+    // Notices raised during onBeforeTurn, before the hook above existed.
+    for (const buffered of state.pendingTurnEvents.splice(0)) emitAGUI(buffered);
+
+    state.toolContextRef.current = input.toolContextId ?? null;
+    state.policyContextRef.current = input.toolContextId
+      ? {
+          toolContextId: input.toolContextId,
+          turnContext: input.turnContext ?? "interactive",
+          enforcementMode: session.runtimePolicy.policyEnforcementMode
+        }
+      : null;
+    state.autoApprovedKindsForTurn = new Set();
 
     const modelId = input.model ?? defaultDeepAgentsModelId();
     const effort = input.effort ?? defaultEffortForModel(modelId);
@@ -614,14 +660,33 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       effort,
       promptText,
       signal: turnAbort.signal,
+      onGraphReady: async () => {
+        // Availability is recorded once per turn, after MCP loading succeeds.
+        // Empty-instruction skills are excluded by the library builder too.
+        const resources = [
+          ...state.configBundle.skills
+            .filter((skill) => skill.instructions.trim())
+            .map((skill) => ({
+              resourceType: "skill" as const,
+              resourceId: skill.id,
+              metadata: { associatedToolIds: skill.associatedToolIds ?? [] }
+            })),
+          ...[...new Set(state.runtime.getMcpToolServers().values())].map((serverId) => ({
+            resourceType: "mcp_server" as const,
+            resourceId: serverId
+          }))
+        ];
+        await this.stores.activationTracker?.recordMaterialization(
+          { tenantId: state.tenantId, sessionId: state.sessionId, messageId: responseId },
+          resources
+        );
+      },
       awaitDecisions: async (actions, emit) => {
         if (turnAbort.signal.aborted) {
           return actions.map(() => ({ type: "reject" as const, message: "Turn aborted." }));
         }
         const sink = {
-          push: (event: RuntimeEvent) => {
-            for (const ev of runtimeEventToAGUI(auxState, event)) emit(ev);
-          }
+          push: emit
         };
         // Human approval latency is bounded by APPROVAL_REQUEST_TTL_MS, not the
         // turn watchdog — disarm while the prompt is pending, re-arm after
@@ -660,11 +725,34 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const subscription = agent
       .run({ threadId: state.threadId, runId: responseId, state: {}, messages: [] } as never)
       .subscribe({
-        next: (event) => queue.push(event),
+        next: (event) => {
+          queue.push(event);
+          // The run's first event has now led the stream (RUN_STARTED, or
+          // RUN_ERROR which the verifier also accepts), so held events are
+          // legal from here. Flip the sink BEFORE draining so anything pushed
+          // concurrently during the drain goes straight to the queue and cannot
+          // be appended to a buffer nobody will read again.
+          if (!runStarted) {
+            runStarted = true;
+            for (const pending of preRunEvents.splice(0)) queue.push(pending);
+          }
+        },
         error: (err: unknown) => {
+          // Any error path means the run never emitted a first event, so the
+          // `next` handler never flushed pre-run notices. They cannot be
+          // emitted from here: a CUSTOM ahead of the terminal event would break
+          // the verifier's RUN_STARTED-first rule that this buffering exists to
+          // satisfy. Logged rather than dropped silently, and done BEFORE the
+          // branch returns below so a watchdog timeout or a Stop is covered too.
+          if (preRunEvents.length > 0) {
+            this.log.warn(
+              { sessionId: state.sessionId, dropped: preRunEvents.length },
+              "Deep Agents AG-UI turn ended before its run started; pre-run notices were not delivered"
+            );
+            preRunEvents.length = 0;
+          }
           // Watchdog expiry is a terminal FAILURE, not a user interrupt: emit
-          // RUN_ERROR so the client surfaces it as an error/retry (mirrors
-          // runTurn's response.failed on timeout). Checked before the abort
+          // RUN_ERROR so the client surfaces it as an error/retry. Checked before the abort
           // branch because the watchdog fires via turnAbort.abort().
           if (timedOut()) {
             this.log.error(
@@ -680,8 +768,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           }
           // A turn-abort (Stop button / client disconnect / session teardown)
           // surfaces here as the graph stream's AbortError. That is a graceful
-          // stop, NOT a failure — mirror runTurn, which emits an interrupted
-          // completion rather than response.failed. Emitting RUN_ERROR would make
+          // stop, not a failure. Emitting RUN_ERROR would make
           // an intentional Stop render as an error/retry in AG-UI clients.
           //
           // This is a clean terminal RUN_FINISHED (a successful-but-early
@@ -708,8 +795,29 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         complete: () => queue.end()
       });
 
+    // Token usage + cost must land on the row BEFORE the terminal frame reaches
+    // the client: RUN_FINISHED / RUN_ERROR is what makes the frontend stop
+    // streaming and refetch the message, so a flush in the `finally` below —
+    // which only runs once the consumer has already written that frame to the
+    // socket — races the refetch and can serve null tokens and null cost.
+    // Memoized, so the `finally` stays a backstop for turns that ended without
+    // a terminal event (an abandoned generator) rather than writing twice.
+    let usageFlush: Promise<void> | null = null;
+    const flushUsage = (): Promise<void> => {
+      // Deadline memoized with the write — see the note in runTurn's twin.
+      usageFlush ??= withUsageFlushDeadline(
+        this.persistTurnUsage(state, responseId, usageTotals, usageModelName)
+      );
+      return usageFlush;
+    };
+
     try {
-      yield* queue;
+      for await (const event of queue) {
+        if (event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR) {
+          await flushUsage();
+        }
+        yield event;
+      }
     } finally {
       disarmWatchdog();
       subscription.unsubscribe();
@@ -718,210 +826,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       state.abortController.signal.removeEventListener("abort", onSessionAbort);
       state.activeTurnInterrupt.current = null;
       state.activeTurnPush.current = null;
-      state.activeTurnWatchdog.current = null;
+      state.activeTurnResponseId.current = null;
+      state.pendingTurnEvents = [];
+      state.policyContextRef.current = null;
       // A stopped/failed turn must not leave stale approval prompts behind; a
       // clean completion has none pending, so skip the DB round-trip.
       if (wasAborted) this.cancelSessionApprovals(state, "turn_interrupted");
       // Record token usage + cumulative cost onto the assistant row (no-ops when
       // the turn consumed nothing or the writer created no backing row).
-      await this.persistTurnUsage(state, responseId, usageTotals, usageModelName);
+      await flushUsage();
       this.activeTurns.delete(session.sessionId);
       this.scheduleIdleTeardown(state);
     }
   }
 
-  private async runTurn(
-    state: DeepAgentsSessionState,
-    eventQueue: AsyncQueue<RuntimeEvent>,
-    responseId: string,
-    input: {
-      prompt: string;
-      userInputs?: RuntimeUserInput[];
-      toolContextId?: string | null;
-      model?: string;
-      effort?: RuntimeReasoningEffort;
-    }
-  ): Promise<void> {
-    // Stop button aborts THIS turn only; the session abort cascades too.
-    const turnAbort = new AbortController();
-    const onSessionAbort = () => turnAbort.abort();
-    // An `abort` listener added to an already-aborted signal never fires, so a
-    // turn started on a session that was aborted between reservation and here
-    // would otherwise run unguarded — mirror the abort eagerly.
-    if (state.abortController.signal.aborted) {
-      turnAbort.abort();
-    } else {
-      state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
-    }
-    // Per-turn token accounting, persisted in the finally below so partial
-    // (failed/interrupted) turns still record what they consumed.
-    const usageTotals = createEmptyUsage();
-    let usageModelName: string | null = null;
-    let interrupted = false;
-    state.activeTurnInterrupt.current = async () => {
-      interrupted = true;
-      turnAbort.abort();
-    };
-
-    const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
-      state,
-      turnAbort
-    );
-    armWatchdog();
-
-    try {
-      eventQueue.push({ type: "response.created", responseId });
-
-      const hasImageInput = (input.userInputs ?? []).some(
-        (entry) => entry.type === "image" || entry.type === "localImage"
-      );
-      if (hasImageInput) {
-        eventQueue.push({
-          type: "framework:runtime_notice",
-          responseId,
-          noticeId: `deepagents-image-unsupported:${responseId}`,
-          level: "warning",
-          title: "Images not supported",
-          message:
-            "The Deep Agents runtime does not support image attachments yet; the message text was sent without them.",
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      const modelId = input.model ?? defaultDeepAgentsModelId();
-      // The pricing table + messages.model_name use the bare VENDOR model id
-      // (e.g. "claude-sonnet-5", "gpt-5.4", "meta-llama/llama-4-70b-instruct").
-      // Strip only the FIRST namespace segment so OpenRouter ids keep their own
-      // slash. calculateCostUsd returns null for models without a pricing row
-      // (unlisted / `:free` routes) — tokens are still recorded, cost is null.
-      usageModelName = resolveModelConstruction(modelId).vendorModel;
-      // Fall back to the catalog's defaultEffort when the turn omits an explicit
-      // effort (scheduled jobs, API callers, or UI tenants with the effort
-      // selector hidden all send none). Without this, the advertised default —
-      // e.g. gpt-5.5 → "medium" — would apply only when the frontend dropdown
-      // explicitly sends it. defaultEffort is a member of the model's
-      // supportedEfforts (or null) by construction, so no re-validation is
-      // needed; an explicit effort was already validated upstream by the resolver.
-      const effort = input.effort ?? defaultEffortForModel(modelId);
-      const agent = await state.runtime.getAgentForModel(modelId, effort);
-      const mapperState = createDeepAgentsEventMapperState(responseId);
-      const mapperOptions = {
-        mcpToolNames: state.runtime.getMcpToolNames?.() ?? new Set<string>(),
-        mcpToolServers: state.runtime.getMcpToolServers?.() ?? new Map<string, string>()
-      };
-
-      // Per-turn context for MCP tool-call enrichment and remembered kinds.
-      state.toolContextRef.current = input.toolContextId ?? null;
-      state.autoApprovedKindsForTurn = new Set();
-
-      // Artifact-scoped turns arrive with `userInputs` REPLACING the raw
-      // prompt (the artifact-context block embeds the prompt at its end).
-      // Dropping them would hide the selected artifacts' metadata, synced
-      // paths, and inline excerpts from the model. Images stay unsupported
-      // (the notice above covers them).
-      const textInputs = (input.userInputs ?? []).filter(
-        (entry): entry is Extract<RuntimeUserInput, { type: "text" }> => entry.type === "text"
-      );
-      const promptText =
-        textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
-
-      // Interrupt loop: a HITL interrupt pauses the graph BEFORE tool
-      // execution and checkpoints, ending the stream. We collect human
-      // decisions through the shared approval plane, resume with a Command,
-      // and keep pumping — repeatedly, since one turn can hit several
-      // approval rounds. No pending interrupt → the turn is done.
-      let streamInput: unknown = { messages: [{ role: "user", content: promptText }] };
-      for (;;) {
-        const stream = agent.streamEvents(streamInput, {
-          version: "v2",
-          configurable: { thread_id: state.threadId },
-          signal: turnAbort.signal
-        });
-
-        for await (const rawEvent of stream) {
-          // Every model completion (root AND subagent namespaces — subagent
-          // tokens cost real money too) contributes to the turn's usage.
-          accumulateUsageFromStreamEvent(usageTotals, rawEvent);
-          for (const event of mapDeepAgentsEvent(mapperState, rawEvent, mapperOptions)) {
-            eventQueue.push(event);
-          }
-        }
-
-        const actions = (await state.runtime.getPendingActions?.(state.threadId)) ?? [];
-        if (actions.length === 0 || !state.runtime.buildResumeInput) break;
-
-        // The watchdog (or an abort) may have fired between the stream ending
-        // and pending-interrupt detection — never start an approval round for
-        // a turn that is already dead.
-        if (turnAbort.signal.aborted) {
-          throw new Error("Turn aborted before approval collection.");
-        }
-        disarmWatchdog();
-        const decisions = await this.collectApprovalDecisions({
-          state,
-          eventQueue,
-          responseId,
-          actions,
-          turnAbort
-        });
-        if (turnAbort.signal.aborted) {
-          throw new Error("Turn aborted while awaiting approval.");
-        }
-        armWatchdog();
-        streamInput = state.runtime.buildResumeInput(actions, decisions);
-      }
-
-      eventQueue.push({ type: "response.output_item.done", responseId });
-      eventQueue.push({ type: "response.completed", responseId });
-    } catch (err: unknown) {
-      if (timedOut()) {
-        // Watchdog expiry is a terminal failure, not a user interrupt.
-        this.log.error(
-          { err, sessionId: state.sessionId, timeoutMs: this.config.RUNTIME_TURN_TIMEOUT_MS },
-          "Deep Agents turn exceeded RUNTIME_TURN_TIMEOUT_MS and was aborted"
-        );
-        this.cancelSessionApprovals(state, "turn_interrupted");
-        eventQueue.push({
-          type: "response.failed",
-          responseId,
-          message: "The turn exceeded the platform time limit and was stopped."
-        });
-      } else if (interrupted || turnAbort.signal.aborted) {
-        // Stop button / session teardown: the partial text already streamed
-        // persists with status "interrupted" — same contract as the other
-        // adapters.
-        eventQueue.push({ type: "response.output_item.done", responseId });
-        eventQueue.push({ type: "response.completed", responseId, interrupted: true });
-        // A stopped turn must not leave stale approval prompts behind.
-        this.cancelSessionApprovals(state, "turn_interrupted");
-      } else {
-        // Raw error text can carry internals (pg hosts/DDL from checkpoint
-        // writes, provider request detail) — those persist to the transcript
-        // via response.failed, so only classified, client-safe messages go
-        // out. Full detail stays in the log line.
-        this.log.error({ err, sessionId: state.sessionId }, "Deep Agents turn failed");
-        eventQueue.push({
-          type: "response.failed",
-          responseId,
-          message: clientSafeTurnFailureMessage(err)
-        });
-      }
-    } finally {
-      disarmWatchdog();
-      state.activeTurnWatchdog.current = null;
-      state.abortController.signal.removeEventListener("abort", onSessionAbort);
-      await this.persistTurnUsage(state, responseId, usageTotals, usageModelName);
-    }
-  }
-
-  /**
-   * Writes the turn's accumulated token usage + recomputed cumulative cost
-   * onto the assistant message through the MessageStore, so downstream billing
-   * and eval tooling read one consistent surface. A responseId with no
-   * backing message row (synthetic turns) makes addTokenUsage return null
-   * and the write is skipped. Best-effort: accounting failures never fail
-   * the turn.
-   */
   private async persistTurnUsage(
     state: DeepAgentsSessionState,
     responseId: string,
@@ -1160,72 +1078,73 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     rememberForTurn?: boolean;
   }): Promise<"resolved" | "missing"> {
     const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
-
-    // Policy Center gateway-routed approvals are held by the coordinator.
-    if (this.policyApprovals.has(approvalId)) {
-      return this.policyApprovals.resolve({ tenantId, approvalId, userId, decision });
-    }
-
-    // Native HITL approval: settle the turn loop's promise first (in-process,
-    // so unlike the Claude sandbox path there is no delivery failure mode),
-    // then flip the DB row + audit. Ownership check mirrors Claude: only the
-    // initiating tenant/user may decide.
     const entry = this.pendingApprovals.get(approvalId);
-    if (!entry) return "missing";
-    const state = this.sessions.get(entry.sessionId);
-    if (!state || state.tenantId !== tenantId || state.userId !== userId) {
-      return "missing";
-    }
-
-    if (rememberForTurn && decision === "approve") {
-      entry.autoApprovedKinds.add(entry.rememberKey);
-    }
-    entry.settle(decision);
-
-    // Atomic once-only guard: a double-click or a row already settled by the
-    // TTL sweep returns null — the decision already reached the turn loop, so
-    // still report resolved but skip a duplicate audit row.
-    const approval = await this.stores.approvals.resolve(
-      tenantId,
-      approvalId,
-      userId,
-      decision === "approve" ? "approve" : "reject"
-    );
-    if (approval) {
+    if (entry && !entry.requiresDurableProof) {
+      const state = this.sessions.get(entry.sessionId);
+      if (!state || state.tenantId !== tenantId || state.userId !== userId) return "missing";
+      if (rememberForTurn && decision === "approve") {
+        entry.autoApprovedKinds.add(entry.rememberKey);
+      }
+      entry.settle(decision);
       try {
-        await this.stores.auditEvents.create({
-          tenantId,
-          sessionId: approval.sessionId,
-          userId: approval.userId,
-          approvalId: approval.approvalId,
-          type: decision === "approve" ? "approval.approved" : "approval.rejected",
-          payload: { itemId: approval.itemId, kind: approval.kind }
-        });
+        const approval = await this.stores.approvals.resolve(tenantId, approvalId, userId, decision);
+        if (approval) {
+          await this.stores.auditEvents.create({
+            tenantId,
+            sessionId: approval.sessionId,
+            userId: approval.userId,
+            approvalId: approval.approvalId,
+            type: decision === "approve" ? "approval.approved" : "approval.rejected",
+            payload: { itemId: approval.itemId, kind: approval.kind }
+          });
+        }
       } catch (err) {
-        this.log.warn(
-          { err, approvalId },
-          "failed to write approval decision audit event (decision already delivered)"
-        );
+        this.log.error({ err, approvalId, tenantId }, "failed to persist native approval decision");
+      }
+      return "resolved";
+    }
+    // The approvals row is the ownership check and the cross-replica rendezvous.
+    // Persist first: a Policy Center proof is valid only after this transition,
+    // so the graph must never resume before the gateway can observe it.
+    let approval: Awaited<ReturnType<ApprovalStore["resolve"]>>;
+    try {
+      approval = await this.stores.approvals.resolve(
+        tenantId,
+        approvalId,
+        userId,
+        decision === "approve" ? "approve" : "reject"
+      );
+    } catch (err) {
+      this.log.error(
+        { err, approvalId, tenantId },
+        "failed to persist approval decision"
+      );
+      throw err;
+    }
+    if (!approval) return "missing";
+
+    if (entry) {
+      const state = this.sessions.get(entry.sessionId);
+      if (state?.tenantId === tenantId && state.userId === userId) {
+        if (rememberForTurn && decision === "approve") {
+          entry.autoApprovedKinds.add(entry.rememberKey);
+        }
+        entry.settle(decision);
       }
     }
-    return "resolved";
-  }
-
-  async requestPolicyApproval(input: PolicyApprovalRouteInput): Promise<PolicyApprovalDisposition> {
-    // A Policy Center approval is held at the MCP gateway — the graph turn is
-    // meanwhile suspended awaiting that tool's HTTP response, so it never reaches
-    // the native `awaitDecisions` path that disarms the turn watchdog. Pause the
-    // watchdog for the owning session's active turn while the human decides
-    // (bounded instead by APPROVAL_REQUEST_TTL_MS, which config pins below the
-    // turn timeout); otherwise a long turn can time out mid-approval. Ref-counted
-    // inside the watchdog handle, so overlapping approvals resume only once.
-    const watchdog = this.sessions.get(input.sessionId)?.activeTurnWatchdog.current ?? null;
-    watchdog?.pause();
     try {
-      return await this.policyApprovals.request(input);
-    } finally {
-      watchdog?.resume();
+      await this.stores.auditEvents.create({
+        tenantId,
+        sessionId: approval.sessionId,
+        userId: approval.userId,
+        approvalId: approval.approvalId,
+        type: decision === "approve" ? "approval.approved" : "approval.rejected",
+        payload: { itemId: approval.itemId, kind: approval.kind }
+      });
+    } catch (err) {
+      this.log.warn({ err, approvalId }, "failed to write approval decision audit event");
     }
+    return "resolved";
   }
 
   private cancelSessionApprovals(
@@ -1241,9 +1160,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       auditEvents: this.stores.auditEvents,
       logger: this.log,
       onCancelLocal: (approvalId) => {
-        // Release a policy-held tool call and settle any native HITL wait so
-        // neither the gateway response nor the turn loop hangs.
-        this.policyApprovals.cancel(approvalId);
+        // Settle any native HITL wait so the turn loop cannot hang.
         this.pendingApprovals.get(approvalId)?.settle("reject");
         return undefined;
       }
@@ -1259,44 +1176,50 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    * end-to-end to tear the graph run down; the caller reads `timedOut()` to
    * distinguish that from a user interrupt.
    *
-   * Installs the `state.activeTurnWatchdog.current` pause/resume handle so a
-   * Policy Center approval held at the MCP gateway (outside the native
-   * awaitDecisions loop) can stop the timer while a human decides. Pauses are
-   * ref-counted for concurrent approvals from parallel subagents; while paused,
-   * `arm` is a no-op so a re-arm from the native-approval path can't restart the
-   * timer under a held policy approval. The caller must `disarm()` and clear
-   * `state.activeTurnWatchdog.current` at turn cleanup.
+   * The native checkpointed approval loop disarms this timer while a human
+   * decides, then re-arms it with the remaining work budget.
    */
   private createTurnWatchdog(
-    state: DeepAgentsSessionState,
     turnAbort: AbortController
   ): { arm: () => void; disarm: () => void; timedOut: () => boolean } {
     let timedOut = false;
     let watchdogTimer: NodeJS.Timeout | null = null;
-    let watchdogPauses = 0;
+    // Budget REMAINING, not elapsed. The watchdog measures time the turn spent
+    // working, excluding time a human spent on approvals — but that budget must
+    // be consumed, not refunded. Re-arming for the full duration after every
+    // pause made the turn's wall-clock ceiling unbounded across repeated
+    // approval rounds, which is what config's
+    // TOOL_CONTEXT_TTL_MS > RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS
+    // invariant assumes cannot happen. Tracking the remainder makes the total
+    // working time a turn can accumulate exactly RUNTIME_TURN_TIMEOUT_MS,
+    // however many times it pauses.
+    let remainingMs = this.config.RUNTIME_TURN_TIMEOUT_MS;
+    let armedAt: number | null = null;
     const disarm = () => {
-      if (watchdogTimer) clearTimeout(watchdogTimer);
+      if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+        // Debit the time this arming actually ran for.
+        if (armedAt !== null) remainingMs -= Date.now() - armedAt;
+      }
       watchdogTimer = null;
+      armedAt = null;
     };
     const arm = () => {
       disarm();
       if (this.config.RUNTIME_TURN_TIMEOUT_MS <= 0) return;
-      if (watchdogPauses > 0) return;
-      watchdogTimer = setTimeout(() => {
+      const fire = () => {
         timedOut = true;
         turnAbort.abort();
-      }, this.config.RUNTIME_TURN_TIMEOUT_MS);
-      watchdogTimer.unref?.();
-    };
-    state.activeTurnWatchdog.current = {
-      pause: () => {
-        watchdogPauses += 1;
-        disarm();
-      },
-      resume: () => {
-        watchdogPauses = Math.max(0, watchdogPauses - 1);
-        if (watchdogPauses === 0 && !turnAbort.signal.aborted) arm();
+      };
+      // Budget already spent while paused-and-resumed repeatedly: fire now
+      // rather than arming a zero/negative timer.
+      if (remainingMs <= 0) {
+        fire();
+        return;
       }
+      armedAt = Date.now();
+      watchdogTimer = setTimeout(fire, remainingMs);
+      watchdogTimer.unref?.();
     };
     return { arm, disarm, timedOut: () => timedOut };
   }
@@ -1304,7 +1227,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   /**
    * One approval round-trip per pending HITL action. Auto-approves kinds the
    * user already remembered this turn (audited); everything else gets a DB
-   * approval row + `framework:approval_required` on the live stream, settled
+   * approval row plus an AG-UI `CUSTOM` event named `approval_required`, settled
    * by `POST /approvals/:id/decision` → {@link resolveApproval}, a TTL sweep
    * (reject + `approval.expired` audit + runtime notice), or turn abort
    * (reject). Decision order matches `actions` order — the HITL resume
@@ -1312,7 +1235,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    */
   private async collectApprovalDecisions(input: {
     state: DeepAgentsSessionState;
-    eventQueue: { push: (event: RuntimeEvent) => void };
+    eventQueue: { push: (event: BaseEvent) => void };
     responseId: string;
     actions: DeepAgentsPendingAction[];
     turnAbort: AbortController;
@@ -1323,18 +1246,27 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         this.requestNativeApproval({ state, eventQueue, responseId, action, turnAbort })
       )
     );
-    return decisions.map((decision) =>
-      decision === "approve"
-        ? { type: "approve" as const }
-        : { type: "reject" as const, message: "User denied permission." }
-    );
+    return decisions.map((decision) => {
+      if (decision === "approve") return { type: "approve" as const };
+      // The message goes to the MODEL as the tool result. A denial nobody made
+      // must not read as one: told "User denied permission" for an approval that
+      // was never recorded, the model apologises for a refusal that did not
+      // happen and reasons about a preference the user never expressed.
+      return {
+        type: "reject" as const,
+        message:
+          decision === "unavailable"
+            ? "This action was blocked: its approval request could not be recorded."
+            : "User denied permission."
+      };
+    });
   }
 
   private classifyApprovalKind(
     state: DeepAgentsSessionState,
     toolName: string
   ): RuntimeApprovalKind {
-    if (state.runtime.getMcpToolNames?.().has(toolName)) return "mcp_tool";
+    if (state.runtime.getMcpToolNames().has(toolName)) return "mcp_tool";
     if (toolName === "execute") return "command_execution";
     if (toolName === "write_file" || toolName === "edit_file") return "file_change";
     return "permissions";
@@ -1353,11 +1285,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
   private async requestNativeApproval(input: {
     state: DeepAgentsSessionState;
-    eventQueue: { push: (event: RuntimeEvent) => void };
+    eventQueue: { push: (event: BaseEvent) => void };
     responseId: string;
     action: DeepAgentsPendingAction;
     turnAbort: AbortController;
-  }): Promise<RuntimeApprovalDecision> {
+  }): Promise<NativeApprovalOutcome> {
     const { state, eventQueue, responseId, action, turnAbort } = input;
     // Belt-and-braces vs the pre-collection abort check in the turn loop: an
     // already-aborted turn gets an immediate reject — the abort listener
@@ -1369,7 +1301,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
     // "Remember for this turn": answer without a DB row or prompt, but leave
     // an audit trail.
-    if (state.autoApprovedKindsForTurn.has(rememberKey)) {
+    if (!action.policyApproval && state.autoApprovedKindsForTurn.has(rememberKey)) {
       try {
         await this.stores.auditEvents.create({
           tenantId: state.tenantId,
@@ -1385,36 +1317,66 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       return "approve";
     }
 
-    const approvalId = `daapr_${uuidv7()}`;
+    const approvalId = action.policyApproval?.approvalId ?? `daapr_${uuidv7()}`;
     const redactedArgs = redactSecrets(action.args);
+    let approval = action.policyApproval
+      ? await this.stores.approvals.get(state.tenantId, approvalId, state.userId)
+      : null;
+    if (approval?.status === "approved") return "approve";
+    if (approval?.status === "rejected" || approval?.status === "expired") return "reject";
     try {
-      await this.stores.approvals.create({
-        tenantId: state.tenantId,
-        approvalId,
-        sessionId: state.sessionId,
-        userId: state.userId,
-        runtimeId: state.runtimeId,
-        turnId: responseId,
-        itemId: approvalId,
-        requestMethod: `deepagents/${action.name}`,
-        requestId: approvalId,
-        kind,
-        title: `Approve ${action.name}`,
-        summary: JSON.stringify(redactedArgs),
-        status: "pending",
-        decision: null,
-        requestPayload: redactedArgs,
-        // DB-level deadline mirroring the in-process TTL below, so a process
-        // death still lets the startup sweep recover this row.
-        expiresAt: new Date(Date.now() + this.config.APPROVAL_REQUEST_TTL_MS).toISOString()
-      });
+      approval ??= await this.stores.approvals.create({
+          tenantId: state.tenantId,
+          approvalId,
+          sessionId: state.sessionId,
+          userId: state.userId,
+          runtimeId: state.runtimeId,
+          turnId: responseId,
+          itemId: approvalId,
+          requestMethod: action.policyApproval
+            ? POLICY_APPROVAL_REQUEST_METHOD
+            : `deepagents/${action.name}`,
+          requestId: approvalId,
+          kind,
+          title: `Approve ${action.name}`,
+          summary: JSON.stringify(redactedArgs),
+          status: "pending",
+          decision: null,
+          requestPayload: action.policyApproval
+            ? { ...redactedArgs, policyApproval: action.policyApproval }
+            : redactedArgs,
+          expiresAt: new Date(Date.now() + this.config.APPROVAL_REQUEST_TTL_MS).toISOString()
+        });
     } catch (err) {
-      this.log.warn({ err, approvalId }, "Failed to persist Deep Agents approval to store");
+      // A replay on another replica can race the original insert. The
+      // deterministic policy approval id makes that safe: reuse the winner.
+      if (action.policyApproval) {
+        approval = await this.stores.approvals.get(state.tenantId, approvalId, state.userId);
+        if (approval?.status === "approved") return "approve";
+        if (approval?.status === "rejected" || approval?.status === "expired") return "reject";
+      }
+      if (approval?.status === "pending") {
+        this.log.debug({ approvalId }, "Reusing checkpointed Policy Center approval");
+      } else {
+        // Fail closed. Without the row there is no approval to decide: the sweep
+        // and a restart cannot see the prompt, `resolveApproval` has nothing to
+        // settle, and no approval decision audit event can be written.
+        this.log.error(
+          { err, approvalId, sessionId: state.sessionId, toolName: action.name },
+          "Failed to persist Deep Agents approval to store — denying"
+        );
+        eventQueue.push(runtimeNoticeEvent({
+          noticeId: `approval-unavailable:${approvalId}`,
+          level: "warning",
+          title: "Approval unavailable",
+          message: `The approval request for ${action.name} could not be recorded, so it was denied.`,
+          createdAt: new Date().toISOString()
+        }));
+        return "unavailable";
+      }
     }
 
-    eventQueue.push({
-      type: "framework:approval_required",
-      responseId,
+    eventQueue.push(approvalRequiredEvent({
       approvalId,
       itemId: approvalId,
       kind,
@@ -1425,7 +1387,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         ? action.args.command
         : action.name,
       cwd: null
-    });
+    }));
 
     return new Promise<RuntimeApprovalDecision>((resolve) => {
       let settled = false;
@@ -1433,11 +1395,17 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (settled) return;
         settled = true;
         clearTimeout(ttlTimer);
+        clearInterval(pollTimer);
         turnAbort.signal.removeEventListener("abort", onAbort);
         this.pendingApprovals.delete(approvalId);
         resolve(decision);
       };
       const onAbort = () => settle("reject");
+      const remainingTtlMs = Math.max(
+        0,
+        new Date(approval?.expiresAt ?? Date.now() + this.config.APPROVAL_REQUEST_TTL_MS).getTime() -
+          Date.now()
+      );
       const ttlTimer = setTimeout(() => {
         // TTL expiry: DB row moves to expired + audit + user-facing notice;
         // the reject unblocks the paused graph.
@@ -1452,18 +1420,32 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           logger: this.log,
           onCancelLocal: () => undefined
         });
-        eventQueue.push({
-          type: "framework:runtime_notice",
-          responseId,
+        eventQueue.push(runtimeNoticeEvent({
           noticeId: `approval-expired:${approvalId}`,
           level: "warning",
           title: "Approval expired",
           message: `The approval request for ${action.name} expired and was rejected.`,
           createdAt: new Date().toISOString()
-        });
+        }));
         settle("reject");
-      }, this.config.APPROVAL_REQUEST_TTL_MS);
+      }, remainingTtlMs);
       ttlTimer.unref?.();
+      let pollInFlight = false;
+      const pollTimer = setInterval(() => {
+        if (pollInFlight || settled) return;
+        pollInFlight = true;
+        void this.stores.approvals
+          .get(state.tenantId, approvalId, state.userId)
+          .then((row) => {
+            if (row?.status === "approved") settle("approve");
+            else if (row?.status === "rejected" || row?.status === "expired") settle("reject");
+          })
+          .catch((err) => this.log.warn({ err, approvalId }, "Failed to poll approval status"))
+          .finally(() => {
+            pollInFlight = false;
+          });
+      }, 250);
+      pollTimer.unref?.();
       turnAbort.signal.addEventListener("abort", onAbort, { once: true });
       this.pendingApprovals.set(approvalId, {
         sessionId: state.sessionId,
@@ -1472,7 +1454,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         settle,
         // Capture THIS turn's remember-set so a late decision can't pollute
         // the next turn's set.
-        autoApprovedKinds: state.autoApprovedKindsForTurn
+        autoApprovedKinds: state.autoApprovedKindsForTurn,
+        requiresDurableProof: Boolean(action.policyApproval)
       });
     });
   }
@@ -1539,7 +1522,6 @@ function buildDeepAgentsRuntimeManifest(
       sandboxMode: runtimePolicy.sandboxMode,
       networkMode: runtimePolicy.networkMode,
       allowCommandExecution: runtimePolicy.allowCommandExecution,
-      allowUserTokenForwarding: runtimePolicy.allowUserTokenForwarding,
       autoApproveReadOnlyTools: runtimePolicy.autoApproveReadOnlyTools,
       webSearchMode: runtimePolicy.webSearchMode,
       enabledToolIds: runtimePolicy.enabledToolIds
@@ -1572,7 +1554,7 @@ function buildDeepAgentsRuntimeManifest(
 
 /**
  * Client-facing text for a failed turn (persisted to the transcript). Mirrors
- * sse-stream-writer's clientSafeFailureMessage: 4xx provider errors (invalid
+ * sse-writer's clientSafeFailureMessage: 4xx provider errors (invalid
  * key, overloaded model, bad request) are user-actionable and pass through;
  * everything else — pg/checkpointer failures, network errors — collapses to a
  * generic message so internals never reach the client. GraphRecursionError is

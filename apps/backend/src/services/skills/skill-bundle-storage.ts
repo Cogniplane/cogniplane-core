@@ -29,15 +29,12 @@ export type StoreBundleResult = {
   storageUri: string;
 };
 
-export type InstallBundleInput = {
-  storageUri: string;
-  destinationPath: string;
-};
-
 export interface SkillBundleStorage {
   readonly backend: "local" | "bucket";
   storeBundle(input: StoreBundleInput): Promise<StoreBundleResult>;
-  installBundle(input: InstallBundleInput): Promise<void>;
+  // Bundles are read in place from the content-addressed cache
+  // (materializeBundle). There is deliberately no "install to a caller-supplied
+  // destination" method: it had no callers and no containment check.
   materializeBundle(storageUri: string): Promise<{ localPath: string }>;
   deleteBundle(storageUri: string): Promise<void>;
 }
@@ -134,13 +131,6 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
     }
 
     return { storageUri: `file://${bundlePath}` };
-  }
-
-  async installBundle(input: InstallBundleInput): Promise<void> {
-    const sourcePath = parseFileUri(input.storageUri);
-    await rm(input.destinationPath, { recursive: true, force: true });
-    await mkdir(path.dirname(input.destinationPath), { recursive: true });
-    await cp(sourcePath, input.destinationPath, { recursive: true });
   }
 
   async materializeBundle(storageUri: string): Promise<{ localPath: string }> {
@@ -313,13 +303,6 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
     }
 
     return { localPath: cachePath };
-  }
-
-  async installBundle(input: InstallBundleInput): Promise<void> {
-    const { localPath } = await this.materializeBundle(input.storageUri);
-    await rm(input.destinationPath, { recursive: true, force: true });
-    await mkdir(path.dirname(input.destinationPath), { recursive: true });
-    await cp(localPath, input.destinationPath, { recursive: true });
   }
 
   async deleteBundle(storageUri: string): Promise<void> {

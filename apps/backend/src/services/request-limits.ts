@@ -4,9 +4,10 @@ export type LimitResource =
   | "session_create"
   | "message_turn"
   | "artifact_upload"
-  | "artifact_create"
   | "scheduled_job_create"
-  | "oauth_callback";
+  | "oauth_callback"
+  | "admin_query"
+  | "auth_organizations";
 type LimitScope = "user" | "tenant";
 type LimitType = "rate_limit" | "usage_quota";
 
@@ -17,9 +18,10 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   session_create: "session creation",
   message_turn: "message",
   artifact_upload: "artifact upload",
-  artifact_create: "artifact creation",
   scheduled_job_create: "scheduled job creation",
-  oauth_callback: "OAuth callback"
+  oauth_callback: "OAuth callback",
+  admin_query: "admin request",
+  auth_organizations: "organization list"
 };
 
 export function rateLimitMessage(resource: LimitResource, scope: LimitScope): string {
@@ -37,12 +39,14 @@ export type RequestLimitsConfigKeys = Pick<
   | "MESSAGE_LIMIT_PER_TENANT_PER_WINDOW"
   | "ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW"
   | "ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW"
-  | "ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW"
-  | "ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW"
+  | "ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW"
+  | "ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW"
+  | "AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW"
+  | "AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW"
   | "TURN_QUOTA_PER_USER_PER_DAY"
   | "TURN_QUOTA_PER_TENANT_PER_DAY"
 >;
@@ -69,10 +73,6 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
           user: config.ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW
         },
-        artifact_create: {
-          user: config.ARTIFACT_CREATE_LIMIT_PER_USER_PER_WINDOW,
-          tenant: config.ARTIFACT_CREATE_LIMIT_PER_TENANT_PER_WINDOW
-        },
         scheduled_job_create: {
           user: config.SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW
@@ -80,6 +80,14 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
         oauth_callback: {
           user: config.OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        admin_query: {
+          user: config.ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        auth_organizations: {
+          user: config.AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW
         }
       }
     },

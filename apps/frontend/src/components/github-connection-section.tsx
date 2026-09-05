@@ -1,6 +1,9 @@
 import type { GithubConnectionStatus } from "@cogniplane/shared-types";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  OAuthConnectionActions,
+  OAuthConnectionSectionHeading
+} from "./oauth-connection-presentation";
 import { formatMediumDateTime } from "../lib/time-format";
 import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
@@ -20,24 +23,13 @@ function getConnectionHeadline(status: GithubConnectionStatus | null): string {
   return "GitHub not connected";
 }
 
-function getConnectButtonLabel(
-  busyKey: string | null,
-  userConnection: GithubConnectionStatus["userConnection"]
-): string {
-  if (busyKey === "connect") return "Redirecting...";
-  return userConnection ? "Reconnect GitHub" : "Connect GitHub";
-}
-
 export function GithubConnectionSection(input: GithubConnectionSectionProps) {
   const { status, error, flashMessage, busyKey, onConnect, onDisconnect } = input;
   const userConnection = status?.userConnection ?? null;
 
   return (
     <section id="github" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Live module</p>
-        <h3 className="text-lg font-semibold text-on-surface">GitHub</h3>
-      </div>
+      <OAuthConnectionSectionHeading provider="GitHub" />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
@@ -60,28 +52,19 @@ export function GithubConnectionSection(input: GithubConnectionSectionProps) {
             </div>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {flashMessage ? <p className={HINT}>{flashMessage}</p> : null}
-            {error ? <p className="text-sm text-danger">{error}</p> : null}
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                disabled={!status?.configured || busyKey !== null}
-                onClick={onConnect}
-              >
-                {getConnectButtonLabel(busyKey, userConnection)}
-              </Button>
-              {userConnection ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={busyKey !== null}
-                  onClick={onDisconnect}
-                >
-                  {busyKey === "disconnect" ? "Disconnecting..." : "Disconnect"}
-                </Button>
-              ) : null}
-            </div>
+            <OAuthConnectionActions
+              busyKey={busyKey === "connect" || busyKey === "disconnect" ? busyKey : null}
+              configured={status?.configured === true}
+              connected={userConnection !== null}
+              connectLabel="Connect GitHub"
+              reconnectLabel="Reconnect GitHub"
+              error={error}
+              flashMessage={flashMessage}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+            >
+              {null}
+            </OAuthConnectionActions>
 
             {!status?.configured ? (
               <p className={HINT}>GitHub OAuth is not configured on this deployment yet.</p>

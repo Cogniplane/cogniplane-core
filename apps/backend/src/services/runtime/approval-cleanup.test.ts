@@ -1,13 +1,36 @@
 import type { FastifyBaseLogger } from "fastify";
 import { test, expect } from "vitest";
 
+import type { ApprovalRecord } from "../auth/approval-store.js";
 import { cancelPendingApprovals, expireApprovalById } from "./approval-cleanup.js";
 
-type FakeApproval = { approvalId: string };
+function makeApproval(approvalId: string): ApprovalRecord {
+  return {
+    approvalId,
+    tenantId: "t",
+    sessionId: "s",
+    userId: "u",
+    runtimeId: "rt",
+    turnId: "turn",
+    itemId: `item-${approvalId}`,
+    requestMethod: "tools/call",
+    requestId: `request-${approvalId}`,
+    kind: "mcp_tool",
+    title: "Approve tool call",
+    summary: "Test approval",
+    status: "pending",
+    decision: null,
+    requestPayload: {},
+    createdAt: "2026-09-04T12:00:00.000Z",
+    updatedAt: "2026-09-04T12:00:00.000Z",
+    resolvedAt: null,
+    expiresAt: "2026-09-04T12:10:00.000Z"
+  };
+}
 
 function makeApprovalsFake(opts: {
-  pending: FakeApproval[];
-  expireResults?: Record<string, FakeApproval | null>;
+  pending: ApprovalRecord[];
+  expireResults?: Record<string, ApprovalRecord | null>;
   listPendingThrows?: Error;
   expireThrows?: Set<string>;
 }) {
@@ -18,13 +41,13 @@ function makeApprovalsFake(opts: {
       if (opts.listPendingThrows) throw opts.listPendingThrows;
       return opts.pending;
     },
-    expire: async (_t: string, approvalId: string): Promise<FakeApproval | null> => {
+    expire: async (_t: string, approvalId: string): Promise<ApprovalRecord | null> => {
       expireCalls.push(approvalId);
       if (opts.expireThrows?.has(approvalId)) throw new Error("expire boom");
       if (opts.expireResults && approvalId in opts.expireResults) {
         return opts.expireResults[approvalId];
       }
-      return { approvalId };
+      return makeApproval(approvalId);
     }
   };
 }
@@ -70,7 +93,7 @@ test("empty pending list issues no expire and no audit", async () => {
 
 test("happy path: onCancelLocal both releases in-memory state and supplies audit payload extras in one pass", async () => {
   const approvals = makeApprovalsFake({
-    pending: [{ approvalId: "a-1" }, { approvalId: "a-2" }]
+    pending: [makeApproval("a-1"), makeApproval("a-2")]
   });
   const audit = makeAuditFake();
   const localCalls: string[] = [];
@@ -103,7 +126,7 @@ test("happy path: onCancelLocal both releases in-memory state and supplies audit
 });
 
 test("onCancelLocal returning undefined is fine — audit payload contains only `reason`", async () => {
-  const approvals = makeApprovalsFake({ pending: [{ approvalId: "a-only" }] });
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-only")] });
   const audit = makeAuditFake();
 
   await cancelPendingApprovals({
@@ -129,7 +152,7 @@ test("onCancelLocal returning undefined is fine — audit payload contains only 
 
 test("decision-raced row (expire returns null) skips audit but still ran onCancelLocal", async () => {
   const approvals = makeApprovalsFake({
-    pending: [{ approvalId: "a-raced" }],
+    pending: [makeApproval("a-raced")],
     expireResults: { "a-raced": null }
   });
   const audit = makeAuditFake();
@@ -153,7 +176,7 @@ test("decision-raced row (expire returns null) skips audit but still ran onCance
 
 test("onCancelLocal throwing on one approval does not abort cleanup of subsequent rows; failed row gets empty payload extras", async () => {
   const approvals = makeApprovalsFake({
-    pending: [{ approvalId: "a-1" }, { approvalId: "a-2" }, { approvalId: "a-3" }]
+    pending: [makeApproval("a-1"), makeApproval("a-2"), makeApproval("a-3")]
   });
   const audit = makeAuditFake();
   const logger = makeLogger();
@@ -181,7 +204,7 @@ test("onCancelLocal throwing on one approval does not abort cleanup of subsequen
 });
 
 test("expireApprovalById: ttl sweep expires the single row, drops in-memory state, and audits with reason ttl_expired", async () => {
-  const approvals = makeApprovalsFake({ pending: [{ approvalId: "a-1" }, { approvalId: "a-2" }] });
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-1"), makeApproval("a-2")] });
   const audit = makeAuditFake();
   const dropped: string[] = [];
 
@@ -216,7 +239,7 @@ test("expireApprovalById: ttl sweep expires the single row, drops in-memory stat
 
 test("expireApprovalById: decision-raced row (expire returns null) skips audit but still released memory", async () => {
   const approvals = makeApprovalsFake({
-    pending: [{ approvalId: "a-1" }],
+    pending: [makeApproval("a-1")],
     expireResults: { "a-1": null }
   });
   const audit = makeAuditFake();
@@ -241,7 +264,7 @@ test("expireApprovalById: decision-raced row (expire returns null) skips audit b
 
 test("expireApprovalById: expire throwing is logged, never rejects", async () => {
   const approvals = makeApprovalsFake({
-    pending: [{ approvalId: "a-1" }],
+    pending: [makeApproval("a-1")],
     expireThrows: new Set(["a-1"])
   });
   const audit = makeAuditFake();

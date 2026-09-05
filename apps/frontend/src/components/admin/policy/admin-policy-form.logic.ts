@@ -155,10 +155,14 @@ export const EFFECT_LABELS: Record<PolicyEffect, string> = {
   block: "Block"
 };
 
+// `command_execution` never matches an action: the gateway derives severity
+// from the tool's read/write flag alone, and the shell built-in is gated by the
+// runtime's own approval interrupt instead. The label says so rather than
+// hiding the option, because older rules and decisions can still carry it.
 export const SEVERITY_LABELS: Record<PolicySeverity, string> = {
   read_only: "Read-only",
   file_change: "File change",
-  command_execution: "Command"
+  command_execution: "Command (legacy — matches nothing)"
 };
 
 export const TURN_CONTEXT_LABELS: Record<PolicyTurnContext, string> = {

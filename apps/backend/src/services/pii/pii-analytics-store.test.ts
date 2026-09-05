@@ -51,7 +51,9 @@ test("getQueueStats targets pii_scan_jobs (not pii_scan_runs) and ignores range 
 
   const aggregateQuery = db.queries.find((q) => q.text.includes("FROM pii_scan_jobs"));
   expect(aggregateQuery).toBeTruthy();
-  expect(aggregateQuery!.values).toEqual([]);
+  // Point-in-time query: no range binds, but the tenant predicate still applies.
+  expect(aggregateQuery!.values).toEqual(["tenant-1"]);
+  expect(aggregateQuery!.text).toMatch(/tenant_id = \$1/);
   // Sanity: didn't accidentally run against the runs table.
   expect(db.queries.some((q) => q.text.includes("FROM pii_scan_runs"))).toBeFalsy();
 });
@@ -66,6 +68,54 @@ test("getRecentActivity threads action filter + limit through positional params"
 
   const aggregateQuery = db.queries.find((q) => q.text.includes("FROM pii_scan_runs"));
   expect(aggregateQuery).toBeTruthy();
-  // [from, to, actionTakenValues (without 'failed'), includeFailed=true, limit]
-  expect(aggregateQuery!.values).toEqual([from, to, ["block"], true, 25]);
+  // [from, to, actionTakenValues (without 'failed'), includeFailed=true, limit, tenantId]
+  expect(aggregateQuery!.values).toEqual([from, to, ["block"], true, 25, "tenant-1"]);
+});
+
+// The isolation guard, applied to every method rather than a chosen few.
+//
+// This store aggregates across whole tables, so a query that loses its tenant
+// filter does not error — it silently returns other tenants' counts. RLS is
+// the primary boundary, but nothing in a unit test exercises RLS, and these
+// asserts are what would catch a new method (or an edited WHERE clause) that
+// ships without the predicate.
+//
+// Both halves are asserted deliberately: a bound `tenantId` proves nothing on
+// its own, because a query can bind a parameter it never references.
+test("every analytics query filters by tenant_id, not only binds it", async () => {
+  const from = new Date("2026-01-01");
+  const to = new Date("2026-02-01");
+  const range = { from, to, bucket: "day" } as never;
+
+  const invocations: Array<[string, (store: PiiAnalyticsStore) => Promise<unknown>]> = [
+    ["getKpis", (s) => s.getKpis("tenant-1", from, to)],
+    ["getTimeSeries", (s) => s.getTimeSeries("tenant-1", range)],
+    ["getByEntityType", (s) => s.getByEntityType("tenant-1", from, to)],
+    ["getByConfidence", (s) => s.getByConfidence("tenant-1", from, to)],
+    ["getBySubjectType", (s) => s.getBySubjectType("tenant-1", from, to)],
+    ["getTopByUser", (s) => s.getTopByUser("tenant-1", from, to, 10)],
+    ["getTopBySession", (s) => s.getTopBySession("tenant-1", from, to, 10)],
+    ["getRecentActivity", (s) => s.getRecentActivity("tenant-1", from, to, ["block"], 25)],
+    ["getQueueStats", (s) => s.getQueueStats("tenant-1")],
+    ["getLatencyPercentiles", (s) => s.getLatencyPercentiles("tenant-1", from, to)],
+    ["getTopErrors", (s) => s.getTopErrors("tenant-1", from, to)]
+  ];
+
+  for (const [name, invoke] of invocations) {
+    const db = new CaptureDatabase();
+    await invoke(new PiiAnalyticsStore(db as unknown as Pool));
+
+    const aggregates = db.queries.filter(
+      (q) => q.text.includes("FROM pii_scan_runs") || q.text.includes("FROM pii_scan_jobs")
+    );
+    expect(aggregates.length, `${name} issued no aggregate query`).toBeGreaterThan(0);
+
+    for (const query of aggregates) {
+      // The predicate must reference a bind, and that bind must be the tenant.
+      const predicate = query.text.match(/tenant_id = \$(\d+)/);
+      expect(predicate, `${name} has no tenant_id predicate`).toBeTruthy();
+      const position = Number(predicate![1]);
+      expect(query.values[position - 1], `${name} binds the wrong value as tenant`).toBe("tenant-1");
+    }
+  }
 });

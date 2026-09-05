@@ -42,7 +42,9 @@ export const ToolResultSchema = z.object({
   durationMs: z.number().nullable(),
   // Character length of the assistant text when this tool call started; lets a
   // session reload interleave the card back into the right spot in the turn's
-  // text. Null/absent on legacy rows — reload then falls back to text-then-tools.
+  // text. Null/absent on legacy rows, so reload falls back to text-then-tools.
+  // Remove the default only after retained tool results have offsets backfilled
+  // or the affected conversations are deleted.
   textOffset: z.number().nullable().default(null),
   // Present only when an MCP tool returns UI resource blocks (MCP Apps).
   uiResources: z.array(UiResourceSchema).optional()
@@ -61,8 +63,10 @@ export const MessageSchema = z.object({
   content: z.string(),
   reasoningContent: z.string(),
   // Reasoning bursts positioned by their character offset into the assistant
-  // text, for interleaved reload of AG-UI turns. Null on legacy/RuntimeEvent
-  // rows — reload then renders the single `reasoningContent` block.
+  // text, for interleaved reload of AG-UI turns. Null on legacy rows, where
+  // reload renders the single `reasoningContent` block. Remove this default only
+  // after retained reasoning is backfilled into segments or its conversations
+  // are deleted.
   reasoningSegments: z.array(ReasoningSegmentSchema).nullable().default(null),
   planContent: z.string(),
   toolResults: z.array(ToolResultSchema),
@@ -72,7 +76,7 @@ export const MessageSchema = z.object({
   feedbackRating: MessageFeedbackRatingSchema.nullable(),
   // Frontend-only field (passthrough): when the user's message was rewritten
   // by the PII detector before the runtime saw it, the SSE stream surfaces a
-  // `runtime.user_message_replaced` event carrying the scan_run_id. The
+  // `user_message_replaced` custom event carrying the scan_run_id. The
   // optimistic user message stamps this id so the activity timeline can show
   // a "this was redacted" banner. The backend does not currently persist or
   // return this value on session reload.
@@ -125,8 +129,15 @@ export const ApprovalDecisionRequestSchema = z.object({
 });
 export type ApprovalDecisionRequest = z.infer<typeof ApprovalDecisionRequestSchema>;
 
+// Shape of `GET /sessions/:id/messages`. `SessionMessagesResponseSchema`
+// (schemas/session.ts) extends this with the session envelope rather than
+// redeclaring the fields — one endpoint, one source of truth for the payload.
 export const MessagesListResponseSchema = z.object({
-  messages: z.array(MessageSchema)
+  messages: z.array(MessageSchema),
+  // True when the transcript was clipped to the newest N messages and older
+  // turns were withheld (see MessageStore.listBySession). Optional so an older
+  // backend, or an in-memory test fake, can omit it.
+  hasMore: z.boolean().optional()
 }).passthrough();
 export type MessagesListResponse = z.infer<typeof MessagesListResponseSchema>;
 

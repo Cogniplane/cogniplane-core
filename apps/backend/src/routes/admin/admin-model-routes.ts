@@ -23,9 +23,9 @@ import type { OpenRouterCatalogFetcher } from "../../services/openrouter-catalog
 import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
 export type ModelAdminRouteStores = {
-  customModels: CustomModelStore;
-  dynamicConfig: DynamicConfigService;
-  auditEvents: AuditEventStore;
+  customModels: Pick<CustomModelStore, "list" | "create" | "delete">;
+  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
+  auditEvents: Pick<AuditEventStore, "create">;
   /** See admin-tenant-settings-routes: tenant/platform/none per provider. */
   providerKeySources: (
     tenantId: string

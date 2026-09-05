@@ -202,23 +202,6 @@ test("PiiScanRunStore.getById returns mapped record", async () => {
   expect(record?.status).toBe("completed");
 });
 
-test("PiiScanRunStore.listForSubject queries by subject tuple", async () => {
-  const db = new CaptureDatabase();
-  db.selectReturn = [sampleRow(), sampleRow({ scan_run_id: "scan-2" })];
-  const store = new PiiScanRunStore(db as unknown as Pool);
-
-  const rows = await store.listForSubject("tenant-1", "message", "msg-1", 10);
-
-  expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery!.text).toMatch(/FROM pii_scan_runs/);
-  // The subject tuple + limit all reach the query as bound values.
-  expect(db.lastQuery!.values).toContain("tenant-1");
-  expect(db.lastQuery!.values).toContain("message");
-  expect(db.lastQuery!.values).toContain("msg-1");
-  expect(db.lastQuery!.values).toContain(10);
-  expect(rows.length).toBe(2);
-});
-
 test("mapRow preserves canonical action_taken values", async () => {
   const db = new CaptureDatabase();
   db.selectReturn = [sampleRow({ action_taken: "report" })];

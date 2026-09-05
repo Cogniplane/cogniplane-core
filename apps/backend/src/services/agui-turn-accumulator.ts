@@ -9,7 +9,7 @@
 // feed each event to `apply`, then read `assistantText`, `reasoningText`,
 // `planMarkdown`, and `toolResults()` at the end to persist.
 //
-// The event shapes mirror what `runtimeEventToAGUI` emits (its inverse):
+// The event shapes mirror what the direct AG-UI producers emit:
 //   TEXT_MESSAGE_CONTENT      → assistant text (delta)
 //   REASONING_MESSAGE_CONTENT → reasoning text (delta)
 //   TOOL_CALL_START           → open a tool call (toolCallId, toolCallName)

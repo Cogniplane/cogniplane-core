@@ -2,9 +2,11 @@ import { test, expect } from "vitest";
 
 import {
   DEFAULT_PII_PROTECTION,
-  parsePiiProtection,
-  piiProtectionSchema
-} from "./pii-policy.js";
+  PiiProtectionSettingsRequestSchema,
+  PiiProtectionSettingsSchema
+} from "@cogniplane/shared-types";
+
+import { parsePiiProtection } from "./pii-policy.js";
 
 test("parsePiiProtection returns defaults for undefined input", () => {
   const result = parsePiiProtection(undefined);
@@ -32,6 +34,14 @@ test("parsePiiProtection returns defaults when rawRetention enum is invalid", ()
   expect(result.rawRetention).toBe("never");
 });
 
+test("parsePiiProtection preserves future persisted fields", () => {
+  const result = parsePiiProtection({
+    ...DEFAULT_PII_PROTECTION,
+    futureOption: true
+  });
+  expect(result).toHaveProperty("futureOption", true);
+});
+
 test("parsePiiProtection accepts a fully valid payload", () => {
   const input = {
     enabled: true,
@@ -49,23 +59,23 @@ test("parsePiiProtection accepts a fully valid payload", () => {
   expect(result).toEqual(input);
 });
 
-test("piiProtectionSchema rejects unknown entityType values", () => {
-  const parsed = piiProtectionSchema.safeParse({
+test("the request schema rejects unknown entityType values", () => {
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
     detectors: { useRulesFirst: true, entityTypes: ["credit_card"] }
   });
   expect(parsed.success).toBe(false);
 });
 
-test("piiProtectionSchema rejects missing required field", () => {
+test("the request schema rejects missing required fields", () => {
   const { enabled: _enabled, ...withoutEnabled } = DEFAULT_PII_PROTECTION;
   void _enabled;
-  const parsed = piiProtectionSchema.safeParse(withoutEnabled);
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse(withoutEnabled);
   expect(parsed.success).toBe(false);
 });
 
-test("piiProtectionSchema accepts empty provider model (=use provider default)", () => {
-  const parsed = piiProtectionSchema.safeParse({
+test("the request schema accepts an empty provider model (=use provider default)", () => {
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
     provider: { type: "openai-compatible", model: "" }
   });
@@ -75,8 +85,8 @@ test("piiProtectionSchema accepts empty provider model (=use provider default)",
   }
 });
 
-test("piiProtectionSchema trims whitespace-only provider model to empty string", () => {
-  const parsed = piiProtectionSchema.safeParse({
+test("the request schema trims whitespace-only provider models to empty string", () => {
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
     provider: { type: "openai-compatible", model: "   " }
   });
@@ -86,8 +96,8 @@ test("piiProtectionSchema trims whitespace-only provider model to empty string",
   }
 });
 
-test("piiProtectionSchema trims provider model whitespace", () => {
-  const parsed = piiProtectionSchema.safeParse({
+test("the request schema trims provider model whitespace", () => {
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse({
     ...DEFAULT_PII_PROTECTION,
     provider: { type: "openai-compatible", model: "  my-model  " }
   });
@@ -95,4 +105,23 @@ test("piiProtectionSchema trims provider model whitespace", () => {
   if (parsed.success) {
     expect(parsed.data.provider.model).toBe("my-model");
   }
+});
+
+test("the shared response schema preserves unknown fields", () => {
+  const parsed = PiiProtectionSettingsSchema.safeParse({
+    ...DEFAULT_PII_PROTECTION,
+    provider: { ...DEFAULT_PII_PROTECTION.provider, model: "  model-x  ", futureOption: true }
+  });
+  expect(parsed.success).toBe(true);
+  if (parsed.success) {
+    expect(parsed.data.provider).toMatchObject({ model: "model-x", futureOption: true });
+  }
+});
+
+test("the shared request schema rejects unknown fields", () => {
+  const parsed = PiiProtectionSettingsRequestSchema.safeParse({
+    ...DEFAULT_PII_PROTECTION,
+    unexpected: true
+  });
+  expect(parsed.success).toBe(false);
 });

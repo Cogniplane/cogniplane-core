@@ -1,20 +1,9 @@
+import { readPiiScanRunId } from "../../../lib/admin-session-pii-utils";
 import type {
   AdminSessionDetailMessage,
   AdminSessionDetailPiiRun
 } from "@cogniplane/shared-types";
 
-/**
- * Pull the canonical scanRunId out of a message's detail_json, if present.
- * Mirrors the shape used by the alerts tab — keeping the helpers symmetric
- * lets both views resolve message↔scan links through the same path.
- */
-export function readPiiScanRunId(detailJson: unknown): string | null {
-  if (!detailJson || typeof detailJson !== "object") return null;
-  const pii = (detailJson as Record<string, unknown>).pii;
-  if (!pii || typeof pii !== "object") return null;
-  const id = (pii as Record<string, unknown>).scanRunId;
-  return typeof id === "string" ? id : null;
-}
 
 export type PiiRunIndex = {
   byScanId: Map<string, AdminSessionDetailPiiRun>;

@@ -83,7 +83,7 @@ export async function readSkillRevisionFile(input: {
   revision: AdminSkillRevisionRecord;
   requestedPath: string;
   limitBytes?: number;
-  skillBundleStorage: SkillBundleStorage;
+  skillBundleStorage: Pick<SkillBundleStorage, "materializeBundle">;
 }): Promise<SkillFilePreview> {
   const limitBytes = input.limitBytes ?? SKILL_FILE_PREVIEW_LIMIT_BYTES;
   const bundleStorageUri = input.revision.bundleStorageUri;

@@ -1,24 +1,71 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Husky pre-push hook — fast local sanity check.
 #
-# Only lint runs here. Typecheck and the backend test suite + coverage
-# live in .github/workflows/ci.yml so we don't block pushes on minute-long
-# checks. ESLint over the workspace is fast enough (~10s) to catch the
-# obviously-broken stuff before it lands on a remote branch.
+# Only a gitleaks scan of the pushed commits and lint run here. Typecheck
+# and the backend test suite + coverage live in .github/workflows/ci.yml so
+# we don't block pushes on minute-long checks. ESLint over the workspace is
+# fast enough (~10s) to catch the obviously-broken stuff before it lands on
+# a remote branch.
 #
 # To skip this hook for a single push: `git push --no-verify`.
 # To disable globally: `git config core.hooksPath /dev/null` (not recommended).
-set -e
+set -eu
 
-if command -v gitleaks &>/dev/null; then
+if command -v gitleaks >/dev/null 2>&1; then
   echo "▶ Pre-push: gitleaks"
-  gitleaks detect --no-banner --redact --config .gitleaks.toml
+
+  # Scan ONLY the commits being pushed, not all of history. A full-history
+  # `gitleaks detect` re-litigates every old commit on every push, so one
+  # historical false positive blocks the repo for everyone until it is
+  # allowlisted — and the scan cost grows with the project. Git feeds this
+  # hook one line per ref on stdin:
+  #
+  #   <local-ref> <local-sha> <remote-ref> <remote-sha>
+  #
+  # A remote-sha of all-zeros means the remote has no such branch yet (new
+  # branch), so there is no range to diff against; fall back to scanning the
+  # branch's full history in that case. A local-sha of all-zeros is a branch
+  # deletion — nothing to scan, skip it.
+  zero="0000000000000000000000000000000000000000"
+  leak_status=0
+
+  while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$zero" ] && continue  # branch deletion
+
+    if [ "$remote_sha" = "$zero" ]; then
+      # New branch: scan its commits that aren't already on another remote ref.
+      log_opts="$local_sha --not --remotes"
+    else
+      log_opts="$remote_sha..$local_sha"
+    fi
+
+    if gitleaks detect --no-banner --redact --config .gitleaks.toml \
+      --log-opts="$log_opts"; then
+      continue
+    else
+      status=$?
+      if [ "$status" -eq 1 ]; then
+        leak_status=1
+      else
+        echo "✖ gitleaks failed with exit status $status; the scan did not complete."
+        exit "$status"
+      fi
+    fi
+  done
+
+  if [ "$leak_status" -ne 0 ]; then
+    echo "✖ gitleaks found a secret in the commits being pushed."
+    echo "  If it is a false positive, allowlist it in .gitleaks.toml."
+    echo "  If it is real, rotate the credential and rewrite it out of history."
+    exit 1
+  fi
 else
   echo "▶ Pre-push: gitleaks not installed — skipping (install with: brew install gitleaks)"
 fi
 
 echo "▶ Pre-push: lint"
-if command -v pnpm &>/dev/null; then
+if command -v pnpm >/dev/null 2>&1; then
   pnpm lint
 else
   npm run lint

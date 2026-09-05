@@ -1,3 +1,4 @@
+import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { describe, expect, it, vi } from "vitest";
 import { Command } from "@langchain/langgraph";
 import { createDeepAgent } from "deepagents";
@@ -11,15 +12,47 @@ const mcpMockState = vi.hoisted(() => ({
   lastConfig: null as null | Record<string, unknown>
 }));
 
+const deepAgentMockState = vi.hoisted(() => ({
+  lastConfig: null as null | Record<string, unknown>
+}));
+
+vi.mock("deepagents", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("deepagents")>();
+  return {
+    ...actual,
+    createDeepAgent: (config: Parameters<typeof actual.createDeepAgent>[0]) => {
+      deepAgentMockState.lastConfig = config ? { ...config } : null;
+      return actual.createDeepAgent(config);
+    }
+  };
+});
+
 vi.mock("@langchain/mcp-adapters", () => ({
   MultiServerMCPClient: class {
     constructor(config?: Record<string, unknown>) {
       mcpMockState.lastConfig = config ?? null;
       if (!mcpMockState.current) throw new Error("mcpMockState.current not set for this test");
-      return mcpMockState.current as never;
+    }
+
+    getTools(serverId: string) {
+      if (!mcpMockState.current) throw new Error("mcpMockState.current not set for this test");
+      return mcpMockState.current.getTools(serverId);
+    }
+
+    close() {
+      if (!mcpMockState.current) throw new Error("mcpMockState.current not set for this test");
+      return mcpMockState.current.close();
     }
   }
 }));
+
+function lastDeepAgentConfig(): Record<string, unknown> | null {
+  return deepAgentMockState.lastConfig;
+}
+
+function lastMcpConfig(): Record<string, unknown> | null {
+  return mcpMockState.lastConfig;
+}
 
 import {
   applyReasoningEffort,
@@ -32,16 +65,7 @@ import {
   resolveModelConstruction
 } from "./deep-agents-graph.js";
 
-const fakeLog = {
-  info: () => {},
-  error: () => {},
-  warn: () => {},
-  debug: () => {},
-  trace: () => {},
-  fatal: () => {},
-  child: () => fakeLog,
-  level: "silent"
-} as unknown as import("fastify").FastifyBaseLogger;
+const fakeLog = createSilentLogger();
 
 function makeRuntime(overrides: Partial<Parameters<typeof createDeepAgentsSessionRuntime>[0]> = {}) {
   return createDeepAgentsSessionRuntime({
@@ -223,19 +247,42 @@ describe("applyReasoningEffort (bead i52g)", () => {
   });
 });
 
-describe("RESERVED_BUILTIN_TOOL_NAMES pin (deepagents@1.10.5)", () => {
+describe("RESERVED_BUILTIN_TOOL_NAMES pin (deepagents@1.13.3)", () => {
   // The library does not export BUILTIN_TOOL_NAMES, so our copy is pinned by
-  // behavior: createDeepAgent must reject every name we reserve. If an SDK
-  // bump changes the built-in set, this fails and the pinned list (and the
-  // MUTATING/READ_ONLY gating splits) must be re-verified against the new
+  // behavior: createDeepAgent must reject every name it treats as built-in. If
+  // an SDK bump changes the built-in set, this fails and the pinned list (and
+  // the MUTATING/READ_ONLY gating splits) must be re-verified against the new
   // version's agent.ts.
-  it("createDeepAgent rejects every reserved name as a tool-name collision", () => {
-    for (const name of RESERVED_BUILTIN_TOOL_NAMES) {
+  //
+  // `write_todos` is reserved by us but NOT by the library since 1.12.0 — it
+  // still ships via langchain's todoListMiddleware and drives the plan pane, so
+  // we keep dropping MCP tools that claim the name even though createDeepAgent
+  // would accept them. Asserted explicitly below so a future SDK change in
+  // either direction is caught.
+  const LIBRARY_RESERVED = [...RESERVED_BUILTIN_TOOL_NAMES].filter(
+    (name) => name !== "write_todos"
+  );
+
+  it("createDeepAgent rejects every library-reserved name as a tool-name collision", () => {
+    for (const name of LIBRARY_RESERVED) {
       expect(
         () => createDeepAgent({ tools: [{ name } as never] }),
         `expected collision for built-in name "${name}"`
       ).toThrow(/conflict with built-in tools/);
     }
+  });
+
+  it("reserves write_todos beyond the library's own collision set", () => {
+    expect(RESERVED_BUILTIN_TOOL_NAMES.has("write_todos")).toBe(true);
+    // Pins the 1.12.x behavior change: no longer a library-level collision.
+    expect(() => createDeepAgent({ tools: [{ name: "write_todos" } as never] })).not.toThrow();
+  });
+
+  it("reserves the recursive delete tool for approval gating", () => {
+    expect(RESERVED_BUILTIN_TOOL_NAMES.has("delete")).toBe(true);
+    expect(() => createDeepAgent({ tools: [{ name: "delete" } as never] })).toThrow(
+      /conflict with built-in tools/
+    );
   });
 
   it("createDeepAgent accepts a non-reserved tool name (collision check still selective)", () => {
@@ -356,7 +403,7 @@ describe("buildResumeInput", () => {
 
 describe("buildInterruptOn (native HITL gating map)", () => {
   const READ_ONLY_BUILTINS = ["ls", "read_file", "glob", "grep"];
-  const MUTATING_BUILTINS = ["execute", "write_file", "edit_file"];
+  const MUTATING_BUILTINS = ["execute", "write_file", "edit_file", "delete"];
 
   it("returns undefined when approvals are off (approvalPolicy 'never' → no gating)", () => {
     // No approvals object at all…
@@ -373,7 +420,7 @@ describe("buildInterruptOn (native HITL gating map)", () => {
 
   it("always gates the mutating built-ins and carries approve/reject decisions on every entry", () => {
     // No MCP tools, read-only bypass ON: the only thing left to gate is the
-    // mutating built-in set — execute/write_file/edit_file are ALWAYS gated
+    // mutating built-in set — execute/write_file/edit_file/delete are ALWAYS gated
     // when approvals are on, regardless of the read-only bypass.
     const map = buildInterruptOn({
       approvals: { gate: true, autoApproveReadOnly: true, readOnlyToolNames: READ_ONLY_BUILTINS },
@@ -424,10 +471,96 @@ describe("buildInterruptOn (native HITL gating map)", () => {
       expect(map![name]).toEqual({ allowedDecisions: ["approve", "reject"] });
     }
   });
+
+  it("turns an enforced Policy Center match into the same MCP interrupt", async () => {
+    const proofByToolCallId = new Map();
+    const evaluate = vi.fn(async () => ({
+      outcome: "require_approval" as const,
+      matchedRuleId: "rule-1",
+      matchedRuleName: "Review writes",
+      gating: true,
+      explanation: "Review this write."
+    }));
+    const map = buildInterruptOn({
+      approvals: { gate: false, autoApproveReadOnly: true, readOnlyToolNames: [] },
+      mcpToolNames: ["github_write_file"],
+      policy: {
+        tenantId: "tenant-1",
+        sessionId: "session-1",
+        policyService: { evaluate },
+        contextRef: {
+          current: {
+            toolContextId: "context-1",
+            turnContext: "interactive",
+            enforcementMode: "enforce"
+          }
+        },
+        toolServers: new Map([["github_write_file", "managed"]]),
+        toolFacts: new Map([["github_write_file", { readOnly: false, category: "github" }]]),
+        proofByToolCallId
+      }
+    });
+    const toolCall = {
+      id: "call-1",
+      name: "github_write_file",
+      args: { path: "README.md", content: "hello" }
+    };
+
+    expect(await map!.github_write_file.when!({ toolCall })).toBe(true);
+    expect(evaluate).toHaveBeenCalledWith("tenant-1", {
+      toolName: "github_write_file",
+      category: "github",
+      severity: "file_change",
+      serverId: "managed",
+      turnContext: "interactive"
+    });
+    expect(proofByToolCallId.get("call-1")?.approvalId).toMatch(/^polapr_/);
+    expect(map!.github_write_file.description!(toolCall)).toBe("Review this write.");
+  });
+
+  it("does not create a Policy Center interrupt on a scheduled turn", async () => {
+    const evaluate = vi.fn();
+    const map = buildInterruptOn({
+      approvals: { gate: false, autoApproveReadOnly: true, readOnlyToolNames: [] },
+      mcpToolNames: ["github_write_file"],
+      policy: {
+        tenantId: "tenant-1",
+        sessionId: "session-1",
+        policyService: { evaluate },
+        contextRef: {
+          current: {
+            toolContextId: "context-1",
+            turnContext: "scheduled",
+            enforcementMode: "enforce"
+          }
+        },
+        toolServers: new Map([["github_write_file", "managed"]]),
+        toolFacts: new Map([["github_write_file", { readOnly: false, category: "github" }]]),
+        proofByToolCallId: new Map()
+      }
+    });
+
+    expect(await map!.github_write_file.when!({
+      toolCall: {
+        id: "call-1",
+        name: "github_write_file",
+        args: { path: "README.md", content: "hello" }
+      }
+    })).toBe(false);
+    expect(evaluate).not.toHaveBeenCalled();
+  });
 });
 
 describe("MCP tool loading", () => {
-  function makeMcpMocks(toolsByServer: Record<string, Array<{ name: string }>>) {
+  function makeMcpMocks(
+    toolsByServer: Record<
+      string,
+      Array<{
+        name: string;
+        metadata?: { annotations?: { readOnlyHint?: boolean } };
+      }>
+    >
+  ) {
     return {
       getTools: vi.fn(async (serverId: string) => {
         const tools = toolsByServer[serverId];
@@ -455,13 +588,28 @@ describe("MCP tool loading", () => {
       notion: [{ name: "search_pages" }, { name: "create_issue" }]
       // "sharepoint" missing → getTools throws for it
     });
-    mcpMockState.current = mocks as never;
+    mcpMockState.current = mocks;
     try {
       const runtime = makeRuntime({
         mcpServers: [
-          { id: "github", url: "http://gw/mcp/github", authorization: "Bearer rt_1" },
-          { id: "notion", url: "http://gw/mcp/notion", authorization: "Bearer rt_1" },
-          { id: "sharepoint", url: "http://gw/mcp/sharepoint", authorization: "Bearer rt_1" }
+          {
+            id: "github",
+            mode: "managed",
+            url: "http://gw/mcp/github",
+            authorization: "Bearer rt_1"
+          },
+          {
+            id: "notion",
+            mode: "managed",
+            url: "http://gw/mcp/notion",
+            authorization: "Bearer rt_1"
+          },
+          {
+            id: "sharepoint",
+            mode: "proxy",
+            url: "http://gw/mcp/sharepoint",
+            authorization: "Bearer rt_1"
+          }
         ]
       });
       await loadVia(runtime);
@@ -478,23 +626,123 @@ describe("MCP tool loading", () => {
     }
   });
 
+  it("uses proxy annotations when a proxy tool name collides with the managed catalog", async () => {
+    const evaluate = vi.fn(async () => ({
+      outcome: "require_approval" as const,
+      matchedRuleId: "rule-1",
+      matchedRuleName: "Review proxy reads",
+      gating: true,
+      explanation: "Review this proxy read."
+    }));
+    const mocks = makeMcpMocks({
+      proxy_docs: [
+        {
+          name: "github_write_file",
+          metadata: { annotations: { readOnlyHint: true } }
+        }
+      ]
+    });
+    mcpMockState.current = mocks;
+    deepAgentMockState.lastConfig = null;
+    try {
+      const runtime = makeRuntime({
+        mcpServers: [
+          {
+            id: "proxy_docs",
+            mode: "proxy",
+            url: "http://gw/mcp/proxy_docs",
+            authorization: "Bearer rt_1"
+          }
+        ],
+        managedToolFacts: {
+          github_write_file: { readOnly: false, category: "github" }
+        },
+        policyService: { evaluate },
+        policyContextRef: {
+          current: {
+            toolContextId: "ctx-1",
+            turnContext: "interactive",
+            enforcementMode: "enforce"
+          }
+        }
+      });
+      await loadVia(runtime);
+
+      const interruptOn = lastDeepAgentConfig()?.interruptOn as
+        | Record<
+            string,
+            {
+              when?: (request: {
+                toolCall: { id?: string; name: string; args: Record<string, unknown> };
+              }) => Promise<boolean>;
+            }
+          >
+        | undefined;
+      await expect(
+        interruptOn?.github_write_file?.when?.({
+          toolCall: { id: "call-1", name: "github_write_file", args: {} }
+        })
+      ).resolves.toBe(true);
+      expect(evaluate).toHaveBeenCalledWith("t1", {
+        toolName: "github_write_file",
+        category: "proxy_docs",
+        severity: "read_only",
+        serverId: "proxy_docs",
+        turnContext: "interactive"
+      });
+    } finally {
+      mcpMockState.current = null;
+      deepAgentMockState.lastConfig = null;
+    }
+  });
+
+  it("omits the tool timeout when none is configured rather than sending undefined", async () => {
+    const mocks = makeMcpMocks({ github: [{ name: "create_issue" }] });
+    mcpMockState.current = mocks;
+    mcpMockState.lastConfig = null;
+    try {
+      const runtime = makeRuntime({
+        mcpServers: [
+          {
+            id: "github",
+            mode: "managed",
+            url: "http://gw/mcp/github",
+            authorization: "Bearer rt_1"
+          }
+        ]
+      });
+      await loadVia(runtime);
+
+      expect("defaultToolTimeout" in (lastMcpConfig() ?? {})).toBe(false);
+    } finally {
+      mcpMockState.current = null;
+    }
+  });
+
   it("injects the backend-held toolContextId via beforeToolCall, overriding any model-supplied id", async () => {
     // Security property: the current turn's toolContextId is the ONLY trusted
     // source. The top-level beforeToolCall hook must inject it into every managed
     // tool call AND override a model-hallucinated id, or the gateway would trust
     // an id the model invented.
     const mocks = makeMcpMocks({ github: [{ name: "create_issue" }] });
-    mcpMockState.current = mocks as never;
+    mcpMockState.current = mocks;
     mcpMockState.lastConfig = null;
-    const toolContextRef = { current: "ctx-trusted" };
+    const toolContextRef: { current: string | null } = { current: "ctx-trusted" };
     try {
       const runtime = makeRuntime({
         toolContextRef,
-        mcpServers: [{ id: "github", url: "http://gw/mcp/github", authorization: "Bearer rt_1" }]
+        mcpServers: [
+          {
+            id: "github",
+            mode: "managed",
+            url: "http://gw/mcp/github",
+            authorization: "Bearer rt_1"
+          }
+        ]
       });
       await loadVia(runtime);
 
-      const beforeToolCall = mcpMockState.lastConfig?.beforeToolCall as
+      const beforeToolCall = lastMcpConfig()?.beforeToolCall as
         | ((request: { args?: unknown }) => { args?: unknown })
         | undefined;
       expect(typeof beforeToolCall).toBe("function");
@@ -505,7 +753,7 @@ describe("MCP tool loading", () => {
       });
 
       // If the backend has no active context, the hook injects nothing (no id).
-      toolContextRef.current = null as unknown as string;
+      toolContextRef.current = null;
       expect(beforeToolCall!({ args: {} })).toEqual({});
     } finally {
       mcpMockState.current = null;

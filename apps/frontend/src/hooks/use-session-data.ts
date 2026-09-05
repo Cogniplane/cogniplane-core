@@ -1,162 +1,146 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { isCancelledError, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect } from "react";
 
-import { listApprovals } from "../lib/session-api";
+import type { Approval, Artifact, Message } from "@cogniplane/shared-types";
+
 import { listArtifacts } from "../lib/artifact-api";
 import { listMessages } from "../lib/message-api";
-import type { Approval, Artifact, Message } from "@cogniplane/shared-types";
 import { queryKeys } from "../lib/query-keys";
+import { listApprovals } from "../lib/session-api";
 
 type SessionData = {
   messages: Message[];
+  hasMoreMessages: boolean;
   artifacts: Artifact[];
   approvals: Approval[];
 };
 
-async function loadSessionData(sessionId: string): Promise<SessionData> {
-  const [messages, artifacts, approvals] = await Promise.all([
-    listMessages(sessionId),
-    listArtifacts(sessionId),
-    listApprovals(sessionId)
+async function loadSessionData(sessionId: string, signal?: AbortSignal): Promise<SessionData> {
+  const [messagePage, artifacts, approvals] = await Promise.all([
+    listMessages(sessionId, signal),
+    listArtifacts(sessionId, signal),
+    listApprovals(sessionId, signal)
   ]);
-  return { messages, artifacts, approvals };
+  return {
+    messages: messagePage.messages,
+    hasMoreMessages: messagePage.hasMore,
+    artifacts,
+    approvals
+  };
 }
+
+const EMPTY_SESSION_DATA: SessionData = {
+  messages: [],
+  hasMoreMessages: false,
+  artifacts: [],
+  approvals: []
+};
 
 export function useSessionData(input: {
   selectedSessionId: string | null;
   onError: (message: string) => void;
-  replacePendingApprovals: (approvals: Approval[]) => void;
 }) {
-  const { selectedSessionId, onError, replacePendingApprovals } = input;
+  const { selectedSessionId, onError } = input;
   const queryClient = useQueryClient();
-
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  // The session whose rows currently populate `messages`. Distinct from the
-  // query's `isSuccess` (which flips a render EARLIER, before the populate effect
-  // runs) and survives a cache-hit switch where `messages` still holds the prior
-  // session. Consumers seed UI (e.g. the CopilotChat transcript) from `messages`,
-  // so readiness must mean "messages belong to the selected session", not merely
-  // "the query resolved" — else the seed is stale or empty.
-  const [readySessionId, setReadySessionId] = useState<string | null>(null);
-  const selectedSessionIdRef = useRef<string | null>(null);
-  const refreshEpochRef = useRef(0);
-
-  useEffect(() => {
-    selectedSessionIdRef.current = selectedSessionId;
-  }, [selectedSessionId]);
 
   const sessionDetailQuery = useQuery({
     queryKey: selectedSessionId
       ? queryKeys.sessions.detail(selectedSessionId)
       : ["sessions", "detail", "__no-session__"],
-    queryFn: () =>
-      selectedSessionId
-        ? loadSessionData(selectedSessionId)
-        : Promise.resolve<SessionData>({ messages: [], artifacts: [], approvals: [] }),
-    enabled: selectedSessionId !== null
+    queryFn: ({ signal }) => {
+      if (!selectedSessionId) return Promise.resolve(EMPTY_SESSION_DATA);
+      return loadSessionData(selectedSessionId, signal);
+    },
+    enabled: selectedSessionId !== null,
+    staleTime: 0
   });
 
-  // Clear immediately when the session changes to avoid flashing stale data from
-  // the previous session. Must run before the populate effect below so that a
-  // cache-hit (synchronous sessionDetailQuery.data) doesn't get wiped after it
-  // has already been written.
-  useEffect(() => {
-    // Clear stale data on session change before the populate effect runs.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setMessages([]);
-    setArtifacts([]);
-    // Invalidate readiness immediately so a cache-hit switch can't seed UI from
-    // the prior session's messages before the populate effect swaps them.
-    setReadySessionId(null);
-  }, [selectedSessionId]);
-
-  // Populate from query data once it is available (sync on cache hit, async on miss).
-  useEffect(() => {
-    if (!selectedSessionId) {
-      replacePendingApprovals([]);
-      return;
-    }
-    const data = sessionDetailQuery.data;
-    if (!data) return;
-    if (selectedSessionIdRef.current !== selectedSessionId) return;
-    setMessages(data.messages);
-    setArtifacts(data.artifacts);
-    setReadySessionId(selectedSessionId);
-    replacePendingApprovals(data.approvals);
-  }, [selectedSessionId, sessionDetailQuery.data, replacePendingApprovals]);
+  const sessionData = selectedSessionId ? sessionDetailQuery.data : undefined;
+  const messages = sessionData?.messages ?? EMPTY_SESSION_DATA.messages;
+  const hasMoreMessages = sessionData?.hasMoreMessages ?? false;
+  const artifacts = sessionData?.artifacts ?? EMPTY_SESSION_DATA.artifacts;
+  // Wait for this visit's refetch before seeding the chat with cached history.
+  // If it fails, keep the cached transcript available instead of leaving chat blank.
+  const isSessionDataReady =
+    selectedSessionId !== null &&
+    sessionData !== undefined &&
+    sessionDetailQuery.isFetchedAfterMount;
 
   useEffect(() => {
-    if (sessionDetailQuery.error) {
-      onError(
-        sessionDetailQuery.error instanceof Error
-          ? sessionDetailQuery.error.message
-          : String(sessionDetailQuery.error)
-      );
-    }
+    if (!sessionDetailQuery.error || isCancelledError(sessionDetailQuery.error)) return;
+    onError(
+      sessionDetailQuery.error instanceof Error
+        ? sessionDetailQuery.error.message
+        : String(sessionDetailQuery.error)
+    );
   }, [sessionDetailQuery.error, onError]);
 
   const hasInFlightArtifact = artifacts.some(
     (artifact) => artifact.status === "pending" || artifact.status === "processing"
   );
 
-  // Poll artifacts only while something is pending/processing. TanStack Query
-  // pauses refetchInterval automatically when the tab is backgrounded.
   const artifactsPollQuery = useQuery({
     queryKey: selectedSessionId
       ? queryKeys.sessions.artifacts(selectedSessionId)
       : ["sessions", "artifacts", "__no-session__"],
-    queryFn: () => (selectedSessionId ? listArtifacts(selectedSessionId) : Promise.resolve([])),
+    queryFn: async ({ signal }) => {
+      if (!selectedSessionId) return undefined;
+      // Reject a poll if a newer detail result lands before it returns.
+      // Use the update counter: separate writes can share a millisecond timestamp.
+      const detailDataUpdateCount =
+        queryClient.getQueryState(queryKeys.sessions.detail(selectedSessionId))
+          ?.dataUpdateCount ?? 0;
+      return {
+        artifacts: await listArtifacts(selectedSessionId, signal),
+        detailDataUpdateCount
+      };
+    },
     enabled: selectedSessionId !== null && hasInFlightArtifact,
     refetchInterval: hasInFlightArtifact ? 2_000 : false
   });
 
   useEffect(() => {
-    if (!selectedSessionId) return;
-    if (!artifactsPollQuery.data) return;
-    if (selectedSessionIdRef.current !== selectedSessionId) return;
-    setArtifacts(artifactsPollQuery.data);
-  }, [artifactsPollQuery.data, selectedSessionId]);
-
-  // Called when a send appends optimistic bubbles: any refresh already in
-  // flight predates them and must discard its snapshot instead of landing.
-  const invalidateInFlightSessionRefreshes = useCallback(() => {
-    refreshEpochRef.current += 1;
-  }, []);
+    if (!selectedSessionId || !isSessionDataReady || !artifactsPollQuery.data) return;
+    const detailState = queryClient.getQueryState(
+      queryKeys.sessions.detail(selectedSessionId)
+    );
+    if (artifactsPollQuery.data.detailDataUpdateCount !== detailState?.dataUpdateCount) {
+      return;
+    }
+    queryClient.setQueryData<SessionData>(
+      queryKeys.sessions.detail(selectedSessionId),
+      (current) =>
+        current
+          ? { ...current, artifacts: artifactsPollQuery.data?.artifacts ?? current.artifacts }
+          : current
+    );
+  }, [artifactsPollQuery.data, isSessionDataReady, queryClient, selectedSessionId]);
 
   const refreshSessionData = useCallback(
     async (sessionId: string) => {
-      // Overlapping refreshes resolve last-call-wins via the epoch.
-      const epoch = ++refreshEpochRef.current;
-      const nextData = await loadSessionData(sessionId);
-      // When superseded, skip the cache write too — setQueryData feeds the
-      // populate effect, which would re-apply the stale messages anyway.
-      if (refreshEpochRef.current !== epoch) return;
-      // Keep the cache in sync so navigating away and back within the stale
-      // window serves fresh data instead of the pre-turn snapshot.
-      queryClient.setQueryData(queryKeys.sessions.detail(sessionId), nextData);
-      if (selectedSessionIdRef.current !== sessionId) return;
-      setMessages(nextData.messages);
-      setArtifacts(nextData.artifacts);
-      setReadySessionId(sessionId);
-      replacePendingApprovals(nextData.approvals);
+      const queryKey = queryKeys.sessions.detail(sessionId);
+      void queryClient.cancelQueries({ queryKey, exact: true });
+      try {
+        await queryClient.fetchQuery({
+          queryKey,
+          queryFn: ({ signal }) => loadSessionData(sessionId, signal),
+          staleTime: 0
+        });
+      } catch (error) {
+        if (!isCancelledError(error)) throw error;
+      }
     },
-    [queryClient, replacePendingApprovals]
+    [queryClient]
   );
 
   return {
     messages,
-    setMessages,
+    hasMoreMessages,
     artifacts,
-    setArtifacts,
+    initialApprovals: sessionData?.approvals ?? EMPTY_SESSION_DATA.approvals,
     refreshSessionData,
-    invalidateInFlightSessionRefreshes,
-    // Ready only once `messages` state actually holds the selected session's rows
-    // (set together with readySessionId in the populate effect / refresh), so a
-    // consumer seeding from `messages` in the same render sees this session's data
-    // — not the prior session's (cache-hit switch) or an empty pre-populate array.
-    isSessionDataReady: selectedSessionId !== null && readySessionId === selectedSessionId
+    isSessionDataReady
   };
 }

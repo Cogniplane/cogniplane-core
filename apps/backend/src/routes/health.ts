@@ -8,7 +8,9 @@ export function buildHealthRouteStores(deps: AppDependencies) {
   };
 }
 
-export type HealthRouteStores = ReturnType<typeof buildHealthRouteStores>;
+export type HealthRouteStores = {
+  deepAgentsAdapter: Pick<AppDependencies["deepAgentsAdapter"], "getHealthSnapshot">;
+};
 
 export async function registerHealthRoutes(
   app: FastifyInstance,

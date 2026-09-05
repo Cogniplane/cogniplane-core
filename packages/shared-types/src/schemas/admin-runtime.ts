@@ -53,10 +53,6 @@ export type RuntimeRolloutResponse = z.infer<typeof RuntimeRolloutResponseSchema
 
 export const AdminRuntimeConfigSchema = z.object({
   e2bTemplateId: z.string(),
-  // Retained for backward compatibility; prefer `platformProviders`, which
-  // reports the full per-provider platform-key map (an OpenAI/Google/Z.AI-only
-  // deployment reads "missing" on the Anthropic flag alone while working fine).
-  anthropicKeyConfigured: z.boolean(),
   /** Providers with a platform-level env key configured (tenant-independent). */
   platformProviders: z.array(z.enum(MODEL_PROVIDERS))
 }).passthrough();

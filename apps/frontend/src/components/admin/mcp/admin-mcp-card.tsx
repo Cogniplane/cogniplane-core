@@ -27,7 +27,6 @@ type McpDraft = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string;
-  headersAllowlist: string;
   enabled: boolean;
 };
 
@@ -38,20 +37,8 @@ const emptyMcpDraft: McpDraft = {
   mode: "managed",
   routePath: "/mcp/",
   upstreamUrl: "",
-  headersAllowlist: "",
   enabled: true
 };
-
-function toCsv(values: string[]): string {
-  return values.join(", ");
-}
-
-function parseCsv(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
 
 export function AdminMcpCard(props: {
   mcpServers: AdminMcpServer[];
@@ -64,7 +51,6 @@ export function AdminMcpCard(props: {
       mode: "managed" | "proxy";
       routePath: string;
       upstreamUrl: string | null;
-      headersAllowlist: string[];
       enabled: boolean;
     },
     editingId: string | null
@@ -92,7 +78,6 @@ export function AdminMcpCard(props: {
       mode: server.mode,
       routePath: server.routePath,
       upstreamUrl: server.upstreamUrl ?? "",
-      headersAllowlist: toCsv(server.headersAllowlist),
       enabled: server.enabled
     });
     setShowForm(true);
@@ -109,7 +94,6 @@ export function AdminMcpCard(props: {
           mode: mcpDraft.mode,
           routePath: mcpDraft.routePath,
           upstreamUrl: mcpDraft.upstreamUrl || null,
-          headersAllowlist: parseCsv(mcpDraft.headersAllowlist),
           enabled: mcpDraft.enabled
         },
         editingMcpServerId
@@ -232,18 +216,6 @@ export function AdminMcpCard(props: {
               </div>
             </div>
 
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="mcp-headers">Header allowlist</Label>
-              <Input
-                id="mcp-headers"
-                value={mcpDraft.headersAllowlist}
-                onChange={(e) =>
-                  setMcpDraft((c) => ({ ...c, headersAllowlist: e.target.value }))
-                }
-                placeholder="X-Header-One, X-Header-Two"
-              />
-            </div>
-
             <div className="flex flex-wrap items-center justify-between gap-3">
               <label className="inline-flex items-center gap-2 text-sm text-on-surface">
                 <input
@@ -308,11 +280,6 @@ export function AdminMcpCard(props: {
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <span className={CHIP}>transport {server.transportKind}</span>
                   {server.upstreamUrl ? <span className={CHIP}>proxy upstream</span> : null}
-                  {server.headersAllowlist.length ? (
-                    <span className={CHIP}>
-                      {server.headersAllowlist.length} forwarded headers
-                    </span>
-                  ) : null}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2 sm:flex-col sm:items-stretch">

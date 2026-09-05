@@ -6,18 +6,28 @@ import { uuidv7 } from "../lib/uuid.js";
 
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
+import { EventType, type BaseEvent } from "@ag-ui/client";
+import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 
 import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
 import {
   createTestApp,
   createTestToolContext,
-  parseSseEvents
+  TEST_RUNTIME_TOKEN_SECRET
 } from "../test-helpers/routes-test-support.js";
 import { registerArtifactRoutes } from "../routes/artifacts.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { generateRuntimeToken } from "../services/auth/runtime-token.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
+
+function parseAguiEvents(payload: string): BaseEvent[] {
+  return payload
+    .split("\n\n")
+    .map((chunk) => chunk.split("\n").find((line) => line.startsWith("data: ")))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice("data: ".length)) as BaseEvent);
+}
 
 // The MCP gateway is runtime-token-only: every /mcp request must carry a valid
 // rt_* token, and caller-supplied toolContextIds are bound to its sid/uid.
@@ -27,7 +37,7 @@ function mcpAuthHeaders(claims: { sid?: string; uid?: string } = {}): { authoriz
   return {
     authorization: `Bearer ${generateRuntimeToken(
       { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: `runtime-${sid}` },
-      "test-runtime-token-secret"
+      TEST_RUNTIME_TOKEN_SECRET
     )}`
   };
 }
@@ -137,22 +147,21 @@ describe("session lifecycle: create, stream, replay", () => {
     expect(messageResponse.headers.get("access-control-allow-origin")).toBe("http://localhost:3000");
 
     const streamedBody = await messageResponse.text();
-    const streamedEvents = parseSseEvents(streamedBody);
+    const streamedEvents = parseAguiEvents(streamedBody);
 
-    expect(streamedEvents.map((event) => event.event)).toEqual([
-              "response.created",
-              "response.tool.started",
-              "response.tool.output.delta",
-              "response.tool.completed",
-              "response.output_text.delta",
-              "response.output_text.delta",
-              "response.output_item.done",
-              "response.completed"
-            ]);
-    expect(streamedEvents[1].data.item_id).toBe("cmd-1");
-    expect(streamedEvents[2].data.delta).toBe("/tmp/cogniplane-tests\n");
-    expect(streamedEvents[4].data.delta).toBe("Hello");
-    expect(streamedEvents[5].data.delta).toBe(" world");
+    expect(streamedEvents[0]?.type).toBe(EventType.RUN_STARTED);
+    expect(streamedEvents.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+    expect(
+      streamedEvents.find((event) => event.type === EventType.TOOL_CALL_START)
+    ).toMatchObject({ toolCallId: "cmd-1" });
+    expect(
+      streamedEvents.find((event) => event.type === EventType.TOOL_CALL_RESULT)
+    ).toMatchObject({ toolCallId: "cmd-1", content: "/tmp/cogniplane-tests\n" });
+    expect(
+      streamedEvents
+        .filter((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)
+        .map((event) => event.delta)
+    ).toEqual(["Hello", " world"]);
   });
 
   test("replays persisted history via GET /sessions/:id/messages", async () => {
@@ -311,8 +320,8 @@ test("preserves an explicit empty artifact scope on a message turn", async () =>
   expect(runtimeManager.runMessageInputs.at(-1)?.prompt ?? "").not.toMatch(/Artifact context:/);
 });
 
-test("attaches rendered PDF images and extracted text to the runtime turn for summaries", async () => {
-  const { app, sessions, artifacts, runtimeManager, toolContexts, artifactProcessor } = await createTestApp();
+test("attaches extracted PDF text to the runtime turn for summaries", async () => {
+  const { app, sessions, artifacts, runtimeManager, toolContexts } = await createTestApp();
   onTestFinished(async () => {
         await app.close();
       });
@@ -353,7 +362,7 @@ test("attaches rendered PDF images and extracted text to the runtime turn for su
   });
 
   expect(response.statusCode).toBe(200);
-  expect(response.body).toMatch(/Sources: Document 2\.pdf/);
+  expect(response.body).toMatch(/Summary body\./);
   const pdfContext = toolContexts.createdContexts.at(-1)?.metadata as {
     selectedArtifactIds: string[];
     runtimePolicy: { id: string };
@@ -363,15 +372,10 @@ test("attaches rendered PDF images and extracted text to the runtime turn for su
       ]);
   expect(pdfContext.runtimePolicy.id).toBe("tenant-settings:test-tenant");
   const userInputs = runtimeManager.runMessageInputs.at(-1)?.userInputs ?? [];
+  expect(userInputs).toHaveLength(1);
   expect(userInputs[0]?.type).toBe("text");
   expect(userInputs[0]?.type === "text" ? userInputs[0].text : "").toMatch(/Document 2\.pdf/);
   expect(userInputs[0]?.type === "text" ? userInputs[0].text : "").toMatch(/Extracted PDF text for testing\./);
-  expect(userInputs[0]?.type === "text" ? userInputs[0].text : "").toMatch(/Attached 2 rendered PDF page image\(s\) from: Document 2\.pdf/);
-  expect(userInputs.slice(1)).toEqual([
-          { type: "localImage", path: "/tmp/document-2-page-1.png" },
-          { type: "localImage", path: "/tmp/document-2-page-2.png" }
-        ]);
-  expect(artifactProcessor.cleanedImageSets).toBe(1);
 });
 
 test("deleting a session aborts its runtime", async () => {
@@ -669,6 +673,7 @@ test("lists pending approvals and resolves a decision", async () => {
 
   approvals.approvals.push({
     approvalId: "approval-1",
+    tenantId: "test-tenant",
     sessionId,
     userId: "test-user",
     runtimeId: "runtime-1",
@@ -684,7 +689,8 @@ test("lists pending approvals and resolves a decision", async () => {
     requestPayload: {},
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    resolvedAt: null
+    resolvedAt: null,
+    expiresAt: new Date(Date.now() + 60_000).toISOString()
   });
 
   const listResponse = await app.inject({
@@ -758,32 +764,44 @@ test("serves the managed MCP tool and resolves context from toolContextId", asyn
   expect(payload.result.structuredContent.session.sessionId).toBe(session.sessionId);
 });
 
-test("managed MCP tools/list omits outputSchema", async () => {
-  // The Claude Agent SDK's bundled MCP client rejects tools whose
-  // `outputSchema` uses a top-level `{ oneOf: [...] }` discriminator and
-  // silently drops every tool from the response. We advertise only
-  // `inputSchema` so the model actually sees the managed tools.
+test("managed MCP tools/list advertises output schemas accepted by the current client", async () => {
   const { app } = await createTestApp();
-  onTestFinished(async () => {
-        await app.close();
-      });
-
-  const response = await app.inject({
-    method: "POST",
-    url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders(),
-    payload: {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/list"
+  const baseUrl = await app.listen({ host: "127.0.0.1", port: 0 });
+  const client = new MultiServerMCPClient({
+    mcpServers: {
+      managed: {
+        transport: "http",
+        url: `${baseUrl}/mcp/managed-session-context`,
+        headers: mcpAuthHeaders()
+      }
     }
   });
 
-  expect(response.statusCode).toBe(200);
-  const tool = response.json().result.tools.find((entry: { name: string }) => entry.name === "session_context");
-  expect(tool).toBeTruthy();
-  expect(tool.inputSchema).toBeTruthy();
-  expect(tool.outputSchema).toBe(undefined);
+  try {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mcp/managed-session-context",
+      headers: mcpAuthHeaders(),
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    const advertisedTool = response
+      .json()
+      .result.tools.find((entry: { name: string }) => entry.name === "write_artifact");
+    expect(advertisedTool.outputSchema.type).toBe("object");
+    expect(advertisedTool.outputSchema.oneOf).toHaveLength(2);
+
+    const loadedTools = await client.getTools("managed");
+    expect(loadedTools.map((tool) => tool.name)).toContain("write_artifact");
+  } finally {
+    await client.close();
+    await app.close();
+  }
 });
 
 test("managed MCP tools/list only exposes tools enabled by the active runtime policy", async () => {
@@ -806,7 +824,7 @@ test("managed MCP tools/list only exposes tools enabled by the active runtime po
 
   const runtimeToken = generateRuntimeToken(
     { sid: sessionId, tid: "test-tenant", uid: "test-user", rid: "runtime-session-filtered-tools" },
-    "test-runtime-token-secret"
+    TEST_RUNTIME_TOKEN_SECRET
   );
 
   const response = await app.inject({
@@ -916,7 +934,6 @@ test("denies managed MCP tools that are not enabled by the runtime policy", asyn
         id: "baseline-chat",
         label: "Baseline chat",
         allowCommandExecution: false,
-        allowUserTokenForwarding: false,
         autoApproveReadOnlyTools: false,
         enabledToolIds: ["write_artifact"],
         enabledMcpServers: ["managed-session-context"]
@@ -967,7 +984,6 @@ test("allows write_artifact through the baseline runtime policy", async () => {
         id: "baseline-chat",
         label: "Baseline chat",
         allowCommandExecution: false,
-        allowUserTokenForwarding: false,
         autoApproveReadOnlyTools: false,
         enabledToolIds: ["write_artifact"],
         enabledMcpServers: ["managed-session-context"]
@@ -1002,6 +1018,9 @@ test("allows write_artifact through the baseline runtime policy", async () => {
   const artifactId = String(payload.result.structuredContent.artifactId);
   const artifact = await artifacts.getOwned("test-tenant", artifactId, "test-user");
   expect(artifact).toBeTruthy();
+  if (!artifact) {
+    throw new Error("Expected write_artifact to persist an artifact");
+  }
   expect(artifact.artifactName).toBe("baseline.txt");
 });
 
@@ -1162,15 +1181,30 @@ test("forwards proxy MCP calls with validated context headers", async () => {
   expect(upstreamRequests[0].headers["x-framework-session-id"]).toBe("session-1");
   expect(upstreamRequests[0].headers["x-framework-runtime-id"]).toBe("runtime-session-1");
 
-  // Signature must be present and verifiable using the framework's secret.
+  // Signature must verify under the DERIVED upstream-signature key — the value
+  // a verifying partner legitimately holds — and must NOT verify under the raw
+  // DATA_ENCRYPTION_SECRET. That second assertion is the point: the root secret
+  // also decrypts every stored OAuth token and provider key and mints rt_*
+  // gateway tokens for any tenant, so it must never be the value we ask an
+  // upstream to hold.
   const { verifyProxyHeaders } = await import("../lib/mcp-proxy-signature.js");
   const { createTestConfig } = await import("../test-helpers/test-config.js");
+  const { proxySignatureSecret } = await import("../lib/derived-secrets.js");
+  const rootSecret = createTestConfig().DATA_ENCRYPTION_SECRET;
+
   const verified = verifyProxyHeaders(
     upstreamRequests[0].headers,
-    createTestConfig().DATA_ENCRYPTION_SECRET,
+    proxySignatureSecret(rootSecret),
     { maxAgeMs: 60_000 }
   );
   expect(verified.ok).toBe(true);
+
+  const verifiedUnderRoot = verifyProxyHeaders(
+    upstreamRequests[0].headers,
+    rootSecret,
+    { maxAgeMs: 60_000 }
+  );
+  expect(verifiedUnderRoot.ok).toBe(false);
 });
 
 test("rejects invalid message payloads with a 400 response", async () => {
@@ -1391,7 +1425,7 @@ test("enforces daily per-user turn quotas before runtime execution starts", asyn
   });
   expect(first.statusCode).toBe(200);
 
-  const messageCountBefore = (await messages.listBySession("tenant-a", session.sessionId, "quota-user")).length;
+  const messageCountBefore = (await messages.listBySession("tenant-a", session.sessionId, "quota-user")).messages.length;
   const second = await app.inject({
     method: "POST",
     url: "/messages",
@@ -1409,7 +1443,7 @@ test("enforces daily per-user turn quotas before runtime execution starts", asyn
   expect(second.json().error).toBe("limit_exceeded");
   expect(second.json().limitType).toBe("usage_quota");
   expect(second.json().scope).toBe("user");
-  const messageCountAfter = (await messages.listBySession("tenant-a", session.sessionId, "quota-user")).length;
+  const messageCountAfter = (await messages.listBySession("tenant-a", session.sessionId, "quota-user")).messages.length;
   expect(messageCountAfter).toBe(messageCountBefore);
   expect(runtimeManager.runMessageInputs.length).toBe(1);
 });
@@ -1434,6 +1468,9 @@ test("GET /models returns the hardcoded model list", async () => {
   expect(body.showEffortSelector).toBe(false);
   const defaultModel = body.models.find((m) => m.isDefault);
   expect(defaultModel).toBeTruthy();
+  if (!defaultModel) {
+    throw new Error("Expected the model catalog to include a default model");
+  }
   expect(defaultModel.id).toBe("deepagents/claude-sonnet-5");
   // Reasoning-capable models now advertise effort levels (bead i52g); the
   // Anthropic default supports the none/low/medium/high scale.
@@ -1676,17 +1713,22 @@ test("GET /artifacts/:id/preview-text returns 422 pdf_extraction_failed when pro
     sessions: { async getOwned() { return null; } },
     messages: { async getOwned() { return null; } },
     artifacts: {
+      async listForUser() { return { items: [], nextCursor: null }; },
       async getOwned(_tenantId: string, id: string, userId: string) {
         return id === artifactId && userId === "platform-user" ? artifactRecord : null;
       },
       async create() { return artifactRecord; },
       async listBySession() { return []; },
-      async createDownloadToken() { return null as never; },
+      async createDownloadToken() { throw new Error("Unexpected createDownloadToken call"); },
+      async peekDownloadToken() { return null; },
       async consumeDownloadToken() { return null; }
     },
     auditEvents: new InMemoryAuditEventStore(),
     storage: new LocalArtifactStorage(artifactStorageRoot),
-    processor: nullProcessor
+    processor: nullProcessor,
+    limits: {
+      async consumeRateLimit() { return null; }
+    }
   };
   const app = Fastify();
   await app.register(multipart);

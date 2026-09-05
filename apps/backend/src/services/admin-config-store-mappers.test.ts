@@ -303,13 +303,6 @@ describe("mapMcpServer", () => {
     );
   });
 
-  test("filters non-string entries from headers allowlist", () => {
-    const s = mapMcpServer(
-      makeRow({ headers_allowlist: ["x-custom", 42, "x-other"] })
-    );
-    expect(s.headersAllowlist).toEqual(["x-custom", "x-other"]);
-  });
-
   test("description null when source is null/empty", () => {
     expect(mapMcpServer(makeRow({ description: null })).description).toBeNull();
     expect(mapMcpServer(makeRow({ description: "" })).description).toBeNull();

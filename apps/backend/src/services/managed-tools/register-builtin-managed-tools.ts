@@ -15,13 +15,15 @@ type RawCatalogEntry = {
 
 function asCatalogEntries(
   entries: ReadonlyArray<RawCatalogEntry>,
-  tenantConfigurable: boolean
+  tenantConfigurable: boolean,
+  category: string
 ): ManagedToolCatalogEntry[] {
   return entries.map((entry) => ({
     name: entry.name,
     description: entry.description,
     readOnly: entry.readOnly,
-    tenantConfigurable
+    tenantConfigurable,
+    category
   }));
 }
 
@@ -37,15 +39,15 @@ export function registerBuiltinManagedTools(
 ): void {
   // tenantConfigurable=true: managed tools governed by the tenant Agent
   // settings picker (session_context, list_artifacts, write_artifact, ...).
-  catalog.register(asCatalogEntries(SESSION_TOOL_CATALOG, true));
-  catalog.register(asCatalogEntries(SKILL_CORPUS_TOOL_CATALOG, true));
-  catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true));
-  catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true));
+  catalog.register(asCatalogEntries(SESSION_TOOL_CATALOG, true, "session"));
+  catalog.register(asCatalogEntries(SKILL_CORPUS_TOOL_CATALOG, true, "skill-corpus"));
+  catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true, "write-artifact"));
+  catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true, "memory"));
 
   // tenantConfigurable=false: integration-owned tools, gated by the
   // integrations system (tenant_integrations toggles + readiness).
-  catalog.register(asCatalogEntries(GITHUB_TOOL_CATALOG, false));
-  catalog.register(asCatalogEntries(NOTION_TOOL_CATALOG, false));
+  catalog.register(asCatalogEntries(GITHUB_TOOL_CATALOG, false, "github"));
+  catalog.register(asCatalogEntries(NOTION_TOOL_CATALOG, false, "notion"));
 
   factoryRegistry.register("session", createSessionTools);
   factoryRegistry.register("skill-corpus", createSkillCorpusTool);

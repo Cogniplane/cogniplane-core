@@ -1,3 +1,4 @@
+import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -7,16 +8,7 @@ import {
 } from "./deep-agents-e2b-backend.js";
 import type { loadE2bSandboxClass } from "../runtime/e2b-sandbox.js";
 
-const fakeLog = {
-  info: () => {},
-  error: () => {},
-  warn: () => {},
-  debug: () => {},
-  trace: () => {},
-  fatal: () => {},
-  child: () => fakeLog,
-  level: "silent"
-} as unknown as import("fastify").FastifyBaseLogger;
+const fakeLog = createSilentLogger();
 
 type RunCall = { command: string; options?: Record<string, unknown> };
 
@@ -26,8 +18,12 @@ function makeFakeSandbox(overrides: {
   const runCalls: RunCall[] = [];
   const files = new Map<string, Uint8Array>();
   const killed = vi.fn(async () => {});
+  const setTimeoutCalls: number[] = [];
   const sandbox = {
     sandboxId: "sbx-123",
+    setTimeout: vi.fn(async (timeoutMs: number) => {
+      setTimeoutCalls.push(timeoutMs);
+    }),
     files: {
       write: async (entries: Array<{ path: string; data: string | ArrayBuffer }>) => {
         for (const entry of entries) {
@@ -61,7 +57,7 @@ function makeFakeSandbox(overrides: {
     },
     kill: killed
   };
-  return { sandbox, runCalls, files, killed };
+  return { sandbox, runCalls, files, killed, setTimeoutCalls };
 }
 
 function makeBackend(input: {
@@ -91,7 +87,7 @@ function makeBackend(input: {
 describe("E2bDeepAgentsSandbox", () => {
   it("creates the sandbox lazily and only once", async () => {
     const fake = makeFakeSandbox();
-    const create = vi.fn(async () => fake.sandbox);
+    const create = vi.fn(async (_templateId: string) => fake.sandbox);
     const { backend } = makeBackend({ fake, createSpy: create });
 
     expect(backend.isCreated).toBe(false);
@@ -577,6 +573,189 @@ describe("E2bDeepAgentsSandbox", () => {
 
     await backend.writeFileBytes("/data2.csv", view);
     expect(await backend.readFileBytes("/data2.csv")).toEqual(csv);
+  });
+
+  it("extendTimeout() pushes the lifetime cap back to the full window", async () => {
+    // R12: the E2B cap runs from FIRST tool use and is never renewed, so an
+    // active session crosses it mid-turn and loses its whole workspace. Called
+    // at each turn start, this converts the cap from an absolute deadline into
+    // an idle timeout.
+    const fake = makeFakeSandbox();
+    const { backend } = makeBackend({ fake, options: { sandboxTimeoutMs: 30 * 60_000 } });
+
+    await backend.execute("echo hi");
+    await backend.extendTimeout();
+
+    expect(fake.setTimeoutCalls).toEqual([30 * 60_000]);
+  });
+
+  it("extendTimeout() does NOT create a sandbox for a session that never used one", async () => {
+    // Laziness is load-bearing: chat-only sessions must pay zero sandbox cost,
+    // and extending at every turn start would otherwise create one on turn 1.
+    const fake = makeFakeSandbox();
+    const { backend, create } = makeBackend({ fake });
+
+    await backend.extendTimeout();
+
+    expect(create).not.toHaveBeenCalled();
+    expect(backend.isCreated).toBe(false);
+    expect(fake.setTimeoutCalls).toEqual([]);
+  });
+
+  it("extendTimeout() swallows a failed extension instead of failing the turn", async () => {
+    // A sandbox that already expired throws here. The turn must proceed —
+    // withSandbox recreates on the next op — rather than dying at turn start.
+    const fake = makeFakeSandbox();
+    fake.sandbox.setTimeout = vi.fn(async () => {
+      throw Object.assign(new Error("sandbox sbx-123 was not found"), {
+        name: "SandboxNotFoundError"
+      });
+    });
+    const { backend } = makeBackend({ fake });
+
+    await backend.execute("echo hi");
+
+    await expect(backend.extendTimeout()).resolves.toBeUndefined();
+  });
+
+  it("notifies when a gone sandbox is transparently replaced", async () => {
+    // The replacement silently discards every agent-written file and every
+    // synced artifact; without this the model only meets file_not_found on its
+    // own work. The notice must carry the sandbox that was lost.
+    const gone = Object.assign(new Error("sandbox sbx-123 was not found"), {
+      name: "SandboxNotFoundError"
+    });
+    let firstRead = true;
+    const deadSandbox = makeFakeSandbox();
+    deadSandbox.sandbox.files.read = vi.fn(async () => {
+      if (firstRead) {
+        firstRead = false;
+        throw gone;
+      }
+      return new Uint8Array([1]);
+    });
+    const freshSandbox = makeFakeSandbox();
+    freshSandbox.sandbox.sandboxId = "sbx-456";
+    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([1]));
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(deadSandbox.sandbox)
+      .mockResolvedValue(freshSandbox.sandbox);
+    const onSandboxRecreated = vi.fn();
+    const { backend } = makeBackend({
+      fake: deadSandbox,
+      createSpy: create,
+      options: { onSandboxRecreated }
+    });
+
+    await backend.downloadFiles(["/data.bin"]);
+
+    expect(onSandboxRecreated).toHaveBeenCalledTimes(1);
+    expect(onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "sbx-123" });
+  });
+
+  it("notifies on a sandbox replacement even when the command is NOT replayed", async () => {
+    // execute() declines to replay (it can't tell "never ran" from "ran but the
+    // stream dropped), but the workspace is just as gone — the notice must not
+    // be tied to the retry branch.
+    const gone = Object.assign(new Error("sandbox sbx-123 was not found"), {
+      name: "SandboxNotFoundError"
+    });
+    const fake = makeFakeSandbox({
+      runResult: (command) => {
+        if (command.includes("mkdir")) return { stdout: "", stderr: "", exitCode: 0 };
+        throw gone;
+      }
+    });
+    const onSandboxRecreated = vi.fn();
+    const { backend } = makeBackend({ fake, options: { onSandboxRecreated } });
+
+    const result = await backend.execute("curl -X POST /deploy");
+
+    // execute() surfaces the loss as a structured non-replay result rather than
+    // throwing, so the model is told the command may or may not have landed.
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toMatch(/NOT re-run/);
+    expect(onSandboxRecreated).toHaveBeenCalledTimes(1);
+  });
+
+  it("a throwing recreation notice never breaks the tool call", async () => {
+    const gone = Object.assign(new Error("sandbox sbx-123 was not found"), {
+      name: "SandboxNotFoundError"
+    });
+    let firstRead = true;
+    const deadSandbox = makeFakeSandbox();
+    deadSandbox.sandbox.files.read = vi.fn(async () => {
+      if (firstRead) {
+        firstRead = false;
+        throw gone;
+      }
+      return new Uint8Array([7]);
+    });
+    const freshSandbox = makeFakeSandbox();
+    freshSandbox.sandbox.sandboxId = "sbx-456";
+    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([7]));
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(deadSandbox.sandbox)
+      .mockResolvedValue(freshSandbox.sandbox);
+    const { backend } = makeBackend({
+      fake: deadSandbox,
+      createSpy: create,
+      options: {
+        onSandboxRecreated: () => {
+          throw new Error("push failed");
+        }
+      }
+    });
+
+    const [res] = await backend.downloadFiles(["/data.bin"]);
+
+    expect(res!.error).toBeNull();
+    expect(res!.content).toEqual(new Uint8Array([7]));
+  });
+
+  it("replaces a dead sandbox ONCE when concurrent ops both hit it", async () => {
+    // Two in-flight ops against the same expired sandbox both enter the
+    // sandbox-gone handler. Without a guard the second discards the first's
+    // fresh sandbox, starts a third, fires a duplicate notice, and splits
+    // writes across two sandboxes while the memo keeps only one.
+    const gone = Object.assign(new Error("sandbox sbx-123 was not found"), {
+      name: "SandboxNotFoundError"
+    });
+    const deadSandbox = makeFakeSandbox();
+    // Both reads on the dead sandbox fail; both callers then recover.
+    deadSandbox.sandbox.files.read = vi.fn(async () => {
+      throw gone;
+    });
+    const freshSandbox = makeFakeSandbox();
+    freshSandbox.sandbox.sandboxId = "sbx-456";
+    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([9]));
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(deadSandbox.sandbox)
+      .mockResolvedValue(freshSandbox.sandbox);
+    const onSandboxRecreated = vi.fn();
+    const { backend } = makeBackend({
+      fake: deadSandbox,
+      createSpy: create,
+      options: { onSandboxRecreated }
+    });
+
+    const [a, b] = await Promise.all([
+      backend.downloadFiles(["/a.bin"]),
+      backend.downloadFiles(["/b.bin"])
+    ]);
+
+    // Both callers get their data from the SAME replacement sandbox.
+    expect(a[0]!.content).toEqual(new Uint8Array([9]));
+    expect(b[0]!.content).toEqual(new Uint8Array([9]));
+    expect(backend.id).toBe("sbx-456");
+    // One death, one replacement, one notice — not two of each.
+    expect(onSandboxRecreated).toHaveBeenCalledTimes(1);
+    expect(onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "sbx-123" });
+    // The dead sandbox plus exactly one replacement.
+    expect(create).toHaveBeenCalledTimes(2);
   });
 
   it("kill() terminates a created sandbox and blocks further use", async () => {

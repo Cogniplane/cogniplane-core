@@ -273,15 +273,6 @@ test("getIntegrationsForUser only returns enabled, available integrations", asyn
   expect(views.map((v) => v.id).sort()).toEqual(["notion"]);
 });
 
-test("hasIntegrationState returns true when a tenant_integrations row exists", async () => {
-  const store = new FakeStateStore([
-    makeState({ tenantId: "tenant-1", integrationId: "microsoft" })
-  ]);
-  const service = new IntegrationRegistryService(buildConfig(), store, probes);
-
-  expect(await service.hasIntegrationState("tenant-1", "microsoft")).toBe(true);
-  expect(await service.hasIntegrationState("tenant-1", "github")).toBe(false);
-});
 
 test("isReadyToEnable for github (configMode=none) is always true regardless of probe state", async () => {
   const store = new FakeStateStore([]);

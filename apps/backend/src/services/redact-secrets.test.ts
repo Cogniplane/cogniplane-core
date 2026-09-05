@@ -189,3 +189,108 @@ test("redactSecrets preserves the URL fragment and surrounding quotes when redac
     `link: "https://x/?token=REDACTED#frag" and 'https://y/?apiKey=REDACTED'.`
   );
 });
+
+// ── Non-plain object handling ────────────────────────────────────────────────
+// redactSecrets walks arbitrary MCP tool results, so it meets values that are
+// not plain objects. Two competing failure modes: walking an opaque built-in
+// destroys it, and NOT walking a class instance leaks whatever it holds. The
+// allowlist has to land exactly between them.
+
+test("redactSecrets redacts secret-keyed properties on a class instance", () => {
+  class ToolResult {
+    constructor(
+      public authorization: string,
+      public label: string
+    ) {}
+  }
+
+  const result = redactSecrets(new ToolResult("Bearer sk-ant-abcdefghijklmnopqrstuvwx", "ok")) as {
+    authorization: string;
+    label: string;
+  };
+
+  // A class instance is NOT opaque: skipping the walk here would put a live
+  // credential on the wire and into the durable checkpointer.
+  expect(result.authorization).toBe("[REDACTED]");
+  expect(result.label).toBe("ok");
+});
+
+test("redactSecrets redacts secret-keyed properties nested under a class instance", () => {
+  class Envelope {
+    constructor(public payload: { apiKey: string; keep: number }) {}
+  }
+
+  const result = redactSecrets(new Envelope({ apiKey: "sk-live-abcdefghijklmnop", keep: 7 })) as {
+    payload: { apiKey: string; keep: number };
+  };
+
+  expect(result.payload.apiKey).toBe("[REDACTED]");
+  expect(result.payload.keep).toBe(7);
+});
+
+test("redactSecrets preserves opaque built-ins instead of flattening them to {}", () => {
+  const date = new Date("2026-07-25T00:00:00.000Z");
+  const pattern = /ab+c/gi;
+
+  const result = redactSecrets({ date, pattern, note: "fine" }) as {
+    date: Date;
+    pattern: RegExp;
+    note: string;
+  };
+
+  // Walking these would yield {} and lose the value entirely.
+  expect(result.date).toBeInstanceOf(Date);
+  expect(result.date.toISOString()).toBe("2026-07-25T00:00:00.000Z");
+  expect(result.pattern).toBeInstanceOf(RegExp);
+  expect(result.note).toBe("fine");
+});
+
+test("redactSecrets still redacts a secret-keyed string alongside opaque built-ins", () => {
+  const result = redactSecrets({
+    createdAt: new Date("2026-07-25T00:00:00.000Z"),
+    apiKey: "sk-live-abcdefghijklmnopqrst"
+  }) as { createdAt: Date; apiKey: string };
+
+  expect(result.createdAt).toBeInstanceOf(Date);
+  expect(result.apiKey).toBe("[REDACTED]");
+});
+
+// A built-in's TYPE is not a safe reason to skip redaction: any of them can
+// carry expando properties, and those serialize. `Object.assign(/x/, {apiKey})`
+// JSON-stringifies to {"apiKey":"..."} — a live credential past the boundary.
+test("redactSecrets redacts an expando credential on a RegExp instead of passing it through", () => {
+  const withExpando = Object.assign(/x/, { apiKey: "live-secret-value" });
+
+  const result = redactSecrets(withExpando) as unknown as { apiKey: string };
+
+  expect(result.apiKey).toBe("[REDACTED]");
+  expect(JSON.stringify(result)).not.toContain("live-secret-value");
+});
+
+test("redactSecrets redacts an expando credential on a Date", () => {
+  const withExpando = Object.assign(new Date("2026-07-25T00:00:00.000Z"), {
+    authorization: "Bearer sk-ant-abcdefghijklmnopqrstuvwx"
+  });
+
+  const result = redactSecrets(withExpando) as unknown as { authorization: string };
+
+  expect(result.authorization).toBe("[REDACTED]");
+});
+
+test("redactSecrets redacts an expando credential on a typed array", () => {
+  const withExpando = Object.assign(new Uint8Array([1, 2]), { apiKey: "live-secret-value" });
+
+  const result = redactSecrets(withExpando) as unknown as { apiKey: string };
+
+  expect(result.apiKey).toBe("[REDACTED]");
+  expect(JSON.stringify(result)).not.toContain("live-secret-value");
+});
+
+test("redactSecrets leaves a clean Date opaque but walks one carrying any own key", () => {
+  const clean = new Date("2026-07-25T00:00:00.000Z");
+  expect(redactSecrets(clean)).toBe(clean); // same reference — not rebuilt
+
+  const dirty = Object.assign(new Date("2026-07-25T00:00:00.000Z"), { note: "hi" });
+  // Walked, so no longer a Date — the deliberate lossy-not-leaky trade.
+  expect(redactSecrets(dirty)).not.toBeInstanceOf(Date);
+});

@@ -1,4 +1,4 @@
--- Multi-provider LLM support (AgenticEntrepriseFramework-9p81).
+-- Multi-provider LLM support (bead 9p81).
 --
 -- Adds per-provider encrypted API-key columns to tenant_org_settings so a
 -- tenant can configure OpenAI / Google / OpenRouter credentials alongside the

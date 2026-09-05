@@ -1,8 +1,4 @@
-import {
-  DEFAULT_PII_PROTECTION,
-  type PiiMode,
-  type PiiProtectionSettings
-} from "./pii-policy.js";
+import { DEFAULT_PII_PROTECTION, type PiiMode, type PiiProtectionSettings } from "@cogniplane/shared-types";
 import type { PiiFindingEncryptor } from "./pii-finding-encryption.js";
 import type {
   PiiFinding,
@@ -524,21 +520,6 @@ export class PiiProtectionService {
       }));
     }
     return findings.map((finding) => ({ ...finding, value: "" }));
-  }
-
-  /**
-   * Decrypts an encrypted finding value back to plaintext. Intended for
-   * admin "reveal" UIs gated by role check at the route layer. Throws
-   * `pii_kek_missing` when no encryptor is configured.
-   */
-  decryptFindingValue(envelope: string, tenantId: string): string {
-    if (!this.options.findingEncryptor) {
-      throw new PiiProtectionServiceError(
-        "pii_kek_missing",
-        "decryption requires PII_RETENTION_KEK to be configured"
-      );
-    }
-    return this.options.findingEncryptor.decryptValue(envelope, tenantId);
   }
 }
 

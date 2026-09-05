@@ -314,9 +314,7 @@ test("MessageStore.upsertToolResult redacts secrets in tool input/output before 
   const store = new MessageStore(db as unknown as Pool);
 
   // An upstream MCP tool echoes credentials into its call args and result.
-  // Both the RuntimeEvent and AG-UI writers funnel through upsertToolResult,
-  // and only the RuntimeEvent path redacted upstream — the store boundary must
-  // redact so the AG-UI (?format=agui) path can't leak the secret into durable
+  // The store boundary must redact so the AG-UI path cannot leak the secret into durable
   // storage or the next turn's prompt context.
   const result = await store.upsertToolResult({
     tenantId: "test-tenant",
@@ -380,34 +378,19 @@ test("MessageStore.upsertToolResult strips NUL bytes from tool text before persi
   expect(result.output).toBe("PNG\uFFFD\uFFFDheader");
 });
 
-test("MessageStore.updateContent and appendToolResultOutput strip NUL bytes", async () => {
+test("MessageStore.updateContent strips NUL bytes", async () => {
   const db = new ScriptedDatabase();
   let contentBind: unknown[] | null = null;
-  let deltaBind: unknown[] | null = null;
-  db.scripts = [
-    {
-      match: (t) => t.includes("UPDATE messages") && t.includes("content_text = $5"),
-      fn: (vals) => {
-        contentBind = vals;
-        return { rows: [], rowCount: 0 };
-      }
-    },
-    {
-      match: (t) => t.includes("UPDATE message_tool_results") && t.includes("output_text || $4"),
-      fn: (vals) => {
-        deltaBind = vals;
-        return { rows: [], rowCount: 0 };
-      }
+  db.scripts = [{
+    match: (sql) => sql.includes("UPDATE messages") && sql.includes("content_text = $5"),
+    fn: (values) => {
+      contentBind = values;
+      return { rows: [], rowCount: 0 };
     }
-  ];
+  }];
   const store = new MessageStore(db as unknown as Pool);
-
   await store.updateContent("t", "m-1", "u", "completed", "before\u0000after");
   expect(contentBind![4]).toBe("before\uFFFDafter");
-
-  await store.appendToolResultOutput("t", "tool-1", "u", "chunk\u0000");
-  // The append binds the delta as $4 — the bound value is what reaches storage.
-  expect(deltaBind![3]).toBe("chunk\uFFFD");
 });
 
 test("MessageStore.create truncates oversized content before persistence", async () => {
@@ -635,8 +618,26 @@ test("MessageStore.listBySession joins tool results onto messages and skips unre
   db.scripts = [
     {
       match: (t) => t.includes("FROM messages") && t.includes("session_titling"),
+      // The query selects DESC (newest first) and the store re-orders ascending,
+      // so the scripted rows are newest-first to match real Postgres behavior.
       fn: () => ({
         rows: [
+          {
+            id: 2,
+            message_id: "m-b",
+            session_id: "s",
+            user_id: "u",
+            role: "assistant",
+            status: "streaming",
+            content_text: "ok",
+            reasoning_content: "thinking",
+            plan_content: "plan",
+            input_tokens: 1, cached_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0, total_tokens: 3,
+            model_name: "x", cost_usd: 0.001, feedback_rating: "thumbs_down",
+            detail_json: {},
+            created_at: "2026-01-02",
+            updated_at: "2026-01-02"
+          },
           {
             id: 1,
             message_id: "m-a",
@@ -658,22 +659,6 @@ test("MessageStore.listBySession joins tool results onto messages and skips unre
             detail_json: {},
             created_at: "2026-01-01",
             updated_at: "2026-01-01"
-          },
-          {
-            id: 2,
-            message_id: "m-b",
-            session_id: "s",
-            user_id: "u",
-            role: "assistant",
-            status: "streaming",
-            content_text: "ok",
-            reasoning_content: "thinking",
-            plan_content: "plan",
-            input_tokens: 1, cached_input_tokens: 0, output_tokens: 2, reasoning_output_tokens: 0, total_tokens: 3,
-            model_name: "x", cost_usd: 0.001, feedback_rating: "thumbs_down",
-            detail_json: {},
-            created_at: "2026-01-02",
-            updated_at: "2026-01-02"
           }
         ],
         rowCount: 2
@@ -729,7 +714,8 @@ test("MessageStore.listBySession joins tool results onto messages and skips unre
     }
   ];
   const store = new MessageStore(db as unknown as Pool);
-  const list = await store.listBySession("t", "s", "u");
+  const { messages: list, hasMore } = await store.listBySession("t", "s", "u");
+  expect(hasMore).toBe(false);
   expect(list.length).toBe(2);
   expect(list[0].messageId).toBe("m-a");
   expect(list[0].toolResults.length).toBe(1);
@@ -737,6 +723,97 @@ test("MessageStore.listBySession joins tool results onto messages and skips unre
   // assistant message with no tool results gets []
   expect(list[1].toolResults).toEqual([]);
   expect(list[1].status).toBe("streaming");
+});
+
+// The read caps are the whole point of the bounded projection — a regression here
+// silently restores the unbounded-response behavior, so pin both axes.
+test("MessageStore.listBySession caps the page and reports hasMore", async () => {
+  const db = new ScriptedDatabase();
+  const messageRow = (n: number) => ({
+    id: n,
+    message_id: `m-${n}`,
+    session_id: "s",
+    user_id: "u",
+    role: "user",
+    status: "completed",
+    content_text: `msg ${n}`,
+    reasoning_content: "",
+    plan_content: "",
+    input_tokens: null, cached_input_tokens: null, output_tokens: null,
+    reasoning_output_tokens: null, total_tokens: null,
+    model_name: null, cost_usd: null, feedback_rating: null,
+    detail_json: {},
+    created_at: `2026-01-0${n}`,
+    updated_at: `2026-01-0${n}`
+  });
+
+  let requestedLimit: unknown;
+  let toolQueryMessageIds: unknown;
+  db.scripts = [
+    {
+      match: (t) => t.includes("FROM messages") && t.includes("session_titling"),
+      // limit=2 → the store asks for 3 (n+1) to detect hasMore. Return all 3
+      // newest-first; the store must drop the probe row and keep m-3, m-2.
+      fn: (values) => {
+        requestedLimit = values[3];
+        return { rows: [messageRow(3), messageRow(2), messageRow(1)], rowCount: 3 };
+      }
+    },
+    {
+      match: (t) => t.includes("FROM message_tool_results"),
+      fn: (values) => {
+        toolQueryMessageIds = values[4];
+        return {
+          rows: [
+            {
+              id: 1,
+              tool_result_id: "tr-1",
+              message_id: "m-3",
+              session_id: "s",
+              user_id: "u",
+              kind: "command",
+              title: "big",
+              status: "completed",
+              command_text: "cat huge",
+              cwd: null,
+              server_name: null,
+              tool_name: null,
+              input_text: "in",
+              input_text_length: 2,
+              // Postgres already applied left(output_text, $4); the length column
+              // reports the pre-truncation size so the marker can be honest.
+              output_text: "TRUNCATED_HEAD",
+              output_text_length: 1_000_014,
+              exit_code: 0,
+              duration_ms: 1,
+              created_at: "2026-01-03",
+              updated_at: "2026-01-03"
+            }
+          ],
+          rowCount: 1
+        };
+      }
+    }
+  ];
+
+  const store = new MessageStore(db as unknown as Pool);
+  const { messages: list, hasMore } = await store.listBySession("t", "s", "u", {
+    limit: 2,
+    toolTextMaxChars: 14
+  });
+
+  expect(requestedLimit).toBe(3); // limit + 1 probe row
+  expect(hasMore).toBe(true);
+  // Newest two, chronological, probe row dropped.
+  expect(list.map((m) => m.messageId)).toEqual(["m-2", "m-3"]);
+  // Tool results are scoped to the returned page, not the whole session.
+  expect(toolQueryMessageIds).toEqual(["m-2", "m-3"]);
+
+  const output = list[1]!.toolResults[0]!.output;
+  expect(output.startsWith("TRUNCATED_HEAD")).toBe(true);
+  expect(output).toContain("truncated 1000000 characters");
+  // Short fields are left exactly as-is — no spurious marker.
+  expect(list[1]!.toolResults[0]!.input).toBe("in");
 });
 
 test("MessageStore.updateContent returns null when no row matched", async () => {
@@ -969,65 +1046,12 @@ test("MessageStore.updateFeedback: returns false when rowCount is null/undefined
   expect(ok).toBe(false);
 });
 
-test("MessageStore.appendToolResultOutput: returns null when no row matched", async () => {
-  const db = new ScriptedDatabase();
-  db.scripts = [
-    {
-      match: (t) => t.includes("UPDATE message_tool_results") && t.includes("output_text"),
-      fn: () => ({ rows: [], rowCount: 0 })
-    }
-  ];
-  const store = new MessageStore(db as unknown as Pool);
-  const r = await store.appendToolResultOutput("t", "tr-1", "u", "delta");
-  expect(r).toBe(null);
-});
-
-test("MessageStore.appendToolResultOutput: returns mapped tool result on success", async () => {
-  const db = new ScriptedDatabase();
-  db.scripts = [
-    {
-      match: (t) => t.includes("UPDATE message_tool_results") && t.includes("output_text"),
-      fn: (vals) => ({
-        rows: [
-          {
-            id: 5,
-            tool_result_id: vals[1],
-            message_id: "m-1",
-            session_id: "s",
-            user_id: vals[2],
-            kind: "mcp",
-            title: "fn",
-            status: "completed",
-            command_text: null,
-            cwd: null,
-            server_name: "srv",
-            tool_name: "fn",
-            input_text: "{}",
-            output_text: "ok",
-            exit_code: null,
-            duration_ms: null,
-            created_at: "2026-01-01",
-            updated_at: "2026-01-01"
-          }
-        ],
-        rowCount: 1
-      })
-    }
-  ];
-  const store = new MessageStore(db as unknown as Pool);
-  const r = await store.appendToolResultOutput("t", "tr-7", "u", "more");
-  expect(r).toBeTruthy();
-  expect(r!.toolResultId).toBe("tr-7");
-  expect(r!.kind).toBe("mcp");
-  expect(r!.command).toBe(null);
-});
-
 test("mapToolResult: unknown status falls back to in_progress", async () => {
-  // Drive through the public path: appendToolResultOutput maps the row.
+  // The live upsert path maps database rows into persisted tool results.
   const db = new ScriptedDatabase();
   db.scripts = [
     {
-      match: (t) => t.includes("UPDATE message_tool_results"),
+      match: (t) => t.includes("INSERT INTO message_tool_results"),
       fn: (vals) => ({
         rows: [
           {
@@ -1035,7 +1059,7 @@ test("mapToolResult: unknown status falls back to in_progress", async () => {
             tool_result_id: vals[1],
             message_id: "m",
             session_id: "s",
-            user_id: vals[2],
+            user_id: "u",
             kind: "garbage", // unrecognized -> 'command'
             title: undefined, // -> ''
             status: "weird",  // unrecognized -> 'in_progress'
@@ -1056,11 +1080,69 @@ test("mapToolResult: unknown status falls back to in_progress", async () => {
     }
   ];
   const store = new MessageStore(db as unknown as Pool);
-  const r = await store.appendToolResultOutput("t", "tr", "u", "x");
+  const r = await store.upsertToolResult({
+    tenantId: "t", toolResultId: "tr", messageId: "m", sessionId: "s", userId: "u",
+    kind: "command", title: "", status: "completed", command: null, cwd: null,
+    server: null, toolName: null, input: "", output: "x", exitCode: null, durationMs: null
+  });
   expect(r).toBeTruthy();
   expect(r!.kind).toBe("command");
   expect(r!.title).toBe("");
   expect(r!.status).toBe("in_progress");
   expect(r!.exitCode).toBe(null);
   expect(r!.durationMs).toBe(null);
+});
+
+test("sweepStaleStreaming runs unscoped so it can see every tenant's rows", async () => {
+  // The sweep spans all tenants in one statement, so it MUST run on the
+  // privileged pool OUTSIDE withTenantScope. If it ever picked up a
+  // `SET LOCAL app.current_tenant_id`, RLS would silently narrow it to a tenant
+  // nobody set — matching nothing, forever, with no error to notice.
+  const statements: string[] = [];
+  const params: unknown[][] = [];
+  const db = {
+    async connect() {
+      throw new Error("sweepStaleStreaming must not take a pooled client (that implies a tenant scope)");
+    },
+    async query(text: string, values: unknown[] = []) {
+      statements.push(text);
+      params.push(values);
+      return {
+        rows: [{ tenant_id: "t1", session_id: "s1", message_id: "m1" }],
+        rowCount: 1
+      };
+    }
+  };
+
+  const store = new MessageStore(db as unknown as Pool);
+  const swept = await store.sweepStaleStreaming(90_000, 25);
+
+  expect(swept).toEqual([{ tenantId: "t1", sessionId: "s1", messageId: "m1" }]);
+  expect(statements.some((sql) => sql.includes("set_config"))).toBe(false);
+  expect(params[0]).toEqual([90_000, 25]);
+  const sql = statements[0]!;
+  // Only unfinished ASSISTANT rows, and only under SKIP LOCKED — a live turn's
+  // own write must never block on the sweep, nor the sweep on it.
+  expect(sql).toContain("role = 'assistant'");
+  expect(sql).toContain("status IN ('pending', 'streaming')");
+  expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+});
+
+test("sweepStaleStreaming never sends a negative or fractional deadline", async () => {
+  // The interval arithmetic is caller-supplied config; a negative value would
+  // make NOW() - interval sweep into the FUTURE, marking live turns interrupted.
+  const params: unknown[][] = [];
+  const db = {
+    async query(_text: string, values: unknown[] = []) {
+      params.push(values);
+      return { rows: [], rowCount: 0 };
+    }
+  };
+  const store = new MessageStore(db as unknown as Pool);
+
+  await store.sweepStaleStreaming(-5_000);
+  await store.sweepStaleStreaming(1_500.7);
+
+  expect(params[0]?.[0]).toBe(0);
+  expect(params[1]?.[0]).toBe(1_500);
 });

@@ -14,9 +14,11 @@ export { z, type ZodType, type ZodSchema } from "zod";
 // Schema barrels — runtime-validated API contracts shared with the backend.
 // Frontend imports the inferred types; backend imports the schemas (for
 // `serialize(...)`) and types both.
+export { AdminIdSchema } from "./schemas/_helpers.js";
 export * from "./schemas/admin-runtime.js";
 export * from "./schemas/admin-session.js";
 export * from "./schemas/admin-user.js";
+export * from "./schemas/custom-events.js";
 export * from "./schemas/artifact.js";
 export * from "./schemas/integration.js";
 export * from "./schemas/mcp-server.js";
@@ -26,5 +28,4 @@ export * from "./schemas/policy.js";
 export * from "./schemas/session.js";
 export * from "./schemas/settings.js";
 export * from "./schemas/skill.js";
-export * from "./schemas/streaming.js";
 export * from "./schemas/tenant.js";

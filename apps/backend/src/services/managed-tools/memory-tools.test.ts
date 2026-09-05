@@ -60,7 +60,7 @@ function makeFakeMemories(overrides: Partial<Pick<MemoryStore, "search" | "save"
 }
 
 function findTool(memories: FakeMemories, name: string) {
-  return createMemoryTools({ memories: memories as unknown as MemoryStore }).find(
+  return createMemoryTools({ memories }).find(
     (tool) => tool.name === name
   )!;
 }

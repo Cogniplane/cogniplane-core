@@ -22,8 +22,8 @@ export interface PiiFindingEncryptor {
 
 export class PiiFindingEncryptionError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
-    super(message);
+  constructor(code: string, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "PiiFindingEncryptionError";
     this.code = code;
   }
@@ -91,10 +91,12 @@ export class Aes256GcmFindingEncryptor implements PiiFindingEncryptor {
       const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
       return plain.toString("utf8");
     } catch (error) {
-      throw new PiiFindingEncryptionError(
-        "pii_decrypt_failed",
-        `decryption failed: ${error instanceof Error ? error.message : "unknown"}`
-      );
+      // Static message: distinguishing tag-verification failure from an
+      // envelope-parse failure is a padding-oracle-shaped hint if a future
+      // caller ever surfaces this. The detail stays server-side.
+      throw new PiiFindingEncryptionError("pii_decrypt_failed", "decryption failed", {
+        cause: error
+      });
     }
   }
 

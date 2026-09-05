@@ -37,8 +37,7 @@ function makeStorage(textByKey: Record<string, string>): Pick<ArtifactStorage, "
       if (body === undefined) throw new Error("missing");
       return {
         stream: Readable.from([Buffer.from(body)]),
-        contentType: "text/plain",
-        sizeBytes: body.length
+        fileSizeBytes: body.length
       };
     }
   };
@@ -202,8 +201,7 @@ test("string-typed stream chunks are coerced to bytes", async () => {
       // Yield raw strings (some streams do this)
       return {
         stream: Readable.from(["hello", " world"]),
-        contentType: "text/plain",
-        sizeBytes: 11
+        fileSizeBytes: 11
       };
     }
   };

@@ -1,14 +1,12 @@
 import { test, expect, onTestFinished } from "vitest";
 
 import Fastify from "fastify";
+import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import { registerTenantRoutes } from "./tenant.js";
-import {
-  DEFAULT_PII_PROTECTION,
-  parsePiiProtection,
-  type PiiProtectionSettings
-} from "../services/pii/pii-policy.js";
+import { parsePiiProtection } from "../services/pii/pii-policy.js";
 import type { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
+import type { Role } from "../lib/rbac.js";
 
 // ---------------------------------------------------------------------------
 // In-memory TenantOrgSettingsStore for route-level tests. The real store
@@ -37,8 +35,6 @@ function makeFakeOrgSettingsStore(initial: Partial<FakeOrgSettingsState> = {}): 
     async get(_tenantId: string) {
       return {
         tenantId: _tenantId,
-        hasOpenaiApiKey: Boolean(state.openaiApiKey),
-        hasAnthropicApiKey: Boolean(state.anthropicApiKey),
         providerKeys: {
           anthropic: Boolean(state.anthropicApiKey),
           openai: Boolean(state.openaiApiKey),
@@ -104,7 +100,7 @@ function makeTenantsDb() {
   };
 }
 
-function makeOrgSettingsApp(role: string = "owner") {
+function makeOrgSettingsApp(role: Role = "owner") {
   const app = Fastify();
   app.addHook("preHandler", async (request) => {
     request.auth = {
@@ -313,7 +309,12 @@ function makeMembersDb(targetRole: string | null) {
     deleteCalled: false,
     updateCalled: false,
     deleteValues: null as unknown[] | null,
-    updateValues: null as unknown[] | null
+    updateValues: null as unknown[] | null,
+    disableJobsCalled: false,
+    disableJobsValues: null as unknown[] | null,
+    // Order matters: the jobs must be disabled in the same transaction as the
+    // membership delete, so both statements are recorded in sequence.
+    statements: [] as string[]
   };
   const client = {
     async query(text: string, values: unknown[]) {
@@ -333,9 +334,16 @@ function makeMembersDb(targetRole: string | null) {
         tracked.updateValues = values;
         return { rows: [{ tenant_id: values[1], user_id: values[2], role: values[0] }] };
       }
+      if (text.includes("UPDATE scheduled_jobs")) {
+        tracked.disableJobsCalled = true;
+        tracked.disableJobsValues = values;
+        tracked.statements.push("disable_jobs");
+        return { rows: [] };
+      }
       if (text.includes("DELETE FROM tenant_memberships")) {
         tracked.deleteCalled = true;
         tracked.deleteValues = values;
+        tracked.statements.push("delete_membership");
         return { rows: [] };
       }
       throw new Error(`Unexpected query: ${text}`);
@@ -351,7 +359,7 @@ function makeMembersDb(targetRole: string | null) {
   return { db, tracked };
 }
 
-function makeMembersApp(role: string, userId: string) {
+function makeMembersApp(role: Role, userId: string) {
   const app = Fastify();
   app.addHook("preHandler", async (request) => {
     request.auth = {
@@ -443,6 +451,39 @@ test("DELETE member: happy path returns 200 and fires DELETE scoped to tenant + 
   expect(tracked.deleteValues).toContain("member-user");
 });
 
+test("DELETE member: disables the removed member's scheduled jobs in the same transaction", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/member-user" });
+
+  expect(response.statusCode).toBe(200);
+  // Left enabled, these keep running as synthetic turns under the removed
+  // user's identity and stored OAuth tokens.
+  expect(tracked.disableJobsCalled).toBe(true);
+  expect(tracked.disableJobsValues).toContain("tenant-1");
+  expect(tracked.disableJobsValues).toContain("member-user");
+  // Both statements ran on the same client, before the commit — the disable is
+  // not a best-effort follow-up that a crash could skip.
+  expect(tracked.statements).toEqual(["disable_jobs", "delete_membership"]);
+});
+
+test("DELETE member: an owner rejection disables no jobs", async () => {
+  const { db, tracked } = makeMembersDb("owner");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/other-owner" });
+
+  expect(response.statusCode).toBe(403);
+  expect(tracked.disableJobsCalled).toBe(false);
+});
+
 // ---------------------------------------------------------------------------
 // PUT /tenant/members/:userId/role  (privilege guards)
 // ---------------------------------------------------------------------------
@@ -501,6 +542,41 @@ test("SECURITY REGRESSION: PUT member role — a non-owner admin cannot assign o
   expect(response.json()).toEqual({ error: "only_owner_can_assign_owner" });
   // The guard must short-circuit before the membership lookup OR the UPDATE.
   expect(tracked.updateCalled).toBe(false);
+});
+
+test("SECURITY REGRESSION: PUT member role — a non-owner admin cannot demote another admin to member", async () => {
+  const { db, tracked } = makeMembersDb("admin");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/other-admin/role",
+    payload: { role: "member" }
+  });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toEqual({ error: "only_owner_can_change_admin_role" });
+  expect(tracked.updateCalled).toBe(false);
+});
+
+test("PUT member role: an owner can demote an admin to member", async () => {
+  const { db, tracked } = makeMembersDb("admin");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/tenant/members/other-admin/role",
+    payload: { role: "member" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(tracked.updateCalled).toBe(true);
 });
 
 test("PUT member role: changing your own role returns 400 cannot_change_own_role and never issues an UPDATE", async () => {
@@ -580,7 +656,55 @@ test("provider key: an empty apiKey CLEARS the selected provider's key (R11)", a
   expect(response.json().ok).toBe(true);
   // The stored key is revoked, not left in place.
   expect(state.anthropicApiKey).toBe(null);
-  expect(response.json().anthropicApiKeyConfigured).toBe(false);
+  expect(response.json().providerKeys.anthropic).toBe(false);
+});
+
+test.each([
+  {},
+  { anthropicApiKey: "sk-ant-legacy" },
+  { provider: "anthropic" },
+  { apiKey: "sk-ant-new" },
+  { provider: "anthropic", apiKey: "", anthropicApiKey: "sk-ant-legacy" },
+  { provider: "invalid", apiKey: "" },
+  { provider: "anthropic", apiKey: null },
+  { provider: "anthropic", apiKey: "x".repeat(513) }
+])("provider key: rejects invalid or obsolete payload %j without changing keys", async (payload) => {
+  const { store, state } = makeFakeOrgSettingsStore({
+    anthropicApiKey: "sk-ant-existing",
+    openaiApiKey: "sk-openai-existing"
+  });
+  const before = { ...state };
+  const app = makeOrgSettingsApp();
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: makeTenantsDb() as never, tenantOrgSettings: store });
+
+  const response = await app.inject({ method: "PUT", url: "/tenant/settings", payload });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json().error).toBe("invalid_request");
+  expect(state).toEqual(before);
+});
+
+test("tenant responses expose provider presence without compatibility aliases", async () => {
+  const { store } = makeFakeOrgSettingsStore({ anthropicApiKey: "sk-ant-existing" });
+  const app = makeOrgSettingsApp();
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: makeTenantsDb() as never, tenantOrgSettings: store });
+
+  const details = await app.inject({ method: "GET", url: "/tenant" });
+  expect(details.statusCode).toBe(200);
+  expect(details.json().settings.providerKeys.anthropic).toBe(true);
+  expect(details.json().settings).not.toHaveProperty("anthropicApiKeyConfigured");
+
+  const update = await app.inject({
+    method: "PUT", url: "/tenant/settings",
+    payload: { provider: "openai", apiKey: "  sk-openai-new  " }
+  });
+  expect(update.statusCode).toBe(200);
+  expect(update.json()).toEqual({
+    ok: true,
+    providerKeys: { anthropic: true, openai: true, google: false, openrouter: false, zai: false }
+  });
 });
 
 // PUT /tenant/settings/marketplace

@@ -6,7 +6,11 @@ import type { ModelProvider } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
 import { AVAILABLE_MODELS } from "../domain/models.js";
 import { listEnabledModels, withEffectiveDefaultEffort } from "../domain/model-availability.js";
-import { toAvailableModel } from "../services/custom-model-store.js";
+import {
+  toAvailableModel,
+  type CustomModelStore
+} from "../services/custom-model-store.js";
+import type { DynamicConfigService } from "../services/dynamic-config-service.js";
 import { serialize } from "../lib/serialize-response.js";
 
 export function buildModelRouteStores(
@@ -19,12 +23,15 @@ export function buildModelRouteStores(
   return {
     dynamicConfig: deps.dynamicConfig,
     customModels: deps.customModels,
-    runtimeAdapter: deps.runtimeAdapter,
     configuredProviders: extras.configuredProviders
   };
 }
 
-export type ModelRouteStores = ReturnType<typeof buildModelRouteStores>;
+export type ModelRouteStores = {
+  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings">;
+  customModels?: Pick<CustomModelStore, "list">;
+  configuredProviders: (tenantId: string) => Promise<Set<ModelProvider>>;
+};
 
 export async function registerModelRoutes(app: FastifyInstance, stores: ModelRouteStores): Promise<void> {
   app.get("/models", async (request) => {

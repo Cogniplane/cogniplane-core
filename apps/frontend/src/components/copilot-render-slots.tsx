@@ -1,17 +1,6 @@
 "use client";
-// ─────────────────────────────────────────────────────────────────────────────
-// Track B — CopilotKit in-chat render slots (slice B: tool cards + plan pane)
-//
-// These ride CopilotKit's NATIVE render pipeline (unlike the CUSTOM events in
-// use-agui-custom-events.ts), so they must run inside <CopilotKit>. CopilotChat
-// renders text natively but shows NOTHING for tool calls or agent state:
-//   • useDefaultTool  — a catch-all card for every tool call (standard
-//     TOOL_CALL_* events), since we have many tools (write_file, edit_file, MCP…)
-//     and want one generic card rather than per-tool renderers.
-//   • useCoAgentStateRender — the plan pane, fed by the STATE_DELTA `/plan`
-//     patch the translator emits for write_todos. Reuses PlanRowView for parity.
-// The component renders nothing itself; the hooks register in-chat renderers.
-// ─────────────────────────────────────────────────────────────────────────────
+// CopilotKit hooks register the tool cards and plan renderer inside its provider.
+// Custom event cards are owned by useAguiCustomEvents.
 
 import { useCoAgentStateRender, useDefaultTool } from "@copilotkit/react-core";
 import { useState } from "react";

@@ -15,9 +15,10 @@ import type { AuditEventStore } from "../services/audit-event-store.js";
 import { RefreshTokenRotationService } from "../services/auth/refresh-token-rotation-service.js";
 import {
   provisionTenantIdentity,
-  resolveWorkOsOrganization
+  resolveWorkOsOrganization,
+  WorkOsEmailConflictError
 } from "../services/auth/workos-tenant-provisioning.js";
-import { listIntegrationDescriptors } from "../services/integrations/integration-registry.js";
+import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 
@@ -114,6 +115,7 @@ export async function registerAuthRoutes(
     config,
     auditEvents,
     limits,
+    integrationDescriptors = new IntegrationRegistry(),
     workos: injectedWorkos
   }: {
     db: Pool;
@@ -121,15 +123,12 @@ export async function registerAuthRoutes(
     auditEvents: AuditEventStore;
     limits?: RequestLimitsInterface;
     /** Optional WorkOS instance — overrides the module-level singleton. Tests pass a stub. */
+    integrationDescriptors?: IntegrationRegistry;
     workos?: WorkOS;
   }
 ): Promise<void> {
-  // OAuth callback registration is delegated to each integration descriptor.
-  // Bootstrap (`registerBuiltinIntegrations`) wires up the connection-service
-  // handlers; private overlay descriptors can register their own callbacks
-  // by setting `descriptor.oauthRoutes` and being registered before this
-  // function runs.
-  for (const descriptor of listIntegrationDescriptors()) {
+  // Register callbacks from this app's integration services.
+  for (const descriptor of integrationDescriptors.list()) {
     if (descriptor.oauthRoutes) {
       await descriptor.oauthRoutes.register(app);
     }
@@ -238,14 +237,31 @@ export async function registerAuthRoutes(
       }
 
       const displayName = `${workosUser.firstName ?? ""} ${workosUser.lastName ?? ""}`.trim();
-      const identity = await provisionTenantIdentity(db, {
-        organizationId: organization.organizationId,
-        organizationName: organization.organizationName,
-        workosUserId: workosUser.id,
-        email: workosUser.email,
-        displayName,
-        workosRoleSlug: organization.roleSlug
-      });
+      let identity: Awaited<ReturnType<typeof provisionTenantIdentity>>;
+      try {
+        identity = await provisionTenantIdentity(db, {
+          organizationId: organization.organizationId,
+          organizationName: organization.organizationName,
+          workosUserId: workosUser.id,
+          email: workosUser.email,
+          displayName,
+          workosRoleSlug: organization.roleSlug
+        });
+      } catch (error) {
+        // The email belongs to a different WorkOS identity. Answer 409 rather
+        // than letting the unique violation surface as a 500. Both the typed
+        // error and a raw 23505 are handled: a concurrent login can still lose
+        // the race on the email constraint after our check.
+        const isEmailConflict =
+          error instanceof WorkOsEmailConflictError ||
+          (error as { code?: string })?.code === "23505";
+        if (!isEmailConflict) throw error;
+        request.log.warn(
+          { workosUserId: workosUser.id },
+          "auth callback 409: email already bound to a different WorkOS identity"
+        );
+        return reply.code(409).send({ error: "email_in_use" });
+      }
 
       if (identity.previousRole !== undefined && identity.previousRole !== identity.role) {
         await auditEvents.create({
@@ -254,6 +270,25 @@ export async function registerAuthRoutes(
           userId: identity.userId,
           type: "role_changed",
           payload: { from: identity.previousRole, to: identity.role },
+          ipAddress: request.ip,
+          userAgent: request.headers["user-agent"] ?? null
+        });
+      }
+
+      // App RBAC is authoritative after provisioning (see
+      // resolveTenantMembershipRole), so a WorkOS-side role change does not
+      // propagate — including a revocation. Record the divergence so an
+      // IdP-demoted user who still holds an elevated app role is visible in
+      // the audit trail instead of silent. Owners are excluded: owner is an
+      // app-level role WorkOS has no slug for.
+      const idpRole = organization.roleSlug === "admin" ? "admin" : "member";
+      if (identity.previousRole !== undefined && identity.role !== "owner" && identity.role !== idpRole) {
+        await auditEvents.create({
+          tenantId: identity.tenantId,
+          sessionId: null,
+          userId: identity.userId,
+          type: "role_sync_divergence",
+          payload: { appRole: identity.role, workosRoleSlug: organization.roleSlug ?? null },
           ipAddress: request.ip,
           userAgent: request.headers["user-agent"] ?? null
         });
@@ -313,6 +348,16 @@ export async function registerAuthRoutes(
         return reply.code(401).send({ error: "missing_refresh_token" });
       }
 
+      // Which side of the claim a throw lands on decides the response. Before
+      // the claim, the presented token is untouched and 401 is honest. After
+      // it, the jti is already consumed: answering 401 makes the SPA drop the
+      // session for what is usually a transient blip, and the client's retry
+      // would later trip replay detection and revoke the whole family. So a
+      // post-claim failure restores the jti and answers 503, which is
+      // retryable.
+      let phase: "pre_claim" | "claimed" | "issued" = "pre_claim";
+      let claimedJti: { jti: string; familyId: string } | null = null;
+
       try {
         const payload = await verifyRefreshToken(config, refreshToken);
 
@@ -362,6 +407,9 @@ export async function registerAuthRoutes(
           return reply.code(401).send({ error: "token_revoked" });
         }
 
+        phase = "claimed";
+        claimedJti = { jti: payload.jti, familyId: claim.familyId };
+
         const membership = await db.query(
           `SELECT role FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2 LIMIT 1`,
           [payload.tid, payload.sub]
@@ -398,11 +446,49 @@ export async function registerAuthRoutes(
           familyId
         });
 
+        // Past this point the new token is live and the old jti must NOT be
+        // restored — that would leave two valid jtis in one family.
+        phase = "issued";
+
         const result = { accessToken, refreshToken: newRefreshToken };
-        await refreshTokens.complete(payload.jti, result);
+        // Best-effort: `complete` only caches the result for concurrent callers
+        // waiting on the grace marker. Failing to write that cache is not a
+        // reason to fail a rotation that already succeeded — the tokens below
+        // are valid either way.
+        try {
+          await refreshTokens.complete(payload.jti, result);
+        } catch (error) {
+          request.log.warn({ err: error }, "auth refresh: rotation result cache write failed");
+        }
         return sendRefreshResult(reply, result);
-      } catch {
-        return reply.code(401).send({ error: "invalid_refresh_token" });
+      } catch (error) {
+        if (phase === "pre_claim") {
+          return reply.code(401).send({ error: "invalid_refresh_token" });
+        }
+
+        if (phase === "claimed" && claimedJti) {
+          // Best-effort. If the restore itself fails, the client falls back to
+          // the grace-marker path (503 for 60s, then a family revoke) — bad,
+          // but not worth turning into a 500 here.
+          try {
+            const restored = await refreshTokens.restore(claimedJti);
+            if (!restored) {
+              request.log.error(
+                { jti: claimedJti.jti },
+                "auth refresh: jti restore declined after a failed rotation"
+              );
+            }
+          } catch (restoreError) {
+            request.log.error(
+              { err: restoreError, jti: claimedJti.jti },
+              "auth refresh: jti restore failed after a failed rotation"
+            );
+          }
+        }
+
+        request.log.error({ err: error, phase }, "auth refresh: rotation failed after claim");
+        reply.header("Retry-After", "1");
+        return reply.code(503).send({ error: "refresh_unavailable" });
       }
     });
 
@@ -468,6 +554,22 @@ export async function registerAuthRoutes(
     app.get("/auth/organizations", async (request, reply) => {
       if (!request.auth?.userId) {
         return reply.code(401).send({ error: "unauthorized" });
+      }
+
+      // One WorkOS API call per membership below — unlimited, an authenticated
+      // user can amplify backend→WorkOS traffic until WorkOS throttles the
+      // whole deployment.
+      if (limits) {
+        const limitError = await limits.consumeRateLimit({
+          resource: "auth_organizations",
+          userId: request.auth.userId,
+          tenantId: request.auth.tenantId
+        });
+        if (limitError) {
+          reply.code(429);
+          reply.header("retry-after", Math.max(1, Math.ceil(limitError.retryAfterMs / 1000)));
+          return reply.send(limitError);
+        }
       }
 
       const userResult = await db.query(

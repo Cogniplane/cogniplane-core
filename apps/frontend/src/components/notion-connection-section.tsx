@@ -1,6 +1,9 @@
 import type { NotionConnectionStatus } from "@cogniplane/shared-types";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  OAuthConnectionActions,
+  OAuthConnectionSectionHeading
+} from "./oauth-connection-presentation";
 import { formatMediumDateTime } from "../lib/time-format";
 import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
@@ -25,24 +28,13 @@ function getConnectionHeadline(status: NotionConnectionStatus | null): string {
   return "Notion not configured";
 }
 
-function getConnectButtonLabel(
-  busyKey: string | null,
-  userConnection: NotionConnectionStatus["userConnection"]
-): string {
-  if (busyKey === "connect") return "Redirecting...";
-  return userConnection ? "Reconnect my account" : "Connect my Notion account";
-}
-
 export function NotionConnectionSection(input: NotionConnectionSectionProps) {
   const { status, error, flashMessage, busyKey, onConnect, onDisconnect } = input;
   const userConnection = status?.userConnection ?? null;
 
   return (
     <section id="notion" className="flex flex-col gap-5">
-      <div>
-        <p className={SECTION_LABEL}>Live module</p>
-        <h3 className="text-lg font-semibold text-on-surface">Notion</h3>
-      </div>
+      <OAuthConnectionSectionHeading provider="Notion" />
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Card>
@@ -66,36 +58,25 @@ export function NotionConnectionSection(input: NotionConnectionSectionProps) {
             </div>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {flashMessage ? <p className={HINT}>{flashMessage}</p> : null}
-            {error ? <p className="text-sm text-danger">{error}</p> : null}
-
-            <div>
-              <h3 className="text-sm font-semibold text-on-surface">Authorization</h3>
-              <p className={`${HINT} mt-1`}>
-                Your Notion credentials are encrypted at rest and used only when the agent needs
-                to read or modify Notion content during a session.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                disabled={!status?.configured || busyKey !== null}
-                onClick={onConnect}
-              >
-                {getConnectButtonLabel(busyKey, userConnection)}
-              </Button>
-              {userConnection ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={busyKey !== null}
-                  onClick={onDisconnect}
-                >
-                  {busyKey === "disconnect" ? "Disconnecting..." : "Disconnect"}
-                </Button>
-              ) : null}
-            </div>
+            <OAuthConnectionActions
+              busyKey={busyKey === "connect" || busyKey === "disconnect" ? busyKey : null}
+              configured={status?.configured === true}
+              connected={userConnection !== null}
+              connectLabel="Connect my Notion account"
+              reconnectLabel="Reconnect my account"
+              error={error}
+              flashMessage={flashMessage}
+              onConnect={onConnect}
+              onDisconnect={onDisconnect}
+            >
+              <div>
+                <h3 className="text-sm font-semibold text-on-surface">Authorization</h3>
+                <p className={`${HINT} mt-1`}>
+                  Your Notion credentials are encrypted at rest and used only when the agent needs
+                  to read or modify Notion content during a session.
+                </p>
+              </div>
+            </OAuthConnectionActions>
 
             {!status?.configured ? (
               <p className={HINT}>

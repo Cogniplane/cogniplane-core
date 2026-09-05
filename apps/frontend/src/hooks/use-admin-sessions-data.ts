@@ -13,7 +13,7 @@ import type {
 
 export function useAdminSessionsData(params: AdminSessionsListParams = {}) {
   const sessionsQuery = useInfiniteQuery<AdminSessionsListResponse>({
-    queryKey: queryKeys.admin.sessions(params as Record<string, unknown>),
+    queryKey: queryKeys.admin.sessions(params),
     queryFn: ({ pageParam }) =>
       listAdminSessions({
         ...params,

@@ -1,58 +1,23 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-
 import {
   createGithubAuthorizationUrl,
   deleteGithubConnection,
   fetchGithubConnectionStatus
 } from "../lib/settings-api";
-import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
+import { useOAuthConnection } from "./use-oauth-connection";
 
 export function useGithubConnection() {
-  const queryClient = useQueryClient();
-  const [connectError, setConnectError] = useState<string | null>(null);
-  const [activeMutation, setActiveMutation] = useState<"connect" | "disconnect" | null>(null);
-
-  const statusQuery = useQuery({
+  return useOAuthConnection({
     queryKey: queryKeys.settings.github(),
-    queryFn: fetchGithubConnectionStatus
+    fetchStatus: fetchGithubConnectionStatus,
+    createAuthorizationUrl: createGithubAuthorizationUrl,
+    deleteConnection: deleteGithubConnection,
+    messages: {
+      load: "Failed to load GitHub connection status.",
+      connect: "Failed to start GitHub authorization.",
+      disconnect: "Failed to disconnect GitHub."
+    }
   });
-
-  const disconnectMutation = useMutation({
-    mutationFn: deleteGithubConnection,
-    onMutate: () => setActiveMutation("disconnect"),
-    onSettled: () => setActiveMutation(null),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.settings.github() })
-  });
-
-  const loadError = statusQuery.error
-    ? toErrorMessage(statusQuery.error, "Failed to load GitHub connection status.")
-    : null;
-  const disconnectError = disconnectMutation.error
-    ? toErrorMessage(disconnectMutation.error, "Failed to disconnect GitHub.")
-    : null;
-
-  return {
-    status: statusQuery.data ?? null,
-    busyKey: activeMutation,
-    error: connectError ?? disconnectError ?? loadError,
-    reload: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.settings.github() }),
-    connect: async () => {
-      setActiveMutation("connect");
-      setConnectError(null);
-      try {
-        const url = await createGithubAuthorizationUrl();
-        window.location.href = url;
-      } catch (error) {
-        setConnectError(toErrorMessage(error, "Failed to start GitHub authorization."));
-        setActiveMutation(null);
-      }
-    },
-    disconnect: () => disconnectMutation.mutate()
-  };
 }

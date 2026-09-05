@@ -4,13 +4,14 @@ import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.
 import type { MessageStore } from "../message-store.js";
 import type { SessionStore } from "../session-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
+import { ToolCallError } from "../../lib/tool-call-error.js";
 import { allRequiredObjectSchema, arraySchema, type ManagedToolDefinition } from "./types.js";
 
 type SessionToolDeps = {
-  sessions: SessionStore;
-  messages: MessageStore;
-  artifacts: ArtifactStore;
-  storage: ArtifactStorage;
+  sessions: Pick<SessionStore, "getOwned">;
+  messages: Pick<MessageStore, "listBySession">;
+  artifacts: Pick<ArtifactStore, "getOwned" | "listBySession" | "findLatestReadableDerived">;
+  storage: Pick<ArtifactStorage, "openReadStream">;
 };
 
 // ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
@@ -74,18 +75,18 @@ function getScopedArtifactIds(context: ToolExecutionContext): string[] | null {
 }
 
 async function resolveReadableArtifact(input: {
-  artifacts: ArtifactStore;
+  artifacts: Pick<ArtifactStore, "getOwned" | "findLatestReadableDerived">;
   context: ToolExecutionContext;
   artifactId: string;
 }): Promise<ArtifactRecord> {
   const artifact = await input.artifacts.getOwned(input.context.tenantId, input.artifactId, input.context.userId);
   if (!artifact || artifact.sessionId !== input.context.sessionId || artifact.status !== "ready") {
-    throw new Error("Artifact not found for tool context.");
+    throw new ToolCallError("Artifact not found for tool context.");
   }
 
   const scopedArtifactIds = getScopedArtifactIds(input.context);
   if (scopedArtifactIds && scopedArtifactIds.length && !scopedArtifactIds.includes(input.artifactId)) {
-    throw new Error("Artifact is outside the selected artifact scope for this turn.");
+    throw new ToolCallError("Artifact is outside the selected artifact scope for this turn.");
   }
 
   if (isTextReadableArtifact(artifact.mimeType)) return artifact;
@@ -96,7 +97,7 @@ async function resolveReadableArtifact(input: {
     input.context.userId
   );
   if (!derivedArtifact) {
-    throw new Error(`Artifact ${artifact.artifactName} is not a text-readable MIME type.`);
+    throw new ToolCallError(`Artifact ${artifact.artifactName} is not a text-readable MIME type.`);
   }
   return derivedArtifact;
 }
@@ -125,11 +126,18 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
       handler: async ({ context, arguments: args }) => {
         const session = await deps.sessions.getOwned(context.tenantId, context.sessionId, context.userId);
         if (!session || session.status !== "active") {
-          throw new Error("Session not found for tool context.");
+          throw new ToolCallError("Session not found for tool context.");
         }
 
         const recentMessageCount = Math.max(1, Math.min(10, Number(args.recentMessageCount ?? 4) || 4));
-        const messages = await deps.messages.listBySession(context.tenantId, context.sessionId, context.userId);
+        // Only the newest `recentMessageCount` are returned, so ask the store for
+        // exactly those instead of pulling the whole transcript to slice its tail.
+        const { messages } = await deps.messages.listBySession(
+          context.tenantId,
+          context.sessionId,
+          context.userId,
+          { limit: recentMessageCount }
+        );
 
         return {
           session: {
@@ -165,7 +173,7 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
       handler: async ({ context }) => {
         const session = await deps.sessions.getOwned(context.tenantId, context.sessionId, context.userId);
         if (!session || session.status !== "active") {
-          throw new Error("Session not found for tool context.");
+          throw new ToolCallError("Session not found for tool context.");
         }
 
         const scopedArtifactIds = getScopedArtifactIds(context);
@@ -203,7 +211,7 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
       }),
       handler: async ({ context, arguments: args }) => {
         const artifactId = String(args.artifactId ?? "");
-        if (!artifactId) throw new Error("artifactId is required.");
+        if (!artifactId) throw new ToolCallError("artifactId is required.");
 
         const artifact = await resolveReadableArtifact({ artifacts: deps.artifacts, context, artifactId });
         const maxChars = Math.max(1, Math.min(20_000, Number(args.maxChars ?? 4_000) || 4_000));

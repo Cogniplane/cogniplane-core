@@ -1,9 +1,10 @@
 import { test, expect } from "vitest";
+import { DEFAULT_PII_PROTECTION } from "@cogniplane/shared-types";
 
 import type { Pool } from "../lib/db.js";
 import { decrypt } from "../lib/crypto-utils.js";
 import { TenantOrgSettingsStore } from "./tenant-org-settings-store.js";
-import { DEFAULT_PII_PROTECTION, parsePiiProtection } from "./pii/pii-policy.js";
+import { parsePiiProtection } from "./pii/pii-policy.js";
 
 const SECRET = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -109,7 +110,7 @@ test("get returns defaults when no row exists", async () => {
   const { store } = makeStore();
   const record = await store.get("tenant-1");
   expect(record.tenantId).toBe("tenant-1");
-  expect(record.hasAnthropicApiKey).toBe(false);
+  expect(record.providerKeys.anthropic).toBe(false);
   expect(record.skillMarketplaceManifestUrl).toBe(null);
   expect(record.piiProtection).toEqual(DEFAULT_PII_PROTECTION);
 });
@@ -128,7 +129,7 @@ test("setApiKey encrypts before persisting and round-trips on read", async () =>
   expect(await store.getDecryptedApiKey("tenant-1", "anthropic")).toBe("sk-ant-secret");
 
   const record = await store.get("tenant-1");
-  expect(record.hasAnthropicApiKey).toBe(true);
+  expect(record.providerKeys.anthropic).toBe(true);
 });
 
 test("setApiKey persists per-provider keys independently and surfaces the presence map", async () => {
@@ -148,8 +149,6 @@ test("setApiKey persists per-provider keys independently and surfaces the presen
     openrouter: true,
     zai: false
   });
-  // Legacy alias still tracks anthropic.
-  expect(record.hasAnthropicApiKey).toBe(false);
 });
 
 test("setApiKey with null clears just that provider", async () => {

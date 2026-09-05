@@ -31,3 +31,11 @@ export function summarizeFindings(findings: unknown[]): string {
 export function summarizePiiRun(run: AdminSessionDetailPiiRun): string {
   return summarizeFindings(run.findings);
 }
+
+export function readPiiScanRunId(detailJson: unknown): string | null {
+  if (!detailJson || typeof detailJson !== "object") return null;
+  const pii = (detailJson as Record<string, unknown>).pii;
+  if (!pii || typeof pii !== "object") return null;
+  const id = (pii as Record<string, unknown>).scanRunId;
+  return typeof id === "string" ? id : null;
+}

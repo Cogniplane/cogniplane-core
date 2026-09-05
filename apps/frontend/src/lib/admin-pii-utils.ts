@@ -113,14 +113,12 @@ export function sparklineFromTimeSeries(
 // ─── Charts: stacked time series ────────────────────────────────────────────
 
 export const TIME_SERIES_ACTIONS = ["allow", "report", "block", "transform", "failed"] as const;
-export type TimeSeriesAction = (typeof TIME_SERIES_ACTIONS)[number];
 
 // ─── Charts: entity-type colors ──────────────────────────────────────────────
 
 // Categorical palette for entity types. Order is stable so the same entity
 // always renders in the same slot when re-querying. Picked from existing
-// CSS tokens — no new colors. 6 slots covers the current PII_ENTITY_TYPES
-// set; if a 7th type is added, the 7th entity falls back to --on-surface.
+// CSS tokens. Entity types beyond the six palette entries cycle through them.
 const ENTITY_PALETTE = [
   "var(--color-accent)",
   "var(--color-success)",

@@ -1,0 +1,171 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`streamEventsToAGUI > maps the captured streamEvents corpus directly to valid AG-UI events 1`] = `
+[
+  {
+    "messageId": "generated-1",
+    "role": "reasoning",
+    "type": "REASONING_MESSAGE_START",
+  },
+  {
+    "delta": "I should inspect it.",
+    "messageId": "generated-1",
+    "type": "REASONING_MESSAGE_CONTENT",
+  },
+  {
+    "messageId": "generated-1",
+    "type": "REASONING_MESSAGE_END",
+  },
+  {
+    "messageId": "generated-2",
+    "role": "assistant",
+    "type": "TEXT_MESSAGE_START",
+  },
+  {
+    "delta": "Checking now.",
+    "messageId": "generated-2",
+    "type": "TEXT_MESSAGE_CONTENT",
+  },
+  {
+    "messageId": "generated-2",
+    "type": "TEXT_MESSAGE_END",
+  },
+  {
+    "parentMessageId": "generated-2",
+    "toolCallId": "tool-execute",
+    "toolCallName": "execute",
+    "type": "TOOL_CALL_START",
+  },
+  {
+    "delta": "{"command":"printf ok"}",
+    "toolCallId": "tool-execute",
+    "type": "TOOL_CALL_ARGS",
+  },
+  {
+    "toolCallId": "tool-execute",
+    "type": "TOOL_CALL_END",
+  },
+  {
+    "name": "tool_meta",
+    "type": "CUSTOM",
+    "value": {
+      "command": "printf ok",
+      "kind": "command",
+      "server": null,
+      "toolCallId": "tool-execute",
+    },
+  },
+  {
+    "content": "ok�",
+    "messageId": "generated-3",
+    "role": "tool",
+    "toolCallId": "tool-execute",
+    "type": "TOOL_CALL_RESULT",
+  },
+  {
+    "name": "tool_status",
+    "type": "CUSTOM",
+    "value": {
+      "durationMs": 0,
+      "status": "failed",
+      "toolCallId": "tool-execute",
+      "toolName": "execute",
+    },
+  },
+  {
+    "toolCallId": "tool-mcp",
+    "toolCallName": "show_widget",
+    "type": "TOOL_CALL_START",
+  },
+  {
+    "delta": "{"query":"sales"}",
+    "toolCallId": "tool-mcp",
+    "type": "TOOL_CALL_ARGS",
+  },
+  {
+    "toolCallId": "tool-mcp",
+    "type": "TOOL_CALL_END",
+  },
+  {
+    "name": "tool_meta",
+    "type": "CUSTOM",
+    "value": {
+      "command": null,
+      "kind": "mcp",
+      "server": "analytics",
+      "toolCallId": "tool-mcp",
+    },
+  },
+  {
+    "content": "Sales",
+    "messageId": "generated-4",
+    "role": "tool",
+    "toolCallId": "tool-mcp",
+    "type": "TOOL_CALL_RESULT",
+  },
+  {
+    "name": "tool_ui_resources",
+    "type": "CUSTOM",
+    "value": {
+      "toolCallId": "tool-mcp",
+      "uiResources": [
+        {
+          "mimeType": "text/html",
+          "text": "<p>chart</p>",
+          "uri": "ui://sales/chart",
+        },
+      ],
+    },
+  },
+  {
+    "delta": [
+      {
+        "op": "add",
+        "path": "/plan",
+        "value": "- [ ] Inspect data _(in progress)_",
+      },
+    ],
+    "type": "STATE_DELTA",
+  },
+  {
+    "delta": [
+      {
+        "op": "add",
+        "path": "/plan",
+        "value": "- [ ] Inspect data _(in progress)_
+
+- [x] Inspect data",
+      },
+    ],
+    "type": "STATE_DELTA",
+  },
+  {
+    "messageId": "generated-5",
+    "role": "reasoning",
+    "type": "REASONING_MESSAGE_START",
+  },
+  {
+    "delta": "Done.",
+    "messageId": "generated-5",
+    "type": "REASONING_MESSAGE_CONTENT",
+  },
+  {
+    "messageId": "generated-5",
+    "type": "REASONING_MESSAGE_END",
+  },
+  {
+    "messageId": "generated-6",
+    "role": "assistant",
+    "type": "TEXT_MESSAGE_START",
+  },
+  {
+    "delta": "Finished.",
+    "messageId": "generated-6",
+    "type": "TEXT_MESSAGE_CONTENT",
+  },
+  {
+    "messageId": "generated-6",
+    "type": "TEXT_MESSAGE_END",
+  },
+]
+`;

@@ -10,7 +10,7 @@ import {
   respondAdminNotFound,
   withAdmin
 } from "./admin-route-helpers.js";
-import { mcpBodySchema } from "./admin-route-schemas.js";
+import { mcpCreateBodySchema, mcpUpdateBodySchema } from "./admin-route-schemas.js";
 import type { AdminMcpServerRecord } from "../../services/admin-config-records.js";
 import type { ActivationTracker } from "../../services/activation-tracker.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
@@ -22,12 +22,19 @@ const serverIdParamsSchema = z.object({ serverId: adminIdSchema });
 export async function registerAdminMcpServerRoutes(
   app: FastifyInstance,
   stores: {
-    dynamicConfig: DynamicConfigService;
-    auditEvents: AuditEventStore;
+    dynamicConfig: Pick<
+      DynamicConfigService,
+      | "listMcpServers"
+      | "createMcpServer"
+      | "updateMcpServer"
+      | "disableMcpServer"
+      | "setMcpServerPublished"
+    >;
+    auditEvents: Pick<AuditEventStore, "create">;
     // Optional: when present, the server list is decorated with activation
     // counts (last 30 days) per server. Failures are swallowed — counts are
     // decorative. Tests that don't supply it just get servers with no counts.
-    activations?: ActivationTracker;
+    activations?: Pick<ActivationTracker, "countMcpServerActivations">;
   }
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
@@ -102,16 +109,11 @@ export async function registerAdminMcpServerRoutes(
   }));
 
   app.post("/admin/mcp-servers", withAdmin(app, async (request, reply) => {
-    const bodyResult = parseRequestInput(reply, mcpBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, mcpCreateBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
     const body = bodyResult.value;
-    if (!body.serverId) {
-      reply.code(400);
-      return configError("serverId is required.");
-    }
-
     try {
       const mcpServer = await stores.dynamicConfig.createMcpServer(request.auth.tenantId, {
         ...body,
@@ -141,7 +143,7 @@ export async function registerAdminMcpServerRoutes(
       return paramsResult.response;
     }
 
-    const bodyResult = parseRequestInput(reply, mcpBodySchema, request.body);
+    const bodyResult = parseRequestInput(reply, mcpUpdateBodySchema, request.body);
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
@@ -160,7 +162,6 @@ export async function registerAdminMcpServerRoutes(
         mode: body.mode,
         routePath: body.routePath,
         upstreamUrl: body.upstreamUrl ?? null,
-        headersAllowlist: body.headersAllowlist,
         enabled: body.enabled
       });
       return await finalizeMutation(reply, {

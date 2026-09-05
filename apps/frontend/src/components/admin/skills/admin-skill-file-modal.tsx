@@ -1,9 +1,14 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
 import { SafeMarkdown } from "../../safe-markdown";
-import SyntaxHighlighter from "react-syntax-highlighter";
-import { atomOneDark } from "react-syntax-highlighter/dist/esm/styles/hljs";
+
+// react-syntax-highlighter's default export eagerly bundles every highlight.js
+// grammar (100KB+). next/dynamic splits components, not the style object, so
+// both static imports live inside ArtifactCodeBlock and this splits that —
+// the same shape ArtifactPreviewModal uses.
+const CodeBlock = dynamic(() => import("../../artifact-code-block"), { ssr: false });
 
 import { getSkillRevisionFile, type SkillRevisionFilePreview } from "../../../lib/admin-api";
 import { getPreviewLanguage, isImageArtifact } from "../../../lib/artifact-preview";
@@ -122,17 +127,7 @@ function FileBody({
     );
   }
 
-  const language = getPreviewLanguage(contentType);
-  return (
-    <SyntaxHighlighter
-      language={language}
-      style={atomOneDark}
-      customStyle={{ margin: 0, borderRadius: 4, fontSize: "0.85rem", lineHeight: 1.6 }}
-      wrapLongLines
-    >
-      {content}
-    </SyntaxHighlighter>
-  );
+  return <CodeBlock language={getPreviewLanguage(contentType)} code={content} />;
 }
 
 function CsvTable({ content }: { content: string }) {

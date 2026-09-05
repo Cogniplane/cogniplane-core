@@ -1,3 +1,5 @@
+import { Response, type fetch as undiciFetch, type RequestInit } from "undici";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -35,7 +37,10 @@ type RecordedImportInput = {
 
 function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; storageUris: Array<string | null> }) {
   return {
-    async importSkillBundle(_tenantId: string, input: RecordedImportInput) {
+    async importSkillBundle(
+      _tenantId: string,
+      input: RecordedImportInput
+    ): Promise<ImportedSkillBundleRecord> {
       recorder?.calls.push(input);
       const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
       recorder?.storageUris.push(storageUri);
@@ -48,6 +53,7 @@ function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; stor
           version: 0,
           contentHash: input.bundleHash,
           enabled: false,
+          isPublished: false,
           createdBy: input.createdBy,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -57,7 +63,8 @@ function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; stor
           activeBundleStorageUri: null,
           activeBundleHash: null,
           activeValidationStatus: null,
-          activeReviewStatus: null
+          activeReviewStatus: null,
+          isInherited: false
         },
         revision: {
           skillRevisionId: 1,
@@ -74,11 +81,12 @@ function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; stor
           reviewNotes: null,
           metadata: input.metadata,
           createdBy: input.createdBy,
+          createdAt: new Date().toISOString(),
           reviewedBy: null,
           reviewedAt: null,
           activatedAt: null
         }
-      } as ImportedSkillBundleRecord;
+      };
     }
   };
 }
@@ -132,7 +140,7 @@ test("importSkillBundleFromGithub sends Authorization header when githubToken is
     githubUrl: "https://github.com/owner/repo",
     actorUserId: "admin-user",
     githubToken: TOKEN,
-    fetchFn: fakeFetch as typeof fetch
+    fetchFn: fakeFetch as typeof undiciFetch
   });
 
   expect(capturedHeaders.length >= 2).toBeTruthy();
@@ -143,8 +151,8 @@ test("importSkillBundleFromGithub sends Authorization header when githubToken is
   expect(repoLookupCall).toBeTruthy();
   expect(zipballCall).toBeTruthy();
 
-  expect(repoLookupCall.Authorization).toBe(`Bearer ${TOKEN}`);
-  expect(zipballCall.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(repoLookupCall?.Authorization).toBe(`Bearer ${TOKEN}`);
+  expect(zipballCall?.Authorization).toBe(`Bearer ${TOKEN}`);
 });
 
 test("importSkillBundleFromGithub rejects a nonexistent subdirectory as AdminConfigError", async () => {
@@ -178,7 +186,7 @@ test("importSkillBundleFromGithub rejects a nonexistent subdirectory as AdminCon
         skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
         githubUrl: "https://github.com/owner/repo/tree/main/missing-dir",
         actorUserId: "admin-user",
-        fetchFn: fakeFetch as typeof fetch
+        fetchFn: fakeFetch as typeof undiciFetch
       })).rejects.toThrow(AdminConfigError);
 });
 
@@ -228,7 +236,7 @@ test("importSkillBundleFromGithub omits Authorization header when no githubToken
     skillBundleStorage: storage,
     githubUrl: "https://github.com/owner/repo",
     actorUserId: "admin-user",
-    fetchFn: fakeFetch as typeof fetch
+    fetchFn: fakeFetch as typeof undiciFetch
   });
 
   for (const headers of capturedHeaders) {
@@ -263,7 +271,269 @@ test("importSkillBundleFromZip rejects archives with excessive uncompressed size
         archiveBuffer,
         originalFileName: "test-skill.zip",
         actorUserId: "admin-user"
-      })).rejects.toThrow(/maximum uncompressed size/);
+      })).rejects.toThrow(/exceeds the maximum uncompressed size|expands past the \d+-byte limit/);
+});
+
+test("importSkillBundleFromZip rejects a zip bomb before inflating it", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-zipbomb-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  // A zip bomb: 20 MB of a single repeated byte, which DEFLATE crushes to a
+  // few KB. Every declared-size check passes if the header is then rewritten
+  // to a small lie — so the only thing that can stop this is a bound on how
+  // much the entry is allowed to expand relative to the compressed bytes
+  // actually present, applied BEFORE decompression.
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
+  );
+  archive.file("test-skill/references/bomb.txt", "A".repeat(5_000_000));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  // A few KB on the wire, 5 MB on disk. That gap is the attack.
+  expect(archiveBuffer.byteLength).toBeLessThan(100_000);
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "bomb.zip",
+        actorUserId: "admin-user"
+      })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
+});
+
+test("importSkillBundleFromZip rejects many entries that individually pass every declared check", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-multibomb-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  // The subtlest construction: each entry is padded with incompressible random
+  // bytes so its true ratio sits well under the per-entry cap (~60:1), AND
+  // every declared size is then rewritten to 64 bytes. Declared total ~2.6 KB,
+  // declared worst ratio ~1.7:1 — every size and every ratio check passes —
+  // while the archive really inflates to about 32 MB.
+  //
+  // What refuses it is the per-entry length comparison after inflation, which
+  // fires on the first entry. Worth pinning explicitly: it is the check that
+  // makes the declared sizes safe to reason about at all, and the one that
+  // makes the archive-wide total counter unfoolable downstream of it.
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
+  );
+  for (let i = 0; i < 40; i += 1) {
+    const incompressible = randomBytes(12_000).toString("base64");
+    archive.file(`test-skill/references/pad-${i}.txt`, `${incompressible}${"Z".repeat(800_000)}`);
+  }
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  const LOCAL_SIG = 0x04034b50;
+  const CENTRAL_SIG = 0x02014b50;
+  const lie = 64;
+  for (let i = 0; i + 4 <= archiveBuffer.byteLength; i += 1) {
+    const sig = archiveBuffer.readUInt32LE(i);
+    if (sig === LOCAL_SIG && i + 26 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 22);
+    } else if (sig === CENTRAL_SIG && i + 28 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 24);
+    }
+  }
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "multi.zip",
+        actorUserId: "admin-user"
+      })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
+}, 30_000);
+
+test("importSkillBundleFromZip rejects a bomb whose header also lies about its size", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-zipbomb-lie-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
+  );
+  archive.file("test-skill/references/bomb.txt", "A".repeat(20_000_000));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  // Rewrite every 4-byte uncompressed-size field (local header offset 22,
+  // central-directory offset 24) to a harmless-looking value, so the declared
+  // size caps see a 64-byte file. This is the case the old code let through:
+  // it inflated the whole entry and only compared lengths afterwards.
+  const LOCAL_SIG = 0x04034b50;
+  const CENTRAL_SIG = 0x02014b50;
+  const lie = 64;
+  for (let i = 0; i + 4 <= archiveBuffer.byteLength; i += 1) {
+    const sig = archiveBuffer.readUInt32LE(i);
+    if (sig === LOCAL_SIG && i + 26 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 22);
+    } else if (sig === CENTRAL_SIG && i + 28 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 24);
+    }
+  }
+
+  // The lie makes the ratio look SMALL (64 bytes from a few KB compressed), so
+  // it slips past the ratio check — and is then caught by the post-inflate
+  // length comparison. That inflation is bounded: the ratio check already
+  // capped this entry at compressedSize x 100, which is why running it is safe.
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "bomb.zip",
+        actorUserId: "admin-user"
+      })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
+});
+
+test("importSkillBundleFromZip accepts a bundle with ordinary text compression", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-ratio-ok-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  // Real prose compresses maybe 3-5x, nowhere near the 100:1 bound. The ratio
+  // check must not become a limit on legitimate bundles.
+  const prose = Array.from(
+    { length: 400 },
+    (_, i) => `Line ${i}: guidance about writing a good skill, with varied wording and punctuation.`
+  ).join("\n");
+
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    `---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\n${prose}\n`
+  );
+  archive.file("test-skill/references/notes.md", prose);
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "test-skill.zip",
+        actorUserId: "admin-user"
+      })).resolves.toBeDefined();
+});
+
+test("importSkillBundleFromZip bounds ALLOCATION, not just retention, on a lying zip bomb", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-oom-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  // The assertion that distinguishes a real fix from a plausible one. Every
+  // earlier attempt — trusting the declared size, streaming with a counting
+  // cap, a ratio computed from the declared size — also REJECTED this archive,
+  // but only after decompressing the whole thing. That reports the OOM instead
+  // of preventing it, so "it throws" proves nothing on its own.
+  //
+  // What is asserted instead: the rejection names the byte limit and the
+  // COMPRESSED size it was derived from. Only a check that runs on the
+  // compressed bytes can produce that message; every design that inflates
+  // first reports a declared-vs-actual mismatch, or jszip's own post-hoc
+  // "uncompressed data size mismatch", neither of which matches here.
+  //
+  // (A heap-delta assertion was tried and removed: it failed about two runs in
+  // three from unrelated GC timing. A flaky test is worse than none. The
+  // payload is 60 MB rather than the 600 MB used when measuring by hand,
+  // because building the archive dominates the runtime and the property does
+  // not depend on the size.)
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
+  );
+  archive.file("test-skill/references/bomb.txt", Buffer.alloc(60_000_000, 0x41));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  // Rewrite every declared uncompressed size to 64 bytes, so nothing that
+  // reads the header can tell this apart from a trivial file.
+  const LOCAL_SIG = 0x04034b50;
+  const CENTRAL_SIG = 0x02014b50;
+  const lie = 64;
+  for (let i = 0; i + 4 <= archiveBuffer.byteLength; i += 1) {
+    const sig = archiveBuffer.readUInt32LE(i);
+    if (sig === LOCAL_SIG && i + 26 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 22);
+    } else if (sig === CENTRAL_SIG && i + 28 <= archiveBuffer.byteLength) {
+      archiveBuffer.writeUInt32LE(lie, i + 24);
+    }
+  }
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "bomb.zip",
+        actorUserId: "admin-user"
+      })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
+  // Generous: building a 60 MB archive dominates the runtime and slows further
+  // under coverage instrumentation. The assertion itself is instant.
+}, 30_000);
+
+test("importSkillBundleFromZip handles STORE-compressed (uncompressed) entries", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-store-"));
+  onTestFinished(async () => {
+        await rm(root, { recursive: true, force: true });
+      });
+
+  // Method 0 has no compressed stream to inflate, so `inflateEntryBounded`
+  // returns the raw bytes on a separate branch. Archives written by some tools
+  // (and any already-compressed file) take it, so it needs its own coverage —
+  // driving zlib directly means the two methods no longer share a code path.
+  const archive = new JSZip();
+  archive.file(
+    "test-skill/SKILL.md",
+    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nStored entry instructions.\n",
+    { compression: "STORE" }
+  );
+  archive.file("test-skill/references/notes.md", "Companion file, stored verbatim.", {
+    compression: "STORE"
+  });
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "STORE" });
+
+  await expect(importSkillBundleFromZip({
+        tenantId: "test-tenant",
+        config: createTestConfig({
+          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
+        }),
+        skillRevisions: buildFakeSkillRevisions(),
+        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+        archiveBuffer,
+        originalFileName: "stored.zip",
+        actorUserId: "admin-user"
+      })).resolves.toBeDefined();
 });
 
 test("importSkillBundleFromZip rejects malformed (non-zip) bytes as AdminConfigError, not a library error", async () => {
@@ -424,10 +694,10 @@ type FakeHop = { url: string; headers: Record<string, string> };
  * records the URL + headers it was invoked with on every hop, so the
  * production redirect loop runs unmodified.
  */
-function makeRedirectFake(responses: Response[]): { fake: typeof fetch; hops: FakeHop[] } {
+function makeRedirectFake(responses: Response[]): { fake: typeof undiciFetch; hops: FakeHop[] } {
   const hops: FakeHop[] = [];
   let index = 0;
-  const fake = (async (url: string | URL, init?: RequestInit) => {
+  const fake: typeof undiciFetch = async (url, init) => {
     hops.push({
       url: url.toString(),
       headers: { ...((init?.headers ?? {}) as Record<string, string>) }
@@ -438,7 +708,7 @@ function makeRedirectFake(responses: Response[]): { fake: typeof fetch; hops: Fa
       throw new Error(`No scripted response for hop ${index} (${url.toString()})`);
     }
     return response;
-  }) as unknown as typeof fetch;
+  };
   return { fake, hops };
 }
 

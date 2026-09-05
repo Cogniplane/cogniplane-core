@@ -10,7 +10,7 @@ import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
 import { CORS_ALLOWED_METHODS, isCorsOriginAllowed } from "./lib/cors.js";
-import { createDatabase } from "./lib/db.js";
+import { createDatabase, createPrivilegedDatabase } from "./lib/db.js";
 import { getRedis } from "./lib/redis.js";
 import { sanitizeUrl } from "./lib/sanitize-url.js";
 import { registerSecurityHeaders } from "./lib/security-headers.js";
@@ -18,7 +18,8 @@ import { registerAuthRoutes } from "./routes/auth.js";
 import { registerTenantRoutes } from "./routes/tenant.js";
 import { TenantMemberStore } from "./services/tenant-member-store.js";
 import { ApprovalStore } from "./services/auth/approval-store.js";
-import { Pool } from "pg";
+import { MessageStore } from "./services/message-store.js";
+import { resolveStaleMessageDeadline } from "./services/runtime/stale-message-sweeper.js";
 
 /**
  * Map unhandled errors to a safe envelope so internal Error messages and stack
@@ -51,15 +52,34 @@ export function handleAppError(
 
 /**
  * Parse the TRUST_PROXY config string into the shape Fastify's `trustProxy`
- * option expects. `request.ip` resolution (and therefore the /mcp and /llm
- * egress IP controls) depend on this matching the deployment's real proxy
- * topology. See the TRUST_PROXY docs in config.ts for the value semantics.
+ * option expects. This governs `request.ip` resolution for general request
+ * handling and logging ONLY. It does not participate in `/mcp` admission: the
+ * gateway reads the raw socket peer (`request.raw.socket.remoteAddress`) and
+ * deliberately ignores every forwarded header. See the TRUST_PROXY docs in
+ * config.ts for the value semantics.
  */
-export function parseTrustProxy(raw: string): boolean | number | string {
+export function parseTrustProxy(raw: string): boolean | string {
   const value = raw.trim();
   if (value === "" || value.toLowerCase() === "false") return false;
   if (value.toLowerCase() === "true") return true;
-  if (/^\d+$/.test(value)) return Number(value);
+  if (/^\d+$/.test(value)) {
+    // Hop-count trust is GONE, deliberately. Fastify 5.12.1 removed it for
+    // GHSA-3m5p-2c4r-xxw2 and now fails closed on a numeric value at runtime
+    // ("Hop-count-only trust cannot validate the immediate peer"): counting
+    // hops never checks WHO the immediate peer is, so a direct client can
+    // spoof X-Forwarded-For by supplying enough hops itself.
+    //
+    // Reproducing it as a hop-comparing TrustProxyFunction would reintroduce
+    // exactly the vulnerability, so this refuses instead. Operators set an
+    // IP/CIDR allowlist of their actual proxies (e.g. the ALB subnets), which
+    // validates the peer rather than trusting a count.
+    throw new Error(
+      `TRUST_PROXY="${value}": numeric hop counts are no longer supported. ` +
+        "Fastify removed them as spoofable (GHSA-3m5p-2c4r-xxw2). Set TRUST_PROXY to a " +
+        "comma-separated IP/CIDR list of your trusted proxies (e.g. the load balancer's " +
+        "subnets), or \"true\" only if every path to this server is already trusted."
+    );
+  }
   // Otherwise treat as a comma-separated IP/CIDR allowlist of trusted proxies.
   return value;
 }
@@ -68,10 +88,9 @@ export async function buildApp() {
   const config = loadConfig();
   const app = Fastify({
     // Resolve `request.ip` from X-Forwarded-For per the deployment's proxy
-    // topology. Without this, behind the ECS ALB `request.ip` is the ALB node
-    // and the per-runtime egress IP pin (/mcp + /llm) would pin a shared LB
-    // address — useless at best, intermittently rejecting cross-AZ traffic at
-    // worst. Default "1" trusts exactly the ALB hop.
+    // topology, so logs and rate limits see the real client rather than the
+    // load balancer. This does NOT affect /mcp admission, which checks the raw
+    // socket peer for loopback and ignores forwarded headers entirely.
     trustProxy: parseTrustProxy(config.TRUST_PROXY),
     // Defense-in-depth HTTP-layer cap on JSON/raw request bodies. Field-level
     // schemas (e.g. MessagePostRequestSchema.text) enforce tighter per-field
@@ -132,7 +151,7 @@ export async function buildApp() {
   const privilegedDb =
     privilegedConnectionString === config.DATABASE_URL
       ? app.db
-      : new Pool({ connectionString: privilegedConnectionString });
+      : createPrivilegedDatabase(privilegedConnectionString);
 
   // Fail fast if Postgres is unavailable so the app does not boot into a half-working state.
   await app.db.query("SELECT 1");
@@ -171,13 +190,34 @@ export async function buildApp() {
     );
   }
 
+  // The mirror of the assertion above, and the more security-relevant of the
+  // two: the app pool must NOT bypass RLS. Row-Level Security is the tenant
+  // isolation boundary for every request path, and a superuser or BYPASSRLS
+  // role silently ignores every policy — `withTenantScope` would still set the
+  // GUC, every query would still look correct, and each tenant would quietly
+  // see all the others' rows. Nothing else in the system would report a fault.
+  // Checked in workos mode only: local dev routinely points DATABASE_URL at a
+  // superuser, and there is no tenant isolation to protect there.
+  if (config.AUTH_MODE === "workos") {
+    const { rows } = await app.db.query<{ bypassrls: boolean; superuser: boolean }>(
+      "SELECT rolbypassrls AS bypassrls, rolsuper AS superuser FROM pg_roles WHERE rolname = current_user"
+    );
+    if (rows[0]?.bypassrls || rows[0]?.superuser) {
+      throw new Error(
+        "The application database pool must NOT bypass Row-Level Security. " +
+          "DATABASE_URL is connecting as a superuser or a BYPASSRLS role, which disables every tenant " +
+          "isolation policy. Point DATABASE_URL at the unprivileged application role (app_user)."
+      );
+    }
+  }
+
   await registerSecurityHeaders(app);
 
   await app.register(cors, {
     origin: (requestOrigin, cb) => cb(null, isCorsOriginAllowed(requestOrigin, config.API_ORIGIN)),
     credentials: true,
     methods: CORS_ALLOWED_METHODS,
-    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "X-Tenant-Id"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "X-Tenant-Id", "X-Dev-Auth-Key"]
   });
   await app.register(cookie);
   // Plugin-level defaults so any route that calls `request.file()` without
@@ -209,20 +249,41 @@ export async function buildApp() {
     const authTenantMembers = new TenantMemberStore(privilegedDb);
     // onRequest, not preHandler: authentication only reads headers/url, so
     // gating here rejects unauthenticated callers before body parsing/validation.
-    app.addHook("onRequest", workosAuth(config, authTenantMembers));
+    app.addHook("onRequest", workosAuth(config, authTenantMembers, deps.integrationDescriptors.oauthCallbackPaths()));
     await registerTenantRoutes(app, {
       db: app.db,
       tenantOrgSettings: deps.tenantOrgSettings,
       githubConnections: deps.githubConnectionService,
+      integrationDescriptors: deps.integrationDescriptors,
       getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
     });
   } else {
-    app.addHook("onRequest", localDevAuth(config));
+    app.addHook("onRequest", localDevAuth(config, deps.integrationDescriptors.oauthCallbackPaths()));
     await registerTenantRoutes(app, {
       db: app.db,
       tenantOrgSettings: deps.tenantOrgSettings,
       githubConnections: deps.githubConnectionService,
+      integrationDescriptors: deps.integrationDescriptors,
       getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
+    });
+  }
+
+  // Admin routes run the heaviest aggregate queries in the app and are spread
+  // across a dozen registration functions, so throttle them in one place rather
+  // than per route. Added after the auth hook, so request.auth is populated.
+  if (deps.limits) {
+    const limits = deps.limits;
+    app.addHook("onRequest", async (request, reply) => {
+      if (!request.url.startsWith("/admin/") || !request.auth) return;
+      const limitError = await limits.consumeRateLimit({
+        resource: "admin_query",
+        userId: request.auth.userId,
+        tenantId: request.auth.tenantId
+      });
+      if (!limitError) return;
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(limitError.retryAfterMs / 1000)));
+      return reply.send(limitError);
     });
   }
 
@@ -230,7 +291,8 @@ export async function buildApp() {
     db: config.AUTH_MODE === "workos" ? privilegedDb : app.db,
     config,
     auditEvents: deps.auditEvents,
-    limits: deps.limits
+    limits: deps.limits,
+    integrationDescriptors: deps.integrationDescriptors
   });
 
   await registerAppRoutes(app, deps);
@@ -250,6 +312,8 @@ export async function buildApp() {
     logger: app.log
   });
 
+  const staleMessageDeadlineMs = resolveStaleMessageDeadline(config);
+
   registerAppLifecycle({
     app,
     config,
@@ -265,7 +329,30 @@ export async function buildApp() {
       approvals: new ApprovalStore(privilegedDb),
       auditEvents: deps.auditEvents,
       logger: app.log
-    }
+    },
+    // Same pool, same reason: assistant rows a killed process left `pending`/
+    // `streaming` span every tenant. Disabled when the turn watchdog is off —
+    // RUNTIME_TURN_TIMEOUT_MS=0 means a turn has no ceiling, so no staleness
+    // deadline can distinguish an abandoned row from a live one.
+    //
+    // The deadline is the turn's wall-clock ceiling: the watchdog caps WORKING
+    // time at RUNTIME_TURN_TIMEOUT_MS but pauses while a human decides an
+    // approval, so real elapsed time is working time plus approval time. The
+    // approval loop is unbounded (bead l2pq), so no finite deadline covers every
+    // turn. The x3 factor budgets for a few approval rounds, and the AG-UI writer
+    // refreshes `updated_at` on a timer so an approval wait keeps its row alive.
+    //
+    // That false positive is self-healing and not worth a heavier mechanism: the
+    // live writer's terminal updateContent overwrites the row with the true
+    // status at turn end. Leaving abandoned rows `pending` forever is the worse
+    // failure, and it is the one that actually happens.
+    staleMessageSweeper: staleMessageDeadlineMs
+      ? {
+          messages: new MessageStore(privilegedDb),
+          logger: app.log,
+          staleAfterMs: staleMessageDeadlineMs
+        }
+      : null
   });
 
   return app;

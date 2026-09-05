@@ -115,10 +115,10 @@ describe("createAdminAuditEvent", () => {
         events.push(input);
       }
     };
-    await createAdminAuditEvent(auditEvents as never, {
+    await createAdminAuditEvent(auditEvents, {
       tenantId: "t",
       userId: "u",
-      type: "admin.skill.activate",
+      type: "admin.skill.activated",
       payload: { skillId: "x" },
       ipAddress: "127.0.0.1",
       userAgent: "test"
@@ -128,7 +128,7 @@ describe("createAdminAuditEvent", () => {
         tenantId: "t",
         sessionId: null,
         userId: "u",
-        type: "admin.skill.activate",
+        type: "admin.skill.activated",
         payload: { skillId: "x" },
         ipAddress: "127.0.0.1",
         userAgent: "test"
@@ -143,10 +143,10 @@ describe("createAdminAuditEvent", () => {
         events.push(input);
       }
     };
-    await createAdminAuditEvent(auditEvents as never, {
+    await createAdminAuditEvent(auditEvents, {
       tenantId: "t",
       userId: "u",
-      type: "admin.skill.activate",
+      type: "admin.skill.activated",
       payload: {}
     });
     expect(events[0]?.ipAddress).toBeUndefined();

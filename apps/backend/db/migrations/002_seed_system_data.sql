@@ -24,15 +24,6 @@ INSERT INTO admin_mcp_servers (
     'Read current session context and recent message history through first-party managed tools.',
     'http', 'managed', '/mcp/managed-session-context', NULL, '[]'::jsonb,
     1, md5('managed-session-context:v1'), TRUE, 'system'
-  ),
-  -- Disabled by default. Trusted-echo is a placeholder proxy server kept here
-  -- as a worked example for tenants that want to wire their own upstream MCP.
-  (
-    'system', 'trusted-echo', 'Trusted echo',
-    'Forward validated framework context to a trusted upstream MCP server.',
-    'http', 'proxy', '/mcp/trusted-echo', NULL,
-    '["X-Framework-User-Id","X-Framework-Session-Id","X-Framework-Runtime-Id"]'::jsonb,
-    1, md5('trusted-echo:v1'), FALSE, 'system'
   )
 ON CONFLICT (tenant_id, server_id) DO NOTHING;
 

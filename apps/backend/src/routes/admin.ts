@@ -4,16 +4,34 @@ import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 import type { ModelProvider } from "@cogniplane/shared-types";
 
 import { registerAdminArtifactRoutes } from "./admin/admin-artifact-routes.js";
-import { registerAdminIntegrationsRoutes } from "./admin/admin-integrations-routes.js";
+import {
+  registerAdminIntegrationsRoutes,
+  type AdminIntegrationsRouteStores
+} from "./admin/admin-integrations-routes.js";
 import { registerAdminMcpServerRoutes } from "./admin/admin-mcp-server-routes.js";
-import { registerAdminModelRoutes } from "./admin/admin-model-routes.js";
-import { registerAdminPiiRoutes } from "./admin/admin-pii-routes.js";
-import { registerAdminPolicyRoutes } from "./admin/admin-policy-routes.js";
+import {
+  registerAdminModelRoutes,
+  type ModelAdminRouteStores
+} from "./admin/admin-model-routes.js";
+import {
+  registerAdminPiiRoutes,
+  type AdminPiiRouteStores
+} from "./admin/admin-pii-routes.js";
+import {
+  registerAdminPolicyRoutes,
+  type PolicyRouteStores
+} from "./admin/admin-policy-routes.js";
 import { registerAdminRuntimeRoutes } from "./admin/admin-runtime-routes.js";
 import { registerAdminSessionDetailRoute } from "./admin/admin-session-detail.js";
 import { registerAdminSessionRoutes } from "./admin/admin-session-routes.js";
-import { registerAdminSkillRoutes } from "./admin/admin-skill-routes.js";
-import { registerAdminTenantSettingsRoutes } from "./admin/admin-tenant-settings-routes.js";
+import {
+  registerAdminSkillRoutes,
+  type AdminSkillRouteStores
+} from "./admin/admin-skill-routes.js";
+import {
+  registerAdminTenantSettingsRoutes,
+  type TenantSettingsRouteStores
+} from "./admin/admin-tenant-settings-routes.js";
 import { registerAdminTokenUsageRoutes } from "./admin/admin-token-usage-routes.js";
 import { registerAdminUserRoutes } from "./admin/admin-user-routes.js";
 import type { AppConfig } from "../config.js";
@@ -83,7 +101,24 @@ export function buildAdminRouteStores(
   };
 }
 
-export type AdminRouteStores = ReturnType<typeof buildAdminRouteStores>;
+type OptionalAdminPiiRouteStores =
+  | AdminPiiRouteStores
+  | {
+      piiCircuitBreaker?: undefined;
+      piiProtection?: undefined;
+      piiAnalytics?: undefined;
+      platformEvents?: undefined;
+    };
+
+export type AdminRouteStores = AdminSkillRouteStores &
+  Parameters<typeof registerAdminUserRoutes>[1] &
+  Parameters<typeof registerAdminRuntimeRoutes>[1] &
+  Parameters<typeof registerAdminMcpServerRoutes>[1] &
+  TenantSettingsRouteStores &
+  ModelAdminRouteStores &
+  PolicyRouteStores &
+  AdminIntegrationsRouteStores &
+  OptionalAdminPiiRouteStores;
 
 export async function registerAdminRoutes(
   app: FastifyInstance,

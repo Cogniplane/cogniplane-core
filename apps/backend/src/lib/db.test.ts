@@ -13,20 +13,29 @@ import { withTenantScope, withTransaction } from "./db.js";
  */
 type RecordedQuery = { text: string; values: unknown[] };
 
-function makeRecordingPool(): {
+function makeRecordingPool(options: { failOnSql?: string } = {}): {
   pool: Pool;
   queries: RecordedQuery[];
   releaseCount: () => number;
+  releaseArgs: unknown[];
 } {
   const queries: RecordedQuery[] = [];
+  const releaseArgs: unknown[] = [];
   let releaseCount = 0;
   const client = {
     async query(text: string, values: unknown[] = []) {
       queries.push({ text, values });
+      if (options.failOnSql && text === options.failOnSql) {
+        throw new Error(`injected failure: ${text}`);
+      }
       return { rows: [], rowCount: 0 };
     },
-    release() {
+    // `pg-pool` only destroys a client when release is called WITH an error, so
+    // the argument is the observable signal for "this client must not go back
+    // into the pool" — record it, don't just count calls.
+    release(err?: unknown) {
       releaseCount += 1;
+      releaseArgs.push(err);
     }
   };
   const pool = {
@@ -37,6 +46,7 @@ function makeRecordingPool(): {
   return {
     pool: pool as unknown as Pool,
     queries,
+    releaseArgs,
     releaseCount: () => releaseCount
   };
 }
@@ -140,4 +150,59 @@ test("withTransaction rejects with the same error, issues ROLLBACK (not COMMIT),
   expect(texts.indexOf(SENTINEL)).toBeLessThan(texts.indexOf("ROLLBACK"));
 
   expect(releaseCount()).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Failed ROLLBACK — the client must be destroyed, not pooled
+// ---------------------------------------------------------------------------
+//
+// pg-pool returns a still-queryable client to the pool unless release() is given
+// an error; it does NOT notice an open transaction. If a failed ROLLBACK left a
+// withTenantScope transaction open, the next borrower's BEGIN would be a no-op
+// inside it and its queries would run under the PREVIOUS tenant's
+// app.current_tenant_id — a cross-tenant read. These pin the destroy signal.
+
+test("withTenantScope releases WITH an error when ROLLBACK fails, so the pool discards the client", async () => {
+  const { pool, queries, releaseCount, releaseArgs } = makeRecordingPool({ failOnSql: "ROLLBACK" });
+
+  const original = new Error("callback exploded");
+  await expect(
+    withTenantScope(pool, "tenant-42", async () => {
+      throw original;
+    })
+  ).rejects.toBe(original); // the ROLLBACK failure must not mask the real error
+
+  expect(queries.map((q) => q.text)).toContain("ROLLBACK");
+  expect(releaseCount()).toBe(1);
+  expect(releaseArgs[0]).toBeInstanceOf(Error);
+  expect((releaseArgs[0] as Error).message).toMatch(/injected failure: ROLLBACK/);
+});
+
+test("withTransaction releases WITH an error when ROLLBACK fails", async () => {
+  const { pool, releaseCount, releaseArgs } = makeRecordingPool({ failOnSql: "ROLLBACK" });
+
+  const original = new Error("callback exploded");
+  await expect(
+    withTransaction(pool, async () => {
+      throw original;
+    })
+  ).rejects.toBe(original);
+
+  expect(releaseCount()).toBe(1);
+  expect(releaseArgs[0]).toBeInstanceOf(Error);
+});
+
+test("a successful rollback releases the client back to the pool undamaged", async () => {
+  const { pool, releaseCount, releaseArgs } = makeRecordingPool();
+
+  await expect(
+    withTenantScope(pool, "tenant-42", async () => {
+      throw new Error("callback exploded");
+    })
+  ).rejects.toThrow("callback exploded");
+
+  // ROLLBACK worked, so the connection is clean — destroying it here would
+  // needlessly churn the pool on every ordinary query error.
+  expect(releaseCount()).toBe(1);
+  expect(releaseArgs[0]).toBeUndefined();
 });

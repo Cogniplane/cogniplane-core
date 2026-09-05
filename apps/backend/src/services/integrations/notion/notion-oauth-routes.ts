@@ -12,7 +12,7 @@ export const NOTION_OAUTH_CALLBACK_PATHS = ["/integrations/notion/callback"] as 
 
 export function registerNotionOAuthRoutes(
   app: FastifyInstance,
-  connections: NotionConnectionService,
+  connections: Pick<NotionConnectionService, "completeAuthorization">,
   limits?: RequestLimitsInterface
 ): void {
   app.get("/integrations/notion/callback", async (request, reply) => {

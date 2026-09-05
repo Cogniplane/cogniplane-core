@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { API_URL } from "../../../lib/api-client";
@@ -18,8 +18,16 @@ function AuthCallbackInner() {
   const [organizations, setOrganizations] = useState<OrganizationOption[]>([]);
   const [isRedirecting, setIsRedirecting] = useState(false);
   const { completeLogin, login } = useAuth();
+  // A WorkOS authorization code is single-use: a second exchange fails and the
+  // page shows "Authentication failed" on a sign-in that actually worked.
+  // StrictMode replays this effect on the same instance in development, so the
+  // latch has to be a ref, checked before the effect reads anything.
+  const exchangeStartedRef = useRef(false);
 
   useEffect(() => {
+    if (exchangeStartedRef.current) return;
+    exchangeStartedRef.current = true;
+
     const code = searchParams.get("code");
     const state = searchParams.get("state");
     if (!code) {

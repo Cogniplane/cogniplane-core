@@ -2,7 +2,7 @@ import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
 import type { AppConfig } from "../../config.js";
-import { ssrfSafeAgent } from "../../lib/url-validation.js";
+import { assertDispatcherAwareFetch, ssrfSafeAgent } from "../../lib/url-validation.js";
 
 const marketplaceSlugSchema = z
   .string()
@@ -154,8 +154,10 @@ export class SkillMarketplaceService {
       AppConfig,
       "SKILL_MARKETPLACE_MANIFEST_URL" | "SKILL_MARKETPLACE_CACHE_TTL_MS"
     >,
-    private readonly fetchImpl: typeof fetch = undiciFetch as unknown as typeof fetch
-  ) {}
+    private readonly fetchImpl: typeof undiciFetch = undiciFetch
+  ) {
+    assertDispatcherAwareFetch(fetchImpl);
+  }
 
   async getCatalog(opts?: { manifestUrl?: string; githubToken?: string }): Promise<SkillMarketplaceCatalog> {
     const overrideUrl = opts?.manifestUrl;
@@ -207,9 +209,8 @@ export class SkillMarketplaceService {
       // closing the DNS-rebinding TOCTOU window between tenant-time URL
       // validation (httpsUrlSchema) and this on-demand fetch. Must reach
       // undici's fetch directly — Node's global fetch ignores `dispatcher`
-      // as of undici v8 (the default fetchImpl is undici.fetch for this
-      // reason); the cast keeps the dispatcher field through the wider type.
-      const response = await (this.fetchImpl as unknown as typeof undiciFetch)(manifestUrl, {
+      // as of undici v8. The default fetchImpl is undici.fetch for this reason.
+      const response = await this.fetchImpl(manifestUrl, {
         headers,
         dispatcher: ssrfSafeAgent
       });

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 
 import type { AppConfig } from "./config.js";
+import { runtimeTokenSecret } from "./lib/derived-secrets.js";
 import { closeRedis } from "./lib/redis.js";
 import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
@@ -23,6 +24,10 @@ import {
   sweepStaleApprovals,
   type StaleApprovalSweeperDeps
 } from "./services/runtime/stale-approval-sweeper.js";
+import {
+  sweepStaleAssistantMessages,
+  type StaleMessageSweeperDeps
+} from "./services/runtime/stale-message-sweeper.js";
 
 export async function registerAppRoutes(
   app: FastifyInstance,
@@ -51,8 +56,7 @@ export async function registerAppRoutes(
   await registerMcpRoutes(
     app,
     buildMcpRouteStores(deps, {
-      runtimeTokenSecret: app.config.DATA_ENCRYPTION_SECRET,
-      egressCidrs: app.config.E2B_EGRESS_CIDRS,
+      runtimeTokenSecret: runtimeTokenSecret(app.config.DATA_ENCRYPTION_SECRET),
       readRuntimeFile: async (sessionId, runtimeId, filePath) => {
         const runtime = resolveOwningFileAdapter(deps.runtimeAdapter, sessionId, runtimeId);
         if (!runtime?.readRuntimeFile) {
@@ -73,22 +77,6 @@ export async function registerAppRoutes(
           throw new Error(`No active runtime for session ${sessionId}.`);
         }
         return runtime.writeRuntimeFile(sessionId, filePath, data);
-      },
-      // Policy Center require_approval routing. The gateway holds its HTTP
-      // response open while this awaits the human decision; the owning adapter
-      // emits the SSE prompt and the /approvals decision route settles it. When
-      // no adapter owns the session (no active turn), an enforce-mode
-      // require_approval degrades to a deny (see PolicyService.routeApproval).
-      requestPolicyApproval: async (input) => {
-        const runtime = resolveOwningFileAdapter(
-          deps.runtimeAdapter,
-          input.sessionId,
-          input.runtimeId ?? undefined
-        );
-        if (!runtime?.requestPolicyApproval) return null;
-        // input is a PolicyApprovalRouteInput — the adapter method takes the
-        // same shape, so forward it as-is rather than re-listing every field.
-        return runtime.requestPolicyApproval(input);
       }
     })
   );
@@ -112,6 +100,12 @@ export function registerAppLifecycle(input: {
    * always wires it.
    */
   staleApprovalSweeper?: StaleApprovalSweeperDeps | null;
+  /**
+   * Cross-tenant recovery for assistant rows a killed process left streaming.
+   * Backed by the privileged store for the same reason. Optional only so tests
+   * can omit it; production always wires it.
+   */
+  staleMessageSweeper?: StaleMessageSweeperDeps | null;
 }) {
   const {
     app,
@@ -121,7 +115,8 @@ export function registerAppLifecycle(input: {
     runtimeAdapter,
     privilegedDb,
     schedulerWorker,
-    staleApprovalSweeper
+    staleApprovalSweeper,
+    staleMessageSweeper
   } = input;
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
@@ -145,10 +140,28 @@ export function registerAppLifecycle(input: {
     approvalSweepInterval.unref();
   }
 
+  // Same shape for assistant rows a prior process left mid-turn: recover the
+  // crash backlog at boot, then keep sweeping so a kill during THIS process's
+  // lifetime is picked up by the next instance (or by this one, if the row was
+  // orphaned by a worker that died without taking the process with it).
+  let messageSweepInterval: ReturnType<typeof setInterval> | null = null;
+  if (staleMessageSweeper) {
+    void sweepStaleAssistantMessages(staleMessageSweeper).catch((err) => {
+      app.log.error({ err }, "Startup stale-message sweep failed");
+    });
+    messageSweepInterval = setInterval(() => {
+      void sweepStaleAssistantMessages(staleMessageSweeper).catch((err) => {
+        app.log.error({ err }, "Periodic stale-message sweep failed");
+      });
+    }, staleMessageSweeper.staleAfterMs);
+    messageSweepInterval.unref();
+  }
+
   app.addHook("onClose", async () => {
     schedulerWorker?.stop();
     clearInterval(sweepInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
+    if (messageSweepInterval) clearInterval(messageSweepInterval);
     await runtimeAdapter.close();
     await policyService.close();
     await closeRedis();

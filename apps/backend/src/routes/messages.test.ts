@@ -45,7 +45,6 @@ function makeStores(
           sandboxMode: "workspace-write" as const,
           networkMode: "restricted" as const,
           allowCommandExecution: false,
-          allowUserTokenForwarding: false,
           autoApproveReadOnlyTools: false,
           policyEnforcementMode: "monitor" as const,
           developerInstructions: null,
@@ -56,16 +55,9 @@ function makeStores(
         }
       };
     },
-    async *runMessage() {
-      await (options.gateRuntime ? options.gateRuntime() : runtimeGate);
-      yield { type: "response.created", responseId: "r1" } as const;
-      yield { type: "response.completed", responseId: "r1" } as const;
-    },
-    // AG-UI dispatch path (streamAssistantReplyAGUI → runMessageAGUI). Emits a
-    // minimal, valid AG-UI run carrying one assistant text message. Unlike
-    // runMessage this does not wait on runtimeGate — the AG-UI happy-path tests
-    // want a deterministic turn that completes on its own.
+    // Emit a minimal valid AG-UI run carrying one assistant text message.
     async *runMessageAGUI(): AsyncGenerator<BaseEvent> {
+      await (options.gateRuntime ? options.gateRuntime() : runtimeGate);
       const runId = "run-agui-1";
       const messageId = "msg-agui-1";
       yield { type: EventType.RUN_STARTED, threadId: SESSION_ID, runId } as BaseEvent;
@@ -309,47 +301,19 @@ test("hijacked SSE responses set security and no-store cache headers directly", 
   expect(response.headers["cache-control"]).toBe("no-store, no-cache, no-transform");
 });
 
-test("rejects ?format=agui with 400 (no side effects) when AGUI_WIRE is disabled", async () => {
-  // buildApp's config decorator omits AGUI_WIRE, so it reads as off — the guard
-  // must reject up front rather than silently serve the RuntimeEvent SSE stream
-  // (which an AG-UI client like CopilotKit cannot parse).
-  const harness = makeStores();
-  const app = await buildApp(harness.stores);
+test("POST /messages dispatches AG-UI, persists the user turn, and releases the slot", async () => {
+  const harness = makeStores({ gateRuntime: async () => undefined });
+  const app = await buildApp(harness.stores, { TOOL_CONTEXT_TTL_MS: 60_000 });
   activeApp = app;
 
   const response = await app.inject({
     method: "POST",
-    url: "/messages?format=agui",
-    payload: { sessionId: SESSION_ID, text: "hi" }
-  });
-
-  expect(response.statusCode).toBe(400);
-  expect(response.json()).toMatchObject({ error: "agui_wire_disabled" });
-  // Rejected before any side effects (no user message persisted, no quota spent).
-  expect(harness.createdMessages.length).toBe(0);
-  expect(harness.consumedQuota.length).toBe(0);
-});
-
-test("?format=agui dispatches the AG-UI stream, persists the user turn, and releases the slot", async () => {
-  // The disabled-400 and PII-block cases return before the real dispatch branch;
-  // this drives it: AGUI_WIRE on + a gated runtime turn routed through
-  // streamAssistantReplyAGUI. Assert the observable contract — the AG-UI run the
-  // client receives (RUN_STARTED…RUN_FINISHED with the assistant text delta), the
-  // persisted user message, and the reserved slot released in the branch's
-  // try/finally so a follow-up turn is not wedged as busy.
-  const harness = makeStores();
-  const app = await buildApp(harness.stores, { AGUI_WIRE: true, TOOL_CONTEXT_TTL_MS: 60_000 });
-  activeApp = app;
-
-  const response = await app.inject({
-    method: "POST",
-    url: "/messages?format=agui",
+    url: "/messages",
     payload: { sessionId: SESSION_ID, text: "hi over agui" }
   });
 
   expect(response.statusCode).toBe(200);
-  // AG-UI wire format: `data: <json>\n\n` frames (not the RuntimeEvent SSE
-  // vocabulary). The client's HttpAgent parses these directly.
+  // The client's HttpAgent parses these data frames directly.
   const frames = response.body
     .split("\n\n")
     .map((line) => line.replace(/^data: /, "").trim())
@@ -359,8 +323,7 @@ test("?format=agui dispatches the AG-UI stream, persists the user turn, and rele
 
   expect(eventTypes).toContain(EventType.RUN_STARTED);
   expect(eventTypes).toContain(EventType.RUN_FINISHED);
-  // The assistant text reaches the client as a TEXT_MESSAGE_CONTENT delta — this
-  // is the payload the disabled/PII short-circuits never produce.
+  // The assistant text reaches the client as a TEXT_MESSAGE_CONTENT delta.
   const contentFrame = frames.find(
     (frame) => frame.type === EventType.TEXT_MESSAGE_CONTENT
   ) as { delta?: string } | undefined;
@@ -369,7 +332,6 @@ test("?format=agui dispatches the AG-UI stream, persists the user turn, and rele
   // The user's turn was persisted (dispatch ran, not a short-circuit).
   expect(harness.createdMessages).toContainEqual({ role: "user", content: "hi over agui" });
 
-  // The reserved slot is released after the AG-UI turn (by the route's turn-slot
-  // finally), so a follow-up turn on this session is not wedged as busy.
+  // The route releases the reserved slot after the turn.
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
 });

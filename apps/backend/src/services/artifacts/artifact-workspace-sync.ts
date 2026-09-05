@@ -51,7 +51,7 @@ function uniqueWorkspacePath(artifact: ArtifactRecord, usedNames: Set<string>): 
 export async function syncArtifactsToWorkspace(input: {
   sessionId: string;
   scopedArtifacts: ArtifactRecord[];
-  storage: ArtifactStorage;
+  storage: Pick<ArtifactStorage, "openReadStream">;
   writeRuntimeFile: (sessionId: string, filePath: string, data: Uint8Array | string) => Promise<string>;
 }): Promise<SyncedArtifact[]> {
   const { sessionId, scopedArtifacts, storage, writeRuntimeFile } = input;

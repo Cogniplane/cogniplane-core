@@ -3,10 +3,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 
+import { ApiError } from "./api-client";
+
 export function isAuthError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message;
-  return message.includes("401") || message.toLowerCase().includes("unauthorized");
+  return error instanceof ApiError && error.status === 401;
 }
 
 export function shouldRetryQuery(failureCount: number, error: unknown): boolean {

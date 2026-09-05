@@ -28,18 +28,21 @@ test("resolveTenantMembershipRole preserves an existing owner role", () => {
         })).toBe("owner");
 });
 
-test("resolveTenantMembershipRole syncs non-owner roles from WorkOS", () => {
+// The tenant's own RBAC wins once a membership exists: WorkOS seeds the role at
+// provisioning only. Re-syncing on every login would restore an admin the owner
+// just demoted in-app, and reverse an in-app promotion.
+test("resolveTenantMembershipRole never overwrites an existing role from WorkOS", () => {
   expect(resolveTenantMembershipRole({
           existingRole: "admin",
           isFirstMember: false,
           workosRoleSlug: "member"
-        })).toBe("member");
+        })).toBe("admin");
 
   expect(resolveTenantMembershipRole({
           existingRole: "member",
           isFirstMember: false,
           workosRoleSlug: "admin"
-        })).toBe("admin");
+        })).toBe("member");
 });
 
 test("resolveTenantMembershipRole derives the initial role for new memberships", () => {
@@ -396,6 +399,11 @@ describe("POST /auth/callback", () => {
         rows: [{ tenant_id: "tenant-uuid-1" }],
         rowCount: 1
       }))
+      // No row holds this email yet → the INSERT path.
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
+        rows: [],
+        rowCount: 0
+      }))
       .onQuery(/INSERT INTO users/, () => ({
         rows: [{ user_id: "user-uuid-1" }],
         rowCount: 1
@@ -453,11 +461,127 @@ describe("POST /auth/callback", () => {
     expect(harness.auditEvents.events.filter((e) => e.type === "role_changed")).toHaveLength(0);
   });
 
+  // A WorkOS user deleted and re-created reuses the email under a NEW
+  // workos_user_id. The users upsert can only name one conflict target, so
+  // before this the INSERT hit the email unique constraint and 500'd a
+  // legitimate login.
+  test("a recycled WorkOS identity reusing an existing email logs in instead of 500ing", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+
+    let insertAttempted = false;
+    harness.pool
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
+      // The email is already held, by a row that was never bound to a WorkOS id.
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
+        rows: [{ user_id: "existing-user", workos_user_id: null }],
+        rowCount: 1
+      }))
+      .onQuery(/INSERT INTO users/, () => {
+        insertAttempted = true;
+        throw Object.assign(new Error("duplicate key value violates unique constraint"), {
+          code: "23505"
+        });
+      })
+      .onQuery(/UPDATE users/, () => ({ rows: [{ user_id: "existing-user" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({
+        rows: [{ cnt: "5" }],
+        rowCount: 1
+      }))
+      .onQuery(/SELECT role FROM tenant_memberships/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload: { code: "code-1", state: "the-state" }
+    });
+
+    expect(res.statusCode).toBe(200);
+    // The existing row is rebound rather than re-inserted — an INSERT here
+    // would collide on the email constraint the ON CONFLICT target misses.
+    expect(insertAttempted).toBe(false);
+  });
+
+  // The other side of the same lookup: taking over an email that a DIFFERENT
+  // live identity holds would hand one person another's account.
+  test("an email held by a different WorkOS identity is refused with 409, not taken over", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+
+    let membershipWritten = false;
+    harness.pool
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
+        rows: [{ user_id: "someone-else", workos_user_id: "workos-someone-else" }],
+        rowCount: 1
+      }))
+      .onQuery(/INSERT INTO tenant_memberships/, () => {
+        membershipWritten = true;
+        return { rows: [], rowCount: 1 };
+      });
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload: { code: "code-1", state: "the-state" }
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: "email_in_use" });
+    // No session, and nothing granted against the other person's account.
+    expect(membershipWritten).toBe(false);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+  });
+
+  // The owner renames the tenant through PUT /tenant; provisioning must not
+  // undo that on the next member's login.
+  test("provisioning does not overwrite tenant_name on an existing tenant", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+
+    let tenantUpsertSql = "";
+    harness.pool
+      .onQuery(/INSERT INTO tenants/, (text) => {
+        tenantUpsertSql = text;
+        return { rows: [{ tenant_id: "t1" }], rowCount: 1 };
+      })
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({
+        rows: [{ cnt: "5" }],
+        rowCount: 1
+      }))
+      .onQuery(/SELECT role FROM tenant_memberships/, () => ({ rows: [{ role: "member" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload: { code: "code-1", state: "the-state" }
+    });
+
+    expect(res.statusCode).toBe(200);
+    // The conflict clause must touch only updated_at.
+    const doUpdateClause = tenantUpsertSql.slice(tenantUpsertSql.indexOf("DO UPDATE"));
+    expect(doUpdateClause).not.toMatch(/tenant_name/);
+  });
+
   test("existing owner keeps owner role even if WorkOS sends a downgraded slug — no role_changed audit", async () => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
     harness.pool
       .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
       .onQuery(/SELECT role FROM tenant_memberships/, () => ({
@@ -478,11 +602,14 @@ describe("POST /auth/callback", () => {
     expect(harness.auditEvents.events.filter((e) => e.type === "role_changed")).toHaveLength(0);
   });
 
-  test("role change from member to admin emits a role_changed audit event with from/to payload", async () => {
+  test("existing member is NOT re-promoted from the WorkOS slug — no role_changed audit", async () => {
+    // The tenant's own RBAC is authoritative after provisioning. Re-syncing here
+    // would restore an admin the owner just demoted in-app.
     seedWorkOSHappyPath({ workosRoleSlug: "admin" });
 
     harness.pool
       .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
       .onQuery(/SELECT role FROM tenant_memberships/, () => ({
@@ -499,10 +626,40 @@ describe("POST /auth/callback", () => {
     });
 
     expect(res.statusCode).toBe(200);
-    const audits = harness.auditEvents.events.filter((e) => e.type === "role_changed");
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.payload).toEqual({ from: "member", to: "admin" });
-    expect(audits[0]!.userId).toBe("u1");
+    expect((res.json() as { user: { role: string } }).user.role).toBe("member");
+    expect(harness.auditEvents.events.filter((e) => e.type === "role_changed")).toHaveLength(0);
+    // The kept-vs-IdP mismatch is recorded instead of silently ignored.
+    expect(harness.auditEvents.events.filter((e) => e.type === "role_sync_divergence")).toHaveLength(1);
+  });
+
+  test("existing admin demoted in WorkOS keeps the app role but emits role_sync_divergence", async () => {
+    // App RBAC stays authoritative, so the IdP revocation does not propagate —
+    // but it must leave an audit trace for the tenant owner to act on.
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+
+    harness.pool
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
+      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
+        rows: [{ role: "admin" }],
+        rowCount: 1
+      }))
+      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: { code: "c", state: "s" },
+      cookies: { cogniplane_oauth_state: "s", cogniplane_oauth_pkce: TEST_PKCE_VERIFIER }
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { user: { role: string } }).user.role).toBe("admin");
+    const divergence = harness.auditEvents.events.filter((e) => e.type === "role_sync_divergence");
+    expect(divergence).toHaveLength(1);
+    expect(divergence[0].payload).toMatchObject({ appRole: "admin", workosRoleSlug: "member" });
   });
 
   test("rejects when no organization membership exists (403)", async () => {
@@ -822,6 +979,60 @@ describe("POST /auth/refresh", () => {
 
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: "not_a_member" });
+  });
+
+  // A transient failure AFTER the jti is claimed is the dangerous case: the
+  // token is already spent, so a naive 401 both drops the session for a blip
+  // and sets up the client's retry to look like a replay and revoke the family.
+  test("a DB failure after the claim restores the jti and returns a retryable 503", async () => {
+    const familyId = "fid-transient";
+    const jti = "jti-transient";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, {
+      sub: "user-transient",
+      tid: "tenant-transient",
+      jti,
+      fid: familyId
+    });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+
+    let failMembershipLookup = true;
+    harness.pool
+      .onQuery(/SELECT role FROM tenant_memberships/, () => {
+        if (failMembershipLookup) throw new Error("connection terminated unexpectedly");
+        return { rows: [{ role: "admin" }], rowCount: 1 };
+      })
+      .onQuery(/SELECT email FROM users/, () => ({
+        rows: [{ email: "alice@example.com" }],
+        rowCount: 1
+      }));
+
+    const failed = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    // 503 + Retry-After, not 401: the frontend clears auth state on any non-2xx,
+    // so a 401 here logs the user out mid-conversation over a blip.
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).toEqual({ error: "refresh_unavailable" });
+    expect(failed.headers["retry-after"]).toBe("1");
+
+    // The claim was undone, so the same cookie is usable again.
+    expect(harness.redis.store.get(`refresh_jti:${jti}`)).toBe(familyId);
+    expect(harness.redis.store.has(`refresh_rotation:${jti}`)).toBe(false);
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
+
+    // The retry succeeds rather than tripping replay detection.
+    failMembershipLookup = false;
+    const retried = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    expect(retried.statusCode).toBe(200);
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
   });
 
   test("rejects a malformed/invalid refresh token (401)", async () => {

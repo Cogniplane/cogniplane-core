@@ -41,8 +41,8 @@ export default function AdminAgentSettingsPage() {
           onSave={save}
           managedTools={managedToolsQuery.data ?? []}
           mcpServers={mcpServersQuery.data ?? []}
-          anthropicKeyConfigured={Boolean(
-            tenantDetailsQuery.data?.settings.anthropicApiKeyConfigured
+          hasAnthropicTenantKey={Boolean(
+            tenantDetailsQuery.data?.settings.providerKeys.anthropic
           )}
           isOwner={user?.role === "owner"}
         />

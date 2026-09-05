@@ -1,3 +1,4 @@
+import { fetch as undiciFetch } from "undici";
 import type { AppConfig } from "../config.js";
 import { unique } from "../lib/crypto-utils.js";
 import { AdminConfigError } from "./admin-config-error.js";
@@ -49,11 +50,34 @@ export type {
 } from "./admin-config-records.js";
 
 type DynamicConfigStores = {
-  skills: SkillConfigStore;
-  skillRevisions: SkillRevisionStore;
-  mcpServers: McpServerStore;
-  tenantSettings: TenantSettingsStore;
+  skills: Pick<
+    SkillConfigStore,
+    "listSkills" | "disableSkill" | "getSkillOwnerTenantId" | "setSkillPublished"
+  >;
+  skillRevisions: Pick<
+    SkillRevisionStore,
+    | "listSkillRevisions"
+    | "getSkillRevision"
+    | "activateSkillRevision"
+    | "listAllSkillRevisions"
+    | "listActiveRuntimeSkillReferences"
+    | "deleteSkillRevision"
+    | "countSkillRevisionsByBundleStorageUri"
+    | "importSkillBundle"
+  >;
+  mcpServers: Pick<
+    McpServerStore,
+    | "listMcpServers"
+    | "getMcpServer"
+    | "createMcpServer"
+    | "updateMcpServer"
+    | "disableMcpServer"
+    | "setMcpServerPublished"
+  >;
+  tenantSettings: Pick<TenantSettingsStore, "get" | "upsert">;
 };
+
+type DynamicConfigSkillBundleStorage = Pick<SkillBundleStorage, "storeBundle" | "deleteBundle">;
 
 /**
  * Facade that provides a single entry point for all admin-config operations.
@@ -69,9 +93,9 @@ export class DynamicConfigService {
   constructor(
     private readonly config: AppConfig,
     private readonly stores: DynamicConfigStores,
-    private readonly skillBundleStorage: SkillBundleStorage,
+    private readonly skillBundleStorage: DynamicConfigSkillBundleStorage,
     private readonly managedToolCatalog: ManagedToolCatalog,
-    private readonly fetchFn: typeof fetch = fetch
+    private readonly fetchFn: typeof undiciFetch = undiciFetch
   ) {}
 
   listSkills(tenantId: string, includeDisabled = true): Promise<AdminSkillRecord[]> {
@@ -111,7 +135,7 @@ export class DynamicConfigService {
 
   async compileRuntimeConfig(
     tenantId: string,
-    isBetaTester = true,
+    isBetaTester: boolean,
     // Retained for call-site compatibility (the session id is still threaded
     // through by the runtime adapter) but no longer narrows the config — the
     // per-session override path was retired with the skill-improvement flow.

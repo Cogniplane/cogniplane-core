@@ -14,7 +14,7 @@ export const queryKeys = {
     users: () => [...queryKeys.admin.all, "users"] as const,
     runtimeSessions: () => [...queryKeys.admin.all, "runtime", "sessions"] as const,
     runtimeConfig: () => [...queryKeys.admin.all, "runtime", "config"] as const,
-    sessions: (params?: Record<string, unknown>) =>
+    sessions: <T extends object>(params?: T) =>
       [...queryKeys.admin.all, "sessions", params ?? {}] as const,
     sessionDetail: (sessionId: string) =>
       [...queryKeys.admin.all, "sessions", "detail", sessionId] as const,
@@ -40,11 +40,15 @@ export const queryKeys = {
     policyRules: () => [...queryKeys.admin.all, "policy", "rules"] as const,
     // Params are the serializable decisions filter+paging shape; passed verbatim
     // so two different filter sets get distinct cache entries.
-    policyDecisions: (params?: Record<string, unknown>) =>
+    policyDecisions: <T extends object>(params?: T) =>
       [...queryKeys.admin.all, "policy", "decisions", params ?? {}] as const,
     policyDecision: (decisionId: string) =>
       [...queryKeys.admin.all, "policy", "decision", decisionId] as const,
-    policyLint: () => [...queryKeys.admin.all, "policy", "lint"] as const
+    policyLint: () => [...queryKeys.admin.all, "policy", "lint"] as const,
+    tokenUsage: (days: number) =>
+      [...queryKeys.admin.all, "reports", "token-usage", { days }] as const,
+    messageFeedback: (days: number) =>
+      [...queryKeys.admin.all, "reports", "message-feedback", { days }] as const
   },
   settings: {
     all: ["settings"] as const,
@@ -56,6 +60,8 @@ export const queryKeys = {
     github: () => [...queryKeys.settings.all, "github"] as const,
     microsoft: () => [...queryKeys.settings.all, "microsoft"] as const,
     notion: () => [...queryKeys.settings.all, "notion"] as const,
+    tokenUsage: (days: number) =>
+      [...queryKeys.settings.all, "reports", "token-usage", { days }] as const,
     integrationsAvailability: () =>
       [...queryKeys.settings.all, "integrations-availability"] as const
   },
@@ -85,7 +91,7 @@ export const queryKeys = {
   },
   artifacts: {
     all: ["artifacts"] as const,
-    browse: (params?: Record<string, unknown>) =>
+    browse: <T extends object>(params?: T) =>
       [...queryKeys.artifacts.all, "browse", params ?? {}] as const
   }
 } as const;

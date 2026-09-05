@@ -1,6 +1,6 @@
 "use client";
 
-import { formatCostUsd, formatTokenCount } from "./chat-shell.logic";
+import { formatCostUsd, formatTokenCount } from "./context-window-meter.logic";
 
 // A compact ring + label showing how full the model's context window is, based
 // on the most recent assistant turn's total token count, plus the session's

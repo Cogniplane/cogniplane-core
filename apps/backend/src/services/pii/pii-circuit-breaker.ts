@@ -341,7 +341,7 @@ export class DisabledPiiCircuitBreaker implements PiiCircuitBreaker {
   async shouldAllow(): Promise<boolean> {
     return true;
   }
-  async record(): Promise<void> {
+  async record(_outcome: BreakerOutcome): Promise<void> {
     /* no-op */
   }
   async snapshot(): Promise<BreakerSnapshot> {

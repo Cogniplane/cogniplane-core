@@ -39,6 +39,13 @@ class CaptureDatabase {
   async query(text: string, values: unknown[] = []) {
     return this._query(text, values);
   }
+
+  get requiredLastQuery(): { text: string; values: unknown[] } {
+    if (!this.lastQuery) {
+      throw new Error("Expected the store to issue a query.");
+    }
+    return this.lastQuery;
+  }
 }
 
 function artifactRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -78,9 +85,9 @@ test("ArtifactStore.setPiiDetail binds the full PII detail as the JSON patch, sc
 
   expect(db.lastQuery).toBeTruthy();
   // Bound contract: $1 tenant, $2 artifact, $3 the serialized PII patch.
-  expect(db.lastQuery.values[0]).toBe("test-tenant");
-  expect(db.lastQuery.values[1]).toBe("artifact-1");
-  const patch = JSON.parse(String(db.lastQuery.values[2]));
+  expect(db.requiredLastQuery.values[0]).toBe("test-tenant");
+  expect(db.requiredLastQuery.values[1]).toBe("artifact-1");
+  const patch = JSON.parse(String(db.requiredLastQuery.values[2]));
   expect(patch).toEqual({
     status: "scanned",
     modeApplied: "detect",
@@ -99,7 +106,7 @@ test("ArtifactStore.setPiiDetail sends only the caller's partial fields as the p
   // Only the field the caller passed is sent — the merge semantics live in the
   // DB, so the patch must not be padded with undefined keys that would clobber
   // previously-stored PII detail.
-  const patch = JSON.parse(String(db.lastQuery.values[2]));
+  const patch = JSON.parse(String(db.requiredLastQuery.values[2]));
   expect(patch).toEqual({ status: "transformed" });
 });
 
@@ -117,12 +124,12 @@ test("ArtifactStore.consumeDownloadToken binds [token, tenant, user, callerIsAdm
   expect(db.lastQuery).toBeTruthy();
   // The exact bound contract is the observable signal a store-level fake can't
   // reproduce, so we pin it: token, tenant, user, callerIsAdmin (in order).
-  expect(db.lastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  expect(db.requiredLastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
   // Structural invariant with no fake equivalent: consume must reject expired
   // tokens in SQL so an expired token is never burned (the route surfaces
   // expiry as a repeatable 410). The expiry predicate is the ONLY way to assert
   // this against a query-capturing fake.
-  expect(db.lastQuery.text.includes("expires_at > NOW()")).toBe(true);
+  expect(db.requiredLastQuery.text.includes("expires_at > NOW()")).toBe(true);
 });
 
 test("ArtifactStore.peekDownloadToken is read-only and omits the expiry filter so the route can answer 410", async () => {
@@ -137,16 +144,16 @@ test("ArtifactStore.peekDownloadToken is read-only and omits the expiry filter s
   });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.lastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  expect(db.requiredLastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
   // Structural invariants with no DB-backed equivalent in a fake:
   // 1. Peek must NOT mutate the row — a failed storage read later cannot have
   //    already burned the token. The absence of an UPDATE / consumed_at write
   //    is the only observable proof against a query-capturing fake.
-  expect(db.lastQuery.text.includes("UPDATE")).toBe(false);
-  expect(db.lastQuery.text.includes("consumed_at = NOW()")).toBe(false);
+  expect(db.requiredLastQuery.text.includes("UPDATE")).toBe(false);
+  expect(db.requiredLastQuery.text.includes("consumed_at = NOW()")).toBe(false);
   // 2. Peek deliberately omits the expiry filter (which consume includes) so an
   //    expired-but-unconsumed token still resolves and the route can answer 410.
-  expect(db.lastQuery.text.includes("expires_at > NOW()")).toBe(false);
+  expect(db.requiredLastQuery.text.includes("expires_at > NOW()")).toBe(false);
 });
 
 test("ArtifactStore.listForUser always scopes to tenant + user and excludes deleted/derived", async () => {
@@ -157,12 +164,12 @@ test("ArtifactStore.listForUser always scopes to tenant + user and excludes dele
 
   expect(db.lastQuery).toBeTruthy();
   // tenant_id=$1, user_id=$2 are the isolation predicates (RLS is tenant-only).
-  expect(db.lastQuery.values[0]).toBe("tenant-A");
-  expect(db.lastQuery.values[1]).toBe("user-1");
-  expect(db.lastQuery.text).toContain("tenant_id = $1");
-  expect(db.lastQuery.text).toContain("user_id = $2");
-  expect(db.lastQuery.text).toContain("status <> 'deleted'");
-  expect(db.lastQuery.text).toContain("artifact_type <> 'derived'");
+  expect(db.requiredLastQuery.values[0]).toBe("tenant-A");
+  expect(db.requiredLastQuery.values[1]).toBe("user-1");
+  expect(db.requiredLastQuery.text).toContain("tenant_id = $1");
+  expect(db.requiredLastQuery.text).toContain("user_id = $2");
+  expect(db.requiredLastQuery.text).toContain("status <> 'deleted'");
+  expect(db.requiredLastQuery.text).toContain("artifact_type <> 'derived'");
 });
 
 test("ArtifactStore.listForUser default sort is created_desc with id DESC tiebreaker", async () => {
@@ -171,7 +178,7 @@ test("ArtifactStore.listForUser default sort is created_desc with id DESC tiebre
 
   await store.listForUser("tenant-A", "user-1", {});
 
-  expect(db.lastQuery.text).toContain("ORDER BY created_at DESC, id DESC");
+  expect(db.requiredLastQuery.text).toContain("ORDER BY created_at DESC, id DESC");
 });
 
 test("ArtifactStore.listForUser maps each sort to the correct ORDER BY", async () => {
@@ -186,7 +193,7 @@ test("ArtifactStore.listForUser maps each sort to the correct ORDER BY", async (
     const db = new CaptureDatabase();
     const store = new ArtifactStore(db as unknown as Pool);
     await store.listForUser("tenant-A", "user-1", { sort });
-    expect(db.lastQuery.text).toContain(expected);
+    expect(db.requiredLastQuery.text).toContain(expected);
   }
 });
 
@@ -203,7 +210,7 @@ test("ArtifactStore.listForUser fetches limit+1 rows and trims, emitting a curso
   const result = await store.listForUser("tenant-A", "user-1", { limit: 2 });
 
   // LIMIT bind is the last value and equals limit + 1.
-  expect(db.lastQuery.values[db.lastQuery.values.length - 1]).toBe(3);
+  expect(db.requiredLastQuery.values[db.requiredLastQuery.values.length - 1]).toBe(3);
   expect(result.items).toHaveLength(2);
   expect(result.items.map((a) => a.artifactId)).toEqual(["a3", "a2"]);
   expect(result.nextCursor).toBeTruthy();
@@ -234,8 +241,8 @@ test("ArtifactStore.listForUser round-trips its own cursor and emits the keyset 
   const store2 = new ArtifactStore(db2 as unknown as Pool);
   await store2.listForUser("tenant-A", "user-1", { limit: 1, cursor: page1.nextCursor! });
 
-  expect(db2.lastQuery.text).toContain("(created_at, id) < ($");
-  expect(db2.lastQuery.text).toContain("::timestamptz");
+  expect(db2.requiredLastQuery.text).toContain("(created_at, id) < ($");
+  expect(db2.requiredLastQuery.text).toContain("::timestamptz");
 });
 
 test("ArtifactStore.listForUser rejects a malformed cursor", async () => {
@@ -308,9 +315,9 @@ test("ArtifactStore.listForUser escapes LIKE wildcards in q and binds an ILIKE p
 
   await store.listForUser("tenant-A", "user-1", { q: "50%_off" });
 
-  expect(db.lastQuery.text).toContain("artifact_name ILIKE");
+  expect(db.requiredLastQuery.text).toContain("artifact_name ILIKE");
   // % and _ are escaped so they are treated literally, wrapped in %…%.
-  expect(db.lastQuery.values).toContain("%50\\%\\_off%");
+  expect(db.requiredLastQuery.values).toContain("%50\\%\\_off%");
 });
 
 test("ArtifactStore.listForUser binds array filters as text[] ANY predicates", async () => {
@@ -322,10 +329,10 @@ test("ArtifactStore.listForUser binds array filters as text[] ANY predicates", a
     status: ["ready"]
   });
 
-  expect(db.lastQuery.text).toContain("artifact_type = ANY($");
-  expect(db.lastQuery.text).toContain("status = ANY($");
-  expect(db.lastQuery.values).toContainEqual(["upload", "generated"]);
-  expect(db.lastQuery.values).toContainEqual(["ready"]);
+  expect(db.requiredLastQuery.text).toContain("artifact_type = ANY($");
+  expect(db.requiredLastQuery.text).toContain("status = ANY($");
+  expect(db.requiredLastQuery.values).toContainEqual(["upload", "generated"]);
+  expect(db.requiredLastQuery.values).toContainEqual(["ready"]);
 });
 
 /**

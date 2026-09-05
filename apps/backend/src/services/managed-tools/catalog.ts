@@ -17,6 +17,8 @@ export type ManagedToolCatalogEntry = {
   description: string;
   readOnly: boolean;
   tenantConfigurable: boolean;
+  /** Policy Center category shared with the gateway definition. */
+  category?: string;
 };
 
 export class ManagedToolCatalog {

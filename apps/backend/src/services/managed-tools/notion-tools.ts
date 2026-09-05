@@ -53,7 +53,7 @@ function invalidNotionIdError(field: string): { error: string } {
 }
 
 type NotionToolDeps = {
-  notionConnections: NotionConnectionService;
+  notionConnections: Pick<NotionConnectionService, "getRuntimeCredentials">;
 };
 
 /**

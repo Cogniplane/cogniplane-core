@@ -13,7 +13,7 @@
 -- `message_tool_results.text_offset`). On reload we merge these with the tool
 -- offsets to interleave reasoning, text, and tool cards in stream order.
 --
--- Nullable: pre-existing rows and the legacy RuntimeEvent writer (which doesn't
+-- Nullable: pre-existing rows and the retired writer (which didn't
 -- set it) fall back to the old single-block-then-body layout via
 -- `reasoning_content`, which is retained unchanged.
 ALTER TABLE public.messages

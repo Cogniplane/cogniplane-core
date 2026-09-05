@@ -1,5 +1,3 @@
-import type { FastifyBaseLogger } from "fastify";
-
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
@@ -43,6 +41,11 @@ export interface PiiArtifactSubjectReader {
   }): Promise<PiiScanArtifactInput | null>;
 }
 
+type PiiArtifactScanLogger = {
+  warn(payload: unknown, message: string): void;
+  error(payload: unknown, message: string): void;
+};
+
 /**
  * Runs after an artifact has been persisted. Enforces the tenant's PII policy
  * for uploads and Microsoft imports:
@@ -69,15 +72,15 @@ export class PiiArtifactScanEnqueuer {
 
   constructor(
     private readonly deps: {
-      piiProtection: PiiProtectionService;
-      piiScanRuns: PiiScanRunStore;
-      piiScanJobs: PiiScanJobStore;
-      artifacts: ArtifactStore;
+      piiProtection: Pick<PiiProtectionService, "getActiveSettings" | "evaluateArtifact">;
+      piiScanRuns: Pick<PiiScanRunStore, "create" | "update">;
+      piiScanJobs: Pick<PiiScanJobStore, "create">;
+      artifacts: Pick<ArtifactStore, "setPiiDetail" | "update">;
       /** Deletes the stored object bytes on a block so they don't persist. */
       storage: Pick<ArtifactStorage, "delete">;
       subjectReader: PiiArtifactSubjectReader;
-      auditEvents?: AuditEventStore;
-      logger?: Pick<FastifyBaseLogger, "warn" | "error">;
+      auditEvents?: Pick<AuditEventStore, "create">;
+      logger?: PiiArtifactScanLogger;
     }
   ) {}
 

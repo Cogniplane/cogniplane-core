@@ -1,3 +1,4 @@
+import { IntegrationRegistry } from "./integration-registry.js";
 import type { AppConfig } from "../../config.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
 import type { RuntimeInvalidator } from "./contracts.js";
@@ -16,26 +17,11 @@ import type { Redis } from "ioredis";
 export function buildIntegrationServices(
   config: AppConfig,
   stores: Stores,
-  // Lazy getter that returns the live `RuntimeInvalidator` once it's been
-  // constructed. Called only inside async OAuth/disconnect paths, never at
-  // module load — so the runtime manager can be wired *after* this builder
-  // runs without any setter dance. Throws if invoked before the runtime
-  // manager exists, which would indicate a wiring bug.
-  resolveRuntimeInvalidator: () => RuntimeInvalidator,
+  runtimeInvalidator: RuntimeInvalidator,
   // Rate limiter applied (per-IP) to the unauthenticated OAuth callback routes.
   limits?: RequestLimitsInterface,
   redis?: Redis | null
 ) {
-  const runtimeInvalidator: RuntimeInvalidator = {
-    invalidateRuntimesForIntegration(tenantId, userId, integrationId) {
-      return resolveRuntimeInvalidator().invalidateRuntimesForIntegration(
-        tenantId,
-        userId,
-        integrationId
-      );
-    }
-  };
-
   const oauthStates = new IntegrationOAuthStateStore(redis);
   const githubConnectionService = new GithubConnectionService(
     config,
@@ -52,16 +38,9 @@ export function buildIntegrationServices(
     oauthStates
   );
 
-  // Register the built-in integration descriptors (idempotent across
-  // multiple `buildAppDependencies()` calls) and attach this app's live
-  // wiring (connection probes + OAuth callback handlers). The attach
-  // step always runs so a fresh app-dependencies build replaces any
-  // wiring captured by a previous build (matters in tests that spin up
-  // multiple Fastify apps in one process). Private overlay packages
-  // (e.g. SharePoint) register their additional descriptors via the
-  // overlay shim in `attachOverlays` below.
   registerBuiltinIntegrations();
-  attachBuiltinIntegrationRuntime({
+  const integrationDescriptors = new IntegrationRegistry();
+  attachBuiltinIntegrationRuntime(integrationDescriptors, {
     probes: {
       notion: notionConnectionService,
       github: githubConnectionService
@@ -73,14 +52,12 @@ export function buildIntegrationServices(
     limits
   });
 
-  const integrationRegistry = new IntegrationRegistryService(config, stores.integrationStates);
+  const integrationRegistry = new IntegrationRegistryService(config, stores.integrationStates, {}, integrationDescriptors);
 
   return {
+    integrationDescriptors,
     githubConnectionService,
-    runtimeInvalidator,
     notionConnectionService,
     integrationRegistry
   };
 }
-
-export type IntegrationServices = ReturnType<typeof buildIntegrationServices>;

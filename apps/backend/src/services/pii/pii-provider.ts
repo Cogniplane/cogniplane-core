@@ -1,4 +1,4 @@
-import type { PiiEntityType } from "./pii-policy.js";
+import type { PiiEntityType } from "@cogniplane/shared-types";
 
 export type PiiFindingConfidence = "low" | "medium" | "high";
 

@@ -2,32 +2,36 @@ import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
 
-export const PiiModeSchema = z.enum(["off", "detect", "block", "transform"]);
+export const PII_MODES = ["off", "detect", "block", "transform"] as const;
+export const PiiModeSchema = z.enum(PII_MODES);
 export type PiiMode = z.infer<typeof PiiModeSchema>;
 
-export const PiiRawRetentionSchema = z.enum(["never", "admin_only", "reversible_encrypted"]);
+export const PII_RAW_RETENTION = ["never", "admin_only", "reversible_encrypted"] as const;
+export const PiiRawRetentionSchema = z.enum(PII_RAW_RETENTION);
 export type PiiRawRetention = z.infer<typeof PiiRawRetentionSchema>;
 
-export const PiiProviderTypeSchema = z.enum(["openai-compatible"]);
+export const PII_PROVIDER_TYPES = ["openai-compatible"] as const;
+export const PiiProviderTypeSchema = z.enum(PII_PROVIDER_TYPES);
 export type PiiProviderType = z.infer<typeof PiiProviderTypeSchema>;
 
-export const PiiEntityTypeSchema = z.enum([
+export const PII_ENTITY_TYPES = [
   "email",
   "phone",
   "person_name",
   "address",
   "financial",
   "government_id"
-]);
+] as const;
+export const PiiEntityTypeSchema = z.enum(PII_ENTITY_TYPES);
 export type PiiEntityType = z.infer<typeof PiiEntityTypeSchema>;
 
-export const PiiProtectionSettingsSchema = z.object({
+const PiiProtectionSettingsBaseSchema = z.object({
   enabled: z.boolean(),
   mode: PiiModeSchema,
   rawRetention: PiiRawRetentionSchema,
   provider: z.object({
     type: PiiProviderTypeSchema,
-    model: z.string()
+    model: z.string().trim()
   }).passthrough(),
   scopes: z.object({
     chatPrompts: z.boolean(),
@@ -41,8 +45,40 @@ export const PiiProtectionSettingsSchema = z.object({
     useRulesFirst: z.boolean(),
     entityTypes: z.array(PiiEntityTypeSchema)
   }).passthrough()
-}).passthrough();
+});
+
+export const PiiProtectionSettingsSchema = PiiProtectionSettingsBaseSchema.passthrough();
 export type PiiProtectionSettings = z.infer<typeof PiiProtectionSettingsSchema>;
+
+export const PiiProtectionSettingsRequestSchema = PiiProtectionSettingsBaseSchema.extend({
+  provider: z.object({
+    type: PiiProviderTypeSchema,
+    model: z.string().trim().max(256)
+  }).strict(),
+  scopes: z.object({
+    chatPrompts: z.boolean(),
+    uploads: z.boolean(),
+    microsoftImports: z.boolean()
+  }).strict(),
+  actions: z.object({
+    reportToAdmins: z.boolean()
+  }).strict(),
+  detectors: z.object({
+    useRulesFirst: z.boolean(),
+    entityTypes: z.array(PiiEntityTypeSchema).max(PII_ENTITY_TYPES.length)
+  }).strict()
+}).strict();
+export type PiiProtectionSettingsRequest = z.infer<typeof PiiProtectionSettingsRequestSchema>;
+
+export const DEFAULT_PII_PROTECTION: PiiProtectionSettings = {
+  enabled: false,
+  mode: "off",
+  rawRetention: "never",
+  provider: { type: "openai-compatible", model: "" },
+  scopes: { chatPrompts: true, uploads: true, microsoftImports: true },
+  actions: { reportToAdmins: true },
+  detectors: { useRulesFirst: true, entityTypes: [...PII_ENTITY_TYPES] }
+};
 
 // ── Provider circuit-breaker status ───────────────────────────────────────────
 

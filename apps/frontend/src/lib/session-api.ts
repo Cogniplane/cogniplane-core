@@ -36,27 +36,8 @@ export async function deleteSession(sessionId: string): Promise<void> {
   });
 }
 
-// Stop button — asks the backend to interrupt the in-flight turn while keeping
-// the runtime warm. Returns true when the backend dispatched an interrupt,
-// false when there was nothing to stop (e.g. the user clicked Stop in the
-// race window between Send and turn/start, before Codex assigned a turnId).
-// "Nothing to stop" is a valid no-op, not a user-facing error.
-export async function interruptSession(sessionId: string): Promise<boolean> {
-  try {
-    await request<unknown>(`/sessions/${sessionId}/interrupt`, {
-      method: "POST"
-    });
-    return true;
-  } catch (err) {
-    if (err instanceof Error && /no_active_turn/.test(err.message)) {
-      return false;
-    }
-    throw err;
-  }
-}
-
-export async function listApprovals(sessionId: string): Promise<Approval[]> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/approvals`);
+export async function listApprovals(sessionId: string, signal?: AbortSignal): Promise<Approval[]> {
+  const raw = await request<unknown>(`/sessions/${sessionId}/approvals`, { signal });
   return parseResponse(ApprovalsListResponseSchema, raw, "GET /sessions/:id/approvals").approvals;
 }
 

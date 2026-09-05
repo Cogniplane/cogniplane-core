@@ -33,6 +33,13 @@ export type E2bSandboxLike = {
       }
     ) => Promise<E2bCommandResult>;
   };
+  /**
+   * Resets the sandbox's lifetime cap to `timeoutMs` from NOW (the SDK
+   * documents it as extending or reducing the timeout set at creation or by
+   * the previous call — it is not additive). This is what turns the cap from
+   * an absolute deadline into an idle timeout.
+   */
+  setTimeout: (timeoutMs: number) => Promise<void>;
   kill: () => Promise<void>;
 };
 

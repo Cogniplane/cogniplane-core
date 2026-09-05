@@ -1,5 +1,7 @@
 "use client";
 
+import { formatTimestamp } from "../../../lib/time-format";
+
 import { useMemo, useState } from "react";
 
 import type {
@@ -8,8 +10,7 @@ import type {
 } from "@cogniplane/shared-types";
 import {
   buildToolRows,
-  formatToolDuration,
-  formatToolTimestamp
+  formatToolDuration
 } from "./admin-session-tools-tab.logic";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -91,7 +92,7 @@ export function AdminSessionToolsTab(props: {
                     </div>
                   </div>
                   <p className="mt-1 text-xs text-on-surface-faint">
-                    {formatToolTimestamp(row.createdAt)} · {formatToolDuration(row.durationMs)}
+                    {formatTimestamp(row.createdAt)} · {formatToolDuration(row.durationMs)}
                   </p>
                 </div>
               </summary>

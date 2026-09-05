@@ -29,6 +29,14 @@ export function AdminSessionArtifactsTab(props: { artifacts: AdminSessionDetailA
     setError(null);
     try {
       const download = await createAdminArtifactDownload(artifactId);
+      // Not an internal Next route. API_URL is the backend origin: a different
+      // port in dev, a different domain in production. A full browser
+      // navigation is what we want here, so the browser follows the signed URL
+      // and takes the attachment. The lint rule fires because the template
+      // literal starts with an expression, leaving an empty static prefix, so
+      // the rule reads the URL as relative. Same reasoning as
+      // use-artifact-actions.ts.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- absolute cross-origin download URL, see above
       window.location.assign(`${API_URL}${download.url}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start download.");

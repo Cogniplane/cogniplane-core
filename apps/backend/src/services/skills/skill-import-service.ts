@@ -1,15 +1,20 @@
 import { createHash } from "node:crypto";
+import { inflateRawSync } from "node:zlib";
 import { access, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import JSZip from "jszip";
-import { fetch as undiciFetch } from "undici";
+import { fetch as undiciFetch, type RequestInit, type Response } from "undici";
 import YAML from "yaml";
 
 import type { AppConfig } from "../../config.js";
 import { AdminConfigError } from "../admin-config-error.js";
-import { isPrivateOrReservedHost, ssrfSafeAgent } from "../../lib/url-validation.js";
+import {
+  assertDispatcherAwareFetch,
+  isPrivateOrReservedHost,
+  ssrfSafeAgent
+} from "../../lib/url-validation.js";
 import type {
   AdminSkillRecord,
   AdminSkillRevisionRecord
@@ -40,15 +45,168 @@ function assertArchiveWithinLimit(archiveBuffer: Buffer, maxBytes: number): void
   }
 }
 
+/**
+ * Download a response body with a hard byte cap.
+ *
+ * `response.arrayBuffer()` buffers the whole body first, so checking the size
+ * afterwards is too late: a hostile or misconfigured GitHub-compatible host
+ * serving a multi-GB zipball takes the process down before the check runs.
+ * This aborts mid-download instead.
+ */
+async function readResponseWithLimit(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number
+): Promise<Buffer> {
+  if (!body) return Buffer.alloc(0);
+
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new AdminConfigError(
+          `Archive exceeds the maximum allowed size of ${maxBytes} bytes.`
+        );
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks);
+}
+
+// jszip does not expose an entry's raw compressed bytes or its compression
+// method through its public API, but it keeps both on the internal `_data`
+// object it builds while parsing the central directory. `inflateEntryBounded`
+// needs them, so this type names what we reach for. Pinned by
+// `skill-import-service.test.ts`, which builds real archives — a jszip bump
+// that reshapes these fails the suite rather than silently disabling the cap.
 type ZipEntryWithMetadata = JSZip.JSZipObject & {
   _data?: {
     uncompressedSize?: number;
+    compressedSize?: number;
+    compressedContent?: Uint8Array;
+    compression?: { magic?: string };
   };
 };
 
 function getUncompressedSize(entry: JSZip.JSZipObject): number | null {
   const value = (entry as ZipEntryWithMetadata)._data?.uncompressedSize;
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function getCompressedSize(entry: JSZip.JSZipObject): number | null {
+  const value = (entry as ZipEntryWithMetadata)._data?.compressedSize;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/** Zip compression method 0 (stored) — the bytes already are the content. */
+const ZIP_METHOD_STORE_MAGIC = "\u0000\u0000";
+/** Zip compression method 8 (deflate) — the only compressed method we accept. */
+const ZIP_METHOD_DEFLATE_MAGIC = "\u0008\u0000";
+
+/**
+ * Largest expansion any single entry is allowed, as a multiple of the
+ * compressed bytes actually present for it.
+ *
+ * Generous on purpose. This is not the memory bound — `maxOutputLength` below
+ * is, and it is additionally floored by the caller's per-file byte cap. The
+ * ratio only rejects the shape of a bomb with a message that explains itself.
+ * Measured on real content: prose 2-3x, JSON about 10x, but a legitimately
+ * repetitive generated file reaches ~175x, so a tight bound here would reject
+ * honest bundles for no safety gain.
+ */
+const MAX_ZIP_COMPRESSION_RATIO = 1000;
+
+/**
+ * Inflate one zip entry with a hard cap on how many bytes may be ALLOCATED.
+ *
+ * This is the zip-bomb defense, and reaching it meant discarding two designs
+ * that look like they work:
+ *
+ *  - **Trusting `uncompressedSize`.** It comes from the central directory,
+ *    which whoever built the archive wrote. Checking a size — or a ratio —
+ *    against it proves nothing: a bomb declares 64 bytes and passes every such
+ *    check. jszip does compare the inflated length to it, but only on the
+ *    stream's "end" event, i.e. after the entry is fully in memory. That
+ *    comparison reports the OOM rather than preventing it.
+ *
+ *  - **Counting bytes off `entry.nodeStream()` and destroying at a cap.**
+ *    Measured against jszip 3.10.1: with a 20 MB entry and a 1 KB cap the
+ *    internal worker still produced all 20 MB after `destroy()`, and after
+ *    `_helper.pause()` too. The Readable stops delivering; the decompression
+ *    does not stop running. Streaming bounds what we retain, never what the
+ *    process allocates — and allocation is what an OOM is about.
+ *
+ * So this bypasses jszip's inflater and drives zlib directly, where
+ * `maxOutputLength` is enforced inside the decompressor: it throws
+ * `ERR_BUFFER_TOO_LARGE` at the limit without allocating past it. Measured on
+ * an archive declaring 64 bytes for 50 MB of content, this returns with an RSS
+ * delta under 1 MB where `entry.async()` grew the process by the full amount.
+ *
+ * The budget is the smaller of the ratio allowance and the per-file byte cap,
+ * so neither can be escaped by satisfying the other.
+ */
+function inflateEntryBounded(entry: JSZip.JSZipObject, maxFileBytes: number): Buffer {
+  const data = (entry as ZipEntryWithMetadata)._data;
+  const compressedContent = data?.compressedContent;
+  const magic = data?.compression?.magic;
+  const compressedSize = getCompressedSize(entry);
+
+  if (!compressedContent || compressedSize === null || typeof magic !== "string") {
+    // A jszip version that reshapes `_data` lands here. Refuse rather than
+    // fall back to the unbounded path: an import failing loudly is a far
+    // better outcome than the cap quietly ceasing to exist.
+    throw new AdminConfigError(
+      `Unable to read the compressed contents of zip entry: ${entry.name}`
+    );
+  }
+
+  const raw = Buffer.from(
+    compressedContent.buffer,
+    compressedContent.byteOffset,
+    compressedContent.byteLength
+  );
+
+  if (magic === ZIP_METHOD_STORE_MAGIC) {
+    // Stored: no expansion is possible, the bytes are the content.
+    if (raw.byteLength > maxFileBytes) {
+      throw new AdminConfigError(
+        `Zip entry ${entry.name} exceeds the maximum file size of ${maxFileBytes} bytes.`
+      );
+    }
+    return Buffer.from(raw);
+  }
+
+  if (magic !== ZIP_METHOD_DEFLATE_MAGIC) {
+    throw new AdminConfigError(
+      `Zip entry ${entry.name} uses an unsupported compression method.`
+    );
+  }
+
+  const maxOutputLength = Math.min(
+    Math.max(compressedSize, 1) * MAX_ZIP_COMPRESSION_RATIO,
+    maxFileBytes
+  );
+
+  try {
+    return inflateRawSync(raw, { maxOutputLength });
+  } catch (error) {
+    if ((error as { code?: string }).code === "ERR_BUFFER_TOO_LARGE") {
+      throw new AdminConfigError(
+        `Zip entry ${entry.name} expands past the ${maxOutputLength}-byte limit allowed for its ${compressedSize} compressed bytes.`
+      );
+    }
+    throw new AdminConfigError(`Zip entry ${entry.name} could not be decompressed.`);
+  }
 }
 
 function formatValidationErrors(messages: SkillBundleValidationMessage[]): string {
@@ -96,6 +254,10 @@ async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxT
       throw new AdminConfigError(`Skill bundle archive exceeds the maximum file count of ${MAX_SKILL_BUNDLE_FILES}.`);
     }
 
+    // A cheap pre-filter on the DECLARED size: it rejects an honestly
+    // oversized archive without touching the compressed bytes. It proves
+    // nothing about a bomb — the declared value is written by whoever built
+    // the archive — so `inflateEntryBounded` is what actually holds the line.
     const uncompressedSize = getUncompressedSize(entry);
     if (uncompressedSize === null) {
       throw new AdminConfigError(`Unable to determine uncompressed size for zip entry: ${entry.name}`);
@@ -104,16 +266,22 @@ async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxT
       throw new AdminConfigError(`Zip entry ${entry.name} exceeds the maximum file size of ${maxFileBytes} bytes.`);
     }
 
-    totalUncompressedBytes += uncompressedSize;
+    await mkdir(path.dirname(absolutePath), { recursive: true });
+
+    // The per-entry allocation budget is also floored by whatever is LEFT of
+    // the archive-wide total, so a bomb cannot evade the total by splitting
+    // itself across entries that are each individually within the cap.
+    const remainingTotalBytes = maxAllowedTotalBytes - totalUncompressedBytes;
+    const content = inflateEntryBounded(entry, Math.min(maxFileBytes, remainingTotalBytes));
+
+    // Accumulate the ACTUAL inflated length. The declared value is never
+    // summed: it is an input, and a bomb that claims 64 bytes per entry would
+    // leave this counter at nothing regardless of what really landed on disk.
+    totalUncompressedBytes += content.byteLength;
     if (totalUncompressedBytes > maxAllowedTotalBytes) {
       throw new AdminConfigError(`Skill bundle archive exceeds the maximum uncompressed size of ${maxAllowedTotalBytes} bytes.`);
     }
 
-    await mkdir(path.dirname(absolutePath), { recursive: true });
-    const content = await entry.async("nodebuffer");
-    if (content.byteLength !== uncompressedSize) {
-      throw new AdminConfigError(`Zip entry ${entry.name} size changed while extracting.`);
-    }
     await writeFile(absolutePath, content);
   }
 }
@@ -285,18 +453,19 @@ export async function ssrfSafeGithubFetch(
   // Fetch used inside the manual-redirect loop. Defaults to undici's fetch
   // (Node's global fetch ignores the `dispatcher` option). Injectable so tests
   // can drive the real redirect/SSRF machinery with a fake.
-  fetchFn: typeof fetch = undiciFetch as unknown as typeof fetch
+  fetchFn: typeof undiciFetch = undiciFetch
 ): Promise<Response> {
+  assertDispatcherAwareFetch(fetchFn);
   let currentUrl = assertFetchableHttpsUrl(url).toString();
   const headers = { ...(init.headers as Record<string, string> | undefined) };
 
   for (let hop = 0; hop <= MAX_GITHUB_REDIRECTS; hop += 1) {
-    const response = (await fetchFn(currentUrl, {
+    const response = await fetchFn(currentUrl, {
       ...init,
       headers,
       redirect: "manual",
       dispatcher: ssrfSafeAgent
-    } as never)) as unknown as Response;
+    });
 
     if (response.status < 300 || response.status >= 400) {
       return response;
@@ -321,7 +490,7 @@ export async function ssrfSafeGithubFetch(
 
 async function resolveGitHubDefaultBranch(
   source: ReturnType<typeof parseGitHubSkillSource>,
-  fetchFn: typeof fetch,
+  fetchFn: typeof undiciFetch,
   githubToken?: string
 ): Promise<string> {
   const response = await ssrfSafeGithubFetch(
@@ -382,18 +551,21 @@ function isSingleFileSkillBundle(
   return bundle.files.length === 1 && bundle.files[0]?.path === "SKILL.md";
 }
 
+type SkillRevisionImporter = Pick<SkillRevisionStore, "importSkillBundle">;
+type SkillBundleWriter = Pick<SkillBundleStorage, "storeBundle">;
+
 function buildSkillImportPayload(input: {
   tenantId: string;
   validation: Awaited<ReturnType<typeof validateSkillBundle>> & {
     bundle: NonNullable<Awaited<ReturnType<typeof validateSkillBundle>>["bundle"]>;
   };
   bundleLocalPath: string;
-  skillBundleStorage: SkillBundleStorage;
+  skillBundleStorage: SkillBundleWriter;
   sourceType: "zip" | "github";
   sourceLabel: string;
   createdBy: string;
   extraMetadata?: Record<string, unknown>;
-}): Parameters<SkillRevisionStore["importSkillBundle"]>[1] {
+}): Parameters<SkillRevisionImporter["importSkillBundle"]>[1] {
   const { validation } = input;
   // Auto-promote single-file zip/github bundles (SKILL.md only) to inline
   // storage: no bundle is uploaded and the SKILL.md body lives in
@@ -453,8 +625,8 @@ async function validateSkillBundleOrThrow(bundleRootPath: string) {
 export async function importSkillBundleFromZip(input: {
   tenantId: string;
   config: AppConfig;
-  skillRevisions: SkillRevisionStore;
-  skillBundleStorage: SkillBundleStorage;
+  skillRevisions: SkillRevisionImporter;
+  skillBundleStorage: SkillBundleWriter;
   archiveBuffer: Buffer;
   originalFileName: string;
   actorUserId: string;
@@ -504,7 +676,7 @@ function buildInlineSkillMarkdown(input: {
 
 export async function importSkillBundleFromInline(input: {
   tenantId: string;
-  skillRevisions: SkillRevisionStore;
+  skillRevisions: SkillRevisionImporter;
   skillId: string;
   skillName: string;
   description: string;
@@ -578,16 +750,16 @@ export async function importSkillBundleFromInline(input: {
 export async function importSkillBundleFromGithub(input: {
   tenantId: string;
   config: AppConfig;
-  skillRevisions: SkillRevisionStore;
-  skillBundleStorage: SkillBundleStorage;
+  skillRevisions: SkillRevisionImporter;
+  skillBundleStorage: SkillBundleWriter;
   githubUrl: string;
   ref?: string;
   subdirectory?: string;
   actorUserId: string;
   githubToken?: string;
-  fetchFn?: typeof fetch;
+  fetchFn?: typeof undiciFetch;
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
-  const fetchFn = input.fetchFn ?? (undiciFetch as unknown as typeof fetch);
+  const fetchFn = input.fetchFn ?? undiciFetch;
   const source = parseGitHubSkillSource({
     githubUrl: input.githubUrl,
     ref: input.ref,
@@ -610,8 +782,10 @@ export async function importSkillBundleFromGithub(input: {
     throw new AdminConfigError(`GitHub archive download failed with status ${response.status}.`);
   }
 
-  const archiveBuffer = Buffer.from(await response.arrayBuffer());
-  assertArchiveWithinLimit(archiveBuffer, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
+  const archiveBuffer = await readResponseWithLimit(
+    response.body as ReadableStream<Uint8Array> | null,
+    input.config.ARTIFACT_MAX_UPLOAD_BYTES
+  );
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-github-"));
 
   try {

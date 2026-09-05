@@ -10,8 +10,7 @@ import {
   buildAlertItems,
   buildApprovalAlertItem,
   buildErrorAlertItem,
-  buildPiiAlertItem,
-  readPiiScanRunId
+  buildPiiAlertItem
 } from "./admin-session-alerts-tab.logic";
 
 function makePiiRun(partial: Partial<AdminSessionDetailPiiRun> & { scanRunId: string }): AdminSessionDetailPiiRun {
@@ -64,20 +63,6 @@ function makeMessage(
   } as AdminSessionDetailMessage;
 }
 
-describe("readPiiScanRunId", () => {
-  test("reads detailJson.pii.scanRunId when present", () => {
-    expect(readPiiScanRunId({ pii: { scanRunId: "scan-1" } })).toBe("scan-1");
-  });
-
-  test("returns null when shape doesn't match", () => {
-    expect(readPiiScanRunId(null)).toBeNull();
-    expect(readPiiScanRunId(undefined)).toBeNull();
-    expect(readPiiScanRunId("string")).toBeNull();
-    expect(readPiiScanRunId({})).toBeNull();
-    expect(readPiiScanRunId({ pii: null })).toBeNull();
-    expect(readPiiScanRunId({ pii: { scanRunId: 42 } })).toBeNull();
-  });
-});
 
 describe("buildPiiAlertItem", () => {
   test("prefers messageIdByScanRunId match over subjectId", () => {

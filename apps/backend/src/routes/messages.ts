@@ -5,24 +5,23 @@ import { MessagePostRequestSchema } from "@cogniplane/shared-types";
 import type { ModelProvider } from "@cogniplane/shared-types";
 
 import type { AppDependencies } from "../app-dependencies.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
 import { apiError, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { STATIC_SECURITY_HEADERS } from "../lib/security-headers.js";
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import { sseFrame } from "../runtime-contracts.js";
 import { uuidv7 } from "../lib/uuid.js";
 import type { ArtifactRecord } from "../services/artifacts/artifact-store.js";
 import { toAvailableModel } from "../services/custom-model-store.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
-import { streamAssistantReply } from "../services/sse-stream-writer.js";
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { UtilityLlmClient } from "../services/utility-llm-client.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
 import { isCorsOriginAllowed } from "../lib/cors.js";
-import { handlePiiDecision, type PiiHandlerOutcome } from "./messages-pii-handler.js";
+import { handlePiiDecision, type PiiHandlerOutcome, type PiiHandlerStores } from "./messages-pii-handler.js";
 import { AVAILABLE_MODELS } from "../domain/models.js";
 
 function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: FastifyReply): void {
@@ -83,7 +82,24 @@ export function buildMessageRouteStores(
   };
 }
 
-export type MessageRouteStores = ReturnType<typeof buildMessageRouteStores>;
+export type MessageRouteStores = {
+  sessions: Pick<AppDependencies["sessions"], "getOwned" | "renameIfCurrent">;
+  artifacts: Pick<AppDependencies["artifacts"], "listBySession">;
+  artifactProcessor: Pick<AppDependencies["artifactProcessor"], "extractArtifactText">;
+  storage: AppDependencies["artifactStorage"];
+  limits: AppDependencies["limits"];
+  messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult">;
+  toolContexts: Pick<AppDependencies["toolContexts"], "create">;
+  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getOrCreateTenantSettings">;
+  customModels: Pick<AppDependencies["customModels"], "list">;
+  runtimeAdapter: RuntimeAdapter;
+  hasProviderKey: (tenantId: string, provider: ModelProvider) => Promise<boolean>;
+  getTenantAnthropicApiKey: AppDependencies["getTenantAnthropicApiKey"];
+  piiProtection: Pick<NonNullable<AppDependencies["piiProtection"]>, "evaluateText"> | undefined;
+  piiScanRuns: PiiHandlerStores["piiScanRuns"];
+  auditEvents: Pick<AppDependencies["auditEvents"], "create">;
+  activeTurns: AppDependencies["activeTurns"];
+};
 
 const DEFAULT_MODEL_ID =
   AVAILABLE_MODELS.find((m) => m.isDefault)?.id ?? AVAILABLE_MODELS[0]!.id;
@@ -107,19 +123,6 @@ export async function registerMessageRoutes(
 
     const { userId, tenantId } = request.auth;
     const input = inputResult.value;
-
-    // Track B spike: `?format=agui` opts into the AG-UI BaseEvent stream. Reject
-    // it up front (before any side effects) when the wire is disabled, instead
-    // of silently falling through to the RuntimeEvent SSE path — an AG-UI client
-    // (CopilotKit) would otherwise receive frames it can't parse and fail opaquely.
-    const wantsAgui = (request.query as { format?: string } | undefined)?.format === "agui";
-    if (wantsAgui && !app.config.AGUI_WIRE) {
-      reply.code(400);
-      return apiError(
-        "agui_wire_disabled",
-        "AG-UI streaming (?format=agui) is not enabled on this backend (set AGUI_WIRE=true)."
-      );
-    }
 
     const session = await stores.sessions.getOwned(tenantId, input.sessionId, userId);
 
@@ -157,9 +160,8 @@ export async function registerMessageRoutes(
 
     const { runtimeAdapter, selectedModel, selectedEffort } = resolution;
 
-    // Atomic turn-slot reservation. The adapter only flips `hasActiveTurn` to
-    // true deep inside `runMessage`, which doesn't run until `streamAssistantReply`
-    // far below — after several `await`s that persist the user message and burn
+    // Atomic turn-slot reservation. The adapter only flips `hasActiveTurn` deep
+    // inside `runMessageAGUI`, after several awaits that persist the user message and burn
     // rate-limit/quota. Two requests racing on the same session would BOTH pass
     // an `hasActiveTurn`-only check and BOTH do those side effects before one
     // loses. `activeTurns` is the single-process, synchronous registry the stream
@@ -167,8 +169,7 @@ export async function registerMessageRoutes(
     // NO `await` in between so the event loop cannot interleave a second request.
     // The loser returns 429 before persisting anything or consuming quota.
     //
-    // We release the slot on every early-return path below, and the stream
-    // writer clears it in its own `finally` once the turn ends. `activeTurns`
+    // We release the slot on every path below. `activeTurns`
     // is optional only in the in-memory test harness; when absent we fall back
     // to the adapter check alone (single-process, best-effort).
     const reservedSessionId = input.sessionId;
@@ -194,163 +195,116 @@ export async function registerMessageRoutes(
       slotReserved = true;
     }
 
-    // Everything past the reservation must release the slot on any early exit
-    // (validation error, PII block, thrown error) UNLESS the turn was handed to
-    // `streamAssistantReply`, which then owns the slot's lifetime and clears it
-    // in its own `finally`.
-    let handedOff = false;
+    // Everything past the reservation releases the slot on early exit or after
+    // the AG-UI stream finishes.
     try {
-    const artifactScope = await resolveEligibleArtifacts(reply, stores, {
-      tenantId,
-      sessionId: input.sessionId,
-      userId,
-      requestedArtifactIds: input.artifactIds
-    });
-    if (!artifactScope.ok) {
-      return artifactScope.response;
-    }
-    const { readyArtifactById, selectedArtifactIds } = artifactScope;
-
-    // The rate limit is consumed BEFORE the PII evaluation so the PII provider
-    // (an LLM call) cannot be triggered by an over-limit user, and so probing
-    // the PII filter costs a rate-limit token per attempt. The daily turn
-    // quota is only consumed AFTER the PII gate: a blocked turn (or a provider
-    // 503 fail-closed) never burns quota for a turn that was never dispatched.
-    const rateLimitError = await stores.limits.consumeRateLimit({
-      resource: "message_turn",
-      userId: request.auth.userId,
-      tenantId: request.auth.tenantId
-    });
-    if (rateLimitError) {
-      reply.code(429);
-      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
-      return rateLimitError;
-    }
-
-    const piiEvaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
-      tenantId,
-      sessionId: input.sessionId,
-      text: input.text
-    });
-    if (!piiEvaluation.ok) {
-      return piiEvaluation.response;
-    }
-    const { piiDecision } = piiEvaluation;
-
-    const scopedArtifacts = selectedArtifactIds
-      .map((artifactId) => readyArtifactById.get(artifactId))
-      .filter((artifact): artifact is ArtifactRecord => Boolean(artifact));
-
-    const piiOutcome = await handlePiiDecision(
-      piiDecision,
-      { tenantId, sessionId: input.sessionId, userId, rawText: input.text },
-      { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents }
-    );
-
-    if (piiOutcome.kind === "block") {
-      return respondWithPiiBlock({
-        app,
-        request,
-        reply,
-        stores,
+        const artifactScope = await resolveEligibleArtifacts(reply, stores, {
         tenantId,
         sessionId: input.sessionId,
         userId,
-        outcome: piiOutcome,
-        wantsAgui
+        requestedArtifactIds: input.artifactIds
       });
-    }
-
-    // Past the PII gate: this turn will actually be dispatched, so it now
-    // spends a daily-quota unit.
-    const quotaError = await stores.limits.consumeTurnQuota({
-      userId: request.auth.userId,
-      tenantId: request.auth.tenantId
-    });
-    if (quotaError) {
-      reply.code(429);
-      reply.header("retry-after", Math.max(1, Math.ceil(quotaError.retryAfterMs / 1000)));
-      return quotaError;
-    }
-
-    const { persistedText: persistedUserText, runtimePrompt } = piiOutcome;
-    const { userMessageReplacement } = await persistUserTurnMessage(stores, {
-      tenantId,
-      sessionId: input.sessionId,
-      userId,
-      piiOutcome,
-      piiDecision
-    });
-
-    openSseResponse(app, request, reply);
-
-    // Session auto-titling is fire-and-forget and path-agnostic (it keys off the
-    // persisted user message, not the runtime stream), so trigger it BEFORE the
-    // AG-UI branch below — otherwise AG-UI turns would skip titling and sessions
-    // would stay named "New session"/"Session N".
-    if (isUntitledSessionName(session.sessionName)) {
-      request.log.info(
-        { sessionId: input.sessionId, currentName: session.sessionName },
-        "session titler triggered"
-      );
-      void titleSessionAsync({
-        app,
-        stores,
-        tenantId,
-        userId,
-        sessionId: input.sessionId,
-        currentSessionName: session.sessionName,
-        firstMessage: persistedUserText,
-        logger: request.log
-      });
-    }
-
-    // Track B spike (boundary b): stream AG-UI BaseEvents instead of the
-    // RuntimeEvent SSE frames. Opt-in per request (`?format=agui`); the early
-    // guard above already rejected this when AGUI_WIRE is off, so reaching here
-    // means the wire is enabled. Owns the reserved slot for the turn's lifetime;
-    // releases it here (the AG-UI writer has no slot registry).
-    if (wantsAgui) {
-      try {
-        await streamAssistantReplyAGUI({
-          logger: request.log,
-          reply,
-          messages: stores.messages,
-          toolContexts: stores.toolContexts,
-          runtimeAdapter,
-          tenantId: request.auth.tenantId,
-          sessionId: input.sessionId,
-          userId: request.auth.userId,
-          modelName: selectedModel?.id ?? input.model ?? DEFAULT_MODEL_ID,
-          effort: selectedEffort,
-          prompt: runtimePrompt,
-          scopedArtifacts,
-          artifactProcessor: stores.artifactProcessor,
-          storage: stores.storage,
-          selectedArtifactIds,
-          userMessageReplacement,
-          turnContext: "interactive",
-          toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS
-        });
-      } finally {
-        releaseSlot();
+      if (!artifactScope.ok) {
+        return artifactScope.response;
       }
-      return;
-    }
+      const { readyArtifactById, selectedArtifactIds } = artifactScope;
 
-    // From here the stream writer owns the reserved slot (it re-marks at turn
-    // start and clears in its `finally`, whose try covers every await on the
-    // hijacked reply). Mark handoff so this route's `finally` does not also
-    // clear it. The throw-path release below is defense in depth — `clear()`
-    // is idempotent, so it never double-frees a slot the writer already cleared.
-    handedOff = true;
-    try {
-      await streamAssistantReply({
+      // The rate limit is consumed BEFORE the PII evaluation so the PII provider
+      // (an LLM call) cannot be triggered by an over-limit user, and so probing
+      // the PII filter costs a rate-limit token per attempt. The daily turn
+      // quota is only consumed AFTER the PII gate: a blocked turn (or a provider
+      // 503 fail-closed) never burns quota for a turn that was never dispatched.
+      const rateLimitError = await stores.limits.consumeRateLimit({
+        resource: "message_turn",
+        userId: request.auth.userId,
+        tenantId: request.auth.tenantId
+      });
+      if (rateLimitError) {
+        reply.code(429);
+        reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+        return rateLimitError;
+      }
+
+      const piiEvaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
+        tenantId,
+        sessionId: input.sessionId,
+        text: input.text
+      });
+      if (!piiEvaluation.ok) {
+        return piiEvaluation.response;
+      }
+      const { piiDecision } = piiEvaluation;
+
+      const scopedArtifacts = selectedArtifactIds
+        .map((artifactId) => readyArtifactById.get(artifactId))
+        .filter((artifact): artifact is ArtifactRecord => Boolean(artifact));
+
+      const piiOutcome = await handlePiiDecision(
+        piiDecision,
+        { tenantId, sessionId: input.sessionId, userId, rawText: input.text },
+        { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents }
+      );
+
+      if (piiOutcome.kind === "block") {
+        return respondWithPiiBlock({
+          app,
+          request,
+          reply,
+          stores,
+          tenantId,
+          sessionId: input.sessionId,
+          userId,
+          outcome: piiOutcome
+        });
+      }
+
+      // Past the PII gate: this turn will actually be dispatched, so it now
+      // spends a daily-quota unit.
+      const quotaError = await stores.limits.consumeTurnQuota({
+        userId: request.auth.userId,
+        tenantId: request.auth.tenantId
+      });
+      if (quotaError) {
+        reply.code(429);
+        reply.header("retry-after", Math.max(1, Math.ceil(quotaError.retryAfterMs / 1000)));
+        return quotaError;
+      }
+
+      const { persistedText: persistedUserText, runtimePrompt } = piiOutcome;
+      const { userMessageReplacement } = await persistUserTurnMessage(stores, {
+        tenantId,
+        sessionId: input.sessionId,
+        userId,
+        piiOutcome,
+        piiDecision
+      });
+
+      openSseResponse(app, request, reply);
+
+      // Session auto-titling is fire-and-forget and uses the persisted user message.
+      if (isUntitledSessionName(session.sessionName)) {
+        request.log.info(
+          { sessionId: input.sessionId, currentName: session.sessionName },
+          "session titler triggered"
+        );
+        void titleSessionAsync({
+          app,
+          stores,
+          tenantId,
+          userId,
+          sessionId: input.sessionId,
+          currentSessionName: session.sessionName,
+          firstMessage: persistedUserText,
+          logger: request.log
+        });
+      }
+
+      await streamAssistantReplyAGUI({
         logger: request.log,
         reply,
         messages: stores.messages,
         toolContexts: stores.toolContexts,
-        runtimeAdapter: runtimeAdapter,
+        runtimeAdapter,
         tenantId: request.auth.tenantId,
         sessionId: input.sessionId,
         userId: request.auth.userId,
@@ -361,22 +315,12 @@ export async function registerMessageRoutes(
         artifactProcessor: stores.artifactProcessor,
         storage: stores.storage,
         selectedArtifactIds,
-        sourceArtifactNames: scopedArtifacts.map((artifact) => artifact.artifactName),
         userMessageReplacement,
-        activeTurns: stores.activeTurns,
-        toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS,
-        // Policy Center turn-context snapshot — this is an interactive turn (a
-        // user in the loop); the scheduler passes turnContext: "scheduled".
-        turnContext: "interactive"
+        turnContext: "interactive",
+        toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS
       });
-    } catch (streamError) {
-      releaseSlot();
-      throw streamError;
-    }
     } finally {
-      if (!handedOff) {
-        releaseSlot();
-      }
+      releaseSlot();
     }
   });
 }
@@ -469,14 +413,8 @@ async function respondWithPiiBlock(args: {
   sessionId: string;
   userId: string;
   outcome: Extract<PiiHandlerOutcome, { kind: "block" }>;
-  // The block short-circuit runs before the wantsAgui dispatch below, so it must
-  // emit the right wire format itself: RuntimeEvent frames for the legacy SSE
-  // client, AG-UI BaseEvents for the CopilotKit HttpAgent. Emitting RuntimeEvent
-  // frames on an AG-UI request makes the client's EventSchemas.parse throw and
-  // the block message never renders live.
-  wantsAgui: boolean;
 }): Promise<void> {
-  const { app, request, reply, stores, tenantId, sessionId, userId, outcome, wantsAgui } = args;
+  const { app, request, reply, stores, tenantId, sessionId, userId, outcome } = args;
 
   const blockMessage = "Message blocked by organization policy.";
 
@@ -501,40 +439,18 @@ async function respondWithPiiBlock(args: {
 
   openSseResponse(app, request, reply);
 
-  if (wantsAgui) {
-    // AG-UI wire: a valid, minimal run that carries the block copy as an
-    // assistant text message and terminates cleanly. threadId === sessionId
-    // (matches the AG-UI writer/driver), runId/messageId are fresh ids.
-    const runId = uuidv7();
-    const messageId = uuidv7();
-    const aguiFrame = (event: BaseEvent) => `data: ${JSON.stringify(event)}\n\n`;
-    reply.raw.write(aguiFrame({ type: EventType.RUN_STARTED, threadId: sessionId, runId } as BaseEvent));
-    reply.raw.write(
-      aguiFrame({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent)
-    );
-    reply.raw.write(
-      aguiFrame({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: blockMessage } as BaseEvent)
-    );
-    reply.raw.write(aguiFrame({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent));
-    reply.raw.write(aguiFrame({ type: EventType.RUN_FINISHED, threadId: sessionId, runId } as BaseEvent));
-    reply.raw.end();
-    return;
-  }
-
-  // Legacy SSE: stay on the RuntimeEvent contract and emit a terminal blocked
-  // frame so existing streamMessage() handlers complete cleanly with the block
-  // payload visible to the UI.
-  reply.raw.write(sseFrame("framework:message_blocked", {
-    type: "framework:message_blocked",
-    reason: "pii_block",
-    block_reason: outcome.blockReason,
-    scan_run_id: outcome.scanRunId,
-    message: blockMessage
-  }));
-  reply.raw.write(sseFrame("response.completed", {
-    type: "response.completed",
-    response: { id: null, status: "blocked" }
-  }));
+  const runId = uuidv7();
+  const messageId = uuidv7();
+  const aguiFrame = (event: BaseEvent) => `data: ${JSON.stringify(event)}\n\n`;
+  reply.raw.write(aguiFrame({ type: EventType.RUN_STARTED, threadId: sessionId, runId } as BaseEvent));
+  reply.raw.write(
+    aguiFrame({ type: EventType.TEXT_MESSAGE_START, messageId, role: "assistant" } as BaseEvent)
+  );
+  reply.raw.write(
+    aguiFrame({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: blockMessage } as BaseEvent)
+  );
+  reply.raw.write(aguiFrame({ type: EventType.TEXT_MESSAGE_END, messageId } as BaseEvent));
+  reply.raw.write(aguiFrame({ type: EventType.RUN_FINISHED, threadId: sessionId, runId } as BaseEvent));
   reply.raw.end();
 }
 

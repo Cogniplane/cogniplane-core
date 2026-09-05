@@ -172,7 +172,7 @@ async function buildApp(opts: {
     integrationRegistry: registry,
     integrationStates: stateStore,
     auditEvents,
-    runtimeAdapter: runtime as never
+    runtimeAdapter: runtime
   });
   await app.ready();
 
@@ -430,7 +430,7 @@ test("non-admin requests are rejected with 403", async () => {
     integrationRegistry: registry,
     integrationStates: stateStore,
     auditEvents: new InMemoryAuditEventStore(),
-    runtimeAdapter: new FakeRuntimeManager() as never
+    runtimeAdapter: new FakeRuntimeManager()
   });
   await app.ready();
 

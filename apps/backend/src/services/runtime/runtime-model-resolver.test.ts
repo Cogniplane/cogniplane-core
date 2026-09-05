@@ -122,7 +122,7 @@ test("resolveRuntimeModel: no-model path with zero configured providers returns 
 test("resolveRuntimeModel: an EXPLICIT model with no key is still rejected (not silently swapped)", async () => {
   const result = await resolveRuntimeModel(
     makeInput({
-      requestedModel: "openai/gpt-5.4",
+      requestedModel: "openai/gpt-5.6-sol",
       stores: {
         // Anthropic is configured, but the user explicitly asked for OpenAI.
         hasProviderKey: async (_tenantId, provider) => provider === "anthropic"
@@ -138,7 +138,7 @@ test("resolveRuntimeModel: gates on the SELECTED model's provider", async () => 
   const seen: string[] = [];
   const result = await resolveRuntimeModel(
     makeInput({
-      requestedModel: "openai/gpt-5.4",
+      requestedModel: "openai/gpt-5.6-sol",
       stores: {
         hasProviderKey: async (_tenantId, provider) => {
           seen.push(provider);

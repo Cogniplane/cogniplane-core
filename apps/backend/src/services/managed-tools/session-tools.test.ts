@@ -3,6 +3,8 @@ import { test, expect } from "vitest";
 
 import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
+import type { MessageRecord } from "../message-store.js";
+import type { SessionRecord } from "../session-store.js";
 
 import { createSessionTools } from "./session-tools.js";
 
@@ -47,6 +49,40 @@ function makeArtifact(o: Partial<ArtifactRecord> = {}): ArtifactRecord {
   };
 }
 
+function makeSession(status: SessionRecord["status"] = "active"): SessionRecord {
+  return {
+    sessionId: "s",
+    userId: "u",
+    sessionName: "Sess",
+    status,
+    createdAt: "2026-01-01",
+    updatedAt: "2026-01-01"
+  };
+}
+
+function makeMessage(index: number): MessageRecord {
+  return {
+    id: index,
+    messageId: `m${index}`,
+    sessionId: "s",
+    userId: "u",
+    role: "user",
+    status: "completed",
+    content: `m${index}`,
+    reasoningContent: "",
+    reasoningSegments: null,
+    planContent: "",
+    tokenUsage: null,
+    modelName: null,
+    costUsd: null,
+    feedbackRating: null,
+    detail: {},
+    toolResults: [],
+    createdAt: "2026-01-01",
+    updatedAt: "2026-01-01"
+  };
+}
+
 function findTool(deps: Parameters<typeof createSessionTools>[0], name: string) {
   return createSessionTools(deps).find((t) => t.name === name)!;
 }
@@ -54,14 +90,10 @@ function findTool(deps: Parameters<typeof createSessionTools>[0], name: string) 
 const baseDeps: Parameters<typeof createSessionTools>[0] = {
   sessions: {
     async getOwned() {
-      return {
-        sessionId: "s",
-        sessionName: "Sess",
-        status: "active"
-      } as never;
+      return makeSession();
     }
   },
-  messages: { async listBySession() { return []; } },
+  messages: { async listBySession() { return { messages: [], hasMore: false }; } },
   artifacts: {
     async getOwned() { return null; },
     async listBySession() { return []; },
@@ -69,7 +101,7 @@ const baseDeps: Parameters<typeof createSessionTools>[0] = {
   },
   storage: {
     async openReadStream() {
-      return { stream: Readable.from(["x"]) } as never;
+      return { stream: Readable.from(["x"]), fileSizeBytes: 1 };
     }
   }
 };
@@ -85,12 +117,12 @@ test("session_context throws when session is not found or not active", async () 
   await expect(() => tool.handler({ context: ctx(), arguments: {} })).rejects.toThrow(/Session not found/);
 });
 
-test("session_context throws when session is archived", async () => {
+test("session_context throws when session is deleted", async () => {
   const deps = {
     ...baseDeps,
     sessions: {
       async getOwned() {
-        return { sessionId: "s", sessionName: "S", status: "archived" } as never;
+        return makeSession("deleted");
       }
     }
   };
@@ -99,14 +131,15 @@ test("session_context throws when session is archived", async () => {
 });
 
 test("session_context: clamps recentMessageCount and returns the trailing N messages", async () => {
-  const allMessages = Array.from({ length: 6 }, (_, i) => ({
-    role: "user",
-    status: "completed",
-    content: `m${i}`
-  }));
+  const allMessages = Array.from({ length: 6 }, (_, i) => makeMessage(i));
   const deps = {
     ...baseDeps,
-    messages: { async listBySession() { return allMessages as never; } }
+    // session_context now pushes the tail-slice down into the store as `limit`
+    // instead of loading the whole transcript, so the fake has to honor it —
+    // otherwise the clamp assertions below would pass regardless.
+    messages: { async listBySession(_t: string, _s: string, _u: string, opts: { limit?: number } = {}) {
+      return { messages: allMessages.slice(-(opts.limit ?? allMessages.length)), hasMore: false };
+    } }
   };
   const tool = findTool(deps, "session_context");
   const result = await tool.handler({
@@ -119,14 +152,12 @@ test("session_context: clamps recentMessageCount and returns the trailing N mess
 });
 
 test("session_context: invalid recentMessageCount falls back to 4", async () => {
-  const all = Array.from({ length: 6 }, (_, i) => ({
-    role: "user",
-    status: "completed",
-    content: String(i)
-  }));
+  const all = Array.from({ length: 6 }, (_, i) => ({ ...makeMessage(i), content: String(i) }));
   const deps = {
     ...baseDeps,
-    messages: { async listBySession() { return all as never; } }
+    messages: { async listBySession(_t: string, _s: string, _u: string, opts: { limit?: number } = {}) {
+      return { messages: all.slice(-(opts.limit ?? all.length)), hasMore: false };
+    } }
   };
   const tool = findTool(deps, "session_context");
   const result = await tool.handler({
@@ -257,7 +288,7 @@ test("read_text_artifact: text mime returns content directly with truncated=fals
     },
     storage: {
       async openReadStream() {
-        return { stream: Readable.from([Buffer.from("body")]) } as never;
+        return { stream: Readable.from([Buffer.from("body")]), fileSizeBytes: 4 };
       }
     }
   };
@@ -295,7 +326,7 @@ test("read_text_artifact: non-text mime falls back to derived readable artifact"
     storage: {
       async openReadStream(key: string) {
         expect(key).toBe("k-derived");
-        return { stream: Readable.from([Buffer.from("derived body")]) } as never;
+        return { stream: Readable.from([Buffer.from("derived body")]), fileSizeBytes: 12 };
       }
     }
   };
@@ -332,7 +363,7 @@ test("read_text_artifact: maxChars=0 falls back to default 4000 (truthy fallback
     },
     storage: {
       async openReadStream() {
-        return { stream: Readable.from([Buffer.from("hello")]) } as never;
+        return { stream: Readable.from([Buffer.from("hello")]), fileSizeBytes: 5 };
       }
     }
   };
@@ -358,7 +389,10 @@ test("read_text_artifact: caps maxChars at 20000 when given an absurd value", as
     storage: {
       async openReadStream() {
         // Stream exactly 20,000 chars; if cap fails the test will see > 20_000
-        return { stream: Readable.from([Buffer.from("a".repeat(20_001))]) } as never;
+        return {
+          stream: Readable.from([Buffer.from("a".repeat(20_001))]),
+          fileSizeBytes: 20_001
+        };
       }
     }
   };

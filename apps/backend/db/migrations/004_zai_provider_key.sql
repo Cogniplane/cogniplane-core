@@ -1,4 +1,4 @@
--- Z.AI (Zhipu / GLM) direct provider support (AgenticEntrepriseFramework-i52g).
+-- Z.AI (Zhipu / GLM) direct provider support (bead i52g).
 --
 -- Adds a per-tenant encrypted API-key column for the Z.AI provider, mirroring
 -- the OpenAI / Google / OpenRouter columns from 003. Nullable and encrypted at

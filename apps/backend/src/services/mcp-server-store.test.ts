@@ -31,7 +31,6 @@ test("McpServerStore rejects tenant servers that reuse a system server ID", asyn
       mode: "managed",
       routePath: "/mcp/custom-context",
       upstreamUrl: null,
-      headersAllowlist: [],
       configHash: "hash",
       enabled: true,
       createdBy: "admin"

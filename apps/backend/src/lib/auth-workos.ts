@@ -19,15 +19,12 @@ const STATIC_PUBLIC_AUTH_PATHS: readonly string[] = [
   "/auth/logout"
 ];
 
-function buildPublicAuthPaths(): ReadonlySet<string> {
-  return new Set<string>([...STATIC_PUBLIC_AUTH_PATHS, ...listIntegrationOAuthCallbackPaths()]);
-}
-
-export function workosAuth(config: AppConfig, tenantMembers: Pick<TenantMemberStore, "getRole">) {
-  // Snapshot the allowlist at middleware-construction time. By this point
-  // `registerBuiltinIntegrations` has run (called from `buildAppDependencies`),
-  // so registry contents are stable.
-  const publicAuthPaths = buildPublicAuthPaths();
+export function workosAuth(
+  config: AppConfig,
+  tenantMembers: Pick<TenantMemberStore, "getRole">,
+  oauthCallbackPaths: readonly string[] = listIntegrationOAuthCallbackPaths()
+) {
+  const publicAuthPaths = new Set([...STATIC_PUBLIC_AUTH_PATHS, ...oauthCallbackPaths]);
 
   return async function authenticate(request: FastifyRequest, reply: FastifyReply) {
     // Compare the path only — request.url includes any query string, so an

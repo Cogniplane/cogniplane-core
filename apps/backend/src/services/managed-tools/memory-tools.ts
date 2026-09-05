@@ -4,10 +4,11 @@ import {
   type MemoryRecord,
   type MemoryStore
 } from "../memory-store.js";
+import { ToolCallError } from "../../lib/tool-call-error.js";
 import { allRequiredObjectSchema, arraySchema, type ManagedToolDefinition } from "./types.js";
 
 type MemoryToolDeps = {
-  memories: MemoryStore;
+  memories: Pick<MemoryStore, "search" | "save" | "remove">;
 };
 
 // ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
@@ -117,7 +118,7 @@ export function createMemoryTools(deps: MemoryToolDeps): ManagedToolDefinition[]
       handler: async ({ context, arguments: args }) => {
         const name = String(args.name ?? "").trim();
         const content = String(args.content ?? "");
-        if (!name) throw new Error("name is required.");
+        if (!name) throw new ToolCallError("name is required.");
         const metadata =
           args.metadata && typeof args.metadata === "object" && !Array.isArray(args.metadata)
             ? (args.metadata as Record<string, unknown>)
@@ -139,7 +140,7 @@ export function createMemoryTools(deps: MemoryToolDeps): ManagedToolDefinition[]
       }),
       handler: async ({ context, arguments: args }) => {
         const name = String(args.name ?? "").trim();
-        if (!name) throw new Error("name is required.");
+        if (!name) throw new ToolCallError("name is required.");
         const deleted = await deps.memories.remove(context.tenantId, context.userId, name);
         return { deleted, name };
       }

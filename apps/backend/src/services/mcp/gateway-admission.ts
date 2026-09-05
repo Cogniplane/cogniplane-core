@@ -1,29 +1,27 @@
 import type { FastifyBaseLogger } from "fastify";
 
-import { cidrAllowlistAllows, parseCidrAllowlist } from "../../lib/cidr-allowlist.js";
 import { rpcFailure as failure, type McpRpcResponse as RpcResponse } from "../../lib/mcp-upstream-client.js";
 import { verifyRuntimeToken, type RuntimeTokenClaims } from "../auth/runtime-token.js";
 import type { AuditEventStore } from "../audit-event-store.js";
-import type { RuntimeEgressIpPinStore } from "../runtime-egress-ip-pin.js";
 
 // Admission slice of the gateway stores, defined locally to avoid coupling this
 // service module "up" to the route-owned McpRouteStores type.
 type GatewayAdmissionStores = {
   runtimeTokenSecret: string;
-  egressAllowlist: ReturnType<typeof parseCidrAllowlist>;
-  egressIpPins: RuntimeEgressIpPinStore;
-  auditEvents: AuditEventStore;
+  auditEvents: Pick<AuditEventStore, "create">;
 };
+
+const LOOPBACK_IPS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 
 // Best-effort evidence row for a gateway rejection. A failure here (e.g. the DB
 // is unreachable) must never change the gating decision — the audit protects
 // the platform; losing the evidence row is the lesser failure.
 async function recordGatewayRejection(
-  auditEvents: AuditEventStore,
+  auditEvents: Pick<AuditEventStore, "create">,
   reason: string,
   ctx: {
     claims: RuntimeTokenClaims;
-    ipAddress: string | null;
+    remoteAddress: string | null;
     serverId: string;
     rpcMethod: string;
   },
@@ -36,7 +34,7 @@ async function recordGatewayRejection(
       userId: ctx.claims.uid,
       type: "mcp.gateway.rejected",
       payload: { reason, serverId: ctx.serverId, rpcMethod: ctx.rpcMethod },
-      ipAddress: ctx.ipAddress
+      ipAddress: ctx.remoteAddress
     });
   } catch (err) {
     log.warn({ err, reason, serverId: ctx.serverId }, "failed to persist mcp.gateway.rejected audit event");
@@ -69,22 +67,19 @@ export type GatewayAdmissionInput = {
   rpcMethod: string;
   serverId: string;
   tenantId: string;
-  ipAddress: string | null;
+  remoteAddress: string | null | undefined;
   stores: GatewayAdmissionStores;
   logger: FastifyBaseLogger;
 };
 
 export type GatewayAdmissionResult =
-  | { ok: true; claims: RuntimeTokenClaims; ipAddress: string | null }
+  | { ok: true; claims: RuntimeTokenClaims }
   | { ok: false; statusCode: 401 | 403; body: RpcResponse };
 
-// Verifies the runtime token and enforces the egress controls, returning either
-// the admitted claims + peer IP or a JSON-RPC failure to write. Every side
-// effect (warn logs, recordGatewayRejection evidence writes) runs in the same
-// order the inline preamble did — callers just translate `{ ok: false }` into
-// `reply.code(statusCode); return body`.
+// Verifies the runtime token and enforces loopback-only admission, returning either
+// the admitted claims or a JSON-RPC failure to write.
 export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise<GatewayAdmissionResult> {
-  const { authorizationHeader, rpcId, rpcMethod, serverId, tenantId, ipAddress, stores, logger } = input;
+  const { authorizationHeader, rpcId, rpcMethod, serverId, tenantId, remoteAddress, stores, logger } = input;
 
   // The MCP gateway exists for the sandboxed runtime alone — every request,
   // including initialize, must carry a valid session-scoped rt_* token as
@@ -104,30 +99,21 @@ export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise
     return { ok: false, statusCode: 401, body: failure(rpcId, -32000, "The MCP gateway requires a valid runtime token (rt_*).") };
   }
 
-  // Egress controls for the /mcp gateway. The CIDR allowlist
-  // (E2B_EGRESS_CIDRS) is dormant unless configured — E2B does not publish
-  // egress ranges — so the per-runtime IP pin is the operative control: the
-  // first gateway call for a runtimeId records the peer IP, and a leaked rt_*
-  // token replayed from any other host is refused for the rest of its TTL.
-  if (stores.egressAllowlist && !cidrAllowlistAllows(stores.egressAllowlist, ipAddress ?? "")) {
-    await recordGatewayRejection(stores.auditEvents, "egress_ip_not_allowed", { claims, ipAddress, serverId, rpcMethod }, logger);
-    return { ok: false, statusCode: 403, body: failure(rpcId, -32000, "Egress IP is not allowed.") };
-  }
-  if (ipAddress) {
-    const pinResult = await stores.egressIpPins.checkAndPin(claims.rid, ipAddress);
-    if (pinResult.kind === "mismatch") {
-      await recordGatewayRejection(stores.auditEvents, "egress_ip_mismatch", { claims, ipAddress, serverId, rpcMethod }, logger);
-      // Log expected/observed at warn so an operator investigating a leak
-      // can see both — the audit payload deliberately omits the expected IP
-      // to avoid storing per-runtime peer addresses in a long-retention
-      // table.
-      logger.warn(
-        { runtimeId: claims.rid, expectedIp: pinResult.expectedIp, observedIp: pinResult.observedIp },
-        "MCP gateway egress IP mismatch — refusing rt_* call from unexpected peer"
-      );
-      return { ok: false, statusCode: 403, body: failure(rpcId, -32000, "Egress IP mismatch.") };
-    }
+  // Loopback-only egress check: the gateway must only accept connections originating
+  // from the local host (127.0.0.1, ::1, or IPv4-mapped IPv6 loopback).
+  if (!remoteAddress || !LOOPBACK_IPS.has(remoteAddress)) {
+    await recordGatewayRejection(
+      stores.auditEvents,
+      "non_loopback_peer",
+      { claims, remoteAddress: remoteAddress ?? null, serverId, rpcMethod },
+      logger
+    );
+    logger.warn(
+      { serverId, rpcMethod, remoteAddress: remoteAddress ?? null },
+      "MCP gateway 403: connection from non-loopback peer rejected"
+    );
+    return { ok: false, statusCode: 403, body: failure(rpcId, -32000, "Loopback connection required.") };
   }
 
-  return { ok: true, claims, ipAddress };
+  return { ok: true, claims };
 }

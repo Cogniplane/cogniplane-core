@@ -16,6 +16,6 @@ export function createSilentLogger(): FastifyBaseLogger {
     child: () => logger,
     level: "silent",
     silent: () => {}
-  } as FastifyBaseLogger;
+  };
   return logger;
 }

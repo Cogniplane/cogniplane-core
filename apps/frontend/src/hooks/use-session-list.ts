@@ -94,8 +94,8 @@ export function useSessionList(input?: { enabled?: boolean }) {
   const [hasRestored, setHasRestored] = useState(false);
   useEffect(() => {
     if (!enabled) {
-      // First-successful-load: restore persisted selection or pick the first
-      // session. Guarded by hasRestored so it runs once per mount, not on poll ticks.
+      // Disabled (signed out): drop the selection and re-arm the restore so a
+      // later sign-in restores again. Prop-change reset, not a render loop.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedSessionId(null);
       setHasRestored(false);
@@ -159,15 +159,17 @@ export function useSessionList(input?: { enabled?: boolean }) {
   const deleteMutation = useMutation({
     mutationFn: apiDeleteSession,
     onSuccess: (_unused, sessionId) => {
-      queryClient.setQueryData<Session[]>(activeListKey, (prev) => {
-        const next = (prev ?? []).filter((s) => s.sessionId !== sessionId);
-        if (selectedSessionId === sessionId) {
-          const fallbackId = next.length > 0 ? next[0].sessionId : null;
-          setSelectedSessionId(fallbackId);
-          persistSelectedSessionId(fallbackId);
-        }
-        return next;
-      });
+      // Work out the fallback before the cache write, so the updater stays a
+      // pure prev → next function with no selection side effects inside it.
+      const remaining = (
+        queryClient.getQueryData<Session[]>(activeListKey) ?? []
+      ).filter((s) => s.sessionId !== sessionId);
+      queryClient.setQueryData<Session[]>(activeListKey, remaining);
+      if (selectedSessionId === sessionId) {
+        const fallbackId = remaining.length > 0 ? remaining[0].sessionId : null;
+        setSelectedSessionId(fallbackId);
+        persistSelectedSessionId(fallbackId);
+      }
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
       if (renameSessionId === sessionId) {
         setRenameSessionId(null);

@@ -11,13 +11,42 @@ import {
   type RuntimeTokenMintClaims
 } from "../services/auth/runtime-token.js";
 import { tryAuthenticateRuntimeToken } from "./auth-runtime-token.js";
+import { runtimeTokenSecret } from "./derived-secrets.js";
 
-// All tokens are minted under this config's DATA_ENCRYPTION_SECRET (>=32 chars,
-// supplied by loadTestConfig). The same secret is used by the production
-// verifyRuntimeToken inside tryAuthenticateRuntimeToken, so a token minted here
+// Tokens are minted under the HKDF-derived runtime-token subkey, NOT the raw
+// DATA_ENCRYPTION_SECRET (see lib/derived-secrets.ts — the root secret is no
+// longer handed to any HMAC consumer directly). tryAuthenticateRuntimeToken
+// derives the same subkey from the config it is given, so a token minted here
 // verifies there.
 const config = createTestConfig();
-const SECRET = config.DATA_ENCRYPTION_SECRET;
+const SECRET = runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET);
+
+/**
+ * The mint side (deep-agents-runtime-adapter) and BOTH verify sides
+ * (this module, and services/mcp/gateway-admission via app-bootstrap) each
+ * derive their key independently from `DATA_ENCRYPTION_SECRET`. Nothing passes
+ * a key between them, so a token minted by the adapter reaching a gateway that
+ * derives differently is a silent total auth failure — every tool call 401s
+ * with no signal beyond a `runtime_token_invalid` log line.
+ *
+ * The route suite cannot catch that: its test app injects `request.auth`
+ * directly, so the production admission path never runs there. This asserts the
+ * relationship head-on, against the exact expressions the three call sites use.
+ */
+test("a token minted the way the adapter mints it verifies the way the gateway verifies it", () => {
+  // deep-agents-runtime-adapter.ts:309
+  const minted = generateRuntimeToken(
+    { ...CLAIMS, exp: runtimeTokenExpiry(60 * 60 * 1000) },
+    runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET)
+  );
+
+  // app-bootstrap.ts:59 → services/mcp/gateway-admission.ts:62
+  const admissionSecret = runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET);
+  expect(verifyRuntimeToken(minted, admissionSecret).kind).toBe("valid");
+
+  // And the root secret is NOT the key — the point of the derivation.
+  expect(verifyRuntimeToken(minted, config.DATA_ENCRYPTION_SECRET).kind).toBe("invalid");
+});
 
 const CLAIMS: RuntimeTokenMintClaims = {
   sid: "session-1",

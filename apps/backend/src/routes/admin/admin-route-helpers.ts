@@ -1,5 +1,4 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { z } from "zod";
 
 import { ensureUser } from "../../lib/db.js";
 import { apiError, notFoundError } from "../../lib/http-errors.js";
@@ -7,12 +6,7 @@ import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
 
-export const adminIdSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(80)
-  .regex(/^[a-z0-9][a-z0-9-_]*$/);
+export { AdminIdSchema as adminIdSchema } from "@cogniplane/shared-types";
 
 export function configError(message: string) {
   return apiError("invalid_config", message);
@@ -81,7 +75,7 @@ export function respondAdminNotFound(reply: FastifyReply, errorCode: string) {
 }
 
 export async function createAdminAuditEvent(
-  auditEvents: AuditEventStore,
+  auditEvents: Pick<AuditEventStore, "create">,
   input: {
     tenantId: string;
     userId: string;

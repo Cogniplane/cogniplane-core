@@ -132,10 +132,11 @@ function readNotionConfig(config: AppConfig): NotionOAuthConfig | null {
 export class NotionConnectionService {
   constructor(
     private readonly config: AppConfig,
-    private readonly store: NotionConnectionStore,
-    private readonly auditEvents?: AuditEventStore,
+    private readonly store: Pick<NotionConnectionStore, "get" | "upsert" | "delete" | "markTokenUsed">,
+    private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
-    private readonly oauthStates = new IntegrationOAuthStateStore()
+    private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
+      new IntegrationOAuthStateStore()
   ) {}
 
   isConfigured(): boolean {
@@ -309,6 +310,16 @@ export class NotionConnectionService {
         reason: "notion_authorization_failed"
       });
     }
+  }
+
+  /**
+   * `IntegrationConnectionProbe.deleteConnection`. Member removal calls this
+   * through the registry; it is `disconnect` under the name the probe declares,
+   * so revoking on removal writes the same audit event and runtime
+   * invalidation as a user-initiated disconnect.
+   */
+  async deleteConnection(tenantId: string, userId: string): Promise<boolean> {
+    return this.disconnect(tenantId, userId);
   }
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {

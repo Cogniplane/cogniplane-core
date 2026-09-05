@@ -98,7 +98,7 @@ describe("UserSettingsStore – scheduler methods", () => {
   // ---- listDueJobs -------------------------------------------------------
 
   describe("listDueJobs", () => {
-    it("returns only enabled jobs with past nextRunAt", async () => {
+    it("maps returned job rows and forwards the requested limit", async () => {
       const dueJob = fakeJobRow({ job_id: "job-due", next_run_at: "2026-03-18T09:00:00.000Z", enabled: true });
       db.onQuery((sql) => {
         if (sql.includes("scheduled_jobs") && sql.includes("enabled") && sql.includes("next_run_at")) {
@@ -177,7 +177,7 @@ describe("UserSettingsStore – scheduler methods", () => {
   // ---- createJobRun + completeJobRun --------------------------------------
 
   describe("createJobRun + completeJobRun", () => {
-    it("creates a pending run and then completes it", async () => {
+    it("maps returned pending and completed run rows", async () => {
       // createJobRun handler
       db.onQuery((sql) => {
         if (sql.includes("INSERT") && sql.includes("scheduled_job_runs")) {
@@ -236,7 +236,7 @@ describe("UserSettingsStore – scheduler methods", () => {
       expect(completed.summary).toBe("All done");
     });
 
-    it("completeJobRun can record an error", async () => {
+    it("maps a returned failed run", async () => {
       db.onQuery((sql) => {
         if (sql.includes("UPDATE") && sql.includes("scheduled_job_runs")) {
           return {
@@ -344,7 +344,7 @@ describe("UserSettingsStore – scheduler methods", () => {
 
       // Verify params (tenantId is $1, jobId is $2, userId is $3)
       const call = db.calls.find((entry) => entry.sql.includes("FROM scheduled_job_runs"));
-      expect(call).toBeTruthy();
+      if (!call) throw new Error("Expected listJobRuns query.");
       expect(call.params[0]).toBe("test-tenant");
       expect(call.params[1]).toBe("job-1");
       expect(call.params[2]).toBe("user-1");

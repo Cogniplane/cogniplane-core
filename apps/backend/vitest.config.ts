@@ -3,18 +3,32 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-// Coverage thresholds are sourced from the repo-root .coverage-thresholds.json
-// so out-of-process CI tooling and Vitest stay in lockstep. See
-// `.coverage-thresholds.json` for the documented baseline.
-const thresholdsPath = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../.coverage-thresholds.json"
-);
-const thresholds = JSON.parse(readFileSync(thresholdsPath, "utf-8")).thresholds as {
+type CoverageThresholds = {
   lines: number;
   branches: number;
   functions: number;
 };
+
+type CoverageThresholdFile = {
+  thresholds: CoverageThresholds;
+  importedThresholds: CoverageThresholds;
+};
+
+// Default coverage counts every production module, including modules no test
+// imports. Set COVERAGE_SCOPE=imported to preserve the older imported-module
+// measurement as a secondary trend.
+const coverageScope = process.env.COVERAGE_SCOPE === "imported" ? "imported" : "full";
+const thresholdsPath = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../.coverage-thresholds.json"
+);
+const thresholdFile = JSON.parse(
+  readFileSync(thresholdsPath, "utf-8")
+) as CoverageThresholdFile;
+const thresholds =
+  coverageScope === "imported"
+    ? thresholdFile.importedThresholds
+    : thresholdFile.thresholds;
 
 // Backend tests run in the Node environment. Globals are off — we'll keep
 // explicit `import { test, expect, vi } from "vitest"` so a reader doesn't
@@ -27,21 +41,26 @@ export default defineConfig({
     environment: "node",
     globals: false,
     include: ["src/**/*.test.ts"],
+    // Reserve .integration.test.ts for Postgres suites under src/integration/.
+    // Hermetic transport tests use .test.ts and run in this project.
+    exclude: ["**/node_modules/**", "**/.git/**", "src/**/*.integration.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "json-summary"],
-      // Match the previous `tsx --test --experimental-test-coverage` reporting
-      // scope: only files actually loaded by tests count toward the totals.
-      // Coverage of untested production files (stores faked end-to-end in
-      // tests) shows as 0% — that's the design, not a regression.
-      // No `include` here intentionally; that switches Vitest from
-      // "measure every src file" to "measure only files imported by tests".
+      ...(coverageScope === "full" ? { include: ["src/**/*.ts"] } : {}),
       exclude: [
         "src/**/*.test.ts",
         "src/test-helpers/**",
-        "src/scripts/**",
+        // This directory boots and seeds the Postgres integration test rig.
+        // The separate integration suite owns it; it is not product code.
+        "src/integration/support/**",
         "src/types.d.ts",
-        "src/server.ts"
+        // Keep the imported trend comparable with its old denominator. The
+        // full-source run counts production entrypoints and omits only the
+        // local dashboard data generator.
+        ...(coverageScope === "imported"
+          ? ["src/scripts/**", "src/server.ts"]
+          : ["src/scripts/seed-dev-data.ts"])
       ],
       thresholds: {
         lines: thresholds.lines,

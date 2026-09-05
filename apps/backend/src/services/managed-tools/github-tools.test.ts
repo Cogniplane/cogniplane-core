@@ -22,8 +22,7 @@ const fakeCreds = {
   login: "octocat",
   name: "Octocat",
   email: "octo@example.com",
-  token: "ghp_faketoken",
-  source: "user" as const
+  token: "ghp_faketoken"
 };
 
 const deps = {
@@ -50,20 +49,8 @@ function capturedUrl(): string | null {
   return calls.length > 0 ? calls[calls.length - 1]!.url : null;
 }
 
-function installFakeFetch(responseBody: Record<string, unknown> = {}, ok = true, status = 200) {
-  fake = createFakeFetch(
-    () =>
-      ({
-        ok,
-        status,
-        async json() {
-          return responseBody;
-        },
-        async text() {
-          return JSON.stringify(responseBody);
-        }
-      }) as unknown as Response
-  );
+function installFakeFetch(responseBody: Record<string, unknown> = {}) {
+  fake = createFakeFetch(() => Response.json(responseBody));
 }
 
 beforeEach(() => {

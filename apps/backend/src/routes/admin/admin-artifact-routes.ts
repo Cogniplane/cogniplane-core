@@ -14,7 +14,7 @@ import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
 export async function registerAdminArtifactRoutes(
   app: FastifyInstance,
-  stores: { auditEvents: AuditEventStore }
+  stores: { auditEvents: Pick<AuditEventStore, "create"> }
 ): Promise<void> {
   app.post(
     "/admin/artifacts/:artifactId/download-token",

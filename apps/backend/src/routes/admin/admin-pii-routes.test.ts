@@ -4,7 +4,7 @@ import Fastify from "fastify";
 import type { Pool } from "../../lib/db.js";
 import { PiiAnalyticsStore } from "../../services/pii/pii-analytics-store.js";
 import type { BreakerSnapshot } from "../../services/pii/pii-circuit-breaker.js";
-import type { PiiProtectionSettings } from "../../services/pii/pii-policy.js";
+import type { PiiProtectionSettings } from "@cogniplane/shared-types";
 import { registerAdminPiiRoutes, resolveRange } from "./admin-pii-routes.js";
 
 type StubRow = Record<string, unknown>;

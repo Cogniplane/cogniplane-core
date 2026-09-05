@@ -9,7 +9,7 @@ import {
 } from "./types.js";
 
 type GithubToolDeps = {
-  githubConnections: GithubConnectionService;
+  githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
 };
 
 // `repo` and `path` are interpolated into the GitHub API URL. The values come

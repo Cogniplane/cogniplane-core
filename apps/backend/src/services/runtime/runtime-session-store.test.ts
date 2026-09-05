@@ -3,7 +3,10 @@ import { test, expect } from "vitest";
 import type { Pool } from "../../lib/db.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 
-import { RuntimeSessionStore } from "./runtime-session-store.js";
+import {
+  RuntimeSessionStore,
+  type RuntimeSessionUpsertInput
+} from "./runtime-session-store.js";
 
 type QueryCall = {
   sql: string;
@@ -316,7 +319,7 @@ test("RuntimeSessionStore.listRecent returns mapped rows", async () => {
   expect(result[0].sessionId).toBe("s");
 });
 
-function makeUpsertInput() {
+function makeUpsertInput(): RuntimeSessionUpsertInput {
   return {
     tenantId: "tenant-1",
     sessionId: "session-1",
@@ -328,17 +331,37 @@ function makeUpsertInput() {
     runtimeSchemaVersion: "v2",
     manifestPath: "/tmp/runtime-1/.framework/runtime-manifest.json",
     manifestMetadata: {
+      manifestVersion: "v2",
+      manifestHash: "manifest-hash",
+      configBundleHash: "config-bundle-hash",
+      sessionId: "session-1",
+      userId: "user-1",
       generatedAt: "2026-04-08T12:00:00.000Z",
-      tenantId: "tenant-1",
+      workspacePath: "/tmp/runtime-1",
       runtimePolicy: {
         id: "cap-1",
+        version: 1,
+        hash: "policy-hash",
         enabledToolIds: [],
-        enabledMcpServerIds: [],
-        approvalPolicy: "never" as const,
-        autoApproveReadOnlyTools: false
+        approvalPolicy: "never",
+        sandboxMode: "workspace-write",
+        networkMode: "restricted",
+        allowCommandExecution: true,
+        autoApproveReadOnlyTools: false,
+        webSearchMode: "disabled"
       },
       mcpServers: [],
-      skills: []
+      skills: [],
+      configSources: {
+        runtimePolicy: { id: "cap-1", version: 1, hash: "policy-hash" },
+        skills: [],
+        mcpServers: []
+      },
+      config: {
+        skillsPath: "/skills",
+        customSkillsEnabled: true,
+        customMcpServersEnabled: true
+      }
     },
     healthStatus: "healthy",
     lastActiveAt: "2026-04-08T12:00:00.000Z",

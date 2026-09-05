@@ -87,11 +87,10 @@ function createFakeUploader(objects: Map<string, Buffer>) {
   };
 }
 
-test("local skill bundle storage caches and installs a bundle directory", async () => {
+test("local skill bundle storage caches and materializes a bundle directory", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-storage-"));
   const sourcePath = path.join(root, "source-bundle");
   const cacheRoot = path.join(root, "cache");
-  const installRoot = path.join(root, "runtime", ".codex", "skills", "pdf-processing");
   const storage = new LocalSkillBundleStorage(cacheRoot);
 
   await mkdir(sourcePath, { recursive: true });
@@ -109,10 +108,7 @@ test("local skill bundle storage caches and installs a bundle directory", async 
     sourcePath
   });
   expect(stored.storageUri.startsWith("file://")).toBe(true);
-  await storage.installBundle({
-    storageUri: stored.storageUri,
-    destinationPath: installRoot
-  });
+  const { localPath: installRoot } = await storage.materializeBundle(stored.storageUri);
 
   const installedContent = await readFile(path.join(installRoot, "SKILL.md"), "utf8");
   expect(installedContent.includes("pdf-processing")).toBe(true);
@@ -204,11 +200,7 @@ test("bucket skill bundle storage uploads a tarball and extracts on materialize"
   expect(stored.storageUri).toBe("s3://skill-bucket/skills/tenant-a/pdf-processing/3-deadbeef.tar.gz");
   expect(objects.has("skill-bucket/skills/tenant-a/pdf-processing/3-deadbeef.tar.gz")).toBeTruthy();
 
-  const installRoot = path.join(root, "install", ".codex", "skills", "pdf-processing");
-  await storage.installBundle({
-    storageUri: stored.storageUri,
-    destinationPath: installRoot
-  });
+  const { localPath: installRoot } = await storage.materializeBundle(stored.storageUri);
 
   const installedSkill = await readFile(path.join(installRoot, "SKILL.md"), "utf8");
   expect(installedSkill.includes("pdf-processing")).toBe(true);
@@ -295,9 +287,7 @@ test("bucket skill bundle storage reads URIs whose bucket differs from the confi
   });
 
   const legacyUri = "s3://legacy-bucket/skills/tenant-a/pdf-processing/1-oldhash.tar.gz";
-  const installRoot = path.join(root, "install", ".codex", "skills", "pdf-processing");
-
-  await storage.installBundle({ storageUri: legacyUri, destinationPath: installRoot });
+  const { localPath: installRoot } = await storage.materializeBundle(legacyUri);
   const installed = await readFile(path.join(installRoot, "SKILL.md"), "utf8");
   expect(installed.includes("pdf-processing")).toBe(true);
 
@@ -337,8 +327,7 @@ test("bucket skill bundle storage handles bucket prefixes with regex metacharact
   expect(stored.storageUri).toBe(`s3://my-bucket/${prefix}/skills/t1/s1/4-abc.tar.gz`);
 
   // Materialize must not throw even though the prefix has `[`, `]`, `.`.
-  const installRoot = path.join(root, "install", "s1");
-  await storage.installBundle({ storageUri: stored.storageUri, destinationPath: installRoot });
+  const { localPath: installRoot } = await storage.materializeBundle(stored.storageUri);
   const body = await readFile(path.join(installRoot, "SKILL.md"), "utf8");
   expect(body.includes("Body")).toBe(true);
 });

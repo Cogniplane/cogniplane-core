@@ -6,14 +6,20 @@ import cors from "@fastify/cors";
 import { CORS_ALLOWED_METHODS } from "../lib/cors.js";
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
+import { EventType, type BaseEvent } from "@ag-ui/client";
 
-import type { RuntimeEvent, RuntimeUserInput } from "../runtime-contracts.js";
+import type { RuntimeAdapter, RuntimeUserInput } from "../runtime-contracts.js";
 import type { AppConfig } from "../config.js";
 import type { Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
+import type { ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
 import type { ApprovalRecord } from "../services/auth/approval-store.js";
-import type { ArtifactDetail, ArtifactDownloadTokenRecord, ArtifactPiiDetail, ArtifactRecord } from "../services/artifacts/artifact-store.js";
+import type { ArtifactDetail, ArtifactDownloadTokenRecord, ArtifactPiiDetail, ArtifactRecord, ArtifactStore } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
+import type { SessionRecord } from "../services/session-store.js";
+import type { MessageRecord, ToolResultRecord, MessageStore } from "../services/message-store.js";
+import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
+import { MemoryStore } from "../services/memory-store.js";
 import { RequestLimits } from "../services/request-limits.js";
 import { FakeDatabase } from "./fake-database.js";
 import { InMemoryAuditEventStore } from "./in-memory-audit-events.js";
@@ -23,92 +29,67 @@ import { registerApprovalRoutes, type ApprovalRouteStores } from "../routes/appr
 import { registerArtifactRoutes, type ArtifactRouteStores } from "../routes/artifacts.js";
 import { registerHealthRoutes, type HealthRouteStores } from "../routes/health.js";
 import { registerMcpRoutes, type McpRouteStores } from "../routes/mcp.js";
-import { RuntimeEgressIpPinStore } from "../services/runtime-egress-ip-pin.js";
+import { ProxyToolMetadataCache } from "../services/mcp/proxy-tool-metadata-cache.js";
 import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "../services/managed-tools/factory.js";
+import { runtimeTokenSecret } from "../lib/derived-secrets.js";
+import type { ManagedToolDefinition } from "../services/managed-tools/types.js";
 import { registerBuiltinManagedTools } from "../services/managed-tools/register-builtin-managed-tools.js";
+
+type ScriptedAgentEvent = {
+  type: string;
+  responseId?: string;
+  message?: string;
+  delta?: string;
+  toolCall?: {
+    itemId: string;
+    toolName?: string | null;
+    title: string;
+    input?: string;
+    output?: string;
+    server?: string | null;
+    command?: string | null;
+    kind?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+};
 
 // Tests that exercise the MCP route or managed-tool catalog get a fresh
 // pair of registries with the built-in factories pre-registered. Tests that
 // need additional tool factories (e.g. private overlays) construct their
 // own pair separately.
-function makeTestManagedToolRegistries(): {
+function makeTestManagedToolRegistries(extraTools: readonly ManagedToolDefinition[] = []): {
   catalog: ManagedToolCatalog;
   factoryRegistry: ManagedToolFactoryRegistry;
 } {
   const catalog = new ManagedToolCatalog();
   const factoryRegistry = new ManagedToolFactoryRegistry();
   registerBuiltinManagedTools(catalog, factoryRegistry);
+
+  // Test-only tools. A test needs a handler whose OUTPUT it controls — the
+  // built-ins all derive theirs from store state — to exercise what the
+  // gateway does to a tool result on its way to the model.
+  if (extraTools.length > 0) {
+    catalog.register(
+      extraTools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        readOnly: tool.readOnly,
+        tenantConfigurable: true
+      }))
+    );
+    // One factory key for all of them — a factory produces a LIST of tool
+    // definitions, and the key is a domain, not a tool name.
+    factoryRegistry.register("test-extras", () => [...extraTools]);
+  }
+
   return { catalog, factoryRegistry };
 }
 import { registerMessageRoutes, type MessageRouteStores } from "../routes/messages.js";
 import { registerModelRoutes, type ModelRouteStores } from "../routes/models.js";
 import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessions.js";
 
-type SessionRecord = {
-  sessionId: string;
-  userId: string;
-  sessionName: string;
-  status: "active" | "deleted";
-  purpose?: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type MessageRecord = {
-  id: number;
-  messageId: string;
-  sessionId: string;
-  userId: string;
-  role: "user" | "assistant" | "system";
-  status: "pending" | "streaming" | "completed" | "error";
-  content: string;
-  reasoningContent: string;
-  planContent: string;
-  tokenUsage: null;
-  modelName: string | null;
-  costUsd: number | null;
-  feedbackRating: null;
-  detail: Record<string, unknown>;
-  toolResults: ToolResultRecord[];
-  createdAt: string;
-  updatedAt: string;
-};
-
-type ToolResultRecord = {
-  id: number;
-  toolResultId: string;
-  messageId: string;
-  sessionId: string;
-  userId: string;
-  kind: "command" | "mcp";
-  title: string;
-  status: "in_progress" | "completed" | "failed" | "declined";
-  command: string | null;
-  cwd: string | null;
-  server: string | null;
-  toolName: string | null;
-  input: string;
-  output: string;
-  exitCode: number | null;
-  durationMs: number | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type ToolContextRecord = {
-  toolContextId: string;
-  tenantId: string;
-  sessionId: string;
-  userId: string;
-  runtimeId: string;
-  runtimePolicyId: string;
-  messageId: string | null;
-  credentialEnvelope: Record<string, unknown>;
-  metadata: Record<string, unknown>;
-  expiresAt: string;
-  createdAt: string;
-};
 
 class InMemorySessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
@@ -203,8 +184,15 @@ class InMemoryMessageStore {
   private nextId = 1;
   private nextToolId = 1;
 
-  async listBySession(_tenantId: string, sessionId: string, userId: string): Promise<MessageRecord[]> {
-    return this.messages
+  // Mirrors the real store's bounded contract: newest-N selection with a
+  // `hasMore` flag (see MessageStore.listBySession).
+  async listBySession(
+    _tenantId: string,
+    sessionId: string,
+    userId: string,
+    options: { limit?: number } = {}
+  ): Promise<{ messages: MessageRecord[]; hasMore: boolean }> {
+    const all = this.messages
       .filter((message) => message.sessionId === sessionId && message.userId === userId)
       .map((message) => ({
         ...message,
@@ -212,6 +200,8 @@ class InMemoryMessageStore {
           (toolResult) => toolResult.messageId === message.messageId
         )
       }));
+    const limit = options.limit ?? all.length;
+    return { messages: all.slice(-limit), hasMore: all.length > limit };
   }
 
   async getOwned(_tenantId: string, messageId: string, userId: string): Promise<MessageRecord | null> {
@@ -223,7 +213,7 @@ class InMemoryMessageStore {
     sessionId: string;
     userId: string;
     role: "user" | "assistant" | "system";
-    status: "pending" | "streaming" | "completed" | "error";
+    status: MessageRecord["status"];
     content: string;
     detail?: Record<string, unknown>;
   }): Promise<MessageRecord> {
@@ -237,6 +227,7 @@ class InMemoryMessageStore {
       status: input.status,
       content: input.content,
       reasoningContent: "",
+      reasoningSegments: null,
       planContent: "",
       tokenUsage: null,
       modelName: null,
@@ -287,8 +278,26 @@ class InMemoryMessageStore {
     message.updatedAt = new Date().toISOString();
   }
 
-  async updateTokenUsage() {
-    // no-op in tests
+  async addTokenUsage(...args: Parameters<MessageStore["addTokenUsage"]>) {
+    const [tenantId, messageId, userId, delta, modelName] = args;
+    const message = await this.getOwned(tenantId, messageId, userId);
+    if (!message) return null;
+    const current = message.tokenUsage ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+    message.tokenUsage = {
+      inputTokens: current.inputTokens + delta.inputTokens,
+      cachedInputTokens: current.cachedInputTokens + delta.cachedInputTokens,
+      outputTokens: current.outputTokens + delta.outputTokens,
+      reasoningOutputTokens: current.reasoningOutputTokens + delta.reasoningOutputTokens,
+      totalTokens: current.totalTokens + delta.totalTokens
+    };
+    message.modelName = modelName ?? null;
+    return message.tokenUsage;
+  }
+
+  async setCostUsd(...args: Parameters<MessageStore["setCostUsd"]>) {
+    const [tenantId, messageId, userId, costUsd] = args;
+    const message = await this.getOwned(tenantId, messageId, userId);
+    if (message) message.costUsd = costUsd;
   }
 
   async upsertToolResult(input: {
@@ -327,6 +336,7 @@ class InMemoryMessageStore {
       output: input.output,
       exitCode: input.exitCode,
       durationMs: input.durationMs,
+      textOffset: null,
       createdAt: now,
       updatedAt: now
     };
@@ -344,19 +354,10 @@ class InMemoryMessageStore {
     this.toolResults.set(input.toolResultId, next);
     return next;
   }
-
-  async appendToolResultOutput(_tenantId: string, toolResultId: string, userId: string, delta: string): Promise<ToolResultRecord | null> {
-    const toolResult = this.toolResults.get(toolResultId);
-    if (!toolResult || toolResult.userId !== userId) {
-      return null;
-    }
-    toolResult.output += delta;
-    toolResult.updatedAt = new Date().toISOString();
-    return toolResult;
-  }
 }
 
-class FakeRuntimeManager {
+class FakeRuntimeManager implements RuntimeAdapter {
+  readonly id = "deep-agents";
   readonly busySessions = new Set<string>();
   readonly abortedSessions: Array<{ sessionId: string; userId: string }> = [];
   readonly resolvedApprovals: Array<{ approvalId: string; tenantId: string; userId: string; decision: string; rememberForTurn?: boolean }> = [];
@@ -365,29 +366,119 @@ class FakeRuntimeManager {
     runtimeId: string;
     prompt: string;
     userInputs?: RuntimeUserInput[];
-    runtimePolicyId: string;
     toolContextId: string | null;
     assistantMessageId?: string | null;
     effort?: string;
     model?: string;
   }> = [];
-  private readonly eventScripts = new Map<string, RuntimeEvent[]>();
+  private readonly eventScripts = new Map<string, ScriptedAgentEvent[]>();
 
-  queueEvents(sessionId: string, events: RuntimeEvent[]): void {
+  queueEvents(sessionId: string, events: ScriptedAgentEvent[]): void {
     this.eventScripts.set(sessionId, events);
   }
   hasActiveTurn(sessionId: string): boolean { return this.busySessions.has(sessionId); }
   hasSession(_sessionId: string): boolean { return false; }
+  hasRuntime(_sessionId: string, _runtimeId: string): boolean { return false; }
+  async interruptTurn(input: { sessionId: string }) {
+    return this.busySessions.delete(input.sessionId) ? "interrupted" as const : "no_active_turn" as const;
+  }
+  async purgeSessionData() {}
+  async invalidateTenantRuntimes() { return []; }
+  async invalidateRuntimesForIntegration() { return []; }
+  async close() {}
+  async statRuntimeFile() { return { sizeBytes: 0 }; }
   async createSession(input: { sessionId: string; userId: string }) {
     return { sessionId: input.sessionId, runtimeId: `runtime-${input.sessionId}`, runtimePolicy: testRuntimePolicy };
   }
   async getRuntimePolicyId(_tenantId: string): Promise<string> { return "tenant-settings:test-tenant"; }
-  async *runMessage(session: { sessionId: string; runtimeId: string }, input: {
-    prompt: string; userInputs?: RuntimeUserInput[]; runtimePolicyId: string; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; model?: string; onBeforeTurn?: () => Promise<void>;
-  }) {
+  async *runMessageAGUI(session: { sessionId: string; runtimeId: string }, input: {
+    prompt: string; userInputs?: RuntimeUserInput[]; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; model?: string; onBeforeTurn?: () => Promise<void>;
+  }): AsyncGenerator<BaseEvent> {
     if (input.onBeforeTurn) await input.onBeforeTurn();
     this.runMessageInputs.push({ sessionId: session.sessionId, runtimeId: session.runtimeId, ...input });
-    for (const event of this.eventScripts.get(session.sessionId) ?? []) yield event;
+    let textMessageId: string | null = null;
+    for (const event of this.eventScripts.get(session.sessionId) ?? []) {
+      if (event.type === "response.created") {
+        yield {
+          type: EventType.RUN_STARTED,
+          threadId: session.sessionId,
+          runId: event.responseId
+        } as BaseEvent;
+        continue;
+      }
+      if (event.type === "response.completed") {
+        yield {
+          type: EventType.RUN_FINISHED,
+          threadId: session.sessionId,
+          runId: event.responseId
+        } as BaseEvent;
+        continue;
+      }
+      if (event.type === "response.failed") {
+        yield { type: EventType.RUN_ERROR, message: event.message } as BaseEvent;
+        continue;
+      }
+      if (event.type === "response.output_text.delta") {
+        if (!textMessageId) {
+          textMessageId = uuidv7();
+          yield {
+            type: EventType.TEXT_MESSAGE_START,
+            messageId: textMessageId,
+            role: "assistant"
+          } as BaseEvent;
+        }
+        yield {
+          type: EventType.TEXT_MESSAGE_CONTENT,
+          messageId: textMessageId,
+          delta: event.delta
+        } as BaseEvent;
+        continue;
+      }
+      if (event.type === "response.output_item.done" && textMessageId) {
+        yield { type: EventType.TEXT_MESSAGE_END, messageId: textMessageId } as BaseEvent;
+        textMessageId = null;
+        continue;
+      }
+      if (event.type === "response.tool.started") {
+        const toolCall = event.toolCall;
+        if (!toolCall) continue;
+        yield {
+          type: EventType.TOOL_CALL_START,
+          toolCallId: toolCall.itemId,
+          toolCallName: toolCall.toolName ?? toolCall.title
+        } as BaseEvent;
+        yield {
+          type: EventType.TOOL_CALL_ARGS,
+          toolCallId: toolCall.itemId,
+          delta: toolCall.input ?? "{}"
+        } as BaseEvent;
+        yield { type: EventType.TOOL_CALL_END, toolCallId: toolCall.itemId } as BaseEvent;
+        if (toolCall.server || toolCall.command || toolCall.kind === "mcp") {
+          yield {
+            type: EventType.CUSTOM,
+            name: "tool_meta",
+            value: {
+              toolCallId: toolCall.itemId,
+              kind: toolCall.kind,
+              server: toolCall.server,
+              command: toolCall.command
+            }
+          } as BaseEvent;
+        }
+        continue;
+      }
+      if (event.type === "response.tool.completed") {
+        const toolCall = event.toolCall;
+        if (!toolCall) continue;
+        yield {
+          type: EventType.TOOL_CALL_RESULT,
+          messageId: uuidv7(),
+          toolCallId: toolCall.itemId,
+          content: toolCall.output ?? "",
+          role: "tool"
+        } as BaseEvent;
+      }
+    }
   }
   async abortSession(input: { tenantId: string; sessionId: string; userId: string }) { this.abortedSessions.push(input); }
   async resolveApproval(input: { approvalId: string; tenantId: string; userId: string; decision: "approve" | "reject"; rememberForTurn?: boolean }) {
@@ -400,14 +491,14 @@ class FakeRuntimeManager {
 }
 
 class InMemoryToolContextStore {
-  private readonly contexts = new Map<string, ToolContextRecord>();
-  readonly createdContexts: ToolContextRecord[] = [];
+  private readonly contexts = new Map<string, ToolExecutionContext>();
+  readonly createdContexts: ToolExecutionContext[] = [];
   private nextId = 1;
   async create(input: {
     tenantId: string; sessionId: string; userId: string; runtimeId: string; runtimePolicyId: string; messageId: string | null; credentialEnvelope?: Record<string, unknown>; metadata?: Record<string, unknown>; ttlMs: number;
-  }): Promise<ToolContextRecord> {
+  }): Promise<ToolExecutionContext> {
     const now = new Date();
-    const context: ToolContextRecord = {
+    const context: ToolExecutionContext = {
       toolContextId: `ctx-test-${this.nextId++}`,
       tenantId: input.tenantId,
       sessionId: input.sessionId,
@@ -431,7 +522,7 @@ class InMemoryToolContextStore {
   }
   async findLatestActiveBySession(tenantId: string, sessionId: string) {
     const now = Date.now();
-    let latest: ToolContextRecord | null = null;
+    let latest: ToolExecutionContext | null = null;
     for (const ctx of this.contexts.values()) {
       if (ctx.tenantId !== tenantId || ctx.sessionId !== sessionId) continue;
       if (new Date(ctx.expiresAt).getTime() <= now) continue;
@@ -444,6 +535,14 @@ class InMemoryToolContextStore {
 class InMemoryApprovalStore {
   approvals: ApprovalRecord[] = [];
   async listPending(_tenantId: string, sessionId: string, _userId: string) { return this.approvals.filter((approval) => approval.sessionId === sessionId); }
+  async get(tenantId: string, approvalId: string, userId: string) {
+    return this.approvals.find(
+      (approval) =>
+        approval.tenantId === tenantId &&
+        approval.approvalId === approvalId &&
+        approval.userId === userId
+    ) ?? null;
+  }
 }
 
 class InMemoryArtifactStore {
@@ -451,6 +550,9 @@ class InMemoryArtifactStore {
   private readonly downloadTokens = new Map<string, ArtifactDownloadTokenRecord>();
   private nextId = 1;
   constructor(private readonly sessions: InMemorySessionStore) {}
+  async listForUser(..._args: Parameters<ArtifactStore["listForUser"]>): ReturnType<ArtifactStore["listForUser"]> {
+    throw new Error("Configure listForUser for cross-session artifact tests; this fixture serves session artifacts.");
+  }
   async create(input: {
     tenantId?: string; artifactType: ArtifactRecord["artifactType"]; sessionId: string; userId: string; sourceArtifactId?: string | null; artifactName: string; mimeType: string; storageBackend: ArtifactRecord["storageBackend"]; storageKey: string; fileSizeBytes: number; checksumSha256: string; status: ArtifactRecord["status"]; createdByType: ArtifactRecord["createdByType"]; createdByRef?: string | null; detail?: ArtifactDetail;
   }): Promise<ArtifactRecord> {
@@ -471,7 +573,7 @@ class InMemoryArtifactStore {
   }
   async getOwned(_tenantId: string, artifactId: string, userId: string) { const artifact = this.artifacts.get(artifactId); return artifact && artifact.userId === userId ? artifact : null; }
   async get(_tenantId: string, artifactId: string) { return this.artifacts.get(artifactId) ?? null; }
-  async findLatestReadableDerived(sourceArtifactId: string, userId: string) {
+  async findLatestReadableDerived(_tenantId: string, sourceArtifactId: string, userId: string) {
     const candidates = [...this.artifacts.values()].filter((artifact) => artifact.userId === userId && artifact.sourceArtifactId === sourceArtifactId && artifact.status === "ready" && artifact.mimeType.startsWith("text/"));
     return candidates[candidates.length - 1] ?? null;
   }
@@ -489,9 +591,6 @@ class InMemoryArtifactStore {
       updatedAt: new Date().toISOString()
     };
     this.artifacts.set(artifactId, updated);
-  }
-  async listPendingProcessingUploads(_tenantId: string) {
-    return [...this.artifacts.values()].filter((artifact) => artifact.artifactType === "upload" && artifact.mimeType === "application/pdf" && (artifact.status === "pending" || artifact.status === "processing"));
   }
   async createDownloadToken(input: { tenantId?: string; artifactId: string; sessionId: string; userId: string; storageBackend: ArtifactRecord["storageBackend"]; storageKey: string; fileName: string; contentType: string; ttlMs: number; }): Promise<ArtifactDownloadTokenRecord> {
     const now = Date.now();
@@ -554,68 +653,53 @@ class InMemoryArtifactStore {
 }
 
 class NoopArtifactProcessor {
-  cleanedImageSets = 0;
   async extractArtifactText(artifact: ArtifactRecord): Promise<string | null> { return artifact.mimeType !== "application/pdf" ? null : "Extracted PDF text for testing."; }
-  async renderArtifactImages(artifact: ArtifactRecord) {
-    if (artifact.mimeType !== "application/pdf") return { paths: [], cleanup: async () => {} };
-    return { paths: ["/tmp/document-2-page-1.png", "/tmp/document-2-page-2.png"], cleanup: async () => { this.cleanedImageSets += 1; } };
-  }
-}
-
-export function parseSseEvents(payload: string): Array<{ event: string; data: Record<string, unknown> }> {
-  return payload.trim().split("\n\n").filter(Boolean).map((chunk) => {
-    const eventLine = chunk.split("\n").find((line) => line.startsWith("event: "));
-    const dataLine = chunk.split("\n").find((line) => line.startsWith("data: "));
-    if (!eventLine) throw new Error(`Missing SSE event line in chunk: ${chunk}`);
-    if (!dataLine) throw new Error(`Missing SSE data line in chunk: ${chunk}`);
-    return { event: eventLine.slice("event: ".length), data: JSON.parse(dataLine.slice("data: ".length)) as Record<string, unknown> };
-  });
 }
 
 type TestAppPiiOptions = {
-  piiProtection?: {
-    evaluateText: (input: { tenantId: string; text: string; subject: unknown }) => Promise<unknown>;
-    getActiveSettings?: (tenantId: string) => Promise<unknown>;
-  };
-  piiScanRuns?: {
-    create: (input: unknown) => Promise<{ scanRunId: string }>;
-    update?: (tenantId: string, scanRunId: string, patch: unknown) => Promise<unknown>;
-  };
+  piiProtection?: MessageRouteStores["piiProtection"];
+  piiScanRuns?: MessageRouteStores["piiScanRuns"];
 };
+
+/**
+ * The secret the test app's MCP gateway verifies runtime tokens with. Derived
+ * from the test config the same way production derives from the real one, so a
+ * test that mints with this exercises the actual key relationship rather than
+ * a shared literal.
+ */
+export const TEST_RUNTIME_TOKEN_SECRET = runtimeTokenSecret(
+  createTestConfig().DATA_ENCRYPTION_SECRET
+);
 
 export async function createTestApp(
   configOverrides: Partial<AppConfig> & {
     proxyUpstreamUrl?: string;
+    /** Extra managed tools registered on `managed-session-context`, for tests
+     * that need to control a handler's return value. */
+    extraManagedTools?: readonly ManagedToolDefinition[];
     pii?: TestAppPiiOptions;
     showEffortSelector?: boolean;
     // Override the Policy Center gate at the MCP route. Defaults to a no-rules
-    // stub (every action allows). Pass a real PolicyService (+ optional approval
-    // router) to exercise transform / require_approval through the gateway.
-    policyService?: unknown;
-    requestPolicyApproval?: (input: {
-      tenantId: string;
-      sessionId: string;
-      userId: string;
-      runtimeId: string | null;
-      toolName: string;
-      serverId: string | null;
-      severity: "read_only" | "file_change" | "command_execution";
-      explanation: string;
-    }) => Promise<"approve" | "reject" | "expired" | null>;
+    // stub (every action allows). Pass a real PolicyService to exercise policy
+    // enforcement through the gateway.
+    policyService?: McpRouteStores["policyService"];
+    activationTracker?: McpRouteStores["activationTracker"];
   } = {}
 ) {
   const {
     proxyUpstreamUrl,
+    extraManagedTools,
     pii,
     showEffortSelector,
     policyService: policyServiceOverride,
-    requestPolicyApproval: requestPolicyApprovalOverride,
+    activationTracker,
     ...appConfigOverrides
   } = configOverrides;
   const db = new FakeDatabase();
   const sessions = new InMemorySessionStore();
   const messages = new InMemoryMessageStore();
   const runtimeManager = new FakeRuntimeManager();
+  const activeTurns = new ActiveTurnsRegistry();
   const toolContexts = new InMemoryToolContextStore();
   const approvals = new InMemoryApprovalStore();
   const artifacts = new InMemoryArtifactStore(sessions);
@@ -627,7 +711,8 @@ export async function createTestApp(
   const app = Fastify({ bodyLimit: config.MAX_REQUEST_BODY_BYTES });
   const limits = RequestLimits.fromAppConfig(config);
   app.decorate("config", config);
-  app.decorate("db", db as unknown as Pool);
+  const pool = db as unknown as Pool;
+  app.decorate("db", pool);
   await app.register(cors, { origin: config.API_ORIGIN, methods: CORS_ALLOWED_METHODS, allowedHeaders: ["Content-Type", "X-User-Id", "X-Tenant-Id"] });
   await app.register(multipart, {
     limits: { fileSize: config.ARTIFACT_MAX_UPLOAD_BYTES, files: 1 }
@@ -642,17 +727,18 @@ export async function createTestApp(
       role: isAdmin ? ("owner" as const) : ("member" as const)
     };
   });
-  await registerHealthRoutes(app, { deepAgentsAdapter: runtimeManager as unknown as HealthRouteStores["deepAgentsAdapter"] });
-  const fakeDynamicConfig = {
+  await registerHealthRoutes(app, { deepAgentsAdapter: runtimeManager } satisfies HealthRouteStores);
+  const fakeDynamicConfig: ModelRouteStores["dynamicConfig"] = {
     async getOrCreateTenantSettings() {
       return {
         tenantId: "test-tenant",
         showEffortSelector: showEffortSelector ?? false,
+        webSearchMode: "disabled" as const,
         approvalPolicy: "on-request" as const,
         approvalReviewer: "user" as const,
         allowCommandExecution: false,
-        allowUserTokenForwarding: true,
         autoApproveReadOnlyTools: true,
+        policyEnforcementMode: "monitor" as const,
         developerInstructions: null,
         enabledToolIds: [
           "managed-session-context",
@@ -662,7 +748,7 @@ export async function createTestApp(
           "write_artifact"
         ],
         enabledMcpServerIds: ["managed-session-context"],
-        enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"] as const,
+        enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
         enabledModelIds: null,
         modelDefaultEfforts: {},
         version: 1,
@@ -673,24 +759,24 @@ export async function createTestApp(
   };
   await registerModelRoutes(app, {
     dynamicConfig: fakeDynamicConfig,
-    runtimeAdapter: runtimeManager,
     configuredProviders: async () => new Set(["anthropic"])
-  } as unknown as ModelRouteStores);
+  } satisfies ModelRouteStores);
   await registerSessionRoutes(app, {
     sessions,
     messages,
     runtimeAdapter: runtimeManager,
-    limits
-  } as unknown as SessionRouteStores);
+    limits,
+    activeTurns,
+    auditEvents
+  } satisfies SessionRouteStores);
   await registerArtifactRoutes(app, {
     sessions,
-    messages,
     artifacts,
     auditEvents,
     storage: artifactStorage,
     processor: artifactProcessor,
     limits
-  } as unknown as ArtifactRouteStores);
+  } satisfies ArtifactRouteStores);
   await registerMessageRoutes(app, {
     sessions,
     artifacts,
@@ -701,22 +787,30 @@ export async function createTestApp(
     toolContexts,
     runtimeAdapter: runtimeManager,
     dynamicConfig: fakeDynamicConfig,
-    ...(pii?.piiProtection ? { piiProtection: pii.piiProtection as never } : {}),
-    ...(pii?.piiScanRuns ? { piiScanRuns: pii.piiScanRuns as never } : {})
-  } as unknown as MessageRouteStores);
+    customModels: { async list() { return []; } },
+    hasProviderKey: async () => true,
+    getTenantAnthropicApiKey: async () => null,
+    activeTurns,
+    auditEvents,
+    piiProtection: pii?.piiProtection,
+    piiScanRuns: pii?.piiScanRuns,
+  } satisfies MessageRouteStores);
   await registerApprovalRoutes(app, {
     approvals,
     runtimeAdapter: runtimeManager
-  } as unknown as ApprovalRouteStores);
+  } satisfies ApprovalRouteStores);
   const { factoryRegistry: managedToolFactoryRegistry, catalog: managedToolCatalog } =
-    makeTestManagedToolRegistries();
+    makeTestManagedToolRegistries(extraManagedTools);
   await registerMcpRoutes(app, {
+    db: pool,
+    memories: new MemoryStore(pool),
     dynamicConfig: {
+      async listSkills() { return []; },
       async getMcpServer(_tenantId: string, serverId: string) {
         if (serverId === "managed-session-context") {
-          return { id: "managed-session-context", description: "Managed session context", mode: "managed" as const, routePath: "/mcp/managed-session-context", upstreamUrl: null, transportKind: "http" as const, headersAllowlist: [], version: 1, hash: "hash-managed-session-context" };
+          return { id: "managed-session-context", description: "Managed session context", mode: "managed" as const, routePath: "/mcp/managed-session-context", upstreamUrl: null, transportKind: "http" as const, version: 1, hash: "hash-managed-session-context" };
         }
-        return { id: serverId, description: "Test proxy", mode: "proxy" as const, routePath: `/mcp/${serverId}`, upstreamUrl: proxyUpstreamUrl ?? "https://example.com/mcp", transportKind: "http" as const, headersAllowlist: ["X-Framework-User-Id", "X-Framework-Session-Id", "X-Framework-Runtime-Id"], version: 1, hash: "hash-test-proxy" };
+        return { id: serverId, description: "Test proxy", mode: "proxy" as const, routePath: `/mcp/${serverId}`, upstreamUrl: proxyUpstreamUrl ?? "https://example.com/mcp", transportKind: "http" as const, version: 1, hash: "hash-test-proxy" };
       }
     },
     sessions,
@@ -743,28 +837,26 @@ export async function createTestApp(
         return { outcome: "allow", matchedRuleId: null, matchedRuleName: null, gating: false, explanation: null };
       }
     },
-    // No active turn in these route tests by default → no adapter hosts
-    // approvals, so the gateway degrades enforce-mode require_approval to a deny
-    // (returns null). Tests can override to simulate a human decision.
-    requestPolicyApproval: requestPolicyApprovalOverride ?? (async () => null),
-    runtimeTokenSecret: "test-runtime-token-secret",
-    // Egress controls: no CIDR allowlist; a real pin store so the per-runtime
-    // IP pin behaves as in production (inject() always presents the same peer
-    // IP, so pins are consistent within a test unless remoteAddress is varied).
-    egressAllowlist: null,
-    egressIpPins: new RuntimeEgressIpPinStore(60_000)
-  } as unknown as McpRouteStores);
+    approvals,
+    // Derive it exactly the way app-bootstrap does, from the same config the
+    // test app already holds — not a literal. A literal here would let the
+    // mint side (the adapter) and the verify side drift apart under a future
+    // key-derivation change while the whole route suite stayed green.
+    runtimeTokenSecret: runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET),
+    activationTracker,
+    proxyToolMetadataCache: new ProxyToolMetadataCache()
+  } satisfies McpRouteStores);
   app.addHook("onClose", async () => { await rm(artifactStorageRoot, { recursive: true, force: true }); });
   await app.ready();
-  return { app, db, sessions, messages, runtimeManager, toolContexts, approvals, artifacts, auditEvents, artifactProcessor, limits };
+  return { app, db, activeTurns, sessions, messages, runtimeManager, toolContexts, approvals, artifacts, auditEvents, artifactProcessor, limits };
 }
 
 export async function createTestToolContext(
   toolContexts: InMemoryToolContextStore,
-  overrides: Partial<{ sessionId: string; userId: string; runtimeId: string; runtimePolicyId: string; messageId: string | null; credentialEnvelope: Record<string, unknown>; metadata: Record<string, unknown>; ttlMs: number; }> = {}
+  overrides: Partial<{ tenantId: string; sessionId: string; userId: string; runtimeId: string; runtimePolicyId: string; messageId: string | null; credentialEnvelope: Record<string, unknown>; metadata: Record<string, unknown>; ttlMs: number; }> = {}
 ) {
   return toolContexts.create({
-    tenantId: "test-tenant",
+    tenantId: overrides.tenantId ?? "test-tenant",
     sessionId: overrides.sessionId ?? "session-1",
     userId: overrides.userId ?? "test-user",
     runtimeId: overrides.runtimeId ?? "runtime-session-1",

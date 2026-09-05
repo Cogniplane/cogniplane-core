@@ -5,12 +5,13 @@ import { uuidv7 } from "../../lib/uuid.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
+import { ToolCallError } from "../../lib/tool-call-error.js";
 import { allRequiredObjectSchema, withManagedToolErrorSchema, type ManagedToolDefinition } from "./types.js";
 
 type WriteArtifactDeps = {
-  artifacts: ArtifactStore;
-  storage: ArtifactStorage;
-  auditEvents: AuditEventStore;
+  artifacts: Pick<ArtifactStore, "create">;
+  storage: Pick<ArtifactStorage, "put">;
+  auditEvents: Pick<AuditEventStore, "create">;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
   statRuntimeFile?: (
     sessionId: string,
@@ -107,23 +108,23 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
       ),
       handler: async ({ context, arguments: args }) => {
         const name = String(args.name ?? "").trim();
-        if (!name) throw new Error("name is required.");
+        if (!name) throw new ToolCallError("name is required.");
 
         const hasContent = args.content != null && String(args.content) !== "";
         const hasFilePath = args.filePath != null && String(args.filePath).trim() !== "";
-        if (!hasContent && !hasFilePath) throw new Error("Either content or filePath is required.");
-        if (hasContent && hasFilePath) throw new Error("Provide content or filePath, not both.");
+        if (!hasContent && !hasFilePath) throw new ToolCallError("Either content or filePath is required.");
+        if (hasContent && hasFilePath) throw new ToolCallError("Provide content or filePath, not both.");
 
         let contentBuffer: Buffer;
         if (hasFilePath) {
-          if (!deps.readRuntimeFile) throw new Error("filePath is not supported on this runtime backend.");
+          if (!deps.readRuntimeFile) throw new ToolCallError("filePath is not supported on this runtime backend.");
           const filePath = String(args.filePath).trim();
           // Probe the size BEFORE buffering the file into backend memory —
           // an oversized sandbox file must not be read just to be rejected.
           if (deps.statRuntimeFile) {
             const { sizeBytes } = await deps.statRuntimeFile(context.sessionId, context.runtimeId, filePath);
             if (sizeBytes > MAX_FILE_BYTES) {
-              throw new Error(`File too large (${sizeBytes} bytes). Maximum is ${MAX_FILE_BYTES} bytes (10 MB).`);
+              throw new ToolCallError(`File too large (${sizeBytes} bytes). Maximum is ${MAX_FILE_BYTES} bytes (10 MB).`);
             }
           }
           const bytes = await deps.readRuntimeFile(context.sessionId, context.runtimeId, filePath);
@@ -132,9 +133,9 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
           contentBuffer = Buffer.from(String(args.content), "utf-8");
         }
 
-        if (contentBuffer.length === 0) throw new Error("File is empty.");
+        if (contentBuffer.length === 0) throw new ToolCallError("File is empty.");
         if (contentBuffer.length > MAX_FILE_BYTES) {
-          throw new Error(`File too large (${contentBuffer.length} bytes). Maximum is ${MAX_FILE_BYTES} bytes (10 MB).`);
+          throw new ToolCallError(`File too large (${contentBuffer.length} bytes). Maximum is ${MAX_FILE_BYTES} bytes (10 MB).`);
         }
 
         const mimeType = args.mimeType ? String(args.mimeType) : inferMimeType(name);

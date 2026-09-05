@@ -13,6 +13,7 @@ import type {
   UserSettingsSectionKey,
   UserSettingsSectionRecord
 } from "../services/user-settings-store.js";
+import type { NotionUserConnectionSummary } from "../services/integrations/notion/notion-connection-service.js";
 
 class InMemoryGithubConnectionService {
   userConnection: {
@@ -53,13 +54,7 @@ class InMemoryGithubConnectionService {
 }
 
 class InMemoryNotionConnectionService {
-  userConnection: {
-    notionUserId: string;
-    notionWorkspaceId: string | null;
-    notionWorkspaceName: string | null;
-    connectedAt: string;
-    updatedAt: string;
-  } | null = null;
+  userConnection: NotionUserConnectionSummary | null = null;
   authorizeRequested = false;
   configured = true;
 
@@ -164,6 +159,7 @@ class InMemoryUserSettingsStore {
       input: input.input,
       settingsSnapshot: input.settingsSnapshot,
       enabled: input.enabled,
+      consecutiveFailures: 0,
       lastRunAt: null,
       nextRunAt: input.nextRunAt,
       createdAt: now,
@@ -248,10 +244,10 @@ async function createApp(overrides: {
   });
 
   await registerSettingsRoutes(app, {
-    settings: settings as SettingsRouteStores["settings"],
+    settings,
     auditEvents,
-    githubConnections: githubConnections as SettingsRouteStores["githubConnections"],
-    notionConnections: notionConnections as SettingsRouteStores["notionConnections"],
+    githubConnections,
+    notionConnections,
     config: overrides.config ?? createTestConfig({}),
     integrationStates: overrides.integrationStates ?? {
       async get() {
@@ -389,6 +385,41 @@ test("scheduled jobs routes create, update, validate, and delete jobs", async ()
   });
   expect(deleteResponse.statusCode).toBe(204);
   expect(auditEvents.events.length).toBe(3);
+
+  await app.close();
+});
+
+test("scheduled job request defaults reach create and update persistence", async () => {
+  const { app } = await createApp();
+  const payload = {
+    jobName: "Defaulted job",
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    input: { prompt: "Run with request defaults." }
+  };
+
+  const created = await app.inject({
+    method: "POST",
+    url: "/me/scheduled-jobs",
+    payload
+  });
+  expect(created.statusCode).toBe(201);
+  expect(created.json().scheduledJob).toMatchObject({
+    targetType: "prompt",
+    enabled: true
+  });
+
+  const updated = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${created.json().scheduledJob.jobId}`,
+    payload: { ...payload, jobName: "Defaulted job updated" }
+  });
+  expect(updated.statusCode).toBe(200);
+  expect(updated.json().scheduledJob).toMatchObject({
+    jobName: "Defaulted job updated",
+    targetType: "prompt",
+    enabled: true
+  });
 
   await app.close();
 });
@@ -670,8 +701,8 @@ test("notion connection routes expose status, authorization URL, and disconnect 
     notionWorkspaceId: "ws-xyz",
     notionWorkspaceName: "Test Workspace",
     notionWorkspaceIcon: null,
-    notionOwnerEmail: null,
-    notionOwnerName: null,
+    notionOwnerEmail: "owner@example.com",
+    notionOwnerName: "Test Owner",
     scopes: [],
     accessTokenExpiresAt: null,
     refreshTokenExpiresAt: null,

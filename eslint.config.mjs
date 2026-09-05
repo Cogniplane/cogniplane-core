@@ -8,6 +8,7 @@ export default tseslint.config(
   {
     ignores: [
       "**/dist/**",
+      "apps/backend/bundle/**",
       "**/.next/**",
       "**/.open-next/**",
       "**/node_modules/**",
@@ -78,9 +79,19 @@ export default tseslint.config(
   // Plugins are loaded so existing `eslint-disable-next-line
   // react-hooks/exhaustive-deps` and `@next/next/no-sync-scripts`
   // comments resolve instead of erroring with "Definition for rule not
-  // found". The rule severity is downgraded to "warn" in bulk because the
-  // pre-existing codebase has ~40 violations that are out of scope for
-  // any single feature PR — they need their own dedicated cleanup pass.
+  // found".
+  //
+  // The react-hooks set no longer downgrades in bulk. A 2026-09-03 audit
+  // (bead yegr, clean-code C4) linted the frontend with inline suppressions
+  // disabled and found violations in only 4 of the 16 recommended rules. The
+  // other 12, including rules-of-hooks, purity, set-state-in-render and
+  // immutability, are clean, so they run as errors and now gate. Only the four
+  // below stay at "warn", each with the reason it is not an error yet.
+  //
+  // One trap: the plugin's `recommended` set is not uniformly "error". Three
+  // rules ship as "warn" (exhaustive-deps, incompatible-library,
+  // unsupported-syntax), so spreading it gates 11, not 12. unsupported-syntax
+  // is re-raised to "error" below to close that gap.
   {
     files: ["apps/frontend/**/*.{ts,tsx}"],
     plugins: {
@@ -88,7 +99,33 @@ export default tseslint.config(
       "@next/next": nextPlugin
     },
     rules: {
-      ...downgradeToWarn(reactHooks.configs.recommended.rules),
+      ...reactHooks.configs.recommended.rules,
+      // 23 sites, all deliberate: writes to localStorage or another external
+      // system, async fetch-on-mount loading flags, and prop-change resets.
+      // Each carries an inline suppression stating which; the 10 that batch 10
+      // (bead 1q6n) rewrote were re-triaged afterwards and land in the same
+      // three categories. Kept at "warn" so a NEW violation is visible without
+      // a reviewer having to know that every existing one was already triaged.
+      "react-hooks/set-state-in-effect": "warn",
+      // 2 sites, both deliberate single-run effects whose omitted deps must
+      // NOT retrigger them: the admin sessions page seeds the URL on first
+      // paint, and copilot-chat-host keys its agent on sessionId alone so a
+      // model/effort change cannot rebuild the agent and drop a live turn.
+      // Re-checked after batch 10 (bead 1q6n) landed; the third site went with
+      // use-auto-scroll.ts, but these two are load-bearing and stay.
+      "react-hooks/exhaustive-deps": "warn",
+      // 1 site: copilot-chat-host.tsx's agent memo reads its refs lazily at
+      // send time, not during render, so the rule's heuristic misfires. Also
+      // re-checked after batch 10; the pattern survived that rewrite.
+      "react-hooks/refs": "warn",
+      // 1 site: TanStack Table returns functions React Compiler cannot
+      // memoize, so it skips the component. Upstream constraint, not ours.
+      "react-hooks/incompatible-library": "warn",
+      // No violations, but the plugin ships this one as "warn" in its own
+      // recommended set (alongside exhaustive-deps and incompatible-library),
+      // so spreading `recommended.rules` alone would leave it ungated. Named
+      // explicitly so it errors like the other clean rules.
+      "react-hooks/unsupported-syntax": "error",
       ...downgradeToWarn(nextPlugin.configs.recommended.rules),
       // App Router only — no pages/ dir for this rule to validate against.
       "@next/next/no-html-link-for-pages": "off",
@@ -116,7 +153,8 @@ export default tseslint.config(
 );
 
 // Helper: rewrite a recommended-rules object so every entry runs as a warning
-// instead of an error, preserving the original options tuple shape.
+// instead of an error, preserving the original options tuple shape. Used for
+// the Next.js set only; the react-hooks set is enabled per rule above.
 function downgradeToWarn(rules) {
   const result = {};
   for (const [name, value] of Object.entries(rules)) {

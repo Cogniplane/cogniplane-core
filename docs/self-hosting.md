@@ -121,12 +121,11 @@ E2B_TEMPLATE_ID=<from your template build>
 
 # RUNTIME_GATEWAY_BASE_URL is the URL the runtime's MCP client dials for /mcp.
 # The agent loop (and its MCP client) run in the backend process itself, so
-# this must be reachable from the backend — the default http://localhost:3001
-# works for a single-host deployment.
-RUNTIME_GATEWAY_BASE_URL=https://your-backend-host
+# this must be reachable from the backend over loopback only.
+RUNTIME_GATEWAY_BASE_URL=http://localhost:3001
 ```
 
-Note: the backend logs a boot warning when `RUNTIME_GATEWAY_BASE_URL` points at localhost. For multi-instance deployments, point it at a URL that always resolves to a healthy backend (the load balancer).
+Note: `RUNTIME_GATEWAY_BASE_URL` must resolve to a loopback address (`localhost`, `127.0.0.1`, or `[::1]`). The MCP gateway enforces loopback-only peer admission and rejects external hostnames at startup validation.
 
 ### Model provider key (Anthropic)
 

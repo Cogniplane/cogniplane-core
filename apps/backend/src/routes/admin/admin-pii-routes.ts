@@ -19,21 +19,34 @@ import {
 export { resolveRange } from "./admin-pii-schemas.js";
 
 export interface AdminPiiRouteStores {
-  piiCircuitBreaker: PiiCircuitBreaker;
+  piiCircuitBreaker: Pick<PiiCircuitBreaker, "snapshot">;
   /**
    * Optional so test harnesses that don't exercise the metrics endpoint can
    * skip wiring it. When absent, /admin/pii/metrics, /admin/pii/top,
    * /admin/pii/recent, and /admin/pii/jobs/stats are not registered.
    */
-  piiProtection?: PiiProtectionService;
+  piiProtection?: Pick<PiiProtectionService, "getActiveSettings">;
   /** Read-only aggregates for the dashboard. Required when piiProtection is wired. */
-  piiAnalytics?: PiiAnalyticsStore;
+  piiAnalytics?: Pick<
+    PiiAnalyticsStore,
+    | "getKpis"
+    | "getTimeSeries"
+    | "getByEntityType"
+    | "getByConfidence"
+    | "getBySubjectType"
+    | "getTopByUser"
+    | "getTopBySession"
+    | "getQueueStats"
+    | "getLatencyPercentiles"
+    | "getTopErrors"
+    | "getRecentActivity"
+  >;
   /**
    * Powers the breaker transition timeline on the ops health endpoint.
    * Optional — when missing, /admin/pii/jobs/stats returns an empty
    * breakerTimeline rather than 404'ing the whole route.
    */
-  platformEvents?: PlatformEventStore;
+  platformEvents?: Pick<PlatformEventStore, "listByType">;
 }
 
 export async function registerAdminPiiRoutes(

@@ -1,8 +1,9 @@
 import { test, expect } from "vitest";
-import { EventType, type BaseEvent } from "@ag-ui/client";
+import { EventType, verifyEvents, type BaseEvent } from "@ag-ui/client";
+import { firstValueFrom, from as rxFrom, toArray } from "rxjs";
 
 import { streamAssistantReplyAGUI, type StreamAssistantReplyAGUIInput } from "./sse-stream-writer-agui.js";
-import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/runtime-event-to-agui.js";
+import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 
 // ---------------------------------------------------------------------------
 // Minimal fakes — the writer only touches reply.raw, messages.{create,
@@ -78,12 +79,13 @@ function makeToolContexts() {
   };
 }
 
-function makeAdapter(events: BaseEvent[]) {
+function makeAdapter(events: BaseEvent[], runInputs: Array<{ turnContext?: string }>) {
   return {
     async createSession() {
       return { sessionId: "session-1", runtimeId: "runtime-1", runtimePolicy: { id: "default" } };
     },
-    async *runMessageAGUI() {
+    async *runMessageAGUI(_session: unknown, input: { turnContext?: string }) {
+      runInputs.push(input);
       for (const event of events) yield event;
     }
   };
@@ -92,11 +94,12 @@ function makeAdapter(events: BaseEvent[]) {
 function runInput(events: BaseEvent[], extra: Partial<StreamAssistantReplyAGUIInput> = {}) {
   const reply = makeRawResponse();
   const messages = makeMessages();
+  const runInputs: Array<{ turnContext?: string }> = [];
   const input = {
     reply: reply as unknown,
     messages,
     toolContexts: makeToolContexts(),
-    runtimeAdapter: makeAdapter(events),
+    runtimeAdapter: makeAdapter(events, runInputs),
     tenantId: "tenant-1",
     sessionId: "session-1",
     userId: "user-1",
@@ -104,7 +107,7 @@ function runInput(events: BaseEvent[], extra: Partial<StreamAssistantReplyAGUIIn
     prompt: "hi",
     ...extra
   } as unknown as StreamAssistantReplyAGUIInput;
-  return { input, messages, reply };
+  return { input, messages, reply, runInputs };
 }
 
 test("persists a completed turn with the streamed assistant text", async () => {
@@ -299,8 +302,10 @@ test("remaps tool + reasoning offsets to redacted positions when the narration h
 test("emits a user_message_replaced CUSTOM event when a PII transform replacement is present (F8)", async () => {
   const { input, reply } = runInput(
     [
+      { type: EventType.RUN_STARTED, threadId: "t", runId: "r" } as BaseEvent,
       { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
       { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "ok" } as BaseEvent,
+      { type: EventType.TEXT_MESSAGE_END, messageId: "m" } as BaseEvent,
       { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
     ],
     { userMessageReplacement: { messageId: "u-1", text: "my card is [REDACTED]", scanRunId: "scan-9" } }
@@ -308,14 +313,83 @@ test("emits a user_message_replaced CUSTOM event when a PII transform replacemen
 
   await streamAssistantReplyAGUI(input);
 
-  const frame = reply.writes
-    .map((w) => {
-      const line = w.split("\n").find((l) => l.startsWith("data: "));
-      return line ? (JSON.parse(line.slice("data: ".length)) as Record<string, unknown>) : null;
-    })
-    .find((f) => f?.type === "CUSTOM" && f?.name === "user_message_replaced");
+  const emittedEvents = reply.writes.flatMap((write) =>
+    write
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice("data: ".length)) as BaseEvent)
+  );
+  expect(emittedEvents.slice(0, 2).map((event) => event.type)).toEqual([
+    EventType.RUN_STARTED,
+    EventType.CUSTOM
+  ]);
+  await expect(
+    firstValueFrom(rxFrom(emittedEvents).pipe(verifyEvents(false), toArray()))
+  ).resolves.toHaveLength(emittedEvents.length);
+
+  const frame = emittedEvents.find(
+    (event) => event.type === EventType.CUSTOM && event.name === "user_message_replaced"
+  );
   expect(frame).toBeTruthy();
   expect(frame?.value).toEqual({ messageId: "u-1", text: "my card is [REDACTED]", scanRunId: "scan-9" });
+});
+
+test("emits the PII replacement before RUN_ERROR when setup fails before RUN_STARTED", async () => {
+  const { input, reply } = runInput([], {
+    userMessageReplacement: { messageId: "u-1", text: "my card is [REDACTED]", scanRunId: "scan-9" },
+    runtimeAdapter: {
+      async createSession() {
+        throw new Error("session build failed");
+      },
+      async *runMessageAGUI() {}
+    } as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"]
+  });
+
+  await streamAssistantReplyAGUI(input);
+
+  const emittedEvents = reply.writes.flatMap((write) =>
+    write
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice("data: ".length)) as BaseEvent)
+  );
+  expect(emittedEvents.map((event) => event.type)).toEqual([
+    EventType.RUN_STARTED,
+    EventType.CUSTOM,
+    EventType.RUN_ERROR
+  ]);
+  expect(emittedEvents[1]).toMatchObject({
+    name: "user_message_replaced",
+    value: { messageId: "u-1", text: "my card is [REDACTED]", scanRunId: "scan-9" }
+  });
+  await expect(
+    firstValueFrom(rxFrom(emittedEvents).pipe(verifyEvents(false), toArray()))
+  ).resolves.toHaveLength(emittedEvents.length);
+});
+
+test("emits the PII replacement before an adapter RUN_ERROR that precedes RUN_STARTED", async () => {
+  const { input, reply, messages } = runInput(
+    [{ type: EventType.RUN_ERROR, message: "provider key missing" } as BaseEvent],
+    { userMessageReplacement: { messageId: "u-1", text: "email [REDACTED]" } }
+  );
+
+  await streamAssistantReplyAGUI(input);
+
+  const emittedEvents = reply.writes.flatMap((write) =>
+    write
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice("data: ".length)) as BaseEvent)
+  );
+  expect(emittedEvents.map((event) => event.type)).toEqual([
+    EventType.RUN_STARTED,
+    EventType.CUSTOM,
+    EventType.RUN_ERROR
+  ]);
+  await expect(
+    firstValueFrom(rxFrom(emittedEvents).pipe(verifyEvents(false), toArray()))
+  ).resolves.toHaveLength(emittedEvents.length);
+  expect(messages.contentLog.at(-1)).toEqual({ status: "error", content: "provider key missing" });
 });
 
 test("emits NO user_message_replaced event when there is no replacement (F8)", async () => {
@@ -328,4 +402,224 @@ test("emits NO user_message_replaced event when there is no replacement (F8)", a
 
   const hasReplacement = reply.writes.some((w) => w.includes("user_message_replaced"));
   expect(hasReplacement).toBe(false);
+});
+
+test.each([
+  { turnContext: "scheduled" as const, expected: "scheduled" },
+  { turnContext: undefined, expected: "interactive" }
+])("forwards the $expected turn context to the runtime adapter", async ({ turnContext, expected }) => {
+  const { input, runInputs } = runInput(
+    [
+      { type: EventType.RUN_STARTED, threadId: "t", runId: "r" } as BaseEvent,
+      { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+    ],
+    turnContext ? { turnContext } : {}
+  );
+
+  await streamAssistantReplyAGUI(input);
+
+  expect(runInputs).toHaveLength(1);
+  expect(runInputs[0]?.turnContext).toBe(expected);
+});
+
+// ── Review batch 3 (bead tnci), R11: incremental persistence ─────────────────
+
+/** An adapter whose stream pauses between events, so the checkpoint timer runs. */
+function makeSlowAdapter(events: BaseEvent[], gapMs: number) {
+  return {
+    async createSession() {
+      return { sessionId: "session-1", runtimeId: "runtime-1", runtimePolicy: { id: "default" } };
+    },
+    async *runMessageAGUI() {
+      for (const event of events) {
+        await new Promise((resolve) => setTimeout(resolve, gapMs));
+        yield event;
+      }
+    }
+  };
+}
+
+test("checkpoints the in-progress assistant text so a killed process leaves partial work", async () => {
+  // Every path that closes the row out runs in a `finally` — and none of them
+  // runs when the process is SIGKILLed or a rolling deploy replaces the task
+  // mid-turn. Without a mid-turn checkpoint the row stays `pending` and EMPTY
+  // forever: the UI renders a spinner that never resolves and history shows a
+  // turn with no content at all. The checkpoint bounds that loss to one
+  // interval.
+  const { input, messages } = runInput([], {
+    runtimeAdapter: makeSlowAdapter(
+      [
+        { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "first half " } as BaseEvent,
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "second half" } as BaseEvent,
+        { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+      ],
+      12
+    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+    streamingPersistIntervalMs: 5
+  });
+
+  await streamAssistantReplyAGUI(input);
+
+  const streamingWrites = messages.contentLog.filter((entry) => entry.status === "streaming");
+  expect(streamingWrites.length).toBeGreaterThan(0);
+  // Some checkpoint captured real partial text — that is what survives a kill.
+  expect(streamingWrites.some((entry) => entry.content.startsWith("first half"))).toBe(true);
+  // The terminal write still owns the final status, and lands LAST: an
+  // in-flight checkpoint settling afterwards would pin the row at "streaming".
+  expect(messages.contentLog.at(-1)).toEqual({
+    status: "completed",
+    content: "first half second half"
+  });
+});
+
+test("keeps checkpointing while the turn emits nothing at all", async () => {
+  // A human sitting on an approval prompt produces no events for as long as
+  // APPROVAL_REQUEST_TTL_MS. An event-driven checkpoint would go silent for
+  // exactly that window — and `updated_at` is what the stale-message sweeper
+  // reads to decide a row belongs to a live turn, so a silent turn would be
+  // swept and marked interrupted underneath itself.
+  const { input, messages } = runInput([], {
+    runtimeAdapter: makeSlowAdapter(
+      [{ type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent],
+      60
+    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+    streamingPersistIntervalMs: 5
+  });
+
+  await streamAssistantReplyAGUI(input);
+
+  const streamingWrites = messages.contentLog.filter((entry) => entry.status === "streaming");
+  // Several refreshes across a stretch with zero stream events.
+  expect(streamingWrites.length).toBeGreaterThan(1);
+  expect(messages.contentLog.at(-1)?.status).toBe("completed");
+});
+
+test("a failing checkpoint does not end a turn the client is still reading", async () => {
+  // The checkpoint is crash insurance, not the render path. A transient DB
+  // failure must not take down a turn that is streaming fine.
+  const { input, messages } = runInput([], {
+    runtimeAdapter: makeSlowAdapter(
+      [
+        { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
+        { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+      ],
+      12
+    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+    streamingPersistIntervalMs: 5
+  });
+  let checkpointAttempts = 0;
+  const realUpdate = messages.updateContent.bind(messages);
+  messages.updateContent = async (
+    tid: string,
+    mid: string,
+    uid: string,
+    status: string,
+    content: string
+  ) => {
+    if (status === "streaming") {
+      checkpointAttempts += 1;
+      throw new Error("connection terminated");
+    }
+    await realUpdate(tid, mid, uid, status, content);
+  };
+
+  await expect(streamAssistantReplyAGUI(input)).resolves.toBeUndefined();
+  // Proves a checkpoint really was attempted and really did throw — without
+  // this the test would also pass with checkpointing removed altogether.
+  expect(checkpointAttempts).toBeGreaterThan(0);
+  expect(messages.contentLog.at(-1)).toEqual({ status: "completed", content: "hello" });
+});
+
+test("a slow in-flight checkpoint cannot land after the terminal write", async () => {
+  // The failure this guards: the timer fires, its "streaming" write is still
+  // awaiting the DB when the stream ends, the terminal "completed" write lands
+  // first, and then the checkpoint resolves and flips the row BACK to
+  // "streaming" — permanently, since nothing runs after it. That is exactly the
+  // stuck-row state R11 exists to eliminate, reintroduced by its own fix.
+  const { input, messages } = runInput([], {
+    runtimeAdapter: makeSlowAdapter(
+      [
+        { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
+        { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+      ],
+      12
+    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+    streamingPersistIntervalMs: 5
+  });
+  let slowCheckpoints = 0;
+  const realUpdate = messages.updateContent.bind(messages);
+  messages.updateContent = async (
+    tid: string,
+    mid: string,
+    uid: string,
+    status: string,
+    content: string
+  ) => {
+    // A checkpoint write that outlives the stream it belongs to.
+    if (status === "streaming") {
+      slowCheckpoints += 1;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    await realUpdate(tid, mid, uid, status, content);
+  };
+
+  await streamAssistantReplyAGUI(input);
+  // The writer must have drained its own in-flight checkpoint before returning.
+  // Waiting past the slow write proves nothing landed behind the terminal one:
+  // if the drain is missing, the checkpoint resolves in here and appends a
+  // "streaming" row after "completed".
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  // Without this the test would also pass with checkpointing removed entirely —
+  // there would simply be no late write to race.
+  expect(slowCheckpoints).toBeGreaterThan(0);
+  expect(messages.contentLog.at(-1)?.status).toBe("completed");
+});
+
+
+test("a checkpoint that never resolves does not wedge the request", async () => {
+  // The drain waits for an in-flight checkpoint so it cannot settle "streaming"
+  // after the terminal status. That wait must itself be bounded: the checkpoint
+  // is a database write with no cancellation, so an unbounded drain trades one
+  // stuck ROW for a stuck REQUEST — no terminal update, no writer.end(), and the
+  // route's turn slot held until the pool gives up. A stuck row is recoverable
+  // by the sweeper; a wedged session is not.
+  const { input, messages } = runInput([], {
+    runtimeAdapter: makeSlowAdapter(
+      [
+        { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
+        { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+      ],
+      12
+    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+    streamingPersistIntervalMs: 5,
+    checkpointDrainDeadlineMs: 20
+  });
+  let stalledCheckpoints = 0;
+  const realUpdate = messages.updateContent.bind(messages);
+  messages.updateContent = async (
+    tid: string,
+    mid: string,
+    uid: string,
+    status: string,
+    content: string
+  ) => {
+    if (status === "streaming") {
+      stalledCheckpoints += 1;
+      // Never settles — a pool that has stopped answering.
+      await new Promise<void>(() => {});
+      return;
+    }
+    await realUpdate(tid, mid, uid, status, content);
+  };
+
+  await streamAssistantReplyAGUI(input);
+
+  expect(stalledCheckpoints).toBeGreaterThan(0);
+  // The turn still recorded its outcome instead of hanging.
+  expect(messages.contentLog.at(-1)?.status).toBe("completed");
 });

@@ -6,6 +6,7 @@ import {
   GithubConnectionStatusSchema,
   NotionConnectionStatusSchema,
   ScheduledJobEnvelopeSchema,
+  ScheduledJobRequestSchema,
   ScheduledJobRunsListResponseSchema,
   ScheduledJobsListResponseSchema,
   UserSettingsSectionEnvelopeSchema,
@@ -25,6 +26,12 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { GithubConnectionNotConfiguredError } from "../services/integrations/github/github-connection-service.js";
 import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
 import { NotionConnectionNotConfiguredError } from "../services/integrations/notion/notion-connection-service.js";
+import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
+import type { NotionConnectionService } from "../services/integrations/notion/notion-connection-service.js";
+import type { IntegrationStateStore } from "../services/integrations/integration-state-store.js";
+import type { IntegrationRegistryService } from "../services/integrations/integration-registry-service.js";
+import type { AuditEventStore } from "../services/audit-event-store.js";
+import type { RequestLimitsInterface } from "../services/request-limits.js";
 import {
   userSettingsSectionKeys,
   type UserSettingsStore
@@ -44,20 +51,7 @@ const settingsSectionBodySchema = z.object({
   config: z.record(z.string(), z.unknown())
 });
 
-const scheduledJobBodySchema = z.object({
-  jobName: z.string().trim().min(1).max(120),
-  description: z.string().trim().max(500).nullable().optional(),
-  cronExpression: z.string().trim().min(1).max(120),
-  timeZone: z.string().trim().min(1).max(100),
-  targetType: z.enum(["prompt", "skill"]).default("prompt"),
-  targetRef: z.string().trim().min(1).max(120).nullable().optional(),
-  input: z.object({
-    prompt: z.string().trim().min(1).max(4_000)
-  }),
-  enabled: z.boolean().default(true)
-});
-
-type ScheduledJobBody = z.infer<typeof scheduledJobBodySchema>;
+type ScheduledJobBody = z.output<typeof ScheduledJobRequestSchema>;
 
 function buildInvalidScheduledJobConfigError(error: unknown) {
   return requestError([
@@ -69,7 +63,7 @@ function buildInvalidScheduledJobConfigError(error: unknown) {
 }
 
 async function buildScheduledJobPersistenceInput(
-  settings: UserSettingsStore,
+  settings: Pick<UserSettingsStore, "listSections">,
   tenantId: string,
   userId: string,
   body: ScheduledJobBody
@@ -95,12 +89,12 @@ async function buildScheduledJobPersistenceInput(
 
 async function resolveScheduledJobPersistenceInput(
   reply: FastifyReply,
-  settings: UserSettingsStore,
+  settings: Pick<UserSettingsStore, "listSections">,
   tenantId: string,
   userId: string,
   body: unknown
 ) {
-  const bodyResult = parseRequestInput(reply, scheduledJobBodySchema, body);
+  const bodyResult = parseRequestInput(reply, ScheduledJobRequestSchema, body);
   if (!bodyResult.ok) {
     return bodyResult;
   }
@@ -132,7 +126,33 @@ export function buildSettingsRouteStores(deps: AppDependencies, extras: { config
   };
 }
 
-export type SettingsRouteStores = ReturnType<typeof buildSettingsRouteStores>;
+export type SettingsRouteStores = {
+  settings: Pick<
+    UserSettingsStore,
+    | "listSections"
+    | "upsertSection"
+    | "listScheduledJobs"
+    | "getScheduledJob"
+    | "countActiveScheduledJobs"
+    | "createScheduledJob"
+    | "updateScheduledJob"
+    | "deleteScheduledJob"
+    | "listJobRuns"
+  >;
+  auditEvents: Pick<AuditEventStore, "create">;
+  githubConnections: Pick<
+    GithubConnectionService,
+    "getConnectionStatus" | "getAuthorizationUrl" | "disconnect"
+  >;
+  notionConnections: Pick<
+    NotionConnectionService,
+    "getConnectionStatus" | "getAuthorizationUrl" | "disconnect"
+  >;
+  config: AppConfig;
+  integrationStates: Pick<IntegrationStateStore, "get">;
+  integrationRegistry: Pick<IntegrationRegistryService, "getIntegrationsForUser">;
+  limits: RequestLimitsInterface;
+};
 
 export async function registerSettingsRoutes(
   app: FastifyInstance,

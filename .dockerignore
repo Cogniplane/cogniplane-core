@@ -4,13 +4,12 @@ node_modules
 apps/*/node_modules
 apps/*/.next
 apps/*/dist
+apps/backend/bundle
 packages/*/node_modules
 packages/*/dist
 docker-compose.override.yaml
 *.log
 
-# Exclude all env files (real secrets) but keep .env.example (docs).
+# No Docker build copies env files. Exclude every one of them.
 .env*
 **/.env*
-!.env.example
-!**/.env.example

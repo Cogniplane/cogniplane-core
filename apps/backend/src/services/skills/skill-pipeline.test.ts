@@ -22,12 +22,12 @@ function buildResolvedProfile(): ResolvedRuntimePolicy {
     id: "test-profile",
     label: "Test profile",
     description: null,
+    webSearchMode: "disabled",
     approvalPolicy: "on-request",
     approvalReviewer: "user",
     sandboxMode: "workspace-write",
     networkMode: "restricted",
     allowCommandExecution: false,
-    allowUserTokenForwarding: false,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "monitor",
     developerInstructions: null,
@@ -47,9 +47,8 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
   // Step 1: import a minimal inline bundle. The inline path runs
   // `validateSkillBundle` internally and yields the record shape the
   // skill-revisions store would produce after a real INSERT + active-revision
-  // update. We capture that record below and feed it directly to the runtime
+  // update. The fake returns that record and feeds it directly to the runtime
   // compiler, simulating an already-activated revision without needing a DB.
-  let captured: AdminSkillRecord | null = null;
   const fakeSkillRevisions = {
     async importSkillBundle(_tenantId: string, input: {
       skillId: string;
@@ -86,7 +85,6 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
         activeReviewStatus: "active",
         isInherited: false
       };
-      captured = skill;
       return {
         skill,
         revision: {
@@ -104,6 +102,7 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
           reviewNotes: null,
           metadata: input.metadata,
           createdBy: input.createdBy,
+          createdAt: new Date().toISOString(),
           reviewedBy: null,
           reviewedAt: null,
           activatedAt: new Date().toISOString()
@@ -112,7 +111,7 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
     }
   };
 
-  await importSkillBundleFromInline({
+  const imported = await importSkillBundleFromInline({
     tenantId: TENANT_ID,
     skillRevisions: fakeSkillRevisions,
     skillId: SKILL_ID,
@@ -122,8 +121,7 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
     actorUserId: "test-actor"
   });
 
-  expect(captured).toBeTruthy();
-  const importedSkill = captured as AdminSkillRecord;
+  const importedSkill = imported.skill;
   expect(importedSkill.instructions).toMatch(/pipeline confirmed/);
 
   // Step 2: compile a runtime config from the imported skill. `compileRuntimeConfig`
@@ -132,6 +130,7 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
   const runtimeConfig = await compileRuntimeConfig({
     tenantId: TENANT_ID,
     runtimePolicy: buildResolvedProfile(),
+    isBetaTester: true,
     skills: {
       async listSkills() {
         return [importedSkill];

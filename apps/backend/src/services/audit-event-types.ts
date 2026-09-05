@@ -60,6 +60,9 @@ export const AUDIT_EVENT_TYPES = [
   // Auth.
   "auth.refresh_token_reuse_detected",
   "role_changed",
+  // App role kept despite a different WorkOS role slug — IdP changes do not
+  // propagate after provisioning, so revocations surface here, not as errors.
+  "role_sync_divergence",
 
   // MCP gateway egress-control refusals (CIDR allowlist / per-runtime IP
   // pin) — a leaked rt_* token replayed from an unexpected peer is refused.

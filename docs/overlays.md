@@ -37,75 +37,55 @@ input.managedToolFactoryRegistry.register("myint", (coreDeps) =>
 
 The factory key (`"myint"` above) is a domain identifier, not a tool name — one factory typically produces multiple tool definitions. Pick something stable; collisions throw at boot.
 
-### 2. Module-level registry (free functions)
+### 2. Static catalog and app-owned integration hooks
 
-`registerIntegration(...)`, `setIntegrationRuntimeWiring(...)`, and `listIntegrationOAuthCallbackPaths()` are module-level free functions in `services/integrations/integration-registry.ts`. They are module-level, not instance-based, because the OAuth callback paths are aggregated into the auth middleware's public-path allowlist at boot — before any DI container is wired.
+`registerIntegration(...)` stores immutable catalog metadata. It accepts names, tool IDs, configuration fields, and static OAuth callback paths. It does not accept connection probes or callback handlers.
+
+Each `buildAppDependencies()` creates an `IntegrationRegistry` and passes it to the overlay as `input.integrationDescriptors`. Attach services to that instance. Another app in the same process has its own probes and OAuth handlers.
 
 ```ts
 import {
-  registerIntegration,
-  setIntegrationRuntimeWiring
+  getIntegrationDescriptor,
+  registerIntegration
 } from "@cogniplane/backend/src/services/integrations/integration-registry";
 
-// Static descriptor — registered once per process.
-registerIntegration({
+const descriptor = {
   id: "myint",
   name: "My Integration",
-  description: "Short blurb",
-  longDescription: "Longer paragraph for the integrations page.",
+  description: "Short description",
+  longDescription: "Description for the integrations page.",
   logoSlug: "myint",
-  status: "available",
+  status: "available" as const,
   category: "communication",
-  readToolIds:  ["myint_read_thing"],
+  readToolIds: ["myint_read_thing"],
   writeToolIds: ["myint_write_thing"],
-  configMode: "oauth_app",
-  configFields: [
-    { key: "client_id", label: "Client ID", type: "text",     required: true },
-    { key: "client_secret", label: "Client Secret", type: "password", required: true }
-  ],
-  docsUrl: "https://docs.example.com/cogniplane-myint"
-});
+  configMode: "none" as const,
+  oauthCallbackPaths: ["/integrations/myint/callback"]
+};
 
-// Live wiring — attached lazily so the connection service can come from a
-// per-app instance.
-setIntegrationRuntimeWiring("myint", {
+if (!getIntegrationDescriptor(descriptor.id)) registerIntegration(descriptor);
+// An overlay can add metadata after the app took its catalog snapshot.
+if (!input.integrationDescriptors.get(descriptor.id)) {
+  input.integrationDescriptors.register(descriptor);
+}
+input.integrationDescriptors.setRuntimeWiring(descriptor.id, {
   connectionProbe: myintConnectionService,
   oauthRoutes: {
-    paths: ["/integrations/myint/callback"],
+    paths: descriptor.oauthCallbackPaths,
     register: (app) => registerMyintCallbackRoutes(app, { myintConnectionService })
   }
 });
 ```
 
-Because `registerIntegration` is module-level state, your overlay's `bootstrap(...)` must guard descriptor registration against re-entry:
-
-```ts
-let descriptorRegistered = false;
-
-export function bootstrap(input: MyintOverlayBootstrapInput): MyintOverlay {
-  // ...
-  if (!descriptorRegistered) {
-    descriptorRegistered = true;
-    registerIntegration({ /* ... */ });
-  }
-  setIntegrationRuntimeWiring("myint", { /* fresh per-app wiring */ });
-  // ...
-}
-
-export function __resetMyintOverlayForTesting(): void {
-  descriptorRegistered = false;
-}
-```
-
-The catalog and factory registry are per-instance, so they don't need a reset hook — every `buildAppDependencies()` builds fresh registries.
+Register metadata once, then attach fresh live hooks for each app. No overlay registration flag or reset helper is needed. The host reads callback paths and registers OAuth routes from this app's registry after the overlay finishes bootstrapping.
 
 ## Required call order
 
 Inside `bootstrap(input)`, the order matters:
 
 1. **Construct your stores and services** — `MyintConnectionStore`, `MyintConnectionService`, etc.
-2. **Register the descriptor** (idempotent guard).
-3. **Attach runtime wiring** — `setIntegrationRuntimeWiring(...)`.
+2. Register catalog metadata if absent and add it to the app registry.
+3. Attach live hooks with `input.integrationDescriptors.setRuntimeWiring(...)`.
 4. **Register the catalog and factory** on the per-instance registries.
 5. **Return the bootstrap result** — including any services core needs (e.g. for the runtime invalidator) and an `attachOverlayRoutes(app)` callback.
 

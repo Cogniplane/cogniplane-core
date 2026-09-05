@@ -24,6 +24,13 @@ export type FakeRedisSetCall = {
 export class FakeRefreshTokenRedis implements RefreshTokenRedis {
   readonly store = new Map<string, string>();
   readonly setCalls: FakeRedisSetCall[] = [];
+  /**
+   * Remaining TTL per key, in milliseconds. Modelled because the restore
+   * script copies the family key's PTTL onto the jti it restores — a fake that
+   * ignored TTLs could not tell a correctly restored lifetime from a silently
+   * extended one.
+   */
+  readonly ttlMs = new Map<string, number>();
 
   async get(key: string): Promise<string | null> {
     return this.store.get(key) ?? null;
@@ -60,6 +67,24 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
       }
       await this.set(jtiKey, familyId, "EX", Number(ttl));
       await this.set(familyKey, active, "EX", Number(ttl));
+      return 1;
+    }
+
+    if (script.includes("refresh-token-restore-v1") && numberOfKeys === 3) {
+      const [jtiKey, familyKey, rotationKey, familyId, pendingPrefix, active] = args;
+      if (!jtiKey || !familyKey || !rotationKey || !familyId || !pendingPrefix || !active) {
+        throw new Error("Invalid refresh restore script arguments");
+      }
+      // A completed rotation must keep its cached result.
+      const marker = this.store.get(rotationKey);
+      if (marker !== undefined && !marker.startsWith(pendingPrefix)) return 0;
+      // Never resurrect a jti into a family that is gone or revoked.
+      if (this.store.get(familyKey) !== active) return 0;
+      const ttlMs = this.ttlMs.get(familyKey);
+      if (ttlMs === undefined || ttlMs <= 0) return 0;
+      this.store.delete(rotationKey);
+      this.store.set(jtiKey, familyId);
+      this.ttlMs.set(jtiKey, ttlMs);
       return 1;
     }
 
@@ -115,6 +140,7 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
   async set(key: string, value: string, mode: "EX", ttlSeconds: number): Promise<unknown> {
     this.setCalls.push({ key, value, mode, ttlSeconds });
     this.store.set(key, value);
+    this.ttlMs.set(key, ttlSeconds * 1000);
     return "OK";
   }
 

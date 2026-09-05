@@ -1,14 +1,10 @@
 "use client";
 
-import { Suspense, lazy, memo, useMemo, useState } from "react";
+import { Suspense, lazy, memo } from "react";
 import { type Components } from "react-markdown";
 
-import { ImageLightbox } from "./image-lightbox";
-import {
-  classifyMarkdownLink,
-  describeImageHost,
-  isTrustedImageSource
-} from "./safe-markdown.logic";
+import { MarkdownImage } from "./markdown-image";
+import { classifyMarkdownLink } from "./safe-markdown.logic";
 
 // react-markdown pulls in the remark/rehype/micromark stack. Split it into its
 // own chunk so it's not in the initial client bundle; it loads on first render.
@@ -68,56 +64,23 @@ const LinkRenderer: NonNullable<Components["a"]> = ({ href, children }) => {
   );
 };
 
+// Both renderers are static, so the map is built once at module scope.
+const COMPONENTS: Components = {
+  a: LinkRenderer,
+  img: MarkdownImage
+};
+
 function SafeMarkdownImpl({ children }: { children: string }) {
-  // Lightbox target: the src/alt of the inline image the user clicked, or null.
-  const [zoomed, setZoomed] = useState<{ src: string; alt: string } | null>(null);
-
-  // setZoomed is stable, so the map only needs building once per mount.
-  const components = useMemo<Components>(
-    () => ({
-      a: LinkRenderer,
-      img: ({ src, alt }) => {
-        if (typeof src !== "string" || src.length === 0) return null;
-        const altText = alt ?? "";
-        if (!isTrustedImageSource(src)) {
-          // External images never auto-fetch: rendering them would let a
-          // prompt-injected agent exfiltrate data through the URL the moment the
-          // message is displayed. Show a click-through link instead.
-          return (
-            <a href={src} target="_blank" rel="noopener noreferrer">
-              [External image{altText ? `: ${altText}` : ""} ({describeImageHost(src)})]
-            </a>
-          );
-        }
-        return (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={src}
-            alt={altText}
-            onClick={() => setZoomed({ src, alt: altText })}
-            className="cursor-zoom-in rounded-md"
-          />
-        );
-      }
-    }),
-    []
-  );
-
   return (
-    <>
-      <Suspense fallback={<span className="whitespace-pre-wrap">{children}</span>}>
-        {/* .md-body picks up the shared rendered-markdown rules in globals.css
-            (tables, blockquotes, links) that react-markdown emits unstyled. */}
-        <div className="md-body">
-          <ReactMarkdown allowedElements={ALLOWED_ELEMENTS} unwrapDisallowed components={components}>
-            {children}
-          </ReactMarkdown>
-        </div>
-      </Suspense>
-      {zoomed ? (
-        <ImageLightbox src={zoomed.src} alt={zoomed.alt} onClose={() => setZoomed(null)} />
-      ) : null}
-    </>
+    <Suspense fallback={<span className="whitespace-pre-wrap">{children}</span>}>
+      {/* .md-body picks up the shared rendered-markdown rules in globals.css
+          (tables, blockquotes, links) that react-markdown emits unstyled. */}
+      <div className="md-body">
+        <ReactMarkdown allowedElements={ALLOWED_ELEMENTS} unwrapDisallowed components={COMPONENTS}>
+          {children}
+        </ReactMarkdown>
+      </div>
+    </Suspense>
   );
 }
 

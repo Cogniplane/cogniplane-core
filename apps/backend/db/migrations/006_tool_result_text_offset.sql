@@ -9,7 +9,7 @@
 -- `text_offset` records the character length of the assistant text accumulated
 -- at the moment this tool call started. On reload we split `content` at the
 -- sorted offsets to recover the segments and interleave them with the cards.
--- Nullable: pre-existing rows (and the legacy RuntimeEvent writer, which doesn't
+-- Nullable: pre-existing rows (and the retired writer, which didn't
 -- set it) fall back to the old "text then tools" layout.
 ALTER TABLE public.message_tool_results
   ADD COLUMN IF NOT EXISTS text_offset integer;

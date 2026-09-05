@@ -1,7 +1,9 @@
-import type { FastifyBaseLogger } from "fastify";
-
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
-import type { ArtifactPiiDetail, ArtifactStore } from "../artifacts/artifact-store.js";
+import type {
+  ArtifactPiiDetail,
+  ArtifactRecord,
+  ArtifactStore
+} from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { MessagePiiDetail, MessageStore } from "../message-store.js";
 import type { PiiDecision, PiiProtectionService, PiiSubject } from "./pii-protection-service.js";
@@ -9,7 +11,7 @@ import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type {
   PiiScanArtifactInput
 } from "./pii-provider.js";
-import type { PiiScanJobRecord, PiiScanJobStore } from "./pii-scan-job-store.js";
+import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanRunStore } from "./pii-scan-run-store.js";
 
 /**
@@ -27,17 +29,40 @@ export interface PiiScanSubjectReader {
   }): Promise<PiiScanArtifactInput | null>;
 }
 
+type PiiScanJobLogger = {
+  error(payload: unknown, message: string): void;
+  warn(payload: unknown, message: string): void;
+};
+
+type PiiScanJobStoreCapability = {
+  markCompleted(tenantId: string, jobId: string): Promise<void>;
+  recordFailure(
+    tenantId: string,
+    jobId: string,
+    error: string,
+    options?: { backoffMs?: number; permanent?: boolean }
+  ): Promise<{ status: PiiScanJobRecord["status"] } | null>;
+};
+
+type ArtifactPiiStoreCapability = {
+  get(
+    tenantId: string,
+    artifactId: string
+  ): Promise<Pick<ArtifactRecord, "storageKey" | "status"> | null>;
+  setPiiDetail: ArtifactStore["setPiiDetail"];
+};
+
 export type PiiScanJobHandlerDeps = {
-  piiProtection: PiiProtectionService;
-  piiScanRuns: PiiScanRunStore;
-  piiScanJobs: PiiScanJobStore;
-  messages: MessageStore;
-  artifacts: ArtifactStore;
+  piiProtection: Pick<PiiProtectionService, "evaluateText" | "evaluateArtifact">;
+  piiScanRuns: Pick<PiiScanRunStore, "update">;
+  piiScanJobs: PiiScanJobStoreCapability;
+  messages: Pick<MessageStore, "setPiiDetail">;
+  artifacts: ArtifactPiiStoreCapability;
   /** Deletes stored object bytes on a block so they don't persist. */
   storage: Pick<ArtifactStorage, "delete">;
   subjectReader: PiiScanSubjectReader;
-  auditEvents?: AuditEventStore;
-  logger: FastifyBaseLogger;
+  auditEvents?: Pick<AuditEventStore, "create">;
+  logger: PiiScanJobLogger;
 };
 
 export class PiiScanJobHandler {

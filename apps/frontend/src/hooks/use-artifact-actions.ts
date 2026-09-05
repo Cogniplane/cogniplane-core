@@ -46,6 +46,18 @@ export function useArtifactActions(input: {
     setDownloadArtifactId(artifactId);
     try {
       const download = await createArtifactDownload(artifactId);
+      // Not an internal Next route. artifactApiBase() is NEXT_PUBLIC_API_URL,
+      // the backend origin: a different port in dev, a different domain in
+      // production. A full browser navigation is what we want here, so the
+      // browser follows the signed URL and takes the attachment.
+      //
+      // The lint rule fires because the template literal starts with an
+      // expression. Its static prefix is empty, so the rule reads the URL as
+      // relative and cannot see the absolute base. router.push would also
+      // work, since Next treats an external URL as an MPA navigation and ends
+      // up calling location.assign anyway, but routing a download through the
+      // app router buys nothing.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- absolute cross-origin download URL, see above
       window.location.assign(`${artifactApiBase()}${download.url}`);
     } catch {
       onError("Failed to download artifact.");

@@ -95,7 +95,7 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
           approvalPolicy: "on-request" as const,
           approvalReviewer: "user" as const, sandboxMode: "workspace-write" as const,
           networkMode: "restricted" as const, allowCommandExecution: false,
-          allowUserTokenForwarding: true, autoApproveReadOnlyTools: true,
+          autoApproveReadOnlyTools: true,
           developerInstructions: null, enabledToolIds: [], enabledMcpServers: [],
           version: 1, hash: "test"
         };
@@ -107,7 +107,6 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
           approvalPolicy: "on-request",
           approvalReviewer: "user",
           allowCommandExecution: false,
-          allowUserTokenForwarding: true,
           autoApproveReadOnlyTools: true,
           developerInstructions: null,
           enabledToolIds: [],
@@ -124,7 +123,6 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
           approvalPolicy: "on-request",
           approvalReviewer: "user",
           allowCommandExecution: false,
-          allowUserTokenForwarding: true,
           autoApproveReadOnlyTools: true,
           developerInstructions: null,
           enabledToolIds: [],

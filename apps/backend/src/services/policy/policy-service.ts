@@ -4,7 +4,6 @@ import type {
   PolicyTurnContext
 } from "@cogniplane/shared-types";
 
-import type { PolicyApprovalDisposition } from "../../runtime-contracts.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import { redactSecrets } from "../redact-secrets.js";
 
@@ -18,8 +17,10 @@ import type { PolicyDecisionStore } from "./policy-decision-store.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
 import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
 
+type PolicyApprovalDisposition = "approve" | "reject" | "expired";
+
 // Raised when an enforce-mode rule refuses the action: a `block`, or a
-// `require_approval` whose human decision was reject/expire. The MCP gateway
+// `require_approval` without a matching approved graph-interrupt proof. The MCP gateway
 // turns this into a JSON-RPC error so the model sees an explained refusal
 // rather than a silent drop.
 export class PolicyBlockedError extends Error {
@@ -48,35 +49,16 @@ export type PolicyEvaluationInput = {
   actionSnapshot?: Record<string, unknown>;
 };
 
-// What the gateway passes when it wants the action GATED (not just evaluated):
-// the tenant's enforcement mode plus an approval router the service calls to
-// pause-and-resume an enforce-mode `require_approval`.
+// What the gateway passes when it wants the action gated. Policy Center
+// approvals are collected by the graph before this call; the gateway receives
+// only the verified disposition.
 export type PolicyGateInput = PolicyEvaluationInput & {
   // The tenant-level Policy Center switch. In `monitor` the gate records a
   // would-have decision and never gates; in `enforce` a matching block /
   // require_approval rule actually gates the action.
   enforcementMode: PolicyEnforcementMode;
-  // Routes a human approval and resolves when the decision (or TTL) lands.
-  // Omitted by callers that can't host approvals (e.g. a context with no active
-  // turn) — in that case an enforce-mode `require_approval` degrades to a block.
-  approvalRouter?: PolicyApprovalRouter;
+  approvalDisposition?: PolicyApprovalDisposition;
 };
-
-// Supplied by the gateway, backed by the owning runtime adapter. Emits the
-// `framework:approval_required` SSE event to the active turn, persists the
-// approval row (reusing ApprovalStore + TTL/sweep), and resolves when
-// `POST /approvals/:id/decision` settles it or the TTL expires.
-export type PolicyApprovalRouter = (request: {
-  tenantId: string;
-  sessionId: string | null;
-  userId: string | null;
-  runtimeId: string | null;
-  toolName: string;
-  serverId: string | null;
-  severity: PolicySeverity | null;
-  matchedRuleId: string | null;
-  explanation: string;
-}) => Promise<PolicyApprovalDisposition>;
 
 // The result of gating an action that may proceed.
 export type PolicyGateResult = {
@@ -175,22 +157,14 @@ export class PolicyService {
   }
 
   /**
-   * Gate an action at the MCP gateway choke point: evaluate it, route any
-   * `require_approval` (in enforce mode), persist replay evidence, emit an audit
+   * Gate an action at the MCP gateway choke point: evaluate it, verify any
+   * graph-resolved `require_approval`, persist replay evidence, emit an audit
    * event, and either return (proceed) or throw {@link PolicyBlockedError}.
    *
    * Outcomes:
    *   no match / monitor / allow → proceed
    *   block (enforce)            → throw PolicyBlockedError
-   *   require_approval (enforce) → route a human approval, then proceed
-   *                                (approve) or throw (reject / expired). If no
-   *                                approvalRouter is available the action
-   *                                degrades to a block.
-   *
-   * The gateway holds its HTTP response open while this awaits the approval —
-   * the agent loop calls managed tools over HTTP, so an `await` here is a
-   * legitimate pause without touching the runtime's native approval coordinator
-   * (which gates shell/file actions on an entirely separate path).
+   *   require_approval (enforce) → proceed only with a verified approval proof
    */
   async gateAction(input: PolicyGateInput): Promise<PolicyGateResult> {
     const action: PolicyActionContext = {
@@ -225,14 +199,12 @@ export class PolicyService {
       );
     }
 
-    // Enforce-mode require_approval → route a human approval and resume/deny.
+    // Enforce-mode require_approval → accept only the gateway-verified proof.
     if (evaluation.outcome === "require_approval") {
-      // A scheduled turn has no human at the other end: the prompt would be
-      // "delivered" to the scheduler's event consumer and the gateway would
-      // hold its response until the approval TTL — longer than the scheduler's
-      // job timeout, so the job dies first. Deny immediately instead.
+      // Scheduled turns are unattended. Creating an approval would pause the
+      // graph until the scheduler timeout, so reject the action immediately.
       if (input.turnContext === "scheduled") {
-        this.logger.warn("policy: require_approval matched on a scheduled turn — no human to prompt; denying", {
+        this.logger.warn("policy: require_approval matched on a scheduled turn; denying", {
           tenantId: input.tenantId,
           toolName: input.toolName,
           matchedRuleId: evaluation.matchedRuleId
@@ -243,7 +215,7 @@ export class PolicyService {
           evaluation.matchedRuleId
         );
       }
-      const disposition = await this.routeApproval(input, evaluation);
+      const disposition = input.approvalDisposition ?? "reject";
       await this.recordEvidence(input, evaluation, enforced, disposition);
       if (disposition === "approve") {
         return { evaluation, enforced };
@@ -251,7 +223,9 @@ export class PolicyService {
       const why =
         disposition === "expired"
           ? "Approval request expired before a decision was made."
-          : "Action denied by approver.";
+          : input.approvalDisposition === "reject"
+            ? "Action denied by approver."
+            : "No matching approved graph action was provided.";
       throw new PolicyBlockedError(
         `${evaluation.explanation ?? "Action requires approval."} ${why}`.trim(),
         evaluation.matchedRuleId
@@ -260,36 +234,6 @@ export class PolicyService {
 
     // Defensive: an enforced outcome we don't have a branch for. Proceed.
     return { evaluation, enforced };
-  }
-
-  /**
-   * Drive the injected approval router. When the gateway can't host approvals
-   * (no router available — e.g. a context with no active turn), an enforce-mode
-   * require_approval degrades to a deny rather than letting the action through.
-   */
-  private async routeApproval(
-    input: PolicyGateInput,
-    evaluation: PolicyEvaluation
-  ): Promise<PolicyApprovalDisposition> {
-    if (!input.approvalRouter) {
-      this.logger.warn("policy: require_approval matched but no approval router available — denying", {
-        tenantId: input.tenantId,
-        toolName: input.toolName,
-        matchedRuleId: evaluation.matchedRuleId
-      });
-      return "reject";
-    }
-    return input.approvalRouter({
-      tenantId: input.tenantId,
-      sessionId: input.sessionId,
-      userId: input.userId,
-      runtimeId: input.runtimeId,
-      toolName: input.toolName,
-      serverId: input.serverId,
-      severity: input.severity,
-      matchedRuleId: evaluation.matchedRuleId,
-      explanation: evaluation.explanation ?? "Action requires approval."
-    });
   }
 
   private async recordEvidence(

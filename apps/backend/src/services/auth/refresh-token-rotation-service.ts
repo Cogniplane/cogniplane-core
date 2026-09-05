@@ -2,6 +2,7 @@ import {
   completeRefreshRotation,
   consumeRefreshJti,
   issueRefreshJti,
+  restoreRefreshJti,
   revokeRefreshFamily,
   waitForRefreshRotation,
   type RefreshRotationResult,
@@ -54,6 +55,16 @@ export class RefreshTokenRotationService {
       case "not_found":
         return { status: "revoked" };
     }
+  }
+
+  /**
+   * Undoes a claim whose rotation never completed, so the client's next attempt
+   * is an ordinary retry instead of a replay that revokes the family. Returns
+   * false when the restore was declined (the rotation completed after all, or
+   * the family is gone).
+   */
+  async restore(input: { jti: string; familyId: string }): Promise<boolean> {
+    return restoreRefreshJti(this.redis, input);
   }
 
   async complete(jti: string, result: RefreshRotationResult): Promise<void> {

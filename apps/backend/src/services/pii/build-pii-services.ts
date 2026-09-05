@@ -1,4 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
+import type { PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import type { AppConfig } from "../../config.js";
 import type { Pool } from "../../lib/db.js";
@@ -16,7 +17,6 @@ import { Aes256GcmFindingEncryptor } from "./pii-finding-encryption.js";
 import { PiiProtectionService } from "./pii-protection-service.js";
 import { PiiArtifactScanEnqueuer } from "./pii-artifact-scan-enqueuer.js";
 import { PiiScanJobHandler } from "./pii-scan-job-handler.js";
-import type { PiiProtectionSettings } from "./pii-policy.js";
 import { DatabasePiiScanSubjectReader } from "./pii-scan-subject-reader.js";
 import { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
 
@@ -59,7 +59,6 @@ export function buildPiiServices(input: {
 
   const piiSubjectReader = new DatabasePiiScanSubjectReader({
     db,
-    messages: stores.messages,
     artifacts: stores.artifacts,
     storage: artifactStorage,
     // Same source as the service-level cap, so the stream-time guard never

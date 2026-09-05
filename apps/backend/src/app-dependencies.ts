@@ -5,9 +5,8 @@ import { type Pool } from "./lib/db.js";
 import { attachOverlays, type OverlayHandles } from "./overlays.js";
 import { buildBootstrapServices } from "./services/build-bootstrap-services.js";
 import { buildStores } from "./services/build-stores.js";
-import { RuntimeEgressIpPinStore } from "./services/runtime-egress-ip-pin.js";
+import { ProxyToolMetadataCache } from "./services/mcp/proxy-tool-metadata-cache.js";
 import { buildIntegrationServices } from "./services/integrations/build-integration-services.js";
-import type { RuntimeInvalidator } from "./services/integrations/contracts.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
 import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
@@ -25,7 +24,7 @@ export function buildAppDependencies(input: {
 }) {
   const { db, schedulerDb = db, privilegedDb = db, config, logger } = input;
 
-  const stores = buildStores(db, schedulerDb, privilegedDb, logger);
+  const stores = buildStores(db, schedulerDb, privilegedDb, logger, config);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
 
   const bootstrap = buildBootstrapServices({
@@ -49,58 +48,21 @@ export function buildAppDependencies(input: {
       : undefined
   });
 
-  // Construction-order inversion: integration connection services need a
-  // `RuntimeInvalidator` at construction time, but the runtime manager (the
-  // invalidator) needs the integration registry. The closure below resolves
-  // to the runtime manager only when an integration actually invokes it,
-  // which happens inside async OAuth/disconnect flows — long after all
-  // construction is finished.
-  let runtimeManagerRef: RuntimeInvalidator | null = null;
-  const resolveRuntimeInvalidator = (): RuntimeInvalidator => {
-    if (!runtimeManagerRef) {
-      throw new Error(
-        "buildAppDependencies: runtime manager was not yet wired when an integration tried to invalidate runtimes. " +
-          "This indicates a wiring bug — integrations should never invalidate during composition, only inside async flows."
-      );
-    }
-    return runtimeManagerRef;
-  };
-
-  const integrations = buildIntegrationServices(
-    config,
-    stores,
-    resolveRuntimeInvalidator,
-    bootstrap.limits,
-    bootstrap.redis
-  );
-  // Per-runtime egress IP pin for the /mcp gateway — first observed peer IP
-  // for a runtimeId is recorded and subsequent calls must match. TTL aligned
-  // with the rt_* token so eviction is handled by token expiry; the runtime
-  // adapters additionally clear pins on explicit teardown.
-  const egressIpPins = new RuntimeEgressIpPinStore(
-    config.RUNTIME_TOKEN_TTL_MS,
-    bootstrap.redis ?? undefined
-  );
-
   const { deepAgentsAdapter } = buildRuntimeAdapter({
     config,
     logger,
     stores,
-    integrations,
     dynamicConfig: bootstrap.dynamicConfig,
-    artifactStorage: bootstrap.artifactStorage,
     skillBundleStorage: bootstrap.skillBundleStorage,
     managedToolCatalog,
     providerCredentials: bootstrap.providerCredentials,
     policyService
   });
 
-  // Integration (re)connect/disconnect tears down the user's stale sessions
-  // on the runtime adapter.
-  runtimeManagerRef = {
-    invalidateRuntimesForIntegration: (tenantId, userId, integrationId) =>
-      deepAgentsAdapter.invalidateRuntimesForIntegration(tenantId, userId, integrationId)
-  };
+  const integrations = buildIntegrationServices(
+    config, stores, deepAgentsAdapter, bootstrap.limits, bootstrap.redis
+  );
+  const proxyToolMetadataCache = new ProxyToolMetadataCache();
 
   const pii = buildPiiServices({
     config,
@@ -126,7 +88,8 @@ export function buildAppDependencies(input: {
       sessions: stores.sessions
     },
     piiScanEnqueuer: pii.piiScanEnqueuer,
-    runtimeInvalidator: integrations.runtimeInvalidator,
+    integrationDescriptors: integrations.integrationDescriptors,
+    runtimeInvalidator: deepAgentsAdapter,
     managedToolCatalog,
     managedToolFactoryRegistry
   });
@@ -151,6 +114,7 @@ export function buildAppDependencies(input: {
     notionConnectionService: integrations.notionConnectionService,
     integrationStates: stores.integrationStates,
     integrationRegistry: integrations.integrationRegistry,
+    integrationDescriptors: integrations.integrationDescriptors,
     approvals: stores.approvals,
     auditEvents: stores.auditEvents,
     platformEvents: stores.platformEvents,
@@ -183,7 +147,7 @@ export function buildAppDependencies(input: {
     piiScanJobHandler: pii.piiScanJobHandler,
     piiScanEnqueuer: pii.piiScanEnqueuer,
     activeTurns: stores.activeTurns,
-    egressIpPins,
+    proxyToolMetadataCache,
     policyRules: stores.policyRules,
     policyDecisions: stores.policyDecisions,
     policyService,

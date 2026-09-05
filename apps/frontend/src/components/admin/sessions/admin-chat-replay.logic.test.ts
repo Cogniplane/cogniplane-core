@@ -8,8 +8,7 @@ import type {
 import {
   chatReplayStatusClass,
   indexPiiRuns,
-  piiRunsForMessage,
-  readPiiScanRunId
+  piiRunsForMessage
 } from "./admin-chat-replay.logic";
 
 function makeRun(
@@ -45,17 +44,6 @@ function makeMessage(
   } as AdminSessionDetailMessage;
 }
 
-describe("readPiiScanRunId", () => {
-  test("reads detailJson.pii.scanRunId when present", () => {
-    expect(readPiiScanRunId({ pii: { scanRunId: "scan-1" } })).toBe("scan-1");
-  });
-
-  test("returns null on missing/wrong shape", () => {
-    expect(readPiiScanRunId(null)).toBeNull();
-    expect(readPiiScanRunId({})).toBeNull();
-    expect(readPiiScanRunId({ pii: { scanRunId: 42 } })).toBeNull();
-  });
-});
 
 describe("indexPiiRuns", () => {
   test("indexes by scan id and by message-subject id", () => {

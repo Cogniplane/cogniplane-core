@@ -74,22 +74,36 @@ function respondSkillUploadTooLarge(reply: FastifyReply) {
   return apiError("skill_import_too_large", "Skill import exceeds size limit.");
 }
 
-export async function registerAdminSkillRoutes(
-  app: FastifyInstance,
-  stores: {
-    dynamicConfig: DynamicConfigService;
-    skillMarketplace: SkillMarketplaceService;
-    auditEvents: AuditEventStore;
-    skillBundleStorage: SkillBundleStorage;
-    githubConnections?: GithubConnectionService;
+export type AdminSkillRouteStores = {
+    dynamicConfig: Pick<
+      DynamicConfigService,
+      | "listSkills"
+      | "disableSkill"
+      | "setSkillPublished"
+      | "listSkillRevisions"
+      | "getSkillRevision"
+      | "importSkillBundleFromZip"
+      | "importSkillBundleFromGithub"
+      | "importSkillBundleFromInline"
+      | "activateSkillRevision"
+      | "cleanupInactiveSkillRevisions"
+    >;
+    skillMarketplace: Pick<SkillMarketplaceService, "getCatalog">;
+    auditEvents: Pick<AuditEventStore, "create">;
+    skillBundleStorage: Pick<SkillBundleStorage, "materializeBundle">;
+    githubConnections?: Pick<GithubConnectionService, "getRuntimeCredentials">;
     tenantSettings?: {
       getMarketplaceManifestUrl(tenantId: string): Promise<string | null>;
     };
     // Optional: when present, the skill list is decorated with adoption
     // counts (last 30 days) per skill. Failures are swallowed — counts are
     // decorative. Tests that don't supply it just get skills with no counts.
-    activations?: ActivationTracker;
-  }
+    activations?: Pick<ActivationTracker, "countSkillActivations">;
+};
+
+export async function registerAdminSkillRoutes(
+  app: FastifyInstance,
+  stores: AdminSkillRouteStores
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
   const skillLifecycle = new SkillLifecycleService(stores.dynamicConfig, stores.auditEvents);

@@ -144,7 +144,8 @@ export class ActivationTracker {
 
   /**
    * Records `invoked` skill rows for every skill materialized in this
-   * session whose `metadata.associatedToolIds` contains `toolName`. Looks
+   * turn whose `metadata.associatedToolIds` contains `toolName`. Callers without
+   * a message id match only materializations that also have no message id. Looks
    * up the candidate skills directly from `resource_activations` so the
    * MCP gateway doesn't need to thread the runtime config through every
    * request — the materialization rows already carry everything we need.
@@ -166,12 +167,13 @@ export class ActivationTracker {
             FROM resource_activations ra
             WHERE ra.tenant_id = $1
               AND ra.session_id = $2
+              AND ra.message_id IS NOT DISTINCT FROM $4::text
               AND ra.resource_type = 'skill'
               AND ra.event_type = 'materialized'
               AND ra.metadata ? 'associatedToolIds'
               AND ra.metadata -> 'associatedToolIds' @> to_jsonb($3::text)
           `,
-          [context.tenantId, context.sessionId, toolName]
+          [context.tenantId, context.sessionId, toolName, context.messageId ?? null]
         );
         const skillIds = result.rows.map((row) => String(row.resource_id));
         if (skillIds.length === 0) return [];

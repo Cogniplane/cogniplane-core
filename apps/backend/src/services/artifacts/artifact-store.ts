@@ -644,25 +644,6 @@ export class ArtifactStore {
     });
   }
 
-  async listPendingProcessingUploads(tenantId: string): Promise<ArtifactRecord[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const pendingUploadRows = await client.query(
-        `
-          SELECT ${ARTIFACT_COLUMNS}
-          FROM artifacts
-          WHERE
-            tenant_id = $1
-            AND artifact_type = 'upload'
-            AND mime_type = 'application/pdf'
-            AND status IN ('pending', 'processing')
-          ORDER BY created_at ASC, id ASC
-        `,
-        [tenantId]
-      );
-      return pendingUploadRows.rows.map(mapArtifact);
-    });
-  }
-
   async createDownloadToken(input: {
     tenantId: string;
     artifactId: string;

@@ -1,8 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import { TenantDetailsSchema } from "@cogniplane/shared-types";
-import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
+import {
+  PiiProtectionSettingsRequestSchema,
+  TenantDetailsSchema,
+  TenantProviderKeyUpdateRequestSchema
+} from "@cogniplane/shared-types";
 
 import type { Pool } from "../lib/db.js";
 import { withTenantScope } from "../lib/db.js";
@@ -11,21 +14,11 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import { httpsUrlSchema } from "../lib/url-validation.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
-import { piiProtectionSchema } from "../services/pii/pii-policy.js";
+import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import type { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 
 const tenantUpdateSchema = z.object({
   tenantName: z.string().trim().min(1).max(200).optional()
-});
-
-// Backward-compatible: the legacy body is `{ anthropicApiKey }`; the new body
-// is `{ provider, apiKey }`. Accept either — `provider` defaults to anthropic
-// and `apiKey` falls back to the legacy `anthropicApiKey` field.
-const apiKeysSchema = z.object({
-  provider: z.enum(MODEL_PROVIDERS).optional(),
-  // Provider keys are well under 512 chars; cap to reject junk payloads early.
-  apiKey: z.string().max(512).optional(),
-  anthropicApiKey: z.string().max(512).optional()
 });
 
 const marketplaceSchema = z.object({
@@ -45,11 +38,13 @@ export async function registerTenantRoutes(
     db,
     tenantOrgSettings,
     githubConnections,
-    getMicrosoftConfigured
+    getMicrosoftConfigured,
+    integrationDescriptors = new IntegrationRegistry()
   }: {
     db: Pool;
     tenantOrgSettings: TenantOrgSettingsStore;
     githubConnections?: GithubConnectionService;
+    integrationDescriptors?: IntegrationRegistry;
     // Optional callback supplied by the SharePoint private overlay. Returns
     // whether the tenant has a Microsoft OAuth app configured. When absent
     // (OSS subset, no overlay), the response carries `configured: false`.
@@ -85,7 +80,6 @@ export async function registerTenantRoutes(
       ssoProvider: row.sso_provider,
       plan: row.plan,
       settings: {
-        anthropicApiKeyConfigured: orgSettings.hasAnthropicApiKey,
         providerKeys: orgSettings.providerKeys,
         skillMarketplaceManifestUrl: orgSettings.skillMarketplaceManifestUrl,
         piiProtection: orgSettings.piiProtection,
@@ -144,23 +138,17 @@ export async function registerTenantRoutes(
     if (!requireRole(request, reply, "owner")) return;
 
     const { tenantId } = request.auth;
-    const parsed = parseRequestInput(reply, apiKeysSchema, request.body);
+    const parsed = parseRequestInput(reply, TenantProviderKeyUpdateRequestSchema, request.body);
     if (!parsed.ok) return parsed.response;
-    const provider = parsed.value.provider ?? "anthropic";
-    const rawKey = parsed.value.apiKey ?? parsed.value.anthropicApiKey;
-
-    // An empty/absent apiKey CLEARS the selected provider's stored key (the
-    // off-boarding / revocation path). A non-empty key sets it. Passing `null`
-    // to setApiKey removes the encrypted column value.
-    const trimmedKey = rawKey?.trim() || null;
+    const { provider, apiKey } = parsed.value;
+    // An explicitly empty key revokes only the selected provider's credential.
+    const trimmedKey = apiKey.trim() || null;
     await tenantOrgSettings.setApiKey(tenantId, provider, trimmedKey);
     const refreshed = await tenantOrgSettings.get(tenantId);
 
     return reply.send({
       ok: true,
-      providerKeys: refreshed.providerKeys,
-      // Backward-compat echo for older clients.
-      anthropicApiKeyConfigured: refreshed.providerKeys.anthropic
+      providerKeys: refreshed.providerKeys
     });
   });
 
@@ -198,7 +186,7 @@ export async function registerTenantRoutes(
   app.put("/tenant/settings/pii", async (request, reply) => {
     if (!requireRole(request, reply, "owner", "admin")) return;
 
-    const parsed = piiProtectionSchema.safeParse(request.body);
+    const parsed = PiiProtectionSettingsRequestSchema.safeParse(request.body);
     if (!parsed.success) {
       const details = parsed.error.issues.map((issue) => ({
         path: issue.path.join("."),
@@ -269,9 +257,12 @@ export async function registerTenantRoutes(
       return reply.code(400).send({ error: "invalid_role" });
     }
 
-    // Only owners can assign the owner role
-    if (role === "owner" && request.auth.role !== "owner") {
-      return reply.code(403).send({ error: "only_owner_can_assign_owner" });
+    // Only owners grant elevated roles. An admin who could mint more admins
+    // could entrench accomplices the owner has no single action to undo.
+    if ((role === "owner" || role === "admin") && request.auth.role !== "owner") {
+      return reply
+        .code(403)
+        .send({ error: role === "owner" ? "only_owner_can_assign_owner" : "only_owner_can_assign_admin" });
     }
 
     // Cannot change your own role
@@ -293,6 +284,12 @@ export async function registerTenantRoutes(
         return { kind: "cannot_demote_owner" as const };
       }
 
+      // Mirror of the elevation guard: an admin who could demote peers could
+      // strip every other admin and entrench themselves as the only one.
+      if (target.rows[0].role === "admin" && request.auth.role !== "owner") {
+        return { kind: "only_owner_can_change_admin_role" as const };
+      }
+
       const result = await client.query(
         `UPDATE tenant_memberships SET role = $1, updated_at = NOW()
           WHERE tenant_id = $2 AND user_id = $3
@@ -309,6 +306,10 @@ export async function registerTenantRoutes(
 
     if (outcome.kind === "cannot_demote_owner") {
       return reply.code(403).send({ error: "cannot_demote_owner" });
+    }
+
+    if (outcome.kind === "only_owner_can_change_admin_role") {
+      return reply.code(403).send({ error: "only_owner_can_change_admin_role" });
     }
 
     return reply.send(outcome.row);
@@ -342,6 +343,18 @@ export async function registerTenantRoutes(
         return { kind: "cannot_remove_owner" as const };
       }
 
+      // Disable the removed member's scheduled jobs in the same transaction as
+      // the membership delete. Left enabled, they keep firing as synthetic
+      // turns under the removed user's identity, using their stored OAuth
+      // tokens — the membership row is not consulted anywhere on the scheduler
+      // path. `next_run_at = NULL` also drops them out of the due-job query.
+      await client.query(
+        `UPDATE scheduled_jobs
+         SET enabled = FALSE, next_run_at = NULL, updated_at = NOW()
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [tenantId, targetUserId]
+      );
+
       await client.query(
         `DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`,
         [tenantId, targetUserId]
@@ -358,6 +371,35 @@ export async function registerTenantRoutes(
       return reply.code(403).send({ error: "cannot_remove_owner" });
     }
 
+    // Revoke the removed member's stored OAuth connections. This runs AFTER the
+    // membership transaction, not inside it: each connection service opens its
+    // own `withTenantScope` and writes an audit event, so it cannot join the
+    // client above. A crash in the gap leaves connection rows for a user who is
+    // no longer a member — they are unreachable while the membership is gone,
+    // but note that a later re-add through WorkOS provisioning recreates the
+    // membership and would restore access to them.
+    //
+    // Driven off the integration registry rather than a hardcoded table list so
+    // a private overlay's integrations are covered too.
+    for (const descriptor of integrationDescriptors.list()) {
+      const revoke = descriptor.connectionProbe?.deleteConnection;
+      if (!revoke) continue;
+      try {
+        await revoke.call(descriptor.connectionProbe, tenantId, targetUserId);
+      } catch (error) {
+        // One failing integration must not strand the others, and the member is
+        // already removed. Log and continue; the row is unreachable meanwhile.
+        request.log.error(
+          { err: error, integrationId: descriptor.id, tenantId, userId: targetUserId },
+          "member removal: failed to revoke integration connection"
+        );
+      }
+    }
+
+    // Known gap: a scheduled job already claimed and in flight is not aborted —
+    // it runs to completion or the scheduler timeout. Revoking the connections
+    // above makes its integration tool calls fail, but the turn itself
+    // continues. Tracked separately.
     return reply.send({ ok: true });
   });
 }

@@ -6,22 +6,15 @@ import {
   type PolicyTurnContext
 } from "@cogniplane/shared-types";
 
-import type {
-  PolicyApprovalDisposition,
-  PolicyApprovalRouteInput,
-  RuntimeApprovalKind
-} from "../../runtime-contracts.js";
-import { classifyToolSeverity } from "../tool-classification.js";
+import type { ApprovalRecord, ApprovalStore } from "../auth/approval-store.js";
 import type { PolicyService } from "../policy/policy-service.js";
+import {
+  POLICY_APPROVAL_REQUEST_METHOD,
+  policyArgsHash,
+  type PolicyApprovalProof
+} from "../policy/policy-approval-proof.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 import { parseRuntimePolicySnapshot, type ResolvedRuntimePolicy } from "../admin-config-records.js";
-
-// Routes a Policy Center require_approval to whichever adapter owns the
-// session. Returns the human disposition, or null when no adapter could host
-// the approval (no active turn) — the gateway then degrades to a deny.
-export type GatewayPolicyApprovalRouter = (
-  input: PolicyApprovalRouteInput
-) => Promise<PolicyApprovalDisposition | null>;
 
 export function getRuntimePolicySnapshot(context: ToolExecutionContext): ResolvedRuntimePolicy {
   return parseRuntimePolicySnapshot(context.metadata.runtimePolicy, {
@@ -31,41 +24,30 @@ export function getRuntimePolicySnapshot(context: ToolExecutionContext): Resolve
 
 // Dependencies the Policy Center hook needs at the tool-call choke point.
 export type PolicyGate = {
-  policyService: PolicyService;
-  requestPolicyApproval: GatewayPolicyApprovalRouter;
-  /** Aborts when the gateway's HTTP response dies before the tool call returns. */
-  clientDisconnectSignal?: AbortSignal;
+  policyService: Pick<PolicyService, "gateAction" | "evaluate">;
+  approvals: Pick<ApprovalStore, "get">;
   logger: Pick<FastifyBaseLogger, "warn">;
 };
 
 /**
  * Derive the policy severity for a tool action.
  *
- * Managed tools carry an authoritative `readOnly` boolean (from the catalog):
- * read-only → `read_only`, otherwise it's a state-changing call → `file_change`.
- * We deliberately do NOT name-classify managed tools — `classifyToolSeverity`
- * only knows Claude SDK native names (Read/Write/Bash/…), so a managed write
- * like `github_write_file` would mis-classify as `command_execution` and a
- * `file_change` rule would silently never match it.
+ * The only signal is one boolean: `ManagedToolDefinition.readOnly` for managed
+ * tools, the upstream `annotations.readOnlyHint` learned from `tools/list` for
+ * proxy tools. Literal `true` gives `read_only`; false, missing, and unknown
+ * all give the conservative `file_change`.
  *
- * Forwarded/proxy tools have no catalog entry (`readOnly === null`), so their
- * severity is genuinely unknown — name-based classification is the only signal
- * available and is used as a best-effort fallback.
+ * This deliberately never returns `command_execution`. The shell built-in that
+ * severity describes runs inside the graph and is gated by the runtime's own
+ * native HITL interrupt, not by the MCP gateway, so no gateway action can
+ * carry it. `PolicySeverity` keeps the value for stored rules and decision
+ * rows — see the comment on POLICY_SEVERITIES in shared-types.
  */
 export function deriveActionSeverity(
-  toolName: string,
-  readOnly: boolean | null
+  _toolName: string,
+  readOnly?: boolean | null
 ): PolicySeverity {
-  if (readOnly === true) return "read_only";
-  if (readOnly === false) return "file_change";
-  return classifyToolSeverity(toolName);
-}
-
-// Map the policy severity onto the approval `kind` the SSE prompt + approvals
-// row use. A read-only or state-changing tool surfaces as a "file_change"
-// approval (it isn't a shell command); command_execution maps through directly.
-function severityToApprovalKind(severity: PolicySeverity): RuntimeApprovalKind {
-  return severity === "command_execution" ? "command_execution" : "file_change";
+  return readOnly === true ? "read_only" : "file_change";
 }
 
 // Read a policy turn-context off the tool-execution context metadata, validating
@@ -82,20 +64,61 @@ function parsePolicyTurnContext(value: unknown): PolicyTurnContext | null {
  * against the tenant's rules, records a decision as evidence (audit +
  * policy_decision), and either:
  *   - proceeds (returns) — for allow / monitor mode / no-match; or
- *   - routes a human approval for an enforce-mode `require_approval`, holding
- *     this gateway HTTP response open until the decision lands (approve →
- *     proceed, reject/expire → throw); or
+ *   - verifies the checkpointed approval proof for an enforce-mode
+ *     `require_approval` (approved → proceed, missing/mismatched → throw); or
  *   - throws {@link PolicyBlockedError} for an enforce-mode `block`.
  *
  * Whether a gating rule actually gates is the tenant's `policyEnforcementMode`,
  * read from the runtime-policy snapshot already on the tool-execution context.
  */
 // The signal that varies per managed/forwarded path and isn't on the
-// ToolExecutionContext: the tool's read/write flag (drives severity). Null for
-// forwarded tools (no catalog entry → name-based severity classification).
+// ToolExecutionContext: the tool's read/write flag (drives severity).
+// For managed tools, read from the catalog. For forwarded/proxy tools,
+// read from the proxy-tool-metadata cache (or null if unannotated/uncached,
+// which defaults to "file_change").
 export type PolicyToolFacts = {
   readOnly: boolean | null;
 };
+
+function storedPolicyProof(record: ApprovalRecord): PolicyApprovalProof | null {
+  const value = record.requestPayload.policyApproval;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as PolicyApprovalProof)
+    : null;
+}
+
+export function approvalDispositionForToolCall(input: {
+  approval: ApprovalRecord | null;
+  context: ToolExecutionContext;
+  toolName: string;
+  serverId: string;
+  args: Record<string, unknown>;
+}): "approve" | "reject" | "expired" | undefined {
+  const { approval, context, toolName, serverId, args } = input;
+  if (!approval) return undefined;
+  if (
+    approval.requestMethod !== POLICY_APPROVAL_REQUEST_METHOD ||
+    approval.sessionId !== context.sessionId ||
+    approval.userId !== context.userId
+  ) {
+    return undefined;
+  }
+  const proof = storedPolicyProof(approval);
+  if (
+    !proof ||
+    proof.approvalId !== approval.approvalId ||
+    proof.toolContextId !== context.toolContextId ||
+    proof.toolName !== toolName ||
+    proof.serverId !== serverId ||
+    proof.argsHash !== policyArgsHash(args)
+  ) {
+    return undefined;
+  }
+  if (approval.status === "approved" && approval.decision === "approve") return "approve";
+  if (approval.status === "rejected" && approval.decision === "reject") return "reject";
+  if (approval.status === "expired") return "expired";
+  return undefined;
+}
 
 export async function enforcePolicyCenter(
   gate: PolicyGate,
@@ -113,12 +136,23 @@ export async function enforcePolicyCenter(
 ): Promise<void> {
   const severity = deriveActionSeverity(toolName, facts.readOnly);
   // Turn context is snapshotted into the tool-execution context at creation time
-  // (see sse-stream-writer / scheduler), so the hot path reads it with no extra
+  // (see sse-stream-writer-agui / scheduler), so the hot path reads it with no extra
   // DB lookup. A malformed snapshot degrades to null ("no constraint").
   const turnContext = parsePolicyTurnContext(context.metadata.turnContext);
   // The tenant-level monitor/enforce switch rides on the runtime-policy snapshot
   // already on the context — no extra DB call.
   const enforcementMode = getRuntimePolicySnapshot(context).policyEnforcementMode;
+  const approvalId = typeof args.policyApprovalId === "string" ? args.policyApprovalId : null;
+  const approval = approvalId
+    ? await gate.approvals.get(context.tenantId, approvalId, context.userId)
+    : null;
+  const approvalDisposition = approvalDispositionForToolCall({
+    approval,
+    context,
+    toolName,
+    serverId,
+    args
+  });
   await gate.policyService.gateAction({
     tenantId: context.tenantId,
     sessionId: context.sessionId,
@@ -136,29 +170,10 @@ export async function enforcePolicyCenter(
     // model — exclude it so the evidence snapshot reflects the caller's real
     // argument set.
     actionSnapshot: {
-      argumentKeys: Object.keys(args).filter((key) => key !== "toolContextId")
+      argumentKeys: Object.keys(args).filter(
+        (key) => key !== "toolContextId" && key !== "policyApprovalId"
+      )
     },
-    approvalRouter: async (request) => {
-      const disposition = await gate.requestPolicyApproval({
-        tenantId: request.tenantId,
-        sessionId: request.sessionId ?? "",
-        userId: request.userId ?? "",
-        runtimeId: request.runtimeId,
-        toolName: request.toolName,
-        serverId: request.serverId,
-        kind: severityToApprovalKind(request.severity ?? severity),
-        explanation: request.explanation,
-        signal: gate.clientDisconnectSignal
-      });
-      if (disposition === null) {
-        // No adapter could host the approval (no active turn) — deny.
-        gate.logger.warn(
-          { toolName, serverId, sessionId: context.sessionId },
-          "policy require_approval: no runtime adapter to host approval — denying"
-        );
-        return "reject";
-      }
-      return disposition;
-    }
+    approvalDisposition
   });
 }

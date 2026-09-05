@@ -13,7 +13,7 @@ type ArtifactBrowseFilters = Omit<ArtifactBrowseParams, "cursor">;
 
 export function useArtifactBrowserData(filters: ArtifactBrowseFilters = {}) {
   const query = useInfiniteQuery<ArtifactBrowseResponse>({
-    queryKey: queryKeys.artifacts.browse(filters as Record<string, unknown>),
+    queryKey: queryKeys.artifacts.browse(filters),
     queryFn: ({ pageParam }) =>
       browseArtifacts({
         ...filters,

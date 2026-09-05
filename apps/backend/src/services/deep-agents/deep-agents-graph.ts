@@ -24,6 +24,15 @@ import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 
 import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import { deriveActionSeverity } from "../mcp/policy-gate.js";
+import {
+  POLICY_APPROVAL_MARKER_KEY,
+  createPolicyApprovalProof,
+  policyArgsHash,
+  readPolicyApprovalMarker,
+  withoutPolicyApprovalMetadata,
+  type PolicyApprovalProof
+} from "../policy/policy-approval-proof.js";
 
 import { E2bDeepAgentsSandbox } from "./deep-agents-e2b-backend.js";
 import { SKILLS_LIBRARY_PREFIX, createSkillsLibraryBackend } from "./deep-agents-skills-library.js";
@@ -201,7 +210,7 @@ export function applyReasoningEffort(
 }
 
 /** Built-in Deep Agents tools that mutate state — gated whenever approvals are on. */
-const MUTATING_BUILTIN_TOOLS = ["execute", "write_file", "edit_file"];
+const MUTATING_BUILTIN_TOOLS = ["execute", "write_file", "edit_file", "delete"];
 /**
  * Read-only built-ins. Gated only when the tenant turned OFF
  * autoApproveReadOnlyTools — that flag is the explicit "prompt me even for
@@ -214,15 +223,19 @@ const MUTATING_BUILTIN_TOOLS = ["execute", "write_file", "edit_file"];
 const READ_ONLY_BUILTIN_TOOLS = ["ls", "read_file", "glob", "grep"];
 
 /**
- * Names createDeepAgent reserves for its built-in tools — pinned to
- * deepagents@1.10.5 (BUILTIN_TOOL_NAMES in agent.ts = FILESYSTEM_TOOL_NAMES +
- * ASYNC_TASK_TOOL_NAMES + task + write_todos; the library does not export the
- * constant, so re-check on every SDK bump — deep-agents-graph.test.ts pins
- * this list against createDeepAgent's actual collision check). An MCP tool
- * with one of these names would make createDeepAgent throw
- * TOOL_NAME_COLLISION and brick the session, so such tools (possible via
- * proxy MCP servers exposing arbitrary upstream names) are dropped at load
- * time with a warning instead.
+ * Names we refuse to let an MCP server claim — pinned to deepagents@1.13.3
+ * (BUILTIN_TOOL_NAMES in agent.ts = FILESYSTEM_TOOL_NAMES +
+ * ASYNC_TASK_TOOL_NAMES + task; the library does not export the constant, so
+ * re-check on every SDK bump — deep-agents-graph.test.ts pins this list
+ * against createDeepAgent's actual collision check). An MCP tool with one of
+ * those names would make createDeepAgent throw TOOL_NAME_COLLISION and brick
+ * the session, so such tools (possible via proxy MCP servers exposing
+ * arbitrary upstream names) are dropped at load time with a warning instead.
+ *
+ * `write_todos` is deliberately reserved beyond the library's own set: 1.12.0
+ * dropped it from BUILTIN_TOOL_NAMES, but the tool still ships via langchain's
+ * todoListMiddleware and drives the plan pane, so an MCP server exposing that
+ * name would silently shadow it rather than fail loudly.
  */
 export const RESERVED_BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set([
   ...MUTATING_BUILTIN_TOOLS,
@@ -240,6 +253,7 @@ type LangchainToolLike = {
   name: string;
   description?: string;
   schema?: unknown;
+  metadata?: { annotations?: { readOnlyHint?: boolean } };
   invoke: (args: Record<string, unknown>) => Promise<unknown>;
 };
 
@@ -260,6 +274,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         workspacePath: init.workspacePath,
         sessionId: init.sessionId,
         runtimeId: init.runtimeId,
+        onSandboxRecreated: init.onSandboxRecreated,
         logger: init.logger
       })
     : null;
@@ -291,8 +306,11 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     : sandbox;
 
   const toolContextRef = init.toolContextRef ?? { current: null };
+  const policyContextRef = init.policyContextRef ?? { current: null };
+  const policyApprovalProofs = new Map<string, PolicyApprovalProof>();
   const mcpToolNames = new Set<string>();
   const mcpToolServers = new Map<string, string>();
+  const mcpToolFacts = new Map<string, { readOnly: boolean; category: string }>();
   let mcpClient: MultiServerMCPClient | null = null;
   let mcpToolsPromise: Promise<LangchainToolLike[]> | null = null;
   // Cached compiled agent, keyed by BOTH the model id and the reasoning effort
@@ -357,9 +375,21 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       // the field, and models hallucinate ids into it (observed live), which
       // the gateway then rejects. The backend-held per-turn id is the only
       // trusted source.
-      const beforeToolCall = (_request: { args?: unknown }) => {
-        if (!toolContextRef.current) return {};
-        return { args: { toolContextId: toolContextRef.current } };
+      const beforeToolCall = (
+        _request: { args?: unknown },
+        _state: unknown,
+        config?: object
+      ) => {
+        const toolCallId = (config as { toolCallId?: string } | undefined)?.toolCallId;
+        const proof = toolCallId ? policyApprovalProofs.get(toolCallId) : null;
+        if (!toolContextRef.current && !proof) return {};
+        return {
+          args: {
+            ...(toolContextRef.current ? { toolContextId: toolContextRef.current } : {}),
+            ...(proof ? { toolContextId: proof.toolContextId } : {}),
+            ...(proof ? { policyApprovalId: proof.approvalId } : {})
+          }
+        };
       };
       mcpClient = new MultiServerMCPClient({
         mcpServers: Object.fromEntries(
@@ -423,6 +453,12 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
           }
           mcpToolNames.add(tool.name);
           mcpToolServers.set(tool.name, server.id);
+          const managedFacts =
+            server.mode === "managed" ? init.managedToolFacts?.[tool.name] : undefined;
+          mcpToolFacts.set(tool.name, {
+            readOnly: managedFacts?.readOnly ?? tool.metadata?.annotations?.readOnlyHint === true,
+            category: managedFacts?.category ?? server.id
+          });
           tools.push(tool);
         }
       }
@@ -473,7 +509,18 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
 
       const interruptOn = buildInterruptOn({
         approvals: init.approvals,
-        mcpToolNames: [...mcpToolNames]
+        mcpToolNames: [...mcpToolNames],
+        policy: init.policyService
+          ? {
+              tenantId: init.tenantId,
+              sessionId: init.sessionId,
+              policyService: init.policyService,
+              contextRef: policyContextRef,
+              toolServers: mcpToolServers,
+              toolFacts: mcpToolFacts,
+              proofByToolCallId: policyApprovalProofs
+            }
+          : undefined
       });
 
       // The tools cast bridges our structural LangchainToolLike view back to
@@ -511,11 +558,13 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
             | undefined;
           for (const request of value?.actionRequests ?? []) {
             if (typeof request.name !== "string") continue;
+            const policyApproval = readPolicyApprovalMarker(request.args ?? {});
             actions.push({
               interruptId: typeof interruptEntry.id === "string" ? interruptEntry.id : null,
               name: request.name,
-              args: request.args ?? {},
-              description: request.description
+              args: withoutPolicyApprovalMetadata(request.args ?? {}),
+              description: request.description,
+              ...(policyApproval ? { policyApproval } : {})
             });
           }
         }
@@ -574,7 +623,8 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
           readFileBytes: (filePath: string) => sandbox.readFileBytes(filePath),
           statFile: (filePath: string) => sandbox.statFile(filePath),
           writeFileBytes: (filePath: string, data: Uint8Array | ArrayBuffer | string) =>
-            sandbox.writeFileBytes(filePath, data)
+            sandbox.writeFileBytes(filePath, data),
+          extendSandboxTimeout: () => sandbox.extendTimeout()
         }
       : {}),
     async dispose(): Promise<void> {
@@ -596,26 +646,116 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
  * (minus read-only ones when autoApproveReadOnly) + the mutating built-ins
  * (always — write_file/edit_file exist on the StateBackend too, not just the
  * sandbox) + the read-only built-ins when the tenant disabled the read-only
- * bypass. approvalPolicy "never" → undefined (bypass, like Claude's bypass
- * mode). Entries for tools that never get called (e.g. execute without a
- * sandbox) are inert.
+ * bypass. Entries for tools that never get called (e.g. execute without a
+ * sandbox) are inert. A native `"never"` policy disables native gating, but
+ * Policy Center can still add MCP interrupts through its dynamic predicate.
  */
 export function buildInterruptOn(input: {
   approvals?: { gate: boolean; autoApproveReadOnly: boolean; readOnlyToolNames: string[] };
   mcpToolNames: string[];
-}): Record<string, { allowedDecisions: Array<"approve" | "reject"> }> | undefined {
-  const { approvals, mcpToolNames } = input;
-  if (!approvals?.gate) return undefined;
+  policy?: {
+    tenantId: string;
+    sessionId: string;
+    policyService: { evaluate: import("../policy/policy-service.js").PolicyService["evaluate"] };
+    contextRef: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["policyContextRef"]>;
+    toolServers: ReadonlyMap<string, string>;
+    toolFacts: ReadonlyMap<string, { readOnly: boolean; category: string }>;
+    proofByToolCallId: Map<string, PolicyApprovalProof>;
+  };
+}): Record<
+  string,
+  {
+    allowedDecisions: Array<"approve" | "reject">;
+    when?: (request: { toolCall: { id?: string; name: string; args: Record<string, unknown> } }) => Promise<boolean>;
+    description?: (toolCall: { args: Record<string, unknown> }) => string;
+  }
+> | undefined {
+  const { approvals, mcpToolNames, policy } = input;
+  if (!approvals?.gate && !policy) return undefined;
 
-  const readOnly = new Set(approvals.autoApproveReadOnly ? approvals.readOnlyToolNames : []);
-  const gated = [
-    ...mcpToolNames.filter((name) => !readOnly.has(name)),
-    ...MUTATING_BUILTIN_TOOLS,
-    ...(approvals.autoApproveReadOnly ? [] : READ_ONLY_BUILTIN_TOOLS)
-  ];
-  if (gated.length === 0) return undefined;
-
-  return Object.fromEntries(
-    gated.map((name) => [name, { allowedDecisions: ["approve", "reject"] as Array<"approve" | "reject"> }])
+  const readOnly = new Set(
+    approvals?.autoApproveReadOnly ? approvals.readOnlyToolNames : []
   );
+  const entries: Array<[string, {
+    allowedDecisions: Array<"approve" | "reject">;
+    when?: (request: { toolCall: { id?: string; name: string; args: Record<string, unknown> } }) => Promise<boolean>;
+    description?: (toolCall: { args: Record<string, unknown> }) => string;
+  }]> = [];
+
+  for (const name of mcpToolNames) {
+    const nativeApproval = Boolean(approvals?.gate && !readOnly.has(name));
+    if (!policy && !nativeApproval) continue;
+    if (!policy) {
+      entries.push([name, { allowedDecisions: ["approve", "reject"] }]);
+      continue;
+    }
+    entries.push([
+      name,
+      {
+        allowedDecisions: ["approve", "reject"],
+        when: async ({ toolCall }) => {
+          if (!policy) return nativeApproval;
+          const context = policy.contextRef.current;
+          // A scheduled turn has nobody available to resolve a Policy Center
+          // prompt. Let the gateway reject the action with its policy error.
+          if (context?.turnContext === "scheduled") return nativeApproval;
+          const serverId = policy.toolServers.get(toolCall.name);
+          const facts = policy.toolFacts.get(toolCall.name);
+          if (!context || !serverId || !facts) return nativeApproval;
+          const severity = deriveActionSeverity(toolCall.name, facts.readOnly);
+          const evaluation = await policy.policyService.evaluate(policy.tenantId, {
+            toolName: toolCall.name,
+            category: facts.category,
+            severity,
+            serverId,
+            turnContext: context.turnContext
+          });
+          const requiresPolicyApproval =
+            context.enforcementMode === "enforce" &&
+            evaluation.gating &&
+            evaluation.outcome === "require_approval";
+          if (!requiresPolicyApproval) return nativeApproval;
+          const toolCallId = toolCall.id;
+          if (!toolCallId) return true;
+          const checkpointedProof = readPolicyApprovalMarker(toolCall.args);
+          if (
+            checkpointedProof?.toolCallId === toolCallId &&
+            checkpointedProof.toolName === toolCall.name &&
+            checkpointedProof.serverId === serverId &&
+            checkpointedProof.argsHash === policyArgsHash(toolCall.args)
+          ) {
+            policy.proofByToolCallId.set(toolCallId, checkpointedProof);
+            return true;
+          }
+          const proof = createPolicyApprovalProof({
+            tenantId: policy.tenantId,
+            sessionId: policy.sessionId,
+            toolContextId: context.toolContextId,
+            toolCallId,
+            toolName: toolCall.name,
+            serverId,
+            args: toolCall.args,
+            ruleId: evaluation.matchedRuleId,
+            explanation: evaluation.explanation ?? "Action requires approval."
+          });
+          policy.proofByToolCallId.set(toolCallId, proof);
+          toolCall.args[POLICY_APPROVAL_MARKER_KEY] = proof;
+          return true;
+        },
+        description: (toolCall) =>
+          readPolicyApprovalMarker(toolCall.args)?.explanation ??
+          `Tool execution requires approval: ${name}`
+      }
+    ]);
+  }
+
+  if (approvals?.gate) {
+    for (const name of [
+      ...MUTATING_BUILTIN_TOOLS,
+      ...(approvals.autoApproveReadOnly ? [] : READ_ONLY_BUILTIN_TOOLS)
+    ]) {
+      entries.push([name, { allowedDecisions: ["approve", "reject"] }]);
+    }
+  }
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
