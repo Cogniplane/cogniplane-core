@@ -89,13 +89,13 @@ function findTool(deps: Parameters<typeof createSessionTools>[0], name: string) 
 
 const baseDeps: Parameters<typeof createSessionTools>[0] = {
   sessions: {
-    async getOwned() {
+    async getReadable() {
       return makeSession();
     }
   },
   messages: { async listBySession() { return { messages: [], hasMore: false }; } },
   artifacts: {
-    async getOwned() { return null; },
+    async getReadable() { return null; },
     async listBySession() { return []; },
     async findLatestReadableDerived() { return null; }
   },
@@ -111,7 +111,7 @@ const baseDeps: Parameters<typeof createSessionTools>[0] = {
 test("session_context throws when session is not found or not active", async () => {
   const deps = {
     ...baseDeps,
-    sessions: { async getOwned() { return null; } }
+    sessions: { async getReadable() { return null; } }
   };
   const tool = findTool(deps, "session_context");
   await expect(() => tool.handler({ context: ctx(), arguments: {} })).rejects.toThrow(/Session not found/);
@@ -121,7 +121,7 @@ test("session_context throws when session is deleted", async () => {
   const deps = {
     ...baseDeps,
     sessions: {
-      async getOwned() {
+      async getReadable() {
         return makeSession("deleted");
       }
     }
@@ -180,7 +180,7 @@ test("session_context: echoes the context's runtimePolicyId in the result", asyn
 test("list_artifacts throws when session not active", async () => {
   const deps = {
     ...baseDeps,
-    sessions: { async getOwned() { return null; } }
+    sessions: { async getReadable() { return null; } }
   };
   const tool = findTool(deps, "list_artifacts");
   await expect(() => tool.handler({ context: ctx(), arguments: {} })).rejects.toThrow();
@@ -250,7 +250,7 @@ test("read_text_artifact: throws when artifact belongs to a different session", 
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ sessionId: "other-session" });
       }
     }
@@ -264,7 +264,7 @@ test("read_text_artifact: throws when artifact is not in scoped set", async () =
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ artifactId: "z" });
       }
     }
@@ -282,7 +282,7 @@ test("read_text_artifact: text mime returns content directly with truncated=fals
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ artifactId: "z", mimeType: "text/plain", storageKey: "ks" });
       }
     },
@@ -312,7 +312,7 @@ test("read_text_artifact: non-text mime falls back to derived readable artifact"
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({
           artifactId: "z",
           mimeType: "application/pdf",
@@ -343,7 +343,7 @@ test("read_text_artifact: non-text mime with no derived artifact throws", async 
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ mimeType: "image/png" });
       }
     }
@@ -357,7 +357,7 @@ test("read_text_artifact: maxChars=0 falls back to default 4000 (truthy fallback
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ mimeType: "text/plain" });
       }
     },
@@ -382,7 +382,7 @@ test("read_text_artifact: caps maxChars at 20000 when given an absurd value", as
     ...baseDeps,
     artifacts: {
       ...baseDeps.artifacts,
-      async getOwned() {
+      async getReadable() {
         return makeArtifact({ mimeType: "text/plain" });
       }
     },

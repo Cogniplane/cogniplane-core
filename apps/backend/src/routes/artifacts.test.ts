@@ -64,10 +64,10 @@ function buildApp(opts: {
   const audit = new InMemoryAuditEventStore();
 
   const stores = {
-    sessions: { async getOwned() { return null; } },
+    sessions: { async getOwned() { return null; }, async getReadable() { return null; } },
     messages: { async getOwned() { return null; } },
     artifacts: {
-      async getOwned() { return null; },
+      async getReadable() { return null; },
       async create() { throw new Error("not used"); },
       async listBySession() { return []; },
       async createDownloadToken() { throw new Error("not used"); },
@@ -184,7 +184,7 @@ test("GET /downloads/:token returns 404 for a same-tenant different-user caller 
   await app.close();
 });
 
-test("GET /downloads/:token attributes an admin peer download to the actor and records the owner", async () => {
+test("GET /downloads/:token attributes an admin peer download to the actor and records the token user", async () => {
   // Admin-minted tokens carry the artifact OWNER's user_id, not the admin's.
   // role=admin sets callerIsAdmin=true, which skips the user-equality check so
   // the admin can resolve and consume the token.
@@ -205,7 +205,7 @@ test("GET /downloads/:token attributes an admin peer download to the actor and r
   expect(event?.payload).toMatchObject({
     artifactId: "artifact-1",
     actorUserId: "admin-user",
-    ownerUserId: "user-1"
+    tokenUserId: "user-1"
   });
 
   await app.close();
@@ -326,10 +326,10 @@ function buildBrowseApp(opts: {
   onListForUser?: (tenantId: string, userId: string, listOpts: Record<string, unknown>) => unknown;
 }) {
   const stores = {
-    sessions: { async getOwned() { return null; } },
+    sessions: { async getOwned() { return null; }, async getReadable() { return null; } },
     messages: { async getOwned() { return null; } },
     artifacts: {
-      async getOwned() { return null; },
+      async getReadable() { return null; },
       async create() { throw new Error("not used"); },
       async listBySession() { return []; },
       async createDownloadToken() { throw new Error("not used"); },

@@ -122,7 +122,7 @@ A "unified provider-abstraction layer" was rejected: it re-introduces the "rebui
 - Policy decisions are evaluated at the MCP gateway, after the trusted `ToolExecutionContext` is resolved and before the tool call is dispatched.
 - The tenant enforcement mode is snapshotted into the runtime policy on the tool context; no hot-path tenant-settings DB call is needed.
 - Only matched rules write `policy_decision` evidence rows. Default/no-match allows are not recorded.
-- Native runtime approvals (`approval_policy`, shell/file/permission requests) remain separate from Policy Center approvals, even though both use the same frontend event and decision route.
+- Since September 2026, native approvals and Policy Center confirmations share a checkpointed graph interrupt. The gateway still verifies the call-bound approval proof before dispatch. This supersedes the original held-response Policy Center mechanism.
 
 ---
 
@@ -140,3 +140,17 @@ A "unified provider-abstraction layer" was rejected: it re-introduces the "rebui
 - The E2B template is a dumb code-execution box (Python data stack, no agent CLIs). The sandbox is lazy: chat-only sessions never create one, and `allowCommandExecution=false` attaches no sandbox at all.
 - Checkpointer tables live in their own `deep_agents` schema with app-layer (not RLS) tenant isolation — every entry point resolves the session through the RLS-scoped `sessions` table first.
 - The provider dimension is gone end-to-end: no `runtimeProvider` tenant setting, no OPENAI_API_KEY, one `E2B_TEMPLATE_ID`. The DB was nuked and migrations re-squashed rather than carrying compat shims.
+
+## 13. AG-UI with an in-process graph
+
+The browser and scheduler consume AG-UI events emitted from the existing in-process Deep Agents graph. CopilotKit owns the chat presentation, while the backend retains session authorization, persistence, tool context and policy enforcement.
+
+The July evaluation found that the standard LangGraph bridge expected a LangGraph API server, rather than an embedded compiled graph. Adopting that server would have required moving the existing checkpointer and gateway integration. We kept the embedded graph and mapped its events to AG-UI through the agent adapter. The protocol change reduced frontend plumbing without removing the backend event mapper.
+
+Custom events carry application-specific approval, policy, PII and tool metadata. Shared schemas define their payloads. Persisted UI-resource data alone does not provide an interactive MCP Apps host; rendering and tool-action authorization remain separate concerns.
+
+## 14. Sandbox isolation applies to code execution
+
+E2B remains the per-session execution environment after retirement of the sandbox-hosted agent runtimes. The sandbox is created only when needed, and the backend synchronizes scoped files and collects generated artifacts. Model-provider credentials and the agent loop remain in the backend.
+
+The original sandbox comparison favored VM isolation for untrusted code. Its always-on agent-session capacity assumptions no longer describe the current workload. Any hosting change must preserve workspace isolation and measure cold starts, idle time, execution time and recovery behavior. Historical cloud estimates are not a deployment or purchasing decision.

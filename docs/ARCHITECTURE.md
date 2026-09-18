@@ -221,6 +221,24 @@ Effects are `allow`, `require_approval`, and `block`. Conditions have four activ
 
 ## Tenant Settings
 
+Model enablement is defined once by `isModelEnabled` in
+[shared model availability](../packages/shared-types/src/model-availability.ts).
+Both backend model filtering/turn validation and the Agent settings warning use it.
+An enabled provider and a null model allowlist permit all of that provider's models;
+an empty allowlist permits none. Credential availability is a separate check.
+The backend still enforces both restrictions for direct API calls and scheduled turns.
+
+After provider-key, availability, or custom-model changes, the frontend refreshes
+both the admin catalog and chat model query by invalidating the shared
+`queryKeys.models.all` prefix in `apps/frontend/src/lib/query-keys.ts`.
+Custom-model deletion returns updated tenant settings directly to the cache. The
+backend prunes unavailable model IDs and removes the deleted model's effort override.
+An allowlist emptied by pruning becomes null; an intentionally empty list stays empty.
+Tenant settings and integration mutations also invalidate the runtime-session cache.
+Agent settings saves refresh chat metadata because `/models` also returns
+`showEffortSelector`. These invalidations update the current browser's cache;
+backend validation still protects turns from stale data in other browsers.
+
 `tenant_settings` is one row per tenant — the single source of truth for runtime policy. The `system` tenant's row acts as the platform default; effective config merges the tenant row over the system row.
 
 Owners exclusively control `allowCommandExecution`. Admins may update the remaining Agent Settings, but unchanged copies of that owner-only field are removed from admin writes to prevent stale forms from overwriting an owner decision.
@@ -438,29 +456,11 @@ For the full security control inventory, see [SECURITY_FEATURES.md](SECURITY_FEA
 
 ## Environment
 
-Full schema with defaults is in `apps/backend/src/config.ts`. Production-relevant non-obvious knobs:
-
-```
-E2B_API_KEY                      # Required — shell/file tools execute inside E2B; boot fails fast without it
-E2B_TEMPLATE_ID                  # Deep Agents code-execution template id (docker/template.ts, `make e2b-build`)
-E2B_SANDBOX_TIMEOUT_MS           # Sandbox lifetime cap (default 30 min)
-DEEP_AGENTS_EXECUTE_TIMEOUT_MS   # Per-execute() wall-clock budget inside the sandbox (default 2 min)
-RUNTIME_TURN_TIMEOUT_MS          # Per-turn watchdog (default 20 min); must exceed APPROVAL_REQUEST_TTL_MS, stay under E2B_SANDBOX_TIMEOUT_MS
-TOOL_CONTEXT_TTL_MS              # Per-turn tool-context lifetime; validated strictly above RUNTIME_TURN_TIMEOUT_MS
-RUNTIME_GATEWAY_BASE_URL         # URL the runtime's MCP client uses to reach /mcp
-ARTIFACT_STORAGE_BACKEND=bucket  # S3-backed artifacts in production
-SKILL_BUNDLE_STORAGE_BACKEND=bucket
-SKILL_BUNDLE_BUCKET_NAME         # Reuses ARTIFACT_BUCKET_* credentials
-ANTHROPIC_API_KEY                # Platform-level Anthropic key (tenant per-provider key overrides). Peers: OPENAI_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY / ZAI_API_KEY
-PII_PROVIDER_ENABLED             # Validates the configured PII provider's API key at boot when true
-SCHEDULER_ENABLED=true
-AUTH_MODE=workos                 # Production
-WORKOS_API_KEY / WORKOS_CLIENT_ID / WORKOS_REDIRECT_URI
-JWT_SECRET                       # Refresh token signing — must differ from default in prod
-DATA_ENCRYPTION_SECRET           # Symmetric secret encryption — must differ from default in prod
-REDIS_URL                        # Required when AUTH_MODE=workos (jti revocation, rate limits)
-MIGRATION_DATABASE_URL           # Superuser DSN; bypasses RLS for migrations + checkpointer DDL only
-```
+The [backend config schema](../apps/backend/src/config.ts) defines environment
+variables, defaults, and boot validation. The [backend example](../apps/backend/.env.example)
+and [frontend example](../apps/frontend/.env.example) document local configuration.
+Model-provider labels and platform-key names come from `MODEL_PROVIDER_META` in
+[shared primitives](../packages/shared-types/src/primitives.ts).
 
 ## Historical note: retired dual-runtime architecture
 

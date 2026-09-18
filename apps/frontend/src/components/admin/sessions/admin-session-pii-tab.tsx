@@ -32,7 +32,8 @@ export function AdminSessionPiiTab(props: { piiRuns: AdminSessionDetailPiiRun[] 
             <div className="inline-block w-[calc(100%-24px)] align-top">
               <div className="flex flex-wrap items-center gap-2">
                 <strong className="text-sm font-semibold text-on-surface">
-                  {run.subjectType === "message" ? "Message" : "Artifact"} {shortId(run.subjectId)}
+                  {run.subjectType === "project_instructions" ? "Project instructions" : run.subjectType === "message" ? "Message" : "Artifact"} {shortId(run.subjectId)}
+                      {run.instructionsRevision != null ? ` · Revision ${run.instructionsRevision}` : ""}
                 </strong>
                 <span className={statusPillClass(run.status)}>{run.status}</span>
                 <span className={PILL_GRAY}>mode: {run.mode}</span>

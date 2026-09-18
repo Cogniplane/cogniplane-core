@@ -7,6 +7,8 @@ import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
+import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import type { ProjectFileStore } from "./project-file-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore } from "./session-store.js";
 import { clientSafeFailureMessage } from "./sse-writer.js";
@@ -42,6 +44,7 @@ export type SchedulerWorkerDeps = {
   sessions: Pick<SessionStore, "create">;
   messages: Pick<MessageStore, "create" | "getOwned" | "updateContent">;
   toolContexts: Pick<ToolExecutionContextStore, "create">;
+  runtimeAdapter: SchedulerRuntimeAdapter;
   resolveRuntime: (tenantId: string) => Promise<SchedulerRuntimeResolution>;
   auditEvents: Pick<AuditEventStore, "create">;
   /**
@@ -55,6 +58,11 @@ export type SchedulerWorkerDeps = {
    */
   piiScanJobs?: Pick<PiiScanJobStore, "claimDueJobs" | "sweepStaleClaims">;
   piiScanJobHandler?: Pick<PiiScanJobHandler, "execute">;
+  /** Best-effort retention sweep for project files and their stored objects. */
+  projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
+  projectFileStorage?: Pick<ArtifactStorage, "delete">;
+  sessionTrash?: Pick<SessionStore, "cleanupExpired">;
+  sessionStorage?: Pick<ArtifactStorage, "delete">;
   /**
    * Disables a job (sets enabled = FALSE) so it permanently leaves the
    * `listDueJobs` query. Used for poison jobs whose cron is invalid or which
@@ -67,6 +75,7 @@ export type SchedulerWorkerDeps = {
   logger: {
     error(payload: unknown, message: string): void;
     warn(payload: unknown, message: string): void;
+    info(payload: unknown, message: string): void;
   };
 };
 
@@ -136,6 +145,8 @@ export class SchedulerWorker {
   private interval: ReturnType<typeof setInterval> | null = null;
   private activeCount = 0;
   private activePiiCount = 0;
+  private projectCleanupInFlight = false;
+  private sessionCleanupInFlight = false;
 
   constructor(
     private readonly deps: SchedulerWorkerDeps,
@@ -163,6 +174,9 @@ export class SchedulerWorker {
 
   async tick(): Promise<void> {
     const executions: Promise<void>[] = [];
+
+    void this.cleanupExpiredProjectFiles();
+    void this.cleanupExpiredSessions();
 
     const schedulingEnabled = this.options.schedulingEnabled ?? true;
     if (schedulingEnabled) {
@@ -224,6 +238,52 @@ export class SchedulerWorker {
     await this.drainPiiScanJobs(executions);
 
     await Promise.allSettled(executions);
+  }
+
+  private async cleanupExpiredSessions(): Promise<void> {
+    if (!this.deps.sessionTrash || !this.deps.sessionStorage || this.sessionCleanupInFlight) return;
+    this.sessionCleanupInFlight = true;
+    try {
+      const result = await this.deps.sessionTrash.cleanupExpired(this.deps.sessionStorage, {
+        purgeRuntime: (input) => this.deps.runtimeAdapter.purgeSessionData(input),
+      });
+      if (result.deletedSessions || result.deletedObjects || result.purgedRuntimes) {
+        this.deps.logger.info(result, "Expired session Trash cleaned up");
+      }
+    } catch (error) {
+      this.deps.logger.error({ error }, "Expired session Trash cleanup failed; will retry");
+    } finally {
+      this.sessionCleanupInFlight = false;
+    }
+  }
+
+  private async cleanupExpiredProjectFiles(): Promise<void> {
+    if (!this.deps.projectFiles || !this.deps.projectFileStorage) {
+      return;
+    }
+    if (this.projectCleanupInFlight) {
+      return;
+    }
+    this.projectCleanupInFlight = true;
+
+    try {
+      const result = await this.deps.projectFiles.cleanupExpired(
+        this.deps.projectFileStorage,
+      );
+      if (result.deletedFiles || result.deletedObjects) {
+        this.deps.logger.info(
+          result,
+          "Expired project files cleaned up",
+        );
+      }
+    } catch (error) {
+      this.deps.logger.error(
+        { error },
+        "Expired project file cleanup failed; will retry",
+      );
+    } finally {
+      this.projectCleanupInFlight = false;
+    }
   }
 
   /**
@@ -576,6 +636,10 @@ export class SchedulerWorker {
         ttlMs: this.options.jobTimeoutMs + 60 * 1000
       });
 
+      // Scheduled turns intentionally use the organization default: they are
+      // unattended, so nobody can answer a native approval prompt. Policy
+      // Center still receives the scheduled turn context through the tool
+      // execution metadata above.
       const stream = runtime.runMessageAGUI(runtimeSession, {
         prompt,
         toolContextId: toolContext.toolContextId,
@@ -670,7 +734,7 @@ export class SchedulerWorker {
    * touched files — parked until RUNTIME_IDLE_TIMEOUT_MS, and left a LangGraph
    * thread in the `deep_agents` schema forever. A scheduled session is never
    * resumed (a new one is created next tick), so that thread is pure garbage;
-   * `purgeSessionData` is normally only called from the session DELETE route.
+   * `purgeSessionData` is normally called from session or project deletion.
    *
    * The `sessions` / `messages` rows are deliberately KEPT: `scheduled_job_runs`
    * references the session id and the run-detail UI reads the transcript. Their

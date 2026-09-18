@@ -816,6 +816,56 @@ test("MessageStore.listBySession caps the page and reports hasMore", async () =>
   expect(list[1]!.toolResults[0]!.input).toBe("in");
 });
 
+test("MessageStore.listBySession can read an uncapped transcript for project runtime state", async () => {
+  const db = new ScriptedDatabase();
+  db.scripts = [
+    {
+      match: (t) => {
+        expect(t).not.toContain("LIMIT $4");
+        return t.includes("FROM messages") && t.includes("session_titling");
+      },
+      fn: (values) => {
+        expect(values).toEqual(["t", "s", "u"]);
+        return {
+          rows: [{
+            id: 1,
+            message_id: "m-1",
+            session_id: "s",
+            user_id: "u",
+            role: "user",
+            status: "completed",
+            content_text: "first turn",
+            reasoning_content: "",
+            plan_content: "",
+            input_tokens: null,
+            cached_input_tokens: null,
+            output_tokens: null,
+            reasoning_output_tokens: null,
+            total_tokens: null,
+            model_name: null,
+            cost_usd: null,
+            feedback_rating: null,
+            detail_json: {},
+            created_at: "2026-01-01",
+            updated_at: "2026-01-01"
+          }],
+          rowCount: 1
+        };
+      }
+    },
+    {
+      match: (t) => t.includes("FROM message_tool_results"),
+      fn: () => ({ rows: [], rowCount: 0 })
+    }
+  ];
+
+  const store = new MessageStore(db as unknown as Pool);
+  const result = await store.listBySession("t", "s", "u", { limit: null });
+
+  expect(result.hasMore).toBe(false);
+  expect(result.messages.map((message) => message.messageId)).toEqual(["m-1"]);
+});
+
 test("MessageStore.updateContent returns null when no row matched", async () => {
   const db = new ScriptedDatabase();
   db.scripts = [
@@ -1145,4 +1195,14 @@ test("sweepStaleStreaming never sends a negative or fractional deadline", async 
 
   expect(params[0]?.[0]).toBe(0);
   expect(params[1]?.[0]).toBe(1_500);
+});
+
+test.each([84000, -1, NaN, Infinity])("maps duration %s to a single validated field", async (durationMs) => {
+  const store = new MessageStore(new CaptureMessageDatabase() as unknown as Pool);
+  const record = await store.create({
+    tenantId: "t", sessionId: "s", userId: "u", role: "assistant", status: "completed", content: "done",
+    detail: { durationMs, pii: { status: "scanned" } }
+  });
+  expect(record.durationMs).toBe(durationMs === 84000 ? 84000 : null);
+  expect(record.detail).toEqual({ pii: { status: "scanned" } });
 });

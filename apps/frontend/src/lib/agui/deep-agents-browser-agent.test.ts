@@ -63,11 +63,13 @@ describe("DeepAgentsBrowserAgent.requestInit", () => {
     let model = "zai/glm-4.7";
     let effort: string | null = "low";
     let artifactIds: string[] = [];
+    let projectFileIds: string[] = [];
     const agent = new ProbeAgent({
       sessionId: "s-1",
       getModel: () => model,
       getEffort: () => effort as never,
-      getArtifactIds: () => artifactIds
+      getArtifactIds: () => artifactIds,
+      getProjectFileIds: () => projectFileIds
     });
 
     expect(bodyOf(agent.buildRequestInit(runInput([{ role: "user", content: "hi" }])))).toEqual({
@@ -82,12 +84,14 @@ describe("DeepAgentsBrowserAgent.requestInit", () => {
     model = "openai/gpt-5.4";
     effort = null;
     artifactIds = ["a-1", "a-2"];
+    projectFileIds = ["file-1"];
 
     expect(bodyOf(agent.buildRequestInit(runInput([{ role: "user", content: "hi" }])))).toEqual({
       sessionId: "s-1",
       text: "hi",
       model: "openai/gpt-5.4",
-      artifactIds: ["a-1", "a-2"]
+      artifactIds: ["a-1", "a-2"],
+      projectFileIds: ["file-1"]
     });
   });
 

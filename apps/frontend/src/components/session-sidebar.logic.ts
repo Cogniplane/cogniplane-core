@@ -1,6 +1,7 @@
 import type { Session } from "@cogniplane/shared-types";
 
 export type SessionGroups = {
+  attention: Session[];
   pinned: Session[];
   today: Session[];
   earlier: Session[];
@@ -43,13 +44,18 @@ export function groupSessions(
   sessions: Session[],
   pinnedSessionIds: Set<string>,
   query: string,
-  now: Date = new Date()
+  now: Date = new Date(),
+  attentionSessionIds: ReadonlySet<string> = new Set()
 ): SessionGroups {
   const q = query.trim().toLowerCase();
   const matches = (s: Session) => !q || s.sessionName.toLowerCase().includes(q);
-  const groups: SessionGroups = { pinned: [], today: [], earlier: [], improvement: [] };
+  const groups: SessionGroups = { attention: [], pinned: [], today: [], earlier: [], improvement: [] };
   for (const session of sessions) {
     if (!matches(session)) continue;
+    if (attentionSessionIds.has(session.sessionId)) {
+      groups.attention.push(session);
+      continue;
+    }
     if (session.purpose === "skill_improvement") {
       groups.improvement.push(session);
       continue;
@@ -66,5 +72,5 @@ export function groupSessions(
 }
 
 export function totalGroupedCount(groups: SessionGroups): number {
-  return groups.pinned.length + groups.today.length + groups.earlier.length + groups.improvement.length;
+  return groups.attention.length + groups.pinned.length + groups.today.length + groups.earlier.length + groups.improvement.length;
 }

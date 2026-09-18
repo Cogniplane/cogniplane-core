@@ -27,7 +27,10 @@ export type Model = z.infer<typeof ModelSchema>;
 
 export const ModelsListResponseSchema = z.object({
   models: z.array(ModelSchema),
-  showEffortSelector: z.boolean()
+  showEffortSelector: z.boolean(),
+  // Capabilities visible to authenticated users, used by project actions
+  // that need to avoid offering a disabled managed tool.
+  enabledToolIds: z.array(z.string())
 }).passthrough();
 export type ModelsListResponse = z.infer<typeof ModelsListResponseSchema>;
 

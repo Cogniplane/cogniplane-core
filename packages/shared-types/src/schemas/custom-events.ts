@@ -6,6 +6,10 @@ import { ApprovalSchema, UiResourceSchema } from "./message.js";
 // AG-UI's CUSTOM envelope is open-ended. These are the payloads Cogniplane owns.
 export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
   z.object({
+    name: z.literal("turn_started"),
+    value: z.object({ messageId: z.string(), sequence: z.number().int().nonnegative() })
+  }),
+  z.object({
     name: z.literal("approval_required"),
     value: z.object({
       approvalId: z.string().min(1),

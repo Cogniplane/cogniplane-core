@@ -94,8 +94,9 @@ export type AdminSessionDetailApproval = z.infer<typeof AdminSessionDetailApprov
 
 export const AdminSessionDetailPiiRunSchema = z.object({
   scanRunId: z.string(),
-  subjectType: z.enum(["message", "artifact"]),
+  subjectType: z.enum(["message", "artifact", "project_instructions"]),
   subjectId: z.string(),
+  instructionsRevision: z.number().int().nonnegative().nullable().optional(),
   sourceUserId: z.string().nullable(),
   mode: z.string(),
   providerType: z.string().nullable(),

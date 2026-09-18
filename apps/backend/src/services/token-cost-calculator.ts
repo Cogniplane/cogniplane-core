@@ -196,7 +196,11 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "minimax/minimax-m3:free": {
+  "deepseek/deepseek-v4-flash-0731:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "nvidia/nemotron-3-ultra-550b-a55b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
@@ -204,17 +208,22 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "z-ai/glm-5.2:free": {
-    short: { input: 0, cachedInput: 0, output: 0 },
-    long:  null
-  },
-  // Retired free routes kept for billing history on past messages
-  // (both 404 on OpenRouter as of 2026-09-05).
+  // Retired free routes kept for billing history on past messages. As of
+  // 2026-09-18 gpt-oss-120b:free, tencent/hy3:free and minimax-m3:free 404 on
+  // OpenRouter, and glm-5.2:free no longer accepts tools.
   "openai/gpt-oss-120b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
   "tencent/hy3:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "minimax/minimax-m3:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "z-ai/glm-5.2:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },

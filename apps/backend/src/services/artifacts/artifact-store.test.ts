@@ -48,6 +48,24 @@ class CaptureDatabase {
   }
 }
 
+class GeneratedCreateDatabase extends CaptureDatabase {
+  readonly seenQueries: string[] = [];
+
+  override _query(text: string, values: unknown[] = []) {
+    this.seenQueries.push(text);
+    if (text.includes("SELECT project_id FROM sessions")) {
+      return { rows: [{ project_id: null }], rowCount: 1 };
+    }
+    if (text.includes("SELECT session_id FROM sessions s")) {
+      return { rows: [{ session_id: "session-1" }], rowCount: 1 };
+    }
+    if (text.includes("INSERT INTO artifacts")) {
+      return { rows: [artifactRow()], rowCount: 1 };
+    }
+    return super._query(text, values);
+  }
+}
+
 function artifactRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 1,
@@ -94,6 +112,29 @@ test("ArtifactStore.setPiiDetail binds the full PII detail as the JSON patch, sc
     scanRunId: "scan-123",
     findingsCount: 2
   });
+});
+
+test("ArtifactStore.createGenerated rechecks session upload access before inserting", async () => {
+  const db = new GeneratedCreateDatabase();
+  const store = new ArtifactStore(db as unknown as Pool);
+
+  const artifact = await store.createGenerated({
+    tenantId: "test-tenant",
+    artifactType: "generated",
+    sessionId: "session-1",
+    userId: "user-1",
+    artifactName: "generated.txt",
+    mimeType: "text/plain",
+    storageBackend: "local",
+    storageKey: "user-1/session-1/generated.txt",
+    fileSizeBytes: 1,
+    checksumSha256: "checksum",
+    status: "ready",
+    createdByType: "tool"
+  });
+
+  expect(artifact.artifactId).toBe("artifact-1");
+  expect(db.seenQueries.some((query) => query.includes("upload_project.archived_at IS NULL"))).toBe(true);
 });
 
 test("ArtifactStore.setPiiDetail sends only the caller's partial fields as the patch (server-side merge owns the rest)", async () => {

@@ -1,7 +1,7 @@
 import Fastify from "fastify";
 import { test, expect } from "vitest";
 
-import type { ModelProvider } from "@cogniplane/shared-types";
+import type { ModelProvider, TenantSettings } from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
@@ -47,10 +47,25 @@ const OPENROUTER_CATALOG: OpenRouterCatalogEntry[] = [
   { id: "mistralai/mistral-large-3", name: "Mistral Large 3", contextLength: null }
 ];
 
-function makeSettings(overrides: Record<string, unknown> = {}) {
+function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
   return {
-    enabledModelIds: null as string[] | null,
-    modelDefaultEfforts: {} as Record<string, string>,
+    tenantId: "admin-tenant",
+    version: 1,
+    configHash: "hash-1",
+    updatedAt: "2026-09-07T12:00:00Z",
+    enabledProviders: ["openai"],
+    enabledModelIds: null,
+    modelDefaultEfforts: {},
+    showEffortSelector: false,
+    webSearchMode: "disabled",
+    approvalPolicy: "never",
+    approvalReviewer: "user",
+    allowCommandExecution: false,
+    autoApproveReadOnlyTools: true,
+    policyEnforcementMode: "monitor",
+    developerInstructions: null,
+    enabledToolIds: [],
+    enabledMcpServerIds: [],
     ...overrides
   };
 }
@@ -83,6 +98,7 @@ async function makeApp(options: {
       },
       async updateTenantSettings(_tenantId: string, input: Record<string, unknown>) {
         settingsUpdates.push(input);
+        Object.assign(settings, input);
         return settings;
       }
     } as never,
@@ -295,6 +311,7 @@ test("DELETE /admin/custom-models removes the model and scrubs availability refe
     });
     expect(response.statusCode).toBe(200);
     expect(customModels.records.size).toBe(0);
+    expect(response.json().settings).toEqual(settings);
     expect(settingsUpdates).toEqual([
       {
         enabledModelIds: ["deepagents/claude-sonnet-5"],
@@ -308,6 +325,30 @@ test("DELETE /admin/custom-models removes the model and scrubs availability refe
       url: "/admin/custom-models?modelId=nope"
     });
     expect(missing.statusCode).toBe(404);
+  } finally {
+    await app.close();
+  }
+});
+
+
+test.each([
+  { name: "last selected model", ids: ["openrouter/moonshotai/kimi-k3"], expected: null },
+  { name: "explicit empty list", ids: [], expected: [] },
+  { name: "unrestricted list", ids: null, expected: null },
+  { name: "unrelated retired model", ids: ["openai/retired", "deepagents/claude-sonnet-5"], expected: ["deepagents/claude-sonnet-5"] },
+  { name: "deleted and retired models", ids: ["openrouter/moonshotai/kimi-k3", "openai/retired"], expected: null }
+])("DELETE normalizes $name and returns persisted settings", async ({ ids, expected }) => {
+  const { app, customModels, settingsUpdates } = await makeApp({ settings: makeSettings({ enabledModelIds: ids }) });
+  await customModels.create("admin-tenant", {
+    provider: "openrouter", vendorModelId: "moonshotai/kimi-k3", displayName: "Kimi",
+    description: "", contextWindow: 1000, createdBy: "admin-user"
+  });
+  try {
+    const response = await app.inject({ method: "DELETE", url: "/admin/custom-models?modelId=openrouter%2Fmoonshotai%2Fkimi-k3" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().settings.enabledModelIds).toEqual(expected);
+    if (ids === null || ids.length === 0) expect(settingsUpdates).toEqual([]);
+    else expect(settingsUpdates).toEqual([{ enabledModelIds: expected }]);
   } finally {
     await app.close();
   }

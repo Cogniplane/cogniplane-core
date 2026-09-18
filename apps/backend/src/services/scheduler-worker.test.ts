@@ -221,6 +221,7 @@ function createFakeDeps(options?: {
   };
 
   const deps: SchedulerWorkerDeps = {
+    runtimeAdapter,
     settings: {
       listDueJobs: async (limit: number) => dueJobs.slice(0, limit),
       claimJob: async (tenantId, jobId, nextRunAt) => {
@@ -376,7 +377,8 @@ function createFakeDeps(options?: {
     },
     logger: {
       warn: () => {},
-      error: () => {}
+      error: () => {},
+      info: () => {}
     }
   };
 

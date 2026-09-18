@@ -54,6 +54,7 @@ export type RecentActivityRow = {
   completedAt: string | null;
   subjectType: string;
   subjectId: string;
+  instructionsRevision?: number | null;
   sessionId: string | null;
   userId: string | null;
   mode: string;
@@ -364,6 +365,7 @@ export class PiiAnalyticsStore {
             completed_at,
             subject_type,
             subject_id,
+            instructions_revision,
             source_session_id,
             source_user_id,
             mode,
@@ -414,6 +416,7 @@ export class PiiAnalyticsStore {
           completedAt: isoTimestampOrNull(row.completed_at),
           subjectType: String(row.subject_type),
           subjectId: String(row.subject_id),
+          instructionsRevision: row.instructions_revision == null ? null : Number(row.instructions_revision),
           sessionId: row.source_session_id ? String(row.source_session_id) : null,
           userId: row.source_user_id ? String(row.source_user_id) : null,
           mode: String(row.mode),

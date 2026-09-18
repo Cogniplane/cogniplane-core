@@ -1,3 +1,5 @@
+import { SessionStore } from "../services/session-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { describe, expect, test } from "vitest";
 
 import { ActivationTracker } from "../services/activation-tracker.js";
@@ -27,6 +29,7 @@ describe.skipIf(!adminDatabaseUrl())("runtime activation attribution", () => {
     };
     const context = { tenantId: tenant.tenantId, sessionId: tenant.sessionId, messageId: tenant.messageId };
     const factory: DeepAgentsRuntimeFactory = () => ({
+      setApprovalSettings() {},
       async getAgentForModel() {
         return {
           async *streamEvents() {
@@ -42,6 +45,7 @@ describe.skipIf(!adminDatabaseUrl())("runtime activation attribution", () => {
       buildResumeInput() { throw new Error("No approvals in this fixture"); },
       getMcpToolNames() { return new Set(["write_artifact"]); },
       getMcpToolServers() { return new Map([["write_artifact", "artifacts"]]); },
+      async refreshCapabilities() {},
       async dispose() {}
     });
     const adapter = new DeepAgentsRuntimeAdapter(
@@ -56,6 +60,7 @@ describe.skipIf(!adminDatabaseUrl())("runtime activation attribution", () => {
       },
       createSilentLogger(),
       {
+        sessions: new SessionStore(appPool()), executions: new SessionExecutionStore(appPool()),
         approvals: new ApprovalStore(appPool()), auditEvents: new AuditEventStore(appPool()),
         activationTracker: tracker, tenantMembers: { async isUserBetaTester() { return false; } }
       },

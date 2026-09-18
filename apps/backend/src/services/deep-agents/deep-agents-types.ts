@@ -1,4 +1,4 @@
-import type { ModelProvider, PolicyEnforcementMode, PolicyTurnContext } from "@cogniplane/shared-types";
+import type { ProjectInstructionsSnapshot, ModelProvider, PolicyEnforcementMode, PolicyTurnContext } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
@@ -6,6 +6,7 @@ import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import type { SkillsLibraryFiles } from "./deep-agents-skills-library.js";
 import type { PolicyService } from "../policy/policy-service.js";
 import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
+import type { SessionExecution } from "../session-execution-store.js";
 
 /**
  * One pending HITL action extracted from a LangGraph interrupt: the tool the
@@ -40,6 +41,7 @@ export type DeepAgentsGraph = {
     config: {
       version: "v2";
       configurable: { thread_id: string };
+      context?: { projectInstructions: ProjectInstructionsSnapshot | null };
       signal?: AbortSignal;
     }
   ): AsyncIterable<Record<string, unknown>>;
@@ -52,6 +54,16 @@ export type DeepAgentsGraph = {
  * conversation survives the rebuild).
  */
 export type DeepAgentsSessionRuntime = {
+  /** Changes only the native approval gate for the next active turn. */
+  setApprovalSettings(approvals: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["approvals"]>): void | Promise<void>;
+  refreshCapabilities(input: {
+    skillsLibraryFiles: SkillsLibraryFiles;
+    mcpServers: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["mcpServers"]>;
+    approvals?: Parameters<DeepAgentsRuntimeFactory>[0]["approvals"];
+    allowCommandExecution?: boolean;
+    e2b?: DeepAgentsE2bOptions | null;
+    systemPrompt?: string | null;
+  }): Promise<void>;
   /**
    * Returns the compiled agent for `modelId` (an AVAILABLE_MODELS id, e.g.
    * "deepagents/claude-sonnet-5") at reasoning `effort`, building or rebuilding
@@ -129,6 +141,8 @@ export type DeepAgentsE2bOptions = {
 };
 
 export type DeepAgentsRuntimeFactory = (init: {
+  /** Backend-owned authorization, checked before model and tool dispatch. */
+  requireExecution?: () => Promise<void>;
   tenantId: string;
   sessionId: string;
   userId: string;
@@ -159,7 +173,7 @@ export type DeepAgentsRuntimeFactory = (init: {
    * to the agent at /skills/ via a CompositeBackend route and surfaced by the
    * native deepagents skills middleware (progressive disclosure — skills are
    * NOT inlined into the system prompt). Built by buildSkillsLibraryFiles;
-   * null/empty disables the skills middleware.
+   * An empty library exposes no skills and shadows any old /skills/ files.
    */
   skillsLibraryFiles?: SkillsLibraryFiles | null;
   /** Sandbox workspace root (e.g. /home/user/workspace/<sessionId>). */
@@ -221,6 +235,7 @@ export type DeepAgentsRuntimeFactory = (init: {
 }) => DeepAgentsSessionRuntime;
 
 export type DeepAgentsSessionState = {
+  execution?: SessionExecution;
   sessionId: string;
   tenantId: string;
   userId: string;

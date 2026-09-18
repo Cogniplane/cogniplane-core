@@ -1,12 +1,11 @@
 import type { ModelProvider } from "@cogniplane/shared-types";
-import { MODEL_PROVIDER_META } from "@cogniplane/shared-types";
+import { isModelEnabled, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 
 import { apiError, requestError } from "../../lib/http-errors.js";
 import type { ApiError } from "../../lib/http-errors.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
 import {
   effectiveDefaultEffort,
-  isModelEnabled,
   listEnabledModels
 } from "../../domain/model-availability.js";
 import type { ModelAvailabilitySettings } from "../../domain/model-availability.js";

@@ -321,11 +321,12 @@ describe("skills library wiring", () => {
     await expect(runtime.getAgentForModel("deepagents/claude-sonnet-5")).resolves.toBeTruthy();
   });
 
-  it("compiles without skills exactly as before (no composite, library default backend)", async () => {
+  it("compiles an empty read-only skills library without a sandbox", async () => {
     const runtime = makeRuntime({ skillsLibraryFiles: null });
     await expect(runtime.getAgentForModel("deepagents/claude-sonnet-5")).resolves.toBeTruthy();
   });
 });
+
 
 describe("lazy provider-key resolution", () => {
   it("throws a 400 ProviderKeyMissingError when the per-turn provider key is null", async () => {
@@ -552,6 +553,28 @@ describe("buildInterruptOn (native HITL gating map)", () => {
 });
 
 describe("MCP tool loading", () => {
+
+it("rebuilds the MCP tool list when connectors are removed and enabled again", async () => {
+  const mocks = makeMcpMocks({ docs: [{ name: "find_document" }] });
+  mcpMockState.current = mocks;
+  const servers = [{ id: "docs", mode: "proxy" as const, url: "http://gateway/mcp/docs", authorization: "Bearer test" }];
+  const runtime = makeRuntime({ mcpServers: servers });
+  try {
+    await loadVia(runtime);
+    expect([...runtime.getMcpToolNames()]).toEqual(["find_document"]);
+    await runtime.refreshCapabilities!({ skillsLibraryFiles: {}, mcpServers: [] });
+    await loadVia(runtime);
+    expect([...runtime.getMcpToolNames()]).toEqual([]);
+    expect([...runtime.getMcpToolServers()]).toEqual([]);
+    await runtime.refreshCapabilities!({ skillsLibraryFiles: {}, mcpServers: servers });
+    await loadVia(runtime);
+    expect([...runtime.getMcpToolNames()]).toEqual(["find_document"]);
+  } finally {
+    await runtime.dispose();
+    mcpMockState.current = null;
+  }
+});
+
   function makeMcpMocks(
     toolsByServer: Record<
       string,
@@ -790,4 +813,29 @@ describe("resolveModelConstruction custom-model namespace fallback", () => {
     expect(construction.provider).toBe("anthropic");
     expect(construction.initModelId).toBe("anthropic:claude-sonnet-5");
   });
+});
+
+it("enables shell after an initially disabled policy and retains the handle across toggles", async () => {
+  const runtime = makeRuntime();
+  await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+  expect(typeof lastDeepAgentConfig()!.backend).toBe("function");
+  expect(runtime.readFileBytes).toBeUndefined();
+  const next = { skillsLibraryFiles: {}, mcpServers: [] };
+  await runtime.refreshCapabilities({ ...next, allowCommandExecution: true,
+    e2b: { apiKey: "test", templateId: "test", sandboxTimeoutMs: 60000, executeTimeoutMs: 10000 } });
+  await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+  const backend = lastDeepAgentConfig()!.backend as { id: string };
+  expect(backend.id).toBeTruthy();
+  expect(runtime.readFileBytes).toBeTypeOf("function");
+  expect(lastDeepAgentConfig()!.systemPrompt).toContain("Your working directory");
+  await runtime.refreshCapabilities({ ...next, allowCommandExecution: false });
+  await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+  expect(typeof lastDeepAgentConfig()!.backend).toBe("function");
+  expect(runtime.readFileBytes).toBeUndefined();
+  expect(lastDeepAgentConfig()!.systemPrompt).toBeUndefined();
+  await runtime.refreshCapabilities({ ...next, allowCommandExecution: true });
+  await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+  expect((lastDeepAgentConfig()!.backend as { id: string }).id).toBe(backend.id);
+  expect(runtime.readFileBytes).toBeTypeOf("function");
+  await runtime.dispose();
 });

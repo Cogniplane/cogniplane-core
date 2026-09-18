@@ -8,12 +8,13 @@ import {
   MODEL_PROVIDERS,
   MODEL_PROVIDER_META,
   OpenRouterModelsResponseSchema,
-  TenantOkResponseSchema
+  TenantSettingsEnvelopeSchema
 } from "@cogniplane/shared-types";
 import type { ModelProvider } from "@cogniplane/shared-types";
 
 import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
+import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { CustomModelStore } from "../../services/custom-model-store.js";
@@ -211,17 +212,21 @@ export async function registerAdminModelRoutes(
       return reply.status(404).send(apiError("custom_model_not_found"));
     }
 
-    // Scrub availability references so the settings row doesn't accumulate
-    // stale entries (harmless at runtime, but confusing in the admin UI).
-    const settings = await stores.dynamicConfig.getOrCreateTenantSettings(tenantId);
-    const referencedInAllowlist = settings.enabledModelIds?.includes(modelId) ?? false;
-    const referencedInEfforts = Object.hasOwn(settings.modelDefaultEfforts, modelId);
-    if (referencedInAllowlist || referencedInEfforts) {
-      const { [modelId]: _removed, ...remainingEfforts } = settings.modelDefaultEfforts;
-      await stores.dynamicConfig.updateTenantSettings(tenantId, {
-        ...(referencedInAllowlist
-          ? { enabledModelIds: settings.enabledModelIds!.filter((id) => id !== modelId) }
-          : {}),
+    // Use the same catalog pruning as GET, including its empty-list policy.
+    const [current, remainingModels] = await Promise.all([
+      stores.dynamicConfig.getOrCreateTenantSettings(tenantId),
+      stores.customModels.list(tenantId)
+    ]);
+    const pruned = pruneUnknownModelIds(current, new Set([
+      ...AVAILABLE_MODELS.map((model) => model.id),
+      ...remainingModels.map((model) => model.modelId)
+    ]));
+    const referencedInEfforts = Object.hasOwn(current.modelDefaultEfforts, modelId);
+    let settings = pruned;
+    if (pruned !== current || referencedInEfforts) {
+      const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;
+      settings = await stores.dynamicConfig.updateTenantSettings(tenantId, {
+        ...(pruned !== current ? { enabledModelIds: pruned.enabledModelIds } : {}),
         ...(referencedInEfforts ? { modelDefaultEfforts: remainingEfforts } : {})
       });
     }
@@ -235,6 +240,6 @@ export async function registerAdminModelRoutes(
       userAgent: request.headers["user-agent"]
     });
 
-    return serialize(TenantOkResponseSchema, { ok: true });
+    return serialize(TenantSettingsEnvelopeSchema, { settings });
   }));
 }

@@ -60,8 +60,8 @@ async function makeApp() {
   return { app, deepAgents };
 }
 
-describe("DELETE /sessions/:sessionId durable purge", () => {
-  it("purges durable runtime data after the owner deletes", async () => {
+describe("DELETE /sessions/:sessionId recovery", () => {
+  it("keeps durable runtime data available during the recovery window", async () => {
     const { app, deepAgents } = await makeApp();
     const response = await app.inject({
       method: "DELETE",
@@ -69,11 +69,7 @@ describe("DELETE /sessions/:sessionId durable purge", () => {
       headers: { "x-tenant-id": OWNER.tenantId, "x-user-id": OWNER.userId }
     });
     expect(response.statusCode).toBe(204);
-    expect(deepAgents.purgeSessionData).toHaveBeenCalledWith({
-      tenantId: OWNER.tenantId,
-      sessionId: SESSION_ID,
-      userId: OWNER.userId
-    });
+    expect(deepAgents.purgeSessionData).not.toHaveBeenCalled();
   });
 
   it("404s a foreign tenant before any purge or abort runs (thread-ownership boundary)", async () => {

@@ -10,7 +10,7 @@ help:
 	@echo "  install              Install workspace dependencies"
 	@echo "  build                Build all workspace packages"
 	@echo "  lint                 Run ESLint across the repo"
-	@echo "  test                 Run package tests if present, then typecheck"
+	@echo "  test                 Run the root Vitest suite, then typecheck"
 	@echo "  typecheck            Run TypeScript checks across the workspace"
 	@echo "  db-up                Start local PostgreSQL with Docker Compose"
 	@echo "  db-down              Stop local PostgreSQL"
@@ -36,7 +36,7 @@ lint:
 	$(PNPM) lint
 
 test:
-	$(PNPM) -r --if-present test
+	$(PNPM) test:all
 	$(PNPM) typecheck
 
 typecheck:

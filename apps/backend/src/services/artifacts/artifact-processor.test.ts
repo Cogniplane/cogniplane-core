@@ -79,8 +79,7 @@ test("ArtifactProcessor skips non-PDF artifacts for on-demand extraction", async
   });
   const extracted = await processor.extractArtifactText({
     ...createPdfArtifact(),
-    mimeType: "text/plain",
-    artifactName: "notes.txt"
+    mimeType: "text/plain"
   });
   expect(extracted).toBe(null);
 });

@@ -45,6 +45,30 @@ const profile: ResolvedRuntimePolicy = {
   hash: "hash-profile"
 };
 
+test("session choices intersect current admin availability, including empty and stale selections", async () => {
+  const server: AdminMcpServerRecord = {
+    serverId: "docs", serverName: "Docs", description: null, mode: "proxy", routePath: "/mcp/docs",
+    transportKind: "http", upstreamUrl: "https://example.test/mcp", version: 1, configHash: "docs-hash",
+    enabled: true, isPublished: true, createdBy: "admin", createdAt: "", updatedAt: ""
+  };
+  const input = { tenantId: "tenant", isBetaTester: false, runtimePolicy: { ...profile, enabledMcpServers: ["docs"] },
+    skills: { listSkills: async () => [baseSkill] }, mcpServers: { listMcpServers: async () => [server] } };
+  const defaults = await compileRuntimeConfig(input);
+  const none = await compileRuntimeConfig({ ...input, selection: { skillIds: [], connectorIds: [] } });
+  expect(none.skills).toEqual([]);
+  expect(none.mcpServers).toEqual([]);
+  expect(none.runtimePolicy.enabledMcpServers).toEqual([]);
+  expect(none.hash).not.toBe(defaults.hash);
+  const selected = await compileRuntimeConfig({ ...input,
+    selection: { skillIds: [baseSkill.skillId, "removed"], connectorIds: ["docs", "foreign"] } });
+  expect(selected.skills.map((s) => s.id)).toEqual([baseSkill.skillId]);
+  expect(selected.mcpServers.map((s) => s.id)).toEqual(["docs"]);
+  const revoked = await compileRuntimeConfig({ ...input, runtimePolicy: profile,
+    skills: { listSkills: async () => [] }, selection: { skillIds: [baseSkill.skillId], connectorIds: ["docs"] } });
+  expect(revoked.skills).toEqual([]);
+  expect(revoked.runtimePolicy.enabledMcpServers).toEqual([]);
+});
+
 test("compileRuntimeConfig propagates associatedToolIds onto each skill", async () => {
   const bundle = await compileRuntimeConfig({
     tenantId: "tenant-1",

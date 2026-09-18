@@ -38,7 +38,7 @@ type Props = {
   onSave: (input: TenantSettingsInput) => Promise<boolean>;
   managedTools: AdminManagedTool[];
   mcpServers: AdminMcpServer[];
-  hasAnthropicTenantKey: boolean;
+  modelWarning: string | null;
   isOwner: boolean;
 };
 
@@ -121,7 +121,7 @@ export function TenantSettingsForm({
   onSave,
   managedTools,
   mcpServers,
-  hasAnthropicTenantKey,
+  modelWarning,
   isOwner
 }: Props) {
   const [draft, setDraft] = useState<FormDraft>(() => buildDraft(settings));
@@ -213,7 +213,7 @@ export function TenantSettingsForm({
           <RuntimeSection
             draft={draft}
             updateDraft={updateDraft}
-            hasAnthropicTenantKey={hasAnthropicTenantKey}
+            modelWarning={modelWarning}
           />
 
           <div className="border-t border-outline-variant" />
@@ -258,25 +258,22 @@ export function TenantSettingsForm({
 function RuntimeSection(props: {
   draft: FormDraft;
   updateDraft: UpdateDraft;
-  hasAnthropicTenantKey: boolean;
+  modelWarning: string | null;
 }) {
-  const { draft, updateDraft, hasAnthropicTenantKey } = props;
+  const { draft, updateDraft, modelWarning } = props;
 
   return (
     <div className="flex flex-col gap-3">
       <div>
         <p className={FORM_SECTION_LABEL}>Runtime</p>
         <p className="mt-1 text-xs text-on-surface-faint">
-          All sessions run on the Deep Agents runtime (Anthropic models). The API key is
-          configured in Organization settings.
+          All sessions run on the Deep Agents runtime. Manage model providers and API keys
+          in Organization settings.
         </p>
       </div>
 
-      {!hasAnthropicTenantKey ? (
-        <p className="text-sm text-danger">
-          No Anthropic API key is configured — agent turns will fail. Add one in Organization
-          settings.
-        </p>
+      {modelWarning ? (
+        <p role="alert" className="text-sm text-danger">{modelWarning}</p>
       ) : null}
 
       <CheckboxRow

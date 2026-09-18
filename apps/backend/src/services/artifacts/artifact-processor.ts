@@ -31,7 +31,7 @@ export class ArtifactProcessor {
     }
   ) {}
 
-  async extractArtifactText(artifact: ArtifactRecord): Promise<string | null> {
+  async extractArtifactText(artifact: Pick<ArtifactRecord, "mimeType" | "status" | "storageKey">): Promise<string | null> {
     if (
       artifact.mimeType !== "application/pdf" ||
       artifact.status === "deleted" ||

@@ -325,10 +325,11 @@ export async function createCustomModel(input: CustomModelCreateRequest): Promis
   return parseResponse(CustomModelEnvelopeSchema, raw, "POST /admin/custom-models").model;
 }
 
-export async function deleteCustomModel(modelId: string): Promise<void> {
-  await request<unknown>(`/admin/custom-models?modelId=${encodeURIComponent(modelId)}`, {
+export async function deleteCustomModel(modelId: string): Promise<TenantSettings> {
+  const raw = await request<unknown>(`/admin/custom-models?modelId=${encodeURIComponent(modelId)}`, {
     method: "DELETE"
   });
+  return parseResponse(TenantSettingsEnvelopeSchema, raw, "DELETE /admin/custom-models").settings;
 }
 
 /**

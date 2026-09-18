@@ -8,6 +8,12 @@
 export const MIME_CLASSES = ["image", "pdf", "text", "code", "other"] as const;
 export type MimeClass = (typeof MIME_CLASSES)[number];
 
+/** Whether an artifact can safely be loaded as text by agent-facing tools. */
+export function isTextReadableArtifact(mimeType: string): boolean {
+  const mime = mimeType.toLowerCase().split(";")[0]?.trim() ?? "";
+  return mime.startsWith("text/") || mime === "application/json";
+}
+
 // MIME types we treat as "code" (syntax-highlighted) rather than plain "text".
 // Kept narrow and explicit; everything else under `text/*` falls to "text".
 const CODE_MIME_TYPES = new Set([

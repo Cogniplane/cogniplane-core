@@ -1,10 +1,32 @@
 import type {
+  AdminModelCatalogResponse,
   ApprovalPolicy,
   GranularApprovalPolicy,
   PolicyEnforcementMode,
   TenantSettings,
   WebSearchMode
 } from "@cogniplane/shared-types";
+import { isModelEnabled } from "@cogniplane/shared-types";
+
+export function modelAvailabilityWarning(
+  modelId: string,
+  catalog: AdminModelCatalogResponse,
+  settings: Pick<TenantSettings, "enabledProviders" | "enabledModelIds">
+): string | null {
+  const model = catalog.models.find((entry) => entry.id === modelId);
+  if (!model) {
+    return "Your selected chat model is no longer available. Choose another model in chat.";
+  }
+  if (!isModelEnabled(model, settings)) {
+    return `${model.displayName} is disabled for this organization. Choose another model in chat or enable it in Organization settings.`;
+  }
+
+  // /admin/models always returns every provider, so a miss here is not a state
+  // worth a message of its own — treat it as "nothing to warn about".
+  const provider = catalog.providers.find((entry) => entry.id === model.provider);
+  if (!provider || provider.keySource !== "none") return null;
+  return `No ${provider.label} API key is configured for your selected chat model, ${model.displayName}. Add one in Organization settings or choose another model in chat.`;
+}
 
 export type ApprovalPolicyKind = "never" | "on-request" | "granular";
 

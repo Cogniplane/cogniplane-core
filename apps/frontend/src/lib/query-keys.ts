@@ -1,4 +1,10 @@
 export const queryKeys = {
+  projects: {
+    all: ["projects"] as const,
+    list: () => [...queryKeys.projects.all, "list"] as const,
+    library: (projectId: string) => ["projects", projectId, "library"] as const,
+    instructionsStatus: (projectId: string) => ["projects", projectId, "instructions-status"] as const
+  },
   admin: {
     all: ["admin"] as const,
     skills: () => [...queryKeys.admin.all, "skills"] as const,
@@ -9,7 +15,6 @@ export const queryKeys = {
     managedTools: () => [...queryKeys.admin.all, "managed-tools"] as const,
     tenant: () => [...queryKeys.admin.all, "tenant"] as const,
     tenantSettings: () => [...queryKeys.admin.all, "tenant-settings"] as const,
-    modelCatalog: () => [...queryKeys.admin.all, "model-catalog"] as const,
     openRouterModels: () => [...queryKeys.admin.all, "openrouter-models"] as const,
     users: () => [...queryKeys.admin.all, "users"] as const,
     runtimeSessions: () => [...queryKeys.admin.all, "runtime", "sessions"] as const,
@@ -67,6 +72,7 @@ export const queryKeys = {
   },
   sessions: {
     all: ["sessions"] as const,
+    archived: () => [...queryKeys.sessions.all, "archived"] as const,
     list: (scope?: string) =>
       scope ? ([...queryKeys.sessions.all, "list", scope] as const) : ([...queryKeys.sessions.all, "list"] as const),
     detail: (sessionId: string) => [...queryKeys.sessions.all, "detail", sessionId] as const,
@@ -85,9 +91,13 @@ export const queryKeys = {
       [...queryKeys.microsoft.all, "browse", location] as const,
     search: (query: string) => [...queryKeys.microsoft.all, "search", query] as const
   },
+  // Everything derived from the tenant's model availability shares this prefix,
+  // so one invalidateQueries({ queryKey: queryKeys.models.all }) refreshes the
+  // chat catalog and the admin key-source view together.
   models: {
     all: ["models"] as const,
-    list: () => [...queryKeys.models.all, "list"] as const
+    list: () => [...queryKeys.models.all, "list"] as const,
+    adminCatalog: () => [...queryKeys.models.all, "admin-catalog"] as const
   },
   artifacts: {
     all: ["artifacts"] as const,

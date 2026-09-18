@@ -50,6 +50,7 @@ export type {
 } from "./admin-config-records.js";
 
 type DynamicConfigStores = {
+  sessions?: Pick<import("./session-store.js").SessionStore, "getCapabilitySelection">;
   skills: Pick<
     SkillConfigStore,
     "listSkills" | "disableSkill" | "getSkillOwnerTenantId" | "setSkillPublished"
@@ -136,10 +137,7 @@ export class DynamicConfigService {
   async compileRuntimeConfig(
     tenantId: string,
     isBetaTester: boolean,
-    // Retained for call-site compatibility (the session id is still threaded
-    // through by the runtime adapter) but no longer narrows the config — the
-    // per-session override path was retired with the skill-improvement flow.
-    _sessionId?: string | null
+    session?: { sessionId: string; userId: string }
   ): Promise<RuntimeConfigBundle> {
     const runtimePolicy = await this.getRuntimePolicy(tenantId);
     return compileRuntimeConfigBundle({
@@ -147,7 +145,10 @@ export class DynamicConfigService {
       skills: this.stores.skills,
       mcpServers: this.stores.mcpServers,
       runtimePolicy,
-      isBetaTester
+      isBetaTester,
+      selection: session && this.stores.sessions
+        ? await this.stores.sessions.getCapabilitySelection(tenantId, session.sessionId, session.userId)
+        : null
     });
   }
 

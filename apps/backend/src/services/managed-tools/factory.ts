@@ -10,6 +10,8 @@ import type { MessageStore } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import type { SessionStore } from "../session-store.js";
 import type { ManagedToolDefinition } from "./types.js";
+import type { ProjectFileStore } from "../project-file-store.js";
+import type { RequestLimitsInterface } from "../request-limits.js";
 
 // Shared deps bag every managed-tool factory may consume. Each factory only
 // reads the slots it needs. Integration-specific dependencies (e.g. the
@@ -20,11 +22,11 @@ import type { ManagedToolDefinition } from "./types.js";
 export type ManagedToolFactoryDeps = {
   db: Pool;
   dynamicConfig: Pick<DynamicConfigService, "listSkills">;
-  sessions: Pick<SessionStore, "getOwned">;
+  sessions: Pick<SessionStore, "getReadable">;
   messages: Pick<MessageStore, "listBySession">;
   memories: Pick<MemoryStore, "search" | "save" | "remove">;
-  artifacts: Pick<ArtifactStore, "create" | "getOwned" | "listBySession" | "findLatestReadableDerived">;
-  storage: Pick<ArtifactStorage, "put" | "openReadStream">;
+  artifacts: Pick<ArtifactStore, "create" | "createGenerated" | "getReadable" | "listBySession" | "findLatestReadableDerived">;
+  storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
   auditEvents: Pick<AuditEventStore, "create">;
   githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
   notionConnections: Pick<NotionConnectionService, "getRuntimeCredentials">;
@@ -37,12 +39,16 @@ export type ManagedToolFactoryDeps = {
     runtimeId: string,
     filePath: string
   ) => Promise<{ sizeBytes: number }>;
+  /** Shared artifact/project-file size cap, sourced from ARTIFACT_MAX_UPLOAD_BYTES. */
+  artifactMaxBytes: number;
+  limits: Pick<RequestLimitsInterface, "consumeRateLimit" | "refundRateLimit">;
   writeRuntimeFile?: (
     sessionId: string,
     runtimeId: string,
     filePath: string,
     data: Uint8Array | ArrayBuffer | string
   ) => Promise<string>;
+  projectFiles?: Pick<ProjectFileStore, "readRuntimeSnapshotFile" | "createAgentDraftFromContent" | "readConflictContext" | "readConflictMetadata">;
 };
 
 export type ManagedToolFactory = (deps: ManagedToolFactoryDeps) => ManagedToolDefinition[];

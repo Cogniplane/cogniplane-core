@@ -10,6 +10,7 @@ import type {
 } from "./admin-config-records.js";
 import type { McpServerStore } from "./mcp-server-store.js";
 import type { SkillConfigStore } from "./skills/skill-config-store.js";
+import type { SessionCapabilitySelection } from "@cogniplane/shared-types";
 
 export function normalizeMcpServer(
   record: AdminMcpServerRecord
@@ -51,6 +52,7 @@ export async function compileRuntimeConfig(input: {
   mcpServers: Pick<McpServerStore, "listMcpServers">;
   runtimePolicy: ResolvedRuntimePolicy;
   isBetaTester: boolean;
+  selection?: SessionCapabilitySelection | null;
 }): Promise<RuntimeConfigBundle> {
   const isBetaTester = input.isBetaTester;
   const profile = input.runtimePolicy;
@@ -60,10 +62,13 @@ export async function compileRuntimeConfig(input: {
     input.mcpServers.listMcpServers(input.tenantId, false, isBetaTester)
   ]);
 
-  const enabledSkills = allSkills.map((skill) => normalizeSkill(skill));
+  const enabledSkills = allSkills
+    .filter((skill) => !input.selection || input.selection.skillIds.includes(skill.skillId))
+    .map((skill) => normalizeSkill(skill));
   const enabledMcpServerIds = new Set<string>();
   const enabledMcpServers = allMcpServers.flatMap((server) => {
-    if (!profile.enabledMcpServers.includes(server.serverId) || enabledMcpServerIds.has(server.serverId)) {
+    if (!profile.enabledMcpServers.includes(server.serverId) || enabledMcpServerIds.has(server.serverId) ||
+        (input.selection && !input.selection.connectorIds.includes(server.serverId))) {
       return [];
     }
 

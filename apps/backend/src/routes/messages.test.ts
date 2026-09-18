@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
@@ -69,8 +69,13 @@ function makeStores(
   };
 
   const stores = {
+    executions: {
+      acquire: vi.fn(async (actor: { tenantId: string; sessionId: string; userId: string }) => ({ ...actor, executionId: "execution-test", projectId: "project-1", expiresAt: new Date(Date.now() + 30_000).toISOString() })),
+      heartbeat: vi.fn(async () => true),
+      release: vi.fn(async () => {}),
+    },
     sessions: {
-      async getOwned() {
+      async getReadable() {
         return { sessionId: "session-1", sessionName: "Existing session", status: "active" };
       }
     },
@@ -148,6 +153,8 @@ async function buildApp(
   const app = Fastify();
   app.decorate("config", {
     API_ORIGIN: "http://localhost:3000",
+    SESSION_EXECUTION_LEASE_MS: 30_000,
+    SESSION_EXECUTION_HEARTBEAT_MS: 5_000,
     ...configOverrides
   } as never);
   app.addHook("preHandler", async (request) => {
@@ -334,4 +341,222 @@ test("POST /messages dispatches AG-UI, persists the user turn, and releases the 
 
   // The route releases the reserved slot after the turn.
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+});
+
+
+test("a stale runtime failure releases the route reservation and allows the next turn", async () => {
+  let rejectTurn = true;
+  const failureMessage = "Runtime session is no longer current. Start a new turn.";
+  const harness = makeStores({ gateRuntime: async () => {
+    expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(true);
+    if (rejectTurn) throw Object.assign(new Error(failureMessage), { statusCode: 409 });
+  } });
+  const persist = vi.spyOn(harness.stores.messages, "updateContent");
+  const app = await buildApp(harness.stores);
+  activeApp = app;
+  const request = { method: "POST" as const, url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "hello" } };
+  const response = await app.inject(request);
+  expect(response.statusCode).toBe(200);
+  const frames = response.body.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as BaseEvent);
+  expect(frames.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: failureMessage });
+  expect(persist).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.any(String),
+    "error", failureMessage, expect.any(Number));
+  expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+
+  rejectTurn = false;
+  const next = await app.inject(request);
+  expect(next.statusCode).toBe(200);
+  expect(next.body).toContain('"type":"RUN_FINISHED"');
+  expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+});
+
+test("rejects a session archived between model resolution and turn reservation", async () => {
+  const harness = makeStores();
+  const getReadable = vi.spyOn(harness.stores.sessions, "getReadable");
+  const original = await harness.stores.sessions.getReadable("tenant", SESSION_ID, "user");
+  getReadable.mockClear();
+  getReadable.mockResolvedValueOnce(original).mockResolvedValueOnce({ ...original!, status: "archived" });
+  const app = await buildApp(harness.stores);
+  activeApp = app;
+  const response = await app.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "too late" } });
+  expect(response.statusCode).toBe(404);
+  expect(harness.createdMessages).toEqual([]);
+  expect(harness.consumedQuota).toEqual([]);
+  expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+});
+
+test("capability mutations block new turns without reporting streaming activity", async () => {
+  const harness = makeStores();
+  const app = await buildApp(harness.stores);
+  activeApp = app;
+  const release = harness.activeTurns.reserveMutation(SESSION_ID)!;
+  try {
+    const response = await app.inject({ method: "POST", url: "/messages",
+      payload: { sessionId: SESSION_ID, text: "during capability save" } });
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toEqual({ error: "session_busy" });
+    expect(harness.activeTurns.snapshot().size).toBe(0);
+    expect(harness.createdMessages).toHaveLength(0);
+    expect(harness.consumedQuota).toHaveLength(0);
+  } finally { release(); }
+});
+
+test("records the resolved project revision and sends the same snapshot to the runtime", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
+    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  const snapshot = { projectId: "project-1", instructions: "Write in French", instructionsRevision: 2 };
+  h.stores.projects = { getReadable: vi.fn().mockResolvedValue(snapshot) };
+  const create = vi.spyOn(h.stores.messages, "create");
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  const response = await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Draft it" } });
+  expect(response.statusCode).toBe(200);
+  const expected = { projectId: "project-1", instructions: "Write in French", revision: 2 };
+  expect(create).toHaveBeenCalledWith(expect.objectContaining({ role: "assistant", detail: { projectInstructions: expected } }));
+  expect(run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ prompt: "Draft it", projectInstructions: expected }));
+  expect(h.stores.projects.getReadable).toHaveBeenCalledWith("test-tenant", "platform-user", "project-1");
+});
+
+test("captures selected project files even when project tools are disabled in tenant settings", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.dynamicConfig.getOrCreateTenantSettings = vi.fn().mockResolvedValue({
+    enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
+    enabledModelIds: null,
+    modelDefaultEfforts: {},
+    enabledToolIds: []
+  });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({
+    sessionId: SESSION_ID,
+    sessionName: "Proposal",
+    status: "active",
+    projectId: "project-1"
+  });
+  h.stores.projects = {
+    getReadable: vi.fn().mockResolvedValue({
+      projectId: "project-1",
+      instructions: "",
+      instructionsRevision: 1
+    })
+  };
+  const captureRuntimeSnapshot = vi.fn().mockResolvedValue({
+    projectId: "project-1",
+    capturedAt: "2026-09-16T00:00:00.000Z",
+    truncated: false,
+    files: []
+  });
+  h.stores.projectFiles = { captureRuntimeSnapshot };
+  activeApp = await buildApp(h.stores);
+
+  const response = await activeApp.inject({
+    method: "POST",
+    url: "/messages",
+    payload: {
+      sessionId: SESSION_ID,
+      text: "Use the selected project file",
+      projectFileIds: ["4b6f7a7a-8a0a-4b64-9bd2-1d2f0c2dd4c1"]
+    }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(captureRuntimeSnapshot).toHaveBeenCalledWith(
+    { tenantId: "test-tenant", userId: "platform-user", projectId: "project-1" },
+    ["4b6f7a7a-8a0a-4b64-9bd2-1d2f0c2dd4c1"]
+  );
+});
+
+test("returns 503 when tenant settings are unavailable during model resolution", async () => {
+  const h = makeStores();
+  h.stores.dynamicConfig.getOrCreateTenantSettings = vi.fn().mockRejectedValue(new Error("postgres unreachable"));
+  activeApp = await buildApp(h.stores);
+
+  const response = await activeApp.inject({
+    method: "POST",
+    url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "Retry this later" }
+  });
+
+  expect(response.statusCode).toBe(503);
+});
+
+test("blocks project instructions before consuming quota or starting the runtime", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
+    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Sensitive instructions", instructionsRevision: 1 }) };
+  h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "block", findings: [], blockReason: "Sensitive" }) };
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  const response = await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Draft it" } });
+  expect(response.statusCode).toBe(422);
+  expect(response.json().error).toBe("project_instructions_blocked");
+  expect(h.consumedQuota).toHaveLength(0);
+  expect(run).not.toHaveBeenCalled();
+  expect(h.activeTurns.isBusy(SESSION_ID)).toBe(false);
+});
+
+test("uses PII-transformed instructions in both the saved snapshot and model input", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
+    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Private name", instructionsRevision: 1 }) };
+  h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "transform", findings: [], transformedText: "[PERSON]" }) };
+  const scan = vi.fn().mockResolvedValue({ scanRunId: "instruction-scan" });
+  const audit = vi.fn().mockResolvedValue(undefined);
+  h.stores.piiScanRuns = { create: scan };
+  h.stores.auditEvents = { create: audit };
+  const create = vi.spyOn(h.stores.messages, "create");
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  expect((await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Draft it" } })).statusCode).toBe(200);
+  expect(scan).toHaveBeenCalledWith(expect.objectContaining({ subjectType: "project_instructions",
+    subjectId: "project-1", instructionsRevision: 1, sourceSessionId: SESSION_ID }));
+  expect(audit).toHaveBeenCalledWith(expect.objectContaining({ type: "pii_transformed", payload: expect.objectContaining({
+    subjectType: "project_instructions", projectId: "project-1", instructionsRevision: 1
+  }) }));
+  expect(create).toHaveBeenCalledWith(expect.objectContaining({ role: "assistant", detail: {
+    projectInstructions: { projectId: "project-1", revision: 1, instructions: "[PERSON]" }
+  } }));
+  expect(run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ projectInstructions: expect.objectContaining({ instructions: "[PERSON]" }) }));
+});
+
+
+test("lost execution releases admission even when runtime abort and streaming are stalled", async () => {
+  let start!: () => void;
+  const started = new Promise<void>(resolve => { start = resolve; });
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  let finishAbort!: () => void;
+  const abortGate = new Promise<void>(resolve => { finishAbort = resolve; });
+  const h = makeStores({ gateRuntime: async () => { start(); await gate; } });
+  const original = await h.stores.sessions.getReadable("tenant", SESSION_ID, "user");
+  vi.spyOn(h.stores.sessions, "getReadable").mockResolvedValue({ ...original!, projectId: "project-1" });
+  h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "", instructionsRevision: 0 }) };
+  const renew = vi.mocked(h.stores.executions.heartbeat).mockResolvedValue(false);
+  const abort = vi.fn(() => abortGate);
+  h.stores.runtimeAdapter.abortSession = abort;
+  activeApp = await buildApp(h.stores);
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+  const response = activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Hello" } }).then(result => result);
+  try {
+    await started;
+    expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
+    expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+    expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(renew).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+  } finally {
+    finish();
+    finishAbort();
+    vi.useRealTimers();
+    await response;
+  }
+  expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
 });

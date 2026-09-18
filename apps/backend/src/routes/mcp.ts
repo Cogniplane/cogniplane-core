@@ -74,6 +74,7 @@ export function buildMcpRouteStores(
   deps: AppDependencies,
   extras: {
     runtimeTokenSecret: string;
+    artifactMaxBytes: number;
     readRuntimeFile: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
     statRuntimeFile: (
       sessionId: string,
@@ -108,6 +109,9 @@ export function buildMcpRouteStores(
     readRuntimeFile: extras.readRuntimeFile,
     statRuntimeFile: extras.statRuntimeFile,
     writeRuntimeFile: extras.writeRuntimeFile,
+    projectFiles: deps.projectFiles,
+    artifactMaxBytes: extras.artifactMaxBytes,
+    limits: deps.limits,
     runtimeTokenSecret: extras.runtimeTokenSecret,
     proxyToolMetadataCache: deps.proxyToolMetadataCache,
     activationTracker: deps.activationTracker
@@ -141,7 +145,10 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     piiProtection: stores.piiProtection,
     readRuntimeFile: stores.readRuntimeFile,
     statRuntimeFile: stores.statRuntimeFile,
-    writeRuntimeFile: stores.writeRuntimeFile
+    writeRuntimeFile: stores.writeRuntimeFile,
+    projectFiles: stores.projectFiles,
+    artifactMaxBytes: app.config.ARTIFACT_MAX_UPLOAD_BYTES,
+    limits: stores.limits
   });
 
   // Streamable HTTP transport clients may open a GET
@@ -609,7 +616,8 @@ async function recordToolCallTelemetry(input: {
  * another user's or session's context id into a tool call — for proxy mode that
  * means the gateway would sign identity headers for the substituted identity.
  * We therefore assert that the resolved context belongs to the runtime token's
- * sid + uid. Path 3 is inherently bound: it looks up by the token's sid.
+ * tenant, session, user and runtime ID on all three paths. Session fallback may
+ * return a newer participant's context and requires the same checks.
  *
  * The claims are always present: the POST /mcp/:serverId handler rejects any
  * request that did not authenticate with a valid rt_* token before this
@@ -662,6 +670,9 @@ async function handleManagedToolCall(
   try {
     const runtimePolicy = requireMcpServerAllowed(serverId, context);
     requireManagedToolAllowed(tool.name, runtimePolicy);
+    if (isProjectToolUnavailableInTurn(tool, context)) {
+      throw new ToolCallError("Project tools are only available during interactive project turns.");
+    }
     // Native approval for managed tool calls is NOT enforced here. The
     // deep-agents HITL interceptor gates every tool call (including MCP)
     // in-process before the HTTP request is made, where
@@ -725,6 +736,13 @@ async function handleManagedToolCall(
   }
 }
 
+function isProjectToolUnavailableInTurn(
+  tool: ManagedToolDefinition,
+  context: Pick<ToolExecutionContext, "metadata">
+): boolean {
+  return tool.category === "project" && context.metadata.turnContext === "scheduled";
+}
+
 async function getVisibleManagedTools(input: {
   tenantId: string;
   serverId: string;
@@ -750,7 +768,8 @@ async function getVisibleManagedTools(input: {
   }
 
   return input.managedTools.filter((tool) =>
-    runtimePolicy.enabledToolIds.includes(tool.name)
+    runtimePolicy.enabledToolIds.includes(tool.name) &&
+    !isProjectToolUnavailableInTurn(tool, context)
   );
 }
 

@@ -1,9 +1,11 @@
-import { extname } from "node:path";
+import { canBrowseSessionContent } from "../services/session-access.js";
 import { Readable } from "node:stream";
 import { z } from "zod";
 import { ArtifactListQuerySchema } from "@cogniplane/shared-types";
-import { uuidv7 } from "../lib/uuid.js";
+import { buildArtifactStorageKey } from "../services/artifacts/artifact-storage-key.js";
 import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
+import { ProjectAccessError } from "../services/project-access.js";
+import { SessionUploadAccessError } from "../services/session-upload-access.js";
 
 import type { FastifyInstance } from "fastify";
 
@@ -48,16 +50,6 @@ function getUploadFields(
   return values;
 }
 
-function buildStorageKey(input: {
-  userId: string;
-  sessionId: string;
-  artifactName: string;
-}): string {
-  const extension = extname(input.artifactName).slice(0, 32);
-  const safeExtension = extension.replace(/[^a-zA-Z0-9._-]/g, "");
-  return `${input.userId}/${input.sessionId}/${uuidv7()}${safeExtension}`;
-}
-
 function contentDispositionFileName(fileName: string): string {
   const sanitized = fileName.replace(/["\\\r\n;]/g, "_");
   const encoded = encodeURIComponent(fileName);
@@ -77,19 +69,20 @@ export function buildArtifactRouteStores(deps: AppDependencies) {
 }
 
 export type ArtifactRouteStores = {
-  sessions: Pick<SessionStore, "getOwned">;
+  sessions: Pick<SessionStore, "requireUploadAccess" | "getReadable">;
   artifacts: Pick<
     ArtifactStore,
     | "listForUser"
     | "listBySession"
-    | "create"
-    | "getOwned"
+    | "createUpload"
+    | "update"
+    | "getReadable"
     | "createDownloadToken"
     | "peekDownloadToken"
     | "consumeDownloadToken"
   >;
   auditEvents: Pick<AuditEventStore, "create">;
-  storage: Pick<ArtifactStorage, "put" | "openReadStream">;
+  storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
   processor: Pick<ArtifactProcessor, "extractArtifactText">;
   piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "enqueue">;
   limits: Pick<RequestLimitsInterface, "consumeRateLimit">;
@@ -139,12 +132,13 @@ export async function registerArtifactRoutes(
 
     const { userId, tenantId } = request.auth;
     const { sessionId } = paramsResult.value;
-    const session = await stores.sessions.getOwned(tenantId, sessionId, userId);
-    if (!session || session.status !== "active") {
+    const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
+    if (!session || !canBrowseSessionContent(session)) {
       reply.code(404);
       return notFoundError("session_not_found");
     }
 
+    reply.header("cache-control", "private, no-store");
     return {
       session,
       artifacts: (await stores.artifacts.listBySession(tenantId, sessionId, userId)).filter(
@@ -153,7 +147,13 @@ export async function registerArtifactRoutes(
     };
   });
 
-  app.post("/artifacts", async (request, reply) => {
+  app.post("/artifacts", {
+    errorHandler(error, _request, reply) {
+      if (error instanceof ProjectAccessError || error instanceof SessionUploadAccessError)
+        return reply.code(error.status).send(apiError(error.code, error.message));
+      throw error;
+    },
+  }, async (request, reply) => {
     const { userId, tenantId } = request.auth;
 
     // Throttle BEFORE buffering the upload so an abusive client can't burn
@@ -235,15 +235,11 @@ export async function registerArtifactRoutes(
     }
 
     const fields = fieldsResult.value;
-    const session = await stores.sessions.getOwned(tenantId, fields.sessionId, userId);
-    if (!session || session.status !== "active") {
-      reply.code(404);
-      return notFoundError("session_not_found");
-    }
+    const expectedProjectId = await stores.sessions.requireUploadAccess(tenantId, fields.sessionId, userId);
 
     const artifactName = fields.name ?? file.filename ?? "upload.bin";
     const stored = await stores.storage.put({
-      storageKey: buildStorageKey({
+      storageKey: buildArtifactStorageKey({
         userId,
         sessionId: fields.sessionId,
         artifactName
@@ -251,24 +247,35 @@ export async function registerArtifactRoutes(
       stream: Readable.from([buffer])
     });
 
-    const artifact = await stores.artifacts.create({
-      tenantId,
-      artifactType: "upload",
-      sessionId: fields.sessionId,
-      userId,
-      artifactName,
-      mimeType: file.mimetype,
-      storageBackend: stored.storageBackend,
-      storageKey: stored.storageKey,
-      fileSizeBytes: stored.fileSizeBytes,
-      checksumSha256: stored.checksumSha256,
-      status: "ready",
-      createdByType: "user",
-      detail: {
-        fieldName: file.fieldname,
-        encoding: file.encoding
+    let artifact;
+    try {
+      artifact = await stores.artifacts.createUpload({
+        expectedProjectId,
+        tenantId,
+        sessionId: fields.sessionId,
+        userId,
+        artifactName,
+        mimeType: file.mimetype,
+        storageBackend: stored.storageBackend,
+        storageKey: stored.storageKey,
+        fileSizeBytes: stored.fileSizeBytes,
+        checksumSha256: stored.checksumSha256,
+        detail: {
+          fieldName: file.fieldname,
+          encoding: file.encoding
+        }
+      });
+    } catch (error) {
+      // Access and lifecycle are rechecked in the insert transaction after I/O.
+      // Preserve the actionable request error if object cleanup also fails.
+      try {
+        await stores.storage.delete(stored.storageKey);
+      } catch (cleanupError) {
+        request.log.error({ err: cleanupError, tenantId, sessionId: fields.sessionId, storageKey: stored.storageKey },
+          "Failed to delete rejected artifact upload");
       }
-    });
+      throw error;
+    }
 
     await stores.auditEvents.create({
       tenantId,
@@ -309,10 +316,20 @@ export async function registerArtifactRoutes(
         reply.code(isClientError ? 422 : 503);
         return apiError(scanResult.errorCode, scanResult.errorMessage);
       }
+      if (scanResult.kind === "skipped" || scanResult.kind === "allowed") {
+        await stores.artifacts.update(tenantId, artifact.artifactId, { status: "ready" });
+      }
+    } else {
+      await stores.artifacts.update(tenantId, artifact.artifactId, { status: "ready" });
     }
 
+    // Return the persisted PII state, and do not return a stale response if the
+    // uploader lost project access while a synchronous scan was running.
+    const current = await stores.artifacts.getReadable(tenantId, artifact.artifactId, userId);
+    if (!current) return reply.code(404).send(notFoundError("artifact_not_found"));
     reply.code(201);
-    return { artifact };
+    reply.header("cache-control", "private, no-store");
+    return { artifact: current };
   });
 
   app.post("/artifacts/:artifactId/download-token", async (request, reply) => {
@@ -322,8 +339,8 @@ export async function registerArtifactRoutes(
     }
 
     const { userId, tenantId } = request.auth;
-    const artifact = await stores.artifacts.getOwned(tenantId, paramsResult.value.artifactId, userId);
-    if (!artifact || artifact.status === "deleted") {
+    const artifact = await stores.artifacts.getReadable(tenantId, paramsResult.value.artifactId, userId);
+    if (!artifact) {
       reply.code(404);
       return notFoundError("artifact_not_found");
     }
@@ -361,8 +378,8 @@ export async function registerArtifactRoutes(
       return paramsResult.response;
     }
 
-    const artifact = await stores.artifacts.getOwned(tenantId, paramsResult.value.artifactId, userId);
-    if (!artifact || artifact.status === "deleted") {
+    const artifact = await stores.artifacts.getReadable(tenantId, paramsResult.value.artifactId, userId);
+    if (!artifact) {
       reply.code(404);
       return notFoundError("artifact_not_found");
     }
@@ -381,6 +398,10 @@ export async function registerArtifactRoutes(
       return apiError("pdf_extraction_failed");
     }
 
+    const current = await stores.artifacts.getReadable(tenantId, artifact.artifactId, userId);
+    if (!current) return reply.code(404).send(notFoundError("artifact_not_found"));
+    if (current.status !== "ready") return reply.code(422).send(apiError("artifact_not_ready"));
+    reply.header("cache-control", "private, no-store");
     return { text };
   });
 
@@ -391,9 +412,8 @@ export async function registerArtifactRoutes(
     }
 
     // Single-use download, ordered so a transient storage error can't burn
-    // the token. Caller identity (tenant + user, with admin bypass) is matched
-    // in SQL on every step so an unauthorized request never observes or
-    // consumes a peer's token.
+    // the token. SQL checks caller identity and current session access at both
+    // steps. The administrative bypass applies only to non-project sessions.
     //
     // 1. `peekDownloadToken` validates without consuming. Unknown token,
     //    cross-tenant, wrong user, already-consumed, or unreadable artifact
@@ -455,7 +475,7 @@ export async function registerArtifactRoutes(
           artifactId: token.artifactId,
           fileName: token.fileName,
           actorUserId: request.auth.userId,
-          ownerUserId: token.userId
+          tokenUserId: token.userId
         }
       });
     } catch (err) {
@@ -465,6 +485,8 @@ export async function registerArtifactRoutes(
       );
     }
 
+    reply.header("cache-control", "private, no-store");
+    reply.header("x-content-type-options", "nosniff");
     reply.header("referrer-policy", "no-referrer");
     reply.header("content-type", token.contentType);
     reply.header(

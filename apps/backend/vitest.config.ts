@@ -55,6 +55,11 @@ export default defineConfig({
         // The separate integration suite owns it; it is not product code.
         "src/integration/support/**",
         "src/types.d.ts",
+        // Declaration-only modules. TypeScript erases every line, so v8 counts
+        // them as uncovered source that no test can ever execute. Verify a file
+        // holds no runtime value before adding it here.
+        "src/services/pii/pii-provider.ts",
+        "src/services/integrations/contracts.ts",
         // Keep the imported trend comparable with its old denominator. The
         // full-source run counts production entrypoints and omits only the
         // local dashboard data generator.

@@ -93,9 +93,11 @@ export function useAdminOrganizationData() {
         },
         async () => {
           await updateTenantProviderKey({ provider, apiKey });
-          await invalidateTenant();
-          // Key presence feeds the admin model catalog's key-source pills.
-          await queryClient.invalidateQueries({ queryKey: queryKeys.admin.modelCatalog() });
+          // Key presence feeds both the admin key-source pills and the chat catalog.
+          await Promise.all([
+            invalidateTenant(),
+            queryClient.invalidateQueries({ queryKey: queryKeys.models.all })
+          ]);
         }
       );
     },

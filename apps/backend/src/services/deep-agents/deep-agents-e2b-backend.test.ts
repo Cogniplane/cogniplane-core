@@ -339,7 +339,7 @@ describe("E2bDeepAgentsSandbox", () => {
     // the current regex ("not running anymore" ≠ "no longer running"). Today
     // this is harmless — the SDK throws it as a real SandboxNotFoundError caught
     // by the NAME branch — but pinning it documents the gap so broadening the
-    // regex later is a deliberate, test-visible change. See TEST_SUITE_REVIEW.md.
+    // regex later is a deliberate, test-visible change.
     expect(isSandboxGoneError(new Error("Sandbox is probably not running anymore"))).toBe(false);
   });
 

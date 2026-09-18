@@ -37,6 +37,9 @@ export function useTenantSettings() {
     mutationFn: updateTenantAgentSettings,
     onSuccess: (updated: TenantSettings) => {
       queryClient.setQueryData(queryKeys.admin.tenantSettings(), updated);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
+      // /models includes showEffortSelector alongside the catalog.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     }
   });
 

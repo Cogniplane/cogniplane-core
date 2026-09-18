@@ -2,6 +2,7 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { projectContextExecutionSql } from "../session-execution-store.js";
 
 /**
  * Thrown when a `require`/`requireOwned` lookup finds no live tool context
@@ -124,6 +125,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND session_id = $2 AND expires_at > NOW()
+            AND ${projectContextExecutionSql("tool_execution_contexts")}
           ORDER BY created_at DESC
           LIMIT 1
         `,
@@ -141,6 +143,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
+            AND ${projectContextExecutionSql("tool_execution_contexts")}
           LIMIT 1
         `,
         [tenantId, toolContextId]

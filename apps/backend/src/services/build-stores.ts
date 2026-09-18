@@ -1,3 +1,6 @@
+import { ProjectStore } from "./project-store.js";
+import { ProjectMemberStore } from "./project-member-store.js";
+import { SessionExecutionStore } from "./session-execution-store.js";
 import type { FastifyBaseLogger } from "fastify";
 
 import type { Pool } from "../lib/db.js";
@@ -28,6 +31,7 @@ import { ToolEventStore } from "./tool-event-store.js";
 import { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import { TenantMemberStore } from "./tenant-member-store.js";
 import { UserSettingsStore } from "./user-settings-store.js";
+import { ProjectFileStore } from "./project-file-store.js";
 
 export function buildStores(
   db: Pool,
@@ -37,9 +41,15 @@ export function buildStores(
   // Only the two timers the active-turn stale window derives from. Kept as a
   // structural subset rather than the whole AppConfig so the store builder
   // stays trivially constructible in tests.
-  timers?: { E2B_SANDBOX_TIMEOUT_MS: number; TOOL_CONTEXT_TTL_MS: number }
+  timers?: {
+    E2B_SANDBOX_TIMEOUT_MS: number;
+    TOOL_CONTEXT_TTL_MS: number;
+    SESSION_TRASH_RETENTION_DAYS?: number;
+  }
 ) {
-  const sessions = new SessionStore(db);
+  const sessions = new SessionStore(db, schedulerDb, {
+    retentionDays: timers?.SESSION_TRASH_RETENTION_DAYS,
+  });
   const messages = new MessageStore(db);
   const memories = new MemoryStore(db);
   const activeTurns = new ActiveTurnsRegistry(timers ? deriveStaleAfterMs(timers) : undefined);
@@ -68,6 +78,10 @@ export function buildStores(
   const policyDecisions = new PolicyDecisionStore(db);
 
   return {
+    executions: new SessionExecutionStore(db),
+    projects: new ProjectStore(db),
+    projectFiles: new ProjectFileStore(db, logger, privilegedDb),
+    projectMembers: new ProjectMemberStore(db),
     sessions,
     messages,
     memories,

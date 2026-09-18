@@ -54,6 +54,31 @@ export const AUDIT_EVENT_TYPES = [
 
   // Artifact lifecycle. Snake_case retained from pre-enum era.
   "artifact_uploaded",
+  "project_file_copied",
+  "project_sharing_changed",
+  "project_member_changed",
+  "project_owner_recovered",
+  "project_archived",
+  "project_restored",
+  "project_reference_removed",
+  "project_reference_storage_deleted",
+  "project_reference_storage_deletion_failed",
+  "project_approval_mode_changed",
+  "project_agent_file_mode_changed",
+  "project_file_read",
+  "project_file_created",
+  "project_folder_created",
+  "project_folder_renamed",
+  "project_folder_removed",
+  "project_file_moved",
+  "project_draft_created",
+  "project_draft_rewritten",
+  "project_draft_promoted",
+  "project_draft_retargeted",
+  "project_file_version_restored",
+  "project_file_trashed",
+  "project_file_restored",
+  "project_file_retention_deleted",
   "artifact_generated",
   "artifact_downloaded",
 
@@ -101,6 +126,11 @@ export const AUDIT_EVENT_TYPES = [
   "tenant.integration.config_cleared",
   "tenant.integration.runtime_invalidated",
   "tenant.integration.updated",
+
+  // Session lifecycle.
+  "session.archived",
+  "session.restored",
+  "session.deleted",
 
   // Runtime turn lifecycle.
   "turn.interrupted",

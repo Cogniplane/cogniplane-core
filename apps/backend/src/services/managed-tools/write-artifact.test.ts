@@ -1,4 +1,5 @@
-import { test, expect } from "vitest";
+import { Readable } from "node:stream";
+import { test, expect, vi } from "vitest";
 
 import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
@@ -26,15 +27,19 @@ function makeDeps(opts: {
   putReturns?: Partial<{ storageBackend: "local" | "bucket"; storageKey: string; fileSizeBytes: number; checksumSha256: string }>;
   artifactReturns?: Partial<ArtifactRecord>;
   putThrows?: boolean;
+  createThrows?: boolean;
   readRuntimeFile?: (s: string, r: string, p: string) => Promise<Uint8Array>;
+  artifactMaxBytes?: number;
 } = {}) {
   const auditCalls: unknown[] = [];
   const artifactCalls: unknown[] = [];
   const storageCalls: Array<{ storageKey: string }> = [];
+  const deleteCalls: string[] = [];
   const deps: Parameters<typeof createWriteArtifactTool>[0] = {
     artifacts: {
-      async create(input) {
+      async createGenerated(input) {
         artifactCalls.push(input);
+        if (opts.createThrows) throw new Error("artifact create failed");
         const artifact: ArtifactRecord = {
           id: 1,
           artifactId: "a-1",
@@ -72,6 +77,12 @@ function makeDeps(opts: {
           fileSizeBytes: opts.putReturns?.fileSizeBytes ?? 4,
           checksumSha256: opts.putReturns?.checksumSha256 ?? "stored-csum"
         };
+      },
+      async openReadStream() {
+        return { stream: Readable.from([]), fileSizeBytes: 0 };
+      },
+      async delete(storageKey) {
+        deleteCalls.push(storageKey);
       }
     },
     auditEvents: {
@@ -79,12 +90,14 @@ function makeDeps(opts: {
         auditCalls.push(input);
       }
     },
+    artifactMaxBytes: opts.artifactMaxBytes ?? 10_000_000,
     readRuntimeFile: opts.readRuntimeFile
   };
   return {
     auditCalls,
     artifactCalls,
     storageCalls,
+    deleteCalls,
     deps
   };
 }
@@ -145,10 +158,18 @@ test("write_artifact: rejects empty content", async () => {
   await expect(() => tool(deps).handler({ context: ctx(), arguments: { name: "x.txt", filePath: "./x" } })).rejects.toThrow(/File is empty/);
 });
 
-test("write_artifact: rejects oversized content (> 10MB)", async () => {
+test("write_artifact: rejects content above the configured artifact limit", async () => {
   const huge = new Uint8Array(10_000_001);
   const { deps } = makeDeps({ readRuntimeFile: async () => huge });
   await expect(() => tool(deps).handler({ context: ctx(), arguments: { name: "x.bin", filePath: "./x" } })).rejects.toThrow(/File too large/);
+});
+
+test("write_artifact: enforces a non-default configured artifact limit", async () => {
+  const { deps } = makeDeps({ artifactMaxBytes: 3 });
+  await expect(() => tool(deps).handler({
+    context: ctx(),
+    arguments: { name: "note.txt", content: "four" }
+  })).rejects.toThrow(/File too large/);
 });
 
 test("write_artifact (content path): creates artifact with inferred MIME and emits audit", async () => {
@@ -166,6 +187,127 @@ test("write_artifact (content path): creates artifact with inferred MIME and emi
   expect(auditCalls.length).toBe(1);
   expect((auditCalls[0] as Record<string, unknown>).type).toBe("artifact_generated");
   expect((result as Record<string, unknown>).artifactId).toBe("a-1");
+});
+
+test("write_artifact: removes the stored object when the artifact insert fails", async () => {
+  const { deps, storageCalls, deleteCalls } = makeDeps({ createThrows: true });
+
+  await expect(() => tool(deps).handler({
+    context: ctx(),
+    arguments: { name: "failed.txt", content: "orphan me" }
+  })).rejects.toThrow("artifact create failed");
+
+  expect(deleteCalls).toEqual([storageCalls[0]?.storageKey]);
+});
+
+test("write_artifact: saves a permitted project output as a draft while keeping the session artifact", async () => {
+  const { deps } = makeDeps({ artifactMaxBytes: 7 });
+  const createAgentDraftFromContent = vi.fn().mockResolvedValue({
+    fileId: "project-draft-1",
+    targetFileId: null
+  });
+  const result = await tool({
+    ...deps,
+    projectFiles: { createAgentDraftFromContent }
+  }).handler({
+    context: ctx({
+      metadata: {
+        projectContext: { projectId: "project-1", agentFileMode: "create-only" },
+        runtimePolicy: { enabledToolIds: ["project_write_file"] }
+      }
+    }),
+    arguments: { name: "report.md", content: "draft" }
+  });
+
+  expect(result).toMatchObject({ artifactId: "a-1", projectDraftId: "project-draft-1" });
+  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({
+    actor: { tenantId: "t", userId: "u", projectId: "project-1" },
+    name: "report.md",
+    targetFileId: null,
+    baseVersionId: null,
+    mimeType: "text/markdown",
+    maxBytes: 7
+  }));
+});
+
+test("write_artifact: keeps the session artifact when the automatic project draft fails", async () => {
+  const { deps, auditCalls, artifactCalls } = makeDeps();
+  const createAgentDraftFromContent = vi.fn().mockRejectedValue(new Error("project draft failed"));
+  const result = await tool({
+    ...deps,
+    projectFiles: { createAgentDraftFromContent }
+  }).handler({
+    context: ctx({
+      metadata: {
+        projectContext: { projectId: "project-1", agentFileMode: "create-only" },
+        runtimePolicy: { enabledToolIds: ["project_write_file"] }
+      }
+    }),
+    arguments: { name: "report.md", content: "draft" }
+  });
+
+  expect(result).toMatchObject({
+    artifactId: "a-1",
+    projectDraftId: null,
+    projectDraftError: "The session artifact was saved, but the project draft could not be created."
+  });
+  expect(artifactCalls).toHaveLength(1);
+  expect(auditCalls).toHaveLength(1);
+});
+
+test("write_artifact: does not create a project draft when the project tool is disabled", async () => {
+  const { deps } = makeDeps();
+  const createAgentDraftFromContent = vi.fn();
+  const result = await tool({
+    ...deps,
+    projectFiles: { createAgentDraftFromContent }
+  }).handler({
+    context: ctx({
+      metadata: {
+        projectContext: { projectId: "project-1", agentFileMode: "create-only" },
+        runtimePolicy: { enabledToolIds: [] }
+      }
+    }),
+    arguments: { name: "report.md", content: "draft" }
+  });
+
+  expect(result).toMatchObject({ artifactId: "a-1", projectDraftId: null });
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+});
+
+test("write_artifact: read-write mode updates a matching published file draft", async () => {
+  const { deps } = makeDeps();
+  const createAgentDraftFromContent = vi.fn().mockResolvedValue({ fileId: "draft-1" });
+  await tool({
+    ...deps,
+    projectFiles: { createAgentDraftFromContent }
+  }).handler({
+    context: ctx({
+      metadata: {
+        projectContext: {
+          projectId: "project-1",
+          agentFileMode: "read-write",
+          snapshot: {
+            files: [{
+              fileId: "file-1",
+              versionId: "version-7",
+              name: "Report.md",
+              folderId: null,
+              kind: "published"
+            }]
+          }
+        },
+        runtimePolicy: { enabledToolIds: ["project_write_file"] }
+      }
+    }),
+    arguments: { name: "report.md", content: "draft" }
+  });
+
+  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({
+    targetFileId: "file-1",
+    baseVersionId: "version-7",
+    stored: expect.objectContaining({ storageKey: expect.any(String) })
+  }));
 });
 
 test("write_artifact: explicit mimeType overrides extension inference", async () => {

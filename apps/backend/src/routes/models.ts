@@ -54,7 +54,8 @@ export async function registerModelRoutes(app: FastifyInstance, stores: ModelRou
 
     return serialize(ModelsListResponseSchema, {
       models,
-      showEffortSelector: models.length > 0 ? settings.showEffortSelector : false
+      showEffortSelector: models.length > 0 ? settings.showEffortSelector : false,
+      enabledToolIds: settings.enabledToolIds
     });
   });
 }

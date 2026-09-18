@@ -1,7 +1,11 @@
+import { canBrowseSessionContent } from "../services/session-access.js";
+import { ProjectAccessError } from "../services/project-access.js";
+import { SessionExecutionError } from "../services/session-execution-store.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import {
+  SESSION_TRASH_RETENTION_DAYS,
   SessionEnvelopeSchema,
   SessionMessagesResponseSchema,
   SessionsListResponseSchema
@@ -23,7 +27,8 @@ const renameSessionSchema = z.object({
 });
 
 const listSessionsQuerySchema = z.object({
-  purposes: z.string().optional()
+  purposes: z.string().optional(),
+  status: z.enum(["active", "archived"]).optional()
 });
 
 export function buildSessionRouteStores(deps: AppDependencies) {
@@ -33,20 +38,37 @@ export function buildSessionRouteStores(deps: AppDependencies) {
     runtimeAdapter: deps.runtimeAdapter,
     limits: deps.limits,
     activeTurns: deps.activeTurns,
+    executions: deps.executions,
     auditEvents: deps.auditEvents
   };
 }
 
 export type SessionRouteStores = {
-  sessions: Pick<AppDependencies["sessions"], "list" | "create" | "rename" | "getOwned" | "remove">;
+  sessions: Pick<AppDependencies["sessions"], "list" | "create" | "rename" | "getReadable" | "getOwned" | "remove" | "setArchived" | "restoreDeleted">
+    & { getRetentionDays?: () => number };
   messages: Pick<AppDependencies["messages"], "listBySession">;
   runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "id" | "hasActiveTurn" | "abortSession" | "purgeSessionData" | "interruptTurn">;
   limits: AppDependencies["limits"];
   activeTurns: AppDependencies["activeTurns"];
   auditEvents: Pick<AppDependencies["auditEvents"], "create">;
+  executions: Pick<AppDependencies["executions"], "stop">;
 };
 
 export async function registerSessionRoutes(
+  app: FastifyInstance,
+  stores: SessionRouteStores
+): Promise<void> {
+  await app.register(async routes => {
+    routes.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ProjectAccessError) return reply.code(error.status).send(apiError(error.code, error.message));
+      if (error instanceof SessionExecutionError) return reply.code(error.statusCode).send(apiError(error.code, error.message));
+      throw error;
+    });
+    await registerScopedSessionRoutes(routes, stores);
+  });
+}
+
+async function registerScopedSessionRoutes(
   app: FastifyInstance,
   stores: SessionRouteStores
 ): Promise<void> {
@@ -76,14 +98,24 @@ export async function registerSessionRoutes(
       }
     }
 
-    const sessions = await stores.sessions.list(tenantId, userId, { purposes });
+    const sessions = await stores.sessions.list(tenantId, userId, { purposes, ...(queryResult.value.status ? { status: queryResult.value.status } : {}) });
     const running = stores.activeTurns?.snapshot();
-    if (running && running.size > 0) {
-      for (const session of sessions) {
-        if (running.has(session.sessionId)) session.isRunning = true;
-      }
-    }
-    return serialize(SessionsListResponseSchema, { sessions });
+    const decoratedSessions = sessions.map((session) => {
+      const isRunning = running?.has(session.sessionId) ?? false;
+      const startedAt = isRunning ? stores.activeTurns?.startedAt(session.sessionId) : undefined;
+      const turn = isRunning ? stores.activeTurns?.identity(session.sessionId) : undefined;
+      return {
+        ...session,
+        ...(turn ? { latestTurnId: turn.messageId, latestTurnSequence: turn.sequence } : {}),
+        hasTurnFailed: !isRunning && session.hasTurnFailed === true,
+        isRunning,
+        activeTurnStartedAt: startedAt === undefined ? undefined : new Date(startedAt).toISOString()
+      };
+    });
+    return serialize(SessionsListResponseSchema, {
+      sessions: decoratedSessions,
+      trashRetentionDays: stores.sessions.getRetentionDays?.() ?? SESSION_TRASH_RETENTION_DAYS
+    });
   });
 
   app.post("/sessions", async (request, reply) => {
@@ -141,10 +173,73 @@ export async function registerSessionRoutes(
     return serialize(SessionEnvelopeSchema, { session });
   });
 
-  // Stop button — interrupt the in-flight turn while keeping the runtime warm.
-  // Routes to the adapter holding in-memory state for the session (mirrors
-  // DELETE /sessions/:sessionId). 200 on stop dispatched, 409 when nothing
-  // was running.
+  for (const action of ["archive", "restore"] as const) {
+    app.post(`/sessions/:sessionId/${action}`, async (request, reply) => {
+      const params = parseRequestInput(reply, sessionIdParams, request.params);
+      if (!params.ok) return params.response;
+      const { tenantId, userId } = request.auth;
+      const { sessionId } = params.value;
+      if (action === "restore") {
+        const restored = await stores.sessions.restoreDeleted(tenantId, sessionId, userId);
+        if (restored) {
+          try {
+            await stores.auditEvents.create({
+              tenantId,
+              sessionId,
+              userId,
+              type: "session.restored",
+              payload: { status: restored.status, fromTrash: true }
+            });
+          } catch (error) {
+            request.log.warn({ error, sessionId }, "Failed to record session restore activity");
+          }
+          return serialize(SessionEnvelopeSchema, { session: restored });
+        }
+      }
+      const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
+      if (!session || session.status === "deleted") {
+        reply.code(404);
+        return notFoundError("session_not_found");
+      }
+      const archived = action === "archive";
+      // Shared retries must recheck current mutation authority in the store.
+      // The conditional UPDATE rejects an unchanged state without a new audit.
+      if (!session.projectId && session.status === (archived ? "archived" : "active")) {
+        return serialize(SessionEnvelopeSchema, { session });
+      }
+      if (stores.runtimeAdapter.hasActiveTurn(sessionId) || stores.activeTurns?.isBusy(sessionId)) {
+        reply.code(409);
+        return apiError("session_busy", "Wait for the current turn to finish before archiving or restoring this session.");
+      }
+      // Share the interactive turn reservation so archive cannot overlap a new turn.
+      stores.activeTurns?.mark(sessionId);
+      try {
+        const updated = await stores.sessions.setArchived(tenantId, sessionId, userId, archived);
+        if (!updated) {
+          reply.code(409);
+          return apiError("session_archive_conflict", "The session changed or has a pending approval. Refresh and try again.");
+        }
+        // Match interrupt telemetry: an audit failure does not undo a completed transition.
+        try {
+          await stores.auditEvents.create({
+            tenantId,
+            sessionId,
+            userId,
+            type: archived ? "session.archived" : "session.restored",
+            payload: { previousStatus: session.status, status: updated.status, purpose: updated.purpose ?? "normal" }
+          });
+        } catch (err) {
+          request.log.warn({ err, sessionId, action }, "Failed to record session lifecycle audit event");
+        }
+        return serialize(SessionEnvelopeSchema, { session: updated });
+      } finally {
+        stores.activeTurns?.clear(sessionId);
+      }
+    });
+  }
+
+  // Shared cancellation fences execution in the database. The worker observes
+  // it through dispatch authorization and its heartbeat, on any replica.
   app.post("/sessions/:sessionId/interrupt", async (request, reply) => {
     const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
     if (!paramsResult.ok) return paramsResult.response;
@@ -152,13 +247,29 @@ export async function registerSessionRoutes(
     const { userId, tenantId } = request.auth;
     const { sessionId } = paramsResult.value;
 
-    const session = await stores.sessions.getOwned(tenantId, sessionId, userId);
+    const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
     if (!session) {
       reply.code(404);
       return notFoundError("session_not_found");
     }
 
     const owningAdapter = stores.runtimeAdapter;
+
+    if (session.projectId) {
+      const stopped = await stores.executions.stop({ tenantId, sessionId, userId });
+      if (!stopped) {
+        reply.code(409);
+        return apiError("no_active_turn", "There is no active turn you can interrupt in this session.");
+      }
+      // Durable fencing handles another replica. Signal the local runtime too,
+      // so Stop does not wait for its next heartbeat to release in-process state.
+      try {
+        await owningAdapter.interruptTurn({ tenantId, sessionId, userId });
+      } catch (error) {
+        request.log.warn({ err: error, sessionId }, "Failed to signal the local project runtime after fencing");
+      }
+      return { status: "interrupted" };
+    }
 
     if (!owningAdapter.interruptTurn) {
       reply.code(501);
@@ -221,16 +332,18 @@ export async function registerSessionRoutes(
       );
     }
 
-    // Durable per-session runtime data (Deep Agents checkpointer threads, …)
-    // is only deleted here — never from abortSession, which also fires on
-    // idle teardown. Purge is idempotent and works with no in-memory state.
+    // Keep the conversation and its durable runtime state during the
+    // configured recovery period. The retention worker purges them after expiry.
     try {
-      await stores.runtimeAdapter.purgeSessionData({ tenantId, sessionId, userId });
-    } catch (err) {
-      request.log.warn(
-        { err, sessionId, adapter: stores.runtimeAdapter.id },
-        "Failed to purge per-session runtime data after session deletion"
-      );
+      await stores.auditEvents.create({
+        tenantId,
+        sessionId,
+        userId,
+        type: "session.deleted",
+        payload: { fromTrash: true }
+      });
+    } catch (error) {
+      request.log.warn({ error, sessionId }, "Failed to record session deletion activity");
     }
 
     reply.code(204);
@@ -245,9 +358,9 @@ export async function registerSessionRoutes(
 
     const { userId, tenantId } = request.auth;
     const { sessionId } = paramsResult.value;
-    const session = await stores.sessions.getOwned(tenantId, sessionId, userId);
+    const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
 
-    if (!session || session.status !== "active") {
+    if (!session || !canBrowseSessionContent(session)) {
       reply.code(404);
       return notFoundError("session_not_found");
     }
@@ -257,6 +370,7 @@ export async function registerSessionRoutes(
     // older turns were withheld rather than silently dropping them.
     const { messages, hasMore } = await stores.messages.listBySession(tenantId, sessionId, userId);
 
+    reply.header("cache-control", "private, no-store");
     return serialize(SessionMessagesResponseSchema, {
       session,
       messages,

@@ -12,14 +12,14 @@
 // pane via CopilotRenderSlots.
 
 import { CopilotKit } from "@copilotkit/react-core";
-import { CopilotChat, type ComponentsMap } from "@copilotkit/react-ui";
+import { CopilotChat, type ComponentsMap, type InputProps } from "@copilotkit/react-ui";
 import "@copilotkit/react-ui/styles.css";
 import { useEffect, useMemo, useRef } from "react";
-import type { Message as AGUIMessage, State as AGUIState } from "@ag-ui/client";
+import { randomUUID, type Message as AGUIMessage, type State as AGUIState } from "@ag-ui/client";
 import type { Approval, EffortLevel, Model } from "@cogniplane/shared-types";
 
 import { DeepAgentsBrowserAgent } from "../lib/agui/deep-agents-browser-agent";
-import { useAguiCustomEvents } from "../lib/agui/use-agui-custom-events";
+import { useAguiCustomEvents, type AguiCustomEvents } from "../lib/agui/use-agui-custom-events";
 import { CopilotRenderSlots } from "./copilot-render-slots";
 import { ModelEffortSelector } from "./model-effort-selector";
 import { ContextWindowMeter } from "./context-window-meter";
@@ -33,6 +33,15 @@ import {
 } from "./chat-cards/status-rows";
 
 const AGENT_NAME = "deepAgents";
+const EMPTY_PROJECT_FILE_IDS: string[] = [];
+
+function ReadOnlyChatInput(_props: InputProps) {
+  return (
+    <div role="note" className="border-t border-outline-variant bg-surface-container-low px-4 py-3 text-center text-sm text-on-surface-variant">
+      You can read this shared session, but only project owners and editors can send messages.
+    </div>
+  );
+}
 
 // CopilotKit sanitizes assistant markdown with rehype's default schema, which
 // permits <img> — so an agent-authored image tag reaches the DOM and the CSP
@@ -56,6 +65,9 @@ export type ChatSessionModel = {
   initialToolStatuses: ToolStatusRow[];
   /** Pending REST approvals seed the live owner when this session opens. */
   initialApprovals: Approval[];
+  canEdit?: boolean;
+  /** Optional one-shot instruction attached to an explicit project action. */
+  initialPrompt?: string;
 };
 
 export type ChatModelSelection = {
@@ -74,22 +86,25 @@ export type ChatUsageModel = {
 };
 
 export type ChatEventHandlers = {
+  onInitialPromptSent?: () => void;
   onTurnSettled?: () => void;
+  onTurnActivityChange?: (activity: AguiCustomEvents["turnActivity"]) => void;
   onRunningChange?: (isRunning: boolean) => void;
   onPendingApprovalsChange?: (count: number) => void;
 };
 
-export function CopilotChatHost({ session, modelSelection, usage, artifactIds, events }: {
+export function CopilotChatHost({ session, modelSelection, usage, artifactIds, projectFileIds, events }: {
   session: ChatSessionModel;
   modelSelection: ChatModelSelection;
   usage: ChatUsageModel;
   /** Artifacts the user has checkboxed; read live at send time via a ref. */
   artifactIds: string[];
+  projectFileIds?: string[];
   events: ChatEventHandlers;
 }) {
-  const { id: sessionId, initialMessages, initialState, initialToolStatuses, initialApprovals } = session;
+  const { id: sessionId, initialMessages, initialState, initialToolStatuses, initialApprovals, initialPrompt, canEdit = true } = session;
   const { model, effort, models, showEffortSelector, onModelChange, onEffortChange } = modelSelection;
-  const { onTurnSettled, onRunningChange, onPendingApprovalsChange } = events;
+  const { onInitialPromptSent, onTurnSettled, onRunningChange, onPendingApprovalsChange, onTurnActivityChange } = events;
   // Per-turn inputs (model, effort, checkboxed artifact ids) are held in refs the
   // agent reads at send time, so a change between turns is picked up WITHOUT
   // re-keying the agent. Re-keying would rebind CopilotKit to a fresh agent and
@@ -99,11 +114,14 @@ export function CopilotChatHost({ session, modelSelection, usage, artifactIds, e
   const modelRef = useRef(model);
   const effortRef = useRef(effort);
   const artifactIdsRef = useRef(artifactIds);
+  const stableProjectFileIds = projectFileIds ?? EMPTY_PROJECT_FILE_IDS;
+  const projectFileIdsRef = useRef(stableProjectFileIds);
   useEffect(() => {
     modelRef.current = model;
     effortRef.current = effort;
     artifactIdsRef.current = artifactIds;
-  }, [model, effort, artifactIds]);
+    projectFileIdsRef.current = stableProjectFileIds;
+  }, [model, effort, artifactIds, stableProjectFileIds]);
 
   // `initialMessages`/`initialState` seed the transcript + plan pane at
   // construction; they are intentionally NOT deps — the parent gates this mount
@@ -121,7 +139,8 @@ export function CopilotChatHost({ session, modelSelection, usage, artifactIds, e
         initialState,
         getModel: () => modelRef.current,
         getEffort: () => effortRef.current,
-        getArtifactIds: () => artifactIdsRef.current
+        getArtifactIds: () => artifactIdsRef.current,
+        getProjectFileIds: () => projectFileIdsRef.current
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [sessionId]
@@ -141,8 +160,19 @@ export function CopilotChatHost({ session, modelSelection, usage, artifactIds, e
 
   // Slice B: the CUSTOM AG-UI events CopilotChat doesn't render natively. We
   // subscribe to the same agent instance CopilotKit runs and drive local state.
-  const { approvals, notices, mcpStatuses, toolStatuses, isRunning, onApprovalDecision } =
+  const { approvals, notices, mcpStatuses, toolStatuses, isRunning, turnActivity, onApprovalDecision } =
     useAguiCustomEvents(agent, onTurnSettled, initialToolStatuses, initialApprovals);
+
+  // Start only after the custom-event subscriber is attached, so the explicit
+  // action's running/approval/tool state is visible from its first event.
+  const initialPromptSent = useRef(false);
+  useEffect(() => {
+    if (!initialPrompt || !canEdit || initialPromptSent.current) return;
+    initialPromptSent.current = true;
+    agent.addMessage({ id: randomUUID(), role: "user", content: initialPrompt });
+    void agent.runAgent();
+    onInitialPromptSent?.();
+  }, [agent, canEdit, initialPrompt, onInitialPromptSent]);
 
   // Lift the live turn-running + pending-approval signals to the shell so the
   // sidebar streaming dot and header attention dot track the AG-UI stream in
@@ -154,6 +184,10 @@ export function CopilotChatHost({ session, modelSelection, usage, artifactIds, e
   useEffect(() => {
     onPendingApprovalsChange?.(approvals.length);
   }, [approvals.length, onPendingApprovalsChange]);
+
+  useEffect(() => {
+    onTurnActivityChange?.(turnActivity);
+  }, [turnActivity, onTurnActivityChange]);
 
   return (
     <CopilotKit
@@ -208,6 +242,7 @@ export function CopilotChatHost({ session, modelSelection, usage, artifactIds, e
           // <table>/<blockquote> tags; the shared rules in globals.css style them.
           className="chat-markdown flex min-h-0 flex-1 flex-col"
           labels={{ title: "Cogniplane", initial: "Ask me anything." }}
+          Input={canEdit ? undefined : ReadOnlyChatInput}
           markdownTagRenderers={MARKDOWN_TAG_RENDERERS}
         />
       </div>

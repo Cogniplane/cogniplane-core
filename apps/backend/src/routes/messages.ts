@@ -1,8 +1,9 @@
+import { startExecutionHeartbeat } from "../services/execution-heartbeat.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import { MessagePostRequestSchema } from "@cogniplane/shared-types";
-import type { ModelProvider } from "@cogniplane/shared-types";
+import type { ProjectInstructionsSnapshot, ModelProvider } from "@cogniplane/shared-types";
 
 import type { AppDependencies } from "../app-dependencies.js";
 import type { RuntimeAdapter } from "../runtime-contracts.js";
@@ -17,6 +18,9 @@ import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
+import { SessionExecutionError, type SessionExecution } from "../services/session-execution-store.js";
+import { ProjectAccessError } from "../services/project-access.js";
+import { ProjectFileError, type ProjectRuntimeFileSnapshot } from "../services/project-file-store.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { UtilityLlmClient } from "../services/utility-llm-client.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
@@ -63,7 +67,9 @@ export function buildMessageRouteStores(
   }
 ) {
   return {
+    executions: deps.executions,
     sessions: deps.sessions,
+    projects: deps.projects,
     artifacts: deps.artifacts,
     artifactProcessor: deps.artifactProcessor,
     storage: deps.artifactStorage,
@@ -78,12 +84,15 @@ export function buildMessageRouteStores(
     piiProtection: deps.piiProtection,
     piiScanRuns: deps.piiScanRuns,
     auditEvents: deps.auditEvents,
-    activeTurns: deps.activeTurns
+    activeTurns: deps.activeTurns,
+    projectFiles: deps.projectFiles
   };
 }
 
 export type MessageRouteStores = {
-  sessions: Pick<AppDependencies["sessions"], "getOwned" | "renameIfCurrent">;
+  executions: Pick<AppDependencies["executions"], "acquire" | "heartbeat" | "release">;
+  projects: Pick<AppDependencies["projects"], "getReadable">;
+  sessions: Pick<AppDependencies["sessions"], "getReadable" | "renameIfCurrent">;
   artifacts: Pick<AppDependencies["artifacts"], "listBySession">;
   artifactProcessor: Pick<AppDependencies["artifactProcessor"], "extractArtifactText">;
   storage: AppDependencies["artifactStorage"];
@@ -99,6 +108,7 @@ export type MessageRouteStores = {
   piiScanRuns: PiiHandlerStores["piiScanRuns"];
   auditEvents: Pick<AppDependencies["auditEvents"], "create">;
   activeTurns: AppDependencies["activeTurns"];
+  projectFiles?: Pick<AppDependencies["projectFiles"], "captureRuntimeSnapshot">;
 };
 
 const DEFAULT_MODEL_ID =
@@ -124,9 +134,10 @@ export async function registerMessageRoutes(
     const { userId, tenantId } = request.auth;
     const input = inputResult.value;
 
-    const session = await stores.sessions.getOwned(tenantId, input.sessionId, userId);
+    const readSession = () => stores.sessions.getReadable(tenantId, input.sessionId, userId);
+    const session = await readSession();
 
-    if (!session || session.status !== "active") {
+    if (!session || session.status !== "active" || session.purpose === "project_reference") {
       reply.code(404);
       return notFoundError("session_not_found");
     }
@@ -141,7 +152,7 @@ export async function registerMessageRoutes(
         // Admin-controlled provider/model enablement + default-effort
         // overrides (tenant_settings). Gates disabled models even on direct
         // API calls that bypass the /models-filtered picker.
-        getModelAvailability: (tenantId) =>
+        getModelAvailability: tenantId =>
           stores.dynamicConfig.getOrCreateTenantSettings(tenantId),
         // Built-ins + this tenant's admin-added custom models.
         listModels: async (tenantId) => [
@@ -185,7 +196,7 @@ export async function registerMessageRoutes(
     // above), the adapter check is the best-effort fallback.
     const alreadyBusy =
       runtimeAdapter.hasActiveTurn(input.sessionId) ||
-      (stores.activeTurns?.snapshot().has(input.sessionId) ?? false);
+      (stores.activeTurns?.isBusy(input.sessionId) ?? false);
     if (alreadyBusy) {
       reply.code(429);
       return apiError("session_busy");
@@ -195,10 +206,64 @@ export async function registerMessageRoutes(
       slotReserved = true;
     }
 
+    let execution: SessionExecution | undefined;
+    let stopHeartbeat: (() => void) | undefined;
+    let releaseAdmissionPromise: Promise<void> | undefined;
+    const releaseAdmission = () => releaseAdmissionPromise ??= (async () => {
+      stopHeartbeat?.();
+      if (execution) {
+        try { await stores.executions.release(execution); }
+        catch (error) { request.log.error({ err: error, sessionId: input.sessionId }, "Failed to release execution lease"); }
+      }
+      releaseSlot();
+    })();
     // Everything past the reservation releases the slot on early exit or after
     // the AG-UI stream finishes.
     try {
-        const artifactScope = await resolveEligibleArtifacts(reply, stores, {
+      // Ownership may have been read before a concurrent archive completed.
+      const currentSession = await readSession();
+      if (!currentSession || currentSession.status !== "active" || currentSession.purpose === "project_reference") {
+        reply.code(404);
+        return notFoundError("session_not_found");
+      }
+      if (currentSession.projectId) {
+        const leaseStartedAt = performance.now();
+        execution = await stores.executions.acquire({ tenantId, sessionId: input.sessionId, userId }, app.config.SESSION_EXECUTION_LEASE_MS);
+        const admitted = execution;
+        const leaseExpiresAt = performance.now() + Math.max(0, new Date(admitted.expiresAt).getTime() - Date.now());
+        stopHeartbeat = startExecutionHeartbeat({
+          leaseStartedAt,
+          leaseExpiresAt,
+          leaseMs: app.config.SESSION_EXECUTION_LEASE_MS,
+          intervalMs: app.config.SESSION_EXECUTION_HEARTBEAT_MS,
+          renew: () => stores.executions.heartbeat(admitted, app.config.SESSION_EXECUTION_LEASE_MS),
+          onError: error => request.log.warn({ err: error, sessionId: input.sessionId }, "Execution heartbeat failed"),
+          onLost: async () => {
+            // Release independently: a stuck runtime abort must not retain the
+            // admission. Dispatch checks still reject this execution generation.
+            await Promise.all([
+              runtimeAdapter.abortSession(admitted).catch(error => request.log.error({ err: error }, "Failed to stop expired execution")),
+              releaseAdmission(),
+            ]);
+          },
+        });
+      }
+      const project = currentSession.projectId
+        ? await stores.projects.getReadable(tenantId, userId, currentSession.projectId) : null;
+      if (currentSession.projectId && !project) {
+        return reply.code(404).send(notFoundError("project_not_found"));
+      }
+      let projectInstructions: ProjectInstructionsSnapshot | null = project ? {
+        projectId: project.projectId, revision: project.instructionsRevision, instructions: project.instructions
+      } : null;
+      let projectFileSnapshot: ProjectRuntimeFileSnapshot | null = null;
+      if (project && stores.projectFiles) {
+        projectFileSnapshot = await stores.projectFiles.captureRuntimeSnapshot(
+          { tenantId, userId, projectId: project.projectId },
+          input.projectFileIds ?? []
+        );
+      }
+      const artifactScope = await resolveEligibleArtifacts(reply, stores, {
         tenantId,
         sessionId: input.sessionId,
         userId,
@@ -258,6 +323,22 @@ export async function registerMessageRoutes(
         });
       }
 
+      if (projectInstructions?.instructions) {
+        const evaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
+          tenantId, sessionId: input.sessionId, text: projectInstructions.instructions
+        });
+        if (!evaluation.ok) return evaluation.response;
+        const outcome = await handlePiiDecision(evaluation.piiDecision, {
+          tenantId, sessionId: input.sessionId, userId, rawText: projectInstructions.instructions,
+          projectInstructions: { projectId: projectInstructions.projectId, revision: projectInstructions.revision }
+        }, { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents });
+        if (outcome.kind === "block") {
+          return reply.code(422).send(apiError("project_instructions_blocked",
+            "Project instructions were blocked by organization policy. Edit them before sending another message."));
+        }
+        projectInstructions = { ...projectInstructions, instructions: outcome.runtimePrompt };
+      }
+
       // Past the PII gate: this turn will actually be dispatched, so it now
       // spends a daily-quota unit.
       const quotaError = await stores.limits.consumeTurnQuota({
@@ -300,6 +381,10 @@ export async function registerMessageRoutes(
       }
 
       await streamAssistantReplyAGUI({
+        execution,
+        startedAt: stores.activeTurns?.startedAt(input.sessionId),
+        onTurnCreated: (turn) => stores.activeTurns?.identify(input.sessionId, turn),
+        onTurnSettled: releaseAdmission,
         logger: request.log,
         reply,
         messages: stores.messages,
@@ -311,6 +396,11 @@ export async function registerMessageRoutes(
         modelName: selectedModel?.id ?? input.model ?? DEFAULT_MODEL_ID,
         effort: selectedEffort,
         prompt: runtimePrompt,
+        projectInstructions,
+        projectApprovalMode: project?.approvalMode,
+        projectId: project?.projectId,
+        projectAgentFileMode: project?.agentFileMode,
+        projectFileSnapshot,
         scopedArtifacts,
         artifactProcessor: stores.artifactProcessor,
         storage: stores.storage,
@@ -319,8 +409,16 @@ export async function registerMessageRoutes(
         turnContext: "interactive",
         toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS
       });
+    } catch (error) {
+      if (error instanceof SessionExecutionError)
+        return reply.code(error.statusCode).send(apiError(error.code, error.message));
+      if (error instanceof ProjectAccessError)
+        return reply.code(error.status).send(apiError(error.code, error.message));
+      if (error instanceof ProjectFileError)
+        return reply.code(error.status).send(apiError(error.code, error.message));
+      throw error;
     } finally {
-      releaseSlot();
+      await releaseAdmission();
     }
   });
 }

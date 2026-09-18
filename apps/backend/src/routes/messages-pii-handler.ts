@@ -7,6 +7,7 @@ export type PiiHandlerInput = {
   sessionId: string;
   userId: string;
   rawText: string;
+  projectInstructions?: { projectId: string; revision: number };
 };
 
 export type PiiHandlerStores = {
@@ -59,7 +60,7 @@ export async function handlePiiDecision(
     await emitPiiAudit(stores, input, "pii_blocked", {
       scanRunId: scanRun?.scanRunId ?? null,
       mode: "block",
-      subjectType: "message",
+      subjectType: input.projectInstructions ? "project_instructions" : "message",
       findingsCount: decision.findings.length,
       providerType: decision.providerType,
       providerModel: decision.providerModel,
@@ -81,7 +82,7 @@ export async function handlePiiDecision(
     await emitPiiAudit(stores, input, "pii_transformed", {
       scanRunId: scanRun?.scanRunId ?? null,
       mode: "transform",
-      subjectType: "message",
+      subjectType: input.projectInstructions ? "project_instructions" : "message",
       findingsCount: decision.findings.length,
       providerType: decision.providerType,
       providerModel: decision.providerModel
@@ -112,7 +113,7 @@ export async function handlePiiDecision(
   await emitPiiAudit(stores, input, "pii_reported", {
     scanRunId: scanRun?.scanRunId ?? null,
     mode: "detect",
-    subjectType: "message",
+    subjectType: input.projectInstructions ? "project_instructions" : "message",
     findingsCount: decision.findings.length,
     providerType: decision.providerType,
     providerModel: decision.providerModel
@@ -145,7 +146,10 @@ async function emitPiiAudit(
     sessionId: input.sessionId,
     userId: input.userId,
     type: eventType,
-    payload
+    payload: { ...payload, ...(input.projectInstructions ? {
+      projectId: input.projectInstructions.projectId,
+      instructionsRevision: input.projectInstructions.revision
+    } : {}) }
   });
 }
 
@@ -164,8 +168,9 @@ async function createScanRun(
   if (!stores.piiScanRuns) return null;
   return stores.piiScanRuns.create({
     tenantId: input.tenantId,
-    subjectType: "message",
-    subjectId: input.sessionId,
+    subjectType: input.projectInstructions ? "project_instructions" : "message",
+    subjectId: input.projectInstructions?.projectId ?? input.sessionId,
+    ...(input.projectInstructions ? { instructionsRevision: input.projectInstructions.revision } : {}),
     sourceSessionId: input.sessionId,
     sourceUserId: input.userId,
     mode: meta.mode,

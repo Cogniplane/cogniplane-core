@@ -418,3 +418,13 @@ test("PiiProtectionServiceError with a permanent code is classified as permanent
   expect(failureCalls.length).toBe(1);
   expect(failureCalls[0].permanent).toBe(true);
 });
+
+test("removed artifacts finish queued jobs without reading or sending file content", async () => {
+  const h = buildDeps({ reader: { readArtifact: async () => { throw new Error("Must not read a removed file"); } } });
+  h.setArtifactGet(() => ({ storageBackend: "local", storageKey: "removed", status: "deleted" }));
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.completedCalls).toHaveLength(1);
+  expect(h.failureCalls).toEqual([]);
+  expect(h.artifactPiiCalls).toEqual([]);
+  expect(h.updateCalls[0].patch).toMatchObject({ status: "completed", summaryText: "File removed before scanning." });
+});

@@ -171,7 +171,12 @@ test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async
         "write_artifact",
         "memory_search",
         "memory_save",
-        "memory_delete"
+        "memory_delete",
+        "project_list_files",
+        "project_read_file",
+        "project_get_conflict_context",
+        "project_reconcile_conflict",
+        "project_write_file"
       ]);
   expect(created.enabledMcpServerIds).toEqual(["managed-session-context"]);
   expect(created.version).toBe(1);

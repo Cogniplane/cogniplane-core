@@ -19,15 +19,12 @@ export async function resolveBoundToolContext(input: {
   const argToolContextId = typeof args.toolContextId === "string" ? args.toolContextId : "";
 
   let context: ToolExecutionContext | null;
-  let suppliedByCaller = false;
 
   try {
     if (argToolContextId) {
       context = await toolContexts.require(tenantId, argToolContextId);
-      suppliedByCaller = true;
     } else if (urlToolContextId) {
       context = await toolContexts.require(tenantId, urlToolContextId);
-      suppliedByCaller = true;
     } else {
       context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
     }
@@ -39,12 +36,12 @@ export async function resolveBoundToolContext(input: {
     return { error: failure(rpc.id, -32602, "toolContextId is required.") };
   }
 
-  // Bind a caller-supplied context id to the authenticated runtime token so a
-  // same-tenant caller cannot substitute another user's/session's context.
-  if (suppliedByCaller) {
-    if (context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid) {
-      return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
-    }
+  // Session fallback can find a newer participant's turn. Every lookup path
+  // must bind the context to the token's identity and runtime generation.
+  if (context.tenantId !== tenantId || context.tenantId !== runtimeTokenClaims.tid ||
+      context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid ||
+      context.runtimeId !== runtimeTokenClaims.rid) {
+    return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
   }
 
   return { context };

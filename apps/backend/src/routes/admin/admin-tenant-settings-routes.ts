@@ -7,6 +7,7 @@ import {
 
 import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
+import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { RuntimeAdapter } from "../../runtime-contracts.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
@@ -64,32 +65,6 @@ async function invalidateTenantRuntimes(
       [err]
     );
   }
-}
-
-/**
- * Drops model ids the catalog no longer knows about from a tenant's saved
- * availability settings.
- *
- * PUT validates enabledModelIds against the catalog and 400s on an unknown id.
- * The admin form round-trips whatever GET returns, so a catalog removal (a
- * retired vendor model, a deleted custom model) would otherwise wedge the
- * page: the stale id no longer renders as a checkbox, yet it rides along on
- * every save and is rejected. Filtering on read keeps the settings the admin
- * can actually see and the settings they submit in agreement.
- *
- * An allowlist that filters down to empty becomes null ("all models") rather
- * than [] ("no models"): every model the admin picked is gone, and locking the
- * tenant out of the picker is a worse failure than widening it. modelDefaultEfforts
- * needs no such pass — effectiveDefaultEffort already ignores unknown ids.
- */
-export function pruneUnknownModelIds<T extends { enabledModelIds: string[] | null }>(
-  settings: T,
-  knownModelIds: ReadonlySet<string>
-): T {
-  if (settings.enabledModelIds === null) return settings;
-  const kept = settings.enabledModelIds.filter((id) => knownModelIds.has(id));
-  if (kept.length === settings.enabledModelIds.length) return settings;
-  return { ...settings, enabledModelIds: kept.length > 0 ? kept : null };
 }
 
 export async function registerAdminTenantSettingsRoutes(

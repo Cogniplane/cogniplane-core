@@ -5,6 +5,7 @@ import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 
 export type PiiScanSubjectType = "message" | "artifact";
+export type PiiScanRunSubjectType = PiiScanSubjectType | "project_instructions";
 
 export type PiiScanMode = "off" | "detect" | "block" | "transform";
 
@@ -22,7 +23,8 @@ export type PiiScanStatus =
 export type PiiScanRunRecord = {
   tenantId: string;
   scanRunId: string;
-  subjectType: PiiScanSubjectType;
+  subjectType: PiiScanRunSubjectType;
+  instructionsRevision?: number | null;
   subjectId: string;
   sourceSessionId: string | null;
   sourceUserId: string | null;
@@ -42,7 +44,8 @@ export type PiiScanRunRecord = {
 export type CreatePiiScanRunInput = {
   tenantId: string;
   scanRunId?: string;
-  subjectType: PiiScanSubjectType;
+  subjectType: PiiScanRunSubjectType;
+  instructionsRevision?: number | null;
   subjectId: string;
   sourceSessionId?: string | null;
   sourceUserId?: string | null;
@@ -86,7 +89,9 @@ function mapRow(row: Record<string, unknown>): PiiScanRunRecord {
   return {
     tenantId: String(row.tenant_id),
     scanRunId: String(row.scan_run_id),
-    subjectType: row.subject_type === "artifact" ? "artifact" : "message",
+    subjectType: row.subject_type === "project_instructions" ? "project_instructions"
+      : row.subject_type === "artifact" ? "artifact" : "message",
+    instructionsRevision: row.instructions_revision == null ? null : Number(row.instructions_revision),
     subjectId: String(row.subject_id),
     sourceSessionId: row.source_session_id == null ? null : String(row.source_session_id),
     sourceUserId: row.source_user_id == null ? null : String(row.source_user_id),
@@ -118,6 +123,7 @@ export class PiiScanRunStore {
             tenant_id,
             scan_run_id,
             subject_type,
+            instructions_revision,
             subject_id,
             source_session_id,
             source_user_id,
@@ -130,11 +136,12 @@ export class PiiScanRunStore {
             action_taken,
             error_message
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)
+          VALUES ($1, $2, $3, $15, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)
           RETURNING
             tenant_id,
             scan_run_id,
             subject_type,
+            instructions_revision,
             subject_id,
             source_session_id,
             source_user_id,
@@ -164,7 +171,8 @@ export class PiiScanRunStore {
           JSON.stringify(findings),
           input.summaryText ?? null,
           input.actionTaken ?? null,
-          input.errorMessage ?? null
+          input.errorMessage ?? null,
+          input.instructionsRevision ?? null
         ]
       );
       return mapRow(result.rows[0] as Record<string, unknown>);
@@ -215,6 +223,7 @@ export class PiiScanRunStore {
             tenant_id,
             scan_run_id,
             subject_type,
+            instructions_revision,
             subject_id,
             source_session_id,
             source_user_id,
@@ -245,6 +254,7 @@ export class PiiScanRunStore {
             tenant_id,
             scan_run_id,
             subject_type,
+            instructions_revision,
             subject_id,
             source_session_id,
             source_user_id,

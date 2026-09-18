@@ -69,6 +69,17 @@ test("consumeRateLimit rolls back counter when tenant limit is exceeded", async 
   expect(third.scope).toBe("tenant");
 });
 
+test("refundRateLimit releases a charge from both scopes", async () => {
+  const limits = makeConfig({ userRateLimit: 2, tenantRateLimit: 2 });
+  const input = { resource: "message_turn" as const, userId: "u1", tenantId: "t1" };
+
+  await limits.consumeRateLimit(input);
+  await limits.consumeRateLimit(input);
+  await limits.refundRateLimit(input);
+
+  expect(await limits.consumeRateLimit(input)).toBeNull();
+});
+
 test("consumeRateLimit concurrent calls respect the limit", async () => {
   // With limit=2, firing 5 concurrent calls should result in exactly 2 allowed
   // and 3 rejected — the increment-first strategy prevents over-admission.

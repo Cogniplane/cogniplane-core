@@ -192,6 +192,61 @@ test("loopback peer admission allows loopback peers and rejects non-loopback pee
   expect(rejectedEvent?.payload.reason).toBe("non_loopback_peer");
 });
 
+test.each(["managed-session-context", "test-proxy"].flatMap((serverId) =>
+  ["args", "url", "fallback"].flatMap((source) =>
+    ["user", "runtime", "matching"].map((identity) => ({ serverId, source, identity }))
+  )
+))("binds $serverId context from $source to $identity identity", async ({ serverId, source, identity }) => {
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const handler = vi.fn(async () => ({ allowed: true }));
+  const { app, toolContexts } = await createTestApp({
+    proxyUpstreamUrl: upstreamUrl,
+    extraManagedTools: [{
+      name: "identity_probe", description: "Identity test", readOnly: true,
+      inputSchema: { type: "object" }, handler
+    }]
+  });
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: "shared-session", userId: "current-user", runtimeId: "current-runtime",
+    metadata: { runtimePolicy: {
+      ...testRuntimePolicy, enabledMcpServers: [serverId], enabledToolIds: ["identity_probe"]
+    } }
+  });
+  const requireContext = vi.spyOn(toolContexts, "require");
+  const findContext = vi.spyOn(toolContexts, "findLatestActiveBySession");
+  const response = await app.inject({
+    method: "POST",
+    url: `/mcp/${serverId}${source === "url" ? `?toolContextId=${context.toolContextId}` : ""}`,
+    headers: { authorization: `Bearer ${runtimeToken({
+      sid: context.sessionId,
+      uid: identity === "user" ? "prior-user" : context.userId,
+      rid: identity === "runtime" ? "prior-runtime" : context.runtimeId
+    })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "identity_probe",
+      arguments: source === "args" ? { toolContextId: context.toolContextId } : {}
+    } }
+  });
+  expect(response.statusCode).toBe(200);
+  if (source === "fallback") {
+    expect(findContext).toHaveBeenCalledWith("test-tenant", context.sessionId);
+    expect(requireContext).not.toHaveBeenCalled();
+  } else {
+    expect(requireContext).toHaveBeenCalledWith("test-tenant", context.toolContextId);
+    expect(findContext).not.toHaveBeenCalled();
+  }
+  if (identity === "matching") {
+    expect(response.json().error).toBeUndefined();
+    expect(handler).toHaveBeenCalledTimes(serverId === "test-proxy" ? 0 : 1);
+    expect(upstreamRequests).toHaveLength(serverId === "test-proxy" ? 1 : 0);
+  } else {
+    expect(response.json().error.message).toBe("Tool context does not belong to the authenticated runtime session.");
+    expect(handler).not.toHaveBeenCalled();
+    expect(upstreamRequests).toHaveLength(0);
+  }
+});
+
 test("rejects a managed tool call whose toolContextId belongs to another user/session", async () => {
   const { app, sessions, messages, toolContexts } = await createTestApp();
   onTestFinished(async () => {
@@ -267,7 +322,7 @@ test("accepts a managed tool call whose toolContextId matches the runtime token"
     method: "POST",
     url: "/mcp/managed-session-context",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: session.sessionId, uid: "owner-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: session.sessionId, uid: "owner-user", rid: "runtime-owner" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -536,7 +591,7 @@ test("ProxyToolMetadataCache populates from tools/list upstream response and dri
   });
 
   const headers = {
-    authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "cache-user" })}`
+    authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "cache-user", rid: "runtime-cache" })}`
   };
 
   // 1. tools/list primes the proxyToolMetadataCache
@@ -695,7 +750,7 @@ test("upstream tools/list response with JSON-RPC error does NOT mutate cache and
   });
 
   const headers = {
-    authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "cache-user" })}`
+    authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "cache-user", rid: "runtime-cache" })}`
   };
 
   // 1. First tools/list succeeds and primes cache: cached_tool -> readOnlyHint: true
@@ -822,7 +877,7 @@ test("two tenants with identically-named servers do not share proxy tool metadat
     }
   });
   const headersA = {
-    authorization: `Bearer ${runtimeToken({ tid: "tenant-a", sid: "session-a", uid: "user-a" })}`
+    authorization: `Bearer ${runtimeToken({ tid: "tenant-a", sid: "session-a", uid: "user-a", rid: "runtime-a" })}`
   };
 
   const listRespA = await app.inject({
@@ -848,7 +903,7 @@ test("two tenants with identically-named servers do not share proxy tool metadat
     }
   });
   const headersB = {
-    authorization: `Bearer ${runtimeToken({ tid: "tenant-b", sid: "session-b", uid: "user-b" })}`
+    authorization: `Bearer ${runtimeToken({ tid: "tenant-b", sid: "session-b", uid: "user-b", rid: "runtime-b" })}`
   };
 
   // Tenant B calls delete_record on test-proxy
@@ -921,7 +976,7 @@ test("proxy tool/call forwards the framework-signed X-Framework identity and ign
     method: "POST",
     url: "/mcp/test-proxy",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "header-user" })}`,
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "header-user", rid: "runtime-header" })}`,
       "x-framework-user-id": "spoofed-user"
     },
     payload: {
@@ -974,7 +1029,7 @@ test("redacts credentials in a proxy tool result before returning to the runtime
     method: "POST",
     url: "/mcp/test-proxy",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "redact-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "redact-user", rid: "runtime-redact" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -1034,7 +1089,7 @@ test("strips policy approval metadata before dispatching to a managed tool handl
     method: "POST",
     url: "/mcp/managed-session-context",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "metadata-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "metadata-user", rid: "runtime-metadata" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -1085,7 +1140,7 @@ test("strips policy approval metadata before forwarding proxy tool arguments", a
     method: "POST",
     url: "/mcp/test-proxy",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "metadata-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "metadata-user", rid: "runtime-metadata" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -1157,7 +1212,7 @@ test("redacts a managed tool result in content[0].text, not only structuredConte
     method: "POST",
     url: "/mcp/managed-session-context",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "redact-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "redact-user", rid: "runtime-redact" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -1226,7 +1281,7 @@ test("a managed tool handler's internal error never reaches the model", async ()
     method: "POST",
     url: "/mcp/managed-session-context",
     headers: {
-      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "error-user" })}`
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "error-user", rid: "runtime-error" })}`
     },
     payload: {
       jsonrpc: "2.0",
@@ -1796,6 +1851,48 @@ test("a turnContext=scheduled rule does NOT gate an interactive turn", async () 
   expect(interactive.upstreamRequests.length).toBe(1);
 });
 
+test("scheduled turns hide and reject project-category managed tools", async () => {
+  const { app, toolContexts } = await createTestApp();
+  onTestFinished(async () => { await app.close(); });
+
+  const sessionId = "scheduled-project-tools";
+  const context = await createTestToolContext(toolContexts, {
+    sessionId,
+    runtimeId: `runtime-${sessionId}`,
+    metadata: {
+      turnContext: "scheduled",
+      runtimePolicy: {
+        ...testRuntimePolicy,
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "project_read_file"]
+      }
+    }
+  });
+  const headers = {
+    authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "test-user" })}`
+  };
+
+  const listed = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    headers,
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/list" }
+  });
+  expect(listed.json().result.tools.some((tool: { name: string }) => tool.name === "project_read_file")).toBe(false);
+
+  const called = await app.inject({
+    method: "POST",
+    url: "/mcp/managed-session-context",
+    headers,
+    payload: {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "project_read_file", arguments: { toolContextId: context.toolContextId } }
+    }
+  });
+  expect(called.json().error.message).toMatch(/only available during interactive project turns/);
+});
+
 
 test.each(["managed-session-context", "test-proxy"])(
   "%s attributes tool calls to the bound context's message instead of the latest turn",
@@ -1823,7 +1920,7 @@ test.each(["managed-session-context", "test-proxy"])(
     await createTestToolContext(toolContexts, { sessionId, messageId: "later-message" });
     const response = await app.inject({
       method: "POST", url: `/mcp/${serverId}`,
-      headers: { authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "test-user" })}` },
+      headers: { authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "test-user", rid: context.runtimeId })}` },
       payload: {
         jsonrpc: "2.0", id: 1, method: "tools/call",
         params: { name: "telemetry_tool", arguments: { toolContextId: context.toolContextId } }

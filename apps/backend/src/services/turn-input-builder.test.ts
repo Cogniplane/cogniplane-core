@@ -45,7 +45,7 @@ function makeStorage(textByKey: Record<string, string>): Pick<ArtifactStorage, "
 }
 
 function makeProcessor(opts: {
-  text?: (artifact: ArtifactRecord) => string | null | Promise<string | null>;
+  text?: (artifact: Parameters<ArtifactProcessor["extractArtifactText"]>[0]) => string | null | Promise<string | null>;
   textThrows?: boolean;
 }): Pick<ArtifactProcessor, "extractArtifactText"> {
   return {

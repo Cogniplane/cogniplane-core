@@ -34,6 +34,7 @@ describe("ActiveTurnsRegistry", () => {
     const registry = new ActiveTurnsRegistry(staleAfterMs);
     const start = Date.now();
     registry.mark("s1");
+    expect(registry.startedAt("s1")).toBe(start);
 
     // A turn one minute short of the window is still live and must stay busy.
     vi.setSystemTime(start + staleAfterMs - 60_000);
@@ -41,6 +42,7 @@ describe("ActiveTurnsRegistry", () => {
 
     vi.setSystemTime(start + staleAfterMs + 1);
     expect(registry.snapshot().has("s1")).toBe(false);
+    expect(registry.startedAt("s1")).toBeUndefined();
   });
 
   it("clears a turn explicitly", () => {
@@ -49,5 +51,23 @@ describe("ActiveTurnsRegistry", () => {
     expect(registry.snapshot().has("s1")).toBe(true);
     registry.clear("s1");
     expect(registry.snapshot().has("s1")).toBe(false);
+    expect(registry.startedAt("s1")).toBeUndefined();
   });
+});
+
+it("reserves mutations without reporting turns and releases only its own reservation", () => {
+  const registry = new ActiveTurnsRegistry();
+  const release = registry.reserveMutation("s1")!;
+  expect(registry.isBusy("s1")).toBe(true);
+  expect(registry.snapshot().size).toBe(0);
+  expect(registry.startedAt("s1")).toBeUndefined();
+  expect(registry.reserveMutation("s1")).toBeNull();
+  release();
+  const releaseNext = registry.reserveMutation("s1")!;
+  release();
+  expect(registry.isBusy("s1")).toBe(true);
+  registry.mark("s1");
+  releaseNext();
+  expect(registry.snapshot().has("s1")).toBe(true);
+  expect(registry.reserveMutation("s1")).toBeNull();
 });

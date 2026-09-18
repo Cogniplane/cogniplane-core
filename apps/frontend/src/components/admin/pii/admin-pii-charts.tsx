@@ -255,45 +255,28 @@ function SubjectSplitCard({ rows }: { rows: PiiActivityMetrics["bySubjectType"] 
       </article>
     );
   }
-  const messageCount = rows.find((r) => r.subjectType === "message")?.count ?? 0;
-  const artifactCount = rows.find((r) => r.subjectType === "artifact")?.count ?? 0;
-  const messagePct = (messageCount / total) * 100;
-  const artifactPct = (artifactCount / total) * 100;
+  const sources = [
+    { type: "message", label: "chat", color: "var(--color-accent)" },
+    { type: "artifact", label: "uploads", color: "var(--color-success)" },
+    { type: "project_instructions", label: "project instructions", color: "var(--color-warning)" }
+  ].map((source) => ({ ...source, count: rows.find((r) => r.subjectType === source.type)?.count ?? 0 }));
 
   return (
     <article className={STAT_CARD}>
       <p className={SECTION_LABEL}>By source</p>
-      <div className="mt-2 flex gap-4 tabular-nums">
-        <div className="flex-1">
-          <strong className="block text-[1.4rem] text-on-surface">{messageCount}</strong>
+      <div className="mt-2 flex flex-wrap gap-4 tabular-nums">
+        {sources.map((source) => <div key={source.type} className="flex-1">
+          <strong className="block text-[1.4rem] text-on-surface">{source.count}</strong>
           <span className="text-[0.78rem] text-on-surface-variant">
-            chat ({messagePct.toFixed(0)}%)
+            {source.label} ({((source.count / total) * 100).toFixed(0)}%)
           </span>
-        </div>
-        <div className="flex-1">
-          <strong className="block text-[1.4rem] text-on-surface">{artifactCount}</strong>
-          <span className="text-[0.78rem] text-on-surface-variant">
-            uploads ({artifactPct.toFixed(0)}%)
-          </span>
-        </div>
+        </div>)}
       </div>
-      <div
-        role="img"
-        aria-label={`${messageCount} chat scans, ${artifactCount} upload scans`}
-        className="mt-3 flex h-2.5 overflow-hidden rounded bg-surface-container"
-      >
-        {messageCount > 0 ? (
-          <span
-            title={`chat: ${buildSegmentTooltip(messageCount, total)}`}
-            style={{ width: `${messagePct}%`, background: "var(--color-accent)" }}
-          />
-        ) : null}
-        {artifactCount > 0 ? (
-          <span
-            title={`uploads: ${buildSegmentTooltip(artifactCount, total)}`}
-            style={{ width: `${artifactPct}%`, background: "var(--color-success)" }}
-          />
-        ) : null}
+      <div role="img" aria-label={sources.map((s) => `${s.count} ${s.label} scans`).join(", ")}
+        className="mt-3 flex h-2.5 overflow-hidden rounded bg-surface-container">
+        {sources.filter((s) => s.count > 0).map((source) => <span key={source.type}
+          title={`${source.label}: ${buildSegmentTooltip(source.count, total)}`}
+          style={{ width: `${(source.count / total) * 100}%`, background: source.color }} />)}
       </div>
     </article>
   );

@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import { EventType, verifyEvents, type BaseEvent } from "@ag-ui/client";
 import { firstValueFrom, from as rxFrom, toArray } from "rxjs";
 
@@ -47,7 +47,7 @@ function makeMessages() {
     streamingLog,
     toolResultLog,
     async create() {
-      return { messageId: "msg-assistant" };
+      return { messageId: "msg-assistant", id: 42 };
     },
     async updateContent(_tid: string, _mid: string, _uid: string, status: string, content: string) {
       contentLog.push({ status, content });
@@ -150,6 +150,25 @@ test("persists a stop-button turn as interrupted with the partial text preserved
   await streamAssistantReplyAGUI(input);
 
   expect(messages.contentLog.at(-1)).toEqual({ status: "interrupted", content: "partial thou" });
+});
+
+test.each([
+  { error: Object.assign(new Error("Session ownership mismatch"), { statusCode: 403 }),
+    expected: "Session ownership mismatch" },
+  { error: new Error("private setup details"), expected: "The assistant run failed." }
+])("handles runtime setup failure without exposing internals: $expected", async ({ error, expected }) => {
+  const { input, messages, reply, runInputs } = runInput([]);
+  input.runtimeAdapter.createSession = async () => { throw error; };
+
+  await streamAssistantReplyAGUI(input);
+
+  const events = reply.writes.flatMap((chunk) => chunk.split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as BaseEvent));
+  expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR, message: expected });
+  expect(messages.contentLog.at(-1)).toEqual({ status: "error", content: expected });
+  expect(runInputs).toHaveLength(0);
+  expect(reply.raw.writableEnded).toBe(true);
 });
 
 test("threads selected artifacts into the tool context and an onBeforeTurn hook", async () => {
@@ -356,9 +375,10 @@ test("emits the PII replacement before RUN_ERROR when setup fails before RUN_STA
   expect(emittedEvents.map((event) => event.type)).toEqual([
     EventType.RUN_STARTED,
     EventType.CUSTOM,
+    EventType.CUSTOM,
     EventType.RUN_ERROR
   ]);
-  expect(emittedEvents[1]).toMatchObject({
+  expect(emittedEvents[2]).toMatchObject({
     name: "user_message_replaced",
     value: { messageId: "u-1", text: "my card is [REDACTED]", scanRunId: "scan-9" }
   });
@@ -383,6 +403,7 @@ test("emits the PII replacement before an adapter RUN_ERROR that precedes RUN_ST
   );
   expect(emittedEvents.map((event) => event.type)).toEqual([
     EventType.RUN_STARTED,
+    EventType.CUSTOM,
     EventType.CUSTOM,
     EventType.RUN_ERROR
   ]);
@@ -622,4 +643,86 @@ test("a checkpoint that never resolves does not wedge the request", async () => 
   expect(stalledCheckpoints).toBeGreaterThan(0);
   // The turn still recorded its outcome instead of hanging.
   expect(messages.contentLog.at(-1)?.status).toBe("completed");
+});
+
+
+test.each([false, true])("streams persisted turn identity before settlement, setup failure=%s", async (setupFailure) => {
+  const onTurnCreated = vi.fn();
+  const { input, reply, messages } = runInput([
+    { type: EventType.RUN_STARTED, threadId: "session-1", runId: "msg-assistant" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "msg-assistant" } as BaseEvent
+  ], { onTurnCreated });
+  if (setupFailure) input.runtimeAdapter.createSession = async () => { throw new Error("setup failed"); };
+  await streamAssistantReplyAGUI(input);
+  expect(onTurnCreated).toHaveBeenCalledExactlyOnceWith({ messageId: "msg-assistant", sequence: 42 });
+  const events = reply.writes.flatMap((write) => write.split("\n")
+    .filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)) as BaseEvent));
+  expect(events[0].type).toBe(EventType.RUN_STARTED);
+  expect(events[1]).toMatchObject({ type: EventType.CUSTOM, name: "turn_started", value: { messageId: "msg-assistant", sequence: 42 } });
+  expect(events.at(-1)?.type).toBe(setupFailure ? EventType.RUN_ERROR : EventType.RUN_FINISHED);
+  expect(messages.contentLog.at(-1)?.status).toBe(setupFailure ? "error" : "completed");
+  await expect(firstValueFrom(rxFrom(events).pipe(verifyEvents(false), toArray()))).resolves.toHaveLength(events.length);
+});
+
+test.each(["completed", "error", "interrupted", "setup-error"] as const)(
+  "persists whole-turn timing before the %s terminal event", async (outcome) => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    const terminal = outcome === "error"
+      ? { type: EventType.RUN_ERROR, message: "failed" }
+      : { type: EventType.RUN_FINISHED, threadId: "t", runId: "r", ...(outcome === "interrupted" ? { result: AGUI_INTERRUPTED_RESULT } : {}) };
+    const { input } = runInput([], { startedAt: 16_000 });
+    const originalCreate = input.runtimeAdapter.createSession;
+    input.runtimeAdapter.createSession = async (...args) => {
+      if (outcome === "setup-error") throw new Error("setup failed");
+      return originalCreate(...args);
+    };
+    input.runtimeAdapter.runMessageAGUI = async function* () {
+      yield { type: EventType.RUN_STARTED, threadId: "t", runId: "r" } as BaseEvent;
+      yield { type: EventType.CUSTOM, name: "approval_required", value: {} } as BaseEvent;
+      yield terminal as BaseEvent;
+      // Adapter cleanup is outside the measured runtime.
+      now.mockReturnValue(110_000);
+    };
+    let persisted = false;
+    input.messages.updateContent = vi.fn(async (_tenant, _message, _user, status, _content, duration) => {
+      expect(status).toBe(outcome === "setup-error" ? "error" : outcome);
+      expect(duration).toBe(84_000);
+      persisted = true;
+      return null;
+    });
+    input.reply.raw.write = ((chunk: string) => {
+      if (chunk.includes('"type":"RUN_FINISHED"') || chunk.includes('"type":"RUN_ERROR"')) {
+        expect(persisted).toBe(true);
+      }
+      return true;
+    }) as typeof input.reply.raw.write;
+    try {
+      await streamAssistantReplyAGUI(input);
+      expect(persisted).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  }
+);
+
+test.each([false, true])("terminates with one error when final persistence fails, retry fails=%s", async (retryFails) => {
+  const { input, reply } = runInput([
+    { type: EventType.RUN_STARTED, threadId: "t", runId: "r" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+  ]);
+  const attemptedStatuses: string[] = [];
+  input.messages.updateContent = vi.fn(async (_tenant, _message, _user, status) => {
+    attemptedStatuses.push(status);
+    if (status === "completed" || retryFails) throw new Error("database unavailable");
+    return null;
+  });
+  await streamAssistantReplyAGUI(input);
+  const events = reply.writes.flatMap((write) => write.split("\n")
+    .filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)) as BaseEvent));
+  expect(attemptedStatuses).toEqual(["completed", "error"]);
+  expect(events.filter((event) => event.type === EventType.RUN_FINISHED)).toHaveLength(0);
+  expect(events.filter((event) => event.type === EventType.RUN_ERROR)).toHaveLength(1);
+  expect(events.at(-1)).toMatchObject({ type: EventType.RUN_ERROR });
+  expect(reply.raw.writableEnded).toBe(true);
+  await expect(firstValueFrom(rxFrom(events).pipe(verifyEvents(false), toArray()))).resolves.toHaveLength(events.length);
 });

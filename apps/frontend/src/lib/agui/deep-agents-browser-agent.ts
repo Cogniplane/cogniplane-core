@@ -80,6 +80,8 @@ export interface DeepAgentsBrowserAgentConfig {
   getEffort?: () => EffortLevel | null | undefined;
   /** Artifacts the user has checkboxed for the next turn. */
   getArtifactIds?: () => string[];
+  /** Project files the user selected for extra attention on the next turn. */
+  getProjectFileIds?: () => string[];
 }
 
 export class DeepAgentsBrowserAgent extends HttpAgent {
@@ -87,6 +89,7 @@ export class DeepAgentsBrowserAgent extends HttpAgent {
   private readonly getModel?: () => string | undefined;
   private readonly getEffort?: () => EffortLevel | null | undefined;
   private readonly getArtifactIds?: () => string[];
+  private readonly getProjectFileIds?: () => string[];
 
   constructor(config: DeepAgentsBrowserAgentConfig) {
     super({
@@ -100,12 +103,14 @@ export class DeepAgentsBrowserAgent extends HttpAgent {
     this.getModel = config.getModel;
     this.getEffort = config.getEffort;
     this.getArtifactIds = config.getArtifactIds;
+    this.getProjectFileIds = config.getProjectFileIds;
   }
 
   protected requestInit(input: RunAgentInput): RequestInit {
     const model = this.getModel?.();
     const effort = this.getEffort?.();
     const artifactIds = this.getArtifactIds?.() ?? [];
+    const projectFileIds = this.getProjectFileIds?.() ?? [];
     return {
       method: "POST",
       headers: { "Content-Type": "application/json", ...this.headers },
@@ -114,7 +119,8 @@ export class DeepAgentsBrowserAgent extends HttpAgent {
         text: latestUserText(input),
         ...(model ? { model } : {}),
         ...(effort ? { effort } : {}),
-        ...(artifactIds.length ? { artifactIds } : {})
+        ...(artifactIds.length ? { artifactIds } : {}),
+        ...(projectFileIds.length ? { projectFileIds } : {})
       }),
       signal: this.abortController.signal
     };

@@ -7,6 +7,7 @@ import { test, expect, onTestFinished } from "vitest";
 import JSZip from "jszip";
 
 import { createTestConfig } from "../test-helpers/test-config.js";
+import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 
 import {
   type ImportedSkillBundleRecord
@@ -74,6 +75,27 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
     }
   };
 }
+
+test("session config reads persisted selections and fails closed when that read fails", async () => {
+  let calls = 0;
+  let fail = false;
+  const service = new DynamicConfigService(createTestConfig(), {
+    ...makeStores(),
+    sessions: { async getCapabilitySelection(tenantId, sessionId, userId) {
+      expect([tenantId, sessionId, userId]).toEqual(["tenant", "session", "user"]);
+      calls++;
+      if (fail) throw new Error("capabilities unavailable");
+      return { skillIds: [], connectorIds: [] };
+    } }
+  }, { storeBundle: async () => { throw new Error("unused"); }, deleteBundle: async () => {} }, makeManagedToolCatalog());
+  service.getRuntimePolicy = async () => testRuntimePolicy;
+  await service.compileRuntimeConfig("tenant", false);
+  expect(calls).toBe(0);
+  expect((await service.compileRuntimeConfig("tenant", false, { sessionId: "session", userId: "user" })).runtimePolicy.enabledMcpServers).toEqual([]);
+  expect(calls).toBe(1);
+  fail = true;
+  await expect(service.compileRuntimeConfig("tenant", false, { sessionId: "session", userId: "user" })).rejects.toThrow("capabilities unavailable");
+});
 
 function makeImportedSkillBundle(
   input: ImportSkillBundleInput,

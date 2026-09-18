@@ -1,5 +1,6 @@
 // Tracks which sessions have a turn streaming *right now* on this backend
-// process. Used only to decorate the sidebar with a "busy" dot.
+// process. Reserves interactive turns and lifecycle mutations, and supplies
+// activity identity and timing to the session list.
 //
 // Single-process scope by design: if we ever scale horizontally, swap this
 // for a DB-backed flag (a `sessions.current_turn_started_at` column works).
@@ -35,12 +36,16 @@ export function deriveStaleAfterMs(config: {
 // context TTL) + 5 min margin.
 const DEFAULT_STALE_AFTER_MS = 40 * 60 * 1000;
 
+export type TurnIdentity = { messageId: string; sequence: number };
+
 type Entry = {
+  turn?: TurnIdentity;
   startedAt: number;
 };
 
 export class ActiveTurnsRegistry {
   private readonly entries = new Map<string, Entry>();
+  private readonly mutations = new Map<string, symbol>();
   private readonly staleAfterMs: number;
 
   constructor(staleAfterMs: number = DEFAULT_STALE_AFTER_MS) {
@@ -49,6 +54,33 @@ export class ActiveTurnsRegistry {
 
   mark(sessionId: string): void {
     this.entries.set(sessionId, { startedAt: Date.now() });
+  }
+
+  isBusy(sessionId: string): boolean {
+    return this.mutations.has(sessionId) || this.snapshot().has(sessionId);
+  }
+
+  /** Reserve a mutation without advertising a streaming turn or start time. */
+  reserveMutation(sessionId: string): (() => void) | null {
+    if (this.isBusy(sessionId)) return null;
+    const token = Symbol(sessionId);
+    this.mutations.set(sessionId, token);
+    return () => {
+      if (this.mutations.get(sessionId) === token) this.mutations.delete(sessionId);
+    };
+  }
+
+  identify(sessionId: string, turn: TurnIdentity): void {
+    const entry = this.entries.get(sessionId);
+    if (entry) entry.turn = turn;
+  }
+
+  identity(sessionId: string): TurnIdentity | undefined {
+    return this.entries.get(sessionId)?.turn;
+  }
+
+  startedAt(sessionId: string): number | undefined {
+    return this.entries.get(sessionId)?.startedAt;
   }
 
   clear(sessionId: string): void {

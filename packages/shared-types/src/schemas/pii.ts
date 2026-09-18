@@ -226,8 +226,9 @@ export const PiiRecentRowSchema = z.object({
   scanRunId: z.string(),
   createdAt: IsoDateSchema,
   completedAt: IsoDateSchema.nullable(),
-  subjectType: z.enum(["message", "artifact"]),
+  subjectType: z.enum(["message", "artifact", "project_instructions"]),
   subjectId: z.string(),
+  instructionsRevision: z.number().int().nonnegative().nullable().optional(),
   sessionId: z.string().nullable(),
   userId: z.string().nullable(),
   mode: z.string(),
@@ -263,7 +264,7 @@ export const PiiQueueStatsSchema = z.object({
 export type PiiQueueStats = z.infer<typeof PiiQueueStatsSchema>;
 
 export const PiiLatencyRowSchema = z.object({
-  subjectType: z.enum(["message", "artifact"]),
+  subjectType: z.enum(["message", "artifact", "project_instructions"]),
   p50Ms: z.number().nullable(),
   p95Ms: z.number().nullable(),
   p99Ms: z.number().nullable(),

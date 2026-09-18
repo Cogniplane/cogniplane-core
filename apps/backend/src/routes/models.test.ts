@@ -127,6 +127,25 @@ test("/models surfaces showEffortSelector from tenant settings", async () => {
   }
 });
 
+test("/models returns the tenant's enabled tool ids", async () => {
+  const enabledToolIds = ["project_get_conflict_context", "project_reconcile_conflict"];
+  const app = await makeModelsApp(
+    makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith({ enabledToolIds });
+        }
+      }
+    })
+  );
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.json().enabledToolIds).toEqual(enabledToolIds);
+  } finally {
+    await app.close();
+  }
+});
+
 test("/models hides models of a disabled provider even when its key is configured", async () => {
   const app = await makeModelsApp(
     makeStores({
@@ -167,6 +186,30 @@ test("/models applies the enabledModelIds allowlist", async () => {
     await app.close();
   }
 });
+
+test.each([
+  { enabledProviders: [] },
+  { enabledModelIds: [] }
+] satisfies Partial<TenantSettingsRecord>[])(
+  "/models returns no models for an empty allowlist: %j",
+  async (availability) => {
+    const app = await makeModelsApp(makeStores({
+      dynamicConfig: {
+        async getOrCreateTenantSettings() {
+          return settingsWith(availability);
+        }
+      },
+      configuredProviders: configured(...MODEL_PROVIDERS)
+    }));
+    try {
+      const response = await app.inject({ method: "GET", url: "/models" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().models).toEqual([]);
+    } finally {
+      await app.close();
+    }
+  }
+);
 
 test("/models overrides defaultEffort from tenant modelDefaultEfforts", async () => {
   const app = await makeModelsApp(

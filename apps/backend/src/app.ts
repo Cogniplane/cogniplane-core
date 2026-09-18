@@ -158,7 +158,7 @@ export async function buildApp() {
 
   // The privileged pool is, by definition, the RLS-bypassing superuser pool:
   // background work that must read across tenants (scheduler claiming due jobs,
-  // PII scan jobs) and getDownloadToken depend on it. If
+  // PII scan jobs, project-file retention) and getDownloadToken depend on it. If
   // MIGRATION_DATABASE_URL is unset, privilegedDb silently falls back to the
   // RLS-bound app_user pool, and those cross-tenant queries return zero rows
   // with no error — a near-invisible failure. Verify the pool's contract at boot
@@ -167,10 +167,16 @@ export async function buildApp() {
   //   1. If a distinct privileged pool exists, it MUST actually bypass RLS —
   //      asserted unconditionally, never gated on feature flags, so a flag
   //      flipping on later can't be the first thing to reveal a broken pool.
-  //   2. If no distinct pool exists (fell back to app.db) but a feature needs
-  //      cross-tenant reads, that's fatal — boot would silently return no rows.
+  //   2. If no distinct pool exists (fell back to app.db) but an enabled
+  //      feature needs cross-tenant reads, that's fatal — boot would silently
+  //      return no rows. Retention can be disabled explicitly for deployments
+  //      that do not provide its privileged maintenance pool.
   const privilegedNeedsBypassRls =
-    config.SCHEDULER_ENABLED || config.PII_PROVIDER_ENABLED || config.AUTH_MODE === "workos";
+    config.PROJECT_FILE_RETENTION_ENABLED ||
+    config.SESSION_TRASH_RETENTION_ENABLED ||
+    config.SCHEDULER_ENABLED ||
+    config.PII_PROVIDER_ENABLED ||
+    config.AUTH_MODE === "workos";
   if (privilegedDb !== app.db) {
     const { rows } = await privilegedDb.query<{ bypassrls: boolean }>(
       "SELECT rolbypassrls AS bypassrls FROM pg_roles WHERE rolname = current_user"
@@ -179,12 +185,12 @@ export async function buildApp() {
       throw new Error(
         "Privileged database pool must use a role with BYPASSRLS (e.g. a superuser). " +
           "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
-          "Without it, scheduler/PII cross-tenant queries silently return zero rows under RLS."
+          "Without it, scheduler/PII/project-retention queries silently return zero rows under RLS."
       );
     }
   } else if (privilegedNeedsBypassRls) {
     throw new Error(
-      "Scheduler/PII/workos are enabled but no distinct privileged (BYPASSRLS) database pool is configured. " +
+      "Project retention or another cross-tenant workload is enabled but no distinct privileged (BYPASSRLS) database pool is configured. " +
         "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
         "Without it, cross-tenant background queries silently return zero rows under RLS."
     );
@@ -309,6 +315,10 @@ export async function buildApp() {
     auditEvents: deps.auditEvents,
     piiScanJobs: deps.piiScanJobs,
     piiScanJobHandler: deps.piiScanJobHandler,
+    projectFiles: deps.projectFiles,
+    projectFileStorage: deps.artifactStorage,
+    sessionTrash: deps.sessions,
+    sessionStorage: deps.artifactStorage,
     logger: app.log
   });
 

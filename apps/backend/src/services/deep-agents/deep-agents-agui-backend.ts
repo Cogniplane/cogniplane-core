@@ -1,3 +1,4 @@
+import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 // Adapts a session graph to the AG-UI driver. Graph resolution and MCP metadata
 // stay session-scoped; the runtime adapter supplies the approval decision loop.
 
@@ -56,6 +57,8 @@ export interface SessionAGUITurnBackendParams {
   effort?: RuntimeReasoningEffort | null;
   /** Prompt text for the initial turn input. */
   promptText: string;
+  conversationMessages?: Array<{ role: "user" | "assistant"; content: string }>;
+  projectInstructions?: ProjectInstructionsSnapshot | null;
   signal?: AbortSignal;
   /** Records availability after the graph and its tools have loaded. */
   onGraphReady?: () => Promise<void>;
@@ -95,7 +98,7 @@ export function createSessionAGUITurnBackend(
     },
 
     buildInitialInput() {
-      return { messages: [{ role: "user", content: promptText }] };
+      return { messages: [...(params.conversationMessages ?? []), { role: "user", content: promptText }] };
     },
 
     async *streamTurn(input) {
@@ -107,6 +110,7 @@ export function createSessionAGUITurnBackend(
       yield* g.streamEvents(input, {
         version: "v2",
         configurable: { thread_id: threadId },
+        context: { projectInstructions: params.projectInstructions ?? null },
         signal
       });
     },

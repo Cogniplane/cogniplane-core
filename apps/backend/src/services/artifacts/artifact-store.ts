@@ -1,8 +1,15 @@
+import { sessionReadAccessSql, sessionContentReadAccessSql, artifactReadAccessSql } from "../session-access.js";
 import { randomBytes } from "node:crypto";
+import type { PoolClient } from "pg";
+import { requireSessionUploadAccess, sessionUploadAccessSql, SessionUploadAccessError } from "../session-upload-access.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import { escapeLikePattern, type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+
+// Persisted metadata key shared by copy creation and scan completion.
+export const PROJECT_COPY_SOURCE_KEY = "reusedFromArtifactId";
+export const UPLOAD_SCAN_PENDING_KEY = "awaitingUploadScan";
 
 export type ArtifactPiiDetail = {
   status?: "pending" | "scanning" | "scanned" | "blocked" | "transformed" | "failed";
@@ -137,11 +144,19 @@ const DOWNLOAD_TOKEN_COLUMNS = `
 const DOWNLOAD_TOKEN_GATING = `
   download.token = $1
   AND download.tenant_id = $2
-  AND ($4::boolean OR download.user_id = $3)
+  AND EXISTS (SELECT 1 FROM sessions token_session
+    WHERE token_session.tenant_id = artifact.tenant_id
+      AND token_session.session_id = artifact.session_id
+      AND CASE WHEN token_session.project_id IS NULL
+        THEN ($4::boolean OR (download.user_id = $3 AND token_session.user_id = $3))
+        ELSE download.user_id = $3 AND ${sessionReadAccessSql("token_session", "$3")}
+      END)
   AND download.consumed_at IS NULL
   AND artifact.tenant_id   = download.tenant_id
   AND artifact.artifact_id = download.artifact_id
-  AND artifact.user_id     = download.user_id
+  AND artifact.session_id  = download.session_id
+  AND artifact.storage_key = download.storage_key
+  AND artifact.storage_backend = download.storage_backend
   AND artifact.status     <> 'deleted'
   AND (artifact.artifact_type = 'upload' OR artifact.status = 'ready')
 `.trim();
@@ -388,51 +403,99 @@ export class ArtifactStore {
     createdByRef?: string | null;
     detail?: ArtifactDetail;
   }): Promise<ArtifactRecord> {
+    return withTenantScope(this.db, input.tenantId, client => this.insert(client, input));
+  }
+
+  /**
+   * Create an artifact produced by an active runtime turn. Unlike the generic
+   * fixture/import path above, tool output must re-check session upload access
+   * while holding the session/project locks so a revocation cannot race the
+   * insert after runtime admission has already succeeded.
+   */
+  async createGenerated(input: Parameters<ArtifactStore["create"]>[0]): Promise<ArtifactRecord> {
+    return withTenantScope(this.db, input.tenantId, async client => {
+      await requireSessionUploadAccess(client, input, true);
+      return this.insert(client, input);
+    });
+  }
+
+  async createUpload(
+    input: Omit<Parameters<ArtifactStore["create"]>[0], "artifactType" | "createdByType" | "status"> & {
+      expectedProjectId: string | null;
+    },
+  ): Promise<ArtifactRecord> {
+    return withTenantScope(this.db, input.tenantId, async client => {
+      const projectId = await requireSessionUploadAccess(client, input, true);
+      if (projectId !== input.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
+      return this.insert(client, {
+        ...input, artifactType: "upload", createdByType: "user", status: "pending",
+        detail: { ...input.detail, [UPLOAD_SCAN_PENDING_KEY]: true },
+      }, true);
+    });
+  }
+
+  private async insert(
+    client: PoolClient,
+    input: Parameters<ArtifactStore["create"]>[0],
+    upload = false,
+  ): Promise<ArtifactRecord> {
     const artifactId = uuidv7();
-    return withTenantScope(this.db, input.tenantId, async (client) => {
-      const insertedArtifact = await client.query(
-        `
-          INSERT INTO artifacts (
-            artifact_id,
-            tenant_id,
-            session_id,
-            user_id,
-            artifact_type,
-            source_artifact_id,
-            artifact_name,
-            mime_type,
-            storage_backend,
-            storage_key,
-            file_size_bytes,
-            checksum_sha256,
-            status,
-            created_by_type,
-            created_by_ref,
-            detail_json
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb)
-          RETURNING ${ARTIFACT_COLUMNS}
-        `,
-        [
-          artifactId,
-          input.tenantId,
-          input.sessionId,
-          input.userId,
-          input.artifactType,
-          input.sourceArtifactId ?? null,
-          input.artifactName,
-          input.mimeType,
-          input.storageBackend,
-          input.storageKey,
-          input.fileSizeBytes,
-          input.checksumSha256,
-          input.status,
-          input.createdByType,
-          input.createdByRef ?? null,
-          JSON.stringify(input.detail ?? {})
-        ]
-      );
-      return mapArtifact(insertedArtifact.rows[0]);
+    const insertedArtifact = await client.query(
+      `
+        INSERT INTO artifacts (
+          artifact_id,
+          tenant_id,
+          session_id,
+          user_id,
+          artifact_type,
+          source_artifact_id,
+          artifact_name,
+          mime_type,
+          storage_backend,
+          storage_key,
+          file_size_bytes,
+          checksum_sha256,
+          status,
+          created_by_type,
+          created_by_ref,
+          detail_json
+        )
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb
+        ${upload ? `WHERE EXISTS (SELECT 1 FROM sessions s
+          WHERE s.tenant_id=$2 AND s.session_id=$3 AND ${sessionUploadAccessSql("s", "$4")})` : ""}
+        RETURNING ${ARTIFACT_COLUMNS}
+      `,
+      [
+        artifactId,
+        input.tenantId,
+        input.sessionId,
+        input.userId,
+        input.artifactType,
+        input.sourceArtifactId ?? null,
+        input.artifactName,
+        input.mimeType,
+        input.storageBackend,
+        input.storageKey,
+        input.fileSizeBytes,
+        input.checksumSha256,
+        input.status,
+        input.createdByType,
+        input.createdByRef ?? null,
+        JSON.stringify(input.detail ?? {})
+      ]
+    );
+    if (!insertedArtifact.rows[0]) throw new SessionUploadAccessError();
+    return mapArtifact(insertedArtifact.rows[0]);
+  }
+
+  async listByProject(tenantId: string, userId: string, projectId: string): Promise<ArtifactRecord[]> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const rows = await client.query(`SELECT a.* FROM artifacts a
+        JOIN sessions s ON s.tenant_id = a.tenant_id AND s.session_id = a.session_id
+        WHERE a.tenant_id = $1 AND ${sessionReadAccessSql("s", "$2")} AND s.project_id = $3
+          AND a.status <> 'deleted' AND a.artifact_type <> 'derived'
+        ORDER BY a.created_at DESC, a.id DESC`, [tenantId, userId, projectId]);
+      return rows.rows.map(mapArtifact);
     });
   }
 
@@ -442,7 +505,7 @@ export class ArtifactStore {
         `
           SELECT ${ARTIFACT_COLUMNS}
           FROM artifacts
-          WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3 AND status <> 'deleted'
+          WHERE tenant_id = $1 AND session_id = $2 AND ${sessionContentReadAccessSql("artifacts", "$3")} AND status <> 'deleted'
           ORDER BY created_at ASC, id ASC
         `,
         [tenantId, sessionId, userId]
@@ -478,6 +541,7 @@ export class ArtifactStore {
     const conditions: string[] = [
       "tenant_id = $1",
       "user_id = $2",
+      artifactReadAccessSql("artifacts", "$2"),
       "status <> 'deleted'",
       "artifact_type <> 'derived'"
     ];
@@ -546,6 +610,18 @@ export class ArtifactStore {
     });
   }
 
+  async getReadable(tenantId: string, artifactId: string, userId: string): Promise<ArtifactRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `SELECT ${ARTIFACT_COLUMNS} FROM artifacts
+         WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
+           AND ${artifactReadAccessSql("artifacts", "$3")}`,
+        [tenantId, artifactId, userId]
+      );
+      return result.rows[0] ? mapArtifact(result.rows[0]) : null;
+    });
+  }
+
   async getOwned(tenantId: string, artifactId: string, userId: string): Promise<ArtifactRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const artifactRows = await client.query(
@@ -588,7 +664,7 @@ export class ArtifactStore {
           WHERE
             tenant_id = $1
             AND source_artifact_id = $2
-            AND user_id = $3
+            AND ${artifactReadAccessSql("artifacts", "$3")}
             AND status = 'ready'
             AND mime_type LIKE 'text/%'
           ORDER BY created_at DESC, id DESC
@@ -612,7 +688,7 @@ export class ArtifactStore {
         `
           UPDATE artifacts
           SET status = $3, updated_at = NOW()
-          WHERE tenant_id = $1 AND artifact_id = $2
+          WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
           RETURNING ${ARTIFACT_COLUMNS}
         `,
         [tenantId, artifactId, input.status]
@@ -636,8 +712,17 @@ export class ArtifactStore {
                 COALESCE(detail_json->'pii', '{}'::jsonb) || $3::jsonb,
                 true
               ),
+              -- Uploads and project copies opt into pending-until-scanned status.
+              -- Worker completion and the PII verdict become visible atomically.
+              status = CASE WHEN status = 'pending' AND
+                (detail_json ? '${PROJECT_COPY_SOURCE_KEY}' OR detail_json ? '${UPLOAD_SCAN_PENDING_KEY}')
+                THEN CASE $3::jsonb->>'status'
+                  WHEN 'scanned' THEN 'ready' WHEN 'transformed' THEN 'ready'
+                  WHEN 'blocked' THEN 'failed' WHEN 'failed' THEN 'failed'
+                  ELSE status END
+                ELSE status END,
               updated_at = NOW()
-          WHERE tenant_id = $1 AND artifact_id = $2
+          WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
         `,
         [tenantId, artifactId, JSON.stringify(pii)]
       );
@@ -712,11 +797,10 @@ export class ArtifactStore {
   // Does NOT filter on expiry — an expired token still resolves here so the
   // route can answer 410.
   //
-  // Caller-identity gating happens in SQL so an unauthorized request can never
-  // observe a peer's token. When `callerIsAdmin` is true the user-equality
-  // check is skipped — admin-minted tokens (POST /admin/artifacts/:id/download-token)
-  // carry the artifact OWNER's user_id, not the admin's, because the
-  // persistence layer joins on (tenant_id, artifact_id, user_id).
+  // Project tokens belong to the requesting member and require current access.
+  // The registered /admin/artifacts/:artifactId/download-token route stores
+  // the artifact owner as the token user. Its administrative download bypass
+  // applies only to non-project sessions.
   async peekDownloadToken(input: {
     token: string;
     requesterTenantId: string;

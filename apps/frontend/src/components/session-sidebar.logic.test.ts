@@ -75,6 +75,33 @@ describe("initialsOf", () => {
 });
 
 describe("groupSessions", () => {
+  test("attention takes priority over every group without duplicating or reordering sessions", () => {
+    const sessions = [
+      makeSession({ sessionId: "today" }),
+      makeSession({ sessionId: "old", updatedAt: isoMinutesAgo(60 * 48) }),
+      makeSession({ sessionId: "pinned" }),
+      makeSession({ sessionId: "improvement", purpose: "skill_improvement" })
+    ];
+    const pins = new Set(["pinned"]);
+    const groups = groupSessions(sessions, pins, "", NOW_DATE, new Set(sessions.map((s) => s.sessionId)));
+    expect(groups.attention).toEqual(sessions);
+    expect(totalGroupedCount(groups)).toBe(sessions.length);
+    const resolved = groupSessions(sessions, pins, "", NOW_DATE, new Set());
+    expect(resolved.attention).toEqual([]);
+    expect(resolved.pinned).toEqual([sessions[2]]);
+    expect(resolved.today).toEqual([sessions[0]]);
+    expect(resolved.earlier).toEqual([sessions[1]]);
+    expect(resolved.improvement).toEqual([sessions[3]]);
+  });
+
+  test("search filters attention sessions and ignores attention IDs outside the list", () => {
+    const sessions = [makeSession({ sessionId: "a", sessionName: "Research" }), makeSession({ sessionId: "b" })];
+    const groups = groupSessions(sessions, new Set(), "  RESEARCH  ", NOW_DATE, new Set(["a", "b", "missing"]));
+    expect(groups.attention).toEqual([sessions[0]]);
+    expect(totalGroupedCount(groups)).toBe(1);
+    expect(totalGroupedCount(groupSessions(sessions, new Set(), "no match", NOW_DATE, new Set(["a"])))).toBe(0);
+  });
+
   test("places skill_improvement sessions in their own bucket", () => {
     const sessions = [
       makeSession({ sessionId: "imp", purpose: "skill_improvement" }),
@@ -112,13 +139,14 @@ describe("groupSessions", () => {
 });
 
 describe("totalGroupedCount", () => {
-  test("sums all four buckets", () => {
+  test("sums all five buckets", () => {
     const groups = {
+      attention: [makeSession({ sessionId: "e" })],
       pinned: [makeSession({ sessionId: "a" })],
       today: [makeSession({ sessionId: "b" }), makeSession({ sessionId: "c" })],
       earlier: [],
       improvement: [makeSession({ sessionId: "d" })]
     };
-    expect(totalGroupedCount(groups)).toBe(4);
+    expect(totalGroupedCount(groups)).toBe(5);
   });
 });

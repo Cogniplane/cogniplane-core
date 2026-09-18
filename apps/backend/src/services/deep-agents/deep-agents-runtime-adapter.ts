@@ -1,3 +1,5 @@
+import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
+import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "../session-execution-store.js";
 // Sole runtime provider (bead im5e.1, then quap.4): the agent loop runs IN
 // the Fastify backend via deepagentsjs instead of inside an E2B sandbox
 // harness. This adapter drives the loop and emits the AG-UI stream consumed by
@@ -13,6 +15,7 @@ import { AsyncQueue } from "../../lib/async-queue.js";
 import { runtimeTokenSecret } from "../../lib/derived-secrets.js";
 import {
   SessionBusyError,
+  resolveTurnApprovalSettings,
   type RuntimeAdapter,
   type RuntimeApprovalDecision,
   type RuntimeApprovalKind,
@@ -20,7 +23,7 @@ import {
   type RuntimeSessionRef,
   type RuntimeUserInput
 } from "../../runtime-contracts.js";
-import type { ModelProvider, PolicyTurnContext } from "@cogniplane/shared-types";
+import type { ModelProvider, PolicyTurnContext, ProjectApprovalMode } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import { AVAILABLE_MODELS } from "../../domain/models.js";
@@ -71,6 +74,10 @@ import type {
 import { E2B_WORKSPACE_BASE } from "../runtime/e2b-sandbox.js";
 
 const PROVIDER_ID = "deep-agents";
+
+function sessionOwnershipMismatch(): Error & { statusCode: number } {
+  return Object.assign(new Error("Session ownership mismatch"), { statusCode: 403 });
+}
 
 /**
  * How long a terminal event will wait for the turn's usage write.
@@ -147,9 +154,15 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    * it registers the new state, so two concurrent calls for the same session
    * would each build a runtime and the loser would silently overwrite the
    * winner un-disposed with its idle timer armed. Memoizing the in-flight
-   * promise collapses concurrent calls onto one build.
+   * promise collapses concurrent calls from the same tenant and user onto one
+   * build. Other callers must not inherit that participant's runtime policy.
    */
-  private readonly pendingSessionCreations = new Map<string, Promise<RuntimeSessionRef>>();
+  private readonly pendingSessionCreations = new Map<string, {
+    tenantId: string;
+    userId: string;
+    executionId?: string;
+    promise: Promise<RuntimeSessionRef>;
+  }>();
 
   constructor(
     private readonly config: AppConfig,
@@ -157,6 +170,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     private readonly log: FastifyBaseLogger,
     private readonly stores: {
       approvals: ApprovalStore;
+      executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime">;
+      conversationMessages?: Pick<MessageStore, "listBySession">;
+      sessions: Pick<import("../session-store.js").SessionStore, "getReadable">;
       auditEvents: AuditEventStore;
       activationTracker?: Pick<ActivationTracker, "recordMaterialization">;
       runtimeSessions?: RuntimeSessionStore;
@@ -207,13 +223,96 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     tenantId: string;
     sessionId: string;
     userId: string;
+    execution?: SessionExecution;
+  }): Promise<RuntimeSessionRef> {
+    const inFlight = this.pendingSessionCreations.get(input.sessionId);
+    if (inFlight) {
+      if (inFlight.tenantId !== input.tenantId || inFlight.userId !== input.userId ||
+          inFlight.executionId !== input.execution?.executionId) {
+        throw sessionOwnershipMismatch();
+      }
+      return inFlight.promise;
+    }
+    // Return the finally-chain promise so cleanup precedes caller continuation.
+    const creation = this.createOrRefreshSession(input).finally(() => {
+      this.pendingSessionCreations.delete(input.sessionId);
+    });
+    this.pendingSessionCreations.set(input.sessionId, {
+      tenantId: input.tenantId,
+      userId: input.userId,
+      executionId: input.execution?.executionId,
+      promise: creation
+    });
+    return creation;
+  }
+
+  private async createOrRefreshSession(input: {
+    tenantId: string; sessionId: string; userId: string; execution?: SessionExecution;
   }): Promise<RuntimeSessionRef> {
     const { sessionId } = input;
+    await this.requireRuntimeSessionAccess(input);
+    if (input.execution) {
+      if (input.execution.tenantId !== input.tenantId || input.execution.userId !== input.userId ||
+          input.execution.sessionId !== sessionId || !this.stores.executions ||
+          !await this.stores.executions.isCurrent(input.execution)) throw new SessionExecutionError("execution_stopped", 403);
+      if (this.activeTurns.has(sessionId)) throw new SessionBusyError(sessionId);
+      const previous = this.sessions.get(sessionId);
+      if (previous && previous.tenantId !== input.tenantId) throw sessionOwnershipMismatch();
+      if (previous?.execution?.executionId === input.execution.executionId && !previous.abortController.signal.aborted) {
+        return { sessionId, runtimeId: previous.runtimeId, runtimePolicy: previous.configBundle.runtimePolicy };
+      }
+      // A new admitted project turn gets fresh credentials, sandbox and graph
+      // state. Only the authorized saved conversation crosses generations.
+      if (previous) await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
+      return this.buildSession(input);
+    }
 
     // Idempotency: reuse a live session so conversation state (the session
     // runtime's checkpointer thread) carries across turns.
     const existing = this.sessions.get(sessionId);
     if (existing && !existing.abortController.signal.aborted) {
+      if (existing.tenantId !== input.tenantId || existing.userId !== input.userId) {
+        throw sessionOwnershipMismatch();
+      }
+      if (this.activeTurns.has(sessionId)) throw new SessionBusyError(sessionId);
+      const beta = await this.stores.tenantMembers.isUserBetaTester(input.tenantId, input.userId);
+      const bundle = await this.dynamicConfig.compileRuntimeConfig(input.tenantId, beta, { sessionId, userId: input.userId });
+      if (bundle.hash !== existing.configBundle.hash) {
+        const skillsLibraryFiles = await buildSkillsLibraryFiles({
+          skills: bundle.skills, bundles: this.stores.skillBundles ?? null, logger: this.log
+        });
+        const token = generateRuntimeToken({
+          sid: sessionId, tid: input.tenantId, uid: input.userId, rid: existing.runtimeId,
+          exp: runtimeTokenExpiry(this.config.RUNTIME_TOKEN_TTL_MS)
+        }, runtimeTokenSecret(this.config.DATA_ENCRYPTION_SECRET));
+        const gatewayBase = this.config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "");
+        const memories = await loadWorkspaceMemories(this.stores.memories, {
+          tenantId: input.tenantId, userId: input.userId, enabledToolIds: bundle.runtimePolicy.enabledToolIds,
+          readPolicy: this.stores.policyService ? {
+            policy: this.stores.policyService, enforcementMode: bundle.runtimePolicy.policyEnforcementMode
+          } : undefined
+        }, this.log);
+        const memoryLines = buildMemorySectionLines(memories, bundle.runtimePolicy.enabledToolIds);
+        await existing.runtime.refreshCapabilities({
+          skillsLibraryFiles,
+          allowCommandExecution: bundle.runtimePolicy.allowCommandExecution && Boolean(this.config.E2B_API_KEY),
+          e2b: this.config.E2B_API_KEY ? {
+            apiKey: this.config.E2B_API_KEY, templateId: this.config.E2B_TEMPLATE_ID,
+            sandboxTimeoutMs: this.config.E2B_SANDBOX_TIMEOUT_MS,
+            executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS
+          } : null,
+          approvals: {
+            ...resolveTurnApprovalSettings(bundle.runtimePolicy),
+            readOnlyToolNames: this.managedToolCatalog?.listReadOnlyIds() ?? []
+          },
+          systemPrompt: [bundle.runtimePolicy.developerInstructions?.trim(), memoryLines.join("\n")].filter(Boolean).join("\n\n") || null,
+          mcpServers: bundle.mcpServers.map((server) => ({
+            id: server.id, mode: server.mode,
+            url: new URL(server.routePath, gatewayBase + "/").toString(), authorization: `Bearer ${token}`
+          }))
+        });
+        existing.configBundle = bundle;
+      }
       return {
         sessionId,
         runtimeId: existing.runtimeId,
@@ -221,24 +320,14 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       };
     }
 
-    // Collapse concurrent creations for the same session onto one build (see
-    // pendingSessionCreations) — the whole build below runs past several awaits
-    // before it registers the state, so without this two callers would each
-    // create a runtime.
-    const inFlight = this.pendingSessionCreations.get(sessionId);
-    if (inFlight) return inFlight;
-
-    const creation = this.buildSession(input).finally(() => {
-      this.pendingSessionCreations.delete(sessionId);
-    });
-    this.pendingSessionCreations.set(sessionId, creation);
-    return creation;
+    return this.buildSession(input);
   }
 
   private async buildSession(input: {
     tenantId: string;
     sessionId: string;
     userId: string;
+    execution?: SessionExecution;
   }): Promise<RuntimeSessionRef> {
     const { tenantId, sessionId, userId } = input;
     const runtimeId = `deepagents-${uuidv7()}`;
@@ -246,7 +335,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const isBetaTester = await this.stores.tenantMembers.isUserBetaTester(tenantId, userId);
 
     const configBundle = await startupTimer.time("compileConfigMs", () =>
-      this.dynamicConfig.compileRuntimeConfig(tenantId, isBetaTester, sessionId)
+      this.dynamicConfig.compileRuntimeConfig(tenantId, isBetaTester, { sessionId, userId })
     );
     const { runtimePolicy } = configBundle;
 
@@ -315,10 +404,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // through the native deepagents skills middleware (progressive
     // disclosure) instead of the retired "## Skill:" system-prompt inlining.
     // Bundle companion files are materialized into the library; a bundle
-    // failure degrades that skill to SKILL.md-only. Note: the middleware
-    // checkpoints the skill LISTING into thread state, so an existing
-    // session's prompt listing only refreshes on a new thread — the file
-    // contents themselves are always served fresh from this build.
+    // failure degrades that skill to SKILL.md-only. Each new turn replaces
+    // the checkpointed listing with the currently selected skills.
     const skillsLibraryFiles = await startupTimer.time("skillsBuildMs", () =>
       buildSkillsLibraryFiles({
         skills: configBundle.skills,
@@ -354,13 +441,18 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       })
     );
     const runtime = this.runtimeFactory({
+      ...(input.execution ? { requireExecution: async () => {
+        await this.requireRuntimeSessionAccess(input);
+        if (input.execution && !await this.stores.executions!.isCurrent(input.execution, runtimeId))
+          throw new SessionExecutionError("execution_stopped", 403);
+      } } : {}),
       tenantId,
       sessionId,
       userId,
       runtimeId,
       // Deferred, provider-aware key resolution. The in-process loop calls
       // each provider's API directly with the real key; usage/cost is captured
-      // in-process — see the usage accumulation in runTurn.
+      // by runMessageAGUI.
       resolveProviderKey,
       providerBaseUrls: null,
       systemPrompt,
@@ -372,10 +464,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       policyService: this.stores.policyService,
       managedToolFacts,
       approvals: {
-        // approvalPolicy "never" bypasses native approvals entirely — same
-        // meaning as the Claude turn frame's `bypass`.
-        gate: runtimePolicy.approvalPolicy !== "never",
-        autoApproveReadOnly: runtimePolicy.autoApproveReadOnlyTools,
+        ...resolveTurnApprovalSettings(runtimePolicy),
         readOnlyToolNames: this.managedToolCatalog?.listReadOnlyIds() ?? []
       },
       // `allowCommandExecution` is owner-controlled security posture: when
@@ -427,11 +516,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           createdAt: new Date().toISOString()
         }));
       },
-      checkpointer: this.stores.checkpointer,
+      checkpointer: input.execution ? undefined : this.stores.checkpointer,
       logger: this.log
     });
 
     const state: DeepAgentsSessionState = {
+      execution: input.execution,
       sessionId,
       tenantId,
       userId,
@@ -492,6 +582,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       "session_startup_timing"
     );
 
+    if (input.execution) {
+      try { await this.stores.executions!.bindRuntime(input.execution, runtimeId); }
+      catch (error) {
+        await this.abortSession(input);
+        throw error;
+      }
+    }
     this.scheduleIdleTeardown(state);
 
     return {
@@ -505,8 +602,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     session: RuntimeSessionRef,
     input: {
       prompt: string;
+      projectInstructions?: ProjectInstructionsSnapshot | null;
       userInputs?: RuntimeUserInput[];
       toolContextId: string | null;
+      projectApprovalMode?: ProjectApprovalMode;
       turnContext?: PolicyTurnContext;
       assistantMessageId?: string | null;
       model?: string;
@@ -518,7 +617,22 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     if (!state) {
       throw new Error(`No Deep Agents session found for ${session.sessionId}`);
     }
-    if (this.activeTurns.has(session.sessionId)) {
+    // A reference retained across teardown must never select its replacement's
+    // credentials, workspace or checkpoint execution by session ID alone.
+    if (state.runtimeId !== session.runtimeId || state.abortController.signal.aborted) {
+      throw Object.assign(new Error("Runtime session is no longer current. Start a new turn."), {
+        statusCode: 409
+      });
+    }
+    await this.requireRuntimeSessionAccess(state);
+    if (state.execution && !await this.stores.executions!.isCurrent(state.execution, state.runtimeId)) {
+      throw new SessionExecutionError("execution_stopped", 403);
+    }
+    if (this.sessions.get(session.sessionId) !== state || state.abortController.signal.aborted)
+      throw new SessionExecutionError("execution_stopped", 403);
+    // Refresh awaits configuration and mutates capabilities. Reserve admission
+    // against it before any sandbox, context or graph work can begin.
+    if (this.pendingSessionCreations.has(session.sessionId) || this.activeTurns.has(session.sessionId)) {
       throw new SessionBusyError(session.sessionId);
     }
     this.activeTurns.add(session.sessionId);
@@ -560,8 +674,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const onSessionAbort = () => turnAbort.abort();
     // An `abort` listener added to an already-aborted signal never fires, so a
     // turn started on a session that was aborted between slot reservation and
-    // here would otherwise run unguarded — mirror the abort eagerly (parity with
-    // runTurn, which documents the same hazard).
+    // here would otherwise run unguarded. Mirror the abort eagerly.
     if (state.abortController.signal.aborted) {
       turnAbort.abort();
     } else {
@@ -581,10 +694,52 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       this.scheduleIdleTeardown(state);
     };
 
+    // Project approval mode is read before dispatch and belongs to this turn,
+    // not to the warm session. Reconfigure the graph before artifact sync or
+    // model work so a later setting change cannot affect an active turn.
+    try {
+      await state.runtime.setApprovalSettings({
+        ...resolveTurnApprovalSettings(state.configBundle.runtimePolicy, input.projectApprovalMode),
+        readOnlyToolNames: this.managedToolCatalog?.listReadOnlyIds() ?? []
+      });
+    } catch (error) {
+      releaseTurnSlot();
+      throw error;
+    }
+
     // Artifact workspace sync and turn-input building run after slot reservation.
     if (input.onBeforeTurn) {
       try {
         await input.onBeforeTurn();
+      } catch (error) {
+        releaseTurnSlot();
+        throw error;
+      }
+    }
+
+    let conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+    if (state.execution && this.stores.conversationMessages) {
+      try {
+        // Project sessions do not use the LangGraph checkpointer for transcript
+        // state. Read the complete durable transcript so a long-lived shared
+        // conversation does not silently lose its oldest turns at the normal
+        // UI list cap.
+        const history = await this.stores.conversationMessages.listBySession(
+          state.tenantId,
+          state.sessionId,
+          state.userId,
+          { limit: null },
+        );
+        const preceding = history.messages.filter((message) => message.messageId !== input.assistantMessageId);
+        // The current user message is already represented by promptText below.
+        let lastUser = preceding.length - 1;
+        while (lastUser >= 0 && preceding[lastUser]!.role !== "user") lastUser--;
+        conversationMessages = preceding.slice(0, lastUser < 0 ? preceding.length : lastUser)
+          .filter((message): message is typeof message & { role: "user" | "assistant" } =>
+            (message.role === "user" || message.role === "assistant") && Boolean(message.content))
+          .map(({ role, content }) => ({ role, content }));
+        if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId))
+          throw new SessionExecutionError("execution_stopped", 403);
       } catch (error) {
         releaseTurnSlot();
         throw error;
@@ -599,7 +754,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // rejects immediately rather than doing any model work.
 
     // Artifact-scoped turns arrive with `userInputs` REPLACING the raw prompt
-    // (the artifact-context block embeds the prompt at its end); mirror runTurn.
+    // because the artifact-context block embeds the prompt at its end.
     const textInputs = input.userInputs ?? [];
     const promptText =
       textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
@@ -645,8 +800,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const modelId = input.model ?? defaultDeepAgentsModelId();
     const effort = input.effort ?? defaultEffortForModel(modelId);
 
-    // Per-turn token accounting — mirrors runTurn so the AG-UI path records the
-    // same usage/cost onto the assistant row (keyed on responseId). The raw
+    // Record per-turn usage and cost on the assistant row keyed by responseId. The raw
     // streamEvents envelopes flow through the backend's streamTurn, so wrap it
     // to accumulate usage in-band without the driver needing to know.
     const usageTotals = createEmptyUsage();
@@ -659,6 +813,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       modelId,
       effort,
       promptText,
+      conversationMessages,
+      projectInstructions: input.projectInstructions,
       signal: turnAbort.signal,
       onGraphReady: async () => {
         // Availability is recorded once per turn, after MCP loading succeeds.
@@ -689,8 +845,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           push: emit
         };
         // Human approval latency is bounded by APPROVAL_REQUEST_TTL_MS, not the
-        // turn watchdog — disarm while the prompt is pending, re-arm after
-        // (mirrors runTurn).
+        // turn watchdog. Disarm while the prompt is pending, re-arm after.
         disarmWatchdog();
         try {
           return await this.collectApprovalDecisions({
@@ -804,7 +959,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // a terminal event (an abandoned generator) rather than writing twice.
     let usageFlush: Promise<void> | null = null;
     const flushUsage = (): Promise<void> => {
-      // Deadline memoized with the write — see the note in runTurn's twin.
+      // Share the write and its deadline across terminal-event and final cleanup.
       usageFlush ??= withUsageFlushDeadline(
         this.persistTurnUsage(state, responseId, usageTotals, usageModelName)
       );
@@ -876,7 +1031,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   // session workspace by the backend's traversal guard. First use lazily
   // creates the sandbox.
   async readRuntimeFile(sessionId: string, filePath: string): Promise<Uint8Array> {
-    const runtime = this.requireSessionState(sessionId).runtime;
+    const state = this.requireSessionState(sessionId);
+    await this.requireCurrentExecution(state);
+    const runtime = state.runtime;
     if (!runtime.readFileBytes) {
       throw new Error("The Deep Agents runtime has no sandbox backend for file reads.");
     }
@@ -884,7 +1041,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }
 
   async statRuntimeFile(sessionId: string, filePath: string): Promise<{ sizeBytes: number }> {
-    const runtime = this.requireSessionState(sessionId).runtime;
+    const state = this.requireSessionState(sessionId);
+    await this.requireCurrentExecution(state);
+    const runtime = state.runtime;
     if (!runtime.statFile) {
       throw new Error("The Deep Agents runtime has no sandbox backend for file stats.");
     }
@@ -896,7 +1055,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     filePath: string,
     data: Uint8Array | ArrayBuffer | string
   ): Promise<string> {
-    const runtime = this.requireSessionState(sessionId).runtime;
+    const state = this.requireSessionState(sessionId);
+    await this.requireCurrentExecution(state);
+    const runtime = state.runtime;
     if (!runtime.writeFileBytes) {
       throw new Error("The Deep Agents runtime has no sandbox backend for file writes.");
     }
@@ -924,9 +1085,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     tenantId: string;
     sessionId: string;
     userId: string;
+    executionId?: string;
   }): Promise<void> {
     const state = this.sessions.get(input.sessionId);
     if (!state) return;
+    if (input.executionId && state.execution?.executionId !== input.executionId) return;
+    if (state.tenantId !== input.tenantId) throw sessionOwnershipMismatch();
 
     this.clearIdleTimer(state);
     state.abortController.abort();
@@ -961,9 +1125,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }
 
   /**
-   * Delete the session's checkpointer thread. Called from the session
-   * DELETE route only — abortSession (idle teardown, invalidation) must keep
-   * the thread so the conversation survives a warm-session recycle.
+   * Delete the session's checkpointer thread. Called after session or project
+   * deletion. abortSession (idle teardown, invalidation) must keep the thread
+   * so the conversation survives a warm-session recycle.
    * thread_id === sessionId by construction.
    */
   async purgeSessionData(input: {
@@ -1079,6 +1243,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }): Promise<"resolved" | "missing"> {
     const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
     const entry = this.pendingApprovals.get(approvalId);
+    if (entry) {
+      const state = this.sessions.get(entry.sessionId);
+      if (!state || state.tenantId !== tenantId || state.userId !== userId) return "missing";
+      try { await this.requireCurrentExecution(state); } catch { return "missing"; }
+    }
     if (entry && !entry.requiresDurableProof) {
       const state = this.sessions.get(entry.sessionId);
       if (!state || state.tenantId !== tenantId || state.userId !== userId) return "missing";
@@ -1455,9 +1624,27 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         // Capture THIS turn's remember-set so a late decision can't pollute
         // the next turn's set.
         autoApprovedKinds: state.autoApprovedKindsForTurn,
-        requiresDurableProof: Boolean(action.policyApproval)
+        requiresDurableProof: Boolean(action.policyApproval || state.execution)
       });
     });
+  }
+
+  private async requireRuntimeSessionAccess(input: {
+    tenantId: string; sessionId: string; userId: string; execution?: SessionExecution;
+  }): Promise<void> {
+    const session = await this.stores.sessions.getReadable(input.tenantId, input.sessionId, input.userId);
+    if (!session || session.status !== "active" || session.purpose === "project_reference" ||
+        (session.projectId ? input.execution?.projectId !== session.projectId : Boolean(input.execution?.projectId))) {
+      throw new SessionExecutionError("session_unavailable", 403);
+    }
+  }
+
+  private async requireCurrentExecution(state: DeepAgentsSessionState): Promise<void> {
+    await this.requireRuntimeSessionAccess(state);
+    if (!state.execution) return;
+    if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId) ||
+        this.sessions.get(state.sessionId) !== state || state.abortController.signal.aborted)
+      throw new SessionExecutionError("execution_stopped", 403);
   }
 
   private requireSessionState(sessionId: string): DeepAgentsSessionState {

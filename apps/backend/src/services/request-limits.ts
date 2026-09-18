@@ -4,6 +4,7 @@ export type LimitResource =
   | "session_create"
   | "message_turn"
   | "artifact_upload"
+  | "project_file_write"
   | "scheduled_job_create"
   | "oauth_callback"
   | "admin_query"
@@ -18,6 +19,7 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   session_create: "session creation",
   message_turn: "message",
   artifact_upload: "artifact upload",
+  project_file_write: "project file write",
   scheduled_job_create: "scheduled job creation",
   oauth_callback: "OAuth callback",
   admin_query: "admin request",
@@ -39,6 +41,8 @@ export type RequestLimitsConfigKeys = Pick<
   | "MESSAGE_LIMIT_PER_TENANT_PER_WINDOW"
   | "ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW"
   | "ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW"
+  | "PROJECT_FILE_WRITE_LIMIT_PER_USER_PER_WINDOW"
+  | "PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
@@ -72,6 +76,10 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
         artifact_upload: {
           user: config.ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        project_file_write: {
+          user: config.PROJECT_FILE_WRITE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW
         },
         scheduled_job_create: {
           user: config.SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW,
@@ -136,6 +144,12 @@ export interface RequestLimitsInterface {
     userId: string;
     tenantId: string;
   }): Promise<LimitExceededErrorPayload | null>;
+
+  refundRateLimit?(input: {
+    resource: LimitResource;
+    userId: string;
+    tenantId: string;
+  }): Promise<void>;
 
   consumeTurnQuota(input: {
     userId: string;
@@ -218,6 +232,25 @@ export class RequestLimits implements RequestLimitsInterface {
     }
 
     return Promise.resolve(null);
+  }
+
+  async refundRateLimit(input: {
+    resource: LimitResource;
+    userId: string;
+    tenantId: string;
+  }): Promise<void> {
+    const now = Date.now();
+    const scopes: Array<{ scope: LimitScope; subjectId: string }> = [
+      { scope: "user", subjectId: input.userId },
+      { scope: "tenant", subjectId: input.tenantId }
+    ];
+    for (const { scope, subjectId } of scopes) {
+      const key = this.rateKey(input.resource, scope, subjectId);
+      const entry = this.rateWindows.get(key);
+      if (entry && entry.resetAtMs > now && entry.count > 0) {
+        entry.count -= 1;
+      }
+    }
   }
 
   consumeTurnQuota(input: {

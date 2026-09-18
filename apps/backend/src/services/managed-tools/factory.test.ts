@@ -61,9 +61,13 @@ class InMemoryStorage {
     if (!file) throw new Error("not found");
     return { stream: Readable.from([file]), fileSizeBytes: file.length };
   }
+
+  async delete(storageKey: string) {
+    this.stored.delete(storageKey);
+  }
 }
 
-function makeArtifactStore(): Pick<ArtifactStore, "create" | "getOwned" | "listBySession" | "findLatestReadableDerived"> & { created: Record<string, unknown>[] } {
+function makeArtifactStore(): Pick<ArtifactStore, "create" | "createGenerated" | "getReadable" | "listBySession" | "findLatestReadableDerived"> & { created: Record<string, unknown>[] } {
   let counter = 0;
   const records: Record<string, unknown>[] = [];
   return {
@@ -92,7 +96,10 @@ function makeArtifactStore(): Pick<ArtifactStore, "create" | "getOwned" | "listB
       records.push({ ...record });
       return record;
     },
-    async getOwned(_tenantId: string, _artifactId: string, _userId: string) { return null; },
+    async createGenerated(input) {
+      return this.create(input);
+    },
+    async getReadable(_tenantId: string, _artifactId: string, _userId: string) { return null; },
     async listBySession(_tenantId: string, _sessionId: string, _userId: string) { return []; },
     async findLatestReadableDerived(_tenantId: string, _sourceArtifactId: string, _userId: string) { return null; }
   };
@@ -100,7 +107,7 @@ function makeArtifactStore(): Pick<ArtifactStore, "create" | "getOwned" | "listB
 
 function makeSessionStore() {
   return {
-    async getOwned() {
+    async getReadable() {
       return {
         sessionId: "session-1",
         sessionName: "test",
@@ -152,7 +159,17 @@ function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
     storage: new InMemoryStorage(),
     auditEvents: makeAuditEventStore(),
     githubConnections: makeGithubConnections(githubCreds),
-    notionConnections: makeNotionConnections()
+    notionConnections: makeNotionConnections(),
+    artifactMaxBytes: 10_000_000,
+    limits: {
+      async consumeRateLimit() { return null; }
+    },
+    projectFiles: {
+      async readRuntimeSnapshotFile() { throw new Error("project file read should not be called"); },
+      async createAgentDraftFromContent() { throw new Error("project file write should not be called"); },
+      async readConflictContext() { throw new Error("project conflict read should not be called"); },
+      async readConflictMetadata() { throw new Error("project conflict metadata read should not be called"); }
+    }
   } satisfies ManagedToolFactoryDeps;
 }
 

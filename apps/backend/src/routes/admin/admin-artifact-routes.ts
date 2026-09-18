@@ -32,12 +32,12 @@ export async function registerAdminArtifactRoutes(
       const result = await withTenantScope(app.db, tenantId, async (client) => {
         const artifactRow = await client.query(
           `
-            SELECT
-              artifact_id, session_id, user_id, artifact_type, artifact_name,
-              mime_type, storage_backend, storage_key, status
-            FROM artifacts
-            WHERE tenant_id = $1 AND artifact_id = $2
-            LIMIT 1
+            SELECT a.artifact_id, a.session_id, a.user_id, a.artifact_type,
+              a.artifact_name, a.mime_type, a.storage_backend, a.storage_key, a.status
+            FROM artifacts a
+            JOIN sessions s ON s.tenant_id = a.tenant_id AND s.session_id = a.session_id
+            WHERE a.tenant_id = $1 AND a.artifact_id = $2 AND s.project_id IS NULL
+            LIMIT 1 FOR SHARE OF s
           `,
           [tenantId, artifactId]
         );
@@ -51,9 +51,9 @@ export async function registerAdminArtifactRoutes(
           return { kind: "not_ready" as const };
         }
 
-        // Use the artifact OWNER's user_id, not the admin's. The /downloads/:token
-        // resolver joins artifacts on (tenant_id, artifact_id, user_id), so the
-        // token must be minted with the owner ID or it returns download_not_found.
+        // This endpoint only handles personal artifacts. Project members use
+        // the regular endpoint, which binds the token to their own identity.
+        // The session lock prevents assignment to a project during minting.
         const insert = await client.query(
           `
             INSERT INTO artifact_download_tokens (

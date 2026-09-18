@@ -40,6 +40,7 @@ export function buildBootstrapServices(input: {
     config,
     {
       skills: stores.skills,
+      sessions: stores.sessions,
       skillRevisions: stores.skillRevisions,
       mcpServers: stores.mcpServers,
       tenantSettings: stores.tenantSettings

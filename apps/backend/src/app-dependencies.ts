@@ -73,6 +73,7 @@ export function buildAppDependencies(input: {
     tenantOrgSettingsPrivileged: bootstrap.tenantOrgSettingsPrivileged,
     redis: bootstrap.redis
   });
+  stores.projectFiles.setPiiProtection(pii.piiProtection);
 
   // Attach optional overlays. The core OSS tree ships a no-op implementation;
   // derived distributions can wire additional services, descriptors, managed
@@ -96,6 +97,10 @@ export function buildAppDependencies(input: {
 
   return {
     db,
+    projects: stores.projects,
+    projectFiles: stores.projectFiles,
+    projectMembers: stores.projectMembers,
+    executions: stores.executions,
     sessions: stores.sessions,
     messages: stores.messages,
     memories: stores.memories,

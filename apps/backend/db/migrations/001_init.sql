@@ -1096,8 +1096,8 @@ CREATE INDEX idx_artifacts_tenant_session ON public.artifacts USING btree (tenan
 -- Supports the cross-session artifact browser (GET /artifacts): filter by
 -- (tenant_id, user_id) excluding soft-deleted rows, ordered by
 -- (created_at DESC, id DESC) with keyset pagination — WHERE + ORDER BY +
--- keyset seek from a single index. name_*/size_*/ILIKE sorts still scan
--- (acceptable at per-user volumes — see docs/research/artifact-browser-plan.md §1).
+-- keyset seek from a single index. Name/size sorts and ILIKE search still scan;
+-- the index serves the default per-user chronological browse.
 
 CREATE INDEX idx_artifacts_user_created ON public.artifacts USING btree (tenant_id, user_id, created_at DESC, id DESC) WHERE (status <> 'deleted'::text);
 

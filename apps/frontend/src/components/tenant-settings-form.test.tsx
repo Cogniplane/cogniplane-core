@@ -5,26 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TenantSettings } from "@cogniplane/shared-types";
 
 import { TenantSettingsForm } from "./tenant-settings-form";
+import { makeTenantSettings as makeSettings } from "../test-helpers/tenant-settings";
 
-function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
-  return {
-    tenantId: "t-1",
-    showEffortSelector: false,
-    webSearchMode: "disabled",
-    approvalPolicy: "never",
-    approvalReviewer: "user",
-    allowCommandExecution: false,
-    autoApproveReadOnlyTools: true,
-    policyEnforcementMode: "monitor",
-    developerInstructions: null,
-    enabledToolIds: [],
-    enabledMcpServerIds: [],
-    version: 1,
-    configHash: "hash-1",
-    updatedAt: new Date().toISOString(),
-    ...overrides
-  } as TenantSettings;
-}
+
 
 function renderForm(
   settings: TenantSettings,
@@ -38,7 +21,7 @@ function renderForm(
       onSave={onSave}
       managedTools={[]}
       mcpServers={[]}
-      hasAnthropicTenantKey={true}
+      modelWarning={null}
       isOwner={isOwner}
     />
   );
@@ -67,7 +50,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        hasAnthropicTenantKey={false}
+        modelWarning={null}
         isOwner={true}
       />
     );
@@ -86,7 +69,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={vi.fn(async () => true)}
         managedTools={[]}
         mcpServers={[]}
-        hasAnthropicTenantKey={false}
+        modelWarning={null}
         isOwner={true}
       />
     );
@@ -115,7 +98,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        hasAnthropicTenantKey={false}
+        modelWarning={null}
         isOwner={true}
       />
     );
@@ -138,7 +121,7 @@ describe("TenantSettingsForm resync", () => {
         onSave={onSave}
         managedTools={[]}
         mcpServers={[]}
-        hasAnthropicTenantKey={false}
+        modelWarning={null}
         isOwner={true}
       />
     );

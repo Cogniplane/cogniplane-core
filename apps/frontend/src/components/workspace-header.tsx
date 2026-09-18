@@ -7,6 +7,11 @@ import { CheckIcon, ClipboardIcon, PanelLeftIcon, PanelRightIcon } from "lucide-
 
 import { useAuth } from "../lib/auth-context";
 import { useOrganizations } from "../hooks/use-organizations";
+import { SessionActionMenu, type SessionActionMenuProps } from "./session-action-menu";
+import { SessionStatusIndicator } from "./session-status";
+import { ProjectInstructionsIndicator } from "./project-instructions-indicator";
+import { SessionCapabilitiesButton } from "./session-capabilities";
+import type { CompletedTurn, SessionStatus } from "./session-status.logic";
 import { ThemeToggle } from "./theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,8 +38,12 @@ function avatarInitials(name: string | undefined, email: string | undefined): st
 
 export function WorkspaceHeader(props: {
   title: string;
+  projectId?: string | null;
+  sessionActions?: SessionActionMenuProps;
   subtitle?: string;
-  statusLabel?: string;
+  sessionStatus?: SessionStatus;
+  activeTurnStartedAt?: string;
+  completedTurn?: CompletedTurn;
   menuLinks: MenuLink[];
   isArtifactPaneOpen?: boolean;
   onToggleArtifactPane?: () => void;
@@ -50,28 +59,39 @@ export function WorkspaceHeader(props: {
   const currentSlug = user?.tenantSlug?.toLowerCase();
   const otherOrganizations = organizations.filter((org) => org.id.toLowerCase() !== currentSlug);
   const [sessionCopied, setSessionCopied] = useState(false);
-  const [titleDraft, setTitleDraft] = useState(title);
+  const [titleText, setTitleText] = useState(title);
   const titleRef = useRef<HTMLHeadingElement | null>(null);
 
   useEffect(() => {
-    // Resync draft + DOM contentEditable when the prop title changes.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setTitleDraft(title);
+    // A poll may rename the session while the user is editing. Keep their text
+    // until they commit or cancel; the editable DOM owns the in-progress value.
     if (titleRef.current && document.activeElement !== titleRef.current) {
+      setTitleText(title);
       titleRef.current.textContent = title;
     }
-  }, [title]);
+  }, [title, props.sessionActions?.sessionId]);
 
   const commitTitle = useCallback(() => {
     if (!onRenameSession) return;
-    const next = titleDraft.trim();
+    const next = (titleRef.current?.textContent ?? "").trim();
     if (!next || next === title) {
-      setTitleDraft(title);
+      setTitleText(title);
       if (titleRef.current) titleRef.current.textContent = title;
       return;
     }
     void onRenameSession(next);
-  }, [onRenameSession, title, titleDraft]);
+  }, [onRenameSession, title]);
+
+  const focusTitleForRename = useCallback(() => {
+    titleRef.current?.focus();
+    const selection = window.getSelection();
+    if (selection && titleRef.current) {
+      const range = document.createRange();
+      range.selectNodeContents(titleRef.current);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }, []);
 
   const handleTitleKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLHeadingElement>) => {
@@ -81,7 +101,7 @@ export function WorkspaceHeader(props: {
       } else if (event.key === "Escape") {
         event.preventDefault();
         if (titleRef.current) titleRef.current.textContent = title;
-        setTitleDraft(title);
+        setTitleText(title);
         event.currentTarget.blur();
       }
     },
@@ -114,19 +134,14 @@ export function WorkspaceHeader(props: {
             <PanelLeftIcon />
           </Button>
         ) : null}
-        {props.statusLabel ? (
-          <div
-            className="flex items-center gap-2 rounded-md bg-success-surface px-2 py-1 text-xs font-medium text-success"
-            aria-label={props.statusLabel}
-          >
-            <span aria-hidden="true" className="size-1.5 rounded-full bg-success" />
-            <span className="hidden sm:inline">{props.statusLabel}</span>
-          </div>
+        {props.sessionStatus ? (
+          <SessionStatusIndicator status={props.sessionStatus} startedAt={props.activeTurnStartedAt} completedTurn={props.completedTurn} showLabel />
         ) : null}
       </div>
 
       <div className="min-w-0 flex-1">
         <h2
+          key={props.sessionActions?.sessionId}
           ref={titleRef}
           className={`truncate text-base font-semibold text-on-surface outline-none ${
             isTitleEditable
@@ -135,9 +150,6 @@ export function WorkspaceHeader(props: {
           }`}
           contentEditable={isTitleEditable}
           onBlur={isTitleEditable ? commitTitle : undefined}
-          onInput={isTitleEditable
-            ? (event) => setTitleDraft((event.target as HTMLHeadingElement).textContent ?? "")
-            : undefined}
           onKeyDown={isTitleEditable ? handleTitleKeyDown : undefined}
           spellCheck={false}
           suppressContentEditableWarning
@@ -145,7 +157,7 @@ export function WorkspaceHeader(props: {
           aria-label={isTitleEditable ? "Session title" : undefined}
           title={isTitleEditable ? "Click to rename session" : undefined}
         >
-          {title}
+          {titleText}
         </h2>
         {props.subtitle ? (
           <p className="truncate text-xs text-on-surface-variant">{props.subtitle}</p>
@@ -153,6 +165,14 @@ export function WorkspaceHeader(props: {
       </div>
 
       <div className="flex items-center gap-1">
+        {props.projectId ? <ProjectInstructionsIndicator key={props.projectId} projectId={props.projectId} /> : null}
+        {props.sessionActions ? <SessionCapabilitiesButton key={props.sessionActions.sessionId}
+          sessionId={props.sessionActions.sessionId}
+          busy={Boolean(props.sessionActions.isRunning || props.sessionActions.hasPendingApprovals)} /> : null}
+        {props.sessionActions ? <SessionActionMenu
+          {...props.sessionActions}
+          onRename={props.sessionActions.onRename ?? (onRenameSession ? focusTitleForRename : undefined)}
+        /> : null}
         <ThemeToggle />
 
         {onCopySession ? (

@@ -1,6 +1,6 @@
 import { test, expect } from "vitest";
 
-import { pruneUnknownModelIds } from "./admin-tenant-settings-routes.js";
+import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 
 const known = new Set(["openai/gpt-5.6-sol", "deepagents/claude-sonnet-5", "custom/my-model"]);
 

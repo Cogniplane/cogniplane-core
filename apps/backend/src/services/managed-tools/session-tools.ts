@@ -1,4 +1,4 @@
-import { isTextReadableArtifact, readStreamAsText } from "../artifacts/artifact-helpers.js";
+import { isTextReadableArtifact, readStreamAsBoundedText } from "../artifacts/artifact-helpers.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { MessageStore } from "../message-store.js";
@@ -8,9 +8,9 @@ import { ToolCallError } from "../../lib/tool-call-error.js";
 import { allRequiredObjectSchema, arraySchema, type ManagedToolDefinition } from "./types.js";
 
 type SessionToolDeps = {
-  sessions: Pick<SessionStore, "getOwned">;
+  sessions: Pick<SessionStore, "getReadable">;
   messages: Pick<MessageStore, "listBySession">;
-  artifacts: Pick<ArtifactStore, "getOwned" | "listBySession" | "findLatestReadableDerived">;
+  artifacts: Pick<ArtifactStore, "getReadable" | "listBySession" | "findLatestReadableDerived">;
   storage: Pick<ArtifactStorage, "openReadStream">;
 };
 
@@ -75,11 +75,11 @@ function getScopedArtifactIds(context: ToolExecutionContext): string[] | null {
 }
 
 async function resolveReadableArtifact(input: {
-  artifacts: Pick<ArtifactStore, "getOwned" | "findLatestReadableDerived">;
+  artifacts: Pick<ArtifactStore, "getReadable" | "findLatestReadableDerived">;
   context: ToolExecutionContext;
   artifactId: string;
 }): Promise<ArtifactRecord> {
-  const artifact = await input.artifacts.getOwned(input.context.tenantId, input.artifactId, input.context.userId);
+  const artifact = await input.artifacts.getReadable(input.context.tenantId, input.artifactId, input.context.userId);
   if (!artifact || artifact.sessionId !== input.context.sessionId || artifact.status !== "ready") {
     throw new ToolCallError("Artifact not found for tool context.");
   }
@@ -124,7 +124,7 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
         runtimePolicyId: { type: "string" }
       }),
       handler: async ({ context, arguments: args }) => {
-        const session = await deps.sessions.getOwned(context.tenantId, context.sessionId, context.userId);
+        const session = await deps.sessions.getReadable(context.tenantId, context.sessionId, context.userId);
         if (!session || session.status !== "active") {
           throw new ToolCallError("Session not found for tool context.");
         }
@@ -171,7 +171,7 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
         )
       }),
       handler: async ({ context }) => {
-        const session = await deps.sessions.getOwned(context.tenantId, context.sessionId, context.userId);
+        const session = await deps.sessions.getReadable(context.tenantId, context.sessionId, context.userId);
         if (!session || session.status !== "active") {
           throw new ToolCallError("Session not found for tool context.");
         }
@@ -216,7 +216,12 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
         const artifact = await resolveReadableArtifact({ artifacts: deps.artifacts, context, artifactId });
         const maxChars = Math.max(1, Math.min(20_000, Number(args.maxChars ?? 4_000) || 4_000));
         const handle = await deps.storage.openReadStream(artifact.storageKey);
-        const content = await readStreamAsText(handle.stream, maxChars);
+        const bounded = await readStreamAsBoundedText(handle.stream, maxChars);
+        const current = await resolveReadableArtifact({ artifacts: deps.artifacts, context, artifactId });
+        if (current.artifactId !== artifact.artifactId || current.storageKey !== artifact.storageKey ||
+            current.checksumSha256 !== artifact.checksumSha256) {
+          throw new ToolCallError("Artifact changed while reading. Retry the read.");
+        }
 
         return {
           artifact: {
@@ -225,8 +230,8 @@ export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition
             mimeType: artifact.mimeType,
             status: artifact.status
           },
-          content,
-          truncated: content.length >= maxChars
+          content: bounded.text,
+          truncated: bounded.truncated
         };
       }
     }

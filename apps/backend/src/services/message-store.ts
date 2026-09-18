@@ -1,4 +1,5 @@
-import type { UiResource } from "@cogniplane/shared-types";
+import { sessionContentReadAccessSql } from "./session-access.js";
+import { ProjectInstructionsSnapshotSchema, type ProjectInstructionsSnapshot, type UiResource } from "@cogniplane/shared-types";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
@@ -51,6 +52,7 @@ export type MessagePiiDetail = {
 
 export type MessageDetail = {
   pii?: MessagePiiDetail;
+  durationMs?: number;
   [key: string]: unknown;
 };
 
@@ -94,6 +96,8 @@ export type MessageRecord = {
   modelName: string | null;
   costUsd: number | null;
   feedbackRating: MessageFeedbackRating | null;
+  durationMs?: number | null;
+  projectInstructions?: ProjectInstructionsSnapshot | null;
   detail: MessageDetail;
   toolResults: ToolResultRecord[];
   createdAt: string;
@@ -149,7 +153,14 @@ function mapDetail(raw: unknown): MessageDetail {
   return raw as MessageDetail;
 }
 
+function validDuration(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function mapMessage(row: Record<string, unknown>): Omit<MessageRecord, "toolResults"> {
+  // Expose measured duration only through the validated top-level field.
+  const { durationMs, projectInstructions, ...detail } = mapDetail(row.detail_json);
+  const snapshot = ProjectInstructionsSnapshotSchema.safeParse(projectInstructions);
   return {
     id: Number(row.id),
     messageId: String(row.message_id),
@@ -177,7 +188,9 @@ function mapMessage(row: Record<string, unknown>): Omit<MessageRecord, "toolResu
       row.feedback_rating === "thumbs_up" || row.feedback_rating === "thumbs_down"
         ? row.feedback_rating
         : null,
-    detail: mapDetail(row.detail_json),
+    durationMs: validDuration(durationMs),
+    projectInstructions: snapshot.success ? snapshot.data : null,
+    detail,
     createdAt: isoTimestamp(row.created_at),
     updatedAt: isoTimestamp(row.updated_at)
   };
@@ -299,7 +312,7 @@ export const LIST_TOOL_TEXT_MAX_CHARS = 32_000;
 
 export type ListBySessionOptions = {
   /** Max messages returned, newest-first-selected then re-ordered ascending. */
-  limit?: number;
+  limit?: number | null;
   /** Per-field cap on tool input/output text in this projection. */
   toolTextMaxChars?: number;
 };
@@ -401,7 +414,8 @@ export class MessageStore {
   }
 
   /**
-   * Read a session transcript, bounded on both axes — see
+   * Read a session transcript, bounded on both axes by default. Callers that
+   * need the complete durable transcript can pass `limit: null`. See
    * MESSAGE_LIST_DEFAULT_LIMIT / LIST_TOOL_TEXT_MAX_CHARS for why a read cap is
    * needed on top of the write caps.
    *
@@ -421,7 +435,9 @@ export class MessageStore {
     userId: string,
     options: ListBySessionOptions = {}
   ): Promise<ListBySessionResult> {
-    const limit = Math.max(1, Math.trunc(options.limit ?? MESSAGE_LIST_DEFAULT_LIMIT));
+    const limit = options.limit === null
+      ? null
+      : Math.max(1, Math.trunc(options.limit ?? MESSAGE_LIST_DEFAULT_LIMIT));
     const toolTextMaxChars = Math.max(
       1,
       Math.trunc(options.toolTextMaxChars ?? LIST_TOOL_TEXT_MAX_CHARS)
@@ -437,16 +453,16 @@ export class MessageStore {
                    detail_json,
                    created_at, updated_at
             FROM messages
-            WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+            WHERE tenant_id = $1 AND session_id = $2 AND ${sessionContentReadAccessSql("messages", "$3")}
               AND COALESCE(detail_json->>'kind', '') <> 'session_titling'
             ORDER BY created_at DESC, id DESC
-            LIMIT $4
+            ${limit == null ? "" : "LIMIT $4"}
           `,
-        [tenantId, sessionId, userId, limit + 1]
+        limit == null ? [tenantId, sessionId, userId] : [tenantId, sessionId, userId, limit + 1]
       );
 
       // The +1 probe row proves older messages exist; drop it before mapping.
-      const hasMore = messageResult.rows.length > limit;
+      const hasMore = limit != null && messageResult.rows.length > limit;
       const pageRows = hasMore ? messageResult.rows.slice(0, limit) : messageResult.rows;
       // Selected newest-first above; the caller wants chronological order.
       pageRows.reverse();
@@ -484,7 +500,7 @@ export class MessageStore {
               created_at,
               updated_at
             FROM message_tool_results
-            WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
+            WHERE tenant_id = $1 AND session_id = $2 AND ${sessionContentReadAccessSql("message_tool_results", "$3")}
               AND message_id = ANY($5::text[])
             ORDER BY created_at ASC, id ASC
           `,
@@ -570,17 +586,23 @@ export class MessageStore {
     messageId: string,
     userId: string,
     status: MessageRecord["status"],
-    content: string
+    content: string,
+    durationMs?: number
   ): Promise<MessageRecord | null> {
+    const duration = ["completed", "error", "interrupted"].includes(status)
+      ? validDuration(durationMs)
+      : null;
     return withTenantScope(this.db, tenantId, async (client) => {
       const updatedMessage = await client.query(
         `
           UPDATE messages
-          SET status = $4, content_text = $5, updated_at = NOW()
+          SET status = $4, content_text = $5, updated_at = NOW(),
+              detail_json = COALESCE(detail_json, '{}'::jsonb) || $6::jsonb
           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
           RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
-        [tenantId, messageId, userId, status, truncateForStorage(redactSecrets(content), MAX_MESSAGE_CONTENT_LENGTH)]
+        [tenantId, messageId, userId, status, truncateForStorage(redactSecrets(content), MAX_MESSAGE_CONTENT_LENGTH),
+          JSON.stringify(duration === null ? {} : { durationMs: duration })]
       );
 
       return updatedMessage.rows[0]

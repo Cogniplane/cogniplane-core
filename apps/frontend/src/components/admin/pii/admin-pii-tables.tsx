@@ -192,7 +192,8 @@ export function RecentActivityFeed(props: RangeProps) {
                 <>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <strong className="text-sm font-semibold text-on-surface" title={row.subjectId}>
-                      {row.subjectType === "message" ? "Message" : "Artifact"} {shortId(row.subjectId)}
+                      {row.subjectType === "project_instructions" ? "Project instructions" : row.subjectType === "message" ? "Message" : "Artifact"} {shortId(row.subjectId)}
+                      {row.instructionsRevision != null ? ` · Revision ${row.instructionsRevision}` : ""}
                     </strong>
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className={statusPillClass(row.status)}>{row.status}</span>

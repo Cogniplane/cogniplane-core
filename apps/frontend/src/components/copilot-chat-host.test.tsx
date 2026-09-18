@@ -10,7 +10,7 @@ import { MarkdownImage } from "./markdown-image";
 // the whole CopilotKit runtime; the subject here is the prop, not the chat UI.
 const chatProps = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }));
 const agents = vi.hoisted(() => ({
-  instances: [] as Array<{ options: Record<string, unknown>; abortRun: ReturnType<typeof vi.fn> }>
+  instances: [] as Array<{ options: Record<string, unknown>; abortRun: ReturnType<typeof vi.fn>; addMessage: ReturnType<typeof vi.fn>; runAgent: ReturnType<typeof vi.fn> }>
 }));
 const eventState = vi.hoisted(() => ({
   approvals: [] as Array<{ rowId: string }>,
@@ -35,6 +35,8 @@ vi.mock("../lib/agui/deep-agents-browser-agent", () => ({
   DeepAgentsBrowserAgent: class {
     options: Record<string, unknown>;
     abortRun = vi.fn();
+    addMessage = vi.fn();
+    runAgent = vi.fn();
     constructor(options: Record<string, unknown>) {
       this.options = options;
       agents.instances.push(this);
@@ -109,6 +111,23 @@ describe("CopilotChatHost markdown renderers", () => {
     expect((first.options.getModel as () => string)()).toBe("openai/gpt-5.5");
     expect((first.options.getEffort as () => string)()).toBe("high");
     expect((first.options.getArtifactIds as () => string[])()).toEqual(["a-2"]);
+  });
+
+  it("starts an explicit project action once when the session opens", () => {
+    const prompt = "Resolve the selected project draft conflict.";
+    const onInitialPromptSent = vi.fn();
+    render(
+      <CopilotChatHost
+        {...hostProps}
+        artifactIds={[]}
+        session={{ ...hostProps.session, initialPrompt: prompt }}
+        events={{ onInitialPromptSent }}
+      />
+    );
+    const agent = agents.instances[0];
+    expect(agent.addMessage).toHaveBeenCalledWith(expect.objectContaining({ role: "user", content: prompt }));
+    expect(agent.runAgent).toHaveBeenCalledOnce();
+    expect(onInitialPromptSent).toHaveBeenCalledOnce();
   });
 
   it("forwards current running and approval signals through live callbacks", () => {

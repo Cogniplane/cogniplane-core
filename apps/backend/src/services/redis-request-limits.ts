@@ -49,7 +49,10 @@ const INCR_WITH_EXPIRY = `
 const DECR_IF_EXISTS = `
   -- request-limit-decr-v1
   if redis.call('EXISTS', KEYS[1]) == 1 then
-    return redis.call('DECR', KEYS[1])
+    local current = redis.call('GET', KEYS[1])
+    if current and tonumber(current) > 0 then
+      return redis.call('DECR', KEYS[1])
+    end
   end
   return 0
 `;
@@ -112,6 +115,23 @@ export class RedisRequestLimits implements RequestLimitsInterface {
     }
 
     return null;
+  }
+
+  async refundRateLimit(input: {
+    resource: LimitResource;
+    userId: string;
+    tenantId: string;
+  }): Promise<void> {
+    for (const { scope, subjectId } of [
+      { scope: "user", subjectId: input.userId },
+      { scope: "tenant", subjectId: input.tenantId }
+    ] as const) {
+      await this.redis.eval(
+        DECR_IF_EXISTS,
+        1,
+        `rl:${input.resource}:${scope}:${subjectId}`
+      );
+    }
   }
 
   async consumeTurnQuota(input: {

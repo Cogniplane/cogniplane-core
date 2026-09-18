@@ -1,3 +1,6 @@
+import { registerProjectFileRoutes } from "./routes/project-files.js";
+import { registerProjectRoutes } from "./routes/projects.js";
+import { registerProjectMemberRoutes } from "./routes/project-members.js";
 import type { FastifyInstance } from "fastify";
 
 import type { AppConfig } from "./config.js";
@@ -15,6 +18,7 @@ import {
 } from "./routes/message-feedback-routes.js";
 import { buildMcpRouteStores, registerMcpRoutes } from "./routes/mcp.js";
 import { buildSessionRouteStores, registerSessionRoutes } from "./routes/sessions.js";
+import { registerSessionCapabilityRoutes } from "./routes/session-capabilities.js";
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
@@ -45,6 +49,10 @@ export async function registerAppRoutes(
   );
   await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config }));
   await registerSessionRoutes(app, buildSessionRouteStores(deps));
+  await registerSessionCapabilityRoutes(app, deps);
+  await registerProjectRoutes(app, deps);
+  await registerProjectMemberRoutes(app, deps.projectMembers);
+  await registerProjectFileRoutes(app, deps);
   await registerSettingsRoutes(app, buildSettingsRouteStores(deps, { config: app.config }));
   await registerArtifactRoutes(app, buildArtifactRouteStores(deps));
   await registerMessageRoutes(
@@ -57,6 +65,7 @@ export async function registerAppRoutes(
     app,
     buildMcpRouteStores(deps, {
       runtimeTokenSecret: runtimeTokenSecret(app.config.DATA_ENCRYPTION_SECRET),
+      artifactMaxBytes: app.config.ARTIFACT_MAX_UPLOAD_BYTES,
       readRuntimeFile: async (sessionId, runtimeId, filePath) => {
         const runtime = resolveOwningFileAdapter(deps.runtimeAdapter, sessionId, runtimeId);
         if (!runtime?.readRuntimeFile) {

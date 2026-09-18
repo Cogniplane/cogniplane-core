@@ -11,23 +11,9 @@ import {
   toggleInArray,
   toGranularFlags
 } from "./tenant-settings-form.logic";
+import { makeTenantSettings } from "../test-helpers/tenant-settings";
 
-const baseSettings = {
-  tenantId: "tenant-1",
-  configHash: "hash-1",
-  version: 1,
-  updatedAt: "2026-05-09T12:00:00Z",
-  showEffortSelector: false,
-  webSearchMode: "cached",
-  approvalPolicy: "never",
-  approvalReviewer: "user",
-  allowCommandExecution: false,
-  autoApproveReadOnlyTools: true,
-  policyEnforcementMode: "monitor",
-  developerInstructions: null,
-  enabledToolIds: [],
-  enabledMcpServerIds: []
-} as unknown as TenantSettings;
+const baseSettings = makeTenantSettings({ webSearchMode: "cached" });
 
 describe("toApprovalPolicyKind / toGranularFlags / toApprovalPolicy", () => {
   test("scalar policies pass through", () => {

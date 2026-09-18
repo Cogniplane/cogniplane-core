@@ -1,3 +1,4 @@
+import { ProjectInstructionsSnapshotSchema } from "./project-instructions.js";
 import { z } from "zod";
 
 import { EFFORT_LEVELS } from "../primitives.js";
@@ -74,6 +75,9 @@ export const MessageSchema = z.object({
   modelName: z.string().nullable(),
   costUsd: z.number().nullable(),
   feedbackRating: MessageFeedbackRatingSchema.nullable(),
+  // Whole-turn elapsed time, including approval waits. Absent on older turns.
+  durationMs: z.number().finite().nonnegative().nullable().optional(),
+  projectInstructions: ProjectInstructionsSnapshotSchema.nullable().optional(),
   // Frontend-only field (passthrough): when the user's message was rewritten
   // by the PII detector before the runtime saw it, the SSE stream surfaces a
   // `user_message_replaced` custom event carrying the scan_run_id. The
@@ -118,6 +122,7 @@ export const MessagePostRequestSchema = z.object({
   sessionId: z.string().uuid(),
   text: z.string().trim().min(1).max(MAX_MESSAGE_TEXT_LENGTH),
   artifactIds: z.array(z.string().uuid()).max(10).optional(),
+  projectFileIds: z.array(z.string().uuid()).max(20).optional(),
   model: z.string().optional(),
   effort: z.enum(EFFORT_LEVELS).optional()
 });

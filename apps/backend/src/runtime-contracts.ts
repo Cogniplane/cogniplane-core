@@ -1,7 +1,9 @@
+import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
-import type { EffortLevel, PolicyTurnContext } from "@cogniplane/shared-types";
+import type { EffortLevel, PolicyTurnContext, ProjectApprovalMode } from "@cogniplane/shared-types";
 import type { ResolvedRuntimePolicy } from "./services/admin-config-records.js";
+import type { SessionExecution } from "./services/session-execution-store.js";
 
 export type RuntimeSessionRef = {
   sessionId: string;
@@ -21,6 +23,30 @@ export class SessionBusyError extends Error {
 export type RuntimeApprovalKind = "command_execution" | "file_change" | "permissions" | "mcp_tool";
 export type RuntimeApprovalDecision = "approve" | "reject";
 export type RuntimeReasoningEffort = EffortLevel;
+
+export function resolveTurnApprovalSettings(
+  runtimePolicy: ResolvedRuntimePolicy,
+  projectApprovalMode?: ProjectApprovalMode
+): { gate: boolean; autoApproveReadOnly: boolean } {
+  if (!projectApprovalMode || projectApprovalMode === "organization_default") {
+    return {
+      gate: runtimePolicy.approvalPolicy !== "never",
+      autoApproveReadOnly: runtimePolicy.autoApproveReadOnlyTools
+    };
+  }
+  if (projectApprovalMode === "manual") {
+    return { gate: true, autoApproveReadOnly: false };
+  }
+  // Automatic mode cannot weaken the tenant's native approval policy. The
+  // current runtime exposes the native policy as one gate, so every policy
+  // other than "never" remains gated. Policy Center is separate: enforced
+  // block and require_approval rules still run for MCP tools in the graph and
+  // gateway.
+  return {
+    gate: runtimePolicy.approvalPolicy !== "never",
+    autoApproveReadOnly: runtimePolicy.autoApproveReadOnlyTools
+  };
+}
 export type RuntimeUserInput = { type: "text"; text: string };
 
 // Deep Agents is the sole runtime adapter (the Codex/Claude-Code adapters and
@@ -42,14 +68,17 @@ export interface RuntimeAdapter {
    * live one.
    */
   hasRuntime(sessionId: string, runtimeId: string): boolean;
-  createSession(input: { tenantId: string; sessionId: string; userId: string }): Promise<RuntimeSessionRef>;
+  createSession(input: { tenantId: string; sessionId: string; userId: string; execution?: SessionExecution }): Promise<RuntimeSessionRef>;
   /** Drives one turn and yields AG-UI BaseEvents for clients and scheduled jobs. */
   runMessageAGUI(
     session: RuntimeSessionRef,
     input: {
       prompt: string;
+      projectInstructions?: ProjectInstructionsSnapshot | null;
       userInputs?: RuntimeUserInput[];
       toolContextId: string | null;
+      /** Project approval mode captured when this turn was admitted. */
+      projectApprovalMode?: ProjectApprovalMode;
       turnContext?: PolicyTurnContext;
       assistantMessageId?: string | null;
       model?: string;
@@ -57,7 +86,7 @@ export interface RuntimeAdapter {
       onBeforeTurn?: () => Promise<void>;
     }
   ): AsyncIterable<BaseEvent>;
-  abortSession(input: { tenantId: string; sessionId: string; userId: string }): Promise<void>;
+  abortSession(input: { tenantId: string; sessionId: string; userId: string; executionId?: string }): Promise<void>;
   /**
    * Stop the in-flight turn for `sessionId` while keeping the session warm.
    * Returns `"interrupted"` when an active turn was signalled, `"no_active_turn"`
@@ -95,7 +124,8 @@ export interface RuntimeAdapter {
    * Delete durable per-session runtime data (e.g. checkpointer threads) after
    * the session row itself is deleted. Unlike {@link abortSession} — which
    * also fires on idle teardown and config invalidation and must NOT destroy
-   * conversation state — this is called only from session deletion. Idempotent.
+   * conversation state — this is called after session or project deletion.
+   * Idempotent.
    */
   purgeSessionData(input: {
     tenantId: string;

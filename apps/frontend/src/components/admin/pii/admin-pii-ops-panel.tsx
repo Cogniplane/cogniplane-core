@@ -195,7 +195,7 @@ function LatencyTable({ rows }: { rows: PiiLatencyRow[] }) {
             <div className={LIST_ITEM} key={row.subjectType}>
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <strong className="text-sm font-semibold text-on-surface">
-                  {row.subjectType === "message" ? "Chat messages" : "Artifacts"}
+                  {row.subjectType === "project_instructions" ? "Project instructions" : row.subjectType === "message" ? "Chat messages" : "Artifacts"}
                 </strong>
                 <span className={PILL_GRAY}>n={row.sampleCount}</span>
               </div>

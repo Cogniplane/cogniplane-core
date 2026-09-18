@@ -68,14 +68,14 @@ export const AVAILABLE_MODELS: readonly {
   // splits on the FIRST slash only, preserving "deepseek/deepseek-v4-pro".
   // Reasoning-effort support varies per open model and is not applied here
   // (supportedEfforts: []), so the Effort dropdown stays hidden for these.
-  // Slugs and context windows verified 2026-09-05 against
+  // Slugs and context windows verified 2026-09-18 against
   // https://openrouter.ai/api/v1/models.
   { id: "openrouter/z-ai/glm-5.3",                    displayName: "GLM 5.3 (OpenRouter)",        description: "Z.AI GLM 5.3 — top open-weight model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_310_720 },
   { id: "openrouter/deepseek/deepseek-v4-pro",        displayName: "DeepSeek V4 Pro (OpenRouter)", description: "DeepSeek V4 Pro reasoning/coding model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/deepseek/deepseek-v4-flash",      displayName: "DeepSeek V4 Flash (OpenRouter)", description: "Fast, efficient DeepSeek V4 model via OpenRouter.",   isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
 
   // Widely-used open models on OpenRouter (slugs + context windows verified
-  // 2026-09-05 via /api/v1/models). OpenRouter's public API exposes no usage
+  // 2026-09-18 via /api/v1/models). OpenRouter's public API exposes no usage
   // ranking today (the ?order= param is accepted but ignored), so this set is
   // curated by capability tier, not by a live token chart.
   { id: "openrouter/tencent/hy3",                     displayName: "Tencent Hy3 (OpenRouter)",       description: "Tencent Hy3 295B MoE reasoning model.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
@@ -89,15 +89,15 @@ export const AVAILABLE_MODELS: readonly {
   // OpenRouter free tier (":free" slugs) — for testing without spend. Routes
   // rotate: OpenRouter retires a free variant without notice (the slug then
   // 404s), so every entry here was confirmed live AND tool-calling-capable on
-  // 2026-09-05, and each pairs with a paid slug elsewhere in the catalog or a
+  // 2026-09-18, and each pairs with a paid slug elsewhere in the catalog or a
   // vendor equivalent. Tool support matters: a model with no `tools` parameter
   // cannot drive the agent loop at all.
-  // (gpt-oss-120b:free and tencent/hy3:free were retired since the 2026-07
-  // check → dropped.)
+  // (minimax-m3:free was retired, and glm-5.2:free lost tool support and fell
+  // to a 32k window, since the 2026-09-05 check → both dropped.)
   { id: "openrouter/thinkingmachines/inkling:free",         displayName: "Inkling (free)",             description: "Free Thinking Machines Inkling for testing.",         isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
-  { id: "openrouter/minimax/minimax-m3:free",               displayName: "MiniMax M3 (free)",          description: "Free MiniMax M3 agentic/coding model for testing.",   isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/deepseek/deepseek-v4-flash-0731:free",  displayName: "DeepSeek V4 Flash (free)",   description: "Free DeepSeek V4 Flash snapshot for testing.",        isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", displayName: "Nemotron 3 Ultra (free)",   description: "Free NVIDIA Nemotron 3 Ultra for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/nvidia/nemotron-3.5-lightning:free",    displayName: "Nemotron 3.5 Lightning (free)", description: "Free NVIDIA Nemotron 3.5 Lightning for testing.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
-  { id: "openrouter/z-ai/glm-5.2:free",                     displayName: "GLM 5.2 (free)",             description: "Free Z.AI GLM 5.2 for testing.",                      isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 256_000 },
   { id: "openrouter/nvidia/nemotron-3-super-120b-a12b:free", displayName: "Nemotron 3 Super (free)",   description: "Free NVIDIA Nemotron 3 Super for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
   { id: "openrouter/google/gemma-4-31b-it:free",            displayName: "Gemma 4 31B (free)",         description: "Free Google Gemma 4 31B for testing.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
 

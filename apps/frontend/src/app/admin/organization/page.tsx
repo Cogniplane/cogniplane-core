@@ -39,7 +39,7 @@ export default function AdminOrganizationPage() {
   } = useAdminOrganizationData();
 
   const catalogQuery = useQuery({
-    queryKey: queryKeys.admin.modelCatalog(),
+    queryKey: queryKeys.models.adminCatalog(),
     queryFn: getAdminModelCatalog
   });
   const settingsQuery = useQuery({
@@ -50,6 +50,8 @@ export default function AdminOrganizationPage() {
     mutationFn: (input: ModelAvailabilityInput) => updateTenantModelAvailability(input),
     onSuccess: (updated) => {
       queryClient.setQueryData(queryKeys.admin.tenantSettings(), updated);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     }
   });
 
@@ -63,11 +65,8 @@ export default function AdminOrganizationPage() {
   });
   const handleNeedOpenRouterModels = useCallback(() => setOpenRouterWanted(true), []);
 
-  const invalidateModelData = async () => {
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: queryKeys.admin.modelCatalog() }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.admin.tenantSettings() })
-    ]);
+  const invalidateModelData = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
   };
   const addModelMutation = useMutation({
     mutationFn: (input: CustomModelCreateRequest) => createCustomModel(input),
@@ -75,7 +74,10 @@ export default function AdminOrganizationPage() {
   });
   const removeModelMutation = useMutation({
     mutationFn: (modelId: string) => deleteCustomModel(modelId),
-    onSuccess: invalidateModelData
+    onSuccess: (updated) => {
+      queryClient.setQueryData(queryKeys.admin.tenantSettings(), updated);
+      invalidateModelData();
+    }
   });
 
   const pageError =

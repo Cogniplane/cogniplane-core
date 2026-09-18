@@ -6,6 +6,7 @@ import { createNotionTools, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
 import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
 import { createWriteArtifactTool, WRITE_ARTIFACT_CATALOG } from "./write-artifact.js";
+import { createProjectTools, PROJECT_TOOL_CATALOG } from "./project-tools.js";
 
 type RawCatalogEntry = {
   name: string;
@@ -42,6 +43,7 @@ export function registerBuiltinManagedTools(
   catalog.register(asCatalogEntries(SESSION_TOOL_CATALOG, true, "session"));
   catalog.register(asCatalogEntries(SKILL_CORPUS_TOOL_CATALOG, true, "skill-corpus"));
   catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true, "write-artifact"));
+  catalog.register(asCatalogEntries(PROJECT_TOOL_CATALOG, true, "project"));
   catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true, "memory"));
 
   // tenantConfigurable=false: integration-owned tools, gated by the
@@ -54,5 +56,13 @@ export function registerBuiltinManagedTools(
   factoryRegistry.register("github", createGithubTools);
   factoryRegistry.register("notion", createNotionTools);
   factoryRegistry.register("write-artifact", createWriteArtifactTool);
+  factoryRegistry.register("project", (deps) => deps.projectFiles ? createProjectTools({
+    projectFiles: deps.projectFiles,
+    storage: deps.storage,
+    readRuntimeFile: deps.readRuntimeFile,
+    statRuntimeFile: deps.statRuntimeFile,
+    maxProjectFileBytes: deps.artifactMaxBytes,
+    limits: deps.limits
+  }) : []);
   factoryRegistry.register("memory", createMemoryTools);
 }

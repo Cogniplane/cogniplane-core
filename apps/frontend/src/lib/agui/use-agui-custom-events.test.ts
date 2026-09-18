@@ -442,3 +442,23 @@ describe("persisted approval seeds", () => {
     expect(first.unsubscribe).toHaveBeenCalledOnce();
   });
 });
+
+it("publishes turn start, keeps failure through finalization, and clears it on retry", () => {
+  const { agent, run, emit } = makeFakeAgent();
+  const { result } = renderHook(() => useAguiCustomEvents(agent));
+  expect(result.current.turnActivity).toBeNull();
+  run.init();
+  const startedAt = result.current.turnActivity?.startedAt;
+  expect(startedAt).toBeTruthy();
+  expect(result.current.turnActivity?.isRunning).toBe(true);
+  emit("turn_started", { messageId: "persisted-turn", sequence: 42 });
+  run.fail();
+  run.finalize();
+  expect(result.current.turnActivity).toMatchObject({ startedAt, isRunning: false, failed: true });
+  expect(result.current.turnActivity).toMatchObject({ turnId: "persisted-turn", turnSequence: 42, failed: true });
+  run.init();
+  expect(result.current.turnActivity).toMatchObject({ isRunning: true, failed: false });
+  expect(result.current.turnActivity?.turnSequence).toBeUndefined();
+  run.finalize();
+  expect(result.current.turnActivity).toMatchObject({ isRunning: false, failed: false });
+});

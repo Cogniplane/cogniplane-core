@@ -17,7 +17,12 @@ export const DEFAULT_TENANT_TOOL_IDS = [
   "write_artifact",
   "memory_search",
   "memory_save",
-  "memory_delete"
+  "memory_delete",
+  "project_list_files",
+  "project_read_file",
+  "project_get_conflict_context",
+  "project_reconcile_conflict",
+  "project_write_file"
 ];
 
 export const DEFAULT_TENANT_MCP_SERVER_IDS = ["managed-session-context"];

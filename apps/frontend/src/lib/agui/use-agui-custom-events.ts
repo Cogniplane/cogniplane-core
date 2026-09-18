@@ -23,6 +23,7 @@ import type {
   RuntimeNoticeRow,
   ToolStatusRow
 } from "../../components/chat-cards/chat-cards.types";
+import type { LiveTurnActivity } from "../../components/session-status.logic";
 import { resolveApproval } from "../session-api";
 
 // Approval expiry has no dedicated AG-UI event. The backend encodes it in the
@@ -50,6 +51,7 @@ export type AguiCustomEvents = {
   // model change re-keys the agent and would drop a live turn) and lets the
   // host refresh persisted state (tokens/cost) once a turn finalizes.
   isRunning: boolean;
+  turnActivity: LiveTurnActivity | null;
   onApprovalDecision: (approvalId: string, decision: ApprovalDecision) => void;
 };
 
@@ -85,6 +87,7 @@ export function useAguiCustomEvents(
   initialToolStatuses: ToolStatusRow[] = [],
   initialApprovals: Approval[] = []
 ): AguiCustomEvents {
+  const [turnActivity, setTurnActivity] = useState<AguiCustomEvents["turnActivity"]>(null);
   const [approvals, setApprovals] = useState(() => pendingApprovalRows(initialApprovals));
   const [notices, setNotices] = useState<RuntimeNoticeRow[]>([]);
   const [mcpStatuses, setMcpStatuses] = useState<McpServerStatusRow[]>([]);
@@ -122,6 +125,7 @@ export function useAguiCustomEvents(
     // session shows tool failures immediately; live events append on top.
     setToolStatuses(initialToolStatusesRef.current);
     setIsRunning(false);
+    setTurnActivity(null);
     toolMetaRef.current = new Map();
 
     // A failed run reaches BOTH onRunFailed (catchError) and onRunFinalized
@@ -135,6 +139,11 @@ export function useAguiCustomEvents(
       if (settledOutcome) return;
       settledOutcome = outcome;
       setIsRunning(false);
+      setTurnActivity((previous) => previous ? {
+        ...previous,
+        isRunning: false,
+        failed: outcome === "failed"
+      } : null);
       onRunSettledRef.current?.();
     };
 
@@ -142,6 +151,7 @@ export function useAguiCustomEvents(
       onRunInitialized() {
         settledOutcome = null;
         setIsRunning(true);
+        setTurnActivity({ startedAt: new Date().toISOString(), isRunning: true, failed: false });
       },
       onRunFinalized() {
         // A run that finishes cleanly cannot leave a decision outstanding: a
@@ -165,6 +175,12 @@ export function useAguiCustomEvents(
         if (!parsed.success) return;
         const customEvent = parsed.data;
         switch (customEvent.name) {
+          case "turn_started": {
+            setTurnActivity((previous) => previous ? {
+              ...previous, turnId: customEvent.value.messageId, turnSequence: customEvent.value.sequence
+            } : null);
+            break;
+          }
           case "approval_required": {
             const v = customEvent.value;
             setApprovals((prev) =>
@@ -332,5 +348,5 @@ export function useAguiCustomEvents(
     []
   );
 
-  return { approvals, notices, mcpStatuses, toolStatuses, isRunning, onApprovalDecision };
+  return { approvals, notices, mcpStatuses, toolStatuses, isRunning, turnActivity, onApprovalDecision };
 }

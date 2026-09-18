@@ -84,7 +84,7 @@ test("does NOT run the PII drain when PII_PROVIDER_ENABLED is false, even if dep
   // Regression guard (Codex review): the PII deps are ALWAYS constructed and
   // passed, so the worker must not run the cross-tenant drain unless
   // PII_PROVIDER_ENABLED is set — otherwise it queries an RLS-bound pool
-  // (boot only asserts BYPASSRLS when PII/scheduler/workos is on) and silently
+  // (boot also asserts BYPASSRLS for project retention) and silently
   // claims zero rows. With scheduler on + PII off, the worker exists for cron
   // but must leave the PII queue untouched.
   const config = createTestConfig({ SCHEDULER_ENABLED: true, PII_PROVIDER_ENABLED: false });

@@ -16,6 +16,8 @@ import { SchedulerWorker, type SchedulerRuntimeResolution } from "./scheduler-wo
 import type { SessionStore } from "./session-store.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { UserSettingsStore } from "./user-settings-store.js";
+import type { ProjectFileStore } from "./project-file-store.js";
+import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 
 export function buildSchedulerWorker(
   config: AppConfig,
@@ -31,11 +33,16 @@ export function buildSchedulerWorker(
     auditEvents: AuditEventStore;
     piiScanJobs?: PiiScanJobStore;
     piiScanJobHandler?: PiiScanJobHandler;
+    projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
+    projectFileStorage?: Pick<ArtifactStorage, "delete">;
+    sessionTrash?: Pick<SessionStore, "cleanupExpired">;
+    sessionStorage?: Pick<ArtifactStorage, "delete">;
     logger: FastifyBaseLogger;
   }
 ) {
-  // The worker drives two independent workloads: the cron scheduler and the
-  // async PII scan-job drain. Either one alone is reason enough to run it.
+  // The worker drives independent workloads: the cron scheduler, the async
+  // PII scan-job drain, project-file retention, and session Trash retention.
+  // Any one alone is reason enough to run it.
   //
   // The PII drain claims jobs cross-tenant through the privileged (BYPASSRLS)
   // pool. That pool's BYPASSRLS contract is asserted at boot ONLY when
@@ -48,7 +55,13 @@ export function buildSchedulerWorker(
   // the worker's runtime behavior in lockstep.
   const piiDrainEnabled =
     config.PII_PROVIDER_ENABLED && Boolean(input.piiScanJobs && input.piiScanJobHandler);
-  if (!config.SCHEDULER_ENABLED && !piiDrainEnabled) {
+  const projectRetentionEnabled =
+    config.PROJECT_FILE_RETENTION_ENABLED &&
+    Boolean(input.projectFiles && input.projectFileStorage);
+  const sessionRetentionEnabled =
+    config.SESSION_TRASH_RETENTION_ENABLED &&
+    Boolean(input.sessionTrash && input.sessionStorage);
+  if (!config.SCHEDULER_ENABLED && !piiDrainEnabled && !projectRetentionEnabled && !sessionRetentionEnabled) {
     return null;
   }
 
@@ -108,6 +121,11 @@ export function buildSchedulerWorker(
       // absent, so a scheduler-only worker never touches the PII queue.
       piiScanJobs: piiDrainEnabled ? input.piiScanJobs : undefined,
       piiScanJobHandler: piiDrainEnabled ? input.piiScanJobHandler : undefined,
+      projectFiles: projectRetentionEnabled ? input.projectFiles : undefined,
+      projectFileStorage: projectRetentionEnabled ? input.projectFileStorage : undefined,
+      sessionTrash: sessionRetentionEnabled ? input.sessionTrash : undefined,
+      sessionStorage: sessionRetentionEnabled ? input.sessionStorage : undefined,
+      runtimeAdapter: input.runtimeAdapter,
       // Poison-job disable is backed by UserSettingsStore.disableJob; thread it
       // in so the worker can permanently drop invalid-cron / repeatedly-failing
       // jobs instead of leaving them dormant.

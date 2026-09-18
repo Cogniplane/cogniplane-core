@@ -33,6 +33,28 @@ export default defineConfig({
     maxWorkers: 1,
     // Migrating a cold database plus the checkpointer DDL runs in globalSetup.
     hookTimeout: 120_000,
-    testTimeout: 30_000
+    testTimeout: 30_000,
+    // Coverage here is OFF unless `--coverage` is passed, so the points above
+    // still hold: `pnpm test:coverage` measures the unit suite alone and the
+    // blocking floor never depends on a database. `pnpm test:coverage:merged`
+    // opts in to produce the advisory unit + integration report. It writes to
+    // its own directory so it cannot overwrite the gate's report, carries no
+    // thresholds of its own, and matches the unit run's `include` so the two
+    // file lists line up. See scripts/merge-coverage.ts.
+    coverage: {
+      provider: "v8",
+      reporter: ["json-summary"],
+      reportsDirectory: "coverage-integration",
+      include: ["src/**/*.ts"],
+      exclude: [
+        "src/**/*.test.ts",
+        "src/test-helpers/**",
+        "src/integration/support/**",
+        "src/types.d.ts",
+        "src/services/pii/pii-provider.ts",
+        "src/services/integrations/contracts.ts",
+        "src/scripts/seed-dev-data.ts"
+      ]
+    }
   }
 });

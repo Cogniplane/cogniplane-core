@@ -9,6 +9,15 @@ How to update this file:
 4. Each bullet should be understandable to someone who didn't read the code or PRs.
 5. Skip low-signal internal cleanup unless it matters to the audience.
 
+## 2026-09-04
+
+Changed
+
+- Browser and scheduled turns use one AG-UI event path. Native and Policy Center approvals share checkpointed interrupts, and the gateway verifies the approved action before dispatch.
+- Shared schemas validate custom event payloads. Session reload restores pending approval controls, and database timestamp conversion preserves milliseconds.
+- Backend production containers use separate build and runtime stages with an unprivileged runtime user.
+- Application writers of two inert settings columns were removed. Column removal remains a separate deployment-dependent operation; it is not part of automatic migration replay.
+
 ## 2026-07-04
 
 Changed

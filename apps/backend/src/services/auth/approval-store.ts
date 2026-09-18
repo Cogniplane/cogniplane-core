@@ -1,5 +1,6 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
+import { sessionExecutionAccessSql, SessionExecutionError } from "../session-execution-store.js";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
 export type ApprovalKind = "command_execution" | "file_change" | "permissions" | "mcp_tool";
@@ -64,6 +65,17 @@ export class ApprovalStore {
 
   async create(input: Omit<ApprovalRecord, "createdAt" | "updatedAt" | "resolvedAt"> & { tenantId: string }): Promise<ApprovalRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
+      const session = await client.query("SELECT project_id FROM sessions WHERE tenant_id=$1 AND session_id=$2",
+        [input.tenantId, input.sessionId]);
+      if (session.rows[0]?.project_id) {
+        const active = await client.query(`SELECT e.execution_id FROM session_executions e JOIN sessions s
+          ON s.tenant_id=e.tenant_id AND s.session_id=e.session_id
+          WHERE e.tenant_id=$1 AND e.session_id=$2 AND e.user_id=$3 AND e.runtime_id=$4
+            AND e.status='active' AND e.expires_at>clock_timestamp()
+            AND ${sessionExecutionAccessSql("s", "e.user_id")} FOR SHARE OF e`,
+        [input.tenantId, input.sessionId, input.userId, input.runtimeId]);
+        if (!active.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
+      }
       const result = await client.query(
         `
           INSERT INTO approvals (
@@ -154,6 +166,15 @@ export class ApprovalStore {
           UPDATE approvals
           SET status = $4, decision = $5, resolved_at = NOW(), updated_at = NOW()
           WHERE tenant_id = $1 AND approval_id = $2 AND user_id = $3 AND status = 'pending'
+            AND expires_at > clock_timestamp()
+            AND EXISTS (SELECT 1 FROM sessions s
+              WHERE s.tenant_id=approvals.tenant_id AND s.session_id=approvals.session_id
+                AND (s.project_id IS NULL OR EXISTS (
+                  SELECT 1 FROM session_executions e WHERE e.tenant_id=approvals.tenant_id
+                    AND e.session_id=approvals.session_id AND e.user_id=approvals.user_id
+                    AND e.runtime_id=approvals.runtime_id AND e.status='active' AND e.expires_at>clock_timestamp()
+                    AND ${sessionExecutionAccessSql("s", "e.user_id")}
+                )))
           RETURNING *
         `,
         [tenantId, approvalId, userId, status, decision]

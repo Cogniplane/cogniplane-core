@@ -30,13 +30,13 @@ function parseAguiEvents(payload: string): BaseEvent[] {
 }
 
 // The MCP gateway is runtime-token-only: every /mcp request must carry a valid
-// rt_* token, and caller-supplied toolContextIds are bound to its sid/uid.
+// rt_* token, and tool contexts are bound to its tenant, session, user and runtime ID.
 // Defaults mirror createTestToolContext (session-1 / test-user).
-function mcpAuthHeaders(claims: { sid?: string; uid?: string } = {}): { authorization: string } {
+function mcpAuthHeaders(claims: { sid?: string; uid?: string; rid?: string } = {}): { authorization: string } {
   const sid = claims.sid ?? "session-1";
   return {
     authorization: `Bearer ${generateRuntimeToken(
-      { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: `runtime-${sid}` },
+      { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: claims.rid ?? `runtime-${sid}` },
       TEST_RUNTIME_TOKEN_SECRET
     )}`
   };
@@ -743,7 +743,7 @@ test("serves the managed MCP tool and resolves context from toolContextId", asyn
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders({ sid: session.sessionId }),
+    headers: mcpAuthHeaders({ sid: session.sessionId, rid: toolContext.runtimeId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -879,7 +879,7 @@ test("lists and reads scoped text artifacts through the managed MCP server", asy
   const listResponse = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders({ sid: session.sessionId }),
+    headers: mcpAuthHeaders({ sid: session.sessionId, rid: toolContext.runtimeId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -900,7 +900,7 @@ test("lists and reads scoped text artifacts through the managed MCP server", asy
   const readResponse = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders({ sid: session.sessionId }),
+    headers: mcpAuthHeaders({ sid: session.sessionId, rid: toolContext.runtimeId }),
     payload: {
       jsonrpc: "2.0",
       id: 2,
@@ -971,12 +971,15 @@ test("denies managed MCP tools that are not enabled by the runtime policy", asyn
 });
 
 test("allows write_artifact through the baseline runtime policy", async () => {
-  const { app, artifacts, toolContexts } = await createTestApp();
+  const { app, sessions, artifacts, toolContexts } = await createTestApp();
   onTestFinished(async () => {
         await app.close();
       });
+  const session = await sessions.create("test-tenant", "test-user", "baseline artifact");
 
   const toolContext = await createTestToolContext(toolContexts, {
+    sessionId: session.sessionId,
+    runtimeId: `runtime-${session.sessionId}`,
     runtimePolicyId: "baseline-chat",
     metadata: {
       runtimePolicy: {
@@ -994,7 +997,7 @@ test("allows write_artifact through the baseline runtime policy", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders(),
+    headers: mcpAuthHeaders({ sid: session.sessionId, rid: `runtime-${session.sessionId}` }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1056,7 +1059,7 @@ test("read-only managed tools are not blocked when autoApproveReadOnlyTools is o
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders({ sid: session.sessionId }),
+    headers: mcpAuthHeaders({ sid: session.sessionId, rid: toolContext.runtimeId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1090,7 +1093,7 @@ test("surfaces managed MCP broker errors as JSON-RPC failures", async () => {
   const response = await app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
-    headers: mcpAuthHeaders({ sid: toolContext.sessionId }),
+    headers: mcpAuthHeaders({ sid: toolContext.sessionId, rid: toolContext.runtimeId }),
     payload: {
       jsonrpc: "2.0",
       id: 1,
@@ -1710,14 +1713,15 @@ test("GET /artifacts/:id/preview-text returns 422 pdf_extraction_failed when pro
     updatedAt: new Date().toISOString()
   };
   const stubStores = {
-    sessions: { async getOwned() { return null; } },
+    sessions: { async requireUploadAccess() { return null; }, async getReadable() { return null; } },
     messages: { async getOwned() { return null; } },
     artifacts: {
       async listForUser() { return { items: [], nextCursor: null }; },
-      async getOwned(_tenantId: string, id: string, userId: string) {
+      async getReadable(_tenantId: string, id: string, userId: string) {
         return id === artifactId && userId === "platform-user" ? artifactRecord : null;
       },
-      async create() { return artifactRecord; },
+      async createUpload() { return artifactRecord; },
+      async update() { return artifactRecord; },
       async listBySession() { return []; },
       async createDownloadToken() { throw new Error("Unexpected createDownloadToken call"); },
       async peekDownloadToken() { return null; },

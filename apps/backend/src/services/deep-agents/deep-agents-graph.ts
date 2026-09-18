@@ -14,7 +14,8 @@
 // stream ends, runs the approval round-trip, and resumes with a Command.
 
 import { MemorySaver, Command, type BaseCheckpointSaver } from "@langchain/langgraph";
-import type { ServerTool } from "@langchain/core/tools";
+import { executionAuthorizationMiddleware } from "./execution-authorization-middleware.js";
+import type { ServerTool, StructuredTool } from "@langchain/core/tools";
 import { initChatModel } from "langchain";
 import { CompositeBackend, StateBackend, createDeepAgent } from "deepagents";
 import { MultiServerMCPClient } from "@langchain/mcp-adapters";
@@ -35,6 +36,8 @@ import {
 } from "../policy/policy-approval-proof.js";
 
 import { E2bDeepAgentsSandbox } from "./deep-agents-e2b-backend.js";
+import { projectInstructionsContextSchema, projectInstructionsMiddleware } from "./project-instructions-middleware.js";
+import { CurrentSkillsCheckpointer } from "./current-skills-checkpointer.js";
 import { SKILLS_LIBRARY_PREFIX, createSkillsLibraryBackend } from "./deep-agents-skills-library.js";
 import type {
   DeepAgentsGraph,
@@ -262,22 +265,17 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   // conversations then resume across process restarts. Per-session MemorySaver
   // fallback otherwise. Either way the same instance is reused across model
   // rebuilds so a per-turn model switch keeps the thread history.
-  const checkpointer = (init.checkpointer as BaseCheckpointSaver | undefined) ?? new MemorySaver();
-  // One lazy sandbox per session: files persist across turns; chat-only
-  // sessions never create it.
-  const sandbox = init.e2b
-    ? new E2bDeepAgentsSandbox({
-        apiKey: init.e2b.apiKey,
-        templateId: init.e2b.templateId,
-        sandboxTimeoutMs: init.e2b.sandboxTimeoutMs,
-        executeTimeoutMs: init.e2b.executeTimeoutMs,
-        workspacePath: init.workspacePath,
-        sessionId: init.sessionId,
-        runtimeId: init.runtimeId,
-        onSandboxRecreated: init.onSandboxRecreated,
-        logger: init.logger
-      })
-    : null;
+  const saver = (init.checkpointer as BaseCheckpointSaver | undefined) ?? new MemorySaver();
+  const checkpointer = new CurrentSkillsCheckpointer(saver);
+  // Construct a lazy sandbox handle when shell is enabled, including after a
+  // policy refresh. Disabling detaches it; re-enabling reuses its files.
+  const createSandbox = (options: NonNullable<typeof init.e2b>) => new E2bDeepAgentsSandbox({
+    apiKey: options.apiKey, templateId: options.templateId,
+    sandboxTimeoutMs: options.sandboxTimeoutMs, executeTimeoutMs: options.executeTimeoutMs,
+    workspacePath: init.workspacePath, sessionId: init.sessionId, runtimeId: init.runtimeId,
+    onSandboxRecreated: init.onSandboxRecreated, logger: init.logger
+  });
+  let sandbox = init.e2b ? createSandbox(init.e2b) : null;
 
   // Skills library (bead kpit): enabled skills are served read-only at
   // /skills/ through a CompositeBackend route, and surfaced to the model by
@@ -289,21 +287,18 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   // its non-empty `id`, so the execute tool stays available; without a
   // sandbox the composite wraps the same per-run StateBackend the library
   // would default to, and its empty `id` keeps execute hidden.
-  const skillsFiles =
-    init.skillsLibraryFiles && Object.keys(init.skillsLibraryFiles).length > 0
-      ? init.skillsLibraryFiles
-      : null;
-  const skillsRoutes = skillsFiles
-    ? { [SKILLS_LIBRARY_PREFIX]: createSkillsLibraryBackend(skillsFiles) }
-    : null;
-  const backend = skillsRoutes
-    ? sandbox
+  let skillsFiles = init.skillsLibraryFiles ?? {};
+  let allowCommandExecution = Boolean(sandbox);
+  const buildBackend = () => {
+    const skillsRoutes = { [SKILLS_LIBRARY_PREFIX]: createSkillsLibraryBackend(skillsFiles) };
+    return sandbox && allowCommandExecution
       ? new CompositeBackend(sandbox, skillsRoutes)
       : // Mirrors createDeepAgent's default backend factory — StateBackend
         // needs the per-run config, so the composite is built per resolve.
         (config: { state: unknown }) =>
-          new CompositeBackend(new StateBackend(config as ConstructorParameters<typeof StateBackend>[0]), skillsRoutes)
-    : sandbox;
+          new CompositeBackend(new StateBackend(config as ConstructorParameters<typeof StateBackend>[0]), skillsRoutes);
+  };
+  let backend = buildBackend();
 
   const toolContextRef = init.toolContextRef ?? { current: null };
   const policyContextRef = init.policyContextRef ?? { current: null };
@@ -328,7 +323,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   // writable. Relative paths resolve identically on both sides (file tools
   // resolve against the workspace; execute runs with cwd = workspace), so
   // steer the model to relative paths.
-  const workspaceNote = sandbox
+  const workspaceNote = () => sandbox && allowCommandExecution
     ? [
         "## Workspace",
         "",
@@ -348,10 +343,12 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
           : [])
       ].join("\n")
     : null;
-  const systemPromptParts = [init.systemPrompt, workspaceNote].filter(
-    (part): part is string => Boolean(part)
-  );
-  const systemPrompt = systemPromptParts.length > 0 ? systemPromptParts.join("\n\n") : null;
+  let baseSystemPrompt = init.systemPrompt;
+  const buildSystemPrompt = () => [baseSystemPrompt, workspaceNote()].filter(Boolean).join("\n\n") || null;
+  let systemPrompt = buildSystemPrompt();
+  let mcpServers = init.mcpServers ?? [];
+  let approvals = init.approvals;
+
 
   /**
    * Load gateway tools once per session. The Bearer token is session-scoped;
@@ -361,7 +358,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
    */
   const loadMcpTools = (): Promise<LangchainToolLike[]> => {
     if (mcpToolsPromise) return mcpToolsPromise;
-    const servers = init.mcpServers ?? [];
+    const servers = mcpServers;
     if (servers.length === 0) {
       mcpToolsPromise = Promise.resolve([]);
       return mcpToolsPromise;
@@ -468,6 +465,44 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   };
 
   const runtime: DeepAgentsSessionRuntime = {
+    setApprovalSettings(next) {
+      if (
+        approvals?.gate !== next.gate ||
+        approvals?.autoApproveReadOnly !== next.autoApproveReadOnly
+      ) {
+        // Approval configuration is captured when the graph is compiled. Keep
+        // the MCP client and sandbox warm, but rebuild the graph for the next
+        // turn so a project setting never changes an active graph in place.
+        compiled = null;
+        policyApprovalProofs.clear();
+      }
+      approvals = next;
+    },
+    async refreshCapabilities(next) {
+      const nextAllowCommandExecution = next.allowCommandExecution ?? allowCommandExecution;
+      const sandboxOptions = next.e2b ?? init.e2b;
+      if (nextAllowCommandExecution && !sandbox && !sandboxOptions) {
+        throw new Error("Cannot enable command execution without sandbox configuration");
+      }
+      await mcpClient?.close();
+      mcpClient = null;
+      mcpToolsPromise = null;
+      // Rebuild the native skills middleware too: it caches its listing in a closure.
+      compiled = null;
+      mcpToolNames.clear();
+      mcpToolServers.clear();
+      mcpToolFacts.clear();
+      policyApprovalProofs.clear();
+      mcpServers = next.mcpServers;
+      if (next.approvals) approvals = next.approvals;
+      allowCommandExecution = nextAllowCommandExecution;
+      if (allowCommandExecution && !sandbox && sandboxOptions) sandbox = createSandbox(sandboxOptions);
+      if (next.systemPrompt !== undefined) baseSystemPrompt = next.systemPrompt;
+      systemPrompt = buildSystemPrompt();
+      skillsFiles = next.skillsLibraryFiles;
+      backend = buildBackend();
+      syncSandboxAccess();
+    },
     async getAgentForModel(
       modelId: string,
       effort?: RuntimeReasoningEffort | null
@@ -508,7 +543,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       });
 
       const interruptOn = buildInterruptOn({
-        approvals: init.approvals,
+        approvals,
         mcpToolNames: [...mcpToolNames],
         policy: init.policyService
           ? {
@@ -526,6 +561,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       // The tools cast bridges our structural LangchainToolLike view back to
       // the library's tool union (the tools really are DynamicStructuredTools
       // from @langchain/mcp-adapters).
+      const executionMiddleware = init.requireExecution ? executionAuthorizationMiddleware(init.requireExecution) : null;
       const agent = createDeepAgent({
         model,
         checkpointer,
@@ -535,7 +571,17 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // Native skills middleware: lists name/description/path in the system
         // prompt; the model reads SKILL.md (and companions) on demand through
         // the composite backend's /skills/ route.
-        ...(skillsFiles ? { skills: [SKILLS_LIBRARY_PREFIX] } : {}),
+        skills: [SKILLS_LIBRARY_PREFIX],
+        contextSchema: projectInstructionsContextSchema,
+        middleware: [...(executionMiddleware ? [executionMiddleware] : []), projectInstructionsMiddleware],
+        // deepagents 1.13.3 does not append new custom middleware to its default
+        // general-purpose agent. Supply the guard explicitly for delegated work.
+        ...(executionMiddleware ? { subagents: [{
+          name: "general-purpose", description: "Delegate a task using the current turn's permissions.",
+          systemPrompt: systemPrompt ?? "Complete the delegated task using the available tools.",
+          tools: mcpTools as unknown as StructuredTool[], skills: [SKILLS_LIBRARY_PREFIX],
+          middleware: [executionMiddleware, projectInstructionsMiddleware]
+        }] } : {}),
         ...(systemPrompt ? { systemPrompt } : {})
       }) as unknown as DeepAgentsGraph;
 
@@ -618,15 +664,6 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     getMcpToolServers() {
       return mcpToolServers;
     },
-    ...(sandbox
-      ? {
-          readFileBytes: (filePath: string) => sandbox.readFileBytes(filePath),
-          statFile: (filePath: string) => sandbox.statFile(filePath),
-          writeFileBytes: (filePath: string, data: Uint8Array | ArrayBuffer | string) =>
-            sandbox.writeFileBytes(filePath, data),
-          extendSandboxTimeout: () => sandbox.extendTimeout()
-        }
-      : {}),
     async dispose(): Promise<void> {
       compiled = null;
       await mcpClient?.close().catch((err: unknown) => {
@@ -638,6 +675,21 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     }
   };
 
+  function syncSandboxAccess() {
+    const activeSandbox = allowCommandExecution ? sandbox : null;
+    if (activeSandbox) {
+      runtime.readFileBytes = (filePath) => activeSandbox.readFileBytes(filePath);
+      runtime.statFile = (filePath) => activeSandbox.statFile(filePath);
+      runtime.writeFileBytes = (filePath, data) => activeSandbox.writeFileBytes(filePath, data);
+      runtime.extendSandboxTimeout = () => activeSandbox.extendTimeout();
+    } else {
+      delete runtime.readFileBytes;
+      delete runtime.statFile;
+      delete runtime.writeFileBytes;
+      delete runtime.extendSandboxTimeout;
+    }
+  }
+  syncSandboxAccess();
   return runtime;
 };
 

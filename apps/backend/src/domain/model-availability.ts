@@ -1,28 +1,13 @@
-import type { EffortLevel, ModelProvider } from "@cogniplane/shared-types";
+import type { EffortLevel, TenantSettings } from "@cogniplane/shared-types";
+import { isModelEnabled } from "@cogniplane/shared-types";
 
 import type { AvailableModel } from "./models.js";
 import { AVAILABLE_MODELS } from "./models.js";
 
-/**
- * Tenant-level model availability config (a slice of TenantSettingsRecord).
- * A model is selectable iff its provider is enabled AND (the model allowlist
- * is null OR contains the model id). Key presence is a separate, orthogonal
- * gate applied by callers — availability says "the admin allows this model",
- * key presence says "we can actually call it".
- */
-export type ModelAvailabilitySettings = {
-  enabledProviders: ModelProvider[];
-  enabledModelIds: string[] | null;
-  modelDefaultEfforts: Record<string, EffortLevel>;
-};
-
-export function isModelEnabled(
-  model: AvailableModel,
-  settings: ModelAvailabilitySettings
-): boolean {
-  if (!settings.enabledProviders.includes(model.provider)) return false;
-  return settings.enabledModelIds === null || settings.enabledModelIds.includes(model.id);
-}
+export type ModelAvailabilitySettings = Pick<
+  TenantSettings,
+  "enabledProviders" | "enabledModelIds" | "modelDefaultEfforts"
+>;
 
 /**
  * Filters `models` (defaults to the static catalog; pass the tenant-merged
@@ -55,4 +40,20 @@ export function withEffectiveDefaultEffort(
   settings: ModelAvailabilitySettings
 ): AvailableModel {
   return { ...model, defaultEffort: effectiveDefaultEffort(model, settings) };
+}
+
+/**
+ * Drop unavailable IDs so admin forms can save after a catalog removal.
+ * If every selected model is gone, restore the unrestricted allowlist.
+ * Preserve an explicitly empty list, which disables all models.
+ * GET normalizes its response; custom-model deletion persists the result.
+ */
+export function pruneUnknownModelIds<T extends { enabledModelIds: string[] | null }>(
+  settings: T,
+  knownModelIds: ReadonlySet<string>
+): T {
+  if (settings.enabledModelIds === null) return settings;
+  const kept = settings.enabledModelIds.filter((id) => knownModelIds.has(id));
+  if (kept.length === settings.enabledModelIds.length) return settings;
+  return { ...settings, enabledModelIds: kept.length > 0 ? kept : null };
 }

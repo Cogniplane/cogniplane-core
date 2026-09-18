@@ -23,41 +23,30 @@ export type ApprovalRouteStores = {
 
 const RESOLVED_APPROVAL_TTL_MS = 5 * 60 * 1000;
 
-// Cache recently resolved approval IDs so retried decisions return the
-// original outcome instead of 404.
-//
-// Keyed by `tenantId:approvalId` so a tenant that probes another tenant's
-// approval IDs cannot get a positive "resolved" signal — even if approval IDs
-// are 128-bit UUIDs that are practically unguessable, scoping the cache by
-// tenant removes the cross-tenant leak by construction.
-//
-// NOTE: This cache is per-process. In a multi-replica deployment a retried
-// request that lands on a different instance still gets a 404 — it degrades
-// gracefully (the frontend shows an error instead of silently double-approving).
-// To make idempotency work across replicas, replace this Map with a Redis key
-// with the same TTL (RESOLVED_APPROVAL_TTL_MS).
+// Retries are scoped to the initiating user, tenant and approval. This cache
+// is local to one process; a retry on another replica can still return 404.
 export type RecentlyResolvedCache = {
-  remember(tenantId: string, approvalId: string): void;
-  wasRecentlyResolved(tenantId: string, approvalId: string): boolean;
+  remember(tenantId: string, userId: string, approvalId: string): void;
+  wasRecentlyResolved(tenantId: string, userId: string, approvalId: string): boolean;
 };
 
 export function createRecentlyResolvedCache(ttlMs: number = RESOLVED_APPROVAL_TTL_MS): RecentlyResolvedCache {
-  const entries = new Map<string, number>(); // `${tenantId}:${approvalId}` → expiresAt
+  const entries = new Map<string, number>(); // Identity tuple → expiry
 
-  function compositeKey(tenantId: string, approvalId: string): string {
-    return `${tenantId}:${approvalId}`;
+  function compositeKey(tenantId: string, userId: string, approvalId: string): string {
+    return JSON.stringify([tenantId, userId, approvalId]);
   }
 
   return {
-    remember(tenantId, approvalId) {
-      entries.set(compositeKey(tenantId, approvalId), Date.now() + ttlMs);
+    remember(tenantId, userId, approvalId) {
+      entries.set(compositeKey(tenantId, userId, approvalId), Date.now() + ttlMs);
       const now = Date.now();
       for (const [key, expiresAt] of entries) {
         if (expiresAt <= now) entries.delete(key);
       }
     },
-    wasRecentlyResolved(tenantId, approvalId) {
-      const key = compositeKey(tenantId, approvalId);
+    wasRecentlyResolved(tenantId, userId, approvalId) {
+      const key = compositeKey(tenantId, userId, approvalId);
       const expiresAt = entries.get(key);
       if (expiresAt === undefined) return false;
       if (expiresAt <= Date.now()) {
@@ -121,14 +110,14 @@ export async function registerApprovalRoutes(
 
     if (result === "missing") {
       // Return the original outcome on retry rather than 404.
-      if (recentlyResolved.wasRecentlyResolved(request.auth.tenantId, approvalId)) {
+      if (recentlyResolved.wasRecentlyResolved(request.auth.tenantId, request.auth.userId, approvalId)) {
         return { status: "resolved" };
       }
       reply.code(404);
       return notFoundError("approval_not_found");
     }
 
-    recentlyResolved.remember(request.auth.tenantId, approvalId);
+    recentlyResolved.remember(request.auth.tenantId, request.auth.userId, approvalId);
     return { status: "resolved" };
   });
 }

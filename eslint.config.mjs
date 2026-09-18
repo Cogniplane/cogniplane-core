@@ -20,9 +20,13 @@ export default tseslint.config(
       "docs/**",
       // Babel-compiled output of website/src/architecture-app.jsx — generated
       // by `npm run build:arch`. Linting transpiled bundles flags spurious
-      // `React is not defined` errors because React is loaded via a CDN
+      // `React is not defined` errors because React is loaded by a separate
       // <script> tag at runtime, not imported.
-      "website/assets/architecture-app.js"
+      "website/assets/architecture-app.js",
+      // Vendored third-party libraries (minified React UMD builds), served
+      // locally so the architecture page does not depend on a CDN. Not ours
+      // to lint or fix.
+      "website/assets/vendor/**"
     ]
   },
   js.configs.recommended,

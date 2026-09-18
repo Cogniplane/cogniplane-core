@@ -9,6 +9,7 @@ import Fastify from "fastify";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeAdapter, RuntimeUserInput } from "../runtime-contracts.js";
+import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
 import type { AppConfig } from "../config.js";
 import type { Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
@@ -17,6 +18,7 @@ import type { ApprovalRecord } from "../services/auth/approval-store.js";
 import type { ArtifactDetail, ArtifactDownloadTokenRecord, ArtifactPiiDetail, ArtifactRecord, ArtifactStore } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import type { SessionRecord } from "../services/session-store.js";
+import { SessionUploadAccessError } from "../services/session-upload-access.js";
 import type { MessageRecord, ToolResultRecord, MessageStore } from "../services/message-store.js";
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
 import { MemoryStore } from "../services/memory-store.js";
@@ -94,10 +96,14 @@ import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessio
 class InMemorySessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
 
+  getRetentionDays(): number {
+    return SESSION_TRASH_RETENTION_DAYS;
+  }
+
   async list(
     _tenantId: string,
     userId: string,
-    options: { purposes?: string[] | "all" } = {}
+    options: { purposes?: string[] | "all"; status?: "active" | "archived" } = {}
   ): Promise<SessionRecord[]> {
     const purposes = options.purposes;
     const includeAll = purposes === "all";
@@ -107,7 +113,7 @@ class InMemorySessionStore {
         ? new Set(purposes)
         : new Set(["normal"]);
     return [...this.sessions.values()]
-      .filter((session) => session.userId === userId && session.status === "active")
+      .filter((session) => session.userId === userId && session.status === (options.status ?? "active"))
       .filter((session) => purposeFilter === null || purposeFilter.has(session.purpose ?? "normal"))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
@@ -132,9 +138,20 @@ class InMemorySessionStore {
     return session;
   }
 
+  async getReadable(tenantId: string, sessionId: string, userId: string) {
+    const session = await this.getOwned(tenantId, sessionId, userId);
+    return session?.status !== "deleted" ? session : null;
+  }
+
   async getOwned(_tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
     const session = this.sessions.get(sessionId);
     return session && session.userId === userId ? session : null;
+  }
+
+  async requireUploadAccess(tenantId: string, sessionId: string, userId: string) {
+    const session = await this.getOwned(tenantId, sessionId, userId);
+    if (!session || session.status !== "active") throw new SessionUploadAccessError();
+    return session.projectId ?? null;
   }
 
   async rename(_tenantId: string, sessionId: string, userId: string, sessionName: string): Promise<SessionRecord | null> {
@@ -168,13 +185,34 @@ class InMemorySessionStore {
     return updated;
   }
 
+  async setArchived(tenantId: string, sessionId: string, userId: string, archived: boolean): Promise<SessionRecord | null> {
+    const session = await this.getOwned(tenantId, sessionId, userId);
+    if (!session || session.status !== (archived ? "active" : "archived")) return null;
+    const now = new Date().toISOString();
+    const updated: SessionRecord = { ...session, status: archived ? "archived" : "active", updatedAt: now };
+    if (archived) updated.archivedAt = now;
+    else delete updated.archivedAt;
+    this.sessions.set(sessionId, updated);
+    return updated;
+  }
+
   async remove(_tenantId: string, sessionId: string, userId: string): Promise<boolean> {
     const session = this.sessions.get(sessionId);
-    if (!session || session.userId !== userId || session.status !== "active") {
+    if (!session || session.userId !== userId || session.status === "deleted") {
       return false;
     }
-    this.sessions.set(sessionId, { ...session, status: "deleted", updatedAt: new Date().toISOString() });
+    const now = new Date().toISOString();
+    this.sessions.set(sessionId, { ...session, status: "deleted", deletedAt: now, updatedAt: now });
     return true;
+  }
+
+  async restoreDeleted(_tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.userId !== userId || session.status !== "deleted") return null;
+    const updated = { ...session, status: "active" as const, updatedAt: new Date().toISOString() };
+    delete updated.deletedAt;
+    this.sessions.set(sessionId, updated);
+    return updated;
   }
 }
 
@@ -190,7 +228,7 @@ class InMemoryMessageStore {
     _tenantId: string,
     sessionId: string,
     userId: string,
-    options: { limit?: number } = {}
+    options: { limit?: number | null } = {}
   ): Promise<{ messages: MessageRecord[]; hasMore: boolean }> {
     const all = this.messages
       .filter((message) => message.sessionId === sessionId && message.userId === userId)
@@ -200,8 +238,11 @@ class InMemoryMessageStore {
           (toolResult) => toolResult.messageId === message.messageId
         )
       }));
-    const limit = options.limit ?? all.length;
-    return { messages: all.slice(-limit), hasMore: all.length > limit };
+    const limit = options.limit === null ? null : options.limit ?? all.length;
+    return {
+      messages: limit == null ? all : all.slice(-limit),
+      hasMore: limit != null && all.length > limit
+    };
   }
 
   async getOwned(_tenantId: string, messageId: string, userId: string): Promise<MessageRecord | null> {
@@ -499,7 +540,7 @@ class InMemoryToolContextStore {
   }): Promise<ToolExecutionContext> {
     const now = new Date();
     const context: ToolExecutionContext = {
-      toolContextId: `ctx-test-${this.nextId++}`,
+      toolContextId: `ctx_test-${this.nextId++}`,
       tenantId: input.tenantId,
       sessionId: input.sessionId,
       userId: input.userId,
@@ -550,6 +591,10 @@ class InMemoryArtifactStore {
   private readonly downloadTokens = new Map<string, ArtifactDownloadTokenRecord>();
   private nextId = 1;
   constructor(private readonly sessions: InMemorySessionStore) {}
+  async createUpload(input: Parameters<ArtifactStore["createUpload"]>[0]) {
+    await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
+    return this.create({ ...input, artifactType: "upload", createdByType: "user", status: "pending" });
+  }
   async listForUser(..._args: Parameters<ArtifactStore["listForUser"]>): ReturnType<ArtifactStore["listForUser"]> {
     throw new Error("Configure listForUser for cross-session artifact tests; this fixture serves session artifacts.");
   }
@@ -568,9 +613,18 @@ class InMemoryArtifactStore {
     this.artifacts.set(artifact.artifactId, artifact);
     return artifact;
   }
+  async createGenerated(input: Parameters<ArtifactStore["createGenerated"]>[0]) {
+    await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
+    return this.create(input);
+  }
   async listBySession(_tenantId: string, sessionId: string, userId: string) {
     return [...this.artifacts.values()].filter((artifact) => artifact.sessionId === sessionId && artifact.userId === userId && artifact.status !== "deleted");
   }
+  async getReadable(tenantId: string, artifactId: string, userId: string) {
+    const artifact = await this.getOwned(tenantId, artifactId, userId);
+    return artifact?.status !== "deleted" ? artifact : null;
+  }
+
   async getOwned(_tenantId: string, artifactId: string, userId: string) { const artifact = this.artifacts.get(artifactId); return artifact && artifact.userId === userId ? artifact : null; }
   async get(_tenantId: string, artifactId: string) { return this.artifacts.get(artifactId) ?? null; }
   async findLatestReadableDerived(_tenantId: string, sourceArtifactId: string, userId: string) {
@@ -762,6 +816,7 @@ export async function createTestApp(
     configuredProviders: async () => new Set(["anthropic"])
   } satisfies ModelRouteStores);
   await registerSessionRoutes(app, {
+    executions: { stop: async () => { throw new Error("Unexpected shared execution"); } },
     sessions,
     messages,
     runtimeAdapter: runtimeManager,
@@ -778,6 +833,12 @@ export async function createTestApp(
     limits
   } satisfies ArtifactRouteStores);
   await registerMessageRoutes(app, {
+    executions: {
+      acquire: async () => { throw new Error("Unexpected shared execution"); },
+      heartbeat: async () => { throw new Error("Unexpected shared execution"); },
+      release: async () => { throw new Error("Unexpected shared execution"); },
+    },
+    projects: { getReadable: async () => null },
     sessions,
     artifacts,
     artifactProcessor,
@@ -817,6 +878,7 @@ export async function createTestApp(
     messages,
     artifacts,
     storage: artifactStorage,
+    limits,
     auditEvents,
     toolContexts,
     githubConnections: { async getRuntimeCredentials() { return null; } },
@@ -838,11 +900,26 @@ export async function createTestApp(
       }
     },
     approvals,
+    projectFiles: {
+      async readRuntimeSnapshotFile() {
+        throw new Error("Unexpected project file read in route test");
+      },
+      async createAgentDraftFromContent() {
+        throw new Error("Unexpected project file write in route test");
+      },
+      async readConflictContext() {
+        throw new Error("Unexpected project conflict read in route test");
+      },
+      async readConflictMetadata() {
+        throw new Error("Unexpected project conflict metadata read in route test");
+      }
+    },
     // Derive it exactly the way app-bootstrap does, from the same config the
     // test app already holds — not a literal. A literal here would let the
     // mint side (the adapter) and the verify side drift apart under a future
     // key-derivation change while the whole route suite stayed green.
     runtimeTokenSecret: runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET),
+    artifactMaxBytes: config.ARTIFACT_MAX_UPLOAD_BYTES,
     activationTracker,
     proxyToolMetadataCache: new ProxyToolMetadataCache()
   } satisfies McpRouteStores);

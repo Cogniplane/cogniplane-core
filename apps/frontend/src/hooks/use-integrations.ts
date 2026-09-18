@@ -39,6 +39,11 @@ export function useAdminIntegrations() {
     queryFn: fetchAdminIntegrations
   });
 
+  const invalidateIntegrationData = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.settings.integrationsAvailability() });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
+  };
+
   const updateMutation = useMutation({
     mutationFn: async (args: { integrationId: string; input: UpdateIntegrationInput }) => {
       return updateIntegration(args.integrationId, args.input);
@@ -88,9 +93,7 @@ export function useAdminIntegrations() {
           previous.map((entry) => (entry.id === integration.id ? integration : entry))
         );
       }
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.settings.integrationsAvailability()
-      });
+      invalidateIntegrationData();
       flash("Saved.");
     },
     onSettled: () => {
@@ -117,9 +120,7 @@ export function useAdminIntegrations() {
           previous.map((entry) => (entry.id === integration.id ? integration : entry))
         );
       }
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.settings.integrationsAvailability()
-      });
+      invalidateIntegrationData();
       flash("Configuration cleared.");
     },
     onSettled: () => setActiveId(null)

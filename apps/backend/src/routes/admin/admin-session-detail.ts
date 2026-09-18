@@ -58,7 +58,8 @@ export type AdminSessionDetailApproval = {
 
 export type AdminSessionDetailPiiRun = {
   scanRunId: string;
-  subjectType: "message" | "artifact";
+  subjectType: "message" | "artifact" | "project_instructions";
+  instructionsRevision?: number | null;
   subjectId: string;
   sourceUserId: string | null;
   mode: string;
@@ -278,7 +279,7 @@ export async function registerAdminSessionDetailRoute(app: FastifyInstance): Pro
           client.query(
             `
               SELECT
-                scan_run_id, subject_type, subject_id, source_user_id, mode,
+                scan_run_id, subject_type, subject_id, instructions_revision, source_user_id, mode,
                 provider_type, provider_model, status, findings_json,
                 summary_text, action_taken, error_message,
                 created_at, completed_at
@@ -429,6 +430,7 @@ export async function registerAdminSessionDetailRoute(app: FastifyInstance): Pro
             scanRunId: String(row.scan_run_id),
             subjectType: String(row.subject_type) as AdminSessionDetailPiiRun["subjectType"],
             subjectId: String(row.subject_id),
+            instructionsRevision: row.instructions_revision == null ? null : Number(row.instructions_revision),
             sourceUserId: row.source_user_id == null ? null : String(row.source_user_id),
             mode: String(row.mode),
             providerType: row.provider_type == null ? null : String(row.provider_type),

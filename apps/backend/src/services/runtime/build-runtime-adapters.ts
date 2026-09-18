@@ -43,6 +43,9 @@ export function buildRuntimeAdapter(input: {
     logger,
     {
       approvals: stores.approvals,
+      executions: stores.executions,
+      conversationMessages: stores.messages,
+      sessions: stores.sessions,
       auditEvents: stores.auditEvents,
       activationTracker: stores.activationTracker,
       runtimeSessions: stores.runtimeSessions,

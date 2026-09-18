@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
+import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
 
 const envFilePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env");
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -136,6 +137,8 @@ const envSchema = z.object({
   // what the validation below requires this to exceed. Default: 35 min, one
   // margin above the 20-min watchdog plus a 10-min approval.
   TOOL_CONTEXT_TTL_MS: z.coerce.number().int().positive().default(35 * 60 * 1000),
+  SESSION_EXECUTION_LEASE_MS: z.coerce.number().int().min(10_000).default(30_000),
+  SESSION_EXECUTION_HEARTBEAT_MS: z.coerce.number().int().positive().default(5_000),
   APPROVAL_REQUEST_TTL_MS: z.coerce.number().int().positive().default(10 * 60 * 1000),
   ARTIFACT_STORAGE_BACKEND: z.enum(["local", "bucket"]).default("local"),
   ARTIFACT_STORAGE_ROOT: z.string().min(1).default(defaultArtifactStorageRoot),
@@ -164,6 +167,8 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   ARTIFACT_DOWNLOAD_TTL_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   SKILL_BUNDLE_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
+  SESSION_TRASH_RETENTION_ENABLED: booleanFromEnvSchema.default(true),
+  SESSION_TRASH_RETENTION_DAYS: z.coerce.number().int().min(0).default(SESSION_TRASH_RETENTION_DAYS),
   SKILL_MARKETPLACE_MANIFEST_URL: z.string().url().optional(),
   SKILL_MARKETPLACE_CACHE_TTL_MS: z.coerce.number().int().positive().default(5 * 60 * 1000),
   // Exec'd (via execFile, fixed argv) against attacker-influenced PDFs. Pin the
@@ -185,6 +190,9 @@ const envSchema = z.object({
   // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
   ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // Agent project-draft creation, including the write_artifact auto-draft path.
+  PROJECT_FILE_WRITE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   // Scheduled-job creation (POST /me/scheduled-jobs) — each job later runs as a
   // synthetic turn that does NOT draw down the interactive turn quota, so it is
   // throttled at creation time here.
@@ -211,6 +219,7 @@ const envSchema = z.object({
   AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
+  PROJECT_FILE_RETENTION_ENABLED: booleanFromEnvSchema.default(true),
   SCHEDULER_ENABLED: booleanFromEnvSchema.default(true),
   SCHEDULER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   SCHEDULER_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
@@ -435,6 +444,8 @@ export function loadConfig(
     // Local dev can rely on schema defaults when no .env file exists yet.
   }
   const parsed = envSchema.parse(source);
+  if (parsed.SESSION_EXECUTION_HEARTBEAT_MS * 2 >= parsed.SESSION_EXECUTION_LEASE_MS)
+    throw new Error("SESSION_EXECUTION_LEASE_MS must exceed twice SESSION_EXECUTION_HEARTBEAT_MS.");
 
   // Resolve the API_HOST default by auth mode: dev-headers must stay on the IPv4
   // loopback (its trust boundary), while workos binds dual-stack so a load
@@ -496,7 +507,7 @@ export function loadConfig(
     // accepts configurations that expire the context mid-turn.
     //
     // KNOWN RESIDUAL LIMIT — this covers ONE approval, not N. The approval
-    // round loop is unbounded (`for (;;)` in runTurn), so a turn's wall-clock
+    // round loop in DeepAgentsAGUIAgent is unbounded, so a turn's wall-clock
     // length is really `working budget + N x APPROVAL_REQUEST_TTL_MS`. No
     // finite value here can bound that, so a turn that stalls on many
     // consecutive approvals can still outlive its tool context. The watchdog

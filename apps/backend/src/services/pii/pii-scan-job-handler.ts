@@ -70,6 +70,18 @@ export class PiiScanJobHandler {
 
   async execute(job: PiiScanJobRecord): Promise<void> {
     try {
+      if (
+        job.subjectType === "artifact" &&
+        (await this.deps.artifacts.get(job.tenantId, job.subjectId))?.status === "deleted"
+      ) {
+        await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
+          status: "completed",
+          summaryText: "File removed before scanning.",
+          completedAt: new Date()
+        });
+        await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
+        return;
+      }
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "processing"
       });

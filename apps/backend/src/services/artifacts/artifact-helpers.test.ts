@@ -4,6 +4,7 @@ import { test, expect } from "vitest";
 import {
   isTextReadableArtifact,
   readArtifactExcerpt,
+  readStreamAsBoundedText,
   readStreamAsText
 } from "./artifact-helpers.js";
 
@@ -46,6 +47,45 @@ test("readStreamAsText: handles string-typed chunks too (some streams emit them)
   const stream = Readable.from(["hello"]);
   const text = await readStreamAsText(stream, 100);
   expect(text).toBe("hello");
+});
+
+test("readStreamAsText: preserves UTF-8 code points split across chunks", async () => {
+  const encoded = Buffer.from("before 😀 after", "utf8");
+  const emojiStart = encoded.indexOf(Buffer.from("😀", "utf8"));
+  const stream = Readable.from([
+    encoded.subarray(0, emojiStart + 2),
+    encoded.subarray(emojiStart + 2),
+  ]);
+
+  await expect(readStreamAsText(stream, 100)).resolves.toBe("before 😀 after");
+});
+
+test("readStreamAsText: does not split a UTF-16 surrogate at the character limit", async () => {
+  const text = await readStreamAsText(Readable.from([Buffer.from("a😀")]), 2);
+  expect(text).toBe("a😀");
+  expect([...text]).toEqual(["a", "😀"]);
+});
+
+test("readStreamAsText: preserves replacement behavior for malformed trailing UTF-8", async () => {
+  const text = await readStreamAsText(Readable.from([
+    Buffer.from("abc"),
+    Buffer.from([0xf0, 0x9f])
+  ]), 100);
+  expect(text).toBe("abc�");
+});
+
+test("readStreamAsBoundedText: reports overflow without splitting a code point", async () => {
+  await expect(readStreamAsBoundedText(Readable.from([Buffer.from("ab😀def")]), 3))
+    .resolves.toEqual({ text: "ab😀", truncated: true });
+  await expect(readStreamAsBoundedText(Readable.from([Buffer.from("ab😀")]), 3))
+    .resolves.toEqual({ text: "ab😀", truncated: false });
+});
+
+test("readStreamAsBoundedText: treats undecoded trailing bytes as overflow", async () => {
+  await expect(readStreamAsBoundedText(Readable.from([
+    Buffer.from("abc"),
+    Buffer.from([0xf0, 0x9f])
+  ]), 3)).resolves.toEqual({ text: "abc", truncated: true });
 });
 
 // readArtifactExcerpt

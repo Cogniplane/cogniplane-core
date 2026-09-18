@@ -1,7 +1,8 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
+import { useSearchParams } from "next/navigation";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -13,12 +14,19 @@ import { useModelPreference } from "../hooks/use-model-preference";
 import { useAuth } from "../lib/auth-context";
 import { fetchModels } from "../lib/api-client";
 import { queryKeys } from "../lib/query-keys";
+import { listProjects, setProjectSession } from "../lib/project-api";
 
+import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus } from "./session-status.logic";
+import type { AguiCustomEvents } from "../lib/agui/use-agui-custom-events";
 import { SessionSidebar } from "./session-sidebar";
 import { ArtifactPanel } from "./artifact-panel";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { FileSourcePicker } from "./file-source-picker";
 import { WorkspaceHeader } from "./workspace-header";
+import { getProjectLibrary } from "../lib/project-file-api";
+import type { ProjectLibrary } from "@cogniplane/shared-types";
+import { Input } from "./ui/input";
+import { projectFolderPath } from "./project-files.logic";
 
 // CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
 // live HttpAgent in the browser — it never needs to server-render). Loading it
@@ -46,9 +54,14 @@ import {
 } from "./session-list-derivations";
 import { contextWindowForModel, latestContextTokens, sessionCostUsd } from "./session-usage";
 
+const MAX_PROJECT_FILE_SELECTIONS = 20;
+const PROJECT_LIBRARY_DISABLED_QUERY_KEY = ["projects", "chat-project-library-disabled"] as const;
+
 export function ChatShell() {
   const { isLoading: authIsLoading, user } = useAuth();
-  const sessionList = useSessionList({ enabled: Boolean(user) });
+  const searchParams = useSearchParams();
+  const queryClient = useQueryClient();
+  const sessionList = useSessionList({ enabled: Boolean(user), syncUrl: true });
   const { setError: setSessionListError } = sessionList;
   const chatMainRef = useRef<HTMLDivElement | null>(null);
   const modelsQuery = useQuery({
@@ -57,10 +70,15 @@ export function ChatShell() {
     enabled: !authIsLoading && Boolean(user)
   });
   const allModels = modelsQuery.data?.models ?? [];
+  const projectsQuery = useQuery({
+    queryKey: queryKeys.projects.list(),
+    queryFn: () => listProjects(),
+    enabled: !authIsLoading && Boolean(user)
+  });
+  const projects = projectsQuery.data ?? [];
   const showEffortSelector = modelsQuery.data?.showEffortSelector ?? false;
-  // An empty models list after a successful fetch means no provider key is
-  // configured — render the "configure a model provider key" empty state.
-  const noProvidersAvailable =
+  // /models applies both credential availability and the tenant's model policy.
+  const noModelsAvailable =
     Boolean(user) && modelsQuery.data !== undefined && allModels.length === 0;
   const [isArtifactPaneOpen, setIsArtifactPaneOpen] = useState(true);
   const [activeFileSourceId, setActiveFileSourceId] = useState<string | null>(null);
@@ -72,9 +90,88 @@ export function ChatShell() {
   // Live signals lifted from CopilotChatHost (the AG-UI stream) for the active
   // session — the shell renders the sidebar/header but the running/approval
   // state lives inside the host's agent subscription.
+  const [turnActivity, setTurnActivity] = useState<AguiCustomEvents["turnActivity"]>(null);
   const [liveIsRunning, setLiveIsRunning] = useState(false);
   const [liveApprovalCount, setLiveApprovalCount] = useState(0);
   const [signalSessionId, setSignalSessionId] = useState(sessionList.selectedSessionId);
+  const [selectedProjectFiles, setSelectedProjectFiles] = useState<{
+    projectId: string | null;
+    ids: string[];
+  }>({ projectId: null, ids: [] });
+  const projectId = sessionList.selectedSession?.projectId ?? null;
+  const sessionId = sessionList.selectedSessionId;
+  const resolveDraftIdFromUrl = searchParams?.get("resolveDraft") ?? null;
+  const [consumedResolveDraftId, setConsumedResolveDraftId] = useState<string | null>(null);
+  const resolveDraftId = resolveDraftIdFromUrl !== consumedResolveDraftId
+    ? resolveDraftIdFromUrl
+    : null;
+  const [resolveDraftIntent, setResolveDraftIntent] = useState<{
+    sessionId: string;
+    draftId: string;
+  } | null>(null);
+  const projectQuery = useQuery({
+    queryKey: projectId ? queryKeys.projects.library(projectId) : PROJECT_LIBRARY_DISABLED_QUERY_KEY,
+    queryFn: () => getProjectLibrary(projectId!),
+    enabled: Boolean(projectId)
+  });
+  const projectLibrary = projectQuery.data;
+  const availableProjectFileIds = useMemo(
+    () => new Set(projectLibrary?.files
+      .filter((file) => file.trashedAt === null)
+      .map((file) => file.fileId) ?? []),
+    [projectLibrary]
+  );
+  const selectedProjectFileIds = useMemo(() => {
+    const ids = selectedProjectFiles.projectId === projectId
+      ? selectedProjectFiles.ids
+      : [];
+    return ids
+      .filter((fileId) => availableProjectFileIds.has(fileId))
+      .slice(0, MAX_PROJECT_FILE_SELECTIONS);
+  }, [availableProjectFileIds, projectId, selectedProjectFiles]);
+
+  useEffect(() => {
+    if (!resolveDraftId || !projectId || !sessionId || !projectQuery.isSuccess) return;
+    // Wait for the library query before consuming the URL intent. This keeps a
+    // valid draft from being filtered out while the library is still loading.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setConsumedResolveDraftId(resolveDraftId);
+    if (availableProjectFileIds.has(resolveDraftId)) {
+      setResolveDraftIntent({ sessionId, draftId: resolveDraftId });
+      const currentIds = selectedProjectFiles.projectId === projectId
+        ? selectedProjectFiles.ids
+        : [];
+      if (!currentIds.includes(resolveDraftId)) {
+        setSelectedProjectFiles({
+          projectId,
+          ids: [resolveDraftId, ...currentIds].slice(0, MAX_PROJECT_FILE_SELECTIONS)
+        });
+      }
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.delete("resolveDraft");
+    window.history.replaceState(window.history.state, "", url);
+  }, [availableProjectFileIds, projectId, projectQuery.isSuccess, resolveDraftId, selectedProjectFiles.ids, selectedProjectFiles.projectId, sessionId]);
+
+  useEffect(() => {
+    if (!resolveDraftIntent || resolveDraftIntent.sessionId === sessionId) return;
+    // A session switch remounts the host. Do not let the old session's
+    // one-shot intent trigger again if the user returns to it later.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setResolveDraftIntent(null);
+  }, [resolveDraftIntent, sessionId]);
+
+  useEffect(() => {
+    if (selectedProjectFiles.projectId !== projectId) return;
+    const reconciledIds = selectedProjectFiles.ids
+      .filter((fileId) => availableProjectFileIds.has(fileId))
+      .slice(0, MAX_PROJECT_FILE_SELECTIONS);
+    if (reconciledIds.length === selectedProjectFiles.ids.length &&
+        reconciledIds.every((fileId, index) => fileId === selectedProjectFiles.ids[index])) return;
+    // The query is the source of truth after trash/restore/promotion changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSelectedProjectFiles({ projectId, ids: reconciledIds });
+  }, [availableProjectFileIds, projectId, selectedProjectFiles]);
 
   const selectSession = useCallback(
     (sessionId: string) => {
@@ -83,6 +180,17 @@ export function ChatShell() {
     },
     [sessionList]
   );
+
+  const addSessionToProject = useCallback(async (sessionId: string, projectId: string) => {
+    await setProjectSession(projectId, sessionId);
+    // The session list drives project counts and grouping in the sidebar. The
+    // assignment also updates the project's activity timestamp, so refresh
+    // both sidebar lists without invalidating session detail or file queries.
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: queryKeys.sessions.list() }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.projects.list() })
+    ]);
+  }, [queryClient]);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 767px)");
@@ -132,7 +240,7 @@ export function ChatShell() {
     window.localStorage.setItem("artifact-pane-width", String(artifactPaneWidth));
   }, [artifactPaneWidth]);
 
-  // Surface model-fetch failures into the session-list error banner. React
+  // Surface model-fetch failures into the workspace error banner. React
   // Query handles the actual fetch, dedup, and refetch-on-focus; this effect
   // only mirrors the latest error onto the UX surface the rest of the shell
   // already uses.
@@ -156,6 +264,8 @@ export function ChatShell() {
     // safe while the new session data loads.
     setSignalSessionId(sessionList.selectedSessionId);
     setLiveIsRunning(false);
+    // Reset activity with its session identity so it cannot describe the next selection.
+    setTurnActivity(null);
     setLiveApprovalCount(chatWorkspace.initialApprovals.length);
   }
 
@@ -205,13 +315,26 @@ export function ChatShell() {
     event.currentTarget.setPointerCapture?.(event.pointerId);
   }, []);
 
+  // Once a newer server turn is observed, forget the old live activity even
+  // after that server turn ends and its timestamp disappears from the list.
+  const selectedRawSession = sessionList.selectedSession;
+  const liveResolution = selectedRawSession && turnActivity
+    ? applyLiveTurn(selectedRawSession, turnActivity)
+    : null;
+  if (liveResolution && !liveResolution.applied) setTurnActivity(null);
+  const selectedDisplaySession = liveResolution?.session ?? selectedRawSession;
+  const displaySessions = sessionList.sessions.map((session) =>
+    session.sessionId === selectedDisplaySession?.sessionId ? selectedDisplaySession : session
+  );
+  const hasTurnFailed = selectedDisplaySession?.hasTurnFailed === true;
+
   const attentionSessionIds = useMemo(
     () => deriveAttentionSessionIds(
-      sessionList.sessions,
+      displaySessions,
       sessionList.selectedSessionId,
       liveApprovalCount
     ),
-    [sessionList.sessions, sessionList.selectedSessionId, liveApprovalCount]
+    [displaySessions, sessionList.selectedSessionId, liveApprovalCount]
   );
 
   // Only the selected session has a live host, so it's the only one that can be
@@ -220,10 +343,10 @@ export function ChatShell() {
   const streamingSessionIds = useMemo(
     () =>
       deriveStreamingSessionIds(
-        sessionList.sessions,
+        displaySessions,
         liveIsRunning ? sessionList.selectedSessionId : null
       ),
-    [sessionList.sessions, liveIsRunning, sessionList.selectedSessionId]
+    [displaySessions, liveIsRunning, sessionList.selectedSessionId]
   );
 
   const contextTokens = latestContextTokens(chatWorkspace.messages);
@@ -279,15 +402,19 @@ export function ChatShell() {
         }`}
       >
         <SessionSidebar
+          archive={{ onArchive: sessionList.archiveSession, busyId: sessionList.busySessionId }}
+          projects={projects}
+          onAddToProject={addSessionToProject}
           list={{
-            sessions: sessionList.sessions,
+            sessions: displaySessions,
             selectedId: sessionList.selectedSessionId,
             isLoading: sessionList.isLoadingSessions,
             streamingIds: streamingSessionIds,
-            errorId: sessionList.error ? sessionList.selectedSessionId : null,
+            errorId: hasTurnFailed ? sessionList.selectedSessionId : null,
             attentionIds: attentionSessionIds,
             onSelect: selectSession,
-            onCreate: sessionList.createSession
+            onCreate: sessionList.createSession,
+            isCreating: sessionList.isCreatingSession
           }}
           rename={{
             busyId: sessionList.busySessionId,
@@ -301,6 +428,7 @@ export function ChatShell() {
           deletion={{
             busyId: sessionList.busySessionId,
             pendingId: sessionList.pendingDeleteSessionId,
+            trashRetentionDays: sessionList.trashRetentionDays,
             onRequest: sessionList.deleteSession,
             onConfirmDelete: sessionList.confirmDelete,
             onCancelDelete: sessionList.cancelDelete
@@ -315,12 +443,31 @@ export function ChatShell() {
 
       <main className="flex min-h-0 min-w-0 flex-col">
         <WorkspaceHeader
+          projectId={selectedDisplaySession?.projectId}
+          sessionActions={selectedDisplaySession ? {
+            sessionId: selectedDisplaySession.sessionId,
+            sessionName: selectedDisplaySession.sessionName,
+            isPinned: sessionList.pinnedSessionIds.has(selectedDisplaySession.sessionId),
+            busy: sessionList.busySessionId === selectedDisplaySession.sessionId,
+            isRunning: streamingSessionIds.has(selectedDisplaySession.sessionId) || Boolean(selectedDisplaySession.isRunning),
+            hasPendingApprovals: attentionSessionIds.has(selectedDisplaySession.sessionId) || Boolean(selectedDisplaySession.hasPendingApprovals),
+            onTogglePin: () => sessionList.togglePinSession(selectedDisplaySession.sessionId),
+            onRename: selectedDisplaySession.canEdit === false ? undefined : () => sessionList.renameSessionDirect(selectedDisplaySession.sessionId, selectedDisplaySession.sessionName),
+            onArchive: selectedDisplaySession.canEdit === false ? undefined : () => sessionList.archiveSession(selectedDisplaySession.sessionId),
+            onDelete: selectedDisplaySession.canEdit === false ? undefined : () => sessionList.deleteSession(selectedDisplaySession.sessionId)
+          } : undefined}
           menuLinks={[
             { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
             { href: "/settings", label: "Settings", description: "User preferences and jobs" },
             { href: "/admin", label: "Admin", description: "Platform controls and rollout" }
           ]}
-          statusLabel={sessionList.selectedSession ? "Runtime ready" : undefined}
+          sessionStatus={selectedDisplaySession ? resolveSessionStatus({
+            pendingApproval: attentionSessionIds.has(selectedDisplaySession.sessionId),
+            failed: hasTurnFailed,
+            running: streamingSessionIds.has(selectedDisplaySession.sessionId)
+          }) : undefined}
+          activeTurnStartedAt={selectedDisplaySession?.activeTurnStartedAt}
+          completedTurn={latestCompletedTurn(messages, selectedDisplaySession, liveResolution?.applied ? turnActivity : null)}
           title={sessionList.selectedSession?.sessionName ?? "Select a session"}
           isArtifactPaneOpen={isArtifactPaneOpen}
           onToggleArtifactPane={sessionList.selectedSession ? () => setIsArtifactPaneOpen((v) => !v) : undefined}
@@ -334,6 +481,12 @@ export function ChatShell() {
           }
           hasPendingApprovals={liveApprovalCount > 0}
         />
+
+        {sessionList.error ? (
+          <div role="alert" className="shrink-0 border-b border-outline-variant bg-danger-surface px-4 py-3 text-sm text-danger">
+            {sessionList.error}
+          </div>
+        ) : null}
 
         <div
           ref={chatMainRef}
@@ -349,21 +502,21 @@ export function ChatShell() {
           }
         >
           <div className="flex min-h-0 min-w-0 flex-col">
-            {noProvidersAvailable ? (
+            {noModelsAvailable ? (
               <section className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-surface px-6 py-4">
                 <div className="mx-auto flex w-[min(640px,100%)] flex-col items-center gap-4 rounded-xl border border-outline-variant bg-surface-container-lowest px-8 py-12 text-center shadow-sm">
                   <h2 className="text-xl font-semibold text-on-surface">
-                    No model provider is available
+                    No models are available
                   </h2>
                   {/* AuthGuard sends a member straight back here from
                       /admin/organization, so offering them the link is a
-                      redirect loop. `noProvidersAvailable` does not narrow
+                      redirect loop. `noModelsAvailable` does not narrow
                       `user` for TypeScript, hence the optional chain. */}
                   {user?.role === "admin" || user?.role === "owner" ? (
                     <>
                       <p className="max-w-md text-sm text-on-surface-variant">
-                        Add an API key and enable a runtime provider before you can start a
-                        conversation.
+                        Check provider credentials and enable at least one model in Organization
+                        settings to start a conversation.
                       </p>
                       <a
                         href="/admin/organization"
@@ -374,8 +527,8 @@ export function ChatShell() {
                     </>
                   ) : (
                     <p className="max-w-md text-sm text-on-surface-variant">
-                      An administrator needs to add an API key and enable a runtime provider before
-                      you can start a conversation.
+                      Ask an administrator to check provider credentials and enable a model for
+                      your organization.
                     </p>
                   )}
                 </div>
@@ -403,7 +556,11 @@ export function ChatShell() {
                   initialMessages,
                   initialState,
                   initialToolStatuses,
-                  initialApprovals: chatWorkspace.initialApprovals
+                  initialApprovals: chatWorkspace.initialApprovals,
+                  canEdit: selectedDisplaySession?.canEdit !== false,
+                  initialPrompt: resolveDraftIntent?.sessionId === sessionId && projectId
+                    ? "Resolve the selected project draft conflict. First call project_get_conflict_context for the selected draft and compare the base, latest published, and proposed text. If the intended merge is clear, call project_reconcile_conflict with the merged text. If it is ambiguous, explain the alternatives and do not write a draft. Never promote, delete, or change folders."
+                    : undefined
                 }}
                 modelSelection={{
                   model,
@@ -415,14 +572,19 @@ export function ChatShell() {
                 }}
                 usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
                 artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
+                projectFileIds={selectedProjectFileIds}
                 events={{
+                  onInitialPromptSent: () => setResolveDraftIntent(null),
                   onTurnSettled: () => {
+                    void sessionList.reload();
+                    void projectQuery.refetch?.();
                     // CopilotKit owns the live stream, so persisted state (token
                     // usage, cost) only lands via a REST reload once a turn ends.
                     if (sessionList.selectedSessionId) {
                       void chatWorkspace.refreshSessionData(sessionList.selectedSessionId);
                     }
                   },
+                  onTurnActivityChange: setTurnActivity,
                   onRunningChange: setLiveIsRunning,
                   onPendingApprovalsChange: setLiveApprovalCount
                 }}
@@ -457,6 +619,22 @@ export function ChatShell() {
                   showArtifactPane ? "translate-x-0" : "translate-x-full md:translate-x-0"
                 }`}
               >
+                <ProjectFileSelection
+                  library={projectLibrary}
+                  selectedIds={selectedProjectFileIds}
+                  onToggle={(fileId) => setSelectedProjectFiles((current) =>
+                    {
+                      const validIds = current.projectId === projectId
+                        ? current.ids.filter((id) => availableProjectFileIds.has(id))
+                        : [];
+                      if (validIds.includes(fileId)) {
+                        return { projectId, ids: validIds.filter((id) => id !== fileId) };
+                      }
+                      if (validIds.length >= MAX_PROJECT_FILE_SELECTIONS) return current;
+                      return { projectId, ids: [...validIds, fileId] };
+                    }
+                  )}
+                />
                 <ArtifactPanel
                   inventory={{
                     artifacts: chatWorkspace.artifacts
@@ -508,5 +686,82 @@ export function ChatShell() {
         />
       )}
     </div>
+  );
+}
+
+function ProjectFileSelection({
+  library,
+  selectedIds,
+  onToggle
+}: {
+  library?: ProjectLibrary;
+  selectedIds: string[];
+  onToggle: (fileId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const groups = useMemo(() => {
+    const files = library?.files.filter((file) => file.trashedAt === null) ?? [];
+    const folders = library?.folders ?? [];
+    const grouped = new Map<string, typeof files>();
+    for (const file of files) {
+      const folder = projectFolderPath(folders, file.folderId);
+      const searchable = `${file.name} ${folder}`.toLowerCase();
+      if (normalizedQuery && !searchable.includes(normalizedQuery)) continue;
+      const group = grouped.get(folder) ?? [];
+      group.push(file);
+      grouped.set(folder, group);
+    }
+    return [...grouped.entries()]
+      .map(([folder, entries]) => [
+        folder,
+        entries.sort((a, b) => a.name.localeCompare(b.name) || a.fileId.localeCompare(b.fileId))
+      ] as const)
+      .sort(([a], [b]) => a.localeCompare(b));
+  }, [library, normalizedQuery]);
+  if (!library || !library.files.some((file) => file.trashedAt === null)) return null;
+  return (
+    <section aria-labelledby="project-file-selection-title" className="border-b border-outline-variant p-4">
+      <h2 id="project-file-selection-title" className="text-sm font-semibold">Project files</h2>
+      <p className="mt-1 text-xs text-on-surface-variant">
+        Prioritize up to {MAX_PROJECT_FILE_SELECTIONS} files for this turn. Other published files remain available when they are in the captured snapshot.
+      </p>
+      <Input
+        aria-label="Search project files"
+        className="mt-3"
+        placeholder="Search project files"
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+      />
+      <p className="mt-2 text-xs text-on-surface-variant">
+        {selectedIds.length}/{MAX_PROJECT_FILE_SELECTIONS} prioritized
+      </p>
+      <div className="mt-3 max-h-[min(38vh,22rem)] space-y-4 overflow-y-auto pr-1">
+        {groups.map(([folder, entries]) => (
+          <section key={folder} aria-label={folder}>
+            <h3 className="mb-2 text-xs font-medium text-on-surface-variant">{folder}</h3>
+            <div className="space-y-2">
+              {entries.map((file) => (
+                <label key={file.fileId} className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.includes(file.fileId)}
+                    onChange={() => onToggle(file.fileId)}
+                    disabled={!selectedIds.includes(file.fileId) && selectedIds.length >= MAX_PROJECT_FILE_SELECTIONS}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0 break-words">
+                    {file.name}{file.kind === "draft" ? " (draft)" : ""}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </section>
+        ))}
+        {groups.length === 0 ? (
+          <p className="text-sm text-on-surface-variant">No project files match this search.</p>
+        ) : null}
+      </div>
+    </section>
   );
 }

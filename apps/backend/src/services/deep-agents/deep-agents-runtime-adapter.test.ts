@@ -10,7 +10,7 @@ import { firstValueFrom, from as rxFrom, toArray } from "rxjs";
 
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import { testRuntimePolicy } from "../../test-helpers/test-runtime-policy.js";
-import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import { SessionBusyError, type RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import {
   DeepAgentsRuntimeAdapter,
   USAGE_FLUSH_DEADLINE_MS
@@ -62,9 +62,92 @@ function makeDynamicConfig(
 
 const fakeLog = createSilentLogger();
 
+it("refreshes a cached session before the next turn without disposing its workspace", async () => {
+  const original = makeRuntimeFactory(() => scriptedChatStream());
+  const refreshCapabilities = vi.fn(async () => {});
+  const dynamicConfig = makeDynamicConfig();
+  let bundle = await dynamicConfig.compileRuntimeConfig("tenant", false);
+  dynamicConfig.compileRuntimeConfig = vi.fn(async () => bundle);
+  const adapter = makeAdapter({ dynamicConfig, factory: (init) => ({ ...original.factory(init), refreshCapabilities }) });
+  const first = await adapter.createSession(sessionInput);
+  bundle = { ...bundle, hash: "narrowed", runtimePolicy: { ...bundle.runtimePolicy, enabledMcpServers: [] } };
+  const next = await adapter.createSession(sessionInput);
+  expect(next.runtimeId).toBe(first.runtimeId);
+  expect(next.runtimePolicy.enabledMcpServers).toEqual([]);
+  expect(refreshCapabilities).toHaveBeenCalledWith(expect.objectContaining({ skillsLibraryFiles: {}, mcpServers: [] }));
+  expect(original.dispose).not.toHaveBeenCalled();
+  expect(original.factoryCalls).toHaveLength(1);
+  refreshCapabilities.mockRejectedValueOnce(new Error("refresh failed"));
+  bundle = { ...bundle, hash: "new selection" };
+  await expect(adapter.createSession(sessionInput)).rejects.toThrow("refresh failed");
+  await adapter.createSession(sessionInput);
+  expect(refreshCapabilities).toHaveBeenCalledTimes(3);
+  await adapter.close();
+});
+
+it("applies the project approval mode at turn start and keeps it out of tenant settings", async () => {
+  const setApprovalSettings = vi.fn();
+  const base = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({
+    factory: (init) => ({
+      ...base.factory(init),
+      setApprovalSettings
+    })
+  });
+  const session = await adapter.createSession(sessionInput);
+  await collect(adapter.runMessageAGUI(session, {
+    ...runMessageInput(),
+    projectApprovalMode: "manual"
+  }));
+  expect(setApprovalSettings).toHaveBeenCalledWith({
+    gate: true,
+    autoApproveReadOnly: false,
+    readOnlyToolNames: []
+  });
+  await collect(adapter.runMessageAGUI(session, runMessageInput()));
+  expect(setApprovalSettings).toHaveBeenLastCalledWith({
+    gate: true,
+    autoApproveReadOnly: true,
+    readOnlyToolNames: []
+  });
+  await adapter.close();
+});
+
+it("applies automatic project approval only to the new turn", async () => {
+  const setApprovalSettings = vi.fn();
+  const base = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({
+    factory: (init) => ({
+      ...base.factory(init),
+      setApprovalSettings
+    })
+  });
+  const session = await adapter.createSession(sessionInput);
+
+  await collect(adapter.runMessageAGUI(session, {
+    ...runMessageInput(),
+    projectApprovalMode: "automatic"
+  }));
+  expect(setApprovalSettings).toHaveBeenCalledWith({
+    gate: true,
+    autoApproveReadOnly: true,
+    readOnlyToolNames: []
+  });
+
+  await collect(adapter.runMessageAGUI(session, runMessageInput()));
+  expect(setApprovalSettings).toHaveBeenLastCalledWith({
+    gate: true,
+    autoApproveReadOnly: true,
+    readOnlyToolNames: []
+  });
+  await adapter.close();
+});
+
 function emptyRuntimeCapabilities(): Pick<DeepAgentsSessionRuntime,
-  "getPendingActions" | "buildResumeInput" | "getMcpToolNames" | "getMcpToolServers"> {
+  "setApprovalSettings" | "refreshCapabilities" | "getPendingActions" | "buildResumeInput" | "getMcpToolNames" | "getMcpToolServers"> {
   return {
+    setApprovalSettings() {},
+    async refreshCapabilities() {},
     async getPendingActions() { return []; },
     buildResumeInput() { throw new Error("This fixture has no pending approvals"); },
     getMcpToolNames() { return new Set<string>(); },
@@ -128,13 +211,27 @@ async function* scriptedChatStream(): AsyncGenerator<Record<string, unknown>> {
   yield { event: "on_chat_model_end", metadata: {} };
 }
 
+const fakeSessionAccess = {
+  async getReadable(_tenantId: string, sessionId: string, userId: string) {
+    return { sessionId, userId, sessionName: "Test", status: "active" as const, projectId: null,
+      createdAt: "2026-01-01", updatedAt: "2026-01-01" };
+  }
+};
+const unusedExecutions = {
+  async isCurrent() { throw new Error("Unexpected project execution"); },
+  async bindRuntime() { throw new Error("Unexpected project execution"); },
+};
+
 function makeAdapter(input: {
   factory: DeepAgentsRuntimeFactory;
   dynamicConfig?: DynamicConfigService;
   runtimeSessions?: unknown;
   memories?: unknown;
   checkpointer?: { deleteThread: (threadId: string) => Promise<void>; end?: () => Promise<void> };
+  conversationMessages?: unknown;
   messages?: unknown;
+  executions?: Pick<import("../session-execution-store.js").SessionExecutionStore, "isCurrent" | "bindRuntime">;
+  sessions?: Pick<import("../session-store.js").SessionStore, "getReadable">;
   activationTracker?: Pick<import("../activation-tracker.js").ActivationTracker, "recordMaterialization">;
   tenantMembers?: { isUserBetaTester: (tenantId: string, userId: string) => Promise<boolean> };
   /**
@@ -168,6 +265,9 @@ function makeAdapter(input: {
       memories: input.memories as never,
       checkpointer: input.checkpointer,
       messages: input.messages as never,
+      executions: input.executions ?? unusedExecutions,
+      conversationMessages: input.conversationMessages as never,
+      sessions: input.sessions ?? fakeSessionAccess,
       tenantMembers: (input.tenantMembers ?? fakeTenantMemberStore) as never
     },
     credentials,
@@ -370,6 +470,88 @@ describe("DeepAgentsRuntimeAdapter", () => {
     await adapter.close();
   });
 
+  it.each([
+    { phase: "creation", identity: { userId: "other-user" } },
+    { phase: "creation", identity: { tenantId: "other-tenant" } },
+    { phase: "refresh", identity: { userId: "other-user" } },
+    { phase: "refresh", identity: { tenantId: "other-tenant" } }
+  ])("rejects another identity during pending $phase: $identity", async ({ phase, identity }) => {
+    const { factory, factoryCalls } = makeRuntimeFactory(() => scriptedChatStream());
+    const dynamicConfig = makeDynamicConfig();
+    const bundle = await dynamicConfig.compileRuntimeConfig("tenant", false);
+    const adapter = makeAdapter({ factory, dynamicConfig });
+    if (phase === "refresh") await adapter.createSession(sessionInput);
+
+    const started = makeDeferred();
+    const release = makeDeferred();
+    const compile = vi.fn(async () => {
+      started.resolve();
+      await release.promise;
+      return bundle;
+    });
+    dynamicConfig.compileRuntimeConfig = compile;
+    const owner = adapter.createSession(sessionInput);
+    await started.promise;
+    const sameOwner = adapter.createSession(sessionInput);
+    try {
+      const otherIdentity = adapter.createSession({ ...sessionInput, ...identity });
+      release.resolve();
+      await expect(otherIdentity).rejects.toMatchObject({
+        message: "Session ownership mismatch", statusCode: 403
+      });
+      expect(compile).toHaveBeenCalledTimes(1);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([owner, sameOwner]);
+      await adapter.close();
+    }
+    expect(await sameOwner).toEqual(await owner);
+    expect(factoryCalls).toHaveLength(1);
+  });
+
+  it.each([{ userId: "other-user" }, { tenantId: "other-tenant" }])(
+    "rejects a cached runtime identity mismatch as forbidden: %j", async (identity) => {
+      const { factory, factoryCalls } = makeRuntimeFactory(() => scriptedChatStream());
+      const adapter = makeAdapter({ factory });
+      try {
+        const original = await adapter.createSession(sessionInput);
+        await expect(adapter.createSession({ ...sessionInput, ...identity })).rejects.toMatchObject({
+          message: "Session ownership mismatch", statusCode: 403
+        });
+        expect(await adapter.createSession(sessionInput)).toEqual(original);
+        expect(factoryCalls).toHaveLength(1);
+      } finally {
+        await adapter.close();
+      }
+    }
+  );
+
+  it("allows creation retry after a failed shared build", async () => {
+    const { factory, factoryCalls } = makeRuntimeFactory(() => scriptedChatStream());
+    const dynamicConfig = makeDynamicConfig();
+    const bundle = await dynamicConfig.compileRuntimeConfig("tenant", false);
+    const compile = vi.fn()
+      .mockRejectedValueOnce(new Error("compile failed"))
+      .mockResolvedValue(bundle);
+    dynamicConfig.compileRuntimeConfig = compile;
+    const adapter = makeAdapter({ factory, dynamicConfig });
+    try {
+      const results = await Promise.allSettled([
+        adapter.createSession(sessionInput), adapter.createSession(sessionInput)
+      ]);
+      expect(results).toEqual([
+        { status: "rejected", reason: new Error("compile failed") },
+        { status: "rejected", reason: new Error("compile failed") }
+      ]);
+      const retry = await adapter.createSession(sessionInput);
+      expect(retry.runtimeId).toMatch(/^deepagents-/);
+      expect(compile).toHaveBeenCalledTimes(2);
+      expect(factoryCalls).toHaveLength(1);
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it("fails createSession when no provider key is available", async () => {
     const { factory } = makeRuntimeFactory(() => scriptedChatStream());
     // Credentials reporting zero configured providers.
@@ -488,6 +670,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
     // Give the turn a tick to reserve the slot.
     await new Promise((resolve) => setImmediate(resolve));
     expect(adapter.hasActiveTurn("sess-1")).toBe(true);
+    await expect(adapter.createSession(sessionInput)).rejects.toThrow(SessionBusyError);
 
     // The admin "idle" rollout path: the mid-turn session must survive.
     const invalidated = await adapter.invalidateTenantRuntimes("test-tenant", { idleOnly: true });
@@ -672,6 +855,157 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     return events;
   }
 
+  it("loads the complete transcript for a long project session", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const messages = Array.from({ length: 601 }, (_, index) => ({
+      messageId: `message-${index}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `turn-${index}`
+    }));
+    let requestedOptions: unknown;
+    const executions = {
+      isCurrent: vi.fn(async () => true),
+      bindRuntime: vi.fn(async () => {})
+    };
+    const adapter = makeAdapter({
+      factory: runtime.factory,
+      executions,
+      sessions: {
+        getReadable: async (...args) => ({
+          ...await fakeSessionAccess.getReadable(...args),
+          projectId: "project-1"
+        })
+      },
+      conversationMessages: {
+        async listBySession(_tenantId: string, _sessionId: string, _userId: string, options: unknown) {
+          requestedOptions = options;
+          return { messages, hasMore: true };
+        }
+      }
+    });
+    const execution = {
+      ...sessionInput,
+      executionId: "execution-1",
+      projectId: "project-1",
+      expiresAt: new Date(Date.now() + 30_000).toISOString()
+    };
+
+    try {
+      const session = await adapter.createSession({ ...sessionInput, execution });
+      await collectAGUI(adapter.runMessageAGUI(session, runMessageInput()));
+
+      expect(requestedOptions).toEqual({ limit: null });
+      const input = runtime.streamInputs[0] as { messages: Array<{ content: string }> };
+      expect(input.messages[0]?.content).toBe("turn-0");
+      expect(input.messages.at(-1)?.content).toBe("hello");
+      expect(input.messages).toHaveLength(601);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it.each(["creation", "refresh"])("admits a turn immediately after awaiting %s", async (phase) => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const adapter = makeAdapter({ factory: runtime.factory });
+    try {
+      if (phase === "refresh") await adapter.createSession(sessionInput);
+      // No intervening await between createSession and the generator's first next().
+      const events = await collectAGUI(adapter.runMessageAGUI(await adapter.createSession(sessionInput), {
+        prompt: "immediate", toolContextId: null
+      }));
+      expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
+      expect(runtime.streamConfigs).toHaveLength(1);
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("rejects a retired reference before touching its replacement runtime", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const extendSandboxTimeout = vi.fn(async () => {});
+    const adapter = makeAdapter({ factory: (init) => ({ ...runtime.factory(init), extendSandboxTimeout }) });
+    const retired = await adapter.createSession(sessionInput);
+    await adapter.abortSession(sessionInput);
+    const current = await adapter.createSession({ ...sessionInput, userId: "user-2" });
+    const onBeforeTurn = vi.fn(async () => {});
+    try {
+      expect(current.runtimeId).not.toBe(retired.runtimeId);
+      await expect(collectAGUI(adapter.runMessageAGUI(retired, {
+        prompt: "stale", toolContextId: "old-context", onBeforeTurn
+      }))).rejects.toMatchObject({ statusCode: 409 });
+      expect(extendSandboxTimeout).not.toHaveBeenCalled();
+      expect(onBeforeTurn).not.toHaveBeenCalled();
+      expect(runtime.modelRequests).toEqual([]);
+      expect(runtime.streamConfigs).toEqual([]);
+      expect(runtime.factoryCalls[1]!.toolContextRef?.current).toBeNull();
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+      const events = await collectAGUI(adapter.runMessageAGUI(current, {
+        prompt: "current", toolContextId: "new-context"
+      }));
+      expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("rejects an aborted runtime while disposal is still pending", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const release = makeDeferred();
+    const adapter = makeAdapter({ factory: (init) => ({ ...runtime.factory(init), dispose: () => release.promise }) });
+    const session = await adapter.createSession(sessionInput);
+    const disposal = adapter.abortSession(sessionInput);
+    const onBeforeTurn = vi.fn(async () => {});
+    try {
+      await expect(collectAGUI(adapter.runMessageAGUI(session, {
+        prompt: "late", toolContextId: null, onBeforeTurn
+      }))).rejects.toMatchObject({ statusCode: 409 });
+      expect(onBeforeTurn).not.toHaveBeenCalled();
+      expect(runtime.modelRequests).toEqual([]);
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    } finally {
+      release.resolve();
+      await disposal;
+      await adapter.close();
+    }
+  });
+
+  it("reserves admission during warm refresh and allows a turn after refresh", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const dynamicConfig = makeDynamicConfig();
+    const adapter = makeAdapter({ factory: runtime.factory, dynamicConfig });
+    const session = await adapter.createSession(sessionInput);
+    const bundle = await dynamicConfig.compileRuntimeConfig("tenant", false);
+    const started = makeDeferred();
+    const release = makeDeferred();
+    dynamicConfig.compileRuntimeConfig = vi.fn(async () => {
+      started.resolve();
+      await release.promise;
+      return { ...bundle, hash: "refreshed" };
+    });
+    const refresh = adapter.createSession(sessionInput);
+    await started.promise;
+    const onBeforeTurn = vi.fn(async () => {});
+    try {
+      await expect(collectAGUI(adapter.runMessageAGUI(session, {
+        prompt: "early", toolContextId: null, onBeforeTurn
+      }))).rejects.toBeInstanceOf(SessionBusyError);
+      expect(onBeforeTurn).not.toHaveBeenCalled();
+      expect(runtime.modelRequests).toEqual([]);
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+      release.resolve();
+      const refreshed = await refresh;
+      const events = await collectAGUI(adapter.runMessageAGUI(refreshed, {
+        prompt: "ready", toolContextId: null
+      }));
+      expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
+    } finally {
+      release.resolve();
+      await refresh;
+      await adapter.close();
+    }
+  });
+
   it("streams a well-formed AG-UI turn (RUN_STARTED … RUN_FINISHED)", async () => {
     const { factory } = makeRuntimeFactory(() => scriptedChatStream());
     const adapter = makeAdapter({ factory });
@@ -773,6 +1107,8 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
       makeDynamicConfig(),
       fakeLog,
       {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
         approvals: approvals as never,
         auditEvents: { create: async () => {} } as never,
         tenantMembers: fakeTenantMemberStore
@@ -854,6 +1190,8 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
       makeDynamicConfig(),
       fakeLog,
       {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
         approvals: approvals as never,
         auditEvents: { create: async () => {} } as never,
         tenantMembers: fakeTenantMemberStore
@@ -930,20 +1268,16 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     await adapter.close();
   });
 
-  it("does not run an AG-UI turn on a session aborted before the turn started", async () => {
-    // Guards the eager abort mirror in runMessageAGUI. An `abort` listener added
-    // to an ALREADY-aborted signal never fires, so without mirroring the state up
-    // front, a turn that starts in the window between session abort and session
-    // removal would run completely unguarded — burning tokens on a torn-down
-    // session. runTurn has the same guard; this pins the AG-UI twin.
-    let disposeCalled: (() => void) | null = null;
-    const disposeReached = new Promise<void>((resolve) => {
-      disposeCalled = resolve;
-    });
+  it("interrupts a turn when teardown starts during sandbox extension", async () => {
+    const release = makeDeferred();
+    let disposal: Promise<void> | undefined;
     const factory: DeepAgentsRuntimeFactory = () =>
       ({
         ...emptyRuntimeCapabilities(),
-      async getAgentForModel() {
+        async extendSandboxTimeout() {
+          disposal = adapter.abortSession(sessionInput);
+        },
+        async getAgentForModel() {
           return {
             async *streamEvents(_input: unknown, config: { signal?: AbortSignal }) {
               // A real LangGraph stream rejects immediately on a pre-aborted
@@ -963,17 +1297,12 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
         // Hang inside dispose so the session stays registered while its
         // abortController is already aborted — the real race window.
         dispose: async () => {
-          disposeCalled?.();
-          await new Promise<void>(() => {});
+          await release.promise;
         }
       }) as unknown as DeepAgentsSessionRuntime;
 
     const adapter = makeAdapter({ factory });
     const session = await adapter.createSession(sessionInput);
-
-    // Not awaited: abortSession aborts the controller, then parks in dispose().
-    void adapter.abortSession(sessionInput);
-    await disposeReached;
 
     const events = await collectAGUI(
       adapter.runMessageAGUI(session, { prompt: "hi", toolContextId: null })
@@ -986,10 +1315,13 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     expect(events.map((e) => e.type)).not.toContain(AGUIEventType.TEXT_MESSAGE_CONTENT);
     // The slot must be released, or every later POST /messages 429s.
     expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    release.resolve();
+    await disposal;
+    await adapter.close();
   });
 
   it("fails a wedged AG-UI turn on the watchdog and releases the session slot", async () => {
-    // Parity with runTurn's watchdog: an upstream that stalls without erroring
+    // An upstream that stalls without erroring
     // (and never disconnects the client) must not pin activeTurns forever —
     // otherwise every subsequent POST /messages 429s until process restart.
     vi.useFakeTimers();
@@ -1318,6 +1650,8 @@ describe("approval bookkeeping failures (R10, R56)", () => {
       makeDynamicConfig(),
       fakeLog,
       {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
         approvals: {
           async create() {
             throw new Error("approvals table unavailable");
@@ -1378,6 +1712,8 @@ describe("approval bookkeeping failures (R10, R56)", () => {
       makeDynamicConfig(),
       fakeLog,
       {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
         approvals: {
           async create() {
             return {} as never;
@@ -1717,4 +2053,76 @@ describe("turn resource availability", () => {
       await adapter.close();
     }
   });
+});
+
+it("gives a new participant fresh runtime authority and rejects the prior execution", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  let currentId = "execution-alice";
+  const executions = {
+    isCurrent: vi.fn(async (execution: { executionId: string }) => execution.executionId === currentId),
+    bindRuntime: vi.fn(async () => {})
+  };
+  const checkpointer = { deleteThread: vi.fn(async () => {}) };
+  const adapter = makeAdapter({ factory: runtime.factory, executions, checkpointer, sessions: {
+    getReadable: async (...args) => ({ ...await fakeSessionAccess.getReadable(...args), projectId: "project" })
+  } });
+  const alice = { ...sessionInput, executionId: currentId, projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+  try {
+    const first = await adapter.createSession({ ...alice, execution: alice });
+    await collect(adapter.runMessageAGUI(first, runMessageInput()));
+    currentId = "execution-bob";
+    const bob = { ...alice, userId: "user-2", executionId: currentId };
+    const second = await adapter.createSession({ ...bob, execution: bob });
+    expect(second.runtimeId).not.toBe(first.runtimeId);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(runtime.factoryCalls.map((call) => call.userId)).toEqual(["user-1", "user-2"]);
+    expect(runtime.factoryCalls.every((call) => call.checkpointer === undefined)).toBe(true);
+    await expect(runtime.factoryCalls[0]!.requireExecution!()).rejects.toThrow("execution permission");
+    await expect(runtime.factoryCalls[1]!.requireExecution!()).resolves.toBeUndefined();
+    await expect(collect(adapter.runMessageAGUI(first, runMessageInput()))).rejects.toThrow("no longer current");
+    await collect(adapter.runMessageAGUI(second, runMessageInput()));
+    currentId = "revoked";
+    await expect(collect(adapter.runMessageAGUI(second, runMessageInput()))).rejects.toThrow("execution permission");
+    expect(runtime.streamInputs).toHaveLength(2);
+  } finally { await adapter.close(); }
+});
+
+it("does not install execution checks for personal runtimes", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({ factory: runtime.factory });
+  try {
+    await adapter.createSession(sessionInput);
+    expect(runtime.factoryCalls[0]?.requireExecution).toBeUndefined();
+  } finally { await adapter.close(); }
+});
+
+it("does not dispose another tenant's runtime during project participant handoff", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({ factory: runtime.factory, executions: {
+    isCurrent: async () => true, bindRuntime: async () => {}
+  } });
+  try {
+    await adapter.createSession(sessionInput);
+    const execution = { ...sessionInput, tenantId: "another-tenant", executionId: "execution", projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    await expect(adapter.createSession({ ...execution, execution })).rejects.toThrow("unavailable for execution");
+    expect(runtime.dispose).not.toHaveBeenCalled();
+    expect(runtime.factoryCalls).toHaveLength(1);
+  } finally { await adapter.close(); }
+});
+
+it("requires a project execution before opening checkpoints and rejects private runtime reuse after assignment", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const session = { ...sessionInput, sessionName: "Shared", status: "active" as const, projectId: "project" as string | null,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const adapter = makeAdapter({ factory: runtime.factory, sessions: { getReadable: async () => session } });
+  try {
+    await expect(adapter.createSession(sessionInput)).rejects.toMatchObject({ code: "session_unavailable" });
+    expect(runtime.factoryCalls).toHaveLength(0);
+    session.projectId = null;
+    const privateRuntime = await adapter.createSession(sessionInput);
+    expect(runtime.factoryCalls[0]!.requireExecution).toBeUndefined();
+    session.projectId = "project";
+    await expect(collect(adapter.runMessageAGUI(privateRuntime, runMessageInput()))).rejects.toMatchObject({ code: "session_unavailable" });
+    expect(runtime.streamInputs).toHaveLength(0);
+  } finally { await adapter.close(); }
 });
