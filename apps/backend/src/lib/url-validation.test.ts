@@ -229,6 +229,97 @@ describe("isPrivateOrReservedHost — hex-encoded IPv4", () => {
   });
 });
 
+describe("isPrivateOrReservedHost — IANA special-purpose IPv4 ranges", () => {
+  // Every one of these returned false before this suite existed. Two are
+  // reachable rather than merely reserved: 192.88.99.0/24 is the deprecated
+  // 6to4 relay anycast address, and 198.18.0.0/15 is routed inside some
+  // provider networks.
+  const blocked: Array<[string, string]> = [
+    ["IETF protocol assignments 192.0.0.0/24", "192.0.0.1"],
+    ["TEST-NET-1 192.0.2.0/24", "192.0.2.5"],
+    ["6to4 relay anycast 192.88.99.0/24", "192.88.99.1"],
+    ["benchmarking 198.18.0.0/15 lower", "198.18.0.1"],
+    ["benchmarking 198.18.0.0/15 upper", "198.19.255.1"],
+    ["TEST-NET-2 198.51.100.0/24", "198.51.100.7"],
+    ["TEST-NET-3 203.0.113.0/24", "203.0.113.7"],
+    ["multicast 224.0.0.0/4 lower", "224.0.0.1"],
+    ["multicast 224.0.0.0/4 upper", "239.1.2.3"],
+    ["reserved 240.0.0.0/4", "240.0.0.1"],
+    ["reserved 240.0.0.0/4 upper", "254.1.2.3"],
+    ["broadcast", "255.255.255.255"]
+  ];
+
+  for (const [label, host] of blocked) {
+    it(`blocks ${label}: ${host}`, () => {
+      expect(isPrivateOrReservedHost(host)).toBe(true);
+    });
+  }
+
+  // The neighbours of each new range must stay reachable, or this fix silently
+  // breaks legitimate upstreams.
+  const stillAllowed = [
+    "192.0.1.1",
+    "192.0.3.1",
+    "192.88.98.1",
+    "192.88.100.1",
+    "198.17.255.1",
+    "198.20.0.1",
+    "198.51.99.1",
+    "198.51.101.1",
+    "203.0.112.1",
+    "203.0.114.1",
+    "223.255.255.255",
+    "8.8.8.8"
+  ];
+
+  for (const host of stillAllowed) {
+    it(`still allows the adjacent public address ${host}`, () => {
+      expect(isPrivateOrReservedHost(host)).toBe(false);
+    });
+  }
+});
+
+describe("isPrivateOrReservedHost — IPv6 transition forms embedding IPv4", () => {
+  // Each of these routes to an embedded IPv4, so a reserved quad inside one is
+  // as dangerous as the bare address. All three IMDS cases below returned
+  // false before this fix.
+  const blocked: Array<[string, string]> = [
+    ["6to4 2002::/16 embedding IMDS", "2002:a9fe:a9fe::1"],
+    ["6to4 2002::/16 embedding loopback", "2002:7f00:1::1"],
+    ["Teredo 2001::/32 embedding IMDS", "2001:0:a9fe:a9fe::"],
+    ["IPv4-translatable ::ffff:0:0:0/96 embedding IMDS", "::ffff:0:a9fe:a9fe"],
+    ["NAT64 local-use 64:ff9b:1::/48", "64:ff9b:1::a9fe:a9fe"],
+    ["documentation prefix 2001:db8::/32", "2001:db8::1"],
+    ["ISATAP link-local", "fe80::5efe:169.254.169.254"],
+    ["ISATAP under a global prefix", "2600:1f18:abcd:1234:0:5efe:169.254.169.254"],
+    ["ISATAP with the 0200 universal/local bit", "2600:1f18:abcd:1234:200:5efe:169.254.169.254"],
+    ["ISATAP written with hextets", "2600:1f18:abcd:1234:0:5efe:a9fe:a9fe"]
+  ];
+
+  for (const [label, host] of blocked) {
+    it(`blocks ${label}: ${host}`, () => {
+      expect(isPrivateOrReservedHost(host)).toBe(true);
+    });
+  }
+
+  // The transition prefixes are only dangerous because of what they embed.
+  // Wrapping a public IPv4 is legitimate and must not be blocked, or the whole
+  // 2002::/16 and 2001::/32 space becomes unreachable.
+  const stillAllowed: Array<[string, string]> = [
+    ["6to4 wrapping a public IPv4", "2002:808:808::1"],
+    ["ISATAP wrapping a public IPv4", "2600:1f18:abcd:1234:0:5efe:8.8.8.8"],
+    ["ordinary global unicast", "2600:1f18::1"],
+    ["Google DNS", "2001:4860:4860::8888"],
+    ["Cloudflare DNS", "2606:4700:4700::1111"]
+  ];
+
+  for (const [label, host] of stillAllowed) {
+    it(`still allows ${label}: ${host}`, () => {
+      expect(isPrivateOrReservedHost(host)).toBe(false);
+    });
+  }
+});
+
 describe("logSafeUrl", () => {
   it("drops the query string wholesale", () => {
     // The point of the helper: an admin-configured third-party URL uses the

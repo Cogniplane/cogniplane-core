@@ -35,6 +35,16 @@ paths = [
   '''apps/backend/src/services/integrations/integration-registry-service\.test\.ts''',
   # Same file at its historical pre-refactor path, kept for history scans.
   '''apps/backend/src/services/integration-registry-service\.test\.ts''',
+
+  # Boundary redaction tests. Each one feeds a credential-shaped fixture
+  # through redactSecrets() and asserts the value never reaches the persisted
+  # row or the wire, so the fixture has to look like a credential for the
+  # assertion to mean anything. Path-scoped rather than value-scoped because
+  # gitleaks walks history and earlier commits used different fixtures.
+  '''apps/backend/src/services/audit-event-store\.test\.ts''',
+  '''apps/backend/src/services/sse-stream-writer\.test\.ts''',
+  '''apps/backend/src/services/message-store\.test\.ts''',
+  '''apps/backend/src/routes/mcp\.test\.ts''',
 ]
 
 # Stopwords that gitleaks should treat as non-secret regardless of where they

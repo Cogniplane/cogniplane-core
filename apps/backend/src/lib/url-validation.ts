@@ -56,6 +56,23 @@ function isPrivateOrReservedIpv4(host: string): boolean {
   if (a === 172 && b! >= 16 && b! <= 31) return true; // 172.16.0.0/12
   if (a === 192 && b === 168) return true;            // 192.168.0.0/16
   if (a === 255) return true;                         // broadcast
+
+  // Remaining IANA special-purpose ranges (RFC 6890). None is a legitimate
+  // destination for an admin-configured upstream, and two are actively
+  // dangerous: 192.88.99.0/24 is the deprecated 6to4 relay anycast address,
+  // and 198.18.0.0/15 is routed inside some provider networks.
+  const [, , c] = numbers;
+  if (a === 192 && b === 0 && c === 0) return true;    // 192.0.0.0/24 (IETF protocol assignments)
+  if (a === 192 && b === 0 && c === 2) return true;    // 192.0.2.0/24 (TEST-NET-1)
+  if (a === 192 && b === 88 && c === 99) return true;  // 192.88.99.0/24 (6to4 relay anycast)
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 (benchmarking)
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 (TEST-NET-2)
+  if (a === 203 && b === 0 && c === 113) return true;  // 203.0.113.0/24 (TEST-NET-3)
+
+  // 224.0.0.0/4 multicast plus the reserved 240.0.0.0/4 remainder. One
+  // comparison covers both, and it subsumes the 255/8 broadcast check above.
+  if (a! >= 224) return true;
+
   return false;
 }
 
@@ -154,6 +171,17 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
       return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
     }
 
+    // IPv4-translatable ::ffff:0:a.b.c.d (the /96 at ::ffff:0:0:0). Distinct
+    // from the IPv4-mapped form above: group 5 is 0xffff there, group 4 here.
+    // `::ffff:0:a9fe:a9fe` reached IMDS before this check existed.
+    if (groups.slice(0, 4).every((g) => g === 0) && groups[4] === 0xffff && groups[5] === 0) {
+      const a = (groups[6]! >> 8) & 0xff;
+      const b = groups[6]! & 0xff;
+      const c = (groups[7]! >> 8) & 0xff;
+      const d = groups[7]! & 0xff;
+      return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
+    }
+
     // NAT64 well-known prefix 64:ff9b::/96 — embeds an arbitrary IPv4 the
     // gateway will translate to, so classify the embedded quad and, since any
     // NAT64 destination is operator-internal infrastructure, block outright.
@@ -161,9 +189,52 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
       return true;
     }
 
+    // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215). Same translation
+    // behavior as the well-known prefix, so block the whole /48 outright
+    // rather than classifying an embedded quad whose offset varies.
+    if (groups[0] === 0x0064 && groups[1] === 0xff9b && groups[2] === 0x0001) {
+      return true;
+    }
+
+    // 6to4 2002::/16 embeds the relay's IPv4 in groups 1-2, so 2002:a9fe:a9fe::1
+    // routes to 169.254.169.254. Classify that embedded quad.
+    if (groups[0] === 0x2002) {
+      const a = (groups[1]! >> 8) & 0xff;
+      const b = groups[1]! & 0xff;
+      const c = (groups[2]! >> 8) & 0xff;
+      const d = groups[2]! & 0xff;
+      return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
+    }
+
+    // Teredo 2001::/32 embeds the server IPv4 in groups 2-3. The client address
+    // is obfuscated in groups 6-7, but the server quad is the reachable one.
+    if (groups[0] === 0x2001 && groups[1] === 0x0000) {
+      const a = (groups[2]! >> 8) & 0xff;
+      const b = groups[2]! & 0xff;
+      const c = (groups[3]! >> 8) & 0xff;
+      const d = groups[3]! & 0xff;
+      return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
+    }
+
+    // 2001:db8::/32 documentation prefix — never a real destination.
+    if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true;
+
     // fc00::/7 unique-local and fe80::/10 link-local.
     if ((groups[0]! & 0xfe00) === 0xfc00) return true;       // fc00::/7
     if ((groups[0]! & 0xffc0) === 0xfe80) return true;       // fe80::/10
+
+    // ISATAP: the interface identifier is `<prefix>:0:5efe:w.x.y.z`, i.e.
+    // group 4 is 0 or 0x0200 and group 5 is 0x5efe, with the IPv4 in the low
+    // 32 bits. The prefix is arbitrary, so this is not covered by any range
+    // check above — only the link-local case happened to be caught by fe80::/10.
+    // Classify the embedded quad wherever the marker appears.
+    if (groups[5] === 0x5efe && (groups[4] === 0x0000 || groups[4] === 0x0200)) {
+      const a = (groups[6]! >> 8) & 0xff;
+      const b = groups[6]! & 0xff;
+      const c = (groups[7]! >> 8) & 0xff;
+      const d = groups[7]! & 0xff;
+      return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
+    }
 
     return false;
   }

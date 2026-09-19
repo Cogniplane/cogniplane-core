@@ -1,0 +1,58 @@
+name: Docker images
+
+# Builds the two container images a self-hoster runs (docker/backend.Dockerfile
+# and docker/frontend.Dockerfile) and fails when either one breaks.
+#
+# These images are how you deploy Cogniplane Core outside a development shell,
+# so a broken Dockerfile is a broken install. The build runs on every pull
+# request and every push to main, and it is a hard failure rather than a
+# warning.
+#
+# It is a separate workflow from ci.yml so that an image build failure is
+# unambiguous: CI covers lint, types, tests and coverage, and this covers the
+# published container path.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # One image build per ref. A newer push makes an in-flight build obsolete.
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    name: Docker images build
+    runs-on: ubuntu-24.04
+    # Two image builds with a remote layer cache; slower than the CI gates.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build backend image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          push: false
+          load: false
+          tags: cogniplane-backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build frontend image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: docker/frontend.Dockerfile
+          push: false
+          load: false
+          tags: cogniplane-frontend:ci
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
