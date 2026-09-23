@@ -386,7 +386,24 @@ export const httpsUrlSchema = z
       }
     },
     { message: "URL must not embed credentials (user:password@)" }
+  )
+  .refine(
+    (url) => {
+      try {
+        return ![...new URL(url).searchParams.keys()].some(isCredentialQueryParameterName);
+      } catch {
+        return false;
+      }
+    },
+    { message: "URL must not carry credentials in query parameters" }
   );
+
+const CREDENTIAL_QUERY_NAME =
+  /(?:^|[^a-z0-9])(?:api[-_]?key|access[-_]?token|auth(?:orization)?|bearer|client[-_]?secret|key|password|secret|sig(?:nature)?|token)(?=$|[^a-z0-9])/i;
+
+export function isCredentialQueryParameterName(name: string): boolean {
+  return CREDENTIAL_QUERY_NAME.test(name);
+}
 
 /**
  * Reduce an outbound URL to origin + pathname for logging.

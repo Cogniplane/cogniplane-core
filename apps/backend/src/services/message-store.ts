@@ -605,6 +605,14 @@ export class MessageStore {
           JSON.stringify(duration === null ? {} : { durationMs: duration })]
       );
 
+      if (updatedMessage.rows[0] && ["completed", "error", "interrupted"].includes(status)) {
+        await client.query(
+          `UPDATE message_tool_results SET status = 'failed', updated_at = NOW()
+           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND status = 'in_progress'`,
+          [tenantId, messageId, userId]
+        );
+      }
+
       return updatedMessage.rows[0]
         ? {
             ...mapMessage(updatedMessage.rows[0]),
@@ -665,6 +673,56 @@ export class MessageStore {
             : truncateForStorage(redactSecrets(content.planContent), MAX_MESSAGE_CONTENT_LENGTH),
           reasoningSegments
         ]
+      );
+    });
+  }
+
+  async setRuntimeNotices(
+    tenantId: string,
+    messageId: string,
+    userId: string,
+    notices: unknown[]
+  ): Promise<void> {
+    await withTenantScope(this.db, tenantId, async (client) => {
+      await client.query(
+        `UPDATE messages
+         SET detail_json = COALESCE(detail_json, '{}'::jsonb) || jsonb_build_object('runtimeNotices', $4::jsonb),
+             updated_at = NOW()
+         WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3`,
+        [tenantId, messageId, userId, JSON.stringify(redactSecrets(notices.slice(-50)))]
+      );
+    });
+  }
+
+  async markInterruptedIfActive(tenantId: string, messageId: string, userId: string): Promise<void> {
+    await withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE messages SET status = 'interrupted', updated_at = NOW()
+         WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
+           AND status IN ('pending', 'streaming')`,
+        [tenantId, messageId, userId]
+      );
+      if (result.rowCount) {
+        await client.query(
+          `UPDATE message_tool_results SET status = 'failed', updated_at = NOW()
+           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND status = 'in_progress'`,
+          [tenantId, messageId, userId]
+        );
+      }
+    });
+  }
+
+  async deleteToolResult(
+    tenantId: string,
+    messageId: string,
+    userId: string,
+    toolResultId: string
+  ): Promise<void> {
+    await withTenantScope(this.db, tenantId, async (client) => {
+      await client.query(
+        `DELETE FROM message_tool_results
+         WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND tool_result_id = $4`,
+        [tenantId, messageId, userId, toolResultId]
       );
     });
   }
@@ -870,19 +928,29 @@ export class MessageStore {
   ): Promise<Array<{ tenantId: string; sessionId: string; messageId: string }>> {
     const result = await this.db.query(
       `
-        UPDATE messages
-        SET status = 'interrupted', updated_at = NOW()
-        WHERE message_id IN (
-          SELECT message_id
-          FROM messages
-          WHERE role = 'assistant'
-            AND status IN ('pending', 'streaming')
-            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
-          ORDER BY updated_at ASC
-          LIMIT $2
-          FOR UPDATE SKIP LOCKED
+        WITH interrupted AS (
+          UPDATE messages
+          SET status = 'interrupted', updated_at = NOW()
+          WHERE message_id IN (
+            SELECT message_id
+            FROM messages
+            WHERE role = 'assistant'
+              AND status IN ('pending', 'streaming')
+              AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+            ORDER BY updated_at ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING tenant_id, session_id, message_id
+        ), stopped_tools AS (
+          UPDATE message_tool_results tool
+          SET status = 'failed', updated_at = NOW()
+          FROM interrupted message
+          WHERE tool.tenant_id = message.tenant_id
+            AND tool.message_id = message.message_id
+            AND tool.status = 'in_progress'
         )
-        RETURNING tenant_id, session_id, message_id
+        SELECT tenant_id, session_id, message_id FROM interrupted
       `,
       [Math.max(0, Math.floor(olderThanMs)), limit]
     );

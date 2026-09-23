@@ -1,6 +1,6 @@
 import type { Message as AGUIMessage } from "@ag-ui/client";
-import type { Message, ReasoningSegment, ToolResult } from "@cogniplane/shared-types";
-import type { ToolStatusRow } from "./chat-cards/chat-cards.types";
+import { CogniplaneCustomEventSchema, type Message, type ReasoningSegment, type ToolResult } from "@cogniplane/shared-types";
+import type { RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
 
 // Map persisted history → AG-UI messages to seed CopilotChat on reload / session
 // switch. Reconstructs the SAME message shapes the live AG-UI stream produces via
@@ -71,6 +71,21 @@ export function toAguiInitialMessages(messages: Message[]): AGUIMessage[] {
     );
   }
   return seeded;
+}
+
+// A running turn saves its assistant row with status "pending" or "streaming".
+// When the chat attaches to that turn, the replayed events rebuild the reply,
+// so the seed must not contain the row, or the reply shows twice. Only the
+// latest assistant row can belong to the running turn. The user message stays,
+// because the replay does not contain it.
+export function withoutInProgressReply(messages: Message[]): Message[] {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    if (message.status !== "pending" && message.status !== "streaming") return messages;
+    return [...messages.slice(0, index), ...messages.slice(index + 1)];
+  }
+  return messages;
 }
 
 // A reasoning burst as an AG-UI `reasoning`-role message (the thinking block).
@@ -224,6 +239,39 @@ export function toolStatusesFromMessages(messages: Message[]): ToolStatusRow[] {
     }
   }
   return rows;
+}
+
+type RuntimeNoticeValue = Omit<RuntimeNoticeRow, "type" | "rowId">;
+
+export function runtimeNoticeRow(notice: RuntimeNoticeValue): RuntimeNoticeRow {
+  return {
+    type: "runtime-notice",
+    rowId: `notice:${notice.noticeId}`,
+    noticeId: notice.noticeId,
+    level: notice.level,
+    title: notice.title,
+    message: notice.message,
+    createdAt: notice.createdAt
+  };
+}
+
+// The backend saves each `runtime_notice` event value in the assistant row's
+// `detail.runtimeNotices`. `detail` is untyped JSON, so each entry goes through
+// the live event schema. An entry that fails it is not shown. The first entry
+// for a noticeId wins.
+export function runtimeNoticesFromMessages(messages: Message[]): RuntimeNoticeRow[] {
+  const rows = new Map<string, RuntimeNoticeRow>();
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const saved = (message as { detail?: { runtimeNotices?: unknown } }).detail?.runtimeNotices;
+    if (!Array.isArray(saved)) continue;
+    for (const value of saved) {
+      const parsed = CogniplaneCustomEventSchema.safeParse({ name: "runtime_notice", value });
+      if (!parsed.success || parsed.data.name !== "runtime_notice") continue;
+      if (!rows.has(parsed.data.value.noticeId)) rows.set(parsed.data.value.noticeId, runtimeNoticeRow(parsed.data.value));
+    }
+  }
+  return [...rows.values()];
 }
 
 // The plan pane (write_todos) rides agent STATE as `/plan`, not a message — on a

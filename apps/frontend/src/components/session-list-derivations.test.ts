@@ -23,17 +23,31 @@ describe("deriveAttentionSessionIds", () => {
       makeSession({ sessionId: "a", hasPendingApprovals: true }),
       makeSession({ sessionId: "b" })
     ];
-    expect(deriveAttentionSessionIds(sessions, null, 0)).toEqual(new Set(["a"]));
+    expect(deriveAttentionSessionIds(sessions, null, 0, false)).toEqual(new Set(["a"]));
   });
 
-  test("authoritative live state overrides server state for the selected session", () => {
+  test("a fresh approval count overrides the saved flag for the selected session", () => {
     const sessions = [makeSession({ sessionId: "a", hasPendingApprovals: true })];
-    expect(deriveAttentionSessionIds(sessions, "a", 0)).toEqual(new Set());
+    expect(deriveAttentionSessionIds(sessions, "a", 0, true)).toEqual(new Set());
+  });
+
+  test("a fresh count of the selected session does not clear other sessions", () => {
+    const sessions = [
+      makeSession({ sessionId: "a", hasPendingApprovals: true }),
+      makeSession({ sessionId: "b", hasPendingApprovals: true })
+    ];
+    expect(deriveAttentionSessionIds(sessions, "a", 0, true)).toEqual(new Set(["b"]));
+  });
+
+  test("keeps the saved approval flag for the selected session without a fresh count", () => {
+    const sessions = [makeSession({ sessionId: "a", hasPendingApprovals: true })];
+    expect(deriveAttentionSessionIds(sessions, "a", 0, false)).toEqual(new Set(["a"]));
   });
 
   test("adds the selected session when live pending approvals exist even if server-side hasn't caught up", () => {
     const sessions = [makeSession({ sessionId: "a" })];
-    expect(deriveAttentionSessionIds(sessions, "a", 1)).toEqual(new Set(["a"]));
+    expect(deriveAttentionSessionIds(sessions, "a", 1, true)).toEqual(new Set(["a"]));
+    expect(deriveAttentionSessionIds(sessions, "a", 1, false)).toEqual(new Set(["a"]));
   });
 });
 

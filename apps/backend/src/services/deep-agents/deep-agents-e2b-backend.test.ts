@@ -63,6 +63,7 @@ function makeFakeSandbox(overrides: {
 function makeBackend(input: {
   fake: ReturnType<typeof makeFakeSandbox>;
   createSpy?: ReturnType<typeof vi.fn>;
+  loader?: typeof loadE2bSandboxClass;
   options?: Partial<E2bDeepAgentsSandboxOptions>;
 }) {
   const create =
@@ -78,13 +79,89 @@ function makeBackend(input: {
     sessionId: "sess-1",
     runtimeId: "deepagents-rt",
     logger: fakeLog,
-    loadSandboxClass: loader,
+    loadSandboxClass: input.loader ?? loader,
     ...input.options
   });
   return { backend, create };
 }
 
 describe("E2bDeepAgentsSandbox", () => {
+  it("reconnects to a prior replica's workspace", async () => {
+    const fake = makeFakeSandbox();
+    let savedId: string | null = null;
+    const create = vi.fn(async () => fake.sandbox);
+    const connect = vi.fn(async (id: string) => {
+      expect(id).toBe(fake.sandbox.sandboxId);
+      return fake.sandbox;
+    });
+    const loader = (async () => ({ create, connect })) as unknown as typeof loadE2bSandboxClass;
+    const sandboxBinding = {
+      load: async () => savedId,
+      save: async (previousId: string | null, id: string) => {
+        expect(savedId).toBe(previousId);
+        savedId = id;
+      }
+    };
+    const first = makeBackend({ fake, loader, options: { sandboxBinding } }).backend;
+    await first.writeFileBytes("notes.txt", new TextEncoder().encode("kept"));
+    await first.kill();
+    expect(fake.killed).not.toHaveBeenCalled();
+    const second = makeBackend({ fake, loader, options: { sandboxBinding } }).backend;
+    expect(new TextDecoder().decode(await second.readFileBytes("notes.txt"))).toBe("kept");
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconnects when another replica replaced the saved sandbox", async () => {
+    const firstSandbox = makeFakeSandbox();
+    const replacement = makeFakeSandbox();
+    replacement.sandbox.sandboxId = "sbx-456";
+    let savedId: string | null = firstSandbox.sandbox.sandboxId;
+    const connect = vi.fn(async (id: string) => id === replacement.sandbox.sandboxId
+      ? replacement.sandbox : firstSandbox.sandbox);
+    const loader = (async () => ({ create: vi.fn(), connect })) as unknown as typeof loadE2bSandboxClass;
+    const backend = makeBackend({ fake: firstSandbox, loader, options: {
+      sandboxBinding: {
+        load: async () => savedId,
+        save: async () => { throw new Error("unexpected create"); }
+      }
+    } }).backend;
+    await backend.execute("true");
+    savedId = replacement.sandbox.sandboxId;
+    await replacement.sandbox.files.write([{
+      path: "/home/user/workspace/sess-1/notes.txt", data: "new copy"
+    }]);
+    expect(new TextDecoder().decode(await backend.readFileBytes("notes.txt"))).toBe("new copy");
+    expect(connect.mock.calls.map(call => call[0])).toEqual(["sbx-123", "sbx-456"]);
+  });
+
+  it("replaces a saved sandbox only when E2B reports it gone", async () => {
+    const fake = makeFakeSandbox();
+    let savedId: string | null = "expired-sandbox";
+    const connect = vi.fn(async () => {
+      const error = new Error("sandbox is gone");
+      error.name = "SandboxNotFoundError";
+      throw error;
+    });
+    const create = vi.fn(async () => fake.sandbox);
+    const onSandboxRecreated = vi.fn();
+    const loader = (async () => ({ create, connect })) as unknown as typeof loadE2bSandboxClass;
+    const backend = makeBackend({ fake, loader, options: {
+      onSandboxRecreated,
+      sandboxBinding: {
+        load: async () => savedId,
+        save: async (previousId, id) => {
+          expect(previousId).toBe("expired-sandbox");
+          savedId = id;
+        }
+      }
+    } }).backend;
+    await backend.execute("true");
+    expect(onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "expired-sandbox" });
+    expect(savedId).toBe("sbx-123");
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   it("creates the sandbox lazily and only once", async () => {
     const fake = makeFakeSandbox();
     const create = vi.fn(async (_templateId: string) => fake.sandbox);

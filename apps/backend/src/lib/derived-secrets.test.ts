@@ -39,7 +39,16 @@ test("the label is what separates the domains", () => {
   );
 });
 
-test("MCP_UPSTREAM_SIGNING_SECRET overrides the derived signature key", () => {
+test("the v2 signing root is not the key v1 upstreams held", () => {
+  // v1 upstreams verified with this key. Every v2 per-server key is derived
+  // from the signing root, so the root must differ from it.
+  const v1Key = Buffer.from(
+    hkdfSync("sha256", ROOT, "cogniplane-derived-secrets-v1", "cogniplane/v1/proxy-upstream-signature", 32)
+  ).toString("base64url");
+  expect(proxySignatureSecret(ROOT)).not.toBe(v1Key);
+});
+
+test("MCP_UPSTREAM_SIGNING_ROOT_SECRET overrides the derived signature key", () => {
   const override = "operator-supplied-upstream-signing-secret-value";
   expect(proxySignatureSecret(ROOT, override)).toBe(override);
 });

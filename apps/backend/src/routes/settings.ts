@@ -226,10 +226,11 @@ export async function registerSettingsRoutes(
     await ensureUser(app.db, userId);
 
     try {
-      const url = await stores.githubConnections.getAuthorizationUrl({
+      const { url, browserBinding } = await stores.githubConnections.getAuthorizationUrl({
         tenantId,
         userId
       });
+      reply.setCookie(browserBinding.name, browserBinding.value, browserBinding.options);
       return { url };
     } catch (error) {
       if (error instanceof GithubConnectionNotConfiguredError) {
@@ -284,10 +285,11 @@ export async function registerSettingsRoutes(
     await ensureUser(app.db, userId);
 
     try {
-      const url = await stores.notionConnections.getAuthorizationUrl({
+      const { url, browserBinding } = await stores.notionConnections.getAuthorizationUrl({
         tenantId,
         userId
       });
+      reply.setCookie(browserBinding.name, browserBinding.value, browserBinding.options);
       return { url };
     } catch (error) {
       if (error instanceof NotionConnectionNotConfiguredError) {

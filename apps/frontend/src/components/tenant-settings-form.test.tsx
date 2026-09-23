@@ -36,6 +36,18 @@ function instructionsTextarea(): HTMLTextAreaElement {
 afterEach(cleanup);
 
 describe("TenantSettingsForm resync", () => {
+  it("submits the draft's original version after another admin's settings arrive", async () => {
+    const onSave = vi.fn(async () => false);
+    const { view } = renderForm(makeSettings({ version: 4 }), onSave);
+    fireEvent.change(instructionsTextarea(), { target: { value: "my draft" } });
+    view.rerender(<TenantSettingsForm settings={makeSettings({ version: 5 })} saving={false}
+      onSave={onSave} managedTools={[]} mcpServers={[]} modelWarning={null} isOwner={true} />);
+    fireEvent.submit(instructionsTextarea().closest("form")!);
+    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ expectedVersion: 4 })));
+    expect(instructionsTextarea().value).toBe("my draft");
+    expect(instructionsTextarea().maxLength).toBe(4000);
+    expect(screen.getByText("8/4000 characters")).toBeTruthy();
+  });
   it("a settings refetch does not clobber in-progress edits", () => {
     const { view } = renderForm(makeSettings());
 

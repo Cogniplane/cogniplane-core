@@ -3,7 +3,12 @@ import type { Session } from "@cogniplane/shared-types";
 export function deriveAttentionSessionIds(
   sessions: Session[],
   selectedSessionId: string | null,
-  pendingApprovalCount: number
+  pendingApprovalCount: number,
+  // True when the host's count is newer than the saved flag: the host streams
+  // or polls the turn, or the list has not reloaded since the turn ended.
+  // Otherwise an approval can appear in the list before the host sees it, so
+  // the saved flag stays. The count changes only the selected session.
+  hasFreshApprovalCount: boolean
 ): Set<string> {
   const set = new Set<string>();
   for (const session of sessions) {
@@ -12,7 +17,7 @@ export function deriveAttentionSessionIds(
   if (selectedSessionId) {
     if (pendingApprovalCount > 0) {
       set.add(selectedSessionId);
-    } else {
+    } else if (hasFreshApprovalCount) {
       set.delete(selectedSessionId);
     }
   }

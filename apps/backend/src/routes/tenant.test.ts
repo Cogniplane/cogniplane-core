@@ -1,4 +1,4 @@
-import { test, expect, onTestFinished } from "vitest";
+import { test, expect, onTestFinished, vi } from "vitest";
 
 import Fastify from "fastify";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
@@ -6,6 +6,7 @@ import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/
 import { registerTenantRoutes } from "./tenant.js";
 import { parsePiiProtection } from "../services/pii/pii-policy.js";
 import type { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
+import type { AuditEventInput } from "../services/audit-event-store.js";
 import type { Role } from "../lib/rbac.js";
 
 // ---------------------------------------------------------------------------
@@ -23,13 +24,14 @@ type FakeOrgSettingsState = {
 
 function makeFakeOrgSettingsStore(initial: Partial<FakeOrgSettingsState> = {}): {
   store: TenantOrgSettingsStore;
-  state: FakeOrgSettingsState;
+  state: FakeOrgSettingsState & { audits: AuditEventInput[] };
 } {
-  const state: FakeOrgSettingsState = {
+  const state: FakeOrgSettingsState & { audits: AuditEventInput[] } = {
     openaiApiKey: initial.openaiApiKey ?? null,
     anthropicApiKey: initial.anthropicApiKey ?? null,
     marketplaceUrl: initial.marketplaceUrl ?? null,
-    pii: initial.pii ?? null
+    pii: initial.pii ?? null,
+    audits: []
   };
   const store = {
     async get(_tenantId: string) {
@@ -52,15 +54,18 @@ function makeFakeOrgSettingsStore(initial: Partial<FakeOrgSettingsState> = {}): 
       if (provider === "anthropic") return state.anthropicApiKey;
       return null;
     },
-    async setApiKey(_tenantId: string, provider: string, apiKey: string | null) {
+    async setApiKey(_tenantId: string, provider: string, apiKey: string | null, audit?: AuditEventInput) {
       if (provider === "openai") state.openaiApiKey = apiKey;
       else if (provider === "anthropic") state.anthropicApiKey = apiKey;
+      if (audit) state.audits.push(audit);
     },
-    async setMarketplaceUrl(_tenantId: string, url: string | null) {
+    async setMarketplaceUrl(_tenantId: string, url: string | null, audit?: AuditEventInput) {
       state.marketplaceUrl = url;
+      if (audit) state.audits.push(audit);
     },
-    async setPiiProtection(_tenantId: string, policy: PiiProtectionSettings) {
+    async setPiiProtection(_tenantId: string, policy: PiiProtectionSettings, audit?: AuditEventInput) {
       state.pii = policy;
+      if (audit) state.audits.push(audit);
     }
   } as unknown as TenantOrgSettingsStore;
   return { store, state };
@@ -253,6 +258,7 @@ test("tenant role updates still allow changing a non-owner member", async () => 
           rows: [{ tenant_id: values[1], user_id: values[2], role: values[0] }]
         };
       }
+      if (text.includes("INSERT INTO audit_events")) return { rows: [] };
       throw new Error(`Unexpected query: ${text}`);
     },
     release() {}
@@ -312,6 +318,7 @@ function makeMembersDb(targetRole: string | null) {
     updateValues: null as unknown[] | null,
     disableJobsCalled: false,
     disableJobsValues: null as unknown[] | null,
+    audits: [] as Array<{ type: unknown; payload: unknown }>,
     // Order matters: the jobs must be disabled in the same transaction as the
     // membership delete, so both statements are recorded in sequence.
     statements: [] as string[]
@@ -344,6 +351,11 @@ function makeMembersDb(targetRole: string | null) {
         tracked.deleteCalled = true;
         tracked.deleteValues = values;
         tracked.statements.push("delete_membership");
+        return { rows: [] };
+      }
+      if (text.includes("INSERT INTO audit_events")) {
+        tracked.audits.push({ type: values[4], payload: JSON.parse(String(values[5])) });
+        tracked.statements.push("audit");
         return { rows: [] };
       }
       throw new Error(`Unexpected query: ${text}`);
@@ -449,6 +461,30 @@ test("DELETE member: happy path returns 200 and fires DELETE scoped to tenant + 
   // the DELETE must be scoped to this tenant AND this target user.
   expect(tracked.deleteValues).toContain("tenant-1");
   expect(tracked.deleteValues).toContain("member-user");
+  // The audit event is written in the membership transaction, after the delete.
+  expect(tracked.statements.at(-1)).toBe("audit");
+  expect(tracked.audits).toEqual([
+    { type: "tenant.member.removed", payload: { targetUserId: "member-user", previousRole: "member" } }
+  ]);
+});
+
+test("DELETE member: aborts the removed user's active scheduled and interactive runtimes", async () => {
+  const { db, tracked } = makeMembersDb("member");
+  const app = makeMembersApp("admin", "admin-user");
+  const invalidateRuntimesForUser = vi.fn(async () => ["interactive-session", "scheduled-session"]);
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, {
+    db: db as never,
+    tenantOrgSettings: makeFakeOrgSettingsStore().store,
+    runtimeAdapter: { invalidateRuntimesForUser }
+  });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/member-user" });
+
+  expect(response.statusCode).toBe(200);
+  expect(tracked.deleteCalled).toBe(true);
+  expect(invalidateRuntimesForUser).toHaveBeenCalledWith("tenant-1", "member-user");
 });
 
 test("DELETE member: disables the removed member's scheduled jobs in the same transaction", async () => {
@@ -468,7 +504,7 @@ test("DELETE member: disables the removed member's scheduled jobs in the same tr
   expect(tracked.disableJobsValues).toContain("member-user");
   // Both statements ran on the same client, before the commit — the disable is
   // not a best-effort follow-up that a crash could skip.
-  expect(tracked.statements).toEqual(["disable_jobs", "delete_membership"]);
+  expect(tracked.statements).toEqual(["disable_jobs", "delete_membership", "audit"]);
 });
 
 test("DELETE member: an owner rejection disables no jobs", async () => {
@@ -577,6 +613,10 @@ test("PUT member role: an owner can demote an admin to member", async () => {
 
   expect(response.statusCode).toBe(200);
   expect(tracked.updateCalled).toBe(true);
+  expect(tracked.audits).toEqual([{
+    type: "tenant.member.role_changed",
+    payload: { targetUserId: "other-admin", previousRole: "admin", role: "member" }
+  }]);
 });
 
 test("PUT member role: changing your own role returns 400 cannot_change_own_role and never issues an UPDATE", async () => {
@@ -636,6 +676,13 @@ test("provider key: a non-empty apiKey is stored for the selected provider", asy
   expect(response.statusCode).toBe(200);
   expect(response.json().ok).toBe(true);
   expect(state.openaiApiKey).toBe("sk-openai-new");
+  // The audit records that a key changed, never the key.
+  expect(state.audits).toEqual([expect.objectContaining({
+    tenantId: "tenant-1",
+    userId: "user-1",
+    type: "tenant.provider_key.updated",
+    payload: { provider: "openai", keySet: true }
+  })]);
 });
 
 test("provider key: an empty apiKey CLEARS the selected provider's key (R11)", async () => {
@@ -1004,6 +1051,10 @@ test("PUT /tenant/settings/pii stores a valid payload", async () => {
   expect(body.ok).toBe(true);
   expect(body.piiProtection).toEqual(VALID_PII_PAYLOAD);
   expect(state.pii).toEqual(VALID_PII_PAYLOAD);
+  expect(state.audits).toEqual([expect.objectContaining({
+    type: "tenant.pii_protection.updated",
+    payload: { piiProtection: VALID_PII_PAYLOAD }
+  })]);
 });
 
 test("PUT /tenant/settings/pii rejects invalid enum", async () => {

@@ -15,6 +15,7 @@ import * as api from "../lib/project-file-api";
 import * as projectApi from "../lib/project-api";
 import * as apiClient from "../lib/api-client";
 import { uploadArtifact } from "../lib/artifact-api";
+import { queryKeys } from "../lib/query-keys";
 const routerPush = vi.hoisted(() => vi.fn());
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: routerPush }) }));
 vi.mock("../lib/artifact-api", () => ({ uploadArtifact: vi.fn() }));
@@ -192,7 +193,8 @@ it("offers an agent conflict resolution session only when the published target a
   const resolve = await screen.findByRole("button", { name: "Resolve with agent" });
   fireEvent.click(resolve);
   await waitFor(() => expect(projectApi.createProjectSession).toHaveBeenCalledWith("p", "Resolve Proposal.txt"));
-  expect(routerPush).toHaveBeenCalledWith("/?session=resolve-session&resolveDraft=d");
+  await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/?session=resolve-session&resolveDraft=d"));
+  expect(client.getQueryData(queryKeys.sessions.list())).toBeUndefined();
 });
 it("hides conflict resolution when either managed tool is disabled", async () => {
   vi.mocked(apiClient.fetchModels).mockResolvedValue({

@@ -62,7 +62,7 @@ function RuntimeStatus() {
 }
 function AgentSettingsSave() {
   const { save } = useTenantSettings();
-  return <button onClick={() => void save({ ...settings, showEffortSelector: true })}>Save agent settings</button>;
+  return <button onClick={() => void save({ ...settings, expectedVersion: settings.version, showEffortSelector: true })}>Save agent settings</button>;
 }
 const clients: QueryClient[] = [];
 function renderPage({ showChat = true, initialSettings = settings } = {}) {

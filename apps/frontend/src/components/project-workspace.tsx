@@ -15,7 +15,8 @@ import {
   updateProjectApprovalMode,
   updateProjectAgentFileMode
 } from "@/lib/project-api";
-import { archiveSession, deleteSession, interruptSession, listSessions, restoreSession } from "@/lib/session-api";
+import { archiveSession, deleteSession, interruptSession, restoreSession } from "@/lib/session-api";
+import { useProjectSessionPages, useSessionPages } from "@/hooks/use-session-pages";
 import { queryKeys } from "@/lib/query-keys";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -34,14 +35,25 @@ const AGENT_FILE_MODE_HELP = {
   "create-only": "The agent can create drafts, but cannot propose updates to existing files.",
   "read-write": "The agent can create drafts and propose updates. A person must still promote every draft."
 } as const;
-export function ProjectWorkspace({ project }: { project: Project }) {
+export type ProjectWorkspaceView = "overview" | "settings";
+
+export function ProjectWorkspace({
+  project,
+  view = "overview"
+}: {
+  project: Project;
+  view?: ProjectWorkspaceView;
+}) {
   const client = useQueryClient();
   const router = useRouter();
   const [name, setName] = useState(project.name);
   const [renaming, setRenaming] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState("");
   const [sessionToAdd, setSessionToAdd] = useState("");
   const [confirmingSession, setConfirmingSession] = useState(false);
   const [sessionView, setSessionView] = useState<"active" | "archived">("active");
+  const [approvalDraft, setApprovalDraft] = useState<Project["approvalMode"] | null>(null);
+  const [fileModeDraft, setFileModeDraft] = useState<Project["agentFileMode"] | null>(null);
   const detail = useQuery({
     queryKey: ["projects", project.projectId],
     queryFn: () => getProject(project.projectId),
@@ -56,16 +68,20 @@ export function ProjectWorkspace({ project }: { project: Project }) {
   });
   const canManageProject = detail.data?.canManage === true;
   const canEditProject = detail.data?.canEdit === true || canManageProject;
-  const allSessions = useQuery({
-    queryKey: queryKeys.sessions.list(),
-    queryFn: listSessions
-  });
+  const allSessions = useSessionPages({ search: sessionSearch, personalOnly: true, enabled: view === "overview" });
   const currentProject = detail.data?.project ?? project;
-  const sessions = detail.data?.sessions ?? [];
-  const activeSessions = sessions.filter((session) => session.status === "active");
-  const archivedSessions = sessions.filter((session) => session.status === "archived");
+  const pageInput = { projectId: project.projectId, detail: detail.data, updatedAt: detail.dataUpdatedAt,
+    enabled: view === "overview" && detail.isSuccess };
+  const activePage = useProjectSessionPages({ ...pageInput, status: "active" });
+  const archivedPage = useProjectSessionPages({ ...pageInput, status: "archived" });
+  const trashPage = useProjectSessionPages({ ...pageInput, status: "deleted",
+    enabled: pageInput.enabled && canEditProject && detail.data?.trash?.retentionDays !== 0 });
+  const activeSessions = activePage.data?.sessions ?? [];
+  const archivedSessions = archivedPage.data?.sessions ?? [];
+  const trashSessions = trashPage.data?.sessions ?? [];
+  const visiblePage = sessionView === "active" ? activePage : archivedPage;
   const visibleSessions = sessionView === "active" ? activeSessions : archivedSessions;
-  const availableSessions = (allSessions.data ?? []).filter(
+  const availableSessions = (allSessions.data?.sessions ?? []).filter(
     (session) => !session.projectId && session.status === "active" &&
       (!session.purpose || session.purpose === "normal")
   );
@@ -77,12 +93,14 @@ export function ProjectWorkspace({ project }: { project: Project }) {
         client.invalidateQueries({ queryKey: ["projects"] }),
         client.invalidateQueries({ queryKey: queryKeys.sessions.all })
       ]);
+      setApprovalDraft(null);
+      setFileModeDraft(null);
     }
   });
   return (
     <section aria-label={project.name} className="min-w-0 space-y-8">
       <header className="flex flex-wrap items-start justify-between gap-3 border-b border-outline-variant pb-5">
-        {renaming ? (
+        {view === "settings" && renaming ? (
           <form
             className="flex flex-wrap gap-2"
             onSubmit={(event) => {
@@ -116,7 +134,7 @@ export function ProjectWorkspace({ project }: { project: Project }) {
             </p>
           </div>
         )}
-        {!renaming && canManageProject ? (
+        {view === "settings" && !renaming && canManageProject ? (
           <Button
             variant="ghost"
             size="sm"
@@ -128,7 +146,7 @@ export function ProjectWorkspace({ project }: { project: Project }) {
             Rename
           </Button>
         ) : null}
-        {canManageProject ? (
+        {view === "settings" && canManageProject ? (
           <Button
             size="sm"
             variant="outline"
@@ -146,6 +164,24 @@ export function ProjectWorkspace({ project }: { project: Project }) {
           </Button>
         ) : null}
       </header>
+      <nav aria-label="Project sections" className="flex gap-2 border-b border-outline-variant pb-3">
+        <Button asChild size="sm" variant={view === "overview" ? "secondary" : "ghost"}>
+          <Link
+            href={`/projects?project=${encodeURIComponent(project.projectId)}`}
+            aria-current={view === "overview" ? "page" : undefined}
+          >
+            Overview
+          </Link>
+        </Button>
+        <Button asChild size="sm" variant={view === "settings" ? "secondary" : "ghost"}>
+          <Link
+            href={`/projects?project=${encodeURIComponent(project.projectId)}&view=settings`}
+            aria-current={view === "settings" ? "page" : undefined}
+          >
+            Settings
+          </Link>
+        </Button>
+      </nav>
       {detail.isPending ? (
         <div aria-label="Loading project" className="space-y-4">
           <Skeleton className="h-20" />
@@ -166,72 +202,84 @@ export function ProjectWorkspace({ project }: { project: Project }) {
         </p>
       ) : null}
       {detail.data ? (
-        <>
-          <ProjectInstructionsEditor key={project.projectId} project={currentProject} canManage={canManageProject} />
-          <ProjectSharing project={currentProject} canManage={canManageProject} />
-          <section aria-labelledby="project-approval-title" className="rounded-lg border border-outline-variant bg-surface-container-low p-5">
-            <h3 id="project-approval-title" className="font-semibold">Agent approvals</h3>
-            <p id="project-approval-help" className="mt-1 text-sm text-on-surface-variant">
-              Choose how this project's agent actions are approved. Only project owners can change this setting.
-            </p>
-            <label htmlFor="project-approval-mode" className="mt-4 block text-sm font-medium">
-              Approval mode
-            </label>
-            <select
-              id="project-approval-mode"
-              aria-describedby="project-approval-help project-approval-mode-help"
-              className={`${PROJECT_SELECT} mt-1 max-w-md`}
-              value={currentProject.approvalMode}
-              disabled={Boolean(currentProject.archivedAt) || mutate.isPending}
-              onChange={(event) => {
-                const approvalMode = event.target.value as Project["approvalMode"];
-                mutate.mutate(async () => {
-                  try {
-                    await updateProjectApprovalMode(project.projectId, approvalMode);
-                    toast.success("Approval mode updated for new turns.");
-                  } catch (error) {
-                    toast.error(error instanceof Error ? error.message : "Could not update approval mode.");
-                    throw error;
-                  }
-                });
-              }}
-            >
-              <option value="organization_default">Organization default</option>
-              <option value="manual">Manual approval</option>
-              <option value="automatic">Automatic approval</option>
-            </select>
-            <p id="project-approval-mode-help" className="mt-2 max-w-2xl text-sm text-on-surface-variant">
-              {APPROVAL_MODE_HELP[currentProject.approvalMode]} Changes apply to new turns.
-            </p>
-          </section>
-          <section aria-labelledby="project-agent-files-title" className="rounded-lg border border-outline-variant bg-surface-container-low p-5">
-            <h3 id="project-agent-files-title" className="font-semibold">Agent project files</h3>
-            <p id="project-agent-files-help" className="mt-1 text-sm text-on-surface-variant">
-              Choose whether the agent can propose shared project files. Drafts always need human promotion.
-            </p>
-            <label htmlFor="project-agent-file-mode" className="mt-4 block text-sm font-medium">File mode</label>
-            <select
-              id="project-agent-file-mode"
-              aria-describedby="project-agent-files-help project-agent-file-mode-help"
-              className={`${PROJECT_SELECT} mt-1 max-w-md`}
-              value={currentProject.agentFileMode}
-              disabled={Boolean(currentProject.archivedAt) || mutate.isPending}
-              onChange={(event) => {
-                const agentFileMode = event.target.value as Project["agentFileMode"];
-                mutate.mutate(async () => {
-                  await updateProjectAgentFileMode(project.projectId, agentFileMode);
-                  toast.success("Agent file mode updated for new turns.");
-                });
-              }}
-            >
-              <option value="read-only">Read-only</option>
-              <option value="create-only">Create-only</option>
-              <option value="read-write">Read-write</option>
-            </select>
-            <p id="project-agent-file-mode-help" className="mt-2 max-w-2xl text-sm text-on-surface-variant">
-              {AGENT_FILE_MODE_HELP[currentProject.agentFileMode]} New turns use this mode.
-            </p>
-          </section>
+        view === "settings" ? (
+          <div className="space-y-8">
+            <div>
+              <h3 className="text-lg font-semibold">Project settings</h3>
+              <p className="mt-1 text-sm text-on-surface-variant">
+                Manage the project name, instructions, access, and agent behavior.
+              </p>
+            </div>
+            <ProjectInstructionsEditor key={project.projectId} project={currentProject} canManage={canManageProject} />
+            <ProjectSharing project={currentProject} canManage={canManageProject} />
+            {canManageProject ? <section aria-labelledby="project-approval-title" className="rounded-lg border border-outline-variant bg-surface-container-low p-5">
+              <h3 id="project-approval-title" className="font-semibold">Agent approvals</h3>
+              <p id="project-approval-help" className="mt-1 text-sm text-on-surface-variant">
+                Choose how this project's agent actions are approved. Only project owners can change this setting.
+              </p>
+              <label htmlFor="project-approval-mode" className="mt-4 block text-sm font-medium">
+                Approval mode
+              </label>
+              <select
+                id="project-approval-mode"
+                aria-describedby="project-approval-help project-approval-mode-help"
+                className={`${PROJECT_SELECT} mt-1 max-w-md`}
+                value={approvalDraft ?? currentProject.approvalMode}
+                disabled={Boolean(currentProject.archivedAt) || mutate.isPending}
+                onChange={(event) => {
+                  const approvalMode = event.target.value as Project["approvalMode"];
+                  setApprovalDraft(approvalMode);
+                  mutate.mutate(async () => {
+                    try {
+                      await updateProjectApprovalMode(project.projectId, approvalMode);
+                      toast.success("Approval mode updated for new turns.");
+                    } catch (error) {
+                      toast.error(error instanceof Error ? error.message : "Could not update approval mode.");
+                      throw error;
+                    }
+                  });
+                }}
+              >
+                <option value="organization_default">Organization default</option>
+                <option value="manual">Manual approval</option>
+                <option value="automatic">Automatic approval</option>
+              </select>
+              <p id="project-approval-mode-help" className="mt-2 max-w-2xl text-sm text-on-surface-variant">
+                {APPROVAL_MODE_HELP[approvalDraft ?? currentProject.approvalMode]} Changes apply to new turns.
+              </p>
+            </section> : null}
+            {canManageProject ? <section aria-labelledby="project-agent-files-title" className="rounded-lg border border-outline-variant bg-surface-container-low p-5">
+              <h3 id="project-agent-files-title" className="font-semibold">Agent project files</h3>
+              <p id="project-agent-files-help" className="mt-1 text-sm text-on-surface-variant">
+                Choose whether the agent can propose shared project files. Drafts always need human promotion.
+              </p>
+              <label htmlFor="project-agent-file-mode" className="mt-4 block text-sm font-medium">File mode</label>
+              <select
+                id="project-agent-file-mode"
+                aria-describedby="project-agent-files-help project-agent-file-mode-help"
+                className={`${PROJECT_SELECT} mt-1 max-w-md`}
+                value={fileModeDraft ?? currentProject.agentFileMode}
+                disabled={Boolean(currentProject.archivedAt) || mutate.isPending}
+                onChange={(event) => {
+                  const agentFileMode = event.target.value as Project["agentFileMode"];
+                  setFileModeDraft(agentFileMode);
+                  mutate.mutate(async () => {
+                    await updateProjectAgentFileMode(project.projectId, agentFileMode);
+                    toast.success("Agent file mode updated for new turns.");
+                  });
+                }}
+              >
+                <option value="read-only">Read-only</option>
+                <option value="create-only">Create-only</option>
+                <option value="read-write">Read-write</option>
+              </select>
+              <p id="project-agent-file-mode-help" className="mt-2 max-w-2xl text-sm text-on-surface-variant">
+                {AGENT_FILE_MODE_HELP[fileModeDraft ?? currentProject.agentFileMode]} New turns use this mode.
+              </p>
+            </section> : null}
+          </div>
+        ) : (
+          <>
           <section aria-labelledby="project-sessions-title">
             <div className="flex items-center justify-between gap-3">
               <h3 id="project-sessions-title" className="font-semibold">
@@ -258,7 +306,7 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                 aria-selected={sessionView === "active"}
                 onClick={() => setSessionView("active")}
               >
-                Active ({activeSessions.length})
+                Active
               </Button>
               <Button
                 size="xs"
@@ -267,9 +315,17 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                 aria-selected={sessionView === "archived"}
                 onClick={() => setSessionView("archived")}
               >
-                Archived ({archivedSessions.length})
+                Archived
               </Button>
             </div>
+            <Input className="mt-4" aria-label="Search existing sessions" maxLength={200} placeholder="Search existing sessions"
+              value={sessionSearch} disabled={confirmingSession || mutate.isPending}
+              onChange={(event) => { setSessionSearch(event.target.value); setSessionToAdd(""); }} />
+            {allSessions.isPending ? <p role="status">Loading sessions...</p> : null}
+            {allSessions.isError ? <div role="alert">
+              <p>Could not load sessions.</p>
+              <Button variant="ghost" onClick={() => void (allSessions.isFetchNextPageError ? allSessions.fetchNextPage() : allSessions.refetch())}>Try again</Button>
+            </div> : null}
             <form
               className="mt-4 flex gap-2"
               onSubmit={(event) => {
@@ -298,6 +354,8 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                 Add
               </Button>
             </form>
+            {allSessions.hasNextPage ? <Button className="mt-2" variant="ghost" disabled={allSessions.isFetching || confirmingSession || mutate.isPending}
+              onClick={() => void allSessions.fetchNextPage()}>{allSessions.isFetchingNextPage ? "Loading..." : "Load more sessions"}</Button> : null}
             {confirmingSession ? (
               <div role="group" aria-label="Confirm session assignment" className="mt-3 flex flex-col gap-3">
                 <p className="text-sm text-on-surface">
@@ -333,14 +391,6 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                   </Button>
                 </div>
               </div>
-            ) : null}
-            {allSessions.isError ? (
-              <p role="alert" className="mt-2 text-sm text-danger">
-                Could not load existing sessions.{" "}
-                <button className="underline" onClick={() => void allSessions.refetch()}>
-                  Try again
-                </button>
-              </p>
             ) : null}
             {visibleSessions.length ? (
               <ul className="mt-3 divide-y divide-outline-variant">
@@ -409,17 +459,18 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                   </li>
                 ))}
               </ul>
-            ) : (
+            ) : !visiblePage.isPending && !visiblePage.isError ? (
               <p className="mt-4 text-sm text-on-surface-variant">
                 {sessionView === "active" ? "Start a session here or add an existing conversation." : "No archived sessions in this project."}
               </p>
-            )}
-            {detail.data.trash && detail.data.trash.retentionDays !== 0 && detail.data.trash.sessions.length ? (
+            ) : null}
+            <ProjectSessionPagination page={visiblePage} label={sessionView} />
+            {canEditProject && detail.data.trash && detail.data.trash.retentionDays !== 0 && (trashSessions.length > 0 || trashPage.isPending || trashPage.isError) ? (
               <section aria-labelledby="project-session-trash-title" className="mt-6 rounded-lg border border-outline-variant bg-surface-container-low p-4">
                 <h4 id="project-session-trash-title" className="font-medium">Session Trash</h4>
                 <p className="mt-1 text-sm text-on-surface-variant">Deleted sessions can be restored for {detail.data.trash.retentionDays ?? SESSION_TRASH_RETENTION_DAYS} days. Restoring a session keeps its conversation and local files.</p>
                 <ul className="mt-3 divide-y divide-outline-variant">
-                  {detail.data.trash.sessions.map((deletedSession) => (
+                  {trashSessions.map((deletedSession) => (
                     <li key={deletedSession.sessionId} className="flex items-center justify-between gap-3 py-2">
                       <span className="min-w-0 text-sm">
                         <span className="block truncate font-medium">{deletedSession.sessionName}</span>
@@ -439,6 +490,7 @@ export function ProjectWorkspace({ project }: { project: Project }) {
                     </li>
                   ))}
                 </ul>
+                <ProjectSessionPagination page={trashPage} label="Trash" />
               </section>
             ) : null}
           </section>
@@ -458,8 +510,27 @@ export function ProjectWorkspace({ project }: { project: Project }) {
             </details>
           ) : null}
           <ProjectFiles project={currentProject} sources={detail.data.files} canEdit={detail.data.canEdit ?? canManageProject} />
-        </>
+          </>
+        )
       ) : null}
     </section>
   );
+}
+
+function ProjectSessionPagination({ page, label }: {
+  page: ReturnType<typeof useProjectSessionPages>;
+  label: string;
+}) {
+  if (page.isPending) return <p role="status">Loading {label} sessions...</p>;
+  if (page.isError) return <div role="alert" className="mt-3">
+    <p>Could not load {label} sessions.</p>
+    <Button variant="ghost" disabled={page.isFetching}
+      onClick={() => void (page.isFetchNextPageError ? page.fetchNextPage() : page.refetch())}>
+      Retry {label} sessions
+    </Button>
+  </div>;
+  return page.hasNextPage ? <Button className="mt-3" variant="outline" disabled={page.isFetching}
+    onClick={() => void page.fetchNextPage()}>
+    {page.isFetchingNextPage ? "Loading..." : `Load more ${label} sessions`}
+  </Button> : null;
 }

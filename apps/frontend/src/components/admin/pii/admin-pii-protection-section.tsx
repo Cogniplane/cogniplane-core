@@ -251,17 +251,7 @@ export function AdminPiiProtectionSection(props: {
 
         <fieldset className="flex flex-col gap-2">
           <legend className="mb-1 text-sm font-semibold text-on-surface">Detectors</legend>
-          <CheckboxRow
-            id="pii-rules-first"
-            checked={draft.detectors.useRulesFirst}
-            onChange={(checked) =>
-              setDraft({
-                ...draft,
-                detectors: { ...draft.detectors, useRulesFirst: checked }
-              })
-            }
-            label="Run rule-based detection before calling the provider"
-          />
+          <p className="text-xs text-on-surface-faint">Rule-based detection runs before the provider.</p>
           <p className="mt-1 text-xs text-on-surface-faint">Entity types:</p>
           <div className="flex flex-col gap-1.5">
             {ALL_ENTITY_TYPES.map((entity) => (
@@ -276,20 +266,7 @@ export function AdminPiiProtectionSection(props: {
           </div>
         </fieldset>
 
-        <fieldset className="flex flex-col gap-2">
-          <legend className="mb-1 text-sm font-semibold text-on-surface">Actions</legend>
-          <CheckboxRow
-            id="pii-report-admins"
-            checked={draft.actions.reportToAdmins}
-            onChange={(checked) =>
-              setDraft({
-                ...draft,
-                actions: { ...draft.actions, reportToAdmins: checked }
-              })
-            }
-            label="Report findings to admins"
-          />
-        </fieldset>
+        <p className="text-xs text-on-surface-faint">Scan findings are available to admins.</p>
 
         {combinationInvalid ? (
           <p className="text-sm text-danger">

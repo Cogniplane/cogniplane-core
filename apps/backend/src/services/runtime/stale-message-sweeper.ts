@@ -25,7 +25,7 @@ export type StaleMessageSweeperDeps = {
  *
  * The turn watchdog caps WORKING time at `RUNTIME_TURN_TIMEOUT_MS` but pauses
  * while a human decides an approval, so a turn's real elapsed time is working
- * time plus approval time. Approval rounds are unbounded (bead l2pq), so no
+ * time plus approval time. Approval rounds are unbounded, so no
  * finite deadline covers every turn; the multiplier budgets for a handful of
  * rounds. `RUNTIME_TURN_TIMEOUT_MS = 0` disables the watchdog entirely, at which
  * point a turn has no ceiling at all and NO deadline can tell an abandoned row
@@ -34,12 +34,16 @@ export type StaleMessageSweeperDeps = {
 export function resolveStaleMessageDeadline(config: {
   RUNTIME_TURN_TIMEOUT_MS: number;
   APPROVAL_REQUEST_TTL_MS: number;
+  SCHEDULER_JOB_TIMEOUT_MS?: number;
 }): number | null {
   if (config.RUNTIME_TURN_TIMEOUT_MS <= 0) return null;
-  return config.RUNTIME_TURN_TIMEOUT_MS + config.APPROVAL_REQUEST_TTL_MS * APPROVAL_ROUND_BUDGET;
+  return Math.max(
+    config.RUNTIME_TURN_TIMEOUT_MS + config.APPROVAL_REQUEST_TTL_MS * APPROVAL_ROUND_BUDGET,
+    (config.SCHEDULER_JOB_TIMEOUT_MS ?? 0) + 60_000
+  );
 }
 
-/** Approval rounds the deadline above budgets for. See l2pq for why this is finite. */
+/** Approval rounds the deadline above budgets for. Finite by choice: see the note above. */
 const APPROVAL_ROUND_BUDGET = 3;
 
 /**

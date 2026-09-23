@@ -33,6 +33,7 @@ export type Session = z.infer<typeof SessionSchema>;
 
 export const SessionsListResponseSchema = z.object({
   sessions: z.array(SessionSchema),
+  nextCursor: z.string().nullable().optional(),
   trashRetentionDays: z.number().int().nonnegative().optional()
 }).passthrough();
 

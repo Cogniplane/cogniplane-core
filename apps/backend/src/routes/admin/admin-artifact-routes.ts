@@ -59,11 +59,11 @@ export async function registerAdminArtifactRoutes(
             INSERT INTO artifact_download_tokens (
               token, tenant_id, artifact_id, session_id, user_id,
               storage_backend, storage_key, file_name, content_type,
-              expires_at
+              expires_at, issued_by_user_id
             )
             VALUES (
               $1, $2, $3, $4, $5, $6, $7, $8, $9,
-              NOW() + ($10::text || ' milliseconds')::interval
+              NOW() + ($10::text || ' milliseconds')::interval, $11
             )
             RETURNING token, expires_at
           `,
@@ -77,7 +77,8 @@ export async function registerAdminArtifactRoutes(
             artifact.storage_key,
             artifact.artifact_name,
             artifact.mime_type,
-            String(ttlMs)
+            String(ttlMs),
+            request.auth.userId
           ]
         );
 

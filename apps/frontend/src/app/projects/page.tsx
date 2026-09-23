@@ -35,6 +35,7 @@ function Projects() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const selectedId = searchParams.get("project");
+  const selectedView = searchParams.get("view") === "settings" ? "settings" : "overview";
   const selectProject = (id: string) =>
     router.replace(`/projects?project=${encodeURIComponent(id)}`);
   const [archived, setArchived] = useState(searchParams.get("archived") === "true");
@@ -52,7 +53,7 @@ function Projects() {
     enabled: Boolean(user)
   });
   const selected =
-    projects.data?.find((project) => project.projectId === selectedId) ?? projects.data?.[0];
+    selectedId ? projects.data?.find((project) => project.projectId === selectedId) : projects.data?.[0];
   const create = useMutation({
     mutationFn: () => createProject(name.trim()),
     onSuccess: async (project) => {
@@ -168,7 +169,7 @@ function Projects() {
             </nav>
           </aside>
           {selected ? (
-            <ProjectWorkspace key={selected.projectId} project={selected} />
+            <ProjectWorkspace key={selected.projectId} project={selected} view={selectedView} />
           ) : projects.isSuccess ? (
             <section className="py-14 md:px-8">
               <FolderIcon className="mb-4 size-8 text-on-surface-variant" />

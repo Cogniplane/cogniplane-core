@@ -1,6 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { AdminMcpServer } from "@cogniplane/shared-types";
 
 import {
   createAdminMcpServer,
@@ -20,6 +21,9 @@ type SubmitInput = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string | null;
+  upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+  upstreamAuthName: string | null;
+  upstreamAuthSecret?: string | null;
   enabled: boolean;
 };
 

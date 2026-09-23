@@ -118,6 +118,10 @@ class InMemorySessionStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
+  async listPage(...args: Parameters<InMemorySessionStore["list"]>) {
+    return { sessions: await this.list(...args), nextCursor: null };
+  }
+
   async create(
     _tenantId: string,
     userId: string,
@@ -319,6 +323,16 @@ class InMemoryMessageStore {
     message.updatedAt = new Date().toISOString();
   }
 
+  async setRuntimeNotices(_tenantId: string, messageId: string, userId: string, notices: unknown[]): Promise<void> {
+    const message = this.messages.find((entry) => entry.messageId === messageId && entry.userId === userId);
+    if (message) message.detail = { ...message.detail, runtimeNotices: notices.slice(-50) };
+  }
+
+  async deleteToolResult(_tenantId: string, messageId: string, userId: string, toolResultId: string): Promise<void> {
+    const result = this.toolResults.get(toolResultId);
+    if (result?.messageId === messageId && result.userId === userId) this.toolResults.delete(toolResultId);
+  }
+
   async addTokenUsage(...args: Parameters<MessageStore["addTokenUsage"]>) {
     const [tenantId, messageId, userId, delta, modelName] = args;
     const message = await this.getOwned(tenantId, messageId, userId);
@@ -425,6 +439,7 @@ class FakeRuntimeManager implements RuntimeAdapter {
   }
   async purgeSessionData() {}
   async invalidateTenantRuntimes() { return []; }
+  async invalidateRuntimesForUser() { return []; }
   async invalidateRuntimesForIntegration() { return []; }
   async close() {}
   async statRuntimeFile() { return { sizeBytes: 0 }; }
@@ -433,9 +448,9 @@ class FakeRuntimeManager implements RuntimeAdapter {
   }
   async getRuntimePolicyId(_tenantId: string): Promise<string> { return "tenant-settings:test-tenant"; }
   async *runMessageAGUI(session: { sessionId: string; runtimeId: string }, input: {
-    prompt: string; userInputs?: RuntimeUserInput[]; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; model?: string; onBeforeTurn?: () => Promise<void>;
+    prompt: string; userInputs?: RuntimeUserInput[]; toolContextId: string | null; assistantMessageId?: string | null; effort?: string; model?: string; onBeforeTurn?: (signal: AbortSignal) => Promise<void>;
   }): AsyncGenerator<BaseEvent> {
-    if (input.onBeforeTurn) await input.onBeforeTurn();
+    if (input.onBeforeTurn) await input.onBeforeTurn(new AbortController().signal);
     this.runMessageInputs.push({ sessionId: session.sessionId, runtimeId: session.runtimeId, ...input });
     let textMessageId: string | null = null;
     for (const event of this.eventScripts.get(session.sessionId) ?? []) {
@@ -648,24 +663,16 @@ class InMemoryArtifactStore {
   }
   async createDownloadToken(input: { tenantId?: string; artifactId: string; sessionId: string; userId: string; storageBackend: ArtifactRecord["storageBackend"]; storageKey: string; fileName: string; contentType: string; ttlMs: number; }): Promise<ArtifactDownloadTokenRecord> {
     const now = Date.now();
-    const record: ArtifactDownloadTokenRecord = { token: `download-${this.downloadTokens.size + 1}`, tenantId: input.tenantId ?? "test-tenant", artifactId: input.artifactId, sessionId: input.sessionId, userId: input.userId, storageBackend: input.storageBackend, storageKey: input.storageKey, fileName: input.fileName, contentType: input.contentType, expiresAt: new Date(now + input.ttlMs).toISOString(), createdAt: new Date(now).toISOString() };
+    const record: ArtifactDownloadTokenRecord = { token: `download-${this.downloadTokens.size + 1}`, tenantId: input.tenantId ?? "test-tenant", artifactId: input.artifactId, sessionId: input.sessionId, userId: input.userId, issuedByUserId: null, storageBackend: input.storageBackend, storageKey: input.storageKey, fileName: input.fileName, contentType: input.contentType, expiresAt: new Date(now + input.ttlMs).toISOString(), createdAt: new Date(now).toISOString() };
     this.downloadTokens.set(record.token, record); return record;
   }
-  // Shared identity + artifact/session gating for peek and consume so the two
-  // paths can never diverge. Identity gating (tenant + user, with admin bypass)
-  // lives here so an unauthorized request never observes or consumes the token.
-  // Deliberately does NOT filter on expiry — the route surfaces expiry as a
-  // distinct 410 via the peeked record.
-  private async resolveGatedDownloadToken(input: {
-    token: string;
-    requesterTenantId: string;
-    requesterUserId: string;
-    callerIsAdmin: boolean;
-  }): Promise<ArtifactDownloadTokenRecord | null> {
+  // Shared artifact/session gating for peek and consume so the two paths can
+  // never diverge. The token is the credential: identity comes from the token
+  // row. Deliberately does NOT filter on expiry — the route surfaces expiry as
+  // a distinct 410 via the peeked record.
+  private async resolveGatedDownloadToken(input: { token: string }): Promise<ArtifactDownloadTokenRecord | null> {
     const downloadToken = this.downloadTokens.get(input.token);
     if (!downloadToken) return null;
-    if (downloadToken.tenantId !== input.requesterTenantId) return null;
-    if (!input.callerIsAdmin && downloadToken.userId !== input.requesterUserId) return null;
     const artifact = this.artifacts.get(downloadToken.artifactId);
     const session = await this.sessions.getOwned(downloadToken.tenantId, downloadToken.sessionId, downloadToken.userId);
     if (!artifact || artifact.status === "deleted" || !session || session.status !== "active") {
@@ -680,24 +687,14 @@ class InMemoryArtifactStore {
   // Non-consuming lookup used by GET /downloads/:token to validate the token
   // and open the storage stream before committing the single-use consume.
   // Returns the row (regardless of expiry) on the same gating as consume.
-  async peekDownloadToken(input: {
-    token: string;
-    requesterTenantId: string;
-    requesterUserId: string;
-    callerIsAdmin: boolean;
-  }) {
+  async peekDownloadToken(input: { token: string }) {
     return this.resolveGatedDownloadToken(input);
   }
 
   // Mirrors production single-use semantics: returns the row only on the
-  // first call AND only when caller identity matches; subsequent calls return
-  // null. An expired token is never consumed.
-  async consumeDownloadToken(input: {
-    token: string;
-    requesterTenantId: string;
-    requesterUserId: string;
-    callerIsAdmin: boolean;
-  }) {
+  // first call; subsequent calls return null. An expired token is never
+  // consumed.
+  async consumeDownloadToken(input: { token: string }) {
     const downloadToken = await this.resolveGatedDownloadToken(input);
     if (!downloadToken) return null;
     if (new Date(downloadToken.expiresAt).getTime() <= Date.now()) return null;
@@ -834,9 +831,11 @@ export async function createTestApp(
   } satisfies ArtifactRouteStores);
   await registerMessageRoutes(app, {
     executions: {
-      acquire: async () => { throw new Error("Unexpected shared execution"); },
-      heartbeat: async () => { throw new Error("Unexpected shared execution"); },
-      release: async () => { throw new Error("Unexpected shared execution"); },
+      acquire: async (actor) => ({ ...actor, executionId: `test-${actor.sessionId}`,
+        ownerId: "test-replica", projectId: null,
+        expiresAt: new Date(Date.now() + 30_000).toISOString() }),
+      heartbeat: async () => true,
+      release: async () => {},
     },
     projects: { getReadable: async () => null },
     sessions,

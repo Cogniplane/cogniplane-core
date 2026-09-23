@@ -73,19 +73,23 @@ function createOAuthConfig() {
   });
 }
 
-test("authorizes a user, persists encrypted tokens, and serves user runtime credentials", async () => {
+test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("authorizes a user despite %s follow-up failure", async (failure) => {
   const config = createOAuthConfig();
   const store = new InMemoryGithubConnectionStore();
   const auditEvents = new InMemoryAuditEventStore();
+  if (failure === "audit") auditEvents.create = async () => { throw new Error("audit unavailable"); };
+  if (failure === "audit_sync") auditEvents.create = () => { throw new Error("audit unavailable"); };
   const invalidatedUsers: Array<{ tenantId: string; userId: string; integrationId: string }> = [];
   const service = new GithubConnectionService(config, store, auditEvents, {
-    async invalidateRuntimesForIntegration(tenantId: string, userId: string, integrationId: string) {
+    invalidateRuntimesForIntegration(tenantId: string, userId: string, integrationId: string) {
       invalidatedUsers.push({ tenantId, userId, integrationId });
-      return [];
+      if (failure === "runtime") return Promise.reject(new Error("runtime unavailable"));
+      if (failure === "runtime_sync") throw new Error("runtime unavailable");
+      return Promise.resolve([]);
     }
-  });
+  }, undefined, { warn() {} });
 
-  const authorizeUrl = await service.getAuthorizationUrl({
+  const { url: authorizeUrl, browserBinding } = await service.getAuthorizationUrl({
     tenantId: "tenant-1",
     userId: "user-1"
   });
@@ -135,7 +139,8 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
   try {
     const authRedirect = await service.completeAuthorization({
       code: "oauth-code",
-      state: authState
+      state: authState,
+      browserNonce: browserBinding.value
     });
     expect(authRedirect).toMatch(/githubAuth=connected/);
     expect(invalidatedUsers).toEqual([
@@ -145,7 +150,7 @@ test("authorizes a user, persists encrypted tokens, and serves user runtime cred
     expect(store.record?.githubLogin).toBe("octocat");
     expect(store.record?.accessTokenEncrypted).not.toBe("ghu_user_token");
     expect(decrypt(String(store.record?.accessTokenEncrypted), config.DATA_ENCRYPTION_SECRET)).toBe("ghu_user_token");
-    expect(auditEvents.events[0]?.type).toBe("user.github.connected");
+    if (!failure.startsWith("audit")) expect(auditEvents.events[0]?.type).toBe("user.github.connected");
 
     const runtimeCredentials = (await service.getRuntimeCredentials(
       "tenant-1",
@@ -222,9 +227,12 @@ test("completeAuthorization consumes GitHub OAuth state before token exchange", 
   const config = createOAuthConfig();
   const store = new InMemoryGithubConnectionStore();
   const service = new GithubConnectionService(config, store);
-  const state = new URL(
-    await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })
-  ).searchParams.get("state")!;
+  const { url, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1",
+    userId: "user-1"
+  });
+  const state = new URL(url).searchParams.get("state")!;
+  const browserNonce = browserBinding.value;
   let exchangeCalls = 0;
   const fake = createFakeFetch(() => {
     exchangeCalls += 1;
@@ -235,14 +243,45 @@ test("completeAuthorization consumes GitHub OAuth state before token exchange", 
   });
 
   try {
-    const first = await service.completeAuthorization({ code: "code-1", state });
-    const replay = await service.completeAuthorization({ code: "code-2", state });
+    const first = await service.completeAuthorization({ code: "code-1", state, browserNonce });
+    const replay = await service.completeAuthorization({ code: "code-2", state, browserNonce });
 
     expect(first).toMatch(/githubAuth=error/);
     expect(first).toMatch(/reason=github_authorization_failed/);
     expect(first).not.toMatch(/invalid_grant/);
     expect(replay).toMatch(/reason=invalid_state/);
     expect(exchangeCalls).toBe(1);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("completeAuthorization rejects a state from another browser without storing a connection", async () => {
+  const config = createOAuthConfig();
+  const store = new InMemoryGithubConnectionStore();
+  const service = new GithubConnectionService(config, store);
+  // The attacker starts the flow; the victim's browser has no cookie or its own.
+  const attacker = await service.getAuthorizationUrl({ tenantId: "tenant-a", userId: "attacker" });
+  const victim = await service.getAuthorizationUrl({ tenantId: "tenant-v", userId: "victim" });
+  const state = new URL(attacker.url).searchParams.get("state")!;
+  let exchangeCalls = 0;
+  const fake = createFakeFetch(() => {
+    exchangeCalls += 1;
+    throw new Error("token exchange must not run");
+  });
+
+  try {
+    const noCookie = await service.completeAuthorization({ code: "code", state, browserNonce: null });
+    const mismatched = await service.completeAuthorization({
+      code: "code",
+      state,
+      browserNonce: victim.browserBinding.value
+    });
+
+    expect(noCookie).toMatch(/reason=invalid_state/);
+    expect(mismatched).toMatch(/reason=invalid_state/);
+    expect(exchangeCalls).toBe(0);
+    expect(store.record).toBe(null);
   } finally {
     fake.restore();
   }

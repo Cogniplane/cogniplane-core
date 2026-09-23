@@ -31,11 +31,16 @@ export const ProjectsResponseSchema = z.object({ projects: z.array(ProjectSchema
 export const ProjectDetailSchema = z.object({
   project: ProjectSchema,
   sessions: z.array(SessionSchema),
+  sessionCursors: z.object({
+    active: z.string().nullable(),
+    archived: z.string().nullable()
+  }).optional(),
   files: z.array(ArtifactSchema),
   canManage: z.boolean(),
   canEdit: z.boolean().optional(),
   trash: z.object({
     sessions: z.array(SessionSchema),
+    nextCursor: z.string().nullable().optional(),
     retentionDays: z.number().int().nonnegative().optional()
   }).optional(),
   activity: z.array(z.object({

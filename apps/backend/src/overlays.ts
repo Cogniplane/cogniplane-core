@@ -19,6 +19,7 @@ import type { ArtifactStorage } from "./services/artifacts/artifact-storage.js";
 import type { ArtifactStore } from "./services/artifacts/artifact-store.js";
 import type { AuditEventStore } from "./services/audit-event-store.js";
 import type { IntegrationStateStore } from "./services/integrations/integration-state-store.js";
+import type { IntegrationOAuthStateStore } from "./services/integrations/integration-oauth-state-store.js";
 import type { RuntimeInvalidator } from "./services/integrations/contracts.js";
 import type { SessionStore } from "./services/session-store.js";
 import type { ManagedToolCatalog } from "./services/managed-tools/catalog.js";
@@ -37,6 +38,7 @@ export type AttachOverlaysInput = {
   };
   piiScanEnqueuer: PiiArtifactScanEnqueuer;
   integrationDescriptors: IntegrationRegistry;
+  oauthStates: IntegrationOAuthStateStore;
   runtimeInvalidator: RuntimeInvalidator;
   managedToolCatalog: ManagedToolCatalog;
   managedToolFactoryRegistry: ManagedToolFactoryRegistry;

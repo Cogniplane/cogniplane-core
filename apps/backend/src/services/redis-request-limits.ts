@@ -57,20 +57,53 @@ const DECR_IF_EXISTS = `
   return 0
 `;
 
+export class RequestLimitsUnavailableError extends Error {
+  readonly statusCode = 503;
+
+  constructor(cause: unknown) {
+    super("Request limits are temporarily unavailable.", { cause });
+    this.name = "RequestLimitsUnavailableError";
+  }
+}
+
 export class RedisRequestLimits implements RequestLimitsInterface {
+  private lastWarningAt = Number.NEGATIVE_INFINITY;
+
   constructor(
     private readonly redis: Redis,
     private readonly config: {
       rateLimit: RateLimitConfig;
       quota: QuotaConfig;
-    }
+    },
+    private readonly logger?: { warn(meta: object, message: string): void }
   ) {}
 
-  static fromAppConfig(redis: Redis, config: RequestLimitsConfigKeys): RedisRequestLimits {
-    return new RedisRequestLimits(redis, buildLimitsConfig(config));
+  static fromAppConfig(redis: Redis, config: RequestLimitsConfigKeys, logger?: { warn(meta: object, message: string): void }): RedisRequestLimits {
+    return new RedisRequestLimits(redis, buildLimitsConfig(config), logger);
+  }
+
+  private unavailable(error: unknown): RequestLimitsUnavailableError {
+    const now = Date.now();
+    if (now - this.lastWarningAt >= 60_000) {
+      this.lastWarningAt = now;
+      this.logger?.warn({ err: error }, "Request limit store unavailable; requests fail closed");
+    }
+    return new RequestLimitsUnavailableError(error);
   }
 
   async consumeRateLimit(input: {
+    resource: LimitResource;
+    userId: string;
+    tenantId: string;
+  }): Promise<LimitExceededErrorPayload | null> {
+    try {
+      return await this.consumeRateLimitFromRedis(input);
+    } catch (error) {
+      throw this.unavailable(error);
+    }
+  }
+
+  private async consumeRateLimitFromRedis(input: {
     resource: LimitResource;
     userId: string;
     tenantId: string;
@@ -135,6 +168,17 @@ export class RedisRequestLimits implements RequestLimitsInterface {
   }
 
   async consumeTurnQuota(input: {
+    userId: string;
+    tenantId: string;
+  }): Promise<LimitExceededErrorPayload | null> {
+    try {
+      return await this.consumeTurnQuotaFromRedis(input);
+    } catch (error) {
+      throw this.unavailable(error);
+    }
+  }
+
+  private async consumeTurnQuotaFromRedis(input: {
     userId: string;
     tenantId: string;
   }): Promise<LimitExceededErrorPayload | null> {

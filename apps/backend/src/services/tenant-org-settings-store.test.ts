@@ -24,8 +24,13 @@ type Row = {
 // the store's lazy upsert and applies it against a single row keyed by tenant.
 class FakeOrgSettingsDb {
   readonly rows = new Map<string, Row>();
+  readonly statements: string[] = [];
 
   async query(text: string, values: unknown[] = []) {
+    this.statements.push(text.trim().split(/\s+/).slice(0, 3).join(" "));
+    if (text.includes("INSERT INTO audit_events")) {
+      return { rows: [], rowCount: 1 };
+    }
     if (
       text === "BEGIN" ||
       text === "COMMIT" ||
@@ -130,6 +135,25 @@ test("setApiKey encrypts before persisting and round-trips on read", async () =>
 
   const record = await store.get("tenant-1");
   expect(record.providerKeys.anthropic).toBe(true);
+});
+
+test("a setter writes its audit event inside the settings transaction", async () => {
+  const { db, store } = makeStore();
+  await store.setPiiProtection("tenant-1", DEFAULT_PII_PROTECTION, {
+    tenantId: "tenant-1",
+    sessionId: null,
+    userId: "admin-1",
+    type: "tenant.pii_protection.updated",
+    payload: { piiProtection: DEFAULT_PII_PROTECTION }
+  });
+
+  const writes = db.statements.filter((statement) => !statement.startsWith("SELECT set_config"));
+  expect(writes).toEqual([
+    "BEGIN",
+    "INSERT INTO tenant_org_settings",
+    "INSERT INTO audit_events",
+    "COMMIT"
+  ]);
 });
 
 test("setApiKey persists per-provider keys independently and surfaces the presence map", async () => {

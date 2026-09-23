@@ -38,13 +38,14 @@ export function buildStores(
   schedulerDb: Pool,
   privilegedDb: Pool,
   logger: FastifyBaseLogger,
-  // Only the two timers the active-turn stale window derives from. Kept as a
-  // structural subset rather than the whole AppConfig so the store builder
-  // stays trivially constructible in tests.
+  // Keep this as a structural subset rather than the whole AppConfig. The
+  // timers govern store cleanup and the encryption secret protects MCP
+  // upstream credentials at rest.
   timers?: {
     E2B_SANDBOX_TIMEOUT_MS: number;
     TOOL_CONTEXT_TTL_MS: number;
     SESSION_TRASH_RETENTION_DAYS?: number;
+    DATA_ENCRYPTION_SECRET: string;
   }
 ) {
   const sessions = new SessionStore(db, schedulerDb, {
@@ -60,7 +61,10 @@ export function buildStores(
   const runtimeSessions = new RuntimeSessionStore(db);
   const skills = new SkillConfigStore(db);
   const skillRevisions = new SkillRevisionStore(db, skills);
-  const mcpServers = new McpServerStore(db);
+  if (!timers?.DATA_ENCRYPTION_SECRET) {
+    throw new Error("DATA_ENCRYPTION_SECRET is required to construct McpServerStore.");
+  }
+  const mcpServers = new McpServerStore(db, timers.DATA_ENCRYPTION_SECRET);
   const tenantSettings = new TenantSettingsStore(db);
   const customModels = new CustomModelStore(db);
   const userSettings = new UserSettingsStore(db, schedulerDb);

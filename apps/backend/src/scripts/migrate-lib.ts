@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -33,6 +34,12 @@ export function assertUniqueVersionPrefixes(files: string[]): void {
 /**
  * Applies pending migrations from `migrationsDir` in sorted filename order.
  *
+ * Each applied file is recorded with the sha256 of its contents. An applied
+ * file whose contents changed fails the run: the edit would reach new installs
+ * and the integration test database, but never a database that already applied
+ * the file. Fix a schema with a new migration. A row recorded before checksums
+ * existed gets the current checksum on its first run.
+ *
  * All statements run on ONE client held for the whole loop. Issuing
  * BEGIN/SQL/COMMIT through pool.query would let each statement check out a
  * different connection, so a migration could run in autocommit outside its
@@ -43,36 +50,52 @@ export function assertUniqueVersionPrefixes(files: string[]): void {
 export async function applyMigrations(
   db: Pool,
   migrationsDir: string,
-  log: (message: string) => void = console.log
+  log: (message: string) => void = console.log,
+  afterMigrations?: (client: PoolClient) => Promise<void>
 ): Promise<string[]> {
   const client = await db.connect();
   try {
+    // Bound both the deployment lock and DDL lock waits on this held connection.
+    await client.query("SET lock_timeout = '10s'");
+    await client.query("SELECT pg_advisory_lock(1129270862, 1)");
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version TEXT PRIMARY KEY,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await client.query("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT");
 
     const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
     assertUniqueVersionPrefixes(files);
     const applied: string[] = [];
 
     for (const file of files) {
-      const alreadyApplied = await client.query(
-        "SELECT version FROM schema_migrations WHERE version = $1 LIMIT 1",
+      const sql = await readFile(path.join(migrationsDir, file), "utf8");
+      const checksum = createHash("sha256").update(sql).digest("hex");
+      const alreadyApplied = await client.query<{ checksum: string | null }>(
+        "SELECT checksum FROM schema_migrations WHERE version = $1 LIMIT 1",
         [file]
       );
 
       if (alreadyApplied.rowCount) {
+        const recorded = alreadyApplied.rows[0]!.checksum;
+        if (recorded === null) {
+          await client.query("UPDATE schema_migrations SET checksum = $2 WHERE version = $1", [file, checksum]);
+        } else if (recorded !== checksum) {
+          throw new Error(
+            `Migration ${file} changed after this database applied it ` +
+              `(recorded sha256 ${recorded}, file sha256 ${checksum}). ` +
+              "Restore the applied file and put the change in a new migration."
+          );
+        }
         continue;
       }
 
-      const sql = await readFile(path.join(migrationsDir, file), "utf8");
       await client.query("BEGIN");
       try {
         await client.query(sql);
-        await client.query("INSERT INTO schema_migrations (version) VALUES ($1)", [file]);
+        await client.query("INSERT INTO schema_migrations (version, checksum) VALUES ($1, $2)", [file, checksum]);
         await client.query("COMMIT");
         log(`Applied migration ${file}`);
         applied.push(file);
@@ -82,9 +105,14 @@ export async function applyMigrations(
       }
     }
 
+    // Production also performs checkpointer DDL and role setup. Keep those
+    // under the same deployment lock as the numbered SQL migrations.
+    await afterMigrations?.(client);
     return applied;
   } finally {
-    client.release();
+    // Destroy the dedicated connection to release the session advisory lock
+    // even if a failed rollback left the connection in an aborted transaction.
+    client.release(true);
   }
 }
 

@@ -5,6 +5,7 @@ import type {
   PolicyEnforcementMode,
   WebSearchMode,
 } from "@cogniplane/shared-types";
+import type { McpUpstreamAuth } from "../lib/mcp-upstream-client.js";
 
 export type {
   GranularApprovalPolicy,
@@ -92,6 +93,9 @@ export type AdminMcpServerRecord = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string | null;
+  upstreamAuthType: "none" | "bearer" | "header" | "query";
+  upstreamAuthName: string | null;
+  upstreamAuthConfigured: boolean;
   version: number;
   configHash: string;
   enabled: boolean;
@@ -99,6 +103,10 @@ export type AdminMcpServerRecord = {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type RuntimeMcpServerRecord = AdminMcpServerRecord & {
+  upstreamAuth: McpUpstreamAuth | null;
 };
 
 export type TenantMemberRecord = {
@@ -224,6 +232,7 @@ export type McpServerRegistration = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string | null;
+  upstreamAuth?: McpUpstreamAuth | null;
   transportKind: "http";
   version: number;
   hash: string;
@@ -277,6 +286,7 @@ export type RuntimeConfigBundle = {
       version: number;
       hash: string;
     }>;
+    integrationToolIds?: string[];
   };
 };
 

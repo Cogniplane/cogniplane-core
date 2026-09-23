@@ -12,12 +12,27 @@ import type { ArtifactRecord } from "./artifact-store.js";
 
 const execFile = promisify(execFileCallback);
 
-async function readStreamAsBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
+async function readStreamAsBuffer(
+  stream: NodeJS.ReadableStream,
+  signal?: AbortSignal
+): Promise<Buffer> {
+  const abortStream = () => {
+    if ("destroy" in stream && typeof stream.destroy === "function") {
+      stream.destroy();
+    }
+  };
+  signal?.addEventListener("abort", abortStream, { once: true });
   const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  try {
+    for await (const chunk of stream) {
+      signal?.throwIfAborted();
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+  } finally {
+    signal?.removeEventListener("abort", abortStream);
   }
 
+  signal?.throwIfAborted();
   return Buffer.concat(chunks);
 }
 
@@ -31,7 +46,10 @@ export class ArtifactProcessor {
     }
   ) {}
 
-  async extractArtifactText(artifact: Pick<ArtifactRecord, "mimeType" | "status" | "storageKey">): Promise<string | null> {
+  async extractArtifactText(
+    artifact: Pick<ArtifactRecord, "mimeType" | "status" | "storageKey">,
+    signal?: AbortSignal
+  ): Promise<string | null> {
     if (
       artifact.mimeType !== "application/pdf" ||
       artifact.status === "deleted" ||
@@ -40,12 +58,19 @@ export class ArtifactProcessor {
       return null;
     }
 
-    const handle = await this.deps.storage.openReadStream(artifact.storageKey);
-    const pdfBuffer = await readStreamAsBuffer(handle.stream);
-    return this.extractPdfText(pdfBuffer);
+    const handle = await this.deps.storage.openReadStream(artifact.storageKey, { signal });
+    const pdfBuffer = await readStreamAsBuffer(handle.stream, signal);
+    signal?.throwIfAborted();
+    try {
+      return await this.extractPdfText(pdfBuffer, signal);
+    } catch (err) {
+      signal?.throwIfAborted();
+      this.deps.logger.warn({ err }, "PDF text extraction failed");
+      return null;
+    }
   }
 
-  private async extractPdfText(pdfBuffer: Buffer): Promise<string> {
+  private async extractPdfText(pdfBuffer: Buffer, signal?: AbortSignal): Promise<string> {
     if (this.deps.extractPdfText) {
       return this.deps.extractPdfText(pdfBuffer);
     }
@@ -61,7 +86,7 @@ export class ArtifactProcessor {
         "UTF-8",
         inputPath,
         "-"
-      ]);
+      ], { timeout: 30_000, maxBuffer: 16 * 1024 * 1024, signal });
 
       return stdout.trim();
     } finally {

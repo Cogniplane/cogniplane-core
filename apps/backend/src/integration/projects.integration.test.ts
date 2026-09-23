@@ -1,13 +1,9 @@
 import Fastify from "fastify";
 import { mkdtemp, rm } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import { applyMigrations } from "../scripts/migrate-lib.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { describe, expect, test, vi, onTestFinished } from "vitest";
-import { PiiScanJobHandler } from "../services/pii/pii-scan-job-handler.js";
-import type { PiiScanJobRecord } from "../services/pii/pii-scan-job-store.js";
 import { AuditEventStore } from "../services/audit-event-store.js";
 import * as projectAccess from "../services/project-access.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
@@ -43,11 +39,6 @@ async function setup() {
   const activeTurns = new ActiveTurnsRegistry();
   const abortSession = vi.fn(async () => undefined);
   const purgeSessionData = vi.fn(async () => undefined);
-  const enqueue = vi.fn(async () => ({
-    kind: "skipped" as string,
-    errorCode: "provider_unavailable",
-    errorMessage: "Scan unavailable"
-  }));
   await registerProjectRoutes(app, {
     projects,
     sessions,
@@ -56,7 +47,6 @@ async function setup() {
     activeTurns,
     runtimeAdapter: { id: "test", hasActiveTurn: () => false, abortSession, purgeSessionData },
     limits: { consumeRateLimit: async () => null },
-    piiScanEnqueuer: { enqueue },
     auditEvents: new AuditEventStore(appPool()),
     projectFiles
   } as unknown as ProjectRouteStores);
@@ -90,12 +80,6 @@ async function setup() {
     createdByType: "tool",
     ...stored
   });
-  const copy = (sessionId?: string) =>
-    app.inject({
-      method: "POST",
-      url: `/projects/${project.projectId}/files/copy`,
-      payload: { artifactId: source.artifactId, ...(sessionId ? { sessionId } : {}) }
-    });
   return {
     tenantId,
     userId,
@@ -107,8 +91,6 @@ async function setup() {
     project,
     first,
     source,
-    copy,
-    enqueue,
     purgeSessionData,
     abortSession,
     activeTurns,
@@ -147,7 +129,7 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
     expect(response.statusCode).toBe(404);
   });
 
-  test.skip("organizes sessions and persists independent references through source deletion", async () => {
+  test("organizes sessions and protects the project reference session", async () => {
     const h = await setup();
     const created = await h.app.inject({
       method: "POST",
@@ -157,46 +139,19 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
     expect(created.statusCode).toBe(201);
     const target = created.json().session;
     expect(target.projectId).toBe(h.project.projectId);
-    expect((await h.sessions.list(h.tenantId, h.userId)).map((s) => s.purpose)).toEqual([
+    expect((await h.sessions.listPage(h.tenantId, h.userId)).sessions.map((s) => s.purpose)).toEqual([
       "normal",
       "normal"
     ]);
-    const saved = await h.copy();
-    expect(saved.statusCode).toBe(201);
-    const reference = saved.json().artifact;
-    expect(reference.sessionId).toBe(h.project.referenceSessionId);
-    expect(reference.storageKey).not.toBe(h.source.storageKey);
-    expect(reference.checksumSha256).toBe(h.source.checksumSha256);
+    // The reference session backs project files and must not be removable or
+    // archivable through the ordinary session routes.
     expect(await h.sessions.remove(h.tenantId, h.project.referenceSessionId, h.userId)).toBe(false);
     expect(
       await h.sessions.setArchived(h.tenantId, h.project.referenceSessionId, h.userId, true)
     ).toBeNull();
-    await h.sessions.remove(h.tenantId, h.first.sessionId, h.userId);
-    await h.storage.delete(h.source.storageKey);
-    const detail = await h.app.inject(`/projects/${h.project.projectId}`);
-    expect(detail.json().files.map((f: { artifactId: string }) => f.artifactId)).toEqual([
-      reference.artifactId
-    ]);
-    const reused = await h.app.inject({
-      method: "POST",
-      url: `/projects/${h.project.projectId}/files/copy`,
-      payload: {
-        artifactId: reference.artifactId,
-        sessionId: target.sessionId
-      }
-    });
-    expect(reused.statusCode).toBe(201);
-    expect(reused.json().artifact.storageKey).not.toBe(reference.storageKey);
-    const handle = await h.storage.openReadStream(reused.json().artifact.storageKey);
-    const chunks = [];
-    for await (const chunk of handle.stream)
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-    expect(Buffer.concat(chunks).toString()).toBe("Original report");
-    expect(h.enqueue).toHaveBeenCalledTimes(2);
-    expect(await h.artifacts.listBySession(h.tenantId, target.sessionId, h.userId)).toHaveLength(1);
   });
 
-  test.skip("enforces tenant and owner isolation for projects, membership and file copies", async () => {
+  test("enforces tenant and owner isolation for projects and membership", async () => {
     const h = await setup();
     const foreignUser = await seedUser(),
       foreignTenant = await seedTenant();
@@ -212,7 +167,6 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
       expect(await h.artifacts.listByProject(tenantId, userId, h.project.projectId)).toEqual([]);
       h.setAuth({ tenantId, userId, role: "member", isAdmin: false });
       expect((await h.app.inject(`/projects/${h.project.projectId}`)).statusCode).toBe(404);
-      expect((await h.copy()).statusCode).toBe(404);
     }
     const rows = await withTenantScope(appPool(), foreignTenant, (db) =>
       db.query("SELECT * FROM projects WHERE project_id = $1", [h.project.projectId])
@@ -225,37 +179,73 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
         otherSession.sessionId
       ])
     ).rejects.toThrow(/sessions_project_tenant_fk/);
-    expect(h.enqueue).not.toHaveBeenCalled();
   });
 
-  test.skip("rejects unavailable sources and busy targets, and fails closed on a scan error", async () => {
+  test("activity respects project access and never returns event payloads", async () => {
     const h = await setup();
-    h.activeTurns.mark(h.project.referenceSessionId);
-    expect((await h.copy()).statusCode).toBe(409);
-    h.activeTurns.clear(h.project.referenceSessionId);
-    await h.artifacts.setPiiDetail(h.tenantId, h.source.artifactId, { status: "blocked" });
-    expect((await h.copy()).statusCode).toBe(409);
-    await h.artifacts.setPiiDetail(h.tenantId, h.source.artifactId, { status: "scanned" });
-    h.enqueue.mockResolvedValue({
-      kind: "failed",
-      errorCode: "provider_unavailable",
-      errorMessage: "Scan unavailable"
+    const audits = new AuditEventStore(appPool());
+    // A payload carrying exactly what D11c says the feed must not expose.
+    const secret = "test-only-upstream-token";
+    await audits.create({
+      tenantId: h.tenantId,
+      sessionId: null,
+      userId: h.userId,
+      type: "project_sharing_changed",
+      payload: {
+        projectId: h.project.projectId,
+        upstreamToken: secret,
+        sourceExcerpt: "restricted source content"
+      }
     });
-    expect((await h.copy()).statusCode).toBe(503);
-    expect(h.activeTurns.isBusy(h.project.referenceSessionId)).toBe(false);
-    const copies = await h.artifacts.listBySession(
-      h.tenantId,
-      h.project.referenceSessionId,
-      h.userId
-    );
-    expect(copies).toHaveLength(1);
-    expect(copies[0].status).toBe("pending");
-    expect(copies[0].checksumSha256).toBe(h.source.checksumSha256);
+
+    const detail = (await h.app.inject(`/projects/${h.project.projectId}`)).json();
+    expect(detail.activity).toHaveLength(1);
+    const [event] = detail.activity;
+    expect(event).toMatchObject({ type: "project_sharing_changed", userId: h.userId });
+    expect(Object.keys(event).sort()).toEqual(["createdAt", "eventId", "type", "userId"]);
+    const body = (await h.app.inject(`/projects/${h.project.projectId}`)).body;
+    expect(body).not.toContain(secret);
+    expect(body).not.toContain("restricted source content");
+
+    // Assert redaction at the STORE boundary as well. ProjectDetailSchema
+    // strips unknown keys, so a route-level assertion alone passes even if the
+    // query starts selecting payload. Any other caller of listProjectActivity
+    // would get the credential. This is the assertion that fails if the
+    // projection changes.
+    const events = await audits.listProjectActivity(h.tenantId, h.project.projectId);
+    expect(events).toHaveLength(1);
+    expect(Object.keys(events[0]!).sort()).toEqual(["createdAt", "eventId", "type", "userId"]);
+    expect(JSON.stringify(events)).not.toContain(secret);
+
+    // An event belonging to another project must not appear in this feed.
+    const other = await h.projects.create(h.tenantId, h.userId, "Other project");
+    await audits.create({
+      tenantId: h.tenantId,
+      sessionId: null,
+      userId: h.userId,
+      type: "project_archived",
+      payload: { projectId: other.projectId }
+    });
+    expect((await h.app.inject(`/projects/${h.project.projectId}`)).json().activity)
+      .toHaveLength(1);
+
+    // Current project access gates the feed: a member of the tenant who is not
+    // a member of the project cannot read it at all.
+    const outsider = await seedUser();
+    await seedMembership(h.tenantId, outsider, "member");
+    h.setAuth({ tenantId: h.tenantId, userId: outsider, role: "member", isAdmin: false });
+    expect((await h.app.inject(`/projects/${h.project.projectId}`)).statusCode).toBe(404);
+
+    // Another tenant cannot reach it either, even with the same project id.
+    const foreignTenant = await seedTenant();
+    const foreignUser = await seedUser();
+    await seedMembership(foreignTenant, foreignUser, "owner");
+    h.setAuth({ tenantId: foreignTenant, userId: foreignUser, role: "member", isAdmin: false });
+    expect((await h.app.inject(`/projects/${h.project.projectId}`)).statusCode).toBe(404);
   });
 
-  test.skip("rejects moves and detachment without changing conversation files or references", async () => {
+  test("rejects moves and detachment without changing session assignment", async () => {
     const h = await setup();
-    await h.copy();
     const second = await h.projects.create(h.tenantId, h.userId, "Second project");
     const original = await h.sessions.getOwned(h.tenantId, h.first.sessionId, h.userId);
     for (const [projectId, attach, error] of [
@@ -272,8 +262,6 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
         .toBe(false);
     }
     expect(await h.sessions.getOwned(h.tenantId, h.first.sessionId, h.userId)).toEqual(original);
-    expect((await h.app.inject(`/projects/${h.project.projectId}`)).json().files).toHaveLength(2);
-    expect((await h.app.inject(`/projects/${second.projectId}`)).json().files).toHaveLength(0);
   });
 
   test("requires audience confirmation for an unassigned session and allows identical retries", async () => {
@@ -331,126 +319,6 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
   });
 });
 
-describe.skip("project copy review regressions", () => {
-  test.each(["scanned", "transformed", "blocked", "failed"] as const)(
-    "queued copies stay pending until the worker verdict %s",
-    async (verdict) => {
-      const h = await setup();
-      h.enqueue.mockResolvedValue({ kind: "queued", errorCode: "", errorMessage: "" });
-      const response = await h.copy();
-      expect(response.statusCode).toBe(201);
-      const copy = response.json().artifact;
-      expect(copy.status).toBe("pending");
-      await h.artifacts.setPiiDetail(h.tenantId, copy.artifactId, { status: verdict });
-      expect((await h.artifacts.getOwned(h.tenantId, copy.artifactId, h.userId))?.status).toBe(
-        ["scanned", "transformed"].includes(verdict) ? "ready" : "failed"
-      );
-    }
-  );
-  test("real scan worker completes a queued copy after its project is archived", async () => {
-    const h = await setup();
-    h.enqueue.mockResolvedValue({ kind: "queued", errorCode: "", errorMessage: "" });
-    const copy = (await h.copy()).json().artifact;
-    expect((await h.app.inject({ method: "PUT", url: `/projects/${h.project.projectId}/archive`,
-      payload: { archived: true } })).statusCode).toBe(204);
-    const worker = new PiiScanJobHandler({
-      artifacts: h.artifacts,
-      storage: h.storage,
-      piiProtection: {
-        evaluateArtifact: async () => ({ action: "allow", reason: "disabled" }),
-        evaluateText: async () => ({ action: "allow", reason: "disabled" })
-      },
-      piiScanRuns: { update: async () => null },
-      piiScanJobs: { markCompleted: async () => {}, recordFailure: async () => null },
-      messages: { setPiiDetail: async () => {} },
-      subjectReader: {
-        readMessageText: async () => null,
-        readArtifact: async () => ({
-          artifactId: copy.artifactId,
-          contentType: "text/plain",
-          entityTypes: [],
-          readContent: async () => "Original report"
-        })
-      },
-      logger: { warn() {}, error() {} }
-    });
-    const now = new Date().toISOString();
-    const job: PiiScanJobRecord = {
-      tenantId: h.tenantId,
-      jobId: "job",
-      scanRunId: "scan",
-      subjectType: "artifact",
-      subjectId: copy.artifactId,
-      sourceSessionId: copy.sessionId,
-      sourceUserId: h.userId,
-      mode: "detect",
-      payload: { subjectKind: "upload" },
-      status: "claimed",
-      attempts: 1,
-      maxAttempts: 3,
-      runAfter: now,
-      claimedAt: now,
-      completedAt: null,
-      errorMessage: null,
-      createdAt: now,
-      updatedAt: now
-    };
-    await worker.execute(job);
-    const saved = await h.artifacts.getOwned(h.tenantId, copy.artifactId, h.userId);
-    expect(saved?.status).toBe("ready");
-    expect(saved?.detail.pii?.status).toBe("scanned");
-  });
-  test.each([
-    ["allowed", "", 201],
-    ["failed", "file_too_large", 422],
-    ["failed", "provider_unavailable", 503]
-  ] as const)("maps %s / %s to %s", async (kind, errorCode, status) => {
-    const h = await setup();
-    h.enqueue.mockResolvedValue({ kind, errorCode, errorMessage: "Scan result" });
-    const response = await h.copy();
-    expect(response.statusCode).toBe(status);
-    if (status === 201) expect(response.json().artifact.status).toBe("ready");
-    else expect(response.json()).toMatchObject({ error: errorCode });
-  });
-  test("rejects blank names and derived sources; v7 IDs work through HTTP", async () => {
-    const h = await setup();
-    expect(
-      (await h.app.inject({ method: "POST", url: "/projects", payload: { name: "   " } }))
-        .statusCode
-    ).toBe(400);
-    await superuserPool().query(
-      "UPDATE artifacts SET artifact_type = 'derived' WHERE artifact_id = $1",
-      [h.source.artifactId]
-    );
-    expect((await h.copy()).statusCode).toBe(409);
-    expect(h.enqueue).not.toHaveBeenCalled();
-    const renamed = await h.app.inject({
-      method: "PUT",
-      url: `/projects/${h.project.projectId}`,
-      payload: { name: "Renamed" }
-    });
-    expect(renamed.statusCode).toBe(200);
-    expect(renamed.json().name).toBe("Renamed");
-  });
-  test("rerunning the migration runner preserves rows and isolation", async () => {
-    const h = await setup();
-    const migrations = fileURLToPath(new URL("../../db/migrations/", import.meta.url));
-    expect(await applyMigrations(superuserPool(), migrations, () => {})).toEqual([]);
-    expect(await applyMigrations(superuserPool(), migrations, () => {})).toEqual([]);
-    expect((await h.projects.getOwned(h.tenantId, h.userId, h.project.projectId))?.name).toBe(
-      "Planning"
-    );
-    const otherTenant = await seedTenant();
-    expect(
-      (
-        await withTenantScope(appPool(), otherTenant, (db) =>
-          db.query("SELECT * FROM projects WHERE project_id = $1", [h.project.projectId])
-        )
-      ).rowCount
-    ).toBe(0);
-  });
-});
-
 test.skipIf(!adminDatabaseUrl())(
   "project ordering reflects session membership and conversation activity",
   async () => {
@@ -473,43 +341,6 @@ test.skipIf(!adminDatabaseUrl())(
     await h.projects.rename(h.tenantId, h.userId, other.projectId, "Other renamed");
     await h.sessions.rename(h.tenantId, h.first.sessionId, h.userId, "Active conversation");
     expect((await h.projects.list(h.tenantId, h.userId))[0].projectId).toBe(h.project.projectId);
-  }
-);
-
-test.skip(
-  "copies reject unsupported generated MIME types before scanning",
-  async () => {
-    const h = await setup();
-    await superuserPool().query(
-      "UPDATE artifacts SET mime_type = 'application/x-unsupported' WHERE artifact_id = $1",
-      [h.source.artifactId]
-    );
-    const response = await h.copy();
-    expect(response.statusCode).toBe(415);
-    expect(response.json()).toMatchObject({ error: "unsupported_media_type" });
-    expect(h.enqueue).not.toHaveBeenCalled();
-    expect(
-      await h.artifacts.listBySession(h.tenantId, h.project.referenceSessionId, h.userId)
-    ).toEqual([]);
-  }
-);
-
-test.skip(
-  "scan completion supports previously persisted copy metadata",
-  async () => {
-    const h = await setup();
-    // Literal JSON represents an existing database row, independent of the
-    // current writer's constant. Renaming the persisted key must not strand it.
-    await superuserPool().query(
-      `UPDATE artifacts SET status = 'pending',
-    detail_json = '{"projectId":"old-project","reusedFromArtifactId":"old-source"}'::jsonb
-    WHERE artifact_id = $1`,
-      [h.source.artifactId]
-    );
-    await h.artifacts.setPiiDetail(h.tenantId, h.source.artifactId, { status: "scanned" });
-    expect((await h.artifacts.getOwned(h.tenantId, h.source.artifactId, h.userId))?.status).toBe(
-      "ready"
-    );
   }
 );
 
@@ -769,59 +600,68 @@ describe.skipIf(!adminDatabaseUrl())("project approval settings", () => {
   });
 });
 
-describe.skip("shared legacy project mutations", () => {
-  test("editors create sessions, attach private sessions and copy/remove another member's source", async () => {
+
+describe.skipIf(!adminDatabaseUrl())("project session pagination", () => {
+  test("bounds detail lists and walks active, archived and Trash pages with independent cursors", async () => {
     const h = await setup();
-    const editorId = await seedUser();
-    await seedMembership(h.tenantId, editorId);
-    const members = new ProjectMemberStore(appPool());
-    await members.setMember({ tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, editorId, "editor");
-    h.setAuth({ tenantId: h.tenantId, userId: editorId, role: "member", isAdmin: false });
-    const url = `/projects/${h.project.projectId}/sessions`;
-    expect((await h.app.inject({ method: "POST", url, payload: { name: "Editor session" } })).statusCode).toBe(201);
-    const personal = await h.sessions.create(h.tenantId, editorId, "Personal");
-    expect((await h.app.inject({ method: "PUT", url, payload: { sessionId: personal.sessionId, confirmAudience: true } })).statusCode).toBe(204);
-    const copied = await h.copy();
-    expect(copied.statusCode).toBe(201);
-    expect(copied.json().artifact.userId).toBe(editorId);
-    h.setAuth({ tenantId: h.tenantId, userId: h.userId, role: "member", isAdmin: false });
-    expect((await h.app.inject({ method: "DELETE", url: `/projects/${h.project.projectId}/files/${copied.json().artifact.artifactId}` })).statusCode).toBe(204);
+    const url = `/projects/${h.project.projectId}`;
+    await superuserPool().query(`INSERT INTO sessions
+      (session_id, tenant_id, user_id, session_name, project_id, status, updated_at)
+      SELECT gen_random_uuid()::text, $1, $2, status || '-' || n, $3, status,
+        '2026-09-21T00:00:00.123000Z'::timestamptz + n * interval '1 microsecond'
+      FROM unnest(ARRAY['active','archived','deleted']) status CROSS JOIN generate_series(1, 52) n`,
+    [h.tenantId, h.userId, h.project.projectId]);
+    // Neither personal sessions nor another project's sessions belong in these pages.
+    await h.sessions.create(h.tenantId, h.userId, "Personal");
+    const other = await h.projects.create(h.tenantId, h.userId, "Other project");
+    await h.projects.createSession(h.tenantId, h.userId, other.projectId, "Other conversation");
+    const detail = await h.app.inject(url);
+    expect(detail.statusCode).toBe(200);
+    const body = detail.json();
+    expect(body.sessions).toHaveLength(100);
+    expect(body.trash.sessions).toHaveLength(50);
+    for (const status of ["active", "archived", "deleted"]) {
+      const first = status === "deleted" ? body.trash.sessions : body.sessions.filter((s: { status: string }) => s.status === status);
+      const cursor = status === "deleted" ? body.trash.nextCursor : body.sessionCursors[status];
+      expect(cursor).toEqual(expect.any(String));
+      const page = await h.app.inject(`${url}/sessions?status=${status}&cursor=${encodeURIComponent(cursor)}`);
+      expect(page.statusCode).toBe(200);
+      expect(page.headers["cache-control"]).toBe("private, no-store");
+      const rows = [...first, ...page.json().sessions];
+      expect(rows).toHaveLength(status === "active" ? 53 : 52);
+      expect(new Set(rows.map((s: { sessionId: string }) => s.sessionId)).size).toBe(rows.length);
+      expect(rows.every((s: { projectId: string; status: string; purpose: string }) =>
+        s.projectId === h.project.projectId && s.status === status && s.purpose === "normal")).toBe(true);
+      expect(page.json().nextCursor).toBeNull();
+    }
+    expect((await h.app.inject(`${url}/sessions?limit=1`)).json().sessions).toHaveLength(1);
   });
 
-  test.each(["demoted", "removed", "archived", "source_deleted", "source_blocked"] as const)(
-    "rejects %s during copy and cleans up new bytes", async change => {
+  test.each(["limit=0", "limit=101", "limit=1.5", "cursor=garbage", "status=unknown", "status=active&utm_source=x"])(
+    "rejects invalid or unsupported project session query: %s", async (query) => {
       const h = await setup();
-      const actor = { tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId };
-      const members = new ProjectMemberStore(appPool());
-      const put = h.storage.put.bind(h.storage);
-      let copiedKey = "";
-      vi.spyOn(h.storage, "put").mockImplementationOnce(async input => {
-        const stored = await put(input);
-        copiedKey = stored.storageKey;
-        if (change === "archived") await h.projects.setArchived(h.tenantId, h.userId, h.project.projectId, true);
-        else if (change === "source_deleted") await h.artifacts.update(h.tenantId, h.source.artifactId, { status: "deleted" });
-        else if (change === "source_blocked") await h.artifacts.setPiiDetail(h.tenantId, h.source.artifactId, { status: "blocked" });
-        else await members.setMember(actor, h.userId, change === "removed" ? null : "viewer");
-        return stored;
-      });
-      const response = await h.copy();
-      expect(response.statusCode).toBe(change === "removed" ? 404 : change === "demoted" ? 403 : 409);
-      expect(h.enqueue).not.toHaveBeenCalled();
-      expect(copiedKey).not.toBe("");
-      await expect(h.storage.openReadStream(copiedKey)).rejects.toThrow();
-      const rows = await superuserPool().query("SELECT artifact_id FROM artifacts WHERE tenant_id=$1 AND source_artifact_id=$2", [h.tenantId, h.source.artifactId]);
-      expect(rows.rowCount).toBe(0);
-    },
+      expect((await h.app.inject(`/projects/${h.project.projectId}/sessions?${query}`)).statusCode).toBe(400);
+    }
   );
 
-  test.each(["viewer", "removed", "archived"] as const)("reference creator cannot remove after %s", async change => {
+  test("rechecks project membership and Trash editor access on every page", async () => {
     const h = await setup();
-    const ref = (await h.copy()).json().artifact;
-    if (change === "archived") await h.projects.setArchived(h.tenantId, h.userId, h.project.projectId, true);
-    else await new ProjectMemberStore(appPool()).setMember({ tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, h.userId, change === "removed" ? null : "viewer");
-    const response = await h.app.inject({ method: "DELETE", url: `/projects/${h.project.projectId}/files/${ref.artifactId}` });
-    expect(response.statusCode).toBe(change === "removed" ? 404 : change === "viewer" ? 403 : 409);
-    const row = await superuserPool().query("SELECT status FROM artifacts WHERE artifact_id=$1", [ref.artifactId]);
-    expect(row.rows[0].status).toBe("ready");
+    const reader = await seedUser();
+    await seedMembership(h.tenantId, reader);
+    const members = new ProjectMemberStore(appPool());
+    const actor = { tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId };
+    await members.setMember(actor, reader, "viewer");
+    const url = `/projects/${h.project.projectId}/sessions`;
+    h.setAuth({ tenantId: h.tenantId, userId: reader, role: "member", isAdmin: false });
+    expect((await h.app.inject(url)).json().sessions).toHaveLength(1);
+    expect((await h.app.inject(`${url}?status=deleted`)).statusCode).toBe(403);
+    await members.setMember(actor, reader, "editor");
+    expect((await h.app.inject(`${url}?status=deleted`)).statusCode).toBe(200);
+    const cursor = Buffer.from(JSON.stringify({ updatedAt: h.first.updatedAt, sessionId: h.first.sessionId })).toString("base64url");
+    await members.setMember(actor, reader, null);
+    expect((await h.app.inject(`${url}?cursor=${cursor}`)).statusCode).toBe(404);
+    const foreignTenant = await seedTenant();
+    h.setAuth({ tenantId: foreignTenant, userId: h.userId, role: "member", isAdmin: false });
+    expect((await h.app.inject(url)).statusCode).toBe(404);
   });
 });

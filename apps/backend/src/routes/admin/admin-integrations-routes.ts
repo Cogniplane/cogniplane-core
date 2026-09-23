@@ -87,7 +87,11 @@ async function invalidateAndAudit(
   // tenant runtime is the correct blast radius (the runtime rebuilds with the
   // new tool catalog on the next turn). `integrationId` is retained only for
   // the audit payload below.
-  const ids = await stores.runtimeAdapter.invalidateTenantRuntimes(tenantId);
+  const ids = await stores.runtimeAdapter.invalidateTenantRuntimes(tenantId, {
+    workspaceResetReason:
+      "An administrator changed integration access for this organization. " +
+      "The execution workspace was reset so the new access rules take effect. Recreate any files you still need."
+  });
   for (const id of ids) collected.add(id);
   if (collected.size > 0) {
     await createAdminAuditEvent(stores.auditEvents, {

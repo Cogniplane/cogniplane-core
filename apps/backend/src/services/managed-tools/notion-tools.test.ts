@@ -61,6 +61,47 @@ function stubFetch(handler: (input: RequestInfo | URL, init?: RequestInit) => Pr
   return () => fake.restore();
 }
 
+test("notion_create_page reports content beyond the 100-block cap", async () => {
+  const restore = stubFetch(async (_input, init) => {
+    expect(JSON.parse(String(init?.body)).children).toHaveLength(100);
+    return Response.json({ id: PAGE_ID, url: "https://notion.so/page" });
+  });
+  try {
+    const result = await findTool("notion_create_page").handler({
+      context: TOOL_CONTEXT,
+      arguments: { parentPageId: PARENT_PAGE_ID, title: "Report", content: Array.from({ length: 250 }, (_, i) => `- Line ${i}`).join("\n") }
+    });
+    expect(result).toMatchObject({ blockCount: 100, truncated: true });
+  } finally { restore(); }
+});
+
+test("notion_fetch_page shares its request budget across nested blocks", async () => {
+  let requests = 0;
+  const restore = stubFetch(async (input) => {
+    if (String(input).includes("/pages/")) return Response.json({ id: PAGE_ID, properties: {} });
+    requests += 1;
+    return Response.json({ results: Array.from({ length: 100 }, () => ({
+      id: BLOCK_ID, type: "paragraph", has_children: true,
+      paragraph: { rich_text: [{ plain_text: "text" }] }
+    })), has_more: false });
+  });
+  try {
+    const result = await findTool("notion_fetch_page").handler({ context: TOOL_CONTEXT, arguments: { pageId: PAGE_ID } });
+    expect(requests).toBeLessThanOrEqual(20);
+    expect(result).toMatchObject({ truncated: true });
+  } finally { restore(); }
+});
+
+test("notion tools return a tool error on HTTP timeout", async () => {
+  const restore = stubFetch(async (_input, init) => {
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    throw new DOMException("Timed out", "TimeoutError");
+  });
+  try {
+    expect(await findTool("notion_search").handler({ context: TOOL_CONTEXT, arguments: { query: "x" } })).toEqual({ error: "Notion request timed out." });
+  } finally { restore(); }
+});
+
 test("NOTION_TOOL_CATALOG declares 6 tools with consistent readOnly flags", () => {
   expect(NOTION_TOOL_CATALOG.length).toBe(6);
   const readOnly = new Map(NOTION_TOOL_CATALOG.map((t) => [t.name, t.readOnly]));

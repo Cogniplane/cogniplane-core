@@ -276,13 +276,13 @@ test("POST /messages in detect mode persists raw user message with report metada
   expect(pii.findingsCount).toBe(1);
 });
 
-test("POST /messages returns HTTP 503 pii_provider_unavailable when provider fails, and persists nothing", async () => {
+test.each(["pii_provider_unavailable", "pii_kek_missing"])("POST /messages returns HTTP 503 %s and persists nothing", async (errorCode) => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
       piiProtection: {
         async evaluateText() {
           throw new PiiProtectionServiceError(
-            "pii_provider_unavailable",
+            errorCode,
             "provider timed out"
           );
         }
@@ -307,7 +307,7 @@ test("POST /messages returns HTTP 503 pii_provider_unavailable when provider fai
 
   expect(response.statusCode).toBe(503);
   const body = response.json() as Record<string, unknown>;
-  expect(body.error).toBe("pii_provider_unavailable");
+  expect(body.error).toBe(errorCode);
 
   expect(runtimeManager.runMessageInputs.length).toBe(0);
   const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");

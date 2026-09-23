@@ -77,4 +77,30 @@ describe("calculateCostUsd", () => {
     const expected = (300_000 / 1_000_000) * 5.0 + (100_000 / 1_000_000) * 22.5;
     expect(cost).toBeCloseTo(expected, 6);
   });
+
+  it("prices new models with cached input and long-context rates", () => {
+    const shortUsage = usage({ inputTokens: 200_000, cachedInputTokens: 50_000, outputTokens: 50_000 });
+    expect(calculateCostUsd("gpt-6-sol", shortUsage)).toBeCloseTo(
+      0.15 * 2 + 0.05 * 0.2 + 0.05 * 10, 6
+    );
+    expect(calculateCostUsd("gpt-6-luna", shortUsage)).toBeCloseTo(
+      0.15 * 0.1 + 0.05 * 0.01 + 0.05 * 0.5, 6
+    );
+    expect(calculateCostUsd("claude-opus-5-5", shortUsage)).toBeCloseTo(
+      0.15 * 4 + 0.05 * 0.2 + 0.05 * 20, 6
+    );
+
+    const longUsage = usage({ inputTokens: 300_000, outputTokens: 50_000 });
+    expect(calculateCostUsd("gpt-6-sol", longUsage)).toBeCloseTo(
+      0.3 * 4 + 0.05 * 15, 6
+    );
+    expect(calculateCostUsd("gpt-6-luna", longUsage)).toBeCloseTo(
+      0.3 * 0.2 + 0.05 * 0.75, 6
+    );
+
+    const shortInputWithLargeOutput = usage({ inputTokens: 250_000, outputTokens: 100_000 });
+    expect(calculateCostUsd("gpt-6-sol", shortInputWithLargeOutput)).toBeCloseTo(
+      0.25 * 2 + 0.1 * 10, 6
+    );
+  });
 });

@@ -32,7 +32,7 @@ const booleanFromEnvSchema = z.preprocess((value) => {
   return value;
 }, z.boolean());
 
-const envSchema = z.object({
+export const envSchema = z.object({
   // No flat default: the effective default depends on AUTH_MODE and is resolved
   // in loadConfig (dev-headers → IPv4 loopback; workos → dual-stack all-interfaces).
   // A flat loopback default would silently break networked deployments — an ALB
@@ -187,6 +187,8 @@ const envSchema = z.object({
   SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(50),
   MESSAGE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   MESSAGE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  MAX_RUNNING_TURNS_PER_USER: z.coerce.number().int().positive().default(5),
+  MAX_RUNNING_TURNS_PER_TENANT: z.coerce.number().int().positive().default(50),
   // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
   ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
@@ -245,13 +247,17 @@ const envSchema = z.object({
   // and full cross-tenant impersonation is the assumed network boundary.
   DEV_HEADERS_AUTH_KEY: z.string().trim().min(16).optional(),
   DATA_ENCRYPTION_SECRET: z.string().min(32).default(DEFAULT_DATA_ENCRYPTION_SECRET),
-  // Overrides the HKDF-derived signing key for the `X-Framework-Signature`
-  // header sent to proxy MCP upstreams (lib/derived-secrets.ts). This is the
-  // one key a third party legitimately holds — a verifying upstream must have
-  // the same value — so it needs to be rotatable independently of the root
-  // secret that protects stored credentials. Unset falls back to the derived
-  // value, which is safe to share because the root cannot be recovered from it.
-  MCP_UPSTREAM_SIGNING_SECRET: z.string().trim().min(32).optional(),
+  // Overrides the HKDF-derived root of the per-server keys that sign the
+  // `X-Framework-Signature` header sent to proxy MCP upstreams
+  // (lib/derived-secrets.ts). Each upstream gets only a per-server key derived
+  // from this value (lib/mcp-proxy-signature.ts `proxyServerSigningKey`), never
+  // this value. Setting it lets an operator rotate every per-server key without
+  // touching the root secret that protects stored credentials. Unset falls back
+  // to the derived value. It must be a value no upstream ever held.
+  MCP_UPSTREAM_SIGNING_ROOT_SECRET: z.string().trim().min(32).optional(),
+  // v1 name of the override above. v1 upstreams held this value, and every
+  // v2 per-server key could be derived from it, so boot refuses it.
+  MCP_UPSTREAM_SIGNING_SECRET: z.string().optional(),
   // Per-hop wall-clock budget for a proxy MCP upstream call. An upstream with
   // no timeout can hold a turn open until the turn watchdog fires; 30s is well
   // inside a tool call's useful latency and well under RUNTIME_TURN_TIMEOUT_MS.
@@ -444,6 +450,11 @@ export function loadConfig(
     // Local dev can rely on schema defaults when no .env file exists yet.
   }
   const parsed = envSchema.parse(source);
+  if (parsed.MCP_UPSTREAM_SIGNING_SECRET?.trim())
+    throw new Error(
+      "MCP_UPSTREAM_SIGNING_SECRET is the v1 upstream signing key, which upstreams held. " +
+        "Remove it. To override the v2 root, set MCP_UPSTREAM_SIGNING_ROOT_SECRET to a new value that no upstream held."
+    );
   if (parsed.SESSION_EXECUTION_HEARTBEAT_MS * 2 >= parsed.SESSION_EXECUTION_LEASE_MS)
     throw new Error("SESSION_EXECUTION_LEASE_MS must exceed twice SESSION_EXECUTION_HEARTBEAT_MS.");
 
@@ -506,17 +517,15 @@ export function loadConfig(
     // wall-clock and does not pause, so comparing it to the watchdog alone
     // accepts configurations that expire the context mid-turn.
     //
-    // KNOWN RESIDUAL LIMIT — this covers ONE approval, not N. The approval
+    // This covers ONE approval, not N, and that is now sufficient. The approval
     // round loop in DeepAgentsAGUIAgent is unbounded, so a turn's wall-clock
-    // length is really `working budget + N x APPROVAL_REQUEST_TTL_MS`. No
-    // finite value here can bound that, so a turn that stalls on many
-    // consecutive approvals can still outlive its tool context. The watchdog
-    // fix caps WORKING time exactly; only human deciding time is unbounded.
-    // The real fix is to refresh the context TTL at each approval round (or
-    // adopt the TurnBudget object) rather than trying to out-size it — filed
-    // as a follow-up bead. This check remains the right floor: it rules out
-    // the configurations that break on a SINGLE approval, which is the common
-    // case and was previously accepted.
+    // length is really `working budget + N x APPROVAL_REQUEST_TTL_MS`, which no
+    // finite value here could ever bound. Rather than out-size it, the resume
+    // path extends the context on every approval round
+    // (ToolExecutionContextStore.extend), making the TTL an idle timeout
+    // between rounds. This check is the floor that idle timeout needs: each
+    // individual round must fit inside the TTL, which is exactly what the sum
+    // below guarantees.
     const maxTurnWallClockMs = parsed.RUNTIME_TURN_TIMEOUT_MS + parsed.APPROVAL_REQUEST_TTL_MS;
     if (parsed.TOOL_CONTEXT_TTL_MS <= maxTurnWallClockMs) {
       throw new Error(

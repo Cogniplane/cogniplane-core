@@ -22,6 +22,7 @@ import { registerSessionCapabilityRoutes } from "./routes/session-capabilities.j
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
+import type { SessionExecutionStore } from "./services/session-execution-store.js";
 import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
 import {
@@ -37,6 +38,18 @@ export async function registerAppRoutes(
   app: FastifyInstance,
   deps: AppDependencies
 ): Promise<void> {
+  if (deps.turnBus) {
+    await deps.turnBus.subscribeStop(signal => {
+      if (signal.ownerId !== deps.executions.ownerId) return;
+      void deps.executions.isStopped(signal).then(stopped => {
+        if (!stopped || !deps.activeTurns.requestCancelExecution(signal.sessionId, signal.tenantId, signal.executionId)) return;
+        return deps.runtimeAdapter.interruptTurn(signal);
+      }).catch(err => {
+        app.log.warn({ err, sessionId: signal.sessionId }, "Failed to process remote Stop");
+      });
+    });
+    app.addHook("onClose", () => deps.turnBus!.close());
+  }
   await registerHealthRoutes(app, buildHealthRouteStores(deps));
   const { hasProviderKey, configuredProviders } = buildApiKeyPresenceCheckers({
     credentials: deps.providerCredentials
@@ -101,6 +114,10 @@ export function registerAppLifecycle(input: {
   limits: AppDependencies["limits"];
   policyService: AppDependencies["policyService"];
   runtimeAdapter: AppDependencies["runtimeAdapter"];
+  activeTurns?: AppDependencies["activeTurns"];
+  messages?: Pick<AppDependencies["messages"], "markInterruptedIfActive">;
+  /** Shorter drain wait for lifecycle tests. */
+  turnDrainWaitMs?: number;
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /**
@@ -115,6 +132,7 @@ export function registerAppLifecycle(input: {
    * can omit it; production always wires it.
    */
   staleMessageSweeper?: StaleMessageSweeperDeps | null;
+  expiredExecutions?: Pick<SessionExecutionStore, "sweepExpired">;
 }) {
   const {
     app,
@@ -122,16 +140,26 @@ export function registerAppLifecycle(input: {
     limits,
     policyService,
     runtimeAdapter,
+    activeTurns,
+    messages,
+    turnDrainWaitMs = 5_000,
     privilegedDb,
     schedulerWorker,
     staleApprovalSweeper,
-    staleMessageSweeper
+    staleMessageSweeper,
+    expiredExecutions
   } = input;
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
 
   const sweepInterval = setInterval(() => limits.sweepExpired(), 60_000);
   sweepInterval.unref();
+  const sweepExecutions = () => {
+    void expiredExecutions?.sweepExpired().catch(err => app.log.error({ err }, "Expired execution sweep failed"));
+  };
+  sweepExecutions();
+  const executionSweepInterval = setInterval(sweepExecutions, config.SESSION_EXECUTION_HEARTBEAT_MS);
+  executionSweepInterval.unref();
 
   // Recover approvals orphaned by a prior crash/restart immediately at boot,
   // then keep sweeping for ones whose in-process TTL timer dies mid-run. The
@@ -166,12 +194,39 @@ export function registerAppLifecycle(input: {
     messageSweepInterval.unref();
   }
 
-  app.addHook("onClose", async () => {
+  app.addHook("preClose", async () => {
+    activeTurns?.beginDrain();
     schedulerWorker?.stop();
     clearInterval(sweepInterval);
+    clearInterval(executionSweepInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
     if (messageSweepInterval) clearInterval(messageSweepInterval);
+    const waitForTurns = async (budgetMs: number) => {
+      const deadline = Date.now() + budgetMs;
+      while (activeTurns?.snapshot().size && Date.now() < deadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+    };
+    await waitForTurns(turnDrainWaitMs);
+    const running = activeTurns?.runningOwners() ?? [];
+    if (running.length) {
+      for (const owner of running) activeTurns?.requestCancel(owner.sessionId, owner.tenantId);
+      await Promise.all(running.map((owner) => runtimeAdapter.interruptTurn(owner).catch((err) => {
+        app.log.warn({ err, sessionId: owner.sessionId }, "Failed to interrupt turn during shutdown");
+      })));
+      await waitForTurns(turnDrainWaitMs);
+    }
+    for (const owner of activeTurns?.runningOwners() ?? []) {
+      const turn = activeTurns?.identity(owner.sessionId);
+      if (!turn) continue;
+      await messages?.markInterruptedIfActive(owner.tenantId, turn.messageId, owner.userId).catch((err) => {
+        app.log.error({ err, sessionId: owner.sessionId }, "Failed to mark draining turn interrupted");
+      });
+    }
     await runtimeAdapter.close();
+  });
+
+  app.addHook("onClose", async () => {
     await policyService.close();
     await closeRedis();
     await app.db.end();

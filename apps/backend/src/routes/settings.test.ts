@@ -1,5 +1,6 @@
 import { test, expect } from "vitest";
 
+import cookie from "@fastify/cookie";
 import Fastify from "fastify";
 
 import { registerSettingsRoutes, type SettingsRouteStores } from "./settings.js";
@@ -40,7 +41,20 @@ class InMemoryGithubConnectionService {
 
   async getAuthorizationUrl() {
     this.authorizeRequested = true;
-    return "https://github.com/login/oauth/authorize?client_id=test-client";
+    return {
+      url: "https://github.com/login/oauth/authorize?client_id=test-client",
+      browserBinding: {
+        name: "cogniplane_oauth_bind_github",
+        value: "github-nonce",
+        options: {
+          httpOnly: true as const,
+          secure: true,
+          sameSite: "none" as const,
+          path: "/auth/github/user/callback",
+          maxAge: 600
+        }
+      }
+    };
   }
 
   async disconnect() {
@@ -67,7 +81,20 @@ class InMemoryNotionConnectionService {
 
   async getAuthorizationUrl() {
     this.authorizeRequested = true;
-    return "https://api.notion.com/v1/oauth/authorize?client_id=test-client";
+    return {
+      url: "https://api.notion.com/v1/oauth/authorize?client_id=test-client",
+      browserBinding: {
+        name: "cogniplane_oauth_bind_notion",
+        value: "notion-nonce",
+        options: {
+          httpOnly: true as const,
+          secure: true,
+          sameSite: "none" as const,
+          path: "/integrations/notion/callback",
+          maxAge: 600
+        }
+      }
+    };
   }
 
   async disconnect() {
@@ -227,6 +254,7 @@ async function createApp(overrides: {
   limits?: SettingsRouteStores["limits"];
 } = {}) {
   const app = Fastify();
+  await app.register(cookie);
   const settings = new InMemoryUserSettingsStore();
   const auditEvents = new InMemoryAuditEventStore();
   const githubConnections = new InMemoryGithubConnectionService();
@@ -682,6 +710,15 @@ test("github connection routes expose status, authorization URL, and disconnect 
   expect(authorizeResponse.statusCode).toBe(200);
   expect(authorizeResponse.json().url as string).toMatch(/client_id=test-client/);
   expect(githubConnections.authorizeRequested).toBe(true);
+  const bindingCookie = authorizeResponse.cookies.find((c) => c.name === "cogniplane_oauth_bind_github");
+  expect(bindingCookie).toMatchObject({
+    value: "github-nonce",
+    httpOnly: true,
+    secure: true,
+    sameSite: "None",
+    path: "/auth/github/user/callback",
+    maxAge: 600
+  });
 
   const disconnectResponse = await app.inject({
     method: "DELETE",

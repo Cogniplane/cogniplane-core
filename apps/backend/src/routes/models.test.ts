@@ -93,6 +93,37 @@ test("/models lists a provider's models when only that provider is configured", 
   }
 });
 
+test("/models exposes the new provider models with valid effort choices", async () => {
+  const app = await makeModelsApp(makeStores({
+    configuredProviders: configured("anthropic", "openai")
+  }));
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.statusCode).toBe(200);
+    const models = response.json().models as Array<{
+      id: string;
+      supportedEfforts: string[];
+      defaultEffort: string;
+      contextWindow: number;
+    }>;
+    const opus = models.find((model) => model.id === "deepagents/claude-opus-5-5");
+    expect(opus).toMatchObject({
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultEffort: "medium",
+      contextWindow: 1_000_000
+    });
+    for (const id of ["openai/gpt-6-sol", "openai/gpt-6-luna"]) {
+      expect(models.find((model) => model.id === id)).toMatchObject({
+        supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+        defaultEffort: "medium",
+        contextWindow: 1_050_000
+      });
+    }
+  } finally {
+    await app.close();
+  }
+});
+
 test("/models returns an empty list when no provider key is available", async () => {
   const app = await makeModelsApp(
     makeStores({

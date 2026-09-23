@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 import { initOpenNextCloudflareForDev } from "@opennextjs/cloudflare";
 
 initOpenNextCloudflareForDev();
@@ -23,6 +24,8 @@ if (
 }
 
 const nextConfig: NextConfig = {
+  output: "standalone",
+  outputFileTracingRoot: path.join(__dirname, "../.."),
   reactStrictMode: true,
   async redirects() {
     return [

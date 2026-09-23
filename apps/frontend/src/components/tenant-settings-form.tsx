@@ -5,6 +5,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { AdminManagedTool } from "../lib/admin-api";
 import type { AdminMcpServer } from "@cogniplane/shared-types";
 import type { PolicyEnforcementMode, TenantSettings } from "@cogniplane/shared-types";
+import { DEVELOPER_INSTRUCTIONS_MAX_LENGTH } from "@cogniplane/shared-types";
 import type { TenantSettingsInput } from "../hooks/use-tenant-settings";
 import {
   buildDraft,
@@ -125,6 +126,7 @@ export function TenantSettingsForm({
   isOwner
 }: Props) {
   const [draft, setDraft] = useState<FormDraft>(() => buildDraft(settings));
+  const [draftVersion, setDraftVersion] = useState(settings.version);
   const [isDirty, setIsDirty] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
 
@@ -141,6 +143,7 @@ export function TenantSettingsForm({
     if (isDirty) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setDraft(buildDraft(settings));
+    setDraftVersion(settings.version);
   }, [settings, isDirty]);
 
   const sortedTools = useMemo(
@@ -171,6 +174,7 @@ export function TenantSettingsForm({
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const ok = await onSave({
+      expectedVersion: draftVersion,
       showEffortSelector: draft.showEffortSelector,
       webSearchMode: draft.webSearchMode,
       approvalPolicy: toApprovalPolicy(draft.approvalPolicyKind, draft.granularFlags),
@@ -578,6 +582,8 @@ function DeveloperInstructionsSection(props: { draft: FormDraft; updateDraft: Up
         <Label htmlFor="developer-instructions">Custom system prompt</Label>
         <Textarea
           id="developer-instructions"
+          maxLength={DEVELOPER_INSTRUCTIONS_MAX_LENGTH}
+          aria-describedby="developer-instructions-count"
           value={draft.developerInstructions}
           onChange={(event) =>
             updateDraft((current) => ({
@@ -588,6 +594,9 @@ function DeveloperInstructionsSection(props: { draft: FormDraft; updateDraft: Up
           placeholder="Optional system-level guidance injected at thread start. Use this to set tone, constraints, or context for all agent sessions."
           rows={6}
         />
+        <span id="developer-instructions-count" className="text-xs text-on-surface-variant">
+          {draft.developerInstructions.length}/{DEVELOPER_INSTRUCTIONS_MAX_LENGTH} characters
+        </span>
       </div>
     </div>
   );

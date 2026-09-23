@@ -3,7 +3,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import type { AppConfig } from "../config.js";
 import { verifyAccessToken, isTokenExpiredError } from "./jwt.js";
 import { tryAuthenticateRuntimeToken } from "./auth-runtime-token.js";
-import { isPublicAuthPath } from "./auth-public-paths.js";
+import { isPublicAuthPath, isPublicDownloadRequest } from "./auth-public-paths.js";
 import { listIntegrationOAuthCallbackPaths } from "../services/integrations/integration-registry.js";
 import { sanitizeUrl } from "./sanitize-url.js";
 import type { TenantMemberStore } from "../services/tenant-member-store.js";
@@ -29,11 +29,12 @@ export function workosAuth(
   return async function authenticate(request: FastifyRequest, reply: FastifyReply) {
     // Compare the path only — request.url includes any query string, so an
     // exact match would send a probe like /health?probe=1 through full auth.
-    if (request.url.split("?", 1)[0] === "/health") {
+    const pathname = request.url.split("?", 1)[0];
+    if (pathname === "/health" || pathname === "/ready") {
       return;
     }
 
-    if (isPublicAuthPath(request.url, publicAuthPaths)) {
+    if (isPublicAuthPath(request.url, publicAuthPaths) || isPublicDownloadRequest(request.method, request.url)) {
       return;
     }
 

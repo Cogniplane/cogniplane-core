@@ -2,7 +2,7 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
-import { projectContextExecutionSql } from "../session-execution-store.js";
+import { interactiveContextExecutionSql } from "../session-execution-store.js";
 
 /**
  * Thrown when a `require`/`requireOwned` lookup finds no live tool context
@@ -125,7 +125,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND session_id = $2 AND expires_at > NOW()
-            AND ${projectContextExecutionSql("tool_execution_contexts")}
+            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
           ORDER BY created_at DESC
           LIMIT 1
         `,
@@ -136,6 +136,36 @@ export class ToolExecutionContextStore {
     });
   }
 
+  /**
+   * Push a live context's expiry out to `now + ttlMs`, turning the wall-clock
+   * TTL into an idle timeout. The approval round loop is unbounded, so a turn's
+   * real length is `working budget + N x APPROVAL_REQUEST_TTL_MS`.
+   * No finite TTL validated at config time can bound that, and a turn that
+   * outlives its context loses all managed MCP tool access mid-turn.
+   *
+   * The resume path calls this after each approval decision, which is the same
+   * shape as the E2B sandbox idle-timeout fix. Only extends: a context already
+   * expired stays expired (the WHERE clause requires a live row), so this
+   * cannot resurrect a context the gateway has already rejected. Returns the
+   * new expiry, or null when there was no live row to extend.
+   */
+  async extend(tenantId: string, toolContextId: string, ttlMs: number): Promise<string | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          UPDATE tool_execution_contexts
+          SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
+          WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
+            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+          RETURNING expires_at
+        `,
+        [tenantId, toolContextId, ttlMs]
+      );
+
+      return result.rows[0] ? isoTimestamp(result.rows[0].expires_at) : null;
+    });
+  }
+
   async get(tenantId: string, toolContextId: string): Promise<ToolExecutionContext | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -143,7 +173,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
-            AND ${projectContextExecutionSql("tool_execution_contexts")}
+            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
           LIMIT 1
         `,
         [tenantId, toolContextId]

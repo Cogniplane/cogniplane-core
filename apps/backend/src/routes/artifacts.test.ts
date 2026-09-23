@@ -71,35 +71,21 @@ function buildApp(opts: {
       async create() { throw new Error("not used"); },
       async listBySession() { return []; },
       async createDownloadToken() { throw new Error("not used"); },
-      // Mirrors the SQL gating: unknown token, already-consumed, cross-tenant,
-      // and wrong-user all match no rows. Does NOT consume and does NOT filter
-      // on expiry (the route turns expiry into a 410).
-      async peekDownloadToken(input: {
-        token: string;
-        requesterTenantId: string;
-        requesterUserId: string;
-        callerIsAdmin: boolean;
-      }) {
+      // Mirrors the SQL gating: unknown and already-consumed tokens match no
+      // rows. Does NOT consume and does NOT filter on expiry (the route turns
+      // expiry into a 410).
+      async peekDownloadToken(input: { token: string }) {
         const row = rows.get(input.token);
         if (!row) return null;
         if (row.consumedAt !== null) return null;
-        if (row.tenantId !== input.requesterTenantId) return null;
-        if (!input.callerIsAdmin && row.userId !== input.requesterUserId) return null;
         return toRecord(row);
       },
       // Same gating as peek plus the single-use flip and `expires_at > NOW()`
       // predicate — an expired token is never consumed.
-      async consumeDownloadToken(input: {
-        token: string;
-        requesterTenantId: string;
-        requesterUserId: string;
-        callerIsAdmin: boolean;
-      }) {
+      async consumeDownloadToken(input: { token: string }) {
         const row = rows.get(input.token);
         if (!row) return null;
         if (row.consumedAt !== null) return null;
-        if (row.tenantId !== input.requesterTenantId) return null;
-        if (!input.callerIsAdmin && row.userId !== input.requesterUserId) return null;
         if (new Date(row.expiresAt).getTime() <= Date.now()) return null;
         row.consumedAt = new Date().toISOString();
         return toRecord(row);
@@ -148,49 +134,13 @@ test("GET /downloads/:token streams once, then returns 404 on replay (single-use
   await app.close();
 });
 
-test("GET /downloads/:token returns 404 when caller's tenant does not match the token's tenant — and does NOT consume the token", async () => {
-  const { app, stores, rows } = buildApp({
-    initialRows: [makeRow({ tenantId: "tenant-A" })],
-    auth: { userId: "attacker", tenantId: "tenant-B", role: "member" }
-  });
-  await registerArtifactRoutes(app, stores as never);
-  await app.ready();
-
-  const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
-  expect(response.statusCode).toBe(404);
-  expect(response.json().error).toBe("download_not_found");
-  // Token must remain unconsumed so the legitimate owner can still use it.
-  expect(rows.get("tok-1")?.consumedAt).toBeNull();
-
-  await app.close();
-});
-
-test("GET /downloads/:token returns 404 for a same-tenant different-user caller — and does NOT consume the token", async () => {
-  // Same tenant, but the caller is a non-admin peer who does not own the token.
-  // SQL identity gating must hide it (404) without burning the single-use flag,
-  // so the rightful owner can still download.
-  const { app, stores, rows } = buildApp({
-    initialRows: [makeRow({ tenantId: "tenant-A", userId: "user-1" })],
-    auth: { userId: "user-2", tenantId: "tenant-A", role: "member" }
-  });
-  await registerArtifactRoutes(app, stores as never);
-  await app.ready();
-
-  const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
-  expect(response.statusCode).toBe(404);
-  expect(response.json().error).toBe("download_not_found");
-  expect(rows.get("tok-1")?.consumedAt).toBeNull();
-
-  await app.close();
-});
-
-test("GET /downloads/:token attributes an admin peer download to the actor and records the token user", async () => {
-  // Admin-minted tokens carry the artifact OWNER's user_id, not the admin's.
-  // role=admin sets callerIsAdmin=true, which skips the user-equality check so
-  // the admin can resolve and consume the token.
+test("GET /downloads/:token takes identity from the token, not from request.auth", async () => {
+  // The route is public: browser navigations and <img> tags cannot send the
+  // Bearer header. Whatever the auth hook set, the audit event names the token
+  // user, and the SQL gate checks that user's current session access.
   const { app, stores, rows, audit } = buildApp({
     initialRows: [makeRow({ tenantId: "tenant-A", userId: "user-1" })],
-    auth: { userId: "admin-user", tenantId: "tenant-A", role: "admin" }
+    auth: { userId: "someone-else", tenantId: "tenant-B", role: "member" }
   });
   await registerArtifactRoutes(app, stores as never);
   await app.ready();
@@ -198,15 +148,10 @@ test("GET /downloads/:token attributes an admin peer download to the actor and r
   const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
   expect(response.statusCode).toBe(200);
   expect(response.body).toBe("PAYLOAD");
-  // The bypass path still consumes the token exactly once.
   expect(rows.get("tok-1")?.consumedAt).not.toBeNull();
   const event = audit.events.find((entry) => entry.type === "artifact_downloaded");
-  expect(event?.userId).toBe("admin-user");
-  expect(event?.payload).toMatchObject({
-    artifactId: "artifact-1",
-    actorUserId: "admin-user",
-    tokenUserId: "user-1"
-  });
+  expect(event?.userId).toBe("user-1");
+  expect(event?.payload).toEqual({ artifactId: "artifact-1", fileName: expect.any(String) });
 
   await app.close();
 });

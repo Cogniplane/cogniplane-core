@@ -1,5 +1,5 @@
 import { rpcFailure as failure, type McpRpcResponse as RpcResponse } from "../../lib/mcp-upstream-client.js";
-import { getErrorMessage } from "../../lib/http-errors.js";
+import { ToolContextUnavailableError } from "../auth/tool-execution-context-store.js";
 import type { RuntimeTokenClaims } from "../auth/runtime-token.js";
 import type {
   ToolExecutionContext,
@@ -29,7 +29,7 @@ export async function resolveBoundToolContext(input: {
       context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
     }
   } catch (error) {
-    return { error: failure(rpc.id, -32000, getErrorMessage(error, "Tool context lookup failed.")) };
+    return { error: failure(rpc.id, -32000, error instanceof ToolContextUnavailableError ? error.message : "Tool context lookup failed.") };
   }
 
   if (!context) {

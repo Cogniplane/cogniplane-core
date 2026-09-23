@@ -64,7 +64,8 @@ it.each(["archive", "restore"])("rejects inaccessible or deleted sessions for %s
 it("holds the turn reservation through the archive write and releases it on conflict or failure", async () => {
   const h = await setup();
   h.setArchived.mockImplementationOnce(async () => {
-    expect(h.activeTurns.snapshot().has(sessionId)).toBe(true);
+    expect(h.activeTurns.isBusy(sessionId)).toBe(true);
+    expect(h.activeTurns.snapshot().has(sessionId)).toBe(false);
     return null;
   });
   expect((await h.app.inject({ method: "POST", url: `/sessions/${sessionId}/archive` })).statusCode).toBe(409);

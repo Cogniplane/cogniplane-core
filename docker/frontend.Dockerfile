@@ -1,4 +1,4 @@
-FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9
+FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS builder
 
 # NEXT_PUBLIC_* values are baked into the client bundle by `next build`, so
 # they MUST be set as ENV before the build step. Compose passes them as
@@ -38,6 +38,20 @@ RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build
 
+FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS runner
+
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+
+# Next's traced output contains only the server and its runtime dependencies.
+# Static assets and public files are served by the standalone server too.
+COPY --from=builder /app/apps/frontend/.next/standalone ./
+COPY --from=builder /app/apps/frontend/.next/static ./apps/frontend/.next/static
+COPY --from=builder /app/apps/frontend/public ./apps/frontend/public
+
 # The official Node image already provides an unprivileged uid 1000 user.
 # Build artifacts are world-readable, so no recursive ownership pass is needed.
 USER node
@@ -48,4 +62,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "apps/frontend/node_modules/next/dist/bin/next", "start", "apps/frontend", "--hostname", "0.0.0.0", "--port", "3000"]
+CMD ["node", "apps/frontend/server.js"]

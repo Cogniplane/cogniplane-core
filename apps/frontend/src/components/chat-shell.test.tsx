@@ -5,13 +5,21 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { lazy, useEffect, type ComponentType, type ReactNode } from "react";
 import type { Approval, ProjectLibrary, Session } from "@cogniplane/shared-types";
 
+// @ag-ui/client always passes the error and the run input to onRunFailed. A
+// status on the error means the backend refused the request.
+const runFailure = {
+  error: Object.assign(new Error("HTTP 500"), { status: 500 }) as Error,
+  messages: [],
+  input: { messages: [] }
+};
+const runStart = { input: { forwardedProps: {} } };
 const agents = vi.hoisted(() => ({
   instances: [] as Array<{
     options: Record<string, unknown>;
     abortRun: ReturnType<typeof vi.fn>;
     addMessage: ReturnType<typeof vi.fn>;
     runAgent: ReturnType<typeof vi.fn>;
-    subscriber?: { onRunInitialized?: () => void; onRunFailed?: () => void }
+    subscriber?: { onRunInitialized?: (params: typeof runStart) => void; onRunFailed?: (params: typeof runFailure) => void }
   }>
 }));
 const shellState = vi.hoisted(() => ({
@@ -19,6 +27,7 @@ const shellState = vi.hoisted(() => ({
   busyId: null as string | null,
   hasModels: true,
   error: null as string | null,
+  modelError: null as Error | null,
   role: "admin",
   projectId: null as string | null,
   projectFiles: null as ProjectLibrary | null,
@@ -27,6 +36,8 @@ const shellState = vi.hoisted(() => ({
   serverActivity: {} as Partial<Session>
 }));
 const eventSeeds = vi.hoisted(() => ({ values: [] as unknown[][] }));
+const sessionListActions = vi.hoisted(() => ({ reload: vi.fn(async () => undefined) }));
+const queryActions = vi.hoisted(() => ({ invalidate: vi.fn(), projectRefetch: vi.fn(), refresh: vi.fn(async () => {}) }));
 const hostLifecycle = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }));
 const navigationState = vi.hoisted(() => ({ resolveDraftId: null as string | null }));
 const projectApi = vi.hoisted(() => ({
@@ -44,21 +55,21 @@ vi.mock("next/navigation", () => ({
   })
 }));
 vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+  useQueryClient: () => ({ invalidateQueries: queryActions.invalidate }),
   useQuery: ({ queryKey, queryFn }: { queryKey?: unknown[]; queryFn?: () => unknown }) => {
     if (queryKey?.[2] === "library" || queryKey?.[1] === "chat-project-library-disabled") {
       return {
         data: shellState.projectFiles ?? undefined,
         isSuccess: shellState.projectFiles !== null,
         error: null,
-        refetch: vi.fn()
+        refetch: queryActions.projectRefetch
       };
     }
     if (queryKey?.[0] === "projects" && queryKey?.[1] === "list") {
       void queryFn?.();
       return { data: [], error: null, refetch: vi.fn() };
     }
-    return { data: { models: shellState.hasModels ? [{ id: "model-1", displayName: "Model 1", description: "", isDefault: true, provider: "openai", supportedEfforts: [], defaultEffort: null, contextWindow: 1000 }] : [], showEffortSelector: false }, error: null };
+    return { data: { models: shellState.hasModels ? [{ id: "model-1", displayName: "Model 1", description: "", isDefault: true, provider: "openai", supportedEfforts: [], defaultEffort: null, contextWindow: 1000 }] : [], showEffortSelector: false }, error: shellState.modelError };
   }
 }));
 vi.mock("../lib/auth-context", () => ({ useAuth: () => ({ isLoading: false, user: { role: shellState.role } }) }));
@@ -88,7 +99,7 @@ vi.mock("../hooks/use-session-list", () => ({
       renameDraft: "",
       pinnedSessionIds: new Set<string>(),
       pendingDeleteSessionId: null,
-      reload: vi.fn(), setError: vi.fn(), selectSession: vi.fn(), createSession: vi.fn(), startRename: vi.fn(),
+      reload: sessionListActions.reload, setError: vi.fn(), selectSession: vi.fn(), createSession: vi.fn(), startRename: vi.fn(),
       cancelRename: vi.fn(), confirmRename: vi.fn(), setRenameDraft: vi.fn(), deleteSession: vi.fn(),
       archiveSession: vi.fn(), togglePinSession: vi.fn(), confirmDelete: vi.fn(), cancelDelete: vi.fn(), renameSessionDirect: vi.fn()
     };
@@ -101,7 +112,7 @@ vi.mock("../hooks/use-chat-workspace", () => ({
     initialApprovals: shellState.initialApprovals,
     hasMoreMessages: false,
     isSessionDataReady: true,
-    refreshSessionData: vi.fn(),
+    refreshSessionData: queryActions.refresh,
     artifactState: {
       visibleSelectedArtifactIds: [], isUploadingArtifact: false, downloadArtifactId: null,
       previewArtifactId: null, isLoadingPreview: false, toggleArtifactSelection: vi.fn(),
@@ -109,10 +120,12 @@ vi.mock("../hooks/use-chat-workspace", () => ({
     }
   })
 }));
-vi.mock("./agui-transcript", () => ({
+vi.mock("./agui-transcript", async (importOriginal) => ({
   toAguiInitialMessages: (messages: unknown[]) => [{ id: (messages[0] as { marker: string }).marker }],
   planStateFromMessages: (messages: unknown[]) => ({ marker: (messages[0] as { marker: string }).marker }),
-  toolStatusesFromMessages: (messages: unknown[]) => [{ rowId: (messages[0] as { marker: string }).marker }]
+  toolStatusesFromMessages: (messages: unknown[]) => [{ rowId: (messages[0] as { marker: string }).marker }],
+  runtimeNoticesFromMessages: (await importOriginal<typeof import("./agui-transcript")>()).runtimeNoticesFromMessages,
+  withoutInProgressReply: (await importOriginal<typeof import("./agui-transcript")>()).withoutInProgressReply
 }));
 vi.mock("./session-sidebar", () => ({ SessionSidebar: () => null }));
 vi.mock("./artifact-panel", () => ({ ArtifactPanel: () => null }));
@@ -148,20 +161,36 @@ vi.mock("../lib/agui/use-agui-custom-events", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/agui/use-agui-custom-events")>();
   return {
     useAguiCustomEvents: (...args: Parameters<typeof original.useAguiCustomEvents>) => {
-      eventSeeds.values.push(args[2] ?? []);
+      eventSeeds.values.push(args[1]?.initialToolStatuses ?? []);
       return original.useAguiCustomEvents(...args);
     }
   };
 });
-vi.mock("../lib/session-api", () => ({ resolveApproval: vi.fn(async () => undefined) }));
+vi.mock("../lib/session-api", () => ({
+  resolveApproval: vi.fn(async () => undefined),
+  interruptSession: vi.fn(async () => undefined),
+  listApprovals: vi.fn(async () => []),
+  // The host polls this while a turn runs without its stream.
+  listSessions: vi.fn(async () => ({
+    sessions: [{ sessionId: shellState.selectedId, isRunning: shellState.serverActivity.isRunning === true }],
+    trashRetentionDays: 30
+  }))
+}));
+vi.mock("../lib/message-api", () => ({ listMessages: vi.fn(async () => ({ messages: shellState.messages, hasMore: false })) }));
 vi.mock("../lib/project-api", () => projectApi);
 vi.mock("../lib/agui/deep-agents-browser-agent", () => ({
+  isSessionBusyError: () => false,
+  isReconnectRun: () => false,
   DeepAgentsBrowserAgent: class {
     options: Record<string, unknown>;
+    isRunning = false;
     abortRun = vi.fn();
     addMessage = vi.fn();
     runAgent = vi.fn(async () => undefined);
-    subscriber?: { onRunInitialized?: () => void; onRunFailed?: () => void };
+    connectAgent = vi.fn(async () => undefined);
+    setMessages = vi.fn();
+    setState = vi.fn();
+    subscriber?: { onRunInitialized?: (params: typeof runStart) => void; onRunFailed?: (params: typeof runFailure) => void };
     subscribe(subscriber: NonNullable<typeof this.subscriber>) { this.subscriber = subscriber; return { unsubscribe() {} }; }
     constructor(options: Record<string, unknown>) { this.options = options; agents.instances.push(this); }
   }
@@ -186,6 +215,7 @@ afterEach(() => {
   shellState.projectId = null;
   shellState.projectFiles = null;
   shellState.error = null;
+  shellState.modelError = null;
   shellState.role = "admin";
   shellState.messages = [{ marker: "history-1" }];
   shellState.initialApprovals = [];
@@ -193,10 +223,39 @@ afterEach(() => {
   shellState.busyId = null;
   navigationState.resolveDraftId = null;
   projectApi.listProjects.mockClear();
+  queryActions.invalidate.mockClear();
+  queryActions.projectRefetch.mockClear();
+  queryActions.refresh.mockReset();
+  queryActions.refresh.mockResolvedValue(undefined);
+  sessionListActions.reload.mockReset();
+  sessionListActions.reload.mockResolvedValue(undefined);
   vi.restoreAllMocks();
 });
 
 describe("ChatShell session host boundary", () => {
+  it("clears the model query error after recovery without clearing mutation errors", async () => {
+    shellState.modelError = new Error("offline");
+    const view = render(<ChatShell />);
+    // The first render waits for the lazy chat host, which can take longer when
+    // this file shares workers with the full repository suite.
+    expect((await screen.findByRole("alert", {}, { timeout: 10_000 })).textContent).toContain("Could not load the model list: offline");
+    shellState.modelError = null;
+    view.rerender(<ChatShell />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    shellState.error = "Could not rename session";
+    view.rerender(<ChatShell />);
+    expect(screen.getByRole("alert").textContent).toBe("Could not rename session");
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+  });
+  it("settles a personal turn without refetching the disabled project query or leaking refresh rejection", async () => {
+    queryActions.refresh.mockRejectedValueOnce(new Error("messages unavailable"));
+    render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    await act(async () => agents.instances[0].subscriber?.onRunFailed?.(runFailure));
+    expect(queryActions.refresh).toHaveBeenCalledWith("session-1");
+    expect(queryActions.projectRefetch).not.toHaveBeenCalled();
+    expect(queryActions.invalidate).not.toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["projects", "chat-project-library-disabled"] }));
+  });
   it("loads active projects only for the main screen", async () => {
     render(<ChatShell />);
     await waitFor(() => expect(projectApi.listProjects).toHaveBeenCalled());
@@ -273,6 +332,9 @@ describe("ChatShell session host boundary", () => {
 
     await waitFor(() => expect(getProjectFileIds()).toEqual(["draft-1"]));
     await waitFor(() => expect(agent.runAgent).toHaveBeenCalledOnce());
+    expect(agent.addMessage).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining("selected draft ID is draft-1")
+    }));
 
     shellState.selectedId = "session-2";
     view.rerender(<ChatShell />);
@@ -341,6 +403,49 @@ describe("ChatShell persisted approvals", () => {
     expect(screen.getByTestId("approval-attention").textContent).toBe("clear");
   });
 
+  const pendingApproval: Approval = {
+    approvalId: "approval-1", sessionId: "session-1", itemId: "call-1",
+    kind: "mcp_tool", title: "Publish report", summary: "Publish the draft report",
+    status: "pending"
+  };
+  const status = () => screen.getByTestId("approval-attention").getAttribute("data-session-status");
+
+  it("clears the selected chat's saved approval dot when the remote poll shows the approval answered", async () => {
+    // The saved list still shows the approval. Another tab answered it.
+    shellState.serverActivity = { isRunning: true, hasPendingApprovals: true };
+    shellState.initialApprovals = [pendingApproval];
+    render(<ChatShell />);
+    await screen.findByRole("button", { name: "Approve once" });
+    expect(status()).toBe("approval");
+
+    await waitFor(() => expect(status()).toBe("running"));
+    expect(screen.queryByRole("button", { name: "Approve once" })).toBeNull();
+  });
+
+  it("keeps the dot clear after the remote turn ends, until the list reload lands", async () => {
+    shellState.serverActivity = { isRunning: true, hasPendingApprovals: true };
+    shellState.initialApprovals = [pendingApproval];
+    let finishReload = () => {};
+    sessionListActions.reload.mockImplementation(() => new Promise<undefined>((resolve) => {
+      finishReload = () => resolve(undefined);
+    }));
+    const { listSessions } = await import("../lib/session-api");
+    // The poll reports the end of the turn. The saved list is not reloaded yet.
+    vi.mocked(listSessions).mockResolvedValueOnce({ sessions: [{ sessionId: "session-1", isRunning: false }] as Session[], trashRetentionDays: 30 });
+    const view = render(<ChatShell />);
+    await screen.findByRole("button", { name: "Approve once" });
+
+    await waitFor(() => expect(sessionListActions.reload).toHaveBeenCalledOnce());
+    // The saved row still shows the turn and the approval. The settled poll is newer.
+    await waitFor(() => expect(status()).toBe("running"));
+    expect(screen.queryByRole("button", { name: "Approve once" })).toBeNull();
+
+    shellState.serverActivity = { isRunning: false, hasPendingApprovals: false };
+    await act(async () => finishReload());
+    view.rerender(<ChatShell />);
+    expect(status()).toBe("ready");
+  });
+
   it("clears the previous session's card and attention when switching sessions", async () => {
     shellState.initialApprovals = [{
       approvalId: "approval-1", sessionId: "session-1", itemId: "call-1",
@@ -391,15 +496,17 @@ it.each(["Rename rejected", "Could not load the model list", "Failed to load ses
 it("forgets a failed live turn after observing a newer server turn, including after it finishes", async () => {
   const view = render(<ChatShell />);
   await waitFor(() => expect(agents.instances).toHaveLength(1));
-  act(() => agents.instances[0].subscriber?.onRunInitialized?.());
-  act(() => agents.instances[0].subscriber?.onRunFailed?.());
+  act(() => agents.instances[0].subscriber?.onRunInitialized?.(runStart));
+  act(() => agents.instances[0].subscriber?.onRunFailed?.(runFailure));
   expect(screen.getByTestId("approval-attention").getAttribute("data-session-status")).toBe("failed");
   shellState.serverActivity = { isRunning: true, latestTurnId: "new-turn", latestTurnSequence: 42, activeTurnStartedAt: new Date(Date.now() - 60_000).toISOString() };
   view.rerender(<ChatShell />);
   expect(screen.getByTestId("approval-attention").getAttribute("data-session-status")).toBe("running");
   shellState.serverActivity = { isRunning: false };
   view.rerender(<ChatShell />);
-  expect(screen.getByTestId("approval-attention").getAttribute("data-session-status")).toBe("ready");
+  // The server turn ran without this tab's stream, so the host polls it and
+  // confirms the end before the status changes.
+  await waitFor(() => expect(screen.getByTestId("approval-attention").getAttribute("data-session-status")).toBe("ready"));
 });
 
 
@@ -456,4 +563,37 @@ it("passes refreshed final timing to the header and hides it while another turn 
   shellState.selectedId = "session-2";
   view.rerender(<ChatShell />);
   expect(screen.getByTestId("completed-duration").textContent).toBe("");
+});
+
+it("polls after a dropped stream and refreshes once when the server reports the turn done", async () => {
+  render(<ChatShell />);
+  await waitFor(() => expect(agents.instances).toHaveLength(1));
+  const listSessions = vi.mocked((await import("../lib/session-api")).listSessions);
+  listSessions.mockClear();
+
+  act(() => agents.instances[0].subscriber?.onRunInitialized?.(runStart));
+  act(() => agents.instances[0].subscriber?.onRunFailed?.({ ...runFailure, error: new TypeError("network error") }));
+
+  await waitFor(() => expect(queryActions.refresh).toHaveBeenCalledWith("session-1"));
+  expect(listSessions).toHaveBeenCalledOnce();
+  expect(queryActions.refresh).toHaveBeenCalledOnce();
+  expect(screen.getByTestId("approval-attention").getAttribute("data-session-status")).toBe("ready");
+});
+
+it("shows valid runtime notices saved on the assistant rows", async () => {
+  const notice = { level: "warning", message: "Details", createdAt: "2026-09-22T00:00:00.000Z" };
+  shellState.messages = [{
+    marker: "history-1",
+    role: "assistant",
+    detail: {
+      runtimeNotices: [
+        { ...notice, noticeId: "n-1", title: "Saved notice" },
+        { ...notice, noticeId: "n-2", title: "Bad level", level: "debug" }
+      ]
+    }
+  } as (typeof shellState.messages)[number]];
+  render(<ChatShell />);
+
+  expect(await screen.findByText("Saved notice", {}, { timeout: 10_000 })).toBeTruthy();
+  expect(screen.queryByText("Bad level")).toBeNull();
 });

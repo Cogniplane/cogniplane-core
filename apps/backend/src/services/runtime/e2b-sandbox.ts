@@ -53,6 +53,7 @@ export async function loadE2bSandboxClass(): Promise<{
       metadata?: Record<string, string>;
     }
   ) => Promise<E2bSandboxLike>;
+  connect: (sandboxId: string, options: { apiKey: string; timeoutMs: number }) => Promise<E2bSandboxLike>;
 }> {
   const mod = await import("e2b");
   return mod.Sandbox as {
@@ -65,5 +66,6 @@ export async function loadE2bSandboxClass(): Promise<{
         metadata?: Record<string, string>;
       }
     ) => Promise<E2bSandboxLike>;
+    connect: (sandboxId: string, options: { apiKey: string; timeoutMs: number }) => Promise<E2bSandboxLike>;
   };
 }

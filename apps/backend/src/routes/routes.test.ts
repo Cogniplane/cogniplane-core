@@ -493,7 +493,7 @@ test("uploads a user artifact, lists it on the session, and downloads it with a 
   expect(auditEvents.events.filter((event) => event.type === "artifact_downloaded").length).toBe(1);
 });
 
-test("download token cannot be used by a different user in the same tenant", async () => {
+test("a download token is the credential: it works without identity headers, once", async () => {
   const { app } = await createTestApp();
   onTestFinished(async () => {
         await app.close();
@@ -528,22 +528,14 @@ test("download token cannot be used by a different user in the same tenant", asy
   expect(tokenResponse.statusCode).toBe(200);
   const tokenUrl = tokenResponse.json().download.url as string;
 
-  // user-b in the same tenant must not be able to use user-a's token.
-  const stolenAttempt = await app.inject({
-    method: "GET",
-    url: tokenUrl,
-    headers: { "x-user-id": "user-b" }
-  });
-  expect(stolenAttempt.statusCode).toBe(404);
+  // Browser navigations and <img> tags send no identity, so the single-use
+  // token alone authorizes the download.
+  const download = await app.inject({ method: "GET", url: tokenUrl });
+  expect(download.statusCode).toBe(200);
+  expect(download.body).toBe("secret body");
 
-  // user-a (the original owner) can still download.
-  const legitimateDownload = await app.inject({
-    method: "GET",
-    url: tokenUrl,
-    headers: { "x-user-id": "user-a" }
-  });
-  expect(legitimateDownload.statusCode).toBe(200);
-  expect(legitimateDownload.body).toBe("secret body");
+  const replay = await app.inject({ method: "GET", url: tokenUrl, headers: { "x-user-id": "user-a" } });
+  expect(replay.statusCode).toBe(404);
 });
 
 test("download tokens stop working after the backing session is deleted", async () => {
@@ -1184,30 +1176,44 @@ test("forwards proxy MCP calls with validated context headers", async () => {
   expect(upstreamRequests[0].headers["x-framework-session-id"]).toBe("session-1");
   expect(upstreamRequests[0].headers["x-framework-runtime-id"]).toBe("runtime-session-1");
 
-  // Signature must verify under the DERIVED upstream-signature key — the value
-  // a verifying partner legitimately holds — and must NOT verify under the raw
-  // DATA_ENCRYPTION_SECRET. That second assertion is the point: the root secret
-  // also decrypts every stored OAuth token and provider key and mints rt_*
-  // gateway tokens for any tenant, so it must never be the value we ask an
-  // upstream to hold.
-  const { verifyProxyHeaders } = await import("../lib/mcp-proxy-signature.js");
+  expect(upstreamRequests[0].headers["x-framework-signature-version"]).toBe("v2");
+  expect(upstreamRequests[0].headers["x-framework-tenant-id"]).toBe("test-tenant");
+  expect(upstreamRequests[0].headers["x-framework-server-id"]).toBe("test-proxy");
+
+  // The signature must verify under the per-server key derived for
+  // (test-tenant, test-proxy), over the raw body the upstream received. It must
+  // NOT verify under the deployment-wide upstream secret or the raw
+  // DATA_ENCRYPTION_SECRET: an upstream holds only its own per-server key, so it
+  // cannot sign for another server or tenant.
+  const { proxyServerSigningKey, verifyProxyHeaders } = await import(
+    "../lib/mcp-proxy-signature.js"
+  );
   const { createTestConfig } = await import("../test-helpers/test-config.js");
   const { proxySignatureSecret } = await import("../lib/derived-secrets.js");
   const rootSecret = createTestConfig().DATA_ENCRYPTION_SECRET;
+  const upstreamSecret = proxySignatureSecret(rootSecret);
+  const serverKey = proxyServerSigningKey(upstreamSecret, {
+    tenantId: "test-tenant",
+    serverId: "test-proxy"
+  });
+  const { headers, rawBody } = upstreamRequests[0];
+  const options = { serverId: "test-proxy", maxAgeMs: 60_000 };
 
-  const verified = verifyProxyHeaders(
-    upstreamRequests[0].headers,
-    proxySignatureSecret(rootSecret),
-    { maxAgeMs: 60_000 }
-  );
-  expect(verified.ok).toBe(true);
+  const verified = verifyProxyHeaders(headers, rawBody, serverKey, options);
+  expect(verified).toMatchObject({
+    ok: true,
+    tenantId: "test-tenant",
+    serverId: "test-proxy",
+    nonce: headers["x-framework-nonce"]
+  });
 
-  const verifiedUnderRoot = verifyProxyHeaders(
-    upstreamRequests[0].headers,
-    rootSecret,
-    { maxAgeMs: 60_000 }
-  );
-  expect(verifiedUnderRoot.ok).toBe(false);
+  for (const wrongKey of [upstreamSecret, rootSecret]) {
+    expect(verifyProxyHeaders(headers, rawBody, wrongKey, options).ok).toBe(false);
+  }
+  expect(verifyProxyHeaders(headers, `${rawBody} `, serverKey, options)).toEqual({
+    ok: false,
+    reason: "body_mismatch"
+  });
 });
 
 test("rejects invalid message payloads with a 400 response", async () => {

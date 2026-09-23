@@ -26,8 +26,9 @@ on:
 # the PR comes from a fork — required so the bot can comment on the PR and
 # add the `cla-signed` label.
 permissions:
+  # The action reruns its previous failed check after a contributor signs.
   actions: write
-  contents: write
+  contents: read
   pull-requests: write
   statuses: write
 
@@ -42,7 +43,7 @@ jobs:
       github.event_name == 'pull_request_target'
     steps:
       - name: CLA Assistant
-        uses: contributor-assistant/github-action@v2.6.1
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURE_PAT }}

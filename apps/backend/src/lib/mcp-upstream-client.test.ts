@@ -419,3 +419,69 @@ test("still allows an ordinary public upstream through to the transport", async 
 
   expect(reached).toHaveBeenCalledTimes(1);
 });
+
+test.each([
+  {
+    label: "bearer token",
+    auth: { type: "bearer", secret: "bearer-secret" } as const,
+    assertRequest: (url: URL, headers: Record<string, string>) => {
+      expect(url.toString()).toBe("https://vendor.example/mcp?region=ca");
+      expect(headers.Authorization).toBe("Bearer bearer-secret");
+    }
+  },
+  {
+    label: "custom header",
+    auth: { type: "header", name: "X-API-Key", secret: "header-secret" } as const,
+    assertRequest: (url: URL, headers: Record<string, string>) => {
+      expect(url.toString()).toBe("https://vendor.example/mcp?region=ca");
+      expect(headers["X-API-Key"]).toBe("header-secret");
+    }
+  },
+  {
+    label: "query parameter",
+    auth: { type: "query", name: "api_key", secret: "query-secret" } as const,
+    assertRequest: (url: URL, headers: Record<string, string>) => {
+      expect(url.searchParams.get("region")).toBe("ca");
+      expect(url.searchParams.get("api_key")).toBe("query-secret");
+      expect(headers.Authorization).toBeUndefined();
+    }
+  }
+])("injects $label authentication only at dispatch", async ({ auth, assertRequest }) => {
+  const fetchSpy = vi.fn((input: URL, init: { headers: Record<string, string> }) => {
+    assertRequest(input, init.headers);
+    return Promise.resolve(
+      new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      })
+    );
+  }) as unknown as typeof undiciFetch;
+
+  const response = await forwardRpc(
+    "https://vendor.example/mcp?region=ca",
+    payload,
+    { "X-Forwarded-By": "cogniplane-core" },
+    fetchSpy,
+    {},
+    auth
+  );
+
+  expect(response.result).toEqual({ ok: true });
+  expect(fetchSpy).toHaveBeenCalledTimes(1);
+});
+
+test("refuses a stored custom auth header that could replace proxy identity", async () => {
+  const neverCalled = vi.fn();
+
+  const response = await forwardRpc(
+    "https://vendor.example/mcp",
+    payload,
+    { "X-Framework-Signature": "signed-identity" },
+    neverCalled as unknown as typeof undiciFetch,
+    {},
+    { type: "header", name: "X-Framework-Signature", secret: "attacker-value" }
+  );
+
+  expect(response.error?.message).toBe("Upstream MCP authentication is invalid.");
+  expect(neverCalled).not.toHaveBeenCalled();
+});

@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # Full history so the scan covers every commit, not just HEAD.
           fetch-depth: 0
@@ -33,7 +33,9 @@ jobs:
         run: |
           GITLEAKS_VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+            -o /tmp/gitleaks.tar.gz
+          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  /tmp/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
           gitleaks version
       - name: Scan for secrets
         run: gitleaks detect --config .gitleaks.toml --log-opts='--all' --no-banner --redact
@@ -44,17 +46,17 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -66,42 +68,32 @@ jobs:
       - name: License check
         run: pnpm license:check
 
-      # shared-types and frontend: full type check.
-      # backend production: split into two cheap gates because the full type
-      # check exceeds available memory on free GitHub runners. Backend tests
-      # still get a semantic TypeScript pass from their own entry points below.
-      # The private CI remains the authoritative whole-production semantic gate.
-      #   - tsc --noCheck: parse + syntax (no semantic diagnostics)
-      #   - dpdm:          import resolution (catches TS2307-style breakage)
-      - name: Typecheck (shared-types + frontend)
-        run: pnpm --filter @cogniplane/shared-types --filter @cogniplane/frontend --workspace-concurrency=1 typecheck
+      # Run semantic checks in separate processes and keep the heap below the
+      # runner's memory budget. Each step reports peak RSS for future regressions.
+      - name: Typecheck shared types and frontend
+        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm --filter @cogniplane/shared-types --filter @cogniplane/frontend --workspace-concurrency=1 typecheck
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
-      - name: Backend syntax check
-        run: pnpm --filter @cogniplane/backend exec tsc -p tsconfig.json --noEmit --noCheck
-        env:
-          NODE_OPTIONS: --max-old-space-size=2048
-
-      - name: Backend import resolution
-        # dpdm's --exit-code only fires on circular deps, so we tee the output
-        # and grep for `miss "<module>"` warnings (the TS2307 equivalent).
-        run: |
-          pnpm --filter @cogniplane/backend exec dpdm --no-tree --no-circular 'src/**/*.ts' 2>&1 | tee /tmp/dpdm.log
-          if grep -qE '^\s+[0-9]+\)\s+miss ' /tmp/dpdm.log; then
-            echo "::error::dpdm found unresolved imports — see 'miss' entries above"
-            exit 1
-          fi
-        env:
-          NODE_OPTIONS: --max-old-space-size=2048
-
-      - name: Backend test typecheck
-        run: pnpm --filter @cogniplane/backend typecheck:test
+      - name: Typecheck backend production
+        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm --filter @cogniplane/backend typecheck
         env:
           NODE_OPTIONS: --max-old-space-size=4096
 
-      - name: Script typecheck
-        run: pnpm typecheck:scripts
+      - name: Typecheck backend tests
+        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm typecheck:tests
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Typecheck scripts
+        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm typecheck:scripts
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Cloudflare frontend build
+        run: pnpm --filter @cogniplane/frontend cf:build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.example.com
 
       - name: Tests
         run: pnpm test:all
@@ -163,17 +155,17 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: 'pnpm'
 
       - name: Install dependencies

@@ -27,15 +27,15 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     expect(await store.setArchived(tenant, id, foreignUser, true)).toBeNull();
     const archived = await store.setArchived(tenant, id, user, true);
     expect(archived).toMatchObject({ status: "archived", archivedAt: expect.any(String) });
-    expect(await store.list(tenant, user)).toEqual([]);
-    expect(await store.list(tenant, user, { status: "archived" })).toEqual([{
+    expect((await store.listPage(tenant, user)).sessions).toEqual([]);
+    expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([{
       ...archived,
       hasPendingApprovals: false,
       canEdit: true,
       isRunning: false
     }]);
-    expect(await store.list(foreignTenant, user, { status: "archived" })).toEqual([]);
-    expect(await store.list(tenant, foreignUser, { status: "archived" })).toEqual([]);
+    expect((await store.listPage(foreignTenant, user, { status: "archived" })).sessions).toEqual([]);
+    expect((await store.listPage(tenant, foreignUser, { status: "archived" })).sessions).toEqual([]);
     expect(await store.setArchived(foreignTenant, id, user, false)).toBeNull();
     expect(await store.setArchived(tenant, id, foreignUser, false)).toBeNull();
     expect((await saver!.getTuple(config))?.checkpoint.channel_values).toEqual({ messages: ["preserved history"] });
@@ -44,15 +44,15 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     const restored = await store.setArchived(tenant, id, user, false);
     expect(restored?.status).toBe("active");
     expect(restored).not.toHaveProperty("archivedAt");
-    expect(await store.list(tenant, user, { status: "archived" })).toEqual([]);
-    expect((await store.list(tenant, user)).map((row) => row.sessionId)).toEqual([id]);
+    expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([]);
+    expect((await store.listPage(tenant, user)).sessions.map((row) => row.sessionId)).toEqual([id]);
     expect((await saver!.getTuple(config))?.checkpoint.channel_values).toEqual({ messages: ["preserved history"] });
     await store.setArchived(tenant, id, user, true);
     expect(await store.remove(foreignTenant, id, user)).toBe(false);
     expect(await store.remove(tenant, id, foreignUser)).toBe(false);
     expect(await store.remove(tenant, id, user)).toBe(true);
     expect(await store.setArchived(tenant, id, user, false)).toBeNull();
-    expect(await store.list(tenant, user, { status: "archived" })).toEqual([]);
+    expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([]);
     await saver!.deleteThread(id);
   });
 
@@ -67,12 +67,12 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
       await store.setArchived(tenant, session.sessionId, user, true);
     }
     const purposes = ["normal", "skill_improvement"];
-    const archived = await store.list(tenant, user, { status: "archived", purposes });
+    const archived = (await store.listPage(tenant, user, { status: "archived", purposes })).sessions;
     expect(archived.map((session) => session.sessionId).sort()).toEqual([normal.sessionId, improvement.sessionId].sort());
-    expect(await store.list(tenant, user, { status: "archived", purposes: "all" })).toHaveLength(3);
+    expect((await store.listPage(tenant, user, { status: "archived", purposes: "all" })).sessions).toHaveLength(3);
     const restored = await store.setArchived(tenant, scheduled.sessionId, user, false);
     expect(restored?.purpose).toBe("scheduled");
-    expect(await store.list(tenant, user, { purposes })).toEqual([]);
+    expect((await store.listPage(tenant, user, { purposes })).sessions).toEqual([]);
   });
 
   test("migration 013 can be replayed without losing archive metadata or status validation", async () => {

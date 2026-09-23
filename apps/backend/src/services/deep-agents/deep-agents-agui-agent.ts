@@ -17,6 +17,20 @@ export interface DeepAgentsAGUIAgentConfig {
   backend: AGUITurnBackend;
   /** Per-turn tool-context id; injected via `backend.setToolContext`. */
   toolContextId: string | null;
+  /**
+   * Called after every approval decision, before the turn resumes.
+   * The approval round loop below is unbounded, so a turn's wall-clock length
+   * is `working budget + N x APPROVAL_REQUEST_TTL_MS`. Both the tool-context
+   * TTL and the active-turn staleness window budget for one approval, so
+   * without this a turn parked on several approvals loses its MCP tool access
+   * and gets stale-evicted while still running. Each call pushes both out.
+   *
+   * Failures are logged and swallowed by the caller: a missed keepalive must
+   * not abort a turn the user is actively approving.
+   */
+  onApprovalRound?: (signal?: AbortSignal) => Promise<void>;
+  /** Aborts the current turn when Stop or the watchdog fires. */
+  approvalAbortSignal?: AbortSignal;
   agentId?: string;
   description?: string;
 }
@@ -24,6 +38,8 @@ export interface DeepAgentsAGUIAgentConfig {
 export class DeepAgentsAGUIAgent extends AbstractAgent {
   private readonly backend: AGUITurnBackend;
   private readonly toolContextId: string | null;
+  private readonly onApprovalRound?: (signal?: AbortSignal) => Promise<void>;
+  private readonly approvalAbortSignal?: AbortSignal;
 
   constructor(config: DeepAgentsAGUIAgentConfig) {
     super({
@@ -33,6 +49,8 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
     });
     this.backend = config.backend;
     this.toolContextId = config.toolContextId;
+    this.onApprovalRound = config.onApprovalRound;
+    this.approvalAbortSignal = config.approvalAbortSignal;
   }
 
   run(input: RunAgentInput): Observable<BaseEvent> {
@@ -75,6 +93,15 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
             // each get their own decision.
             const decisions = await this.backend.awaitDecisions(actions, emit);
             if (cancelled) return;
+            // Push the tool-context TTL and the active-turn staleness window
+            // out before resuming: this round consumed wall-clock time that
+            // neither budget accounts for.
+            // An abort still needs to reach the next stream pass so the live
+            // adapter can emit its normal interrupted terminal event. Skip the
+            // keepalive, though: a stopped turn must not renew its authority.
+            if (!this.approvalAbortSignal?.aborted) {
+              await this.onApprovalRound?.(this.approvalAbortSignal);
+            }
             streamInput = this.backend.buildResumeInput(actions, decisions);
           }
 

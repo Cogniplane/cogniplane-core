@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import type { Pool } from "../lib/db.js";
 
@@ -881,7 +881,9 @@ test("MessageStore.updateContent returns null when no row matched", async () => 
 
 test("MessageStore.updateContent returns mapped record on success", async () => {
   const db = new ScriptedDatabase();
+  const finishTools = vi.fn(() => ({ rows: [], rowCount: 1 }));
   db.scripts = [
+    { match: (t) => t.includes("UPDATE message_tool_results SET status = 'failed'"), fn: finishTools },
     {
       match: (t) => t.includes("UPDATE messages") && t.includes("content_text = $5"),
       fn: (vals) => ({
@@ -919,6 +921,7 @@ test("MessageStore.updateContent returns mapped record on success", async () => 
   expect(r!.content).toBe("hello");
   expect(r!.status).toBe("completed");
   expect(r!.toolResults).toEqual([]);
+  expect(finishTools).toHaveBeenCalledWith(["t", "m-1", "u"]);
 });
 
 test("MessageStore.updateStreamingContent: returns early when both fields are undefined", async () => {

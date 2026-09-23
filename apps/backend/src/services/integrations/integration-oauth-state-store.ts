@@ -1,6 +1,6 @@
 import type { Redis } from "ioredis";
 
-export type IntegrationOAuthProvider = "github" | "notion";
+export type IntegrationOAuthProvider = "github" | "notion" | "microsoft";
 
 type OAuthStateRedis = Pick<Redis, "getdel" | "set">;
 

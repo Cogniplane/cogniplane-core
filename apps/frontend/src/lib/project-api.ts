@@ -4,12 +4,27 @@ import {
   ProjectsResponseSchema,
   ProjectDetailSchema,
   SessionEnvelopeSchema,
+  SessionsListResponseSchema,
+  SESSION_TRASH_RETENTION_DAYS,
   ProjectMembersResponseSchema
 } from "@cogniplane/shared-types";
 import type { ProjectAgentFileMode, ProjectApprovalMode } from "@cogniplane/shared-types";
 import { request } from "./api-client";
 import { parseResponse } from "./validate-response";
+import type { SessionList } from "./session-api";
 const projectPath = (id: string) => `/projects/${encodeURIComponent(id)}`;
+export async function listProjectSessions(id: string, options: {
+  status: "active" | "archived" | "deleted";
+  cursor?: string;
+  signal?: AbortSignal;
+}): Promise<SessionList> {
+  const query = new URLSearchParams({ status: options.status });
+  if (options.cursor) query.set("cursor", options.cursor);
+  const response = parseResponse(SessionsListResponseSchema,
+    await request<unknown>(`${projectPath(id)}/sessions?${query}`, { signal: options.signal }),
+    "GET /projects/:id/sessions");
+  return { ...response, trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS };
+}
 export async function listProjects(options: { archived?: boolean; q?: string } = {}) {
   const query = new URLSearchParams({
     archived: String(options.archived ?? false)

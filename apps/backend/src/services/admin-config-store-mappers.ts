@@ -146,6 +146,11 @@ export function mapSkillRevision(row: Record<string, unknown>): AdminSkillRevisi
 }
 
 export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord {
+  const upstreamAuthType = assertEnum(
+    row.upstream_auth_type ?? "none",
+    ["none", "bearer", "header", "query"],
+    "MCP upstream auth type"
+  );
   return {
     serverId: String(row.server_id),
     serverName: String(row.server_name),
@@ -154,6 +159,9 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
     mode: assertEnum(row.mode, ["managed", "proxy"], "MCP server mode"),
     routePath: String(row.route_path),
     upstreamUrl: row.upstream_url ? String(row.upstream_url) : null,
+    upstreamAuthType,
+    upstreamAuthName: row.upstream_auth_name ? String(row.upstream_auth_name) : null,
+    upstreamAuthConfigured: Boolean(row.upstream_auth_secret_encrypted),
     version: Number(row.version),
     configHash: String(row.config_hash),
     enabled: Boolean(row.enabled),
@@ -176,4 +184,3 @@ export function mapTenantMember(row: Record<string, unknown>): TenantMemberRecor
     updatedAt: isoTimestamp(row.updated_at)
   };
 }
-

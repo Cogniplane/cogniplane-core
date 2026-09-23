@@ -8,7 +8,11 @@ import { SessionSidebar } from "./session-sidebar";
 import { deriveAttentionSessionIds } from "./session-list-derivations";
 
 vi.mock("next/image", () => ({ default: (props: Record<string, unknown>) => <span role="img" aria-label={String(props.alt)} /> }));
-vi.mock("next/link", () => ({ default: ({ children }: { children: React.ReactNode }) => children }));
+vi.mock("next/link", () => ({
+  default: ({ children, href, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => (
+    <a href={href} {...props}>{children}</a>
+  )
+}));
 vi.mock("../lib/auth-context", () => ({ useAuth: () => ({ user: { displayName: "Ada", email: "ada@example.com" } }) }));
 vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
 afterEach(cleanup);
@@ -50,7 +54,7 @@ it("promotes pending sessions above pins, filters them, and restores their group
     { ...session, sessionId: "live", sessionName: "Live work", purpose: "skill_improvement" }
   ];
   const props = {
-    list: { sessions, selectedId: "live", isLoading: false, streamingIds: new Set(["running"]), attentionIds: deriveAttentionSessionIds(sessions, "live", 1), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
+    list: { sessions, selectedId: "live", isLoading: false, streamingIds: new Set(["running"]), attentionIds: deriveAttentionSessionIds(sessions, "live", 1, true), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
     deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
     pinning: { busyId: null, ids: new Set(["pinned", "approval"]), onToggle: vi.fn() }
@@ -70,7 +74,7 @@ it("promotes pending sessions above pins, filters them, and restores their group
   expect(screen.getByText("No matches")).toBeTruthy();
   fireEvent.change(screen.getByRole("textbox", { name: "Search sessions" }), { target: { value: "" } });
   const resolved = sessions.map((s) => ({ ...s, hasPendingApprovals: false }));
-  view.rerender(<SessionSidebar {...props} list={{ ...props.list, sessions: resolved, attentionIds: deriveAttentionSessionIds(resolved, "live", 0) }} />);
+  view.rerender(<SessionSidebar {...props} list={{ ...props.list, sessions: resolved, attentionIds: deriveAttentionSessionIds(resolved, "live", 0, true) }} />);
   expect(screen.queryByText("Needs attention")).toBeNull();
   expect(order()).toEqual(["Pinned", "Approval", "Running", "Live"]);
   expect(screen.getByText("Pinned").parentElement?.textContent).toBe("Pinned2");
@@ -99,6 +103,10 @@ it("shows active projects and hides archived projects from the sidebar", async (
   expect(screen.queryByText("Archived")).toBeNull();
   expect(screen.getByLabelText("1 session needing attention")).toBeTruthy();
   expect(screen.getByLabelText("1 pinned session")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Open Launch plan" }).getAttribute("href"))
+    .toBe("/projects?project=project-1");
+  expect(screen.getByRole("link", { name: "Project settings for Launch plan" }).getAttribute("href"))
+    .toBe("/projects?project=project-1&view=settings");
   fireEvent.click(screen.getByRole("button", { name: "Expand Launch plan" }));
   expect(screen.getByRole("button", { name: /^Launch research/ })).toBeTruthy();
 
@@ -199,7 +207,7 @@ it("routes select, pin, rename, and delete actions through their owners", async 
 it("archives idle sessions and disables archive for running turns and pending approvals", async () => {
   const onArchive = vi.fn();
   const props = {
-    list: { sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
+    list: { sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), attentionIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
     deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
     pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() },
@@ -212,7 +220,7 @@ it("archives idle sessions and disables archive for running turns and pending ap
   expect(onArchive).toHaveBeenCalledWith(session.sessionId);
   onArchive.mockClear();
   for (const state of [{ isRunning: true }, { hasPendingApprovals: true }]) {
-    view.rerender(<SessionSidebar {...props} list={{ ...props.list, sessions: [{ ...session, ...state }] }} />);
+    view.rerender(<SessionSidebar {...props} list={{ ...props.list, sessions: [{ ...session, ...state }], attentionIds: "hasPendingApprovals" in state ? new Set([session.sessionId]) : new Set() }} />);
     fireEvent.keyDown(screen.getByRole("button", { name: /Session actions for/ }), { key: "Enter" });
     const button = await screen.findByRole("menuitem", { name: "Archive session" });
     expect(button.getAttribute("aria-disabled")).toBe("true");
@@ -225,6 +233,11 @@ it("archives idle sessions and disables archive for running turns and pending ap
     fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
   }
+  view.rerender(<SessionSidebar {...props} list={{ ...props.list, sessions: [{ ...session, hasPendingApprovals: true }], attentionIds: new Set() }} />);
+  fireEvent.keyDown(screen.getByRole("button", { name: /Session actions for/ }), { key: "Enter" });
+  expect((await screen.findByRole("menuitem", { name: "Archive session" })).getAttribute("aria-disabled")).toBeNull();
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
   view.rerender(<SessionSidebar {...props} archive={{ ...props.archive, busyId: session.sessionId }} />);
   fireEvent.keyDown(screen.getByRole("button", { name: /Session actions for/ }), { key: "Enter" });
   const busyButton = await screen.findByRole("menuitem", { name: "Archive session" });
@@ -245,4 +258,55 @@ it("shows stored failures for unselected sessions and clears them during retry",
   view.rerender(<SessionSidebar {...props} list={{ ...props.list, streamingIds: new Set([session.sessionId]) }} />);
   expect(screen.queryByRole("img", { name: "Failed" })).toBeNull();
   expect(screen.getByRole("img", { name: "Running" })).toBeTruthy();
+});
+
+it("delegates search and paging, disables pending loads and retries without hiding existing rows", () => {
+  const list = {
+    sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), errorId: null,
+    onSelect: vi.fn(), onCreate: vi.fn(), search: "", onSearch: vi.fn(), hasMore: true,
+    isLoadingMore: false, onLoadMore: vi.fn(), error: null as string | null, onRetry: vi.fn()
+  };
+  const props = {
+    list,
+    rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
+    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() }
+  };
+  const view = render(<SessionSidebar {...props} />);
+  fireEvent.change(screen.getByLabelText("Search sessions"), { target: { value: "Older notes" } });
+  expect(list.onSearch).toHaveBeenCalledWith("Older notes");
+  fireEvent.click(screen.getByRole("button", { name: "Load more sessions" }));
+  expect(list.onLoadMore).toHaveBeenCalledOnce();
+  view.rerender(<SessionSidebar {...props} list={{ ...list, isLoadingMore: true }} />);
+  expect(screen.getByRole("button", { name: "Loading..." }).hasAttribute("disabled")).toBe(true);
+  view.rerender(<SessionSidebar {...props} list={{ ...list, error: "Page unavailable" }} />);
+  expect(screen.getByRole("button", { name: /^Research notes/ })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  expect(list.onRetry).toHaveBeenCalledOnce();
+  view.rerender(<SessionSidebar {...props} list={{ ...list, search: "Missing", sessions: [], hasMore: false }} />);
+  expect(screen.getByText("No matches")).toBeTruthy();
+  expect(screen.queryByText("No sessions yet")).toBeNull();
+});
+
+it("trusts server search hits when the cached project name is stale and keeps counts independent of global paging", () => {
+  const props = {
+    projects: [project],
+    list: {
+      sessions: [{ ...session, projectId: project.projectId }], selectedId: null,
+      isLoading: false, streamingIds: new Set<string>(), errorId: null,
+      onSelect: vi.fn(), onCreate: vi.fn(), search: "Renamed project", onSearch: vi.fn(), hasMore: true
+    },
+    rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
+    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() }
+  };
+  const view = render(<SessionSidebar {...props} />);
+  expect(screen.getByRole("button", { name: /^Research notes/ })).toBeTruthy();
+  const count = screen.getByTitle("Loaded sessions").textContent;
+  expect(count).toBe("1");
+  view.rerender(<SessionSidebar {...props} list={{ ...props.list, hasMore: false }} />);
+  expect(screen.getByTitle("Loaded sessions").textContent).toBe(count);
+  // Without a server-search callback the component still supports local filtering.
+  view.rerender(<SessionSidebar {...props} list={{ ...props.list, onSearch: undefined }} />);
+  expect(screen.queryByRole("button", { name: /^Research notes/ })).toBeNull();
 });

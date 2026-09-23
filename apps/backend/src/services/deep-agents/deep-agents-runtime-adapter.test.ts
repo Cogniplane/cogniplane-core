@@ -13,7 +13,8 @@ import { testRuntimePolicy } from "../../test-helpers/test-runtime-policy.js";
 import { SessionBusyError, type RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import {
   DeepAgentsRuntimeAdapter,
-  USAGE_FLUSH_DEADLINE_MS
+  USAGE_FLUSH_DEADLINE_MS,
+  WORKSPACE_RESET_NOTICE_TTL_MS
 } from "./deep-agents-runtime-adapter.js";
 import { isAGUIInterruptedFinish } from "./agui-events.js";
 import type { ProviderCredentials } from "../runtime/provider-credentials.js";
@@ -27,6 +28,7 @@ import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
 import { createPolicyApprovalProof } from "../policy/policy-approval-proof.js";
 import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
+import { ActiveTurnsRegistry } from "../active-turns-registry.js";
 
 const testConfig = createTestConfig({ ANTHROPIC_API_KEY: "sk-ant-test-key" });
 
@@ -83,6 +85,73 @@ it("refreshes a cached session before the next turn without disposing its worksp
   await adapter.createSession(sessionInput);
   expect(refreshCapabilities).toHaveBeenCalledTimes(3);
   await adapter.close();
+});
+
+it("defers integration runtime teardown until the active turn ends", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const runtime = makeRuntimeFactory(async function* () {
+    await gate;
+    yield* scriptedChatStream();
+  });
+  const adapter = makeAdapter({ factory: runtime.factory });
+  try {
+    const session = await adapter.createSession(sessionInput);
+    const { done } = startTurn(adapter, session);
+    for (let i = 0; i < 100 && adapter.getHealthSnapshot().activeTurnCount === 0; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(adapter.getHealthSnapshot().activeTurnCount).toBe(1);
+
+    await adapter.invalidateRuntimesForIntegration(sessionInput.tenantId, sessionInput.userId, "github");
+    expect(runtime.dispose).not.toHaveBeenCalled();
+
+    release();
+    await done;
+    expect(runtime.dispose).toHaveBeenCalledOnce();
+    expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+  } finally {
+    release();
+    await adapter.close();
+  }
+});
+
+it("keeps an admitted turn alive when integration settings change during setup", async () => {
+  const activeTurns = new ActiveTurnsRegistry();
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({ factory: runtime.factory, activeTurns });
+  try {
+    const session = await adapter.createSession(sessionInput);
+    activeTurns.mark(sessionInput.sessionId, sessionInput);
+
+    await adapter.invalidateRuntimesForIntegration(sessionInput.tenantId, sessionInput.userId, "github");
+    expect(runtime.dispose).not.toHaveBeenCalled();
+
+    await collect(adapter.runMessageAGUI(session, runMessageInput()));
+    expect(runtime.dispose).toHaveBeenCalledOnce();
+  } finally {
+    activeTurns.clear(sessionInput.sessionId);
+    await adapter.close();
+  }
+});
+
+it("clears a deferred integration teardown when admission exits before the graph starts", async () => {
+  const activeTurns = new ActiveTurnsRegistry();
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const adapter = makeAdapter({ factory: runtime.factory, activeTurns });
+  try {
+    await adapter.createSession(sessionInput);
+    activeTurns.mark(sessionInput.sessionId, sessionInput);
+    await adapter.invalidateRuntimesForIntegration(sessionInput.tenantId, sessionInput.userId, "github");
+    expect(runtime.dispose).not.toHaveBeenCalled();
+
+    await adapter.finishTurnAdmission(sessionInput);
+    expect(runtime.dispose).toHaveBeenCalledOnce();
+    expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+  } finally {
+    activeTurns.clear(sessionInput.sessionId);
+    await adapter.close();
+  }
 });
 
 it("applies the project approval mode at turn start and keeps it out of tenant settings", async () => {
@@ -224,16 +293,21 @@ const unusedExecutions = {
 
 function makeAdapter(input: {
   factory: DeepAgentsRuntimeFactory;
+  activeTurns?: ActiveTurnsRegistry;
   dynamicConfig?: DynamicConfigService;
   runtimeSessions?: unknown;
   memories?: unknown;
   checkpointer?: { deleteThread: (threadId: string) => Promise<void>; end?: () => Promise<void> };
   conversationMessages?: unknown;
   messages?: unknown;
-  executions?: Pick<import("../session-execution-store.js").SessionExecutionStore, "isCurrent" | "bindRuntime">;
+  executions?: Pick<import("../session-execution-store.js").SessionExecutionStore, "isCurrent" | "bindRuntime"> &
+    Partial<Pick<import("../session-execution-store.js").SessionExecutionStore, "sandboxId" | "bindSandboxId">>;
   sessions?: Pick<import("../session-store.js").SessionStore, "getReadable">;
   activationTracker?: Pick<import("../activation-tracker.js").ActivationTracker, "recordMaterialization">;
-  tenantMembers?: { isUserBetaTester: (tenantId: string, userId: string) => Promise<boolean> };
+  tenantMembers?: {
+    isUserBetaTester: (tenantId: string, userId: string) => Promise<boolean>;
+    getRole?: (tenantId: string, userId: string) => Promise<"owner" | "admin" | "member" | null>;
+  };
   /**
    * Convenience: a single tenant key applied to every provider. Translated to a
    * ProviderCredentials below. Undefined/null → no key for any provider.
@@ -268,7 +342,8 @@ function makeAdapter(input: {
       executions: input.executions ?? unusedExecutions,
       conversationMessages: input.conversationMessages as never,
       sessions: input.sessions ?? fakeSessionAccess,
-      tenantMembers: (input.tenantMembers ?? fakeTenantMemberStore) as never
+      tenantMembers: (input.tenantMembers ?? fakeTenantMemberStore) as never,
+      activeTurns: input.activeTurns
     },
     credentials,
     input.factory
@@ -361,10 +436,12 @@ function makeRichApprovalStore() {
     async get(_tenantId: string, approvalId: string, _userId: string) {
       return (rows.get(approvalId) ?? null) as never;
     },
-    async resolve(_tenantId: string, approvalId: string, _userId: string, decision: string) {
+    async resolve(_tenantId: string, approvalId: string, _userId: string, decision: string,
+      rememberForTurn = false) {
       const row = rows.get(approvalId);
       if (!row || row.status !== "pending") return null;
       row.status = decision;
+      row.rememberForTurn = rememberForTurn;
       return row as never;
     }
   };
@@ -642,17 +719,117 @@ describe("DeepAgentsRuntimeAdapter", () => {
     expect(adapter.hasSession("sess-1")).toBe(false);
   });
 
-  it("invalidateTenantRuntimes tears down only that tenant's sessions", async () => {
+  it("invalidateTenantRuntimes tears down only that tenant and reports workspace loss", async () => {
     const { factory } = makeRuntimeFactory(() => scriptedChatStream());
     const adapter = makeAdapter({ factory });
     await adapter.createSession(sessionInput);
     await adapter.createSession({ tenantId: "other-tenant", sessionId: "sess-2", userId: "u2" });
 
-    const invalidated = await adapter.invalidateTenantRuntimes("test-tenant");
+    const invalidated = await adapter.invalidateTenantRuntimes("test-tenant", {
+      workspaceResetReason: "Configuration changed; recreate workspace files."
+    });
     expect(invalidated).toEqual(["sess-1"]);
     expect(adapter.hasSession("sess-1")).toBe(false);
     expect(adapter.hasSession("sess-2")).toBe(true);
+
+    const rebuilt = await adapter.createSession(sessionInput);
+    const events = await collect(adapter.runMessageAGUI(rebuilt, runMessageInput()));
+    expect(events[0]).toMatchObject({ type: AGUIEventType.RUN_STARTED });
+    expect(
+      events.find(
+        (event) => event.type === AGUIEventType.CUSTOM && event.name === "runtime_notice"
+      )
+    ).toMatchObject({
+      value: expect.objectContaining({
+        level: "warning",
+        title: "Workspace reset",
+        message: "Configuration changed; recreate workspace files."
+      })
+    });
+
+    const nextEvents = await collect(adapter.runMessageAGUI(rebuilt, runMessageInput()));
+    expect(
+      nextEvents.some(
+        (event) => event.type === AGUIEventType.CUSTOM && event.name === "runtime_notice"
+      )
+    ).toBe(false);
     await adapter.close();
+  });
+
+  it("expires an undelivered workspace-reset notice", async () => {
+    vi.useFakeTimers();
+    const { factory } = makeRuntimeFactory(() => scriptedChatStream());
+    const adapter = makeAdapter({ factory });
+    try {
+      await adapter.createSession(sessionInput);
+      await adapter.invalidateTenantRuntimes("test-tenant", {
+        workspaceResetReason: "Configuration changed; recreate workspace files."
+      });
+
+      await vi.advanceTimersByTimeAsync(WORKSPACE_RESET_NOTICE_TTL_MS);
+      const rebuilt = await adapter.createSession(sessionInput);
+      const events = await collect(adapter.runMessageAGUI(rebuilt, runMessageInput()));
+
+      expect(
+        events.some(
+          (event) => event.type === AGUIEventType.CUSTOM && event.name === "runtime_notice"
+        )
+      ).toBe(false);
+      await adapter.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("invalidateRuntimesForUser stops only that member's active runtimes", async () => {
+    const { factory } = makeRuntimeFactory(async function* ({ signal }) {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          { once: true }
+        );
+      });
+      yield { event: "on_chat_model_end", metadata: {} };
+    });
+    const adapter = makeAdapter({ factory });
+    const target = await adapter.createSession(sessionInput);
+    await adapter.createSession({ tenantId: "test-tenant", sessionId: "sess-peer", userId: "user-2" });
+    await adapter.createSession({ tenantId: "other-tenant", sessionId: "sess-other", userId: "user-1" });
+    const activeTurn = collect(adapter.runMessageAGUI(target, runMessageInput()));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const invalidated = await adapter.invalidateRuntimesForUser("test-tenant", "user-1");
+
+    expect(invalidated).toEqual(["sess-1"]);
+    expect(adapter.hasSession("sess-1")).toBe(false);
+    expect(adapter.hasSession("sess-peer")).toBe(true);
+    expect(adapter.hasSession("sess-other")).toBe(true);
+    const events = await activeTurn;
+    expect(events.at(-1)).toMatchObject({
+      type: AGUIEventType.RUN_FINISHED,
+      result: { interrupted: true }
+    });
+    await adapter.close();
+  });
+
+  it("rechecks membership before publishing a runtime created during removal", async () => {
+    const { factory, factoryCalls } = makeRuntimeFactory(() => scriptedChatStream());
+    let membershipChecks = 0;
+    const adapter = makeAdapter({
+      factory,
+      tenantMembers: {
+        isUserBetaTester: async () => false,
+        getRole: async () => (++membershipChecks === 1 ? "member" : null)
+      }
+    });
+
+    await expect(adapter.createSession(sessionInput)).rejects.toMatchObject({
+      code: "session_unavailable",
+      statusCode: 403
+    });
+    expect(factoryCalls).toHaveLength(0);
+    expect(adapter.hasSession("sess-1")).toBe(false);
   });
 
   it("invalidateTenantRuntimes with idleOnly skips sessions with an active turn", async () => {
@@ -886,6 +1063,7 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     const execution = {
       ...sessionInput,
       executionId: "execution-1",
+      ownerId: "replica-1",
       projectId: "project-1",
       expiresAt: new Date(Date.now() + 30_000).toISOString()
     };
@@ -1149,6 +1327,29 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     expect(resumes).toEqual([[{ type: "approve" }]]);
     expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
     await adapter.close();
+  });
+
+  it("keeps a remote approval's remember choice for the next action", async () => {
+    const action = { interruptId: "int-1", name: "execute", args: { command: "pwd" } };
+    const { factory, resumes } = makeInterruptingFactory({ rounds: [[action], [action], []] });
+    const approvals = makeRichApprovalStore();
+    const adapter = new DeepAgentsRuntimeAdapter(testConfig, makeDynamicConfig(), fakeLog, {
+      sessions: fakeSessionAccess, executions: unusedExecutions, approvals: approvals as never,
+      auditEvents: { create: async () => {} } as never, tenantMembers: fakeTenantMemberStore
+    }, undefined, factory);
+    try {
+      const session = await adapter.createSession(sessionInput);
+      const turn = startTurn(adapter, session);
+      const request = (await waitForAGUIEvent(turn.events,
+        event => event.type === AGUIEventType.CUSTOM && (event as { name?: string }).name === "approval_required"
+      )) as AGUIBaseEvent & { value: { approvalId: string } };
+      await approvals.resolve(sessionInput.tenantId, request.value.approvalId, sessionInput.userId,
+        "approved", true);
+      await turn.done;
+      expect(approvals.rows.size).toBe(1);
+      expect(resumes).toHaveLength(2);
+      expect(turn.events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
+    } finally { await adapter.close(); }
   });
 
   it("resumes a checkpointed Policy Center interrupt from its durable approved row", async () => {
@@ -1619,7 +1820,8 @@ describe("interrupting a turn while onBeforeTurn is still running (R9)", () => {
 
     await syncStarted.promise;
     expect(await adapter.interruptTurn(sessionInput)).toBe("interrupted");
-    syncBlocked.resolve();
+    // The callback deliberately ignores cancellation and remains blocked. The
+    // adapter must still finish the wire response and release the slot.
     await done;
 
     expect(streamed).toBe(false);
@@ -1631,12 +1833,91 @@ describe("interrupting a turn while onBeforeTurn is still running (R9)", () => {
     expect(terminal.type).toBe(AGUIEventType.RUN_FINISHED);
     expect(isAGUIInterruptedFinish(terminal)).toBe(true);
     expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    syncBlocked.resolve();
     await adapter.close();
+  });
+
+  it("times out a hung onBeforeTurn and releases the slot", async () => {
+    vi.useFakeTimers();
+    try {
+      const setupStarted = makeDeferred();
+      const setupBlocked = makeDeferred();
+      let setupSignal: AbortSignal | undefined;
+      const { factory } = makeRuntimeFactory(scriptedChatStream);
+      const adapter = makeAdapter({
+        factory,
+        config: createTestConfig({
+          ANTHROPIC_API_KEY: "sk-ant-test-key",
+          RUNTIME_TURN_TIMEOUT_MS: 1000
+        })
+      });
+      const session = await adapter.createSession(sessionInput);
+      const collected = collect(
+        adapter.runMessageAGUI(session, {
+          prompt: "hi",
+          toolContextId: null,
+          onBeforeTurn: async (signal) => {
+            setupSignal = signal;
+            setupStarted.resolve();
+            await setupBlocked.promise;
+          }
+        })
+      );
+
+      await setupStarted.promise;
+      await vi.advanceTimersByTimeAsync(1_100);
+      const events = await collected;
+
+      expect(setupSignal?.aborted).toBe(true);
+      expect(events.at(-1)).toMatchObject({
+        type: AGUIEventType.RUN_ERROR,
+        message: "The turn exceeded the platform time limit and was stopped."
+      });
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+      setupBlocked.resolve();
+      await adapter.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
 });
 
 describe("approval bookkeeping failures (R10, R56)", () => {
+  it("rejects gated tools at once in a scheduled turn, with no approval row", async () => {
+    const { factory, resumes } = makeInterruptingFactory({
+      rounds: [[{ interruptId: "int-1", name: "write_file", args: { file_path: "/a.txt" } }], []]
+    });
+    const create = vi.fn(async () => {
+      throw new Error("a scheduled turn must not create an approval row");
+    });
+    const adapter = new DeepAgentsRuntimeAdapter(
+      testConfig,
+      makeDynamicConfig(),
+      fakeLog,
+      {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
+        approvals: { create, async resolve() { return null; } } as never,
+        auditEvents: fakeAuditEventStore,
+        tenantMembers: fakeTenantMemberStore
+      },
+      undefined,
+      factory
+    );
+    const session = await adapter.createSession(sessionInput);
+    const events = await collect(
+      adapter.runMessageAGUI(session, { ...runMessageInput(), turnContext: "scheduled" } as never)
+    );
+
+    expect(create).not.toHaveBeenCalled();
+    expect(
+      events.some((event) => event.type === AGUIEventType.CUSTOM && event.name === "approval_required")
+    ).toBe(false);
+    expect(resumes).toEqual([[{ type: "reject", message: expect.stringContaining("scheduled job") }]]);
+    await adapter.close();
+  });
+
   it("denies a gated tool when the approval row cannot be written", async () => {
     // Without the row there is nothing to decide: no sweep can recover it, no
     // restart can see it, and no approval.approved audit event can ever be
@@ -1697,6 +1978,46 @@ describe("approval bookkeeping failures (R10, R56)", () => {
       ]
     ]);
     await adapter.close();
+  });
+
+  it("tells the model an approval expired without an answer", async () => {
+    const { factory, resumes } = makeInterruptingFactory({
+      rounds: [[{ interruptId: "int-1", name: "execute", args: { command: "ls" } }], []]
+    });
+    const approvals = makeRichApprovalStore();
+    const adapter = new DeepAgentsRuntimeAdapter(
+      { ...testConfig, APPROVAL_REQUEST_TTL_MS: 30 },
+      makeDynamicConfig(),
+      fakeLog,
+      {
+        sessions: fakeSessionAccess,
+        executions: unusedExecutions,
+        approvals: {
+          ...approvals,
+          async expire(_tenantId: string, approvalId: string) {
+            const row = approvals.rows.get(approvalId);
+            if (!row) return null;
+            row.status = "expired";
+            return row as never;
+          },
+          async listPending() { return []; }
+        } as never,
+        auditEvents: fakeAuditEventStore,
+        tenantMembers: fakeTenantMemberStore
+      },
+      undefined,
+      factory
+    );
+    try {
+      const session = await adapter.createSession(sessionInput);
+      await collect(adapter.runMessageAGUI(session, runMessageInput() as never));
+      expect(resumes).toEqual([[{
+        type: "reject",
+        message: "This action was blocked because the approval request expired without an answer."
+      }]]);
+    } finally {
+      await adapter.close();
+    }
   });
 
   it("reports a decision resolved even when the approval row write throws", async () => {
@@ -1785,43 +2106,45 @@ describe("token usage reaches the row before the terminal event (R50)", () => {
     return factory;
   }
 
-  /**
-   * MessageStore fake that records WHEN usage landed relative to the stream.
-   * The write takes a real tick, as a DB round-trip does: without that, an
-   * unawaited write started after the terminal event still resolves in the same
-   * microtask drain and the ordering looks fine when it is not.
-   */
-  function makeUsageRecorder(marks: string[]) {
-    return {
-      async addTokenUsage() {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        marks.push("usage");
-        return { inputTokens: 10, outputTokens: 5, totalTokens: 15 } as never;
-      },
-      async setCostUsd() {
-        marks.push("cost");
-      }
-    };
-  }
-
   it("persists usage before RUN_FINISHED on the AG-UI wire", async () => {
     const marks: string[] = [];
+    const started = makeDeferred();
+    const release = makeDeferred();
     const adapter = makeAdapter({
       factory: makeUsageFactory(),
-      messages: makeUsageRecorder(marks)
+      messages: {
+        async addTokenUsage() {
+          started.resolve();
+          await release.promise;
+          marks.push("usage");
+          return { inputTokens: 10, outputTokens: 5, totalTokens: 15 } as never;
+        },
+        async setCostUsd() { marks.push("cost"); }
+      }
     });
     const session = await adapter.createSession(sessionInput);
-
-    for await (const event of adapter.runMessageAGUI(session, {
-      prompt: "hi",
-      toolContextId: null
-    })) {
-      if (event.type === AGUIEventType.RUN_FINISHED) marks.push("finished");
+    vi.useFakeTimers();
+    const done = (async () => {
+      for await (const event of adapter.runMessageAGUI(session, {
+        prompt: "hi", toolContextId: null
+      })) {
+        if (event.type === AGUIEventType.RUN_FINISHED) marks.push("finished");
+      }
+    })();
+    try {
+      await started.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(marks).not.toContain("finished");
+      release.resolve();
+      await done;
+      expect(marks.indexOf("usage")).toBeGreaterThanOrEqual(0);
+      expect(marks.indexOf("usage")).toBeLessThan(marks.indexOf("finished"));
+    } finally {
+      release.resolve();
+      await done;
+      await adapter.close();
+      vi.useRealTimers();
     }
-
-    expect(marks.indexOf("usage")).toBeGreaterThanOrEqual(0);
-    expect(marks.indexOf("usage")).toBeLessThan(marks.indexOf("finished"));
-    await adapter.close();
   });
 
   it("does not let a stalled usage write hold the terminal event or the slot", async () => {
@@ -2066,7 +2389,7 @@ it("gives a new participant fresh runtime authority and rejects the prior execut
   const adapter = makeAdapter({ factory: runtime.factory, executions, checkpointer, sessions: {
     getReadable: async (...args) => ({ ...await fakeSessionAccess.getReadable(...args), projectId: "project" })
   } });
-  const alice = { ...sessionInput, executionId: currentId, projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+  const alice = { ...sessionInput, executionId: currentId, ownerId: "replica-1", projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
   try {
     const first = await adapter.createSession({ ...alice, execution: alice });
     await collect(adapter.runMessageAGUI(first, runMessageInput()));
@@ -2087,6 +2410,42 @@ it("gives a new participant fresh runtime authority and rejects the prior execut
   } finally { await adapter.close(); }
 });
 
+it("keeps a standalone runtime and checkpointer across execution generations", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  let currentId = "first";
+  let savedSandboxId: string | null = null;
+  const sandboxExecutions: string[] = [];
+  const adapter = makeAdapter({ factory: runtime.factory, checkpointer: { deleteThread: async () => {} }, executions: {
+    isCurrent: async (execution: { executionId: string }) => execution.executionId === currentId,
+    bindRuntime: async () => {},
+    sandboxId: async (execution: { executionId: string }) => {
+      sandboxExecutions.push(execution.executionId);
+      return savedSandboxId;
+    },
+    bindSandboxId: async (execution: { executionId: string }, previousId: string | null, id: string) => {
+      sandboxExecutions.push(execution.executionId);
+      expect(previousId).toBe(savedSandboxId);
+      savedSandboxId = id;
+    }
+  } });
+  const first = { ...sessionInput, executionId: currentId, ownerId: "replica-a",
+    projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() };
+  try {
+    const original = await adapter.createSession({ ...sessionInput, execution: first });
+    await collect(adapter.runMessageAGUI(original, runMessageInput()));
+    currentId = "second";
+    const second = { ...first, executionId: currentId };
+    const reused = await adapter.createSession({ ...sessionInput, execution: second });
+    expect(reused.runtimeId).toBe(original.runtimeId);
+    expect(runtime.factoryCalls).toHaveLength(1);
+    expect(runtime.factoryCalls[0]?.checkpointer).toBeDefined();
+    await expect(runtime.factoryCalls[0]!.requireExecution!()).resolves.toBeUndefined();
+    await runtime.factoryCalls[0]!.sandboxBinding!.save(null, "sandbox-one");
+    expect(await runtime.factoryCalls[0]!.sandboxBinding!.load()).toBe("sandbox-one");
+    expect(sandboxExecutions).toEqual(["second", "second"]);
+  } finally { await adapter.close(); }
+});
+
 it("does not install execution checks for personal runtimes", async () => {
   const runtime = makeRuntimeFactory(() => scriptedChatStream());
   const adapter = makeAdapter({ factory: runtime.factory });
@@ -2103,7 +2462,7 @@ it("does not dispose another tenant's runtime during project participant handoff
   } });
   try {
     await adapter.createSession(sessionInput);
-    const execution = { ...sessionInput, tenantId: "another-tenant", executionId: "execution", projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    const execution = { ...sessionInput, tenantId: "another-tenant", executionId: "execution", ownerId: "replica-1", projectId: "project", expiresAt: new Date(Date.now() + 30_000).toISOString() };
     await expect(adapter.createSession({ ...execution, execution })).rejects.toThrow("unavailable for execution");
     expect(runtime.dispose).not.toHaveBeenCalled();
     expect(runtime.factoryCalls).toHaveLength(1);

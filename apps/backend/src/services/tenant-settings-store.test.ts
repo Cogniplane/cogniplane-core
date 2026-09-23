@@ -2,7 +2,20 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../lib/db.js";
 
-import { TenantSettingsStore } from "./tenant-settings-store.js";
+import { TenantSettingsStore, TenantSettingsConflictError } from "./tenant-settings-store.js";
+
+test("concurrent saves from one version reject the stale writer without losing changes", async () => {
+  const db = new InMemoryTenantSettingsDatabase();
+  const store = new TenantSettingsStore(db as unknown as Pool);
+  const original = await store.upsert("tenant-1", {});
+  const results = await Promise.allSettled([
+    store.upsert("tenant-1", { expectedVersion: original.version, developerInstructions: "first" }),
+    store.upsert("tenant-1", { expectedVersion: original.version, developerInstructions: "second" })
+  ]);
+  expect(results[0].status).toBe("fulfilled");
+  expect(results[1]).toMatchObject({ status: "rejected", reason: expect.any(TenantSettingsConflictError) });
+  expect(await store.get("tenant-1")).toMatchObject({ version: original.version + 1, developerInstructions: "first" });
+});
 
 type QueryResult = {
   rows: Record<string, unknown>[];
@@ -79,7 +92,7 @@ class InMemoryTenantSettingsDatabase {
         enabled_providers: JSON.parse(String(params[11])) as string[],
         enabled_model_ids: params[12] == null ? null : (JSON.parse(String(params[12])) as string[]),
         model_default_efforts: JSON.parse(String(params[13])) as Record<string, string>,
-        version: 1, // Database version increments are covered by the Postgres suite.
+        version: Number(this.row?.version ?? 0) + 1,
         config_hash: String(params[14]),
         updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
       };

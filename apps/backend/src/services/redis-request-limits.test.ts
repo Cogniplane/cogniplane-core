@@ -11,7 +11,7 @@
 
 import { test, expect } from "vitest";
 
-import { RedisRequestLimits } from "./redis-request-limits.js";
+import { RedisRequestLimits, RequestLimitsUnavailableError } from "./redis-request-limits.js";
 
 class FakeLimitRedis {
   private readonly values = new Map<string, number>();
@@ -102,6 +102,13 @@ function makeLimiter() {
   const redis = new FakeLimitRedis();
   return { redis, limits: new RedisRequestLimits(redis.asRedis(), CONFIG as never) };
 }
+
+test("Redis failures fail closed with a retryable service error for rates and quotas", async () => {
+  const { redis, limits } = makeLimiter();
+  redis.eval = async () => { throw new Error("Redis unavailable"); };
+  await expect(limits.consumeRateLimit({ resource: "message_turn", userId: "u", tenantId: "t" })).rejects.toBeInstanceOf(RequestLimitsUnavailableError);
+  await expect(limits.consumeTurnQuota({ userId: "u", tenantId: "t" })).rejects.toMatchObject({ statusCode: 503 });
+});
 
 test("a rejected request rolls its increment back rather than leaving it counted", async () => {
   const { redis, limits } = makeLimiter();

@@ -8,6 +8,7 @@ import type { MessageStore } from "./message-store.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import { isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore } from "./session-store.js";
@@ -637,7 +638,8 @@ export class SchedulerWorker {
       });
 
       // Scheduled turns intentionally use the organization default: they are
-      // unattended, so nobody can answer a native approval prompt. Policy
+      // unattended, so nobody can answer a native approval prompt. The runtime
+      // rejects gated tool calls at once for `turnContext: "scheduled"`. Policy
       // Center still receives the scheduled turn context through the tool
       // execution metadata above.
       const stream = runtime.runMessageAGUI(runtimeSession, {
@@ -656,6 +658,9 @@ export class SchedulerWorker {
           status = "failed";
           errorMessage =
             typeof event.message === "string" ? event.message : "The assistant run failed.";
+        } else if (isAGUIInterruptedFinish(event)) {
+          status = "failed";
+          errorMessage = "Scheduled job was interrupted.";
         }
       }
 

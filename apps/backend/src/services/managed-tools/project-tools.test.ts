@@ -359,6 +359,24 @@ test("project_reconcile_conflict preserves a non-empty whitespace-only merge", a
   }));
 });
 
+test("project_write_file preserves the write error when its refund fails", async () => {
+  const refundRateLimit = vi.fn().mockRejectedValue(new Error("refund unavailable"));
+  const tools = createProjectTools({
+    projectFiles: {
+      readRuntimeSnapshotFile: vi.fn(),
+      createAgentDraftFromContent: vi.fn().mockRejectedValue(new Error("write failed")),
+      readConflictContext: vi.fn(), readConflictMetadata: vi.fn()
+    },
+    storage: { openReadStream: vi.fn(), put: vi.fn(), delete: vi.fn() },
+    limits: { consumeRateLimit: vi.fn().mockResolvedValue(null), refundRateLimit },
+    maxProjectFileBytes: 10_000
+  });
+  await expect(tool(tools, "project_write_file").handler({
+    context: context(projectContext("read-write")), arguments: { name: "new.txt", content: "text" }
+  })).rejects.toThrow("write failed");
+  expect(refundRateLimit).toHaveBeenCalledOnce();
+});
+
 test("project_write_file creates a draft with the requested target and base version", async () => {
   const createAgentDraftFromContent = vi.fn().mockResolvedValue({
     fileId: "draft-2",

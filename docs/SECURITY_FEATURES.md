@@ -35,6 +35,8 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 - **Match:** exact, after stripping query string — defends against `/auth/login.attack` smuggling.
 - **Allowed:** the static set `/auth/login`, `/auth/callback`, `/auth/refresh`, `/auth/logout`, plus the integration OAuth callback paths sourced from the integration registry (e.g. the GitHub user callback).
 - Files: `apps/backend/src/lib/auth-public-paths.ts`, `apps/backend/src/lib/auth-workos.ts`.
+- `GET /downloads/:token` is also public: the single-use token is the credential (see §10.1).
+- **OAuth callbacks are bound to the browser that started the connect (GitHub and Notion).** Authorize sets a random nonce in an httpOnly cookie scoped to the callback path, and the signed state carries only its SHA-256. The callback requires the cookie, compares the hashes in constant time before it spends the single-use state `jti`, and clears the cookie. A provider URL sent to another person therefore cannot bind that person's account to the attacker's user. The cookie is `SameSite=None; Secure` for an https redirect URI, because the authorize call can be a cross-site fetch.
 
 ### 1.5 Frontend session-hint cookie
 - **Cookie:** `cogniplane_session_hint=1`, Max-Age 7d, `SameSite=Lax`, `Secure` over HTTPS.
@@ -81,14 +83,14 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 - **Tables:** `sessions`, `messages`, `runtime_sessions`, `approvals`, `audit_events`, `tool_execution_contexts`, `artifacts`, `tenant_settings`, `policy_rule`, `policy_decision`, `pii_scan_runs`, `pii_scan_jobs`, `tenant_integrations`, all `user_*_connections`.
 
 ### 3.2 `withTenantScope`
-- Every store method takes `tenantId` first and runs inside `withTenantScope(db, tenantId, fn)`, which issues `SET LOCAL app.current_tenant_id = $1`. Postgres kernel enforces isolation; app-level bugs cannot leak cross-tenant data.
+- Tenant-scoped store methods take `tenantId` first and run inside `withTenantScope(db, tenantId, fn)`, which calls `set_config(..., true)` for the transaction. PostgreSQL policies enforce the tenant predicate in addition to route and store authorization.
 - File: `apps/backend/src/lib/db.ts`.
 
 ### 3.3 Two database pools
 | Pool | Role | Purpose |
 |---|---|---|
 | `db` | `app_user` (non-superuser) | All normal app queries — subject to RLS |
-| `privilegedDb` | superuser | Migrations, artifact download-token signing, narrow bootstrap reads |
+| `privilegedDb` | superuser | Migrations and explicitly reviewed cross-tenant, lifecycle, bootstrap, or token-authorized operations |
 
 ### 3.4 Migration runner separation
 - Runs as superuser via `MIGRATION_DATABASE_URL`, intentionally bypasses RLS.
@@ -244,8 +246,12 @@ File: `apps/backend/src/routes/mcp.ts`.
 2. `toolContextId` in the URL.
 3. Session fallback via `findLatestActiveBySession()` keyed on the runtime token's `sid` claim.
 
-### 9.4 Proxy signature
-- Outbound proxy requests carry `X-Framework-Signature` + tenant/user/runtime/message ids, HMAC-signed for upstream verification.
+### 9.4 Proxy signature (v2)
+- Each request to a proxy upstream carries HMAC-SHA256 signed headers: `X-Framework-Signature-Version` (`v2`), `X-Framework-Tenant-Id`, `X-Framework-Server-Id`, `X-Framework-User-Id`, `X-Framework-Session-Id`, `X-Framework-Runtime-Id`, `X-Framework-Timestamp`, `X-Framework-Nonce` (128 random bits, base64url), `X-Framework-Body-Sha256` (base64url SHA-256 of the exact body bytes sent) and `X-Framework-Signature`.
+- **Key per server:** the key for one (tenant, server) pair comes from HKDF-SHA256 of the upstream signing secret (`MCP_UPSTREAM_SIGNING_ROOT_SECRET`, or a subkey of `DATA_ENCRYPTION_SECRET` under a v2 label), with the tenant ID and the server ID in the HKDF info. Give an upstream only its own key (`proxyServerSigningKey`). That key cannot sign for a different server or tenant. The upstream signing secret is never a value that a v1 upstream held, because anyone with it can derive every per-server key. Boot refuses the v1 override `MCP_UPSTREAM_SIGNING_SECRET`.
+- **Source of identity:** the tenant ID comes from the runtime token and the server ID from the tenant's server registration, never from the model or the request body.
+- **Replay:** the upstream calls `verifyProxyHeaders` with the raw body and its server ID. It must keep each returned nonce for `maxAgeMs` and reject a nonce that it already has.
+- v1 signing (no tenant, server, nonce or body hash; one key for all upstreams) is removed. Upstreams that verify v1 must change to v2.
 - File: `apps/backend/src/lib/mcp-proxy-signature.ts`.
 
 ### 9.5 Managed tool allowlist
@@ -258,9 +264,10 @@ File: `apps/backend/src/routes/mcp.ts`.
 
 ### 10.1 Short-lived download tokens
 - `POST /artifacts/:id/download-token` issues an opaque HMAC token (TTL `ARTIFACT_DOWNLOAD_TTL_MS`); `GET /downloads/:token` redeems it. No long-lived signed URLs leave the API.
+- The token is the credential: browser navigations and `<img>` tags cannot send the Bearer header, so `GET /downloads/:token` is public in every auth mode and takes identity from the token row. The token gate checks the token user's current tenant membership and session access in SQL.
 
-### 10.2 Privileged read for token issuance only
-- `getDownloadToken` uses `privilegedDb` to bypass RLS — the only production read path that does so, scoped to a single function.
+### 10.2 Privileged token read
+- `getDownloadToken` uses `privilegedDb` because the opaque token is the initial authorization input. The method scopes its lookup to one token and applies the token's identity and consumption checks before serving bytes. Other reviewed privileged paths exist for lifecycle, scheduler, authentication, and bootstrap work.
 
 ### 10.3 S3 storage (`ARTIFACT_STORAGE_BACKEND=bucket`)
 - **Key:** `{userId}/{sessionId}/{uuidv7}{safeExtension}`.
@@ -361,7 +368,7 @@ File: `apps/backend/src/lib/security-headers.ts`.
 - Integration tokens encrypted with AES-256-GCM (§5.3).
 
 ### 14.4 Superuser scope minimized
-- App pool runs as `app_user`; only migrations and the artifact-download-token path use `privilegedDb`.
+- The normal app pool runs as `app_user`. Code must opt into `privilegedDb`, and each caller needs an authorization reason that RLS cannot express, such as a migration, cross-tenant worker claim, bootstrap lookup, or opaque-token lookup.
 
 ---
 

@@ -10,6 +10,36 @@ import type { PiiDecision } from "./pii-protection-service.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
 
+test("missing deployment KEK remains retryable and can complete after configuration repair", async () => {
+  const overrides = { evaluateThrows: new PiiProtectionServiceError("pii_kek_missing", "No KEK configured") as Error | undefined };
+  const h = buildDeps(overrides);
+  const handler = new PiiScanJobHandler(h.deps);
+  await handler.execute(sampleJob());
+  expect(h.failureCalls).toHaveLength(1);
+  expect(h.failureCalls[0].permanent).toBe(false);
+  expect(h.updateCalls.some((call) => call.patch.status === "failed")).toBe(false);
+  overrides.evaluateThrows = undefined;
+  await handler.execute(sampleJob({ attempts: 2 }));
+  expect(h.completedCalls).toHaveLength(1);
+});
+
+test("acknowledgement failure preserves an applied decision", async () => {
+  const h = buildDeps();
+  h.deps.piiScanJobs.markCompleted = async () => { throw new Error("database unavailable"); };
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.failureCalls).toEqual([]);
+  expect(h.updateCalls.at(-1)?.patch.status).toBe("completed");
+});
+
+test("a failed subject update cannot publish a terminal scan run", async () => {
+  const h = buildDeps();
+  h.deps.artifacts.setPiiDetail = async () => { throw new Error("subject write unavailable"); };
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.updateCalls.map((call) => call.patch.status)).toEqual(["processing"]);
+  expect(h.failureCalls).toHaveLength(1);
+  expect(h.completedCalls).toEqual([]);
+});
+
 type UpdateScanRunCall = { tenantId: string; scanRunId: string; patch: Record<string, unknown> };
 type SetMessagePiiCall = { tenantId: string; messageId: string; pii: Record<string, unknown> };
 type SetArtifactPiiCall = { tenantId: string; artifactId: string; pii: Record<string, unknown> };

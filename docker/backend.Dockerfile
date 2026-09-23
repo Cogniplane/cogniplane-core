@@ -36,6 +36,11 @@ WORKDIR /app
 ENV BUILD_SHA=$BUILD_SHA
 ENV BUILD_DATE=$BUILD_DATE
 
+# Project PDF previews invoke pdftotext at request time.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends poppler-utils \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /opt/backend/node_modules apps/backend/node_modules
 COPY --from=builder /opt/backend/package.json apps/backend/package.json
 COPY --from=builder /workspace/apps/backend/bundle apps/backend/dist

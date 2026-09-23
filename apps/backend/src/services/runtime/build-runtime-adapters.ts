@@ -57,7 +57,11 @@ export function buildRuntimeAdapter(input: {
       messages: stores.messages,
       // Materializes bundle companion files into the /skills/ library.
       skillBundles: skillBundleStorage,
-      tenantMembers: stores.tenantMembers
+      tenantMembers: stores.tenantMembers,
+      // Keepalives across unbounded approval rounds: both budget for one
+      // approval, so the resume path extends them per round.
+      toolContexts: stores.toolContexts,
+      activeTurns: stores.activeTurns
     },
     providerCredentials,
     undefined,

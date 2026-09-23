@@ -33,6 +33,9 @@ class CaptureDatabase {
     }
     this.lastQuery = { text, values };
     const trimmed = text.trim();
+    if (trimmed.startsWith("UPDATE pii_scan_jobs j")) {
+      return { rows: [], rowCount: 0 };
+    }
     if (trimmed.startsWith("INSERT INTO pii_scan_jobs")) {
       return { rows: this.insertReturn ? [this.insertReturn] : [], rowCount: 1 };
     }

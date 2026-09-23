@@ -19,9 +19,12 @@ import {
 } from "./github-token-lifecycle.js";
 import {
   buildIntegrationRedirectUrl,
+  createOAuthBrowserBinding,
   getSecretKey,
   getVerificationKey,
-  toIsoFromNow
+  oauthBrowserBindingMatches,
+  toIsoFromNow,
+  type OAuthBrowserBindingCookie
 } from "../integration-oauth-helpers.js";
 import type { RuntimeInvalidator } from "../contracts.js";
 import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
@@ -38,6 +41,8 @@ type GithubUserStatePayload = {
   tid: string;
   sub: string;
   jti: string;
+  // SHA-256 of the browser-binding cookie nonce.
+  bnh: string;
 };
 
 export type GithubUserConnectionSummary = {
@@ -97,7 +102,8 @@ export class GithubConnectionService {
     private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
     private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
-      new IntegrationOAuthStateStore()
+      new IntegrationOAuthStateStore(),
+    private readonly logger: Pick<Console, "warn"> = console
   ) {}
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<GithubConnectionStatus> {
@@ -117,15 +123,24 @@ export class GithubConnectionService {
     return Boolean(record.refreshTokenEncrypted);
   }
 
-  async getAuthorizationUrl(input: { tenantId: string; userId: string }): Promise<string> {
+  async getAuthorizationUrl(input: {
+    tenantId: string;
+    userId: string;
+  }): Promise<{ url: string; browserBinding: OAuthBrowserBindingCookie }> {
     this.assertConfigured();
 
     const jti = uuidv7();
+    const binding = createOAuthBrowserBinding(
+      "github",
+      this.config.GITHUB_OAUTH_REDIRECT_URI!,
+      GITHUB_STATE_TTL_SECONDS
+    );
     await this.oauthStates.issue("github", jti, GITHUB_STATE_TTL_SECONDS);
     const state = await new SignJWT({
       tid: input.tenantId,
       sub: input.userId,
-      jti
+      jti,
+      bnh: binding.nonceHash
     } satisfies GithubUserStatePayload)
       .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(GITHUB_STATE_ISSUER)
@@ -139,10 +154,14 @@ export class GithubConnectionService {
     url.searchParams.set("redirect_uri", this.config.GITHUB_OAUTH_REDIRECT_URI!);
     url.searchParams.set("scope", "repo read:user user:email");
     url.searchParams.set("state", state);
-    return url.toString();
+    return { url: url.toString(), browserBinding: binding.cookie };
   }
 
-  async completeAuthorization(input: { code?: string | null; state?: string | null }): Promise<string> {
+  async completeAuthorization(input: {
+    code?: string | null;
+    state?: string | null;
+    browserNonce?: string | null;
+  }): Promise<string> {
     const fallbackUrl = buildIntegrationRedirectUrl(this.config, "/settings/github", {
       githubAuth: "error",
       reason: "invalid_state"
@@ -170,14 +189,20 @@ export class GithubConnectionService {
       if (
         typeof payload.tid !== "string" ||
         typeof payload.sub !== "string" ||
-        typeof payload.jti !== "string"
+        typeof payload.jti !== "string" ||
+        typeof payload.bnh !== "string"
       ) {
+        return fallbackUrl;
+      }
+      // Check the browser binding before spending the state, so a callback
+      // from another browser cannot burn it.
+      if (!oauthBrowserBindingMatches(payload.bnh, input.browserNonce)) {
         return fallbackUrl;
       }
       if (!(await this.oauthStates.consume("github", payload.jti))) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti };
+      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti, bnh: payload.bnh };
     } catch {
       return fallbackUrl;
     }
@@ -203,17 +228,25 @@ export class GithubConnectionService {
         tokenLastRefreshedAt: connection.tokenLastRefreshedAt
       });
 
-      await this.auditEvents?.create({
-        tenantId: state.tid,
-        sessionId: null,
-        userId: state.sub,
-        type: "user.github.connected",
-        payload: {
-          githubLogin: connection.githubLogin,
-          githubUserId: connection.githubUserId
-        }
-      });
-      await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "github");
+      try {
+        await this.auditEvents?.create({
+          tenantId: state.tid,
+          sessionId: null,
+          userId: state.sub,
+          type: "user.github.connected",
+          payload: {
+            githubLogin: connection.githubLogin,
+            githubUserId: connection.githubUserId
+          }
+        });
+      } catch (err) {
+        this.logger.warn({ err }, "Failed to audit GitHub connection");
+      }
+      try {
+        await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "github");
+      } catch (err) {
+        this.logger.warn({ err }, "Failed to refresh runtimes after github connection");
+      }
 
       return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "connected"

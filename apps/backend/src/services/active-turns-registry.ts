@@ -1,9 +1,11 @@
+import { TurnEventLog } from "./turn-event-log.js";
+
 // Tracks which sessions have a turn streaming *right now* on this backend
 // process. Reserves interactive turns and lifecycle mutations, and supplies
 // activity identity and timing to the session list.
 //
-// Single-process scope by design: if we ever scale horizontally, swap this
-// for a DB-backed flag (a `sessions.current_turn_started_at` column works).
+// This registry handles local cancellation and replay. The execution lease in
+// Postgres admits turns and reports running state across replicas.
 
 // Must exceed the longest turn the platform allows. A staleness window shorter
 // than the turn ceiling stale-evicts a *live* turn from snapshot(), letting a
@@ -17,13 +19,17 @@
 // wall-clock caps on a turn — the turn watchdog is not, since it pauses for
 // the duration of an approval.
 //
-// KNOWN RESIDUAL LIMIT (bead l2pq): this budgets for ONE approval. The approval
-// round loop is unbounded, so a turn stalling on two or more consecutive
-// approvals outlives this window and is stale-evicted while still LIVE — the
-// busy check then passes and a second turn starts on the same session, which is
-// the exact failure the window exists to prevent. Fixing the tool-context TTL
-// to refresh per approval round fixes this too, PROVIDED the derivation here is
-// revisited with it; extending only the context TTL would leave this in place.
+// This window budgets for ONE approval, and the approval round loop is
+// unbounded, so the window alone cannot cover a turn's real wall-clock length.
+// It does not have to: staleness is measured from `lastSeenAt`, and the resume
+// path calls `keepAlive` on every approval decision. The window is therefore an
+// idle timeout between rounds, not a cap on total turn length, and a turn parked
+// on N consecutive approvals stays live as long as each round completes inside it.
+//
+// If a future change stops calling `keepAlive` on the resume path, this reverts
+// to a wall-clock cap that stale-evicts LIVE turns, letting the busy check pass
+// and a second turn start on the same session — the exact failure it exists to
+// prevent. Keep the two together.
 export function deriveStaleAfterMs(config: {
   E2B_SANDBOX_TIMEOUT_MS: number;
   TOOL_CONTEXT_TTL_MS: number;
@@ -39,21 +45,120 @@ const DEFAULT_STALE_AFTER_MS = 40 * 60 * 1000;
 export type TurnIdentity = { messageId: string; sequence: number };
 
 type Entry = {
+  tenantId?: string;
+  userId?: string;
+  executionId?: string;
   turn?: TurnIdentity;
+  cancel: AbortController;
+  /** Turn start. Drives the user-visible elapsed timer; never moves. */
   startedAt: number;
+  /**
+   * Last proof of life. Staleness is measured from this, not `startedAt`, so a
+   * turn parked on consecutive approvals stays live without the UI timer
+   * jumping backwards.
+   */
+  lastSeenAt: number;
 };
 
 export class ActiveTurnsRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly mutations = new Map<string, symbol>();
+  private readonly eventLogs = new Map<string, TurnEventLog>();
   private readonly staleAfterMs: number;
+  private draining = false;
 
   constructor(staleAfterMs: number = DEFAULT_STALE_AFTER_MS) {
     this.staleAfterMs = staleAfterMs;
   }
 
-  mark(sessionId: string): void {
-    this.entries.set(sessionId, { startedAt: Date.now() });
+  beginDrain(): void { this.draining = true; }
+
+  isDraining(): boolean { return this.draining; }
+
+  mark(sessionId: string, owner?: { tenantId: string; userId: string }): TurnEventLog {
+    const now = Date.now();
+    // A previous turn can still publish its terminal event after releasing
+    // admission. Its request owns that log and closes it in its finally block.
+    if (this.entries.has(sessionId)) this.closeEventLog(sessionId);
+    this.entries.set(sessionId, { ...owner, cancel: new AbortController(), startedAt: now, lastSeenAt: now });
+    const log = new TurnEventLog();
+    this.eventLogs.set(sessionId, log);
+    return log;
+  }
+
+  eventLog(sessionId: string, tenantId: string): TurnEventLog | undefined {
+    if (this.entries.get(sessionId)?.tenantId !== tenantId) return undefined;
+    return this.eventLogs.get(sessionId);
+  }
+
+  closeEventLog(sessionId: string, log = this.eventLogs.get(sessionId)): void {
+    log?.close();
+    if (this.eventLogs.get(sessionId) === log) this.eventLogs.delete(sessionId);
+  }
+
+  /** Stop can arrive while the request still prepares the runtime. */
+  requestCancel(sessionId: string, tenantId: string): boolean {
+    const entry = this.entries.get(sessionId);
+    if (!entry || entry.tenantId !== tenantId) return false;
+    entry.cancel.abort();
+    return true;
+  }
+
+  setExecution(sessionId: string, executionId: string): void {
+    const entry = this.entries.get(sessionId);
+    if (entry) entry.executionId = executionId;
+  }
+
+  requestCancelExecution(sessionId: string, tenantId: string, executionId: string): boolean {
+    const entry = this.entries.get(sessionId);
+    if (!entry || entry.tenantId !== tenantId || entry.executionId !== executionId) return false;
+    entry.cancel.abort();
+    return true;
+  }
+
+  requestCancelUnadmitted(sessionId: string, tenantId: string): boolean {
+    const entry = this.entries.get(sessionId);
+    if (!entry || entry.tenantId !== tenantId || entry.executionId) return false;
+    entry.cancel.abort();
+    return true;
+  }
+
+  cancelSignal(sessionId: string): AbortSignal | undefined {
+    return this.entries.get(sessionId)?.cancel.signal;
+  }
+
+  countRunning(owner: { tenantId: string; userId?: string }): number {
+    const live = this.snapshot();
+    let count = 0;
+    for (const sessionId of live) {
+      const entry = this.entries.get(sessionId);
+      if (entry?.tenantId === owner.tenantId &&
+        (owner.userId === undefined || entry.userId === owner.userId)) count += 1;
+    }
+    return count;
+  }
+
+  runningOwners(): Array<{ sessionId: string; tenantId: string; userId: string }> {
+    return [...this.snapshot()].flatMap((sessionId) => {
+      const entry = this.entries.get(sessionId);
+      return entry?.tenantId && entry.userId
+        ? [{ sessionId, tenantId: entry.tenantId, userId: entry.userId }]
+        : [];
+    });
+  }
+
+  /**
+   * Refresh a live entry's liveness without moving its start time. Called on
+   * each approval decision so a turn stalled on N consecutive approvals is not
+   * stale-evicted while still running — eviction would let the busy check pass
+   * and a second turn start on the same session.
+   *
+   * No-op when the entry is already gone: this keeps a turn alive, it does not
+   * resurrect one, so it can never re-reserve a session the turn has released.
+   */
+  keepAlive(sessionId: string): void {
+    const entry = this.entries.get(sessionId);
+    if (entry) entry.lastSeenAt = Date.now();
   }
 
   isBusy(sessionId: string): boolean {
@@ -97,8 +202,9 @@ export class ActiveTurnsRegistry {
     const now = Date.now();
     const live = new Set<string>();
     for (const [sessionId, entry] of this.entries) {
-      if (now - entry.startedAt > this.staleAfterMs) {
+      if (now - entry.lastSeenAt > this.staleAfterMs) {
         this.entries.delete(sessionId);
+        this.closeEventLog(sessionId);
         continue;
       }
       live.add(sessionId);

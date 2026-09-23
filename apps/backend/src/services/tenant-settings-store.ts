@@ -8,6 +8,13 @@ import type { ApprovalPolicy, ApprovalReviewer } from "./admin-config-records.js
 import { parseApprovalPolicy, parseApprovalReviewer } from "./admin-config-store-mappers.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
 
+export class TenantSettingsConflictError extends Error {
+  constructor() {
+    super("Settings changed since you started editing. Reload the page and reapply your changes.");
+    this.name = "TenantSettingsConflictError";
+  }
+}
+
 export const DEFAULT_TENANT_TOOL_IDS = [
   "managed-session-context",
   "session_context",
@@ -118,6 +125,7 @@ function serializeApprovalPolicy(policy: ApprovalPolicy): string {
 }
 
 export type TenantSettingsInput = {
+  expectedVersion?: number;
   showEffortSelector?: boolean;
   webSearchMode?: WebSearchMode;
   approvalPolicy?: ApprovalPolicy;
@@ -133,7 +141,7 @@ export type TenantSettingsInput = {
   modelDefaultEfforts?: Record<string, EffortLevel>;
 };
 
-export function buildDefaultTenantSettingsInput(): Required<TenantSettingsInput> {
+export function buildDefaultTenantSettingsInput(): Required<Omit<TenantSettingsInput, "expectedVersion">> {
   return {
     showEffortSelector: false,
     webSearchMode: "disabled",
@@ -184,6 +192,9 @@ export class TenantSettingsStore {
         [tenantId]
       );
       const existing = existingResult.rows[0] ? mapRow(existingResult.rows[0]) : null;
+      if (input.expectedVersion !== undefined && input.expectedVersion !== (existing?.version ?? 0)) {
+        throw new TenantSettingsConflictError();
+      }
       const defaults = buildDefaultTenantSettingsInput();
 
       const resolvedPolicy = Object.hasOwn(input, "approvalPolicy")

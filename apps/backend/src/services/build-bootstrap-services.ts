@@ -50,7 +50,7 @@ export function buildBootstrapServices(input: {
   );
   const redis = getRedis(config, logger);
   const limits: RequestLimitsInterface = redis
-    ? RedisRequestLimits.fromAppConfig(redis, config)
+    ? RedisRequestLimits.fromAppConfig(redis, config, logger)
     : RequestLimits.fromAppConfig(config);
   if (!redis) {
     logger.warn(

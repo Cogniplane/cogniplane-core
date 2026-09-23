@@ -44,6 +44,8 @@ export function useArtifactBrowserData(filters: ArtifactBrowseFilters = {}) {
     isLoading: query.isLoading,
     hasMore: query.hasNextPage,
     isLoadingMore: query.isFetchingNextPage,
+    isRetrying: query.isFetching,
+    retry: () => { void query.refetch(); },
     loadMore: () => {
       if (query.hasNextPage && !query.isFetchingNextPage) {
         void query.fetchNextPage();

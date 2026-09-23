@@ -9,7 +9,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 import type { RuntimeAdapter } from "../runtime-contracts.js";
 import { apiError, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
-import { STATIC_SECURITY_HEADERS } from "../lib/security-headers.js";
+import { openSseResponse } from "../lib/open-sse-response.js";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { uuidv7 } from "../lib/uuid.js";
 import type { ArtifactRecord } from "../services/artifacts/artifact-store.js";
@@ -18,39 +18,16 @@ import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
+import type { TurnEventLog } from "../services/turn-event-log.js";
 import { SessionExecutionError, type SessionExecution } from "../services/session-execution-store.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { ProjectFileError, type ProjectRuntimeFileSnapshot } from "../services/project-file-store.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { UtilityLlmClient } from "../services/utility-llm-client.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
-import { isCorsOriginAllowed } from "../lib/cors.js";
 import { handlePiiDecision, type PiiHandlerOutcome, type PiiHandlerStores } from "./messages-pii-handler.js";
+import { PERMANENT_PII_ERROR_CODES } from "../services/pii/pii-scan-job-handler.js";
 import { AVAILABLE_MODELS } from "../domain/models.js";
-
-function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: FastifyReply): void {
-  // Fastify must be explicitly bypassed when we manage the raw SSE socket.
-  reply.hijack();
-  // @fastify/cors cannot intercept hijacked replies, so CORS headers are set
-  // manually using the same isCorsOriginAllowed check as the plugin.
-  const requestOrigin = request.headers.origin;
-  if (requestOrigin && isCorsOriginAllowed(requestOrigin, app.config.API_ORIGIN)) {
-    reply.raw.setHeader("Access-Control-Allow-Origin", requestOrigin);
-    reply.raw.setHeader("Access-Control-Allow-Credentials", "true");
-    reply.raw.setHeader("Vary", "Origin");
-  }
-  reply.raw.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-  // reply.hijack() bypasses the onSend security-headers hook, so set the same
-  // static headers here to keep parity (otherwise CSP/HSTS/X-Frame are absent
-  // on the SSE stream).
-  for (const [name, value] of STATIC_SECURITY_HEADERS) {
-    reply.raw.setHeader(name, value);
-  }
-  reply.raw.setHeader("X-Request-Id", request.id);
-  reply.raw.setHeader("Cache-Control", "no-store, no-cache, no-transform");
-  reply.raw.setHeader("Connection", "keep-alive");
-  reply.raw.flushHeaders();
-}
 
 // Wire shape lives in `@cogniplane/shared-types`. `model` is a bounded string
 // here, NOT a static enum: the catalog is tenant-dependent (built-ins plus
@@ -85,6 +62,7 @@ export function buildMessageRouteStores(
     piiScanRuns: deps.piiScanRuns,
     auditEvents: deps.auditEvents,
     activeTurns: deps.activeTurns,
+    turnBus: deps.turnBus,
     projectFiles: deps.projectFiles
   };
 }
@@ -97,7 +75,7 @@ export type MessageRouteStores = {
   artifactProcessor: Pick<AppDependencies["artifactProcessor"], "extractArtifactText">;
   storage: AppDependencies["artifactStorage"];
   limits: AppDependencies["limits"];
-  messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult">;
+  messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices" | "deleteToolResult">;
   toolContexts: Pick<AppDependencies["toolContexts"], "create">;
   dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getOrCreateTenantSettings">;
   customModels: Pick<AppDependencies["customModels"], "list">;
@@ -108,6 +86,7 @@ export type MessageRouteStores = {
   piiScanRuns: PiiHandlerStores["piiScanRuns"];
   auditEvents: Pick<AppDependencies["auditEvents"], "create">;
   activeTurns: AppDependencies["activeTurns"];
+  turnBus?: AppDependencies["turnBus"];
   projectFiles?: Pick<AppDependencies["projectFiles"], "captureRuntimeSnapshot">;
 };
 
@@ -171,14 +150,13 @@ export async function registerMessageRoutes(
 
     const { runtimeAdapter, selectedModel, selectedEffort } = resolution;
 
-    // Atomic turn-slot reservation. The adapter only flips `hasActiveTurn` deep
-    // inside `runMessageAGUI`, after several awaits that persist the user message and burn
-    // rate-limit/quota. Two requests racing on the same session would BOTH pass
-    // an `hasActiveTurn`-only check and BOTH do those side effects before one
-    // loses. `activeTurns` is the single-process, synchronous registry the stream
-    // writer already marks for the turn's lifetime; check-and-mark it here with
-    // NO `await` in between so the event loop cannot interleave a second request.
-    // The loser returns 429 before persisting anything or consuming quota.
+    if (stores.activeTurns?.isDraining()) {
+      reply.code(503);
+      return apiError("server_draining");
+    }
+
+    // Reserve the local turn slot before any side effects. The database lease
+    // below handles requests that arrive on different replicas.
     //
     // We release the slot on every path below. `activeTurns`
     // is optional only in the in-memory test harness; when absent we fall back
@@ -192,8 +170,7 @@ export async function registerMessageRoutes(
       }
     };
 
-    // OR source-order is not priority: `activeTurns` is the primary guard (see
-    // above), the adapter check is the best-effort fallback.
+    // Reject a turn already running on this replica before querying the lease.
     const alreadyBusy =
       runtimeAdapter.hasActiveTurn(input.sessionId) ||
       (stores.activeTurns?.isBusy(input.sessionId) ?? false);
@@ -201,8 +178,16 @@ export async function registerMessageRoutes(
       reply.code(429);
       return apiError("session_busy");
     }
+    if (stores.activeTurns && (
+      stores.activeTurns.countRunning({ tenantId, userId }) >= app.config.MAX_RUNNING_TURNS_PER_USER ||
+      stores.activeTurns.countRunning({ tenantId }) >= app.config.MAX_RUNNING_TURNS_PER_TENANT
+    )) {
+      reply.code(429);
+      return apiError("running_turn_limit");
+    }
+    let eventLog: TurnEventLog | undefined;
     if (stores.activeTurns) {
-      stores.activeTurns.mark(input.sessionId);
+      eventLog = stores.activeTurns.mark(input.sessionId, { tenantId, userId });
       slotReserved = true;
     }
 
@@ -215,7 +200,13 @@ export async function registerMessageRoutes(
         try { await stores.executions.release(execution); }
         catch (error) { request.log.error({ err: error, sessionId: input.sessionId }, "Failed to release execution lease"); }
       }
-      releaseSlot();
+      try {
+        await runtimeAdapter.finishTurnAdmission?.({ tenantId, sessionId: input.sessionId, userId });
+      } catch (error) {
+        request.log.error({ err: error, sessionId: input.sessionId }, "Failed to finish turn admission");
+      } finally {
+        releaseSlot();
+      }
     })();
     // Everything past the reservation releases the slot on early exit or after
     // the AG-UI stream finishes.
@@ -226,9 +217,21 @@ export async function registerMessageRoutes(
         reply.code(404);
         return notFoundError("session_not_found");
       }
-      if (currentSession.projectId) {
+      if (stores.executions) {
         const leaseStartedAt = performance.now();
-        execution = await stores.executions.acquire({ tenantId, sessionId: input.sessionId, userId }, app.config.SESSION_EXECUTION_LEASE_MS);
+        execution = await stores.executions.acquire(
+          { tenantId, sessionId: input.sessionId, userId }, app.config.SESSION_EXECUTION_LEASE_MS,
+          { perUser: app.config.MAX_RUNNING_TURNS_PER_USER, perTenant: app.config.MAX_RUNNING_TURNS_PER_TENANT }
+        );
+        stores.activeTurns?.setExecution(input.sessionId, execution.executionId);
+        if (eventLog && stores.turnBus) {
+          const key = { tenantId, sessionId: input.sessionId, executionId: execution.executionId };
+          eventLog.setMirror(
+            entry => stores.turnBus!.append(key, entry),
+            (reason, error) => request.log.warn({ err: error, reason, sessionId: input.sessionId },
+              "Remote turn event mirror unavailable")
+          );
+        }
         const admitted = execution;
         const leaseExpiresAt = performance.now() + Math.max(0, new Date(admitted.expiresAt).getTime() - Date.now());
         stopHeartbeat = startExecutionHeartbeat({
@@ -307,7 +310,7 @@ export async function registerMessageRoutes(
       const piiOutcome = await handlePiiDecision(
         piiDecision,
         { tenantId, sessionId: input.sessionId, userId, rawText: input.text },
-        { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents }
+        { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents, logger: request.log }
       );
 
       if (piiOutcome.kind === "block") {
@@ -331,7 +334,7 @@ export async function registerMessageRoutes(
         const outcome = await handlePiiDecision(evaluation.piiDecision, {
           tenantId, sessionId: input.sessionId, userId, rawText: projectInstructions.instructions,
           projectInstructions: { projectId: projectInstructions.projectId, revision: projectInstructions.revision }
-        }, { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents });
+        }, { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents, logger: request.log });
         if (outcome.kind === "block") {
           return reply.code(422).send(apiError("project_instructions_blocked",
             "Project instructions were blocked by organization policy. Edit them before sending another message."));
@@ -352,7 +355,7 @@ export async function registerMessageRoutes(
       }
 
       const { persistedText: persistedUserText, runtimePrompt } = piiOutcome;
-      const { userMessageReplacement } = await persistUserTurnMessage(stores, {
+      const { persistedUserMessage, userMessageReplacement } = await persistUserTurnMessage(stores, {
         tenantId,
         sessionId: input.sessionId,
         userId,
@@ -381,7 +384,10 @@ export async function registerMessageRoutes(
       }
 
       await streamAssistantReplyAGUI({
+        eventLog,
+        persistedUserMessage,
         execution,
+        cancelSignal: stores.activeTurns?.cancelSignal(input.sessionId),
         startedAt: stores.activeTurns?.startedAt(input.sessionId),
         onTurnCreated: (turn) => stores.activeTurns?.identify(input.sessionId, turn),
         onTurnSettled: releaseAdmission,
@@ -419,6 +425,7 @@ export async function registerMessageRoutes(
       throw error;
     } finally {
       await releaseAdmission();
+      if (eventLog) stores.activeTurns?.closeEventLog(input.sessionId, eventLog);
     }
   });
 }
@@ -495,7 +502,7 @@ async function evaluatePiiDecisionOrFailClosed(
         { err: error, tenantId: input.tenantId, sessionId: input.sessionId },
         "PII provider unavailable; failing closed"
       );
-      reply.code(503);
+      reply.code(PERMANENT_PII_ERROR_CODES.has(error.code) ? 422 : 503);
       return { ok: false, response: apiError(error.code, error.message) };
     }
     throw error;
@@ -562,6 +569,7 @@ async function persistUserTurnMessage(
     piiDecision: PiiDecision | null;
   }
 ): Promise<{
+  persistedUserMessage: { messageId: string; text: string };
   userMessageReplacement: { messageId: string; text: string; scanRunId?: string } | undefined;
 }> {
   const { tenantId, sessionId, userId, piiOutcome, piiDecision } = input;
@@ -585,7 +593,10 @@ async function persistUserTurnMessage(
         }
       : undefined;
 
-  return { userMessageReplacement };
+  return {
+    persistedUserMessage: { messageId: persistedUserMessage.messageId, text: piiOutcome.persistedText },
+    userMessageReplacement
+  };
 }
 
 async function titleSessionAsync(input: {

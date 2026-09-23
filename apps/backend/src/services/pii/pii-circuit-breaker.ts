@@ -159,6 +159,7 @@ export class InMemoryPiiCircuitBreaker implements PiiCircuitBreaker {
  * lets us read+update atomically without a round-trip race.
  */
 export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
+  private lastWarningAt = Number.NEGATIVE_INFINITY;
   private readonly stateKey: string;
   private readonly openedAtKey: string;
   private readonly failuresKey: string;
@@ -174,6 +175,15 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
   }
 
   async shouldAllow(): Promise<boolean> {
+    try {
+      return await this.shouldAllowFromRedis();
+    } catch (error) {
+      this.warnUnavailable(error);
+      return true;
+    }
+  }
+
+  private async shouldAllowFromRedis(): Promise<boolean> {
     const now = this.nowMs();
     const [state, openedAtStr] = await Promise.all([
       this.redis.get(this.stateKey),
@@ -196,6 +206,14 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
   }
 
   async record(outcome: BreakerOutcome): Promise<void> {
+    try {
+      await this.recordInRedis(outcome);
+    } catch (error) {
+      this.warnUnavailable(error);
+    }
+  }
+
+  private async recordInRedis(outcome: BreakerOutcome): Promise<void> {
     const now = this.nowMs();
     const state = (await this.redis.get(this.stateKey)) ?? "closed";
 
@@ -227,6 +245,8 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
     pipeline.zcard(this.failuresKey);
     pipeline.pexpire(this.failuresKey, this.options.windowMs * 2);
     const results = await pipeline.exec();
+    const failure = results?.find(([error]) => error)?.[0];
+    if (!results || failure) throw failure ?? new Error("Breaker transaction aborted.");
     const cardEntry = results?.[2];
     const count = cardEntry && !cardEntry[0] ? Number(cardEntry[1]) : 0;
     if (count >= this.options.failureThreshold) {
@@ -269,7 +289,9 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
     if (next === "closed") {
       pipeline.del(this.failuresKey);
     }
-    await pipeline.exec();
+    const results = await pipeline.exec();
+    const failure = results?.find(([error]) => error)?.[0];
+    if (!results || failure) throw failure ?? new Error("Breaker transaction aborted.");
     this.options.logger?.info(
       { breaker: this.options.name, from: prev, to: next, at: now },
       "PII circuit breaker state change"
@@ -288,6 +310,16 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
 
   private nowMs(): number {
     return this.options.now ? this.options.now() : Date.now();
+  }
+
+  private warnUnavailable(error: unknown): void {
+    const now = this.nowMs();
+    if (now - this.lastWarningAt < 60_000) return;
+    this.lastWarningAt = now;
+    this.options.logger?.warn(
+      { err: error, breaker: this.options.name },
+      "PII breaker store unavailable; provider scanning continues"
+    );
   }
 }
 

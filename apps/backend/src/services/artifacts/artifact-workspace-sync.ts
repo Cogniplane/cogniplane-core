@@ -52,9 +52,10 @@ export async function syncArtifactsToWorkspace(input: {
   sessionId: string;
   scopedArtifacts: ArtifactRecord[];
   storage: Pick<ArtifactStorage, "openReadStream">;
+  signal?: AbortSignal;
   writeRuntimeFile: (sessionId: string, filePath: string, data: Uint8Array | string) => Promise<string>;
 }): Promise<SyncedArtifact[]> {
-  const { sessionId, scopedArtifacts, storage, writeRuntimeFile } = input;
+  const { sessionId, scopedArtifacts, storage, signal, writeRuntimeFile } = input;
   const usedNames = new Set<string>();
   const results: SyncedArtifact[] = [];
 
@@ -62,6 +63,7 @@ export async function syncArtifactsToWorkspace(input: {
   // at once. With 10 artifacts at up to 25 MB each, concurrent loads could
   // allocate hundreds of MB.
   for (const artifact of scopedArtifacts) {
+    if (signal?.aborted) break;
     const workspacePath = uniqueWorkspacePath(artifact, usedNames);
 
     // Skip files that exceed the per-file size cap.
@@ -71,15 +73,28 @@ export async function syncArtifactsToWorkspace(input: {
     }
 
     try {
-      const handle = await storage.openReadStream(artifact.storageKey);
+      const handle = await storage.openReadStream(artifact.storageKey, { signal });
+      const abortStream = () => {
+        if ("destroy" in handle.stream && typeof handle.stream.destroy === "function") {
+          handle.stream.destroy();
+        }
+      };
+      signal?.addEventListener("abort", abortStream, { once: true });
       const chunks: Uint8Array[] = [];
-      for await (const chunk of handle.stream) {
-        chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      try {
+        for await (const chunk of handle.stream) {
+          signal?.throwIfAborted();
+          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+        }
+      } finally {
+        signal?.removeEventListener("abort", abortStream);
       }
+      signal?.throwIfAborted();
       const fileData = Buffer.concat(chunks);
       await writeRuntimeFile(sessionId, workspacePath, fileData);
       results.push({ artifact, workspacePath, synced: true });
     } catch {
+      if (signal?.aborted) break;
       results.push({ artifact, workspacePath, synced: false });
     }
   }

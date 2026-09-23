@@ -26,6 +26,28 @@ export type McpRpcResponse = {
   };
 };
 
+export type McpUpstreamAuth =
+  | { type: "bearer"; secret: string }
+  | { type: "header" | "query"; name: string; secret: string };
+
+const RESERVED_AUTH_HEADERS = new Set([
+  "connection",
+  "content-length",
+  "content-type",
+  "host",
+  "transfer-encoding",
+  "x-forwarded-by",
+  "x-framework-user-id",
+  "x-framework-session-id",
+  "x-framework-runtime-id",
+  "x-framework-timestamp",
+  "x-framework-signature"
+]);
+
+export function isReservedMcpUpstreamHeader(name: string): boolean {
+  return RESERVED_AUTH_HEADERS.has(name.toLowerCase());
+}
+
 export function rpcOk(id: string | number | undefined, result: unknown): McpRpcResponse {
   return {
     jsonrpc: "2.0",
@@ -233,12 +255,22 @@ function classifyTransportError(error: unknown): { errorName: string; errorCode:
  * fixed strings: an upstream `ECONNREFUSED` naming an internal host belongs in
  * the log, not in a model-visible tool result.
  */
+/**
+ * Outbound headers, or a function that builds them from the serialized body.
+ * Use the function form when a header must cover the exact bytes sent (the v2
+ * proxy signature signs a hash of the body).
+ */
+export type ForwardRpcHeaders =
+  | Record<string, string>
+  | ((body: string) => Record<string, string>);
+
 export async function forwardRpc(
   upstreamUrl: string | null,
   payload: McpRpcRequest,
-  headers: Record<string, string>,
+  headers: ForwardRpcHeaders,
   fetchFn: typeof undiciFetch = undiciFetch,
-  limits: ForwardRpcLimits = {}
+  limits: ForwardRpcLimits = {},
+  upstreamAuth: McpUpstreamAuth | null = null
 ): Promise<McpRpcResponse> {
   if (!upstreamUrl) {
     return rpcFailure(payload.id, -32601, "MCP upstream is not configured.");
@@ -255,19 +287,18 @@ export async function forwardRpc(
       fetchFn,
       timeoutMs,
       maxResponseBytes,
-      limits.allowPrivateUpstreamForTests === true
+      limits.allowPrivateUpstreamForTests === true,
+      upstreamAuth
     );
   } catch (error) {
     // AbortSignal.timeout rejects with a TimeoutError; everything else is a
     // transport fault. Both collapse to the same client-visible message — and
     // both are logged here, which is the only place they survive.
     //
-    // The URL is reduced to origin + pathname first. It is admin-supplied, and
-    // several MCP vendors authenticate by API key in the query string, so
-    // logging it whole would write that credential into log retention on the
-    // first upstream timeout. Central `redactSecrets()` does not help: it
-    // covers tool results and persisted errors, not logger fields. Origin and
-    // path are what an operator needs to identify which upstream failed.
+    // The URL is reduced to its origin first. It is admin-supplied, so logging
+    // it whole could write a legacy query or path credential into retention.
+    // Central `redactSecrets()` does not help: it covers tool results and
+    // persisted errors, not logger fields. The server id identifies the route.
     // Classified once, through the same guarded read the log record uses, so a
     // throwing `name` getter cannot escape between here and the response.
     const { errorName, errorCode } = classifyTransportError(error);
@@ -322,11 +353,12 @@ async function discardBody(response: { body?: unknown }): Promise<void> {
 async function forwardRpcInner(
   upstreamUrl: string,
   payload: McpRpcRequest,
-  headers: Record<string, string>,
+  headersOrBuilder: ForwardRpcHeaders,
   fetchFn: typeof undiciFetch,
   timeoutMs: number,
   maxResponseBytes: number,
-  allowPrivateUpstreamForTests: boolean
+  allowPrivateUpstreamForTests: boolean,
+  upstreamAuth: McpUpstreamAuth | null
 ): Promise<McpRpcResponse> {
   let currentUrl: URL;
   try {
@@ -363,18 +395,37 @@ async function forwardRpcInner(
     );
   }
 
+  // Serialize once. Every hop sends these same bytes, and a signed body hash in
+  // `headers` covers exactly them.
+  const requestBody = JSON.stringify(payload);
+  const headers =
+    typeof headersOrBuilder === "function" ? headersOrBuilder(requestBody) : headersOrBuilder;
+
   for (let hop = 0; hop <= MAX_MCP_PROXY_REDIRECTS; hop += 1) {
     // Manual redirect handling is security-critical: automatic fetch redirects
     // can downgrade HTTPS and replay signed identity headers + tool arguments
     // to an attacker-controlled target. The dispatcher still pins DNS on every
     // accepted hop to close the rebinding window.
-    const response = await fetchFn(currentUrl, {
+    const requestUrl = new URL(currentUrl);
+    const requestHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...headers
+    };
+    if (upstreamAuth?.type === "query") {
+      requestUrl.searchParams.set(upstreamAuth.name, upstreamAuth.secret);
+    } else if (upstreamAuth?.type === "bearer") {
+      requestHeaders.Authorization = `Bearer ${upstreamAuth.secret}`;
+    } else if (upstreamAuth?.type === "header") {
+      if (isReservedMcpUpstreamHeader(upstreamAuth.name)) {
+        return rpcFailure(payload.id, -32000, "Upstream MCP authentication is invalid.");
+      }
+      requestHeaders[upstreamAuth.name] = upstreamAuth.secret;
+    }
+
+    const response = await fetchFn(requestUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...headers
-      },
-      body: JSON.stringify(payload),
+      headers: requestHeaders,
+      body: requestBody,
       redirect: "manual",
       dispatcher: ssrfSafeAgent,
       // Per hop, not per chain: the redirect cap already bounds the number of

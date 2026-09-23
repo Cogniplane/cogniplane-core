@@ -418,4 +418,32 @@ describe("httpsUrlSchema — embedded credentials", () => {
   it("still accepts an ordinary public https URL with a query", () => {
     expect(httpsUrlSchema.safeParse("https://mcp.example.com/rpc?region=eu").success).toBe(true);
   });
+
+  it.each([
+    "api_key",
+    "access-token",
+    "authorization",
+    "client_secret",
+    "sig",
+    "token",
+    "x-api-key",
+    "subscription-key",
+    "auth_token"
+  ])(
+    "rejects the credential query parameter %s",
+    (name) => {
+      expect(httpsUrlSchema.safeParse(`https://mcp.example.com/rpc?${name}=SEKRET`).success).toBe(
+        false
+      );
+    }
+  );
+
+  it.each(["monkey", "tokenizer", "signatureVersion", "region"])(
+    "accepts the non-credential query parameter %s",
+    (name) => {
+      expect(httpsUrlSchema.safeParse(`https://mcp.example.com/rpc?${name}=value`).success).toBe(
+        true
+      );
+    }
+  );
 });

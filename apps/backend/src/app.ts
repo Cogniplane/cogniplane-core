@@ -6,6 +6,7 @@ import multipart from "@fastify/multipart";
 
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
+import { SessionExecutionStore } from "./services/session-execution-store.js";
 import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
@@ -19,6 +20,7 @@ import { registerTenantRoutes } from "./routes/tenant.js";
 import { TenantMemberStore } from "./services/tenant-member-store.js";
 import { ApprovalStore } from "./services/auth/approval-store.js";
 import { MessageStore } from "./services/message-store.js";
+import { RequestLimitsUnavailableError } from "./services/redis-request-limits.js";
 import { resolveStaleMessageDeadline } from "./services/runtime/stale-message-sweeper.js";
 
 /**
@@ -33,6 +35,13 @@ export function handleAppError(
   request: FastifyRequest,
   reply: FastifyReply
 ): void {
+  if (error instanceof RequestLimitsUnavailableError) {
+    reply.header("Retry-After", "5").code(503).send({
+      error: "request_limits_unavailable",
+      message: error.message
+    });
+    return;
+  }
   const statusCode = error.statusCode ?? 500;
   if (statusCode >= 400 && statusCode < 500) {
     // Client errors (validation, bad input, explicit 4xx) are safe to surface.
@@ -136,6 +145,15 @@ export async function buildApp() {
   });
 
   app.setErrorHandler(handleAppError);
+  if (parseTrustProxy(config.TRUST_PROXY) === false) {
+    let warned = false;
+    app.addHook("onRequest", async (request) => {
+      if (!warned && request.headers["x-forwarded-for"]) {
+        warned = true;
+        request.log.warn("Forwarded client IP ignored. Configure TRUST_PROXY with the proxy IP/CIDR so auth rate limits use client IPs.");
+      }
+    });
+  }
   // Unmatched routes return the app's standard `{ error }` envelope rather than
   // Fastify's default `{ statusCode, error, message }` body, so clients parse a
   // single 404 contract whether the route is missing or the request was rejected.
@@ -260,6 +278,7 @@ export async function buildApp() {
       db: app.db,
       tenantOrgSettings: deps.tenantOrgSettings,
       githubConnections: deps.githubConnectionService,
+      runtimeAdapter: deps.runtimeAdapter,
       integrationDescriptors: deps.integrationDescriptors,
       getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
     });
@@ -269,6 +288,7 @@ export async function buildApp() {
       db: app.db,
       tenantOrgSettings: deps.tenantOrgSettings,
       githubConnections: deps.githubConnectionService,
+      runtimeAdapter: deps.runtimeAdapter,
       integrationDescriptors: deps.integrationDescriptors,
       getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
     });
@@ -330,6 +350,9 @@ export async function buildApp() {
     limits: deps.limits,
     policyService: deps.policyService,
     runtimeAdapter: deps.runtimeAdapter,
+    activeTurns: deps.activeTurns,
+    expiredExecutions: new SessionExecutionStore(privilegedDb),
+    messages: deps.messages,
     privilegedDb,
     schedulerWorker,
     // Cross-tenant stale-approval recovery needs a BYPASSRLS pool; reuse the
@@ -348,7 +371,7 @@ export async function buildApp() {
     // The deadline is the turn's wall-clock ceiling: the watchdog caps WORKING
     // time at RUNTIME_TURN_TIMEOUT_MS but pauses while a human decides an
     // approval, so real elapsed time is working time plus approval time. The
-    // approval loop is unbounded (bead l2pq), so no finite deadline covers every
+    // approval loop is unbounded, so no finite deadline covers every
     // turn. The x3 factor budgets for a few approval rounds, and the AG-UI writer
     // refreshes `updated_at` on a timer so an approval wait keeps its row alive.
     //

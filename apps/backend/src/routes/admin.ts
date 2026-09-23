@@ -158,7 +158,6 @@ export async function registerAdminRoutes(
     dynamicConfig: stores.dynamicConfig,
     auditEvents: stores.auditEvents,
     managedToolCatalog: stores.managedToolCatalog,
-    runtimeAdapter: stores.runtimeAdapter,
     // Custom models never advertise reasoning efforts (see CustomModelStore).
     // Guarded: test wirings pass partial store literals without customModels.
     listCustomModels: stores.customModels

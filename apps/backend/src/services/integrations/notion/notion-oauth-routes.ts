@@ -4,7 +4,8 @@ import type { RequestLimitsInterface } from "../../request-limits.js";
 import { enforceOAuthCallbackRateLimit } from "../oauth-callback-rate-limit.js";
 import {
   buildIntegrationRedirectUrl,
-  mapOAuthProviderError
+  mapOAuthProviderError,
+  takeOAuthBrowserNonce
 } from "../integration-oauth-helpers.js";
 import type { NotionConnectionService } from "./notion-connection-service.js";
 
@@ -17,6 +18,7 @@ export function registerNotionOAuthRoutes(
 ): void {
   app.get("/integrations/notion/callback", async (request, reply) => {
     if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
+    const browserNonce = takeOAuthBrowserNonce(request, reply, "notion");
     const query = request.query as {
       code?: string;
       state?: string;
@@ -33,7 +35,8 @@ export function registerNotionOAuthRoutes(
     }
     const redirectUrl = await connections.completeAuthorization({
       code: query.code ?? null,
-      state: query.state ?? null
+      state: query.state ?? null,
+      browserNonce
     });
     return reply.redirect(redirectUrl);
   });

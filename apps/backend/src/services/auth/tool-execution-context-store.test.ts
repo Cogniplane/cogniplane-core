@@ -60,6 +60,30 @@ class FakeToolContextDatabase {
       };
     }
 
+    if (text.includes("UPDATE tool_execution_contexts")) {
+      // extend: push expires_at out, but only for a row that is still live and
+      // in the caller's tenant. Same discipline as the SELECT branch — each
+      // predicate is honored ONLY IF the emitted SQL carries it, so dropping
+      // one from the store changes this fake's result and a test catches it.
+      const scopesTenant = text.includes("tenant_id = $1");
+      const scopesContext = text.includes("tool_context_id = $2");
+      const filtersExpiry = text.includes("expires_at > NOW()");
+      const row = this.rows.get(String(values[1]));
+      const eligible =
+        row &&
+        (!scopesTenant || row.tenant_id === String(values[0])) &&
+        (!scopesContext || row.tool_context_id === String(values[1])) &&
+        (!filtersExpiry || Date.parse(row.expires_at) > this.nowMs);
+      if (!eligible || !row) return { rows: [], rowCount: 0 };
+      // Honor the SET clause rather than assuming it: a store that stopped
+      // actually moving expires_at (or moved it from the old expiry instead of
+      // NOW()) must change this fake's result, or these tests pin nothing.
+      if (text.includes("SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')")) {
+        row.expires_at = new Date(this.nowMs + Number(values[2])).toISOString();
+      }
+      return { rows: [row], rowCount: 1 };
+    }
+
     if (text.includes("FROM tool_execution_contexts")) {
       const tenantId = String(values[0]);
       const isUnexpired = (row: StoredContextRow) => Date.parse(row.expires_at) > this.nowMs;
@@ -233,4 +257,73 @@ test("findLatestActiveBySession never returns another tenant or session's contex
   // different tenant, must both be invisible.
   expect(await store.findLatestActiveBySession("tenant-a", "session-OTHER")).toBe(null);
   expect(await store.findLatestActiveBySession("tenant-b", "session-1")).toBe(null);
+});
+
+test("extend keeps a context alive across consecutive approval rounds", async () => {
+  // The defect: the TTL was wall-clock from creation, while the approval round
+  // loop is unbounded. Two approvals that each fit inside the TTL still pushed
+  // the turn past it, and the turn lost every managed MCP tool mid-flight.
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+  const ttlMs = 35 * 60_000;
+
+  const created = await store.create({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: "message-1",
+    ttlMs
+  });
+
+  // Round one resolves 30 minutes in: inside the TTL, so the keepalive lands.
+  db.advanceBy(30 * 60_000);
+  expect(await store.extend("test-tenant", created.toolContextId, ttlMs)).not.toBeNull();
+
+  // Round two resolves 30 minutes later. Total elapsed is past the original
+  // TTL, but each round stayed inside it, so the context is still usable.
+  db.advanceBy(30 * 60_000);
+  expect(await store.get("test-tenant", created.toolContextId)).not.toBeNull();
+});
+
+test("extend refuses a context that already expired", async () => {
+  // The keepalive must not resurrect a context the gateway already rejected:
+  // that would hand back MCP access the turn had lost.
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+  const ttlMs = 35 * 60_000;
+
+  const created = await store.create({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: "message-1",
+    ttlMs
+  });
+
+  db.advanceBy(ttlMs + 1);
+
+  expect(await store.extend("test-tenant", created.toolContextId, ttlMs)).toBeNull();
+  expect(await store.get("test-tenant", created.toolContextId)).toBeNull();
+});
+
+test("extend does not cross tenants", async () => {
+  const db = new FakeToolContextDatabase();
+  const store = new ToolExecutionContextStore(db as unknown as Pool);
+  const ttlMs = 35 * 60_000;
+
+  const created = await store.create({
+    tenantId: "test-tenant",
+    sessionId: "session-1",
+    userId: "user-1",
+    runtimeId: "runtime-1",
+    runtimePolicyId: "test-tools",
+    messageId: "message-1",
+    ttlMs
+  });
+
+  expect(await store.extend("other-tenant", created.toolContextId, ttlMs)).toBeNull();
 });

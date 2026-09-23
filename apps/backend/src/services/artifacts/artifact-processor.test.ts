@@ -30,6 +30,18 @@ const noopLogger = {
   error() {}
 };
 
+test("ArtifactProcessor returns null when PDF extraction fails", async () => {
+  const storage = new InMemoryProcessingStorage();
+  storage.seed("user/session/report.pdf", "invalid PDF");
+  const processor = new ArtifactProcessor({
+    config: { PDFTOTEXT_BINARY_PATH: "pdftotext" },
+    logger: noopLogger,
+    storage,
+    extractPdfText: async () => { throw new Error("encrypted PDF"); }
+  });
+  expect(await processor.extractArtifactText(createPdfArtifact())).toBeNull();
+});
+
 function createPdfArtifact(): ArtifactRecord {
   return {
     id: 1,

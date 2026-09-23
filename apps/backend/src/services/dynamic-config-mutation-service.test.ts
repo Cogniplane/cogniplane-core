@@ -32,6 +32,9 @@ const basePayload = {
   mode: "proxy" as const,
   routePath: "/mcp/vendor",
   upstreamUrl: "https://mcp.example.com/rpc",
+  upstreamAuthType: "none" as const,
+  upstreamAuthName: null,
+  upstreamAuthSecret: null,
   enabled: true
 };
 
@@ -39,7 +42,8 @@ describe("upstreamUrl credential rejection at the persistence boundary", () => {
   const credentialed = [
     "https://user:pw@mcp.example.com/rpc",
     "https://user@mcp.example.com/rpc",
-    "https://user:pw@mcp.example.com/rpc?api_key=SEKRET"
+    "https://user:pw@mcp.example.com/rpc?api_key=SEKRET",
+    "https://mcp.example.com/rpc?api_key=SEKRET"
   ];
 
   for (const upstreamUrl of credentialed) {
@@ -153,5 +157,42 @@ describe("upstreamUrl credential rejection at the persistence boundary", () => {
     });
 
     expect(created).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a secret for newly configured upstream authentication", async () => {
+    const { store, created } = storeSpy();
+
+    await expect(
+      createMcpServer({
+        tenantId: "t1",
+        store,
+        payload: {
+          ...basePayload,
+          upstreamAuthType: "bearer",
+          upstreamAuthSecret: null,
+          actorUserId: "u1"
+        }
+      })
+    ).rejects.toThrow("requires a secret");
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("rejects custom auth headers reserved by the proxy transport", async () => {
+    const { store, created } = storeSpy();
+
+    await expect(
+      createMcpServer({
+        tenantId: "t1",
+        store,
+        payload: {
+          ...basePayload,
+          upstreamAuthType: "header",
+          upstreamAuthName: "X-Framework-Signature",
+          upstreamAuthSecret: "secret",
+          actorUserId: "u1"
+        }
+      })
+    ).rejects.toThrow("reserved");
+    expect(created).not.toHaveBeenCalled();
   });
 });

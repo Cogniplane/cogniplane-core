@@ -45,30 +45,21 @@ function extractPassword(databaseUrl: string): string | null {
 }
 
 async function run() {
-  await applyMigrations(db, migrationsDir);
+  await applyMigrations(db, migrationsDir, console.log, async (client) => {
+    // Checkpointer DDL and role setup share the numbered migrations' lock.
+    await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
+    console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
 
-  // Deep Agents checkpointer DDL (schema + tables + the library's internal
-  // migrations). Runs here — superuser, alongside the SQL migrations — so the
-  // backend never executes DDL at serve time. Idempotent by construction.
-  await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
-  console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
-
-  // Role + grants. Shared with the integration harness via migrate-lib so the
-  // two cannot drift — see ensureAppUserRole's header.
-  const appUserPassword = process.env.APP_USER_PASSWORD || extractPassword(config.DATABASE_URL);
-  if (appUserPassword) {
-    const client = await db.connect();
-    try {
+    const appUserPassword = process.env.APP_USER_PASSWORD || extractPassword(config.DATABASE_URL);
+    if (appUserPassword) {
       await ensureAppUserRole(client, appUserPassword);
-    } finally {
-      client.release();
+      console.log("Ensured app_user role exists with correct password and grants.");
+    } else {
+      console.warn(
+        "Warning: no password found in DATABASE_URL — app_user will have no password set."
+      );
     }
-    console.log("Ensured app_user role exists with correct password and grants.");
-  } else {
-    console.warn(
-      "Warning: no password found in DATABASE_URL — app_user will have no password set."
-    );
-  }
+  });
 }
 
 try {

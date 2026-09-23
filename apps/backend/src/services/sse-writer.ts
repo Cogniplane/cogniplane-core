@@ -63,7 +63,7 @@ export class SseWriter {
   }
 
   end(): void {
-    if (this.raw.writableEnded === true) return;
+    if (this.isClosed) return;
     this.raw.end();
   }
 }

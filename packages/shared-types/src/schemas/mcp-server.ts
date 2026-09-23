@@ -10,6 +10,9 @@ export const AdminMcpServerSchema = z.object({
   mode: z.enum(["managed", "proxy"]),
   routePath: z.string(),
   upstreamUrl: z.string().nullable(),
+  upstreamAuthType: z.enum(["none", "bearer", "header", "query"]),
+  upstreamAuthName: z.string().nullable(),
+  upstreamAuthConfigured: z.boolean(),
   version: z.number(),
   configHash: z.string(),
   enabled: z.boolean(),
@@ -30,6 +33,10 @@ const AdminMcpServerMutationFields = {
   routePath: z.string().trim().min(1).max(200),
   // Backend routes additionally enforce HTTPS and reject unsafe hosts and credentials.
   upstreamUrl: z.string().url().nullable().optional(),
+  upstreamAuthType: z.enum(["none", "bearer", "header", "query"]).default("none"),
+  upstreamAuthName: z.string().trim().min(1).max(100).nullable().optional(),
+  // Write-only. Admin responses expose only upstreamAuthConfigured.
+  upstreamAuthSecret: z.string().min(1).max(8192).nullable().optional(),
   enabled: z.boolean().default(true)
 };
 
@@ -42,6 +49,9 @@ export type AdminMcpServerCreateRequest = z.input<typeof AdminMcpServerCreateReq
 export const AdminMcpServerUpdateRequestSchema = z.object({
   serverId: AdminIdSchema.optional(),
   ...AdminMcpServerMutationFields
+}).extend({
+  // Omission preserves the existing write-only authentication configuration.
+  upstreamAuthType: z.enum(["none", "bearer", "header", "query"]).optional()
 });
 export type AdminMcpServerUpdateRequest = z.input<typeof AdminMcpServerUpdateRequestSchema>;
 

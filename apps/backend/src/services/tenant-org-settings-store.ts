@@ -4,6 +4,7 @@ import { DEFAULT_PII_PROTECTION, MODEL_PROVIDERS } from "@cogniplane/shared-type
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { decrypt, encrypt } from "../lib/crypto-utils.js";
 
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 import { parsePiiProtection } from "./pii/pii-policy.js";
 
 /** Public provider id → its encrypted-key column on tenant_org_settings. */
@@ -97,21 +98,29 @@ export class TenantOrgSettingsStore {
   }
 
   /** Set (or clear, when null) one provider's API key. */
-  async setApiKey(tenantId: string, provider: ModelProvider, apiKey: string | null): Promise<void> {
+  // Each setter takes an optional audit event, written in the same transaction
+  // as the change, so a change never commits without its evidence.
+  async setApiKey(
+    tenantId: string,
+    provider: ModelProvider,
+    apiKey: string | null,
+    audit?: AuditEventInput
+  ): Promise<void> {
     const column = PROVIDER_KEY_COLUMNS[provider];
     await this.upsert(
       tenantId,
       [`${column} = $2`],
-      [tenantId, apiKey ? encrypt(apiKey, this.secret) : null]
+      [tenantId, apiKey ? encrypt(apiKey, this.secret) : null],
+      audit
     );
   }
 
-  async setMarketplaceUrl(tenantId: string, url: string | null): Promise<void> {
-    await this.upsert(tenantId, ["skill_marketplace_manifest_url = $2"], [tenantId, url]);
+  async setMarketplaceUrl(tenantId: string, url: string | null, audit?: AuditEventInput): Promise<void> {
+    await this.upsert(tenantId, ["skill_marketplace_manifest_url = $2"], [tenantId, url], audit);
   }
 
-  async setPiiProtection(tenantId: string, policy: PiiProtectionSettings): Promise<void> {
-    await this.upsert(tenantId, ["pii_protection = $2::jsonb"], [tenantId, JSON.stringify(policy)]);
+  async setPiiProtection(tenantId: string, policy: PiiProtectionSettings, audit?: AuditEventInput): Promise<void> {
+    await this.upsert(tenantId, ["pii_protection = $2::jsonb"], [tenantId, JSON.stringify(policy)], audit);
   }
 
   private async readEncryptedKey(
@@ -130,7 +139,12 @@ export class TenantOrgSettingsStore {
   // Lazy upsert: row is created on first write so callers don't need a separate
   // INSERT step. The SET-list is built per call so each setter only touches the
   // columns it owns.
-  private async upsert(tenantId: string, setExpressions: string[], values: unknown[]): Promise<void> {
+  private async upsert(
+    tenantId: string,
+    setExpressions: string[],
+    values: unknown[],
+    audit?: AuditEventInput
+  ): Promise<void> {
     const setClause = [...setExpressions, "updated_at = NOW()"].join(", ");
     const insertColumns = ["tenant_id"];
     const insertExpressions = ["$1"];
@@ -142,13 +156,14 @@ export class TenantOrgSettingsStore {
       insertExpressions.push(expr.slice(eqIndex + 3));
     }
 
-    await withTenantScope(this.db, tenantId, (client) =>
-      client.query(
+    await withTenantScope(this.db, tenantId, async (client) => {
+      await client.query(
         `INSERT INTO tenant_org_settings (${insertColumns.join(", ")})
          VALUES (${insertExpressions.join(", ")})
          ON CONFLICT (tenant_id) DO UPDATE SET ${setClause}`,
         values
-      )
-    );
+      );
+      if (audit) await AuditEventStore.createInTransaction(client, audit);
+    });
   }
 }

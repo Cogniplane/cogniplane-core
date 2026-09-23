@@ -153,12 +153,14 @@ function FeedbackTable(props: { rows: FeedbackRow[]; firstColLabel: string }) {
         cell: (ctx) => <span className="text-danger">{ctx.getValue<number>()}</span>
       },
       {
-        accessorKey: "rate",
+        id: "rate",
+        accessorFn: (row) => row.rate ?? undefined,
         header: "Rate",
         // null rates sort last regardless of direction.
         sortUndefined: "last",
+        sortDescFirst: true,
         cell: (ctx) => {
-          const v = ctx.getValue<number | null>();
+          const v = ctx.getValue<number | undefined>();
           return v != null ? `${v}%` : "—";
         }
       }

@@ -37,6 +37,13 @@ export type SessionSidebarListModel = {
   onSelect: (sessionId: string) => void;
   onCreate: (projectId: string | null) => Promise<void>;
   isCreating?: boolean;
+  search?: string;
+  onSearch?: (value: string) => void;
+  hasMore?: boolean;
+  isLoadingMore?: boolean;
+  onLoadMore?: () => void;
+  error?: string | null;
+  onRetry?: () => void;
 };
 
 export type SessionSidebarRenameModel = {
@@ -74,7 +81,9 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   pinning: SessionSidebarPinningModel;
 }) {
   const { user } = useAuth();
-  const [query, setQuery] = useState("");
+  const [localQuery, setLocalQuery] = useState("");
+  const query = list.search ?? localQuery;
+  const setQuery = list.onSearch ?? setLocalQuery;
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createProjectId, setCreateProjectId] = useState("personal");
   const [createError, setCreateError] = useState<string | null>(null);
@@ -85,6 +94,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
   const [backendVersion, setBackendVersion] = useState<{ sha: string; buildDate: string } | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
+  const serverSearch = Boolean(list.onSearch);
   const activeProjects = useMemo(
     () => projects.filter((project) => !project.archivedAt),
     [projects]
@@ -108,11 +118,11 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
     () => groupSessions(
       list.sessions.filter((session) => !session.projectId),
       pinning.ids,
-      query,
+      serverSearch ? "" : query,
       undefined,
       list.attentionIds
     ),
-    [list.sessions, pinning.ids, query, list.attentionIds]
+    [list.sessions, pinning.ids, query, list.attentionIds, serverSearch]
   );
 
   const projectGroups = useMemo(
@@ -120,11 +130,11 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
       .map((project) => {
         const projectNameMatches = normalizedQuery !== "" && project.name.toLowerCase().includes(normalizedQuery);
         const sessions = list.sessions.filter((session) => session.projectId === project.projectId &&
-          (!normalizedQuery || projectNameMatches || session.sessionName.toLowerCase().includes(normalizedQuery)));
+          (serverSearch || !normalizedQuery || projectNameMatches || session.sessionName.toLowerCase().includes(normalizedQuery)));
         return { project, sessions, projectNameMatches };
       })
       .filter(({ projectNameMatches, sessions }) => !normalizedQuery || projectNameMatches || sessions.length > 0),
-    [list.sessions, activeProjects, normalizedQuery]
+    [list.sessions, activeProjects, normalizedQuery, serverSearch]
   );
   const hasResults = totalGroupedCount(groups) > 0 || projectGroups.length > 0;
   const addSession = addSessionId ? list.sessions.find((session) => session.sessionId === addSessionId) : null;
@@ -217,7 +227,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
           isPinned={isPinned}
           busy={busy}
           isRunning={isStreaming || Boolean(session.isRunning)}
-          hasPendingApprovals={needsAttention || Boolean(session.hasPendingApprovals)}
+          hasPendingApprovals={needsAttention}
           onRename={canEdit ? () => rename.onStartRename(session) : undefined}
           onTogglePin={() => pinning.onToggle(session.sessionId)}
           onAddToProject={canAddToProject && onAddToProject && activeProjects.length > 0
@@ -250,6 +260,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
         <SearchIcon className="pointer-events-none absolute left-5 top-1/2 size-4 -translate-y-1/2 text-on-surface-faint" />
         <Input
           aria-label="Search sessions"
+          maxLength={200}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search sessions"
           type="text"
@@ -295,19 +306,24 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
               return (
                 <div key={project.projectId} className="px-2">
                   <div className="group flex min-h-10 items-center gap-1 rounded-md px-2 py-1 hover:bg-surface-container">
-                    <span className="flex size-7 shrink-0 items-center justify-center text-on-surface-faint">
-                      {expanded ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
-                    </span>
-                    <button
+                    <Button
                       type="button"
+                      variant="ghost"
+                      size="icon-xs"
                       aria-expanded={expanded}
                       aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
                       onClick={toggleExpanded}
+                    >
+                      {expanded ? <ChevronDownIcon className="size-4" /> : <ChevronRightIcon className="size-4" />}
+                    </Button>
+                    <Link
+                      href={`/projects?project=${encodeURIComponent(project.projectId)}`}
+                      aria-label={`Open ${project.name}`}
                       className="flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1 text-left text-sm font-medium text-on-surface hover:text-brand-strong focus-visible:ring-2 focus-visible:ring-brand/60"
                     >
                       <FolderIcon className="size-4 shrink-0 text-brand-strong" />
                       <span className="truncate">{project.name}</span>
-                      <span className="ml-auto shrink-0 text-xs text-on-surface-faint">{sessions.length}</span>
+                      <span className="ml-auto shrink-0 text-xs text-on-surface-faint" title="Loaded sessions">{sessions.length}</span>
                       {attentionCount > 0 ? (
                         <span
                           aria-label={`${attentionCount} session${attentionCount === 1 ? "" : "s"} needing attention`}
@@ -328,7 +344,15 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                           <span>{pinnedCount}</span>
                         </span>
                       ) : null}
-                    </button>
+                    </Link>
+                    <Button asChild variant="ghost" size="icon-xs">
+                      <Link
+                        href={`/projects?project=${encodeURIComponent(project.projectId)}&view=settings`}
+                        aria-label={`Project settings for ${project.name}`}
+                      >
+                        <SettingsIcon />
+                      </Link>
+                    </Button>
                     <Button
                       type="button"
                       variant="ghost"
@@ -347,8 +371,8 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                       {visibleSessions.map(renderSessionRow)}
                     </div>
                   ) : null}
-                  {expanded && sessions.length === 0 ? (
-                    <p className="ml-11 px-2 py-2 text-xs text-on-surface-faint">No sessions yet</p>
+                  {expanded && sessions.length === 0 && !list.isLoading ? (
+                    <p className="ml-11 px-2 py-2 text-xs text-on-surface-faint">{list.hasMore ? "Load more or search to find sessions" : "No sessions yet"}</p>
                   ) : null}
                 </div>
               );
@@ -381,9 +405,18 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
           </SessionGroupSection>
         ) : null}
 
-        {!hasResults && !list.isLoading ? (
+        {list.error ? <div role="alert" className="px-4 py-2 text-sm text-danger">
+          <p>{list.error}</p>
+          <Button variant="ghost" onClick={list.onRetry}>Try again</Button>
+        </div> : null}
+        {list.hasMore ? <div className="px-3 py-2">
+          <Button variant="outline" className="w-full" disabled={list.isLoadingMore} onClick={list.onLoadMore}>
+            {list.isLoadingMore ? "Loading..." : "Load more sessions"}
+          </Button>
+        </div> : null}
+        {!hasResults && !list.isLoading && !list.error ? (
           <div className="mx-3 my-4 rounded-md bg-surface-container-lowest p-4 text-sm text-on-surface-variant">
-            {list.sessions.length ? (
+            {query.trim() ? (
               <>
                 <p className="font-medium text-on-surface">No matches</p>
                 <p>Try a different search.</p>

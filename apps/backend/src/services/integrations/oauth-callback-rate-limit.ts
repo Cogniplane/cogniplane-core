@@ -26,6 +26,9 @@ export async function enforceOAuthCallbackRateLimit(
     resource: "oauth_callback",
     userId: ip,
     tenantId: ip
+  }).catch((err: unknown) => {
+    request.log.warn({ err }, "OAuth callback rate limiter unavailable");
+    return null;
   });
   if (!limitError) return false;
 

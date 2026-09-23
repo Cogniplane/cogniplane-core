@@ -525,6 +525,7 @@ test("callChat throws invalid_json when model output is not parseable", async ()
   const error = await provider.detectText({ text: "hi", entityTypes: ["email"] }).catch((e: unknown) => e);
   expect(error instanceof OpenAiCompatiblePiiProviderError).toBeTruthy();
   expect((error as OpenAiCompatiblePiiProviderError).code).toBe("invalid_json");
+  expect((error as OpenAiCompatiblePiiProviderError).message).toBe("PII model response was not valid JSON.");
 });
 
 test("callChat surfaces provider_error when payload contains an error object", async () => {

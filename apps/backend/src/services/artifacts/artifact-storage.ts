@@ -24,7 +24,7 @@ export type ArtifactReadHandle = {
 export interface ArtifactStorage {
   readonly backend: "local" | "bucket";
   put(input: { storageKey: string; stream: Readable }): Promise<StoredArtifact>;
-  openReadStream(storageKey: string): Promise<ArtifactReadHandle>;
+  openReadStream(storageKey: string, options?: { signal?: AbortSignal }): Promise<ArtifactReadHandle>;
   /**
    * Removes the stored object. Idempotent: a missing key is a no-op, not an
    * error, so re-runs are safe. Used to purge bytes that must not persist — a
@@ -124,7 +124,8 @@ export class LocalArtifactStorage implements ArtifactStorage {
     };
   }
 
-  async openReadStream(storageKey: string): Promise<ArtifactReadHandle> {
+  async openReadStream(storageKey: string, options?: { signal?: AbortSignal }): Promise<ArtifactReadHandle> {
+    options?.signal?.throwIfAborted();
     const targetPath = resolveStoragePath(this.root, storageKey);
     const info = await stat(targetPath);
     return {
@@ -175,13 +176,14 @@ export class BucketArtifactStorage implements ArtifactStorage {
     };
   }
 
-  async openReadStream(storageKey: string): Promise<ArtifactReadHandle> {
+  async openReadStream(storageKey: string, options?: { signal?: AbortSignal }): Promise<ArtifactReadHandle> {
     const key = resolveBucketKey(this.deps.keyPrefix ?? "", storageKey);
     const response = await this.deps.client.send(
       new GetObjectCommand({
         Bucket: this.deps.bucketName,
         Key: key
-      })
+      }),
+      { abortSignal: options?.signal }
     );
 
     if (!response.Body) {

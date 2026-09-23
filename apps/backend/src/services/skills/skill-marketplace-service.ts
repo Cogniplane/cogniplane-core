@@ -2,7 +2,7 @@ import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
 import type { AppConfig } from "../../config.js";
-import { assertDispatcherAwareFetch, ssrfSafeAgent } from "../../lib/url-validation.js";
+import { assertDispatcherAwareFetch, httpsUrlSchema, ssrfSafeAgent } from "../../lib/url-validation.js";
 
 const marketplaceSlugSchema = z
   .string()
@@ -210,16 +210,36 @@ export class SkillMarketplaceService {
       // validation (httpsUrlSchema) and this on-demand fetch. Must reach
       // undici's fetch directly — Node's global fetch ignores `dispatcher`
       // as of undici v8. The default fetchImpl is undici.fetch for this reason.
-      const response = await this.fetchImpl(manifestUrl, {
-        headers,
-        dispatcher: ssrfSafeAgent
-      });
+      const response = await this.fetchManifest(manifestUrl, headers);
 
       if (!response.ok) {
         throw new Error(`Marketplace manifest request failed with status ${response.status}.`);
       }
 
-      const rawPayload = await response.json();
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Marketplace manifest response is empty.");
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > 1024 * 1024) {
+            throw new Error("Marketplace manifest exceeds the 1 MiB limit.");
+          }
+          chunks.push(value);
+        }
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+      let rawPayload: unknown;
+      try {
+        rawPayload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        throw new Error("Marketplace manifest is not valid JSON.");
+      }
       const manifest = marketplaceManifestSchema.parse(rawPayload);
 
       const normalizedSkills = manifest.skills.map((entry) => {
@@ -277,5 +297,26 @@ export class SkillMarketplaceService {
         skills: []
       };
     }
+  }
+
+  private async fetchManifest(manifestUrl: string, headers: Record<string, string>) {
+    let url = manifestUrl;
+    const signal = AbortSignal.timeout(15_000);
+    for (let hop = 0; hop <= 5; hop += 1) {
+      if (!httpsUrlSchema.safeParse(url).success) {
+        throw new Error("Marketplace manifest target must be a public HTTPS URL without credentials.");
+      }
+      const response = await this.fetchImpl(url, {
+        headers, signal, redirect: "manual", dispatcher: ssrfSafeAgent
+      });
+      if (response.status < 300 || response.status >= 400) return response;
+      const location = response.headers.get("location");
+      await response.body?.cancel();
+      if (!location) throw new Error("Marketplace redirect has no location.");
+      const next = new URL(location, url);
+      if (next.origin !== new URL(url).origin) delete headers.Authorization;
+      url = next.toString();
+    }
+    throw new Error("Marketplace manifest exceeded the redirect limit.");
   }
 }

@@ -1,4 +1,5 @@
 import type { AuditEventStore } from "../services/audit-event-store.js";
+import type { FastifyBaseLogger } from "fastify";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import type { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 
@@ -19,6 +20,7 @@ export type PiiHandlerStores = {
       }
     | undefined;
   auditEvents?: Pick<AuditEventStore, "create">;
+  logger?: Pick<FastifyBaseLogger, "warn">;
 };
 
 export type PiiHandlerOutcome =
@@ -141,16 +143,20 @@ async function emitPiiAudit(
   payload: Record<string, unknown>
 ): Promise<void> {
   if (!stores.auditEvents) return;
-  await stores.auditEvents.create({
-    tenantId: input.tenantId,
-    sessionId: input.sessionId,
-    userId: input.userId,
-    type: eventType,
-    payload: { ...payload, ...(input.projectInstructions ? {
-      projectId: input.projectInstructions.projectId,
-      instructionsRevision: input.projectInstructions.revision
-    } : {}) }
-  });
+  try {
+    await stores.auditEvents.create({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      userId: input.userId,
+      type: eventType,
+      payload: { ...payload, ...(input.projectInstructions ? {
+        projectId: input.projectInstructions.projectId,
+        instructionsRevision: input.projectInstructions.revision
+      } : {}) }
+    });
+  } catch (err) {
+    stores.logger?.warn({ err, eventType, sessionId: input.sessionId }, "Failed to record PII audit event");
+  }
 }
 
 type ScanRunMeta = {

@@ -65,14 +65,18 @@ export function useScheduledJobsData() {
   // Sync local defaults + draft when the remote sections load / refresh,
   // but never clobber an active edit session.
   const appliedDefaultsSignatureRef = useRef<string>("");
+  const previousDefaultsRef = useRef<ScheduledJobDefaults>({ defaultTimeZone: "UTC", enableOnCreate: true });
   useEffect(() => {
     if (!sectionsQuery.data) return;
     const signature = JSON.stringify(defaultsFromSections);
     if (signature === appliedDefaultsSignatureRef.current) return;
     appliedDefaultsSignatureRef.current = signature;
-    setDefaultsDraft(defaultsFromSections);
+    const previous = previousDefaultsRef.current;
+    previousDefaultsRef.current = defaultsFromSections;
+    setDefaultsDraft(current => JSON.stringify(current) === JSON.stringify(previous) ? defaultsFromSections : current);
     if (!editingJobIdRef.current) {
-      setJobDraft(defaultJobDraft(defaultsFromSections));
+      setJobDraft(current => JSON.stringify(current) === JSON.stringify(defaultJobDraft(previous))
+        ? defaultJobDraft(defaultsFromSections) : current);
     }
   }, [sectionsQuery.data, defaultsFromSections]);
 

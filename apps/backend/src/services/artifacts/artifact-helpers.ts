@@ -95,8 +95,21 @@ export function isTextReadableArtifact(mimeType: string): boolean {
 export async function readArtifactExcerpt(
   storage: Pick<ArtifactStorage, "openReadStream">,
   storageKey: string,
-  maxChars: number
+  maxChars: number,
+  signal?: AbortSignal
 ): Promise<string> {
-  const handle = await storage.openReadStream(storageKey);
-  return readStreamAsText(handle.stream, maxChars);
+  const handle = await storage.openReadStream(storageKey, { signal });
+  const abortStream = () => {
+    if ("destroy" in handle.stream && typeof handle.stream.destroy === "function") {
+      handle.stream.destroy();
+    }
+  };
+  signal?.addEventListener("abort", abortStream, { once: true });
+  try {
+    const text = await readStreamAsText(handle.stream, maxChars);
+    signal?.throwIfAborted();
+    return text;
+  } finally {
+    signal?.removeEventListener("abort", abortStream);
+  }
 }

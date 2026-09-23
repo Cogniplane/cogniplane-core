@@ -31,6 +31,8 @@ import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type { AppConfig } from "../../config.js";
 import type { ProviderCredentials } from "../runtime/provider-credentials.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
+import type { ToolExecutionContextStore } from "../auth/tool-execution-context-store.js";
+import type { ActiveTurnsRegistry } from "../active-turns-registry.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { MemoryStore } from "../memory-store.js";
@@ -92,6 +94,7 @@ function sessionOwnershipMismatch(): Error & { statusCode: number } {
  * refetch race comes back, which is a far smaller failure than a wedged session.
  */
 export const USAGE_FLUSH_DEADLINE_MS = 5_000;
+export const WORKSPACE_RESET_NOTICE_TTL_MS = 24 * 60 * 60 * 1_000;
 
 /**
  * Awaits `flush` for at most {@link USAGE_FLUSH_DEADLINE_MS}. The flush itself
@@ -123,7 +126,7 @@ function withUsageFlushDeadline(flush: Promise<void>): Promise<void> {
  * denial the human never made (the approval row could not be written), kept
  * distinct from `"reject"` so the model is not told the user refused.
  */
-type NativeApprovalOutcome = RuntimeApprovalDecision | "unavailable";
+type NativeApprovalOutcome = RuntimeApprovalDecision | "unavailable" | "expired";
 
 type PendingDeepAgentsApproval = {
   sessionId: string;
@@ -136,7 +139,7 @@ type PendingDeepAgentsApproval = {
    */
   rememberKey: string;
   /** Settles the turn loop's decision promise. Idempotent. */
-  settle: (decision: RuntimeApprovalDecision) => void;
+  settle: (decision: NativeApprovalOutcome) => void;
   /** The originating turn's remember-set instance (see autoApprovedKindsForTurn). */
   autoApprovedKinds: Set<string>;
   requiresDurableProof: boolean;
@@ -147,7 +150,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
   private readonly sessions = new Map<string, DeepAgentsSessionState>();
   private readonly activeTurns = new Set<string>();
+  private readonly pendingIntegrationInvalidations = new Set<string>();
   private readonly pendingApprovals = new Map<string, PendingDeepAgentsApproval>();
+  private readonly pendingWorkspaceResetNotices = new Map<
+    string,
+    { noticeId: string; message: string; expiryTimer: NodeJS.Timeout }
+  >();
   /**
    * In-flight createSession promises, keyed by sessionId. createSession awaits
    * several times (config compile, credential probe, memory/skills load) before
@@ -170,7 +178,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     private readonly log: FastifyBaseLogger,
     private readonly stores: {
       approvals: ApprovalStore;
-      executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime">;
+      executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime"> &
+        Partial<Pick<SessionExecutionStore, "sandboxId" | "bindSandboxId">>;
       conversationMessages?: Pick<MessageStore, "listBySession">;
       sessions: Pick<import("../session-store.js").SessionStore, "getReadable">;
       auditEvents: AuditEventStore;
@@ -198,7 +207,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        * skills degrade to SKILL.md-only (unit tests, minimal wiring).
        */
       skillBundles?: Pick<SkillBundleStorage, "materializeBundle">;
-      tenantMembers: Pick<TenantMemberStore, "isUserBetaTester">;
+      tenantMembers: Pick<TenantMemberStore, "isUserBetaTester"> &
+        Partial<Pick<TenantMemberStore, "getRole">>;
+      /**
+       * Pushes a live tool context's expiry out on each approval round (bead
+       * Optional: without it the TTL stays wall-clock and a turn parked on
+       * several approvals loses managed MCP tool access mid-turn.
+       */
+      toolContexts?: Pick<ToolExecutionContextStore, "extend">;
+      /**
+       * Refreshes the active-turn entry's liveness on each approval round
+       * Optional: without it a turn parked on several approvals is stale-evicted
+       * while still live, letting a second turn start on the same session.
+       */
+      activeTurns?: Pick<ActiveTurnsRegistry, "keepAlive" | "snapshot">;
     },
     private readonly providerCredentials?: ProviderCredentials,
     private readonly runtimeFactory: DeepAgentsRuntimeFactory = createDeepAgentsSessionRuntime,
@@ -261,10 +283,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       if (previous?.execution?.executionId === input.execution.executionId && !previous.abortController.signal.aborted) {
         return { sessionId, runtimeId: previous.runtimeId, runtimePolicy: previous.configBundle.runtimePolicy };
       }
-      // A new admitted project turn gets fresh credentials, sandbox and graph
-      // state. Only the authorized saved conversation crosses generations.
-      if (previous) await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
-      return this.buildSession(input);
+      if (input.execution.projectId) {
+        // Shared project turns rebuild the graph from the saved transcript.
+        if (previous) await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
+        return this.buildSession(input);
+      }
+      if (previous && (!previous.execution || previous.execution.projectId)) {
+        await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
+        return this.buildSession(input);
+      }
+      if (previous && !previous.abortController.signal.aborted) {
+        if (previous.userId !== input.userId) throw sessionOwnershipMismatch();
+        await this.stores.executions.bindRuntime(input.execution, previous.runtimeId);
+        previous.execution = input.execution;
+      }
     }
 
     // Idempotency: reuse a live session so conversation state (the session
@@ -440,10 +472,18 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         return [toolName, { readOnly: entry?.readOnly ?? false, category: entry?.category ?? null }];
       })
     );
+    // Member removal can race the asynchronous setup above. Re-check after
+    // the last await and before constructing or publishing the runtime, so a
+    // claimed scheduled job cannot start under a removed identity.
+    await this.requireRuntimeSessionAccess(input);
+
     const runtime = this.runtimeFactory({
       ...(input.execution ? { requireExecution: async () => {
-        await this.requireRuntimeSessionAccess(input);
-        if (input.execution && !await this.stores.executions!.isCurrent(input.execution, runtimeId))
+        const current = this.sessions.get(sessionId);
+        if (!current || current.runtimeId !== runtimeId || !current.execution)
+          throw new SessionExecutionError("execution_stopped", 403);
+        await this.requireRuntimeSessionAccess(current);
+        if (!await this.stores.executions!.isCurrent(current.execution, runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
       } } : {}),
       tenantId,
@@ -484,6 +524,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS
             }
           : null,
+      ...(input.execution && !input.execution.projectId &&
+        this.stores.executions.sandboxId && this.stores.executions.bindSandboxId
+        ? { sandboxBinding: {
+            load: async () => {
+              const current = this.sessions.get(sessionId)?.execution;
+              if (!current) throw new SessionExecutionError("execution_stopped", 403);
+              return this.stores.executions.sandboxId!(current);
+            },
+            save: async (previousId: string | null, sandboxId: string) => {
+              const current = this.sessions.get(sessionId)?.execution;
+              if (!current) throw new SessionExecutionError("execution_stopped", 403);
+              await this.stores.executions.bindSandboxId!(current, previousId, sandboxId);
+            }
+          } } : {}),
       // Surface a transparently replaced sandbox: at that moment every file
       // the agent wrote and every artifact synced into the workspace is gone,
       // and without a notice the model just meets file_not_found on its own
@@ -516,7 +570,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           createdAt: new Date().toISOString()
         }));
       },
-      checkpointer: input.execution ? undefined : this.stores.checkpointer,
+      checkpointer: input.execution?.projectId ? undefined : this.stores.checkpointer,
       logger: this.log
     });
 
@@ -610,7 +664,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       assistantMessageId?: string | null;
       model?: string;
       effort?: RuntimeReasoningEffort;
-      onBeforeTurn?: () => Promise<void>;
+      cancelSignal?: AbortSignal;
+      onBeforeTurn?: (signal: AbortSignal) => Promise<void>;
     }
   ): AsyncIterable<BaseEvent> {
     const state = this.sessions.get(session.sessionId);
@@ -630,6 +685,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     }
     if (this.sessions.get(session.sessionId) !== state || state.abortController.signal.aborted)
       throw new SessionExecutionError("execution_stopped", 403);
+    if (input.cancelSignal?.aborted) throw new Error("Turn stopped during setup");
     // Refresh awaits configuration and mutates capabilities. Reserve admission
     // against it before any sandbox, context or graph work can begin.
     if (this.pendingSessionCreations.has(session.sessionId) || this.activeTurns.has(session.sessionId)) {
@@ -638,6 +694,38 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     this.activeTurns.add(session.sessionId);
     state.lastActiveAt = new Date().toISOString();
     this.clearIdleTimer(state);
+
+    // Install cancellation and the watchdog as soon as the slot is reserved.
+    // Sandbox renewal, approval reconfiguration, artifact sync, and the graph
+    // all consume the same bounded working-time budget.
+    const turnAbort = new AbortController();
+    const onSessionAbort = () => turnAbort.abort();
+    const onAdmissionAbort = () => turnAbort.abort();
+    if (state.abortController.signal.aborted) {
+      turnAbort.abort();
+    } else {
+      state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+    }
+    if (input.cancelSignal?.aborted) turnAbort.abort();
+    else input.cancelSignal?.addEventListener("abort", onAdmissionAbort, { once: true });
+    state.activeTurnInterrupt.current = async () => {
+      turnAbort.abort();
+    };
+    const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
+      turnAbort
+    );
+    const releaseTurnSlot = async () => {
+      disarmWatchdog();
+      state.abortController.signal.removeEventListener("abort", onSessionAbort);
+      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
+      this.activeTurns.delete(session.sessionId);
+      state.activeTurnInterrupt.current = null;
+      state.activeTurnResponseId.current = null;
+      state.pendingTurnEvents = [];
+      await this.finishIntegrationInvalidation(state);
+    };
+    armWatchdog();
+
     // Push the sandbox lifetime back out before anything touches it (artifact
     // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
     // FIRST tool use and is never renewed, so an active session eventually
@@ -651,7 +739,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // recovered by withSandbox on the next op), but the interface does not
     // promise that, and a failed extension must never cost a turn.
     try {
-      await state.runtime.extendSandboxTimeout?.();
+      await this.waitForTurnSetup(
+        Promise.resolve(state.runtime.extendSandboxTimeout?.()),
+        turnAbort.signal
+      );
     } catch (err) {
       this.log.warn(
         { err, sessionId: session.sessionId },
@@ -665,60 +756,36 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     state.activeTurnResponseId.current = responseId;
     state.pendingTurnEvents = [];
 
-    // Arm the interrupt BEFORE onBeforeTurn too. The slot is reserved from here
-    // on, so `interruptTurn` is reachable — but with no hook installed it
-    // answers `no_active_turn`, and the SSE writer latches that single attempt.
-    // A disconnect during artifact sync would then leave the turn to run its
-    // whole loop for a socket that is already gone.
-    const turnAbort = new AbortController();
-    const onSessionAbort = () => turnAbort.abort();
-    // An `abort` listener added to an already-aborted signal never fires, so a
-    // turn started on a session that was aborted between slot reservation and
-    // here would otherwise run unguarded. Mirror the abort eagerly.
-    if (state.abortController.signal.aborted) {
-      turnAbort.abort();
-    } else {
-      state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
-    }
-    // Stop button / client disconnect aborts THIS turn (interruptTurn reads this).
-    state.activeTurnInterrupt.current = async () => {
-      turnAbort.abort();
-    };
-
-    const releaseTurnSlot = () => {
-      state.abortController.signal.removeEventListener("abort", onSessionAbort);
-      this.activeTurns.delete(session.sessionId);
-      state.activeTurnInterrupt.current = null;
-      state.activeTurnResponseId.current = null;
-      state.pendingTurnEvents = [];
-      this.scheduleIdleTeardown(state);
-    };
-
     // Project approval mode is read before dispatch and belongs to this turn,
     // not to the warm session. Reconfigure the graph before artifact sync or
     // model work so a later setting change cannot affect an active turn.
     try {
-      await state.runtime.setApprovalSettings({
-        ...resolveTurnApprovalSettings(state.configBundle.runtimePolicy, input.projectApprovalMode),
-        readOnlyToolNames: this.managedToolCatalog?.listReadOnlyIds() ?? []
-      });
+      await this.waitForTurnSetup(
+        Promise.resolve(
+          state.runtime.setApprovalSettings({
+            ...resolveTurnApprovalSettings(state.configBundle.runtimePolicy, input.projectApprovalMode),
+            readOnlyToolNames: this.managedToolCatalog?.listReadOnlyIds() ?? []
+          })
+        ),
+        turnAbort.signal
+      );
     } catch (error) {
-      releaseTurnSlot();
+      await releaseTurnSlot();
       throw error;
     }
 
     // Artifact workspace sync and turn-input building run after slot reservation.
     if (input.onBeforeTurn) {
       try {
-        await input.onBeforeTurn();
+        await this.waitForTurnSetup(input.onBeforeTurn(turnAbort.signal), turnAbort.signal);
       } catch (error) {
-        releaseTurnSlot();
+        await releaseTurnSlot();
         throw error;
       }
     }
 
     let conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-    if (state.execution && this.stores.conversationMessages) {
+    if (!turnAbort.signal.aborted && state.execution?.projectId && this.stores.conversationMessages) {
       try {
         // Project sessions do not use the LangGraph checkpointer for transcript
         // state. Read the complete durable transcript so a long-lived shared
@@ -741,7 +808,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
       } catch (error) {
-        releaseTurnSlot();
+        await releaseTurnSlot();
         throw error;
       }
     }
@@ -760,9 +827,6 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
 
     const queue = new AsyncQueue<BaseEvent>();
-    const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
-      turnAbort
-    );
     // Events raised BEFORE the agent run starts cannot go onto the queue:
     // @ag-ui/client's verifier rejects any stream whose first event is not
     // RUN_STARTED ("First event must be 'RUN_STARTED'"), and the agent emits
@@ -777,6 +841,18 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // one await above the subscription would silently reopen the ordering bug,
     // and a sink-level switch cannot be defeated that way.
     const preRunEvents: BaseEvent[] = [];
+    const pendingWorkspaceReset = this.pendingWorkspaceResetNotices.get(session.sessionId);
+    if (pendingWorkspaceReset) {
+      preRunEvents.push(
+        runtimeNoticeEvent({
+          noticeId: pendingWorkspaceReset.noticeId,
+          level: "warning",
+          title: "Workspace reset",
+          message: pendingWorkspaceReset.message,
+          createdAt: new Date().toISOString()
+        })
+      );
+    }
     let runStarted = false;
     const emitAGUI = (ev: BaseEvent) => {
       if (runStarted) queue.push(ev);
@@ -841,6 +917,18 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (turnAbort.signal.aborted) {
           return actions.map(() => ({ type: "reject" as const, message: "Turn aborted." }));
         }
+        // A scheduled turn has nobody to answer a prompt. Reject at once, so
+        // the job does not hold its slot until the watchdog fails it.
+        if (input.turnContext === "scheduled") {
+          this.log.info(
+            { sessionId: state.sessionId, toolNames: actions.map((action) => action.name) },
+            "Rejected approval-gated tool calls in a scheduled turn"
+          );
+          return actions.map(() => ({
+            type: "reject" as const,
+            message: "This action needs approval. A scheduled job cannot ask for approval, so the action was not run."
+          }));
+        }
         const sink = {
           push: emit
         };
@@ -873,10 +961,40 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
     const agent = new DeepAgentsAGUIAgent({
       backend,
-      toolContextId: input.toolContextId ?? null
+      toolContextId: input.toolContextId ?? null,
+      approvalAbortSignal: turnAbort.signal,
+      // The approval round loop is unbounded, but both the
+      // tool-context TTL and the active-turn staleness window budget for a
+      // single approval. Extend both after each decision so a turn parked on
+      // several approvals keeps its MCP tool access and is not stale-evicted
+      // while still running. Failures are logged, never thrown: a missed
+      // keepalive degrades the turn, an exception here would kill it.
+      onApprovalRound: async (signal) => {
+        if (signal?.aborted) return;
+        this.stores.activeTurns?.keepAlive(state.sessionId);
+        if (!input.toolContextId || !this.stores.toolContexts) return;
+        if (signal?.aborted) return;
+        try {
+          const extended = await this.stores.toolContexts.extend(
+            state.tenantId,
+            input.toolContextId,
+            this.config.TOOL_CONTEXT_TTL_MS
+          );
+          if (!extended) {
+            this.log.warn(
+              { sessionId: state.sessionId, toolContextId: input.toolContextId },
+              "Tool context was already expired at the approval round; managed MCP tools will fail for the rest of this turn"
+            );
+          }
+        } catch (err) {
+          this.log.error(
+            { err, sessionId: state.sessionId, toolContextId: input.toolContextId },
+            "Failed to extend the tool context across an approval round"
+          );
+        }
+      }
     });
 
-    armWatchdog();
     const subscription = agent
       .run({ threadId: state.threadId, runId: responseId, state: {}, messages: [] } as never)
       .subscribe({
@@ -890,6 +1008,16 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           if (!runStarted) {
             runStarted = true;
             for (const pending of preRunEvents.splice(0)) queue.push(pending);
+            if (
+              pendingWorkspaceReset &&
+              this.pendingWorkspaceResetNotices.get(session.sessionId)?.noticeId ===
+                pendingWorkspaceReset.noticeId
+            ) {
+              this.clearPendingWorkspaceResetNotice(
+                session.sessionId,
+                pendingWorkspaceReset.noticeId
+              );
+            }
           }
         },
         error: (err: unknown) => {
@@ -979,6 +1107,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       const wasAborted = turnAbort.signal.aborted;
       turnAbort.abort();
       state.abortController.signal.removeEventListener("abort", onSessionAbort);
+      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
       state.activeTurnInterrupt.current = null;
       state.activeTurnPush.current = null;
       state.activeTurnResponseId.current = null;
@@ -991,7 +1120,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       // the turn consumed nothing or the writer created no backing row).
       await flushUsage();
       this.activeTurns.delete(session.sessionId);
-      this.scheduleIdleTeardown(state);
+      await this.finishIntegrationInvalidation(state);
     }
   }
 
@@ -1091,6 +1220,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     if (!state) return;
     if (input.executionId && state.execution?.executionId !== input.executionId) return;
     if (state.tenantId !== input.tenantId) throw sessionOwnershipMismatch();
+    this.pendingIntegrationInvalidations.delete(input.sessionId);
 
     this.clearIdleTimer(state);
     state.abortController.abort();
@@ -1135,7 +1265,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     sessionId: string;
     userId: string;
   }): Promise<void> {
-    await this.stores.checkpointer?.deleteThread(input.sessionId);
+    try {
+      await this.stores.checkpointer?.deleteThread(input.sessionId);
+    } finally {
+      this.clearPendingWorkspaceResetNotice(input.sessionId);
+    }
   }
 
   async close(): Promise<void> {
@@ -1148,6 +1282,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         })
       )
     );
+    for (const sessionId of this.pendingWorkspaceResetNotices.keys()) {
+      this.clearPendingWorkspaceResetNotice(sessionId);
+    }
     try {
       await this.stores.checkpointer?.end?.();
     } catch (err) {
@@ -1189,19 +1326,83 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    * Tears down the tenant's in-memory session runtimes so the next turn
    * rebuilds them against fresh config. `idleOnly` skips sessions with an
    * active turn — the admin rollout actions are labeled "idle" and must
-   * never interrupt a running conversation; config/integration invalidation
-   * keeps the abort-everything default (a stale credential mid-turn is
-   * worse than an interrupted turn).
+   * never interrupt a running conversation. Explicit integration/security
+   * security invalidation keeps the abort-everything default. Tenant-setting changes use
+   * the in-place next-turn capability refresh instead.
    */
   async invalidateTenantRuntimes(
     tenantId: string,
-    opts?: { idleOnly?: boolean }
+    opts?: { idleOnly?: boolean; workspaceResetReason?: string }
   ): Promise<string[]> {
     const targets = [...this.sessions.values()].filter(
       (state) =>
         state.tenantId === tenantId &&
         (!opts?.idleOnly || !this.activeTurns.has(state.sessionId))
     );
+    await Promise.all(
+      targets.map(async (state) => {
+        await this.abortSession({
+          tenantId: state.tenantId,
+          sessionId: state.sessionId,
+          userId: state.userId
+        });
+        if (opts?.workspaceResetReason) {
+          this.queuePendingWorkspaceResetNotice(state.sessionId, opts.workspaceResetReason);
+        }
+      })
+    );
+    return targets.map((state) => state.sessionId);
+  }
+
+  async invalidateRuntimesForUser(tenantId: string, userId: string): Promise<string[]> {
+    const targets = [...this.sessions.values()].filter(
+      (state) => state.tenantId === tenantId && state.userId === userId
+    );
+    await Promise.all(
+      targets.map(async (state) => {
+        await this.abortSession({
+          tenantId: state.tenantId,
+          sessionId: state.sessionId,
+          userId: state.userId
+        });
+        this.clearPendingWorkspaceResetNotice(state.sessionId);
+      })
+    );
+    return targets.map((state) => state.sessionId);
+  }
+
+  private queuePendingWorkspaceResetNotice(sessionId: string, message: string): void {
+    this.clearPendingWorkspaceResetNotice(sessionId);
+    const noticeId = `workspace-reset:config:${uuidv7()}`;
+    const expiryTimer = setTimeout(() => {
+      this.clearPendingWorkspaceResetNotice(sessionId, noticeId);
+    }, WORKSPACE_RESET_NOTICE_TTL_MS);
+    expiryTimer.unref?.();
+    this.pendingWorkspaceResetNotices.set(sessionId, { noticeId, message, expiryTimer });
+  }
+
+  private clearPendingWorkspaceResetNotice(sessionId: string, noticeId?: string): void {
+    const pending = this.pendingWorkspaceResetNotices.get(sessionId);
+    if (!pending || (noticeId !== undefined && pending.noticeId !== noticeId)) return;
+    clearTimeout(pending.expiryTimer);
+    this.pendingWorkspaceResetNotices.delete(sessionId);
+  }
+
+  async invalidateRuntimesForIntegration(
+    tenantId: string,
+    userId: string,
+    _integrationId: string
+  ): Promise<string[]> {
+    const owned = [...this.sessions.values()].filter(
+      (state) => state.tenantId === tenantId && state.userId === userId
+    );
+    const admittedTurns = this.stores.activeTurns?.snapshot();
+    for (const state of owned) {
+      if (this.activeTurns.has(state.sessionId) || admittedTurns?.has(state.sessionId)) {
+        this.pendingIntegrationInvalidations.add(state.sessionId);
+      }
+    }
+    const targets = owned.filter((state) => !this.pendingIntegrationInvalidations.has(state.sessionId));
     await Promise.all(
       targets.map((state) =>
         this.abortSession({
@@ -1214,24 +1415,28 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     return targets.map((state) => state.sessionId);
   }
 
-  async invalidateRuntimesForIntegration(
-    tenantId: string,
-    userId: string,
-    _integrationId: string
-  ): Promise<string[]> {
-    const targets = [...this.sessions.values()].filter(
-      (state) => state.tenantId === tenantId && state.userId === userId
-    );
-    await Promise.all(
-      targets.map((state) =>
-        this.abortSession({
-          tenantId: state.tenantId,
-          sessionId: state.sessionId,
-          userId: state.userId
-        })
-      )
-    );
-    return targets.map((state) => state.sessionId);
+  async finishTurnAdmission(input: { tenantId: string; sessionId: string; userId: string }): Promise<void> {
+    const state = this.sessions.get(input.sessionId);
+    if (!state) {
+      this.pendingIntegrationInvalidations.delete(input.sessionId);
+      return;
+    }
+    if (state.tenantId !== input.tenantId || state.userId !== input.userId) throw sessionOwnershipMismatch();
+    if (!this.activeTurns.has(input.sessionId) && this.pendingIntegrationInvalidations.has(input.sessionId)) {
+      await this.finishIntegrationInvalidation(state);
+    }
+  }
+
+  private async finishIntegrationInvalidation(state: DeepAgentsSessionState): Promise<void> {
+    if (this.pendingIntegrationInvalidations.delete(state.sessionId)) {
+      await this.abortSession({
+        tenantId: state.tenantId,
+        sessionId: state.sessionId,
+        userId: state.userId
+      });
+    } else {
+      this.scheduleIdleTeardown(state);
+    }
   }
 
   async resolveApproval(input: {
@@ -1256,7 +1461,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       }
       entry.settle(decision);
       try {
-        const approval = await this.stores.approvals.resolve(tenantId, approvalId, userId, decision);
+        const approval = await this.stores.approvals.resolve(tenantId, approvalId, userId, decision,
+          rememberForTurn === true);
         if (approval) {
           await this.stores.auditEvents.create({
             tenantId,
@@ -1281,7 +1487,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         tenantId,
         approvalId,
         userId,
-        decision === "approve" ? "approve" : "reject"
+        decision === "approve" ? "approve" : "reject",
+        rememberForTurn === true
       );
     } catch (err) {
       this.log.error(
@@ -1394,6 +1601,43 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }
 
   /**
+   * Stop awaiting setup as soon as the turn is cancelled. The callback still
+   * receives the signal and should stop its own I/O, but this race is the hard
+   * safety boundary for third-party callbacks that ignore cancellation. Its
+   * rejection handler remains attached after abort, so a late failure cannot
+   * become an unhandled rejection.
+   */
+  private waitForTurnSetup(setup: Promise<void>, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      void setup.catch(() => undefined);
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      setup.then(
+        () => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  /**
    * One approval round-trip per pending HITL action. Auto-approves kinds the
    * user already remembered this turn (audited); everything else gets a DB
    * approval row plus an AG-UI `CUSTOM` event named `approval_required`, settled
@@ -1426,6 +1670,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         message:
           decision === "unavailable"
             ? "This action was blocked: its approval request could not be recorded."
+            : decision === "expired"
+              ? "This action was blocked because the approval request expired without an answer."
             : "User denied permission."
       };
     });
@@ -1492,7 +1738,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       ? await this.stores.approvals.get(state.tenantId, approvalId, state.userId)
       : null;
     if (approval?.status === "approved") return "approve";
-    if (approval?.status === "rejected" || approval?.status === "expired") return "reject";
+    if (approval?.status === "rejected") return "reject";
+    if (approval?.status === "expired") return "expired";
     try {
       approval ??= await this.stores.approvals.create({
           tenantId: state.tenantId,
@@ -1522,7 +1769,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       if (action.policyApproval) {
         approval = await this.stores.approvals.get(state.tenantId, approvalId, state.userId);
         if (approval?.status === "approved") return "approve";
-        if (approval?.status === "rejected" || approval?.status === "expired") return "reject";
+        if (approval?.status === "rejected") return "reject";
+        if (approval?.status === "expired") return "expired";
       }
       if (approval?.status === "pending") {
         this.log.debug({ approvalId }, "Reusing checkpointed Policy Center approval");
@@ -1558,13 +1806,14 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       cwd: null
     }));
 
-    return new Promise<RuntimeApprovalDecision>((resolve) => {
+    return new Promise<NativeApprovalOutcome>((resolve) => {
       let settled = false;
-      const settle = (decision: RuntimeApprovalDecision) => {
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (decision: NativeApprovalOutcome) => {
         if (settled) return;
         settled = true;
         clearTimeout(ttlTimer);
-        clearInterval(pollTimer);
+        if (pollTimer) clearTimeout(pollTimer);
         turnAbort.signal.removeEventListener("abort", onAbort);
         this.pendingApprovals.delete(approvalId);
         resolve(decision);
@@ -1576,8 +1825,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           Date.now()
       );
       const ttlTimer = setTimeout(() => {
-        // TTL expiry: DB row moves to expired + audit + user-facing notice;
-        // the reject unblocks the paused graph.
+        // TTL expiry moves the DB row to expired and resumes the graph.
         void expireApprovalById({
           tenantId: state.tenantId,
           sessionId: state.sessionId,
@@ -1593,27 +1841,34 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           noticeId: `approval-expired:${approvalId}`,
           level: "warning",
           title: "Approval expired",
-          message: `The approval request for ${action.name} expired and was rejected.`,
+          message: `The approval request for ${action.name} expired without an answer.`,
           createdAt: new Date().toISOString()
         }));
-        settle("reject");
+        settle("expired");
       }, remainingTtlMs);
       ttlTimer.unref?.();
-      let pollInFlight = false;
-      const pollTimer = setInterval(() => {
-        if (pollInFlight || settled) return;
-        pollInFlight = true;
+      let pollDelayMs = 1_000;
+      const poll = () => {
+        if (settled) return;
         void this.stores.approvals
           .get(state.tenantId, approvalId, state.userId)
           .then((row) => {
-            if (row?.status === "approved") settle("approve");
-            else if (row?.status === "rejected" || row?.status === "expired") settle("reject");
+            if (row?.status === "approved") {
+              if (row.rememberForTurn) state.autoApprovedKindsForTurn.add(rememberKey);
+              settle("approve");
+            }
+            else if (row?.status === "rejected") settle("reject");
+            else if (row?.status === "expired") settle("expired");
           })
           .catch((err) => this.log.warn({ err, approvalId }, "Failed to poll approval status"))
           .finally(() => {
-            pollInFlight = false;
+            if (settled) return;
+            pollDelayMs = Math.min(pollDelayMs * 2, 8_000);
+            pollTimer = setTimeout(poll, pollDelayMs);
+            pollTimer.unref?.();
           });
-      }, 250);
+      };
+      pollTimer = setTimeout(poll, pollDelayMs);
       pollTimer.unref?.();
       turnAbort.signal.addEventListener("abort", onAbort, { once: true });
       this.pendingApprovals.set(approvalId, {
@@ -1632,8 +1887,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   private async requireRuntimeSessionAccess(input: {
     tenantId: string; sessionId: string; userId: string; execution?: SessionExecution;
   }): Promise<void> {
-    const session = await this.stores.sessions.getReadable(input.tenantId, input.sessionId, input.userId);
-    if (!session || session.status !== "active" || session.purpose === "project_reference" ||
+    const [session, membershipRole] = await Promise.all([
+      this.stores.sessions.getReadable(input.tenantId, input.sessionId, input.userId),
+      this.stores.tenantMembers.getRole?.(input.tenantId, input.userId) ?? Promise.resolve("member")
+    ]);
+    if (!membershipRole || !session || session.status !== "active" || session.purpose === "project_reference" ||
         (session.projectId ? input.execution?.projectId !== session.projectId : Boolean(input.execution?.projectId))) {
       throw new SessionExecutionError("session_unavailable", 403);
     }

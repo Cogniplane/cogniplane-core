@@ -17,7 +17,7 @@ let rows: Session[];
 beforeEach(() => {
   vi.resetAllMocks();
   rows = [{ sessionId: "s1", userId: "u", sessionName: "Research notes", status: "archived", createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-13T00:00:00Z", archivedAt: "2026-09-13T00:00:00Z" }];
-  api.listArchivedSessions.mockImplementation(async () => [...rows]);
+  api.listArchivedSessions.mockImplementation(async ({ search = "" } = {}) => ({ sessions: rows.filter((row) => row.sessionName.toLowerCase().includes(search.toLowerCase())), trashRetentionDays: 30 }));
   api.restoreSession.mockImplementation(async () => { rows = []; });
   api.deleteSession.mockImplementation(async () => { rows = []; });
 });
@@ -31,7 +31,7 @@ it("searches and restores an archived session", async () => {
   mount();
   await screen.findByText("Research notes");
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "missing" } });
-  expect(screen.getByText("No matching sessions")).toBeTruthy();
+  expect(await screen.findByText("No matching sessions")).toBeTruthy();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "" } });
   fireEvent.click(screen.getByRole("button", { name: "Restore" }));
   await screen.findByText("No archived sessions");
@@ -66,5 +66,27 @@ it("retains the row after restore failure and retries failed list loads", async 
   api.restoreSession.mockRejectedValueOnce(new Error("Restore failed"));
   fireEvent.click(screen.getByRole("button", { name: "Restore" }));
   await screen.findByText("Restore failed");
+  expect(screen.getByText("Research notes")).toBeTruthy();
+});
+
+it("loads and restores an older archive after a failed next-page request", async () => {
+  let fail = true;
+  let restored = false;
+  const old = { ...rows[0], sessionId: "old", sessionName: "Older notes" };
+  api.listArchivedSessions.mockImplementation(async ({ cursor, search } = {}) => {
+    if (cursor && fail) throw new Error("Offline");
+    return { sessions: search ? [old] : cursor ? restored ? [] : [old] : rows, nextCursor: cursor || search || restored ? null : "older", trashRetentionDays: 30 };
+  });
+  api.restoreSession.mockImplementation(async () => { restored = true; });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Load more sessions" }));
+  await screen.findByText("Could not load archived sessions.");
+  expect(screen.getByText("Research notes")).toBeTruthy();
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+  const older = await screen.findByText("Older notes");
+  fireEvent.click(within(older.closest("li")!).getByRole("button", { name: "Restore" }));
+  await waitFor(() => expect(screen.queryByText("Older notes")).toBeNull());
+  expect(api.restoreSession).toHaveBeenCalledWith("old");
   expect(screen.getByText("Research notes")).toBeTruthy();
 });

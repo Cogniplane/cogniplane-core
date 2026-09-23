@@ -32,8 +32,8 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
 
     const store = new SessionStore(appPool(), superuserPool());
     expect(await store.remove(tenant, sessionId, user)).toBe(true);
-    expect(await store.list(tenant, user, { status: "deleted" })).toHaveLength(1);
-    expect(await store.list(otherTenant, otherUser, { status: "deleted" })).toEqual([]);
+    expect((await store.listPage(tenant, user, { status: "deleted" })).sessions).toHaveLength(1);
+    expect((await store.listPage(otherTenant, otherUser, { status: "deleted" })).sessions).toEqual([]);
     await superuserPool().query(
       "UPDATE sessions SET deleted_at=NOW() - INTERVAL '31 days' WHERE session_id=$1",
       [sessionId],

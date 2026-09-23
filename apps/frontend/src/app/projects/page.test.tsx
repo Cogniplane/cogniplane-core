@@ -10,7 +10,7 @@ import Page from "./page";
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
-  useSearchParams: () => new URLSearchParams("project=p1")
+  useSearchParams: () => new URLSearchParams(searchParams)
 }));
 vi.mock("../../lib/auth-context", () => ({ useAuth: () => ({ user: { userId: "u" } }) }));
 vi.mock("../../lib/auth-guard", () => ({
@@ -26,14 +26,16 @@ vi.mock("../../lib/project-api", () => ({
   archiveProject: vi.fn(),
   createProject: vi.fn()
 }));
-vi.mock("../../lib/session-api", () => ({ listSessions: async () => [] }));
+vi.mock("../../lib/session-api", () => ({ listSessions: async () => ({ sessions: [], trashRetentionDays: 30 }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn() } }));
 
 const time = "2026-09-13T00:00:00Z";
 let project: Project;
 let client: QueryClient;
+let searchParams: string;
 beforeEach(() => {
   vi.resetAllMocks();
+  searchParams = "project=p1";
   project = {
     projectId: "p1",
     name: "Planning",
@@ -79,7 +81,16 @@ const renderPage = () =>
     </QueryClientProvider>
   );
 
+it("does not open a different project when the linked project is filtered out", async () => {
+  searchParams = "project=missing";
+  renderPage();
+  await waitFor(() => expect(api.listProjects).toHaveBeenCalled());
+  expect(api.getProject).not.toHaveBeenCalled();
+  expect(screen.queryByRole("heading", { name: "Planning" })).toBeNull();
+});
+
 it("moves an archived project out of Active and restores it through the Archived view", async () => {
+  searchParams = "project=p1&view=settings";
   renderPage();
   fireEvent.click(await screen.findByRole("button", { name: "Archive project" }));
   await screen.findByRole("heading", { name: "Give ongoing work a home" });
@@ -98,6 +109,7 @@ it("moves an archived project out of Active and restores it through the Archived
 
 it("keeps the project visible and reports an archive failure", async () => {
   vi.mocked(api.archiveProject).mockRejectedValueOnce(new Error("Archive failed"));
+  searchParams = "project=p1&view=settings";
   renderPage();
   fireEvent.click(await screen.findByRole("button", { name: "Archive project" }));
   await screen.findByText("Archive failed");
@@ -106,6 +118,7 @@ it("keeps the project visible and reports an archive failure", async () => {
 });
 
 it("debounces server searches while updating the input immediately", async () => {
+  searchParams = "project=p1&view=settings";
   renderPage();
   await screen.findByRole("button", { name: "Archive project" });
   fireEvent.click(screen.getByRole("button", { name: "Rename" }));
@@ -134,4 +147,23 @@ it("debounces server searches while updating the input immediately", async () =>
   expect((screen.getByRole("textbox", { name: "Rename project" }) as HTMLInputElement).value).toBe("Unsaved name");
   await act(async () => { finishSearch([{ ...project }]); });
   expect((screen.getByRole("textbox", { name: "Rename project" }) as HTMLInputElement).value).toBe("Unsaved name");
+});
+
+it("selects Overview by default and Settings from the view query", async () => {
+  renderPage();
+  expect((await screen.findByRole("link", { name: "Overview" })).getAttribute("aria-current"))
+    .toBe("page");
+  expect(screen.queryByText("Project settings")).toBeNull();
+  cleanup();
+  client.clear();
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
+  });
+
+  searchParams = "project=p1&view=settings";
+  renderPage();
+  expect((await screen.findByRole("link", { name: "Settings" })).getAttribute("aria-current"))
+    .toBe("page");
+  expect(await screen.findByText("Project settings")).toBeTruthy();
+  expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
 });

@@ -95,7 +95,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
       { userId: h.userId, content: "Question" },
       { userId: h.viewerId, content: "Shared result", toolResults: [{ output: "Shared source" }] },
     ]);
-    expect(await h.sessions.list(h.tenantId, h.viewerId)).toMatchObject([{ sessionId: h.sessionId, latestTurnId: h.second.messageId }]);
+    expect((await h.sessions.listPage(h.tenantId, h.viewerId)).sessions).toMatchObject([{ sessionId: h.sessionId, latestTurnId: h.second.messageId }]);
     expect((await h.app.inject(`/sessions/${h.sessionId}/artifacts`)).json().artifacts).toMatchObject([{ artifactId: h.artifact.artifactId }]);
     expect(await h.artifacts.listByProject(h.tenantId, h.viewerId, h.actor.projectId)).toHaveLength(1);
     await superuserPool().query("UPDATE sessions SET status='archived' WHERE session_id=$1", [h.sessionId]);
@@ -117,7 +117,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     expect((await h.app.inject(`/projects/${h.actor.projectId}`)).statusCode).toBe(404);
     expect((await h.app.inject("/projects")).json().projects).toEqual([]);
     expect(await h.sessions.getReadable(h.tenantId, h.sessionId, h.viewerId)).toBeNull();
-    expect(await h.sessions.list(h.tenantId, h.viewerId)).toEqual([]);
+    expect((await h.sessions.listPage(h.tenantId, h.viewerId)).sessions).toEqual([]);
     expect((await h.messages.listBySession(h.tenantId, h.sessionId, h.viewerId)).messages).toEqual([]);
     expect(await h.artifacts.listBySession(h.tenantId, h.sessionId, h.viewerId)).toEqual([]);
     expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
@@ -133,14 +133,12 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     expect(await h.artifacts.getReadable(h.tenantId, h.artifact.artifactId, h.userId)).toBeNull();
   });
 
-  test("binds tokens to the requester and rejects revocation between peek and consumption", async () => {
+  test("takes identity from the token and rejects revocation between peek and consumption", async () => {
     const h = await setup();
     const token = await h.mint();
-    h.authenticate(h.userId);
-    expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
-    h.authenticate(h.viewerId, await seedTenant());
-    expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
-    h.authenticate(h.viewerId);
+    // The token is the credential: the request identity does not matter, but
+    // the token user's access is checked again at consumption.
+    h.authenticate(h.userId, await seedTenant());
     const stream = Readable.from(["data"]);
     h.openReadStream.mockImplementationOnce(async () => {
       await h.members.setMember(h.actor, h.viewerId, null);
@@ -172,8 +170,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     await h.members.setMember(h.actor, h.userId, null);
     expect((await h.app.inject(`/projects/${h.actor.projectId}`)).statusCode).toBe(200);
     expect((await h.app.inject(`/sessions/${h.sessionId}/messages`)).statusCode).toBe(200);
-    const consume = () => h.artifacts.consumeDownloadToken({ token, requesterTenantId: h.tenantId,
-      requesterUserId: h.viewerId, callerIsAdmin: false });
+    const consume = () => h.artifacts.consumeDownloadToken({ token });
     const results = await Promise.all([consume(), consume()]);
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(results.filter(result => result === null)).toHaveLength(1);
@@ -226,9 +223,6 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     const mint = await h.app.inject({ method: "POST", url: `/artifacts/${artifact.artifactId}/download-token` });
     expect(mint.statusCode).toBe(200);
     const token = mint.json().download.token;
-    h.authenticate(h.viewerId);
-    expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
-    h.authenticate(h.userId);
     expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(200);
     const adminId = await seedUser();
     await seedMembership(h.tenantId, adminId, "admin");
@@ -236,9 +230,23 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     const adminMint = await h.app.inject({ method: "POST", url: `/admin/artifacts/${artifact.artifactId}/download-token` });
     expect(adminMint.statusCode).toBe(200);
     const adminToken = adminMint.json().download.token;
-    const persisted = await superuserPool().query("SELECT user_id FROM artifact_download_tokens WHERE token=$1", [adminToken]);
-    expect(persisted.rows[0].user_id).toBe(h.userId);
+    const persisted = await superuserPool().query("SELECT user_id, issued_by_user_id FROM artifact_download_tokens WHERE token=$1", [adminToken]);
+    expect(persisted.rows[0]).toEqual({ user_id: h.userId, issued_by_user_id: adminId });
     expect((await h.app.inject(`/downloads/${adminToken}`)).statusCode).toBe(200);
+    const downloaded = await superuserPool().query(
+      "SELECT user_id, payload FROM audit_events WHERE tenant_id=$1 AND event_type='artifact_downloaded' ORDER BY id DESC LIMIT 1",
+      [h.tenantId]);
+    expect(downloaded.rows[0]).toMatchObject({ user_id: adminId, payload: { ownerUserId: h.userId } });
+
+    // An admin token is checked against the issuing admin, not the owner: it
+    // survives the owner's removal and stops working when the admin is demoted.
+    const mintAdminToken = async () =>
+      (await h.app.inject({ method: "POST", url: `/admin/artifacts/${artifact.artifactId}/download-token` })).json().download.token;
+    await superuserPool().query("DELETE FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2", [h.tenantId, h.userId]);
+    expect((await h.app.inject(`/downloads/${await mintAdminToken()}`)).statusCode).toBe(200);
+    const demotedToken = await mintAdminToken();
+    await superuserPool().query("UPDATE tenant_memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2", [h.tenantId, adminId]);
+    expect((await h.app.inject(`/downloads/${demotedToken}`)).statusCode).toBe(404);
   });
 
   test("lets members inspect capabilities without granting mutation access", async () => {

@@ -17,6 +17,11 @@ import { ManagedToolCatalog } from "./managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "./managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "./managed-tools/register-builtin-managed-tools.js";
 import { LocalSkillBundleStorage } from "./skills/skill-bundle-storage.js";
+import {
+  buildDefaultTenantSettingsInput,
+  type TenantSettingsInput,
+  type TenantSettingsRecord
+} from "./tenant-settings-store.js";
 
 function makeManagedToolCatalog(): ManagedToolCatalog {
   const catalog = new ManagedToolCatalog();
@@ -584,6 +589,9 @@ test("DynamicConfigService rejects unknown tenant tool IDs before persisting set
               mode: "proxy" as const,
               routePath: "/mcp/trusted-echo",
               upstreamUrl: "https://example.com/mcp",
+              upstreamAuthType: "none" as const,
+              upstreamAuthName: null,
+              upstreamAuthConfigured: false,
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -629,6 +637,9 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
               mode: "proxy" as const,
               routePath: "/mcp/trusted-echo",
               upstreamUrl: "https://example.com/mcp",
+              upstreamAuthType: "none" as const,
+              upstreamAuthName: null,
+              upstreamAuthConfigured: false,
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -656,4 +667,72 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
         enabledMcpServerIds: ["trusted-ecoh"]
       })).rejects.toThrow(/Unknown enabled MCP server IDs: trusted-ecoh\./);
   expect(upsertCalls).toBe(0);
+});
+
+function makeTenantSettingsRecord(enabledToolIds: string[]): TenantSettingsRecord {
+  return {
+    ...buildDefaultTenantSettingsInput(),
+    tenantId: "tenant-1",
+    enabledToolIds,
+    version: 1,
+    configHash: "hash-settings",
+    updatedAt: new Date().toISOString()
+  };
+}
+
+test("compileRuntimeConfig takes integration tools from the toggles, not tenant settings", async () => {
+  const resolved: Array<[string, string]> = [];
+  const service = new DynamicConfigService(
+    createTestConfig(),
+    makeStores({
+      tenantSettings: {
+        async get() { return makeTenantSettingsRecord(["write_artifact", "github_write_file"]); }
+      }
+    }),
+    unusedSkillBundleStorage,
+    makeManagedToolCatalog()
+  );
+  service.setIntegrationToolSource({
+    async resolveSessionToolIds(tenantId, userId) {
+      resolved.push([tenantId, userId]);
+      return ["github_read_file"];
+    }
+  });
+
+  // No session means no user connection to check: no integration tools.
+  const catalog = await service.compileRuntimeConfig("tenant-1", false);
+  expect(catalog.runtimePolicy.enabledToolIds).toEqual(["write_artifact"]);
+  expect(resolved).toEqual([]);
+
+  // A stored integration tool ID grants nothing; the toggles add read only.
+  const session = await service.compileRuntimeConfig("tenant-1", false, { sessionId: "session-1", userId: "user-1" });
+  expect(session.runtimePolicy.enabledToolIds).toEqual(["write_artifact", "github_read_file"]);
+  expect(resolved).toEqual([["tenant-1", "user-1"]]);
+});
+
+test("DynamicConfigService rejects new integration tool IDs but keeps stored ones", async () => {
+  const upserts: TenantSettingsInput[] = [];
+  const service = new DynamicConfigService(
+    createTestConfig(),
+    makeStores({
+      tenantSettings: {
+        async get() { return makeTenantSettingsRecord(["write_artifact", "github_write_file"]); },
+        async upsert(_tenantId, input) {
+          upserts.push(input);
+          return makeTenantSettingsRecord(input.enabledToolIds ?? []);
+        }
+      }
+    }),
+    unusedSkillBundleStorage,
+    makeManagedToolCatalog()
+  );
+
+  await expect(() => service.updateTenantSettings("tenant-1", {
+    enabledToolIds: ["write_artifact", "github_write_file", "notion_create_page"]
+  })).rejects.toThrow(/owned by an integration cannot be enabled in tenant settings: notion_create_page\./);
+  expect(upserts).toEqual([]);
+
+  // The admin form sends the stored list back; saving it still works.
+  await service.updateTenantSettings("tenant-1", { enabledToolIds: ["write_artifact", "github_write_file"] });
+  expect(upserts).toHaveLength(1);
 });

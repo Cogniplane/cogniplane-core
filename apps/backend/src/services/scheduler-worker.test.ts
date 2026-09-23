@@ -1,8 +1,9 @@
-import { describe, test, beforeEach, expect } from "vitest";
+import { describe, test, beforeEach, expect, vi } from "vitest";
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeSessionRef } from "../runtime-contracts.js";
+import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
@@ -454,6 +455,32 @@ describe("SchedulerWorker", () => {
     const completedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.completed");
     if (!completedAudit) throw new Error("Expected scheduler completion audit event.");
     expect(completedAudit.userId).toBe("user-1");
+  });
+
+  test("an interrupted scheduled turn records a terminal failed run", async () => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
+      dueJobs: [job],
+      runMessageImpl: async function* () {
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        yield {
+          type: EventType.RUN_FINISHED,
+          threadId: "session-1",
+          runId: "resp-1",
+          result: AGUI_INTERRUPTED_RESULT
+        } as BaseEvent;
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(jobRunsCompleted).toHaveLength(1);
+    expect(jobRunsCompleted[0]).toMatchObject({
+      status: "failed",
+      errorMessage: "Scheduled job was interrupted."
+    });
+    expect(auditEvents.some((event) => event.type === "scheduler.job.run.failed")).toBe(true);
   });
 
   test("tick resolves the runtime per job tenant and dispatches to the resolved adapter", async () => {
@@ -953,36 +980,46 @@ describe("SchedulerWorker", () => {
   });
 
   test("reclamation aborts the runtime resolved after a watchdog timeout fired", async () => {
-    const job = makeFakeJob();
+    vi.useFakeTimers();
+    try {
+      const job = makeFakeJob();
 
-    const { deps, runtimeAdapter, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({
-      dueJobs: [job],
-      // Resolve the runtime only AFTER the watchdog has already fired, so
-      // `turn.adapter` was still null when executeJobWithTimeout checked it and
-      // no abort happened there.
-      resolveRuntimeDelayMs: 40,
-      runMessageImpl: async function* () {
-        yield {
-          type: EventType.RUN_FINISHED,
-          threadId: "session-1",
-          runId: "resp-1"
-        } as BaseEvent;
-      }
-    });
-    runtimeAdapter.abortSession = async (input) => {
-      abortSessionCalls.push(input);
-    };
+      const { deps, runtimeAdapter, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({
+        dueJobs: [job],
+        // Resolve the runtime only AFTER the watchdog has already fired, so
+        // `turn.adapter` was still null when executeJobWithTimeout checked it and
+        // no abort happened there.
+        resolveRuntimeDelayMs: 40,
+        runMessageImpl: async function* () {
+          yield {
+            type: EventType.RUN_FINISHED,
+            threadId: "session-1",
+            runId: "resp-1"
+          } as BaseEvent;
+        }
+      });
+      runtimeAdapter.abortSession = async (input) => {
+        abortSessionCalls.push(input);
+      };
 
-    const worker = new SchedulerWorker(deps, {
-      maxConcurrentJobs: 1,
-      jobTimeoutMs: 10,
-      abortSettleGraceMs: 500
-    });
-    await worker.tick();
+      const worker = new SchedulerWorker(deps, {
+        maxConcurrentJobs: 1,
+        jobTimeoutMs: 10,
+        abortSettleGraceMs: 500
+      });
+      const tick = worker.tick();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(abortSessionCalls).toHaveLength(0);
+      expect(purgeSessionDataCalls).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(40);
+      await tick;
 
-    expect(abortSessionCalls.length).toBe(1);
-    expect(abortSessionCalls[0].sessionId).toBe("session-1");
-    expect(purgeSessionDataCalls.length).toBe(1);
+      expect(abortSessionCalls.length).toBe(1);
+      expect(abortSessionCalls[0].sessionId).toBe("session-1");
+      expect(purgeSessionDataCalls.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("tick releases the slot after the abort grace even when the turn never settles", async () => {

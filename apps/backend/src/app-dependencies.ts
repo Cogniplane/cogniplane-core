@@ -12,6 +12,7 @@ import { buildPiiServices } from "./services/pii/build-pii-services.js";
 import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
 import { PolicyService } from "./services/policy/policy-service.js";
 import { buildRuntimeAdapter } from "./services/runtime/build-runtime-adapters.js";
+import { TurnCoordinationBus } from "./services/turn-coordination-bus.js";
 
 export { buildSchedulerWorker } from "./services/build-scheduler-worker.js";
 
@@ -35,6 +36,7 @@ export function buildAppDependencies(input: {
     stores,
     managedToolCatalog
   });
+  const turnBus = bootstrap.redis ? new TurnCoordinationBus(bootstrap.redis) : undefined;
   // Policy Center — runtime rule engine. Redis pub/sub evicts cached rule sets
   // across replicas after admin mutations; the short TTL remains a fallback
   // for local deployments and transient Redis disconnects.
@@ -60,9 +62,10 @@ export function buildAppDependencies(input: {
   });
 
   const integrations = buildIntegrationServices(
-    config, stores, deepAgentsAdapter, bootstrap.limits, bootstrap.redis
+    config, stores, deepAgentsAdapter, bootstrap.limits, bootstrap.redis, logger
   );
-  const proxyToolMetadataCache = new ProxyToolMetadataCache();
+  bootstrap.dynamicConfig.setIntegrationToolSource(integrations.integrationRegistry);
+  const proxyToolMetadataCache = new ProxyToolMetadataCache(logger);
 
   const pii = buildPiiServices({
     config,
@@ -90,6 +93,7 @@ export function buildAppDependencies(input: {
     },
     piiScanEnqueuer: pii.piiScanEnqueuer,
     integrationDescriptors: integrations.integrationDescriptors,
+    oauthStates: integrations.oauthStates,
     runtimeInvalidator: deepAgentsAdapter,
     managedToolCatalog,
     managedToolFactoryRegistry
@@ -152,6 +156,7 @@ export function buildAppDependencies(input: {
     piiScanJobHandler: pii.piiScanJobHandler,
     piiScanEnqueuer: pii.piiScanEnqueuer,
     activeTurns: stores.activeTurns,
+    turnBus,
     proxyToolMetadataCache,
     policyRules: stores.policyRules,
     policyDecisions: stores.policyDecisions,

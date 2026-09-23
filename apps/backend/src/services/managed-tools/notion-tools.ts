@@ -25,9 +25,10 @@ const NOTION_API_VERSION = "2025-09-03";
 // deep through nested toggles and synced blocks. 3 levels covers typical
 // reading workloads without amplifying token cost runaway.
 const NOTION_FETCH_MAX_DEPTH = 3;
-// Per-page-children fetch ceiling. Notion's API paginates at 100; we cap at
-// 200 to bound a single tool call.
+// Shared across the entire block tree, including nested children.
 const NOTION_FETCH_MAX_BLOCKS_PER_LEVEL = 200;
+const NOTION_FETCH_MAX_CHARS = 100_000;
+const NOTION_FETCH_MAX_REQUESTS = 20;
 // Cap the number of blocks the agent can append in one call. Notion's API
 // limit is 100 children per request; we surface it as an explicit guardrail.
 const NOTION_APPEND_MAX_BLOCKS = 100;
@@ -79,7 +80,14 @@ function withNotionAuth(
     if (!creds) {
       return { error: "No Notion connection found. Connect your Notion account in settings." };
     }
-    return fn(creds.token, { context, arguments: args });
+    try {
+      return await fn(creds.token, { context, arguments: args });
+    } catch (error) {
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+        return { error: "Notion request timed out." };
+      }
+      throw error;
+    }
   };
 }
 
@@ -160,7 +168,7 @@ export const NOTION_TOOL_CATALOG: ReadonlyArray<{
   {
     name: "notion_create_page",
     description:
-      "Create a new Notion page under a parent page or database. Optional content is appended as markdown-converted blocks.",
+      "Create a new Notion page under a parent page or database. Optional content is converted to at most 100 blocks. The result reports blockCount and truncated; append remaining content separately.",
     readOnly: false,
     inputSchema: {
       type: "object",
@@ -387,7 +395,9 @@ export function createNotionTools(deps: NotionToolDeps): ManagedToolDefinition[]
         strictObjectSchema({
           id: { type: "string" },
           url: nullableStringSchema,
-          parentType: { type: "string" }
+          parentType: { type: "string" },
+          blockCount: { type: "number" },
+          truncated: { type: "boolean" }
         })
       ),
       handler: withNotionAuth(deps, async (token, { arguments: args }) => {
@@ -427,10 +437,9 @@ export function createNotionTools(deps: NotionToolDeps): ManagedToolDefinition[]
         }
         body.properties = props;
 
-        if (typeof args.content === "string" && args.content.length > 0) {
-          const blocks = markdownToNotionBlocks(args.content).slice(0, NOTION_APPEND_MAX_BLOCKS);
-          if (blocks.length > 0) body.children = blocks;
-        }
+        const blocks = typeof args.content === "string" ? markdownToNotionBlocks(args.content) : [];
+        const children = blocks.slice(0, NOTION_APPEND_MAX_BLOCKS);
+        if (children.length > 0) body.children = children;
 
         const res = await callNotion("/pages", "POST", token, body);
         if (!res.ok) return notionError(res.status, await safeJsonBody(res.response));
@@ -439,7 +448,9 @@ export function createNotionTools(deps: NotionToolDeps): ManagedToolDefinition[]
         return {
           id: String(data.id ?? ""),
           url: typeof data.url === "string" ? data.url : null,
-          parentType: parentPageId ? "page" : "database"
+          parentType: parentPageId ? "page" : "database",
+          blockCount: children.length,
+          truncated: blocks.length > children.length
         };
       })
     },
@@ -516,9 +527,11 @@ async function callNotion(
   path: string,
   method: "GET" | "POST" | "PATCH",
   token: string,
-  body?: Record<string, unknown>
+  body?: Record<string, unknown>,
+  signal: AbortSignal = AbortSignal.timeout(30_000)
 ): Promise<NotionApiResult> {
   const response = await fetch(`${NOTION_API_BASE}${path}`, {
+    signal,
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -583,6 +596,10 @@ async function fetchBlockTree(
 ): Promise<{ lines: string[]; truncated: boolean }> {
   const lines: string[] = [];
   let truncated = false;
+  let totalBlocks = 0;
+  let totalChars = 0;
+  let requests = 0;
+  const signal = AbortSignal.timeout(30_000);
 
   async function visit(blockId: string, depth: number): Promise<void> {
     if (depth > maxDepth) {
@@ -592,10 +609,22 @@ async function fetchBlockTree(
     let cursor: string | undefined;
     let fetched = 0;
     do {
+      if (requests >= NOTION_FETCH_MAX_REQUESTS || totalBlocks >= NOTION_FETCH_MAX_BLOCKS_PER_LEVEL || totalChars >= NOTION_FETCH_MAX_CHARS) {
+        truncated = true;
+        return;
+      }
+      requests += 1;
       const url = cursor
         ? `/blocks/${encodeURIComponent(blockId)}/children?page_size=100&start_cursor=${encodeURIComponent(cursor)}`
         : `/blocks/${encodeURIComponent(blockId)}/children?page_size=100`;
-      const res = await callNotion(url, "GET", token);
+      let res: NotionApiResult;
+      try {
+        res = await callNotion(url, "GET", token, undefined, signal);
+      } catch (error) {
+        if (!signal.aborted) throw error;
+        truncated = true;
+        return;
+      }
       if (!res.ok) {
         truncated = true;
         return;
@@ -603,11 +632,22 @@ async function fetchBlockTree(
       const data = res.data;
       const results = Array.isArray(data.results) ? data.results : [];
       for (const block of results) {
+        if (totalBlocks >= NOTION_FETCH_MAX_BLOCKS_PER_LEVEL || totalChars >= NOTION_FETCH_MAX_CHARS) {
+          truncated = true;
+          return;
+        }
+        totalBlocks += 1;
         if (typeof block !== "object" || block === null) continue;
         const blockObj = block as Record<string, unknown>;
         const indent = "  ".repeat(Math.max(0, depth - 1));
         const text = blockToText(blockObj);
-        if (text) lines.push(`${indent}${text}`);
+        if (text) {
+          const line = `${indent}${text}`;
+          const remaining = NOTION_FETCH_MAX_CHARS - totalChars;
+          lines.push(line.slice(0, remaining));
+          totalChars += Math.min(line.length, remaining);
+          if (line.length > remaining) truncated = true;
+        }
 
         if (blockObj.has_children === true && typeof blockObj.id === "string") {
           await visit(blockObj.id, depth + 1);

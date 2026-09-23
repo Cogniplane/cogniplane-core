@@ -273,7 +273,8 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     apiKey: options.apiKey, templateId: options.templateId,
     sandboxTimeoutMs: options.sandboxTimeoutMs, executeTimeoutMs: options.executeTimeoutMs,
     workspacePath: init.workspacePath, sessionId: init.sessionId, runtimeId: init.runtimeId,
-    onSandboxRecreated: init.onSandboxRecreated, logger: init.logger
+    onSandboxRecreated: init.onSandboxRecreated, sandboxBinding: init.sandboxBinding,
+    logger: init.logger
   });
   let sandbox = init.e2b ? createSandbox(init.e2b) : null;
 

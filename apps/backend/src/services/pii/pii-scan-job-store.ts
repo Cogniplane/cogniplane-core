@@ -227,6 +227,21 @@ export class PiiScanJobStore {
    * it is requeued for another attempt. Returns the number of rows swept.
    */
   async sweepStaleClaims(staleAfterMs: number): Promise<number> {
+    // A decision may have committed before its job acknowledgement failed.
+    // Recover those jobs without evaluating or auditing the subject again.
+    const completed = await this.schedulerDb.query(
+      `UPDATE pii_scan_jobs j
+       SET status = 'completed', claimed_at = NULL, completed_at = NOW(),
+           error_message = NULL, updated_at = NOW()
+       WHERE j.status = 'claimed'
+         AND j.claimed_at < NOW() - ($1::int * INTERVAL '1 millisecond')
+         AND EXISTS (
+           SELECT 1 FROM pii_scan_runs r
+           WHERE r.tenant_id = j.tenant_id AND r.scan_run_id = j.scan_run_id
+             AND r.status IN ('completed', 'blocked', 'transformed')
+         )`,
+      [staleAfterMs]
+    );
     const result = await this.schedulerDb.query(
       `
         UPDATE pii_scan_jobs
@@ -242,7 +257,7 @@ export class PiiScanJobStore {
       `,
       [staleAfterMs]
     );
-    return result.rowCount ?? 0;
+    return (completed.rowCount ?? 0) + (result.rowCount ?? 0);
   }
 
   async getById(tenantId: string, jobId: string): Promise<PiiScanJobRecord | null> {

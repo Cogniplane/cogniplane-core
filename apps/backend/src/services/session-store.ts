@@ -1,4 +1,5 @@
 
+import { z } from "zod";
 import { type Pool, withTenantScope, withTransaction } from "../lib/db.js";
 import { requireSessionUploadAccess } from "./session-upload-access.js";
 import { projectRoleSql, requireProjectAccess } from "./project-access.js";
@@ -37,6 +38,24 @@ export type SessionRecord = {
   latestTurnId?: string;
   latestTurnSequence?: number;
   hasTurnFailed?: boolean;
+};
+
+export const SessionListCursorSchema = z.object({
+  updatedAt: z.string().datetime({ offset: true }),
+  sessionId: z.string().min(1).max(200)
+});
+
+export type SessionListOptions = {
+  purposes?: string[] | "all";
+  status?: "active" | "archived" | "deleted";
+  projectId?: string;
+  search?: string;
+  ids?: string[];
+  personalOnly?: boolean;
+};
+export type SessionPageOptions = SessionListOptions & {
+  limit?: number;
+  cursor?: z.infer<typeof SessionListCursorSchema>;
 };
 
 export type SessionTrashCleanupOptions = {
@@ -207,11 +226,8 @@ export class SessionStore {
    * Pass `purposes: 'all'` (or an explicit list) to include them. Empty
    * list = same as default.
    */
-  async list(
-    tenantId: string,
-    userId: string,
-    options: { purposes?: string[] | "all"; status?: "active" | "archived" | "deleted"; projectId?: string } = {}
-  ): Promise<SessionRecord[]> {
+  async listPage(tenantId: string, userId: string, options: SessionPageOptions = {}) {
+    const limit = Math.max(1, Math.min(100, options.limit ?? 50));
     const purposes = options.purposes;
     const includeAll = purposes === "all";
     const purposeList = includeAll
@@ -232,6 +248,27 @@ export class SessionStore {
         params.push(options.projectId);
         projectClause = `AND s.project_id = $${params.length}`;
       }
+      const filters: string[] = [];
+      if (options.personalOnly) filters.push("s.project_id IS NULL");
+      if (options.ids) {
+        params.push(options.ids);
+        filters.push(`s.session_id = ANY($${params.length}::text[])`);
+      }
+      if (options.search) {
+        params.push(options.search);
+        const searchParam = `$${params.length}`;
+        // Literal substring search, including percent and underscore characters.
+        filters.push(`(strpos(lower(s.session_name), lower(${searchParam})) > 0 OR EXISTS (
+          SELECT 1 FROM projects p WHERE p.tenant_id=s.tenant_id AND p.project_id=s.project_id
+            AND strpos(lower(p.name), lower(${searchParam})) > 0
+        ))`);
+      }
+      if (options.cursor) {
+        params.push(options.cursor.updatedAt, options.cursor.sessionId);
+        filters.push(`(s.updated_at, s.session_id) < ($${params.length - 1}::timestamptz, $${params.length}::text)`);
+      }
+      params.push(limit + 1);
+      const limitClause = `LIMIT $${params.length}`;
       const sessionRows = await client.query(
         `
           SELECT
@@ -245,6 +282,7 @@ export class SessionStore {
             s.project_id,
             s.created_at,
             s.updated_at,
+            to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_updated_at,
             latest_turn.message_id AS latest_turn_id,
             latest_turn.id AS latest_turn_sequence,
             latest_turn.status AS latest_turn_status,
@@ -260,14 +298,24 @@ export class SessionStore {
               SELECT 1 FROM session_executions e
               WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
                 AND e.status='active' AND e.expires_at>clock_timestamp()
-            ) OR EXISTS (
+            ) OR (s.purpose='scheduled' AND EXISTS (
               SELECT 1 FROM messages streaming
               WHERE streaming.tenant_id=s.tenant_id AND streaming.session_id=s.session_id
                 AND streaming.role='assistant' AND streaming.status='streaming'
-            )) AS is_running
+            ))) AS is_running
             , (SELECT MIN(e.started_at) FROM session_executions e
                WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active') AS active_turn_started_at
-          FROM sessions s
+          FROM (
+            SELECT s.* FROM sessions s
+            WHERE s.tenant_id = $1 AND ${options.status === "deleted"
+              ? sessionTrashAccessSql("s", "$2")
+              : sessionReadAccessSql("s", "$2")} AND s.status = $3
+              ${purposeClause}
+              ${projectClause}
+              ${filters.map((filter) => `AND ${filter}`).join("\n")}
+            ORDER BY s.updated_at DESC, s.session_id DESC
+            ${limitClause}
+          ) s
           LEFT JOIN LATERAL (
             SELECT m.message_id, m.id, m.status
             FROM messages m
@@ -276,16 +324,19 @@ export class SessionStore {
             ORDER BY m.id DESC
             LIMIT 1
           ) latest_turn ON TRUE
-          WHERE s.tenant_id = $1 AND ${options.status === "deleted"
-            ? sessionTrashAccessSql("s", "$2")
-            : sessionReadAccessSql("s", "$2")} AND s.status = $3
-            ${purposeClause}
-            ${projectClause}
-          ORDER BY s.updated_at DESC
+          ORDER BY s.updated_at DESC, s.session_id DESC
         `,
         params
       );
-      return sessionRows.rows.map(mapSession);
+      const hasMore = sessionRows.rows.length > limit;
+      const rows = hasMore ? sessionRows.rows.slice(0, limit) : sessionRows.rows;
+      const last = rows.at(-1);
+      return {
+        sessions: rows.map(mapSession),
+        nextCursor: hasMore && last ? Buffer.from(JSON.stringify({
+          updatedAt: last.cursor_updated_at, sessionId: last.session_id
+        })).toString("base64url") : null
+      };
     });
   }
 

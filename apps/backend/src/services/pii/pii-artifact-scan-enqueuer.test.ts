@@ -13,6 +13,7 @@ function buildDeps(overrides: {
   decision?: PiiDecision;
   evaluateThrows?: Error;
   readerReturnsNull?: boolean;
+  readerThrows?: Error;
   scanRunCreateThrows?: Error;
   storageDeleteThrows?: Error;
   withAuditEvents?: boolean;
@@ -36,6 +37,7 @@ function buildDeps(overrides: {
 
   const reader: PiiArtifactSubjectReader = {
     async readArtifact({ tenantId, artifactId }) {
+      if (overrides.readerThrows) throw overrides.readerThrows;
       if (overrides.readerReturnsNull) return null;
       return {
         artifactId,
@@ -134,6 +136,14 @@ function sampleInput(overrides: Partial<EnqueueArtifactPiiScanInput> = {}): Enqu
     ...overrides
   };
 }
+
+test("block mode records a failed scan when the subject lookup throws", async () => {
+  const h = buildDeps({ settings: { enabled: true, mode: "block" }, readerThrows: new Error("database unavailable") });
+  const result = await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput());
+  expect(result.kind).toBe("failed");
+  expect(h.scanRunUpdateCalls.at(-1)?.patch.status).toBe("failed");
+  expect(h.artifactUpdateCalls.at(-1)?.input.status).toBe("failed");
+});
 
 test("enqueue returns skipped when PII protection is disabled", async () => {
   const { deps, scanRunCreateCalls } = buildDeps({

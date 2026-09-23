@@ -20,6 +20,7 @@ export type ApprovalRecord = {
   summary: string;
   status: ApprovalStatus;
   decision: "approve" | "reject" | null;
+  rememberForTurn?: boolean;
   requestPayload: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -49,6 +50,7 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
         ? row.status
         : "pending",
     decision: row.decision === "approve" || row.decision === "reject" ? row.decision : null,
+    rememberForTurn: row.remember_for_turn === true,
     requestPayload:
       row.request_payload && typeof row.request_payload === "object"
         ? (row.request_payload as Record<string, unknown>)
@@ -65,9 +67,11 @@ export class ApprovalStore {
 
   async create(input: Omit<ApprovalRecord, "createdAt" | "updatedAt" | "resolvedAt"> & { tenantId: string }): Promise<ApprovalRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
-      const session = await client.query("SELECT project_id FROM sessions WHERE tenant_id=$1 AND session_id=$2",
+      const session = await client.query(`SELECT project_id, EXISTS (
+        SELECT 1 FROM session_executions e WHERE e.tenant_id=$1 AND e.session_id=$2
+      ) AS has_execution FROM sessions WHERE tenant_id=$1 AND session_id=$2`,
         [input.tenantId, input.sessionId]);
-      if (session.rows[0]?.project_id) {
+      if (session.rows[0]?.project_id || session.rows[0]?.has_execution) {
         const active = await client.query(`SELECT e.execution_id FROM session_executions e JOIN sessions s
           ON s.tenant_id=e.tenant_id AND s.session_id=e.session_id
           WHERE e.tenant_id=$1 AND e.session_id=$2 AND e.user_id=$3 AND e.runtime_id=$4
@@ -157,19 +161,23 @@ export class ApprovalStore {
     tenantId: string,
     approvalId: string,
     userId: string,
-    decision: "approve" | "reject"
+    decision: "approve" | "reject",
+    rememberForTurn = false
   ): Promise<ApprovalRecord | null> {
     const status = decision === "approve" ? "approved" : "rejected";
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           UPDATE approvals
-          SET status = $4, decision = $5, resolved_at = NOW(), updated_at = NOW()
+          SET status = $4, decision = $5, remember_for_turn = $6,
+              resolved_at = NOW(), updated_at = NOW()
           WHERE tenant_id = $1 AND approval_id = $2 AND user_id = $3 AND status = 'pending'
             AND expires_at > clock_timestamp()
             AND EXISTS (SELECT 1 FROM sessions s
               WHERE s.tenant_id=approvals.tenant_id AND s.session_id=approvals.session_id
-                AND (s.project_id IS NULL OR EXISTS (
+                AND ((s.project_id IS NULL AND NOT EXISTS (SELECT 1 FROM session_executions prior
+                  WHERE prior.tenant_id=approvals.tenant_id AND prior.session_id=approvals.session_id))
+                  OR EXISTS (
                   SELECT 1 FROM session_executions e WHERE e.tenant_id=approvals.tenant_id
                     AND e.session_id=approvals.session_id AND e.user_id=approvals.user_id
                     AND e.runtime_id=approvals.runtime_id AND e.status='active' AND e.expires_at>clock_timestamp()
@@ -177,7 +185,7 @@ export class ApprovalStore {
                 )))
           RETURNING *
         `,
-        [tenantId, approvalId, userId, status, decision]
+        [tenantId, approvalId, userId, status, decision, rememberForTurn && decision === "approve"]
       );
 
       return result.rows[0] ? mapApproval(result.rows[0]) : null;

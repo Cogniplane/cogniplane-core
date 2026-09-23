@@ -49,6 +49,7 @@ test("session choices intersect current admin availability, including empty and 
   const server: AdminMcpServerRecord = {
     serverId: "docs", serverName: "Docs", description: null, mode: "proxy", routePath: "/mcp/docs",
     transportKind: "http", upstreamUrl: "https://example.test/mcp", version: 1, configHash: "docs-hash",
+    upstreamAuthType: "none", upstreamAuthName: null, upstreamAuthConfigured: false,
     enabled: true, isPublished: true, createdBy: "admin", createdAt: "", updatedAt: ""
   };
   const input = { tenantId: "tenant", isBetaTester: false, runtimePolicy: { ...profile, enabledMcpServers: ["docs"] },
@@ -110,6 +111,9 @@ test("compileRuntimeConfig filters MCP servers to the tenant policy's enabled se
     mode: "managed",
     routePath: "/mcp/managed-session-context",
     upstreamUrl: null,
+    upstreamAuthType: "none",
+    upstreamAuthName: null,
+    upstreamAuthConfigured: false,
     version: 1,
     configHash: "hash-mcp",
     enabled: true,
@@ -152,6 +156,9 @@ test("compileRuntimeConfig keeps only one enabled MCP server per server ID", asy
     mode: "managed",
     routePath: "/mcp/tenant-context",
     upstreamUrl: null,
+    upstreamAuthType: "none",
+    upstreamAuthName: null,
+    upstreamAuthConfigured: false,
     version: 2,
     configHash: "tenant-hash",
     enabled: true,
@@ -177,4 +184,33 @@ test("compileRuntimeConfig keeps only one enabled MCP server per server ID", asy
 
   expect(bundle.mcpServers).toHaveLength(1);
   expect(bundle.mcpServers[0]).toMatchObject({ id: "managed-session-context", hash: "tenant-hash" });
+});
+
+test("compileRuntimeConfig adds integration tool IDs and hashes them", async () => {
+  const managedServer: AdminMcpServerRecord = {
+    serverId: "managed-session-context", serverName: "Session context", description: null, mode: "managed",
+    routePath: "/mcp/managed-session-context", transportKind: "http", upstreamUrl: null,
+    upstreamAuthType: "none", upstreamAuthName: null, upstreamAuthConfigured: false, version: 1,
+    configHash: "managed-hash", enabled: true, isPublished: true, createdBy: "system", createdAt: "", updatedAt: ""
+  };
+  const input = {
+    tenantId: "tenant-1",
+    isBetaTester: false,
+    skills: { listSkills: async () => [] },
+    mcpServers: { listMcpServers: async () => [managedServer] },
+    runtimePolicy: { ...profile, enabledMcpServers: ["managed-session-context"] }
+  };
+
+  const withoutIntegrations = await compileRuntimeConfig(input);
+  const readOnly = await compileRuntimeConfig({ ...input, integrationToolIds: ["github_read_file"] });
+  const readWrite = await compileRuntimeConfig({
+    ...input, integrationToolIds: ["github_read_file", "github_write_file", "github_read_file"]
+  });
+
+  expect(withoutIntegrations.runtimePolicy.enabledToolIds).toEqual(["write_artifact"]);
+  expect(readOnly.runtimePolicy.enabledToolIds).toEqual(["write_artifact", "github_read_file"]);
+  expect(readWrite.runtimePolicy.enabledToolIds).toEqual(["write_artifact", "github_read_file", "github_write_file"]);
+  // Toggle and connection changes do not touch tenant settings, so the
+  // resolved IDs must change the hash that refreshes a warm runtime.
+  expect(new Set([withoutIntegrations.hash, readOnly.hash, readWrite.hash]).size).toBe(3);
 });

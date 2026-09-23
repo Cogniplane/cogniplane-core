@@ -27,7 +27,14 @@ import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js"
  *  - `platform_events` — platform-wide telemetry, deliberately not per-tenant.
  *  - `schema_migrations` — created by the migration runner, not a domain table.
  */
-const GLOBAL_TABLES = new Set(["users", "platform_events", "schema_migrations"]);
+const GLOBAL_TABLES = new Set([
+  "users",
+  "platform_events",
+  "schema_migrations",
+  "tenant_deletion_cleanup",
+  "tenant_deletion_receipts"
+]);
+const OPERATOR_ONLY_TABLES = new Set(["tenant_deletion_cleanup", "tenant_deletion_receipts"]);
 
 type TableRow = {
   table_name: string;
@@ -96,13 +103,16 @@ describe.skipIf(!adminDatabaseUrl())("RLS catalog", () => {
     ).toEqual([...GLOBAL_TABLES].sort());
   });
 
-  test("no tenant-less table has RLS enabled", async () => {
+  test("only operator-only tenant-less tables have RLS enabled", async () => {
     const tables = await loadTables();
     // RLS on a table with no tenant column cannot isolate anything, and its
     // policies would have to reference a column that does not exist. If this
     // fires, the table probably wants a tenant_id rather than a policy.
     const wrong = tables
-      .filter((row) => !row.has_tenant_id && row.row_security)
+      .filter(
+        (row) =>
+          !row.has_tenant_id && row.row_security !== OPERATOR_ONLY_TABLES.has(row.table_name)
+      )
       .map((row) => row.table_name);
 
     expect(wrong).toEqual([]);

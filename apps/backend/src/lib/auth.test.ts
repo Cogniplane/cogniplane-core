@@ -2,6 +2,7 @@ import Fastify from "fastify";
 import { test, expect } from "vitest";
 
 import { localDevAuth } from "./auth.js";
+import { workosAuth } from "./auth-workos.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 
 // The non-loopback opt-in removes the network guard, so this shared-secret check
@@ -13,6 +14,30 @@ async function buildApp(overrides: Parameters<typeof createTestConfig>[0]) {
   app.get("/whoami", async (request) => request.auth);
   return app;
 }
+
+test.each(["dev-headers", "workos"])("%s exposes only exact liveness and readiness paths", async (mode) => {
+  const app = Fastify();
+  const config = createTestConfig({
+    COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: true,
+    DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret"
+  });
+  app.addHook("onRequest", mode === "workos"
+    ? workosAuth(config, { async getRole() { throw new Error("probe must not query membership"); } })
+    : localDevAuth(config));
+  for (const path of ["/health", "/ready", "/ready/private", "/readyevil", "/health/private"]) {
+    app.get(path, async () => ({ ok: true }));
+  }
+  try {
+    for (const path of ["/health", "/ready"]) {
+      expect((await app.inject(`${path}?probe=1`)).statusCode).toBe(200);
+    }
+    for (const path of ["/ready/private", "/readyevil", "/health/private"]) {
+      expect((await app.inject(path)).statusCode).toBe(401);
+    }
+  } finally {
+    await app.close();
+  }
+});
 
 test("dev-headers without the non-loopback opt-in does not require a key", async () => {
   const app = await buildApp({});
@@ -62,65 +87,42 @@ test("with the opt-in, identity headers are rejected without the shared key", as
   expect(ok.json()).toMatchObject({ userId: "u1", tenantId: "t1" });
 });
 
-test("GET /downloads/:token works without the key, but identity headers are ignored", async () => {
+test("GET /downloads/:token skips header auth: the token is the credential", async () => {
   const app = await buildApp({
     COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: true,
     DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret"
   });
-  app.get("/downloads/:token", async (request) => request.auth);
+  app.get("/downloads/:token", async (request) => ({ auth: request.auth ?? null }));
+  app.post("/downloads/:token", async () => ({ ok: true }));
 
-  // <img> tags cannot send custom headers; the download token is the credential.
-  const headerless = await app.inject({ method: "GET", url: "/downloads/tok123" });
-  expect(headerless.statusCode).toBe(200);
-  expect(headerless.json()).toMatchObject({ userId: "test-user", tenantId: "local-dev-tenant" });
-
-  // Identity headers without the key must not be trusted on the exempted path.
+  // <img> tags cannot send custom headers. No identity is set, so identity
+  // headers without the key cannot reach the route either.
   const spoofed = await app.inject({
     method: "GET",
     url: "/downloads/tok123",
     headers: { "x-user-id": "attacker", "x-tenant-id": "victim-tenant" }
   });
   expect(spoofed.statusCode).toBe(200);
-  expect(spoofed.json()).toMatchObject({ userId: "test-user", tenantId: "local-dev-tenant" });
+  expect(spoofed.json()).toEqual({ auth: null });
 
-  // Non-GET and non-download paths stay gated.
-  const post = await app.inject({ method: "POST", url: "/downloads/tok123" });
-  expect(post.statusCode).toBe(401);
+  // Non-GET and nested paths stay gated.
+  expect((await app.inject({ method: "POST", url: "/downloads/tok123" })).statusCode).toBe(401);
+  expect((await app.inject({ method: "GET", url: "/downloads/tok123/x" })).statusCode).toBe(401);
 });
 
-test("/health stays reachable without the shared key (container probes)", async () => {
+test.each(["/health", "/ready"])("%s stays reachable without the shared key", async (path) => {
   const app = await buildApp({
     COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: true,
     DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret"
   });
-  app.get("/health", async () => ({ ok: true }));
+  app.get(path, async () => ({ ok: true }));
 
-  const res = await app.inject({ method: "GET", url: "/health?probe=1" });
+  const res = await app.inject({ method: "GET", url: `${path}?probe=1` });
   expect(res.statusCode).toBe(200);
 });
 
-// GET /downloads/:token is let through without the shared key, because <img>
-// tags cannot send custom headers. That request carries no identity headers, so
-// it lands on LOCAL_DEV_USER_ID — which ADMIN_USER_IDS contains by default.
-// Without the demotion, an unauthenticated caller would arrive holding the
-// admin bypass on the download token's user_id check.
-test("the /downloads/ fallback identity is never privileged", async () => {
-  const app = await buildApp({
-    COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: true,
-    DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret"
-  });
-  app.get("/downloads/:token", async (request) => request.auth);
-
-  const res = await app.inject({ method: "GET", url: "/downloads/tok-1" });
-
-  expect(res.statusCode).toBe(200);
-  // Both fields matter: routes/artifacts.ts gates the bypass on `role`, so
-  // dropping only `isAdmin` would leave the hole open.
-  expect(res.json()).toMatchObject({ isAdmin: false, role: "member" });
-});
-
-// The demotion is scoped to the stripped-header case. Ordinary local dev never
-// sets a key, and the admin workbench depends on that identity being admin.
+// Ordinary local dev never sets a key, and the admin workbench depends on that
+// identity being admin.
 test("ordinary local dev keeps its admin identity", async () => {
   const app = await buildApp({});
 

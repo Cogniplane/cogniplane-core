@@ -1,3 +1,4 @@
+import cookie from "@fastify/cookie";
 import Fastify from "fastify";
 import { IntegrationRegistryService } from "./integration-registry-service.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
@@ -90,6 +91,7 @@ test("independent apps retain their own probes and OAuth handlers", async () => 
   const firstApp = Fastify();
   const secondApp = Fastify();
   try {
+    await Promise.all([firstApp.register(cookie), secondApp.register(cookie)]);
     await firstRegistry.get("github")!.oauthRoutes!.register(firstApp);
     await secondRegistry.get("github")!.oauthRoutes!.register(secondApp);
     const firstResponse = await firstApp.inject({ url: "/auth/github/user/callback?code=c&state=s" });

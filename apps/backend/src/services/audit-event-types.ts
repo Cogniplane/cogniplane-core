@@ -122,6 +122,14 @@ export const AUDIT_EVENT_TYPES = [
   "scheduler.job.run.failed",
   "scheduler.job.disabled",
 
+  // Tenant organization settings and membership (routes/tenant.ts). Written
+  // in the same transaction as the change.
+  "tenant.provider_key.updated",
+  "tenant.marketplace_url.updated",
+  "tenant.pii_protection.updated",
+  "tenant.member.role_changed",
+  "tenant.member.removed",
+
   // Tenant-level integration toggles (admin-driven).
   "tenant.integration.config_cleared",
   "tenant.integration.runtime_invalidated",

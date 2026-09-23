@@ -155,7 +155,7 @@ async function setup(personalNotion = false) {
   }
   onTestFinished(async () => { await Promise.all([runtimeAdapter.close(), replicaRuntime.close()]); await Promise.all([app.close(), replica.close(), gateway.close()]); });
   const send = (text: string, server = app) => server.inject({ method: "POST", url: "/messages", payload: { sessionId, text, model: AVAILABLE_MODELS.find(model => model.provider === "openai")!.id } });
-  return { app, replica, approvals, notionStore, config, tenantId, ownerId, editorId, viewerId, sessionId, sessions, messages, executions, toolContexts,
+  return { app, replica, approvals, notionStore, config, tenantId, ownerId, editorId, viewerId, sessionId, sessions, messages, executions, toolContexts, projects, project,
     created, inputs, toolsStarted, members, actor, send, quota, authenticate(next: string) { userId = next; } };
 }
 
@@ -263,6 +263,57 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     await turn;
     expect(h.toolsStarted).not.toContain("write_file");
     expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("expired");
+  });
+
+  test("an approval-mode change mid-turn does not alter the running turn", async () => {
+    const h = await setup(true);
+    // D10g: a turn captures the project's approval mode at start and keeps it
+    // for the whole turn, including approval resumes.
+    //
+    // The observable difference between the modes is autoApproveReadOnly:
+    // manual forces it false, automatic inherits the tenant policy (true in
+    // testRuntimePolicy). "gate" is identical under both, because automatic
+    // cannot weaken a native policy of "on-request". So the assertion below
+    // uses a READ-ONLY tool: under the captured manual mode it must stop for
+    // approval even after the project flips to automatic.
+    expect(await h.projects.setApprovalMode(h.tenantId, h.ownerId, h.project.projectId, "manual")).toBe(true);
+    await h.notionStore.upsert({ tenantId: h.tenantId, userId: h.editorId, notionUserId: "notion-editor",
+      notionWorkspaceId: "workspace", notionWorkspaceName: "Test workspace", notionWorkspaceIcon: null,
+      notionBotId: null, notionOwnerEmail: null, notionOwnerName: null, tokenType: "bearer", grantedScopes: [],
+      accessTokenEncrypted: encrypt("test-only-mode-capture-token", h.config.DATA_ENCRYPTION_SECRET),
+      accessTokenExpiresAt: null, refreshTokenEncrypted: null, refreshTokenExpiresAt: null,
+      tokenLastRefreshedAt: null });
+    h.authenticate(h.editorId);
+    modelControl.notion = true;
+    modelControl.afterOutput = async () => { modelControl.notion = false; };
+    const turn = h.send("Search the shared source").then(response => response);
+    let approvalId = "";
+    await vi.waitFor(async () => {
+      const pending = await h.approvals.listPending(h.tenantId, h.sessionId, h.editorId);
+      expect(pending).toHaveLength(1);
+      approvalId = pending[0]!.approvalId;
+    }, { timeout: 5000 });
+    expect(h.toolsStarted).not.toContain("notion_search");
+
+    // Flip the project to automatic while the turn is parked on the approval.
+    expect(await h.projects.setApprovalMode(h.tenantId, h.ownerId, h.project.projectId, "automatic")).toBe(true);
+    expect((await h.projects.getOwned(h.tenantId, h.ownerId, h.project.projectId))?.approvalMode)
+      .toBe("automatic");
+
+    // The running turn is unchanged: its approval is still pending and the
+    // read-only tool has still not run. A turn that re-read the project setting
+    // would auto-approve it and proceed.
+    expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("pending");
+    expect(h.toolsStarted).not.toContain("notion_search");
+
+    // It still resolves through its captured manual mode, by explicit approval.
+    expect((await h.app.inject({
+      method: "POST",
+      url: `/approvals/${approvalId}/decision`,
+      payload: { decision: "approve" }
+    })).statusCode).toBe(200);
+    await turn;
+    expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("approved");
   });
 
   test("MCP uses each participant's encrypted personal connection without inheriting the previous user's credentials", async () => {

@@ -20,15 +20,15 @@ describe.skipIf(!adminDatabaseUrl())("persisted session activity", () => {
     await messages.create({ tenantId, userId: otherUser, sessionId: otherSession, role: "assistant", status: "completed", content: "private" });
 
     const sessions = new SessionStore(appPool());
-    expect(await sessions.list(tenantId, userId)).toMatchObject([{
+    expect((await sessions.listPage(tenantId, userId)).sessions).toMatchObject([{
       sessionId, latestTurnId: failed.messageId, latestTurnSequence: failed.id, hasTurnFailed: true
     }]);
-    expect(await sessions.list(foreignTenant, userId)).toEqual([]);
-    expect(await sessions.list(tenantId, otherUser)).toMatchObject([{ sessionId: otherSession, hasTurnFailed: false }]);
+    expect((await sessions.listPage(foreignTenant, userId)).sessions).toEqual([]);
+    expect((await sessions.listPage(tenantId, otherUser)).sessions).toMatchObject([{ sessionId: otherSession, hasTurnFailed: false }]);
     const retry = await create("assistant", "pending");
     expect(retry.id).toBeGreaterThan(failed.id);
     await messages.updateContent(tenantId, retry.messageId, userId, "completed", "recovered");
-    expect(await new SessionStore(appPool()).list(tenantId, userId)).toMatchObject([{
+    expect((await new SessionStore(appPool()).listPage(tenantId, userId)).sessions).toMatchObject([{
       sessionId, latestTurnId: retry.messageId, latestTurnSequence: retry.id, hasTurnFailed: false
     }]);
   });
@@ -57,5 +57,49 @@ describe.skipIf(!adminDatabaseUrl())("persisted whole-turn duration", () => {
     expect(reloaded.messages[0].detail).not.toHaveProperty("durationMs");
     await messages.updateContent(tenantId, message.messageId, userId, "completed", "edited");
     expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].durationMs).toBe(84000);
+  });
+});
+
+describe.skipIf(!adminDatabaseUrl())("detached turn persistence", () => {
+  test("saves notices and finalizes a live row without exposing it to another user", async () => {
+    const tenantId = await seedTenant();
+    const userId = await seedUser();
+    const otherUser = await seedUser();
+    const sessionId = await seedSession(tenantId, userId);
+    const messages = new MessageStore(appPool());
+    const row = await messages.create({ tenantId, sessionId, userId, role: "assistant", status: "streaming", content: "partial" });
+    const token = `ghp_${"A".repeat(36)}`;
+
+    await messages.setRuntimeNotices(tenantId, row.messageId, otherUser, [{ message: "wrong owner" }]);
+    await messages.setRuntimeNotices(tenantId, row.messageId, userId, [{ message: `expired ${token}` }]);
+    await messages.upsertToolResult({
+      tenantId, messageId: row.messageId, sessionId, userId,
+      toolResultId: `tool-${row.messageId}`, kind: "command", title: "execute",
+      status: "completed", command: "ls", cwd: null, server: null,
+      toolName: "execute", input: "{}", output: "ok", exitCode: 0,
+      durationMs: 1, textOffset: 0
+    });
+    await messages.deleteToolResult(tenantId, row.messageId, otherUser, `tool-${row.messageId}`);
+    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].toolResults).toHaveLength(1);
+    await messages.deleteToolResult(tenantId, row.messageId, userId, `tool-${row.messageId}`);
+    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].toolResults).toEqual([]);
+    await messages.upsertToolResult({
+      tenantId, messageId: row.messageId, sessionId, userId,
+      toolResultId: `unfinished-${row.messageId}`, kind: "command", title: "execute",
+      status: "in_progress", command: "sleep", cwd: null, server: null,
+      toolName: "execute", input: "{}", output: "", exitCode: null,
+      durationMs: null, textOffset: 0
+    });
+    await messages.markInterruptedIfActive(tenantId, row.messageId, otherUser);
+    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0]).toMatchObject({
+      status: "streaming", detail: { runtimeNotices: [{ message: "expired [REDACTED]" }] }
+    });
+
+    await messages.markInterruptedIfActive(tenantId, row.messageId, userId);
+    await messages.markInterruptedIfActive(tenantId, row.messageId, userId);
+    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0]).toMatchObject({
+      status: "interrupted", content: "partial",
+      toolResults: [{ status: "failed" }]
+    });
   });
 });

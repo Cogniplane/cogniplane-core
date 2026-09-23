@@ -27,6 +27,16 @@ const limitPayload: LimitExceededErrorPayload = {
   message: "User OAuth callback rate limit exceeded."
 };
 
+test("a limiter outage lets OAuth state validation handle the redirect", async () => {
+  const warn = vi.fn();
+  const request = { ip: "203.0.113.1", log: { warn } } as unknown as FastifyRequest;
+  const limits = { consumeRateLimit: async () => { throw new Error("Redis offline"); } } as unknown as RequestLimitsInterface;
+  const reply = fakeReply();
+  expect(await enforceOAuthCallbackRateLimit(request, reply, limits)).toBe(false);
+  expect(warn).toHaveBeenCalledOnce();
+  expect(reply.send).not.toHaveBeenCalled();
+});
+
 test("allows the request and keys the limit on the client IP for both scopes", async () => {
   const consumeRateLimit = vi.fn(async () => null);
   const limits = { consumeRateLimit } as unknown as RequestLimitsInterface;

@@ -4,6 +4,20 @@ import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 
 import { handlePiiDecision, type PiiHandlerStores } from "./messages-pii-handler.js";
 
+test.each(["sync", "async"])("a %s audit failure preserves the PII decision", async (mode) => {
+  const outcome = await handlePiiDecision({
+    action: "block", providerType: "openai-compatible", providerModel: "test",
+    findings: [], blockReason: "email"
+  }, baseInput, {
+    piiScanRuns: undefined,
+    auditEvents: { create() {
+      if (mode === "sync") throw new Error("audit unavailable");
+      return Promise.reject(new Error("audit unavailable"));
+    } }
+  });
+  expect(outcome).toEqual({ kind: "block", scanRunId: null, blockReason: "email" });
+});
+
 const baseInput = {
   tenantId: "t",
   sessionId: "s",

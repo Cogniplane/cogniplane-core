@@ -13,7 +13,14 @@ import { parseResponse } from "./validate-response";
 import type { Approval, ApprovalDecisionRequest, Session } from "@cogniplane/shared-types";
 
 const CHAT_SESSION_PURPOSES = "normal,skill_improvement";
-export type SessionList = Session[] & { trashRetentionDays?: number };
+export type SessionList = { sessions: Session[]; trashRetentionDays: number; nextCursor?: string | null };
+export type SessionListOptions = {
+  cursor?: string;
+  search?: string;
+  ids?: string[];
+  personalOnly?: boolean;
+  signal?: AbortSignal;
+};
 
 export async function getSessionCapabilities(sessionId: string) {
   return parseResponse(SessionCapabilitiesSchema,
@@ -27,20 +34,25 @@ export async function updateSessionCapabilities(sessionId: string, input: Sessio
     }), "PUT /sessions/:id/capabilities");
 }
 
-export async function listSessions(): Promise<SessionList> {
-  const raw = await request<unknown>(`/sessions?purposes=${CHAT_SESSION_PURPOSES}`);
+async function fetchSessionPage(status: "active" | "archived", options: SessionListOptions): Promise<SessionList> {
+  const params = new URLSearchParams({ purposes: options.personalOnly ? "normal" : CHAT_SESSION_PURPOSES, limit: "50" });
+  if (status === "archived") params.set("status", status);
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.search) params.set("search", options.search);
+  if (options.ids) { params.set("ids", options.ids.join(",")); params.set("limit", "100"); }
+  if (options.personalOnly) params.set("personalOnly", "true");
+  const raw = await request<unknown>(`/sessions?${params}`, { signal: options.signal });
   const response = parseResponse(SessionsListResponseSchema, raw, "GET /sessions");
-  return Object.assign(response.sessions, {
-    trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS
-  });
+  return { sessions: response.sessions, nextCursor: response.nextCursor ?? null,
+    trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS };
 }
 
-export async function listArchivedSessions(): Promise<SessionList> {
-  const raw = await request<unknown>(`/sessions?status=archived&purposes=${CHAT_SESSION_PURPOSES}`);
-  const response = parseResponse(SessionsListResponseSchema, raw, "GET /sessions?status=archived");
-  return Object.assign(response.sessions, {
-    trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS
-  });
+export function listSessions(options: SessionListOptions = {}): Promise<SessionList> {
+  return fetchSessionPage("active", options);
+}
+
+export function listArchivedSessions(options: SessionListOptions = {}): Promise<SessionList> {
+  return fetchSessionPage("archived", options);
 }
 
 export async function archiveSession(sessionId: string): Promise<Session> {

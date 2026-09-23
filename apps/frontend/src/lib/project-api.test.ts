@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from "vitest";
+import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
 import { request } from "./api-client";
-import { archiveProject, createProjectSession, getProjectAccess, listProjects, setProjectSession, updateProjectAgentFileMode, updateProjectApprovalMode, updateProjectSharing } from "./project-api";
+import { archiveProject, createProjectSession, getProjectAccess, listProjectSessions, listProjects, setProjectSession, updateProjectAgentFileMode, updateProjectApprovalMode, updateProjectSharing } from "./project-api";
 vi.mock("./api-client", () => ({ request: vi.fn() }));
 beforeEach(() => vi.resetAllMocks());
 
@@ -135,4 +136,31 @@ it("loads and updates project sharing through the project endpoints", async () =
     method: "PUT",
     body: JSON.stringify({ visibility: "organization", organizationRole: "editor", confirmAudience: true })
   });
+});
+
+
+it("requests project pages with an encoded cursor and cancellation signal", async () => {
+  vi.mocked(request).mockResolvedValue({ sessions: [], nextCursor: null, trashRetentionDays: 7 });
+  const signal = new AbortController().signal;
+  await expect(listProjectSessions("project/id", { status: "deleted", cursor: "next+page", signal }))
+    .resolves.toEqual({ sessions: [], nextCursor: null, trashRetentionDays: 7 });
+  expect(request).toHaveBeenCalledWith("/projects/project%2Fid/sessions?status=deleted&cursor=next%2Bpage", { signal });
+});
+
+
+it("uses the retention fallback when the project page omits it", async () => {
+  vi.mocked(request).mockResolvedValue({ sessions: [], nextCursor: null });
+  await expect(listProjectSessions("p1", { status: "active" })).resolves.toEqual({
+    sessions: [], nextCursor: null, trashRetentionDays: SESSION_TRASH_RETENTION_DAYS
+  });
+});
+
+it("rejects malformed project session responses", async () => {
+  const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    vi.mocked(request).mockResolvedValue({ sessions: [{ sessionId: "incomplete" }], nextCursor: null });
+    await expect(listProjectSessions("p1", { status: "active" })).rejects.toThrow("Schema mismatch");
+  } finally {
+    log.mockRestore();
+  }
 });

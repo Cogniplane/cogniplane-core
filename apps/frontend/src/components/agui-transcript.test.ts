@@ -3,8 +3,10 @@ import type { Message } from "@cogniplane/shared-types";
 
 import {
   planStateFromMessages,
+  runtimeNoticesFromMessages,
   toAguiInitialMessages,
-  toolStatusesFromMessages
+  toolStatusesFromMessages,
+  withoutInProgressReply
 } from "./agui-transcript";
 
 function makeMessage(overrides: Partial<Message>): Message {
@@ -15,6 +17,17 @@ function makeMessage(overrides: Partial<Message>): Message {
     ...overrides
   } as Message;
 }
+
+test("reattach seeds the user turn without its saved in-progress reply", () => {
+  const history = [
+    makeMessage({ messageId: "u1", role: "user", content: "earlier" }),
+    makeMessage({ messageId: "a1", role: "assistant", content: "done" }),
+    makeMessage({ messageId: "u2", role: "user", content: "current" }),
+    makeMessage({ messageId: "a2", role: "assistant", status: "streaming", content: "partial" })
+  ];
+  expect(withoutInProgressReply(history).map((message) => message.messageId)).toEqual(["u1", "a1", "u2"]);
+  expect(withoutInProgressReply(history.slice(0, 2))).toEqual(history.slice(0, 2));
+});
 
 describe("toAguiInitialMessages", () => {
   test("keeps user + assistant text, drops system and empty rows", () => {
@@ -426,5 +439,63 @@ describe("planStateFromMessages", () => {
 
   test("returns an empty plan when nothing persisted one", () => {
     expect(planStateFromMessages([makeMessage({})])).toEqual({ plan: "" });
+  });
+});
+
+describe("runtimeNoticesFromMessages", () => {
+  const saved = (noticeId: string, overrides: Record<string, unknown> = {}) => ({
+    noticeId, level: "warning", title: "Tool slow", message: "The tool took 30 s.",
+    createdAt: "2026-09-22T00:00:00.000Z", ...overrides
+  });
+  const withNotices = (messageId: string, runtimeNotices: unknown, role: Message["role"] = "assistant") =>
+    makeMessage({ messageId, role, detail: { runtimeNotices } } as Partial<Message>);
+
+  test("builds notice rows in history order from the assistant rows", () => {
+    const rows = runtimeNoticesFromMessages([
+      withNotices("a-1", [saved("n-1")]),
+      withNotices("a-2", [saved("n-2", { level: "error", title: "Failed" })])
+    ]);
+
+    expect(rows).toEqual([
+      {
+        type: "runtime-notice", rowId: "notice:n-1", noticeId: "n-1", level: "warning",
+        title: "Tool slow", message: "The tool took 30 s.", createdAt: "2026-09-22T00:00:00.000Z"
+      },
+      expect.objectContaining({ rowId: "notice:n-2", level: "error", title: "Failed" })
+    ]);
+  });
+
+  test("drops entries that fail the runtime_notice schema", () => {
+    const rows = runtimeNoticesFromMessages([
+      withNotices("a-1", [
+        saved("ok"),
+        saved("bad-level", { level: "debug" }),
+        saved("", {}),
+        saved("bad-date", { createdAt: "yesterday" }),
+        { noticeId: "missing-fields" },
+        "text",
+        null
+      ])
+    ]);
+
+    expect(rows.map((row) => row.noticeId)).toEqual(["ok"]);
+  });
+
+  test("ignores a detail without a notice array and rows that are not assistant rows", () => {
+    expect(runtimeNoticesFromMessages([
+      makeMessage({ role: "assistant" }),
+      withNotices("a-1", { noticeId: "not-an-array" }),
+      withNotices("u-1", [saved("user-row")], "user"),
+      withNotices("s-1", [saved("system-row")], "system")
+    ])).toEqual([]);
+  });
+
+  test("keeps the first entry for a noticeId", () => {
+    const rows = runtimeNoticesFromMessages([
+      withNotices("a-1", [saved("n-1", { title: "First" }), saved("n-1", { title: "Again" })]),
+      withNotices("a-2", [saved("n-1", { title: "Later" })])
+    ]);
+
+    expect(rows.map((row) => row.title)).toEqual(["First"]);
   });
 });

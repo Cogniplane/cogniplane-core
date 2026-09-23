@@ -185,7 +185,7 @@ export function ArtifactBrowser() {
   }, [settledState, pathname, router]);
 
   const filters = useMemo(() => artifactFilterStateToParams(settledState), [settledState]);
-  const { artifacts, error, isLoading, hasMore, isLoadingMore, loadMore } =
+  const { artifacts, error, isLoading, hasMore, isLoadingMore, loadMore, isRetrying, retry } =
     useArtifactBrowserData(filters);
 
   const onError = useCallback((message: string) => toast.error(message), []);
@@ -210,6 +210,7 @@ export function ArtifactBrowser() {
       <div className="flex flex-wrap items-center gap-2">
         <Input
           type="search"
+          aria-label="Search artifacts by name"
           placeholder="Search by name…"
           value={state.q}
           onChange={(event) => setState((s) => ({ ...s, q: event.target.value }))}
@@ -261,27 +262,38 @@ export function ArtifactBrowser() {
         ) : null}
       </div>
 
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
+      {error ? (
+        <div role="alert" className="space-y-2 text-sm text-danger">
+          <p>{error}</p>
+          {artifacts.length === 0 ? (
+            <Button type="button" variant="outline" size="sm" disabled={isRetrying} onClick={retry}>
+              Try again
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
 
-      <div className="rounded-lg border border-outline-variant">
-        {isLoading ? (
-          <p className="px-3 py-8 text-center text-sm text-on-surface-faint">Loading artifacts…</p>
-        ) : artifacts.length === 0 ? (
-          <p className="px-3 py-8 text-center text-sm text-on-surface-faint">
-            {hasSettledFilters ? "No artifacts match these filters." : "No artifacts yet."}
-          </p>
-        ) : (
-          artifacts.map((artifact) => (
-            <ArtifactBrowserRow
-              key={artifact.artifactId}
-              artifact={artifact}
-              isDownloading={actions.downloadArtifactId === artifact.artifactId}
-              onPreview={(a) => void actions.openPreview(a)}
-              onDownload={(id) => void actions.handleDownloadArtifact(id)}
-            />
-          ))
-        )}
-      </div>
+      {!error || artifacts.length > 0 ? (
+        <div className="rounded-lg border border-outline-variant">
+          {isLoading ? (
+            <p className="px-3 py-8 text-center text-sm text-on-surface-faint">Loading artifacts…</p>
+          ) : artifacts.length === 0 ? (
+            <p className="px-3 py-8 text-center text-sm text-on-surface-faint">
+              {hasSettledFilters ? "No artifacts match these filters." : "No artifacts yet."}
+            </p>
+          ) : (
+            artifacts.map((artifact) => (
+              <ArtifactBrowserRow
+                key={artifact.artifactId}
+                artifact={artifact}
+                isDownloading={actions.downloadArtifactId === artifact.artifactId}
+                onPreview={(a) => void actions.openPreview(a)}
+                onDownload={(id) => void actions.handleDownloadArtifact(id)}
+              />
+            ))
+          )}
+        </div>
+      ) : null}
 
       {hasMore ? (
         <div className="flex justify-center">

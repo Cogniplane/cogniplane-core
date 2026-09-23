@@ -76,6 +76,8 @@ export function ScheduledJobsSection(input: {
     handleToggleRuns
   } = input;
 
+  const isMutating = busyKey !== null && !busyKey.startsWith("runs-");
+
   return (
     <section id="scheduled-jobs" className="flex flex-col gap-5 pt-5">
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -98,35 +100,37 @@ export function ScheduledJobsSection(input: {
               className="flex flex-col gap-4"
               onSubmit={(event) => void handleDefaultsSubmit(event)}
             >
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="default-tz">Default time zone</Label>
-                <Input
-                  id="default-tz"
-                  placeholder="UTC or America/Montreal"
-                  value={defaultsDraft.defaultTimeZone}
-                  onChange={(event) =>
-                    setDefaultsDraft((current) => ({
-                      ...current,
-                      defaultTimeZone: event.target.value
-                    }))
+              <fieldset disabled={isMutating} className="contents">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="default-tz">Default time zone</Label>
+                  <Input
+                    id="default-tz"
+                    placeholder="UTC or America/Montreal"
+                    value={defaultsDraft.defaultTimeZone}
+                    onChange={(event) =>
+                      setDefaultsDraft((current) => ({
+                        ...current,
+                        defaultTimeZone: event.target.value
+                      }))
+                    }
+                  />
+                </div>
+
+                <ToggleCard
+                  checked={defaultsDraft.enableOnCreate}
+                  onChange={(next) =>
+                    setDefaultsDraft((current) => ({ ...current, enableOnCreate: next }))
                   }
+                  label="Enable new jobs by default"
+                  hint="Useful when you want new scheduled jobs to start computing immediately."
                 />
-              </div>
 
-              <ToggleCard
-                checked={defaultsDraft.enableOnCreate}
-                onChange={(next) =>
-                  setDefaultsDraft((current) => ({ ...current, enableOnCreate: next }))
-                }
-                label="Enable new jobs by default"
-                hint="Useful when you want new scheduled jobs to start computing immediately."
-              />
-
-              <div>
-                <Button type="submit" disabled={busyKey === "scheduled-job-defaults"}>
-                  {busyKey === "scheduled-job-defaults" ? "Saving..." : "Save defaults"}
-                </Button>
-              </div>
+                <div>
+                  <Button type="submit" disabled={isMutating}>
+                    {busyKey === "scheduled-job-defaults" ? "Saving..." : "Save defaults"}
+                  </Button>
+                </div>
+              </fieldset>
             </form>
           </CardContent>
         </Card>
@@ -155,88 +159,90 @@ export function ScheduledJobsSection(input: {
               className="flex flex-col gap-4"
               onSubmit={(event) => void handleJobSubmit(event)}
             >
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <fieldset disabled={isMutating} className="contents">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="job-name">Job name</Label>
+                    <Input
+                      id="job-name"
+                      placeholder="Morning digest"
+                      value={jobDraft.jobName}
+                      onChange={(event) =>
+                        setJobDraft((current) => ({ ...current, jobName: event.target.value }))
+                      }
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="job-tz">Time zone</Label>
+                    <Input
+                      id="job-tz"
+                      placeholder="UTC"
+                      value={jobDraft.timeZone}
+                      onChange={(event) =>
+                        setJobDraft((current) => ({ ...current, timeZone: event.target.value }))
+                      }
+                    />
+                  </div>
+                </div>
+
                 <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="job-name">Job name</Label>
+                  <Label htmlFor="job-description">Description</Label>
                   <Input
-                    id="job-name"
-                    placeholder="Morning digest"
-                    value={jobDraft.jobName}
+                    id="job-description"
+                    placeholder="Optional context for what this recurring job is meant to do"
+                    value={jobDraft.description}
                     onChange={(event) =>
-                      setJobDraft((current) => ({ ...current, jobName: event.target.value }))
+                      setJobDraft((current) => ({ ...current, description: event.target.value }))
                     }
                   />
                 </div>
+
                 <div className="flex flex-col gap-1.5">
-                  <Label htmlFor="job-tz">Time zone</Label>
+                  <Label htmlFor="job-cron">Cron expression</Label>
                   <Input
-                    id="job-tz"
-                    placeholder="UTC"
-                    value={jobDraft.timeZone}
+                    id="job-cron"
+                    placeholder="0 9 * * 1-5"
+                    value={jobDraft.cronExpression}
                     onChange={(event) =>
-                      setJobDraft((current) => ({ ...current, timeZone: event.target.value }))
+                      setJobDraft((current) => ({ ...current, cronExpression: event.target.value }))
                     }
                   />
                 </div>
-              </div>
 
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="job-description">Description</Label>
-                <Input
-                  id="job-description"
-                  placeholder="Optional context for what this recurring job is meant to do"
-                  value={jobDraft.description}
-                  onChange={(event) =>
-                    setJobDraft((current) => ({ ...current, description: event.target.value }))
-                  }
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="job-prompt">Prompt</Label>
+                  <Textarea
+                    id="job-prompt"
+                    rows={6}
+                    value={jobDraft.prompt}
+                    onChange={(event) =>
+                      setJobDraft((current) => ({ ...current, prompt: event.target.value }))
+                    }
+                  />
+                </div>
+
+                <ToggleCard
+                  checked={jobDraft.enabled}
+                  onChange={(next) => setJobDraft((current) => ({ ...current, enabled: next }))}
+                  label="Enabled"
+                  hint="Disabled jobs stay saved but stop computing the next scheduled run."
                 />
-              </div>
 
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="job-cron">Cron expression</Label>
-                <Input
-                  id="job-cron"
-                  placeholder="0 9 * * 1-5"
-                  value={jobDraft.cronExpression}
-                  onChange={(event) =>
-                    setJobDraft((current) => ({ ...current, cronExpression: event.target.value }))
-                  }
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="job-prompt">Prompt</Label>
-                <Textarea
-                  id="job-prompt"
-                  rows={6}
-                  value={jobDraft.prompt}
-                  onChange={(event) =>
-                    setJobDraft((current) => ({ ...current, prompt: event.target.value }))
-                  }
-                />
-              </div>
-
-              <ToggleCard
-                checked={jobDraft.enabled}
-                onChange={(next) => setJobDraft((current) => ({ ...current, enabled: next }))}
-                label="Enabled"
-                hint="Disabled jobs stay saved but stop computing the next scheduled run."
-              />
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button type="submit" disabled={busyKey === "scheduled-job"}>
-                  {busyKey === "scheduled-job"
-                    ? "Saving..."
-                    : editingJobId
-                      ? "Update job"
-                      : "Create job"}
-                </Button>
-                {editingJobId ? (
-                  <Button type="button" variant="ghost" onClick={handleCancelEdit}>
-                    Cancel edit
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="submit" disabled={isMutating}>
+                    {busyKey === "scheduled-job"
+                      ? "Saving..."
+                      : editingJobId
+                        ? "Update job"
+                        : "Create job"}
                   </Button>
-                ) : null}
-              </div>
+                  {editingJobId ? (
+                    <Button type="button" variant="ghost" disabled={isMutating} onClick={handleCancelEdit}>
+                      Cancel edit
+                    </Button>
+                  ) : null}
+                </div>
+              </fieldset>
             </form>
           </CardContent>
         </Card>
@@ -334,6 +340,7 @@ export function ScheduledJobsSection(input: {
                         type="button"
                         variant="outline"
                         size="sm"
+                        disabled={isMutating}
                         onClick={() => handleEditJob(job)}
                       >
                         Edit
@@ -351,7 +358,7 @@ export function ScheduledJobsSection(input: {
                         type="button"
                         variant="outline"
                         size="sm"
-                        disabled={busyKey === `toggle-${job.jobId}`}
+                        disabled={isMutating}
                         onClick={() => handleToggleJob(job)}
                       >
                         {job.enabled ? "Disable" : "Enable"}
@@ -360,7 +367,7 @@ export function ScheduledJobsSection(input: {
                         type="button"
                         variant="outline"
                         size="sm"
-                        disabled={busyKey === `delete-${job.jobId}`}
+                        disabled={isMutating}
                         onClick={() => handleDeleteJob(job.jobId)}
                       >
                         {busyKey === `delete-${job.jobId}` ? "Deleting..." : "Delete"}

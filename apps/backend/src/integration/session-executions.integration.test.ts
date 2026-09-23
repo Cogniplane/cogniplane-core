@@ -7,8 +7,9 @@ import { withTenantScope } from "../lib/db.js";
 import { ProjectStore } from "../services/project-store.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
 import { SessionExecutionStore } from "../services/session-execution-store.js";
+import { ApprovalStore } from "../services/auth/approval-store.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
-import { seedTenant, seedUser, seedMembership, seedRuntimeSession, seedApproval } from "./support/fixtures.js";
+import { seedTenant, seedUser, seedMembership, seedSession, seedRuntimeSession, seedApproval } from "./support/fixtures.js";
 
 async function setup() {
   const tenantId = await seedTenant(), userId = await seedUser(), editorId = await seedUser();
@@ -25,6 +26,143 @@ async function setup() {
 }
 
 describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
+  test("a later replica reconnects to the session sandbox and stale owners cannot replace it", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const actor = { tenantId, sessionId, userId };
+    const first = new SessionExecutionStore(appPool(), "replica-a");
+    const second = new SessionExecutionStore(appPool(), "replica-b");
+    const firstTurn = await first.acquire(actor, 30_000);
+    expect(await first.sandboxId(firstTurn)).toBeNull();
+    await first.bindSandboxId(firstTurn, null, "sandbox-one");
+    await first.release(firstTurn);
+    const secondTurn = await second.acquire(actor, 30_000);
+    expect(await second.sandboxId(secondTurn)).toBe("sandbox-one");
+    await expect(first.bindSandboxId(firstTurn, "sandbox-one", "stale-sandbox"))
+      .rejects.toMatchObject({ code: "execution_stopped" });
+    await second.bindSandboxId(secondTurn, "sandbox-one", "sandbox-two");
+    expect(await second.sandboxId(secondTurn)).toBe("sandbox-two");
+  });
+  test("standalone admission, owner lookup, and limits work across replicas", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const otherSession = await seedSession(tenantId, userId);
+    const first = new SessionExecutionStore(appPool(), "replica-a");
+    const second = new SessionExecutionStore(appPool(), "replica-b");
+    const actor = { tenantId, sessionId, userId };
+    const results = await Promise.allSettled([
+      first.acquire(actor, 30_000, { perUser: 1, perTenant: 1 }),
+      second.acquire(actor, 30_000, { perUser: 1, perTenant: 1 })
+    ]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    const winner = results.find(result => result.status === "fulfilled");
+    if (winner?.status !== "fulfilled") throw new Error("Expected one admitted turn");
+    expect(await second.currentOwner(tenantId, sessionId)).toEqual({
+      executionId: winner.value.executionId, ownerId: winner.value.ownerId
+    });
+    const sessions = new SessionStore(appPool());
+    const page = await sessions.listPage(tenantId, userId, { ids: [sessionId] });
+    expect(page.sessions[0]).toMatchObject({ isRunning: true });
+    expect(page.sessions[0]?.activeTurnStartedAt).toBeTruthy();
+    await expect(second.acquire({ ...actor, sessionId: otherSession }, 30_000,
+      { perUser: 1, perTenant: 1 })).rejects.toMatchObject({ code: "running_turn_limit" });
+    await second.release(winner.value);
+    expect(await first.currentOwner(tenantId, sessionId)).toBeNull();
+    expect((await sessions.listPage(tenantId, userId, { ids: [sessionId] })).sessions[0]?.isRunning).toBe(false);
+    const thirdSession = await seedSession(tenantId, userId);
+    const capped = await Promise.allSettled([
+      first.acquire({ ...actor, sessionId: otherSession }, 30_000, { perUser: 1, perTenant: 1 }),
+      second.acquire({ ...actor, sessionId: thirdSession }, 30_000, { perUser: 1, perTenant: 1 })
+    ]);
+    expect(capped.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(capped.find(result => result.status === "rejected")).toMatchObject({
+      reason: { code: "running_turn_limit" }
+    });
+  });
+
+  test("an expired standalone owner is swept with its unfinished reply", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const owner = new SessionExecutionStore(appPool(), "dead-replica");
+    const execution = await owner.acquire({ tenantId, sessionId, userId }, 30_000);
+    const runtimeId = await seedRuntimeSession(tenantId, userId, sessionId);
+    await owner.bindRuntime(execution, runtimeId);
+    const approvalId = await seedApproval({ tenantId, sessionId, userId, runtimeId });
+    await superuserPool().query(`INSERT INTO messages
+      (message_id, tenant_id, session_id, user_id, role, status, content_text)
+      VALUES ($1,$2,$3,$4,'assistant','streaming','partial')`,
+    [`reply-${execution.executionId}`, tenantId, sessionId, userId]);
+    await superuserPool().query("UPDATE messages SET created_at=NOW()-INTERVAL '2 seconds' WHERE message_id=$1",
+      [`reply-${execution.executionId}`]);
+    await superuserPool().query(`UPDATE session_executions
+      SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1`, [execution.executionId]);
+    const sweeper = new SessionExecutionStore(superuserPool());
+    expect(await sweeper.sweepExpired()).toBeGreaterThanOrEqual(1);
+    expect(await owner.currentOwner(tenantId, sessionId)).toBeNull();
+    const reply = await superuserPool().query("SELECT status FROM messages WHERE message_id=$1", [`reply-${execution.executionId}`]);
+    expect(reply.rows[0].status).toBe("interrupted");
+    const approval = await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId]);
+    expect(approval.rows[0].status).toBe("expired");
+    expect(await owner.heartbeat(execution, 30_000)).toBe(false);
+  });
+
+  test("admission cleans an expired reply and tool before replacing its execution", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const actor = { tenantId, sessionId, userId };
+    const first = new SessionExecutionStore(appPool(), "dead-replica");
+    const old = await first.acquire(actor, 30_000);
+    const runtimeId = await seedRuntimeSession(tenantId, userId, sessionId);
+    await first.bindRuntime(old, runtimeId);
+    const approvalId = await seedApproval({ ...actor, runtimeId });
+    const messageId = `reply-${old.executionId}`;
+    const toolResultId = `tool-${old.executionId}`;
+    await superuserPool().query(`INSERT INTO messages
+      (message_id, tenant_id, session_id, user_id, role, status, content_text, created_at)
+      VALUES ($1,$2,$3,$4,'assistant','streaming','partial',NOW()-INTERVAL '2 seconds')`,
+    [messageId, tenantId, sessionId, userId]);
+    await superuserPool().query(`INSERT INTO message_tool_results
+      (tool_result_id, tenant_id, message_id, session_id, user_id, kind, title, status)
+      VALUES ($1,$2,$3,$4,$5,'shell','Running','in_progress')`,
+    [toolResultId, tenantId, messageId, sessionId, userId]);
+    await superuserPool().query(`UPDATE session_executions
+      SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1`, [old.executionId]);
+    const next = await new SessionExecutionStore(appPool(), "new-replica").acquire(actor, 30_000);
+    expect(next.executionId).not.toBe(old.executionId);
+    expect((await superuserPool().query("SELECT status FROM messages WHERE message_id=$1", [messageId])).rows[0].status)
+      .toBe("interrupted");
+    expect((await superuserPool().query("SELECT status FROM message_tool_results WHERE tool_result_id=$1", [toolResultId])).rows[0].status)
+      .toBe("failed");
+    expect((await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId])).rows[0].status)
+      .toBe("expired");
+    await new SessionExecutionStore(superuserPool()).sweepExpired();
+    expect(await first.isCurrent(next)).toBe(true);
+  });
+
+  test("a remote approval keeps the turn preference and rejects an expired standalone lease", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const executions = new SessionExecutionStore(appPool(), "owner");
+    const execution = await executions.acquire({ tenantId, sessionId, userId }, 30_000);
+    const runtimeId = await seedRuntimeSession(tenantId, userId, sessionId);
+    await executions.bindRuntime(execution, runtimeId);
+    const firstId = await seedApproval({ tenantId, sessionId, userId, runtimeId });
+    const secondId = await seedApproval({ tenantId, sessionId, userId, runtimeId });
+    const approvals = new ApprovalStore(appPool());
+    expect(await approvals.resolve(tenantId, firstId, userId, "approve", true)).toMatchObject({
+      status: "approved", rememberForTurn: true
+    });
+    expect(await approvals.get(tenantId, firstId, userId)).toMatchObject({ rememberForTurn: true });
+    await superuserPool().query("UPDATE session_executions SET expires_at=NOW()-INTERVAL '1 second' WHERE execution_id=$1",
+      [execution.executionId]);
+    expect(await approvals.resolve(tenantId, secondId, userId, "approve", true)).toBeNull();
+  });
+
   test("admits an editor to another member's session and excludes concurrent turns across stores", async () => {
     const h = await setup();
     const second = new SessionExecutionStore(appPool());
@@ -105,6 +243,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(await h.executions.isCurrent(execution)).toBe(true);
     expect(await h.executions.stop({ ...h.actor, userId: h.userId })).toBe(true);
     expect(await h.executions.isCurrent(execution)).toBe(false);
+    expect(await h.executions.isStopped(execution)).toBe(true);
   });
 
   test("tenant RLS hides execution records and forbids forged tenant writes", async () => {
@@ -167,7 +306,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
       userId = h.userId;
       expect((await app.inject({ method: "POST", url })).json()).toEqual({ status: "interrupted" });
       expect(await h.executions.isCurrent(execution)).toBe(false);
-      expect(interruptTurn).toHaveBeenCalledWith({ tenantId: h.tenantId, sessionId: h.sessionId, userId: h.userId });
+      expect(interruptTurn).not.toHaveBeenCalled();
       const audit = await superuserPool().query("SELECT user_id, payload FROM audit_events WHERE tenant_id=$1 AND event_type='turn.interrupted'", [h.tenantId]);
       expect(audit.rows).toHaveLength(1);
       expect(audit.rows[0]).toMatchObject({ user_id: h.userId, payload: { executionId: execution.executionId, initiatorUserId: h.editorId } });

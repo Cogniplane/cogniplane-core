@@ -304,7 +304,7 @@ export function createProjectTools(deps: ProjectToolDeps): ManagedToolDefinition
             status: "draft"
           };
         } catch (error) {
-          if (charged) await deps.limits?.refundRateLimit?.(rateLimitInput);
+          if (charged) await deps.limits?.refundRateLimit?.(rateLimitInput).catch(() => undefined);
           throw error;
         }
       }
@@ -377,7 +377,7 @@ export function createProjectTools(deps: ProjectToolDeps): ManagedToolDefinition
             status: "draft"
           };
         } catch (error) {
-          if (charged) await deps.limits?.refundRateLimit?.(rateLimitInput);
+          if (charged) await deps.limits?.refundRateLimit?.(rateLimitInput).catch(() => undefined);
           throw error;
         }
       }

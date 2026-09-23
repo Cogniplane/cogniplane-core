@@ -9,9 +9,9 @@ import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
-import type { RuntimeAdapter } from "../../runtime-contracts.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
+import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { ManagedToolCatalog } from "../../services/managed-tools/catalog.js";
 import { tenantSettingsBodySchema } from "./admin-route-schemas.js";
 import {
@@ -24,7 +24,6 @@ export type TenantSettingsRouteStores = {
   dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
   auditEvents: Pick<AuditEventStore, "create">;
   managedToolCatalog: Pick<ManagedToolCatalog, "listTenantConfigurable">;
-  runtimeAdapter: Pick<RuntimeAdapter, "invalidateTenantRuntimes">;
   /**
    * The tenant's admin-added custom models (id + supported efforts are all
    * this route needs). Merged with AVAILABLE_MODELS when validating
@@ -35,37 +34,6 @@ export type TenantSettingsRouteStores = {
     tenantId: string
   ) => Promise<{ id: string; supportedEfforts: readonly string[] }[]>;
 };
-
-class TenantRuntimeInvalidationError extends Error {
-  constructor(
-    message: string,
-    readonly causes: unknown[]
-  ) {
-    super(message);
-    this.name = "TenantRuntimeInvalidationError";
-  }
-}
-
-async function invalidateTenantRuntimes(
-  app: FastifyInstance,
-  stores: TenantSettingsRouteStores,
-  tenantId: string
-): Promise<string[]> {
-  // Deep Agents is the sole adapter, so this is a single direct call — the old
-  // Promise.allSettled fan-out existed to tolerate one provider failing among
-  // several. The settings row is already persisted by the caller; a failure
-  // here means the live runtimes still hold the old config, so surface it as a
-  // retryable error rather than silently reporting success.
-  try {
-    return await stores.runtimeAdapter.invalidateTenantRuntimes(tenantId);
-  } catch (err) {
-    app.log.warn({ err, tenantId }, "tenant settings runtime invalidation failed");
-    throw new TenantRuntimeInvalidationError(
-      "Tenant settings were saved, but active runtimes could not be refreshed. Retry before relying on the new settings.",
-      [err]
-    );
-  }
-}
 
 export async function registerAdminTenantSettingsRoutes(
   app: FastifyInstance,
@@ -165,11 +133,6 @@ export async function registerAdminTenantSettingsRoutes(
         request.auth.tenantId,
         updateInput
       );
-      const invalidatedSessionIds = await invalidateTenantRuntimes(
-        app,
-        stores,
-        request.auth.tenantId
-      );
       await createAdminAuditEvent(stores.auditEvents, {
         tenantId: request.auth.tenantId,
         userId: request.auth.userId,
@@ -188,7 +151,10 @@ export async function registerAdminTenantSettingsRoutes(
           enabledProviders: settings.enabledProviders,
           enabledModelIds: settings.enabledModelIds,
           modelDefaultEfforts: settings.modelDefaultEfforts,
-          invalidatedSessionIds,
+          // Cached sessions compare the bundle hash and refresh capabilities
+          // in place before their next turn. Do not dispose their E2B sandbox:
+          // that would erase agent-created workspace files for a settings save.
+          runtimeRefresh: "next_turn_in_place",
           version: settings.version,
           configHash: settings.configHash
         },
@@ -197,10 +163,8 @@ export async function registerAdminTenantSettingsRoutes(
       });
       return serialize(TenantSettingsEnvelopeSchema, { settings });
     } catch (error) {
-      if (error instanceof TenantRuntimeInvalidationError) {
-        return reply.status(503).send(
-          apiError("runtime_refresh_failed", error.message)
-        );
+      if (error instanceof TenantSettingsConflictError) {
+        return reply.status(409).send({ error: "settings_conflict", message: error.message });
       }
       return respondAdminMutationError(reply, error, "Failed to update tenant settings.");
     }

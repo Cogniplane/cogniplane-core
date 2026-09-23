@@ -220,7 +220,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       return new ArtifactStore(appPool(), superuserPool());
     }
 
-    test("peek resolves the owner's own token", async () => {
+    test("peek resolves a token from the token row alone", async () => {
       const token = await seedDownloadToken({
         tenantId: tenantA.tenantId,
         userId: tenantA.userId,
@@ -228,134 +228,66 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         artifactId: tenantA.artifactId
       });
 
-      const record = await store().peekDownloadToken({
-        token,
-        requesterTenantId: tenantA.tenantId,
-        requesterUserId: tenantA.userId,
-        callerIsAdmin: false
-      });
-      expect(record?.artifactId).toBe(tenantA.artifactId);
+      const record = await store().peekDownloadToken({ token });
+      expect(record).toMatchObject({ tenantId: tenantA.tenantId, userId: tenantA.userId, artifactId: tenantA.artifactId });
     });
 
-    test("peek refuses another tenant, holding the user constant", async () => {
-      // The requester is tenant A's OWN user, only the tenant differs. Varying
-      // both tenant and user would leave `download.user_id = $3` to reject the
-      // call, so the test would pass with the tenant predicate deleted. This
-      // isolates the tenant clause.
-      const token = await seedDownloadToken({
-        tenantId: tenantA.tenantId,
-        userId: tenantA.userId,
-        sessionId: tenantA.sessionId,
-        artifactId: tenantA.artifactId
-      });
-
-      expect(
-        await store().peekDownloadToken({
-          token,
-          requesterTenantId: tenantB.tenantId,
-          requesterUserId: tenantA.userId,
-          callerIsAdmin: false
-        })
-      ).toBeNull();
-    });
-
-    test("peek refuses a peer USER in the same tenant", async () => {
-      // The gating clause protects peer users, not only peer tenants — a
-      // download token is per-user. This half of the predicate has no RLS
-      // backstop at all, since both users are in the same tenant.
-      const token = await seedDownloadToken({
-        tenantId: tenantA.tenantId,
-        userId: tenantA.userId,
-        sessionId: tenantA.sessionId,
-        artifactId: tenantA.artifactId
-      });
+    test("peek refuses a personal-session token whose user does not own the session", async () => {
+      // Identity comes from the token row, so the session clause is what keeps
+      // a token minted for a peer from reading another user's session.
       const peer = await seedUser();
-
-      expect(
-        await store().peekDownloadToken({
-          token,
-          requesterTenantId: tenantA.tenantId,
-          requesterUserId: peer,
-          callerIsAdmin: false
-        })
-      ).toBeNull();
-    });
-
-    test("callerIsAdmin resolves a token minted for another user in the tenant", async () => {
-      // Admin-minted tokens carry the artifact OWNER's user_id, not the
-      // admin's, so this bypass has to work — and it must stay scoped to the
-      // admin's own tenant, which the next assertion checks.
       const token = await seedDownloadToken({
         tenantId: tenantA.tenantId,
-        userId: tenantA.userId,
-        sessionId: tenantA.sessionId,
-        artifactId: tenantA.artifactId
-      });
-      const admin = await seedUser();
-
-      const record = await store().peekDownloadToken({
-        token,
-        requesterTenantId: tenantA.tenantId,
-        requesterUserId: admin,
-        callerIsAdmin: true
-      });
-      expect(record?.artifactId).toBe(tenantA.artifactId);
-    });
-
-    test("callerIsAdmin does NOT cross tenants", async () => {
-      const token = await seedDownloadToken({
-        tenantId: tenantA.tenantId,
-        userId: tenantA.userId,
+        userId: peer,
         sessionId: tenantA.sessionId,
         artifactId: tenantA.artifactId
       });
 
-      // Admin of tenant B, but naming tenant A's user, so the admin bypass
-      // cannot be what saves this: only the tenant clause can.
-      expect(
-        await store().peekDownloadToken({
-          token,
-          requesterTenantId: tenantB.tenantId,
-          requesterUserId: tenantA.userId,
-          callerIsAdmin: true
-        })
-      ).toBeNull();
+      expect(await store().peekDownloadToken({ token })).toBeNull();
     });
 
-    test("a cross-tenant consume returns null AND leaves the token unburnt", async () => {
-      // Tokens are single-use, so a refused cross-tenant call that still
-      // flipped consumed_at would be a denial-of-service on the real owner.
+    test("peek and consume refuse a token whose user left the tenant", async () => {
+      // The route is public, so the auth hook no longer checks membership. The
+      // gate must, or a removed member keeps access until the token expires.
+      const graph = await seedTenantGraph();
       const token = await seedDownloadToken({
+        tenantId: graph.tenantId,
+        userId: graph.userId,
+        sessionId: graph.sessionId,
+        artifactId: graph.artifactId
+      });
+      await superuserPool().query(
+        "DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2",
+        [graph.tenantId, graph.userId]
+      );
+
+      expect(await store().peekDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token })).toBeNull();
+    });
+
+    test("a refused consume leaves the token unburnt, and the first good consume wins", async () => {
+      const peer = await seedUser();
+      const refused = await seedDownloadToken({
         tenantId: tenantA.tenantId,
-        userId: tenantA.userId,
+        userId: peer,
         sessionId: tenantA.sessionId,
         artifactId: tenantA.artifactId
       });
-
-      // Tenant A's own user again, so only the tenant clause can reject this.
-      expect(
-        await store().consumeDownloadToken({
-          token,
-          requesterTenantId: tenantB.tenantId,
-          requesterUserId: tenantA.userId,
-          callerIsAdmin: false
-        })
-      ).toBeNull();
-
+      expect(await store().consumeDownloadToken({ token: refused })).toBeNull();
       const { rows } = await superuserPool().query<{ consumed_at: string | null }>(
         `SELECT consumed_at FROM artifact_download_tokens WHERE token = $1`,
-        [token]
+        [refused]
       );
       expect(rows[0]?.consumed_at).toBeNull();
 
-      // The owner can still use it.
-      const consumed = await store().consumeDownloadToken({
-        token,
-        requesterTenantId: tenantA.tenantId,
-        requesterUserId: tenantA.userId,
-        callerIsAdmin: false
+      const token = await seedDownloadToken({
+        tenantId: tenantA.tenantId,
+        userId: tenantA.userId,
+        sessionId: tenantA.sessionId,
+        artifactId: tenantA.artifactId
       });
-      expect(consumed?.artifactId).toBe(tenantA.artifactId);
+      expect((await store().consumeDownloadToken({ token }))?.artifactId).toBe(tenantA.artifactId);
+      expect(await store().consumeDownloadToken({ token })).toBeNull();
     });
   });
 
@@ -505,6 +437,12 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         tenantB.userId,
         tenantB.sessionId
       );
+      await new MessageStore(appPool()).upsertToolResult({
+        tenantId: tenantA.tenantId, messageId: msgA, sessionId: tenantA.sessionId, userId: tenantA.userId,
+        toolResultId: `tool-${msgA}`, kind: "command", title: "execute", status: "in_progress",
+        command: "sleep", cwd: null, server: null, toolName: "execute", input: "{}", output: "",
+        exitCode: null, durationMs: null, textOffset: 0
+      });
 
       expect(await new MessageStore(appPool()).sweepStaleStreaming(1000, 500)).toEqual([]);
 
@@ -512,6 +450,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       const ids = swept.map((row) => row.messageId);
       expect(ids).toContain(msgA);
       expect(ids).toContain(msgB);
+      const recovered = await new MessageStore(appPool()).listBySession(tenantA.tenantId, tenantA.sessionId, tenantA.userId);
+      expect(recovered.messages.find((message) => message.messageId === msgA)?.toolResults).toMatchObject([{ status: "failed" }]);
     });
 
     test("ApprovalStore.sweepExpired is empty on the RLS pool, cross-tenant on the privileged one", async () => {
@@ -544,11 +484,9 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 // ── Relationship integrity across tenants. ─────────────────────────────────
 //
 // Separate from the two shapes above because neither RLS nor a tenant predicate
-// covers it. `artifacts.session_id` FKs to `sessions(session_id)` alone, not to
-// `(tenant_id, session_id)`, and session ids are globally unique. So the FK is
-// satisfied by ANY tenant's session, and the artifact's own row passes its
-// WITH CHECK as long as its `tenant_id` is the caller's. Table-level RLS has
-// nothing to say about whether a row's parent belongs to the same tenant.
+// checks that a child row's parent belongs to the same tenant. Composite foreign
+// keys provide that database-level guarantee even if a route or store trusts a
+// caller-supplied session id.
 describe.skipIf(!adminDatabaseUrl())("cross-tenant parent references", () => {
   let tenantA: TenantFixture;
   let tenantB: TenantFixture;
@@ -558,29 +496,11 @@ describe.skipIf(!adminDatabaseUrl())("cross-tenant parent references", () => {
     tenantB = await seedTenantGraph();
   });
 
-  test("an artifact naming another tenant's session is either rejected or stays tenant-scoped", async () => {
-    // Characterizes a known gap WITHOUT pinning the vulnerable behaviour.
-    //
-    // `artifacts.session_id` references `sessions(session_id)`, not
-    // `(tenant_id, session_id)`, and session ids are globally unique. So the FK
-    // is satisfied by ANY tenant's session, and the artifact's own WITH CHECK
-    // passes as long as its `tenant_id` is the caller's. Table-level RLS has
-    // nothing to say about whether a row's parent belongs to the same tenant.
-    //
-    // Written to accept BOTH outcomes on purpose. Asserting "the write
-    // succeeds" would mean fixing bead 700o turns this test red, which is a
-    // security suite penalising a security fix. Asserting "the write fails"
-    // would fail today. So: whichever happens, the invariant that must hold is
-    // that tenant B never gains access.
-    //
-    // When 700o lands (composite FK on (tenant_id, session_id)), tighten this
-    // to require rejection.
+  test("rejects an artifact that names another tenant's session", async () => {
     const store = new ArtifactStore(appPool(), superuserPool());
 
-    let created: Awaited<ReturnType<typeof store.create>> | null = null;
-    let rejection: unknown = null;
-    try {
-      created = await store.create({
+    await expect(
+      store.create({
         tenantId: tenantA.tenantId,
         artifactType: "upload",
         sessionId: tenantB.sessionId,
@@ -593,34 +513,26 @@ describe.skipIf(!adminDatabaseUrl())("cross-tenant parent references", () => {
         checksumSha256: "",
         status: "ready",
         createdByType: "user"
-      });
-    } catch (error) {
-      rejection = error;
-    }
+      })
+    ).rejects.toMatchObject({ code: "23503" });
+  });
 
-    if (rejection !== null) {
-      // 700o fixed: the database refused the cross-tenant parent. Nothing more
-      // to check.
-      return;
-    }
-
-    // Current behaviour: the write lands. The row must still be tenant A's, and
-    // tenant B must not be able to see it despite the row pointing at B's own
-    // session. If THAT ever broke, it would be a live cross-tenant read.
-    const artifactId = created!.artifactId;
-    const { rows } = await superuserPool().query<{ tenant_id: string }>(
-      `SELECT tenant_id FROM artifacts WHERE artifact_id = $1`,
-      [artifactId]
-    );
-    expect(rows[0]?.tenant_id).toBe(tenantA.tenantId);
-
-    const visibleToB = await withTenantScope(appPool(), tenantB.tenantId, async (client) => {
-      const result = await client.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM artifacts WHERE artifact_id = $1`,
-        [artifactId]
-      );
-      return Number(result.rows[0]?.count);
-    });
-    expect(visibleToB).toBe(0);
+  test("rejects a scheduled run that names another tenant's session", async () => {
+    await expect(
+      withTenantScope(appPool(), tenantA.tenantId, (client) =>
+        client.query(
+          `INSERT INTO scheduled_job_runs
+             (run_id, tenant_id, job_id, user_id, session_id, status)
+           VALUES ($1, $2, $3, $4, $5, 'pending')`,
+          [
+            `cross-tenant-run-${tenantA.sessionId}`,
+            tenantA.tenantId,
+            tenantA.jobId,
+            tenantA.userId,
+            tenantB.sessionId
+          ]
+        )
+      )
+    ).rejects.toMatchObject({ code: "23503" });
   });
 });

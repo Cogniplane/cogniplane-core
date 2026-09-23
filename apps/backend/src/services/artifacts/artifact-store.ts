@@ -52,6 +52,8 @@ export type ArtifactDownloadTokenRecord = {
   artifactId: string;
   sessionId: string;
   userId: string;
+  /** Admin who minted the token for the owner; null when the user minted it. */
+  issuedByUserId: string | null;
   storageBackend: "local" | "bucket";
   storageKey: string;
   fileName: string;
@@ -128,6 +130,7 @@ const DOWNLOAD_TOKEN_COLUMNS = `
   download.artifact_id,
   download.session_id,
   download.user_id,
+  download.issued_by_user_id,
   download.storage_backend,
   download.storage_key,
   download.file_name,
@@ -137,19 +140,31 @@ const DOWNLOAD_TOKEN_COLUMNS = `
 `.trim();
 
 // Identity + artifact-state gating shared by peek and consume so the two
-// paths can never diverge. Placeholders: $1 token, $2 tenant, $3 user, $4
-// callerIsAdmin. Deliberately does NOT filter on `expires_at` — expiry is
-// surfaced to the caller as a distinct 410 rather than collapsed into a 404,
-// and an expired token must never be consumed (so the 410 stays repeatable).
+// paths can never diverge. Placeholder: $1 token. Deliberately does NOT filter
+// on `expires_at` — expiry is surfaced to the caller as a distinct 410 rather
+// than collapsed into a 404, and an expired token must never be consumed (so
+// the 410 stays repeatable).
+//
+// The token is the credential: GET /downloads/:token is fetched by browser
+// navigations and <img> tags, which cannot send the Bearer header. Identity
+// comes from the token row, so the gate repeats what the auth hook would
+// check: the holder must still be a tenant member. That is the token user,
+// or for an admin-minted token the issuing admin, who must still be an owner
+// or admin. The token user must also still be able to read the session.
+// Admin tokens exist only for personal sessions.
 const DOWNLOAD_TOKEN_GATING = `
   download.token = $1
-  AND download.tenant_id = $2
+  AND EXISTS (SELECT 1 FROM tenant_memberships holder
+    WHERE holder.tenant_id = download.tenant_id
+      AND holder.user_id = COALESCE(download.issued_by_user_id, download.user_id)
+      AND (download.issued_by_user_id IS NULL OR holder.role IN ('owner', 'admin')))
   AND EXISTS (SELECT 1 FROM sessions token_session
     WHERE token_session.tenant_id = artifact.tenant_id
       AND token_session.session_id = artifact.session_id
       AND CASE WHEN token_session.project_id IS NULL
-        THEN ($4::boolean OR (download.user_id = $3 AND token_session.user_id = $3))
-        ELSE download.user_id = $3 AND ${sessionReadAccessSql("token_session", "$3")}
+        THEN token_session.user_id = download.user_id
+        ELSE download.issued_by_user_id IS NULL
+          AND ${sessionReadAccessSql("token_session", "download.user_id")}
       END)
   AND download.consumed_at IS NULL
   AND artifact.tenant_id   = download.tenant_id
@@ -168,6 +183,7 @@ function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRe
     artifactId: String(row.artifact_id),
     sessionId: String(row.session_id),
     userId: String(row.user_id),
+    issuedByUserId: row.issued_by_user_id ? String(row.issued_by_user_id) : null,
     storageBackend: row.storage_backend === "bucket" ? "bucket" : "local",
     storageKey: String(row.storage_key),
     fileName: String(row.file_name),
@@ -583,7 +599,7 @@ export class ArtifactStore {
     return withTenantScope(this.db, tenantId, async (client) => {
       const rows = await client.query(
         `
-          SELECT ${ARTIFACT_COLUMNS}
+          SELECT ${ARTIFACT_COLUMNS}, created_at::text AS cursor_created_at
           FROM artifacts
           WHERE ${conditions.join(" AND ")}
           ORDER BY ${order.orderBy}
@@ -599,7 +615,9 @@ export class ArtifactStore {
       const nextCursor =
         hasMore && last
           ? encodeArtifactCursor({
-              k: cursorKeyForRow(sort, last),
+              k: sort === "created_asc" || sort === "created_desc"
+                ? String(rows.rows[items.length - 1]!.cursor_created_at)
+                : cursorKeyForRow(sort, last),
               id: last.id,
               sort,
               fv: filterFingerprint
@@ -763,6 +781,7 @@ export class ArtifactStore {
             artifact_id,
             session_id,
             user_id,
+            issued_by_user_id,
             storage_backend,
             storage_key,
             file_name,
@@ -793,20 +812,14 @@ export class ArtifactStore {
   // token (the consume only happens once the stream is in hand), and lets the
   // route distinguish expired-but-unconsumed (→ 410, repeatable) from
   // not-found (→ 404). Returns null on the same conditions as consume:
-  // unknown token, wrong tenant/user, already-consumed, or unreadable artifact.
-  // Does NOT filter on expiry — an expired token still resolves here so the
-  // route can answer 410.
+  // unknown token, already-consumed, lost session access, or unreadable
+  // artifact. Does NOT filter on expiry — an expired token still resolves here
+  // so the route can answer 410.
   //
-  // Project tokens belong to the requesting member and require current access.
-  // The registered /admin/artifacts/:artifactId/download-token route stores
-  // the artifact owner as the token user. Its administrative download bypass
-  // applies only to non-project sessions.
-  async peekDownloadToken(input: {
-    token: string;
-    requesterTenantId: string;
-    requesterUserId: string;
-    callerIsAdmin: boolean;
-  }): Promise<ArtifactDownloadTokenRecord | null> {
+  // Project tokens require the token user's current access. The
+  // /admin/artifacts/:artifactId/download-token route mints personal-session
+  // tokens only, with the artifact owner as the token user.
+  async peekDownloadToken(input: { token: string }): Promise<ArtifactDownloadTokenRecord | null> {
     const tokenRows = await this.privilegedDb.query(
       `
         SELECT ${DOWNLOAD_TOKEN_COLUMNS}
@@ -815,7 +828,7 @@ export class ArtifactStore {
             ON artifact.tenant_id = download.tenant_id
          WHERE ${DOWNLOAD_TOKEN_GATING}
       `,
-      [input.token, input.requesterTenantId, input.requesterUserId, input.callerIsAdmin]
+      [input.token]
     );
     return tokenRows.rows[0] ? mapDownloadToken(tokenRows.rows[0]) : null;
   }
@@ -826,14 +839,9 @@ export class ArtifactStore {
   // predicate means an expired token is never consumed — the route surfaces
   // expiry via peek (→ 410) before reaching here.
   //
-  // Caller-identity gating is identical to `peekDownloadToken`; see that
-  // method for why an unauthorized request never burns the token.
-  async consumeDownloadToken(input: {
-    token: string;
-    requesterTenantId: string;
-    requesterUserId: string;
-    callerIsAdmin: boolean;
-  }): Promise<ArtifactDownloadTokenRecord | null> {
+  // Gating is identical to `peekDownloadToken`, so a refused request never
+  // burns the token.
+  async consumeDownloadToken(input: { token: string }): Promise<ArtifactDownloadTokenRecord | null> {
     const tokenRows = await this.privilegedDb.query(
       `
         UPDATE artifact_download_tokens AS download
@@ -843,7 +851,7 @@ export class ArtifactStore {
            AND download.expires_at > NOW()
         RETURNING ${DOWNLOAD_TOKEN_COLUMNS}
       `,
-      [input.token, input.requesterTenantId, input.requesterUserId, input.callerIsAdmin]
+      [input.token]
     );
     return tokenRows.rows[0] ? mapDownloadToken(tokenRows.rows[0]) : null;
   }

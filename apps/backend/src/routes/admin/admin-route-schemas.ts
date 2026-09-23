@@ -3,6 +3,7 @@ import {
   AdminMcpServerCreateRequestSchema,
   AdminMcpServerUpdateRequestSchema,
   EFFORT_LEVELS,
+  DEVELOPER_INSTRUCTIONS_MAX_LENGTH,
   MODEL_PROVIDERS,
   PolicyEnforcementModeSchema
 } from "@cogniplane/shared-types";
@@ -30,6 +31,7 @@ const granularApprovalPolicySchema = z.object({
 });
 
 export const tenantSettingsBodySchema = z.object({
+  expectedVersion: z.number().int().nonnegative().optional(),
   showEffortSelector: z.boolean().optional(),
   webSearchMode: z.enum(["disabled", "cached", "live"]).optional(),
   approvalPolicy: z.union([z.enum(["never", "on-request"]), granularApprovalPolicySchema]).optional(),
@@ -37,7 +39,7 @@ export const tenantSettingsBodySchema = z.object({
   allowCommandExecution: z.boolean().optional(),
   autoApproveReadOnlyTools: z.boolean().optional(),
   policyEnforcementMode: PolicyEnforcementModeSchema.optional(),
-  developerInstructions: z.string().trim().max(4000).nullable().optional(),
+  developerInstructions: z.string().trim().max(DEVELOPER_INSTRUCTIONS_MAX_LENGTH).nullable().optional(),
   enabledToolIds: z.array(adminIdSchema).optional(),
   enabledMcpServerIds: z.array(adminIdSchema).optional(),
   // Model availability. Model ids are catalog-namespaced ("openrouter/z-ai/…"),

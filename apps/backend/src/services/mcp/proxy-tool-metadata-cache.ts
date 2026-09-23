@@ -50,6 +50,8 @@ export class ProxyToolMetadataCache {
   // Keyed by tenantId -> serverId
   private readonly cache = new Map<string, Map<string, ServerEntry>>();
 
+  constructor(private readonly logger?: { warn(meta: object, message: string): void }) {}
+
   private entry(tenantId: string, serverId: string): ServerEntry {
     let tenantMap = this.cache.get(tenantId);
     if (!tenantMap) {
@@ -87,6 +89,7 @@ export class ProxyToolMetadataCache {
       if (!existing || existing.expectedCursor !== requestCursor) {
         // Never publish a terminal fragment that did not continue a listing
         // started by the same runtime.
+        this.logger?.warn({ tenantId, serverId }, "Ignoring proxy tool page without a matching staged listing; restart tools/list without a cursor");
         return;
       }
       staged = existing.tools;
@@ -104,6 +107,13 @@ export class ProxyToolMetadataCache {
       entry.published = staged;
       entry.staged.delete(listingId);
       return;
+    }
+    // Bound abandoned listings by count, without expiring slow upstream pages.
+    // Refresh insertion order so capacity eviction selects the least active listing.
+    entry.staged.delete(listingId);
+    if (entry.staged.size >= 100) {
+      entry.staged.delete(entry.staged.keys().next().value!);
+      this.logger?.warn({ tenantId, serverId }, "Evicted least recently active proxy tool listing at capacity");
     }
     entry.staged.set(listingId, { tools: staged, expectedCursor: nextCursor });
   }

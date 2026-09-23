@@ -13,6 +13,7 @@ import {
 
 import type { Stores } from "../build-stores.js";
 import type { Redis } from "ioredis";
+import type { FastifyBaseLogger } from "fastify";
 
 export function buildIntegrationServices(
   config: AppConfig,
@@ -20,7 +21,8 @@ export function buildIntegrationServices(
   runtimeInvalidator: RuntimeInvalidator,
   // Rate limiter applied (per-IP) to the unauthenticated OAuth callback routes.
   limits?: RequestLimitsInterface,
-  redis?: Redis | null
+  redis?: Redis | null,
+  logger?: Pick<FastifyBaseLogger, "warn">
 ) {
   const oauthStates = new IntegrationOAuthStateStore(redis);
   const githubConnectionService = new GithubConnectionService(
@@ -28,14 +30,16 @@ export function buildIntegrationServices(
     stores.githubConnections,
     stores.auditEvents,
     runtimeInvalidator,
-    oauthStates
+    oauthStates,
+    logger
   );
   const notionConnectionService = new NotionConnectionService(
     config,
     stores.notionConnections,
     stores.auditEvents,
     runtimeInvalidator,
-    oauthStates
+    oauthStates,
+    logger
   );
 
   registerBuiltinIntegrations();
@@ -56,6 +60,8 @@ export function buildIntegrationServices(
 
   return {
     integrationDescriptors,
+    // Shared single-use state store; overlay OAuth flows (Microsoft) use it too.
+    oauthStates,
     githubConnectionService,
     notionConnectionService,
     integrationRegistry

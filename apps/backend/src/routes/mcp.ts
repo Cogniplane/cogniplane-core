@@ -294,7 +294,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           proxyToolMetadataCache: stores.proxyToolMetadataCache,
           upstreamSignatureSecret: proxySignatureSecret(
             app.config.DATA_ENCRYPTION_SECRET,
-            app.config.MCP_UPSTREAM_SIGNING_SECRET
+            app.config.MCP_UPSTREAM_SIGNING_ROOT_SECRET
           ),
           upstreamLimits,
           logger: request.log
@@ -411,7 +411,8 @@ async function handleToolsList(input: {
     undefined,
     // serverId, not the URL path, is what tells two upstreams on one origin
     // apart in the failure log — see logSafeUrl.
-    { ...upstreamLimits, serverId: server.id }
+    { ...upstreamLimits, serverId: server.id },
+    server.upstreamAuth ?? null
   );
 
   if (
@@ -871,13 +872,22 @@ async function handleForwardedToolCall(
         arguments: forwardArgs
       }
     },
-    signProxyHeaders({
-      userId: context.userId,
-      sessionId: context.sessionId,
-      runtimeId: context.runtimeId,
-      secret: upstreamSignatureSecret
-    }),
+    // forwardRpc serializes the payload once and passes those bytes here, so
+    // the signed body hash covers exactly what is sent. The tenant ID comes
+    // from the runtime token and the server ID from the tenant's server
+    // registration, never from the model or the request body.
+    (body) =>
+      signProxyHeaders({
+        tenantId,
+        serverId: server.id,
+        userId: context.userId,
+        sessionId: context.sessionId,
+        runtimeId: context.runtimeId,
+        body,
+        secret: upstreamSignatureSecret
+      }),
     undefined,
-    { ...upstreamLimits, serverId: server.id }
+    { ...upstreamLimits, serverId: server.id },
+    server.upstreamAuth ?? null
   );
 }

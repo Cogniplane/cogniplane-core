@@ -1,10 +1,11 @@
-import { computeConfigHash } from "../lib/crypto-utils.js";
+import { computeConfigHash, unique } from "../lib/crypto-utils.js";
 
 import type {
   AdminMcpServerRecord,
   AdminSkillRecord,
   McpServerRegistration,
   ResolvedRuntimePolicy,
+  RuntimeMcpServerRecord,
   RuntimeConfigBundle,
   RuntimeSkillDefinition
 } from "./admin-config-records.js";
@@ -13,7 +14,7 @@ import type { SkillConfigStore } from "./skills/skill-config-store.js";
 import type { SessionCapabilitySelection } from "@cogniplane/shared-types";
 
 export function normalizeMcpServer(
-  record: AdminMcpServerRecord
+  record: AdminMcpServerRecord | RuntimeMcpServerRecord
 ): McpServerRegistration {
   return {
     id: record.serverId,
@@ -21,6 +22,7 @@ export function normalizeMcpServer(
     mode: record.mode,
     routePath: record.routePath,
     upstreamUrl: record.upstreamUrl,
+    upstreamAuth: "upstreamAuth" in record ? record.upstreamAuth : null,
     transportKind: "http",
     version: record.version,
     hash: record.configHash
@@ -53,6 +55,12 @@ export async function compileRuntimeConfig(input: {
   runtimePolicy: ResolvedRuntimePolicy;
   isBetaTester: boolean;
   selection?: SessionCapabilitySelection | null;
+  /**
+   * Integration tool IDs this session may use (integration toggle on and user
+   * connected). The caller removes integration IDs from
+   * `runtimePolicy.enabledToolIds` first; the toggles are their only source.
+   */
+  integrationToolIds?: readonly string[];
 }): Promise<RuntimeConfigBundle> {
   const isBetaTester = input.isBetaTester;
   const profile = input.runtimePolicy;
@@ -76,6 +84,11 @@ export async function compileRuntimeConfig(input: {
     return [normalizeMcpServer(server)];
   });
 
+  // Integration tools reach the agent through a managed server, so the tenant
+  // and session server gates apply to them like any other managed tool.
+  const integrationToolIds = unique([...(input.integrationToolIds ?? [])]).sort();
+  const enabledToolIds = unique([...profile.enabledToolIds, ...integrationToolIds]);
+
   const sources = {
     runtimePolicy: {
       id: profile.id,
@@ -93,12 +106,16 @@ export async function compileRuntimeConfig(input: {
       id: server.id,
       version: server.version,
       hash: server.hash
-    }))
+    })),
+    // The tenant settings hash does not cover the integration toggles or the
+    // user's connections, so the resolved IDs are part of the hash.
+    integrationToolIds
   };
 
   return {
     runtimePolicy: {
       ...profile,
+      enabledToolIds,
       enabledMcpServers: enabledMcpServers.map((server) => server.id)
     },
     skills: enabledSkills,

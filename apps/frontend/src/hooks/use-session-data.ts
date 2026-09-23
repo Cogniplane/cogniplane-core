@@ -42,7 +42,7 @@ export function useSessionData(input: {
   selectedSessionId: string | null;
   onError: (message: string) => void;
 }) {
-  const { selectedSessionId, onError } = input;
+  const { selectedSessionId } = input;
   const queryClient = useQueryClient();
 
   const sessionDetailQuery = useQuery({
@@ -68,14 +68,11 @@ export function useSessionData(input: {
     sessionData !== undefined &&
     sessionDetailQuery.isFetchedAfterMount;
 
-  useEffect(() => {
-    if (!sessionDetailQuery.error || isCancelledError(sessionDetailQuery.error)) return;
-    onError(
-      sessionDetailQuery.error instanceof Error
-        ? sessionDetailQuery.error.message
-        : String(sessionDetailQuery.error)
-    );
-  }, [sessionDetailQuery.error, onError]);
+  const loadError = sessionDetailQuery.error && !isCancelledError(sessionDetailQuery.error)
+    ? sessionDetailQuery.error instanceof Error
+      ? sessionDetailQuery.error.message
+      : String(sessionDetailQuery.error)
+    : null;
 
   const hasInFlightArtifact = artifacts.some(
     (artifact) => artifact.status === "pending" || artifact.status === "processing"
@@ -136,6 +133,7 @@ export function useSessionData(input: {
   );
 
   return {
+    loadError,
     messages,
     hasMoreMessages,
     artifacts,

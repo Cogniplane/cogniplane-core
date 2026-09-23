@@ -1,6 +1,6 @@
 import type { TokenUsageRecord } from "./message-store.js";
 
-// Long context threshold per OpenAI pricing docs (>272K total tokens)
+// OpenAI's long-context rates apply above 272K input tokens.
 const LONG_CONTEXT_THRESHOLD = 272_000;
 
 type PricingTier = {
@@ -22,6 +22,14 @@ const PRICING: Record<string, ModelPricing> = {
   "gpt-6-astra": {
     short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
     long:  null
+  },
+  "gpt-6-sol": {
+    short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
+    long:  { input:  4.00, cachedInput: 0.40,  output: 15.00 }
+  },
+  "gpt-6-luna": {
+    short: { input:  0.10, cachedInput: 0.01,  output:  0.50 },
+    long:  { input:  0.20, cachedInput: 0.02,  output:  0.75 }
   },
   "gpt-5.6-sol": {
     short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
@@ -56,12 +64,16 @@ const PRICING: Record<string, ModelPricing> = {
     long:  { input: 60.00, cachedInput: 0,     output: 270.00 }
   },
 
-  // Claude models. Cache-read tokens bill at 10% of input. Cache-creation
+  // Claude models. Cache-read rates vary by model. Cache-creation
   // tokens (1.25x input in reality) are folded into `inputTokens` at the
   // mapper and billed at the regular input rate — small under-bill on that
   // bucket, not worth a dedicated pricing tier.
   "claude-fable-5-1": {
     short: { input: 10.00, cachedInput: 0.25,  output: 50.00 },
+    long:  null
+  },
+  "claude-opus-5-5": {
+    short: { input:  4.00, cachedInput: 0.20,  output: 20.00 },
     long:  null
   },
   "claude-opus-5": {
@@ -260,7 +272,7 @@ export function calculateCostUsd(model: string, tokenUsage: TokenUsageRecord): n
     return null;
   }
 
-  const isLongContext = tokenUsage.totalTokens > LONG_CONTEXT_THRESHOLD;
+  const isLongContext = tokenUsage.inputTokens > LONG_CONTEXT_THRESHOLD;
   const tier = (isLongContext && pricing.long) ? pricing.long : pricing.short;
 
   const billableInput = tokenUsage.inputTokens - tokenUsage.cachedInputTokens;

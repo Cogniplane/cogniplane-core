@@ -8,6 +8,7 @@ import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
 import { handleAppError } from "../../app.js";
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
+import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type {
   TenantSettingsInput,
@@ -540,6 +541,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
         mode: "proxy" as const,
         routePath: "/mcp/trusted-echo",
         upstreamUrl: "https://example.com/mcp",
+        upstreamAuthType: "none" as const,
+        upstreamAuthName: null,
+        upstreamAuthConfigured: false,
         version: 1,
         configHash: "hash-trusted-echo",
         enabled: true,
@@ -560,6 +564,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       mode: "managed" as const,
       routePath: "/mcp/unused",
       upstreamUrl: null,
+      upstreamAuthType: "none" as const,
+      upstreamAuthName: null,
+      upstreamAuthConfigured: false,
       version: 1,
       configHash: "unused",
       enabled: true,
@@ -705,7 +712,14 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
       getRuntimeHealthDetail() {
         return [];
       },
-      async invalidateTenantRuntimes() {
+      async invalidateTenantRuntimes(
+        _tenantId: string,
+        options?: { idleOnly?: boolean; workspaceResetReason?: string }
+      ) {
+        expect(options).toMatchObject({
+          idleOnly: true,
+          workspaceResetReason: expect.stringContaining("workspace was reset")
+        });
         return ["session-1"];
       }
     },
@@ -948,7 +962,7 @@ test("admin tenant settings updates are audited", async () => {
         enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
         enabledModelIds: null,
         modelDefaultEfforts: {},
-        invalidatedSessionIds: [],
+        runtimeRefresh: "next_turn_in_place",
         version: 2,
         configHash: "hash-tenant-settings"
       });
@@ -982,10 +996,19 @@ test("admin tenant settings updates are audited", async () => {
   expect(adminConfig.lastUpdateInput).not.toHaveProperty("allowCommandExecution");
   expect(adminConfig.lastUpdateInput).toHaveProperty("showEffortSelector", true);
 
+  vi.spyOn(adminConfig, "updateTenantSettings").mockRejectedValueOnce(new TenantSettingsConflictError());
+  const auditCount = auditEvents.events.length;
+  const conflict = await app.inject({ method: "PUT", url: "/admin/tenant-settings",
+    payload: { expectedVersion: 1, developerInstructions: "stale draft" } });
+  expect(conflict.statusCode).toBe(409);
+  expect(conflict.json()).toMatchObject({ error: "settings_conflict", message: expect.stringContaining("Reload") });
+  expect(adminConfig.updateTenantSettings).toHaveBeenLastCalledWith("admin-tenant", expect.objectContaining({ expectedVersion: 1 }));
+  expect(auditEvents.events).toHaveLength(auditCount);
+
   await app.close();
 });
 
-test("admin tenant settings refresh active runtimes after update", async () => {
+test("admin tenant settings preserve runtime workspaces and refresh in place next turn", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -1040,16 +1063,16 @@ test("admin tenant settings refresh active runtimes after update", async () => {
   });
 
   expect(response.statusCode).toBe(200);
-  expect(invalidatedTenants).toEqual(["admin-tenant"]);
+  expect(invalidatedTenants).toEqual([]);
   expect(auditEvents.events.at(-1)?.payload).toMatchObject({
     policyEnforcementMode: "enforce",
-    invalidatedSessionIds: ["session-a"]
+    runtimeRefresh: "next_turn_in_place"
   });
 
   await app.close();
 });
 
-test("admin tenant settings returns an error when active runtimes cannot be refreshed", async () => {
+test("admin tenant settings do not depend on destructive runtime invalidation", async () => {
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -1099,11 +1122,12 @@ test("admin tenant settings returns an error when active runtimes cannot be refr
     payload: { policyEnforcementMode: "enforce" }
   });
 
-  expect(response.statusCode).toBe(503);
-  expect(response.json()).toMatchObject({
-    error: "runtime_refresh_failed"
+  expect(response.statusCode).toBe(200);
+  expect(auditEvents.events).toHaveLength(1);
+  expect(auditEvents.events.at(-1)?.payload).toMatchObject({
+    policyEnforcementMode: "enforce",
+    runtimeRefresh: "next_turn_in_place"
   });
-  expect(auditEvents.events).toEqual([]);
 
   await app.close();
 });
@@ -1274,6 +1298,30 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     transportKind: "http",
     enabled: true
   }));
+
+  const authenticatedResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverId: "authenticated-server",
+      serverName: "Authenticated server",
+      mode: "proxy",
+      routePath: "/mcp/authenticated-server",
+      upstreamUrl: "https://vendor.example/mcp",
+      upstreamAuthType: "bearer",
+      upstreamAuthSecret: "write-only-secret"
+    }
+  });
+  expect(authenticatedResponse.statusCode).toBe(201);
+  expect(authenticatedResponse.body).not.toContain("write-only-secret");
+  expect(authenticatedResponse.json().mcpServer).not.toHaveProperty("upstreamAuthSecret");
+  expect(createMcpServer).toHaveBeenLastCalledWith(
+    "admin-tenant",
+    expect.objectContaining({
+      upstreamAuthType: "bearer",
+      upstreamAuthSecret: "write-only-secret"
+    })
+  );
 
   await app.close();
 });

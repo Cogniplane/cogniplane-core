@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import {
@@ -8,11 +8,14 @@ import {
 } from "@cogniplane/shared-types";
 
 import type { Pool } from "../lib/db.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
 import { withTenantScope } from "../lib/db.js";
 import { requireRole } from "../lib/rbac.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import { httpsUrlSchema } from "../lib/url-validation.js";
+import { AuditEventStore, type AuditEventInput } from "../services/audit-event-store.js";
+import type { AuditEventType } from "../services/audit-event-types.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import type { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
@@ -32,18 +35,37 @@ const memberParamsSchema = z.object({
   userId: z.string().trim().min(1).max(80).regex(/^[a-z0-9][a-z0-9-_]*$/)
 });
 
+// Tenant-level audit event for an admin action on this request.
+function tenantAudit(
+  request: FastifyRequest,
+  type: AuditEventType,
+  payload: Record<string, unknown>
+): AuditEventInput {
+  return {
+    tenantId: request.auth.tenantId,
+    sessionId: null,
+    userId: request.auth.userId,
+    type,
+    payload,
+    ipAddress: request.ip,
+    userAgent: request.headers["user-agent"] ?? null
+  };
+}
+
 export async function registerTenantRoutes(
   app: FastifyInstance,
   {
     db,
     tenantOrgSettings,
     githubConnections,
+    runtimeAdapter,
     getMicrosoftConfigured,
     integrationDescriptors = new IntegrationRegistry()
   }: {
     db: Pool;
     tenantOrgSettings: TenantOrgSettingsStore;
     githubConnections?: GithubConnectionService;
+    runtimeAdapter?: Pick<RuntimeAdapter, "invalidateRuntimesForUser">;
     integrationDescriptors?: IntegrationRegistry;
     // Optional callback supplied by the SharePoint private overlay. Returns
     // whether the tenant has a Microsoft OAuth app configured. When absent
@@ -143,7 +165,8 @@ export async function registerTenantRoutes(
     const { provider, apiKey } = parsed.value;
     // An explicitly empty key revokes only the selected provider's credential.
     const trimmedKey = apiKey.trim() || null;
-    await tenantOrgSettings.setApiKey(tenantId, provider, trimmedKey);
+    await tenantOrgSettings.setApiKey(tenantId, provider, trimmedKey,
+      tenantAudit(request, "tenant.provider_key.updated", { provider, keySet: trimmedKey !== null }));
     const refreshed = await tenantOrgSettings.get(tenantId);
 
     return reply.send({
@@ -177,7 +200,8 @@ export async function registerTenantRoutes(
     // Normalize: empty string → null
     const value = (url === null || url === undefined || url.trim() === "") ? null : url.trim();
 
-    await tenantOrgSettings.setMarketplaceUrl(tenantId, value);
+    await tenantOrgSettings.setMarketplaceUrl(tenantId, value,
+      tenantAudit(request, "tenant.marketplace_url.updated", { skillMarketplaceManifestUrl: value }));
 
     return reply.send({ ok: true, skillMarketplaceManifestUrl: value });
   });
@@ -208,7 +232,8 @@ export async function registerTenantRoutes(
     }
 
     const { tenantId } = request.auth;
-    await tenantOrgSettings.setPiiProtection(tenantId, parsed.data);
+    await tenantOrgSettings.setPiiProtection(tenantId, parsed.data,
+      tenantAudit(request, "tenant.pii_protection.updated", { piiProtection: parsed.data }));
 
     return reply.send({ ok: true, piiProtection: parsed.data });
   });
@@ -296,6 +321,11 @@ export async function registerTenantRoutes(
           RETURNING tenant_id, user_id, role`,
         [role, tenantId, targetUserId]
       );
+      await AuditEventStore.createInTransaction(client, tenantAudit(request, "tenant.member.role_changed", {
+        targetUserId,
+        previousRole: target.rows[0].role,
+        role
+      }));
 
       return { kind: "updated" as const, row: result.rows[0] };
     });
@@ -359,6 +389,10 @@ export async function registerTenantRoutes(
         `DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`,
         [tenantId, targetUserId]
       );
+      await AuditEventStore.createInTransaction(client, tenantAudit(request, "tenant.member.removed", {
+        targetUserId,
+        previousRole: target.rows[0].role
+      }));
 
       return { kind: "deleted" as const };
     });
@@ -369,6 +403,22 @@ export async function registerTenantRoutes(
 
     if (outcome.kind === "cannot_remove_owner") {
       return reply.code(403).send({ error: "cannot_remove_owner" });
+    }
+
+    // Stop live scheduled and interactive turns immediately after the
+    // membership delete commits. Runtime admission also checks membership, so
+    // a claimed job racing before session creation cannot slip through this
+    // invalidation window.
+    try {
+      await runtimeAdapter?.invalidateRuntimesForUser(tenantId, targetUserId);
+    } catch (error) {
+      // The membership is already gone and future runtime admission is denied.
+      // Preserve that security boundary while surfacing the teardown failure
+      // for operators; other connection revocations must still run.
+      request.log.error(
+        { err: error, tenantId, userId: targetUserId },
+        "member removal: failed to invalidate active runtimes"
+      );
     }
 
     // Revoke the removed member's stored OAuth connections. This runs AFTER the
@@ -396,10 +446,6 @@ export async function registerTenantRoutes(
       }
     }
 
-    // Known gap: a scheduled job already claimed and in flight is not aborted —
-    // it runs to completion or the scheduler timeout. Revoking the connections
-    // above makes its integration tool calls fail, but the turn itself
-    // continues. Tracked separately.
     return reply.send({ ok: true });
   });
 }

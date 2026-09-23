@@ -40,6 +40,9 @@ import {
   type TenantSettingsRecord
 } from "./tenant-settings-store.js";
 import type { ManagedToolCatalog } from "./managed-tools/catalog.js";
+import type { IntegrationRegistryService } from "./integrations/integration-registry-service.js";
+
+type IntegrationToolSource = Pick<IntegrationRegistryService, "resolveSessionToolIds">;
 
 export { parseGitHubSkillSource } from "./skills/skill-import-service.js";
 export type {
@@ -99,6 +102,14 @@ export class DynamicConfigService {
     private readonly fetchFn: typeof undiciFetch = undiciFetch
   ) {}
 
+  private integrationTools: IntegrationToolSource | null = null;
+
+  // Set after construction: the integration services depend on the runtime
+  // adapter, which depends on this service.
+  setIntegrationToolSource(source: IntegrationToolSource): void {
+    this.integrationTools = source;
+  }
+
   listSkills(tenantId: string, includeDisabled = true): Promise<AdminSkillRecord[]> {
     return this.stores.skills.listSkills(tenantId, includeDisabled);
   }
@@ -139,7 +150,14 @@ export class DynamicConfigService {
     isBetaTester: boolean,
     session?: { sessionId: string; userId: string }
   ): Promise<RuntimeConfigBundle> {
-    const runtimePolicy = await this.getRuntimePolicy(tenantId);
+    const tenantPolicy = await this.getRuntimePolicy(tenantId);
+    // Integration tools come only from the integration toggles. Stored tenant
+    // settings can still hold integration tool IDs, so remove them here.
+    const runtimePolicy = {
+      ...tenantPolicy,
+      enabledToolIds: tenantPolicy.enabledToolIds.filter((toolId) =>
+        this.managedToolCatalog.get(toolId)?.tenantConfigurable !== false)
+    };
     return compileRuntimeConfigBundle({
       tenantId,
       skills: this.stores.skills,
@@ -148,7 +166,10 @@ export class DynamicConfigService {
       isBetaTester,
       selection: session && this.stores.sessions
         ? await this.stores.sessions.getCapabilitySelection(tenantId, session.sessionId, session.userId)
-        : null
+        : null,
+      integrationToolIds: session && this.integrationTools
+        ? await this.integrationTools.resolveSessionToolIds(tenantId, session.userId)
+        : []
     });
   }
 
@@ -321,7 +342,13 @@ export class DynamicConfigService {
     const validMcpServerIds = collectValidMcpServerIds(defaults, availableMcpServers);
 
     validateEnabledMcpServerIds(enabledMcpServerIds, validMcpServerIds);
-    validateEnabledToolIds(enabledToolIds, defaults, validMcpServerIds, this.managedToolCatalog);
+    validateEnabledToolIds(
+      enabledToolIds,
+      existing?.enabledToolIds ?? [],
+      defaults,
+      validMcpServerIds,
+      this.managedToolCatalog
+    );
   }
 }
 
@@ -345,12 +372,26 @@ function validateEnabledMcpServerIds(
   }
 }
 
+// Integration-owned tools are enabled from /admin/integrations only. Stored
+// settings can still hold them from before that rule. The admin form sends
+// the stored list back, so those IDs are accepted but grant nothing at runtime
+// (see compileRuntimeConfig). A new integration tool ID is rejected.
 function validateEnabledToolIds(
   enabledToolIds: string[],
+  storedToolIds: readonly string[],
   defaults: TenantSettingsInput,
   validMcpServerIds: Set<string>,
   managedToolCatalog: ManagedToolCatalog
 ): void {
+  const integrationOwned = unique(enabledToolIds.filter((toolId) =>
+    managedToolCatalog.get(toolId)?.tenantConfigurable === false && !storedToolIds.includes(toolId)));
+  if (integrationOwned.length > 0) {
+    throw new AdminConfigError(
+      `Tool IDs owned by an integration cannot be enabled in tenant settings: ${integrationOwned.join(", ")}. ` +
+        "Use the integration read and write toggles."
+    );
+  }
+
   const validToolIds = new Set([
     ...(defaults.enabledToolIds ?? []),
     ...managedToolCatalog.listIds(),

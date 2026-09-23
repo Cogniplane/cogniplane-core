@@ -27,6 +27,9 @@ type McpDraft = {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl: string;
+  upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+  upstreamAuthName: string;
+  upstreamAuthSecret: string;
   enabled: boolean;
 };
 
@@ -37,6 +40,9 @@ const emptyMcpDraft: McpDraft = {
   mode: "managed",
   routePath: "/mcp/",
   upstreamUrl: "",
+  upstreamAuthType: "none",
+  upstreamAuthName: "",
+  upstreamAuthSecret: "",
   enabled: true
 };
 
@@ -51,6 +57,9 @@ export function AdminMcpCard(props: {
       mode: "managed" | "proxy";
       routePath: string;
       upstreamUrl: string | null;
+      upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+      upstreamAuthName: string | null;
+      upstreamAuthSecret?: string | null;
       enabled: boolean;
     },
     editingId: string | null
@@ -78,6 +87,9 @@ export function AdminMcpCard(props: {
       mode: server.mode,
       routePath: server.routePath,
       upstreamUrl: server.upstreamUrl ?? "",
+      upstreamAuthType: server.upstreamAuthType,
+      upstreamAuthName: server.upstreamAuthName ?? "",
+      upstreamAuthSecret: "",
       enabled: server.enabled
     });
     setShowForm(true);
@@ -94,6 +106,16 @@ export function AdminMcpCard(props: {
           mode: mcpDraft.mode,
           routePath: mcpDraft.routePath,
           upstreamUrl: mcpDraft.upstreamUrl || null,
+          upstreamAuthType: mcpDraft.mode === "proxy" ? mcpDraft.upstreamAuthType : "none",
+          upstreamAuthName:
+            mcpDraft.mode === "proxy" &&
+            (mcpDraft.upstreamAuthType === "header" || mcpDraft.upstreamAuthType === "query")
+              ? mcpDraft.upstreamAuthName || null
+              : null,
+          upstreamAuthSecret:
+            mcpDraft.mode !== "proxy" || mcpDraft.upstreamAuthType === "none"
+              ? null
+              : mcpDraft.upstreamAuthSecret || (editingMcpServerId ? undefined : null),
           enabled: mcpDraft.enabled
         },
         editingMcpServerId
@@ -216,6 +238,81 @@ export function AdminMcpCard(props: {
               </div>
             </div>
 
+            {mcpDraft.mode === "proxy" ? (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="mcp-upstream-auth-type">Upstream authentication</Label>
+                  <Select
+                    value={mcpDraft.upstreamAuthType}
+                    onValueChange={(value) =>
+                      setMcpDraft((current) => ({
+                        ...current,
+                        upstreamAuthType: value as McpDraft["upstreamAuthType"],
+                        upstreamAuthName:
+                          value === "header" || value === "query"
+                            ? current.upstreamAuthName
+                            : "",
+                        upstreamAuthSecret: value === "none" ? "" : current.upstreamAuthSecret
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="mcp-upstream-auth-type" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">None</SelectItem>
+                      <SelectItem value="bearer">Bearer token</SelectItem>
+                      <SelectItem value="header">Custom header</SelectItem>
+                      <SelectItem value="query">Query parameter</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {mcpDraft.upstreamAuthType === "header" ||
+                mcpDraft.upstreamAuthType === "query" ? (
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="mcp-upstream-auth-name">
+                      {mcpDraft.upstreamAuthType === "header" ? "Header name" : "Parameter name"}
+                    </Label>
+                    <Input
+                      id="mcp-upstream-auth-name"
+                      value={mcpDraft.upstreamAuthName}
+                      onChange={(event) =>
+                        setMcpDraft((current) => ({
+                          ...current,
+                          upstreamAuthName: event.target.value
+                        }))
+                      }
+                      placeholder={mcpDraft.upstreamAuthType === "header" ? "X-API-Key" : "api_key"}
+                    />
+                  </div>
+                ) : null}
+
+                {mcpDraft.upstreamAuthType !== "none" ? (
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="mcp-upstream-auth-secret">Secret</Label>
+                    <Input
+                      id="mcp-upstream-auth-secret"
+                      type="password"
+                      autoComplete="new-password"
+                      value={mcpDraft.upstreamAuthSecret}
+                      onChange={(event) =>
+                        setMcpDraft((current) => ({
+                          ...current,
+                          upstreamAuthSecret: event.target.value
+                        }))
+                      }
+                      placeholder={
+                        editingMcpServerId && mcpDraft.upstreamAuthSecret === ""
+                          ? "Leave blank to keep the existing secret"
+                          : "Upstream credential"
+                      }
+                    />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
             <div className="flex flex-wrap items-center justify-between gap-3">
               <label className="inline-flex items-center gap-2 text-sm text-on-surface">
                 <input
@@ -280,6 +377,9 @@ export function AdminMcpCard(props: {
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <span className={CHIP}>transport {server.transportKind}</span>
                   {server.upstreamUrl ? <span className={CHIP}>proxy upstream</span> : null}
+                  {server.upstreamAuthConfigured ? (
+                    <span className={CHIP}>auth {server.upstreamAuthType}</span>
+                  ) : null}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2 sm:flex-col sm:items-stretch">

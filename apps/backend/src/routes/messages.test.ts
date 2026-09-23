@@ -31,6 +31,7 @@ function makeStores(
   const runtimeManager = {
     id: "deep-agents",
     hasActiveTurn: () => false,
+    finishTurnAdmission: vi.fn(async () => {}),
     async createSession() {
       return {
         sessionId: "session-1",
@@ -70,7 +71,7 @@ function makeStores(
 
   const stores = {
     executions: {
-      acquire: vi.fn(async (actor: { tenantId: string; sessionId: string; userId: string }) => ({ ...actor, executionId: "execution-test", projectId: "project-1", expiresAt: new Date(Date.now() + 30_000).toISOString() })),
+      acquire: vi.fn(async (actor: { tenantId: string; sessionId: string; userId: string }) => ({ ...actor, executionId: "execution-test", ownerId: "replica-test", projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() })),
       heartbeat: vi.fn(async () => true),
       release: vi.fn(async () => {}),
     },
@@ -140,6 +141,7 @@ function makeStores(
   return {
     stores,
     activeTurns,
+    finishTurnAdmission: runtimeManager.finishTurnAdmission,
     createdMessages,
     consumedQuota,
     releaseRuntime: () => releaseRuntime?.()
@@ -155,6 +157,8 @@ async function buildApp(
     API_ORIGIN: "http://localhost:3000",
     SESSION_EXECUTION_LEASE_MS: 30_000,
     SESSION_EXECUTION_HEARTBEAT_MS: 5_000,
+    MAX_RUNNING_TURNS_PER_USER: 5,
+    MAX_RUNNING_TURNS_PER_TENANT: 50,
     ...configOverrides
   } as never);
   app.addHook("preHandler", async (request) => {
@@ -211,6 +215,23 @@ test("a concurrent second turn on the same session is rejected before persisting
   await first;
 });
 
+test.each([
+  { limit: "user", owner: "platform-user", config: { MAX_RUNNING_TURNS_PER_USER: 1 } },
+  { limit: "tenant", owner: "another-user", config: { MAX_RUNNING_TURNS_PER_TENANT: 1 } }
+])("rejects the $limit running-turn cap before side effects", async ({ owner, config }) => {
+  const harness = makeStores();
+  harness.activeTurns.mark("another-session", { tenantId: "test-tenant", userId: owner });
+  const app = await buildApp(harness.stores, config);
+  activeApp = app;
+
+  const response = await app.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "next" } });
+
+  expect(response.statusCode).toBe(429);
+  expect(response.json()).toEqual({ error: "running_turn_limit" });
+  expect(harness.createdMessages).toEqual([]);
+  expect(harness.consumedQuota).toEqual([]);
+});
+
 test("the reserved slot is released after the first turn completes, allowing a follow-up turn", async () => {
   const harness = makeStores();
   const app = await buildApp(harness.stores);
@@ -253,6 +274,9 @@ test("releases the reserved slot when the turn quota is exhausted (early-return 
   expect(response.statusCode).toBe(429);
   // The slot the route reserved is released, so the session is free again.
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+  expect(harness.finishTurnAdmission).toHaveBeenCalledWith({
+    tenantId: expect.any(String), sessionId: SESSION_ID, userId: expect.any(String)
+  });
 });
 
 test("releases the reserved slot when the rate limit is exhausted (early-return path)", async () => {

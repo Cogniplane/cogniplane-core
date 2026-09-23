@@ -350,6 +350,7 @@ export async function updateTenantModelAvailability(input: {
 }
 
 export async function updateTenantAgentSettings(input: {
+  expectedVersion: number;
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;

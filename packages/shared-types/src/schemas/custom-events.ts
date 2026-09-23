@@ -66,6 +66,10 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
     })
   }),
   z.object({
+    name: z.literal("user_message_persisted"),
+    value: z.object({ messageId: z.string().min(1), text: z.string() })
+  }),
+  z.object({
     name: z.literal("user_message_replaced"),
     value: z.object({
       messageId: z.string().min(1),

@@ -535,6 +535,7 @@ export function ProjectFiles({
                                 project.projectId,
                                 `Resolve ${file.name}`,
                               );
+                              await client.invalidateQueries({ queryKey: queryKeys.sessions.list() });
                               router.push(
                                 `/?session=${encodeURIComponent(session.sessionId)}&resolveDraft=${encodeURIComponent(file.fileId)}`,
                               );

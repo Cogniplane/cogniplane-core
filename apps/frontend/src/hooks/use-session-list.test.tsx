@@ -58,7 +58,7 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
   serverSessions = [makeSession("s-1"), makeSession("s-2")];
-  api.listSessions.mockImplementation(async () => [...serverSessions]);
+  api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => ({ sessions: serverSessions.filter((row) => !ids || ids.includes(row.sessionId)), trashRetentionDays: 7 }));
   api.deleteSession.mockImplementation(async (sessionId: string) => {
     serverSessions = serverSessions.filter((s) => s.sessionId !== sessionId);
   });
@@ -157,6 +157,18 @@ it("reloads session lists without refetching an active detail query", async () =
   expect(loadDetail).toHaveBeenCalledOnce();
 });
 
+it("preserves session references on identical refetches and retention during a mutation", async () => {
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.sessions).toHaveLength(2));
+  const sessions = result.current.sessions;
+  await act(async () => { await result.current.reload(); });
+  expect(result.current.sessions).toBe(sessions);
+  api.listSessions.mockImplementation(() => new Promise(() => {}));
+  await act(async () => { await result.current.createSession(); });
+  await waitFor(() => expect(result.current.sessions).toHaveLength(3));
+  expect(result.current.trashRetentionDays).toBe(7);
+});
+
 
 describe("archiving sessions", () => {
   it.each([false, true])("removes the session and updates persisted selection, last session: %s", async (last) => {
@@ -182,6 +194,7 @@ describe("archiving sessions", () => {
     await waitFor(() => expect(result.current.selectedSessionId).toBe("s-1"));
     act(() => result.current.archiveSession("s-1"));
     await waitFor(() => expect(result.current.error).toBe("Session has a pending approval"));
+    expect(result.current.listError).toBeNull();
     expect(result.current.sessions).toHaveLength(2);
     expect(result.current.selectedSessionId).toBe("s-1");
   });
@@ -238,7 +251,7 @@ it("clears the session URL on sign-out and preserves an initial link during auth
   expect(window.location.search).toBe("");
   window.history.replaceState(null, "", "/?session=s-1");
   rerender({ enabled: false });
-  expect(window.location.search).toBe("?session=s-1");
+  await waitFor(() => expect(window.location.search).toBe("?session=s-1"));
   rerender({ enabled: true });
   await waitFor(() => expect(result.current.selectedSessionId).toBe("s-1"));
 });
@@ -251,12 +264,170 @@ it("replaces a deleted session URL without adding history and rejects stale hist
   act(() => result.current.deleteSession("s-2"));
   await act(async () => { await result.current.confirmDelete(); });
   await waitFor(() => expect(result.current.selectedSessionId).toBe("s-1"));
-  expect(window.location.search).toBe("?session=s-1");
+  await waitFor(() => expect(window.location.search).toBe("?session=s-1"));
   expect(window.history.length).toBe(length);
   act(() => {
     window.history.replaceState(null, "", "/?session=s-2");
     window.dispatchEvent(new PopStateEvent("popstate"));
   });
   expect(result.current.selectedSessionId).toBe("s-1");
-  expect(window.location.search).toBe("?session=s-1");
+  await waitFor(() => expect(window.location.search).toBe("?session=s-1"));
+});
+
+it("loads older pages, retains rows on failure, retries and deduplicates sessions moved between pages", async () => {
+  let fail = true;
+  api.listSessions.mockImplementation(async ({ cursor }: { cursor?: string } = {}) => {
+    if (cursor === "older" && fail) throw new Error("Page unavailable");
+    return { sessions: cursor ? [makeSession("s-2"), makeSession("s-3")] : [makeSession("s-1"), makeSession("s-2")],
+      nextCursor: cursor ? null : "older", trashRetentionDays: 7 };
+  });
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.hasMore).toBe(true));
+  act(() => result.current.loadMore());
+  await waitFor(() => expect(result.current.error).toBe("Page unavailable"));
+  expect(result.current.sessions.map((s) => s.sessionId)).toEqual(["s-1", "s-2"]);
+  fail = false;
+  act(() => result.current.loadMore());
+  await waitFor(() => expect(result.current.sessions.map((s) => s.sessionId)).toEqual(["s-1", "s-2", "s-3"]));
+  expect(result.current.hasMore).toBe(false);
+  expect(result.current.selectedSessionId).toBe("s-1");
+  act(() => result.current.selectSession("s-3"));
+  await act(async () => { await result.current.reload(); });
+  expect(result.current.selectedSession?.sessionId).toBe("s-3");
+});
+
+it.each(["url", "storage"])("restores an older %s selection and pins outside the first page, preserving them through search", async (source) => {
+  if (source === "url") window.history.replaceState(null, "", "/?session=old");
+  else window.localStorage.setItem("cogniplane:selected-session-id:v1", "old");
+  window.localStorage.setItem("cogniplane:pinned-sessions:v1:u-1", JSON.stringify(["pinned"]));
+  api.listSessions.mockImplementation(async ({ ids, search }: { ids?: string[]; search?: string } = {}) => ({
+    sessions: ids ? ids.filter((id) => ["old", "pinned", "found-old"].includes(id)).map(makeSession) : search ? [makeSession("found-old")] : [makeSession("recent")],
+    nextCursor: null, trashRetentionDays: 7
+  }));
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSession?.sessionId).toBe("old"));
+  expect(result.current.sessions.some((s) => s.sessionId === "pinned")).toBe(true);
+  act(() => result.current.setSearch("found"));
+  await waitFor(() => expect(result.current.sidebarSessions.map((s) => s.sessionId)).toEqual(["found-old"]));
+  expect(result.current.selectedSession?.sessionId).toBe("old");
+  act(() => result.current.selectSession("found-old"));
+  // Once selected, the session is resolved independently when search is cleared.
+  api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => ({
+    sessions: ids ? ids.map(makeSession) : [makeSession("recent")], nextCursor: null, trashRetentionDays: 7
+  }));
+  act(() => result.current.setSearch(""));
+  await waitFor(() => expect(result.current.selectedSession?.sessionId).toBe("found-old"));
+  expect(window.location.search).toBe("?session=found-old");
+});
+
+it("keeps a saved URL on lookup failure and restores it after retry", async () => {
+  window.history.replaceState(null, "", "/?session=old");
+  let fail = true;
+  api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => {
+    if (ids && fail) throw new Error("Offline");
+    return { sessions: [makeSession(ids ? "old" : "recent")], nextCursor: null, trashRetentionDays: 7 };
+  });
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.error).toContain("saved sessions"));
+  expect(window.location.search).toBe("?session=old");
+  expect(result.current.selectedSessionId).toBeNull();
+  fail = false;
+  await act(async () => { await result.current.reload(); });
+  await waitFor(() => expect(result.current.selectedSession?.sessionId).toBe("old"));
+});
+
+it("resolves an older history link and falls back when the server no longer grants access", async () => {
+  api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => ({
+    sessions: ids ? ids.includes("old") ? [makeSession("old")] : [] : [makeSession("recent")], nextCursor: null, trashRetentionDays: 7
+  }));
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSessionId).toBe("recent"));
+  act(() => {
+    window.history.pushState(null, "", "/?session=old");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  await waitFor(() => expect(result.current.selectedSession?.sessionId).toBe("old"));
+  act(() => {
+    window.history.pushState(null, "", "/?session=denied");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  await waitFor(() => expect(window.location.search).toBe("?session=old"));
+  expect(result.current.selectedSessionId).toBe("old");
+});
+
+it("resolves more than one page of saved pins through bounded requests", async () => {
+  const pins = Array.from({ length: 105 }, (_, index) => `pin-${index}`);
+  window.localStorage.setItem("cogniplane:pinned-sessions:v1:u-1", JSON.stringify(pins));
+  api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => ({
+    sessions: (ids ?? ["recent"]).map(makeSession), nextCursor: null, trashRetentionDays: 7
+  }));
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.sessions).toHaveLength(106));
+  const batches = api.listSessions.mock.calls.map(([options]) => options?.ids).filter(Boolean) as string[][];
+  expect(batches.map((ids) => ids.length)).toEqual([100, 5]);
+  expect(new Set(batches.flat())).toEqual(new Set(pins));
+});
+
+it("ignores a late search response after switching terms", async () => {
+  let release!: (page: { sessions: Session[]; trashRetentionDays: number }) => void;
+  api.listSessions.mockImplementation(async ({ search }: { search?: string } = {}) => {
+    if (search === "first") return new Promise((resolve) => { release = resolve; });
+    return { sessions: [makeSession(search || "recent")], nextCursor: null, trashRetentionDays: 7 };
+  });
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSessionId).toBe("recent"));
+  act(() => result.current.setSearch("first"));
+  await waitFor(() => expect(release).toBeTypeOf("function"));
+  act(() => result.current.setSearch("second"));
+  await waitFor(() => expect(result.current.sidebarSessions[0]?.sessionId).toBe("second"));
+  await act(async () => { release({ sessions: [makeSession("first")], trashRetentionDays: 7 }); });
+  expect(result.current.sidebarSessions[0]?.sessionId).toBe("second");
+  expect(result.current.selectedSessionId).toBe("recent");
+});
+
+it.each(["delete", "archive"])("excludes search-only hits after clearing and from %s selection fallbacks", async (action) => {
+  let removed = false;
+  api.listSessions.mockImplementation(async ({ search }: { search?: string } = {}) => ({
+    sessions: search ? [makeSession("search-only")] : removed ? [] : [makeSession("recent")],
+    nextCursor: null, trashRetentionDays: 7
+  }));
+  api.deleteSession.mockImplementation(async () => { removed = true; });
+  api.archiveSession.mockImplementation(async () => { removed = true; return { ...makeSession("recent"), status: "archived" }; });
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSessionId).toBe("recent"));
+  act(() => result.current.setSearch("term"));
+  await waitFor(() => expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only"));
+  act(() => result.current.setSearch(""));
+  expect(result.current.sessions.map((row) => row.sessionId)).toEqual(["recent"]);
+  act(() => result.current.setSearch("term"));
+  await waitFor(() => expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only"));
+  if (action === "delete") {
+    act(() => result.current.deleteSession("recent"));
+    await act(async () => { await result.current.confirmDelete(); });
+  } else {
+    act(() => result.current.archiveSession("recent"));
+  }
+  await waitFor(() => expect(result.current.selectedSessionId).toBeNull());
+  expect(window.location.search).toBe("");
+});
+
+it.each([false, true])("restores only base or saved sessions when search finishes before the initial list, base exists: %s", async (hasBase) => {
+  window.history.replaceState(null, "", "/?session=missing");
+  window.localStorage.setItem("cogniplane:selected-session-id:v1", "also-missing");
+  let resolveBase!: (page: { sessions: Session[]; trashRetentionDays: number }) => void;
+  api.listSessions.mockImplementation(async ({ search, ids }: { search?: string; ids?: string[] } = {}) => {
+    if (ids) return { sessions: [], trashRetentionDays: 7 };
+    if (search) return { sessions: [makeSession("search-only")], trashRetentionDays: 7 };
+    return new Promise((resolve) => { resolveBase = resolve; });
+  });
+  const { result } = renderSessionList();
+  await waitFor(() => expect(resolveBase).toBeTypeOf("function"));
+  act(() => result.current.setSearch("term"));
+  await waitFor(() => expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only"));
+  expect(result.current.selectedSessionId).toBeNull();
+  await act(async () => { resolveBase({ sessions: hasBase ? [makeSession("recent")] : [], trashRetentionDays: 7 }); });
+  await waitFor(() => expect(window.location.search).toBe(hasBase ? "?session=recent" : ""));
+  expect(result.current.selectedSessionId).toBe(hasBase ? "recent" : null);
+  expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBe(hasBase ? "recent" : null);
+  expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only");
 });

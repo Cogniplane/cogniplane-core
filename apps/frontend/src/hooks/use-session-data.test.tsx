@@ -395,12 +395,12 @@ describe("useSessionData: session-scoped ownership", () => {
   });
 
   it("keeps an uncached failed selection empty and reports the failure", async () => {
-    const { result, onError } = renderSessionData();
+    const { result } = renderSessionData();
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.reject(new Error("session unavailable"));
     });
 
-    await waitFor(() => expect(onError).toHaveBeenCalledWith("session unavailable"));
+    await waitFor(() => expect(result.current.loadError).toBe("session unavailable"));
     expect(result.current.messages).toEqual([]);
     expect(result.current.artifacts).toEqual([]);
     expect(result.current.isSessionDataReady).toBe(false);

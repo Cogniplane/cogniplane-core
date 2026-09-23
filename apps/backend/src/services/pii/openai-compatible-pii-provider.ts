@@ -446,10 +446,10 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
 
     try {
       return JSON.parse(content) as TResponse;
-    } catch (error) {
+    } catch {
       throw new OpenAiCompatiblePiiProviderError(
         "invalid_json",
-        `PII model response was not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+        "PII model response was not valid JSON."
       );
     }
   }

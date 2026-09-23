@@ -509,3 +509,10 @@ test("loadConfig warns that a disabled turn watchdog (0) leaves the context TTL 
   expect(config.RUNTIME_TURN_TIMEOUT_MS).toBe(0);
   expect(warnings.some((w) => w.msg.includes("disables the turn watchdog"))).toBe(true);
 });
+
+test("loadConfig refuses the v1 upstream signing override, which upstreams held", () => {
+  expect(() => loadConfig(devConfig({ MCP_UPSTREAM_SIGNING_SECRET: "x".repeat(40) })))
+    .toThrow(/MCP_UPSTREAM_SIGNING_SECRET is the v1 upstream signing key/);
+  expect(loadConfig(devConfig({ MCP_UPSTREAM_SIGNING_ROOT_SECRET: "y".repeat(40) })).MCP_UPSTREAM_SIGNING_ROOT_SECRET)
+    .toBe("y".repeat(40));
+});

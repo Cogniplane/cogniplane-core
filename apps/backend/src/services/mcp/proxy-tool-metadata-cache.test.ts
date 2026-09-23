@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ProxyToolMetadataCache, type ProxyToolMetadata } from "./proxy-tool-metadata-cache.js";
 
@@ -13,6 +13,37 @@ function recordCompleteListing(
 }
 
 describe("ProxyToolMetadataCache", () => {
+  it("completes slow pagination even when another tenant lists tools during the wait", () => {
+    vi.useFakeTimers();
+    try {
+      const cache = new ProxyToolMetadataCache();
+      cache.recordToolsPage("t", "s", "old", { tools: [{ name: "first", annotations: { readOnlyHint: true } }], nextCursor: "next" });
+      vi.advanceTimersByTime(6 * 60_000);
+      cache.recordToolsPage("other", "s", "fresh", { tools: [] });
+      cache.recordToolsPage("t", "s", "old", { tools: [{ name: "fragment" }], requestCursor: "next" });
+      expect(cache.isReadOnly("t", "s", "first")).toBe(true);
+      expect(cache.isReadOnly("t", "s", "fragment")).toBe(false);
+      cache.recordToolsPage("t", "s", "fresh", { tools: [{ name: "fresh" }] });
+      expect(cache.isReadOnly("t", "s", "fresh")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("bounds abandoned listings while retaining active ones and reporting eviction", () => {
+    const warn = vi.fn();
+    const cache = new ProxyToolMetadataCache({ warn });
+    for (let i = 0; i < 100; i += 1) {
+      cache.recordToolsPage("t", "s", String(i), { tools: [{ name: String(i) }], nextCursor: "next" });
+    }
+    cache.recordToolsPage("t", "s", "0", { tools: [], requestCursor: "next", nextCursor: "last" });
+    cache.recordToolsPage("t", "s", "new", { tools: [], nextCursor: "next" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    cache.recordToolsPage("t", "s", "1", { tools: [{ name: "orphan" }], requestCursor: "next" });
+    expect(cache.isReadOnly("t", "s", "orphan")).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2);
+    cache.recordToolsPage("t", "s", "0", { tools: [], requestCursor: "last" });
+    expect(cache.isReadOnly("t", "s", "0")).toBe(false);
+  });
   it("returns undefined for uncached tools, servers, or tenants", () => {
     const cache = new ProxyToolMetadataCache();
     expect(cache.isReadOnly("tenant-1", "srv-1", "tool_a")).toBeUndefined();

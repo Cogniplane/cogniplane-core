@@ -118,10 +118,16 @@ class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "up
 }
 
 class FakeRuntimeManager {
-  invalidations: Array<{ tenantId: string }> = [];
+  invalidations: Array<{
+    tenantId: string;
+    options?: { idleOnly?: boolean; workspaceResetReason?: string };
+  }> = [];
 
-  async invalidateTenantRuntimes(tenantId: string): Promise<string[]> {
-    this.invalidations.push({ tenantId });
+  async invalidateTenantRuntimes(
+    tenantId: string,
+    options?: { idleOnly?: boolean; workspaceResetReason?: string }
+  ): Promise<string[]> {
+    this.invalidations.push({ tenantId, options });
     return ["session-1"];
   }
 }
@@ -229,6 +235,12 @@ test("PUT /admin/integrations/:id flips toggles, audits, and invalidates runtime
   // runtimes are torn down wholesale; the integrationId is carried on the audit
   // event (asserted below), not the invalidation call.
   expect(runtime.invalidations.length).toBe(1);
+  expect(runtime.invalidations[0]).toEqual({
+    tenantId: "tenant-1",
+    options: {
+      workspaceResetReason: expect.stringContaining("execution workspace was reset")
+    }
+  });
 
   const updateEvents = auditEvents.events.filter((e) => e.type === "tenant.integration.updated");
   expect(updateEvents.length).toBe(1);

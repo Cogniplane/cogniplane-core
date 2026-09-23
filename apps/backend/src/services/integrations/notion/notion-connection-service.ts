@@ -7,9 +7,12 @@ import type { NotionConnectionRecord, NotionConnectionStore } from "./notion-con
 import type { RuntimeInvalidator } from "../contracts.js";
 import {
   buildIntegrationRedirectUrl,
+  createOAuthBrowserBinding,
   getSecretKey,
   getVerificationKey,
-  toIsoFromNow
+  oauthBrowserBindingMatches,
+  toIsoFromNow,
+  type OAuthBrowserBindingCookie
 } from "../integration-oauth-helpers.js";
 import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
 import { uuidv7 } from "../../../lib/uuid.js";
@@ -31,6 +34,8 @@ type NotionStatePayload = {
   tid: string;
   sub: string;
   jti: string;
+  // SHA-256 of the browser-binding cookie nonce.
+  bnh: string;
 };
 
 type NotionOwner = {
@@ -136,7 +141,8 @@ export class NotionConnectionService {
     private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
     private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
-      new IntegrationOAuthStateStore()
+      new IntegrationOAuthStateStore(),
+    private readonly logger: Pick<Console, "warn"> = console
   ) {}
 
   isConfigured(): boolean {
@@ -160,16 +166,21 @@ export class NotionConnectionService {
     return !isExpired(record.accessTokenExpiresAt);
   }
 
-  async getAuthorizationUrl(input: { tenantId: string; userId: string }): Promise<string> {
+  async getAuthorizationUrl(input: {
+    tenantId: string;
+    userId: string;
+  }): Promise<{ url: string; browserBinding: OAuthBrowserBindingCookie }> {
     const oauth = readNotionConfig(this.config);
     if (!oauth) throw new NotionConnectionNotConfiguredError();
 
     const jti = uuidv7();
+    const binding = createOAuthBrowserBinding("notion", oauth.redirectUri, NOTION_STATE_TTL_SECONDS);
     await this.oauthStates.issue("notion", jti, NOTION_STATE_TTL_SECONDS);
     const state = await new SignJWT({
       tid: input.tenantId,
       sub: input.userId,
-      jti
+      jti,
+      bnh: binding.nonceHash
     } satisfies NotionStatePayload)
       .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(NOTION_STATE_ISSUER)
@@ -184,10 +195,14 @@ export class NotionConnectionService {
     url.searchParams.set("owner", "user");
     url.searchParams.set("redirect_uri", oauth.redirectUri);
     url.searchParams.set("state", state);
-    return url.toString();
+    return { url: url.toString(), browserBinding: binding.cookie };
   }
 
-  async completeAuthorization(input: { code?: string | null; state?: string | null }): Promise<string> {
+  async completeAuthorization(input: {
+    code?: string | null;
+    state?: string | null;
+    browserNonce?: string | null;
+  }): Promise<string> {
     const fallbackUrl = buildIntegrationRedirectUrl(this.config, "/settings/notion", {
       notionAuth: "error",
       reason: "invalid_state"
@@ -215,14 +230,20 @@ export class NotionConnectionService {
       if (
         typeof payload.tid !== "string" ||
         typeof payload.sub !== "string" ||
-        typeof payload.jti !== "string"
+        typeof payload.jti !== "string" ||
+        typeof payload.bnh !== "string"
       ) {
+        return fallbackUrl;
+      }
+      // Check the browser binding before spending the state, so a callback
+      // from another browser cannot burn it.
+      if (!oauthBrowserBindingMatches(payload.bnh, input.browserNonce)) {
         return fallbackUrl;
       }
       if (!(await this.oauthStates.consume("notion", payload.jti))) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti };
+      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti, bnh: payload.bnh };
     } catch {
       return fallbackUrl;
     }
@@ -288,18 +309,26 @@ export class NotionConnectionService {
         tokenLastRefreshedAt: tokenPayload.refresh_token ? new Date().toISOString() : null
       });
 
-      await this.auditEvents?.create({
-        tenantId: state.tid,
-        sessionId: null,
-        userId: state.sub,
-        type: "user.notion.connected",
-        payload: {
-          notionUserId,
-          notionWorkspaceId: tokenPayload.workspace_id ?? null,
-          notionWorkspaceName: tokenPayload.workspace_name ?? null
-        }
-      });
-      await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "notion");
+      try {
+        await this.auditEvents?.create({
+          tenantId: state.tid,
+          sessionId: null,
+          userId: state.sub,
+          type: "user.notion.connected",
+          payload: {
+            notionUserId,
+            notionWorkspaceId: tokenPayload.workspace_id ?? null,
+            notionWorkspaceName: tokenPayload.workspace_name ?? null
+          }
+        });
+      } catch (err) {
+        this.logger.warn({ err }, "Failed to audit Notion connection");
+      }
+      try {
+        await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "notion");
+      } catch (err) {
+        this.logger.warn({ err }, "Failed to refresh runtimes after notion connection");
+      }
 
       return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "connected"

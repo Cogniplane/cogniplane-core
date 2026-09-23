@@ -2,11 +2,24 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "vitest";
 
 import { UserSettingsStore } from "../services/user-settings-store.js";
-import { TenantSettingsStore } from "../services/tenant-settings-store.js";
+import { TenantSettingsStore, TenantSettingsConflictError } from "../services/tenant-settings-store.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedScheduledJob, seedTenantGraph } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
+  test("only one concurrent tenant settings save can use the same version", async () => {
+    const { tenantId } = await seedTenantGraph();
+    const store = new TenantSettingsStore(appPool());
+    const initial = await store.upsert(tenantId, {});
+    const results = await Promise.allSettled([
+      store.upsert(tenantId, { expectedVersion: initial.version, developerInstructions: "writer A" }),
+      store.upsert(tenantId, { expectedVersion: initial.version, developerInstructions: "writer B" })
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((result) => result.status === "rejected");
+    expect(rejected).toMatchObject({ reason: expect.any(TenantSettingsConflictError) });
+    expect((await store.get(tenantId))?.version).toBe(initial.version + 1);
+  });
   test("listDueJobs excludes disabled, future, and unscheduled jobs", async () => {
     const tenant = await seedTenantGraph();
     const due = tenant.jobId;

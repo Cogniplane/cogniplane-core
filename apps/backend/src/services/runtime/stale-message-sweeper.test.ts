@@ -6,6 +6,14 @@ import {
   sweepStaleAssistantMessages
 } from "./stale-message-sweeper.js";
 
+test("stale message deadline outlasts the scheduled job wall-clock timeout", () => {
+  expect(resolveStaleMessageDeadline({
+    RUNTIME_TURN_TIMEOUT_MS: 120_000,
+    APPROVAL_REQUEST_TTL_MS: 30_000,
+    SCHEDULER_JOB_TIMEOUT_MS: 600_000
+  })).toBe(660_000);
+});
+
 function row(messageId: string, tenantId = "tenant-1") {
   return { tenantId, sessionId: "session-1", messageId };
 }

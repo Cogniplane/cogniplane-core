@@ -308,11 +308,11 @@ Each job carries a `settings_snapshot_json` so executions remain auditable even 
 
 Two DB pools:
 - `db` — `app_user` (non-superuser, RLS-active).
-- `privilegedDb` — superuser, used only for `getDownloadToken` (where the token IS the auth) and migration runs.
+- `privilegedDb` — superuser for migrations and the small set of explicitly reviewed cross-tenant or token-authorized operations. Tenant content paths use the RLS-active pool unless their authorization design requires otherwise.
 
 The Deep Agents checkpointer additionally manages its own named `app_user` pool. Its tables (schema `deep_agents`) have **no RLS** — isolation is app-layer via the RLS-scoped `sessions` table (see Runtime Architecture).
 
-Every tenant-scoped store call wraps its work in `withTenantScope(db, tenantId, fn)` (`lib/db.ts`), which sets `SET LOCAL app.current_tenant_id` inside a transaction.
+Every tenant-scoped store call wraps its work in `withTenantScope(db, tenantId, fn)` (`lib/db.ts`), which calls `set_config(..., true)` inside a transaction.
 
 ## Authentication
 

@@ -108,7 +108,7 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
 export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[] {
-  return [
+  const tools: ManagedToolDefinition[] = [
     {
       ...GITHUB_TOOL_CATALOG[0], // github_read_file
       outputSchema: withManagedToolErrorSchema(
@@ -131,7 +131,7 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
 
         const res = await fetch(
           `https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/contents/${encodedPath}${ref}`,
-          { headers: { Authorization: `Bearer ${creds.token}`, Accept: "application/vnd.github+json" } }
+          { signal: AbortSignal.timeout(30_000), headers: { Authorization: `Bearer ${creds.token}`, Accept: "application/vnd.github+json" } }
         );
 
         if (!res.ok) return { error: `GitHub API error ${res.status}`, detail: await safeJsonBody(res) };
@@ -180,6 +180,7 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
           `https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/contents/${encodedPath}`,
           {
             method: "PUT",
+            signal: AbortSignal.timeout(30_000),
             headers: {
               Authorization: `Bearer ${creds.token}`,
               Accept: "application/vnd.github+json",
@@ -231,6 +232,7 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
 
         const res = await fetch(`https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/pulls`, {
           method: "POST",
+          signal: AbortSignal.timeout(30_000),
           headers: {
             Authorization: `Bearer ${creds.token}`,
             Accept: "application/vnd.github+json",
@@ -254,4 +256,17 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
       }
     }
   ];
+  return tools.map((tool) => ({
+    ...tool,
+    handler: async (input) => {
+      try {
+        return await tool.handler(input);
+      } catch (error) {
+        if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+          return { error: "GitHub request timed out." };
+        }
+        throw error;
+      }
+    }
+  }));
 }

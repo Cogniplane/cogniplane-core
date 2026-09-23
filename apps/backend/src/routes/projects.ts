@@ -10,9 +10,11 @@ import {
   ProjectsResponseSchema,
   ProjectDetailSchema,
   SESSION_TRASH_RETENTION_DAYS,
-  SessionEnvelopeSchema
+  SessionEnvelopeSchema,
+  SessionsListResponseSchema
 } from "@cogniplane/shared-types";
 import { ProjectAccessError } from "../services/project-access.js";
+import { SessionListCursorSchema } from "../services/session-store.js";
 import type { AppDependencies } from "../app-dependencies.js";
 import { ensureUser } from "../lib/db.js";
 import { parseRequestInput } from "../lib/route-validation.js";
@@ -30,6 +32,18 @@ export type ProjectRouteStores = Pick<
   | "auditEvents"
 >;
 const projectParams = z.object({ projectId: z.string().uuid() });
+const projectSessionsQuery = z.object({
+  status: z.enum(["active", "archived", "deleted"]).default("active"),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cursor: z.string().max(1000).transform((value, ctx) => {
+    try {
+      return SessionListCursorSchema.parse(JSON.parse(Buffer.from(value, "base64url").toString("utf8")));
+    } catch {
+      ctx.addIssue({ code: "custom", message: "Invalid session cursor" });
+      return z.NEVER;
+    }
+  }).optional()
+}).strict();
 const sessionBody = z
   .object({
     sessionId: z.string().uuid(),
@@ -194,6 +208,26 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
     reply.code(201);
     return serialize(ProjectSchema, project);
   });
+  app.get("/projects/:projectId/sessions", async (request, reply) => {
+    const params = parseRequestInput(reply, projectParams, request.params);
+    if (!params.ok) return params.response;
+    const query = parseRequestInput(reply, projectSessionsQuery, request.query);
+    if (!query.ok) return query.response;
+    const { tenantId, userId } = request.auth;
+    const project = await stores.projects.getReadable(tenantId, userId, params.value.projectId);
+    if (!project) return reply.code(404).send(notFoundError("project_not_found"));
+    if (query.value.status === "deleted" && !project.canEdit) {
+      return reply.code(403).send(apiError("project_edit_required", "Project editor access is required."));
+    }
+    const trashRetentionDays = stores.sessions.getRetentionDays?.() ?? SESSION_TRASH_RETENTION_DAYS;
+    const page = query.value.status === "deleted" && trashRetentionDays === 0
+      ? { sessions: [], nextCursor: null }
+      : await stores.sessions.listPage(tenantId, userId, {
+        ...query.value, projectId: project.projectId, purposes: ["normal"]
+      });
+    reply.header("cache-control", "private, no-store");
+    return serialize(SessionsListResponseSchema, { ...page, trashRetentionDays });
+  });
   app.get("/projects/:projectId", async (request, reply) => {
     const params = parseRequestInput(reply, projectParams, request.params);
     if (!params.ok) return params.response;
@@ -201,11 +235,11 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
     const project = await stores.projects.getReadable(tenantId, userId, params.value.projectId);
     if (!project) return reply.code(404).send(notFoundError("project_not_found"));
     const [activeSessions, archivedSessions, files] = await Promise.all([
-      stores.sessions.list(tenantId, userId, {
+      stores.sessions.listPage(tenantId, userId, {
         purposes: ["normal"],
         projectId: project.projectId
       }),
-      stores.sessions.list(tenantId, userId, {
+      stores.sessions.listPage(tenantId, userId, {
         purposes: ["normal"],
         status: "archived",
         projectId: project.projectId
@@ -214,23 +248,24 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
     ]);
     const trashRetentionDays = stores.sessions.getRetentionDays?.() ?? SESSION_TRASH_RETENTION_DAYS;
     const trash = project.canEdit && trashRetentionDays > 0
-      ? await stores.sessions.list(tenantId, userId, {
+      ? await stores.sessions.listPage(tenantId, userId, {
         purposes: ["normal"],
         status: "deleted",
         projectId: project.projectId,
       })
-      : [];
+      : { sessions: [], nextCursor: null };
     const activity = stores.auditEvents.listProjectActivity
       ? await stores.auditEvents.listProjectActivity(tenantId, project.projectId)
       : [];
     reply.header("cache-control", "private, no-store");
     return serialize(ProjectDetailSchema, {
       project,
-      sessions: [...activeSessions, ...archivedSessions],
+      sessions: [...activeSessions.sessions, ...archivedSessions.sessions],
+      sessionCursors: { active: activeSessions.nextCursor, archived: archivedSessions.nextCursor },
       files,
       canManage: project.canManage,
       canEdit: project.canEdit,
-      trash: { sessions: trash, retentionDays: trashRetentionDays },
+      trash: { ...trash, retentionDays: trashRetentionDays },
       activity
     });
   });

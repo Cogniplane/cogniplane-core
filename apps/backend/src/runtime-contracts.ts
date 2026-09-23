@@ -68,6 +68,8 @@ export interface RuntimeAdapter {
    * live one.
    */
   hasRuntime(sessionId: string, runtimeId: string): boolean;
+  /** Clears work deferred while a request owned the session's admission slot. */
+  finishTurnAdmission?(input: { tenantId: string; sessionId: string; userId: string }): Promise<void>;
   createSession(input: { tenantId: string; sessionId: string; userId: string; execution?: SessionExecution }): Promise<RuntimeSessionRef>;
   /** Drives one turn and yields AG-UI BaseEvents for clients and scheduled jobs. */
   runMessageAGUI(
@@ -83,7 +85,8 @@ export interface RuntimeAdapter {
       assistantMessageId?: string | null;
       model?: string;
       effort?: RuntimeReasoningEffort;
-      onBeforeTurn?: () => Promise<void>;
+      cancelSignal?: AbortSignal;
+      onBeforeTurn?: (signal: AbortSignal) => Promise<void>;
     }
   ): AsyncIterable<BaseEvent>;
   abortSession(input: { tenantId: string; sessionId: string; userId: string; executionId?: string }): Promise<void>;
@@ -138,7 +141,16 @@ export interface RuntimeAdapter {
    * toggles). The next turn rebuilds with the new policy/tool settings. Returns
    * the invalidated session ids.
    */
-  invalidateTenantRuntimes(tenantId: string): Promise<string[]>;
+  invalidateTenantRuntimes(
+    tenantId: string,
+    options?: { idleOnly?: boolean; workspaceResetReason?: string }
+  ): Promise<string[]>;
+  /**
+   * Tear down every active runtime owned by one tenant member. Member removal
+   * uses this to stop both interactive and scheduled turns under that identity.
+   * Returns the invalidated session ids.
+   */
+  invalidateRuntimesForUser(tenantId: string, userId: string): Promise<string[]>;
   /**
    * Tear down every active runtime for a specific user after they (re)connect
    * or disconnect an integration (the credentials in their live sandbox are now

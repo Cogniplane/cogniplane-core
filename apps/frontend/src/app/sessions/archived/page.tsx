@@ -2,15 +2,16 @@
 
 import Link from "next/link";
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArchiveIcon, ArchiveRestoreIcon, ArrowLeftIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 import { SESSION_TRASH_RETENTION_DAYS, type Session } from "@cogniplane/shared-types";
 
 import { AuthGuard } from "@/lib/auth-guard";
 import { useAuth } from "@/lib/auth-context";
+import { useSessionPages, updateSessionCaches } from "@/hooks/use-session-pages";
 import { queryKeys } from "@/lib/query-keys";
-import { deleteSession, listArchivedSessions, restoreSession } from "@/lib/session-api";
+import { deleteSession, restoreSession } from "@/lib/session-api";
 import { ConsolePageHeader } from "@/components/console-page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,27 +29,20 @@ function ArchivedSessions() {
   const client = useQueryClient();
   const [search, setSearch] = useState("");
   const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
-  const sessions = useQuery({
-    queryKey: queryKeys.sessions.archived(),
-    queryFn: listArchivedSessions,
-    enabled: Boolean(user),
-    refetchOnWindowFocus: true
-  });
+  const sessions = useSessionPages({ status: "archived", search, enabled: Boolean(user) });
   const mutation = useMutation({
     mutationFn: async ({ session, action }: { session: Session; action: "restore" | "delete" }) => {
       if (action === "restore") await restoreSession(session.sessionId);
       else await deleteSession(session.sessionId);
     },
     onSuccess: (_result, { session, action }) => {
-      client.setQueryData<Session[]>(queryKeys.sessions.archived(), (previous) =>
-        previous?.filter((row) => row.sessionId !== session.sessionId));
+      updateSessionCaches(client, (rows) => rows.filter((row) => row.sessionId !== session.sessionId));
       void client.invalidateQueries({ queryKey: queryKeys.sessions.all });
       setPendingDelete(null);
       toast.success(action === "restore" ? "Session restored. Find it in Chat." : "Session deleted.");
     }
   });
-  const filtered = (sessions.data ?? []).filter((session) =>
-    session.sessionName.toLowerCase().includes(search.trim().toLowerCase()));
+  const filtered = sessions.data?.sessions ?? [];
 
   return (
     <main className="min-h-screen bg-background">
@@ -61,13 +55,13 @@ function ArchivedSessions() {
       <div className="mx-auto max-w-4xl space-y-6 px-4 py-6 md:px-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Button asChild variant="ghost"><Link href="/"><ArrowLeftIcon />Back to chat</Link></Button>
-          <Input className="w-full sm:w-72" aria-label="Search archived sessions" placeholder="Search archived sessions" value={search} onChange={(event) => setSearch(event.target.value)} />
+          <Input className="w-full sm:w-72" maxLength={200} aria-label="Search archived sessions" placeholder="Search archived sessions" value={search} onChange={(event) => setSearch(event.target.value)} />
         </div>
         {sessions.isPending ? <p role="status" className="text-sm text-on-surface-variant">Loading archived sessions...</p> : null}
         {sessions.isError ? (
           <div role="alert" className="space-y-2 text-sm text-danger">
             <p>Could not load archived sessions.</p>
-            <Button variant="outline" disabled={sessions.isFetching} onClick={() => void sessions.refetch()}>Try again</Button>
+            <Button variant="outline" disabled={sessions.isFetching} onClick={() => void (sessions.isFetchNextPageError ? sessions.fetchNextPage() : sessions.refetch())}>Try again</Button>
           </div>
         ) : null}
         {mutation.isError ? <p role="alert" className="text-sm text-danger">{mutation.error instanceof Error ? mutation.error.message : "Could not update session. Try again."}</p> : null}
@@ -94,6 +88,9 @@ function ArchivedSessions() {
             ))}
           </ul>
         ) : null}
+        {sessions.hasNextPage ? <Button variant="outline" disabled={sessions.isFetching} onClick={() => void sessions.fetchNextPage()}>
+          {sessions.isFetchingNextPage ? "Loading..." : "Load more sessions"}
+        </Button> : null}
       </div>
       <AlertDialog open={pendingDelete !== null} onOpenChange={(open) => { if (!open && !mutation.isPending) setPendingDelete(null); }}>
         <AlertDialogContent>

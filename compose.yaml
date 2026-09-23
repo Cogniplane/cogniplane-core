@@ -17,7 +17,7 @@
 # Production caveats:
 #   - dev-headers mode reads X-User-Id from the request — never expose this
 #     stack to the internet without first switching AUTH_MODE=workos.
-#   - See docs/docker-deploy.md for the full walkthrough.
+#   - See README.md for setup instructions.
 
 services:
   exposure-guard:

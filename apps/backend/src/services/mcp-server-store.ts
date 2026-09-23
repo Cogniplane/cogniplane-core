@@ -1,11 +1,143 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
+import { computeConfigHash, decrypt, encrypt } from "../lib/crypto-utils.js";
+import type { McpUpstreamAuth } from "../lib/mcp-upstream-client.js";
+import { isCredentialQueryParameterName } from "../lib/url-validation.js";
 
 import { AdminConfigError } from "./admin-config-error.js";
-import type { AdminMcpServerRecord } from "./admin-config-records.js";
+import type {
+  AdminMcpServerRecord,
+  RuntimeMcpServerRecord
+} from "./admin-config-records.js";
 import { mapMcpServer } from "./admin-config-store-mappers.js";
 
+type UpstreamAuthType = AdminMcpServerRecord["upstreamAuthType"];
+
+function computeMcpServerConfigHash(input: {
+  serverId: string;
+  serverName: string;
+  description: string | null;
+  transportKind: "http";
+  mode: "managed" | "proxy";
+  routePath: string;
+  upstreamUrl: string | null;
+  upstreamAuthType: UpstreamAuthType;
+  upstreamAuthName: string | null;
+  upstreamAuthConfigured: boolean;
+}): string {
+  return computeConfigHash(input);
+}
+
+function extractLegacyQueryAuth(upstreamUrl: string): {
+  cleanUrl: string;
+  name: string;
+  secret: string;
+} | null {
+  const url = new URL(upstreamUrl);
+  const credentials = [...url.searchParams.entries()].filter(([name, value]) =>
+    isCredentialQueryParameterName(name) && value.length > 0
+  );
+  if (credentials.length === 0) return null;
+  if (credentials.length > 1) {
+    throw new AdminConfigError(
+      "The MCP upstream URL contains multiple credential-like query parameters. " +
+        "Move them to the encrypted upstream authentication fields before using this server."
+    );
+  }
+
+  const [name, secret] = credentials[0]!;
+  url.searchParams.delete(name);
+  return { cleanUrl: url.toString(), name, secret };
+}
+
 export class McpServerStore {
-  constructor(private readonly db: Pool) {}
+  constructor(
+    private readonly db: Pool,
+    private readonly encryptionSecret: string
+  ) {}
+
+  private async migrateLegacyQueryAuth(
+    client: { query: Pool["query"] },
+    row: Record<string, unknown>,
+    requestTenantId: string
+  ): Promise<Record<string, unknown>> {
+    if (
+      String(row.upstream_auth_type ?? "none") !== "none" ||
+      row.upstream_auth_secret_encrypted ||
+      !row.upstream_url
+    ) {
+      return row;
+    }
+
+    const legacy = extractLegacyQueryAuth(String(row.upstream_url));
+    if (!legacy) return row;
+
+    const encryptedSecret = encrypt(legacy.secret, this.encryptionSecret);
+    if (String(row.tenant_id) !== requestTenantId) {
+      // Inherited system rows are readable but deliberately not writable under
+      // a tenant's RLS scope. Keep them usable and keep the secret out of the
+      // tenant API; a system-scoped read will persist the migration later.
+      return {
+        ...row,
+        upstream_url: legacy.cleanUrl,
+        upstream_auth_type: "query",
+        upstream_auth_name: legacy.name,
+        upstream_auth_secret_encrypted: encryptedSecret
+      };
+    }
+
+    const result = await client.query(
+      `
+        UPDATE admin_mcp_servers
+        SET upstream_url = $3,
+            upstream_auth_type = 'query',
+            upstream_auth_name = $4,
+            upstream_auth_secret_encrypted = $5
+        WHERE tenant_id = $1
+          AND server_id = $2
+          AND upstream_url = $6
+          AND upstream_auth_type = 'none'
+          AND upstream_auth_secret_encrypted IS NULL
+        RETURNING *
+      `,
+      [
+        String(row.tenant_id),
+        String(row.server_id),
+        legacy.cleanUrl,
+        legacy.name,
+        encryptedSecret,
+        String(row.upstream_url)
+      ]
+    );
+
+    if (result.rows[0]) return result.rows[0];
+    const refreshed = await client.query(
+      `SELECT * FROM admin_mcp_servers WHERE tenant_id = $1 AND server_id = $2 LIMIT 1`,
+      [String(row.tenant_id), String(row.server_id)]
+    );
+    return refreshed.rows[0] ?? row;
+  }
+
+  private runtimeRecord(row: Record<string, unknown>): RuntimeMcpServerRecord {
+    const record = mapMcpServer(row);
+    const encrypted = row.upstream_auth_secret_encrypted
+      ? String(row.upstream_auth_secret_encrypted)
+      : null;
+    let upstreamAuth: McpUpstreamAuth | null = null;
+    if (record.upstreamAuthType === "bearer" && encrypted) {
+      upstreamAuth = { type: "bearer", secret: decrypt(encrypted, this.encryptionSecret) };
+    } else if (
+      (record.upstreamAuthType === "header" || record.upstreamAuthType === "query") &&
+      record.upstreamAuthName &&
+      encrypted
+    ) {
+      upstreamAuth = {
+        type: record.upstreamAuthType,
+        name: record.upstreamAuthName,
+        secret: decrypt(encrypted, this.encryptionSecret)
+      };
+    }
+    return { ...record, upstreamAuth };
+  }
 
   async listMcpServers(tenantId: string, includeDisabled = true, isBetaTester = true): Promise<AdminMcpServerRecord[]> {
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -25,11 +157,14 @@ export class McpServerStore {
         [includeDisabled, tenantId, isBetaTester]
       );
 
-      return result.rows.map((row) => mapMcpServer(row));
+      const rows = await Promise.all(
+        result.rows.map((row) => this.migrateLegacyQueryAuth(client, row, tenantId))
+      );
+      return rows.map((row) => mapMcpServer(row));
     });
   }
 
-  async getMcpServer(tenantId: string, serverId: string): Promise<AdminMcpServerRecord | null> {
+  async getMcpServer(tenantId: string, serverId: string): Promise<RuntimeMcpServerRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
@@ -43,7 +178,9 @@ export class McpServerStore {
         [serverId, tenantId]
       );
 
-      return result.rows[0] ? mapMcpServer(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const row = await this.migrateLegacyQueryAuth(client, result.rows[0], tenantId);
+      return this.runtimeRecord(row);
     });
   }
 
@@ -55,7 +192,9 @@ export class McpServerStore {
     mode: "managed" | "proxy";
     routePath: string;
     upstreamUrl: string | null;
-    configHash: string;
+    upstreamAuthType: UpstreamAuthType;
+    upstreamAuthName: string | null;
+    upstreamAuthSecret: string | null;
     enabled: boolean;
     createdBy: string;
   }): Promise<AdminMcpServerRecord> {
@@ -80,6 +219,18 @@ export class McpServerStore {
         }
       }
 
+      const configHash = computeMcpServerConfigHash({
+        serverId: input.serverId,
+        serverName: input.serverName,
+        description: input.description,
+        transportKind: input.transportKind,
+        mode: input.mode,
+        routePath: input.routePath,
+        upstreamUrl: input.upstreamUrl,
+        upstreamAuthType: input.upstreamAuthType,
+        upstreamAuthName: input.upstreamAuthName,
+        upstreamAuthConfigured: Boolean(input.upstreamAuthSecret)
+      });
       const result = await client.query(
         `
           INSERT INTO admin_mcp_servers (
@@ -91,12 +242,15 @@ export class McpServerStore {
             mode,
             route_path,
             upstream_url,
+            upstream_auth_type,
+            upstream_auth_name,
+            upstream_auth_secret_encrypted,
             version,
             config_hash,
             enabled,
             created_by
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10, $11)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1, $12, $13, $14)
           RETURNING *
         `,
         [
@@ -108,7 +262,12 @@ export class McpServerStore {
           input.mode,
           input.routePath,
           input.upstreamUrl,
-          input.configHash,
+          input.upstreamAuthType,
+          input.upstreamAuthName,
+          input.upstreamAuthSecret
+            ? encrypt(input.upstreamAuthSecret, this.encryptionSecret)
+            : null,
+          configHash,
           input.enabled,
           input.createdBy
         ]
@@ -125,11 +284,74 @@ export class McpServerStore {
     transportKind: "http";
     mode: "managed" | "proxy";
     routePath: string;
-    upstreamUrl: string | null;
-    configHash: string;
+    upstreamUrl?: string | null;
+    upstreamAuthType?: UpstreamAuthType;
+    upstreamAuthName?: string | null;
+    upstreamAuthSecret?: string | null;
     enabled: boolean;
   }): Promise<AdminMcpServerRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      const existing = await client.query(
+        `SELECT upstream_url, upstream_auth_type, upstream_auth_name,
+                upstream_auth_secret_encrypted
+         FROM admin_mcp_servers
+         WHERE server_id = $1 AND tenant_id = $2
+         LIMIT 1
+         FOR UPDATE`,
+        [input.serverId, tenantId]
+      );
+      if (!existing.rows[0]) return null;
+
+      const upstreamUrl = input.upstreamUrl === undefined
+        ? (existing.rows[0].upstream_url ? String(existing.rows[0].upstream_url) : null)
+        : input.upstreamUrl;
+      const existingAuthType = String(existing.rows[0].upstream_auth_type) as UpstreamAuthType;
+      const upstreamAuthType = input.mode === "managed"
+        ? "none"
+        : input.upstreamAuthType ?? existingAuthType;
+      const upstreamAuthName = upstreamAuthType === "none" || upstreamAuthType === "bearer"
+        ? null
+        : input.upstreamAuthName === undefined
+          ? upstreamAuthType === existingAuthType && existing.rows[0].upstream_auth_name
+            ? String(existing.rows[0].upstream_auth_name)
+            : null
+          : input.upstreamAuthName;
+      const encryptedSecret = upstreamAuthType === "none"
+        ? null
+        : input.upstreamAuthSecret
+          ? encrypt(input.upstreamAuthSecret, this.encryptionSecret)
+          : existing.rows[0].upstream_auth_secret_encrypted
+            ? String(existing.rows[0].upstream_auth_secret_encrypted)
+            : null;
+      if (input.mode === "proxy" && !upstreamUrl) {
+        throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
+      }
+      if (upstreamAuthType !== "none" && !encryptedSecret) {
+        throw new AdminConfigError(
+          "Proxy MCP upstream authentication requires a secret when first configured."
+        );
+      }
+      if (
+        (upstreamAuthType === "header" || upstreamAuthType === "query") &&
+        !upstreamAuthName
+      ) {
+        throw new AdminConfigError(
+          `${upstreamAuthType} authentication requires upstreamAuthName.`
+        );
+      }
+      const configHash = computeMcpServerConfigHash({
+        serverId: input.serverId,
+        serverName: input.serverName,
+        description: input.description,
+        transportKind: input.transportKind,
+        mode: input.mode,
+        routePath: input.routePath,
+        upstreamUrl,
+        upstreamAuthType,
+        upstreamAuthName,
+        upstreamAuthConfigured: Boolean(encryptedSecret)
+      });
+
       const result = await client.query(
         `
           UPDATE admin_mcp_servers
@@ -140,12 +362,15 @@ export class McpServerStore {
             mode = $5,
             route_path = $6,
             upstream_url = $7,
-            config_hash = $8,
-            enabled = $9,
+            upstream_auth_type = $8,
+            upstream_auth_name = $9,
+            upstream_auth_secret_encrypted = $10,
+            config_hash = $11,
+            enabled = $12,
             version = version + 1,
             updated_at = NOW()
           WHERE server_id = $1
-            AND tenant_id = $10
+            AND tenant_id = $13
           RETURNING *
         `,
         [
@@ -155,8 +380,11 @@ export class McpServerStore {
           input.transportKind,
           input.mode,
           input.routePath,
-          input.upstreamUrl,
-          input.configHash,
+          upstreamUrl,
+          upstreamAuthType,
+          upstreamAuthName,
+          encryptedSecret,
+          configHash,
           input.enabled,
           tenantId
         ]

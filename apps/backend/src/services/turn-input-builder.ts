@@ -15,6 +15,7 @@ export type ArtifactTurnInput = {
   artifactProcessor: Pick<ArtifactProcessor, "extractArtifactText">;
   storage: Pick<ArtifactStorage, "openReadStream">;
   syncedArtifacts?: SyncedArtifact[];
+  signal?: AbortSignal;
 };
 
 export type PreparedTurnInputs = {
@@ -80,10 +81,16 @@ export async function buildArtifactTurnInputs(
   let remainingBudget = MAX_ARTIFACT_BUDGET_CHARS;
 
   for (const artifact of fallbackList) {
+    if (input.signal?.aborted) break;
     const excerptBudget = Math.min(remainingBudget, PER_ARTIFACT_EXCERPT_CHARS);
 
     if (isTextReadableArtifact(artifact.mimeType) && remainingBudget > 0) {
-      const content = await readArtifactExcerpt(input.storage, artifact.storageKey, excerptBudget);
+      const content = await readArtifactExcerpt(
+        input.storage,
+        artifact.storageKey,
+        excerptBudget,
+        input.signal
+      );
       if (content.trim()) {
         remainingBudget -= content.length;
         inlineArtifactBlocks.push(
@@ -99,7 +106,7 @@ export async function buildArtifactTurnInputs(
 
     if (artifact.mimeType === "application/pdf" && remainingBudget > 0) {
       const extractedTextResult = await input.artifactProcessor
-        .extractArtifactText(artifact)
+        .extractArtifactText(artifact, input.signal)
         .then((content) => content?.slice(0, excerptBudget) ?? "")
         .catch(() => "");
 

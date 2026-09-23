@@ -85,6 +85,7 @@ function artifactRow(overrides: Record<string, unknown> = {}): Record<string, un
     created_by_ref: null,
     detail_json: {},
     created_at: "2026-05-31T00:00:00.000Z",
+    cursor_created_at: overrides.created_at ?? "2026-05-31T00:00:00.000Z",
     updated_at: "2026-05-31T00:00:00.000Z",
     ...overrides
   };
@@ -151,21 +152,16 @@ test("ArtifactStore.setPiiDetail sends only the caller's partial fields as the p
   expect(patch).toEqual({ status: "transformed" });
 });
 
-test("ArtifactStore.consumeDownloadToken binds [token, tenant, user, callerIsAdmin] and gates on token expiry", async () => {
+test("ArtifactStore.consumeDownloadToken binds only the token and gates on token expiry", async () => {
   const db = new CaptureDatabase();
   const store = new ArtifactStore({} as Pool, db as unknown as Pool);
 
-  await store.consumeDownloadToken({
-    token: "tok-123",
-    requesterTenantId: "test-tenant",
-    requesterUserId: "user-1",
-    callerIsAdmin: false
-  });
+  await store.consumeDownloadToken({ token: "tok-123" });
 
   expect(db.lastQuery).toBeTruthy();
-  // The exact bound contract is the observable signal a store-level fake can't
-  // reproduce, so we pin it: token, tenant, user, callerIsAdmin (in order).
-  expect(db.requiredLastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  // The token is the credential: identity comes from the token row, so the
+  // token is the only bound value.
+  expect(db.requiredLastQuery.values).toEqual(["tok-123"]);
   // Structural invariant with no fake equivalent: consume must reject expired
   // tokens in SQL so an expired token is never burned (the route surfaces
   // expiry as a repeatable 410). The expiry predicate is the ONLY way to assert
@@ -177,15 +173,10 @@ test("ArtifactStore.peekDownloadToken is read-only and omits the expiry filter s
   const db = new CaptureDatabase();
   const store = new ArtifactStore({} as Pool, db as unknown as Pool);
 
-  await store.peekDownloadToken({
-    token: "tok-123",
-    requesterTenantId: "test-tenant",
-    requesterUserId: "user-1",
-    callerIsAdmin: false
-  });
+  await store.peekDownloadToken({ token: "tok-123" });
 
   expect(db.lastQuery).toBeTruthy();
-  expect(db.requiredLastQuery.values).toEqual(["tok-123", "test-tenant", "user-1", false]);
+  expect(db.requiredLastQuery.values).toEqual(["tok-123"]);
   // Structural invariants with no DB-backed equivalent in a fake:
   // 1. Peek must NOT mutate the row — a failed storage read later cannot have
   //    already burned the token. The absence of an UPDATE / consumed_at write

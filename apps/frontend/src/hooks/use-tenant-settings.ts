@@ -13,6 +13,7 @@ import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
 export type TenantSettingsInput = {
+  expectedVersion: number;
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;

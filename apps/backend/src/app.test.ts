@@ -2,6 +2,18 @@ import { test, expect, describe } from "vitest";
 import Fastify from "fastify";
 
 import { handleAppError, parseTrustProxy } from "./app.js";
+import { RequestLimitsUnavailableError } from "./services/redis-request-limits.js";
+
+test("request limit outages return a safe 503 with retry guidance", async () => {
+  const app = buildAppWithErrorHandler();
+  app.get("/limited", async () => { throw new RequestLimitsUnavailableError(new Error("private redis address")); });
+  const response = await app.inject({ method: "GET", url: "/limited" });
+  expect(response.statusCode).toBe(503);
+  expect(response.headers["retry-after"]).toBe("5");
+  expect(response.json().error).toBe("request_limits_unavailable");
+  expect(response.body).not.toContain("private redis");
+  await app.close();
+});
 
 describe("parseTrustProxy", () => {
   test("the shipped default trusts nothing", () => {

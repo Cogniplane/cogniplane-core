@@ -69,6 +69,7 @@ export class PiiScanJobHandler {
   constructor(private readonly deps: PiiScanJobHandlerDeps) {}
 
   async execute(job: PiiScanJobRecord): Promise<void> {
+    let decisionApplied = false;
     try {
       if (
         job.subjectType === "artifact" &&
@@ -79,6 +80,7 @@ export class PiiScanJobHandler {
           summaryText: "File removed before scanning.",
           completedAt: new Date()
         });
+        decisionApplied = true;
         await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
         return;
       }
@@ -89,8 +91,15 @@ export class PiiScanJobHandler {
       const subject = resolveSubject(job);
       const decision = await this.evaluate(job, subject);
       await this.applyDecision(job, decision);
+      decisionApplied = true;
       await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
     } catch (error) {
+      if (decisionApplied) {
+        // Leave the applied decision intact. The worker's stale-job recovery
+        // handles an unfinished acknowledgement after a database outage.
+        this.deps.logger.error({ err: error, jobId: job.jobId }, "Failed to acknowledge completed PII scan");
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const errorCode =
         error instanceof PiiProtectionServiceError ? error.code : "pii_job_failed";
@@ -155,24 +164,16 @@ export class PiiScanJobHandler {
     const modeApplied = job.mode;
 
     if (decision.action === "allow") {
+      await this.writeSubjectDetail(job, { status: "scanned", modeApplied, findingsCount: 0 });
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "completed",
         actionTaken: "allow",
         completedAt: new Date()
       });
-      await this.writeSubjectDetail(job, { status: "scanned", modeApplied, findingsCount: 0 });
       return;
     }
 
     if (decision.action === "report") {
-      await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
-        status: "completed",
-        actionTaken: "report",
-        findings: decision.findings,
-        providerType: decision.providerType,
-        providerModel: decision.providerModel,
-        completedAt: new Date()
-      });
       await this.writeSubjectDetail(job, {
         status: "scanned",
         modeApplied,
@@ -187,6 +188,11 @@ export class PiiScanJobHandler {
         providerType: decision.providerType,
         providerModel: decision.providerModel
       });
+      await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
+        status: "completed", actionTaken: "report", findings: decision.findings,
+        providerType: decision.providerType, providerModel: decision.providerModel,
+        completedAt: new Date()
+      });
       return;
     }
 
@@ -196,14 +202,6 @@ export class PiiScanJobHandler {
       // Artifacts only — messages have no stored object.
       const objectDeleted = await this.purgeBlockedObject(job);
 
-      await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
-        status: "blocked",
-        actionTaken: "block",
-        findings: decision.findings,
-        providerType: decision.providerType,
-        providerModel: decision.providerModel,
-        completedAt: new Date()
-      });
       await this.writeSubjectDetail(job, {
         status: "blocked",
         modeApplied,
@@ -221,20 +219,17 @@ export class PiiScanJobHandler {
         blockReason: decision.blockReason,
         objectDeleted
       });
+      await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
+        status: "blocked", actionTaken: "block", findings: decision.findings,
+        providerType: decision.providerType, providerModel: decision.providerModel,
+        completedAt: new Date()
+      });
       return;
     }
 
     // transform path — phase 1 records the finding set; the derived
     // transformed-artifact pipeline (Epic 7) handles persisting the
     // transformed content.
-    await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
-      status: "transformed",
-      actionTaken: "transform",
-      findings: decision.findings,
-      providerType: decision.providerType,
-      providerModel: decision.providerModel,
-      completedAt: new Date()
-    });
     await this.writeSubjectDetail(job, {
       status: "transformed",
       modeApplied,
@@ -248,6 +243,11 @@ export class PiiScanJobHandler {
       findingsCount: decision.findings.length,
       providerType: decision.providerType,
       providerModel: decision.providerModel
+    });
+    await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
+      status: "transformed", actionTaken: "transform", findings: decision.findings,
+      providerType: decision.providerType, providerModel: decision.providerModel,
+      completedAt: new Date()
     });
   }
 

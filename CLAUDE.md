@@ -107,11 +107,11 @@ Policy Center rules live in `policy_rule` and are evaluated before and at the MC
 
 ### Multi-tenancy and database access
 
-Every store method takes `tenantId` as its first argument. All queries run inside `withTenantScope(db, tenantId, fn)` (`lib/db.ts`), which sets `SET LOCAL app.current_tenant_id` and activates PostgreSQL Row-Level Security. Migrations run as superuser and bypass RLS. The migration runner is `src/scripts/migrate.ts`; it also runs the Deep Agents checkpointer DDL (schema `deep_agents`, no RLS — see the Deep Agents section).
+Tenant-scoped store methods take `tenantId` first and run inside `withTenantScope(db, tenantId, fn)` (`lib/db.ts`), which calls `set_config(..., true)` for the transaction and activates PostgreSQL Row-Level Security. Migrations run as superuser and bypass RLS. The migration runner is `src/scripts/migrate.ts`; it also runs the Deep Agents checkpointer DDL (schema `deep_agents`, no RLS — see the Deep Agents section).
 
 Two DB pools exist in production:
 - `db` — `app_user` (non-superuser, subject to RLS)
-- `privilegedDb` — superuser, used only for `getDownloadToken` and migration
+- `privilegedDb` — superuser for migrations and explicitly reviewed cross-tenant, lifecycle, bootstrap, or token-authorized operations
 
 (The Deep Agents checkpointer additionally manages its own named `app_user` pool.)
 

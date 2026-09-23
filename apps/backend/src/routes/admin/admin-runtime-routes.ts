@@ -85,7 +85,12 @@ export async function registerAdminRuntimeRoutes(
     // long-lived process.)
     const affectedSessionIds = await stores.deepAgentsAdapter.invalidateTenantRuntimes(
       request.auth.tenantId,
-      { idleOnly: true }
+      {
+        idleOnly: true,
+        workspaceResetReason:
+          "An administrator refreshed idle runtimes for this organization. " +
+          "The execution workspace was reset. Recreate any files you still need."
+      }
     );
     await createAdminAuditEvent(stores.auditEvents, {
       tenantId: request.auth.tenantId,

@@ -114,16 +114,16 @@ export class PiiArtifactScanEnqueuer {
       status: "processing"
     });
 
-    const subject = await this.deps.subjectReader.readArtifact({
-      tenantId: input.tenantId,
-      artifactId: input.artifactId
-    });
-
-    if (!subject) {
-      return this.handleArtifactNotFound(input, scanRun.scanRunId);
-    }
-
     try {
+      const subject = await this.deps.subjectReader.readArtifact({
+        tenantId: input.tenantId,
+        artifactId: input.artifactId
+      });
+
+      if (!subject) {
+        return this.handleArtifactNotFound(input, scanRun.scanRunId);
+      }
+
       const decision = await this.deps.piiProtection.evaluateArtifact({
         tenantId: input.tenantId,
         artifact: subject,

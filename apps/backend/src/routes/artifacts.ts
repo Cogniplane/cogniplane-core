@@ -411,27 +411,22 @@ export async function registerArtifactRoutes(
       return paramsResult.response;
     }
 
-    // Single-use download, ordered so a transient storage error can't burn
-    // the token. SQL checks caller identity and current session access at both
-    // steps. The administrative bypass applies only to non-project sessions.
+    // Public in every auth mode: the token is the credential (see
+    // lib/auth-public-paths.ts), so identity comes from the token row, never
+    // from `request.auth`. Single-use download, ordered so a transient storage
+    // error can't burn the token. SQL checks the token user's current session
+    // access at both steps.
     //
     // 1. `peekDownloadToken` validates without consuming. Unknown token,
-    //    cross-tenant, wrong user, already-consumed, or unreadable artifact
-    //    all return null → 404.
+    //    already-consumed, lost access, or unreadable artifact all return
+    //    null → 404.
     // 2. Expiry → 410. The peek does NOT consume, so the 410 is repeatable
     //    and an expired token is never spent.
     // 3. Open the storage stream BEFORE consuming. A failure here propagates
     //    (500) with the token still unconsumed, so the client can retry.
     // 4. `consumeDownloadToken` flips `consumed_at` atomically and only then.
     //    A lost race (concurrent request consumed it first) returns null → 404.
-    const callerIsAdmin =
-      request.auth.role === "owner" || request.auth.role === "admin";
-    const token = await stores.artifacts.peekDownloadToken({
-      token: paramsResult.value.token,
-      requesterTenantId: request.auth.tenantId,
-      requesterUserId: request.auth.userId,
-      callerIsAdmin
-    });
+    const token = await stores.artifacts.peekDownloadToken({ token: paramsResult.value.token });
     if (!token) {
       reply.code(404);
       return notFoundError("download_not_found");
@@ -444,12 +439,7 @@ export async function registerArtifactRoutes(
 
     const streamHandle = await stores.storage.openReadStream(token.storageKey);
 
-    const consumed = await stores.artifacts.consumeDownloadToken({
-      token: paramsResult.value.token,
-      requesterTenantId: request.auth.tenantId,
-      requesterUserId: request.auth.userId,
-      callerIsAdmin
-    });
+    const consumed = await stores.artifacts.consumeDownloadToken({ token: paramsResult.value.token });
     if (!consumed) {
       // Lost the single-use race (a concurrent request consumed the token
       // first). We optimistically opened the storage stream before consuming;
@@ -469,14 +459,16 @@ export async function registerArtifactRoutes(
       await stores.auditEvents.create({
         tenantId: token.tenantId,
         sessionId: token.sessionId,
-        userId: request.auth.userId,
+        // An admin-minted token downloads as the issuing admin.
+        userId: token.issuedByUserId ?? token.userId,
         type: "artifact_downloaded",
         payload: {
           artifactId: token.artifactId,
           fileName: token.fileName,
-          actorUserId: request.auth.userId,
-          tokenUserId: token.userId
-        }
+          ...(token.issuedByUserId ? { ownerUserId: token.userId } : {})
+        },
+        ipAddress: request.ip,
+        userAgent: request.headers["user-agent"] ?? null
       });
     } catch (err) {
       request.log.warn(

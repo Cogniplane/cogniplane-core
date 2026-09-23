@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "../lib/auth-context";
@@ -9,10 +9,12 @@ import {
   archiveSession as apiArchiveSession,
   deleteSession as apiDeleteSession,
   listSessions,
+  type SessionList,
   renameSession as apiRenameSession
 } from "../lib/session-api";
 import { createProjectSession as apiCreateProjectSession } from "../lib/project-api";
 import { SESSION_TRASH_RETENTION_DAYS, type Session } from "@cogniplane/shared-types";
+import { useSessionPages, updateSessionCaches } from "./use-session-pages";
 import { queryKeys } from "../lib/query-keys";
 
 const SELECTED_SESSION_KEY = "cogniplane:selected-session-id:v1";
@@ -77,16 +79,9 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
   const { user } = useAuth();
   const queryClient = useQueryClient();
 
-  const sessionsQuery = useQuery({
-    queryKey: queryKeys.sessions.list(),
-    queryFn: () => listSessions(),
-    enabled,
-    refetchInterval: enabled ? 10_000 : false,
-    refetchOnWindowFocus: true,
-    structuralSharing: true
-  });
-
-  const sessions = useMemo(() => sessionsQuery.data ?? [], [sessionsQuery.data]);
+  const [search, setSearch] = useState("");
+  const sessionsQuery = useSessionPages({ enabled, poll: true });
+  const searchQuery = useSessionPages({ search, enabled: enabled && Boolean(search.trim()), poll: true });
 
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
@@ -95,11 +90,48 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
   const [pinnedSessionIds, setPinnedSessionIds] = useState<Set<string>>(() => new Set());
   const [mutationError, setMutationError] = useState<string | null>(null);
 
+  const [restoreIds, setRestoreIds] = useState<string[]>([]);
+  const [hydrated, setHydrated] = useState(false);
+  const baseSessions = useMemo(() => sessionsQuery.data?.sessions ?? [], [sessionsQuery.data?.sessions]);
+  const lookupIds = useMemo(() => {
+    const loadedIds = new Set(baseSessions.map((session) => session.sessionId));
+    return [...new Set([...restoreIds, ...pinnedSessionIds, ...(selectedSessionId ? [selectedSessionId] : [])])]
+      .filter((id) => id.length > 0 && id.length <= 200 && !id.includes(",") && !loadedIds.has(id)).sort();
+  }, [baseSessions, restoreIds, pinnedSessionIds, selectedSessionId]);
+  const lookupQuery = useQuery({
+    queryKey: [...queryKeys.sessions.list(), "lookup", lookupIds],
+    queryFn: async ({ signal }): Promise<SessionList> => {
+      const rows: Session[] = [];
+      // Bound each request even when a user has saved more than 100 pins.
+      for (let offset = 0; offset < lookupIds.length; offset += 100) {
+        const page = await listSessions({ ids: lookupIds.slice(offset, offset + 100), signal });
+        rows.push(...page.sessions);
+      }
+      return { sessions: rows, trashRetentionDays: sessionsQuery.data?.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS };
+    },
+    enabled: enabled && hydrated && sessionsQuery.isSuccess && lookupIds.length > 0,
+    refetchInterval: enabled ? 10_000 : false
+  });
+  const listedSessions = useMemo(() => {
+    const rows = new Map(baseSessions.map((session) => [session.sessionId, session]));
+    for (const session of lookupQuery.data?.sessions ?? []) rows.set(session.sessionId, session);
+    return [...rows.values()];
+  }, [baseSessions, lookupQuery.data?.sessions]);
+  const sessions = useMemo(() => {
+    if (!search.trim() || !searchQuery.data) return listedSessions;
+    const rows = new Map(listedSessions.map((session) => [session.sessionId, session]));
+    for (const session of searchQuery.data.sessions) rows.set(session.sessionId, session);
+    return [...rows.values()];
+  }, [listedSessions, search, searchQuery.data]);
+
   useEffect(() => {
     // SSR-safe localStorage hydration: lazy init would cause hydration mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPinnedSessionIds(readPinnedSessionIds(user?.userId));
-  }, [user?.userId]);
+    const linked = syncUrl && window.location.pathname === "/" ? new URLSearchParams(window.location.search).get("session") : null;
+    setRestoreIds([linked, readPersistedSessionId()].filter((id): id is string => Boolean(id)));
+    setHydrated(true);
+  }, [user?.userId, syncUrl]);
 
   // First-successful-load effect: restore the persisted selection or fall back
   // to the first session. Guarded by a local ref-ish state so we only restore
@@ -116,38 +148,38 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
       return;
     }
     if (hasRestored) return;
-    if (sessionsQuery.status !== "success") return;
-    if (sessions.length === 0) {
+    if (sessionsQuery.status !== "success" || !hydrated) return;
+    if (lookupIds.length > 0 && !lookupQuery.isSuccess) return;
+    if (listedSessions.length === 0) {
+      setSelectedSessionId(null);
+      persistSelectedSessionId(null);
       if (syncUrl) syncSessionLink(null);
       setHasRestored(true);
       return;
     }
     const linkedId = syncUrl && window.location.pathname === "/"
       ? new URLSearchParams(window.location.search).get("session") : null;
-    const persisted = sessions.some((session) => session.sessionId === linkedId)
+    const persisted = listedSessions.some((session) => session.sessionId === linkedId)
       ? linkedId : readPersistedSessionId();
-    const restoredId = sessions.find((s) => s.sessionId === persisted)?.sessionId ?? sessions[0].sessionId;
+    const restoredId = listedSessions.find((s) => s.sessionId === persisted)?.sessionId ?? listedSessions[0].sessionId;
     setSelectedSessionId(restoredId);
     persistSelectedSessionId(restoredId);
     if (syncUrl) syncSessionLink(restoredId);
     setHasRestored(true);
-  }, [enabled, hasRestored, sessionsQuery.status, sessions, syncUrl]);
+  }, [enabled, hasRestored, sessionsQuery.status, listedSessions, syncUrl, hydrated, lookupIds.length, lookupQuery.isSuccess]);
 
   useEffect(() => {
-    if (!enabled || !hasRestored || !syncUrl) return;
+    if (!enabled || !syncUrl) return;
     const restoreFromHistory = () => {
       if (window.location.pathname !== "/") return;
       const linkedId = new URLSearchParams(window.location.search).get("session");
-      const sessionId = sessions.find((session) => session.sessionId === linkedId)?.sessionId
-        ?? sessions.find((session) => session.sessionId === readPersistedSessionId())?.sessionId
-        ?? sessions[0]?.sessionId ?? null;
-      setSelectedSessionId(sessionId);
-      persistSelectedSessionId(sessionId);
-      syncSessionLink(sessionId);
+      const sessionId = linkedId ?? readPersistedSessionId();
+      setRestoreIds(sessionId ? [sessionId] : []);
+      setHasRestored(false);
     };
     window.addEventListener("popstate", restoreFromHistory);
     return () => window.removeEventListener("popstate", restoreFromHistory);
-  }, [enabled, hasRestored, sessions, syncUrl]);
+  }, [enabled, syncUrl]);
 
   // Surface query errors through the hook's `error` derived during render (no
   // effect/extra state). Polling errors stay hidden — only non-refetch failures
@@ -158,9 +190,11 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
         ? sessionsQuery.error.message
         : "Failed to load sessions"
       : null;
-  const error = mutationError ?? queryError;
+  const listError = queryError ?? (lookupQuery.isError ? "Could not load saved sessions. Try again." : null)
+    ?? (search.trim() && searchQuery.isError ? "Could not search sessions. Try again." : null);
+  const error = mutationError ?? listError;
 
-  const activeListKey = queryKeys.sessions.list();
+  const activeListKey = sessionsQuery.queryKey;
 
   const invalidateSessions = useCallback(
     () => queryClient.invalidateQueries({ queryKey: queryKeys.sessions.list() }),
@@ -171,9 +205,9 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     mutationFn: ({ sessionName, projectId }: { sessionName: string; projectId: string | null }) =>
       projectId ? apiCreateProjectSession(projectId, sessionName) : apiCreateSession(sessionName),
     onSuccess: (session: Session) => {
-      queryClient.setQueryData<Session[]>(activeListKey, (prev) =>
-        prev ? [session, ...prev] : [session]
-      );
+      queryClient.setQueryData<InfiniteData<SessionList>>(activeListKey, (prev) => prev ? {
+        ...prev, pages: prev.pages.map((page, index) => index === 0 ? { ...page, sessions: [session, ...page.sessions] } : page)
+      } : { pages: [{ sessions: [session], trashRetentionDays: SESSION_TRASH_RETENTION_DAYS }], pageParams: [undefined] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
       setSelectedSessionId(session.sessionId);
       persistSelectedSessionId(session.sessionId);
@@ -186,9 +220,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     mutationFn: ({ sessionId, nextName }: { sessionId: string; nextName: string }) =>
       apiRenameSession(sessionId, nextName),
     onSuccess: (updated, variables) => {
-      queryClient.setQueryData<Session[]>(activeListKey, (prev) =>
-        prev ? prev.map((s) => (s.sessionId === variables.sessionId ? updated : s)) : prev
-      );
+      updateSessionCaches(queryClient, (rows) => rows.map((s) => s.sessionId === variables.sessionId ? updated : s));
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : "Failed to rename session")
@@ -199,10 +231,9 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     onSuccess: (_unused, sessionId) => {
       // Work out the fallback before the cache write, so the updater stays a
       // pure prev → next function with no selection side effects inside it.
-      const remaining = (
-        queryClient.getQueryData<Session[]>(activeListKey) ?? []
-      ).filter((s) => s.sessionId !== sessionId);
-      queryClient.setQueryData<Session[]>(activeListKey, remaining);
+      const remaining = listedSessions.filter((s) => s.sessionId !== sessionId);
+      updateSessionCaches(queryClient, (rows) => rows.filter((s) => s.sessionId !== sessionId));
+      setRestoreIds((ids) => ids.filter((id) => id !== sessionId));
       if (selectedSessionId === sessionId) {
         const fallbackId = remaining.length > 0 ? remaining[0].sessionId : null;
         setSelectedSessionId(fallbackId);
@@ -228,9 +259,9 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
   const archiveMutation = useMutation({
     mutationFn: apiArchiveSession,
     onSuccess: (_session, sessionId) => {
-      const remaining = (queryClient.getQueryData<Session[]>(activeListKey) ?? [])
-        .filter((session) => session.sessionId !== sessionId);
-      queryClient.setQueryData(activeListKey, remaining);
+      const remaining = listedSessions.filter((session) => session.sessionId !== sessionId);
+      updateSessionCaches(queryClient, (rows) => rows.filter((s) => s.sessionId !== sessionId));
+      setRestoreIds((ids) => ids.filter((id) => id !== sessionId));
       if (selectedSessionId === sessionId) {
         const fallbackId = remaining[0]?.sessionId ?? null;
         setSelectedSessionId(fallbackId);
@@ -331,13 +362,26 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     (deleteMutation.isPending ? deleteMutation.variables : null) ??
     null;
 
+  const visibleQuery = search.trim() ? searchQuery : sessionsQuery;
   return {
     sessions,
+    sidebarSessions: search.trim() ? searchQuery.data?.sessions ?? [] : sessions,
+    search,
+    setSearch,
+    hasMore: visibleQuery.hasNextPage,
+    isLoadingMore: visibleQuery.isFetchingNextPage,
+    loadMore: () => { if (!visibleQuery.isFetching) void visibleQuery.fetchNextPage(); },
+    isSearching: Boolean(search.trim()) && searchQuery.isPending,
+    retry: () => {
+      if (visibleQuery.isFetchNextPageError) void visibleQuery.fetchNextPage();
+      else void invalidateSessions();
+    },
     trashRetentionDays: sessionsQuery.data?.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS,
     selectedSessionId,
     selectedSession,
     isLoadingSessions: sessionsQuery.isPending && enabled,
     error,
+    listError,
     setError: setMutationError,
     selectSession,
     createSession,

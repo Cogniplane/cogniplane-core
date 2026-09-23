@@ -4,6 +4,7 @@ import { firstValueFrom, from as rxFrom, toArray } from "rxjs";
 
 import { streamAssistantReplyAGUI, type StreamAssistantReplyAGUIInput } from "./sse-stream-writer-agui.js";
 import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
+import { TurnEventLog } from "./turn-event-log.js";
 
 // ---------------------------------------------------------------------------
 // Minimal fakes — the writer only touches reply.raw, messages.{create,
@@ -42,10 +43,12 @@ function makeMessages() {
     planContent?: string;
   }> = [];
   const toolResultLog: Array<Record<string, unknown>> = [];
+  const noticeLog: unknown[][] = [];
   return {
     contentLog,
     streamingLog,
     toolResultLog,
+    noticeLog,
     async create() {
       return { messageId: "msg-assistant", id: 42 };
     },
@@ -67,6 +70,12 @@ function makeMessages() {
     async upsertToolResult(input: Record<string, unknown>) {
       toolResultLog.push(input);
       return input;
+    },
+    async setRuntimeNotices(_tid: string, _mid: string, _uid: string, notices: unknown[]) {
+      noticeLog.push([...notices]);
+    },
+    async deleteToolResult() {
+      return;
     }
   };
 }
@@ -120,6 +129,165 @@ test("persists a completed turn with the streamed assistant text", async () => {
   await streamAssistantReplyAGUI(input);
 
   expect(messages.contentLog.at(-1)).toEqual({ status: "completed", content: "hello" });
+});
+
+test("a closed stream still completes the turn and saves its tool result", async () => {
+  const eventLog = new TurnEventLog();
+  const received: BaseEvent[] = [];
+  eventLog.subscribe(0, (entry) => { if (entry) received.push(entry.event); });
+  const { input, messages, reply } = runInput([
+    { type: EventType.RUN_STARTED, threadId: "session-1", runId: "run-1" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "done" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_END, messageId: "m" } as BaseEvent,
+    { type: EventType.TOOL_CALL_START, toolCallId: "tool-1", toolCallName: "execute" } as BaseEvent,
+    { type: EventType.TOOL_CALL_RESULT, toolCallId: "tool-1", content: "ok" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ], { eventLog });
+  reply.raw.destroyed = true;
+
+  await streamAssistantReplyAGUI(input);
+
+  expect(messages.contentLog.at(-1)).toEqual({ status: "completed", content: "done" });
+  expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "tool-1", status: "completed", output: "ok" });
+  expect(reply.writes).toEqual([]);
+  expect(received.map((event) => event.type)).toEqual([
+    EventType.RUN_STARTED,
+    EventType.CUSTOM,
+    EventType.TEXT_MESSAGE_START,
+    EventType.TEXT_MESSAGE_CONTENT,
+    EventType.TEXT_MESSAGE_END,
+    EventType.TOOL_CALL_START,
+    EventType.TOOL_CALL_RESULT,
+    EventType.RUN_FINISHED
+  ]);
+  expect(eventLog.subscribe(0, () => undefined)).toBeNull();
+});
+
+test("replay includes the saved user prompt before the assistant reply", async () => {
+  const eventLog = new TurnEventLog();
+  const received: BaseEvent[] = [];
+  eventLog.subscribe(0, (entry) => { if (entry) received.push(entry.event); });
+  const { input } = runInput([
+    { type: EventType.RUN_STARTED, threadId: "session-1", runId: "run-1" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "answer", delta: "Hello" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ], { eventLog, persistedUserMessage: { messageId: "question", text: "What happened?" } });
+
+  await streamAssistantReplyAGUI(input);
+
+  expect(received[0]?.type).toBe(EventType.RUN_STARTED);
+  const promptIndex = received.findIndex((event) => event.type === EventType.CUSTOM && event.name === "user_message_persisted");
+  const replyIndex = received.findIndex((event) => event.type === EventType.TEXT_MESSAGE_START);
+  expect(promptIndex).toBeGreaterThan(0);
+  expect(promptIndex).toBeLessThan(replyIndex);
+  expect(received[promptIndex]).toMatchObject({
+    name: "user_message_persisted", value: { messageId: "question", text: "What happened?" }
+  });
+});
+
+test("a pending Redis mirror does not block the local stream", async () => {
+  const eventLog = new TurnEventLog();
+  eventLog.setMirror(() => new Promise<void>(() => undefined));
+  const { input, messages, reply } = runInput([
+    { type: EventType.RUN_STARTED, threadId: "session-1", runId: "run-1" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "answer", delta: "Ready" } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ], { eventLog });
+  await streamAssistantReplyAGUI(input);
+  expect(messages.contentLog.at(-1)).toEqual({ status: "completed", content: "Ready" });
+  expect(reply.writes.join("")).toContain('"type":"RUN_FINISHED"');
+});
+
+test("Stop during runtime setup ends the saved turn before the graph starts", async () => {
+  const cancel = new AbortController();
+  const { input, messages } = runInput([], { cancelSignal: cancel.signal });
+  let releaseSetup!: () => void;
+  let setupEntered!: () => void;
+  const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
+  const entered = new Promise<void>((resolve) => { setupEntered = resolve; });
+  const runMessageAGUI = vi.fn(async function* () { yield { type: EventType.RUN_FINISHED } as BaseEvent; });
+  input.runtimeAdapter = {
+    async createSession() {
+      setupEntered();
+      await setupGate;
+      return { sessionId: "session-1", runtimeId: "runtime-1", runtimePolicy: { id: "default" } } as never;
+    },
+    runMessageAGUI
+  } as StreamAssistantReplyAGUIInput["runtimeAdapter"];
+
+  const pending = streamAssistantReplyAGUI(input);
+  await entered;
+  cancel.abort();
+  releaseSetup();
+  await pending;
+
+  expect(runMessageAGUI).not.toHaveBeenCalled();
+  expect(messages.contentLog.at(-1)).toEqual({ status: "interrupted", content: "" });
+});
+
+test("slow progress writes do not hold the live stream", async () => {
+  const { input, reply, messages } = runInput([
+    { type: EventType.STATE_DELTA, delta: [{ op: "add", path: "/plan", value: "working" }] } as BaseEvent,
+    { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ]);
+  let releaseWrite!: () => void;
+  const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  messages.updateStreamingContent = async () => { await writeGate; };
+
+  const pending = streamAssistantReplyAGUI(input);
+  await vi.waitFor(() => expect(reply.writes.some((frame) => frame.includes('"delta":"hello"'))).toBe(true));
+  releaseWrite();
+  await pending;
+  expect(messages.contentLog.at(-1)?.status).toBe("completed");
+});
+
+test("a state delta without a plan does not write an empty plan", async () => {
+  const { input, messages } = runInput([
+    { type: EventType.STATE_DELTA, delta: [{ op: "add", path: "/other", value: true }] } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ]);
+  await streamAssistantReplyAGUI(input);
+  expect(messages.streamingLog).toEqual([]);
+});
+
+test("marks a tool left open by a terminal turn as failed", async () => {
+  const { input, messages } = runInput([
+    { type: EventType.TOOL_CALL_START, toolCallId: "tool-1", toolCallName: "execute" } as BaseEvent,
+    { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent
+  ]);
+  await streamAssistantReplyAGUI(input);
+  expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "tool-1", status: "failed" });
+});
+
+test("saves the plan, tool result, and notice before the turn ends", async () => {
+  const { input, messages } = runInput([]);
+  input.runtimeAdapter = {
+    async createSession() {
+      return { sessionId: "session-1", runtimeId: "runtime-1", runtimePolicy: { id: "default" } } as never;
+    },
+    async *runMessageAGUI() {
+      yield { type: EventType.STATE_DELTA, delta: [{ op: "add", path: "/plan", value: "working" }] } as BaseEvent;
+      await vi.waitFor(() => expect(messages.streamingLog.at(-1)).toEqual({ planContent: "working" }));
+      yield { type: EventType.TOOL_CALL_START, toolCallId: "tool-1", toolCallName: "execute" } as BaseEvent;
+      yield { type: EventType.TOOL_CALL_RESULT, toolCallId: "tool-1", content: "ok" } as BaseEvent;
+      await vi.waitFor(() => expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "tool-1", output: "ok" }));
+      yield { type: EventType.CUSTOM, name: "runtime_notice", value: {
+        noticeId: "notice-1", level: "warning", title: "Approval expired",
+        message: "No answer", createdAt: new Date().toISOString()
+      } } as BaseEvent;
+      await vi.waitFor(() => expect(messages.noticeLog.at(-1)).toHaveLength(1));
+      yield { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" } as BaseEvent;
+    }
+  } as StreamAssistantReplyAGUIInput["runtimeAdapter"];
+
+  await streamAssistantReplyAGUI(input);
+  expect(messages.contentLog.at(-1)?.status).toBe("completed");
 });
 
 test("persists a RUN_ERROR turn as error with the failure message", async () => {
@@ -193,7 +361,10 @@ test("threads selected artifacts into the tool context and an onBeforeTurn hook"
       async writeRuntimeFile() {
         return "/home/user/workspace/session-1/artifacts/a1.txt";
       },
-      async *runMessageAGUI(_session: unknown, runInput: { onBeforeTurn?: () => Promise<void> }) {
+      async *runMessageAGUI(
+        _session: unknown,
+        runInput: { onBeforeTurn?: (signal: AbortSignal) => Promise<void> }
+      ) {
         // The onBeforeTurn hook (artifact sync + prompt build) is threaded so the
         // adapter runs it after the slot is reserved; its internals are covered
         // by turn-input-builder / SSE-path tests, so we only assert the wiring.
@@ -257,14 +428,10 @@ test("persists reasoning, plan, and tool results so a reload renders the full tu
   // Reasoning is persisted both as the flat fallback and as positioned segments
   // (this burst arrives before any assistant text, so offset 0).
   expect(messages.streamingLog).toEqual([
-    {
-      reasoningContent: "let me think",
-      reasoningSegments: [{ offset: 0, text: "let me think" }],
-      planContent: "1. do it"
-    }
+    { planContent: "1. do it" },
+    { reasoningContent: "let me think", reasoningSegments: [{ offset: 0, text: "let me think" }] }
   ]);
-  expect(messages.toolResultLog).toHaveLength(1);
-  expect(messages.toolResultLog[0]).toMatchObject({
+  expect(messages.toolResultLog.at(-1)).toMatchObject({
     messageId: "msg-assistant",
     sessionId: "session-1",
     toolResultId: "c1",
@@ -314,8 +481,7 @@ test("remaps tool + reasoning offsets to redacted positions when the narration h
     { reasoningContent: "hmm", reasoningSegments: [{ offset: 20, text: "hmm" }] }
   ]);
   // (firstChunk+secondChunk).length = 58 → redacted length 28.
-  expect(messages.toolResultLog).toHaveLength(1);
-  expect(messages.toolResultLog[0].textOffset).toBe(28);
+  expect(messages.toolResultLog.at(-1)?.textOffset).toBe(28);
 });
 
 test("emits a user_message_replaced CUSTOM event when a PII transform replacement is present (F8)", async () => {
@@ -554,50 +720,55 @@ test("a failing checkpoint does not end a turn the client is still reading", asy
 });
 
 test("a slow in-flight checkpoint cannot land after the terminal write", async () => {
-  // The failure this guards: the timer fires, its "streaming" write is still
-  // awaiting the DB when the stream ends, the terminal "completed" write lands
-  // first, and then the checkpoint resolves and flips the row BACK to
-  // "streaming" — permanently, since nothing runs after it. That is exactly the
-  // stuck-row state R11 exists to eliminate, reintroduced by its own fix.
-  const { input, messages } = runInput([], {
-    runtimeAdapter: makeSlowAdapter(
-      [
-        { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
-        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
-        { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
-      ],
-      12
-    ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
-    streamingPersistIntervalMs: 5
-  });
-  let slowCheckpoints = 0;
-  const realUpdate = messages.updateContent.bind(messages);
-  messages.updateContent = async (
-    tid: string,
-    mid: string,
-    uid: string,
-    status: string,
-    content: string
-  ) => {
-    // A checkpoint write that outlives the stream it belongs to.
-    if (status === "streaming") {
-      slowCheckpoints += 1;
-      await new Promise((resolve) => setTimeout(resolve, 40));
-    }
-    await realUpdate(tid, mid, uid, status, content);
-  };
+  vi.useFakeTimers();
+  try {
+    // The failure this guards: the timer fires, its "streaming" write is still
+    // awaiting the DB when the stream ends, the terminal "completed" write lands
+    // first, and then the checkpoint resolves and flips the row BACK to
+    // "streaming" — permanently, since nothing runs after it. That is exactly the
+    // stuck-row state R11 exists to eliminate, reintroduced by its own fix.
+    const { input, messages } = runInput([], {
+      runtimeAdapter: makeSlowAdapter(
+        [
+          { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" } as BaseEvent,
+          { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "hello" } as BaseEvent,
+          { type: EventType.RUN_FINISHED, threadId: "t", runId: "r" } as BaseEvent
+        ],
+        12
+      ) as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"],
+      streamingPersistIntervalMs: 5
+    });
+    let slowCheckpoints = 0;
+    const realUpdate = messages.updateContent.bind(messages);
+    messages.updateContent = async (
+      tid: string,
+      mid: string,
+      uid: string,
+      status: string,
+      content: string
+    ) => {
+      // A checkpoint write that outlives the stream it belongs to.
+      if (status === "streaming") {
+        slowCheckpoints += 1;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      await realUpdate(tid, mid, uid, status, content);
+    };
 
-  await streamAssistantReplyAGUI(input);
-  // The writer must have drained its own in-flight checkpoint before returning.
-  // Waiting past the slow write proves nothing landed behind the terminal one:
-  // if the drain is missing, the checkpoint resolves in here and appends a
-  // "streaming" row after "completed".
-  await new Promise((resolve) => setTimeout(resolve, 120));
+    const finished = streamAssistantReplyAGUI(input);
+    await vi.advanceTimersByTimeAsync(36);
+    expect(slowCheckpoints).toBeGreaterThan(0);
+    expect(messages.contentLog.some((entry) => entry.status === "completed")).toBe(false);
+    await vi.advanceTimersByTimeAsync(120);
+    await finished;
 
-  // Without this the test would also pass with checkpointing removed entirely —
-  // there would simply be no late write to race.
-  expect(slowCheckpoints).toBeGreaterThan(0);
-  expect(messages.contentLog.at(-1)?.status).toBe("completed");
+    // Without this the test would also pass with checkpointing removed entirely —
+    // there would simply be no late write to race.
+    expect(slowCheckpoints).toBeGreaterThan(0);
+    expect(messages.contentLog.at(-1)?.status).toBe("completed");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 

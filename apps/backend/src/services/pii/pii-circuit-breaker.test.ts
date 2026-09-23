@@ -2,6 +2,19 @@ import { test, expect } from "vitest";
 
 import type { Redis } from "ioredis";
 
+test("Redis breaker outage permits scanning and does not discard provider outcomes", async () => {
+  const warnings: string[] = [];
+  const redis = { get: async () => { throw new Error("offline"); } } as unknown as Redis;
+  const breaker = new RedisPiiCircuitBreaker(redis, {
+    name: "test", failureThreshold: 2, windowMs: 1000, cooldownMs: 1000,
+    logger: { info() {}, warn(_meta, message) { warnings.push(message); } }
+  });
+  expect(await breaker.shouldAllow()).toBe(true);
+  await expect(breaker.record("success")).resolves.toBeUndefined();
+  await expect(breaker.record("failure")).resolves.toBeUndefined();
+  expect(warnings).toHaveLength(1);
+});
+
 import {
   DisabledPiiCircuitBreaker,
   InMemoryPiiCircuitBreaker,

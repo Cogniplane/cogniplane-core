@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "build:bundle": "esbuild src/server.ts src/scripts/migrate.ts --bundle --packages=external --platform=node --format=esm --outdir=bundle --outbase=src --alias:@cogniplane-private/sharepoint-overlay-backend=../../private/sharepoint-overlay-backend/src/index.ts",
+    "build:bundle": "esbuild src/server.ts src/scripts/migrate.ts src/scripts/delete-tenant.ts --bundle --packages=external --platform=node --format=esm --outdir=bundle --outbase=src --alias:@cogniplane-private/sharepoint-overlay-backend=../../private/sharepoint-overlay-backend/src/index.ts",
     "db:migrate": "tsx src/scripts/migrate.ts",
     "db:seed-dev": "tsx src/scripts/seed-dev-data.ts",
+    "tenant:delete": "tsx src/scripts/delete-tenant.ts",
     "dev": "tsx watch src/server.ts",
     "lint": "eslint src --ext .ts",
     "start": "node dist/server.js",

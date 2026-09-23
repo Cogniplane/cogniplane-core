@@ -23,3 +23,21 @@ it("returns the server's effective Trash retention window", async () => {
 
   expect((await listArchivedSessions()).trashRetentionDays).toBe(7);
 });
+
+it("encodes cursor, literal search and saved IDs and preserves the next cursor", async () => {
+  vi.mocked(request).mockResolvedValue({ sessions: [], nextCursor: "next", trashRetentionDays: 14 });
+  const signal = new AbortController().signal;
+  expect(await listSessions({ cursor: "opaque+/=", search: "100%_ notes & plans", ids: ["old", "pin"], signal }))
+    .toEqual({ sessions: [], nextCursor: "next", trashRetentionDays: 14 });
+  const [path, options] = vi.mocked(request).mock.calls[0];
+  const params = new URL(path, "http://localhost").searchParams;
+  expect(params.get("cursor")).toBe("opaque+/=");
+  expect(params.get("search")).toBe("100%_ notes & plans");
+  expect(params.get("ids")).toBe("old,pin");
+  expect(params.get("limit")).toBe("100");
+  expect(options?.signal).toBe(signal);
+  await listSessions({ personalOnly: true });
+  const pickerParams = new URL(vi.mocked(request).mock.calls[1][0], "http://localhost").searchParams;
+  expect(pickerParams.get("purposes")).toBe("normal");
+  expect(pickerParams.get("personalOnly")).toBe("true");
+});

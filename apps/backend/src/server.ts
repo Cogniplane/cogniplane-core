@@ -21,6 +21,11 @@ async function shutdown(reason: string, exitCode: number, error?: unknown): Prom
     process.exit(exitCode);
   }
   shuttingDown = true;
+  const deadline = setTimeout(() => {
+    app.log.error("Graceful shutdown exceeded 35 seconds");
+    process.exit(1);
+  }, 35_000);
+  deadline.unref();
   if (error) {
     app.log.error({ err: error }, `shutting down: ${reason}`);
   } else {

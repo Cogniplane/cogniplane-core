@@ -5,7 +5,7 @@
 
 import { EventSchemas, EventType, type BaseEvent } from "@ag-ui/client";
 import { firstValueFrom, toArray } from "rxjs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { DeepAgentsAGUIAgent } from "./deep-agents-agui-agent.js";
 import type { AGUIApprovalDecision, AGUITurnBackend } from "./deep-agents-agui-backend.js";
@@ -175,6 +175,100 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
     expect(backend.streamCalls).toBe(2); // resumed
     expect(backend.buildResumeCalls).toBe(1);
     expect(types(events)).toContain(EventType.RUN_FINISHED);
+  });
+
+  it("runs the approval-round keepalive once per round, before each resume", async () => {
+    // The approval loop is unbounded, but the tool-context TTL and the
+    // active-turn staleness window each budget for ONE approval. Without a
+    // keepalive per round, a turn parked on several approvals loses its MCP
+    // tools and is stale-evicted while still running. Ordering matters: the
+    // extension has to land BEFORE the resume, or the resumed pass can dispatch
+    // a tool call against an already-expired context.
+    const backend = new FakeBackend(
+      [[modelText("one")], [modelText("two")], [modelText("done"), modelEnd()]],
+      [
+        [{ interruptId: "int-1", name: "delete_file", args: { path: "/x" } }],
+        [{ interruptId: "int-2", name: "write_artifact", args: { path: "/y" } }],
+        []
+      ]
+    );
+    const order: string[] = [];
+    const agent = new DeepAgentsAGUIAgent({
+      backend,
+      toolContextId: "ctx-1",
+      onApprovalRound: async () => {
+        order.push(`keepalive:${backend.buildResumeCalls}`);
+      }
+    });
+
+    await collectEvents(agent);
+
+    // Two approval rounds, so two keepalives — and each one ran while the
+    // resume count still showed the rounds completed so far.
+    expect(order).toEqual(["keepalive:0", "keepalive:1"]);
+    expect(backend.buildResumeCalls).toBe(2);
+    expect(backend.streamCalls).toBe(3);
+  });
+
+  it("does not run the keepalive on a turn with no approvals", async () => {
+    // A turn that never pauses must not touch the TTL: extending on every turn
+    // would make the context TTL meaningless for abandoned rows.
+    const backend = new FakeBackend([[modelText("hi"), modelEnd()]]);
+    let calls = 0;
+    const agent = new DeepAgentsAGUIAgent({
+      backend,
+      toolContextId: "ctx-1",
+      onApprovalRound: async () => {
+        calls += 1;
+      }
+    });
+
+    await collectEvents(agent);
+
+    expect(calls).toBe(0);
+  });
+
+  it("does not run the keepalive when approval resolution aborts the turn", async () => {
+    const backend = new FakeBackend(
+      [[modelText("one")], [modelText("done"), modelEnd()]],
+      [[{ interruptId: "int-1", name: "delete_file", args: {} }], []]
+    );
+    const abortController = new AbortController();
+    const originalAwaitDecisions = backend.awaitDecisions.bind(backend);
+    vi.spyOn(backend, "awaitDecisions").mockImplementation(async (actions, emit) => {
+      const decisions = await originalAwaitDecisions(actions, emit);
+      abortController.abort();
+      return decisions;
+    });
+    let calls = 0;
+    const agent = new DeepAgentsAGUIAgent({
+      backend,
+      toolContextId: "ctx-1",
+      approvalAbortSignal: abortController.signal,
+      onApprovalRound: async () => {
+        calls += 1;
+      }
+    });
+
+    await collectEvents(agent);
+
+    expect(calls).toBe(0);
+    expect(backend.buildResumeCalls).toBe(1);
+  });
+
+  it("completes the turn when no keepalive is wired", async () => {
+    // The callback is optional (unit tests, minimal wiring). Its absence must
+    // degrade the TTL guarantee, not break the turn.
+    const backend = new FakeBackend(
+      [[modelText("one")], [modelText("done"), modelEnd()]],
+      [[{ interruptId: "int-1", name: "delete_file", args: {} }], []]
+    );
+    const agent = new DeepAgentsAGUIAgent({ backend, toolContextId: "ctx-1" });
+
+    const events = await collectEvents(agent);
+
+    expect(types(events)).toContain(EventType.RUN_FINISHED);
+    expect(backend.buildResumeCalls).toBe(1);
   });
 
   // Invariant 2 (structural) — the driver reaches the graph ONLY through the

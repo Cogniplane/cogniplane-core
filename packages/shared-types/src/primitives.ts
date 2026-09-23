@@ -125,3 +125,5 @@ export const EFFORT_LEVELS = [
   "max"
 ] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+export const DEVELOPER_INSTRUCTIONS_MAX_LENGTH = 4000;

@@ -120,6 +120,9 @@ export async function registerAdminMcpServerRoutes(
         serverId: body.serverId,
         description: body.description ?? null,
         upstreamUrl: body.upstreamUrl ?? null,
+        upstreamAuthType: body.upstreamAuthType,
+        upstreamAuthName: body.upstreamAuthName ?? null,
+        upstreamAuthSecret: body.upstreamAuthSecret ?? null,
         actorUserId: request.auth.userId
       });
       return await finalizeMutation(reply, {
@@ -161,7 +164,10 @@ export async function registerAdminMcpServerRoutes(
         transportKind: body.transportKind,
         mode: body.mode,
         routePath: body.routePath,
-        upstreamUrl: body.upstreamUrl ?? null,
+        upstreamUrl: body.upstreamUrl,
+        upstreamAuthType: body.upstreamAuthType,
+        upstreamAuthName: body.upstreamAuthName,
+        upstreamAuthSecret: body.upstreamAuthSecret,
         enabled: body.enabled
       });
       return await finalizeMutation(reply, {

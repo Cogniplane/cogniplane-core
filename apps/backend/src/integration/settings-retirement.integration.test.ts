@@ -20,16 +20,17 @@ describe.skipIf(!adminDatabaseUrl())("settings schema retirement", () => {
       const updated = await settings.upsert(tenant.tenantId, { developerInstructions: "Second" });
       expect(updated.developerInstructions).toBe("Second");
 
-      const servers = new McpServerStore(appPool());
+      const servers = new McpServerStore(appPool(), "integration-encryption-secret-value");
       const input = {
         serverId: "retirement-example", serverName: "Example", description: null,
         transportKind: "http" as const, mode: "proxy" as const,
         routePath: "/mcp/retirement-example", upstreamUrl: "https://example.com/mcp",
-        configHash: "first", enabled: false, createdBy: tenant.userId
+        upstreamAuthType: "none" as const, upstreamAuthName: null, upstreamAuthSecret: null,
+        enabled: false, createdBy: tenant.userId
       };
       await servers.createMcpServer(tenant.tenantId, input);
       const server = await servers.updateMcpServer(tenant.tenantId, {
-        ...input, serverName: "Renamed", configHash: "second"
+        ...input, serverName: "Renamed"
       });
       expect(server?.serverName).toBe("Renamed");
     } finally {

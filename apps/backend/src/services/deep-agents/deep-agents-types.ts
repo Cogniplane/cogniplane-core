@@ -180,6 +180,10 @@ export type DeepAgentsRuntimeFactory = (init: {
   workspacePath: string;
   /** E2B wiring for the lazy code-execution sandbox; null disables execute. */
   e2b: DeepAgentsE2bOptions | null;
+  sandboxBinding?: {
+    load: () => Promise<string | null>;
+    save: (previousId: string | null, sandboxId: string) => Promise<void>;
+  };
   /**
    * Called when a gone sandbox was transparently replaced — every file the
    * agent wrote and every synced artifact is gone at that point. The adapter

@@ -64,6 +64,10 @@ export type E2bDeepAgentsSandboxOptions = {
    * a runtime notice on the active turn.
    */
   onSandboxRecreated?: (info: { previousSandboxId: string | null }) => void;
+  sandboxBinding?: {
+    load: () => Promise<string | null>;
+    save: (previousId: string | null, sandboxId: string) => Promise<void>;
+  };
   /** Test-only injection of the (dynamically imported) Sandbox class. */
   loadSandboxClass?: typeof loadE2bSandboxClass;
 };
@@ -71,6 +75,7 @@ export type E2bDeepAgentsSandboxOptions = {
 export class E2bDeepAgentsSandbox extends BaseSandbox {
   private sandboxPromise: Promise<E2bSandboxLike> | null = null;
   private sandboxId: string | null = null;
+  private failedSandboxId: string | null = null;
   private killed = false;
 
   constructor(private readonly options: E2bDeepAgentsSandboxOptions) {
@@ -112,6 +117,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     // the error instead of replaying this command.
     retryOnSandboxGone = true
   ): Promise<T> {
+    await this.reconcileSandbox();
     // Capture the promise this call is bound to, so a concurrent op that
     // already replaced the sandbox is detected below instead of having its
     // replacement discarded.
@@ -145,6 +151,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
           const previousSandboxId = this.sandboxId;
           this.sandboxPromise = null;
           this.sandboxId = null;
+          this.failedSandboxId = previousSandboxId;
           // Fire for BOTH branches: the workspace is equally gone whether or
           // not we replay this particular op — the non-retry branch just
           // declines to re-run a side-effecting command, and the next call gets
@@ -161,6 +168,15 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     }
   }
 
+  private async reconcileSandbox(): Promise<void> {
+    if (!this.options.sandboxBinding || !this.sandboxId) return;
+    const savedId = await this.options.sandboxBinding.load();
+    if (savedId === this.sandboxId) return;
+    this.sandboxPromise = null;
+    this.sandboxId = null;
+    this.failedSandboxId = null;
+  }
+
   /**
    * Lazily create the sandbox on first use and memoize it for the session.
    * A failed creation clears the memo so the next call retries instead of
@@ -173,8 +189,22 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     if (!this.sandboxPromise) {
       const timer = createStageTimer();
       const loader = this.options.loadSandboxClass ?? loadE2bSandboxClass;
-      this.sandboxPromise = (async () => {
+      const pending = (async () => {
         const Sandbox = await loader();
+        const previousId = await this.options.sandboxBinding?.load() ?? null;
+        if (previousId && previousId !== this.failedSandboxId) {
+          try {
+            const existing = await Sandbox.connect(previousId, {
+              apiKey: this.options.apiKey, timeoutMs: this.options.sandboxTimeoutMs
+            });
+            this.sandboxId = existing.sandboxId;
+            this.failedSandboxId = null;
+            return existing;
+          } catch (error) {
+            if (!isSandboxGoneError(error)) throw error;
+            this.notifyRecreated(previousId);
+          }
+        }
         const sandbox = await timer.time("sandboxCreateMs", () =>
           Sandbox.create(this.options.templateId, {
             apiKey: this.options.apiKey,
@@ -187,11 +217,13 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
             }
           })
         );
-        this.sandboxId = sandbox.sandboxId;
         try {
           await sandbox.commands.run(`mkdir -p ${shellQuote(this.options.workspacePath)}`, {
             timeoutMs: 30_000
           });
+          await this.options.sandboxBinding?.save(previousId, sandbox.sandboxId);
+          this.sandboxId = sandbox.sandboxId;
+          this.failedSandboxId = null;
         } catch (err) {
           // The sandbox was created but the workspace prep failed, so it's
           // unusable. Kill it before the .catch below clears the memo — once
@@ -213,10 +245,13 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
         );
         return sandbox;
       })();
-      this.sandboxPromise.catch(() => {
+      this.sandboxPromise = pending;
+      void pending.catch(() => {
         // Retry on next use — see method comment.
-        this.sandboxPromise = null;
-        this.sandboxId = null;
+        if (this.sandboxPromise === pending) {
+          this.sandboxPromise = null;
+          this.sandboxId = null;
+        }
       });
     }
     return this.sandboxPromise;
@@ -459,8 +494,10 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
    * withSandbox recovers on the next op.
    */
   async extendTimeout(): Promise<void> {
-    if (this.killed || !this.sandboxPromise) return;
+    if (this.killed) return;
     try {
+      await this.reconcileSandbox();
+      if (!this.sandboxPromise) return;
       const sandbox = await this.sandboxPromise;
       await sandbox.setTimeout(this.options.sandboxTimeoutMs);
     } catch (err: unknown) {
@@ -475,7 +512,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     this.killed = true;
     const pending = this.sandboxPromise;
     this.sandboxPromise = null;
-    if (!pending) return;
+    if (!pending || this.options.sandboxBinding) return;
     try {
       const sandbox = await pending;
       await sandbox.kill();

@@ -4,6 +4,43 @@ import { test, expect } from "vitest";
 import { SkillMarketplaceService } from "./skill-marketplace-service.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 
+test.each(["http://169.254.169.254/secret", "https://127.0.0.1/secret", "https://user:pass@example.com/secret"])(
+  "marketplace rejects unsafe redirect %s before fetching it", async (location) => {
+    let calls = 0;
+    const service = new SkillMarketplaceService(createTestConfig(), async (_url, init) => {
+      calls += 1;
+      expect(init?.redirect).toBe("manual");
+      expect(init?.signal).toBeDefined();
+      return new Response(null, { status: 302, headers: { location } });
+    });
+    const result = await service.getCatalog({ manifestUrl: "https://example.com/catalog" });
+    expect(result.status).toBe("error");
+    expect(calls).toBe(1);
+  }
+);
+
+test("marketplace strips GitHub credentials on cross-origin redirects", async () => {
+  let calls = 0;
+  const service = new SkillMarketplaceService(createTestConfig(), async (_url, init) => {
+    calls += 1;
+    const headers = init?.headers as Record<string, string>;
+    if (calls === 1) {
+      expect(headers.Authorization).toBe("Bearer secret");
+      return new Response(null, { status: 302, headers: { location: "https://example.com/catalog" } });
+    }
+    expect(headers.Authorization).toBeUndefined();
+    return new Response(JSON.stringify({ version: 1, skills: [] }));
+  });
+  expect((await service.getCatalog({ manifestUrl: "https://api.github.com/catalog", githubToken: "secret" })).status).toBe("ready");
+});
+
+test("marketplace rejects oversized bodies", async () => {
+  const service = new SkillMarketplaceService(createTestConfig(), async () => new Response("x".repeat(1024 * 1024 + 1)));
+  const result = await service.getCatalog({ manifestUrl: "https://example.com/catalog" });
+  expect(result.status).toBe("error");
+  expect(result.error).toContain("1 MiB");
+});
+
 test("skill marketplace service returns disabled when no manifest is configured", async () => {
   const service = new SkillMarketplaceService(
     createTestConfig({ SKILL_MARKETPLACE_MANIFEST_URL: undefined })

@@ -106,7 +106,10 @@ test("getAuthorizationUrl returns valid Notion URL", async () => {
   const store = new InMemoryNotionConnectionStore();
   const service = new NotionConnectionService(config, store);
 
-  const url = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
+  const { url, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1",
+    userId: "user-1"
+  });
   const parsed = new URL(url);
   expect(parsed.hostname).toBe("api.notion.com");
   expect(parsed.pathname).toBe("/v1/oauth/authorize");
@@ -116,17 +119,26 @@ test("getAuthorizationUrl returns valid Notion URL", async () => {
   expect(parsed.searchParams.has("state")).toBeTruthy();
   expect(decodeProtectedHeader(parsed.searchParams.get("state")!).kid).toBe(config.JWT_KEY_ID);
   expect(parsed.searchParams.get("redirect_uri")).toBe("http://localhost:3001/integrations/notion/callback");
+  expect(browserBinding.name).toBe("cogniplane_oauth_bind_notion");
+  expect(browserBinding.options.path).toBe("/integrations/notion/callback");
 });
 
-test("completeAuthorization exchanges code and stores connection", async () => {
+test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeAuthorization stores connection despite %s follow-up failure", async (failure) => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
   const store = new InMemoryNotionConnectionStore();
   const auditEvents = new InMemoryAuditEventStore();
   const runtimeManager = new InMemoryRuntimeManager();
-  const service = new NotionConnectionService(config, store, auditEvents, runtimeManager);
+  if (failure === "audit") auditEvents.create = async () => { throw new Error("audit unavailable"); };
+  if (failure === "audit_sync") auditEvents.create = () => { throw new Error("audit unavailable"); };
+  if (failure === "runtime") runtimeManager.invalidateRuntimesForIntegration = async () => { throw new Error("runtime unavailable"); };
+  if (failure === "runtime_sync") runtimeManager.invalidateRuntimesForIntegration = () => { throw new Error("runtime unavailable"); };
+  const service = new NotionConnectionService(config, store, auditEvents, runtimeManager, undefined, { warn() {} });
 
   // Get a valid state JWT by calling getAuthorizationUrl
-  const authUrl = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
+  const { url: authUrl, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1",
+    userId: "user-1"
+  });
   const validStateJwt = new URL(authUrl).searchParams.get("state")!;
 
   const fake = createFakeFetch((url, init) => {
@@ -166,7 +178,8 @@ test("completeAuthorization exchanges code and stores connection", async () => {
   try {
     const redirectUrl = await service.completeAuthorization({
       code: "test-code",
-      state: validStateJwt
+      state: validStateJwt,
+      browserNonce: browserBinding.value
     });
     expect(redirectUrl).toMatch(/notionAuth=connected/);
     const record = requireValue(store.record, "stored Notion connection");
@@ -176,8 +189,8 @@ test("completeAuthorization exchanges code and stores connection", async () => {
     expect(record.notionOwnerEmail).toBe("test@example.com");
     expect(record.notionOwnerName).toBe("Test User");
     expect(decrypt(record.accessTokenEncrypted, config.DATA_ENCRYPTION_SECRET)).toBe("secret_notion_access_token");
-    expect(auditEvents.events[0]?.type).toBe("user.notion.connected");
-    expect(runtimeManager.invalidations).toEqual([
+    if (!failure.startsWith("audit")) expect(auditEvents.events[0]?.type).toBe("user.notion.connected");
+    if (!failure.startsWith("runtime")) expect(runtimeManager.invalidations).toEqual([
             { tenantId: "tenant-1", userId: "user-1", integrationId: "notion" }
           ]);
   } finally {
@@ -211,9 +224,12 @@ test("completeAuthorization consumes Notion OAuth state before token exchange", 
   });
   const store = new InMemoryNotionConnectionStore();
   const service = new NotionConnectionService(config, store);
-  const state = new URL(
-    await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })
-  ).searchParams.get("state")!;
+  const { url, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1",
+    userId: "user-1"
+  });
+  const state = new URL(url).searchParams.get("state")!;
+  const browserNonce = browserBinding.value;
   let exchangeCalls = 0;
   const fake = createFakeFetch(() => {
     exchangeCalls += 1;
@@ -224,12 +240,42 @@ test("completeAuthorization consumes Notion OAuth state before token exchange", 
   });
 
   try {
-    const first = await service.completeAuthorization({ code: "code-1", state });
-    const replay = await service.completeAuthorization({ code: "code-2", state });
+    const first = await service.completeAuthorization({ code: "code-1", state, browserNonce });
+    const replay = await service.completeAuthorization({ code: "code-2", state, browserNonce });
 
     expect(first).toMatch(/notionAuth=error/);
     expect(replay).toMatch(/reason=invalid_state/);
     expect(exchangeCalls).toBe(1);
+  } finally {
+    fake.restore();
+  }
+});
+
+test("completeAuthorization rejects a state without the matching browser cookie", async () => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
+  const store = new InMemoryNotionConnectionStore();
+  const service = new NotionConnectionService(config, store);
+  const attacker = await service.getAuthorizationUrl({ tenantId: "tenant-a", userId: "attacker" });
+  const victim = await service.getAuthorizationUrl({ tenantId: "tenant-v", userId: "victim" });
+  const state = new URL(attacker.url).searchParams.get("state")!;
+  let exchangeCalls = 0;
+  const fake = createFakeFetch(() => {
+    exchangeCalls += 1;
+    throw new Error("token exchange must not run");
+  });
+
+  try {
+    const noCookie = await service.completeAuthorization({ code: "code", state });
+    const mismatched = await service.completeAuthorization({
+      code: "code",
+      state,
+      browserNonce: victim.browserBinding.value
+    });
+
+    expect(noCookie).toMatch(/reason=invalid_state/);
+    expect(mismatched).toMatch(/reason=invalid_state/);
+    expect(exchangeCalls).toBe(0);
+    expect(store.record).toBe(null);
   } finally {
     fake.restore();
   }
@@ -240,7 +286,10 @@ test("completeAuthorization fails when token endpoint returns error", async () =
   const store = new InMemoryNotionConnectionStore();
   const service = new NotionConnectionService(config, store);
 
-  const authUrl = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
+  const { url: authUrl, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1",
+    userId: "user-1"
+  });
   const validStateJwt = new URL(authUrl).searchParams.get("state")!;
 
   const fake = createFakeFetch(
@@ -254,7 +303,8 @@ test("completeAuthorization fails when token endpoint returns error", async () =
   try {
     const redirectUrl = await service.completeAuthorization({
       code: "test-code",
-      state: validStateJwt
+      state: validStateJwt,
+      browserNonce: browserBinding.value
     });
     expect(redirectUrl).toMatch(/notionAuth=error/);
     expect(redirectUrl).toMatch(/reason=notion_authorization_failed/);

@@ -214,3 +214,33 @@ test("string-typed stream chunks are coerced to bytes", async () => {
   });
   expect(cap.writes[0].data.toString("utf8")).toBe("hello world");
 });
+
+test("aborts a pending object-store read without writing a workspace file", async () => {
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const storage: Pick<ArtifactStorage, "openReadStream"> = {
+    async openReadStream(_key, options) {
+      receivedSignal = options?.signal;
+      return await new Promise((_resolve, reject) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true }
+        );
+      });
+    }
+  };
+  const cap = captureWriter();
+  const syncing = syncArtifactsToWorkspace({
+    sessionId: "s",
+    scopedArtifacts: [makeArtifact()],
+    storage,
+    signal: controller.signal,
+    writeRuntimeFile: cap.writer
+  });
+
+  controller.abort();
+  expect(await syncing).toEqual([]);
+  expect(receivedSignal).toBe(controller.signal);
+  expect(cap.writes).toEqual([]);
+});
