@@ -373,6 +373,12 @@ export async function registerTenantRoutes(
         return { kind: "cannot_remove_owner" as const };
       }
 
+      // Same rule as the role change: an admin who could remove peers could
+      // strip every other admin and entrench themselves as the only one.
+      if (target.rows[0].role === "admin" && request.auth.role !== "owner") {
+        return { kind: "only_owner_can_remove_admin" as const };
+      }
+
       // Disable the removed member's scheduled jobs in the same transaction as
       // the membership delete. Left enabled, they keep firing as synthetic
       // turns under the removed user's identity, using their stored OAuth
@@ -403,6 +409,10 @@ export async function registerTenantRoutes(
 
     if (outcome.kind === "cannot_remove_owner") {
       return reply.code(403).send({ error: "cannot_remove_owner" });
+    }
+
+    if (outcome.kind === "only_owner_can_remove_admin") {
+      return reply.code(403).send({ error: "only_owner_can_remove_admin" });
     }
 
     // Stop live scheduled and interactive turns immediately after the

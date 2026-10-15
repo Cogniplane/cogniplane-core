@@ -9,11 +9,13 @@ import type {
   TenantSettings,
   WebSearchMode
 } from "@cogniplane/shared-types";
+import { ApiError } from "../lib/api-client";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
 export type TenantSettingsInput = {
   expectedVersion: number;
+} & Partial<{
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
@@ -24,7 +26,10 @@ export type TenantSettingsInput = {
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
-};
+  approvedSandboxEgressDomains: string[];
+}>;
+
+export type SaveResult = { ok: true } | { ok: false; status: number | null };
 
 export function useTenantSettings() {
   const queryClient = useQueryClient();
@@ -38,6 +43,7 @@ export function useTenantSettings() {
     mutationFn: updateTenantAgentSettings,
     onSuccess: (updated: TenantSettings) => {
       queryClient.setQueryData(queryKeys.admin.tenantSettings(), updated);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.history() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
       // /models includes showEffortSelector alongside the catalog.
       void queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
@@ -55,12 +61,27 @@ export function useTenantSettings() {
     settings: settingsQuery.data ?? null,
     saving: saveMutation.isPending,
     error: saveError ?? loadError,
+    loadError,
+    saveError,
+    resetSaveError: () => saveMutation.reset(),
     save: async (input: TenantSettingsInput): Promise<boolean> => {
       try {
         await saveMutation.mutateAsync(input);
         return true;
       } catch {
         return false;
+      }
+    },
+    /**
+     * Like save, but a failure carries the HTTP status. 409 means the settings
+     * changed first. Other failures can happen after the change was saved.
+     */
+    saveWithResult: async (input: TenantSettingsInput): Promise<SaveResult> => {
+      try {
+        await saveMutation.mutateAsync(input);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, status: error instanceof ApiError ? error.status : null };
       }
     },
     reload: () =>

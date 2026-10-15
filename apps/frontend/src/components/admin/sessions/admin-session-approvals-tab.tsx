@@ -5,8 +5,10 @@ import { formatTimestamp } from "../../../lib/time-format";
 import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
 function decisionPillClass(status: string, decision: string | null): string {
-  // The canonical signal is `approvals.status` (pending|approved|rejected|expired);
-  // `decision` is the lower-level approve|reject|null. Read status first.
+  // `approvals.status` (pending|approved|rejected|expired) and `decision`
+  // (approve|reject|null) never disagree: ApprovalStore.resolve writes them
+  // together, and expiry only touches pending rows, whose decision is null.
+  // So either field identifies the outcome.
   if (status === "approved" || decision === "approve") return PILL_BLUE;
   if (status === "rejected" || decision === "reject") return PILL_RED;
   return PILL_GRAY;

@@ -315,6 +315,28 @@ test("completeAuthorization fails when token endpoint returns error", async () =
   }
 });
 
+test("completeAuthorization bounds the token request and handles a non-JSON gateway error", async () => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
+  const store = new InMemoryNotionConnectionStore();
+  const service = new NotionConnectionService(config, store);
+  const { url: authUrl, browserBinding } = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" });
+  const state = new URL(authUrl).searchParams.get("state")!;
+  let signal: AbortSignal | null | undefined;
+  const fake = createFakeFetch((_url, init) => {
+    signal = init?.signal;
+    return new Response("<html>502 Bad Gateway</html>", { status: 502 });
+  });
+
+  try {
+    const redirectUrl = await service.completeAuthorization({ code: "test-code", state, browserNonce: browserBinding.value });
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(redirectUrl).toMatch(/reason=notion_authorization_failed/);
+    expect(store.record).toBe(null);
+  } finally {
+    fake.restore();
+  }
+});
+
 test("disconnect removes record and emits audit event", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
   const store = new InMemoryNotionConnectionStore();
@@ -415,6 +437,29 @@ test("getRuntimeCredentials returns decrypted token and marks token used", async
   expect(creds.workspaceId).toBe("ws-xyz");
   expect(creds.token).toBe("secret_notion_access_token");
   expect(store.markUsedCount).toBe(1);
+});
+
+test("the Notion account is the user and workspace, and credentials refuse another one", async () => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
+  const store = new InMemoryNotionConnectionStore();
+  const service = new NotionConnectionService(config, store);
+  expect(await service.connectedAccountId("tenant-1", "user-1")).toBeNull();
+  store.record = {
+    tenantId: "tenant-1", userId: "user-1", notionUserId: "notion-user-1", notionWorkspaceId: "ws-new",
+    notionWorkspaceName: "New", notionWorkspaceIcon: null, notionBotId: null, notionOwnerEmail: null,
+    notionOwnerName: null, tokenType: "bearer", grantedScopes: [],
+    accessTokenEncrypted: encrypt("secret_notion_access_token", config.DATA_ENCRYPTION_SECRET),
+    accessTokenExpiresAt: null, refreshTokenEncrypted: null, refreshTokenExpiresAt: null,
+    tokenLastRefreshedAt: null, tokenLastUsedAt: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+  };
+
+  expect(await service.connectedAccountId("tenant-1", "user-1")).toBe("notion-user-1:ws-new");
+  // The same Notion user in another workspace is another account.
+  await expect(service.getRuntimeCredentials("tenant-1", "user-1", "notion-user-1:ws-old"))
+    .rejects.toThrow("Notion account changed");
+  expect(store.markUsedCount).toBe(0);
+  await expect(service.getRuntimeCredentials("tenant-1", "user-1", "notion-user-1:ws-new"))
+    .resolves.toMatchObject({ token: "secret_notion_access_token" });
 });
 
 test("getRuntimeCredentials returns null when access token has expired", async () => {

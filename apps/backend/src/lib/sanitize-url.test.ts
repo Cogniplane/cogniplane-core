@@ -40,3 +40,13 @@ test("sanitizeUrl: bare key without '=' is preserved (and redacted if sensitive)
   expect(sanitizeUrl("/foo?orphan")).toBe("/foo?orphan");
   expect(sanitizeUrl("/foo?token")).toBe("/foo?token=REDACTED");
 });
+
+test("sanitizeUrl: redacts the credential names that MCP URL validation refuses", () => {
+  expect(sanitizeUrl("/foo?key=a&X-Api-Key=b&signature=c&cursor=keep")).toBe(
+    "/foo?key=REDACTED&X-Api-Key=REDACTED&signature=REDACTED&cursor=keep"
+  );
+});
+
+test("sanitizeUrl: redacts a percent-encoded credential name", () => {
+  expect(sanitizeUrl("/foo?api%2Dkey=opaque-secret&page=2")).toBe("/foo?api%2Dkey=REDACTED&page=2");
+});

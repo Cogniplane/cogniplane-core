@@ -6,65 +6,10 @@ import { createArtifactStorage } from "../services/artifacts/artifact-storage.js
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
 import { createSkillBundleStorage } from "../services/skills/skill-bundle-storage.js";
 import { TenantDeletionService } from "../services/tenant-deletion-service.js";
-
-type Arguments = {
-  tenantId: string;
-  confirm: string;
-  requestId: string;
-  thirdPartyDisposition: string;
-  backupDisposition: string;
-  maintenanceConfirmed: boolean;
-};
-
-function usage(): never {
-  throw new Error(
-    "Usage: delete-tenant --tenant-id <id> --confirm <same-id> --request-id <ticket> " +
-      "--third-party-disposition <text> --backup-disposition <text> --maintenance-confirmed"
-  );
-}
-
-function parseArguments(argv: string[]): Arguments {
-  const values = new Map<string, string>();
-  let maintenanceConfirmed = false;
-  for (let index = 0; index < argv.length; index += 1) {
-    const flag = argv[index];
-    if (flag === "--maintenance-confirmed") {
-      maintenanceConfirmed = true;
-      continue;
-    }
-    if (!flag?.startsWith("--")) usage();
-    const value = argv[index + 1];
-    if (!value || value.startsWith("--")) usage();
-    values.set(flag, value);
-    index += 1;
-  }
-
-  const tenantId = values.get("--tenant-id");
-  const confirm = values.get("--confirm");
-  const requestId = values.get("--request-id");
-  const thirdPartyDisposition = values.get("--third-party-disposition");
-  const backupDisposition = values.get("--backup-disposition");
-  if (!tenantId || !confirm || !requestId || !thirdPartyDisposition || !backupDisposition) usage();
-  return {
-    tenantId,
-    confirm,
-    requestId,
-    thirdPartyDisposition,
-    backupDisposition,
-    maintenanceConfirmed
-  };
-}
+import { parseDeleteTenantArguments } from "./delete-tenant-lib.js";
 
 async function run(): Promise<void> {
-  const args = parseArguments(process.argv.slice(2));
-  if (args.confirm !== args.tenantId) {
-    throw new Error("--confirm must exactly match --tenant-id.");
-  }
-  if (!args.maintenanceConfirmed) {
-    throw new Error(
-      "--maintenance-confirmed is required after the backend has stopped gracefully and database writes are quiesced."
-    );
-  }
+  const args = parseDeleteTenantArguments(process.argv.slice(2));
 
   const databaseUrl = process.env.MIGRATION_DATABASE_URL;
   if (!databaseUrl) {

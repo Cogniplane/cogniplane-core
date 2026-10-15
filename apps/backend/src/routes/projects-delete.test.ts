@@ -29,3 +29,31 @@ test("does not expose whole-project deletion", async () => {
   expect(response.statusCode).toBe(404);
   await h.app.close();
 });
+
+test("reads project artifacts without loading sessions or activity", async () => {
+  const h = await makeApp();
+  const getReadable = vi.fn(async () => ({ projectId: PROJECT_ID }));
+  const listByProject = vi.fn(async () => []);
+  const listPage = vi.fn();
+  const listProjectActivity = vi.fn();
+  h.stores.projects.getReadable = getReadable as never;
+  h.stores.artifacts = { listByProject } as never;
+  h.stores.sessions = { listPage } as never;
+  h.stores.auditEvents = { listProjectActivity } as never;
+
+  const response = await h.app.inject({ method: "GET", url: `/projects/${PROJECT_ID}/artifacts` });
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual({ artifacts: [] });
+  expect(listByProject).toHaveBeenCalledWith(TENANT_ID, USER_ID, PROJECT_ID);
+  expect(listPage).not.toHaveBeenCalled();
+  expect(listProjectActivity).not.toHaveBeenCalled();
+  await h.app.close();
+});
+
+test("does not expose artifacts of an unreadable project", async () => {
+  const h = await makeApp();
+  h.stores.projects.getReadable = vi.fn(async () => null) as never;
+  const response = await h.app.inject({ method: "GET", url: `/projects/${PROJECT_ID}/artifacts` });
+  expect(response.statusCode).toBe(404);
+  await h.app.close();
+});

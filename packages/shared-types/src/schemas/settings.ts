@@ -136,6 +136,17 @@ export const ScheduledJobRequestSchema = z.object({
 });
 export type ScheduledJobRequest = z.input<typeof ScheduledJobRequestSchema>;
 
+export const ScheduledJobPreviewRequestSchema = z.object({
+  cronExpression: z.string().trim().min(1).max(120),
+  timeZone: z.string().trim().min(1).max(100)
+}).strict();
+export type ScheduledJobPreviewRequest = z.infer<typeof ScheduledJobPreviewRequestSchema>;
+
+export const ScheduledJobPreviewResponseSchema = z.object({
+  nextRunAt: IsoDateSchema.nullable()
+});
+export type ScheduledJobPreviewResponse = z.infer<typeof ScheduledJobPreviewResponseSchema>;
+
 export const ScheduledJobsListResponseSchema = z.object({
   scheduledJobs: z.array(ScheduledJobSchema)
 }).passthrough();

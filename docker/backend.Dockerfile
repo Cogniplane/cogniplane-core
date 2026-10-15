@@ -20,10 +20,15 @@ COPY packages/shared-types packages/shared-types
 # The bracket-pattern silently no-ops on the public tree.
 COPY privat[e] private/
 
+COPY patches patches
+
 RUN pnpm install --frozen-lockfile
 
 COPY apps/backend apps/backend
+# Legacy deploy checks workspace patches against production dependencies.
+# OpenNext is a frontend build dependency and is absent from the backend image.
 RUN pnpm --filter @cogniplane/backend build:bundle \
+  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); delete pkg.pnpm.patchedDependencies["@opennextjs/cloudflare@1.20.9"]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
   && pnpm --filter @cogniplane/backend deploy --prod --no-optional --legacy /opt/backend
 
 FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS runtime
@@ -47,7 +52,9 @@ COPY --from=builder /workspace/apps/backend/bundle apps/backend/dist
 COPY --from=builder /workspace/apps/backend/db apps/backend/db
 COPY docker/backend-entrypoint.sh /usr/local/bin/backend-entrypoint.sh
 
+# A new named volume copies this directory's owner, so appuser can write to it.
 RUN groupadd -g 1001 appgroup && useradd -u 1001 -g appgroup -m -s /bin/sh appuser \
+  && install -d -o appuser -g appgroup /var/lib/cogniplane \
   && chmod +x /usr/local/bin/backend-entrypoint.sh
 
 USER appuser

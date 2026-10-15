@@ -7,6 +7,7 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { messageIdParams } from "../lib/route-schemas.js";
 import { withTenantScope } from "../lib/db.js";
 import { withAdmin } from "./admin/admin-route-helpers.js";
+import type { MessageStore } from "../services/message-store.js";
 
 const feedbackBodySchema = z.object({
   rating: z.enum(["thumbs_up", "thumbs_down"]),
@@ -42,13 +43,15 @@ export type MessageFeedbackStats = {
   byModel: Array<{ modelName: string } & FeedbackSummary>;
 };
 
-export function buildMessageFeedbackRouteStores(deps: AppDependencies) {
+export type MessageFeedbackRouteStores = {
+  messages: Pick<MessageStore, "updateFeedback">;
+};
+
+export function buildMessageFeedbackRouteStores(deps: AppDependencies): MessageFeedbackRouteStores {
   return {
     messages: deps.messages
   };
 }
-
-export type MessageFeedbackRouteStores = ReturnType<typeof buildMessageFeedbackRouteStores>;
 
 export async function registerMessageFeedbackRoutes(
   app: FastifyInstance,
@@ -114,7 +117,8 @@ export async function registerMessageFeedbackRoutes(
           client.query(
             `
               SELECT
-                DATE(feedback_given_at AT TIME ZONE 'UTC') AS date,
+                -- As text: node-postgres turns a DATE into a JS Date at local midnight.
+                DATE(feedback_given_at AT TIME ZONE 'UTC')::text AS date,
                 COUNT(*) FILTER (WHERE feedback_rating = 'thumbs_up')::int   AS thumbs_up,
                 COUNT(*) FILTER (WHERE feedback_rating = 'thumbs_down')::int AS thumbs_down
               FROM messages

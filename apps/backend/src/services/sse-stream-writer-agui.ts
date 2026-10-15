@@ -9,10 +9,12 @@ import { customEvent } from "./deep-agents/agui-events.js";
 // The live turn renders in CopilotKit from the wire. This writer also persists the
 // turn's transcript so a reload renders the same as live: it creates the
 // assistant row, checkpoints the accumulated text at a coarse interval while the
-// turn runs, and at turn end records assistant text + status, reasoning, the plan
-// pane, and every tool call/result — captured off the same event stream via
-// `AguiTurnAccumulator`. It also hands the row id to `runMessageAGUI` so the
-// adapter can attribute token usage and cost to it. `SseWriter` handles
+// turn runs, and asks for plan, tool, and notice progress. `TurnTranscript`
+// (shared with the scheduler) orders and saves that progress, classifies the
+// outcome, and writes the final text, status, reasoning, plan, and tool
+// results. The writer decides when those writes run against the wire. It also
+// hands the row id to `runMessageAGUI` so the adapter can attribute token
+// usage and cost to it. `SseWriter` handles
 // backpressure and disconnects. A disconnect closes only this stream.
 //
 // The mid-turn checkpoints exist for the case no `finally` can cover: a SIGKILL
@@ -35,11 +37,10 @@ import type { ToolExecutionContextStore } from "./auth/tool-execution-context-st
 import type { ProjectRuntimeFileSnapshot } from "./project-file-store.js";
 import { buildArtifactTurnInputs } from "./turn-input-builder.js";
 import { syncArtifactsToWorkspace } from "./artifacts/artifact-workspace-sync.js";
-import { SseWriter, clientSafeFailureMessage, type RawSseResponse } from "./sse-writer.js";
-import { AguiTurnAccumulator, type AccumulatedToolResult } from "./agui-turn-accumulator.js";
-import { AGUI_INTERRUPTED_RESULT, isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
-import { redactSecrets } from "./redact-secrets.js";
+import { SseWriter, type RawSseResponse } from "./sse-writer.js";
+import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { TurnEventLog } from "./turn-event-log.js";
+import { TurnTranscript, classifyTurnFailure, type TurnOutcome } from "./turn-transcript.js";
 
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
 
@@ -60,30 +61,6 @@ const STREAMING_PERSIST_INTERVAL_MS = 3_000;
 // by sweepStaleAssistantMessages while a wedged session is not.
 const CHECKPOINT_DRAIN_DEADLINE_MS = 2_000;
 
-// Tool `textOffset` and reasoning-segment `offset` index into the RAW assistant
-// text, but the persisted content is `redactSecrets(assistantText)` — which can
-// SHORTEN the string when the model's own narration quotes a secret. Left
-// uncorrected, reload slices the redacted (shorter) content at pre-redaction
-// offsets, attaching cards/reasoning at the wrong points. Remap each offset to
-// its position in the redacted text: the redacted prefix length. `redactSecrets`
-// is a whole-string op, so a secret straddling the boundary can't match in the
-// sliced prefix — but such an offset lands mid-secret, and the frontend clamps,
-// so the result stays within `[REDACTED]`. Returns a pass-through remap when
-// redaction changed nothing (the common case: no secret in the narration).
-function makeOffsetRemap(rawText: string): (offset: number) => number {
-  if (redactSecrets(rawText).length === rawText.length) {
-    return (offset) => offset;
-  }
-  const cache = new Map<number, number>();
-  return (offset) => {
-    const cached = cache.get(offset);
-    if (cached !== undefined) return cached;
-    const remapped = redactSecrets(rawText.slice(0, offset)).length;
-    cache.set(offset, remapped);
-    return remapped;
-  };
-}
-
 export type StreamAssistantReplyAGUIInput = {
   eventLog?: TurnEventLog;
   /** Saved user row for a tab that attaches before the row reaches its initial history read. */
@@ -93,12 +70,16 @@ export type StreamAssistantReplyAGUIInput = {
   /** Server turn reservation time, including setup and approval waits. */
   startedAt?: number;
   onTurnCreated?: (turn: { messageId: string; sequence: number }) => void;
-  /** Release admission after graph/persistence finish and before terminal output. */
+  /**
+   * Release admission after graph/persistence finish and before terminal
+   * output. Called at most once. A rejection is logged and does not change
+   * the turn outcome or the terminal event.
+   */
   onTurnSettled?: () => Promise<void>;
   /** Aborted by Stop or shutdown, including while the request prepares the turn. */
   cancelSignal?: AbortSignal;
   reply: FastifyReply;
-  messages: Pick<MessageStore, "create" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices" | "deleteToolResult">;
+  messages: Pick<MessageStore, "create" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices">;
   toolContexts: Pick<ToolExecutionContextStore, "create">;
   runtimeAdapter: {
     createSession(input: {
@@ -173,6 +154,18 @@ function aguiFrame(event: BaseEvent | { type: string; message: string }): string
   return `data: ${JSON.stringify(event)}\n\n`;
 }
 
+// Terminal event for an outcome the writer reports itself: a thrown turn, or a
+// final text/status write that failed after the runtime finished.
+function terminalEventFor(outcome: TurnOutcome, threadId: string, runId: string): BaseEvent {
+  if (outcome.status === "error") return { type: EventType.RUN_ERROR, message: outcome.message } as BaseEvent;
+  return {
+    type: EventType.RUN_FINISHED,
+    threadId,
+    runId,
+    ...(outcome.status === "interrupted" ? { result: AGUI_INTERRUPTED_RESULT } : {})
+  } as BaseEvent;
+}
+
 export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIInput): Promise<void> {
   const startedAt = input.startedAt ?? Date.now();
   let durationMs: number | undefined;
@@ -222,77 +215,9 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       if (timer) clearTimeout(timer);
     }
   };
-  // Captures assistant text + reasoning + plan + tool calls/results off the event
-  // stream for end-of-turn persistence (reload parity). `assistantText` remains a
-  // convenience alias read in the catch/failure paths.
-  const turn = new AguiTurnAccumulator();
-  const savedTools = new Map<string, string>();
-  let savedPlan = "";
-  const notices: unknown[] = [];
-  let progressQueue: Promise<void> = Promise.resolve();
-  const persistTool = async (result: AccumulatedToolResult, assistantText = turn.assistantText): Promise<void> => {
-    const stored = {
-      ...result,
-      textOffset: makeOffsetRemap(assistantText)(result.textOffset)
-    };
-    const fingerprint = JSON.stringify(stored);
-    if (savedTools.get(result.toolResultId) === fingerprint) return;
-    await input.messages.upsertToolResult({
-      tenantId: input.tenantId,
-      messageId: assistantMessageId!,
-      sessionId: input.sessionId,
-      userId: input.userId,
-      ...stored
-    });
-    savedTools.set(result.toolResultId, fingerprint);
-  };
-  const queueProgress = (event: BaseEvent): void => {
-    const rowId = assistantMessageId;
-    if (!rowId) return;
-    const plan = event.type === EventType.STATE_DELTA ? turn.planMarkdown : undefined;
-    let toolId: string | undefined;
-    let retractedIds: string[] = [];
-    let noticeSnapshot: unknown[] | undefined;
-    if (event.type === EventType.TOOL_CALL_START || event.type === EventType.TOOL_CALL_END ||
-      event.type === EventType.TOOL_CALL_RESULT) {
-      toolId = (event as { toolCallId?: string }).toolCallId;
-    }
-    if (event.type === EventType.CUSTOM) {
-      const custom = event as { name?: string; value?: Record<string, unknown> };
-      if (["tool_meta", "tool_status", "tool_ui_resources"].includes(custom.name ?? "")) {
-        toolId = typeof custom.value?.toolCallId === "string" ? custom.value.toolCallId : undefined;
-      }
-      if (custom.name === "tool_retracted" && Array.isArray(custom.value?.itemIds)) {
-        retractedIds = custom.value.itemIds.filter((id): id is string => typeof id === "string");
-      }
-      if (custom.name === "runtime_notice" && custom.value) {
-        notices.push(custom.value);
-        if (notices.length > 50) notices.shift();
-        noticeSnapshot = notices.slice();
-      }
-    }
-    const tool = toolId ? turn.toolResults().find((item) => item.toolResultId === toolId) : undefined;
-    if (plan === undefined && retractedIds.length === 0 && !noticeSnapshot && !tool) return;
-    const assistantText = turn.assistantText;
-    progressQueue = progressQueue.then(async () => {
-      try {
-        if (plan !== undefined && plan !== savedPlan) {
-          await input.messages.updateStreamingContent(input.tenantId, rowId, input.userId, { planContent: plan });
-          savedPlan = plan;
-        }
-        for (const id of retractedIds) {
-          await input.messages.deleteToolResult(input.tenantId, rowId, input.userId, id);
-          savedTools.delete(id);
-        }
-        if (noticeSnapshot) {
-          await input.messages.setRuntimeNotices(input.tenantId, rowId, input.userId, noticeSnapshot);
-        }
-        if (tool) await persistTool(tool, assistantText);
-      } catch (err) {
-        input.logger?.warn({ err, sessionId: input.sessionId }, "failed to save AG-UI turn progress");
-      }
-    });
-  };
+  // Created with the assistant row. It captures text, reasoning, plan, tool
+  // calls/results, and notices off the event stream and writes the final row.
+  let transcript: TurnTranscript | null = null;
   // AG-UI permits RUN_ERROR as the first event, but no event may follow it. Keep
   // the pending custom events at function scope so setup failures can emit
   // turn identity and any PII replacement before the terminal error.
@@ -308,6 +233,21 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
           scanRunId: input.userMessageReplacement.scanRunId ?? null
       })
     : undefined;
+  // Settlement is cleanup, not part of the turn: its failure must not replace
+  // a saved outcome, and it must not stop the terminal event.
+  let settleStarted = false;
+  const settleTurn = async (): Promise<void> => {
+    if (settleStarted) return;
+    settleStarted = true;
+    try {
+      await input.onTurnSettled?.();
+    } catch (err) {
+      input.logger?.error(
+        { err, sessionId: input.sessionId, tenantId: input.tenantId },
+        "failed to settle the AG-UI turn"
+      );
+    }
+  };
   const writePendingTurnEvents = async (): Promise<void> => {
     if (!userMessageEvent && !userMessageReplacementEvent && !turnStartedEvent) return;
     if (!runStartedWritten) {
@@ -347,6 +287,15 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       detail: { projectInstructions: input.projectInstructions ?? null }
     });
     assistantMessageId = assistant.messageId;
+    const turn = new TurnTranscript({
+      messages: input.messages,
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      userId: input.userId,
+      messageId: assistant.messageId,
+      logger: input.logger
+    });
+    transcript = turn;
     const identity = { messageId: assistant.messageId, sequence: assistant.id };
     input.onTurnCreated?.(identity);
     turnStartedEvent = customEvent("turn_started", identity);
@@ -377,6 +326,8 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
           }
         } : {}),
         runtimePolicy: session.runtimePolicy,
+        ...(session.mcpServerSources ? { mcpServerSources: session.mcpServerSources } : {}),
+        ...(session.integrationAccounts ? { integrationAccounts: session.integrationAccounts } : {}),
         ...(input.turnContext ? { turnContext: input.turnContext } : {})
       },
       ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000
@@ -429,9 +380,8 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
         : undefined;
 
     // The turn continues after the client closes its connection. The adapter
-    // reports a graph failure with RUN_ERROR, so read the final status from events.
-    let finalStatus: "completed" | "interrupted" | "error" = "completed";
-    let errorMessage = "The assistant run failed.";
+    // reports a graph failure with RUN_ERROR; `turn` reads the final status from
+    // the events.
 
     // Mid-turn checkpoint of the accumulated text. Driven by a TIMER, not by the
     // event loop, and that is the point: it must keep running through a stretch
@@ -490,27 +440,10 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
           return turnState.userInputs;
         }
       })) {
-        // Capture every event for end-of-turn persistence (text, reasoning,
-        // plan, tool calls/results, and text/tool retractions are all handled
-        // inside the accumulator). Lifecycle/error events below only affect the
-        // row's terminal status.
-        turn.apply(event);
-        if (event.type === EventType.STATE_DELTA || event.type === EventType.TOOL_CALL_START ||
-          event.type === EventType.TOOL_CALL_END || event.type === EventType.TOOL_CALL_RESULT ||
-          event.type === EventType.CUSTOM) {
-          queueProgress(event);
-        }
-        if (isAGUIInterruptedFinish(event)) {
-          // Turn-abort marker carried on RUN_FINISHED.result — see
-          // AGUI_INTERRUPTED_RESULT for why this is a private field and not
-          // the AG-UI-native `outcome:{type:"interrupt"}`.
-          finalStatus = "interrupted";
-        } else if (event.type === EventType.RUN_ERROR) {
-          // Provider/tool failure surfaced as an event (not a throw); mark the
-          // row failed so refreshed history reflects it.
-          finalStatus = "error";
-          errorMessage = (event as { message?: string }).message ?? errorMessage;
-        }
+        // Capture every event for end-of-turn persistence and outcome
+        // classification, and queue the mid-turn progress write that the
+        // event causes.
+        turn.apply(event, { saveProgress: true });
         // RUN_ERROR is terminal in AG-UI. If the adapter failed before its
         // RUN_STARTED event, emit a synthetic start and pending custom events
         // first so the client receives the turn identity and any PII correction.
@@ -521,6 +454,11 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
           finishTiming();
           terminalEvent = event;
           continue;
+        }
+        if (event.type === EventType.CUSTOM && (event as { name?: string }).name === "tool_mcp_app") {
+          await turn.settleProgress();
+          const toolCallId = (event as { value?: { toolCallId?: string } }).value?.toolCallId;
+          if (!toolCallId || !turn.hasSavedAppCall(toolCallId)) continue;
         }
         await writeEvent(event);
         if (event.type === EventType.RUN_STARTED) {
@@ -533,41 +471,23 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       await settleCheckpoints();
     }
 
-    await progressQueue;
-
     finishTiming();
 
-    // Persist the final assistant text + status. Token usage + cost are written
-    // separately by the adapter (keyed on assistantMessageId) — different
-    // columns, so write order doesn't matter. On error, fall back to the failure
-    // message when no partial text streamed.
-    await input.messages.updateContent(
-      input.tenantId,
-      assistantMessageId,
-      input.userId,
-      finalStatus,
-      finalStatus === "error" ? turn.assistantText || errorMessage : turn.assistantText,
-      durationMs
-    );
-
-    // Persist the rich transcript parts so a reload renders like the live turn.
-    // Best-effort: a failure here must not fail the request or mask the text/
-    // status write above (which is what the context meter depends on).
-    try {
-      await persistTurnTranscript(input, assistantMessageId, turn, persistTool, savedPlan);
-    } catch (persistError) {
-      input.logger?.warn(
-        { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId },
-        "failed to persist AG-UI turn transcript (reasoning/plan/tool results)"
-      );
-    }
+    // Final text + status, then the rich transcript. Token usage + cost are
+    // written separately by the adapter (keyed on assistantMessageId).
+    const finalized = await turn.finalize(undefined, durationMs);
     // The client refreshes history on termination, so commit the row first.
-    await input.onTurnSettled?.();
-    if (terminalEvent) await writeEvent(terminalEvent);
+    await settleTurn();
+    if (finalized.persisted) {
+      if (terminalEvent) await writeEvent(terminalEvent);
+    } else {
+      // The saved row does not show this outcome; do not report success.
+      await writePendingTurnEvents();
+      await writeEvent(terminalEventFor(finalized.outcome, input.sessionId, assistantMessageId));
+    }
   } catch (error) {
     finishTiming();
     await settleCheckpoints();
-    await progressQueue;
     const cancelled = input.cancelSignal?.aborted === true;
     if (!cancelled) {
       input.logger?.error(
@@ -575,39 +495,21 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
         "AG-UI runtime turn failed"
       );
     }
-    // A throw here is pre-stream (session/tool-context setup, or the new
+    // A throw here is usually pre-stream (session/tool-context setup, or the
     // onBeforeTurn artifact machinery) — the graph's own failures surface as a
     // RUN_ERROR event, not a throw. Pass through deliberately-4xx messages
     // (client-safe by convention); collapse internals to a generic message so
     // connection strings / stack detail never reach the client or the row.
-    const failureMessage = clientSafeFailureMessage(error);
+    const failure = classifyTurnFailure(error, cancelled);
     // A setup failure can happen before the runtime yields RUN_STARTED. Flush
     // the pending custom events inside a synthetic run before terminating
     // it with RUN_ERROR. AG-UI rejects CUSTOM after a terminal error.
     await writePendingTurnEvents();
-    // Best-effort: mark the row failed so it doesn't linger as "pending". A
-    // persistence failure here must not mask the socket-closing path.
-    if (assistantMessageId) {
-      try {
-        await input.messages.updateContent(
-          input.tenantId,
-          assistantMessageId,
-          input.userId,
-          cancelled ? "interrupted" : "error",
-          cancelled ? turn.assistantText : turn.assistantText || failureMessage,
-          durationMs
-        );
-      } catch (persistError) {
-        input.logger?.error(
-          { err: persistError, sessionId: input.sessionId, tenantId: input.tenantId },
-          "failed to persist AG-UI turn failure"
-        );
-      }
-    }
-    await input.onTurnSettled?.();
-    await writeEvent(cancelled
-      ? { type: EventType.RUN_FINISHED, threadId: input.sessionId, runId: assistantMessageId ?? uuidv7(), result: AGUI_INTERRUPTED_RESULT } as BaseEvent
-      : { type: EventType.RUN_ERROR, message: failureMessage } as BaseEvent);
+    // Save the failure with any partial text, reasoning, plan, and tools. This
+    // never throws, and it keeps an earlier final write when one already ran.
+    await transcript?.finalize(failure, durationMs);
+    await settleTurn();
+    await writeEvent(terminalEventFor(failure, input.sessionId, assistantMessageId ?? uuidv7()));
   } finally {
     clearInterval(heartbeat);
     // Backstop for every path that did not reach the streaming block's own drain
@@ -618,42 +520,5 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
     // drain at the last exit cannot be defeated by moving it.
     await settleCheckpoints();
     writer.end();
-  }
-}
-
-// Persist the turn's reasoning, plan markdown, and tool results onto the
-// assistant row so a reload can rehydrate the full transcript (the frontend's
-// toAguiInitialMessages / planStateFromMessages read exactly these fields). Only
-// writes what the turn actually produced — a chat-only turn touches nothing here.
-async function persistTurnTranscript(
-  input: StreamAssistantReplyAGUIInput,
-  assistantMessageId: string,
-  turn: AguiTurnAccumulator,
-  persistTool: (result: AccumulatedToolResult) => Promise<void>,
-  savedPlan: string
-): Promise<void> {
-  // updateContent persists redactSecrets(assistantText); remap the raw-text
-  // offsets to their redacted positions so reload interleaves against the same
-  // string that was stored. No-op when the narration held no secret.
-  const remapOffset = makeOffsetRemap(turn.assistantText);
-
-  const reasoningContent = turn.reasoningText.trim();
-  const reasoningSegments = turn
-    .reasoningSegments()
-    .map((segment) => ({ ...segment, offset: remapOffset(segment.offset) }));
-  const planContent = turn.planMarkdown.trim();
-  if (reasoningContent || reasoningSegments.length > 0 || planContent !== savedPlan) {
-    await input.messages.updateStreamingContent(input.tenantId, assistantMessageId, input.userId, {
-      // reasoning_content is the single-block fallback; reasoning_segments carries
-      // the positioned bursts for interleaved reload. Persist both so a client
-      // that ignores segments still shows the reasoning.
-      ...(reasoningContent ? { reasoningContent } : {}),
-      ...(reasoningSegments.length > 0 ? { reasoningSegments } : {}),
-      ...(planContent !== savedPlan ? { planContent } : {})
-    });
-  }
-
-  for (const result of turn.toolResults()) {
-    await persistTool(result.status === "in_progress" ? { ...result, status: "failed" } : result);
   }
 }

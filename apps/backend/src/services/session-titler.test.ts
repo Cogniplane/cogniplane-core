@@ -28,7 +28,7 @@ function mockFetch(responses: Array<{ json: unknown; ok?: boolean }>) {
 }
 
 const CFG = {
-  claudeModel: "claude-haiku-4-5-20251001",
+  claudeModel: "claude-haiku-5-5",
   timeoutMs: 2000
 };
 
@@ -49,42 +49,21 @@ test("generateSessionTitle: deep-agents uses Anthropic and maps usage", async ()
     });
     expect(result).toBeTruthy();
     expect(result!.title).toBe("Debugging React Hooks");
-    expect(result!.modelName).toBe("claude-haiku-4-5-20251001");
+    expect(result!.modelName).toBe("claude-haiku-5-5");
     expect(result!.tokenUsage.inputTokens).toBe(42);
     expect(result!.tokenUsage.cachedInputTokens).toBe(3);
     expect(result!.tokenUsage.outputTokens).toBe(7);
     expect(result!.tokenUsage.totalTokens).toBe(49);
     expect(fake.calls[0]?.url).toBe("https://api.anthropic.com/v1/messages");
     expect((fake.calls[0]?.init.headers as Record<string, string>)["x-api-key"]).toBe("sk-ant-test");
+    const body = JSON.parse(String(fake.calls[0]?.init.body));
+    expect(body.model).toBe("claude-haiku-5-5");
+    // Thinking off, so the 32-token budget goes to the title text.
+    expect(body.thinking).toEqual({ type: "disabled" });
   } finally {
     fake.restore();
   }
 });
-
-test("generateSessionTitle: deep-agents uses Anthropic (Anthropic-only tenants must title)", async () => {
-  const fake = mockFetch([
-    {
-      json: {
-        content: [{ type: "text", text: "Quarterly Sales Analysis" }],
-        usage: { input_tokens: 30, output_tokens: 5 }
-      }
-    }
-  ]);
-  try {
-    const result = await generateSessionTitle({
-      firstMessage: "Analyze the Q3 sales CSV and chart revenue.",
-      keys: { anthropicApiKey: "sk-ant-test" },
-      config: CFG
-    });
-    expect(result).toBeTruthy();
-    expect(result!.title).toBe("Quarterly Sales Analysis");
-    expect(fake.calls[0]?.url).toBe("https://api.anthropic.com/v1/messages");
-  } finally {
-    fake.restore();
-  }
-});
-
-
 
 test("generateSessionTitle: returns null when no Anthropic key", async () => {
   const result = await generateSessionTitle({

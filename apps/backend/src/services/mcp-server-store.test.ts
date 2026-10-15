@@ -8,18 +8,6 @@ import { McpServerStore } from "./mcp-server-store.js";
 
 const ENCRYPTION_SECRET = "test-encryption-secret-must-be-at-least-32chars!";
 
-test("McpServerStore lists one tenant-preferred row per server ID", async () => {
-  const pool = new FakePool().onQuery("FROM admin_mcp_servers", (text) => {
-    expect(text).toContain("SELECT DISTINCT ON (server_id)");
-    expect(text).toContain("(tenant_id = $2::text) DESC");
-    return { rows: [], rowCount: 0 };
-  });
-
-  await expect(
-    new McpServerStore(pool.asPool(), ENCRYPTION_SECRET).listMcpServers("tenant-1")
-  ).resolves.toEqual([]);
-});
-
 test("McpServerStore rejects tenant servers that reuse a system server ID", async () => {
   const pool = new FakePool().onQuery("FROM admin_mcp_servers", () => ({
     rows: [{ exists: 1 }],
@@ -47,6 +35,26 @@ test("McpServerStore rejects tenant servers that reuse a system server ID", asyn
   expect(pool.queries.some((query) => query.text.includes("INSERT INTO admin_mcp_servers"))).toBe(false);
 });
 
+test("McpServerStore refuses an upstream URL in managed mode", async () => {
+  const pool = new FakePool();
+  const store = new McpServerStore(pool.asPool(), ENCRYPTION_SECRET);
+  await expect(store.createMcpServer("system", {
+    serverId: "managed-local",
+    serverName: "Managed local",
+    description: null,
+    transportKind: "http",
+    mode: "managed",
+    routePath: "/mcp/managed-local",
+    upstreamUrl: "http://100.108.24.234:3108/mcp",
+    upstreamAuthType: "none",
+    upstreamAuthName: null,
+    upstreamAuthSecret: null,
+    enabled: true,
+    createdBy: "admin"
+  })).rejects.toThrow("Managed MCP servers cannot configure an upstreamUrl.");
+  expect(pool.queries).toEqual([]);
+});
+
 test("McpServerStore encrypts upstream credentials and never returns them from writes", async () => {
   const now = new Date("2026-09-20T12:00:00.000Z");
   const pool = new FakePool().onQuery("INSERT INTO admin_mcp_servers", (_text, values) => ({
@@ -63,6 +71,8 @@ test("McpServerStore encrypts upstream credentials and never returns them from w
         upstream_auth_type: values[8],
         upstream_auth_name: values[9],
         upstream_auth_secret_encrypted: values[10],
+        credential_scope: values[14],
+        credential_binding_id: values[15],
         version: 1,
         config_hash: values[11],
         enabled: values[12],
@@ -106,7 +116,9 @@ test("McpServerStore encrypts upstream credentials and never returns them from w
       upstreamUrl: "https://vendor.example/mcp",
       upstreamAuthType: "header",
       upstreamAuthName: "X-API-Key",
-      upstreamAuthConfigured: true
+      upstreamAuthConfigured: true,
+      credentialScope: "organization",
+      credentialBindingId: result.credentialBindingId
     })
   );
   expect(result).toMatchObject({
@@ -183,18 +195,25 @@ test.each(["api_key", "x-api-key", "subscription-key", "auth_token"])(
   }
 );
 
-test("McpServerStore hashes resolved update values and stable auth state", async () => {
+test("McpServerStore keeps binding for metadata edits and rotates it for shared-secret replacement", async () => {
   const now = new Date("2026-09-20T12:00:00.000Z");
   const encryptedSecret = encrypt("same-secret", ENCRYPTION_SECRET);
   const existing = {
     upstream_url: "https://vendor.example/mcp",
     upstream_auth_type: "bearer",
     upstream_auth_name: null,
-    upstream_auth_secret_encrypted: encryptedSecret
+    upstream_auth_secret_encrypted: encryptedSecret,
+    credential_scope: "organization",
+    credential_binding_id: "00000000-0000-4000-8000-000000000001"
   };
   const updateHashes: string[] = [];
+  const revoked: unknown[][] = [];
   const pool = new FakePool()
     .onQuery("SELECT upstream_url", () => ({ rows: [existing], rowCount: 1 }))
+    .onQuery("UPDATE member_mcp_credentials", (_text, values) => {
+      revoked.push(values);
+      return { rows: [], rowCount: 1 };
+    })
     .onQuery("UPDATE admin_mcp_servers", (_text, values) => {
       updateHashes.push(String(values[10]));
       return {
@@ -211,6 +230,8 @@ test("McpServerStore hashes resolved update values and stable auth state", async
             upstream_auth_type: values[7],
             upstream_auth_name: values[8],
             upstream_auth_secret_encrypted: values[9],
+            credential_scope: values[13],
+            credential_binding_id: values[14],
             version: 2,
             config_hash: values[10],
             enabled: values[11],
@@ -237,7 +258,7 @@ test("McpServerStore hashes resolved update values and stable auth state", async
   const preserved = await store.updateMcpServer("tenant-1", input);
   const resubmitted = await store.updateMcpServer("tenant-1", {
     ...input,
-    upstreamAuthSecret: "same-secret"
+    upstreamAuthSecret: "replacement-secret"
   });
   const expectedHash = computeConfigHash({
     serverId: "secured-proxy",
@@ -249,10 +270,62 @@ test("McpServerStore hashes resolved update values and stable auth state", async
     upstreamUrl: "https://vendor.example/mcp",
     upstreamAuthType: "bearer",
     upstreamAuthName: null,
-    upstreamAuthConfigured: true
+    upstreamAuthConfigured: true,
+    credentialScope: "organization",
+    credentialBindingId: existing.credential_binding_id
   });
 
   expect(preserved?.configHash).toBe(expectedHash);
-  expect(resubmitted?.configHash).toBe(expectedHash);
-  expect(updateHashes).toEqual([expectedHash, expectedHash]);
+  expect(preserved?.credentialBindingId).toBe(existing.credential_binding_id);
+  expect(resubmitted?.credentialBindingId).not.toBe(existing.credential_binding_id);
+  expect(resubmitted?.configHash).not.toBe(expectedHash);
+  expect(updateHashes).toEqual([expectedHash, resubmitted?.configHash]);
+  // Only the rotation clears member secrets.
+  expect(revoked).toEqual([["tenant-1", "secured-proxy"]]);
+});
+
+test("inherited legacy query auth has a stable binding and hash across tenant reads", async () => {
+  const row = {
+    tenant_id: "system", server_id: "legacy-inherited", server_name: "Legacy inherited",
+    description: null, transport_kind: "http", mode: "proxy", route_path: "/mcp/legacy-inherited",
+    upstream_url: "https://vendor.example/mcp?api_key=legacy-secret", upstream_auth_type: "none",
+    upstream_auth_name: null, upstream_auth_secret_encrypted: null, credential_scope: "organization",
+    credential_binding_id: "00000000-0000-4000-8000-000000000099", version: 1,
+    config_hash: "old", enabled: true, is_published: true, created_by: "admin",
+    created_at: new Date(), updated_at: new Date()
+  };
+  const pool = new FakePool().onQuery("FROM admin_mcp_servers", () => ({ rows: [row], rowCount: 1 }));
+  const store = new McpServerStore(pool.asPool(), ENCRYPTION_SECRET);
+  const first = await store.getAdminMcpServer("tenant-1", "legacy-inherited");
+  const second = await store.getAdminMcpServer("tenant-1", "legacy-inherited");
+  expect(first?.credentialBindingId).toBe(row.credential_binding_id);
+  expect(second?.credentialBindingId).toBe(first?.credentialBindingId);
+  expect(second?.configHash).toBe(first?.configHash);
+  expect(pool.queries.some(query => query.text.includes("UPDATE admin_mcp_servers"))).toBe(false);
+});
+
+test.each([
+  ["a reserved header", "X-Framework-Session", "reserved"],
+  ["invalid characters", "bad header", "invalid characters"]
+])("McpServerStore refuses a partial update that leaves %s on a header server", async (_name, headerName, message) => {
+  const existing = {
+    upstream_url: "https://vendor.example/mcp",
+    upstream_auth_type: "header",
+    upstream_auth_name: "X-Api-Key",
+    upstream_auth_secret_encrypted: encrypt("secret", ENCRYPTION_SECRET),
+    credential_scope: "organization",
+    credential_binding_id: "00000000-0000-4000-8000-000000000001"
+  };
+  let writes = 0;
+  const pool = new FakePool()
+    .onQuery("SELECT upstream_url", () => ({ rows: [existing], rowCount: 1 }))
+    .onQuery("UPDATE admin_mcp_servers", () => { writes += 1; return { rows: [], rowCount: 0 }; });
+  const store = new McpServerStore(pool.asPool(), ENCRYPTION_SECRET);
+
+  // upstreamAuthType is omitted, so the patch alone looks like it has no auth to check.
+  await expect(store.updateMcpServer("tenant-1", {
+    serverId: "header-proxy", serverName: "Header proxy", description: null, transportKind: "http",
+    mode: "proxy", routePath: "/mcp/header", upstreamAuthName: headerName, enabled: true
+  })).rejects.toThrow(message);
+  expect(writes).toBe(0);
 });

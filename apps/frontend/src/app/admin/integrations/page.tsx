@@ -35,10 +35,10 @@ export default function AdminIntegrationsPage() {
   );
 
   return (
-    <>
+    <div className="flex flex-col gap-2 pt-5">
       {flash.error ? <p className="text-sm text-danger">{flash.error}</p> : null}
       {flash.success ? <p className="text-sm text-on-surface-faint">{flash.success}</p> : null}
       <AdminIntegrationsList />
-    </>
+    </div>
   );
 }

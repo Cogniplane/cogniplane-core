@@ -17,7 +17,10 @@ export function ApprovalRowView({
   onDecision: (approvalId: string, decision: ApprovalDecision) => void;
 }) {
   const working = row.decisionState === "approving" || row.decisionState === "rejecting";
-  const [expanded, setExpanded] = useState(false);
+  // A summary of several lines is text that the backend laid out to be read as it is,
+  // for example the exact text of a memory that the user is asked to approve. It opens
+  // in full, so nothing sits below a fold that the user has not opened.
+  const [expanded, setExpanded] = useState(row.summary.includes("\n"));
   // A summary worth expanding is one long enough to be truncated on one line.
   const expandable = row.summary.length > 80;
 
@@ -37,7 +40,7 @@ export function ApprovalRowView({
           <div className="text-[0.64rem] font-extrabold uppercase tracking-[0.14em] text-warning">
             Approval needed · {kindLabel(row.kind)}
           </div>
-          <div className="text-sm font-bold text-on-surface">{row.title}</div>
+          <div className="text-sm font-bold text-on-surface [overflow-wrap:anywhere]">{row.title}</div>
           {row.summary ? (
             expandable ? (
               <button

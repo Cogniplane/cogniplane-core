@@ -118,8 +118,189 @@ test("holds a private-key block across lines until it can be redacted", () => {
   log.append(textEvent("-----END PRIVATE KEY-----"));
   log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
   const replay = JSON.stringify(log.subscribe(0, () => undefined)?.replay);
-  expect(replay).toContain("[REDACTED]");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
   expect(replay).not.toContain("private-bytes");
+});
+
+test("an unclosed key header drops the rest of its message, not the next message", () => {
+  const log = new TurnEventLog();
+  log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+  log.append(textEvent("Look for -----BEGIN RSA PRIVATE KEY----- in your files. "));
+  for (let index = 0; index < 300; index += 1) log.append(textEvent("plenty of ordinary words here ok "));
+  log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "next", role: "assistant" } as BaseEvent);
+  log.append({ type: EventType.TEXT_MESSAGE_CONTENT, messageId: "next", delta: "Next message streams. " } as BaseEvent);
+  log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "next" } as BaseEvent);
+  const replay = JSON.stringify(log.subscribe(0, () => undefined)?.replay);
+  expect(replay).toContain("Look for [REDACTED PRIVATE KEY]");
+  expect(replay).not.toContain("BEGIN RSA PRIVATE KEY");
+  // The held text is dropped, not buffered until the size limit.
+  expect(replay).not.toContain("exceeds live replay limit");
+  expect(replay).toContain("Next message streams.");
+});
+
+const KEY_LINE = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n";
+
+function keyReplay(build: (log: TurnEventLog) => void, contentType = EventType.TEXT_MESSAGE_START): string {
+  const log = new TurnEventLog();
+  log.append({ type: contentType, messageId: "answer", role: "assistant" } as BaseEvent);
+  build(log);
+  return JSON.stringify(log.subscribe(0, () => undefined)?.replay);
+}
+
+test("discards an oversized key block up to its END line, also when END is split", () => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent("Here it is:\n-----BEGIN PRIVATE KEY-----\n"));
+    for (let index = 0; index < 200; index += 1) log.append(textEvent(KEY_LINE));
+    log.append(textEvent("-----END PRIV"));
+    log.append(textEvent("ATE KEY-----\nThat was the key, store it safely please. "));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
+  expect(replay).toContain("That was the key");
+});
+
+test("drops a key block in reasoning text and never flushes it", () => {
+  const replay = keyReplay((log) => {
+    log.append({ type: EventType.REASONING_MESSAGE_CONTENT, messageId: "answer",
+      delta: "Thinking. -----BEGIN RSA PRIVATE KEY-----\n" } as BaseEvent);
+    for (let index = 0; index < 200; index += 1) {
+      log.append({ type: EventType.REASONING_MESSAGE_CONTENT, messageId: "answer", delta: KEY_LINE } as BaseEvent);
+    }
+    log.append({ type: EventType.REASONING_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    log.append({ type: EventType.RUN_FINISHED, threadId: "s", runId: "r" } as BaseEvent);
+  }, EventType.REASONING_MESSAGE_START);
+  expect(replay).toContain("Thinking. [REDACTED PRIVATE KEY]");
+  expect(replay).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw");
+});
+
+test.each([
+  ["two complete keys in one delta",
+    `-----BEGIN PRIVATE KEY-----\n${KEY_LINE}-----END PRIVATE KEY-----\nand -----BEGIN EC PRIVATE KEY-----\n${KEY_LINE}-----END EC PRIVATE KEY-----\nDone now. `],
+  ["a complete key and an unclosed key",
+    `-----BEGIN PRIVATE KEY-----\n${KEY_LINE}-----END PRIVATE KEY-----\nalso -----BEGIN RSA PRIVATE KEY-----\n${KEY_LINE}`],
+  ["an encrypted key with tab headers and spaced body lines",
+    `-----BEGIN RSA PRIVATE KEY-----\nProc-Type:\t4,ENCRYPTED\nDEK-Info: AES-128-CBC,0011\n\nMIIEvQIBADANBgkq hkiG9w0BAQEFAASCBKcw\n${KEY_LINE}`]
+])("never releases key bytes for %s", (_name, text) => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent(text));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+  expect(replay).not.toContain("hkiG9w0BAQEFAASCBKcw");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
+});
+
+test.each([
+  ["the message ends", (log: TurnEventLog) => log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent)],
+  ["the run ends", (log: TurnEventLog) => log.append({ type: EventType.RUN_FINISHED, threadId: "s", runId: "r" } as BaseEvent)]
+])("never flushes an unfinished key block when %s", (_name, end) => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent("-----BEGIN PRIVATE KEY-----\n"));
+    log.append(textEvent(KEY_LINE));
+    end(log);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
+});
+
+test.each([
+  ["text", EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_CONTENT, EventType.TEXT_MESSAGE_END],
+  ["reasoning", EventType.REASONING_MESSAGE_START, EventType.REASONING_MESSAGE_CONTENT, EventType.REASONING_MESSAGE_END]
+])("holds a long BEGIN header split across %s deltas", async (_name, start, content, end) => {
+  const log = new TurnEventLog();
+  const mirrored: string[] = [];
+  log.setMirror(async (entry) => { mirrored.push(JSON.stringify(entry.event)); });
+  log.append({ type: start, messageId: "answer", role: "assistant" } as BaseEvent);
+  const delta = (text: string) => log.append({ type: content, messageId: "answer", delta: text } as BaseEvent);
+  // The label is longer than the eight words that the tail hold keeps.
+  delta("Key: -----BEGIN ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE PRIVATE KEY");
+  delta(`-----\n${KEY_LINE}-----END ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE PRIVATE KEY-----\nAfter the key. `);
+  log.append({ type: end, messageId: "answer" } as BaseEvent);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const replay = JSON.stringify(log.subscribe(0, () => undefined)?.replay);
+  for (const output of [replay, mirrored.join("")]) {
+    expect(output).not.toContain("MIIEvQIBADANBgkq");
+    expect(output).not.toContain("BEGIN ONE TWO");
+  }
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
+  expect(replay).toContain("After the key.");
+});
+
+test.each([
+  ["an END line of another label", "-----END EC PRIVATE KEY-----\n"],
+  ["an END marker inside another line", "Comment: -----END RSA PRIVATE KEY-----\n"],
+  ["an END marker followed by text on its line", "-----END RSA PRIVATE KEY----- trailing\n"]
+])("keeps dropping after %s", (_name, fakeEnd) => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent("-----BEGIN RSA PRIVATE KEY-----\n"));
+    log.append(textEvent(KEY_LINE));
+    log.append(textEvent(fakeEnd));
+    log.append(textEvent("c2Vjb25kLWhhbGYtb2YtdGhlLWtleQ==\n"));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("c2Vjb25kLWhhbGYtb2YtdGhlLWtleQ");
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+});
+
+test.each([
+  ["one delta", ["-----BEGIN PRIVATE KEY----------END PRIVATE KEY-----\nc2VjcmV0LWtleS1ieXRlcw==\n"]],
+  ["split deltas", ["-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----\nc2VjcmV0LWtleS1ieXRlcw==\n"]]
+])("an END marker on the BEGIN line does not end the block (%s)", (_name, deltas) => {
+  for (const end of [EventType.TEXT_MESSAGE_END, EventType.RUN_ERROR]) {
+    const replay = keyReplay((log) => {
+      for (const delta of deltas) log.append(textEvent(delta));
+      log.append(end === EventType.RUN_ERROR
+        ? { type: EventType.RUN_ERROR, message: "failed" } as BaseEvent
+        : { type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    });
+    expect(replay).not.toContain("c2VjcmV0LWtleS1ieXRlcw");
+  }
+});
+
+test("resumes after an END line with a very long label", () => {
+  const label = `${"WORD ".repeat(100)}PRIVATE KEY`;
+  const replay = keyReplay((log) => {
+    log.append(textEvent(`-----BEGIN ${label}-----\n${KEY_LINE}-----END ${label}-----\nSafe after a long label. `));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+  expect(replay).toContain("Safe after a long label.");
+});
+
+test("resumes after a long END line split across deltas", () => {
+  const label = `${"WORD ".repeat(50)}PRIVATE KEY`;
+  const endLine = `-----END ${label}-----\n`;
+  const replay = keyReplay((log) => {
+    log.append(textEvent(`-----BEGIN ${label}-----\n${KEY_LINE}`));
+    log.append(textEvent(endLine.slice(0, 200)));
+    log.append(textEvent(`${endLine.slice(200)}Safe text after the key. `));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+  expect(replay).toContain("Safe text after the key.");
+});
+
+test("treats an overlong header candidate as a key header", () => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent(`-----BEGIN ${"WORD ".repeat(80)}`));
+    log.append(textEvent(`${KEY_LINE}`));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
+});
+
+test("a large delta after a key header neither leaks nor overflows", () => {
+  const replay = keyReplay((log) => {
+    log.append(textEvent("-----BEGIN PRIVATE KEY-----\n"));
+    log.append(textEvent(`${KEY_LINE.repeat(400)}`));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  });
+  expect(replay).not.toContain("exceeds live replay limit");
+  expect(replay).not.toContain("MIIEvQIBADANBgkq");
+  expect(replay).toContain("[REDACTED PRIVATE KEY]");
 });
 
 test("redacts split reasoning and parsed tool arguments", () => {

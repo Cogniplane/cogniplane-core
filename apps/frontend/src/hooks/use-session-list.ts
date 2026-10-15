@@ -17,23 +17,43 @@ import { SESSION_TRASH_RETENTION_DAYS, type Session } from "@cogniplane/shared-t
 import { useSessionPages, updateSessionCaches } from "./use-session-pages";
 import { queryKeys } from "../lib/query-keys";
 
-const SELECTED_SESSION_KEY = "cogniplane:selected-session-id:v1";
-const PINNED_SESSIONS_KEY_PREFIX = "cogniplane:pinned-sessions:v1:";
+// Both keys are scoped to one organization and one user. A person who belongs
+// to several organizations must not see, poll or change another organization's
+// selection or pins.
+const SELECTED_SESSION_KEY_PREFIX = "cogniplane:selected-session-id:v2:";
+const PINNED_SESSIONS_KEY_PREFIX = "cogniplane:pinned-sessions:v2:";
 
-function readPersistedSessionId(): string | null {
+// The v1 keys mixed the ids of all of a person's organizations, so they are
+// removed, not migrated.
+function removeUnscopedKeys(userId: string | undefined): void {
   try {
-    return window.localStorage.getItem(SELECTED_SESSION_KEY);
+    window.localStorage.removeItem("cogniplane:selected-session-id:v1");
+    if (userId) window.localStorage.removeItem(`cogniplane:pinned-sessions:v1:${userId}`);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function storageScope(user: { tenantId: string; userId: string } | null | undefined): string | null {
+  return user ? `${user.tenantId}:${user.userId}` : null;
+}
+
+function readPersistedSessionId(scope: string | null): string | null {
+  if (!scope) return null;
+  try {
+    return window.localStorage.getItem(SELECTED_SESSION_KEY_PREFIX + scope);
   } catch {
     return null;
   }
 }
 
-function persistSelectedSessionId(sessionId: string | null): void {
+function persistSelectedSessionId(scope: string | null, sessionId: string | null): void {
+  if (!scope) return;
   try {
     if (sessionId === null) {
-      window.localStorage.removeItem(SELECTED_SESSION_KEY);
+      window.localStorage.removeItem(SELECTED_SESSION_KEY_PREFIX + scope);
     } else {
-      window.localStorage.setItem(SELECTED_SESSION_KEY, sessionId);
+      window.localStorage.setItem(SELECTED_SESSION_KEY_PREFIX + scope, sessionId);
     }
   } catch {
     // Ignore storage errors
@@ -50,10 +70,10 @@ function syncSessionLink(sessionId: string | null, mode: "push" | "replace" = "r
   else window.history.replaceState(window.history.state, "", url);
 }
 
-function readPinnedSessionIds(userId: string | undefined): Set<string> {
-  if (!userId) return new Set();
+function readPinnedSessionIds(scope: string | null): Set<string> {
+  if (!scope) return new Set();
   try {
-    const raw = window.localStorage.getItem(PINNED_SESSIONS_KEY_PREFIX + userId);
+    const raw = window.localStorage.getItem(PINNED_SESSIONS_KEY_PREFIX + scope);
     if (!raw) return new Set();
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
@@ -64,10 +84,10 @@ function readPinnedSessionIds(userId: string | undefined): Set<string> {
   }
 }
 
-function writePinnedSessionIds(userId: string | undefined, ids: Set<string>): void {
-  if (!userId) return;
+function writePinnedSessionIds(scope: string | null, ids: Set<string>): void {
+  if (!scope) return;
   try {
-    window.localStorage.setItem(PINNED_SESSIONS_KEY_PREFIX + userId, JSON.stringify([...ids]));
+    window.localStorage.setItem(PINNED_SESSIONS_KEY_PREFIX + scope, JSON.stringify([...ids]));
   } catch {
     // Ignore storage errors
   }
@@ -77,11 +97,12 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
   const enabled = input?.enabled ?? true;
   const syncUrl = input?.syncUrl ?? false;
   const { user } = useAuth();
+  const scope = storageScope(user);
   const queryClient = useQueryClient();
 
   const [search, setSearch] = useState("");
   const sessionsQuery = useSessionPages({ enabled, poll: true });
-  const searchQuery = useSessionPages({ search, enabled: enabled && Boolean(search.trim()), poll: true });
+  const searchQuery = useSessionPages({ search, enabled: enabled && Boolean(search.trim()) });
 
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
@@ -126,12 +147,15 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
 
   useEffect(() => {
     // SSR-safe localStorage hydration: lazy init would cause hydration mismatch.
+    // The QueryProvider in lib/auth-context.tsx is keyed by user and tenant, so
+    // a scope change mounts this hook again with fresh selection state.
+    removeUnscopedKeys(user?.userId);
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setPinnedSessionIds(readPinnedSessionIds(user?.userId));
+    setPinnedSessionIds(readPinnedSessionIds(scope));
     const linked = syncUrl && window.location.pathname === "/" ? new URLSearchParams(window.location.search).get("session") : null;
-    setRestoreIds([linked, readPersistedSessionId()].filter((id): id is string => Boolean(id)));
+    setRestoreIds([linked, readPersistedSessionId(scope)].filter((id): id is string => Boolean(id)));
     setHydrated(true);
-  }, [user?.userId, syncUrl]);
+  }, [scope, syncUrl, user?.userId]);
 
   // First-successful-load effect: restore the persisted selection or fall back
   // to the first session. Guarded by a local ref-ish state so we only restore
@@ -152,7 +176,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     if (lookupIds.length > 0 && !lookupQuery.isSuccess) return;
     if (listedSessions.length === 0) {
       setSelectedSessionId(null);
-      persistSelectedSessionId(null);
+      persistSelectedSessionId(scope, null);
       if (syncUrl) syncSessionLink(null);
       setHasRestored(true);
       return;
@@ -160,26 +184,26 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     const linkedId = syncUrl && window.location.pathname === "/"
       ? new URLSearchParams(window.location.search).get("session") : null;
     const persisted = listedSessions.some((session) => session.sessionId === linkedId)
-      ? linkedId : readPersistedSessionId();
+      ? linkedId : readPersistedSessionId(scope);
     const restoredId = listedSessions.find((s) => s.sessionId === persisted)?.sessionId ?? listedSessions[0].sessionId;
     setSelectedSessionId(restoredId);
-    persistSelectedSessionId(restoredId);
+    persistSelectedSessionId(scope, restoredId);
     if (syncUrl) syncSessionLink(restoredId);
     setHasRestored(true);
-  }, [enabled, hasRestored, sessionsQuery.status, listedSessions, syncUrl, hydrated, lookupIds.length, lookupQuery.isSuccess]);
+  }, [enabled, hasRestored, sessionsQuery.status, listedSessions, syncUrl, hydrated, lookupIds.length, lookupQuery.isSuccess, scope]);
 
   useEffect(() => {
     if (!enabled || !syncUrl) return;
     const restoreFromHistory = () => {
       if (window.location.pathname !== "/") return;
       const linkedId = new URLSearchParams(window.location.search).get("session");
-      const sessionId = linkedId ?? readPersistedSessionId();
+      const sessionId = linkedId ?? readPersistedSessionId(scope);
       setRestoreIds(sessionId ? [sessionId] : []);
       setHasRestored(false);
     };
     window.addEventListener("popstate", restoreFromHistory);
     return () => window.removeEventListener("popstate", restoreFromHistory);
-  }, [enabled, syncUrl]);
+  }, [enabled, syncUrl, scope]);
 
   // Surface query errors through the hook's `error` derived during render (no
   // effect/extra state). Polling errors stay hidden — only non-refetch failures
@@ -210,7 +234,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
       } : { pages: [{ sessions: [session], trashRetentionDays: SESSION_TRASH_RETENTION_DAYS }], pageParams: [undefined] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
       setSelectedSessionId(session.sessionId);
-      persistSelectedSessionId(session.sessionId);
+      persistSelectedSessionId(scope, session.sessionId);
       if (syncUrl) syncSessionLink(session.sessionId, "push");
     },
     onError: (err) => setMutationError(err instanceof Error ? err.message : "Failed to create session")
@@ -237,7 +261,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
       if (selectedSessionId === sessionId) {
         const fallbackId = remaining.length > 0 ? remaining[0].sessionId : null;
         setSelectedSessionId(fallbackId);
-        persistSelectedSessionId(fallbackId);
+        persistSelectedSessionId(scope, fallbackId);
         if (syncUrl) syncSessionLink(fallbackId);
       }
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
@@ -249,7 +273,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
         if (!current.has(sessionId)) return current;
         const next = new Set(current);
         next.delete(sessionId);
-        writePinnedSessionIds(user?.userId, next);
+        writePinnedSessionIds(scope, next);
         return next;
       });
     },
@@ -265,7 +289,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
       if (selectedSessionId === sessionId) {
         const fallbackId = remaining[0]?.sessionId ?? null;
         setSelectedSessionId(fallbackId);
-        persistSelectedSessionId(fallbackId);
+        persistSelectedSessionId(scope, fallbackId);
         if (syncUrl) syncSessionLink(fallbackId);
       }
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions.all });
@@ -280,9 +304,9 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
 
   const selectSession = useCallback((sessionId: string) => {
     setSelectedSessionId(sessionId);
-    persistSelectedSessionId(sessionId);
+    persistSelectedSessionId(scope, sessionId);
     if (syncUrl) syncSessionLink(sessionId, "push");
-  }, [syncUrl]);
+  }, [syncUrl, scope]);
 
   const createSession = useCallback(async (projectId: string | null = null) => {
     setMutationError(null);
@@ -349,11 +373,11 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
         } else {
           next.add(sessionId);
         }
-        writePinnedSessionIds(user?.userId, next);
+        writePinnedSessionIds(scope, next);
         return next;
       });
     },
-    [user?.userId]
+    [scope]
   );
 
   const busySessionId =

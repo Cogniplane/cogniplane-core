@@ -16,9 +16,11 @@ import {
 } from "../integration-oauth-helpers.js";
 import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
 import { uuidv7 } from "../../../lib/uuid.js";
+import { assertBoundIntegrationAccount } from "../integration-account-binding.js";
 
 const NOTION_AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize";
 const NOTION_TOKEN_URL = "https://api.notion.com/v1/oauth/token";
+const NOTION_TOKEN_TIMEOUT_MS = 15_000;
 const NOTION_STATE_AUDIENCE = "cogniplane-notion-user-connect";
 const NOTION_STATE_ISSUER = "cogniplane";
 const NOTION_STATE_TTL = "10m";
@@ -157,6 +159,12 @@ export class NotionConnectionService {
     };
   }
 
+  // The same Notion user can connect another workspace, so both identify the account.
+  async connectedAccountId(tenantId: string, userId: string): Promise<string | null> {
+    const record = await this.store.get(tenantId, userId);
+    return record ? notionAccountId(record) : null;
+  }
+
   // Cheap presence check used by IntegrationRegistryService at session start.
   // Avoids the cost of decrypt + token-refresh that getRuntimeCredentials does.
   async hasConnection(tenantId: string, userId: string): Promise<boolean> {
@@ -270,10 +278,12 @@ export class NotionConnectionService {
           grant_type: "authorization_code",
           code: input.code,
           redirect_uri: oauth.redirectUri
-        })
+        }),
+        signal: AbortSignal.timeout(NOTION_TOKEN_TIMEOUT_MS)
       });
 
-      const tokenPayload = (await tokenResponse.json()) as NotionTokenResponse;
+      // A gateway error can have a non-JSON body; it must not hide the HTTP failure.
+      const tokenPayload = (await tokenResponse.json().catch(() => ({}))) as NotionTokenResponse;
       if (!tokenResponse.ok || !tokenPayload.access_token) {
         throw new Error(
           tokenPayload.error_description ?? tokenPayload.error ?? "notion_token_exchange_failed"
@@ -372,11 +382,17 @@ export class NotionConnectionService {
     return removed;
   }
 
-  async getRuntimeCredentials(tenantId: string, userId: string): Promise<NotionRuntimeCredentials | null> {
+  // `expectedAccountId` is the account the turn recorded (see boundIntegrationAccount).
+  async getRuntimeCredentials(tenantId: string, userId: string,
+    expectedAccountId?: string | null): Promise<NotionRuntimeCredentials | null> {
     if (!this.isConfigured()) return null;
 
     const record = await this.store.get(tenantId, userId);
-    if (!record) return null;
+    if (!record) {
+      // No connection, so no token of any account is used.
+      return null;
+    }
+    assertBoundIntegrationAccount("Notion", expectedAccountId, notionAccountId(record));
 
     // Notion currently issues non-expiring tokens. If/when expirations appear,
     // a refresh path will go here.
@@ -396,4 +412,9 @@ export class NotionConnectionService {
     };
   }
 
+}
+
+// The same Notion user can connect another workspace, so both identify the account.
+function notionAccountId(record: Pick<NotionConnectionRecord, "notionUserId" | "notionWorkspaceId">): string {
+  return `${record.notionUserId}:${record.notionWorkspaceId ?? ""}`;
 }

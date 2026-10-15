@@ -12,6 +12,7 @@ import {
 
 import { API_URL, refreshAccessToken, setAccessToken as setApiClientToken, setTokenRefresher } from "./api-client";
 import { QueryProvider } from "./query-provider";
+import { AgentBehaviorDraftProvider } from "../components/agent-behavior-draft-provider";
 
 export type AuthUser = {
   userId: string;
@@ -274,7 +275,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return (
     <AuthContext.Provider value={value}>
       <QueryProvider key={`${user?.userId ?? ""}:${user?.tenantId ?? ""}`}>
-        {children}
+        <AgentBehaviorDraftProvider>{children}</AgentBehaviorDraftProvider>
       </QueryProvider>
     </AuthContext.Provider>
   );

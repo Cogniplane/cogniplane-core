@@ -3,6 +3,7 @@ import { test, expect, vi } from "vitest";
 
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 import type { ProjectRuntimeFileSnapshot } from "../project-file-store.js";
+import type { LimitExceededErrorPayload } from "../request-limits.js";
 
 import { createProjectTools } from "./project-tools.js";
 
@@ -464,4 +465,115 @@ test("project tools require a project runtime context", async () => {
   });
 
   await expect(tool(tools, "project_list_files").handler({ context: context(), arguments: {} })).rejects.toThrow(/not connected to a project/);
+});
+
+// ─── project_write_file input checks ──────────────────────────────────────
+
+function writeTools(options: {
+  maxProjectFileBytes?: number;
+  readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
+  statRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<{ sizeBytes: number }>;
+  limitMessage?: string;
+} = {}) {
+  // The tool reads only these draft fields, as the existing stubs above do.
+  const createAgentDraftFromContent = vi.fn().mockImplementation(
+    async (input: { name: string; targetFileId: string | null; baseVersionId: string | null }) => ({
+      fileId: "draft-9",
+      name: input.name,
+      targetFileId: input.targetFileId,
+      baseVersionId: input.baseVersionId
+    })
+  );
+  const limitExceeded = (message: string): LimitExceededErrorPayload => ({
+    error: "limit_exceeded", limitType: "rate_limit", resource: "project_file_write", scope: "user",
+    limit: 10, retryAfterMs: 1000, resetAt: "2026-10-03T12:00:00.000Z", message
+  });
+  const consumeRateLimit = vi.fn(async () => options.limitMessage ? limitExceeded(options.limitMessage) : null);
+  const refundRateLimit = vi.fn(async () => undefined);
+  const tools = createProjectTools({
+    projectFiles: { readRuntimeSnapshotFile: vi.fn(), createAgentDraftFromContent, readConflictContext: vi.fn(), readConflictMetadata: vi.fn() },
+    storage: { openReadStream: vi.fn(), put: vi.fn(), delete: vi.fn() },
+    readRuntimeFile: options.readRuntimeFile,
+    statRuntimeFile: options.statRuntimeFile,
+    limits: { consumeRateLimit, refundRateLimit },
+    maxProjectFileBytes: options.maxProjectFileBytes ?? 10_000
+  });
+  const write = (args: Record<string, unknown>) =>
+    tool(tools, "project_write_file").handler({ context: context(projectContext("read-write")), arguments: args });
+  return { write, createAgentDraftFromContent, consumeRateLimit, refundRateLimit };
+}
+
+test.each([
+  ["a blank name", { name: "   ", content: "text" }, "name is required."],
+  ["both content and filePath", { name: "a.txt", content: "text", filePath: "/tmp/a.txt" }, "Provide content or filePath, not both."],
+  ["a target without a base version", { name: "a.txt", content: "text", targetFileId: "file-1" }, "targetFileId and baseVersionId must be provided together."],
+  ["a base version without a target", { name: "a.txt", content: "text", baseVersionId: "version-1" }, "targetFileId and baseVersionId must be provided together."],
+  ["empty content", { name: "a.txt", content: "" }, "The project draft cannot be empty."]
+])("project_write_file refuses %s before writing or charging", async (_case, args, message) => {
+  const { write, createAgentDraftFromContent, consumeRateLimit } = writeTools();
+
+  await expect(write(args)).rejects.toThrow(message);
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+  expect(consumeRateLimit).not.toHaveBeenCalled();
+});
+
+test("project_write_file refuses content above the project-file limit before charging", async () => {
+  const { write, createAgentDraftFromContent, consumeRateLimit } = writeTools({ maxProjectFileBytes: 4 });
+
+  await expect(write({ name: "a.txt", content: "12345" })).rejects.toThrow("exceeds the configured project-file size limit");
+  expect(consumeRateLimit).not.toHaveBeenCalled();
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+});
+
+test("project_write_file refuses a filePath when the runtime cannot read files", async () => {
+  const { write, createAgentDraftFromContent } = writeTools();
+
+  await expect(write({ name: "report.pdf", filePath: "out/report.pdf" })).rejects.toThrow("filePath is not supported on this runtime.");
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+});
+
+test("project_write_file checks a runtime file's size before reading it", async () => {
+  const readRuntimeFile = vi.fn(async () => new Uint8Array(1));
+  const { write, createAgentDraftFromContent } = writeTools({
+    maxProjectFileBytes: 100,
+    readRuntimeFile,
+    statRuntimeFile: async () => ({ sizeBytes: 101 })
+  });
+
+  await expect(write({ name: "big.bin", filePath: "out/big.bin" })).rejects.toThrow("exceeds the configured project-file size limit");
+  // The size check runs on the stat, so a large file is never loaded into memory.
+  expect(readRuntimeFile).not.toHaveBeenCalled();
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+});
+
+test("project_write_file drafts a runtime file read from the trimmed path", async () => {
+  const bytes = new TextEncoder().encode("a,b\n1,2\n");
+  const readRuntimeFile = vi.fn(async () => bytes);
+  const statRuntimeFile = vi.fn(async () => ({ sizeBytes: bytes.length }));
+  const { write, createAgentDraftFromContent } = writeTools({ readRuntimeFile, statRuntimeFile });
+
+  await expect(write({ name: "data.csv", filePath: "  out/data.csv  ", folderId: "folder-1" })).resolves.toEqual({
+    draftId: "draft-9", name: "data.csv", targetFileId: null, baseVersionId: null, status: "draft"
+  });
+  expect(statRuntimeFile).toHaveBeenCalledWith("session-1", "runtime-1", "out/data.csv");
+  expect(readRuntimeFile).toHaveBeenCalledWith("session-1", "runtime-1", "out/data.csv");
+  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({
+    name: "data.csv", folderId: "folder-1", content: bytes, mimeType: "text/csv", createdByType: "agent"
+  }));
+});
+
+test("project_write_file keeps an explicit MIME type over the one inferred from the name", async () => {
+  const { write, createAgentDraftFromContent } = writeTools();
+
+  await write({ name: "notes.txt", content: "# Title", mimeType: "text/markdown" });
+
+  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({ mimeType: "text/markdown", folderId: null }));
+});
+
+test("project_write_file stops at the rate limit without writing or refunding", async () => {
+  const { write, createAgentDraftFromContent, refundRateLimit } = writeTools({ limitMessage: "Too many project writes. Try again in a minute." });
+
+  await expect(write({ name: "a.txt", content: "text" })).rejects.toThrow("Too many project writes. Try again in a minute.");
+  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
+  expect(refundRateLimit).not.toHaveBeenCalled();
 });

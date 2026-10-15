@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 
+import { sessionDetailHref, sessionListHref } from "../../../lib/admin-session-links";
 import {
   activeFilterChips,
   dateInputToIso,
@@ -8,7 +9,11 @@ import {
   EMPTY_FILTER_STATE,
   filterStateToParams,
   isoToDateInput,
-  presetRange
+  parseStateFromSearchParams,
+  presetRange,
+  searchParamsHaveAnyFilter,
+  stateToSearchString,
+  type SessionsFilterState
 } from "./admin-sessions-filters.logic";
 
 describe("dateRangeLabel", () => {
@@ -119,5 +124,39 @@ describe("defaultLast7dRange / presetRange", () => {
     const r = presetRange(30);
     const span = Date.parse(r.to) - Date.parse(r.from);
     expect(Math.abs(span - 30 * 24 * 60 * 60 * 1000)).toBeLessThan(1000);
+  });
+});
+
+describe("URL state", () => {
+  const state: SessionsFilterState = {
+    userId: "a&b+c",
+    from: "2026-09-01T00:00:00Z",
+    to: "2026-09-30T23:59:59Z",
+    status: "errored",
+    alert: ["pii-blocked", "approval-pending"]
+  };
+
+  test("writes only the fields that are set, alerts as one comma list", () => {
+    expect(stateToSearchString({ ...EMPTY_FILTER_STATE, status: "active" })).toBe("status=active");
+    expect(stateToSearchString(EMPTY_FILTER_STATE)).toBe("");
+    expect(new URLSearchParams(stateToSearchString(state)).get("alert")).toBe("pii-blocked,approval-pending");
+  });
+
+  test("returns the same filters after a visit to a session's detail page", () => {
+    const detail = new URL(sessionDetailHref("s1", stateToSearchString(state)), "http://localhost");
+    const back = new URL(sessionListHref(detail.searchParams.get("from")), "http://localhost");
+
+    expect(parseStateFromSearchParams(back.searchParams)).toEqual(state);
+  });
+
+  test("drops an unknown status and unknown or blank alert tokens", () => {
+    const parsed = parseStateFromSearchParams(new URLSearchParams("status=deleted&alert=errored, ,bogus, pii-detected"));
+
+    expect(parsed).toEqual({ ...EMPTY_FILTER_STATE, alert: ["errored", "pii-detected"] });
+  });
+
+  test("tells a filtered URL from one with only unrelated parameters", () => {
+    expect(searchParamsHaveAnyFilter(new URLSearchParams("tab=pii"))).toBe(false);
+    expect(searchParamsHaveAnyFilter(new URLSearchParams("alert="))).toBe(true);
   });
 });

@@ -1,6 +1,32 @@
 import { test, expect } from "vitest";
 
-import { redactSecrets } from "./redact-secrets.js";
+import { redactAppData, redactSecrets } from "./redact-secrets.js";
+
+test("redaction preserves app data types and removes nested credentials", () => {
+  expect(redactAppData({ tokenLimits: [100, 200], token: "abc", idToken: "def",
+    "x-api-key": "ghi", credentials: { sessionToken: "jkl" } })).toEqual({
+    tokenLimits: [100, 200], token: "[REDACTED]", idToken: "[REDACTED]",
+    "x-api-key": "[REDACTED]", credentials: { sessionToken: "[REDACTED]" }
+  });
+});
+
+test("app paging cursors survive while credential fields stay redacted", () => {
+  expect(redactAppData({ pageToken: "cursor-1", nextPageToken: "cursor-2", credentials: {
+    sessionToken: "secret", nextPageToken: "nested-secret"
+  } })).toEqual({ pageToken: "cursor-1", nextPageToken: "cursor-2", credentials: {
+    sessionToken: "[REDACTED]", nextPageToken: "[REDACTED]"
+  } });
+  expect(redactSecrets({ pageToken: "cursor-1", nextPageToken: "cursor-2", token: "secret" }))
+    .toEqual({ pageToken: "cursor-1", nextPageToken: "cursor-2", token: "[REDACTED]" });
+});
+
+test("redaction keeps JavaScript template placeholders intact", () => {
+  const source = 'const header = `Bearer ${token}`; const url = `?token=${t}&sig=${s}`;';
+  expect(redactSecrets(source)).toBe(source);
+  expect(redactSecrets("Bearer actual-token ?token=actual-value")).toBe(
+    "Bearer [REDACTED] ?token=REDACTED"
+  );
+});
 
 test("redactSecrets redacts known secret-bearing fields and preserves non-sensitive strings", () => {
   const result = redactSecrets({
@@ -293,4 +319,34 @@ test("redactSecrets leaves a clean Date opaque but walks one carrying any own ke
   const dirty = Object.assign(new Date("2026-07-25T00:00:00.000Z"), { note: "hi" });
   // Walked, so no longer a Date — the deliberate lossy-not-leaky trade.
   expect(redactSecrets(dirty)).not.toBeInstanceOf(Date);
+});
+
+test("redactSecrets keeps tool schemas and numeric arrays under credential-like keys", () => {
+  // Key-based redaction must not corrupt a proxy tool schema or telemetry.
+  expect(redactSecrets({
+    properties: { maxTokens: { type: "integer", minimum: 1 }, token: { type: "string", description: "Page token" } },
+    tokenUsage: { perModel: [{ model: "example", inputTokens: 12 }] }
+  })).toEqual({
+    properties: { maxTokens: { type: "integer", minimum: 1 }, token: { type: "string", description: "Page token" } },
+    tokenUsage: { perModel: [{ model: "example", inputTokens: 12 }] }
+  });
+});
+
+test("redactSecrets finds a credential in a URL nested in another parameter's value", () => {
+  expect(redactSecrets("go to https://outer.test/?next=https://inner.test/?token=opaque-secret&page=2")).toBe(
+    "go to https://outer.test/?next=https://inner.test/?token=REDACTED&page=2"
+  );
+});
+
+test("redactSecrets and sanitizeUrl redact a percent-encoded credential name", () => {
+  expect(redactSecrets("https://x/?api%2Dkey=opaque-secret")).toBe("https://x/?api%2Dkey=REDACTED");
+});
+
+test("redactSecrets strips every credential query name that URL validation refuses", () => {
+  const result = redactSecrets(
+    "https://x/?key=A&api-key=B&x_api_key=C&secret=D&auth=E&signature=F&sig=G&idtoken=H&page=2&monkey=keep"
+  );
+  expect(result).toBe(
+    "https://x/?key=REDACTED&api-key=REDACTED&x_api_key=REDACTED&secret=REDACTED&auth=REDACTED&signature=REDACTED&sig=REDACTED&idtoken=REDACTED&page=2&monkey=keep"
+  );
 });

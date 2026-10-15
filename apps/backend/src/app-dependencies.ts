@@ -2,13 +2,17 @@ import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "./config.js";
 import { type Pool } from "./lib/db.js";
-import { attachOverlays, type OverlayHandles } from "./overlays.js";
+import type { OverlayHandles } from "./overlay-contracts.js";
+import { attachOverlays } from "./overlays.js";
 import { buildBootstrapServices } from "./services/build-bootstrap-services.js";
 import { buildStores } from "./services/build-stores.js";
 import { ProxyToolMetadataCache } from "./services/mcp/proxy-tool-metadata-cache.js";
+import { McpConnectionTestService } from "./services/mcp/mcp-connection-test-service.js";
 import { buildIntegrationServices } from "./services/integrations/build-integration-services.js";
+import { loadIntegrationEnablement } from "./services/integrations/integration-enablement.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
+import { UploadAdmission } from "./services/artifacts/upload-admission.js";
 import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
 import { PolicyService } from "./services/policy/policy-service.js";
 import { buildRuntimeAdapter } from "./services/runtime/build-runtime-adapters.js";
@@ -27,6 +31,13 @@ export function buildAppDependencies(input: {
 
   const stores = buildStores(db, schedulerDb, privilegedDb, logger, config);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
+  const mcpConnectionTests = new McpConnectionTestService({
+    db,
+    servers: stores.mcpServers,
+    credentials: stores.memberMcpCredentials,
+    timeoutMs: config.MCP_CONNECTION_TEST_TIMEOUT_MS,
+    logger
+  });
 
   const bootstrap = buildBootstrapServices({
     config,
@@ -67,6 +78,9 @@ export function buildAppDependencies(input: {
   bootstrap.dynamicConfig.setIntegrationToolSource(integrations.integrationRegistry);
   const proxyToolMetadataCache = new ProxyToolMetadataCache(logger);
 
+  // PII scans read a PDF through its extracted text.
+  const extractPdfText = (pdf: Buffer, signal?: AbortSignal) =>
+    bootstrap.artifactProcessor.extractPdfText(pdf, signal);
   const pii = buildPiiServices({
     config,
     logger,
@@ -74,45 +88,68 @@ export function buildAppDependencies(input: {
     stores,
     artifactStorage: bootstrap.artifactStorage,
     tenantOrgSettingsPrivileged: bootstrap.tenantOrgSettingsPrivileged,
-    redis: bootstrap.redis
+    redis: bootstrap.redis,
+    extractPdfText
   });
-  stores.projectFiles.setPiiProtection(pii.piiProtection);
+  stores.projectFiles.setPiiProtection(pii.piiProtection, extractPdfText);
 
-  // Attach optional overlays. The core OSS tree ships a no-op implementation;
-  // derived distributions can wire additional services, descriptors, managed
-  // tools, and route attachers here.
+  // Attach optional overlays through the core-owned contract in
+  // `overlay-contracts.ts`. The OSS tree ships a no-op implementation.
   const overlays: OverlayHandles = attachOverlays({
-    config,
-    db,
-    artifactStorage: bootstrap.artifactStorage,
-    stores: {
-      artifacts: stores.artifacts,
-      auditEvents: stores.auditEvents,
-      integrationStates: stores.integrationStates,
-      sessions: stores.sessions
+    config: {
+      API_ORIGIN: config.API_ORIGIN,
+      DATA_ENCRYPTION_SECRET: config.DATA_ENCRYPTION_SECRET,
+      JWT_SECRET: config.JWT_SECRET,
+      JWT_KEY_ID: config.JWT_KEY_ID,
+      JWT_VERIFICATION_KEYS: config.JWT_VERIFICATION_KEYS,
+      ARTIFACT_MAX_UPLOAD_BYTES: config.ARTIFACT_MAX_UPLOAD_BYTES
     },
-    piiScanEnqueuer: pii.piiScanEnqueuer,
+    db,
+    uploadAdmission: new UploadAdmission({
+      sessions: stores.sessions,
+      artifacts: stores.artifacts,
+      storage: bootstrap.artifactStorage,
+      auditEvents: stores.auditEvents,
+      piiScanEnqueuer: pii.piiScanEnqueuer,
+      logger
+    }),
+    stores: {
+      auditEvents: stores.auditEvents,
+      integrationStates: stores.integrationStates
+    },
     integrationDescriptors: integrations.integrationDescriptors,
+    loadIntegrationEnablement: (tenantId, integrationId) =>
+      loadIntegrationEnablement(stores.integrationStates, config, tenantId, integrationId),
     oauthStates: integrations.oauthStates,
     runtimeInvalidator: deepAgentsAdapter,
     managedToolCatalog,
-    managedToolFactoryRegistry
+    managedToolFactoryRegistry,
+    limits: bootstrap.limits
   });
 
   return {
     db,
     projects: stores.projects,
+    personalCapabilities: stores.personalCapabilities,
+    personalSkills: stores.personalSkills,
+    organizationSkillSubmissions: stores.organizationSkillSubmissions,
+    skillReleaseImpact: stores.skillReleaseImpact,
+    projectSkills: stores.projectSkills,
+    memberMcpCredentials: stores.memberMcpCredentials,
     projectFiles: stores.projectFiles,
     projectMembers: stores.projectMembers,
     executions: stores.executions,
     sessions: stores.sessions,
     messages: stores.messages,
+    modelSpending: stores.modelSpending,
     memories: stores.memories,
     artifacts: stores.artifacts,
     runtimeSessions: stores.runtimeSessions,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
     mcpServers: stores.mcpServers,
+    mcpAppCsp: stores.mcpAppCsp,
+    mcpConnectionTests,
     tenantSettings: stores.tenantSettings,
     customModels: stores.customModels,
     userSettings: stores.userSettings,
@@ -121,6 +158,7 @@ export function buildAppDependencies(input: {
     githubConnectionService: integrations.githubConnectionService,
     notionConnections: stores.notionConnections,
     notionConnectionService: integrations.notionConnectionService,
+    jiraConnectionService: integrations.jiraConnectionService,
     integrationStates: stores.integrationStates,
     integrationRegistry: integrations.integrationRegistry,
     integrationDescriptors: integrations.integrationDescriptors,

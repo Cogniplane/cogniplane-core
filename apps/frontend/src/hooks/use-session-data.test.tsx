@@ -15,7 +15,7 @@ import { useSessionData } from "./use-session-data";
 // One settler per pending listMessages call, so resolve and reject can never
 // drift out of step the way two parallel arrays would.
 type MessageSettler = {
-  resolve: (messages: unknown[], hasMore?: boolean) => void;
+  resolve: (messages: unknown[]) => void;
   reject: (error: Error) => void;
 };
 const apiState = vi.hoisted(() => ({
@@ -29,10 +29,9 @@ vi.mock("../lib/message-api", () => ({
     () =>
       new Promise<{ messages: unknown[]; hasMore: boolean }>((resolve, reject) => {
         // listMessages returns a paged envelope now. Tests still settle with a
-        // bare Message[], so wrap it here rather than churning every call site;
-        // hasMore defaults false and is overridden where it's the subject.
+        // bare Message[], so wrap it here rather than churning every call site.
         apiState.pendingMessageLoads.push({
-          resolve: (messages: unknown[], hasMore = false) => resolve({ messages, hasMore }),
+          resolve: (messages: unknown[]) => resolve({ messages, hasMore: false }),
           reject
         });
       })
@@ -197,48 +196,6 @@ describe("useSessionData: refreshSessionData vs in-flight sends", () => {
   });
 });
 
-describe("useSessionData: truncated transcripts", () => {
-  beforeEach(() => {
-    apiState.pendingMessageLoads.length = 0;
-  });
-
-  it("exposes hasMoreMessages so a clipped transcript can be surfaced", async () => {
-    const { result } = renderSessionData();
-
-    await act(async () => {
-      apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-1", "newest kept turn")], true);
-    });
-    await waitFor(() => {
-      expect(result.current.isSessionDataReady).toBe(true);
-    });
-
-    // Without this the backend's newest-N cap drops older turns with nothing in
-    // the UI to say so, which is indistinguishable from a short conversation.
-    expect(result.current.hasMoreMessages).toBe(true);
-  });
-
-  it("clears hasMoreMessages when a later refresh returns a complete transcript", async () => {
-    const { result } = renderSessionData();
-
-    await act(async () => {
-      apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-1", "kept")], true);
-    });
-    await waitFor(() => expect(result.current.hasMoreMessages).toBe(true));
-
-    let refreshDone: Promise<void> | null = null;
-    act(() => {
-      refreshDone = result.current.refreshSessionData("s-1");
-    });
-    await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
-    await act(async () => {
-      apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-1", "kept")], false);
-      await refreshDone;
-    });
-
-    await waitFor(() => expect(result.current.hasMoreMessages).toBe(false));
-  });
-});
-
 describe("useSessionData: switch-back serves fresh data, not the cached snapshot (R72)", () => {
   beforeEach(() => {
     apiState.pendingMessageLoads.length = 0;
@@ -389,7 +346,6 @@ describe("useSessionData: session-scoped ownership", () => {
 
     expect(result.current.messages).toEqual([]);
     expect(result.current.artifacts).toEqual([]);
-    expect(result.current.hasMoreMessages).toBe(false);
     expect(result.current.isSessionDataReady).toBe(false);
     expect(result.current.initialApprovals).toEqual([]);
   });
@@ -474,6 +430,32 @@ describe("useSessionData: session-scoped ownership", () => {
     await waitFor(() =>
       expect(result.current.artifacts.map((item) => item.artifactId)).toEqual(["ready"])
     );
+  });
+
+  it("does not update session detail for an unchanged artifact poll", async () => {
+    apiState.artifactResponses.push(
+      Promise.resolve([artifact("a-1", "processing")]),
+      Promise.resolve([artifact("a-1", "processing")])
+    );
+    const { result, queryClient } = renderSessionData();
+    await settleInitialLoad(result, []);
+    await waitFor(() => expect(apiState.artifactResponses).toHaveLength(0));
+
+    const detailKey = queryKeys.sessions.detail("s-1");
+    const pollKey = queryKeys.sessions.artifacts("s-1");
+    const updateCount = queryClient.getQueryState(detailKey)?.dataUpdateCount;
+    apiState.artifactResponses.push(Promise.resolve([artifact("a-1", "processing")]));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: pollKey, exact: true });
+    });
+    expect(queryClient.getQueryState(detailKey)?.dataUpdateCount).toBe(updateCount);
+
+    apiState.artifactResponses.push(Promise.resolve([artifact("a-1", "ready")]));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: pollKey, exact: true });
+    });
+    await waitFor(() => expect(result.current.artifacts[0]?.status).toBe("ready"));
+    expect(queryClient.getQueryState(detailKey)?.dataUpdateCount).toBe(updateCount! + 1);
   });
 
   it("discards a poll that started before a newer full refresh settled", async () => {

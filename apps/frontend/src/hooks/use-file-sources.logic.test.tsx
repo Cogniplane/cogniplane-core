@@ -1,7 +1,12 @@
-import { describe, expect, test } from "vitest";
+// @vitest-environment jsdom
+import { cleanup, renderHook } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+import { afterEach, describe, expect, test } from "vitest";
+import { queryKeys } from "../lib/query-keys";
 
 import type { FileSourceDefinition } from "../components/file-source-picker";
-import { selectEnabledFileSources, type FileSourceFactory } from "./use-file-sources";
+import { registerFileSource, selectEnabledFileSources, useFileSources, type FileSourceFactory } from "./use-file-sources";
 
 function makeEntry(
   integrationId: string,
@@ -38,22 +43,37 @@ describe("selectEnabledFileSources", () => {
   test("empty availability hides every source", () => {
     expect(selectEnabledFileSources([makeEntry("sharepoint")], [])).toEqual([]);
   });
+});
 
-  test("returns the exact entry objects passed in this render (no caching layer)", () => {
-    // useFileSources used to memoize the result on an id:connection-kind key,
-    // so re-renders kept serving entry objects whose renderBody closures
-    // captured stale search state and a stale selected session. The selection
-    // must hand back the fresh objects from the current render, every render.
-    const firstRender = makeEntry("sharepoint");
-    const secondRender = makeEntry("sharepoint", {
-      renderBody: () => "fresh closure"
-    });
+registerFileSource({
+  integrationId: "closure-fixture",
+  useEntry: ({ selectedSessionId }) => ({
+    id: "closure-fixture",
+    label: "Fixture",
+    description: "",
+    connection: { kind: "connected", label: "Connected" },
+    renderBody: () => selectedSessionId
+  })
+});
 
-    const first = selectEnabledFileSources([firstRender], ["sharepoint"]);
-    const second = selectEnabledFileSources([secondRender], ["sharepoint"]);
+afterEach(cleanup);
 
-    expect(first[0]).toBe(firstRender.entry);
-    expect(second[0]).toBe(secondRender.entry);
-    expect(second[0]?.renderBody({ selectedSessionId: null })).toBe("fresh closure");
-  });
+test("useFileSources refreshes factory closures when the selected session changes", () => {
+  const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+  client.setQueryData(queryKeys.settings.integrationsAvailability(), [{ id: "closure-fixture" }]);
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result, rerender, unmount } = renderHook(({ session }) => useFileSources({
+    selectedSessionId: session,
+    onError: () => {},
+    onRefreshArtifacts: async () => {},
+    onImportedArtifact: () => {}
+  }), { wrapper, initialProps: { session: "first-session" } });
+
+  expect(result.current.sources[0]?.renderBody({ selectedSessionId: null })).toBe("first-session");
+  rerender({ session: "second-session" });
+  expect(result.current.sources[0]?.renderBody({ selectedSessionId: null })).toBe("second-session");
+  unmount();
+  client.clear();
 });

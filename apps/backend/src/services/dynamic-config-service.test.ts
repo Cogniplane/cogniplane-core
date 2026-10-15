@@ -10,8 +10,11 @@ import { createTestConfig } from "../test-helpers/test-config.js";
 import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 
 import {
-  type ImportedSkillBundleRecord
+  type AdminMcpServerRecord,
+  type ImportedSkillBundleRecord,
+  type RuntimeSkillDefinition
 } from "./admin-config-records.js";
+
 import { DynamicConfigService, parseGitHubSkillSource } from "./dynamic-config-service.js";
 import { ManagedToolCatalog } from "./managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "./managed-tools/factory.js";
@@ -67,15 +70,18 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
     mcpServers: {
       async listMcpServers() { return []; },
       async getMcpServer() { return null; },
+      async getAdminMcpServer() { return null; },
       async createMcpServer() { throw new Error("createMcpServer should not be called"); },
       async updateMcpServer() { throw new Error("updateMcpServer should not be called"); },
       async disableMcpServer() { return null; },
       async setMcpServerPublished() { return null; },
+      async withTransaction(_tenantId, run) { return run({} as Parameters<typeof run>[0]); },
       ...overrides.mcpServers
     },
     tenantSettings: {
       async get() { return null; },
       async upsert() { throw new Error("upsert should not be called"); },
+      async setMcpServerAllowed() { throw new Error("setMcpServerAllowed should not be called"); },
       ...overrides.tenantSettings
     }
   };
@@ -100,6 +106,83 @@ test("session config reads persisted selections and fails closed when that read 
   expect(calls).toBe(1);
   fail = true;
   await expect(service.compileRuntimeConfig("tenant", false, { sessionId: "session", userId: "user" })).rejects.toThrow("capabilities unavailable");
+});
+
+test("personal skills require a trusted standalone session audience", async () => {
+  const personal: RuntimeSkillDefinition = {
+    id: "personal-skill-1", name: "Private", description: null, instructions: "Private instructions",
+    version: 1, hash: "release-1", revisionId: null, bundleHash: null, sourceType: "personal",
+    bundleName: null, bundleStorageUri: null, validationStatus: "valid", reviewStatus: "approved",
+    associatedToolIds: []
+  };
+  let personalUserId: string | null = "owner";
+  const reads: string[] = [];
+  const service = new DynamicConfigService(createTestConfig(), {
+    ...makeStores(),
+    sessions: {
+      async getCapabilitySelection() { throw new Error("Legacy selection lookup must not run"); },
+      async getRuntimeCapabilities() { return { selection: null, personalUserId, projectId: null }; }
+    },
+    personalSkills: {
+      async listRuntimeSkills(_tenantId, userId) { reads.push(userId); return [personal]; }
+    }
+  }, unusedSkillBundleStorage, makeManagedToolCatalog());
+  service.getRuntimePolicy = async () => testRuntimePolicy;
+
+  expect((await service.compileRuntimeConfig("tenant", false)).skills).toEqual([]);
+  expect((await service.compilePersonalCatalog("tenant", false, "owner")).skills.map(s => s.id)).toEqual([personal.id]);
+  expect((await service.compileRuntimeConfig("tenant", false, { sessionId: "s", userId: "owner" })).skills.map(s => s.id))
+    .toEqual([personal.id]);
+  personalUserId = null;
+  expect((await service.compileRuntimeConfig("tenant", false, { sessionId: "s", userId: "owner" })).skills).toEqual([]);
+  expect(reads).toEqual(["owner", "owner"]);
+  const noAudience = new DynamicConfigService(createTestConfig(), {
+    ...makeStores(), personalSkills: { async listRuntimeSkills() { return [personal]; } }
+  }, unusedSkillBundleStorage, makeManagedToolCatalog());
+  await expect(noAudience.compileRuntimeConfig("tenant", false, { sessionId: "s", userId: "owner" }))
+    .rejects.toThrow("Session audience is unavailable");
+});
+
+test("project skills come only from the session's current project for an executing member", async () => {
+  const projectSkill: RuntimeSkillDefinition = {
+    id: "project-skill-1", name: "shared-notes", description: "Shared", instructions: "Project instructions",
+    version: 2, hash: "release-2", revisionId: null, bundleHash: null, sourceType: "project",
+    bundleName: null, bundleStorageUri: null, validationStatus: "valid", reviewStatus: "approved",
+    associatedToolIds: []
+  };
+  let context: { selection: { skillIds: string[]; connectorIds: string[] } | null;
+    personalUserId: string | null; projectId: string | null } = { selection: null, personalUserId: null, projectId: "project-a" };
+  const reads: string[] = [];
+  const service = new DynamicConfigService(createTestConfig(), {
+    ...makeStores(),
+    sessions: {
+      async getCapabilitySelection() { throw new Error("Legacy selection lookup must not run"); },
+      async getRuntimeCapabilities() { return context; }
+    },
+    personalSkills: { async listRuntimeSkills() { throw new Error("Personal skills must not load in project chats"); } },
+    projectSkills: { async listRuntimeSkills(_tenantId, projectId, userId, forExecution) {
+      reads.push(JSON.stringify([projectId, userId, Boolean(forExecution)])); return [projectSkill];
+    } }
+  }, unusedSkillBundleStorage, makeManagedToolCatalog());
+  service.getRuntimePolicy = async () => testRuntimePolicy;
+  const session = { sessionId: "s", userId: "editor" };
+
+  const active = await service.compileRuntimeConfig("tenant", false, session);
+  expect(active.skills.map(s => [s.id, s.sourceType])).toEqual([["project-skill-1", "project"]]);
+  expect(active.skills[0]?.associatedToolIds).toEqual([]);
+  expect((await service.compileProjectCatalog("tenant", false, "project-a", "owner")).skills.map(s => s.id)).toEqual(["project-skill-1"]);
+  expect((await service.compileRuntimeConfig("tenant", false)).skills).toEqual([]);
+  context = { ...context, selection: { skillIds: [], connectorIds: [] } };
+  expect((await service.compileRuntimeConfig("tenant", false, session)).skills).toEqual([]);
+  context = { selection: null, personalUserId: null, projectId: null };
+  expect((await service.compileRuntimeConfig("tenant", false, session)).skills).toEqual([]);
+  expect(reads.map(value => JSON.parse(value))).toEqual([
+    ["project-a", "editor", true], ["project-a", "owner", false], ["project-a", "editor", true]
+  ]);
+  const noAudience = new DynamicConfigService(createTestConfig(), {
+    ...makeStores(), projectSkills: { async listRuntimeSkills() { return [projectSkill]; } }
+  }, unusedSkillBundleStorage, makeManagedToolCatalog());
+  await expect(noAudience.compileRuntimeConfig("tenant", false, session)).rejects.toThrow("Session audience is unavailable");
 });
 
 function makeImportedSkillBundle(
@@ -592,6 +675,8 @@ test("DynamicConfigService rejects unknown tenant tool IDs before persisting set
               upstreamAuthType: "none" as const,
               upstreamAuthName: null,
               upstreamAuthConfigured: false,
+              credentialScope: "organization" as const,
+              credentialBindingId: "binding-trusted-echo",
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -640,6 +725,8 @@ test("DynamicConfigService rejects unknown tenant MCP server IDs before persisti
               upstreamAuthType: "none" as const,
               upstreamAuthName: null,
               upstreamAuthConfigured: false,
+              credentialScope: "organization" as const,
+              credentialBindingId: "binding-trusted-echo",
               version: 1,
               configHash: "hash-trusted-echo",
               enabled: true,
@@ -693,9 +780,9 @@ test("compileRuntimeConfig takes integration tools from the toggles, not tenant 
     makeManagedToolCatalog()
   );
   service.setIntegrationToolSource({
-    async resolveSessionToolIds(tenantId, userId) {
+    async resolveSessionIntegrations(tenantId, userId) {
       resolved.push([tenantId, userId]);
-      return ["github_read_file"];
+      return { toolIds: ["github_read_file"], accounts: { github: "12345" } };
     }
   });
 
@@ -708,6 +795,9 @@ test("compileRuntimeConfig takes integration tools from the toggles, not tenant 
   const session = await service.compileRuntimeConfig("tenant-1", false, { sessionId: "session-1", userId: "user-1" });
   expect(session.runtimePolicy.enabledToolIds).toEqual(["write_artifact", "github_read_file"]);
   expect(resolved).toEqual([["tenant-1", "user-1"]]);
+  // The executing session records the connected account; the catalog does not.
+  expect(session.sources.integrationAccounts).toEqual({ github: "12345" });
+  expect(catalog.sources.integrationAccounts).toBeUndefined();
 });
 
 test("DynamicConfigService rejects new integration tool IDs but keeps stored ones", async () => {
@@ -735,4 +825,54 @@ test("DynamicConfigService rejects new integration tool IDs but keeps stored one
   // The admin form sends the stored list back; saving it still works.
   await service.updateTenantSettings("tenant-1", { enabledToolIds: ["write_artifact", "github_write_file"] });
   expect(upserts).toHaveLength(1);
+});
+
+test("resolves only the acting member's current personal MCP credential", async () => {
+  const server: AdminMcpServerRecord = {
+    serverId: "docs", ownerTenantId: "tenant", serverName: "Docs", description: null,
+    transportKind: "http", mode: "proxy", routePath: "/mcp/docs", upstreamUrl: "https://example.test/mcp",
+    upstreamAuthType: "bearer", upstreamAuthName: null, upstreamAuthConfigured: false,
+    credentialScope: "personal", credentialBindingId: "binding-1", version: 1, configHash: "hash-1",
+    enabled: true, isPublished: true, createdBy: "admin", createdAt: "", updatedAt: ""
+  };
+  const secrets = new Map([["alice", "alice-secret"], ["bob", "bob-secret"]]);
+  const members = new Set(["alice", "bob"]);
+  let allow = true;
+  const service = new DynamicConfigService(createTestConfig(), {
+    ...makeStores({
+      mcpServers: {
+        // The gateway reads only the target row on each request.
+        listMcpServers: async () => { throw new Error("unexpected full server list read"); },
+        getMcpServer: async () => ({ ...server, upstreamAuth: null })
+      }
+    }),
+    tenantMembers: {
+      getRole: async (_tenant, user) => members.has(user) ? "member" : null,
+      isUserBetaTester: async () => false
+    },
+    memberMcpCredentials: {
+      listStatuses: async (_tenant, _user, servers) => new Map(servers.map(item => [item.serverId,
+        { status: "not_connected" as const, credentialVersion: 0, accountLabel: null }])),
+      getRuntimeCredential: async (_tenant, user) => {
+        const secret = secrets.get(user);
+        return secret ? { auth: { type: "bearer", secret }, version: 1 } : null;
+      }
+    }
+  }, { storeBundle: async () => { throw new Error("unused"); }, deleteBundle: async () => {} }, makeManagedToolCatalog());
+  service.getRuntimePolicy = async () => ({ ...testRuntimePolicy, enabledMcpServers: allow ? ["docs"] : [] });
+  expect((await service.getMcpServerForUser("tenant", "docs", "alice")).upstreamAuth).toEqual({ type: "bearer", secret: "alice-secret" });
+  expect((await service.getMcpServerForUser("tenant", "docs", "bob")).upstreamAuth).toEqual({ type: "bearer", secret: "bob-secret" });
+  secrets.delete("bob");
+  await expect(service.getMcpServerForUser("tenant", "docs", "bob")).rejects.toThrow("unavailable");
+  members.delete("alice");
+  await expect(service.getMcpServerForUser("tenant", "docs", "alice")).rejects.toThrow("Unknown MCP server");
+  members.add("alice");
+  allow = false;
+  await expect(service.getMcpServerForUser("tenant", "docs", "alice")).rejects.toThrow("Unknown MCP server");
+  allow = true;
+  server.isPublished = false;
+  await expect(service.getMcpServerForUser("tenant", "docs", "alice")).rejects.toThrow("Unknown MCP server");
+  server.isPublished = true;
+  server.enabled = false;
+  await expect(service.getMcpServerForUser("tenant", "docs", "alice")).rejects.toThrow("Unknown MCP server");
 });

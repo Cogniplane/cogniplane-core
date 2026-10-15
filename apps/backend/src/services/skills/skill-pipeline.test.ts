@@ -1,7 +1,6 @@
-import os from "node:os";
-import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
-import { test, expect, onTestFinished } from "vitest";
+import { test, expect } from "vitest";
+import { buildSkillsLibraryFiles } from "../deep-agents/deep-agents-skills-library.js";
+import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 
 import type {
   AdminSkillRecord,
@@ -14,7 +13,7 @@ import { importSkillBundleFromInline } from "./skill-import-service.js";
 const TENANT_ID = "tenant-pipeline";
 const SKILL_ID = "pipeline-test";
 const SKILL_NAME = "Pipeline Test Skill";
-const SKILL_DESCRIPTION = "Verifies the import → compile → workspace path.";
+const SKILL_DESCRIPTION = "Verifies the import to runtime library path.";
 const SKILL_INSTRUCTIONS = "When asked about the pipeline, respond with the exact phrase 'pipeline confirmed'.";
 
 function buildResolvedProfile(): ResolvedRuntimePolicy {
@@ -26,7 +25,7 @@ function buildResolvedProfile(): ResolvedRuntimePolicy {
     approvalPolicy: "on-request",
     approvalReviewer: "user",
     sandboxMode: "workspace-write",
-    networkMode: "restricted",
+    sandboxEgressDomains: [],
     allowCommandExecution: false,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "monitor",
@@ -38,12 +37,7 @@ function buildResolvedProfile(): ResolvedRuntimePolicy {
   };
 }
 
-test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-pipeline-"));
-  onTestFinished(async () => {
-        await rm(root, { recursive: true, force: true });
-      });
-
+test("skill pipeline: imported instructions reach the in-memory library SKILL.md unchanged", async () => {
   // Step 1: import a minimal inline bundle. The inline path runs
   // `validateSkillBundle` internally and yields the record shape the
   // skill-revisions store would produce after a real INSERT + active-revision
@@ -122,7 +116,7 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
   });
 
   const importedSkill = imported.skill;
-  expect(importedSkill.instructions).toMatch(/pipeline confirmed/);
+  expect(importedSkill.instructions).toBe(SKILL_INSTRUCTIONS);
 
   // Step 2: compile a runtime config from the imported skill. `compileRuntimeConfig`
   // consumes a `Pick<SkillConfigStore, "listSkills">` so the in-memory record is
@@ -146,8 +140,9 @@ test("skill pipeline: imported bundle reaches workspace SKILL.md unchanged", asy
   expect(runtimeConfig.skills.length).toBe(1);
   expect(runtimeConfig.skills[0]?.id).toBe(SKILL_ID);
 
-  // Step 3: the compiled bundle is what the Deep Agents adapter turns into
-  // the /skills/ library (buildSkillsLibraryFiles generates SKILL.md from
-  // these fields) — assert the instructions survive compilation verbatim.
-  expect(runtimeConfig.skills[0]?.instructions).toMatch(/pipeline confirmed/);
+  const files = await buildSkillsLibraryFiles({ skills: runtimeConfig.skills, logger: createSilentLogger() });
+  const markdown = files["/pipeline-test-skill/SKILL.md"]?.content;
+  expect(typeof markdown).toBe("string");
+  const body = (markdown as string).replace(/^---\n[\s\S]*?\n---\n\n/, "");
+  expect(body).toBe(`${SKILL_INSTRUCTIONS}\n`);
 });

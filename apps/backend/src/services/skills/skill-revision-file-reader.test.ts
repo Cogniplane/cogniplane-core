@@ -120,20 +120,19 @@ test("bundle skill: extracts and reads a manifested file as utf8", async () => {
   }
 });
 
-test("bundle skill: returns not_found when the requested path is not in the manifest", async () => {
+test("bundle skill: refuses an existing file omitted from the manifest", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "skill-reader-"));
   onTestFinished(() => rm(dir, { recursive: true, force: true }));
-  await writeFile(path.join(dir, "SKILL.md"), "# hi");
-
-  const result = await readSkillRevisionFile({
-    revision: revision({
-      bundleStorageUri: "file:///fake",
-      metadata: { files: [{ path: "SKILL.md" }] }
-    }),
-    requestedPath: "SECRET.md", // not in manifest
+  await writeFile(path.join(dir, "SKILL.md"), "# allowed");
+  await writeFile(path.join(dir, "SECRET.md"), "private content");
+  const input = {
+    revision: revision({ bundleStorageUri: "file:///fake", metadata: { files: [{ path: "SKILL.md" }] } }),
     skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
-  });
-  expect(result.kind).toBe("not_found");
+  };
+  await expect(readSkillRevisionFile({ ...input, requestedPath: "SKILL.md" }))
+    .resolves.toMatchObject({ kind: "ok", content: "# allowed" });
+  await expect(readSkillRevisionFile({ ...input, requestedPath: "SECRET.md" }))
+    .resolves.toEqual({ kind: "not_found" });
 });
 
 test("bundle skill: returns not_found when manifest entries are not objects with path strings", async () => {
@@ -148,21 +147,22 @@ test("bundle skill: returns not_found when manifest entries are not objects with
   expect(result.kind).toBe("not_found");
 });
 
-test("bundle skill: refuses path traversal even if the manifest claims it", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "skill-reader-"));
-  onTestFinished(() => rm(dir, { recursive: true, force: true }));
-
-  const result = await readSkillRevisionFile({
-    revision: revision({
-      bundleStorageUri: "file:///fake",
-      // Manifest validation lives elsewhere; here we just confirm the reader
-      // refuses paths that resolve outside the bundle root.
-      metadata: { files: [{ path: "../etc/passwd" }] }
-    }),
-    requestedPath: "../etc/passwd",
+test("bundle skill: refuses an existing sibling file even if the manifest claims it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "skill-reader-"));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const dir = path.join(root, "bundle");
+  await mkdir(dir);
+  await writeFile(path.join(root, "private.md"), "outside the bundle");
+  await writeFile(path.join(dir, "SKILL.md"), "# allowed");
+  const input = {
+    revision: revision({ bundleStorageUri: "file:///fake",
+      metadata: { files: [{ path: "../private.md" }, { path: "SKILL.md" }] } }),
     skillBundleStorage: { async materializeBundle() { return { localPath: dir }; } }
-  });
-  expect(result.kind).toBe("not_found");
+  };
+  await expect(readSkillRevisionFile({ ...input, requestedPath: "SKILL.md" }))
+    .resolves.toMatchObject({ kind: "ok", content: "# allowed" });
+  await expect(readSkillRevisionFile({ ...input, requestedPath: "../private.md" }))
+    .resolves.toEqual({ kind: "not_found" });
 });
 
 test("bundle skill: returns not_found when materializeBundle throws", async () => {

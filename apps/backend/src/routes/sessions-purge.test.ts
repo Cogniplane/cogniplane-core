@@ -84,9 +84,9 @@ describe("DELETE /sessions/:sessionId recovery", () => {
     expect(deepAgents.abortSession).not.toHaveBeenCalled();
   });
 
-  it("does not fail the delete when the adapter's purge throws", async () => {
+  it("does not fail the delete when the adapter's abort throws", async () => {
     const { app, deepAgents } = await makeApp();
-    deepAgents.purgeSessionData.mockRejectedValueOnce(new Error("checkpointer down"));
+    deepAgents.abortSession.mockRejectedValueOnce(new Error("runtime down"));
     const response = await app.inject({
       method: "DELETE",
       url: `/sessions/${SESSION_ID}`,

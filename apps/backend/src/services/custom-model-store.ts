@@ -1,5 +1,7 @@
 import type { ModelProvider } from "@cogniplane/shared-types";
 
+import type { PoolClient } from "pg";
+
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
 import type { AvailableModel } from "../domain/models.js";
@@ -67,14 +69,15 @@ function mapRow(row: Record<string, unknown>): CustomModelRecord {
 export class CustomModelStore {
   constructor(private readonly db: Pool) {}
 
-  async list(tenantId: string): Promise<CustomModelRecord[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+  async list(tenantId: string, transactionClient?: PoolClient): Promise<CustomModelRecord[]> {
+    const read = async (client: PoolClient) => {
       const result = await client.query(
         `SELECT * FROM tenant_custom_models WHERE tenant_id = $1 ORDER BY model_id ASC`,
         [tenantId]
       );
       return result.rows.map(mapRow);
-    });
+    };
+    return transactionClient ? read(transactionClient) : withTenantScope(this.db, tenantId, read);
   }
 
   /** Returns null when the model id already exists for the tenant. */
@@ -104,13 +107,21 @@ export class CustomModelStore {
     });
   }
 
-  async delete(tenantId: string, modelId: string): Promise<boolean> {
+  // `inTransaction` runs after a successful delete, before the commit.
+  // If it throws, the delete rolls back.
+  async delete(
+    tenantId: string,
+    modelId: string,
+    inTransaction?: (client: PoolClient) => Promise<void>
+  ): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `DELETE FROM tenant_custom_models WHERE tenant_id = $1 AND model_id = $2`,
         [tenantId, modelId]
       );
-      return (result.rowCount ?? 0) > 0;
+      const deleted = (result.rowCount ?? 0) > 0;
+      if (deleted && inTransaction) await inTransaction(client);
+      return deleted;
     });
   }
 }

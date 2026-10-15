@@ -2,9 +2,8 @@
 
 import type { AdminIntegrationView } from "@cogniplane/shared-types";
 import { IntegrationLogo } from "../../integration-logo";
-import { PILL_BASE, PILL_GRAY } from "../../../lib/ui-tokens";
-
-const PILL_PLANNED = `${PILL_BASE} bg-surface-container text-on-surface-variant`;
+import { Button } from "../../ui/button";
+import { OverviewRow } from "../overview-row";
 
 type AdminIntegrationRowProps = {
   integration: AdminIntegrationView;
@@ -14,23 +13,18 @@ type AdminIntegrationRowProps = {
   onToggleWrites: (next: boolean) => void;
 };
 
-type CaptionTone = "blue" | "gray" | "red" | "green" | "planned";
+type CaptionTone = "gray" | "red" | "green";
 
 const CAPTION_TONE_CLASS: Record<CaptionTone, string> = {
   red: "text-danger",
   green: "text-success",
-  gray: "text-on-surface-variant",
-  blue: "text-accent",
-  planned: "text-on-surface-faint"
+  gray: "text-on-surface-variant"
 };
 
 function statusCaption(integration: AdminIntegrationView): {
   text: string;
   tone: CaptionTone;
 } {
-  if (integration.status === "coming_soon") {
-    return { text: "Coming soon", tone: "planned" };
-  }
   if (!integration.platformConfigured) {
     return {
       text: integration.platformConfigMessage ?? "Platform not configured",
@@ -49,84 +43,55 @@ function statusCaption(integration: AdminIntegrationView): {
 export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
   const { integration, busy, onOpen, onToggleReads, onToggleWrites } = props;
 
-  // Coming-soon rows can never be flipped on. For everything else, the user
-  // must always retain the ability to flip a currently-on switch off — even
+  // The list shows no coming-soon rows. The user must always retain the ability to flip a currently-on switch off — even
   // when configuration disappears (e.g. the GitHub App is uninstalled while
   // toggles are still true). Otherwise availability and session tools stay
   // enabled with no UI path to disable them.
   const cannotEnable =
-    integration.status === "coming_soon" ||
     !integration.platformConfigured ||
     (integration.configMode !== "none" && !integration.hasConfig);
 
   const readsDisabled =
-    busy || integration.status === "coming_soon" || (!integration.readsEnabled && cannotEnable);
+    busy || (!integration.readsEnabled && cannotEnable);
   const writesDisabled =
-    busy || integration.status === "coming_soon" || (!integration.writesEnabled && cannotEnable);
+    busy || (!integration.writesEnabled && cannotEnable);
+  // A read-only integration has nothing to write. Keep a switch that is
+  // already on, so that it can still be turned off.
+  const showWrites = integration.writeToolIds.length > 0 || integration.writesEnabled;
 
   const status = statusCaption(integration);
+  const action = integration.configMode !== "none" && !integration.hasConfig ? "Configure" : "Details";
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={(e) => {
-        // Ignore key events bubbling up from nested controls (the switches);
-        // otherwise Space/Enter on a focused switch would open the pane
-        // instead of toggling the switch.
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
-      className="flex cursor-pointer items-center justify-between gap-4 border-b border-outline-variant px-4 py-3.5 transition-colors last:border-b-0 hover:bg-surface-container-low focus-visible:bg-surface-container-low focus-visible:outline-none"
+    <OverviewRow
+      title={<><span aria-hidden="true" className="inline-flex"><IntegrationLogo slug={integration.logoSlug} name={integration.name} category={integration.category} size={20} /></span>{integration.name}</>}
+      status={<span className={CAPTION_TONE_CLASS[status.tone]}>{status.text.endsWith(".") ? status.text : `${status.text}.`}</span>}
     >
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        <IntegrationLogo
-          slug={integration.logoSlug}
-          name={integration.name}
-          category={integration.category}
+      <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
+        <input
+          type="checkbox"
+          role="switch"
+          aria-label={`Reads for ${integration.name}`}
+          checked={integration.readsEnabled}
+          disabled={readsDisabled}
+          onChange={(e) => onToggleReads(e.currentTarget.checked)}
+          className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
         />
-        <div className="flex min-w-0 flex-col gap-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <strong className="text-sm font-semibold text-on-surface">
-              {integration.name}
-            </strong>
-            <span className={PILL_GRAY}>{integration.category}</span>
-            {integration.status === "coming_soon" ? (
-              <span className={PILL_PLANNED}>Coming soon</span>
-            ) : null}
-          </div>
-          <small className={`text-xs ${CAPTION_TONE_CLASS[status.tone]}`}>{status.text}</small>
-        </div>
-      </div>
-
-      <div className="flex flex-shrink-0 items-center gap-4" onClick={(e) => e.stopPropagation()}>
-        <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
-          <input
-            type="checkbox"
-            role="switch"
-            checked={integration.readsEnabled}
-            disabled={readsDisabled}
-            onChange={(e) => onToggleReads(e.currentTarget.checked)}
-            className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
-          />
-          <span>Reads</span>
-        </label>
-        <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
-          <input
-            type="checkbox"
-            role="switch"
-            checked={integration.writesEnabled}
-            disabled={writesDisabled}
-            onChange={(e) => onToggleWrites(e.currentTarget.checked)}
-            className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
-          />
-          <span>Writes</span>
-        </label>
-      </div>
-    </div>
+        <span>Reads</span>
+      </label>
+      {showWrites ? <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
+        <input
+          type="checkbox"
+          role="switch"
+          aria-label={`Writes for ${integration.name}`}
+          checked={integration.writesEnabled}
+          disabled={writesDisabled}
+          onChange={(e) => onToggleWrites(e.currentTarget.checked)}
+          className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+        />
+        <span>Writes</span>
+      </label> : null}
+      <Button type="button" variant="outline" size="sm" aria-label={action === "Configure" ? `Configure ${integration.name}` : `Details for ${integration.name}`} onClick={onOpen}>{action}</Button>
+    </OverviewRow>
   );
 }

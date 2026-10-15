@@ -19,8 +19,7 @@ it("documents schema defaults without reading deployment values", async () => {
   expect(table).toContain("JSON object of key IDs to secrets of at least 32 characters");
 });
 
-it("rejects validators it cannot describe instead of silently omitting their constraints", async () => {
-  const source = await readFile(configPath, "utf8");
-  expect(() => renderConfigTable(source.replace("z.coerce.number().int().positive().default(3001)",
-    "z.coerce.number().multipleOf(2).default(3001)"))).toThrow("Undocumented validator: multipleOf");
+it("rejects validators it cannot describe instead of silently omitting their constraints", () => {
+  const source = "const envSchema = z.object({ API_PORT: z.number().multipleOf(2) });";
+  expect(() => renderConfigTable(source)).toThrow("Undocumented validator: multipleOf");
 });

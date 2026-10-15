@@ -46,8 +46,12 @@ it("shows totals and keeps the previous report visible while changing the period
 
 it("sorts model rates in both directions with unrated models last", async () => {
   mount();
+  await screen.findByText("4 rated responses");
+  expect(screen.queryByText("Unrated")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "By model" }));
   await screen.findByText("Unrated");
-  const table = screen.getAllByRole("table")[1];
+  expect(screen.queryByText("Daily breakdown")).toBeNull();
+  const table = screen.getByRole("table");
   const rate = within(table).getByRole("button", { name: "Rate" });
   const names = () => within(table).getAllByRole("row").slice(1)
     .map(row => within(row).getAllByRole("cell")[0].textContent);

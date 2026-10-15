@@ -22,7 +22,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
       approvalPolicy: "on-request",
       approvalReviewer: "guardian_subagent",
       sandboxMode: "workspace-write",
-      networkMode: "restricted",
+      sandboxEgressDomains: ["pypi.org", "*.example.com"],
       allowCommandExecution: true,
       autoApproveReadOnlyTools: true,
       policyEnforcementMode: "enforce",
@@ -43,7 +43,7 @@ test("parseRuntimePolicySnapshot decodes a fully-populated snapshot", () => {
     approvalPolicy: "on-request",
     approvalReviewer: "guardian_subagent",
     sandboxMode: "workspace-write",
-    networkMode: "restricted",
+    sandboxEgressDomains: ["pypi.org", "*.example.com"],
     allowCommandExecution: true,
     autoApproveReadOnlyTools: true,
     policyEnforcementMode: "enforce",
@@ -117,7 +117,19 @@ test("parseRuntimePolicySnapshot fills sensible defaults for missing optional fi
   expect(result.version).toBe(1);
   expect(result.hash).toBe("");
   expect(result.sandboxMode).toBe("workspace-write");
-  expect(result.networkMode).toBe("restricted");
+  // A snapshot without the field gives the strictest policy: no network.
+  expect(result.sandboxEgressDomains).toEqual([]);
+});
+
+test("parseRuntimePolicySnapshot keeps string sandbox hosts and drops the rest", () => {
+  const result = parseRuntimePolicySnapshot(
+    { id: "x", sandboxEgressDomains: ["pypi.org", 42, null, "*.example.com"] },
+    ctx
+  );
+  expect(result.sandboxEgressDomains).toEqual(["pypi.org", "*.example.com"]);
+  // A value that is not a list reads as no hosts, not as an error.
+  expect(parseRuntimePolicySnapshot({ id: "x", sandboxEgressDomains: "pypi.org" }, ctx).sandboxEgressDomains)
+    .toEqual([]);
 });
 
 test("parseRuntimePolicySnapshot drops non-string entries from the array fields", () => {

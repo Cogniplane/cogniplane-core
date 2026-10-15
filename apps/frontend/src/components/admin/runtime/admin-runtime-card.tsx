@@ -41,6 +41,10 @@ export function AdminRuntimeCard(props: {
   const activeCount = countActiveSessions(props.runtimeSessions);
   const filtered = filterRuntimeSessions(props.runtimeSessions, search, statusFilter);
   const visible = showAll ? filtered : filtered.slice(0, PAGE_SIZE);
+  // Drain and refresh share one request state in useAdminRuntimeData. Starting
+  // one while the other runs would hide the first one's result, so a running
+  // rollout blocks both.
+  const rolloutRunning = props.busyKey !== null;
 
   return (
     <Card>
@@ -49,11 +53,10 @@ export function AdminRuntimeCard(props: {
           <div>
             <p className={SECTION_LABEL}>Runtime fleet</p>
             <h2 className="text-lg font-semibold text-on-surface">
-              Rollout and session health
+              Runtime sessions
             </h2>
             <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-              Watch which config bundle is loaded by live runtimes and control idle refresh or
-              drain operations without leaving the admin plane.
+              Inspect recent runtime sessions and refresh idle sessions when their configuration needs to be reloaded.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -65,8 +68,8 @@ export function AdminRuntimeCard(props: {
 
       <CardContent className="flex flex-col gap-4">
         {props.runtimeConfig ? (
-          <div className="rounded-lg border border-outline-variant bg-surface-container-low p-3">
-            <p className={SECTION_LABEL}>Backend configuration</p>
+          <details className="rounded-lg border border-outline-variant bg-surface-container-low p-3">
+            <summary className="cursor-pointer text-sm font-medium">Backend configuration</summary>
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <span className={CHIP}>
                 E2B template:{" "}
@@ -84,21 +87,16 @@ export function AdminRuntimeCard(props: {
                 );
               })}
             </div>
-          </div>
+          </details>
         ) : null}
 
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={CHIP}>rollout aware</span>
-            <span className={CHIP}>config hashes visible</span>
-            <span className={CHIP}>idle controls</span>
-          </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
               variant="outline"
               size="sm"
-              disabled={props.busyKey === "drain"}
+              disabled={rolloutRunning}
               onClick={() => props.onDrainIdle()}
             >
               {props.busyKey === "drain" ? "Draining..." : "Drain idle"}
@@ -106,7 +104,7 @@ export function AdminRuntimeCard(props: {
             <Button
               type="button"
               size="sm"
-              disabled={props.busyKey === "refresh"}
+              disabled={rolloutRunning}
               onClick={() => props.onRefreshIdle()}
             >
               {props.busyKey === "refresh" ? "Refreshing..." : "Refresh idle"}

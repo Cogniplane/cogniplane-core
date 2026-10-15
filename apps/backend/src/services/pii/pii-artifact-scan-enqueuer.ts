@@ -3,10 +3,12 @@ import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { PiiFinding } from "./pii-provider.js";
 import {
+  isScannableContentType,
   PiiProtectionServiceError,
   type PiiProtectionService,
   type PiiScanArtifactInput
 } from "./pii-protection-service.js";
+import { PERMANENT_PII_ERROR_CODES } from "./pii-scan-job-handler.js";
 import type { PiiScanJobMode, PiiScanJobStore } from "./pii-scan-job-store.js";
 import type { PiiScanRunStore } from "./pii-scan-run-store.js";
 
@@ -21,6 +23,11 @@ export interface EnqueueArtifactPiiScanInput {
   storageKey: string;
   source: PiiArtifactScanSource;
 }
+
+// The synchronous path runs in block mode and, in every mode, for a type the
+// scan cannot read. It records the tenant's real mode, as the async handler
+// records `job.mode`.
+type SyncScanInput = EnqueueArtifactPiiScanInput & { mode: PiiScanJobMode };
 
 export type PiiArtifactScanResult =
   | { kind: "skipped" }
@@ -63,12 +70,6 @@ type PiiArtifactScanLogger = {
  * scheduler worker cannot overwrite a completed status with our later update.
  */
 export class PiiArtifactScanEnqueuer {
-  // The synchronous path is only ever entered in `block` mode (see `enqueue`);
-  // every `modeApplied`/`mode` it stamps therefore reflects block mode. Named
-  // once here rather than hardcoded per call site so the invariant is explicit
-  // and the async handler's `modeApplied = job.mode` derivation has a mirror —
-  // a future mode reaching this path can't silently inherit a stale literal.
-  private static readonly SYNC_SCAN_MODE: PiiScanJobMode = "block";
 
   constructor(
     private readonly deps: {
@@ -94,15 +95,17 @@ export class PiiArtifactScanEnqueuer {
 
     const mode = settings.mode as PiiScanJobMode;
 
-    if (mode === "block") {
-      return this.runSyncBlock(input);
+    // A type the scan cannot read is rejected now in every mode, so the
+    // uploader gets the reason at once instead of a later background failure.
+    if (mode === "block" || !isScannableContentType(input.contentType)) {
+      return this.runSyncBlock({ ...input, mode });
     }
 
     return this.runAsync(input, mode);
   }
 
   private async runSyncBlock(
-    input: EnqueueArtifactPiiScanInput
+    input: SyncScanInput
   ): Promise<PiiArtifactScanResult> {
     const scanRun = await this.deps.piiScanRuns.create({
       tenantId: input.tenantId,
@@ -110,7 +113,7 @@ export class PiiArtifactScanEnqueuer {
       subjectId: input.artifactId,
       sourceSessionId: input.sessionId,
       sourceUserId: input.userId,
-      mode: "block",
+      mode: input.mode,
       status: "processing"
     });
 
@@ -134,14 +137,14 @@ export class PiiArtifactScanEnqueuer {
 
       return decision.action === "block"
         ? await this.handleBlockDecision(input, scanRun.scanRunId, decision)
-        : await this.handleAllowDecision(input, scanRun.scanRunId, decision);
+        : await this.handleAllowDecision(input, scanRun.scanRunId, decision, subject.imagesNotScanned?.() ?? false);
     } catch (error) {
       return this.handleProviderError(input, scanRun.scanRunId, error);
     }
   }
 
   private async handleArtifactNotFound(
-    input: EnqueueArtifactPiiScanInput,
+    input: SyncScanInput,
     scanRunId: string
   ): Promise<PiiArtifactScanResult> {
     await this.markArtifactFailed(input, scanRunId, "artifact_not_found");
@@ -159,7 +162,7 @@ export class PiiArtifactScanEnqueuer {
   }
 
   private async handleBlockDecision(
-    input: EnqueueArtifactPiiScanInput,
+    input: SyncScanInput,
     scanRunId: string,
     decision: Extract<
       Awaited<ReturnType<PiiProtectionService["evaluateArtifact"]>>,
@@ -170,7 +173,7 @@ export class PiiArtifactScanEnqueuer {
     // a terminal status never coexists with a silent orphan: if the delete
     // fails we record it (objectDeleted:false + orphan audit) and the row's
     // status is the honest signal that cleanup is incomplete.
-    const objectDeleted = await this.purgeBlockedObject(input, scanRunId);
+    const objectDeleted = await this.purgeRejectedObject(input, scanRunId);
 
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "blocked",
@@ -185,14 +188,14 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "blocked",
-      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
+      modeApplied: input.mode,
       scanRunId,
       blockReason: decision.blockReason,
       findingsCount: decision.findings.length
     });
     await this.emitAudit(input, "pii_blocked", {
       scanRunId,
-      mode: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
+      mode: input.mode,
       subjectType: "artifact",
       subjectId: input.artifactId,
       source: input.source,
@@ -211,12 +214,13 @@ export class PiiArtifactScanEnqueuer {
   }
 
   /**
-   * Best-effort delete of the stored object on a block. Returns whether the
-   * bytes were purged. Never throws — the block outcome must stand even if
-   * cleanup fails; a failure is escalated to a queryable audit event
-   * (`pii_block_object_orphaned`) so the residual orphan is discoverable.
+   * Best-effort delete of the stored object of a rejected upload (a block or a
+   * failed synchronous scan). Returns whether the bytes were purged. Never
+   * throws — the rejection must stand even if cleanup fails; a failure is
+   * escalated to a queryable audit event (`pii_block_object_orphaned`) so the
+   * residual orphan is discoverable.
    */
-  private async purgeBlockedObject(
+  private async purgeRejectedObject(
     input: EnqueueArtifactPiiScanInput,
     scanRunId: string
   ): Promise<boolean> {
@@ -226,7 +230,7 @@ export class PiiArtifactScanEnqueuer {
     } catch (error) {
       this.deps.logger?.error?.(
         { err: error, tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
-        "Failed to delete stored object for PII-blocked artifact"
+        "Failed to delete stored object for PII-rejected artifact"
       );
       await this.emitAudit(input, "pii_block_object_orphaned", {
         scanRunId,
@@ -240,12 +244,13 @@ export class PiiArtifactScanEnqueuer {
   }
 
   private async handleAllowDecision(
-    input: EnqueueArtifactPiiScanInput,
+    input: SyncScanInput,
     scanRunId: string,
     decision: Exclude<
       Awaited<ReturnType<PiiProtectionService["evaluateArtifact"]>>,
       { action: "block" }
-    >
+    >,
+    imagesNotScanned: boolean
   ): Promise<PiiArtifactScanResult> {
     const findingsCount =
       decision.action === "report" ? decision.findings.length : 0;
@@ -259,21 +264,26 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "scanned",
-      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
+      modeApplied: input.mode,
       scanRunId,
-      findingsCount
+      findingsCount,
+      ...(imagesNotScanned ? { imagesNotScanned: true } : {})
     });
     return { kind: "allowed", scanRunId };
   }
 
   private async handleProviderError(
-    input: EnqueueArtifactPiiScanInput,
+    input: SyncScanInput,
     scanRunId: string,
     error: unknown
   ): Promise<PiiArtifactScanResult> {
     const errorCode =
       error instanceof PiiProtectionServiceError ? error.code : "pii_provider_error";
     const errorMessage = error instanceof Error ? error.message : String(error);
+    // A permanent rejection (an unscannable type, an unreadable PDF, an
+    // oversized file) leaves bytes nobody can use, so they go. A provider
+    // error is not a verdict: the content was never scanned, so keep it.
+    if (PERMANENT_PII_ERROR_CODES.has(errorCode)) await this.purgeRejectedObject(input, scanRunId);
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "failed",
       errorMessage,
@@ -368,7 +378,7 @@ export class PiiArtifactScanEnqueuer {
   }
 
   private async markArtifactFailed(
-    input: EnqueueArtifactPiiScanInput,
+    input: SyncScanInput,
     scanRunId: string,
     errorMessage: string
   ): Promise<void> {
@@ -377,7 +387,7 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "failed",
-      modeApplied: PiiArtifactScanEnqueuer.SYNC_SCAN_MODE,
+      modeApplied: input.mode,
       scanRunId,
       summaryText: errorMessage
     });

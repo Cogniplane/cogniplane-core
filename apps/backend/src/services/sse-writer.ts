@@ -1,14 +1,3 @@
-// The SSE reply is hijacked, so runtime failures never pass through the
-// global error handler. Only expose messages from deliberate 4xx errors.
-export function clientSafeFailureMessage(error: unknown): string {
-  const raw = error as { statusCode?: unknown; status?: unknown } | null | undefined;
-  const status = typeof raw?.statusCode === "number" ? raw.statusCode : raw?.status;
-  if (typeof status === "number" && status >= 400 && status < 500 && error instanceof Error) {
-    return error.message;
-  }
-  return "The assistant run failed.";
-}
-
 // Minimal slice of http.ServerResponse used by the streaming writer.
 export type RawSseResponse = {
   write(chunk: string): boolean;

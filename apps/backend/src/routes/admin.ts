@@ -1,3 +1,8 @@
+import { PersonAccessService } from "../services/person-access-service.js";
+import { registerAdminPersonAccessRoutes } from "./admin/admin-person-access-routes.js";
+import { registerAdminHistoryRoutes } from "./admin/admin-history-routes.js";
+import { registerAdminModelSpendingRoutes } from "./admin/admin-model-spending-routes.js";
+import type { ModelSpendingStore } from "../services/model-spending-store.js";
 import type { FastifyInstance } from "fastify";
 
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
@@ -71,6 +76,8 @@ export function buildAdminRouteStores(
   };
 
   return {
+    personAccess: new PersonAccessService(deps),
+    modelSpending: deps.modelSpending,
     config: extras.config,
     dynamicConfig: deps.dynamicConfig,
     skillMarketplace: deps.skillMarketplace,
@@ -90,6 +97,8 @@ export function buildAdminRouteStores(
     // tenant-scoped, so all tenants share the cache.
     fetchOpenRouterCatalog: buildOpenRouterCatalogFetcher(),
     activations: deps.activationTracker,
+    mcpConnectionTests: deps.mcpConnectionTests,
+    mcpAppCsp: deps.mcpAppCsp,
     piiCircuitBreaker: deps.piiCircuitBreaker,
     piiProtection: deps.piiProtection,
     piiAnalytics: deps.piiAnalytics,
@@ -118,7 +127,7 @@ export type AdminRouteStores = AdminSkillRouteStores &
   ModelAdminRouteStores &
   PolicyRouteStores &
   AdminIntegrationsRouteStores &
-  OptionalAdminPiiRouteStores;
+  OptionalAdminPiiRouteStores & { modelSpending?: ModelSpendingStore; personAccess?: Pick<PersonAccessService, "explain"> };
 
 export async function registerAdminRoutes(
   app: FastifyInstance,
@@ -126,6 +135,7 @@ export async function registerAdminRoutes(
 ): Promise<void> {
   await registerAdminSkillRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
+    skillReleaseImpact: stores.skillReleaseImpact,
     skillMarketplace: stores.skillMarketplace,
     auditEvents: stores.auditEvents,
     skillBundleStorage: stores.skillBundleStorage,
@@ -137,7 +147,10 @@ export async function registerAdminRoutes(
     tenantMembers: stores.tenantMembers,
     auditEvents: stores.auditEvents
   });
+  if (stores.personAccess) await registerAdminPersonAccessRoutes(app, stores.personAccess);
   await registerAdminTokenUsageRoutes(app);
+  await registerAdminHistoryRoutes(app);
+  if (stores.modelSpending) await registerAdminModelSpendingRoutes(app, stores.modelSpending);
   await registerAdminSessionRoutes(app);
   await registerAdminSessionDetailRoute(app);
   await registerAdminArtifactRoutes(app, { auditEvents: stores.auditEvents });
@@ -156,7 +169,6 @@ export async function registerAdminRoutes(
   }
   await registerAdminTenantSettingsRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
-    auditEvents: stores.auditEvents,
     managedToolCatalog: stores.managedToolCatalog,
     // Custom models never advertise reasoning efforts (see CustomModelStore).
     // Guarded: test wirings pass partial store literals without customModels.
@@ -164,6 +176,7 @@ export async function registerAdminRoutes(
       ? async (tenantId) =>
           (await stores.customModels.list(tenantId)).map((record) => ({
             id: record.modelId,
+            provider: record.provider,
             supportedEfforts: []
           }))
       : undefined
@@ -191,7 +204,8 @@ export async function registerAdminRoutes(
 
   await registerAdminMcpServerRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
-    auditEvents: stores.auditEvents,
-    activations: stores.activations
+    activations: stores.activations,
+    mcpConnectionTests: stores.mcpConnectionTests,
+    mcpAppCsp: stores.mcpAppCsp
   });
 }

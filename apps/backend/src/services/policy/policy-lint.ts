@@ -3,7 +3,7 @@ import {
   type PolicyConditions,
   type PolicyLintWarning
 } from "@cogniplane/shared-types";
-import { compareRuleEvaluationOrder } from "./policy-engine.js";
+import { compareRuleEvaluationOrder, normalizeToolName } from "./policy-engine.js";
 
 // A rule as the lint sees it — the subset of fields that affect reachability.
 // Mirrors the engine's EvaluableRule but the lint only needs identity, order,
@@ -39,11 +39,15 @@ function asStringArray(value: unknown): string[] | undefined {
 // non-empty SUBSET of it: every value the inner rule admits, the outer rule
 // also admits. (If inner is a wildcard but outer is constrained, outer does NOT
 // subsume — inner admits values outside outer's list.)
-function arrayDimensionSubsumes(outer: string[] | undefined, inner: string[] | undefined): boolean {
+function arrayDimensionSubsumes(
+  outer: string[] | undefined,
+  inner: string[] | undefined,
+  normalize: (value: string) => string = (value) => value
+): boolean {
   if (!outer || outer.length === 0) return true;
   if (!inner || inner.length === 0) return false;
-  const outerSet = new Set(outer);
-  return inner.every((v) => outerSet.has(v));
+  const outerSet = new Set(outer.map(normalize));
+  return inner.every((v) => outerSet.has(normalize(v)));
 }
 
 /**
@@ -63,7 +67,9 @@ function arrayDimensionSubsumes(outer: string[] | undefined, inner: string[] | u
  */
 export function conditionsSubsume(outer: PolicyConditions, inner: PolicyConditions): boolean {
   for (const dim of ARRAY_DIMENSIONS) {
-    if (!arrayDimensionSubsumes(asStringArray(outer[dim]), asStringArray(inner[dim]))) {
+    // The engine matches tool names without regard to case, so lint must too.
+    const normalize = dim === "toolNames" ? normalizeToolName : undefined;
+    if (!arrayDimensionSubsumes(asStringArray(outer[dim]), asStringArray(inner[dim]), normalize)) {
       return false;
     }
   }

@@ -67,6 +67,14 @@ describe("formatPiiLabel", () => {
     expect(formatPiiLabel(p({ status: "scanned", findingsCount: 3 }))).toBe("PII: 3 findings");
   });
 
+  test("a verdict on text only says so", () => {
+    expect(formatPiiLabel(p({ status: "scanned", findingsCount: 0, imagesNotScanned: true })))
+      .toBe("PII: clean (text only)");
+    expect(formatPiiLabel(p({ status: "transformed", imagesNotScanned: true })))
+      .toBe("PII redacted (text only)");
+    expect(formatPiiLabel(p({ status: "failed", imagesNotScanned: true }))).toBe("PII scan failed");
+  });
+
   test("transformed has its own label", () => {
     expect(formatPiiLabel(p({ status: "transformed" }))).toBe("PII redacted");
   });
@@ -83,8 +91,10 @@ describe("piiTone", () => {
 });
 
 describe("canDownloadArtifact", () => {
-  test("uploads are downloadable in any non-deleted state", () => {
-    expect(canDownloadArtifact(makeArtifact({ artifactType: "upload", status: "processing" }))).toBe(true);
+  test("uploads only when their PII scan has made them ready", () => {
+    expect(canDownloadArtifact(makeArtifact({ artifactType: "upload", status: "pending" }))).toBe(false);
+    expect(canDownloadArtifact(makeArtifact({ artifactType: "upload", status: "failed" }))).toBe(false);
+    expect(canDownloadArtifact(makeArtifact({ artifactType: "upload", status: "ready" }))).toBe(true);
   });
 
   test("generated artifacts only when ready", () => {

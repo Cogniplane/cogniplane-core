@@ -5,6 +5,24 @@ import type {
 } from "@cogniplane/shared-types";
 import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN } from "./ui-tokens";
 
+const PII_RANGE_SCOPES = new Set<unknown>(["metrics", "top", "recent", "jobs/stats"]);
+
+/**
+ * True when a cached query belongs to the PII dashboard and to the given range.
+ * The range params are the last key element; groupBy, actions, and limit live
+ * in the same object and do not matter here.
+ */
+export function isPiiRangeQueryKey(
+  key: readonly unknown[],
+  rangeParams: { range: string; from?: string; to?: string }
+): boolean {
+  if (key.length < 4 || key[0] !== "admin" || key[1] !== "pii" || !PII_RANGE_SCOPES.has(key[2])) return false;
+  const params = key[key.length - 1];
+  if (!params || typeof params !== "object") return false;
+  const { range: preset, from, to } = params as { range?: string; from?: string; to?: string };
+  return preset === rangeParams.range && from === rangeParams.from && to === rangeParams.to;
+}
+
 export type PiiKpiKey = "scans" | "findings" | "blocked" | "transformed" | "failed";
 
 export type PiiDeltaDirection = "up" | "down" | "flat" | "new";

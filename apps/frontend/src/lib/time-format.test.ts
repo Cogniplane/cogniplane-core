@@ -1,6 +1,10 @@
 import { describe, expect, test } from "vitest";
 
+import { withUtcDateLocale } from "../test-helpers/date-locale";
+
 import { formatMediumDateTime, formatTimestamp } from "./time-format";
+
+withUtcDateLocale();
 
 describe("formatTimestamp", () => {
   test("nullish returns em dash", () => {
@@ -17,10 +21,9 @@ describe("formatTimestamp", () => {
     expect(formatTimestamp("not-a-date")).toBe("not-a-date");
   });
 
-  test("valid ISO is locale-formatted (contains a digit)", () => {
+  test("valid ISO renders its calendar date and time", () => {
     const out = formatTimestamp("2026-04-30T12:00:00Z");
-    expect(out).toMatch(/\d/);
-    expect(out).not.toBe("2026-04-30T12:00:00Z");
+    expect(out).toBe("4/30/2026, 12:00:00 PM");
   });
 });
 
@@ -36,7 +39,6 @@ describe("formatMediumDateTime", () => {
 
   test("valid ISO renders the fixed en-US medium/short format", () => {
     const out = formatMediumDateTime("2026-04-30T12:00:00Z", "x");
-    expect(out).toMatch(/2026/);
-    expect(out).toMatch(/\d{1,2}:\d{2}/);
+    expect(out).toBe("Apr 30, 2026, 12:00 PM");
   });
 });

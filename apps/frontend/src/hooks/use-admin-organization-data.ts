@@ -16,7 +16,7 @@ import type { ModelProvider, PiiProtectionSettings } from "@cogniplane/shared-ty
 import { MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 
 // Per-provider save keys are `save-<provider>-key` so they line up with
-// providerKeyBusyKey() in admin-organization-card.tsx.
+// providerKeyBusyKey() in provider-key-rows.tsx.
 type ProviderMutationKey = `save-${ModelProvider}-key`;
 type MutationKey =
   | ProviderMutationKey
@@ -35,6 +35,7 @@ export function useAdminOrganizationData() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [successKey, setSuccessKey] = useState<MutationKey | null>(null);
   const [mutationError, setMutationError] = useState<string | null>(null);
+  const [errorKey, setErrorKey] = useState<MutationKey | null>(null);
   const [activeMutation, setActiveMutation] = useState<MutationKey | null>(null);
 
   const tenantQuery = useQuery({
@@ -48,6 +49,7 @@ export function useAdminOrganizationData() {
   const run = async <T>(ctx: OrgMutationContext, fn: () => Promise<T>): Promise<T | undefined> => {
     setActiveMutation(ctx.key);
     setMutationError(null);
+    setErrorKey(null);
     setSuccessMessage(null);
     setSuccessKey(null);
     try {
@@ -59,6 +61,7 @@ export function useAdminOrganizationData() {
       return result;
     } catch (error) {
       setMutationError(toErrorMessage(error, ctx.errorFallback));
+      setErrorKey(ctx.key);
       setSuccessMessage(null);
       setSuccessKey(null);
       return undefined;
@@ -73,6 +76,11 @@ export function useAdminOrganizationData() {
 
   return {
     tenant: tenantQuery.data ?? null,
+    tenantLoading: tenantQuery.isPending,
+    tenantLoadError,
+    retryTenantLoad: () => tenantQuery.refetch(),
+    mutationError,
+    errorKey,
     busyKey: activeMutation,
     error: mutationError ?? tenantLoadError,
     successMessage,
@@ -81,7 +89,7 @@ export function useAdminOrganizationData() {
       const label = MODEL_PROVIDER_META[provider].label;
       // An empty key is the removal path (the backend clears the stored key).
       const removing = apiKey.trim() === "";
-      await run(
+      return (await run(
         {
           key: `save-${provider}-key`,
           successMessage: removing
@@ -98,8 +106,9 @@ export function useAdminOrganizationData() {
             invalidateTenant(),
             queryClient.invalidateQueries({ queryKey: queryKeys.models.all })
           ]);
+          return true;
         }
-      );
+      )) === true;
     },
     handleSaveMicrosoftConfig: async (config: {
       clientId?: string;
@@ -132,7 +141,7 @@ export function useAdminOrganizationData() {
       );
     },
     handleSavePiiProtection: async (settings: PiiProtectionSettings) => {
-      await run(
+      return (await run(
         {
           key: "save-pii-protection",
           successMessage: "PII protection settings saved.",
@@ -141,8 +150,9 @@ export function useAdminOrganizationData() {
         async () => {
           await updateTenantPiiProtection(settings);
           await invalidateTenant();
+          return true;
         }
-      );
+      )) === true;
     }
   };
 }

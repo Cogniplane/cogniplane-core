@@ -91,12 +91,11 @@ test("empty pending list issues no expire and no audit", async () => {
   expect(audit.calls).toEqual([]);
 });
 
-test("happy path: onCancelLocal both releases in-memory state and supplies audit payload extras in one pass", async () => {
+test("happy path: expires each pending row and audits it with only the reason", async () => {
   const approvals = makeApprovalsFake({
     pending: [makeApproval("a-1"), makeApproval("a-2")]
   });
   const audit = makeAuditFake();
-  const localCalls: string[] = [];
 
   await cancelPendingApprovals({
     tenantId: "t",
@@ -105,14 +104,9 @@ test("happy path: onCancelLocal both releases in-memory state and supplies audit
     reason: "turn_interrupted",
     approvals,
     auditEvents: audit,
-    logger: makeLogger(),
-    onCancelLocal: (id) => {
-      localCalls.push(id);
-      return { itemId: `item-${id}`, kind: "command" };
-    }
+    logger: makeLogger()
   });
 
-  expect(localCalls).toEqual(["a-1", "a-2"]);
   expect(approvals.expireCalls).toEqual(["a-1", "a-2"]);
   expect(audit.calls).toHaveLength(2);
   expect(audit.calls[0]).toMatchObject({
@@ -120,43 +114,19 @@ test("happy path: onCancelLocal both releases in-memory state and supplies audit
     sessionId: "s",
     userId: "u",
     approvalId: "a-1",
-    type: "approval.expired",
-    payload: { itemId: "item-a-1", kind: "command", reason: "turn_interrupted" }
+    type: "approval.expired"
   });
-});
-
-test("onCancelLocal returning undefined is fine — audit payload contains only `reason`", async () => {
-  const approvals = makeApprovalsFake({ pending: [makeApproval("a-only")] });
-  const audit = makeAuditFake();
-
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger(),
-    onCancelLocal: () => undefined
-  });
-
-  expect(audit.calls).toHaveLength(1);
-  expect(audit.calls[0]).toMatchObject({
-    payload: { reason: "turn_interrupted" }
-  });
-  // Sanity: nothing else snuck into the payload.
   expect((audit.calls[0] as { payload: Record<string, unknown> }).payload).toEqual({
     reason: "turn_interrupted"
   });
 });
 
-test("decision-raced row (expire returns null) skips audit but still ran onCancelLocal", async () => {
+test("decision-raced row (expire returns null) skips audit", async () => {
   const approvals = makeApprovalsFake({
     pending: [makeApproval("a-raced")],
     expireResults: { "a-raced": null }
   });
   const audit = makeAuditFake();
-  const localCalls: string[] = [];
 
   await cancelPendingApprovals({
     tenantId: "t",
@@ -165,48 +135,16 @@ test("decision-raced row (expire returns null) skips audit but still ran onCance
     reason: "turn_interrupted",
     approvals,
     auditEvents: audit,
-    logger: makeLogger(),
-    onCancelLocal: (id) => { localCalls.push(id); }
+    logger: makeLogger()
   });
 
-  expect(localCalls).toEqual(["a-raced"]);
   expect(approvals.expireCalls).toEqual(["a-raced"]);
   expect(audit.calls).toEqual([]);
 });
 
-test("onCancelLocal throwing on one approval does not abort cleanup of subsequent rows; failed row gets empty payload extras", async () => {
-  const approvals = makeApprovalsFake({
-    pending: [makeApproval("a-1"), makeApproval("a-2"), makeApproval("a-3")]
-  });
-  const audit = makeAuditFake();
-  const logger = makeLogger();
-
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger,
-    onCancelLocal: (id) => {
-      if (id === "a-2") throw new Error("local boom");
-      return { itemId: `item-${id}` };
-    }
-  });
-
-  expect(approvals.expireCalls).toEqual(["a-1", "a-2", "a-3"]);
-  expect(audit.calls).toHaveLength(3);
-  expect((audit.calls[1] as { payload: Record<string, unknown> }).payload).toEqual({
-    reason: "turn_interrupted"
-  });
-  expect(logger._warnings).toHaveLength(1);
-});
-
-test("expireApprovalById: ttl sweep expires the single row, drops in-memory state, and audits with reason ttl_expired", async () => {
+test("expireApprovalById: ttl sweep expires the single row and audits with reason ttl_expired", async () => {
   const approvals = makeApprovalsFake({ pending: [makeApproval("a-1"), makeApproval("a-2")] });
   const audit = makeAuditFake();
-  const dropped: string[] = [];
 
   await expireApprovalById({
     tenantId: "t",
@@ -216,16 +154,11 @@ test("expireApprovalById: ttl sweep expires the single row, drops in-memory stat
     reason: "ttl_expired",
     approvals,
     auditEvents: audit,
-    logger: makeLogger(),
-    onCancelLocal: (id) => {
-      dropped.push(id);
-      return undefined;
-    }
+    logger: makeLogger()
   });
 
-  // Only the aged-out row is touched — siblings are left alone.
+  // Only the aged-out row is touched. Siblings are left alone.
   expect(approvals.expireCalls).toEqual(["a-1"]);
-  expect(dropped).toEqual(["a-1"]);
   expect(audit.calls).toHaveLength(1);
   expect(audit.calls[0]).toMatchObject({
     tenantId: "t",
@@ -237,13 +170,12 @@ test("expireApprovalById: ttl sweep expires the single row, drops in-memory stat
   });
 });
 
-test("expireApprovalById: decision-raced row (expire returns null) skips audit but still released memory", async () => {
+test("expireApprovalById: decision-raced row (expire returns null) skips audit", async () => {
   const approvals = makeApprovalsFake({
     pending: [makeApproval("a-1")],
     expireResults: { "a-1": null }
   });
   const audit = makeAuditFake();
-  const dropped: string[] = [];
 
   await expireApprovalById({
     tenantId: "t",
@@ -253,11 +185,9 @@ test("expireApprovalById: decision-raced row (expire returns null) skips audit b
     reason: "ttl_expired",
     approvals,
     auditEvents: audit,
-    logger: makeLogger(),
-    onCancelLocal: (id) => { dropped.push(id); }
+    logger: makeLogger()
   });
 
-  expect(dropped).toEqual(["a-1"]);
   expect(approvals.expireCalls).toEqual(["a-1"]);
   expect(audit.calls).toEqual([]);
 });
@@ -278,8 +208,7 @@ test("expireApprovalById: expire throwing is logged, never rejects", async () =>
     reason: "ttl_expired",
     approvals,
     auditEvents: audit,
-    logger,
-    onCancelLocal: () => undefined
+    logger
   });
 
   expect(audit.calls).toEqual([]);

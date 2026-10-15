@@ -1,10 +1,15 @@
 import { test, expect } from "vitest";
-import { classifyMimeClass, MIME_CLASSES } from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 
-import { ArtifactCursorError, ArtifactStore, mimeClassSqlClauses } from "./artifact-store.js";
-import type { ArtifactMimeClass } from "./artifact-store.js";
+import {
+  ArtifactCursorError,
+  ArtifactStore,
+  artifactPiiEligibleSql,
+  isArtifactPiiEligible,
+  type ArtifactPiiDetail,
+  type ArtifactRecord
+} from "./artifact-store.js";
 
 class CaptureDatabase {
   lastQuery: { text: string; values: unknown[] } | null = null;
@@ -188,6 +193,74 @@ test("ArtifactStore.peekDownloadToken is read-only and omits the expiry filter s
   expect(db.requiredLastQuery.text.includes("expires_at > NOW()")).toBe(false);
 });
 
+test("ArtifactStore peek and consume both gate on the shared download eligibility SQL", async () => {
+  const eligible = artifactPiiEligibleSql("artifact");
+
+  const peekDb = new CaptureDatabase();
+  await new ArtifactStore({} as Pool, peekDb as unknown as Pool).peekDownloadToken({ token: "tok-123" });
+  const consumeDb = new CaptureDatabase();
+  await new ArtifactStore({} as Pool, consumeDb as unknown as Pool).consumeDownloadToken({ token: "tok-123" });
+
+  // Redemption re-checks eligibility, so a token minted before a later PII block
+  // stops working. Peek and consume share one clause, so a refused request never
+  // burns the token. The clause must be the shared one, not a copy of it.
+  expect(peekDb.requiredLastQuery.text).toContain(eligible);
+  expect(consumeDb.requiredLastQuery.text).toContain(eligible);
+  expect(eligible).toContain("artifact.status = 'ready'");
+  expect(eligible).toContain("artifact.detail_json->'pii'->>'status'");
+});
+
+const PII_STATUSES: NonNullable<ArtifactPiiDetail["status"]>[] = [
+  "pending",
+  "scanning",
+  "scanned",
+  "blocked",
+  "transformed",
+  "failed"
+];
+
+function eligibilityInput(
+  status: ArtifactRecord["status"],
+  pii?: ArtifactPiiDetail
+): Pick<ArtifactRecord, "status" | "detail"> {
+  return { status, detail: pii ? { pii } : {} };
+}
+
+test("isArtifactPiiEligible denies pending, scanning, and blocked verdicts on a ready artifact", () => {
+  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "pending" }))).toBe(false);
+  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "scanning" }))).toBe(false);
+  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "blocked" }))).toBe(false);
+});
+
+test("isArtifactPiiEligible keeps a detect-only verdict and an unscanned record downloadable", () => {
+  // Findings alone are not a block: detect mode reports them and allows the file.
+  expect(
+    isArtifactPiiEligible(
+      eligibilityInput("ready", { status: "scanned", modeApplied: "detect", findingsCount: 3 })
+    )
+  ).toBe(true);
+  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "transformed" }))).toBe(true);
+  expect(isArtifactPiiEligible(eligibilityInput("ready"))).toBe(true);
+  expect(isArtifactPiiEligible({ status: "ready", detail: undefined as never })).toBe(true);
+});
+
+test("isArtifactPiiEligible denies every artifact that is not ready, whatever its verdict", () => {
+  for (const status of ["pending", "processing", "failed", "deleted"] as const) {
+    expect(isArtifactPiiEligible(eligibilityInput(status))).toBe(false);
+    expect(isArtifactPiiEligible(eligibilityInput(status, { status: "scanned" }))).toBe(false);
+  }
+});
+
+test("the SQL eligibility predicate names exactly the verdicts the TS predicate denies", () => {
+  // The SQL twin cannot run here (the integration suite compares them on a real
+  // database). This guards the one thing a fake can: both are built from one list.
+  const sql = artifactPiiEligibleSql("a");
+  for (const status of PII_STATUSES) {
+    const denied = !isArtifactPiiEligible(eligibilityInput("ready", { status }));
+    expect(sql.includes(`'${status}'`), status).toBe(denied);
+  }
+});
+
 test("ArtifactStore.listForUser always scopes to tenant + user and excludes deleted/derived", async () => {
   const db = new CaptureDatabase();
   const store = new ArtifactStore(db as unknown as Pool);
@@ -367,80 +440,24 @@ test("ArtifactStore.listForUser binds array filters as text[] ANY predicates", a
   expect(db.requiredLastQuery.values).toContainEqual(["ready"]);
 });
 
-/**
- * Evaluate the production `mimeClassSqlClauses` output against a mime string,
- * mimicking Postgres semantics for the small clause vocabulary the builder
- * emits (ILIKE prefix, `= 'literal'`, `= ANY($n)`, `<> ALL($n)`, NOT ILIKE).
- * This lets us run a real mime string through the *actual* SQL predicate and
- * compare the bucket to `classifyMimeClass` — so a drift between the two
- * duplicated `CODE_MIME_TYPES` lists (or the branch logic) is caught, which a
- * pure SQL-substring assertion cannot see.
- */
-function sqlClauseMatches(cls: ArtifactMimeClass, mime: string): boolean {
-  const values: unknown[] = [];
-  const clauses = mimeClassSqlClauses(cls, values);
-  const m = mime.toLowerCase();
-  const arrayParam = (n: string) => (values[Number(n) - 1] as string[]).map((s) => s.toLowerCase());
-
-  // Each predicate atom the builder can emit, matched anywhere in a fragment.
-  // A fragment's truth is the AND of every atom it contains (the builder only
-  // ever ANDs atoms within one fragment); the class matches if ANY fragment holds.
-  const evalFragment = (fragment: string): boolean => {
-    const results: boolean[] = [];
-    for (const mt of fragment.matchAll(/mime_type NOT ILIKE '([^']+)'/g)) {
-      results.push(!m.startsWith(mt[1].replace(/%$/, "").toLowerCase()));
-    }
-    for (const mt of fragment.matchAll(/mime_type ILIKE '([^']+)'/g)) {
-      if (fragment.slice(0, mt.index).endsWith("NOT ")) continue; // already handled above
-      results.push(m.startsWith(mt[1].replace(/%$/, "").toLowerCase()));
-    }
-    for (const mt of fragment.matchAll(/mime_type = '([^']+)'/g)) {
-      results.push(m === mt[1].toLowerCase());
-    }
-    for (const mt of fragment.matchAll(/mime_type <> '([^']+)'/g)) {
-      results.push(m !== mt[1].toLowerCase());
-    }
-    for (const mt of fragment.matchAll(/mime_type = ANY\(\$(\d+)::text\[\]\)/g)) {
-      results.push(arrayParam(mt[1]).includes(m));
-    }
-    for (const mt of fragment.matchAll(/mime_type <> ALL\(\$(\d+)::text\[\]\)/g)) {
-      results.push(!arrayParam(mt[1]).includes(m));
-    }
-    if (results.length === 0) throw new Error(`Unhandled clause fragment: ${fragment}`);
-    return results.every(Boolean);
-  };
-
-  return clauses.some(evalFragment);
-}
-
-test("mimeClass SQL predicate agrees with classifyMimeClass for every class and mime type", () => {
-  // A corpus that exercises each bucket, both code-allowlist members and
-  // adjacent text/* non-members (the drift-prone boundary).
-  const corpus = [
-    "image/png",
-    "image/svg+xml",
-    "application/pdf",
-    "application/json",
-    "text/javascript",
-    "text/x-python",
-    "text/x-typescript",
-    "application/x-sh",
-    "text/html",
-    "text/plain",
-    "text/markdown",
-    "text/csv",
-    "application/octet-stream",
-    "application/zip",
-    "audio/mpeg"
+test.each([
+  ["created_desc", "2026-05-31 02:00:00.123456+00"],
+  ["created_asc", "2026-05-31 02:00:00.123456+00"],
+  ["name_asc", "b.txt"],
+  ["name_desc", "b.txt"],
+  ["size_desc", 42],
+  ["size_asc", 42]
+] as const)("ArtifactStore.listForUser keys a %s cursor on the last item's sort value", async (sort, expectedKey) => {
+  const db = new CaptureDatabase();
+  db.nextRows = [
+    artifactRow({ id: 9, artifact_id: "a9", artifact_name: "a.txt", file_size_bytes: 7, cursor_created_at: "2026-05-31 01:00:00.000001+00" }),
+    artifactRow({ id: 5, artifact_id: "a5", artifact_name: "b.txt", file_size_bytes: 42, cursor_created_at: "2026-05-31 02:00:00.123456+00" }),
+    artifactRow({ id: 3, artifact_id: "a3", artifact_name: "c.txt", file_size_bytes: 99 })
   ];
 
-  for (const mime of corpus) {
-    const expected = classifyMimeClass(mime);
-    for (const cls of MIME_CLASSES) {
-      // A mime string must match exactly the class SQL for its canonical bucket
-      // and no other. This fails loudly if either duplicated CODE_MIME_TYPES
-      // list, or the SQL branch logic, drifts from classifyMimeClass.
-      expect(sqlClauseMatches(cls, mime)).toBe(cls === expected);
-    }
-  }
+  const page = await new ArtifactStore(db as unknown as Pool).listForUser("tenant-A", "user-1", { sort, limit: 2 });
+  const cursor = JSON.parse(Buffer.from(page.nextCursor!, "base64url").toString("utf8")) as { k: unknown; id: number; sort: string };
+
+  // The cursor names the last item on this page (a5), not the extra row fetched to detect more.
+  expect(cursor).toMatchObject({ k: expectedKey, id: 5, sort });
 });

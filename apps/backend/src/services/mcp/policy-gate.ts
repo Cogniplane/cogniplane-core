@@ -10,7 +10,8 @@ import type { ApprovalRecord, ApprovalStore } from "../auth/approval-store.js";
 import type { PolicyService } from "../policy/policy-service.js";
 import {
   POLICY_APPROVAL_REQUEST_METHOD,
-  policyArgsHash,
+  matchesPolicyApprovalAction,
+  withoutPolicyApprovalMetadata,
   type PolicyApprovalProof
 } from "../policy/policy-approval-proof.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
@@ -25,7 +26,7 @@ export function getRuntimePolicySnapshot(context: ToolExecutionContext): Resolve
 // Dependencies the Policy Center hook needs at the tool-call choke point.
 export type PolicyGate = {
   policyService: Pick<PolicyService, "gateAction" | "evaluate">;
-  approvals: Pick<ApprovalStore, "get">;
+  approvals: Pick<ApprovalStore, "get" | "consume">;
   logger: Pick<FastifyBaseLogger, "warn">;
 };
 
@@ -108,9 +109,7 @@ export function approvalDispositionForToolCall(input: {
     !proof ||
     proof.approvalId !== approval.approvalId ||
     proof.toolContextId !== context.toolContextId ||
-    proof.toolName !== toolName ||
-    proof.serverId !== serverId ||
-    proof.argsHash !== policyArgsHash(args)
+    !matchesPolicyApprovalAction(proof, { toolName, serverId, args })
   ) {
     return undefined;
   }
@@ -119,6 +118,18 @@ export function approvalDispositionForToolCall(input: {
   if (approval.status === "expired") return "expired";
   return undefined;
 }
+
+/**
+ * What the call's approval proof established. `approvalDisposition` is "approve"
+ * only when the approval belongs to this exact call (session, user, tool, server,
+ * tool context and arguments) AND this call claimed it. A second call with the
+ * same approval gets "consumed". `approval` is the claimed row, for the tools
+ * that need the proof that a user approved the exact call (`requiresUserApproval`).
+ */
+export type PolicyGateOutcome = {
+  approvalDisposition: "approve" | "reject" | "expired" | "consumed" | undefined;
+  approval: ApprovalRecord | null;
+};
 
 export async function enforcePolicyCenter(
   gate: PolicyGate,
@@ -133,7 +144,7 @@ export async function enforcePolicyCenter(
   // enabled managed server's URL. Defaults to serverId for proxy/forwarded
   // tools, which have no domain binding.
   category: string = serverId
-): Promise<void> {
+): Promise<PolicyGateOutcome> {
   const severity = deriveActionSeverity(toolName, facts.readOnly);
   // Turn context is snapshotted into the tool-execution context at creation time
   // (see sse-stream-writer-agui / scheduler), so the hot path reads it with no extra
@@ -146,13 +157,19 @@ export async function enforcePolicyCenter(
   const approval = approvalId
     ? await gate.approvals.get(context.tenantId, approvalId, context.userId)
     : null;
-  const approvalDisposition = approvalDispositionForToolCall({
+  const matched = approvalDispositionForToolCall({
     approval,
     context,
     toolName,
     serverId,
     args
   });
+  // One approval permits one dispatch. Claim it before evaluation, so the
+  // evidence records a reused approval as consumed.
+  const approvalDisposition = matched === "approve" && approvalId &&
+    !await gate.approvals.consume(context.tenantId, approvalId, context.userId)
+    ? "consumed"
+    : matched;
   await gate.policyService.gateAction({
     tenantId: context.tenantId,
     sessionId: context.sessionId,
@@ -170,10 +187,11 @@ export async function enforcePolicyCenter(
     // model — exclude it so the evidence snapshot reflects the caller's real
     // argument set.
     actionSnapshot: {
-      argumentKeys: Object.keys(args).filter(
-        (key) => key !== "toolContextId" && key !== "policyApprovalId"
+      argumentKeys: Object.keys(withoutPolicyApprovalMetadata(args)).filter(
+        (key) => key !== "toolContextId"
       )
     },
     approvalDisposition
   });
+  return { approvalDisposition, approval: approvalDisposition === "approve" ? approval : null };
 }

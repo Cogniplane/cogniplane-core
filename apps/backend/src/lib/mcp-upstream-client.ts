@@ -1,13 +1,14 @@
 // HTTP client for proxy-mode MCP upstreams. Owns the transport-level security
-// posture of the MCP gateway's outbound calls: SSRF-safe DNS-pinned dispatch,
-// manual redirect validation, and response decoding. The route module
+// posture of the MCP gateway's outbound calls: manual same-origin redirect
+// validation and response decoding. The route module
 // (routes/mcp.ts) stays focused on JSON-RPC authorization and policy.
 
 import type { FastifyBaseLogger } from "fastify";
+import { createParser } from "eventsource-parser";
 import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
-import { isPrivateOrReservedHost, logSafeUrl, ssrfSafeAgent } from "./url-validation.js";
+import { logSafeUrl } from "./url-validation.js";
 
 export type McpRpcRequest = {
   jsonrpc: "2.0";
@@ -31,6 +32,7 @@ export type McpUpstreamAuth =
   | { type: "header" | "query"; name: string; secret: string };
 
 const RESERVED_AUTH_HEADERS = new Set([
+  "accept",
   "connection",
   "content-length",
   "content-type",
@@ -45,7 +47,8 @@ const RESERVED_AUTH_HEADERS = new Set([
 ]);
 
 export function isReservedMcpUpstreamHeader(name: string): boolean {
-  return RESERVED_AUTH_HEADERS.has(name.toLowerCase());
+  const normalized = name.toLowerCase();
+  return normalized.startsWith("x-framework-") || RESERVED_AUTH_HEADERS.has(normalized);
 }
 
 export function rpcOk(id: string | number | undefined, result: unknown): McpRpcResponse {
@@ -84,6 +87,10 @@ export type ForwardRpcLimits = {
   timeoutMs?: number;
   /** Hard cap on the decoded response body. */
   maxResponseBytes?: number;
+  /** Cancels the full request chain when the caller's overall budget expires. */
+  signal?: AbortSignal;
+  /** Safe transport facts for callers that need a connection diagnosis. */
+  onDiagnostic?: (diagnostic: { kind: "http"; status: number } | { kind: "transport" }) => void;
   /**
    * Where the real transport error goes.
    *
@@ -105,16 +112,6 @@ export type ForwardRpcLimits = {
    * a path it can never carry a credential.
    */
   serverId?: string;
-  /**
-   * Skip the first-hop private-address check. TEST ONLY.
-   *
-   * Integration tests run a real upstream on 127.0.0.1, which the check
-   * correctly refuses. Production never sets this: the flag exists so the
-   * guard can stay unconditional in the code path that matters, rather than
-   * being softened to accommodate a fixture. Scheme and credential checks are
-   * NOT skipped — only the address-range check the loopback fixture trips.
-   */
-  allowPrivateUpstreamForTests?: boolean;
 };
 
 /**
@@ -144,7 +141,7 @@ const upstreamResponseSchema = z
  * hostile or broken upstream could OOM the shared backend with a multi-GB body
  * before any check ran. Returns null past the cap.
  */
-async function readBodyWithLimit(
+export async function readBodyWithLimit(
   body: ReadableStream<Uint8Array> | null,
   maxBytes: number
 ): Promise<string | null> {
@@ -170,6 +167,77 @@ async function readBodyWithLimit(
   }
 
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
+
+type SseReadResult =
+  | { kind: "response"; response: McpRpcResponse }
+  | { kind: "too_large" | "invalid" | "empty" | "unsupported_request" };
+
+/** Read SSE events until the response for this request arrives. */
+async function readSseResponseWithLimit(
+  body: ReadableStream<Uint8Array> | null,
+  maxBytes: number,
+  requestId: string | number | undefined
+): Promise<SseReadResult> {
+  if (!body) return { kind: "empty" };
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let lastCharWasCr = false;
+  let result: SseReadResult | null = null;
+  const parser = createParser({
+    maxBufferSize: maxBytes,
+    onError(error) {
+      if (error.type === "max-buffer-size-exceeded") result = { kind: "too_large" };
+    },
+    onEvent(event) {
+      // A priming event can contain an ID and an empty data field.
+      if (result || event.data === "") return;
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(event.data);
+      } catch {
+        result = { kind: "invalid" };
+        return;
+      }
+      if (decoded && typeof decoded === "object" && "method" in decoded) {
+        if ("id" in decoded) result = { kind: "unsupported_request" };
+        return;
+      }
+      const parsed = upstreamResponseSchema.safeParse(decoded);
+      if (!parsed.success || parsed.data.id !== requestId) {
+        result = { kind: "invalid" };
+        return;
+      }
+      result = { kind: "response", response: parsed.data as McpRpcResponse };
+    }
+  });
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        const tail = decoder.decode();
+        if (tail) {
+          lastCharWasCr = tail.endsWith("\r");
+          parser.feed(tail);
+        }
+        // The parser holds a final CR until it knows whether LF follows.
+        if (lastCharWasCr) parser.feed("\n");
+        return result ?? { kind: "empty" };
+      }
+      if (!value) continue;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) return { kind: "too_large" };
+      const text = decoder.decode(value, { stream: true });
+      if (!text) continue;
+      lastCharWasCr = text.endsWith("\r");
+      parser.feed(text);
+      if (result) return result;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }
 
 /**
@@ -287,10 +355,12 @@ export async function forwardRpc(
       fetchFn,
       timeoutMs,
       maxResponseBytes,
-      limits.allowPrivateUpstreamForTests === true,
-      upstreamAuth
+      upstreamAuth,
+      limits.signal,
+      limits.onDiagnostic
     );
   } catch (error) {
+    limits.onDiagnostic?.({ kind: "transport" });
     // AbortSignal.timeout rejects with a TimeoutError; everything else is a
     // transport fault. Both collapse to the same client-visible message — and
     // both are logged here, which is the only place they survive.
@@ -357,8 +427,9 @@ async function forwardRpcInner(
   fetchFn: typeof undiciFetch,
   timeoutMs: number,
   maxResponseBytes: number,
-  allowPrivateUpstreamForTests: boolean,
-  upstreamAuth: McpUpstreamAuth | null
+  upstreamAuth: McpUpstreamAuth | null,
+  overallSignal?: AbortSignal,
+  onDiagnostic?: ForwardRpcLimits["onDiagnostic"]
 ): Promise<McpRpcResponse> {
   let currentUrl: URL;
   try {
@@ -367,32 +438,13 @@ async function forwardRpcInner(
     return rpcFailure(payload.id, -32000, "Upstream MCP URL is invalid.");
   }
 
-  // Re-validate the FIRST hop, not only redirects.
-  //
-  // The admin route and the persistence boundary both reject these already, so
-  // this is defence in depth — but it is the layer that does not depend on
-  // every stored row having passed through today's write path. A row written
-  // before those checks existed, or inserted directly against the database,
-  // otherwise goes straight to the socket: `upstream_url` is read back and
-  // dispatched with no validation in between.
-  //
-  // A literal IP is the case that makes this load-bearing rather than
-  // theoretical. undici skips the connect-time DNS hook entirely for literal
-  // addresses (verified), so `http://127.0.0.1/...` is seen by NO other guard
-  // on this path — not the schema (already written), not ssrfSafeLookup
-  // (never consulted).
+  // Recheck the scheme and embedded credentials for legacy or directly
+  // inserted rows before sending a request.
   if (currentUrl.protocol !== "https:" && currentUrl.protocol !== "http:") {
     return rpcFailure(payload.id, -32000, "Upstream MCP URL must use HTTP(S).");
   }
   if (currentUrl.username !== "" || currentUrl.password !== "") {
     return rpcFailure(payload.id, -32000, "Upstream MCP URL must not embed credentials.");
-  }
-  if (!allowPrivateUpstreamForTests && isPrivateOrReservedHost(currentUrl.hostname)) {
-    return rpcFailure(
-      payload.id,
-      -32000,
-      "Upstream MCP URL points to a private or reserved address."
-    );
   }
 
   // Serialize once. Every hop sends these same bytes, and a signed body hash in
@@ -402,14 +454,16 @@ async function forwardRpcInner(
     typeof headersOrBuilder === "function" ? headersOrBuilder(requestBody) : headersOrBuilder;
 
   for (let hop = 0; hop <= MAX_MCP_PROXY_REDIRECTS; hop += 1) {
-    // Manual redirect handling is security-critical: automatic fetch redirects
-    // can downgrade HTTPS and replay signed identity headers + tool arguments
-    // to an attacker-controlled target. The dispatcher still pins DNS on every
-    // accepted hop to close the rebinding window.
+    if (overallSignal?.aborted) {
+      return rpcFailure(payload.id, -32000, "Upstream MCP request timed out.");
+    }
+    // Manual redirects keep signed headers and tool arguments on the
+    // configured origin. HTTP and private destinations are operator choices.
     const requestUrl = new URL(currentUrl);
     const requestHeaders: Record<string, string> = {
       "Content-Type": "application/json",
-      ...headers
+      ...headers,
+      Accept: "application/json, text/event-stream"
     };
     if (upstreamAuth?.type === "query") {
       requestUrl.searchParams.set(upstreamAuth.name, upstreamAuth.secret);
@@ -427,12 +481,14 @@ async function forwardRpcInner(
       headers: requestHeaders,
       body: requestBody,
       redirect: "manual",
-      dispatcher: ssrfSafeAgent,
       // Per hop, not per chain: the redirect cap already bounds the number of
       // hops, and a per-hop budget is the one an operator can reason about
       // against a single upstream's latency.
-      signal: AbortSignal.timeout(timeoutMs)
+      signal: overallSignal
+        ? AbortSignal.any([AbortSignal.timeout(timeoutMs), overallSignal])
+        : AbortSignal.timeout(timeoutMs)
     });
+    onDiagnostic?.({ kind: "http", status: response.status });
 
     if (response.status >= 300 && response.status < 400) {
       await discardBody(response);
@@ -447,28 +503,13 @@ async function forwardRpcInner(
       } catch {
         return rpcFailure(payload.id, -32000, "Upstream MCP redirect location is invalid.");
       }
-      if (nextUrl.protocol !== "https:") {
-        return rpcFailure(payload.id, -32000, "Upstream MCP redirect must use HTTPS.");
+      if (nextUrl.protocol !== "https:" && nextUrl.protocol !== "http:") {
+        return rpcFailure(payload.id, -32000, "Upstream MCP redirect must use HTTP(S).");
       }
-      // A redirect target is built from a Location header, so it never passed
-      // through `httpsUrlSchema` the way the configured upstream did. Without
-      // this check a same-origin redirect can reintroduce userinfo that the
-      // write-time validation rejects — and undici's refusal to send it throws
-      // a TypeError echoing the whole URL, query string included.
+      // A redirect target bypasses the admin URL schema. Reject userinfo
+      // before undici can throw an error that includes the full URL.
       if (nextUrl.username !== "" || nextUrl.password !== "") {
         return rpcFailure(payload.id, -32000, "Upstream MCP redirect must not embed credentials.");
-      }
-      // A redirect target is built from a Location header, so it never passed
-      // through `httpsUrlSchema` the way the configured upstream did. Without
-      // this check a same-origin redirect can reintroduce userinfo that the
-      // write-time validation rejects — and undici's refusal to send it throws
-      // a TypeError echoing the whole URL, query string included.
-      if (isPrivateOrReservedHost(nextUrl.hostname)) {
-        return rpcFailure(
-          payload.id,
-          -32000,
-          "Upstream MCP redirect points to a private or reserved address."
-        );
       }
       if (nextUrl.origin !== currentUrl.origin) {
         return rpcFailure(payload.id, -32000, "Upstream MCP cross-origin redirect is not allowed.");
@@ -483,6 +524,25 @@ async function forwardRpcInner(
       // hostile upstream free to stream into an unread socket.
       await discardBody(response);
       return rpcFailure(payload.id, -32000, `Upstream MCP request failed with ${response.status}.`);
+    }
+
+    if (response.headers.get("content-type")?.toLowerCase().split(";", 1)[0]?.trim() === "text/event-stream") {
+      const sse = await readSseResponseWithLimit(
+        response.body as ReadableStream<Uint8Array> | null,
+        maxResponseBytes,
+        payload.id
+      );
+      if (sse.kind === "response") return sse.response;
+      if (sse.kind === "too_large") {
+        return rpcFailure(payload.id, -32000, `Upstream MCP response exceeded the maximum size of ${maxResponseBytes} bytes.`);
+      }
+      if (sse.kind === "invalid") {
+        return rpcFailure(payload.id, -32000, "Upstream MCP response was not a valid JSON-RPC envelope.");
+      }
+      if (sse.kind === "unsupported_request") {
+        return rpcFailure(payload.id, -32000, "Upstream MCP requested unsupported server-to-client interaction.");
+      }
+      return rpcFailure(payload.id, -32000, "Upstream MCP returned an empty response.");
     }
 
     const body = await readBodyWithLimit(
@@ -515,6 +575,9 @@ async function forwardRpcInner(
         -32000,
         "Upstream MCP response was not a valid JSON-RPC envelope."
       );
+    }
+    if (parsed.data.id !== payload.id) {
+      return rpcFailure(payload.id, -32000, "Upstream MCP response was not a valid JSON-RPC envelope.");
     }
 
     return parsed.data as McpRpcResponse;

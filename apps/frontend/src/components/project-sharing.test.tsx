@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Project } from "@cogniplane/shared-types";
-import { getProjectAccess, updateProjectSharing } from "@/lib/project-api";
+import { getProjectAccess, updateProjectMember, updateProjectSharing } from "@/lib/project-api";
 import { ApiError } from "@/lib/api-client";
 import { ProjectSharing } from "./project-sharing";
 
 vi.mock("@/lib/project-api", () => ({
   getProjectAccess: vi.fn(),
+  updateProjectMember: vi.fn(),
   updateProjectSharing: vi.fn()
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn() } }));
@@ -46,10 +47,10 @@ afterEach(() => {
   client.clear();
 });
 
-function renderSharing() {
+function renderSharing(props: Partial<Parameters<typeof ProjectSharing>[0]> = {}) {
   return render(
     <QueryClientProvider client={client}>
-      <ProjectSharing project={project} />
+      <ProjectSharing project={project} {...props} />
     </QueryClientProvider>
   );
 }
@@ -150,4 +151,31 @@ it("shows a changed-elsewhere notice when a concurrent change makes the audience
   expect(screen.getByText(/shared with the organization as edit/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Use saved access" })).toBeTruthy();
   await waitFor(() => expect(getProjectAccess).toHaveBeenCalledTimes(2));
+});
+
+it("warns that the project will have no owner when the only owner leaves from the member list", async () => {
+  renderSharing({ currentUserId: "u1" });
+
+  fireEvent.click(await screen.findByRole("button", { name: "Leave project" }));
+
+  const dialog = await screen.findByRole("alertdialog");
+  expect(within(dialog).getByRole("alert").textContent).toContain(
+    "The project will have no owner. An organization admin can assign one later."
+  );
+  expect(updateProjectMember).not.toHaveBeenCalled();
+  // The sharing form is not submitted by the member controls.
+  expect(updateProjectSharing).not.toHaveBeenCalled();
+});
+
+it("shows no member controls to a person who cannot manage the project, or when it is archived", async () => {
+  const view = renderSharing({ canManage: false, currentUserId: "u1" });
+  await screen.findByLabelText("Who can access");
+  expect(screen.queryByRole("button", { name: "Leave project" })).toBeNull();
+  expect(screen.queryByLabelText("Role of Owner")).toBeNull();
+  view.unmount();
+
+  renderSharing({ project: { ...project, archivedAt: "2026-09-14T00:00:00Z" }, currentUserId: "u1" });
+  await screen.findByLabelText("Who can access");
+  expect(screen.queryByRole("button", { name: "Leave project" })).toBeNull();
+  expect(screen.queryByLabelText("Role of Owner")).toBeNull();
 });

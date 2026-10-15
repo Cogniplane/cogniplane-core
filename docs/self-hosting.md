@@ -20,6 +20,8 @@ Three runtime components plus their dependencies:
 
 The agent's shell and file tools execute **inside the E2B sandboxes**, not on the backend host. The agent loop itself runs in the backend, which streams events over SSE and writes to Postgres.
 
+Proxy MCP servers can use HTTP or HTTPS URLs on the backend host, LAN, or a tailnet. The backend makes the connection, so the address must be reachable from its container or process. E2B does not make this connection. The admin form warns when a proxy URL uses HTTP or names a local address; it still lets you save the server. Managed MCP servers do not use upstream URLs. Put proxy credentials in the upstream authentication fields, not in the URL.
+
 ## Required infrastructure
 
 | Component | Why | Notes |
@@ -29,7 +31,7 @@ The agent's shell and file tools execute **inside the E2B sandboxes**, not on th
 | **S3-compatible object storage** | Artifact uploads and (in `bucket` mode) skill bundles. | AWS S3, Cloudflare R2, MinIO, GCS with S3 compat. The skill-bundle backend reuses `ARTIFACT_BUCKET_*` credentials by design. |
 | **E2B account** | Per-session agent sandboxes. | Sign up at [e2b.dev](https://e2b.dev). You'll need an API key and you'll build a custom template (next section). |
 | **WorkOS** | SSO. Optional if you can live with `dev-headers` mode, but **do not run `dev-headers` in production** — it accepts user/tenant ids from request headers with no verification. | [workos.com](https://workos.com) — set up an organization, configure SAML/OIDC, get the API key + client id. |
-| **Node.js 24 LTS** | Runtime for the backend. The workspace pins `engines.node` to `>=24.0.0`. | The frontend is a Next.js app; deploy it however you deploy Next apps (Vercel, Cloudflare Workers via `@cloudflare/next-on-pages`, a Node container, etc). |
+| **Node.js 24 LTS** | Runtime for the backend. The workspace pins `engines.node` to `>=24.0.0`. | The frontend is a Next.js app. This repository's Cloudflare build uses `@opennextjs/cloudflare`; verify the build and deployment path for your target. |
 
 ## Build the E2B sandbox template
 
@@ -57,7 +59,10 @@ Full env-var schema with defaults is in `apps/backend/src/config.ts` — boot fa
 # RLS-active runtime pool (non-superuser).
 DATABASE_URL=postgres://app_user:<strong-password>@<host>:5432/<dbname>?sslmode=require
 
-# Superuser DSN — used only by db:migrate. Bypasses RLS to apply schema, create roles, and enable policies.
+# Runtime maintenance role with BYPASSRLS and explicit DML grants.
+MAINTENANCE_DATABASE_URL=postgres://maintenance_user:<separate-password>@<host>:5432/<dbname>?sslmode=require
+
+# Supply this DSN to the migration job only.
 MIGRATION_DATABASE_URL=postgres://postgres:<superuser-password>@<host>:5432/<dbname>?sslmode=require
 ```
 
@@ -65,9 +70,10 @@ The migration runner (`apps/backend/src/scripts/migrate.ts`) uses `MIGRATION_DAT
 1. `CREATE ROLE app_user WITH LOGIN` if missing.
 2. `ALTER ROLE app_user WITH PASSWORD '<from DATABASE_URL>'` so the runtime DSN actually works.
 3. Apply migrations idempotently.
-4. Grant minimal privileges to `app_user`; `app_user` is the role subject to RLS at runtime.
+4. Grant application DML privileges to `app_user`, which is subject to RLS.
+5. Provision `maintenance_user` from `MAINTENANCE_DATABASE_URL` with explicit runtime DML grants, BYPASSRLS, and no schema ownership.
 
-`pnpm db:migrate` is what you run after deployment. It's safe to re-run — migrations track applied state in `_migrations`.
+Run `pnpm db:migrate` before starting the new backend. Migrations track applied state and checksums in `schema_migrations`. Keep the migration credential out of the backend environment. Compose uses a separate `migrate` service. Every backend instance requires `MAINTENANCE_DATABASE_URL`; the migration URL is never a fallback.
 
 **Verifying RLS is active:** after `db:migrate` succeeds, connect as `app_user` and try `SELECT * FROM sessions` without setting `app.current_tenant_id`. You should get zero rows. If you get rows, RLS is misconfigured.
 

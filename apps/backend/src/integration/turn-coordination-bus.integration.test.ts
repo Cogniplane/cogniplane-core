@@ -4,6 +4,13 @@ import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, test } from "vitest";
 import { TurnCoordinationBus, type StopSignal } from "../services/turn-coordination-bus.js";
 
+// The suite skips without INTEGRATION_REDIS_URL so a local database-only run
+// stays green. CI sets INTEGRATION_REQUIRE_REDIS=1 to make a missing URL fail
+// the file instead: "3 skipped, exit 0" reads as a pass.
+if (process.env.INTEGRATION_REQUIRE_REDIS === "1" && !process.env.INTEGRATION_REDIS_URL) {
+  throw new Error("INTEGRATION_REQUIRE_REDIS=1 but INTEGRATION_REDIS_URL is not set.");
+}
+
 describe.skipIf(!process.env.INTEGRATION_REDIS_URL)("cross-replica turn event stream", () => {
   test("delivers Stop to another replica with its execution generation", async () => {
     const redis = new Redis(process.env.INTEGRATION_REDIS_URL!);

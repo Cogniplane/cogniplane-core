@@ -12,13 +12,22 @@
 // must NOT appear in the Agent settings picker — checking one there would
 // bypass `tenant_integrations` read/write toggles and readiness checks.
 
+import type { ManagedToolAppResource } from "./types.js";
+
 export type ManagedToolCatalogEntry = {
   name: string;
   description: string;
   readOnly: boolean;
   tenantConfigurable: boolean;
-  /** Policy Center category shared with the gateway definition. */
-  category?: string;
+  /**
+   * Policy Center category. It must equal the domain key of the factory that
+   * creates the tool: the graph evaluates policy with this value before the
+   * call, and the gateway evaluates it with the factory key.
+   */
+  category: string;
+  appResource?: ManagedToolAppResource;
+  /** See ManagedToolDefinition.requiresUserApproval. The runtime reads it before the call. */
+  requiresUserApproval?: boolean;
 };
 
 export class ManagedToolCatalog {

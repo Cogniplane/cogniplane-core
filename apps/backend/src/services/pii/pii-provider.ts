@@ -47,7 +47,10 @@ export interface PiiTransformTextInput {
 export interface PiiScanArtifactInput {
   artifactId: string;
   contentType: string;
-  readContent: () => Promise<string>;
+  /** The signal aborts when the PII evaluation times out. */
+  readContent: (signal?: AbortSignal) => Promise<string>;
+  /** True when the scan reads only the text of the file, so any images in it (a PDF) are not scanned. */
+  imagesNotScanned?: () => boolean;
   entityTypes: PiiEntityType[];
   /** Optional per-call model override; falls back to the provider's default. */
   model?: string;

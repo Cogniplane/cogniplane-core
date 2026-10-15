@@ -1,20 +1,23 @@
 import { isReservedMcpUpstreamHeader } from "../lib/mcp-upstream-client.js";
-import { httpsUrlSchema } from "../lib/url-validation.js";
+import { mcpUpstreamUrlSchema } from "../lib/url-validation.js";
 
 import { AdminConfigError } from "./admin-config-error.js";
+
+import type { PoolClient } from "pg";
 
 import type { AdminMcpServerRecord } from "./admin-config-records.js";
 import type { McpServerStore } from "./mcp-server-store.js";
 
 const UPSTREAM_AUTH_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
-function validateMcpServerInput(input: {
+export function validateMcpServerInput(input: {
   mode: "managed" | "proxy";
   routePath: string;
   upstreamUrl?: string | null;
   upstreamAuthType?: AdminMcpServerRecord["upstreamAuthType"];
   upstreamAuthName?: string | null;
   upstreamAuthSecret?: string | null;
+  credentialScope?: AdminMcpServerRecord["credentialScope"];
 }, options: { requireUrlAndSecret: boolean }): void {
   if (!input.routePath.startsWith("/mcp/")) {
     throw new AdminConfigError("routePath must start with /mcp/.");
@@ -22,6 +25,18 @@ function validateMcpServerInput(input: {
 
   if (input.mode === "proxy" && options.requireUrlAndSecret && !input.upstreamUrl) {
     throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
+  }
+
+  if (input.mode === "managed" && input.upstreamUrl) {
+    throw new AdminConfigError("Managed MCP servers cannot configure an upstreamUrl.");
+  }
+  if (input.credentialScope === "personal") {
+    if (input.mode !== "proxy" || input.upstreamAuthType === "none") {
+      throw new AdminConfigError("Personal credentials require an authenticated proxy.");
+    }
+    if (input.upstreamAuthSecret != null) {
+      throw new AdminConfigError("Personal MCP connections cannot store a shared secret.");
+    }
   }
 
   if (
@@ -40,7 +55,7 @@ function validateMcpServerInput(input: {
       );
     }
   } else if (input.upstreamAuthType) {
-    if (options.requireUrlAndSecret && !input.upstreamAuthSecret) {
+    if (options.requireUrlAndSecret && input.credentialScope !== "personal" && !input.upstreamAuthSecret) {
       throw new AdminConfigError(
         "Proxy MCP upstream authentication requires a secret when first configured."
       );
@@ -70,16 +85,12 @@ function validateMcpServerInput(input: {
     }
   }
 
-  // Re-run the SAME schema the admin route applies, not a hand-picked subset
-  // of it. This is the persistence boundary — the store below takes a bare
-  // string — so a caller that does not go through the HTTP route must still be
-  // held to the whole policy: https-only, no private or reserved address, no
-  // embedded credentials. Duplicating only the credential check here would
-  // leave this path SSRF-capable while looking validated.
-  if (input.upstreamUrl && !httpsUrlSchema.safeParse(input.upstreamUrl).success) {
+  // Keep the route and persistence boundary on the same MCP URL policy.
+  // The store takes a bare string, so callers outside HTTP still must not
+  // write URL credentials into the plaintext upstream_url column.
+  if (input.upstreamUrl && !mcpUpstreamUrlSchema.safeParse(input.upstreamUrl).success) {
     throw new AdminConfigError(
-      "upstreamUrl must be an https URL, must not point to a private or reserved address, " +
-        "and must not carry credentials."
+      "upstreamUrl must be an HTTP(S) URL and must not carry credentials."
     );
   }
 }
@@ -95,6 +106,7 @@ export type CreateMcpServerPayload = {
   upstreamAuthType: AdminMcpServerRecord["upstreamAuthType"];
   upstreamAuthName: string | null;
   upstreamAuthSecret: string | null;
+  credentialScope?: AdminMcpServerRecord["credentialScope"];
   enabled: boolean;
   actorUserId: string;
 };
@@ -110,6 +122,7 @@ export type UpdateMcpServerPayload = {
   upstreamAuthType?: AdminMcpServerRecord["upstreamAuthType"];
   upstreamAuthName?: string | null;
   upstreamAuthSecret?: string | null;
+  credentialScope?: AdminMcpServerRecord["credentialScope"];
   enabled: boolean;
 };
 
@@ -117,21 +130,23 @@ export async function createMcpServer(input: {
   tenantId: string;
   store: Pick<McpServerStore, "createMcpServer">;
   payload: CreateMcpServerPayload;
+  client?: PoolClient;
 }): Promise<AdminMcpServerRecord> {
   validateMcpServerInput(input.payload, { requireUrlAndSecret: true });
 
   return input.store.createMcpServer(input.tenantId, {
     ...input.payload,
     createdBy: input.payload.actorUserId
-  });
+  }, input.client);
 }
 
 export async function updateMcpServer(input: {
   tenantId: string;
   store: Pick<McpServerStore, "updateMcpServer">;
   payload: UpdateMcpServerPayload;
+  client?: PoolClient;
 }): Promise<AdminMcpServerRecord | null> {
   validateMcpServerInput(input.payload, { requireUrlAndSecret: false });
 
-  return input.store.updateMcpServer(input.tenantId, input.payload);
+  return input.store.updateMcpServer(input.tenantId, input.payload, input.client);
 }

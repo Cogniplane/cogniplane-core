@@ -1,17 +1,22 @@
 import { type ManagedToolCatalog, type ManagedToolCatalogEntry } from "./catalog.js";
 import { type ManagedToolFactoryRegistry } from "./factory.js";
 import { createGithubTools, GITHUB_TOOL_CATALOG } from "./github-tools.js";
+import { createJiraTools, JIRA_TOOL_CATALOG } from "./jira-tools.js";
 import { createMemoryTools, MEMORY_TOOL_CATALOG } from "./memory-tools.js";
 import { createNotionTools, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
 import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
 import { createWriteArtifactTool, WRITE_ARTIFACT_CATALOG } from "./write-artifact.js";
 import { createProjectTools, PROJECT_TOOL_CATALOG } from "./project-tools.js";
+import { createInteractiveUiTool, INTERACTIVE_UI_CATALOG } from "./interactive-ui.js";
+import type { ManagedToolAppResource } from "./types.js";
 
 type RawCatalogEntry = {
   name: string;
   description: string;
   readOnly: boolean;
+  appResource?: ManagedToolAppResource;
+  requiresUserApproval?: boolean;
 };
 
 function asCatalogEntries(
@@ -24,7 +29,9 @@ function asCatalogEntries(
     description: entry.description,
     readOnly: entry.readOnly,
     tenantConfigurable,
-    category
+    category,
+    ...(entry.appResource ? { appResource: entry.appResource } : {}),
+    ...(entry.requiresUserApproval ? { requiresUserApproval: true } : {})
   }));
 }
 
@@ -45,16 +52,19 @@ export function registerBuiltinManagedTools(
   catalog.register(asCatalogEntries(WRITE_ARTIFACT_CATALOG, true, "write-artifact"));
   catalog.register(asCatalogEntries(PROJECT_TOOL_CATALOG, true, "project"));
   catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true, "memory"));
+  catalog.register(asCatalogEntries(INTERACTIVE_UI_CATALOG, true, "interactive-ui"));
 
   // tenantConfigurable=false: integration-owned tools, gated by the
   // integrations system (tenant_integrations toggles + readiness).
   catalog.register(asCatalogEntries(GITHUB_TOOL_CATALOG, false, "github"));
   catalog.register(asCatalogEntries(NOTION_TOOL_CATALOG, false, "notion"));
+  catalog.register(asCatalogEntries(JIRA_TOOL_CATALOG, false, "jira"));
 
   factoryRegistry.register("session", createSessionTools);
   factoryRegistry.register("skill-corpus", createSkillCorpusTool);
   factoryRegistry.register("github", createGithubTools);
   factoryRegistry.register("notion", createNotionTools);
+  factoryRegistry.register("jira", createJiraTools);
   factoryRegistry.register("write-artifact", createWriteArtifactTool);
   factoryRegistry.register("project", (deps) => deps.projectFiles ? createProjectTools({
     projectFiles: deps.projectFiles,
@@ -65,4 +75,5 @@ export function registerBuiltinManagedTools(
     limits: deps.limits
   }) : []);
   factoryRegistry.register("memory", createMemoryTools);
+  factoryRegistry.register("interactive-ui", createInteractiveUiTool);
 }

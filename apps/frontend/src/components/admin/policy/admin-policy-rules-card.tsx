@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import Link from "next/link";
 
 import {
   DndContext,
@@ -13,14 +14,13 @@ import {
 } from "@dnd-kit/core";
 import {
   SortableContext,
-  arrayMove,
   sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
-import type { PolicyLintWarning, PolicyRule } from "@cogniplane/shared-types";
+import type { PolicyLintWarning, PolicyMonitorSummaryResponse, PolicyRule } from "@cogniplane/shared-types";
 
 import {
   ALL_EFFECTS,
@@ -32,13 +32,13 @@ import {
   EFFECT_LABELS,
   emptyDraft,
   isDraftValid,
+  reorderedRuleIds,
   SEVERITY_LABELS,
   toggleInList,
   TURN_CONTEXT_LABELS,
   type PolicyRuleDraft
 } from "./admin-policy-form.logic";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -49,7 +49,9 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { PILL_GRAY, PILL_GREEN, PILL_AMBER, LIST_ITEM } from "../../../lib/ui-tokens";
+import { PILL_AMBER } from "../../../lib/ui-tokens";
+import { OverviewRow } from "../overview-row";
+import { approvalCount, monitorDecisionsHref, plural } from "./policy-monitor.logic";
 
 type Props = {
   rules: PolicyRule[];
@@ -58,6 +60,10 @@ type Props = {
   onSave: (ruleId: string | null, input: ReturnType<typeof draftToInput>) => Promise<boolean>;
   onDelete: (ruleId: string) => void;
   onReorder: (ruleIds: string[]) => void;
+  /** The last 7 days of Monitor records. Each rule shows its own counts. */
+  evidence?: PolicyMonitorSummaryResponse;
+  /** Shown after the rules, such as the tool-call test. */
+  children?: ReactNode;
 };
 
 const LINT_KIND_LABELS: Record<PolicyLintWarning["kind"], string> = {
@@ -66,7 +72,7 @@ const LINT_KIND_LABELS: Record<PolicyLintWarning["kind"], string> = {
   unknown_condition: "Unknown condition"
 };
 
-export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onDelete, onReorder }: Props) {
+export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onDelete, onReorder, evidence, children }: Props) {
   const [draft, setDraft] = useState<PolicyRuleDraft | null>(null);
 
   // Group lint warnings by the rule they're about so each row can show its own.
@@ -88,75 +94,102 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
 
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
-    if (!over || active.id === over.id) return;
-    const oldIndex = rules.findIndex((r) => r.ruleId === active.id);
-    const newIndex = rules.findIndex((r) => r.ruleId === over.id);
-    if (oldIndex === -1 || newIndex === -1) return;
-    const reordered = arrayMove(rules, oldIndex, newIndex);
-    onReorder(reordered.map((r) => r.ruleId));
+    const ruleIds = over ? reorderedRuleIds(rules, active.id, over.id) : null;
+    if (ruleIds) onReorder(ruleIds);
+  }
+
+  // Closing an editor removes the focused control, so move focus to the button that opened it.
+  function closeEditor(focusId: string) {
+    setDraft(null);
+    requestAnimationFrame(() => document.getElementById(focusId)?.focus());
   }
 
   async function handleSave() {
     if (!draft || !isDraftValid(draft)) return;
     const ok = await onSave(draft.ruleId, draftToInput(draft));
-    if (ok) setDraft(null);
+    if (ok) closeEditor(draft.ruleId ? editButtonId(draft.ruleId) : NEW_RULE_ID);
   }
 
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Policy rules</CardTitle>
-        <CardDescription>
-          Evaluated top-to-bottom by priority for every agent tool action — the first matching rule
-          decides. Whether matching rules actually gate is the tenant-level enforcement mode (set in
-          Agent settings); until it&rsquo;s set to enforce, rules only record decisions. Drag a rule
-          by its handle to change its priority.
-        </CardDescription>
-        <div className="pt-2">
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => setDraft(draft ? null : emptyDraft())}
-          >
-            {draft ? "Cancel" : "New rule"}
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        {draft ? (
-          <RuleEditor
-            draft={draft}
-            setDraft={setDraft}
-            onSave={handleSave}
-            saving={busyKey === "submit"}
-          />
-        ) : null}
+  const creating = draft !== null && draft.ruleId === null;
+  const saving = busyKey === "submit";
 
+  return (
+    <section aria-labelledby="policy-rules-title">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="policy-rules-title" className="text-lg font-semibold text-on-surface">Rules</h2>
+        {/* An open editor has unsaved edits, so the button cancels it before it starts a new rule. */}
+        <Button id={NEW_RULE_ID} type="button" variant="outline" size="sm" aria-expanded={creating} onClick={() => setDraft(draft ? null : emptyDraft())}>
+          {draft ? "Cancel" : "New rule"}
+        </Button>
+      </div>
+      <p className="mt-1 text-sm text-on-surface-variant">
+        The first matching rule decides. Drag the handle to change the order. A tool call that matches no rule is allowed.
+      </p>
+      {creating && draft ? <div className="mt-4"><RuleEditor
+            draft={draft}
+            onChange={setDraft}
+            onCancel={() => closeEditor(NEW_RULE_ID)}
+            onSave={handleSave}
+            saving={saving}
+          /></div> : null}
+
+      <div className="mt-3 border-t border-outline-variant">
         {rules.length === 0 ? (
-          <p className="text-sm text-on-surface-faint">
-            No rules yet. Policy Center is inert until you add one.
-          </p>
+          <p className="py-4 text-sm text-on-surface-variant">No rules. Every tool call is allowed.</p>
         ) : (
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={rules.map((r) => r.ruleId)} strategy={verticalListSortingStrategy}>
-              <ul className="flex flex-col gap-2">
+              <ul className="divide-y divide-outline-variant">
                 {rules.map((rule) => (
                   <SortableRuleRow
                     key={rule.ruleId}
                     rule={rule}
                     warnings={warningsByRule.get(rule.ruleId) ?? []}
                     reorderable={reorderable}
-                    deleting={busyKey === `delete-${rule.ruleId}`}
-                    onEdit={() => setDraft(draftFromRule(rule))}
-                    onDelete={() => onDelete(rule.ruleId)}
-                  />
+                    showHandle={rules.length > 1}
+                    evidence={evidence}
+                    editing={draft?.ruleId === rule.ruleId}
+                    // One editor at a time, so an open draft is never replaced without a warning.
+                    editDisabled={draft !== null && draft.ruleId !== rule.ruleId}
+                    onEdit={() => draft?.ruleId === rule.ruleId ? closeEditor(editButtonId(rule.ruleId)) : setDraft(draftFromRule(rule))}
+                  >
+                    {draft?.ruleId === rule.ruleId ? <RuleEditor
+            draft={draft}
+            onChange={setDraft}
+            onCancel={() => closeEditor(editButtonId(rule.ruleId))}
+            onSave={handleSave}
+            saving={saving}
+            onDelete={() => { onDelete(rule.ruleId); closeEditor(NEW_RULE_ID); }}
+          /> : null}
+                  </SortableRuleRow>
                 ))}
               </ul>
             </SortableContext>
           </DndContext>
         )}
-      </CardContent>
-    </Card>
+        <div className="border-t border-outline-variant">{children}</div>
+      </div>
+    </section>
+  );
+}
+
+const NEW_RULE_ID = "policy-new-rule";
+const editButtonId = (ruleId: string) => `policy-edit-${ruleId}`;
+
+/** "3 would-be blocks, 1 approval request in 7 days", linked to those rule matches. Null when the rule did not match. */
+function ruleEvidence(rule: PolicyRule, evidence: PolicyMonitorSummaryResponse | undefined): ReactNode {
+  const counts = evidence?.rules.find((entry) => entry.ruleId === rule.ruleId)?.counts;
+  if (!evidence || !counts) return null;
+  const approvals = approvalCount(counts);
+  const text = [
+    counts.block ? plural(counts.block, "would-be block") : null,
+    approvals ? plural(approvals, "approval request") : null
+  ].filter(Boolean).join(", ");
+  if (!text) return null;
+  return (
+    <Link href={monitorDecisionsHref(evidence, { ruleId: rule.ruleId })} aria-label={`${text} in 7 days for ${rule.name}`} className="underline underline-offset-4">
+      {text} in 7 days
+    </Link>
   );
 }
 
@@ -164,16 +197,22 @@ function SortableRuleRow({
   rule,
   warnings,
   reorderable,
-  deleting,
+  showHandle,
+  evidence,
+  editing,
+  editDisabled,
   onEdit,
-  onDelete
+  children
 }: {
   rule: PolicyRule;
   warnings: PolicyLintWarning[];
   reorderable: boolean;
-  deleting: boolean;
+  showHandle: boolean;
+  evidence: PolicyMonitorSummaryResponse | undefined;
+  editing: boolean;
+  editDisabled: boolean;
   onEdit: () => void;
-  onDelete: () => void;
+  children: ReactNode;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: rule.ruleId,
@@ -184,51 +223,41 @@ function SortableRuleRow({
     transition,
     opacity: isDragging ? 0.6 : undefined
   };
+  const matches = ruleEvidence(rule, evidence);
 
   return (
-    <li ref={setNodeRef} style={style} className={LIST_ITEM}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-2">
-          {reorderable ? (
-            <button
-              type="button"
-              aria-label={`Reorder ${rule.name}`}
-              className="mt-0.5 cursor-grab touch-none rounded px-1 text-on-surface-faint hover:text-on-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary active:cursor-grabbing"
-              {...attributes}
-              {...listeners}
-            >
-              ⠿
-            </button>
-          ) : null}
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium text-on-surface">{rule.name}</span>
-              <span className={PILL_GRAY}>{EFFECT_LABELS[rule.effect]}</span>
-              {rule.enabled ? null : <span className={PILL_GRAY}>disabled</span>}
-              <span className={PILL_GREEN}>priority {rule.priority}</span>
-            </div>
-            <p className="mt-1 text-xs text-on-surface-faint">
-              {describeConditions(rule.conditions)}
-            </p>
-            {rule.reason ? (
-              <p className="mt-1 text-xs text-on-surface-variant">{rule.reason}</p>
-            ) : null}
+    <li ref={setNodeRef} style={style} className="flex items-start gap-2 bg-background">
+      {showHandle ? (
+        // While an editor is open the handle stays in place but hidden, so rows do not shift.
+        <button
+          type="button"
+          aria-label={`Reorder ${rule.name}`}
+          className={`mt-4 cursor-grab touch-none rounded px-1 text-on-surface-faint hover:text-on-surface focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary active:cursor-grabbing ${reorderable ? "" : "invisible"}`}
+          {...attributes}
+          {...listeners}
+        >
+          ⠿
+        </button>
+      ) : null}
+      <div className="min-w-0 flex-1">
+        <OverviewRow
+          title={rule.name}
+          status={<>
+            {EFFECT_LABELS[rule.effect]}: {describeConditions(rule.conditions)}{rule.enabled ? "" : " (off)"}.
+            {matches ? <span className="block">{matches}</span> : null}
             {warnings.map((warning, i) => (
-              <p key={i} className="mt-1 flex items-start gap-1.5 text-xs text-warning">
+              <span key={i} className="mt-1 flex items-start gap-1.5 text-xs text-warning">
                 <span className={`${PILL_AMBER} shrink-0`}>{LINT_KIND_LABELS[warning.kind]}</span>
                 <span>{warning.message}</span>
-              </p>
+              </span>
             ))}
-          </div>
-        </div>
-        <div className="flex shrink-0 gap-2">
-          <Button type="button" variant="ghost" onClick={onEdit}>
+          </>}
+        >
+          <Button id={editButtonId(rule.ruleId)} type="button" variant="outline" size="sm" aria-label={`Edit ${rule.name}`} aria-expanded={editing} disabled={editDisabled} onClick={onEdit}>
             Edit
           </Button>
-          <Button type="button" variant="ghost" disabled={deleting} onClick={onDelete}>
-            Delete
-          </Button>
-        </div>
+        </OverviewRow>
+        {children ? <div className="pb-4">{children}</div> : null}
       </div>
     </li>
   );
@@ -236,16 +265,20 @@ function SortableRuleRow({
 
 function RuleEditor({
   draft,
-  setDraft,
+  onChange,
+  onCancel,
   onSave,
-  saving
+  saving,
+  onDelete
 }: {
   draft: PolicyRuleDraft;
-  setDraft: (next: PolicyRuleDraft | null) => void;
+  onChange: (next: PolicyRuleDraft) => void;
+  onCancel: () => void;
   onSave: () => void;
   saving: boolean;
+  onDelete?: () => void;
 }) {
-  const update = (patch: Partial<PolicyRuleDraft>) => setDraft({ ...draft, ...patch });
+  const update = (patch: Partial<PolicyRuleDraft>) => onChange({ ...draft, ...patch });
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-outline bg-surface-container-low p-4">
@@ -296,8 +329,8 @@ function RuleEditor({
         </div>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <Label>Severities</Label>
+      <fieldset className="flex flex-col gap-1.5">
+        <legend className="mb-1.5 text-sm leading-none font-medium">Severities</legend>
         <div className="flex flex-wrap gap-3">
           {ALL_SEVERITIES.map((severity) => (
             <label key={severity} className="flex items-center gap-2 text-sm text-on-surface-variant">
@@ -311,13 +344,12 @@ function RuleEditor({
           ))}
         </div>
         <p className="text-xs text-on-surface-faint">
-          Leave all unchecked to match any severity. All condition dimensions are AND-ed together;
-          within a dimension the checked values are OR-ed.
+          None checked matches any severity. A rule matches when every filled condition matches.
         </p>
-      </div>
+      </fieldset>
 
-      <div className="flex flex-col gap-1.5">
-        <Label>Turn context</Label>
+      <fieldset className="flex flex-col gap-1.5">
+        <legend className="mb-1.5 text-sm leading-none font-medium">Turn context</legend>
         <div className="flex flex-wrap gap-3">
           {ALL_TURN_CONTEXTS.map((tc) => (
             <label key={tc} className="flex items-center gap-2 text-sm text-on-surface-variant">
@@ -331,9 +363,9 @@ function RuleEditor({
           ))}
         </div>
         <p className="text-xs text-on-surface-faint">
-          Unchecked → any. Use &ldquo;Scheduled&rdquo; to gate unattended runs more strictly.
+          None checked matches any turn. Choose Scheduled to control runs that nobody watches.
         </p>
-      </div>
+      </fieldset>
 
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="policy-reason">Explanation shown to the user (optional)</Label>
@@ -358,9 +390,15 @@ function RuleEditor({
         <Button type="button" onClick={onSave} disabled={saving || !isDraftValid(draft)}>
           {saving ? "Saving…" : draft.ruleId ? "Save changes" : "Create rule"}
         </Button>
-        <Button type="button" variant="ghost" onClick={() => setDraft(null)}>
+        <Button type="button" variant="ghost" onClick={onCancel}>
           Cancel
         </Button>
+        {onDelete ? (
+          // A delete during a save would race it, so wait for the save to finish.
+          <Button type="button" variant="ghost" className="ml-auto text-danger" disabled={saving} onClick={onDelete}>
+            Delete rule
+          </Button>
+        ) : null}
       </div>
     </div>
   );

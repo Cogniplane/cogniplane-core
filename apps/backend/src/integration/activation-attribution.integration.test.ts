@@ -56,7 +56,8 @@ describe.skipIf(!adminDatabaseUrl())("runtime activation attribution", () => {
             runtimePolicy: testRuntimePolicy, skills: [skill], mcpServers: [], hash: "h",
             sources: { runtimePolicy: { id: "test", version: 1, hash: "h" }, skills: [], mcpServers: [] }
           };
-        }
+        },
+        async getRuntimePolicy() { return testRuntimePolicy; }
       },
       createSilentLogger(),
       {

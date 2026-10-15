@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Project, Session } from "@cogniplane/shared-types";
 
+import { API_URL, setAccessToken } from "../lib/api-client";
 import { SessionSidebar } from "./session-sidebar";
 import { deriveAttentionSessionIds } from "./session-list-derivations";
 
@@ -13,9 +14,18 @@ vi.mock("next/link", () => ({
     <a href={href} {...props}>{children}</a>
   )
 }));
-vi.mock("../lib/auth-context", () => ({ useAuth: () => ({ user: { displayName: "Ada", email: "ada@example.com" } }) }));
-vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
-afterEach(cleanup);
+const auth = vi.hoisted(() => ({ role: undefined as string | undefined }));
+vi.mock("../lib/auth-context", () => ({
+  useAuth: () => ({ user: { displayName: "Ada", email: "ada@example.com", role: auth.role } })
+}));
+const pendingFetch = vi.fn(() => new Promise(() => {}));
+vi.stubGlobal("fetch", pendingFetch);
+afterEach(() => {
+  cleanup();
+  auth.role = undefined;
+  setAccessToken(null);
+  vi.stubGlobal("fetch", pendingFetch);
+});
 
 const session: Session = {
   sessionId: "session-1",
@@ -119,6 +129,19 @@ it("shows active projects and hides archived projects from the sidebar", async (
   fireEvent.click(await screen.findByRole("menuitem", { name: "Add to project" }));
   fireEvent.click(screen.getByRole("button", { name: "Add to project" }));
   await waitFor(() => expect(onAddToProject).toHaveBeenCalledWith("session-1", project.projectId));
+});
+
+it("opens the create dialog with Ctrl+Shift+O, also from the search field", async () => {
+  render(
+    <SessionSidebar
+      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() }}
+      rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
+      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
+      pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
+    />
+  );
+  fireEvent.keyDown(screen.getByLabelText("Search sessions"), { key: "O", ctrlKey: true, shiftKey: true });
+  expect(await screen.findByRole("dialog", { name: "New session" })).toBeTruthy();
 });
 
 it("keeps the create dialog open and shows a creation error", async () => {
@@ -309,4 +332,88 @@ it("trusts server search hits when the cached project name is stale and keeps co
   // Without a server-search callback the component still supports local filtering.
   view.rerender(<SessionSidebar {...props} list={{ ...props.list, onSearch: undefined }} />);
   expect(screen.queryByRole("button", { name: /^Research notes/ })).toBeNull();
+});
+
+describe("backend build in the sidebar footer", () => {
+  const DIAGNOSTICS = {
+    status: "ok",
+    uptimeSeconds: 120,
+    version: { sha: "abcdef0123456789", buildDate: "2026-10-12T08:30:00Z" },
+    runtimes: { activeRuntimeCount: 1, activeTurnCount: 0 }
+  };
+  const json = (status: number, body: unknown) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const sidebar = () => (
+    <SessionSidebar
+      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() }}
+      rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
+      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
+      pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
+    />
+  );
+  const requested = (fetchMock: ReturnType<typeof vi.fn>) => fetchMock.mock.calls.map((call: unknown[]) => String(call[0]));
+
+  it.each(["admin", "owner"])("shows the backend build to the %s role, from the authenticated diagnostics request", async (role) => {
+    auth.role = role;
+    setAccessToken("admin-token");
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => json(200, DIAGNOSTICS));
+    vi.stubGlobal("fetch", fetchMock);
+    render(sidebar());
+
+    expect(await screen.findByText("be · abcdef0 · 2026-10-12")).toBeTruthy();
+    expect(screen.getByText("be · abcdef0 · 2026-10-12").getAttribute("title"))
+      .toBe("Backend: abcdef0123456789 · 2026-10-12T08:30:00Z");
+    expect(requested(fetchMock)).toEqual([`${API_URL}/admin/diagnostics`]);
+    const init = fetchMock.mock.calls[0]![1];
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer admin-token");
+  });
+
+  it.each(["member", undefined])("makes no diagnostics or health request for the %s role, and shows only the frontend build", async (role) => {
+    auth.role = role;
+    setAccessToken("member-token");
+    const fetchMock = vi.fn(async () => json(200, DIAGNOSTICS));
+    vi.stubGlobal("fetch", fetchMock);
+    render(sidebar());
+
+    expect(screen.getByText(/^fe · /)).toBeTruthy();
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByText(/^be · /)).toBeNull();
+  });
+
+  it("shows no backend build, and no error, when the diagnostics request fails", async () => {
+    auth.role = "admin";
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const unhandled: unknown[] = [];
+    const record = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", record);
+    const fetchMock = vi.fn(async () => json(403, { error: "forbidden" }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(sidebar());
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    process.off("unhandledRejection", record);
+    expect(screen.queryByText(/^be · /)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText(/^fe · /)).toBeTruthy();
+    expect(unhandled).toEqual([]);
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+  });
+
+  it.each([
+    ["a network error", () => { throw new TypeError("Failed to fetch"); }],
+    ["a body with no build", () => json(200, { status: "ok" })],
+    ["a body that is not JSON", () => new Response("<html>Bad gateway</html>", { status: 200 })]
+  ])("shows no backend build after %s", async (_name, reply) => {
+    auth.role = "owner";
+    const fetchMock = vi.fn(async () => reply());
+    vi.stubGlobal("fetch", fetchMock);
+    render(sidebar());
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+    expect(screen.queryByText(/^be · /)).toBeNull();
+  });
 });

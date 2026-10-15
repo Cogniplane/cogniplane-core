@@ -7,6 +7,7 @@ import {
   ProjectSchema,
   ProjectApprovalModeUpdateSchema,
   ProjectAgentFileModeUpdateSchema,
+  ArtifactsListResponseSchema,
   ProjectsResponseSchema,
   ProjectDetailSchema,
   SESSION_TRASH_RETENTION_DAYS,
@@ -74,7 +75,13 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
     const project = await (editor ? stores.projects.getEditable : stores.projects.getOwned)
       .call(stores.projects, tenantId, userId, parsed.value.projectId);
     if (!project) {
-      reply.code(404).send(notFoundError("project_not_found"));
+      // A member who can read the project lacks the role; anyone else must not
+      // learn that the project exists.
+      if (await stores.projects.getReadable(tenantId, userId, parsed.value.projectId)) {
+        reply.code(403).send(apiError("project_role_required", "Your project role does not allow this action."));
+      } else {
+        reply.code(404).send(notFoundError("project_not_found"));
+      }
       return null;
     }
     if (active && project.archivedAt) {
@@ -135,7 +142,10 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
       return reply.code(409).send(apiError("project_instructions_conflict",
         "Instructions changed in another tab. Reload the saved version before trying again."));
     }
-    return serialize(ProjectSchema, await stores.projects.getOwned(tenantId, userId, project.projectId));
+    // Ownership can be revoked between the update and this read.
+    const updated = await stores.projects.getOwned(tenantId, userId, project.projectId);
+    if (!updated) return reply.code(404).send(notFoundError("project_not_found"));
+    return serialize(ProjectSchema, updated);
   });
   app.put("/projects/:projectId/approval-mode", async (request, reply) => {
     const body = parseRequestInput(reply, ProjectApprovalModeUpdateSchema, request.body);
@@ -227,6 +237,17 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
       });
     reply.header("cache-control", "private, no-store");
     return serialize(SessionsListResponseSchema, { ...page, trashRetentionDays });
+  });
+  app.get("/projects/:projectId/artifacts", async (request, reply) => {
+    const params = parseRequestInput(reply, projectParams, request.params);
+    if (!params.ok) return params.response;
+    const { tenantId, userId } = request.auth;
+    const project = await stores.projects.getReadable(tenantId, userId, params.value.projectId);
+    if (!project) return reply.code(404).send(notFoundError("project_not_found"));
+    reply.header("cache-control", "private, no-store");
+    return serialize(ArtifactsListResponseSchema, {
+      artifacts: await stores.artifacts.listByProject(tenantId, userId, project.projectId)
+    });
   });
   app.get("/projects/:projectId", async (request, reply) => {
     const params = parseRequestInput(reply, projectParams, request.params);
@@ -344,14 +365,12 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
       return apiError("session_busy", "Finish the current turn before adding this session to a project.");
     }
     try {
-      if (
-        !(await stores.projects.setSession(
-          tenantId,
-          userId,
-          project.projectId,
-          session.sessionId
-        ))
-      ) {
+      const attached = await stores.projects.setSession(tenantId, userId, project.projectId, session.sessionId);
+      if (attached === "busy") {
+        reply.code(409);
+        return apiError("session_busy", "Finish the current turn before adding this session to a project.");
+      }
+      if (!attached) {
         reply.code(409);
         return apiError("project_conflict", "The session changed. Reload and try again.");
       }

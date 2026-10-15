@@ -2,22 +2,31 @@ import { z } from "zod";
 import {
   AdminMcpServerCreateRequestSchema,
   AdminMcpServerUpdateRequestSchema,
+  AdminSkillReleaseSnapshotSchema,
   EFFORT_LEVELS,
   DEVELOPER_INSTRUCTIONS_MAX_LENGTH,
   MODEL_PROVIDERS,
   PolicyEnforcementModeSchema
 } from "@cogniplane/shared-types";
+// Loads a public suffix list, so it is a separate entry point.
+import { SandboxEgressDomainsSchema } from "@cogniplane/shared-types/sandbox-egress";
 
-import { httpsUrlSchema } from "../../lib/url-validation.js";
+import { httpsUrlSchema, mcpUpstreamUrlSchema } from "../../lib/url-validation.js";
 
 import { adminIdSchema } from "./admin-route-helpers.js";
 
 export const mcpCreateBodySchema = AdminMcpServerCreateRequestSchema.extend({
-  upstreamUrl: httpsUrlSchema.nullable().optional()
+  upstreamUrl: mcpUpstreamUrlSchema.nullable().optional()
+}).refine((body) => body.mode === "proxy" || !body.upstreamUrl, {
+  path: ["upstreamUrl"],
+  message: "Managed MCP servers cannot configure an upstreamUrl"
 });
 
 export const mcpUpdateBodySchema = AdminMcpServerUpdateRequestSchema.extend({
-  upstreamUrl: httpsUrlSchema.nullable().optional()
+  upstreamUrl: mcpUpstreamUrlSchema.nullable().optional()
+}).refine((body) => body.mode === "proxy" || !body.upstreamUrl, {
+  path: ["upstreamUrl"],
+  message: "Managed MCP servers cannot configure an upstreamUrl"
 });
 
 const granularApprovalPolicySchema = z.object({
@@ -47,7 +56,12 @@ export const tenantSettingsBodySchema = z.object({
   // happens in the route, where the catalog is in scope.
   enabledProviders: z.array(z.enum(MODEL_PROVIDERS)).optional(),
   enabledModelIds: z.array(z.string().trim().min(1).max(200)).nullable().optional(),
-  modelDefaultEfforts: z.record(z.string().trim().min(1).max(200), z.enum(EFFORT_LEVELS)).optional()
+  defaultModelId: z.string().trim().min(1).max(200).nullable().optional(),
+  modelDefaultEfforts: z.record(z.string().trim().min(1).max(200), z.enum(EFFORT_LEVELS)).optional(),
+  // Hosts that agent-run code in the sandbox may reach (VULN-13). The provider
+  // checks nothing, so this is the check: exact host names, with `*.` only over
+  // a name that one party registers. An empty list means no network.
+  approvedSandboxEgressDomains: SandboxEgressDomainsSchema.optional()
 });
 
 export const githubImportBodySchema = z.object({
@@ -65,7 +79,8 @@ const inlineSkillNameSchema = z
   .string()
   .trim()
   .min(1)
-  .max(200)
+  // Matches the SKILL.md name limit and organization_skill_author_updates.skill_name.
+  .max(64)
   // Forbid path separators (`/`, `\\`) and control characters (NUL, newlines,
   // etc.). Spaces and ordinary punctuation stay allowed so a name like
   // "PDF Processing" remains valid.
@@ -93,7 +108,9 @@ export const cleanupSkillRevisionsBodySchema = z
   .optional();
 
 export const activateSkillRevisionBodySchema = z.object({
-  reviewNotes: z.string().trim().max(1000).nullable().optional()
+  audience: z.enum(["test-users", "members"]).optional(),
+  reviewNotes: z.string().trim().max(1000).nullable().optional(),
+  expectedSnapshot: AdminSkillReleaseSnapshotSchema
 });
 
 export const rolloutBodySchema = z.object({

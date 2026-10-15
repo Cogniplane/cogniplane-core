@@ -60,7 +60,8 @@ function arrayMatches(
   return values.includes(candidate);
 }
 
-function normalizeToolName(value: string): string {
+// Tool names match without regard to case or Unicode form. Lint uses the same rule.
+export function normalizeToolName(value: string): string {
   return value.normalize("NFC").toLowerCase();
 }
 

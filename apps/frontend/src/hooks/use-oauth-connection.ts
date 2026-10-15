@@ -19,6 +19,11 @@ type OAuthConnectionOptions<TStatus> = {
   createAuthorizationUrl: () => Promise<string>;
   deleteConnection: () => Promise<void>;
   messages: OAuthConnectionMessages;
+  /**
+   * Reload the status after a failed disconnect too. Set it when the server
+   * can remove the connection and still report an error.
+   */
+  refreshAfterDisconnectError?: boolean;
 };
 
 export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TStatus>) {
@@ -35,7 +40,10 @@ export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TSta
     mutationFn: options.deleteConnection,
     onMutate: () => setActiveMutation("disconnect"),
     onSettled: () => setActiveMutation(null),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: options.queryKey })
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: options.queryKey }),
+    onError: () => {
+      if (options.refreshAfterDisconnectError) void queryClient.invalidateQueries({ queryKey: options.queryKey });
+    }
   });
 
   const loadError = statusQuery.error
@@ -47,6 +55,8 @@ export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TSta
 
   return {
     status: statusQuery.data ?? null,
+    isLoading: statusQuery.isFetching,
+    statusError: loadError,
     busyKey: activeMutation,
     error: connectError ?? disconnectError ?? loadError,
     reload: () => queryClient.invalidateQueries({ queryKey: options.queryKey }),

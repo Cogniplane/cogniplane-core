@@ -34,6 +34,37 @@ describe.skipIf(!adminDatabaseUrl())("persisted session activity", () => {
   });
 });
 
+describe.skipIf(!adminDatabaseUrl())("persisted MCP App calls", () => {
+  test("upgrades a started tool call to MCP when its metadata arrives", async () => {
+    const tenantId = await seedTenant();
+    const userId = await seedUser();
+    const sessionId = await seedSession(tenantId, userId);
+    const messages = new MessageStore(appPool());
+    const message = await messages.create({ tenantId, userId, sessionId, role: "assistant", status: "streaming", content: "" });
+    const toolResultId = `quote-${message.messageId}`;
+    const started = {
+      tenantId, userId, sessionId, messageId: message.messageId, toolResultId,
+      title: "show_quote_picker", command: null, cwd: null, input: "{}", output: "",
+      exitCode: null, durationMs: null, textOffset: 0
+    };
+    await messages.upsertToolResult({ ...started, kind: "command", status: "in_progress",
+      server: null, toolName: "show_quote_picker" });
+    expect(await messages.getMcpAppCall(tenantId, sessionId, toolResultId)).toBeNull();
+
+    await messages.upsertToolResult({ ...started, kind: "mcp", status: "completed",
+      server: "quote-server", toolName: "show_quote_picker",
+      mcpApp: { resourceUri: "ui://quote-picker/app.html", input: {},
+        result: { content: [{ type: "text", text: "Three quotes" }] } } });
+
+    expect(await messages.getMcpAppCall(tenantId, sessionId, toolResultId)).toMatchObject({
+      serverId: "quote-server", toolName: "show_quote_picker",
+      app: { resourceUri: "ui://quote-picker/app.html" }
+    });
+    const history = await messages.listBySession(tenantId, sessionId, userId);
+    expect(history.messages[0]?.toolResults).toMatchObject([{ toolResultId, kind: "mcp", status: "completed" }]);
+  });
+});
+
 describe.skipIf(!adminDatabaseUrl())("persisted whole-turn duration", () => {
   test("reloads duration, preserves metadata, and enforces tenant and user ownership", async () => {
     const tenantId = await seedTenant();
@@ -70,19 +101,10 @@ describe.skipIf(!adminDatabaseUrl())("detached turn persistence", () => {
     const row = await messages.create({ tenantId, sessionId, userId, role: "assistant", status: "streaming", content: "partial" });
     const token = `ghp_${"A".repeat(36)}`;
 
-    await messages.setRuntimeNotices(tenantId, row.messageId, otherUser, [{ message: "wrong owner" }]);
     await messages.setRuntimeNotices(tenantId, row.messageId, userId, [{ message: `expired ${token}` }]);
-    await messages.upsertToolResult({
-      tenantId, messageId: row.messageId, sessionId, userId,
-      toolResultId: `tool-${row.messageId}`, kind: "command", title: "execute",
-      status: "completed", command: "ls", cwd: null, server: null,
-      toolName: "execute", input: "{}", output: "ok", exitCode: 0,
-      durationMs: 1, textOffset: 0
-    });
-    await messages.deleteToolResult(tenantId, row.messageId, otherUser, `tool-${row.messageId}`);
-    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].toolResults).toHaveLength(1);
-    await messages.deleteToolResult(tenantId, row.messageId, userId, `tool-${row.messageId}`);
-    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].toolResults).toEqual([]);
+    await messages.setRuntimeNotices(tenantId, row.messageId, otherUser, [{ message: "wrong owner" }]);
+    expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0].detail.runtimeNotices)
+      .toEqual([{ message: "expired [REDACTED]" }]);
     await messages.upsertToolResult({
       tenantId, messageId: row.messageId, sessionId, userId,
       toolResultId: `unfinished-${row.messageId}`, kind: "command", title: "execute",

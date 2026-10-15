@@ -1,7 +1,11 @@
 import {
-  ProjectLibrarySchema,
   ProjectFileSchema,
   ProjectFileHistorySchema,
+  ProjectFilePickerPageSchema,
+  ProjectFilePickerSelectionSchema,
+  ProjectFolderDetailSchema,
+  ProjectFolderPageSchema,
+  ProjectLibraryFilesPageSchema,
   type ProjectFileCreate,
 } from "@cogniplane/shared-types";
 import { request, fetchWithAuthRetry, buildErrorMessage } from "./api-client";
@@ -12,11 +16,93 @@ const filePath = (projectId: string, fileId: string) =>
   `${path(projectId)}/files/${encodeURIComponent(fileId)}`;
 const versionPath = (projectId: string, fileId: string, versionId: string) =>
   `${filePath(projectId, fileId)}/versions/${encodeURIComponent(versionId)}`;
-export async function getProjectLibrary(projectId: string) {
+const withQuery = (base: string, params: URLSearchParams) => {
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
+};
+const searchParams = (values: Record<string, string | number | null | undefined>) => {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+  }
+  return params;
+};
+export type ProjectLibraryFilesParams = {
+  section: "published" | "draft" | "trash";
+  folderId?: string | null;
+  q?: string;
+  sort: "updated" | "name";
+  limit?: number;
+  cursor?: string;
+};
+export async function listProjectLibraryFiles(
+  projectId: string,
+  input: ProjectLibraryFilesParams,
+  signal?: AbortSignal,
+) {
   return parseResponse(
-    ProjectLibrarySchema,
-    await request(path(projectId)),
-    "GET project library",
+    ProjectLibraryFilesPageSchema,
+    await request(withQuery(`${path(projectId)}/files`, searchParams(input)), { signal }),
+    "GET project library files",
+  );
+}
+export type ProjectFolderListParams = {
+  parentId?: string | null;
+  q?: string;
+  limit?: number;
+  cursor?: string;
+};
+export async function listProjectFolders(
+  projectId: string,
+  input: ProjectFolderListParams,
+  signal?: AbortSignal,
+) {
+  return parseResponse(
+    ProjectFolderPageSchema,
+    await request(withQuery(`${path(projectId)}/folders`, searchParams(input)), { signal }),
+    "GET project folders",
+  );
+}
+export async function getProjectFolder(
+  projectId: string,
+  folderId: string,
+  signal?: AbortSignal,
+) {
+  return parseResponse(
+    ProjectFolderDetailSchema,
+    await request(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, { signal }),
+    "GET project folder",
+  );
+}
+export type ProjectFilePickerParams = {
+  q?: string;
+  kind?: "published" | "any";
+  limit?: number;
+  cursor?: string;
+};
+export async function listProjectFilePicker(
+  projectId: string,
+  input: ProjectFilePickerParams,
+  signal?: AbortSignal,
+) {
+  return parseResponse(
+    ProjectFilePickerPageSchema,
+    await request(withQuery(`${path(projectId)}/picker`, searchParams(input)), { signal }),
+    "GET project file picker",
+  );
+}
+/** Returns the live published files and drafts among `fileIds`. Missing IDs are deleted or inaccessible. */
+export async function getProjectFilePickerSelection(
+  projectId: string,
+  fileIds: string[],
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams();
+  for (const fileId of fileIds) params.append("ids", fileId);
+  return parseResponse(
+    ProjectFilePickerSelectionSchema,
+    await request(withQuery(`${path(projectId)}/picker/selection`, params), { signal }),
+    "GET project file selection",
   );
 }
 export async function saveProjectFile(

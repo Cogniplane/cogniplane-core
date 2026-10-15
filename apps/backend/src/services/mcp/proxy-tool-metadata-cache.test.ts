@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { ProxyToolMetadataCache, type ProxyToolMetadata } from "./proxy-tool-metadata-cache.js";
+import { MAX_PROXY_TOOL_METADATA_SCOPES, ProxyToolMetadataCache, type ProxyToolMetadata } from "./proxy-tool-metadata-cache.js";
 
 /** A complete single-page listing (no request cursor, no nextCursor). */
 function recordCompleteListing(
@@ -13,6 +13,70 @@ function recordCompleteListing(
 }
 
 describe("ProxyToolMetadataCache", () => {
+  it("evicts old credential scopes while keeping active members isolated", async () => {
+    const cache = new ProxyToolMetadataCache();
+    const tools = [{ name: "read", annotations: { readOnlyHint: true },
+      _meta: { ui: { resourceUri: "ui://active" } } }];
+    cache.recordToolsPage("tenant-b", "server", "b", { tools }, "member-b:v1");
+    cache.recordToolsPage("tenant-a", "server", "zero", { tools }, "member-a:v0");
+    for (let version = 1; version < MAX_PROXY_TOOL_METADATA_SCOPES - 1; version += 1) {
+      cache.recordToolsPage("tenant-a", "server", String(version), { tools }, `member-a:v${version}`);
+    }
+    expect(cache.isReadOnly("tenant-b", "server", "read", "member-b:v1")).toBe(true);
+    expect(cache.appResourceUri("tenant-a", "server", "read", "member-a:v0")).toBe("ui://active");
+    cache.recordToolsPage("tenant-a", "server", "new", { tools }, "member-a:new");
+    expect(cache.isReadOnly("tenant-a", "server", "read", "member-a:v1")).toBeUndefined();
+    expect(cache.appResourceUri("tenant-a", "server", "read", "member-a:v1")).toBeNull();
+    expect(cache.isReadOnly("tenant-b", "server", "read", "member-b:v1")).toBe(true);
+    expect(cache.isReadOnly("tenant-a", "server", "read", "member-a:v0")).toBe(true);
+    await cache.refreshMissing("tenant-a", "server", "read", async () => {
+      cache.recordToolsPage("tenant-a", "server", "refreshed", { tools }, "member-a:v1");
+    }, "member-a:v1");
+    expect(cache.isReadOnly("tenant-a", "server", "read", "member-a:v1")).toBe(true);
+  });
+  it("separates tool metadata by member, server binding, and credential version", () => {
+    const cache = new ProxyToolMetadataCache();
+    cache.recordToolsPage("tenant", "server", "one", { tools: [{ name: "tool", annotations: { readOnlyHint: true },
+      _meta: { ui: { resourceUri: "ui://one" } } }] }, "member-one:binding-a:v1");
+    expect(cache.isReadOnly("tenant", "server", "tool", "member-one:binding-a:v1")).toBe(true);
+    expect(cache.appResourceUri("tenant", "server", "tool", "member-two:binding-a:v1")).toBeNull();
+    expect(cache.isReadOnly("tenant", "server", "tool", "member-one:binding-a:v2")).toBeUndefined();
+    expect(cache.isReadOnly("tenant", "server", "tool", "member-one:binding-b:v1")).toBeUndefined();
+    cache.clear("tenant", "server");
+    expect(cache.isReadOnly("tenant", "server", "tool", "member-one:binding-a:v1")).toBeUndefined();
+  });
+  it("shares one refresh and caches an absent tool briefly", async () => {
+    const cache = new ProxyToolMetadataCache();
+    let finish!: () => void;
+    const loader = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const first = cache.refreshMissing("t", "s", "missing", loader);
+    const second = cache.refreshMissing("t", "s", "missing", loader);
+    expect(loader).toHaveBeenCalledOnce();
+    finish();
+    await Promise.all([first, second]);
+    await cache.refreshMissing("t", "s", "missing", loader);
+    expect(loader).toHaveBeenCalledOnce();
+    cache.clear("t", "s");
+    const afterClear = cache.refreshMissing("t", "s", "missing", loader);
+    expect(loader).toHaveBeenCalledTimes(2);
+    finish();
+    await afterClear;
+  });
+  it("publishes app links only from the complete listing for the same tenant and server", () => {
+    const cache = new ProxyToolMetadataCache();
+    cache.recordToolsPage("tenant-a", "server", "listing", {
+      tools: [{ name: "show_quote_picker", _meta: { ui: { resourceUri: "ui://quote-picker/app.html" } } }],
+      nextCursor: "next"
+    });
+    expect(cache.appResourceUri("tenant-a", "server", "show_quote_picker")).toBeNull();
+    cache.recordToolsPage("tenant-a", "server", "listing", { requestCursor: "next", tools: [] });
+    expect(cache.appResourceUri("tenant-a", "server", "show_quote_picker")).toBe("ui://quote-picker/app.html");
+    expect(cache.appResourceUri("tenant-b", "server", "show_quote_picker")).toBeNull();
+    expect(cache.appResourceUri("tenant-a", "other", "show_quote_picker")).toBeNull();
+    recordCompleteListing(cache, "tenant-a", "server", [{ name: "show_quote_picker" }]);
+    expect(cache.appResourceUri("tenant-a", "server", "show_quote_picker")).toBeNull();
+  });
+
   it("completes slow pagination even when another tenant lists tools during the wait", () => {
     vi.useFakeTimers();
     try {

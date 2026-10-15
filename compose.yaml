@@ -89,6 +89,23 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: "no"
+    command: ["node", "apps/backend/dist/scripts/migrate.js"]
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
+      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/cogniplane
+      MAINTENANCE_DATABASE_URL: postgres://maintenance_user:${MAINTENANCE_USER_PASSWORD:-local-dev-maintenance-password}@postgres:5432/cogniplane
+      APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
+
   backend:
     build:
       context: .
@@ -103,9 +120,14 @@ services:
     tmpfs:
       - /tmp:mode=1777,size=1g
       - /home/appuser:mode=0755,uid=1001,gid=1001,size=64m
+    # Uploaded files and skill bundles must outlive the container; /tmp is tmpfs.
+    volumes:
+      - backend-data:/var/lib/cogniplane
     mem_limit: 3g
     cpus: 2.0
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -129,15 +151,18 @@ services:
       # beyond a laptop.
       DEV_HEADERS_AUTH_KEY: ${DEV_HEADERS_AUTH_KEY:-local-dev-headers-auth-key}
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
-      MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/cogniplane
-      APP_USER_PASSWORD: ${APP_USER_PASSWORD:-local-dev-app-user-password}
+      MAINTENANCE_DATABASE_URL: postgres://maintenance_user:${MAINTENANCE_USER_PASSWORD:-local-dev-maintenance-password}@postgres:5432/cogniplane
       LOCAL_DEV_USER_ID: local-dev-user
       REDIS_URL: redis://redis:6379
+      ARTIFACT_STORAGE_ROOT: /var/lib/cogniplane/artifacts
+      SKILL_BUNDLE_STORAGE_ROOT: /var/lib/cogniplane/skills
       # Forwarded from host env / .env when non-empty. E2B_* are required at
       # boot (config.ts fails fast); the Anthropic key is optional at boot (turns need it).
       E2B_API_KEY:
       E2B_TEMPLATE_ID:
       ANTHROPIC_API_KEY:
+      MODEL_SPENDING_MONTHLY_LIMIT_USD:
+      MODEL_SPENDING_TURN_RESERVATION_USD:
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
@@ -183,3 +208,4 @@ services:
 volumes:
   redis-data:
   postgres-data:
+  backend-data:

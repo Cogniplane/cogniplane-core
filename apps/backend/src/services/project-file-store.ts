@@ -1,10 +1,21 @@
 import type { FastifyBaseLogger } from "fastify";
 import { z } from "zod";
 import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import type {
   ProjectFile,
   ProjectFileCreate,
+  ProjectFilePickerEntry,
+  ProjectFilePickerQuery,
+  ProjectLibraryFile,
+  ProjectLibraryFilesQuery,
+  ProjectLibraryFilesPage,
+  ProjectFilePickerPage,
+  ProjectFolderEntry,
+  ProjectFolderListQuery,
+  ProjectFolderPage,
+  ProjectFolderDetail,
   ProjectFileVersion,
   ProjectFolder,
   ProjectLibrary,
@@ -18,13 +29,16 @@ import { withTenantScope, withTransaction, type Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
 import type { AuditEventType } from "./audit-event-types.js";
-import { isoTimestamp } from "../lib/db-mappers.js";
+import { AuditEventStore } from "./audit-event-store.js";
+import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
 import { ALLOWED_ARTIFACT_MIME_TYPES } from "../lib/allowed-mime-types.js";
 import type {
   ArtifactStorage,
   StoredArtifact,
 } from "./artifacts/artifact-storage.js";
-import type { PiiProtectionService } from "./pii/pii-protection-service.js";
+import { PiiProtectionServiceError, type PiiProtectionService } from "./pii/pii-protection-service.js";
+import { PERMANENT_PII_ERROR_CODES } from "./pii/pii-scan-job-handler.js";
+import { toScannableText, type PdfTextExtractor } from "./pii/scannable-text.js";
 import { isTextReadableArtifact, readStreamAsBoundedText } from "./artifacts/artifact-helpers.js";
 
 export type ProjectFileActor = {
@@ -85,6 +99,48 @@ const missing = () =>
     "This project file is unavailable.",
     404,
   );
+const pageCursorSchema = z.object({
+  v: z.literal(1),
+  sort: z.enum(["updated", "name"]),
+  key: z.string().max(1024),
+  id: z.string().uuid(),
+  asOf: z.string().datetime({ offset: true }),
+  filter: z.string().regex(/^[a-f0-9]{24}$/),
+}).strict();
+type PageCursor = z.infer<typeof pageCursorSchema>;
+
+function pageFingerprint(input: unknown): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 24);
+}
+function readPageCursor(raw: string | undefined, sort: PageCursor["sort"], filter: string): PageCursor | null {
+  if (!raw) return null;
+  try {
+    const decoded = Buffer.from(raw, "base64url");
+    if (decoded.toString("base64url") !== raw) throw new Error("Invalid encoding");
+    const result = pageCursorSchema.parse(JSON.parse(decoded.toString("utf8")));
+    if (result.sort !== sort || result.filter !== filter ||
+      (sort === "updated" && !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/.test(result.key))) {
+      throw new Error("Cursor does not match this view");
+    }
+    return result;
+  } catch {
+    throw new ProjectFileError("invalid_cursor", "Reload this file list and try again.", 400);
+  }
+}
+function writePageCursor(cursor: PageCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
+}
+function pickerEntry(row: Row): ProjectFilePickerEntry {
+  return {
+    fileId: String(row.file_id),
+    name: String(row.name),
+    kind: row.kind === "draft" ? "draft" : "published",
+    folderId: row.folder_id ? String(row.folder_id) : null,
+    folderPath: String(row.folder_path),
+    versionId: String(row.current_version_id),
+    versionNumber: Number(row.version_number),
+  };
+}
 // Store callers, including the agent runtime, must not depend on HTTP validation.
 function parseInput<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
@@ -145,9 +201,27 @@ const joinedFiles = `SELECT ${joinedFileColumns}
 const joinedFilesWithCount = `SELECT ${joinedFileColumns}, COUNT(*) OVER() AS total_count
   FROM project_files f JOIN project_file_versions v USING (tenant_id, project_id, file_id)
   WHERE f.tenant_id = $1 AND f.project_id = $2 AND v.version_id = f.current_version_id`;
+const fileFolderPathJoin = `LEFT JOIN LATERAL (
+  WITH RECURSIVE ancestors AS (
+    SELECT folder_id, parent_id, name, deleted_at, 1 AS depth, ARRAY[folder_id] AS seen
+    FROM project_folders
+    WHERE tenant_id=f.tenant_id AND project_id=f.project_id AND folder_id=f.folder_id
+    UNION ALL
+    SELECT parent.folder_id, parent.parent_id, parent.name, parent.deleted_at, ancestors.depth + 1,
+      ancestors.seen || parent.folder_id
+    FROM project_folders parent JOIN ancestors ON parent.folder_id=ancestors.parent_id
+    WHERE parent.tenant_id=f.tenant_id AND parent.project_id=f.project_id
+      AND ancestors.depth < 8 AND NOT parent.folder_id = ANY(ancestors.seen)
+  )
+  SELECT CASE WHEN bool_or(deleted_at IS NOT NULL) THEN 'Missing folder'
+    ELSE 'Files / ' || CASE WHEN bool_or(depth=8 AND parent_id IS NOT NULL) THEN '… / ' ELSE '' END
+      || string_agg(name, ' / ' ORDER BY depth DESC) END AS path
+  FROM ancestors
+) folder_path ON TRUE`;
 
 export class ProjectFileStore {
   private piiProtection: Pick<PiiProtectionService, "evaluateArtifact"> | undefined;
+  private extractPdfText: PdfTextExtractor | undefined;
 
   constructor(
     private readonly db: Pool,
@@ -262,18 +336,13 @@ export class ProjectFileStore {
           auditByProject.set(key, group);
         }
         for (const group of auditByProject.values()) {
-          await db.query(
-          `INSERT INTO audit_events (tenant_id, user_id, session_id, event_type, payload)
-           VALUES ($1, NULL, NULL, 'project_file_retention_deleted', $2::jsonb)`,
-            [
-              group.tenantId,
-              JSON.stringify({
-                projectId: group.projectId,
-                fileIds: group.fileIds,
-                reason: "retention",
-              }),
-            ],
-          );
+          await AuditEventStore.createInTransaction(db, {
+            tenantId: group.tenantId,
+            sessionId: null,
+            userId: null,
+            type: "project_file_retention_deleted",
+            payload: { projectId: group.projectId, fileIds: group.fileIds, reason: "retention" },
+          });
         }
       }
       // Older versions of the sweep could enqueue keys that were still
@@ -358,8 +427,10 @@ export class ProjectFileStore {
 
   setPiiProtection(
     piiProtection: Pick<PiiProtectionService, "evaluateArtifact">,
+    extractPdfText?: PdfTextExtractor,
   ): void {
     this.piiProtection = piiProtection;
+    this.extractPdfText = extractPdfText;
   }
   private async scoped<T>(
     actor: ProjectFileActor,
@@ -432,32 +503,285 @@ export class ProjectFileStore {
     type: AuditEventType,
     payload: Record<string, unknown>,
   ) {
-    await db.query(
-      `INSERT INTO audit_events (tenant_id, user_id, session_id, event_type, payload)
-      VALUES ($1, $2, NULL, $3, $4::jsonb)`,
-      [
-        actor.tenantId,
-        actor.userId,
-        type,
-        JSON.stringify({ projectId: actor.projectId, ...payload }),
-      ],
-    );
+    // The shared writer redacts secrets in the payload, like every other audit event.
+    await AuditEventStore.createInTransaction(db, {
+      tenantId: actor.tenantId,
+      sessionId: null,
+      userId: actor.userId,
+      type,
+      payload: { projectId: actor.projectId, ...payload },
+    });
     await db.query(
       `UPDATE projects SET updated_at = NOW() WHERE tenant_id = $1 AND project_id = $2`,
       [actor.tenantId, actor.projectId],
     );
   }
-  async list(actor: ProjectFileActor): Promise<ProjectLibrary> {
+  async list(actor: ProjectFileActor): Promise<ProjectLibrary & { truncated: boolean }> {
     return this.scoped(actor, false, async (db) => {
+      const limit = 100;
       const files = await db.query(
-        `${joinedFiles} AND f.kind <> 'promoted' ORDER BY f.updated_at DESC, f.file_id`,
-        [actor.tenantId, actor.projectId],
+        `${joinedFiles} AND f.kind <> 'promoted' ORDER BY f.updated_at DESC, f.file_id
+          LIMIT $3`,
+        [actor.tenantId, actor.projectId, limit + 1],
       );
       const folders = await db.query(
-        `SELECT * FROM project_folders WHERE tenant_id = $1 AND project_id = $2 ORDER BY name, folder_id`,
-        [actor.tenantId, actor.projectId],
+        `SELECT * FROM project_folders WHERE tenant_id = $1 AND project_id = $2 ORDER BY name, folder_id
+          LIMIT $3`,
+        [actor.tenantId, actor.projectId, limit + 1],
       );
-      return { files: files.rows.map(file), folders: folders.rows.map(folder) };
+      return { files: files.rows.slice(0, limit).map(file), folders: folders.rows.slice(0, limit).map(folder),
+        truncated: files.rows.length > limit || folders.rows.length > limit };
+    });
+  }
+  async listFilesPage(actor: ProjectFileActor, query: ProjectLibraryFilesQuery): Promise<ProjectLibraryFilesPage> {
+    return this.scoped(actor, false, async (db) => {
+      const folderId = query.section === "published" && !query.q ? query.folderId ?? null : null;
+      const fingerprint = pageFingerprint({ endpoint: "files", tenantId: actor.tenantId, projectId: actor.projectId,
+        section: query.section, folderId, q: query.q ?? null, sort: query.sort });
+      const cursor = readPageCursor(query.cursor, query.sort, fingerprint);
+      const params: unknown[] = [actor.tenantId, actor.projectId];
+      const filters = ["f.tenant_id=$1", "f.project_id=$2", "f.kind <> 'promoted'"];
+      if (query.section === "trash") filters.push("f.trashed_at IS NOT NULL");
+      else {
+        filters.push("f.trashed_at IS NULL", `f.kind='${query.section}'`);
+      }
+      if (query.section === "published" && !query.q) {
+        params.push(folderId);
+        filters.push(`f.folder_id IS NOT DISTINCT FROM $${params.length}::text`);
+      }
+      if (query.q) {
+        params.push(query.q);
+        filters.push(`strpos(lower(f.name), lower($${params.length}::text)) > 0`);
+      }
+      const asOf = cursor ? `$${params.push(cursor.asOf)}::timestamptz` : "transaction_timestamp()";
+      // Snapshot on creation time, like folders. New files stay out of the scroll.
+      // An edit, rename, move, or publish changes the sort key. The file can then move
+      // before the cursor and this scroll does not show it. `listChanged` tells the
+      // client that a file in this list changed after the first page. Only the
+      // updated sort uses it: a content edit does not move a file in the name sort.
+      filters.push(`f.created_at <= ${asOf}`);
+      const listChanged = cursor && query.sort === "updated"
+        ? (await db.query(
+          `SELECT EXISTS (SELECT 1 FROM project_files f
+            WHERE ${filters.join(" AND ")} AND f.updated_at > ${asOf}) AS changed`,
+          params,
+        )).rows[0]?.changed === true
+        : false;
+      if (cursor) {
+        params.push(cursor.key, cursor.id);
+        const key = `$${params.length - 1}`;
+        const id = `$${params.length}`;
+        filters.push(query.sort === "updated"
+          ? `(f.updated_at, f.file_id) < (${key}::timestamptz, ${id}::text)`
+          : `(lower(f.name), f.file_id) > (${key}::text, ${id}::text)`);
+      }
+      params.push(query.limit + 1);
+      const order = query.sort === "updated"
+        ? "f.updated_at DESC, f.file_id DESC"
+        : "lower(f.name), f.file_id";
+      const result = await db.query(
+        `WITH page AS (
+          SELECT f.*, lower(f.name) AS cursor_name,
+            ${utcMicrosText("f.updated_at")} AS cursor_updated,
+            ${utcMicrosText(asOf)} AS cursor_as_of
+          FROM project_files f WHERE ${filters.join(" AND ")}
+          ORDER BY ${order} LIMIT $${params.length}
+        )
+        SELECT ${joinedFileColumns}, f.cursor_name, f.cursor_updated, f.cursor_as_of,
+          t.name AS target_name, t.current_version_id AS target_version_id,
+          (t.kind='published' AND t.trashed_at IS NULL) AS target_available,
+          CASE WHEN f.folder_id IS NULL THEN 'Files'
+            ELSE COALESCE(folder_path.path, 'Missing folder') END AS folder_path
+        FROM page f JOIN project_file_versions v
+          ON v.tenant_id=f.tenant_id AND v.project_id=f.project_id AND v.file_id=f.file_id
+          AND v.version_id=f.current_version_id
+        LEFT JOIN project_files t ON t.tenant_id=f.tenant_id AND t.project_id=f.project_id
+          AND t.file_id=f.target_file_id
+        ${fileFolderPathJoin}
+        ORDER BY ${order}`,
+        params,
+      );
+      const rows = result.rows.slice(0, query.limit);
+      const last = rows.at(-1);
+      return {
+        items: rows.map((row): ProjectLibraryFile => ({
+          ...file(row),
+          folderPath: String(row.folder_path),
+          target: row.target_file_id && row.target_name ? {
+            fileId: String(row.target_file_id),
+            name: String(row.target_name),
+            currentVersionId: String(row.target_version_id),
+            available: row.target_available === true,
+          } : null,
+        })),
+        nextCursor: result.rows.length > query.limit && last
+          ? writePageCursor({ v: 1, sort: query.sort,
+            key: String(query.sort === "updated" ? last.cursor_updated : last.cursor_name),
+            id: String(last.file_id), asOf: String(last.cursor_as_of), filter: fingerprint })
+          : null,
+        listChanged,
+      };
+    });
+  }
+  async pickerPage(actor: ProjectFileActor, query: ProjectFilePickerQuery): Promise<ProjectFilePickerPage> {
+    return this.scoped(actor, false, async (db) => {
+      const fingerprint = pageFingerprint({ endpoint: "picker", tenantId: actor.tenantId, projectId: actor.projectId,
+        q: query.q ?? null, kind: query.kind });
+      const cursor = readPageCursor(query.cursor, "name", fingerprint);
+      const params: unknown[] = [actor.tenantId, actor.projectId];
+      const filters = ["f.tenant_id=$1", "f.project_id=$2", "f.trashed_at IS NULL",
+        "f.kind IN ('published','draft')"];
+      if (query.kind === "published") filters.push("f.kind='published'");
+      let matchedFolders = "WITH ";
+      if (query.q) {
+        params.push(query.q);
+        const search = `$${params.length}::text`;
+        matchedFolders = `WITH RECURSIVE matched AS (
+          SELECT folder_id, ARRAY[folder_id] AS seen FROM project_folders
+          WHERE tenant_id=$1 AND project_id=$2 AND deleted_at IS NULL
+            AND strpos(lower(name), lower(${search})) > 0
+          UNION ALL
+          SELECT child.folder_id, matched.seen || child.folder_id
+          FROM project_folders child JOIN matched ON child.parent_id=matched.folder_id
+          WHERE child.tenant_id=$1 AND child.project_id=$2 AND child.deleted_at IS NULL
+            AND NOT child.folder_id = ANY(matched.seen)
+        ), `;
+        filters.push(`(strpos('files', lower(${search})) > 0
+          OR strpos(lower(f.name), lower(${search})) > 0
+          OR f.folder_id IN (SELECT folder_id FROM matched))`);
+      }
+      const asOf = cursor ? `$${params.push(cursor.asOf)}::timestamptz` : "transaction_timestamp()";
+      // Snapshot on creation time, like folders. A content edit keeps the name sort key.
+      // A rename can move the file before the cursor.
+      filters.push(`f.created_at <= ${asOf}`);
+      if (cursor) {
+        params.push(cursor.key, cursor.id);
+        filters.push(`(lower(f.name), f.file_id) > ($${params.length - 1}::text, $${params.length}::text)`);
+      }
+      params.push(query.limit + 1);
+      const result = await db.query(
+        `${matchedFolders}page AS (
+          SELECT f.tenant_id, f.project_id, f.file_id, f.folder_id, f.name, f.kind, f.current_version_id,
+            lower(f.name) AS cursor_name,
+            ${utcMicrosText(asOf)} AS cursor_as_of
+          FROM project_files f
+          WHERE ${filters.join(" AND ")}
+          ORDER BY lower(f.name), f.file_id LIMIT $${params.length}
+        )
+        SELECT f.*, v.version_number,
+          CASE WHEN f.folder_id IS NULL THEN 'Files'
+            ELSE COALESCE(folder_path.path, 'Missing folder') END AS folder_path
+        FROM page f JOIN project_file_versions v
+          ON v.tenant_id=f.tenant_id AND v.project_id=f.project_id AND v.file_id=f.file_id
+          AND v.version_id=f.current_version_id
+        ${fileFolderPathJoin}
+        ORDER BY f.cursor_name, f.file_id`,
+        params,
+      );
+      const rows = result.rows.slice(0, query.limit);
+      const last = rows.at(-1);
+      return {
+        items: rows.map(pickerEntry),
+        nextCursor: result.rows.length > query.limit && last
+          ? writePageCursor({ v: 1, sort: "name", key: String(last.cursor_name),
+            id: String(last.file_id), asOf: String(last.cursor_as_of), filter: fingerprint })
+          : null,
+      };
+    });
+  }
+  async pickerSelection(actor: ProjectFileActor, ids: string[]): Promise<ProjectFilePickerEntry[]> {
+    if (ids.length > MAX_PROJECT_FILE_SELECTIONS)
+      throw new ProjectFileError("invalid_request", "Choose up to 20 project files.", 400);
+    return this.scoped(actor, false, async (db) => {
+      const result = await db.query(
+        `
+        SELECT f.file_id, f.folder_id, f.name, f.kind, f.current_version_id, v.version_number,
+          CASE WHEN f.folder_id IS NULL THEN 'Files'
+            ELSE COALESCE(folder_path.path, 'Missing folder') END AS folder_path
+        FROM project_files f JOIN project_file_versions v
+          ON v.tenant_id=f.tenant_id AND v.project_id=f.project_id AND v.file_id=f.file_id
+          AND v.version_id=f.current_version_id
+        ${fileFolderPathJoin}
+        WHERE f.tenant_id=$1 AND f.project_id=$2 AND f.file_id=ANY($3::text[])
+          AND f.kind IN ('published','draft') AND f.trashed_at IS NULL
+        ORDER BY lower(f.name), f.file_id LIMIT 20`,
+        [actor.tenantId, actor.projectId, ids],
+      );
+      return result.rows.map(pickerEntry);
+    });
+  }
+  async listFolders(actor: ProjectFileActor, query: ProjectFolderListQuery): Promise<ProjectFolderPage> {
+    return this.scoped(actor, false, async (db) => {
+      const fingerprint = pageFingerprint({ endpoint: "folders", tenantId: actor.tenantId, projectId: actor.projectId,
+        parentId: query.parentId ?? null, q: query.q?.toLowerCase() ?? null });
+      const cursor = readPageCursor(query.cursor, "name", fingerprint);
+      const params: unknown[] = [actor.tenantId, actor.projectId];
+      const filters = ["f.tenant_id=$1", "f.project_id=$2", "f.deleted_at IS NULL"];
+      if (query.q) {
+        params.push(query.q);
+        filters.push(`strpos(lower(f.name), lower($${params.length}::text)) > 0`);
+      } else {
+        params.push(query.parentId ?? "");
+        filters.push(`coalesce(f.parent_id, '')=$${params.length}::text`);
+      }
+      const asOf = cursor ? `$${params.push(cursor.asOf)}::timestamptz` : "transaction_timestamp()";
+      filters.push(`f.created_at <= ${asOf}`);
+      if (cursor) {
+        params.push(cursor.key, cursor.id);
+        filters.push(`(lower(f.name), f.folder_id) > ($${params.length - 1}::text, $${params.length}::text)`);
+      }
+      params.push(query.limit + 1);
+      const result = await db.query(
+        `WITH page AS (
+          SELECT f.*, lower(f.name) AS cursor_name,
+            ${utcMicrosText(asOf)} AS cursor_as_of
+          FROM project_folders f WHERE ${filters.join(" AND ")}
+          ORDER BY lower(f.name), f.folder_id LIMIT $${params.length}
+        )
+        SELECT f.*, CASE WHEN folder_path.path IS NULL THEN 'Missing folder'
+          ELSE folder_path.path END AS path
+        FROM page f ${fileFolderPathJoin}
+        ORDER BY f.cursor_name, f.folder_id`, params,
+      );
+      const rows = result.rows.slice(0, query.limit);
+      const last = rows.at(-1);
+      return {
+        items: rows.map((row): ProjectFolderEntry => ({ ...folder(row), path: String(row.path) })),
+        nextCursor: result.rows.length > query.limit && last
+          ? writePageCursor({ v: 1, sort: "name", key: String(last.cursor_name),
+            id: String(last.folder_id), asOf: String(last.cursor_as_of), filter: fingerprint })
+          : null,
+      };
+    });
+  }
+  async getFolder(actor: ProjectFileActor, folderId: string): Promise<ProjectFolderDetail> {
+    return this.scoped(actor, false, async (db) => {
+      const result = await db.query(
+        `WITH RECURSIVE ancestors AS (
+          SELECT folder_id, parent_id, name, deleted_at, 0 AS depth,
+            deleted_at IS NULL AS found_live, ARRAY[folder_id] AS seen
+          FROM project_folders WHERE tenant_id=$1 AND project_id=$2 AND folder_id=$3
+          UNION ALL
+          SELECT p.folder_id, p.parent_id, p.name, p.deleted_at, a.depth + 1,
+            a.found_live OR p.deleted_at IS NULL, a.seen || p.folder_id
+          FROM ancestors a JOIN project_folders p ON p.tenant_id=$1 AND p.project_id=$2
+            AND p.folder_id=a.parent_id
+          WHERE (a.depth < 8 OR NOT a.found_live) AND NOT p.folder_id=ANY(a.seen)
+        )
+        SELECT folder_id, parent_id, name, deleted_at, depth FROM ancestors
+        WHERE depth <= 8 OR deleted_at IS NULL ORDER BY depth`,
+        [actor.tenantId, actor.projectId, folderId],
+      );
+      const first = result.rows[0];
+      if (!first) throw new ProjectFileError("project_folder_missing", "This folder is unavailable.", 404);
+      const ancestors = result.rows.filter((row) => Number(row.depth) > 0 && Number(row.depth) <= 8);
+      const nearestLive = result.rows.find((row) => row.deleted_at === null);
+      return {
+        folder: folder(first),
+        ancestors: ancestors.reverse().map((row) => ({ folderId: String(row.folder_id), name: String(row.name) })),
+        ancestorsTruncated: ancestors.some((row) => Number(row.depth) === 8 && row.parent_id !== null),
+        nearestLiveFolderId: nearestLive ? String(nearestLive.folder_id) : null,
+      };
     });
   }
   async listPublished(actor: ProjectFileActor): Promise<ProjectFile[]> {
@@ -542,12 +866,13 @@ export class ProjectFileStore {
     messageId: string | null,
     entry: ProjectRuntimeFileSnapshotEntry
   ) {
-    await withTenantScope(this.db, actor.tenantId, (db) => db.query(
-      `INSERT INTO audit_events (tenant_id, user_id, session_id, event_type, payload)
-       VALUES ($1, $2, $3, 'project_file_read', $4::jsonb)`,
-      [actor.tenantId, actor.userId, sessionId,
-        JSON.stringify({ projectId: actor.projectId, fileId: entry.fileId, versionId: entry.versionId, messageId })]
-    ));
+    await withTenantScope(this.db, actor.tenantId, (db) => AuditEventStore.createInTransaction(db, {
+      tenantId: actor.tenantId,
+      sessionId,
+      userId: actor.userId,
+      type: "project_file_read",
+      payload: { projectId: actor.projectId, fileId: entry.fileId, versionId: entry.versionId, messageId },
+    }));
   }
 
   async createAgentDraftFromContent(input: {
@@ -561,7 +886,6 @@ export class ProjectFileStore {
     storage: Pick<ArtifactStorage, "put" | "delete">;
     maxBytes: number;
     createdByType?: ProjectFileCreatedByType;
-    stored?: StoredArtifact;
   }): Promise<ProjectFile> {
     const { actor } = input;
     const parsed = parseInput(ProjectFileLocationSchema, {
@@ -600,17 +924,25 @@ export class ProjectFileStore {
         throw new ProjectFileError("project_agent_create_only", "Create-only mode cannot update an existing project file.");
     });
     if (this.piiProtection) {
-      const decision = await this.piiProtection.evaluateArtifact({
+      const piiProtection = this.piiProtection;
+      const decision = await piiProtection.evaluateArtifact({
         tenantId: actor.tenantId,
         artifact: {
           artifactId: `project-draft:${uuidv7()}`,
           contentType: mimeType,
           entityTypes: [],
-          readContent: async () => Buffer.from(input.content).toString("utf8")
+          readContent: (signal) => toScannableText(mimeType, Buffer.from(input.content), this.extractPdfText, signal)
         },
         // Project drafts are new bytes entering the shared library, so they
         // follow the tenant's existing upload PII scope and blocking policy.
         subject: { kind: "upload" }
+      }).catch((error: unknown) => {
+        // A file the scan cannot read is a client error the agent can act on,
+        // for example by writing a text version instead.
+        if (error instanceof PiiProtectionServiceError && PERMANENT_PII_ERROR_CODES.has(error.code)) {
+          throw new ProjectFileError(error.code, error.message, 422);
+        }
+        throw error;
       });
       if (decision.action === "block") {
         throw new ProjectFileError(
@@ -620,14 +952,10 @@ export class ProjectFileStore {
         );
       }
     }
-    // A supplied object is already owned by the artifact path and this method
-    // only adds a project-file reference. Any future PII purge of that shared
-    // object must check project_file_versions before deleting by storage key.
-    const stored = input.stored ?? await input.storage.put({
+    const stored = await input.storage.put({
       storageKey: `project-files/${actor.projectId}/${uuidv7()}`,
       stream: Readable.from([Buffer.from(input.content)])
     });
-    const ownsStoredObject = !input.stored;
     try {
       return await this.scoped(actor, true, async (db) => {
         const modeResult = await db.query(
@@ -715,7 +1043,6 @@ export class ProjectFileStore {
         return file(await this.entry(db, actor, fileId));
       });
     } catch (error) {
-      if (!ownsStoredObject) throw error;
       await input.storage.delete(stored.storageKey).catch((cleanupError) => {
         this.logger.warn({ err: cleanupError, tenantId: actor.tenantId, projectId: actor.projectId, storageKey: stored.storageKey }, "Failed to remove an uncommitted project draft");
       });
@@ -729,7 +1056,11 @@ export class ProjectFileStore {
     sessionId: string;
     messageId: string | null;
   }): Promise<Row> {
-    return this.scoped(input.actor, false, async (db) => {
+    return this.scoped(input.actor, false, (db) => this.queryConflictRow(db, input));
+  }
+
+  private async queryConflictRow(db: PoolClient, input: { actor: ProjectFileActor; draftId: string }): Promise<Row> {
+    {
       const result = await db.query(
         `SELECT
            draft.file_id AS draft_file_id,
@@ -777,8 +1108,7 @@ export class ProjectFileStore {
         );
       }
       return found;
-    });
-
+    }
   }
 
   private validateConflictMime(row: Row): string {
@@ -809,24 +1139,25 @@ export class ProjectFileStore {
     };
   }
 
-  private async auditConflictRead(input: {
+  private async auditConflictRead(db: PoolClient, input: {
     actor: ProjectFileActor;
     sessionId: string;
     messageId: string | null;
   }, row: Row): Promise<void> {
-    await withTenantScope(this.db, input.actor.tenantId, (db) => db.query(
-      `INSERT INTO audit_events (tenant_id, user_id, session_id, event_type, payload)
-       VALUES ($1, $2, $3, 'project_file_read', $4::jsonb)`,
-      [input.actor.tenantId, input.actor.userId, input.sessionId,
-        JSON.stringify({
-          projectId: input.actor.projectId,
-          draftId: String(row.draft_file_id),
-          fileIds: [String(row.target_file_id), String(row.draft_file_id)],
-          versionIds: [String(row.base_version_id_actual), String(row.latest_version_id), String(row.proposed_version_id)],
-          purpose: "conflict_resolution",
-          messageId: input.messageId,
-        })],
-    ));
+    await AuditEventStore.createInTransaction(db, {
+      tenantId: input.actor.tenantId,
+      sessionId: input.sessionId,
+      userId: input.actor.userId,
+      type: "project_file_read",
+      payload: {
+        projectId: input.actor.projectId,
+        draftId: String(row.draft_file_id),
+        fileIds: [String(row.target_file_id), String(row.draft_file_id)],
+        versionIds: [String(row.base_version_id_actual), String(row.latest_version_id), String(row.proposed_version_id)],
+        purpose: "conflict_resolution",
+        messageId: input.messageId,
+      },
+    });
   }
 
   async readConflictMetadata(input: {
@@ -835,10 +1166,13 @@ export class ProjectFileStore {
     sessionId: string;
     messageId: string | null;
   }): Promise<ProjectConflictMetadata> {
-    const row = await this.loadConflictRow(input);
-    const mimeType = this.validateConflictMime(row);
-    await this.auditConflictRead(input, row);
-    return this.conflictMetadata(row, mimeType);
+    // The row, its access check and the audit share one transaction.
+    return this.scoped(input.actor, false, async (db) => {
+      const row = await this.queryConflictRow(db, input);
+      const mimeType = this.validateConflictMime(row);
+      await this.auditConflictRead(db, input, row);
+      return this.conflictMetadata(row, mimeType);
+    });
   }
 
   /**
@@ -875,7 +1209,20 @@ export class ProjectFileStore {
       readVersion(String(row.base_storage_key)),
       readVersion(String(row.latest_storage_key)),
     ]);
-    await this.auditConflictRead(input, row);
+    // The reads can be slow. Check access and the conflict again before the
+    // content is returned: the actor can have lost the project, or a version
+    // can have changed. The check and the audit share one transaction.
+    await this.scoped(input.actor, false, async (db) => {
+      const current = await this.queryConflictRow(db, input);
+      if (["proposed_version_id", "base_version_id_actual", "latest_version_id"].some((key) => current[key] !== row[key])) {
+        throw new ProjectFileError(
+          "project_conflict_changed",
+          "The conflict changed while it was read. Read it again.",
+          409,
+        );
+      }
+      await this.auditConflictRead(db, input, row);
+    });
     const metadata = this.conflictMetadata(row, mimeType);
     return {
       ...metadata,

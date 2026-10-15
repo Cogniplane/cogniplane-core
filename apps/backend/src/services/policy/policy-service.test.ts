@@ -96,6 +96,29 @@ function gateInput(overrides: Partial<PolicyGateInput> = {}): PolicyGateInput {
   };
 }
 
+describe("PolicyService.gateCompletedToolResource", () => {
+  it("records a scheduled block and refuses the resource", async () => {
+    const { service, records, events } = buildService([
+      makeRule({ ruleId: "scheduled-block", effect: "block", conditions: { turnContexts: ["scheduled"] } })
+    ]);
+    await expect(service.gateCompletedToolResource(gateInput({ turnContext: "scheduled" })))
+      .rejects.toBeInstanceOf(PolicyBlockedError);
+    expect(records[0]).toMatchObject({ outcome: "block", enforced: true });
+    expect(events).toHaveLength(1);
+    expect((records[0]?.actionSnapshot as Record<string, unknown>).turnContext).toBe("scheduled");
+  });
+
+  it("keeps a completed approved call readable under a current approval rule", async () => {
+    const { service, records } = buildService([
+      makeRule({ ruleId: "approval", effect: "require_approval", conditions: {} })
+    ]);
+    const result = await service.gateCompletedToolResource(gateInput());
+    expect(result.evaluation.outcome).toBe("require_approval");
+    expect(result.enforced).toBe(false);
+    expect(records).toHaveLength(1);
+  });
+});
+
 describe("PolicyService.gateAction — non-gating outcomes", () => {
   it("no matching rule → proceeds, records nothing", async () => {
     const { service, records, events } = buildService([
@@ -195,11 +218,10 @@ describe("PolicyService.gateAction — enforce-mode block", () => {
         reason: "Blocked for a reason."
       })
     ]);
-    await service.gateAction(gateInput()).catch((err: unknown) => {
-      expect(err).toBeInstanceOf(PolicyBlockedError);
-      const e = err as PolicyBlockedError;
-      expect(e.explanation).toBe("Blocked for a reason.");
-      expect(e.matchedRuleId).toBe("pol_x");
+    const pending = service.gateAction(gateInput());
+    await expect(pending).rejects.toBeInstanceOf(PolicyBlockedError);
+    await expect(pending).rejects.toMatchObject({
+      explanation: "Blocked for a reason.", matchedRuleId: "pol_x"
     });
   });
 });
@@ -228,23 +250,34 @@ describe("PolicyService.gateAction — enforce-mode require_approval", () => {
     const { service } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
     ]);
-    await service.gateAction(gateInput({ approvalDisposition: "expired" })).catch((err: unknown) => {
-      expect((err as PolicyBlockedError).explanation).toContain("expired");
+    const pending = service.gateAction(gateInput({ approvalDisposition: "expired" }));
+    await expect(pending).rejects.toBeInstanceOf(PolicyBlockedError);
+    await expect(pending).rejects.toMatchObject({
+      explanation: expect.stringContaining("expired"), matchedRuleId: "pol_1"
     });
+  });
+
+  it("denies an approval that an earlier call already used", async () => {
+    const { service, records } = buildService([
+      makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
+    ]);
+    const pending = service.gateAction(gateInput({ approvalDisposition: "consumed" }));
+    await expect(pending).rejects.toMatchObject({
+      explanation: expect.stringContaining("already used"), matchedRuleId: "pol_1"
+    });
+    expect((records[0].actionSnapshot as Record<string, unknown>).approvalDisposition).toBe("consumed");
   });
 
   it("denies a scheduled turn before waiting for approval", async () => {
     const { service, records } = buildService([
       makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {}, reason: "Needs sign-off." })
     ]);
-    await service
-      .gateAction(gateInput({ turnContext: "scheduled", approvalDisposition: "approve" }))
-      .catch((err: unknown) => {
-        expect(err).toBeInstanceOf(PolicyBlockedError);
-        expect((err as PolicyBlockedError).explanation).toContain(
-          "Approval is not available on scheduled runs"
-        );
-      });
+    const pending = service.gateAction(gateInput({ turnContext: "scheduled", approvalDisposition: "approve" }));
+    await expect(pending).rejects.toBeInstanceOf(PolicyBlockedError);
+    await expect(pending).rejects.toMatchObject({
+      explanation: expect.stringContaining("Approval is not available on scheduled runs"),
+      matchedRuleId: "pol_1"
+    });
     expect(records[0].outcome).toBe("require_approval");
     expect((records[0].actionSnapshot as Record<string, unknown>).approvalDisposition).toBe("reject");
   });

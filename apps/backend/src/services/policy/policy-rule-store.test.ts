@@ -6,10 +6,8 @@ import { PolicyRuleStore, PolicyReorderMismatchError } from "./policy-rule-store
 
 type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 
-// In-memory fake of the `policy_rule` table. Pattern-matches the store's SQL
-// (the same approach as tenant-settings-store.test.ts) so we exercise the real
-// store logic — priority math, partial-update preservation, reorder guards —
-// without a database.
+// Supplies rows for application-side patch merging and validation.
+// SQL ordering, tenant filtering, and append priorities run in the integration suite.
 class InMemoryRuleDatabase {
   rows: Record<string, unknown>[] = [];
   private clock = 0;
@@ -25,15 +23,22 @@ class InMemoryRuleDatabase {
     return new Date(Date.UTC(2026, 4, 31, 0, 0, this.clock++)).toISOString();
   }
 
+  // Statement kinds in order, to check what runs in one locked transaction.
+  readonly statements: string[] = [];
+
   async query(sql: string, params: unknown[] = []): Promise<QueryResult> {
-    if (
-      sql === "BEGIN" ||
-      sql === "COMMIT" ||
-      sql === "ROLLBACK" ||
-      sql.startsWith("SELECT set_config")
-    ) {
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+      this.statements.push(sql);
       return { rows: [], rowCount: 0 };
     }
+    if (sql.startsWith("SELECT set_config")) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (sql.startsWith("SELECT pg_advisory_xact_lock")) {
+      this.statements.push(`lock:${String(params[0])}`);
+      return { rows: [], rowCount: 0 };
+    }
+    this.statements.push(sql.trim().split(/\s+/)[0]!.toUpperCase());
 
     const tenantId = String(params[0]);
     const ofTenant = () => this.rows.filter((r) => r.tenant_id === tenantId);
@@ -127,40 +132,11 @@ function makeStore() {
   return { db, store: new PolicyRuleStore(db as unknown as Pool) };
 }
 
-test("create assigns the first rule priority 0 and appends subsequent rules by +10", async () => {
-  const { store } = makeStore();
-  const first = await store.create("t1", { name: "a", effect: "block" }, "user-1");
-  const second = await store.create("t1", { name: "b", effect: "allow" }, "user-1");
-
-  expect(first.priority).toBe(0);
-  expect(second.priority).toBe(10);
-  expect(first.ruleId).toMatch(/^pol_/);
-  expect(first.createdBy).toBe("user-1");
-  expect(first.enabled).toBe(true);
-});
-
 test("create honors an explicit priority instead of appending", async () => {
   const { store } = makeStore();
   const rule = await store.create("t1", { name: "x", effect: "require_approval", priority: 250 }, null);
   expect(rule.priority).toBe(250);
   expect(rule.createdBy).toBe(null);
-});
-
-test("list returns rules ordered by priority then rule_id", async () => {
-  const { store } = makeStore();
-  await store.create("t1", { name: "late", effect: "allow", priority: 30 }, null);
-  await store.create("t1", { name: "early", effect: "block", priority: 5 }, null);
-  const rules = await store.list("t1");
-  expect(rules.map((r) => r.name)).toEqual(["early", "late"]);
-});
-
-test("list scopes to the tenant", async () => {
-  const { store } = makeStore();
-  await store.create("t1", { name: "mine", effect: "allow" }, null);
-  await store.create("t2", { name: "theirs", effect: "allow" }, null);
-  const rules = await store.list("t1");
-  expect(rules).toHaveLength(1);
-  expect(rules[0].name).toBe("mine");
 });
 
 test("get returns null for a missing rule", async () => {
@@ -234,13 +210,6 @@ test("reorder rejects a set that does not match the tenant's current rules", asy
   );
 });
 
-test("nextAppendPriority is 0 for an empty tenant and max+10 otherwise", async () => {
-  const { store } = makeStore();
-  expect(await store.nextAppendPriority("t1")).toBe(0);
-  await store.create("t1", { name: "a", effect: "allow", priority: 40 }, null);
-  expect(await store.nextAppendPriority("t1")).toBe(50);
-});
-
 test("mapRow normalizes malformed condition dimensions to a clean shape", async () => {
   const { db, store } = makeStore();
   // Seed a row directly with messy JSONB: non-string entries and an empty array.
@@ -279,4 +248,33 @@ test("listForLint surfaces the raw conditions including unknown keys", async () 
   const lintable = await store.listForLint("t1");
   expect(lintable).toHaveLength(1);
   expect(lintable[0].conditions).toEqual({ toolName: ["typo"] });
+});
+
+test("update reads and writes the rule in one transaction under the tenant's rule lock", async () => {
+  const db = new InMemoryRuleDatabase();
+  const store = new PolicyRuleStore(db as unknown as Pool);
+  const rule = await store.create("t1", { name: "r", effect: "block", conditions: {} }, null);
+  db.statements.length = 0;
+
+  await store.update("t1", rule.ruleId, { enabled: false });
+
+  // A read in one transaction and a write in another let a concurrent partial
+  // update or reorder be lost between them.
+  expect(db.statements).toEqual(["BEGIN", "lock:t1", "SELECT", "UPDATE", "COMMIT"]);
+});
+
+test.each([
+  ["create", (store: PolicyRuleStore) => store.create("t1", { name: "r2", effect: "block", conditions: {} }, null)],
+  ["delete", (store: PolicyRuleStore) => store.delete("t1", "missing")],
+  ["reorder", (store: PolicyRuleStore, ruleId: string) => store.reorder("t1", [ruleId])]
+])("%s takes the tenant's rule lock before it reads or writes", async (_name, run) => {
+  const db = new InMemoryRuleDatabase();
+  const store = new PolicyRuleStore(db as unknown as Pool);
+  const rule = await store.create("t1", { name: "r", effect: "block", conditions: {} }, null);
+  db.statements.length = 0;
+
+  await run(store, rule.ruleId);
+
+  expect(db.statements.slice(0, 2)).toEqual(["BEGIN", "lock:t1"]);
+  expect(db.statements.filter((statement) => statement === "BEGIN")).toHaveLength(1);
 });

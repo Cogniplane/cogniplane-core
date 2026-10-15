@@ -9,8 +9,12 @@ import { listSessions, restoreSession, archiveSession, deleteSession, interruptS
 import type { Artifact, Project, Session } from "@cogniplane/shared-types";
 vi.mock("./project-files", () => ({ ProjectFiles: ({ project }: { project: Project }) => <div data-testid="project-files">{project.archivedAt ? "Archived file library" : "File library"}</div> }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn(), replace: vi.fn() }) }));
+vi.mock("@/lib/auth-context", () => ({ useAuth: () => ({ user: { tenantId: "t1", userId: "u" } }) }));
+vi.mock("./project-skills", () => ({ ProjectSkills: ({ projectName }: { projectName: string }) => <div data-testid="project-skills">Project skills in {projectName}</div> }));
 vi.mock("../lib/project-api", () => ({
   getProject: vi.fn(),
+  getProjectCapabilities: vi.fn(),
+  updateProjectCapabilities: vi.fn(),
   listProjectSessions: vi.fn(),
   renameProject: vi.fn(),
   setProjectSession: vi.fn(),
@@ -77,6 +81,8 @@ const reference: Artifact = {
 let client: QueryClient;
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(api.getProjectCapabilities).mockResolvedValue({ selection: null, version: 1, canEdit: true,
+    skills: [], connectors: [] });
   vi.mocked(api.getProject).mockResolvedValue({
     project,
     sessions: [session],
@@ -136,6 +142,7 @@ it("keeps everyday project work in Overview and owner controls in Settings", asy
   expect(screen.getByRole("link", { name: "Overview" }).getAttribute("href"))
     .toBe("/projects?project=p1");
   expect(screen.getByRole("combobox", { name: "Approval mode" })).toBeTruthy();
+  expect(screen.getByTestId("project-skills").textContent).toBe("Project skills in Planning");
   expect(screen.getByRole("button", { name: "Rename" })).toBeTruthy();
   expect(screen.queryByRole("heading", { name: "Sessions" })).toBeNull();
   expect(screen.queryByText("File library")).toBeNull();
@@ -196,16 +203,6 @@ it("lets the owner choose automatic approval and explains organization limits", 
   });
   await waitFor(() => expect(api.updateProjectApprovalMode).toHaveBeenCalledWith("p1", "automatic"));
   expect(screen.getByText(/same effective behavior as Organization default/)).toBeTruthy();
-});
-
-it("lets the owner choose an agent file mode and explains that it affects new turns", async () => {
-  vi.mocked(api.updateProjectAgentFileMode).mockResolvedValue({ ...project, agentFileMode: "read-write" });
-  await open("settings");
-  fireEvent.change(screen.getByRole("combobox", { name: "File mode" }), {
-    target: { value: "read-write" }
-  });
-  await waitFor(() => expect(api.updateProjectAgentFileMode).toHaveBeenCalledWith("p1", "read-write"));
-  expect(screen.getByText(/New turns use this mode/)).toBeTruthy();
 });
 
 it("lets the owner choose an agent file mode and explains that it affects new turns", async () => {

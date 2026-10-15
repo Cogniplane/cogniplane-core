@@ -18,6 +18,14 @@ export function formatArtifactStatus(status: Artifact["status"]): string {
 }
 
 export function formatPiiLabel(pii: ArtifactPiiDetail): string | null {
+  const label = formatPiiVerdict(pii);
+  // A PDF verdict covers only its text; images in it are not scanned.
+  return label && pii.imagesNotScanned && (pii.status === "scanned" || pii.status === "transformed")
+    ? `${label} (text only)`
+    : label;
+}
+
+function formatPiiVerdict(pii: ArtifactPiiDetail): string | null {
   switch (pii.status) {
     case "pending":
     case "scanning":
@@ -56,8 +64,8 @@ export function piiTone(pii: ArtifactPiiDetail): PiiTone {
 }
 
 export function canDownloadArtifact(artifact: Artifact): boolean {
-  if (artifact.status === "deleted") return false;
-  if (artifact.artifactType === "upload") return true;
+  // Uploads stay pending until their PII scan completes; the backend refuses
+  // a download token before then.
   return artifact.status === "ready";
 }
 

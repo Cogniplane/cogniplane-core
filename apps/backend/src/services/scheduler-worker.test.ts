@@ -5,9 +5,11 @@ import { EventType, type BaseEvent } from "@ag-ui/client";
 import type { RuntimeSessionRef } from "../runtime-contracts.js";
 import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { SessionRecord } from "./session-store.js";
-import type { MessageRecord } from "./message-store.js";
+import type { MessageRecord, ToolResultRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
 import type { ScheduledJobRecord } from "./user-settings-store.js";
+import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
+import type { PiiFinding } from "./pii/pii-provider.js";
 import {
   SchedulerWorker,
   type SchedulerRuntimeResolution,
@@ -19,6 +21,8 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
   return {
     sessionId,
     runtimeId: `rt-${sessionId}`,
+    mcpServerSources: [{ id: "docs", hash: "server-hash", credentialVersion: 1 }],
+    integrationAccounts: { notion: "notion-user:workspace" },
     runtimePolicy: {
       id: "default-profile",
       label: "Default",
@@ -27,7 +31,7 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
       approvalPolicy: "never",
       approvalReviewer: "user",
       sandboxMode: "workspace-write",
-      networkMode: "restricted",
+      sandboxEgressDomains: [],
       allowCommandExecution: true,
       autoApproveReadOnlyTools: false,
       policyEnforcementMode: "monitor",
@@ -125,6 +129,13 @@ function createFakeDeps(options?: {
   /** Delay runtime resolution so a short jobTimeoutMs fires BEFORE `turn.adapter`
    *  is assigned — the watchdog then has no adapter to abort through. */
   resolveRuntimeDelayMs?: number;
+  /** Make every assistant text/status write fail. */
+  updateContentError?: Error;
+  /** Make every assistant text/status write match no row, as the store does
+   *  when the tenant, message, and user scope finds nothing. */
+  updateContentReturnsNull?: boolean;
+  /** Hold the usage read that runs before the final transcript write. */
+  getOwnedGate?: Promise<void>;
 }) {
   const dueJobs = options?.dueJobs ?? [];
   const claimReturns = options?.claimReturns ?? dueJobs.map((j) => j);
@@ -168,6 +179,13 @@ function createFakeDeps(options?: {
     status: string;
     content: string;
   }> = [];
+  const streamingUpdates: Array<{
+    reasoningContent?: string;
+    reasoningSegments?: Array<{ offset: number; text: string }>;
+    planContent?: string;
+  }> = [];
+  const toolResultsSaved: Array<Record<string, unknown>> = [];
+  const noticesSaved: unknown[][] = [];
   const toolContextsCreated: Array<{
     sessionId: string;
     userId: string;
@@ -292,11 +310,13 @@ function createFakeDeps(options?: {
         const sessionId = `session-${sessionsCreated.length}`;
         return {
           sessionId,
+          projectId: null,
           userId,
           sessionName,
           status: "active",
           createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
+          updatedAt: new Date().toISOString(),
+          transcriptFormat: "current"
         };
       }
     },
@@ -313,9 +333,22 @@ function createFakeDeps(options?: {
       },
       updateContent: async (_tenantId, messageId, userId, status, content) => {
         messagesUpdated.push({ messageId, userId, status, content });
-        return null;
+        if (options?.updateContentError) throw options.updateContentError;
+        if (options?.updateContentReturnsNull) return null;
+        return makeFakeMessageRecord("session-1", userId, "assistant", status, content, { messageId });
+      },
+      updateStreamingContent: async (_tenantId, _messageId, _userId, content) => {
+        streamingUpdates.push(content);
+      },
+      upsertToolResult: async (input) => {
+        toolResultsSaved.push(input);
+        return input as unknown as ToolResultRecord;
+      },
+      setRuntimeNotices: async (_tenantId, _messageId, _userId, notices) => {
+        noticesSaved.push([...notices]);
       },
       getOwned: async (_tenantId: string, messageId: string, userId: string) => {
+        await options?.getOwnedGate;
         const usage = options?.assistantTokenUsage;
         return makeFakeMessageRecord("session-1", userId, "assistant", "completed", "", {
           messageId,
@@ -392,6 +425,9 @@ function createFakeDeps(options?: {
     jobRunsCompleted,
     messagesCreated,
     messagesUpdated,
+    streamingUpdates,
+    toolResultsSaved,
+    noticesSaved,
     toolContextsCreated,
     runtimeSessionsCreated,
     runMessageCalls,
@@ -417,6 +453,130 @@ describe("SchedulerWorker", () => {
 
     expect(sessionsCreated.length).toBe(0);
     expect(jobRunsCreated.length).toBe(0);
+  });
+
+  test("a stopped worker claims no new job", async () => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCreated } = createFakeDeps({ dueJobs: [job] });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
+    worker.stop();
+    await worker.tick();
+    expect(jobRunsCreated).toHaveLength(0);
+  });
+
+  test("drain waits for a running job and its outcome write", async () => {
+    const job = makeFakeJob();
+    let finishTurn = () => {};
+    let turnStarted = false;
+    const turnGate = new Promise<void>((resolve) => { finishTurn = resolve; });
+    const { deps, jobRunsCompleted } = createFakeDeps({
+      dueJobs: [job],
+      async *runMessageImpl() {
+        turnStarted = true;
+        await turnGate;
+        yield* [];
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
+    void worker.tick();
+    await vi.waitFor(() => expect(turnStarted).toBe(true));
+    worker.stop();
+
+    // The job is still running: a short budget is not enough.
+    await expect(worker.drain(20)).resolves.toBe(false);
+    const drained = worker.drain(5_000);
+    finishTurn();
+    await expect(drained).resolves.toBe(true);
+    expect(jobRunsCompleted).toHaveLength(1);
+  });
+
+  test("drain waits for a job that outlives its timeout wrapper", async () => {
+    const job = makeFakeJob();
+    let finishTurn = () => {};
+    const turnGate = new Promise<void>((resolve) => { finishTurn = resolve; });
+    const { deps, jobRunsCompleted } = createFakeDeps({
+      dueJobs: [job],
+      // The turn ignores the abort and ends only when the gate opens.
+      async *runMessageImpl() {
+        await turnGate;
+        yield* [];
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 10, abortSettleGraceMs: 10 });
+
+    // The tick settles once the abort grace frees the slot; the job does not.
+    await worker.tick();
+    worker.stop();
+    await expect(worker.drain(30)).resolves.toBe(false);
+    const drained = worker.drain(5_000);
+    finishTurn();
+    await expect(drained).resolves.toBe(true);
+    expect(jobRunsCompleted).toHaveLength(1);
+  });
+
+  test("drain waits for a started job when a later claim fails", async () => {
+    const first = makeFakeJob();
+    const second = { ...makeFakeJob(), jobId: "job-2" };
+    let finishTurn = () => {};
+    const turnGate = new Promise<void>((resolve) => { finishTurn = resolve; });
+    const { deps, jobRunsCompleted } = createFakeDeps({
+      dueJobs: [first, second],
+      async *runMessageImpl() {
+        await turnGate;
+        yield* [];
+      }
+    });
+    const claim = deps.settings.claimJob.bind(deps.settings);
+    deps.settings.claimJob = async (tenantId, jobId, nextRunAt) => {
+      if (jobId === "job-2") throw new Error("claim failed");
+      return claim(tenantId, jobId, nextRunAt);
+    };
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
+
+    await expect(worker.tick()).rejects.toThrow("claim failed");
+    worker.stop();
+    await expect(worker.drain(30)).resolves.toBe(false);
+    const drained = worker.drain(5_000);
+    finishTurn();
+    await expect(drained).resolves.toBe(true);
+    expect(jobRunsCompleted).toHaveLength(1);
+  });
+
+  test("a job still preparing when the runtimes close fails instead of starting a turn", async () => {
+    const job = makeFakeJob();
+    let turns = 0;
+    const { deps, jobRunsCompleted, jobRunsCreated } = createFakeDeps({
+      dueJobs: [job],
+      resolveRuntimeDelayMs: 50,
+      async *runMessageImpl() {
+        turns += 1;
+        yield* [];
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
+    const tick = worker.tick();
+    // Shutdown refuses new turns while the claimed job still resolves its runtime.
+    await vi.waitFor(() => expect(jobRunsCreated).toHaveLength(1));
+    worker.refuseNewTurns();
+    await tick;
+    await expect(worker.drain(5_000)).resolves.toBe(true);
+    expect(turns).toBe(0);
+    expect(jobRunsCompleted).toEqual([expect.objectContaining({ status: "failed" })]);
+  });
+
+  test("a worker stopped while it lists due jobs claims none of them", async () => {
+    const job = makeFakeJob();
+    const { deps, claimsCalled } = createFakeDeps({ dueJobs: [job] });
+    const list = deps.settings.listDueJobs.bind(deps.settings);
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
+    deps.settings.listDueJobs = async (limit) => {
+      worker.stop();
+      return list(limit);
+    };
+
+    await worker.tick();
+
+    expect(claimsCalled).toHaveLength(0);
   });
 
   test("tick claims and executes a due job", async () => {
@@ -451,6 +611,10 @@ describe("SchedulerWorker", () => {
       enabledToolIds: [],
       enabledMcpServers: []
     });
+    expect(toolContextsCreated[0].metadata.mcpServerSources).toEqual([
+      { id: "docs", hash: "server-hash", credentialVersion: 1 }
+    ]);
+    expect(toolContextsCreated[0].metadata.integrationAccounts).toEqual({ notion: "notion-user:workspace" });
 
     const completedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.completed");
     if (!completedAudit) throw new Error("Expected scheduler completion audit event.");
@@ -459,10 +623,11 @@ describe("SchedulerWorker", () => {
 
   test("an interrupted scheduled turn records a terminal failed run", async () => {
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
+    const { deps, jobRunsCompleted, auditEvents, messagesUpdated } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: async function* () {
         yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "partial" } as BaseEvent;
         yield {
           type: EventType.RUN_FINISHED,
           threadId: "session-1",
@@ -481,6 +646,10 @@ describe("SchedulerWorker", () => {
       errorMessage: "Scheduled job was interrupted."
     });
     expect(auditEvents.some((event) => event.type === "scheduler.job.run.failed")).toBe(true);
+    // Same row outcome as a stopped interactive turn: partial text is kept.
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "interrupted", content: "partial" })
+    ]);
   });
 
   test("tick resolves the runtime per job tenant and dispatches to the resolved adapter", async () => {
@@ -551,7 +720,7 @@ describe("SchedulerWorker", () => {
     // a pg or E2B failure put connection strings and sandbox ids in front of a
     // user. The interactive path already classified; this one did not.
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
+    const { deps, jobRunsCompleted, auditEvents, messagesUpdated } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: () => {
         throw Object.assign(
@@ -569,8 +738,13 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted[0].status).toBe("failed");
     expect(jobRunsCompleted[0].errorMessage).toBe("The assistant run failed.");
 
-    // Nothing internal in the run row or the audit trail.
-    const serialized = JSON.stringify({ runs: jobRunsCompleted, audit: auditEvents });
+    // The assistant row is closed out instead of staying pending.
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "error", content: "The assistant run failed." })
+    ]);
+
+    // Nothing internal in the run row, the transcript, or the audit trail.
+    const serialized = JSON.stringify({ runs: jobRunsCompleted, audit: auditEvents, rows: messagesUpdated });
     expect(serialized).not.toContain("10.0.4.17");
     expect(serialized).not.toContain("s3cr3t");
     expect(serialized).not.toContain("i7x9k2mq0zt4vabc");
@@ -609,7 +783,7 @@ describe("SchedulerWorker", () => {
       { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
       { type: EventType.RUN_ERROR, message: "Something went wrong" }
     ];
-    const { deps, jobRunsCompleted, auditEvents } = createFakeDeps({
+    const { deps, jobRunsCompleted, auditEvents, messagesUpdated } = createFakeDeps({
       dueJobs: [job],
       runtimeEvents: [failedEvents]
     });
@@ -619,9 +793,156 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted.length).toBe(1);
     expect(jobRunsCompleted[0].status).toBe("failed");
     expect(jobRunsCompleted[0].errorMessage).toBe("Something went wrong");
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "error", content: "Something went wrong" })
+    ]);
 
     const failedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.failed");
     expect(failedAudit).toBeTruthy();
+  });
+
+  test("a scheduled turn saves reasoning, plan, notices, and tools like an interactive turn", async () => {
+    const job = makeFakeJob();
+    // The narration quotes a 40-character token. The store saves the redacted
+    // text, so the tool offset must point into "token is [REDACTED] ".
+    const narration = "token is ghp_" + "A".repeat(36) + " ";
+    const notice = { noticeId: "n-1", level: "warning", title: "Skipped", message: "Tool gated" };
+    const { deps, jobRunsCompleted, messagesUpdated, streamingUpdates, toolResultsSaved, noticesSaved } =
+      createFakeDeps({
+        dueJobs: [job],
+        runtimeEvents: [[
+          { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
+          { type: EventType.REASONING_MESSAGE_START, messageId: "r", role: "reasoning" },
+          { type: EventType.REASONING_MESSAGE_CONTENT, messageId: "r", delta: "check the files" },
+          { type: EventType.REASONING_MESSAGE_END, messageId: "r" },
+          { type: EventType.STATE_DELTA, delta: [{ op: "add", path: "/plan", value: "1. list files" }] },
+          { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: narration },
+          { type: EventType.TOOL_CALL_START, toolCallId: "kept", toolCallName: "execute" },
+          { type: EventType.TOOL_CALL_RESULT, toolCallId: "kept", messageId: "t", content: "file.txt" },
+          { type: EventType.CUSTOM, name: "runtime_notice", value: notice },
+          { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" }
+        ] as BaseEvent[]]
+      });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(messagesUpdated).toEqual([expect.objectContaining({ status: "completed", content: narration })]);
+    expect(streamingUpdates).toEqual([{
+      reasoningContent: "check the files",
+      reasoningSegments: [{ offset: 0, text: "check the files" }],
+      planContent: "1. list files"
+    }]);
+    expect(noticesSaved).toEqual([[notice]]);
+    expect(toolResultsSaved).toHaveLength(1);
+    expect(toolResultsSaved[0]).toMatchObject({
+      toolResultId: "kept",
+      status: "completed",
+      output: "file.txt",
+      textOffset: "token is [REDACTED] ".length
+    });
+    // The row keeps the raw text for the store to redact; the summary is redacted here.
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "completed", summary: "token is [REDACTED] " });
+  });
+
+  test.each([
+    ["ordinary text", "a".repeat(600), "a".repeat(500)],
+    ["a recognizable secret", "key ghp_" + "A".repeat(36) + " end", "key [REDACTED] end"],
+    // Cut first, the summary would keep "sk-BBBBBBB": too short to match the key pattern.
+    ["a secret across the 500-character limit", "x".repeat(489) + " sk-" + "B".repeat(40) + " done",
+      "x".repeat(489) + " [REDACTED]"]
+  ])("the run summary for %s is redacted before the cut", async (_name, text, summary) => {
+    const { deps, jobRunsCompleted, messagesUpdated } = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      runtimeEvents: [[
+        { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
+        { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: text },
+        { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" }
+      ] as BaseEvent[]]
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "completed", summary });
+    expect(messagesUpdated).toEqual([expect.objectContaining({ status: "completed", content: text })]);
+  });
+
+  test("a scheduled turn that throws mid-stream keeps its partial transcript", async () => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls } = createFakeDeps({
+      dueJobs: [job],
+      runMessageImpl: async function* () {
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "partial" } as BaseEvent;
+        yield { type: EventType.TOOL_CALL_START, toolCallId: "call-1", toolCallName: "execute" } as BaseEvent;
+        throw new Error("socket closed by 10.0.4.17");
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(messagesUpdated).toEqual([expect.objectContaining({ status: "error", content: "partial" })]);
+    // The unfinished call is saved as failed, not left in progress.
+    expect(toolResultsSaved).toEqual([expect.objectContaining({ toolResultId: "call-1", status: "failed" })]);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
+    expect(JSON.stringify(jobRunsCompleted)).not.toContain("10.0.4.17");
+    expect(purgeSessionDataCalls).toHaveLength(1);
+  });
+
+  test("a failed transcript write records a failed run and still cleans up", async () => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, abortSessionCalls, purgeSessionDataCalls, auditEvents, recordOutcomeCalls } =
+      createFakeDeps({
+        dueJobs: [job],
+        updateContentError: new Error("pool timeout"),
+        runtimeEvents: [[
+          { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "done" },
+          { type: EventType.TOOL_CALL_START, toolCallId: "call-1", toolCallName: "execute" },
+          { type: EventType.TOOL_CALL_RESULT, toolCallId: "call-1", messageId: "t", content: "ok" },
+          { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" }
+        ] as BaseEvent[]]
+      });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    // One attempt with the runtime outcome, one that marks the row failed.
+    expect(messagesUpdated.map((update) => update.status)).toEqual(["completed", "error"]);
+    // Rich parts are skipped when the required write failed.
+    expect(toolResultsSaved).toEqual([]);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
+    expect(auditEvents.some((event) => event.type === "scheduler.job.run.completed")).toBe(false);
+    expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
+    expect(abortSessionCalls).toHaveLength(1);
+    expect(purgeSessionDataCalls).toHaveLength(1);
+  });
+
+  test("a text/status write that updates no row records a failed run and still cleans up", async () => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls, auditEvents, recordOutcomeCalls } =
+      createFakeDeps({
+        dueJobs: [job],
+        updateContentReturnsNull: true,
+        runtimeEvents: [[
+          { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "done" },
+          { type: EventType.TOOL_CALL_START, toolCallId: "call-1", toolCallName: "execute" },
+          { type: EventType.TOOL_CALL_RESULT, toolCallId: "call-1", messageId: "t", content: "ok" },
+          { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" }
+        ] as BaseEvent[]]
+      });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(messagesUpdated.map((update) => update.status)).toEqual(["completed", "error"]);
+    expect(toolResultsSaved).toEqual([]);
+    expect(jobRunsCompleted).toHaveLength(1);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
+    expect(auditEvents.some((event) => event.type === "scheduler.job.run.completed")).toBe(false);
+    expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
+    expect(purgeSessionDataCalls).toHaveLength(1);
   });
 
   test("tick records the real token usage persisted on the assistant message, not 0", async () => {
@@ -852,7 +1173,7 @@ describe("SchedulerWorker", () => {
       releaseStream = resolve;
     });
 
-    const { deps, runtimeAdapter, jobRunsCompleted, auditEvents, abortSessionCalls } = createFakeDeps({
+    const { deps, runtimeAdapter, jobRunsCompleted, auditEvents, abortSessionCalls, messagesUpdated } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: async function* () {
         // Never yields a terminal event on its own — simulates a stuck turn.
@@ -887,9 +1208,131 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted.length).toBe(1);
     expect(jobRunsCompleted[0].status).toBe("failed");
     expect(jobRunsCompleted[0].errorMessage).toMatch(/timed out/);
+    // The runtime's own "aborted" error loses to the timeout on the row too.
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "error", content: "Scheduled job timed out after 10ms" })
+    ]);
 
     const failedAudit = auditEvents.find((e) => e.type === "scheduler.job.run.failed");
     expect(failedAudit).toBeTruthy();
+  });
+
+  test("a timeout during the usage read fails the row and the run", async () => {
+    // The usage read runs before finalization, so a timeout that fires while
+    // it waits still counts.
+    const job = makeFakeJob();
+    let watchdogFired!: () => void;
+    const getOwnedGate = new Promise<void>((resolve) => { watchdogFired = resolve; });
+    const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, recordOutcomeCalls } = createFakeDeps({
+      dueJobs: [job],
+      getOwnedGate
+    });
+    // The first abort comes from the watchdog; only then does the usage read end.
+    runtimeAdapter.abortSession = async () => { watchdogFired(); };
+    const worker = new SchedulerWorker(deps, {
+      maxConcurrentJobs: 1,
+      jobTimeoutMs: 50,
+      abortSettleGraceMs: 1_000
+    });
+
+    await worker.tick();
+
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "error", content: "Hello from scheduler" })
+    ]);
+    expect(jobRunsCompleted).toHaveLength(1);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 50ms" });
+    expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
+  });
+
+  test.each(["text/status", "tool result"] as const)(
+    "a timeout while the final %s write is blocked fails the row and the run",
+    async (blocked) => {
+      const job = makeFakeJob();
+      let watchdogFired!: () => void;
+      const writeGate = new Promise<void>((resolve) => { watchdogFired = resolve; });
+      const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls,
+        auditEvents, recordOutcomeCalls } = createFakeDeps({
+        dueJobs: [job],
+        runtimeEvents: [[
+          { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "done" },
+          { type: EventType.TOOL_CALL_START, toolCallId: "call-1", toolCallName: "execute" },
+          { type: EventType.TOOL_CALL_RESULT, toolCallId: "call-1", messageId: "t", content: "ok" },
+          { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" }
+        ] as BaseEvent[]]
+      });
+      // The first write of the blocked kind waits until the watchdog aborts.
+      if (blocked === "text/status") {
+        const write = deps.messages.updateContent;
+        let calls = 0;
+        deps.messages.updateContent = async (...args) => {
+          calls += 1;
+          if (calls === 1) await writeGate;
+          return write(...args);
+        };
+      } else {
+        const write = deps.messages.upsertToolResult;
+        deps.messages.upsertToolResult = async (input) => {
+          await writeGate;
+          return write(input);
+        };
+      }
+      const abortSession = runtimeAdapter.abortSession;
+      runtimeAdapter.abortSession = async (input) => {
+        watchdogFired();
+        await abortSession(input);
+      };
+      const worker = new SchedulerWorker(deps, {
+        maxConcurrentJobs: 1,
+        jobTimeoutMs: 50,
+        abortSettleGraceMs: 1_000
+      });
+
+      await worker.tick();
+
+      // The runtime outcome is saved first, then replaced by the timeout.
+      expect(messagesUpdated.map((update) => update.status)).toEqual(["completed", "error"]);
+      expect(messagesUpdated.at(-1)).toMatchObject({ content: "done" });
+      expect(toolResultsSaved).toEqual([expect.objectContaining({ toolResultId: "call-1" })]);
+      expect(jobRunsCompleted).toHaveLength(1);
+      expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 50ms" });
+      expect(auditEvents.filter((event) => event.type.startsWith("scheduler.job.run."))
+        .map((event) => event.type)).toEqual(["scheduler.job.run.failed"]);
+      expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
+      expect(purgeSessionDataCalls).toHaveLength(1);
+    }
+  );
+
+  test("a timeout during cleanup after the transcript is final keeps the run completed", async () => {
+    const job = makeFakeJob();
+    let watchdogFired!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => { watchdogFired = resolve; });
+    const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, recordOutcomeCalls, purgeSessionDataCalls } =
+      createFakeDeps({ dueJobs: [job] });
+    // Cleanup aborts first and waits there. The second abort comes from the
+    // watchdog, which then lets cleanup continue.
+    let aborts = 0;
+    runtimeAdapter.abortSession = async () => {
+      aborts += 1;
+      if (aborts === 1) await cleanupGate;
+      else watchdogFired();
+    };
+    const worker = new SchedulerWorker(deps, {
+      maxConcurrentJobs: 1,
+      jobTimeoutMs: 50,
+      abortSettleGraceMs: 1_000
+    });
+
+    await worker.tick();
+
+    expect(aborts).toBe(2);
+    expect(messagesUpdated).toEqual([
+      expect.objectContaining({ status: "completed", content: "Hello from scheduler" })
+    ]);
+    expect(jobRunsCompleted).toHaveLength(1);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "completed", errorMessage: null });
+    expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: true }]);
+    expect(purgeSessionDataCalls).toHaveLength(1);
   });
 
   // R2: `timedOut` must never be treated as proof the runtime was aborted.
@@ -1017,6 +1460,32 @@ describe("SchedulerWorker", () => {
       expect(abortSessionCalls.length).toBe(1);
       expect(abortSessionCalls[0].sessionId).toBe("session-1");
       expect(purgeSessionDataCalls.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a watchdog timeout before the runtime session exists starts no turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const job = makeFakeJob();
+      const { deps, runtimeSessionsCreated, runMessageCalls, jobRunsCompleted, messagesUpdated } = createFakeDeps({
+        dueJobs: [job],
+        // The watchdog fires while the runtime resolves, so it has no session to abort.
+        resolveRuntimeDelayMs: 40
+      });
+      const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 10, abortSettleGraceMs: 500 });
+      const tick = worker.tick();
+      await vi.advanceTimersByTimeAsync(50);
+      await tick;
+
+      expect(runtimeSessionsCreated).toHaveLength(0);
+      expect(runMessageCalls).toHaveLength(0);
+      expect(jobRunsCompleted).toHaveLength(1);
+      expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 10ms" });
+      expect(messagesUpdated).toEqual([
+        expect.objectContaining({ status: "error", content: "Scheduled job timed out after 10ms" })
+      ]);
     } finally {
       vi.useRealTimers();
     }
@@ -1172,6 +1641,9 @@ describe("SchedulerWorker", () => {
       async sweepStaleClaims() {
         return 0;
       },
+      async listUnfinishedFailures() {
+        return [];
+      },
       async claimDueJobs(limit: number) {
         claimCalls.push(limit);
         if (claimCalls.length === 1) {
@@ -1183,6 +1655,7 @@ describe("SchedulerWorker", () => {
       }
     };
     deps.piiScanJobHandler = {
+      async finishFailedJob() {},
       async execute() {
         await new Promise<void>(() => {}); // hangs — keeps the slot occupied
       }
@@ -1208,6 +1681,46 @@ describe("SchedulerWorker", () => {
     await tick3;
     expect(claimCalls).toEqual([2, 1]);
     void tick1;
+  });
+
+  test("tick closes the scan run of each failed PII job and continues after an error", async () => {
+    const { deps } = createFakeDeps({ dueJobs: [] });
+    const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    deps.logger = logger;
+    const now = new Date().toISOString();
+    const failedJob = (jobId: string) => ({
+      tenantId: "test-tenant", jobId, scanRunId: `scan-${jobId}`, subjectType: "artifact" as const,
+      subjectId: `art-${jobId}`, sourceSessionId: null, sourceUserId: "user-1", mode: "detect" as const,
+      payload: {}, status: "failed" as const, attempts: 3, maxAttempts: 3, runAfter: now, claimedAt: null,
+      completedAt: now, errorMessage: "claim expired", createdAt: now, updatedAt: now
+    });
+    const finished: string[] = [];
+    deps.piiScanJobs = {
+      async sweepStaleClaims() {
+        return 1;
+      },
+      async listUnfinishedFailures() {
+        return [failedJob("pii-1"), failedJob("pii-2")];
+      },
+      async claimDueJobs() {
+        return [];
+      }
+    };
+    deps.piiScanJobHandler = {
+      async finishFailedJob(job) {
+        if (job.jobId === "pii-1") throw new Error("subject write unavailable");
+        finished.push(job.jobId);
+      },
+      async execute() {}
+    };
+
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 2, jobTimeoutMs: 60_000 }).tick();
+
+    expect(finished).toEqual(["pii-2"]);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: "pii-1" }),
+      "Failed to close the scan run of a failed PII scan job"
+    );
   });
 
   test("tick drains PII scan jobs when the subsystem is wired", async () => {
@@ -1241,12 +1754,16 @@ describe("SchedulerWorker", () => {
       async sweepStaleClaims() {
         return 0;
       },
+      async listUnfinishedFailures() {
+        return [];
+      },
       async claimDueJobs(limit: number) {
         claimed.push(piiJob);
         return claimed.slice(0, limit);
       }
     };
     deps.piiScanJobHandler = {
+      async finishFailedJob() {},
       async execute(job) {
         executed.push(job as typeof piiJob);
       }
@@ -1294,11 +1811,15 @@ describe("SchedulerWorker", () => {
       async sweepStaleClaims() {
         return 0;
       },
+      async listUnfinishedFailures() {
+        return [];
+      },
       async claimDueJobs(limit: number) {
         return [piiJob].slice(0, limit);
       }
     };
     deps.piiScanJobHandler = {
+      async finishFailedJob() {},
       async execute(job) {
         executed.push(job as typeof piiJob);
       }
@@ -1347,11 +1868,15 @@ describe("SchedulerWorker", () => {
       async sweepStaleClaims() {
         return 0;
       },
+      async listUnfinishedFailures() {
+        return [];
+      },
       async claimDueJobs() {
         return [piiJob];
       }
     };
     deps.piiScanJobHandler = {
+      async finishFailedJob() {},
       async execute() {
         throw new Error("handler exploded");
       }
@@ -1359,5 +1884,191 @@ describe("SchedulerWorker", () => {
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 2, jobTimeoutMs: 60_000 });
     await expect(worker.tick()).resolves.toBeUndefined();
+  });
+});
+
+describe("SchedulerWorker chat-prompt PII policy", () => {
+  function runWithPii(evaluateText: () => Promise<PiiDecision>) {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob({ input: { prompt: "Email jane@example.com" } })] });
+    fake.deps.piiProtection = { evaluateText };
+    fake.deps.piiScanRuns = { create: async () => ({ scanRunId: "scan-1" }) };
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 5 });
+    return { ...fake, run: () => worker.tick() };
+  }
+  const finding: PiiFinding = { entityType: "email", value: "jane@example.com", start: 6, end: 22, confidence: "high" };
+
+  test("a blocked prompt fails the run without saving the prompt or calling the model", async () => {
+    const { run, runMessageCalls, jobRunsCompleted, messagesCreated, recordOutcomeCalls, auditEvents } = runWithPii(
+      async () => ({ action: "block", findings: [finding], blockReason: "email", providerType: null, providerModel: null })
+    );
+    await run();
+
+    expect(runMessageCalls).toEqual([]);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed" });
+    expect(jobRunsCompleted[0].errorMessage).toContain("blocked by organization policy (email)");
+    expect(messagesCreated.map((m) => m.role)).toEqual(["system"]);
+    expect(messagesCreated.some((m) => m.content.includes("jane@example.com"))).toBe(false);
+    expect(auditEvents.some((e) => e.type === "pii_blocked")).toBe(true);
+    // The prompt never changes, so a block counts toward auto-disable.
+    expect(recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+
+  test("a transformed prompt is saved and sent in its transformed form", async () => {
+    const { run, runMessageCalls, messagesCreated, jobRunsCompleted } = runWithPii(async () => ({
+      action: "transform", transformedText: "Email [EMAIL]", findings: [finding], providerType: null, providerModel: null
+    }));
+    await run();
+
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "completed" });
+    expect(runMessageCalls[0].prompt).toBe("Email [EMAIL]");
+    expect(messagesCreated.find((m) => m.role === "user")?.content).toBe("Email [EMAIL]");
+  });
+
+  test("a provider outage fails the run but does not count toward auto-disable", async () => {
+    const { run, runMessageCalls, jobRunsCompleted, messagesCreated, recordOutcomeCalls } = runWithPii(async () => {
+      throw new PiiProtectionServiceError("pii_provider_unavailable", "down");
+    });
+    await run();
+
+    expect(runMessageCalls).toEqual([]);
+    expect(messagesCreated).toEqual([]);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed" });
+    expect(jobRunsCompleted[0].errorMessage).toContain("PII protection was unavailable");
+    expect(recordOutcomeCalls).toEqual([]);
+  });
+
+  test("a permanent PII error counts toward auto-disable", async () => {
+    const { run, runMessageCalls, recordOutcomeCalls } = runWithPii(async () => {
+      throw new PiiProtectionServiceError("file_too_large", "Prompt is too large to scan.");
+    });
+    await run();
+
+    expect(runMessageCalls).toEqual([]);
+    expect(recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+});
+
+// Each tick starts the retention cleanups in the background. What counts as
+// expired is the stores' job; the worker must hand them the right storage,
+// report what they removed, contain a failure, and never run two at once.
+describe("SchedulerWorker retention cleanup", () => {
+  type CleanupCase = {
+    name: string;
+    wire: (deps: SchedulerWorkerDeps, cleanupExpired: ReturnType<typeof vi.fn>, storage: { delete: () => Promise<void> } | undefined) => void;
+    removed: Record<string, number>;
+    nothing: Record<string, number>;
+    logged: string;
+    failed: string;
+  };
+  const cases: CleanupCase[] = [
+    {
+      name: "session Trash",
+      wire: (deps, cleanupExpired, storage) => {
+        deps.sessionTrash = { cleanupExpired } as unknown as SchedulerWorkerDeps["sessionTrash"];
+        deps.sessionStorage = storage;
+      },
+      removed: { deletedSessions: 2, deletedObjects: 3, purgedRuntimes: 1 },
+      nothing: { deletedSessions: 0, deletedObjects: 0, purgedRuntimes: 0 },
+      logged: "Expired session Trash cleaned up",
+      failed: "Expired session Trash cleanup failed; will retry"
+    },
+    {
+      name: "project files",
+      wire: (deps, cleanupExpired, storage) => {
+        deps.projectFiles = { cleanupExpired } as unknown as SchedulerWorkerDeps["projectFiles"];
+        deps.projectFileStorage = storage;
+      },
+      removed: { deletedFiles: 4, deletedObjects: 5 },
+      nothing: { deletedFiles: 0, deletedObjects: 0 },
+      logged: "Expired project files cleaned up",
+      failed: "Expired project file cleanup failed; will retry"
+    }
+  ];
+
+  function setup(cleanupCase: CleanupCase, cleanupExpired: ReturnType<typeof vi.fn>, withStorage = true) {
+    const fake = createFakeDeps({ dueJobs: [] });
+    const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    fake.deps.logger = logger;
+    const storage = withStorage ? { delete: async () => undefined } : undefined;
+    cleanupCase.wire(fake.deps, cleanupExpired, storage);
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    return { worker, logger, storage, fake };
+  }
+
+  test.each(cases)("hands the storage to the $name cleanup and logs what it removed", async (cleanupCase) => {
+    const cleanupExpired = vi.fn(async (_storage: unknown, _options?: unknown) => cleanupCase.removed);
+    const { worker, logger, storage } = setup(cleanupCase, cleanupExpired);
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(logger.info).toHaveBeenCalledWith(cleanupCase.removed, cleanupCase.logged));
+    expect(cleanupExpired.mock.calls[0]![0]).toBe(storage);
+  });
+
+  test.each(cases)("logs nothing when the $name cleanup removed nothing", async (cleanupCase) => {
+    const cleanupExpired = vi.fn(async () => cleanupCase.nothing);
+    const { worker, logger } = setup(cleanupCase, cleanupExpired);
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(cleanupExpired).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(logger.info).not.toHaveBeenCalled();
+  });
+
+  test.each(cases)("contains a failed $name cleanup and retries it on the next tick", async (cleanupCase) => {
+    const cleanupExpired = vi.fn()
+      .mockRejectedValueOnce(new Error("storage down"))
+      .mockResolvedValueOnce(cleanupCase.removed);
+    const { worker, logger } = setup(cleanupCase, cleanupExpired);
+
+    await expect(worker.tick()).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(logger.error).toHaveBeenCalledWith({ error: expect.any(Error) }, cleanupCase.failed));
+
+    await worker.tick();
+    await vi.waitFor(() => expect(logger.info).toHaveBeenCalledWith(cleanupCase.removed, cleanupCase.logged));
+    expect(cleanupExpired).toHaveBeenCalledTimes(2);
+  });
+
+  test.each(cases)("does not start a second $name cleanup while one runs", async (cleanupCase) => {
+    let finish!: () => void;
+    const cleanupExpired = vi.fn()
+      .mockReturnValueOnce(new Promise((resolve) => { finish = () => resolve(cleanupCase.nothing); }))
+      .mockResolvedValue(cleanupCase.nothing);
+    const { worker } = setup(cleanupCase, cleanupExpired);
+
+    await worker.tick();
+    await worker.tick();
+    expect(cleanupExpired).toHaveBeenCalledTimes(1);
+
+    finish();
+    // Once the first cleanup settles, the next tick may start another.
+    await vi.waitFor(async () => {
+      await worker.tick();
+      expect(cleanupExpired).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test.each(cases)("skips the $name cleanup when its storage is not wired", async (cleanupCase) => {
+    const cleanupExpired = vi.fn(async () => cleanupCase.removed);
+    const { worker } = setup(cleanupCase, cleanupExpired, false);
+
+    await worker.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(cleanupExpired).not.toHaveBeenCalled();
+  });
+
+  test("lets the session Trash cleanup purge a runtime through the runtime adapter", async () => {
+    const target = { tenantId: "tenant-a", sessionId: "session-1", userId: "user-1" };
+    const cleanupExpired = vi.fn(async (_storage: unknown, options: { purgeRuntime: (input: typeof target) => Promise<void> }) => {
+      await options.purgeRuntime(target);
+      return cases[0]!.removed;
+    });
+    const { worker, fake } = setup(cases[0]!, cleanupExpired);
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(fake.purgeSessionDataCalls).toEqual([target]));
   });
 });

@@ -6,6 +6,14 @@
 // managed-tool catalog. This narrowed interface captures only the structural
 // shape integrations need; the real adapter already implements it.
 
+// Tears down every runtime of a tenant, for a change that affects all its users.
+export interface TenantRuntimeInvalidator {
+  invalidateTenantRuntimes(
+    tenantId: string,
+    opts?: { idleOnly?: boolean; workspaceResetReason?: string }
+  ): Promise<string[]>;
+}
+
 export interface RuntimeInvalidator {
   // Restart any running session whose runtime needs to refresh credentials
   // for the given integration. The `integrationId` is the same id the

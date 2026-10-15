@@ -6,6 +6,44 @@ import {
 } from "./frontend-security-headers";
 
 describe("buildFrontendContentSecurityPolicy", () => {
+  it("allows the configured sandbox origin for frames", () => {
+    const previous = process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+    process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = "https://apps.example.test/path";
+    try {
+      const csp = buildFrontendContentSecurityPolicy({ nonce: "n", apiUrl: "https://api.example.test", development: false });
+      expect(csp).toContain("frame-src 'self' https://apps.example.test");
+      expect(csp).not.toContain("/path");
+    } finally {
+      if (previous === undefined) delete process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+      else process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = previous;
+    }
+  });
+
+  it("keeps pages available when the sandbox origin is malformed", () => {
+    const previous = process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+    process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = "sandbox.example.test";
+    try {
+      expect(buildFrontendContentSecurityPolicy({ nonce: "n", apiUrl: "https://api.example.test", development: false }))
+        .toContain("frame-src 'self';");
+    } finally {
+      if (previous === undefined) delete process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+      else process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = previous;
+    }
+  });
+
+  it("does not allow the app origin as its own sandbox", () => {
+    const previous = process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+    process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = "https://app.example.test";
+    try {
+      const csp = buildFrontendContentSecurityPolicy({ nonce: "n", apiUrl: "https://api.example.test",
+        appOrigin: "https://app.example.test", development: false });
+      expect(csp).toContain("frame-src 'self';");
+    } finally {
+      if (previous === undefined) delete process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN;
+      else process.env.NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN = previous;
+    }
+  });
+
   it("uses a nonce and restricts framing and active content", () => {
     const csp = buildFrontendContentSecurityPolicy({
       nonce: "nonce123",

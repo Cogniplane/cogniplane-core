@@ -4,6 +4,8 @@ import Link from "next/link";
 
 import { useAuth } from "../lib/auth-context";
 import { useOrganizations } from "../hooks/use-organizations";
+import { openKeyboardShortcuts } from "./keyboard-shortcuts-dialog";
+import { QuickJump } from "./quick-jump/quick-jump";
 import { ThemeToggle } from "./theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,18 +43,21 @@ export function ConsolePageHeader(props: {
   const initials = avatarInitials(user?.displayName, user?.email);
 
   return (
-    <header className="flex items-start justify-between gap-4 border-b border-outline-variant bg-surface-container-lowest px-6 py-5">
-      <div>
-        <p className="text-[0.62rem] font-bold uppercase tracking-[0.14em] text-brand">
-          {props.eyebrow}
-        </p>
-        <h1 className="text-2xl font-semibold tracking-tight text-on-surface">{props.title}</h1>
-        {props.subtitle ? (
-          <p className="mt-1 max-w-2xl text-sm text-on-surface-variant">{props.subtitle}</p>
-        ) : null}
-      </div>
+    // On narrow screens the controls share the eyebrow row, and the title and subtitle span both columns.
+    // From sm up, the controls span the eyebrow and title rows, as in a two-column header.
+    <header className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 border-b border-outline-variant bg-surface-container-lowest px-6 py-5 sm:items-start">
+      <p className="col-start-1 row-start-1 min-w-0 text-[0.62rem] font-bold uppercase tracking-[0.14em] text-brand">
+        {props.eyebrow}
+      </p>
+      <h1 className="col-span-2 row-start-2 min-w-0 text-2xl font-semibold tracking-tight text-on-surface sm:col-span-1">
+        {props.title}
+      </h1>
+      {props.subtitle ? (
+        <p className="col-span-2 row-start-3 mt-1 max-w-2xl text-sm text-on-surface-variant sm:col-span-1">{props.subtitle}</p>
+      ) : null}
 
-      <div className="flex items-center gap-2">
+      <div className="col-start-2 row-start-1 flex items-center gap-2 sm:row-span-2">
+        <QuickJump />
         <ThemeToggle />
 
         <DropdownMenu>
@@ -90,6 +95,10 @@ export function ConsolePageHeader(props: {
               </DropdownMenuItem>
             ))}
             <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={openKeyboardShortcuts} className="flex flex-col items-start gap-0.5">
+              <span className="font-medium">Keyboard shortcuts</span>
+              <span className="text-xs text-muted-foreground">Press ? on any page</span>
+            </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => void logout()}
               className="flex flex-col items-start gap-0.5"

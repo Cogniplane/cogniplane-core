@@ -45,28 +45,13 @@ test("consumeRateLimit rejects when user limit is reached", async () => {
 });
 
 test("consumeRateLimit rolls back counter when tenant limit is exceeded", async () => {
-  // Set tenant limit to 1 so the second request hits the tenant cap.
-  // The user counter should be rolled back to its pre-call value.
   const limits = makeConfig({ userRateLimit: 10, tenantRateLimit: 1 });
-
-  // First call: both user and tenant incremented, both under limit → allowed.
-  const first = await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" });
-  expect(first).toBe(null);
-
-  // Second call: user would increment to 2 (under limit=10), tenant would
-  // increment to 2 (over limit=1). Both should be rolled back.
-  const second = requireLimit(
-    await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" })
-  );
-  expect(second.scope).toBe("tenant");
-
-  // After rollback, the user counter should still be at 1 (from the first allowed call),
-  // so 9 more calls should be allowed before hitting the user limit.
-  // But the tenant is still at 1, so the very next call will hit tenant again.
-  const third = requireLimit(
-    await limits.consumeRateLimit({ resource: "message_turn", userId: "u1", tenantId: "t1" })
-  );
-  expect(third.scope).toBe("tenant");
+  const input = { resource: "message_turn" as const, userId: "u1", tenantId: "t1", now: 1_000 };
+  expect(await limits.consumeRateLimit(input)).toBeNull();
+  // Without rollback these retries consume the remaining user allowance.
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    expect(requireLimit(await limits.consumeRateLimit(input)).scope).toBe("tenant");
+  }
 });
 
 test("refundRateLimit releases a charge from both scopes", async () => {
@@ -123,12 +108,10 @@ test("consumeTurnQuota rolls back counter when tenant quota is exceeded", async 
   const first = await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now });
   expect(first).toBe(null);
 
-  const second = requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now }));
-  expect(second.scope).toBe("tenant");
-
-  // After rollback, tenant is still at 1 — next call also rejected.
-  const third = requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now }));
-  expect(third.scope).toBe("tenant");
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    expect(requireLimit(await limits.consumeTurnQuota({ userId: "u1", tenantId: "t1", now })).scope)
+      .toBe("tenant");
+  }
 });
 
 test("consumeTurnQuota concurrent calls respect the quota", async () => {

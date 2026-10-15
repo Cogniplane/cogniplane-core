@@ -12,6 +12,7 @@ import {
   emptyDraft,
   isDraftValid,
   parseCsv,
+  reorderedRuleIds,
   toggleInList,
   type DecisionFilterDraft
 } from "./admin-policy-form.logic";
@@ -185,5 +186,26 @@ describe("decisionFiltersFromDraft", () => {
       from: undefined,
       to: undefined
     });
+  });
+});
+
+describe("reorderedRuleIds", () => {
+  const rules = [rule({ ruleId: "a" }), rule({ ruleId: "b" }), rule({ ruleId: "c" })];
+
+  test("moves the dragged rule into the place of the rule it was dropped on", () => {
+    expect(reorderedRuleIds(rules, "a", "c")).toEqual(["b", "c", "a"]);
+    expect(reorderedRuleIds(rules, "c", "a")).toEqual(["c", "a", "b"]);
+    expect(reorderedRuleIds(rules, "b", "c")).toEqual(["a", "c", "b"]);
+  });
+
+  test("changes nothing for a drop on itself or on an unknown rule", () => {
+    expect(reorderedRuleIds(rules, "b", "b")).toBeNull();
+    expect(reorderedRuleIds(rules, "missing", "a")).toBeNull();
+    expect(reorderedRuleIds(rules, "a", "missing")).toBeNull();
+  });
+
+  test("leaves the given list unchanged", () => {
+    reorderedRuleIds(rules, "a", "c");
+    expect(rules.map((r) => r.ruleId)).toEqual(["a", "b", "c"]);
   });
 });

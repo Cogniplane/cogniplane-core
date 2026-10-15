@@ -123,16 +123,13 @@ export function NotionConnectionSection(input: NotionConnectionSectionProps) {
                   {userConnection.notionOwnerEmail ? (
                     <span className={CHIP}>{userConnection.notionOwnerEmail}</span>
                   ) : null}
-                  <span className={CHIP}>
-                    connected {formatMediumDateTime(userConnection.connectedAt, "Not available")}
-                  </span>
-                  <span className={CHIP}>
-                    last used {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}
-                  </span>
                 </div>
-                <p className={`${HINT} mt-2`}>
-                  Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}.
-                </p>
+                <details className="mt-3 text-sm text-on-surface-variant">
+                  <summary className="cursor-pointer font-medium text-on-surface">Connection diagnostics</summary>
+                  <p className="mt-2">Connected: {formatMediumDateTime(userConnection.connectedAt, "Not available")}</p>
+                  <p>Last used: {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}</p>
+                  <p>Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}</p>
+                </details>
               </>
             ) : (
               <p className={HINT}>

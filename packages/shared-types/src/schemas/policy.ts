@@ -205,9 +205,23 @@ export const POLICY_DECISIONS_MAX_LIMIT = 500;
 // Cap offset so a hand-crafted ?offset=99999999 can't force an expensive deep scan.
 export const POLICY_DECISIONS_MAX_OFFSET = 100_000;
 
+// Named evidence sets that the store can filter on.
+//   monitor_gateway: a matched block or require_approval rule that the MCP
+//     gateway recorded while the tenant was in Monitor mode (enforced=false and
+//     an action snapshot with argumentKeys). It excludes resource checks after a
+//     completed tool call: those record require_approval with enforced=false in
+//     both modes. The monitor summary counts this same set.
+export const POLICY_DECISION_EVIDENCE = ["monitor_gateway"] as const;
+export const PolicyDecisionEvidenceSchema = z.enum(POLICY_DECISION_EVIDENCE);
+export type PolicyDecisionEvidence = (typeof POLICY_DECISION_EVIDENCE)[number];
+
 export const PolicyDecisionFiltersSchema = z
   .object({
     sessionId: z.string().trim().min(1).optional(),
+    // The rule ID recorded on the decision. The rule can be changed or deleted
+    // after the decision was recorded.
+    matchedRuleId: z.string().trim().min(1).max(200).optional(),
+    evidence: PolicyDecisionEvidenceSchema.optional(),
     outcomes: z.array(PolicyEffectSchema).optional(),
     // Tri-state: omitted = any; true = enforce-mode effects that gated the
     // action; false = recorded-only decisions.
@@ -216,8 +230,12 @@ export const PolicyDecisionFiltersSchema = z
     severities: z.array(PolicySeveritySchema).optional(),
     // Date-only (YYYY-MM-DD) UTC bounds. `to` is treated as inclusive of the whole
     // day by the store (half-open: created_at < to+1day), so the picked end-day counts.
+    // `from` also accepts a full ISO timestamp as an exact lower bound.
     from: z.string().optional(),
     to: z.string().optional(),
+    // Exact inclusive upper bound (created_at <= before). With an ISO `from`, it
+    // selects the same window as the monitor summary. Microseconds in an ISO
+    // value count, so a decision's createdAt sent as `before` includes it.
     before: z.string().optional(),
     limit: z.number().int().min(1).max(POLICY_DECISIONS_MAX_LIMIT).optional(),
     offset: z.number().int().min(0).max(POLICY_DECISIONS_MAX_OFFSET).optional()
@@ -238,6 +256,77 @@ export const PolicyDecisionsListResponseSchema = z
   })
   .passthrough();
 export type PolicyDecisionsListResponse = z.infer<typeof PolicyDecisionsListResponseSchema>;
+
+// ── Monitor summary ─────────────────────────────────────────────────────────
+//
+// GET /admin/policy/monitor-summary: what matched rules recorded in Monitor mode
+// during the last seven days, grouped by rule. The counts are outcomes of the
+// rules as they were when each decision was recorded. They are not a replay of
+// the current rules, and they are not a count of all tool activity: the
+// gateway records no row when no rule matches, and evidence writes are best
+// effort. The response carries no arguments, snapshots, or credentials.
+
+export const POLICY_MONITOR_SUMMARY_DAYS = 7;
+
+const countSchema = z.number().int().min(0);
+
+export const PolicyMonitorOutcomeCountsSchema = z
+  .object({
+    // Enforce would have blocked the action.
+    block: countSchema,
+    // require_approval split by the recorded turn context. Interactive turns ask
+    // the user. Scheduled turns deny the action because nobody can approve it.
+    // Unknown means the record has no recognized turn context.
+    approvalInteractive: countSchema,
+    approvalScheduled: countSchema,
+    approvalUnknownContext: countSchema,
+    total: countSchema
+  })
+  .strict();
+export type PolicyMonitorOutcomeCounts = z.infer<typeof PolicyMonitorOutcomeCountsSchema>;
+
+export const PolicyMonitorRuleSummarySchema = z
+  .object({
+    ruleId: z.string(),
+    // The rule as it is now. Null when the rule no longer exists. Its name,
+    // status, or effect can differ from when the decisions were recorded.
+    currentRule: z
+      .object({
+        name: z.string(),
+        enabled: z.boolean(),
+        effect: PolicyEffectSchema
+      })
+      .strict()
+      .nullable(),
+    counts: PolicyMonitorOutcomeCountsSchema,
+    lastRecordedAt: IsoDateSchema
+  })
+  .strict();
+export type PolicyMonitorRuleSummary = z.infer<typeof PolicyMonitorRuleSummarySchema>;
+
+export const PolicyMonitorSummaryResponseSchema = z
+  .object({
+    // Exact window: windowStart <= created_at <= windowEnd. Use these values as
+    // `from` and `before` on /admin/policy/decisions with
+    // evidence=monitor_gateway to list the same rows.
+    windowStart: IsoDateSchema,
+    windowEnd: IsoDateSchema,
+    totals: PolicyMonitorOutcomeCountsSchema,
+    // Most counted first.
+    rules: z.array(PolicyMonitorRuleSummarySchema),
+    // Unenforced block or require_approval records in the window that the
+    // summary does not count.
+    excluded: z
+      .object({
+        // Resource checks after a completed tool call.
+        resourceChecks: countSchema,
+        // Older or unrecognized records, for example without argument keys.
+        unrecognized: countSchema
+      })
+      .strict()
+  })
+  .strict();
+export type PolicyMonitorSummaryResponse = z.infer<typeof PolicyMonitorSummaryResponseSchema>;
 
 // Detail view: the row plus the redacted action snapshot (omitted from list rows
 // to keep payloads lean). The snapshot carries the redacted args and the

@@ -73,26 +73,28 @@ test("syncs scoped artifacts to ./artifacts/ keeping safe basenames", async () =
   expect(cap.writes[0].data.toString("utf8")).toBe("PDF body");
 });
 
-test("dedupes colliding filenames using a short artifactId suffix", async () => {
+test("dedupes colliding filenames when artifact IDs share a timestamp prefix", async () => {
+  // UUIDv7 IDs created close together share their first 8 characters.
   const arts = [
-    makeArtifact({ artifactId: "id-aaaaaaaa", artifactName: "img.png", storageKey: "k1" }),
-    makeArtifact({ artifactId: "id-bbbbbbbb", artifactName: "img.png", storageKey: "k2" }),
-    makeArtifact({ artifactId: "id-cccccccc", artifactName: "img.png", storageKey: "k3" })
+    makeArtifact({ artifactId: "0199aaaa-0000-7000-8000-000000000001", artifactName: "img.png", storageKey: "k1" }),
+    makeArtifact({ artifactId: "0199aaaa-0000-7000-8000-000000000002", artifactName: "img.png", storageKey: "k2" }),
+    makeArtifact({ artifactId: "0199aaaa-0000-7000-8000-000000000003", artifactName: "img.png", storageKey: "k3" }),
+    // A user file that already has the generated name of the next duplicate.
+    makeArtifact({ artifactId: "0199aaaa-0000-7000-8000-000000000004", artifactName: "img_0199aaaa-0000-7000-8000-000000000005.png", storageKey: "k4" }),
+    makeArtifact({ artifactId: "0199aaaa-0000-7000-8000-000000000005", artifactName: "img.png", storageKey: "k5" })
   ];
   const cap = captureWriter();
   const result = await syncArtifactsToWorkspace({
     sessionId: "s",
     scopedArtifacts: arts,
-    storage: makeStorage({ k1: "a", k2: "b", k3: "c" }),
+    storage: makeStorage({ k1: "a", k2: "b", k3: "c", k4: "d", k5: "e" }),
     writeRuntimeFile: cap.writer
   });
-  // Distinct workspace paths
   const paths = result.map((r) => r.workspacePath);
-  expect(new Set(paths).size).toBe(3);
-  // The first stays as the bare name
+  expect(new Set(paths).size).toBe(5);
   expect(paths[0]).toBe("./artifacts/img.png");
-  // Subsequent get suffix
-  expect(paths[1]).toMatch(/^\.\/artifacts\/img_id-bbbbb\.png$/);
+  expect(paths[1]).toBe("./artifacts/img_0199aaaa-0000-7000-8000-000000000002.png");
+  expect(paths[4]).toBe("./artifacts/img_0199aaaa-0000-7000-8000-000000000005_2.png");
 });
 
 test("strips path traversal from artifact names", async () => {

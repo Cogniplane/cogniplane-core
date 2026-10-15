@@ -1,6 +1,6 @@
 "use client";
 
-import { isCancelledError, useQuery, useQueryClient } from "@tanstack/react-query";
+import { isCancelledError, replaceEqualDeep, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect } from "react";
 
 import type { Approval, Artifact, Message } from "@cogniplane/shared-types";
@@ -12,7 +12,6 @@ import { listApprovals } from "../lib/session-api";
 
 type SessionData = {
   messages: Message[];
-  hasMoreMessages: boolean;
   artifacts: Artifact[];
   approvals: Approval[];
 };
@@ -25,7 +24,6 @@ async function loadSessionData(sessionId: string, signal?: AbortSignal): Promise
   ]);
   return {
     messages: messagePage.messages,
-    hasMoreMessages: messagePage.hasMore,
     artifacts,
     approvals
   };
@@ -33,7 +31,6 @@ async function loadSessionData(sessionId: string, signal?: AbortSignal): Promise
 
 const EMPTY_SESSION_DATA: SessionData = {
   messages: [],
-  hasMoreMessages: false,
   artifacts: [],
   approvals: []
 };
@@ -59,7 +56,6 @@ export function useSessionData(input: {
 
   const sessionData = selectedSessionId ? sessionDetailQuery.data : undefined;
   const messages = sessionData?.messages ?? EMPTY_SESSION_DATA.messages;
-  const hasMoreMessages = sessionData?.hasMoreMessages ?? false;
   const artifacts = sessionData?.artifacts ?? EMPTY_SESSION_DATA.artifacts;
   // Wait for this visit's refetch before seeding the chat with cached history.
   // If it fails, keep the cached transcript available instead of leaving chat blank.
@@ -106,13 +102,12 @@ export function useSessionData(input: {
     if (artifactsPollQuery.data.detailDataUpdateCount !== detailState?.dataUpdateCount) {
       return;
     }
-    queryClient.setQueryData<SessionData>(
-      queryKeys.sessions.detail(selectedSessionId),
-      (current) =>
-        current
-          ? { ...current, artifacts: artifactsPollQuery.data?.artifacts ?? current.artifacts }
-          : current
-    );
+    const detailKey = queryKeys.sessions.detail(selectedSessionId);
+    const current = queryClient.getQueryData<SessionData>(detailKey);
+    if (!current) return;
+    const artifacts = replaceEqualDeep(current.artifacts, artifactsPollQuery.data.artifacts);
+    if (artifacts === current.artifacts) return;
+    queryClient.setQueryData<SessionData>(detailKey, { ...current, artifacts });
   }, [artifactsPollQuery.data, isSessionDataReady, queryClient, selectedSessionId]);
 
   const refreshSessionData = useCallback(
@@ -135,7 +130,6 @@ export function useSessionData(input: {
   return {
     loadError,
     messages,
-    hasMoreMessages,
     artifacts,
     initialApprovals: sessionData?.approvals ?? EMPTY_SESSION_DATA.approvals,
     refreshSessionData,

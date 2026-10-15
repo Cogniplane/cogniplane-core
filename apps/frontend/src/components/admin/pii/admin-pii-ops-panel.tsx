@@ -20,6 +20,7 @@ import type {
   PiiRangePreset
 } from "@cogniplane/shared-types";
 import { queryKeys } from "../../../lib/query-keys";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { PILL_GRAY, PILL_RED, HINT, LIST_ITEM, SECTION_LABEL } from "../../../lib/ui-tokens";
 
@@ -81,29 +82,19 @@ export function OpsHealthPanel(props: Props) {
   const data = statsQuery.data ?? null;
 
   return (
-    <Card aria-label="pii-ops">
-      <button
-        type="button"
-        onClick={toggle}
-        aria-expanded={expanded}
-        aria-controls="pii-ops-panel-content"
-        className="flex w-full cursor-pointer items-start justify-between gap-3 px-6 text-left"
-      >
+    <Card>
+      <div className="flex flex-wrap items-center justify-between gap-3 px-6">
         <div>
-          <p className={SECTION_LABEL}>Operational health</p>
-          <p className="mt-1 text-sm text-on-surface-faint">
-            {expanded
-              ? "Hide queue, latency, breaker timeline"
-              : "Show queue, latency, breaker timeline"}
-          </p>
+          <h2 id="pii-ops-title" className="text-base font-semibold text-on-surface">Operational health</h2>
+          <p className="mt-1 text-sm text-on-surface-variant">Scan queue, scan speed, and detection service health.</p>
         </div>
-        <span className={PILL_GRAY} aria-hidden="true">
-          {expanded ? "▾" : "▸"}
-        </span>
-      </button>
+        <Button type="button" variant="outline" size="sm" onClick={toggle} aria-expanded={expanded} aria-controls="pii-ops-panel-content">
+          {expanded ? "Hide details" : "Show details"}
+        </Button>
+      </div>
       {expanded ? (
         <CardContent>
-          <div id="pii-ops-panel-content" role="region" aria-label="Operational health">
+          <div id="pii-ops-panel-content" role="region" aria-labelledby="pii-ops-title">
             {statsQuery.isLoading ? (
               <p className={HINT}>Loading…</p>
             ) : statsQuery.error ? (

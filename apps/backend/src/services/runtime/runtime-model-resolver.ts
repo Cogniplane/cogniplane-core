@@ -69,9 +69,11 @@ function runtimeUnavailableError(): RuntimeResolutionResult {
 /**
  * Chooses the default model for the no-explicit-model path, preferring one
  * whose provider the tenant has a key for. Preference order:
- *   1. the catalog default (isDefault) if its provider is configured,
- *   2. otherwise the first catalog model with a configured provider,
- *   3. otherwise the catalog default unchanged — so the caller's provider gate
+ *   1. the organization default if its provider is configured,
+ *   2. the first built-in catalog default (one per provider) whose provider
+ *      is configured,
+ *   3. otherwise the first catalog model with a configured provider,
+ *   4. otherwise the preferred default unchanged — so the caller's provider gate
  *      emits the honest "no key" error for that provider.
  * Providers are probed at most once each (memoized) to bound hasProviderKey
  * calls regardless of catalog size.
@@ -80,7 +82,7 @@ async function pickDefaultForConfiguredProvider(
   tenantId: string,
   hasProviderKey: (tenantId: string, provider: ModelProvider) => Promise<boolean>,
   enabledCatalog: readonly ResolverModel[],
-  catalogDefault: ResolverModel | null
+  preferredDefault: ResolverModel | null
 ): Promise<ResolverModel | null> {
   const probed = new Map<ModelProvider, boolean>();
   const isConfigured = async (provider: ModelProvider): Promise<boolean> => {
@@ -91,13 +93,16 @@ async function pickDefaultForConfiguredProvider(
     return result;
   };
 
-  if (catalogDefault && (await isConfigured(catalogDefault.provider))) {
-    return catalogDefault;
+  if (preferredDefault && (await isConfigured(preferredDefault.provider))) {
+    return preferredDefault;
+  }
+  for (const model of enabledCatalog) {
+    if (model.isDefault && (await isConfigured(model.provider))) return model;
   }
   for (const model of enabledCatalog) {
     if (await isConfigured(model.provider)) return model;
   }
-  return catalogDefault;
+  return preferredDefault;
 }
 
 // Resolves the selected model for a turn on the Deep Agents runtime. Validates
@@ -129,8 +134,10 @@ export async function resolveRuntimeModel(
   // The catalog default (isDefault, else first ENABLED entry). Used as the
   // fallback when no model is requested; restricted to enabled models so a
   // disabled provider/model is never picked implicitly.
+  const nativeDefault = enabledCatalog.find((m) => m.isDefault) ?? null;
   const catalogDefault: ResolverModel | null =
-    enabledCatalog.find((m) => m.isDefault) ?? enabledCatalog[0] ?? null;
+    enabledCatalog.find((m) => m.id === availability?.defaultModelId) ??
+    nativeDefault ?? enabledCatalog[0] ?? null;
 
   if (requestedModel && !catalog.some((m) => m.id === requestedModel)) {
     return {

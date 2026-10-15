@@ -47,6 +47,91 @@ export const ProjectLibrarySchema = z.object({
   files: z.array(ProjectFileSchema),
   folders: z.array(ProjectFolderSchema),
 });
+const PageLimitSchema = z.coerce.number().int().min(1).max(100).default(50);
+const PageCursorSchema = z.string().min(1).max(2048).optional();
+const SearchSchema = z.string().trim().max(255).optional().transform((value) => value || undefined);
+
+export const ProjectLibraryFilesQuerySchema = z.object({
+  section: z.enum(["published", "draft", "trash"]),
+  folderId: z.string().uuid().optional(),
+  q: SearchSchema,
+  sort: z.enum(["updated", "name"]).default("updated"),
+  limit: PageLimitSchema,
+  cursor: PageCursorSchema,
+}).strict();
+export type ProjectLibraryFilesQuery = z.infer<typeof ProjectLibraryFilesQuerySchema>;
+
+export const ProjectLibraryFileSchema = ProjectFileSchema.extend({
+  folderPath: z.string(),
+  target: z.object({
+    fileId: z.string(),
+    name: z.string(),
+    currentVersionId: z.string(),
+    available: z.boolean(),
+  }).nullable(),
+});
+export type ProjectLibraryFile = z.infer<typeof ProjectLibraryFileSchema>;
+export const ProjectLibraryFilesPageSchema = z.object({
+  items: z.array(ProjectLibraryFileSchema),
+  nextCursor: z.string().nullable(),
+  /** True when a file in this list changed after the first page. The scroll can miss it. */
+  listChanged: z.boolean().optional(),
+});
+export type ProjectLibraryFilesPage = z.infer<typeof ProjectLibraryFilesPageSchema>;
+
+export const ProjectFilePickerEntrySchema = z.object({
+  fileId: z.string(),
+  name: z.string(),
+  kind: z.enum(["published", "draft"]),
+  folderId: z.string().nullable(),
+  folderPath: z.string(),
+  versionId: z.string(),
+  versionNumber: z.number().int().positive(),
+});
+export type ProjectFilePickerEntry = z.infer<typeof ProjectFilePickerEntrySchema>;
+export const ProjectFilePickerQuerySchema = z.object({
+  q: SearchSchema,
+  kind: z.enum(["published", "any"]).default("any"),
+  limit: PageLimitSchema,
+  cursor: PageCursorSchema,
+}).strict();
+export type ProjectFilePickerQuery = z.infer<typeof ProjectFilePickerQuerySchema>;
+export const ProjectFilePickerPageSchema = z.object({
+  items: z.array(ProjectFilePickerEntrySchema),
+  nextCursor: z.string().nullable(),
+});
+export type ProjectFilePickerPage = z.infer<typeof ProjectFilePickerPageSchema>;
+export const ProjectFilePickerSelectionQuerySchema = z.object({
+  ids: z.union([z.string().uuid(), z.array(z.string().uuid())])
+    .transform((value) => [...new Set(Array.isArray(value) ? value : [value])])
+    .pipe(z.array(z.string().uuid()).min(1).max(20)),
+}).strict();
+export const ProjectFilePickerSelectionSchema = z.object({
+  items: z.array(ProjectFilePickerEntrySchema),
+});
+
+export const ProjectFolderListQuerySchema = z.object({
+  parentId: z.string().uuid().optional(),
+  q: SearchSchema,
+  limit: PageLimitSchema,
+  cursor: PageCursorSchema,
+}).strict().refine((value) => !(value.parentId && value.q),
+  "Use a parent folder or a search term.");
+export type ProjectFolderListQuery = z.infer<typeof ProjectFolderListQuerySchema>;
+export const ProjectFolderEntrySchema = ProjectFolderSchema.extend({ path: z.string() });
+export type ProjectFolderEntry = z.infer<typeof ProjectFolderEntrySchema>;
+export const ProjectFolderPageSchema = z.object({
+  items: z.array(ProjectFolderEntrySchema),
+  nextCursor: z.string().nullable(),
+});
+export type ProjectFolderPage = z.infer<typeof ProjectFolderPageSchema>;
+export const ProjectFolderDetailSchema = z.object({
+  folder: ProjectFolderSchema,
+  ancestors: z.array(z.object({ folderId: z.string(), name: z.string() })).max(8),
+  ancestorsTruncated: z.boolean(),
+  nearestLiveFolderId: z.string().nullable(),
+});
+export type ProjectFolderDetail = z.infer<typeof ProjectFolderDetailSchema>;
 export const ProjectFileCreateSchema = z
   .object({
     artifactId: z.string().uuid(),

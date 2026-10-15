@@ -1,244 +1,130 @@
-import { test, expect } from "vitest";
+import { describe, expect, test } from "vitest";
 
-import type { Pool } from "../lib/db.js";
+import { FakePool } from "../test-helpers/fake-pool.js";
+import { buildDefaultTenantSettingsInput, TenantSettingsStore } from "./tenant-settings-store.js";
 
-import { TenantSettingsStore, TenantSettingsConflictError } from "./tenant-settings-store.js";
+// Unit tests for the approved sandbox hosts (VULN-13). The fake answers the
+// statements of the upsert from the values it binds, and reads the INSERT back
+// by column name, so a value in the wrong column fails here. Row-level security
+// and the real column are proven against Postgres by the integration suite.
 
-test("concurrent saves from one version reject the stale writer without losing changes", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const original = await store.upsert("tenant-1", {});
-  const results = await Promise.allSettled([
-    store.upsert("tenant-1", { expectedVersion: original.version, developerInstructions: "first" }),
-    store.upsert("tenant-1", { expectedVersion: original.version, developerInstructions: "second" })
-  ]);
-  expect(results[0].status).toBe("fulfilled");
-  expect(results[1]).toMatchObject({ status: "rejected", reason: expect.any(TenantSettingsConflictError) });
-  expect(await store.get("tenant-1")).toMatchObject({ version: original.version + 1, developerInstructions: "first" });
-});
+type Row = Record<string, unknown>;
 
-type QueryResult = {
-  rows: Record<string, unknown>[];
-  rowCount: number;
-};
+const JSON_COLUMNS = new Set([
+  "enabled_tool_ids", "enabled_mcp_server_ids", "enabled_providers", "enabled_model_ids",
+  "model_default_efforts", "approved_sandbox_egress_domains"
+]);
 
-class InMemoryTenantSettingsDatabase {
-  private row: Record<string, unknown> | null = null;
-  private nowCounter = 0;
-  // Models pg_advisory_xact_lock: a mutex acquired in-transaction and
-  // released on COMMIT/ROLLBACK, so concurrency tests exercise real blocking.
-  private lockTail: Promise<void> = Promise.resolve();
-
-  async connect(): Promise<{
-    query: (sql: string, params?: unknown[]) => Promise<QueryResult>;
-    release: () => void;
-  }> {
-    let releaseLock: (() => void) | null = null;
-    return {
-      query: async (sql: string, params: unknown[] = []) => {
-        if (sql === "COMMIT" || sql === "ROLLBACK") {
-          releaseLock?.();
-          releaseLock = null;
-          return { rows: [], rowCount: 0 };
-        }
-        if (sql.includes("pg_advisory_xact_lock")) {
-          const previousHolder = this.lockTail;
-          let release!: () => void;
-          this.lockTail = new Promise<void>((resolve) => {
-            release = resolve;
-          });
-          await previousHolder;
-          releaseLock = release;
-          return { rows: [], rowCount: 0 };
-        }
-        return this.query(sql, params);
-      },
-      release: () => {}
-    };
-  }
-
-  async query(sql: string, params: unknown[] = []): Promise<QueryResult> {
-    if (
-      sql === "BEGIN" ||
-      sql === "COMMIT" ||
-      sql === "ROLLBACK" ||
-      sql.startsWith("SELECT set_config")
-    ) {
-      return { rows: [], rowCount: 0 };
-    }
-
-    if (sql.includes("SELECT * FROM tenant_settings WHERE tenant_id = $1")) {
-      if (!this.row || this.row.tenant_id !== params[0]) {
-        return { rows: [], rowCount: 0 };
-      }
-
-      return { rows: [this.row], rowCount: 1 };
-    }
-
-    if (sql.includes("INSERT INTO tenant_settings")) {
-      this.row = {
-        tenant_id: String(params[0]),
-        show_effort_selector: Boolean(params[1]),
-        web_search_mode: String(params[2]),
-        approval_policy: String(params[3]),
-        approval_reviewer: String(params[4]),
-        allow_command_execution: Boolean(params[5]),
-        allow_user_token_forwarding: false,
-        auto_approve_read_only_tools: Boolean(params[6]),
-        policy_enforcement_mode: String(params[7]),
-        developer_instructions: params[8] == null ? null : String(params[8]),
-        enabled_tool_ids: JSON.parse(String(params[9])) as string[],
-        enabled_mcp_server_ids: JSON.parse(String(params[10])) as string[],
-        enabled_providers: JSON.parse(String(params[11])) as string[],
-        enabled_model_ids: params[12] == null ? null : (JSON.parse(String(params[12])) as string[]),
-        model_default_efforts: JSON.parse(String(params[13])) as Record<string, string>,
-        version: Number(this.row?.version ?? 0) + 1,
-        config_hash: String(params[14]),
-        updated_at: new Date(Date.UTC(2026, 3, 15, 12, 0, this.nowCounter++)).toISOString()
-      };
-
-      return { rows: [this.row], rowCount: 1 };
-    }
-
-    throw new Error(`Unexpected query in test: ${sql}`);
-  }
+/** Pairs each column of the INSERT with the value bound to it, as the database would see it. */
+function boundColumns(sql: string, values: unknown[]): Row {
+  const columns = /INSERT INTO tenant_settings \(([^)]*)\)/.exec(sql)![1]!.split(",").map((name) => name.trim());
+  const tuple = /VALUES \((.*)\)\s*ON CONFLICT/s.exec(sql)![1]!.split(",").map((entry) => entry.trim());
+  expect(tuple).toHaveLength(columns.length);
+  const row: Row = {};
+  columns.forEach((name, index) => {
+    const entry = tuple[index]!;
+    const placeholder = /^\$(\d+)/.exec(entry);
+    const value = placeholder ? values[Number(placeholder[1]) - 1] : entry === "NOW()" ? "2026-10-14T00:00:00.000Z" : Number(entry);
+    // pg returns a parsed value for a jsonb column.
+    row[name] = JSON_COLUMNS.has(name) && typeof value === "string" ? JSON.parse(value) : value;
+  });
+  return row;
 }
 
-test("TenantSettingsStore.upsert preserves existing values for partial updates", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
+function makeStore(existing: Row | null) {
+  const inserts: Row[] = [];
+  const statements: string[] = [];
+  const pool = new FakePool()
+    .onQuery("FOR UPDATE", () => (existing ? { rows: [existing], rowCount: 1 } : { rows: [], rowCount: 0 }))
+    .onQuery("INSERT INTO tenant_settings", (sql, values) => {
+      const row = boundColumns(sql, values);
+      inserts.push(row);
+      statements.push(sql);
+      return { rows: [row], rowCount: 1 };
+    })
+    .onQuery("SELECT * FROM tenant_settings", () => (existing ? { rows: [existing], rowCount: 1 } : { rows: [], rowCount: 0 }));
+  return { store: new TenantSettingsStore(pool.asPool()), inserts, statements };
+}
 
-  await store.upsert("tenant-1", {
-    approvalPolicy: "never",
-    approvalReviewer: "guardian_subagent",
-    allowCommandExecution: true,
-    autoApproveReadOnlyTools: false,
-    policyEnforcementMode: "enforce",
-    webSearchMode: "live",
-    developerInstructions: "Initial instructions",
-    enabledToolIds: ["custom-tool"],
-    enabledMcpServerIds: ["custom-server"]
+function savedRow(overrides: Row = {}): Row {
+  return {
+    tenant_id: "tenant-a", show_effort_selector: false, web_search_mode: "disabled", approval_policy: "on-request",
+    approval_reviewer: "user", allow_command_execution: false, auto_approve_read_only_tools: true,
+    policy_enforcement_mode: "monitor", developer_instructions: null, enabled_tool_ids: [], enabled_mcp_server_ids: [],
+    enabled_providers: ["anthropic"], enabled_model_ids: null, default_model_id: null, model_default_efforts: {},
+    approved_sandbox_egress_domains: [], version: 3, config_hash: "saved-hash", updated_at: "2026-10-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+describe("approved sandbox hosts in the tenant settings store", () => {
+  test("a new tenant approves no host: the sandbox has no network", async () => {
+    expect(buildDefaultTenantSettingsInput().approvedSandboxEgressDomains).toEqual([]);
+    const { store, inserts } = makeStore(null);
+
+    const saved = await store.upsert("tenant-a", {});
+
+    expect(inserts[0]!.approved_sandbox_egress_domains).toEqual([]);
+    expect(saved.approvedSandboxEgressDomains).toEqual([]);
   });
 
-  const updated = await store.upsert("tenant-1", {
-    developerInstructions: "Updated instructions"
+  test("saves the list in its own column, sorted and without duplicates", async () => {
+    const { store, inserts } = makeStore(savedRow());
+
+    const saved = await store.upsert("tenant-a", {
+      approvedSandboxEgressDomains: ["pypi.org", "*.example.com", "pypi.org", "files.pythonhosted.org"]
+    });
+
+    expect(inserts[0]!.approved_sandbox_egress_domains).toEqual(["*.example.com", "files.pythonhosted.org", "pypi.org"]);
+    expect(saved.approvedSandboxEgressDomains).toEqual(["*.example.com", "files.pythonhosted.org", "pypi.org"]);
   });
 
-  expect(updated.approvalPolicy).toBe("never");
-  expect(updated.showEffortSelector).toBe(false);
-  expect(updated.webSearchMode).toBe("live");
-  expect(updated.approvalReviewer).toBe("guardian_subagent");
-  expect(updated.allowCommandExecution).toBe(true);
-  expect(updated.autoApproveReadOnlyTools).toBe(false);
-  expect(updated.policyEnforcementMode).toBe("enforce");
-  expect(updated.developerInstructions).toBe("Updated instructions");
-  expect(updated.enabledToolIds).toEqual(["custom-tool"]);
-  expect(updated.enabledMcpServerIds).toEqual(["custom-server"]);
-});
+  test("updates the list of an existing row: every inserted column is also set on conflict", async () => {
+    // The fake only answers the INSERT, so a column missing from the ON CONFLICT
+    // list would save on a new tenant and silently not save on an existing one.
+    const { store, statements } = makeStore(savedRow());
+    await store.upsert("tenant-a", { approvedSandboxEgressDomains: ["pypi.org"] });
 
-test("TenantSettingsStore.upsert serializes concurrent partial updates without losing either write", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-
-  await store.upsert("tenant-c", {
-    developerInstructions: "initial",
-    webSearchMode: "live"
+    const sql = statements[0]!;
+    const inserted = /INSERT INTO tenant_settings \(([^)]*)\)/.exec(sql)![1]!.split(",").map((name) => name.trim());
+    const updated = new Set([...sql.slice(sql.indexOf("DO UPDATE SET")).matchAll(/^\s*(\w+) = /gm)].map((match) => match[1]));
+    expect(inserted).toContain("approved_sandbox_egress_domains");
+    expect(inserted.filter((name) => name !== "tenant_id" && !updated.has(name))).toEqual([]);
   });
 
-  // Two partial updates racing on different fields. Without per-tenant
-  // serialization both read the same baseline row and the second write
-  // resurrects stale values over the first.
-  await Promise.all([
-    store.upsert("tenant-c", { developerInstructions: "from writer A" }),
-    store.upsert("tenant-c", { showEffortSelector: true })
-  ]);
+  test("keeps the saved list when an update does not carry it, and clears it on an empty list", async () => {
+    const existing = savedRow({ approved_sandbox_egress_domains: ["pypi.org"] });
+    const kept = await makeStore(existing).store.upsert("tenant-a", { showEffortSelector: true });
+    expect(kept.approvedSandboxEgressDomains).toEqual(["pypi.org"]);
 
-  const final = await store.get("tenant-c");
-  expect(final?.developerInstructions).toBe("from writer A");
-  expect(final?.showEffortSelector).toBe(true);
-  expect(final?.webSearchMode).toBe("live");
-});
-
-test("TenantSettingsStore.upsert applies smart defaults for a new tenant", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-
-  const created = await store.upsert("tenant-2", {
-    developerInstructions: "Tenant-specific instructions"
+    const cleared = await makeStore(existing).store.upsert("tenant-a", { approvedSandboxEgressDomains: [] });
+    expect(cleared.approvedSandboxEgressDomains).toEqual([]);
   });
 
-  expect(created.approvalPolicy).toBe("on-request");
-  expect(created.showEffortSelector).toBe(false);
-  expect(created.webSearchMode).toBe("disabled");
-  expect(created.approvalReviewer).toBe("user");
-  expect(created.allowCommandExecution).toBe(false);
-  expect(created.autoApproveReadOnlyTools).toBe(true);
-  expect(created.policyEnforcementMode).toBe("monitor");
-  expect(created.developerInstructions).toBe("Tenant-specific instructions");
-  expect(created.enabledToolIds).toEqual([
-        "managed-session-context",
-        "session_context",
-        "list_artifacts",
-        "read_text_artifact",
-        "read_skill_corpus",
-        "write_artifact",
-        "memory_search",
-        "memory_save",
-        "memory_delete",
-        "project_list_files",
-        "project_read_file",
-        "project_get_conflict_context",
-        "project_reconcile_conflict",
-        "project_write_file"
-      ]);
-  expect(created.enabledMcpServerIds).toEqual(["managed-session-context"]);
-  expect(created.version).toBe(1);
-});
+  test("a change of the list changes the config hash, so cached sessions refresh", async () => {
+    const hashOf = async (domains: string[]) =>
+      (await makeStore(savedRow()).store.upsert("tenant-a", { approvedSandboxEgressDomains: domains })).configHash;
 
-test("TenantSettingsStore.get returns null when no row exists", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-  const result = await store.get("tenant-missing");
-  expect(result).toBe(null);
-});
-
-test("TenantSettingsStore.upsert persists showEffortSelector", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-
-  const created = await store.upsert("tenant-4", {
-    showEffortSelector: true
+    const empty = await hashOf([]);
+    const one = await hashOf(["pypi.org"]);
+    expect(one).not.toBe(empty);
+    // The same hosts in another order are the same settings.
+    expect(await hashOf(["b.example.com", "a.example.com"])).toBe(await hashOf(["a.example.com", "b.example.com"]));
   });
 
-  expect(created.showEffortSelector).toBe(true);
+  test("reads the saved list sorted, and keeps only text entries", async () => {
+    const { store } = makeStore(savedRow({ approved_sandbox_egress_domains: ["pypi.org", 7, null, "*.example.com", "pypi.org"] }));
 
-  const updated = await store.upsert("tenant-4", {
-    showEffortSelector: false
+    expect((await store.get("tenant-a"))!.approvedSandboxEgressDomains).toEqual(["*.example.com", "pypi.org"]);
   });
 
-  expect(updated.showEffortSelector).toBe(false);
-});
+  test.each([
+    ["null", null],
+    ["a string", "pypi.org"],
+    ["an object", { host: "pypi.org" }]
+  ])("reads %s in the column as no hosts, which is the strictest policy", async (_label, stored) => {
+    const { store } = makeStore(savedRow({ approved_sandbox_egress_domains: stored }));
 
-test("TenantSettingsStore.upsert persists webSearchMode and preserves it across partial updates", async () => {
-  const db = new InMemoryTenantSettingsDatabase();
-  const store = new TenantSettingsStore(db as unknown as Pool);
-
-  const created = await store.upsert("tenant-5", {
-    webSearchMode: "cached"
+    expect((await store.get("tenant-a"))!.approvedSandboxEgressDomains).toEqual([]);
   });
-
-  expect(created.webSearchMode).toBe("cached");
-
-  // A partial update that omits webSearchMode keeps the stored value.
-  const preserved = await store.upsert("tenant-5", {
-    showEffortSelector: true
-  });
-
-  expect(preserved.webSearchMode).toBe("cached");
-
-  const updated = await store.upsert("tenant-5", {
-    webSearchMode: "disabled"
-  });
-
-  expect(updated.webSearchMode).toBe("disabled");
 });

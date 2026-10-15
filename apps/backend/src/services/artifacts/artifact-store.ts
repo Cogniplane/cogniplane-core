@@ -11,6 +11,30 @@ import { isoTimestamp } from "../../lib/db-mappers.js";
 export const PROJECT_COPY_SOURCE_KEY = "reusedFromArtifactId";
 export const UPLOAD_SCAN_PENDING_KEY = "awaitingUploadScan";
 
+// PII verdicts that keep an artifact's bytes inside the store. One list feeds
+// both the TS predicate and its SQL twin below, so they cannot drift.
+const PII_WITHHELD_STATUSES = ["pending", "scanning", "blocked"] as const;
+
+// Chat context, runtime workspaces and downloads (token issuance and redemption)
+// accept an artifact only when it is ready and its PII scan is not pending,
+// scanning, or blocked. A detect-only verdict (`scanned`, even with findings)
+// stays eligible. The verdict is read from `detail.pii` on its own, never
+// inferred from `status`: a block on a record that is already `ready` leaves
+// `status` unchanged (see `setPiiDetail`) and must still deny.
+export function isArtifactPiiEligible(artifact: Pick<ArtifactRecord, "status" | "detail">): boolean {
+  if (artifact.status !== "ready") return false;
+  const piiStatus = (artifact.detail?.pii as { status?: string } | undefined)?.status;
+  return piiStatus === undefined || !(PII_WITHHELD_STATUSES as readonly unknown[]).includes(piiStatus);
+}
+
+// SQL twin of `isArtifactPiiEligible` for an `artifacts` row aliased `alias`.
+// A missing verdict is eligible, as in the TS predicate. Keep the two together.
+export function artifactPiiEligibleSql(alias: string): string {
+  const withheld = PII_WITHHELD_STATUSES.map((status) => `'${status}'`).join(", ");
+  return `(${alias}.status = 'ready'
+    AND COALESCE(${alias}.detail_json->'pii'->>'status', '') NOT IN (${withheld}))`;
+}
+
 export type ArtifactPiiDetail = {
   status?: "pending" | "scanning" | "scanned" | "blocked" | "transformed" | "failed";
   modeApplied?: "off" | "detect" | "block" | "transform";
@@ -18,6 +42,8 @@ export type ArtifactPiiDetail = {
   summaryText?: string;
   findingsCount?: number;
   blockReason?: string;
+  /** The scan read only the text; any images in the file (a PDF) were not scanned. */
+  imagesNotScanned?: boolean;
 };
 
 export type ArtifactDetail = {
@@ -152,6 +178,9 @@ const DOWNLOAD_TOKEN_COLUMNS = `
 // or for an admin-minted token the issuing admin, who must still be an owner
 // or admin. The token user must also still be able to read the session.
 // Admin tokens exist only for personal sessions.
+//
+// The artifact must also be download-eligible NOW, not only when the token was
+// minted: a PII block that lands after issuance denies an outstanding token.
 const DOWNLOAD_TOKEN_GATING = `
   download.token = $1
   AND EXISTS (SELECT 1 FROM tenant_memberships holder
@@ -172,8 +201,7 @@ const DOWNLOAD_TOKEN_GATING = `
   AND artifact.session_id  = download.session_id
   AND artifact.storage_key = download.storage_key
   AND artifact.storage_backend = download.storage_backend
-  AND artifact.status     <> 'deleted'
-  AND (artifact.artifact_type = 'upload' OR artifact.status = 'ready')
+  AND ${artifactPiiEligibleSql("artifact")}
 `.trim();
 
 function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRecord {
@@ -269,11 +297,15 @@ const ARTIFACT_SORT_ORDER: Record<
   }
 };
 
-function cursorKeyForRow(sort: ArtifactSortKey, row: ArtifactRecord): string | number {
+// The created_* sorts seek on the database's own text for created_at
+// (`cursor_created_at`). ArtifactRecord.createdAt is an ISO string with
+// milliseconds only, so rows that differ by microseconds would be skipped or
+// repeated between pages.
+function cursorKeyForRow(sort: ArtifactSortKey, row: ArtifactRecord, cursorCreatedAt: unknown): string | number {
   switch (sort) {
     case "created_desc":
     case "created_asc":
-      return row.createdAt;
+      return String(cursorCreatedAt);
     case "name_asc":
     case "name_desc":
       return row.artifactName;
@@ -438,13 +470,14 @@ export class ArtifactStore {
   async createUpload(
     input: Omit<Parameters<ArtifactStore["create"]>[0], "artifactType" | "createdByType" | "status"> & {
       expectedProjectId: string | null;
+      createdByType?: ArtifactRecord["createdByType"];
     },
   ): Promise<ArtifactRecord> {
     return withTenantScope(this.db, input.tenantId, async client => {
       const projectId = await requireSessionUploadAccess(client, input, true);
       if (projectId !== input.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
       return this.insert(client, {
-        ...input, artifactType: "upload", createdByType: "user", status: "pending",
+        ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending",
         detail: { ...input.detail, [UPLOAD_SCAN_PENDING_KEY]: true },
       }, true);
     });
@@ -615,9 +648,7 @@ export class ArtifactStore {
       const nextCursor =
         hasMore && last
           ? encodeArtifactCursor({
-              k: sort === "created_asc" || sort === "created_desc"
-                ? String(rows.rows[items.length - 1]!.cursor_created_at)
-                : cursorKeyForRow(sort, last),
+              k: cursorKeyForRow(sort, last, rows.rows[items.length - 1]!.cursor_created_at),
               id: last.id,
               sort,
               fv: filterFingerprint
@@ -683,7 +714,7 @@ export class ArtifactStore {
             tenant_id = $1
             AND source_artifact_id = $2
             AND ${artifactReadAccessSql("artifacts", "$3")}
-            AND status = 'ready'
+            AND ${artifactPiiEligibleSql("artifacts")}
             AND mime_type LIKE 'text/%'
           ORDER BY created_at DESC, id DESC
           LIMIT 1

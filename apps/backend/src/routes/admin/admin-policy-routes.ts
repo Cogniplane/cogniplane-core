@@ -6,6 +6,7 @@ import {
   PolicyDecisionFiltersSchema,
   PolicyDecisionsListResponseSchema,
   PolicyLintResponseSchema,
+  PolicyMonitorSummaryResponseSchema,
   PolicyReorderRequestSchema,
   PolicyRuleEnvelopeSchema,
   PolicyRuleInputSchema,
@@ -40,9 +41,11 @@ export type PolicyRouteStores = {
     PolicyRuleStore,
     "create" | "delete" | "list" | "listForLint" | "reorder" | "update"
   >;
-  policyDecisions: Pick<PolicyDecisionStore, "get" | "list">;
+  policyDecisions: Pick<PolicyDecisionStore, "get" | "list" | "summarizeMonitor">;
   policyService: Pick<PolicyService, "evaluate" | "invalidate">;
   auditEvents: Pick<AuditEventStore, "create">;
+  /** Clock for the monitor summary window. Tests pin it. */
+  now?: () => Date;
 };
 
 const ruleIdParamsSchema = z.object({ ruleId: z.string().min(1) });
@@ -83,6 +86,8 @@ function parseCsvParam(value: QueryValue): string[] | undefined {
 
 type DecisionsQuery = {
   sessionId?: QueryValue;
+  matchedRuleId?: QueryValue;
+  evidence?: QueryValue;
   outcomes?: QueryValue;
   enforced?: QueryValue;
   toolNames?: QueryValue;
@@ -107,6 +112,8 @@ function parseDecisionFilters(query: DecisionsQuery): PolicyDecisionFilters | nu
 
   const parsed = PolicyDecisionFiltersSchema.safeParse({
     sessionId: scalarParam(query.sessionId),
+    matchedRuleId: scalarParam(query.matchedRuleId),
+    evidence: scalarParam(query.evidence),
     outcomes: parseCsvParam(query.outcomes),
     enforced,
     toolNames: parseCsvParam(query.toolNames),
@@ -233,9 +240,10 @@ export async function registerAdminPolicyRoutes(
   }));
 
   // Decisions (evidence), filtered + paginated. Query params (all optional):
-  //   sessionId, outcomes (csv), enforced (true|false), toolNames (csv),
-  //   severities (csv), from/to (YYYY-MM-DD UTC, `to` inclusive of the day),
-  //   before (ISO upper bound to keep paging stable), limit, offset.
+  //   sessionId, matchedRuleId, evidence (monitor_gateway), outcomes (csv),
+  //   enforced (true|false), toolNames (csv), severities (csv),
+  //   from/to (YYYY-MM-DD UTC, `to` inclusive of the day; `from` also takes an
+  //   exact ISO timestamp), before (inclusive ISO upper bound), limit, offset.
   app.get("/admin/policy/decisions", withAdmin(app, async (request, reply) => {
     const filters = parseDecisionFilters(request.query as DecisionsQuery);
     if (!filters) {
@@ -244,6 +252,15 @@ export async function registerAdminPolicyRoutes(
     }
     const result = await stores.policyDecisions.list(request.auth.tenantId, filters);
     return serialize(PolicyDecisionsListResponseSchema, result);
+  }));
+
+  // Monitor evidence for the last seven days, grouped by rule. The window ends
+  // at request time. The response echoes it so that links can list the same
+  // rows with from=windowStart, before=windowEnd, evidence=monitor_gateway.
+  app.get("/admin/policy/monitor-summary", withAdmin(app, async (request) => {
+    const windowEnd = stores.now?.() ?? new Date();
+    const summary = await stores.policyDecisions.summarizeMonitor(request.auth.tenantId, windowEnd);
+    return serialize(PolicyMonitorSummaryResponseSchema, summary);
   }));
 
   // Single decision with its (re-redacted) action snapshot for the detail view.

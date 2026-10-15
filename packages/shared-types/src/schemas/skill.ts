@@ -22,6 +22,7 @@ export const AdminSkillSchema = z.object({
   activeValidationStatus: z.string().nullable(),
   activeReviewStatus: z.string().nullable(),
   isInherited: z.boolean(),
+  pendingRevisionCount: z.number().optional(),
   // Per-skill adoption counts; both optional because older API responses
   // and offline activations table both produce missing values. UI defaults to 0.
   invokedSessions30d: z.number().optional(),

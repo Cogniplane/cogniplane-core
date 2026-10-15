@@ -438,14 +438,9 @@ test("callChat distinguishes an external-caller abort from the internal timeout"
   const controller = new AbortController();
   controller.abort(); // already aborted before the call
 
-  const error = await provider
-    .detectText({ text: "hi", entityTypes: ["email"] }, controller.signal)
-    .catch((e: unknown) => e);
-  // The internal timeout controller never fired (externalSignal.aborted is true),
-  // so this must NOT be classified as a timeout.
-  if (error instanceof OpenAiCompatiblePiiProviderError) {
-    expect(error.code).not.toBe("timeout");
-  }
+  const pending = provider.detectText({ text: "hi", entityTypes: ["email"] }, controller.signal);
+  await expect(pending).rejects.toBeInstanceOf(OpenAiCompatiblePiiProviderError);
+  await expect(pending).rejects.toMatchObject({ code: "network_error" });
 });
 
 test("callChat surfaces HTTP errors with a bounded message", async () => {

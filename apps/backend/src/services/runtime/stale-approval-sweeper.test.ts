@@ -77,8 +77,10 @@ test("sweepStaleApprovals drains multiple full batches", async () => {
 
 test("sweepStaleApprovals continues past a failed audit write", async () => {
   let failed = false;
+  const attempted: Array<string | null | undefined> = [];
   const audit = {
-    create: async () => {
+    create: async (input: { approvalId?: string | null }) => {
+      attempted.push(input.approvalId);
       if (!failed) {
         failed = true;
         throw new Error("audit down");
@@ -96,6 +98,6 @@ test("sweepStaleApprovals continues past a failed audit write", async () => {
     500
   );
 
-  // Both rows counted even though the first audit write threw.
+  expect(attempted).toEqual(["a", "b"]);
   expect(total).toBe(2);
 });

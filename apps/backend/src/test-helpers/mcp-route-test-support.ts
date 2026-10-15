@@ -1,6 +1,9 @@
 import Fastify from "fastify";
 
-export async function createProxyMcpUpstream() {
+/** `respond` replaces the default echo reply, for example with an error envelope. */
+export async function createProxyMcpUpstream(
+  options: { respond?: (body: { id?: string | number; method?: string }) => Record<string, unknown> } = {}
+) {
   const upstreamRequests: Array<{
     headers: Record<string, string | string[] | undefined>;
     body: Record<string, unknown>;
@@ -29,10 +32,12 @@ export async function createProxyMcpUpstream() {
 
     const body = request.body as {
       id?: string | number;
+      method?: string;
       params?: {
         arguments?: Record<string, unknown>;
       };
     };
+    if (options.respond) return options.respond(body);
 
     return {
       jsonrpc: "2.0",

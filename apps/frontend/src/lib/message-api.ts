@@ -15,8 +15,10 @@ export type ListMessagesResult = {
   hasMore: boolean;
 };
 
-export async function listMessages(sessionId: string, signal?: AbortSignal): Promise<ListMessagesResult> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/messages`, { signal });
+export async function listMessages(sessionId: string, signal?: AbortSignal,
+  options?: { since?: string }): Promise<ListMessagesResult> {
+  const suffix = options?.since ? `?${new URLSearchParams({ since: options.since })}` : "";
+  const raw = await request<unknown>(`/sessions/${sessionId}/messages${suffix}`, { signal });
   const result = parseResponse(MessagesListResponseSchema, raw, "GET /sessions/:id/messages");
   // Defensive default in case an older backend doesn't return these fields yet.
   return {

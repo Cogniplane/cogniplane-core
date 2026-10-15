@@ -49,13 +49,14 @@ export function isTokenExpired(value: string | null): boolean {
  * Refreshes a user's GitHub access token using the stored refresh token,
  * encrypts the result, and persists it via the connection store. Returns
  * the original record unchanged if no refresh token is on file or the
- * exchange fails.
+ * exchange fails. Returns null if the connection was disconnected or
+ * replaced during the exchange.
  */
 export async function refreshAndPersistAccessToken(
   config: AppConfig,
-  store: Pick<GithubConnectionStore, "upsert">,
+  store: Pick<GithubConnectionStore, "updateRefreshedToken">,
   record: GithubConnectionRecord
-): Promise<GithubConnectionRecord> {
+): Promise<GithubConnectionRecord | null> {
   if (!record.refreshTokenEncrypted) {
     return record;
   }
@@ -67,14 +68,11 @@ export async function refreshAndPersistAccessToken(
   }
 
   const refreshedScopes = parseScopes(payload.scope);
-  return store.upsert({
+  return store.updateRefreshedToken({
     tenantId: record.tenantId,
     userId: record.userId,
-    githubUserId: record.githubUserId,
-    githubLogin: record.githubLogin,
-    githubName: record.githubName,
-    githubEmail: record.githubEmail,
-    githubAvatarUrl: record.githubAvatarUrl,
+    expectedGithubUserId: record.githubUserId,
+    expectedRefreshTokenEncrypted: record.refreshTokenEncrypted,
     tokenType: payload.token_type ?? record.tokenType,
     grantedScopes: refreshedScopes.length > 0 ? refreshedScopes : record.grantedScopes,
     accessTokenEncrypted: encrypt(payload.access_token, config.DATA_ENCRYPTION_SECRET),
@@ -83,7 +81,6 @@ export async function refreshAndPersistAccessToken(
       ? encrypt(payload.refresh_token, config.DATA_ENCRYPTION_SECRET)
       : record.refreshTokenEncrypted,
     refreshTokenExpiresAt:
-      toIsoFromNow(payload.refresh_token_expires_in) ?? record.refreshTokenExpiresAt,
-    tokenLastRefreshedAt: new Date().toISOString()
+      toIsoFromNow(payload.refresh_token_expires_in) ?? record.refreshTokenExpiresAt
   });
 }

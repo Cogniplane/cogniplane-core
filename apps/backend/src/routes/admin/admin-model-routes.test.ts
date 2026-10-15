@@ -37,7 +37,25 @@ class InMemoryCustomModels {
     return record;
   }
 
-  async delete(_tenantId: string, modelId: string): Promise<boolean> {
+  // Queries run inside the delete transaction. `failQuery` makes one fail,
+  // and then the delete does not happen, like a rollback.
+  readonly transactionQueries: unknown[][] = [];
+  failQuery = false;
+
+  async delete(
+    _tenantId: string,
+    modelId: string,
+    inTransaction?: (client: never) => Promise<void>
+  ): Promise<boolean> {
+    if (!this.records.has(modelId)) return false;
+    const client = {
+      query: async (_sql: string, params: unknown[]) => {
+        if (this.failQuery) throw new Error("audit insert failed");
+        this.transactionQueries.push(params);
+        return { rows: [], rowCount: 1 };
+      }
+    };
+    await inTransaction?.(client as never);
     return this.records.delete(modelId);
   }
 }
@@ -55,7 +73,9 @@ function makeSettings(overrides: Partial<TenantSettings> = {}): TenantSettings {
     updatedAt: "2026-09-07T12:00:00Z",
     enabledProviders: ["openai"],
     enabledModelIds: null,
+    defaultModelId: null,
     modelDefaultEfforts: {},
+    approvedSandboxEgressDomains: [],
     showEffortSelector: false,
     webSearchMode: "disabled",
     approvalPolicy: "never",
@@ -74,11 +94,18 @@ async function makeApp(options: {
   customModels?: InMemoryCustomModels;
   catalog?: OpenRouterCatalogEntry[] | Error;
   settings?: ReturnType<typeof makeSettings>;
+  // The settings that the locked read returns, when they differ from a plain read.
+  lockedSettings?: ReturnType<typeof makeSettings>;
+  // Runs when the settings lock is taken: the moment a concurrent writer has
+  // committed and this request starts to read.
+  onLock?: () => Promise<void>;
 } = {}) {
   const customModels = options.customModels ?? new InMemoryCustomModels();
   const auditEvents = new InMemoryAuditEventStore();
   const settingsUpdates: Record<string, unknown>[] = [];
+  const settingsAudits: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const settings = options.settings ?? makeSettings();
+  let lockedReads = 0;
 
   const app = Fastify();
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -96,9 +123,19 @@ async function makeApp(options: {
       async getOrCreateTenantSettings() {
         return settings;
       },
-      async updateTenantSettings(_tenantId: string, input: Record<string, unknown>) {
+      async lockTenantSettings() {
+        lockedReads += 1;
+        await options.onLock?.();
+        if (options.lockedSettings) Object.assign(settings, options.lockedSettings);
+        return settings;
+      },
+      async updateTenantSettings(_tenantId: string, { expectedVersion, ...input }: Record<string, unknown>,
+        audit?: (saved: typeof settings) => { type: string; payload: Record<string, unknown> }) {
+        // Only the locked read's version may be expected.
+        expect(expectedVersion).toBe(settings.version);
         settingsUpdates.push(input);
         Object.assign(settings, input);
+        if (audit) settingsAudits.push(audit(settings));
         return settings;
       }
     } as never,
@@ -118,7 +155,7 @@ async function makeApp(options: {
     }
   } satisfies ModelAdminRouteStores);
   await app.ready();
-  return { app, customModels, auditEvents, settingsUpdates };
+  return { app, customModels, auditEvents, settingsUpdates, settingsAudits, lockedReads: () => lockedReads };
 }
 
 test("GET /admin/models merges built-ins and custom models with source flags", async () => {
@@ -301,9 +338,10 @@ test("DELETE /admin/custom-models removes the model and scrubs availability refe
   });
   const settings = makeSettings({
     enabledModelIds: ["deepagents/claude-sonnet-5", "openrouter/moonshotai/kimi-k3"],
+    defaultModelId: "openrouter/moonshotai/kimi-k3",
     modelDefaultEfforts: { "openrouter/moonshotai/kimi-k3": "high" }
   });
-  const { app, settingsUpdates, auditEvents } = await makeApp({ customModels, settings });
+  const { app, settingsUpdates, settingsAudits, auditEvents } = await makeApp({ customModels, settings });
   try {
     const response = await app.inject({
       method: "DELETE",
@@ -315,10 +353,19 @@ test("DELETE /admin/custom-models removes the model and scrubs availability refe
     expect(settingsUpdates).toEqual([
       {
         enabledModelIds: ["deepagents/claude-sonnet-5"],
-        modelDefaultEfforts: {}
+        modelDefaultEfforts: {},
+        defaultModelId: null
       }
     ]);
-    expect(auditEvents.events.at(-1)?.type).toBe("admin.custom_model.deleted");
+    // The audit event is written in the delete transaction, not after it.
+    expect(auditEvents.events).toHaveLength(0);
+    expect(customModels.transactionQueries.at(-1)).toContain("admin.custom_model.deleted");
+    // The settings change has its own audit event in the same transaction.
+    expect(settingsAudits).toEqual([expect.objectContaining({
+      type: "admin.tenant_settings.updated",
+      payload: expect.objectContaining({ reason: "custom_model_deleted", modelId: "openrouter/moonshotai/kimi-k3",
+        enabledModelIds: ["deepagents/claude-sonnet-5"], defaultModelId: null })
+    })]);
 
     const missing = await app.inject({
       method: "DELETE",
@@ -330,6 +377,23 @@ test("DELETE /admin/custom-models removes the model and scrubs availability refe
   }
 });
 
+
+test("DELETE /admin/custom-models keeps the model when its audit event fails", async () => {
+  const customModels = new InMemoryCustomModels();
+  await customModels.create("admin-tenant", {
+    provider: "openrouter", vendorModelId: "moonshotai/kimi-k3", displayName: "Kimi",
+    description: "", contextWindow: 1000, createdBy: "admin-user"
+  });
+  customModels.failQuery = true;
+  const { app } = await makeApp({ customModels });
+  try {
+    const response = await app.inject({ method: "DELETE", url: "/admin/custom-models?modelId=openrouter%2Fmoonshotai%2Fkimi-k3" });
+    expect(response.statusCode).toBe(500);
+    expect(customModels.records.has("openrouter/moonshotai/kimi-k3")).toBe(true);
+  } finally {
+    await app.close();
+  }
+});
 
 test.each([
   { name: "last selected model", ids: ["openrouter/moonshotai/kimi-k3"], expected: null },
@@ -349,6 +413,56 @@ test.each([
     expect(response.json().settings.enabledModelIds).toEqual(expected);
     if (ids === null || ids.length === 0) expect(settingsUpdates).toEqual([]);
     else expect(settingsUpdates).toEqual([{ enabledModelIds: expected }]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("DELETE prunes the settings read under the settings lock, not an earlier read", async () => {
+  const customModels = new InMemoryCustomModels();
+  await customModels.create("admin-tenant", {
+    provider: "openrouter", vendorModelId: "moonshotai/kimi-k3", displayName: "Kimi",
+    description: "", contextWindow: 1000, createdBy: "admin-user"
+  });
+  // A plain read is stale: a concurrent save enabled another built-in model.
+  const { app, settingsUpdates, lockedReads } = await makeApp({
+    customModels,
+    settings: makeSettings({ enabledModelIds: ["openrouter/moonshotai/kimi-k3"] }),
+    lockedSettings: makeSettings({
+      enabledModelIds: ["openrouter/moonshotai/kimi-k3", "deepagents/claude-sonnet-5"], version: 7
+    })
+  });
+  try {
+    const response = await app.inject({ method: "DELETE", url: "/admin/custom-models?modelId=openrouter%2Fmoonshotai%2Fkimi-k3" });
+    expect(response.statusCode).toBe(200);
+    expect(lockedReads()).toBe(1);
+    // The concurrent save is kept.
+    expect(settingsUpdates).toEqual([{ enabledModelIds: ["deepagents/claude-sonnet-5"] }]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("DELETE keeps a model that was added and enabled before the settings lock", async () => {
+  const customModels = new InMemoryCustomModels();
+  const kimi = { provider: "openrouter" as const, vendorModelId: "moonshotai/kimi-k3", displayName: "Kimi",
+    description: "", contextWindow: 1000, createdBy: "admin-user" };
+  await customModels.create("admin-tenant", kimi);
+  const settings = makeSettings({ enabledModelIds: ["openrouter/moonshotai/kimi-k3"] });
+  const { app, settingsUpdates } = await makeApp({
+    customModels,
+    settings,
+    // Another admin adds model B and enables it; both commit before the lock.
+    onLock: async () => {
+      await customModels.create("admin-tenant", { ...kimi, vendorModelId: "mistralai/mistral-large-3", displayName: "B" });
+      settings.enabledModelIds = ["openrouter/moonshotai/kimi-k3", "openrouter/mistralai/mistral-large-3"];
+    }
+  });
+  try {
+    const response = await app.inject({ method: "DELETE", url: "/admin/custom-models?modelId=openrouter%2Fmoonshotai%2Fkimi-k3" });
+    expect(response.statusCode).toBe(200);
+    // B is in the catalog read under the lock, so it stays enabled.
+    expect(settingsUpdates).toEqual([{ enabledModelIds: ["openrouter/mistralai/mistral-large-3"] }]);
   } finally {
     await app.close();
   }

@@ -25,14 +25,19 @@ import { beforeAll, describe, expect, test } from "vitest";
 import { withTenantScope } from "../lib/db.js";
 
 import { ApprovalStore } from "../services/auth/approval-store.js";
-import { ArtifactStore } from "../services/artifacts/artifact-store.js";
+import {
+  ArtifactStore,
+  artifactPiiEligibleSql,
+  isArtifactPiiEligible,
+  type ArtifactPiiDetail
+} from "../services/artifacts/artifact-store.js";
 import { MessageStore } from "../services/message-store.js";
 import { PiiScanJobStore } from "../services/pii/pii-scan-job-store.js";
 import { TenantMemberStore } from "../services/tenant-member-store.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { UserSettingsStore } from "../services/user-settings-store.js";
 
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import {
   seedApproval,
   seedDownloadToken,
@@ -68,17 +73,17 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     // itself a tenant-spanning question. If the tenant_id predicate were
     // dropped, a membership in tenant A would admit the user to tenant B.
     test("returns the role for the tenant the user belongs to", async () => {
-      const store = new TenantMemberStore(superuserPool());
+      const store = new TenantMemberStore(maintenancePool());
       expect(await store.getRole(tenantA.tenantId, tenantA.userId)).toBe("owner");
     });
 
     test("returns null for a tenant the user does not belong to", async () => {
-      const store = new TenantMemberStore(superuserPool());
+      const store = new TenantMemberStore(maintenancePool());
       expect(await store.getRole(tenantB.tenantId, tenantA.userId)).toBeNull();
     });
 
     test("returns null for a user with no membership anywhere", async () => {
-      const store = new TenantMemberStore(superuserPool());
+      const store = new TenantMemberStore(maintenancePool());
       const stranger = await seedUser();
       expect(await store.getRole(tenantA.tenantId, stranger)).toBeNull();
     });
@@ -90,13 +95,13 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     // constructed against privilegedDb. A dropped predicate here leaks another
     // tenant's provider API key.
     beforeAll(async () => {
-      const writer = new TenantOrgSettingsStore(superuserPool(), ENCRYPTION_SECRET);
+      const writer = new TenantOrgSettingsStore(appPool(), ENCRYPTION_SECRET);
       await writer.setApiKey(tenantA.tenantId, "anthropic", "sk-tenant-a-secret");
       await writer.setApiKey(tenantB.tenantId, "anthropic", "sk-tenant-b-secret");
     });
 
     test("getDecryptedApiKey returns each tenant's own key", async () => {
-      const store = new TenantOrgSettingsStore(superuserPool(), ENCRYPTION_SECRET);
+      const store = new TenantOrgSettingsStore(maintenancePool(), ENCRYPTION_SECRET);
       expect(await store.getDecryptedApiKey(tenantA.tenantId, "anthropic")).toBe(
         "sk-tenant-a-secret"
       );
@@ -110,7 +115,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       // `WHERE tenant_id = $1` would return whichever row Postgres reaches
       // first, and `mapRow` would report that row's tenant. Reading tenant B
       // (seeded second) makes "first row wins" visibly wrong.
-      const store = new TenantOrgSettingsStore(superuserPool(), ENCRYPTION_SECRET);
+      const store = new TenantOrgSettingsStore(maintenancePool(), ENCRYPTION_SECRET);
 
       const recordB = await store.get(tenantB.tenantId);
       expect(recordB.tenantId).toBe(tenantB.tenantId);
@@ -129,7 +134,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       // The failure this guards is a predicate drop turning "no row for me"
       // into "the first row in the table", which would hand a fresh tenant
       // somebody else's key.
-      const store = new TenantOrgSettingsStore(superuserPool(), ENCRYPTION_SECRET);
+      const store = new TenantOrgSettingsStore(maintenancePool(), ENCRYPTION_SECRET);
       const fresh = await seedTenantGraph();
       const record = await store.get(fresh.tenantId);
       expect(record.tenantId).toBe(fresh.tenantId);
@@ -143,7 +148,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     function store(): UserSettingsStore {
       // Both pools privileged: these methods are called from the scheduler
       // worker, which has no request scope.
-      return new UserSettingsStore(superuserPool(), superuserPool());
+      return new UserSettingsStore(appPool(), maintenancePool());
     }
 
     test("claimJob claims a job for its own tenant", async () => {
@@ -217,7 +222,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 
   describe("ArtifactStore download tokens", () => {
     function store(): ArtifactStore {
-      return new ArtifactStore(appPool(), superuserPool());
+      return new ArtifactStore(appPool(), maintenancePool());
     }
 
     test("peek resolves a token from the token row alone", async () => {
@@ -265,6 +270,121 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       expect(await store().consumeDownloadToken({ token })).toBeNull();
     });
 
+    test("peek and consume refuse a token for an upload still waiting for its PII scan", async () => {
+      const graph = await seedTenantGraph();
+      const token = await seedDownloadToken({
+        tenantId: graph.tenantId,
+        userId: graph.userId,
+        sessionId: graph.sessionId,
+        artifactId: graph.artifactId
+      });
+      await superuserPool().query(
+        "UPDATE artifacts SET status = 'pending' WHERE tenant_id = $1 AND artifact_id = $2",
+        [graph.tenantId, graph.artifactId]
+      );
+
+      expect(await store().peekDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token })).toBeNull();
+    });
+
+    // A block can land on a record that is already ready and carries no pending
+    // marker, so setPiiDetail leaves status alone. The verdict has to deny on its
+    // own, and a token minted before the block has to stop working.
+    async function readyArtifactWithToken() {
+      const graph = await seedTenantGraph();
+      const token = await seedDownloadToken({
+        tenantId: graph.tenantId,
+        userId: graph.userId,
+        sessionId: graph.sessionId,
+        artifactId: graph.artifactId
+      });
+      return { graph, token };
+    }
+
+    async function consumedAt(token: string): Promise<string | null> {
+      const { rows } = await superuserPool().query<{ consumed_at: string | null }>(
+        `SELECT consumed_at FROM artifact_download_tokens WHERE token = $1`,
+        [token]
+      );
+      return rows[0]?.consumed_at ?? null;
+    }
+
+    test("peek and consume refuse a token minted before a later PII block, while status stays ready", async () => {
+      const { graph, token } = await readyArtifactWithToken();
+      // Positive control: the token resolves while the artifact is eligible.
+      expect(await store().peekDownloadToken({ token })).toMatchObject({ artifactId: graph.artifactId });
+
+      await store().setPiiDetail(graph.tenantId, graph.artifactId, { status: "blocked", blockReason: "pii_detected" });
+
+      const { rows } = await superuserPool().query<{ status: string }>(
+        "SELECT status FROM artifacts WHERE tenant_id = $1 AND artifact_id = $2",
+        [graph.tenantId, graph.artifactId]
+      );
+      // Precondition: this is the inconsistent record the verdict must deny.
+      expect(rows[0]?.status).toBe("ready");
+      expect(await store().peekDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect(await consumedAt(token)).toBeNull();
+    });
+
+    test.each(["pending", "scanning"] as const)(
+      "peek and consume refuse a ready artifact whose PII verdict is %s",
+      async (status) => {
+        const { graph, token } = await readyArtifactWithToken();
+        await store().setPiiDetail(graph.tenantId, graph.artifactId, { status });
+
+        expect(await store().peekDownloadToken({ token })).toBeNull();
+        expect(await store().consumeDownloadToken({ token })).toBeNull();
+      }
+    );
+
+    test("a detect-only verdict with findings stays downloadable, once", async () => {
+      const { graph, token } = await readyArtifactWithToken();
+      await store().setPiiDetail(graph.tenantId, graph.artifactId, {
+        status: "scanned",
+        modeApplied: "detect",
+        findingsCount: 3
+      });
+
+      expect(await store().peekDownloadToken({ token })).toMatchObject({ artifactId: graph.artifactId });
+      expect((await store().consumeDownloadToken({ token }))?.artifactId).toBe(graph.artifactId);
+      expect(await store().consumeDownloadToken({ token })).toBeNull();
+    });
+
+    test("the SQL eligibility predicate agrees with the TS predicate for every status and verdict", async () => {
+      // The one drift guard that needs a real database: both predicates are
+      // built side by side, and this proves they answer alike.
+      const graph = await seedTenantGraph();
+      const statuses = ["pending", "processing", "ready", "failed", "deleted"] as const;
+      const verdicts: Array<ArtifactPiiDetail["status"] | undefined> = [
+        undefined,
+        "pending",
+        "scanning",
+        "scanned",
+        "blocked",
+        "transformed",
+        "failed"
+      ];
+
+      for (const status of statuses) {
+        for (const verdict of verdicts) {
+          const detail = verdict ? { pii: { status: verdict } } : {};
+          await superuserPool().query(
+            "UPDATE artifacts SET status = $3, detail_json = $4::jsonb WHERE tenant_id = $1 AND artifact_id = $2",
+            [graph.tenantId, graph.artifactId, status, JSON.stringify(detail)]
+          );
+          const { rows } = await superuserPool().query<{ eligible: boolean }>(
+            `SELECT ${artifactPiiEligibleSql("a")} AS eligible
+               FROM artifacts a WHERE a.tenant_id = $1 AND a.artifact_id = $2`,
+            [graph.tenantId, graph.artifactId]
+          );
+          expect(rows[0]?.eligible, `${status} / ${verdict ?? "no verdict"}`).toBe(
+            isArtifactPiiEligible({ status, detail })
+          );
+        }
+      }
+    });
+
     test("a refused consume leaves the token unburnt, and the first good consume wins", async () => {
       const peer = await seedUser();
       const refused = await seedDownloadToken({
@@ -293,9 +413,39 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 
   // ── Shape 2: sweeps and claims with no tenant predicate. ──────────────────
 
+  // read_text_artifact falls back to derived text for non-text files. That
+  // derived row needs the same PII eligibility as a download.
+  describe("ArtifactStore.findLatestReadableDerived", () => {
+    function store(): ArtifactStore {
+      return new ArtifactStore(appPool(), maintenancePool());
+    }
+
+    test("returns ready derived text, and nothing once its PII verdict blocks it", async () => {
+      const graph = await seedTenantGraph();
+      const derivedId = crypto.randomUUID();
+      await superuserPool().query(
+        `
+          INSERT INTO artifacts
+            (artifact_id, tenant_id, session_id, user_id, artifact_type, source_artifact_id,
+             artifact_name, mime_type, storage_backend, storage_key, status)
+          VALUES ($1, $2, $3, $4, 'derived', $5, 'report.pdf.txt', 'text/plain', 'local', $6, 'ready')
+        `,
+        [derivedId, graph.tenantId, graph.sessionId, graph.userId, graph.artifactId, `${graph.tenantId}/${derivedId}`]
+      );
+
+      // Positive control: the derived row is found while it is eligible.
+      expect(await store().findLatestReadableDerived(graph.tenantId, graph.artifactId, graph.userId)).toMatchObject({
+        artifactId: derivedId
+      });
+
+      await store().setPiiDetail(graph.tenantId, derivedId, { status: "blocked", blockReason: "pii_detected" });
+      expect(await store().findLatestReadableDerived(graph.tenantId, graph.artifactId, graph.userId)).toBeNull();
+    });
+  });
+
   describe("cross-tenant sweeps need the privileged pool", () => {
     test("listDueJobs sees both tenants on the privileged pool and neither on the RLS pool", async () => {
-      const privileged = new UserSettingsStore(superuserPool(), superuserPool());
+      const privileged = new UserSettingsStore(appPool(), maintenancePool());
       const rlsBound = new UserSettingsStore(appPool(), appPool());
 
       const jobA = await seedScheduledJob({
@@ -318,7 +468,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
 
     test("sweepStaleJobRuns recovers runs from both tenants", async () => {
-      const privileged = new UserSettingsStore(superuserPool(), superuserPool());
+      const privileged = new UserSettingsStore(appPool(), maintenancePool());
       const rlsBound = new UserSettingsStore(appPool(), appPool());
 
       const runA = await seedScheduledJobRun({
@@ -341,7 +491,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
 
     test("PiiScanJobStore.claimDueJobs claims across tenants", async () => {
-      const privileged = new PiiScanJobStore(superuserPool(), superuserPool());
+      const privileged = new PiiScanJobStore(appPool(), maintenancePool());
       const rlsBound = new PiiScanJobStore(appPool(), appPool());
 
       const runIdA = await seedPiiScanRun({
@@ -376,7 +526,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
 
     test("PiiScanJobStore.sweepStaleClaims recovers claims across tenants", async () => {
-      const privileged = new PiiScanJobStore(superuserPool(), superuserPool());
+      const privileged = new PiiScanJobStore(appPool(), maintenancePool());
 
       const runIdA = await seedPiiScanRun({
         tenantId: tenantA.tenantId,
@@ -446,7 +596,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 
       expect(await new MessageStore(appPool()).sweepStaleStreaming(1000, 500)).toEqual([]);
 
-      const swept = await new MessageStore(superuserPool()).sweepStaleStreaming(1000, 500);
+      const swept = await new MessageStore(maintenancePool()).sweepStaleStreaming(1000, 500);
       const ids = swept.map((row) => row.messageId);
       expect(ids).toContain(msgA);
       expect(ids).toContain(msgB);
@@ -473,7 +623,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 
       expect(await new ApprovalStore(appPool()).sweepExpired(500)).toEqual([]);
 
-      const swept = await new ApprovalStore(superuserPool()).sweepExpired(500);
+      const swept = await new ApprovalStore(maintenancePool()).sweepExpired(500);
       const ids = swept.map((row) => row.approvalId);
       expect(ids).toContain(apprA);
       expect(ids).toContain(apprB);
@@ -497,7 +647,7 @@ describe.skipIf(!adminDatabaseUrl())("cross-tenant parent references", () => {
   });
 
   test("rejects an artifact that names another tenant's session", async () => {
-    const store = new ArtifactStore(appPool(), superuserPool());
+    const store = new ArtifactStore(appPool(), maintenancePool());
 
     await expect(
       store.create({

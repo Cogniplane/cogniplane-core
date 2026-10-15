@@ -1,3 +1,4 @@
+import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { ProjectInstructionsSnapshot, ModelProvider, PolicyEnforcementMode, PolicyTurnContext } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
@@ -7,6 +8,7 @@ import type { SkillsLibraryFiles } from "./deep-agents-skills-library.js";
 import type { PolicyService } from "../policy/policy-service.js";
 import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
 import type { SessionExecution } from "../session-execution-store.js";
+import type { SandboxNetworkPolicy } from "../runtime/sandbox-network-policy.js";
 
 /**
  * One pending HITL action extracted from a LangGraph interrupt: the tool the
@@ -40,8 +42,13 @@ export type DeepAgentsGraph = {
     input: unknown,
     config: {
       version: "v2";
+      callbacks?: BaseCallbackHandler[];
       configurable: { thread_id: string };
-      context?: { projectInstructions: ProjectInstructionsSnapshot | null };
+      context?: {
+        projectInstructions: ProjectInstructionsSnapshot | null;
+        /** Labelled data message of recalled memories. Model input only, never the system prompt. */
+        memoryContext?: string | null;
+      };
       signal?: AbortSignal;
     }
   ): AsyncIterable<Record<string, unknown>>;
@@ -117,6 +124,20 @@ export type DeepAgentsSessionRuntime = {
    * when the sandbox has not been created yet, so it does not break laziness.
    */
   extendSandboxTimeout?(): Promise<void>;
+  /**
+   * Starts a turn or a job in the sandbox. Call it, synchronously, at the start
+   * of every one, before anything uses the sandbox. The approved hosts can change
+   * between two turns, and another replica may have owned the session, so what
+   * was confirmed in an earlier turn does not carry over: the first operation of
+   * the new turn reads the live network of the sandbox once, compares it with the
+   * policy as it is then, and replaces the sandbox if they differ.
+   *
+   * It returns the function that ends the turn. Call it when the turn is over,
+   * however it ended (it can be called more than once): nothing that the turn asked
+   * of the sandbox runs after that. `signal` is the cancellation of the turn, and
+   * the turn ends when it aborts.
+   */
+  beginSandboxTurn?(signal?: AbortSignal): () => void;
   /** Releases any resources held for the session (checkpointer, sandbox, …). */
   dispose(): Promise<void>;
 };
@@ -138,11 +159,39 @@ export type DeepAgentsE2bOptions = {
   sandboxTimeoutMs: number;
   /** Per-execute() wall-clock budget enforced at our layer. */
   executeTimeoutMs: number;
+  /**
+   * What the sandbox may reach (VULN-13): nothing, or the hosts the tenant
+   * approved. The provider enforces it, and it is fixed when the sandbox is
+   * created. This reads the policy from the tenant settings as it is now: a new
+   * sandbox is created under it, and each turn compares the live network of the
+   * sandbox with it. A sandbox that differs is replaced.
+   */
+  resolveNetworkPolicy: () => Promise<SandboxNetworkPolicy>;
+  /** Longest time to confirm the network policy of one sandbox with the provider (E2B_NETWORK_CONFIRM_TIMEOUT_MS). */
+  networkConfirmTimeoutMs: number;
+  /** Longest time for one provider request in that confirmation (E2B_NETWORK_REQUEST_TIMEOUT_MS). */
+  networkRequestTimeoutMs: number;
+};
+
+/**
+ * Where the sandbox id of a session is saved, so that another replica can
+ * reconnect to it. The hash is that of the network policy that the sandbox was
+ * created under. It is null for a sandbox that was saved before the policy
+ * existed. It is a record for audits, never proof: every turn reads the live
+ * network from the provider and does not use the hash to skip that.
+ */
+export type DeepAgentsSandboxBinding = {
+  load: () => Promise<{ sandboxId: string; networkPolicyHash: string | null } | null>;
+  /** Written under the session lease. It throws when the lease is lost, and the new sandbox is then killed. */
+  save: (previousId: string | null, sandboxId: string, networkPolicyHash: string) => Promise<void>;
 };
 
 export type DeepAgentsRuntimeFactory = (init: {
   /** Backend-owned authorization, checked before model and tool dispatch. */
   requireExecution?: () => Promise<void>;
+  requireSpendingAllowance?: () => void;
+  /** True when the current turn holds a spending reservation. */
+  hasSpendingReservation?: () => boolean;
   tenantId: string;
   sessionId: string;
   userId: string;
@@ -180,17 +229,15 @@ export type DeepAgentsRuntimeFactory = (init: {
   workspacePath: string;
   /** E2B wiring for the lazy code-execution sandbox; null disables execute. */
   e2b: DeepAgentsE2bOptions | null;
-  sandboxBinding?: {
-    load: () => Promise<string | null>;
-    save: (previousId: string | null, sandboxId: string) => Promise<void>;
-  };
+  sandboxBinding?: DeepAgentsSandboxBinding;
   /**
-   * Called when a gone sandbox was transparently replaced — every file the
-   * agent wrote and every synced artifact is gone at that point. The adapter
-   * turns it into a runtime notice so the loss is visible rather than
-   * surfacing to the model as an unexplained file_not_found.
+   * Called when a sandbox was transparently replaced — every file the agent
+   * wrote and every synced artifact is gone at that point. The adapter turns it
+   * into a runtime notice so the loss is visible rather than surfacing to the
+   * model as an unexplained file_not_found. `reason` is `network_policy` when
+   * the old sandbox did not match the current network policy.
    */
-  onSandboxRecreated?: (info: { previousSandboxId: string | null }) => void;
+  onSandboxRecreated?: (info: { previousSandboxId: string | null; reason?: "expired" | "network_policy" }) => void;
   /**
    * Shared durable checkpointer (PostgresSaver). When absent, the factory
    * falls back to a per-session in-memory saver — conversation state then
@@ -223,8 +270,15 @@ export type DeepAgentsRuntimeFactory = (init: {
     } | null;
   };
   policyService?: Pick<PolicyService, "evaluate">;
-  /** Managed-tool facts needed before the gateway call is made. */
-  managedToolFacts?: Record<string, { readOnly: boolean; category: string | null }>;
+  /**
+   * Managed-tool facts needed before the gateway call is made.
+   * `requiresUserApproval` marks a tool that saves durable data: the user must
+   * approve its exact arguments in every turn, whatever the tenant approval policy says.
+   */
+  managedToolFacts?: Record<
+    string,
+    { readOnly: boolean; category: string | null; requiresUserApproval?: boolean }
+  >;
   /**
    * Native approval gating derived from tenant settings. `gate` false =
    * approvalPolicy "never" (no interrupts at all). Read-only tool names are
@@ -284,14 +338,5 @@ export type DeepAgentsSessionState = {
       enforcementMode: PolicyEnforcementMode;
     } | null;
   };
-  /**
-   * Remember-keys the user approved with "remember for this turn". A key is the
-   * approval kind for built-in kinds, but is scoped to the individual tool name
-   * for MCP tools (kind `mcp_tool`) — otherwise remembering one read-only MCP
-   * tool would silently auto-approve every other MCP tool (incl. destructive
-   * writes) for the rest of the turn. REPLACED with a fresh Set at turn start
-   * (pending approvals capture their turn's instance, so a late decision
-   * mutates an orphaned set instead of leaking into the next turn).
-   */
-  autoApprovedKindsForTurn: Set<string>;
+
 };

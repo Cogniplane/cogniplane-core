@@ -14,8 +14,7 @@ import type { AppConfig } from "../config.js";
 import type { Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import type { ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
-import type { ApprovalRecord } from "../services/auth/approval-store.js";
-import type { ArtifactDetail, ArtifactDownloadTokenRecord, ArtifactPiiDetail, ArtifactRecord, ArtifactStore } from "../services/artifacts/artifact-store.js";
+import { type ArtifactDetail, type ArtifactDownloadTokenRecord, type ArtifactPiiDetail, type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import type { SessionRecord } from "../services/session-store.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
@@ -24,12 +23,13 @@ import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
 import { MemoryStore } from "../services/memory-store.js";
 import { RequestLimits } from "../services/request-limits.js";
 import { FakeDatabase } from "./fake-database.js";
+import { createInMemoryApprovalStore } from "./in-memory-approval-store.js";
 import { InMemoryAuditEventStore } from "./in-memory-audit-events.js";
 import { testRuntimePolicy } from "./test-runtime-policy.js";
 import { createTestConfig } from "./test-config.js";
 import { registerApprovalRoutes, type ApprovalRouteStores } from "../routes/approvals.js";
 import { registerArtifactRoutes, type ArtifactRouteStores } from "../routes/artifacts.js";
-import { registerHealthRoutes, type HealthRouteStores } from "../routes/health.js";
+import { registerHealthRoutes } from "../routes/health.js";
 import { registerMcpRoutes, type McpRouteStores } from "../routes/mcp.js";
 import { ProxyToolMetadataCache } from "../services/mcp/proxy-tool-metadata-cache.js";
 import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
@@ -78,7 +78,8 @@ function makeTestManagedToolRegistries(extraTools: readonly ManagedToolDefinitio
         name: tool.name,
         description: tool.description,
         readOnly: tool.readOnly,
-        tenantConfigurable: true
+        tenantConfigurable: true,
+        category: "test-extras"
       }))
     );
     // One factory key for all of them — a factory produces a LIST of tool
@@ -131,12 +132,15 @@ class InMemorySessionStore {
     const now = new Date().toISOString();
     const session: SessionRecord = {
       sessionId: uuidv7(),
+      projectId: null,
       userId,
       sessionName,
       status: "active",
       purpose: options.purpose ?? "normal",
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      // New sessions get the current history format, as the column default does.
+      transcriptFormat: "current"
     };
     this.sessions.set(session.sessionId, session);
     return session;
@@ -225,6 +229,13 @@ class InMemoryMessageStore {
   private readonly toolResults = new Map<string, ToolResultRecord>();
   private nextId = 1;
   private nextToolId = 1;
+
+  async getMcpAppCall(_tenantId: string, sessionId: string, toolCallId: string) {
+    const call = this.toolResults.get(toolCallId);
+    return call?.sessionId === sessionId && call.status === "completed" && call.server && call.toolName && call.mcpApp
+      ? { app: call.mcpApp, serverId: call.server, toolName: call.toolName, input: call.input }
+      : null;
+  }
 
   // Mirrors the real store's bounded contract: newest-N selection with a
   // `hasMore` flag (see MessageStore.listBySession).
@@ -328,16 +339,15 @@ class InMemoryMessageStore {
     if (message) message.detail = { ...message.detail, runtimeNotices: notices.slice(-50) };
   }
 
-  async deleteToolResult(_tenantId: string, messageId: string, userId: string, toolResultId: string): Promise<void> {
-    const result = this.toolResults.get(toolResultId);
-    if (result?.messageId === messageId && result.userId === userId) this.toolResults.delete(toolResultId);
-  }
-
   async addTokenUsage(...args: Parameters<MessageStore["addTokenUsage"]>) {
-    const [tenantId, messageId, userId, delta, modelName] = args;
+    const [tenantId, messageId, userId, delta, modelName, costUsd] = args;
     const message = await this.getOwned(tenantId, messageId, userId);
     if (!message) return null;
     const current = message.tokenUsage ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 };
+    if (costUsd !== undefined) {
+      const unknown = costUsd === null || (current.totalTokens > 0 && message.costUsd === null);
+      message.costUsd = unknown ? null : (message.costUsd ?? 0) + costUsd;
+    }
     message.tokenUsage = {
       inputTokens: current.inputTokens + delta.inputTokens,
       cachedInputTokens: current.cachedInputTokens + delta.cachedInputTokens,
@@ -588,19 +598,6 @@ class InMemoryToolContextStore {
   }
 }
 
-class InMemoryApprovalStore {
-  approvals: ApprovalRecord[] = [];
-  async listPending(_tenantId: string, sessionId: string, _userId: string) { return this.approvals.filter((approval) => approval.sessionId === sessionId); }
-  async get(tenantId: string, approvalId: string, userId: string) {
-    return this.approvals.find(
-      (approval) =>
-        approval.tenantId === tenantId &&
-        approval.approvalId === approvalId &&
-        approval.userId === userId
-    ) ?? null;
-  }
-}
-
 class InMemoryArtifactStore {
   private readonly artifacts = new Map<string, ArtifactRecord>();
   private readonly downloadTokens = new Map<string, ArtifactDownloadTokenRecord>();
@@ -608,7 +605,7 @@ class InMemoryArtifactStore {
   constructor(private readonly sessions: InMemorySessionStore) {}
   async createUpload(input: Parameters<ArtifactStore["createUpload"]>[0]) {
     await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
-    return this.create({ ...input, artifactType: "upload", createdByType: "user", status: "pending" });
+    return this.create({ ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending" });
   }
   async listForUser(..._args: Parameters<ArtifactStore["listForUser"]>): ReturnType<ArtifactStore["listForUser"]> {
     throw new Error("Configure listForUser for cross-session artifact tests; this fixture serves session artifacts.");
@@ -643,7 +640,7 @@ class InMemoryArtifactStore {
   async getOwned(_tenantId: string, artifactId: string, userId: string) { const artifact = this.artifacts.get(artifactId); return artifact && artifact.userId === userId ? artifact : null; }
   async get(_tenantId: string, artifactId: string) { return this.artifacts.get(artifactId) ?? null; }
   async findLatestReadableDerived(_tenantId: string, sourceArtifactId: string, userId: string) {
-    const candidates = [...this.artifacts.values()].filter((artifact) => artifact.userId === userId && artifact.sourceArtifactId === sourceArtifactId && artifact.status === "ready" && artifact.mimeType.startsWith("text/"));
+    const candidates = [...this.artifacts.values()].filter((artifact) => artifact.userId === userId && artifact.sourceArtifactId === sourceArtifactId && isArtifactPiiEligible(artifact) && artifact.mimeType.startsWith("text/"));
     return candidates[candidates.length - 1] ?? null;
   }
   async update(_tenantId: string, artifactId: string, input: { status?: ArtifactRecord["status"]; detail?: ArtifactDetail }) {
@@ -725,6 +722,7 @@ export const TEST_RUNTIME_TOKEN_SECRET = runtimeTokenSecret(
 export async function createTestApp(
   configOverrides: Partial<AppConfig> & {
     proxyUpstreamUrl?: string;
+    resolveMcpServer?: McpRouteStores["dynamicConfig"]["getMcpServerForUser"];
     /** Extra managed tools registered on `managed-session-context`, for tests
      * that need to control a handler's return value. */
     extraManagedTools?: readonly ManagedToolDefinition[];
@@ -735,15 +733,22 @@ export async function createTestApp(
     // enforcement through the gateway.
     policyService?: McpRouteStores["policyService"];
     activationTracker?: McpRouteStores["activationTracker"];
+    // Defaults to a check that lets every integration tool call run.
+    integrationToolCalls?: McpRouteStores["integrationToolCalls"];
+    // Defaults to the real store over the fake database, which keeps nothing.
+    memories?: McpRouteStores["memories"];
   } = {}
 ) {
   const {
     proxyUpstreamUrl,
+    resolveMcpServer,
     extraManagedTools,
     pii,
     showEffortSelector,
     policyService: policyServiceOverride,
     activationTracker,
+    integrationToolCalls = { checkToolCall: async () => null },
+    memories: memoriesOverride,
     ...appConfigOverrides
   } = configOverrides;
   const db = new FakeDatabase();
@@ -752,7 +757,7 @@ export async function createTestApp(
   const runtimeManager = new FakeRuntimeManager();
   const activeTurns = new ActiveTurnsRegistry();
   const toolContexts = new InMemoryToolContextStore();
-  const approvals = new InMemoryApprovalStore();
+  const approvals = createInMemoryApprovalStore();
   const artifacts = new InMemoryArtifactStore(sessions);
   const auditEvents = new InMemoryAuditEventStore();
   const artifactProcessor = new NoopArtifactProcessor();
@@ -778,7 +783,7 @@ export async function createTestApp(
       role: isAdmin ? ("owner" as const) : ("member" as const)
     };
   });
-  await registerHealthRoutes(app, { deepAgentsAdapter: runtimeManager } satisfies HealthRouteStores);
+  await registerHealthRoutes(app);
   const fakeDynamicConfig: ModelRouteStores["dynamicConfig"] = {
     async getOrCreateTenantSettings() {
       return {
@@ -801,7 +806,9 @@ export async function createTestApp(
         enabledMcpServerIds: ["managed-session-context"],
         enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
         enabledModelIds: null,
+        defaultModelId: null,
         modelDefaultEfforts: {},
+        approvedSandboxEgressDomains: [],
         version: 1,
         configHash: "test-hash",
         updatedAt: new Date().toISOString()
@@ -816,6 +823,10 @@ export async function createTestApp(
     executions: { stop: async () => { throw new Error("Unexpected shared execution"); } },
     sessions,
     messages,
+    dynamicConfig: {
+      getMcpServerForUser: async () => { throw new Error("No MCP app server in this test"); },
+      compileRuntimeConfig: async () => { throw new Error("No MCP app config in this test"); }
+    },
     runtimeAdapter: runtimeManager,
     limits,
     activeTurns,
@@ -857,16 +868,18 @@ export async function createTestApp(
   } satisfies MessageRouteStores);
   await registerApprovalRoutes(app, {
     approvals,
+    sessions,
     runtimeAdapter: runtimeManager
   } satisfies ApprovalRouteStores);
   const { factoryRegistry: managedToolFactoryRegistry, catalog: managedToolCatalog } =
     makeTestManagedToolRegistries(extraManagedTools);
   await registerMcpRoutes(app, {
     db: pool,
-    memories: new MemoryStore(pool),
+    memories: memoriesOverride ?? new MemoryStore(pool),
     dynamicConfig: {
       async listSkills() { return []; },
-      async getMcpServer(_tenantId: string, serverId: string) {
+      async getMcpServerForUser(_tenantId: string, serverId: string, userId: string) {
+        if (resolveMcpServer) return resolveMcpServer(_tenantId, serverId, userId);
         if (serverId === "managed-session-context") {
           return { id: "managed-session-context", description: "Managed session context", mode: "managed" as const, routePath: "/mcp/managed-session-context", upstreamUrl: null, transportKind: "http" as const, version: 1, hash: "hash-managed-session-context" };
         }
@@ -882,6 +895,7 @@ export async function createTestApp(
     toolContexts,
     githubConnections: { async getRuntimeCredentials() { return null; } },
     notionConnections: { async getRuntimeCredentials() { return null; } },
+    jiraConnections: { async read() { return { ok: false as const, error: "No Jira connection found." }; } },
     managedToolFactoryRegistry,
     managedToolCatalog,
     // Policy Center with no rules → every action evaluates to default-allow and
@@ -920,6 +934,7 @@ export async function createTestApp(
     runtimeTokenSecret: runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET),
     artifactMaxBytes: config.ARTIFACT_MAX_UPLOAD_BYTES,
     activationTracker,
+    integrationToolCalls,
     proxyToolMetadataCache: new ProxyToolMetadataCache()
   } satisfies McpRouteStores);
   app.addHook("onClose", async () => { await rm(artifactStorageRoot, { recursive: true, force: true }); });

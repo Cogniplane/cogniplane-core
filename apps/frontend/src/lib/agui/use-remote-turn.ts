@@ -1,13 +1,12 @@
 "use client";
-// Remote-running mode. The chat's turn runs on the server, but this tab does
-// not stream it. This happens when another tab started the turn, when the user
-// comes back to a chat, when the backend refuses a send as busy, or when this
-// tab's stream drops. The host
-// polls the saved state until the server reports the turn done. While a
-// reconnect stream shows the turn live, polling waits. When that stream ends,
-// one poll confirms the end of the turn.
+// Polls a turn that runs on the server while no stream in this tab shows it:
+// the session connection could not replay it, this tab's stream dropped, or
+// the backend refused a send as busy. useSessionConnection decides when the
+// poll is active. A poll updates only the side state (approvals, tool
+// failures, notices, apps). It never changes the transcript: after the end of
+// the turn, the connection loads the session again through CopilotKit.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import type { Approval, Message } from "@cogniplane/shared-types";
 
 import { listMessages } from "../message-api";
@@ -17,63 +16,61 @@ export const REMOTE_TURN_POLL_MS = 3_000;
 
 export type RemoteTurnSnapshot = { messages: Message[]; approvals: Approval[] };
 
-export function useRemoteTurn(input: {
+/** True when the session list reports a turn that runs on the session. */
+export async function readServerRunning(sessionId: string, signal?: AbortSignal): Promise<boolean> {
+  const { sessions } = await listSessions({ ids: [sessionId], signal });
+  return sessions.some((session) => session.sessionId === sessionId && session.isRunning === true);
+}
+
+/** The callbacks must be stable: a new identity starts the poll again. */
+export function useRemoteTurnPoll(input: {
   sessionId: string;
-  /** Saved running state from the session list. */
-  serverRunning: boolean;
-  /** True while this tab streams its own turn. */
-  localRunning: boolean;
-  /** True while a live stream shows the turn, or is about to. Polling waits. */
-  liveStream?: boolean;
+  active: boolean;
+  /** A new value polls at once. */
+  refresh: number;
   onSnapshot: (snapshot: RemoteTurnSnapshot) => void;
-  onSettled?: () => void;
-}): { isRemoteRunning: boolean; enterRemoteRunning: () => void; refreshRemoteTurn: () => void } {
-  const { sessionId, serverRunning, localRunning, liveStream = false } = input;
-  const [isRemoteRunning, setIsRemoteRunning] = useState(serverRunning && !localRunning);
-  // Enter on mount and when the saved state changes to running. Do not enter
-  // on a steady `true`. After this tab's own turn ends, the list can still show
-  // the turn as running until its next reload.
-  const [previousServerRunning, setPreviousServerRunning] = useState(serverRunning);
-  // When the saved state changes to done, poll at once instead of at the next
-  // interval, so the chat does not show a finished turn as running.
-  const [pollRequest, setPollRequest] = useState(0);
-  if (serverRunning !== previousServerRunning) {
-    setPreviousServerRunning(serverRunning);
-    if (serverRunning && !localRunning) setIsRemoteRunning(true);
-    if (!serverRunning && isRemoteRunning) setPollRequest((count) => count + 1);
-  }
-
-  const onSnapshotRef = useRef(input.onSnapshot);
-  const onSettledRef = useRef(input.onSettled);
-  useEffect(() => {
-    onSnapshotRef.current = input.onSnapshot;
-    onSettledRef.current = input.onSettled;
-  });
+  /** The server no longer reports the turn. Polling stops until `active`
+   *  or `refresh` changes. */
+  onEnded: () => void;
+}): void {
+  const { sessionId, active, refresh, onSnapshot, onEnded } = input;
 
   useEffect(() => {
-    if (!isRemoteRunning || liveStream) return;
+    if (!active) return;
+    // A change of the inputs aborts the reads of this poll, so a late read
+    // cannot apply after a newer one.
     const controller = new AbortController();
+    let baseline: Message[] | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       try {
         // Read the running state first. If the turn is done, the messages read
         // after it hold the final row.
-        const { sessions } = await listSessions({ ids: [sessionId], signal: controller.signal });
-        const running = sessions.some((session) => session.sessionId === sessionId && session.isRunning === true);
+        const running = await readServerRunning(sessionId, controller.signal);
+        const loadMessages = async () => {
+          const anchor = running ? [...(baseline ?? [])].reverse().find((message) => message.role === "user") : undefined;
+          if (!anchor || !baseline) return (await listMessages(sessionId, controller.signal)).messages;
+          const tail = (await listMessages(sessionId, controller.signal, { since: anchor.messageId })).messages;
+          if (tail[0]?.messageId !== anchor.messageId) {
+            return (await listMessages(sessionId, controller.signal)).messages;
+          }
+          const anchorIndex = baseline.findIndex((message) => message.messageId === anchor.messageId);
+          return [...baseline.slice(0, anchorIndex), ...tail];
+        };
         const [page, approvals] = await Promise.all([
-          listMessages(sessionId, controller.signal),
+          loadMessages(),
           listApprovals(sessionId, controller.signal)
         ]);
         if (controller.signal.aborted) return;
-        onSnapshotRef.current({ messages: page.messages, approvals });
+        baseline = page;
+        onSnapshot({ messages: page, approvals });
         if (!running) {
-          setIsRemoteRunning(false);
-          onSettledRef.current?.();
+          onEnded();
           return;
         }
       } catch {
         if (controller.signal.aborted) return;
-        // A failed poll keeps the mode. The next poll tries again.
+        // A failed poll tries again at the next interval.
       }
       timer = setTimeout(() => void poll(), REMOTE_TURN_POLL_MS);
     };
@@ -82,16 +79,5 @@ export function useRemoteTurn(input: {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [isRemoteRunning, liveStream, pollRequest, sessionId]);
-
-  // Poll at once, also when the mode is already on, so the chat shows the
-  // saved state as soon as this tab loses its stream.
-  const enterRemoteRunning = useCallback(() => {
-    setIsRemoteRunning(true);
-    setPollRequest((count) => count + 1);
-  }, []);
-  // Poll at once only when the mode is on. A poll that reports no running
-  // turn ends the mode. A poll that reports a running turn keeps it.
-  const refreshRemoteTurn = useCallback(() => setPollRequest((count) => count + 1), []);
-  return { isRemoteRunning, enterRemoteRunning, refreshRemoteTurn };
+  }, [active, refresh, sessionId, onSnapshot, onEnded]);
 }

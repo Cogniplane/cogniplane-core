@@ -16,10 +16,10 @@ export type TokenUsage = z.infer<typeof TokenUsageSchema>;
 export const MessageFeedbackRatingSchema = z.enum(["thumbs_up", "thumbs_down"]);
 export type MessageFeedbackRating = z.infer<typeof MessageFeedbackRatingSchema>;
 
-// MCP Apps / MCP-UI resource embedded in a tool result (the `{type:"resource"}`
-// content block). Rendered client-side as a sandboxed iframe by @mcp-ui/client.
-// `uri` uses the `ui://` scheme; content is either inline `text` HTML or a
-// base64 `blob`. Kept `.passthrough()` so forward-compatible fields survive.
+// Legacy inline resource blocks retained in tool-result history. The runtime
+// no longer writes them, and the frontend does not render them; supported
+// widgets use McpAppCallSchema. Keep this read contract while retained rows
+// need it.
 export const UiResourceSchema = z.object({
   uri: z.string(),
   mimeType: z.string(),
@@ -27,6 +27,26 @@ export const UiResourceSchema = z.object({
   blob: z.string().optional()
 }).passthrough();
 export type UiResource = z.infer<typeof UiResourceSchema>;
+
+// The most characters that a widget can put in the chat message box with
+// `ui/message`. The host refuses more, and the built-in widget shell checks the
+// same value before it asks. Change it only with the "Interactive UI" skill text
+// (see apps/backend/db/migrations/069_interactive_ui_skill_draft.sql), which
+// tells the model the limit.
+export const MCP_APP_MESSAGE_MAX_CHARS = 4_000;
+
+export const McpAppCallSchema = z.object({
+  resourceUri: z.string().startsWith("ui://"),
+  readOnly: z.boolean().optional(),
+  turnContext: z.enum(["interactive", "scheduled"]).nullable().optional(),
+  input: z.record(z.string(), z.unknown()).optional(),
+  result: z.object({
+    content: z.array(z.object({ type: z.string() }).passthrough()),
+    structuredContent: z.record(z.string(), z.unknown()).optional(),
+    isError: z.boolean().optional()
+  }).passthrough()
+});
+export type McpAppCall = z.infer<typeof McpAppCallSchema>;
 
 export const ToolResultSchema = z.object({
   toolResultId: z.string(),
@@ -47,8 +67,10 @@ export const ToolResultSchema = z.object({
   // Remove the default only after retained tool results have offsets backfilled
   // or the affected conversations are deleted.
   textOffset: z.number().nullable().default(null),
-  // Present only when an MCP tool returns UI resource blocks (MCP Apps).
-  uiResources: z.array(UiResourceSchema).optional()
+  // Deprecated legacy inline resources. Read from retained rows only; not
+  // written or rendered.
+  uiResources: z.array(UiResourceSchema).optional(),
+  mcpApp: McpAppCallSchema.optional()
 }).passthrough();
 export type ToolResult = z.infer<typeof ToolResultSchema>;
 
@@ -64,8 +86,9 @@ export const MessageSchema = z.object({
   content: z.string(),
   reasoningContent: z.string(),
   // Reasoning bursts positioned by their character offset into the assistant
-  // text, for interleaved reload of AG-UI turns. Null on legacy rows, where
-  // reload renders the single `reasoningContent` block. Remove this default only
+  // text, for interleaved reload of AG-UI turns. Null on legacy rows.
+  // `reasoningContent` is the flat copy that the admin replay shows. Chat
+  // history reads `reasoningSegments`. Remove this default only
   // after retained reasoning is backfilled into segments or its conversations
   // are deleted.
   reasoningSegments: z.array(ReasoningSegmentSchema).nullable().default(null),
@@ -224,7 +247,13 @@ export type TokenUsageSeries = z.infer<typeof TokenUsageSeriesSchema>;
 
 export const TokenUsageResponseSchema = z.object({
   usage: TokenUsageSeriesSchema,
-  days: z.number()
+  days: z.number(),
+  // Present only when the request asked for `period=current_month`: the exact
+  // UTC calendar month [from, to) that every aggregation covers.
+  period: z.literal("current_month").optional(),
+  range: z.object({ from: z.string(), to: z.string() }).optional(),
+  // Echo of the `userId` filter. A response without it covers all members.
+  userId: z.string().optional()
 }).passthrough();
 export type TokenUsageResponse = z.infer<typeof TokenUsageResponseSchema>;
 

@@ -1,11 +1,26 @@
 "use client";
 
+import { Suspense } from "react";
+
+import { LastAdminChange } from "../../../components/admin/history/history-widgets";
+
+import { AdminPolicyEnforcement } from "../../../components/admin/policy/admin-policy-enforcement";
 import { AdminPolicyDecisionsCard } from "../../../components/admin/policy/admin-policy-decisions-card";
 import { AdminPolicyRulesCard } from "../../../components/admin/policy/admin-policy-rules-card";
 import { AdminPolicySimulator } from "../../../components/admin/policy/admin-policy-simulator";
-import { useDecisionsData, usePolicyData } from "../../../hooks/use-policy-data";
+import { useDecisionsData, usePolicyData, usePolicyMonitorSummary } from "../../../hooks/use-policy-data";
+import { useTenantSettings } from "../../../hooks/use-tenant-settings";
 
-export default function AdminPolicyPage() {
+// The decision filters and the review link are read from the URL.
+export default function AdminPolicyRoute() {
+  return (
+    <Suspense fallback={<p role="status" className="pt-6">Loading policies...</p>}>
+      <AdminPolicyPage />
+    </Suspense>
+  );
+}
+
+function AdminPolicyPage() {
   const {
     rules,
     lintWarnings,
@@ -20,14 +35,14 @@ export default function AdminPolicyPage() {
   } = usePolicyData();
 
   const decisions = useDecisionsData();
+  // Same cached queries as the mode row, so each rule can show its own Monitor counts.
+  const { settings } = useTenantSettings();
+  const monitoring = settings?.policyEnforcementMode === "monitor";
+  const monitorSummary = usePolicyMonitorSummary({ enabled: monitoring });
 
   return (
-    <section id="policy" className="flex flex-col gap-5 pt-5">
-      <p className="max-w-prose text-sm text-on-surface-variant">
-        Rules are evaluated at the MCP gateway for every agent tool action. Whether matching rules
-        actually gate is the tenant-level enforcement mode in Agent settings — until it&rsquo;s set
-        to enforce, rules only record decisions you can review below.
-      </p>
+    <section id="policy" className="flex flex-col gap-10 pt-5">
+      <AdminPolicyEnforcement meta={<LastAdminChange section="policy" />} />
       {error ? <p className="text-sm text-danger">{error}</p> : null}
 
       <AdminPolicyRulesCard
@@ -37,9 +52,11 @@ export default function AdminPolicyPage() {
         onSave={saveRule}
         onDelete={deleteRule}
         onReorder={reorderRules}
-      />
-
-      <AdminPolicySimulator result={simulation} simulating={simulating} onSimulate={runSimulation} />
+        // After a failed refresh the mode row says the numbers are old; the rows hide theirs.
+        evidence={monitoring && !monitorSummary.isError ? monitorSummary.data : undefined}
+      >
+        <AdminPolicySimulator result={simulation} simulating={simulating} onSimulate={runSimulation} />
+      </AdminPolicyRulesCard>
 
       <AdminPolicyDecisionsCard
         decisions={decisions.decisions}
@@ -52,6 +69,8 @@ export default function AdminPolicyPage() {
         fetching={decisions.fetching}
         error={decisions.error}
         filters={decisions.filters}
+        urlProblems={decisions.urlProblems}
+        rules={rules}
         onApply={decisions.applyFilters}
         onNext={decisions.nextPage}
         onPrev={decisions.prevPage}

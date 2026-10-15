@@ -16,7 +16,7 @@ import {
   TURN_CONTEXT_LABELS
 } from "./admin-policy-form.logic";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DisclosureRow } from "../overview-row";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -26,7 +26,6 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { PILL_GRAY, PILL_RED, PILL_GREEN } from "../../../lib/ui-tokens";
 
 type Props = {
   result: PolicySimulateResponse | null;
@@ -45,17 +44,27 @@ export function AdminPolicySimulator({ result, simulating, onSimulate }: Props) 
   const [category, setCategory] = useState("");
   const [severity, setSeverity] = useState<PolicySeverity | "any">("any");
   const [turnContext, setTurnContext] = useState<PolicyTurnContext | "any">("any");
+  // The result belongs to the submitted form, not to later edits.
+  const [testedTurn, setTestedTurn] = useState<PolicyTurnContext | "any">("any");
+
+  let status = "Check which rule matches a tool call. Nothing is recorded or blocked.";
+  if (result) {
+    status = result.matchedRuleName
+      ? `${EFFECT_LABELS[result.outcome]}. Matched "${result.matchedRuleName}".`
+      : "Allowed. No rule matched.";
+    // The result does not depend on the mode, so say what each mode does with it.
+    if (result.outcome === "block") status += " In Enforce, the call is blocked. In Monitor, it is only recorded.";
+    if (result.outcome === "require_approval") {
+      status += testedTurn === "scheduled"
+        ? " In Enforce, the call is denied, because nobody can approve a scheduled run. In Monitor, it is only recorded."
+        : testedTurn === "interactive"
+          ? " In Enforce, the user must approve the call. In Monitor, it is only recorded."
+          : " In Enforce, a chat asks the user to approve it and a scheduled run denies it. In Monitor, it is only recorded.";
+    }
+  }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Simulator</CardTitle>
-        <CardDescription>
-          Evaluate a hypothetical action against the active rules without recording or gating
-          anything.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
+    <DisclosureRow title="Test a tool call" action="Test" actionLabel="Test a tool call" status={<span role="status">{status}</span>}>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="sim-tool">Tool name</Label>
@@ -113,45 +122,22 @@ export function AdminPolicySimulator({ result, simulating, onSimulate }: Props) 
           <Button
             type="button"
             disabled={simulating || toolName.trim().length === 0}
-            onClick={() =>
+            onClick={() => {
+              setTestedTurn(turnContext);
               onSimulate({
                 toolName: toolName.trim(),
                 category: category.trim() || null,
                 severity: severity === "any" ? undefined : severity,
                 serverId: category.trim() || null,
                 turnContext: turnContext === "any" ? null : turnContext
-              })
-            }
+              });
+            }}
           >
-            {simulating ? "Evaluating…" : "Simulate"}
+            {simulating ? "Testing…" : "Run test"}
           </Button>
         </div>
 
-        {result ? (
-          <div className="rounded-lg border border-outline-variant bg-surface-container-lowest p-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className={result.outcome === "block" ? PILL_RED : PILL_GRAY}>
-                {EFFECT_LABELS[result.outcome]}
-              </span>
-              {result.enforced ? (
-                <span className={PILL_RED}>would gate</span>
-              ) : (
-                <span className={PILL_GREEN}>would proceed</span>
-              )}
-              {result.matchedRuleName ? (
-                <span className="text-xs text-on-surface-faint">
-                  matched: {result.matchedRuleName}
-                </span>
-              ) : (
-                <span className="text-xs text-on-surface-faint">no rule matched (default allow)</span>
-              )}
-            </div>
-            {result.explanation ? (
-              <p className="mt-1 text-sm text-on-surface-variant">{result.explanation}</p>
-            ) : null}
-          </div>
-        ) : null}
-      </CardContent>
-    </Card>
+        {result?.explanation ? <p className="text-sm text-on-surface-variant">{result.explanation}</p> : null}
+    </DisclosureRow>
   );
 }

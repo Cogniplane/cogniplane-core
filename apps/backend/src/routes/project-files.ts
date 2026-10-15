@@ -8,7 +8,17 @@ import {
   ProjectLibrarySchema,
   ProjectFolderSchema,
   ProjectFileHistorySchema,
+  ProjectLibraryFilesQuerySchema,
+  ProjectLibraryFilesPageSchema,
+  ProjectFilePickerQuerySchema,
+  ProjectFilePickerPageSchema,
+  ProjectFilePickerSelectionQuerySchema,
+  ProjectFilePickerSelectionSchema,
+  ProjectFolderListQuerySchema,
+  ProjectFolderPageSchema,
+  ProjectFolderDetailSchema,
 } from "@cogniplane/shared-types";
+import { attachmentContentDisposition } from "../services/artifacts/artifact-filename.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import type { AppDependencies } from "../app-dependencies.js";
 import {
@@ -53,10 +63,57 @@ export async function registerProjectFileRoutes(
     routes.get("/projects/:projectId/library", async (request, reply) => {
       const params = parseRequestInput(reply, projectParams, request.params);
       if (!params.ok) return params.response;
+      const legacy = await files.list({ ...request.auth, ...params.value });
+      reply.header("cache-control", "private, no-store");
+      reply.header("x-library-truncated", legacy.truncated ? "true" : "false");
       return serialize(
         ProjectLibrarySchema,
-        await files.list({ ...request.auth, ...params.value }),
+        legacy,
       );
+    });
+    routes.get("/projects/:projectId/library/files", async (request, reply) => {
+      const params = parseRequestInput(reply, projectParams, request.params);
+      if (!params.ok) return params.response;
+      const query = parseRequestInput(reply, ProjectLibraryFilesQuerySchema, request.query);
+      if (!query.ok) return query.response;
+      reply.header("cache-control", "private, no-store");
+      return serialize(ProjectLibraryFilesPageSchema,
+        await files.listFilesPage({ ...request.auth, ...params.value }, query.value));
+    });
+    routes.get("/projects/:projectId/library/picker", async (request, reply) => {
+      const params = parseRequestInput(reply, projectParams, request.params);
+      if (!params.ok) return params.response;
+      const query = parseRequestInput(reply, ProjectFilePickerQuerySchema, request.query);
+      if (!query.ok) return query.response;
+      reply.header("cache-control", "private, no-store");
+      return serialize(ProjectFilePickerPageSchema,
+        await files.pickerPage({ ...request.auth, ...params.value }, query.value));
+    });
+    routes.get("/projects/:projectId/library/picker/selection", async (request, reply) => {
+      const params = parseRequestInput(reply, projectParams, request.params);
+      if (!params.ok) return params.response;
+      const query = parseRequestInput(reply, ProjectFilePickerSelectionQuerySchema, request.query);
+      if (!query.ok) return query.response;
+      reply.header("cache-control", "private, no-store");
+      return serialize(ProjectFilePickerSelectionSchema, {
+        items: await files.pickerSelection({ ...request.auth, ...params.value }, query.value.ids),
+      });
+    });
+    routes.get("/projects/:projectId/library/folders", async (request, reply) => {
+      const params = parseRequestInput(reply, projectParams, request.params);
+      if (!params.ok) return params.response;
+      const query = parseRequestInput(reply, ProjectFolderListQuerySchema, request.query);
+      if (!query.ok) return query.response;
+      reply.header("cache-control", "private, no-store");
+      return serialize(ProjectFolderPageSchema,
+        await files.listFolders({ ...request.auth, ...params.value }, query.value));
+    });
+    routes.get("/projects/:projectId/library/folders/:folderId", async (request, reply) => {
+      const params = parseRequestInput(reply, folderParams, request.params);
+      if (!params.ok) return params.response;
+      reply.header("cache-control", "private, no-store");
+      return serialize(ProjectFolderDetailSchema,
+        await files.getFolder({ ...request.auth, ...params.value }, params.value.folderId));
     });
     routes.post(
       "/projects/:projectId/library/files",
@@ -291,7 +348,7 @@ export async function registerProjectFileRoutes(
         reply.header("x-content-type-options", "nosniff");
         reply.header(
           "content-disposition",
-          `attachment; filename*=UTF-8''${encodeURIComponent(content.name)}`,
+          attachmentContentDisposition(content.name),
         );
         return reply.type(content.mimeType).send(handle.stream);
       },
@@ -319,6 +376,15 @@ export async function registerProjectFileRoutes(
           ...content,
           status: "ready",
         });
+        // Extraction can be slow. Check access and the version again before
+        // the text is returned, as the artifact preview does.
+        const current = await files.content(
+          { ...request.auth, ...params.value },
+          params.value.fileId,
+          params.value.versionId,
+        );
+        if (current.storageKey !== content.storageKey)
+          return reply.code(409).send(apiError("project_file_changed", "The file changed. Load the preview again."));
         if (text === null)
           return reply
             .code(422)

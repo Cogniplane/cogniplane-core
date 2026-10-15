@@ -9,6 +9,9 @@ export type RuntimeSessionRef = {
   sessionId: string;
   runtimeId: string;
   runtimePolicy: ResolvedRuntimePolicy;
+  mcpServerSources?: Array<{ id: string; hash: string; credentialVersion?: number | null }>;
+  // Connected upstream account per integration, recorded at turn start.
+  integrationAccounts?: Record<string, string>;
 };
 
 // Thrown by an adapter's turn runner when the session already has a turn in

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { AdminSkillEditModal } from "./admin-skill-edit-modal";
 import { AdminSkillFileModal } from "./admin-skill-file-modal";
@@ -8,8 +8,9 @@ import { AdminSkillGithubImportTab } from "./admin-skill-github-import-tab";
 import { AdminSkillInlineTab } from "./admin-skill-inline-tab";
 import { AdminSkillMarketplaceTab } from "./admin-skill-marketplace-tab";
 import { AdminSkillZipUploadTab } from "./admin-skill-zip-upload-tab";
+import { ReleaseImpactStep } from "./release-impact-step";
+import { previewAdminSkillRelease } from "@/lib/admin-api";
 import {
-  describeSkillState,
   FILE_LIST_COLLAPSED_LIMIT,
   formatBytes,
   formatRevisionLabel,
@@ -21,6 +22,8 @@ import { useSkillImports } from "../../../hooks/use-skill-imports";
 import { useSkillRevisions } from "../../../hooks/use-skill-revisions";
 import type {
   AdminSkill,
+  AdminSkillReleaseSnapshot,
+  SkillImportResponse,
   SkillMarketplaceCatalog,
   SkillMarketplaceEntry,
   SkillRevision
@@ -48,41 +51,73 @@ export function AdminSkillCard(props: {
   marketplace: SkillMarketplaceCatalog | null;
   manifestUrl: string | null;
   busyKey: string | null;
-  onDisable: (skillId: string) => void;
-  onPublish: (skillId: string) => void;
-  onUnpublish: (skillId: string) => void;
-  onImportZip: (file: File) => Promise<void>;
-  onImportGithub: (input: { githubUrl: string; ref?: string; subdirectory?: string }) => Promise<void>;
+  onDisable: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => Promise<AdminSkill>;
+  onPublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => Promise<AdminSkill>;
+  onUnpublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => Promise<AdminSkill>;
+  onImportZip: (file: File) => Promise<SkillImportResponse>;
+  onImportGithub: (input: { githubUrl: string; ref?: string; subdirectory?: string }) => Promise<SkillImportResponse>;
   onImportInline: (input: {
     skillId: string;
     skillName: string;
     description: string;
     instructions: string;
-  }) => Promise<void>;
-  onImportMarketplace: (entry: SkillMarketplaceEntry) => Promise<void>;
+  }) => Promise<SkillImportResponse>;
+  onImportMarketplace: (entry: SkillMarketplaceEntry) => Promise<SkillImportResponse>;
   onListRevisions: (skillId: string) => Promise<SkillRevision[]>;
   onActivateRevision: (input: {
     skillId: string;
     skillRevisionId: number;
     reviewNotes?: string | null;
+    audience?: "test-users" | "members";
+    expectedSnapshot: AdminSkillReleaseSnapshot;
   }) => Promise<void>;
   onSaveManifestUrl: (url: string | null) => Promise<void>;
+  /** A skill to bring into view, for example from quick jump. */
+  targetSkillId?: string | null;
 }) {
   const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
   const [filePreview, setFilePreview] = useState<FilePreview | null>(null);
+  const [importedSkill, setImportedSkill] = useState<AdminSkill | null>(null);
+  const [reviewTarget, setReviewTarget] = useState<number | null>(null);
+  const [quickTarget, setQuickTarget] = useState<{ skillId: string; audience: "off" | "test-users" | "members" } | null>(null);
+
+  async function showImported(result: SkillImportResponse): Promise<void> {
+    setImportedSkill(result.skill);
+    setReviewTarget(result.revision.skillRevisionId);
+    await revisions.open(result.skill.skillId);
+  }
 
   const imports = useSkillImports({
     manifestUrl: props.manifestUrl,
     onImportZip: props.onImportZip,
     onImportGithub: props.onImportGithub,
     onImportInline: props.onImportInline,
+    onImported: (result) => { void showImported(result); },
     onSaveManifestUrl: props.onSaveManifestUrl
   });
 
   const revisions = useSkillRevisions({
-    onListRevisions: props.onListRevisions,
-    onActivateRevision: props.onActivateRevision
+    onListRevisions: props.onListRevisions
   });
+
+  const targetSkillId = props.targetSkillId ?? null;
+  const targetExists = targetSkillId !== null && props.skills.some((skill) => skill.skillId === targetSkillId);
+  const targetCardRef = useRef<HTMLDivElement | null>(null);
+  const shownTarget = useRef<string | null>(null);
+  const { expandedSkillId, open: openRevisions } = revisions;
+  useEffect(() => {
+    if (!targetSkillId) {
+      shownTarget.current = null;
+      return;
+    }
+    if (!targetExists || shownTarget.current === targetSkillId) return;
+    shownTarget.current = targetSkillId;
+    targetCardRef.current?.scrollIntoView?.({ block: "start" });
+    targetCardRef.current?.focus({ preventScroll: true });
+    // Open the history only when no other history is open. Closing another
+    // skill would discard its unsaved review notes.
+    if (expandedSkillId === null) void openRevisions(targetSkillId);
+  }, [targetSkillId, targetExists, expandedSkillId, openRevisions]);
 
   async function handleEditSubmit(input: {
     skillName: string;
@@ -91,13 +126,13 @@ export function AdminSkillCard(props: {
   }): Promise<void> {
     if (!editTarget) return;
     try {
-      await props.onImportInline({
+      const imported = await props.onImportInline({
         skillId: editTarget.skillId,
         skillName: input.skillName,
         description: input.description,
         instructions: input.instructions
       });
-      await revisions.refresh(editTarget.skillId);
+      await showImported(imported);
       setEditTarget(null);
     } catch {
       return;
@@ -120,17 +155,16 @@ export function AdminSkillCard(props: {
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className={SECTION_LABEL}>Skills registry</p>
-            <h2 className="text-lg font-semibold text-on-surface">Bundles, imports, and activation</h2>
+            <h2 className="text-lg font-semibold text-on-surface">Review and release skills</h2>
             <p className="mt-1 text-sm text-on-surface-variant">
-              Import reviewed AgentSkills bundles, inspect revisions, and explicitly activate what new
-              runtimes should receive.
+              Add a skill, review its instructions and permissions, then choose who can use it.
             </p>
           </div>
           <div className="flex items-center gap-2">
             <span className={PILL}>{props.skills.length} total</span>
             <span className={PILL}>{props.skills.filter((skill) => skill.enabled).length} enabled</span>
             <Button type="button" onClick={imports.panel.toggle}>
-              {imports.panel.open ? "Cancel" : "Import skill"}
+              {imports.panel.open ? "Cancel" : "Add skill"}
             </Button>
           </div>
         </div>
@@ -156,7 +190,7 @@ export function AdminSkillCard(props: {
                 manifestUrlDraft={imports.marketplace.manifestUrlDraft}
                 marketplace={props.marketplace}
                 onClearManifestUrl={() => void imports.marketplace.clearManifestUrl()}
-                onImportMarketplace={props.onImportMarketplace}
+                onImportMarketplace={async (entry) => { await showImported(await props.onImportMarketplace(entry)); }}
                 onManifestUrlDraftChange={imports.marketplace.setManifestUrlDraft}
                 onSaveManifestUrl={(event) => void imports.marketplace.saveManifestUrl(event)}
               />
@@ -189,55 +223,40 @@ export function AdminSkillCard(props: {
         )}
 
         <div className="flex flex-col gap-4">
-          {props.skills.map((skill) => {
+          {(importedSkill && !props.skills.some((skill) => skill.skillId === importedSkill.skillId)
+            ? [importedSkill, ...props.skills]
+            : props.skills).map((skill) => {
             const skillRevisions = revisions.revisionMap[skill.skillId] ?? [];
             const isExpanded = revisions.expandedSkillId === skill.skillId;
+            const isTarget = skill.skillId === targetSkillId;
             return (
               <div
                 key={skill.skillId}
-                className="flex flex-col gap-4 rounded-lg border border-outline-variant bg-surface-container-lowest p-4 sm:flex-row"
+                ref={isTarget ? targetCardRef : undefined}
+                tabIndex={isTarget ? -1 : undefined}
+                aria-current={isTarget ? "true" : undefined}
+                className={`flex scroll-mt-6 flex-col gap-4 rounded-lg border p-4 outline-none sm:flex-row sm:flex-wrap ${isTarget ? "border-primary bg-surface-container-lowest ring-2 ring-primary/30" : "border-outline-variant bg-surface-container-lowest"}`}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <strong className="text-base font-semibold text-on-surface">{skill.skillName}</strong>
-                    <span className={PILL}>v{skill.version}</span>
+                    {isTarget ? <span className="rounded-full bg-primary px-2 py-0.5 text-xs font-medium text-primary-foreground">Selected</span> : null}
                     <span
                       className={`rounded-full px-2 py-0.5 text-xs font-medium ${
                         skill.enabled
                           ? "bg-success-surface text-success"
-                          : "bg-surface-container text-on-surface-faint"
+                          : "bg-surface-container text-on-surface-variant"
                       }`}
                     >
-                      {skill.enabled ? "enabled" : "disabled"}
+                      {skill.enabled
+                        ? skill.isPublished ? "Available to members" : "Available to test users"
+                        : skill.activeRevisionId ? "Off" : "Awaiting review"}
                     </span>
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        skill.isPublished
-                          ? "bg-success-surface text-success"
-                          : "bg-surface-container text-on-surface-faint"
-                      }`}
-                    >
-                      {skill.isPublished ? "published" : "draft"}
-                    </span>
-                    {skill.activeSourceType ? <span className={CHIP}>{skill.activeSourceType}</span> : null}
-                    <span
-                      className={PILL}
-                      title="Distinct sessions in the last 30 days where this skill was actually used (tool-call match)."
-                    >
-                      Used {skill.invokedSessions30d ?? 0}
-                    </span>
-                    <span
-                      className={PILL}
-                      title="Distinct sessions in the last 30 days where this skill was offered to the agent (regardless of whether it was used)."
-                    >
-                      Available {skill.materializedSessions30d ?? 0}
-                    </span>
+                    {!skill.isInherited && skill.pendingRevisionCount ? <span className={CHIP}>{skill.pendingRevisionCount} update{skill.pendingRevisionCount === 1 ? "" : "s"} to review</span> : null}
                   </div>
-                  <p className="mt-1 text-xs text-on-surface-faint">{skill.skillId}</p>
                   <p className="mt-1 text-sm text-on-surface-variant">{skill.description ?? "No description"}</p>
-                  <p className="mt-1 text-xs text-on-surface-faint">{describeSkillState(skill)}</p>
-                  {skill.activeRevisionId ? (
-                    <span className={`${CHIP} mt-2`}>active revision #{skill.activeRevisionId}</span>
+                  {skill.isInherited ? (
+                    <p className="mt-2 text-sm text-on-surface-variant">Managed by the platform. You can inspect its history here; availability and revisions are controlled by the platform.</p>
                   ) : null}
 
                   {revisions.loadError[skill.skillId] ? (
@@ -253,9 +272,21 @@ export function AdminSkillCard(props: {
                             skill={skill}
                             revision={revision}
                             busyKey={props.busyKey}
-                            onActivate={(notes) =>
-                              void revisions.activate(skill.skillId, revision.skillRevisionId, notes)
-                            }
+                            onRelease={async (audience, notes, snapshot) => {
+                              await props.onActivateRevision({
+                                skillId: skill.skillId,
+                                skillRevisionId: revision.skillRevisionId,
+                                reviewNotes: notes,
+                                audience, expectedSnapshot: snapshot
+                              });
+                              await revisions.refresh(skill.skillId);
+                              setReviewTarget(null);
+                            }}
+                            isReviewTarget={reviewTarget === revision.skillRevisionId}
+                            onSaveDraft={() => {
+                              setReviewTarget(null);
+                              void revisions.toggle(skill.skillId);
+                            }}
                             onPreviewFile={(path) =>
                               setFilePreview({
                                 skillId: skill.skillId,
@@ -279,21 +310,26 @@ export function AdminSkillCard(props: {
                     variant="outline"
                     onClick={() => void revisions.toggle(skill.skillId)}
                   >
-                    {isExpanded ? "Hide revisions" : "Review revisions"}
+                    {isExpanded ? "Hide history" : "Review and history"}
                   </Button>
-                  {skill.isPublished ? (
-                    <Button type="button" variant="outline" onClick={() => props.onUnpublish(skill.skillId)}>
-                      Unpublish
-                    </Button>
-                  ) : (
-                    <Button type="button" variant="outline" onClick={() => props.onPublish(skill.skillId)}>
-                      Publish
-                    </Button>
-                  )}
-                  <Button type="button" variant="outline" onClick={() => props.onDisable(skill.skillId)}>
-                    Disable
-                  </Button>
+                  {!skill.isInherited && skill.enabled ? <Button type="button" variant="outline" onClick={() => setQuickTarget({ skillId: skill.skillId, audience: skill.isPublished ? "test-users" : "members" })}>{skill.isPublished ? "Limit to test users" : "Make available to members"}</Button> : null}
+                  {!skill.isInherited && (skill.enabled ? <Button type="button" variant="outline" onClick={() => setQuickTarget({ skillId: skill.skillId, audience: "off" })}>Disable</Button> : (
+                    skill.activeRevisionId ? <Button type="button" variant="outline" onClick={() => void revisions.open(skill.skillId)}>Re-enable</Button> : null
+                  ))}
                 </div>
+                {quickTarget?.skillId === skill.skillId && skill.enabled && !skill.isInherited ? <div className="min-w-0 w-full border-t border-outline-variant pt-4"><ReleaseImpactStep
+                  key={`${skill.skillId}:${skill.version}:${quickTarget.audience}`}
+                  choiceKey={`${skill.skillId}:${skill.version}:${quickTarget.audience}`}
+                  previewLabel={`Preview ${quickTarget.audience === "off" ? "disable" : quickTarget.audience === "test-users" ? "limit to test users" : "availability to members"}`}
+                  confirmLabel={`Confirm ${quickTarget.audience === "off" ? "disable" : quickTarget.audience === "test-users" ? "limit to test users" : "availability to members"}`}
+                  disabled={props.busyKey !== null}
+                  load={() => previewAdminSkillRelease(skill.skillId, { action: "audience", revisionId: skill.activeRevisionId, audience: quickTarget.audience })}
+                  confirm={async (snapshot) => {
+                    if (quickTarget.audience === "off") await props.onDisable(skill.skillId, snapshot);
+                    else if (quickTarget.audience === "test-users") await props.onUnpublish(skill.skillId, snapshot);
+                    else await props.onPublish(skill.skillId, snapshot);
+                    setQuickTarget(null);
+                  }} /></div> : null}
               </div>
             );
           })}
@@ -328,7 +364,9 @@ function RevisionRow(props: {
   skill: AdminSkill;
   revision: SkillRevision;
   busyKey: string | null;
-  onActivate: (reviewNotes: string | null) => void;
+  onRelease: (audience: "test-users" | "members", reviewNotes: string | null, snapshot: AdminSkillReleaseSnapshot) => Promise<void>;
+  onSaveDraft: () => void;
+  isReviewTarget: boolean;
   onPreviewFile: (path: string) => void;
   onEdit: () => void;
 }) {
@@ -337,24 +375,56 @@ function RevisionRow(props: {
   const isActive = skill.activeRevisionId === revision.skillRevisionId;
   const github = getRevisionGithubMetadata(revision);
   const files = getRevisionFiles(revision);
-  const validationWarnings = revision.validationMessages.filter(
-    (message) => String(message.level ?? "") === "warning"
-  );
+  const validationMessages = revision.validationMessages;
   const allowedTools = getRevisionAllowedTools(revision);
   const [filesExpanded, setFilesExpanded] = useState(false);
   const [reviewNotes, setReviewNotes] = useState<string>(revision.reviewNotes ?? "");
+  const [audience, setAudience] = useState<"test-users" | "members" | null>(null);
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+  const [releasing, setReleasing] = useState(false);
+  const instructions = typeof revision.metadata?.instructions === "string" ? revision.metadata.instructions : "";
   const visibleFiles = filesExpanded ? files : files.slice(0, FILE_LIST_COLLAPSED_LIMIT);
   const hiddenCount = files.length - visibleFiles.length;
 
   return (
     <div className="rounded-md border border-outline-variant bg-surface-container-low p-3">
+      {props.isReviewTarget ? <p className="mb-2 text-sm font-medium text-on-surface">Review this new draft before release.</p> : null}
       <div className="mb-2 flex flex-wrap items-center gap-2">
         <strong className="text-sm font-semibold text-on-surface">{formatRevisionLabel(revision)}</strong>
         <span className={CHIP}>{revision.reviewStatus}</span>
         <span className={CHIP}>{revision.validationStatus}</span>
         {revision.bundleName ? <span className={CHIP}>{revision.bundleName}</span> : null}
       </div>
-      <p className="text-xs text-on-surface-faint">{revision.sourceLabel ?? "No source label"}</p>
+      <p className="text-xs text-on-surface-variant">{revision.sourceLabel ?? "No source label"}</p>
+
+      {instructions ? (
+        <div className="mt-3">
+          <span className={SECTION_LABEL}>Instructions</span>
+          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-surface-container-lowest p-3 text-xs text-on-surface">{instructions}</pre>
+        </div>
+      ) : null}
+
+      <div className="mt-3">
+        <span className={SECTION_LABEL}>Validation and permissions</span>
+        <p className="text-sm text-on-surface">{revision.validationStatus}</p>
+        {allowedTools.length ? <p className="text-sm text-on-surface-variant">Declared tools: {allowedTools.join(", ")}</p> : <p className="text-sm text-on-surface-variant">No tools declared.</p>}
+      </div>
+
+      {validationMessages.length ? (
+        <div className="mt-3">
+          <span className={SECTION_LABEL}>Validation results</span>
+          <ul className="mt-1 list-disc pl-5 text-sm text-on-surface-variant">
+            {validationMessages.map((message, index) => (
+              <li key={`${revision.skillRevisionId}-validation-${index}`}>
+                {String(message.level ?? "Result")}: {String(message.path ?? "SKILL.md")}: {String(message.message ?? "No details")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <details className="mt-3">
+        <summary className="cursor-pointer text-sm font-medium text-on-surface">Technical details and files</summary>
 
       <div className="mt-3 grid gap-3 sm:grid-cols-3">
         <div>
@@ -382,33 +452,13 @@ function RevisionRow(props: {
           <span className={SECTION_LABEL}>Validation</span>
           <p className="text-sm text-on-surface">{revision.validationStatus}</p>
           <p className="text-xs text-on-surface-faint">
-            {validationWarnings.length
-              ? `${validationWarnings.length} warning${validationWarnings.length === 1 ? "" : "s"}`
-              : "No warnings recorded"}
+            {validationMessages.length
+              ? `${validationMessages.length} result${validationMessages.length === 1 ? "" : "s"}`
+              : "No issues recorded"}
           </p>
         </div>
       </div>
 
-      {allowedTools.length ? (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {allowedTools.map((tool) => (
-            <span key={tool} className={CHIP}>{tool}</span>
-          ))}
-        </div>
-      ) : null}
-
-      {validationWarnings.length ? (
-        <div className="mt-3">
-          <span className={SECTION_LABEL}>Validation warnings</span>
-          <ul className="mt-1 list-disc pl-5 text-sm text-on-surface-variant">
-            {validationWarnings.map((message, index) => (
-              <li key={`${revision.skillRevisionId}-warning-${index}`}>
-                {String(message.path ?? "SKILL.md")}: {String(message.message ?? "Warning")}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
 
       {files.length ? (
         <div className="mt-3">
@@ -442,38 +492,60 @@ function RevisionRow(props: {
           ) : null}
         </div>
       ) : null}
+      <p className="mt-3 text-xs text-on-surface-faint">Skill ID: {skill.skillId}. Revision #{revision.skillRevisionId}. Used in {skill.invokedSessions30d ?? 0} sessions and offered in {skill.materializedSessions30d ?? 0} sessions in the last 30 days.</p>
+      </details>
 
-      <div className="mt-3 flex flex-col gap-1.5">
-        <Label htmlFor={`review-notes-${reviewKey}`}>Review notes</Label>
-        <Textarea
-          id={`review-notes-${reviewKey}`}
-          rows={2}
-          value={reviewNotes}
-          onChange={(event) => setReviewNotes(event.target.value)}
-        />
-      </div>
+      {skill.isInherited ? (
+        revision.reviewNotes ? <p className="mt-3 text-sm text-on-surface-variant">Review notes: {revision.reviewNotes}</p> : null
+      ) : (
+        <div className="mt-3 flex flex-col gap-1.5">
+          <Label htmlFor={`review-notes-${reviewKey}`}>Review notes</Label>
+          <Textarea
+            id={`review-notes-${reviewKey}`}
+            rows={2}
+            value={reviewNotes}
+            onChange={(event) => setReviewNotes(event.target.value)}
+          />
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={isActive || props.busyKey === `activate-skill-${skill.skillId}-${revision.skillRevisionId}`}
-          onClick={() => props.onActivate(reviewNotes.trim() === "" ? null : reviewNotes)}
-        >
-          {isActive ? "Active" : "Activate revision"}
-        </Button>
+        {!skill.isInherited && (!isActive || !skill.enabled || releaseError) ? (
+          <div className="w-full space-y-3">
+            <fieldset className="space-y-1 text-sm text-on-surface">
+              <legend className="font-medium">Who can use this skill?</legend>
+              <label className="flex items-center gap-2"><input type="radio" name={`audience-${reviewKey}`} checked={audience === "test-users"} onChange={() => setAudience("test-users")} /> Test users</label>
+              <label className="flex items-center gap-2"><input type="radio" name={`audience-${reviewKey}`} checked={audience === "members"} onChange={() => setAudience("members")} /> All members</label>
+            </fieldset>
+            <div className="flex flex-wrap gap-2">
+              {audience ? <ReleaseImpactStep
+                key={`${reviewKey}:${skill.version}:${audience}`}
+                choiceKey={`${reviewKey}:${skill.version}:${audience}`}
+                previewLabel={isActive ? "Preview re-enable" : "Preview release"}
+                confirmLabel={isActive ? "Confirm re-enable" : "Confirm release"}
+                disabled={releasing || props.busyKey !== null || !["validated", "validated_with_warnings", "active"].includes(revision.validationStatus)}
+                load={() => previewAdminSkillRelease(skill.skillId, { action: "activate", revisionId: revision.skillRevisionId, audience })}
+                confirm={async (snapshot) => {
+                  setReleaseError(null); setReleasing(true);
+                  try { await props.onRelease(audience, reviewNotes.trim() || null, snapshot); }
+                  catch (error) { setReleaseError(error instanceof Error ? error.message : "Could not release this skill."); throw error; }
+                  finally { setReleasing(false); }
+                }} /> : <Button type="button" size="sm" disabled>Choose an audience to preview</Button>}
+              {!isActive ? <Button type="button" variant="outline" size="sm" onClick={props.onSaveDraft}>Save as draft</Button> : null}
+            </div>
+          </div>
+        ) : isActive && skill.enabled ? <span className="text-sm text-success">Active revision</span> : null}
         {isActive && revision.bundleStorageUri === null && !skill.isInherited ? (
           <Button type="button" variant="outline" size="sm" onClick={props.onEdit}>
             Edit
           </Button>
         ) : null}
-        {isActive && revision.bundleStorageUri !== null ? (
-          <span className="text-xs text-on-surface-faint">Re-upload to update</span>
+        {isActive && revision.bundleStorageUri !== null && !skill.isInherited ? (
+          <span className="text-xs text-on-surface-variant">Re-upload to update</span>
         ) : null}
         {isActive && revision.bundleStorageUri === null && skill.isInherited ? (
-          <span className="text-xs text-on-surface-faint">
-            Inherited from platform — copy to a new skill id to customize
+          <span className="text-xs text-on-surface-variant">
+            Managed by the platform. Import a copy with a new skill ID to customize it.
           </span>
         ) : null}
       </div>

@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import type {
   Artifact,
   Project,
   ProjectFile,
+  ProjectFilePickerEntry,
   ProjectFileVersion,
 } from "@cogniplane/shared-types";
 import { isTextReadableArtifact, SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
@@ -23,9 +24,22 @@ import {
 import { formatFileSize } from "./artifact-panel.logic";
 import { uploadArtifact } from "@/lib/artifact-api";
 import * as api from "@/lib/project-file-api";
-import { createProjectSession } from "@/lib/project-api";
-import { projectFolderPath, selectProjectFiles } from "./project-files.logic";
+import { createProjectSession, listProjectArtifacts } from "@/lib/project-api";
+import { hasTargetConflict } from "./project-files.logic";
+import {
+  FolderBreadcrumbs,
+  FolderDestinationPicker,
+  useFolderDestination,
+} from "./project-folder-picker";
 import { queryKeys } from "@/lib/query-keys";
+import { useDebouncedValue } from "@/hooks/use-debounced-value";
+import {
+  useProjectFileSelection,
+  useProjectFilePicker,
+  useProjectFolder,
+  useProjectFolders,
+  useProjectLibraryFiles,
+} from "@/hooks/use-project-library";
 import { fetchModels } from "../lib/api-client";
 
 const SELECT =
@@ -100,15 +114,28 @@ function VersionPreview({
 
 export function ProjectFiles({
   project,
-  sources,
+  initialSources,
+  sourcesUpdatedAt,
   canEdit = true,
 }: {
   project: Project;
-  sources: Artifact[];
+  initialSources: Artifact[];
+  sourcesUpdatedAt: number;
   canEdit?: boolean;
 }) {
   const router = useRouter();
   const client = useQueryClient();
+  const sourcesQuery = useQuery({
+    queryKey: queryKeys.projects.artifacts(project.projectId),
+    queryFn: ({ signal }) => listProjectArtifacts(project.projectId, signal),
+    initialData: initialSources,
+    initialDataUpdatedAt: sourcesUpdatedAt,
+    staleTime: 10_000,
+    refetchInterval: (query) => query.state.data?.some((file) =>
+      file.status === "pending" || file.status === "processing" ||
+      file.detail?.pii?.status === "pending" || file.detail?.pii?.status === "scanning"
+    ) ? 10_000 : false
+  });
   const capabilitiesQuery = useQuery({
     queryKey: queryKeys.models.list(),
     queryFn: fetchModels
@@ -125,7 +152,9 @@ export function ProjectFiles({
   const [name, setName] = useState("");
   const [destination, setDestination] = useState("");
   const [kind, setKind] = useState<"published" | "draft">("published");
-  const [target, setTarget] = useState<ProjectFile | null>(null);
+  const [target, setTarget] = useState<ProjectFilePickerEntry | null>(null);
+  const [targetSearch, setTargetSearch] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
   const [editing, setEditing] = useState<{
     file: ProjectFile;
     name: string;
@@ -134,30 +163,70 @@ export function ProjectFiles({
   } | null>(null);
   const [removing, setRemoving] = useState<ProjectFile | null>(null);
   const [historyFile, setHistoryFile] = useState<ProjectFile | null>(null);
+  // Panels open below the list. Move focus into a panel when it opens, so
+  // keyboard and screen reader users reach it.
+  const removeConfirmRef = useRef<HTMLButtonElement>(null);
+  const editNameRef = useRef<HTMLInputElement>(null);
+  const historyHeadingRef = useRef<HTMLHeadingElement>(null);
+  const removingId = removing?.fileId;
+  const editingId = editing?.file.fileId;
+  const historyId = historyFile?.fileId;
+  useLayoutEffect(() => { if (removingId) removeConfirmRef.current?.focus(); }, [removingId]);
+  useLayoutEffect(() => { if (editingId) editNameRef.current?.focus(); }, [editingId]);
+  useLayoutEffect(() => { if (historyId) historyHeadingRef.current?.focus(); }, [historyId]);
   const [preview, setPreview] = useState<{
     file: ProjectFile;
     version: ProjectFileVersion;
   } | null>(null);
-  const library = useQuery({
-    queryKey: queryKeys.projects.library(project.projectId),
-    queryFn: () => api.getProjectLibrary(project.projectId),
+  const q = useDebouncedValue(query.trim());
+  const targetQ = useDebouncedValue(targetSearch.trim());
+  // Published files without a search are scoped to one folder. Drafts, Trash,
+  // and search results are project-wide.
+  const files = useProjectLibraryFiles(project.projectId, {
+    section,
+    folderId: section === "published" && !q ? folderId ?? undefined : undefined,
+    q: q || undefined,
+    sort,
   });
+  const childFolders = useProjectFolders(
+    project.projectId,
+    { parentId: folderId ?? undefined },
+    section === "published" && !q,
+  );
+  const folderDetail = useProjectFolder(project.projectId, folderId);
+  const currentFolder = folderDetail.data?.folder.deletedAt
+    ? undefined
+    : folderDetail.data?.folder;
+  const targets = useProjectFilePicker(
+    project.projectId,
+    { q: targetQ || undefined, kind: "published" },
+    addOpen,
+  );
+  // Loads the current version of the chosen target, even when it is not on a loaded page.
+  const targetSelection = useProjectFileSelection(
+    project.projectId,
+    target ? [target.fileId] : [],
+  );
+  const targetNow = targetSelection.data?.items.find(
+    (entry) => entry.fileId === target?.fileId,
+  );
+  const targetGone =
+    Boolean(target) &&
+    targetSelection.isSuccess &&
+    !targetSelection.isPlaceholderData &&
+    !targetNow;
+  const editDestination = useFolderDestination(
+    project.projectId,
+    editing?.folderId ?? "",
+  );
+  const saveDestination = useFolderDestination(project.projectId, destination);
   const history = useQuery({
     queryKey: ["projects", project.projectId, "history", historyFile?.fileId],
     queryFn: () =>
       api.getProjectFileHistory(project.projectId, historyFile!.fileId),
     enabled: Boolean(historyFile),
   });
-  const files = library.data?.files ?? [],
-    folders = library.data?.folders ?? [];
-  const liveFolders = folders.filter((folder) => !folder.deletedAt);
-  const published = files.filter(
-    (file) => file.kind === "published" && !file.trashedAt,
-  );
-  const currentFolder = liveFolders.find(
-    (folder) => folder.folderId === folderId,
-  );
-  const readySources = sources.filter(
+  const readySources = (sourcesQuery.data ?? initialSources).filter(
     (file) =>
       file.status === "ready" &&
       file.artifactType !== "derived" &&
@@ -193,24 +262,16 @@ export function ProjectFiles({
     },
   });
   const disabled = !canEdit || Boolean(project.archivedAt) || mutation.isPending;
-  const folderOptions = (
-    <>
-      <option value="">Files</option>
-      {liveFolders.map((folder) => (
-        <option key={folder.folderId} value={folder.folderId}>
-          {projectFolderPath(folders, folder.folderId)}
-        </option>
-      ))}
-    </>
-  );
-  const visible = selectProjectFiles(files, { section, folderId, query, sort });
-  const canResolveConflict = (file: ProjectFile) => {
+  const visible = files.items;
+  const canResolveConflict = (file: (typeof visible)[number]) => {
     const enabledToolIds = capabilitiesQuery.data?.enabledToolIds ?? [];
     if (!enabledToolIds.includes("project_get_conflict_context") || !enabledToolIds.includes("project_reconcile_conflict")) return false;
-    if (project.agentFileMode !== "read-write" || file.kind !== "draft" || !file.targetFileId || file.trashedAt) return false;
-    const target = files.find((candidate) => candidate.fileId === file.targetFileId);
-    if (!target || target.kind !== "published" || target.trashedAt || target.version.versionId === file.baseVersionId) return false;
+    if (project.agentFileMode !== "read-write" || !hasTargetConflict(file)) return false;
     return isTextReadableArtifact(file.version.mimeType);
+  };
+  const openFolder = (next: string | null) => {
+    setFolderId(next);
+    setRenamingFolder(false);
   };
   const fileActions = (file: ProjectFile, version = file.version) => (
     <>
@@ -233,6 +294,12 @@ export function ProjectFiles({
       </Button>
     </>
   );
+  // The loaded row refreshes after mutations. Fall back to the version shown
+  // when the history opened if the row is no longer on a loaded page.
+  const historyVersionId = historyFile
+    ? (visible.find((file) => file.fileId === historyFile.fileId)?.version
+        .versionId ?? historyFile.version.versionId)
+    : null;
   const edit = (file: ProjectFile) => {
     mutation.reset();
     setEditing({
@@ -281,11 +348,11 @@ export function ProjectFiles({
       {!canEdit ? (
         <p className="text-sm text-on-surface-variant">You have read-only access to this project&apos;s files.</p>
       ) : null}
-      {library.isPending ? <Skeleton className="h-32" /> : null}
-      {library.isError ? (
+      {files.query.isPending ? <Skeleton className="h-32" /> : null}
+      {files.query.isError ? (
         <div role="alert">
           <p>Could not load project files.</p>
-          <Button variant="outline" onClick={() => void library.refetch()}>
+          <Button variant="outline" onClick={() => void files.query.refetch()}>
             Try again
           </Button>
         </div>
@@ -319,32 +386,17 @@ export function ProjectFiles({
             aria-label="Project folders"
             className="flex flex-wrap items-center gap-2"
           >
-            <Button
-              size="xs"
-              variant="ghost"
-              onClick={() => {
-                setFolderId(null);
-                setRenamingFolder(false);
-              }}
-            >
-              Files
-            </Button>
+            <FolderBreadcrumbs
+              detail={folderId ? folderDetail.data : undefined}
+              onNavigate={openFolder}
+            />
             {folderId ? (
               <>
-                <span className="text-sm">
-                  /{" "}
-                  {projectFolderPath(folders, folderId).replace(
-                    /^Files \/ /,
-                    "",
-                  )}
-                </span>
                 <Button
                   size="xs"
                   variant="ghost"
-                  onClick={() => {
-                    setFolderId(currentFolder?.parentId ?? null);
-                    setRenamingFolder(false);
-                  }}
+                  disabled={!folderDetail.data}
+                  onClick={() => openFolder(folderDetail.data?.folder.parentId ?? null)}
                 >
                   Up one folder
                 </Button>
@@ -369,7 +421,7 @@ export function ProjectFiles({
                         project.projectId,
                         folderId,
                       );
-                      setFolderId(currentFolder?.parentId ?? null);
+                      openFolder(currentFolder?.parentId ?? null);
                     })
                   }
                 >
@@ -378,23 +430,60 @@ export function ProjectFiles({
               </>
             ) : null}
           </nav>
-          {!query ? (
+          {folderId && folderDetail.data?.folder.deletedAt ? (
+            <div role="status" className="flex flex-wrap items-center gap-2 text-sm">
+              This folder was removed.
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => openFolder(folderDetail.data?.nearestLiveFolderId ?? null)}
+              >
+                Go to nearest folder
+              </Button>
+            </div>
+          ) : null}
+          {folderId && folderDetail.isError ? (
+            <div role="alert" className="flex flex-wrap items-center gap-2 text-sm">
+              Could not open this folder.
+              <Button size="xs" variant="outline" onClick={() => openFolder(null)}>
+                Go to Files
+              </Button>
+            </div>
+          ) : null}
+          {!q ? (
             <div className="flex flex-wrap gap-2">
-              {liveFolders
-                .filter((folder) => folder.parentId === folderId)
-                .map((folder) => (
+              {childFolders.items.map((folder) => (
+                <Button
+                  key={folder.folderId}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => openFolder(folder.folderId)}
+                >
+                  {folder.name} /
+                </Button>
+              ))}
+              {childFolders.query.hasNextPage ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={childFolders.query.isFetchingNextPage}
+                  onClick={() => void childFolders.query.fetchNextPage()}
+                >
+                  {childFolders.query.isFetchingNextPage ? "Loading..." : "More folders"}
+                </Button>
+              ) : null}
+              {childFolders.query.isError ? (
+                <p role="alert" className="text-sm text-danger">
+                  Could not load folders.{" "}
                   <Button
-                    key={folder.folderId}
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      setFolderId(folder.folderId);
-                      setRenamingFolder(false);
-                    }}
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => void childFolders.query.refetch()}
                   >
-                    {folder.name} /
+                    Try again
                   </Button>
-                ))}
+                </p>
+              ) : null}
             </div>
           ) : null}
           <form
@@ -455,9 +544,9 @@ export function ProjectFiles({
             : "Files and drafts can be recovered for 30 days after removal."}
         </p>
       )}
-      {library.data && visible.length === 0 ? (
+      {files.query.isSuccess && visible.length === 0 ? (
         <p className="text-sm text-on-surface-variant">
-          {query
+          {q
             ? "No file names match your search."
             : section === "draft"
               ? "No drafts to review."
@@ -475,7 +564,7 @@ export function ProjectFiles({
             <div className="min-w-0 flex-1 basis-48">
               <p className="break-words text-sm font-medium">{file.name}</p>
               <p className="text-xs text-on-surface-variant">
-                {projectFolderPath(folders, file.folderId)} · Version{" "}
+                {file.folderPath} · Version{" "}
                 {file.version.versionNumber} ·{" "}
                 {formatFileSize(file.version.fileSizeBytes)}
               </p>
@@ -484,9 +573,9 @@ export function ProjectFiles({
               </p>
               {file.targetFileId ? (
                 <p className="text-xs text-on-surface-variant">
-                  Updates{" "}
-                  {files.find((target) => target.fileId === file.targetFileId)
-                    ?.name ?? "an unavailable file"}
+                  {file.target
+                    ? `Updates ${file.target.name}${file.target.available ? "" : " (no longer published)"}`
+                    : "Updates an unavailable file"}
                 </p>
               ) : null}
               {file.trashedAt ? (
@@ -576,6 +665,25 @@ export function ProjectFiles({
           </li>
         ))}
       </ul>
+      {files.listChanged ? (
+        <div role="status" className="flex flex-wrap items-center gap-2 text-sm">
+          <p>Files changed while you scrolled. Reload the list.</p>
+          <Button size="sm" variant="outline" onClick={() => void files.reload()}>
+            Reload list
+          </Button>
+        </div>
+      ) : null}
+      {files.query.hasNextPage ? (
+        <Button
+          className="self-start"
+          size="sm"
+          variant="outline"
+          disabled={files.query.isFetchingNextPage}
+          onClick={() => void files.query.fetchNextPage()}
+        >
+          {files.query.isFetchingNextPage ? "Loading..." : "More files"}
+        </Button>
+      ) : null}
       {removing ? (
         <div
           role="group"
@@ -587,6 +695,7 @@ export function ProjectFiles({
           </p>
           <div className="flex gap-2">
             <Button
+              ref={removeConfirmRef}
               variant="destructive"
               size="sm"
               disabled={disabled}
@@ -639,6 +748,7 @@ export function ProjectFiles({
         >
           <Label htmlFor="project-file-name">File name</Label>
           <Input
+            ref={editNameRef}
             id="project-file-name"
             value={editing.name}
             maxLength={255}
@@ -646,25 +756,12 @@ export function ProjectFiles({
               setEditing({ ...editing, name: event.target.value })
             }
           />
-          <Label htmlFor="project-file-destination">Destination folder</Label>
-          <select
-            id="project-file-destination"
-            className={SELECT}
+          <FolderDestinationPicker
+            projectId={project.projectId}
+            label="Destination folder"
             value={editing.folderId}
-            onChange={(event) =>
-              setEditing({ ...editing, folderId: event.target.value })
-            }
-          >
-            {folderOptions}
-            {editing.folderId &&
-            !liveFolders.some(
-              (folder) => folder.folderId === editing.folderId,
-            ) ? (
-              <option value={editing.folderId} disabled>
-                Missing folder. Choose a destination.
-              </option>
-            ) : null}
-          </select>
+            onChange={(next) => setEditing({ ...editing, folderId: next })}
+          />
           {editing.file.kind === "draft" &&
           editing.file.targetFileId &&
           !editing.file.trashedAt ? (
@@ -685,12 +782,7 @@ export function ProjectFiles({
               disabled={
                 disabled ||
                 !editing.name.trim() ||
-                Boolean(
-                  editing.folderId &&
-                  !liveFolders.some(
-                    (folder) => folder.folderId === editing.folderId,
-                  ),
-                )
+                editDestination.status !== "live"
               }
             >
               {editing.file.trashedAt ? "Confirm restore" : "Save location"}
@@ -712,7 +804,7 @@ export function ProjectFiles({
           className="flex flex-col gap-2"
         >
           <div className="flex items-center justify-between">
-            <h4 className="text-sm font-semibold">
+            <h4 ref={historyHeadingRef} tabIndex={-1} className="text-sm font-semibold">
               History of {historyFile.name}
             </h4>
             <Button
@@ -743,9 +835,7 @@ export function ProjectFiles({
               </span>
               {fileActions(historyFile, version)}
               {historyFile.kind === "published" &&
-              version.versionId !==
-                files.find((file) => file.fileId === historyFile.fileId)
-                  ?.version.versionId ? (
+              version.versionId !== historyVersionId ? (
                 <Button
                   size="xs"
                   variant="outline"
@@ -756,8 +846,7 @@ export function ProjectFiles({
                         project.projectId,
                         historyFile.fileId,
                         version.versionId,
-                        files.find((file) => file.fileId === historyFile.fileId)
-                          ?.version.versionId ?? historyFile.version.versionId,
+                        historyVersionId!,
                       ),
                     )
                   }
@@ -769,7 +858,10 @@ export function ProjectFiles({
           ))}
         </section>
       ) : null}
-      <details className="border-t border-outline-variant pt-4">
+      <details
+        className="border-t border-outline-variant pt-4"
+        onToggle={(event) => setAddOpen(event.currentTarget.open)}
+      >
         <summary className="cursor-pointer text-sm font-medium">
           Add a file or draft
         </summary>
@@ -816,11 +908,12 @@ export function ProjectFiles({
                   folderId: destination || null,
                   kind: target ? "draft" : kind,
                   targetFileId: target?.fileId ?? null,
-                  baseVersionId: target?.version.versionId ?? null,
+                  baseVersionId: target?.versionId ?? null,
                 });
                 setName("");
                 setSourceId("");
                 setTarget(null);
+                setTargetSearch("");
               });
             }}
           >
@@ -853,41 +946,76 @@ export function ProjectFiles({
               disabled={disabled}
               onChange={(event) => setName(event.target.value)}
             />
-            <Label htmlFor="project-save-folder">Destination folder</Label>
-            <select
-              id="project-save-folder"
-              className={SELECT}
-              value={destination}
-              disabled={disabled}
-              onChange={(event) => setDestination(event.target.value)}
-            >
-              {folderOptions}
-            </select>
+            {addOpen ? (
+              <FolderDestinationPicker
+                projectId={project.projectId}
+                label="Destination folder"
+                value={destination}
+                disabled={disabled}
+                onChange={setDestination}
+              />
+            ) : null}
             <Label htmlFor="project-save-target">New file or update</Label>
-            <select
-              id="project-save-target"
-              className={SELECT}
-              value={target?.fileId ?? ""}
+            <Input
+              aria-label="Search published files to update"
+              placeholder="Search published files"
+              value={targetSearch}
               disabled={disabled}
-              onChange={(event) => {
-                const next =
-                  published.find(
-                    (file) => file.fileId === event.target.value,
-                  ) ?? null;
-                setTarget(next);
-                if (next) {
-                  setName(next.name);
-                  setDestination(next.folderId ?? "");
-                }
-              }}
-            >
-              <option value="">New file</option>
-              {published.map((file) => (
-                <option key={file.fileId} value={file.fileId}>
-                  Update {file.name} · Version {file.version.versionNumber}
-                </option>
-              ))}
-            </select>
+              onChange={(event) => setTargetSearch(event.target.value)}
+            />
+            <div className="flex gap-2">
+              <select
+                id="project-save-target"
+                className={SELECT}
+                value={target?.fileId ?? ""}
+                disabled={disabled}
+                onChange={(event) => {
+                  const next =
+                    [target, ...targets.items].find(
+                      (entry) => entry?.fileId === event.target.value,
+                    ) ?? null;
+                  setTarget(next);
+                  if (next) {
+                    setName(next.name);
+                    setDestination(next.folderId ?? "");
+                  }
+                }}
+              >
+                <option value="">New file</option>
+                {target &&
+                !targets.items.some((entry) => entry.fileId === target.fileId) ? (
+                  <option value={target.fileId}>
+                    Update {target.name} · Version {target.versionNumber}
+                  </option>
+                ) : null}
+                {targets.items.map((entry) => (
+                  <option key={entry.fileId} value={entry.fileId}>
+                    Update {entry.name} · Version {entry.versionNumber}
+                  </option>
+                ))}
+              </select>
+              {targets.query.hasNextPage ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  disabled={targets.query.isFetchingNextPage}
+                  onClick={() => void targets.query.fetchNextPage()}
+                >
+                  {targets.query.isFetchingNextPage ? "Loading..." : "More results"}
+                </Button>
+              ) : null}
+            </div>
+            {targets.query.isError ? (
+              <p role="alert" className="text-sm text-danger">
+                Could not load published files.
+              </p>
+            ) : null}
+            {targetQ && targets.query.isSuccess && targets.items.length === 0 ? (
+              <p className="text-sm text-on-surface-variant">
+                No published files match your search.
+              </p>
+            ) : null}
             {!target ? (
               <>
                 <Label htmlFor="project-save-kind">Save as</Label>
@@ -907,24 +1035,33 @@ export function ProjectFiles({
             ) : (
               <p className="text-sm text-on-surface-variant">
                 This update will be a draft based on version{" "}
-                {target.version.versionNumber}. Promotion checks for newer
-                changes.
+                {target.versionNumber}. Promotion checks for newer changes.
               </p>
             )}
-            {target &&
-            published.find((file) => file.fileId === target.fileId)?.version
-              .versionId !== target.version.versionId ? (
+            {target && targetNow && targetNow.versionId !== target.versionId ? (
               <p role="status" className="text-sm text-on-surface-variant">
                 The target changed since you selected it. This draft keeps
-                version {target.version.versionNumber} as its base and may need
+                version {target.versionNumber} as its base and may need
                 reconciliation before promotion. To start from the current
                 version, choose New file, then select the target again.
+              </p>
+            ) : null}
+            {targetGone ? (
+              <p role="status" className="text-sm text-danger">
+                The target file is no longer published. Choose New file or
+                another file to update.
               </p>
             ) : null}
             <Button
               className="self-start"
               size="sm"
-              disabled={disabled || !source || !name.trim()}
+              disabled={
+                disabled ||
+                !source ||
+                !name.trim() ||
+                targetGone ||
+                saveDestination.status !== "live"
+              }
             >
               {mutation.isPending
                 ? "Saving..."

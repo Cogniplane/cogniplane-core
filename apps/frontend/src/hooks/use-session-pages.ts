@@ -1,7 +1,7 @@
 "use client";
 
-import { useInfiniteQuery, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { replaceEqualDeep, useInfiniteQuery, useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { SESSION_TRASH_RETENTION_DAYS, type ProjectDetail, type Session } from "@cogniplane/shared-types";
 import { listArchivedSessions, listSessions, type SessionList } from "../lib/session-api";
 import { listProjectSessions } from "../lib/project-api";
@@ -69,6 +69,7 @@ export function useSessionPages(input: {
   const effectiveSearch = normalizedSearch ? settledSearch : "";
   const isDebouncing = normalizedSearch !== effectiveSearch;
   const queryEnabled = enabled && !isDebouncing;
+  const queryClient = useQueryClient();
   const queryKey = useMemo(() => [
     ...(status === "archived" ? queryKeys.sessions.archived() : queryKeys.sessions.list()),
     "pages", { search: effectiveSearch, personalOnly }
@@ -82,13 +83,49 @@ export function useSessionPages(input: {
     getNextPageParam: (last) => last.nextCursor ?? undefined,
     select: flattenSessionPages,
     enabled: queryEnabled,
-    refetchInterval: queryEnabled && poll ? 10_000 : false,
     refetchOnWindowFocus: true
   });
+  const headQuery = useQuery({
+    queryKey: ["session-list-head", status, effectiveSearch, personalOnly],
+    queryFn: ({ signal }) => (status === "archived" ? listArchivedSessions : listSessions)({
+      search: effectiveSearch, personalOnly, signal
+    }),
+    initialData: () => queryClient.getQueryData<InfiniteData<SessionList>>(queryKey)?.pages[0],
+    initialDataUpdatedAt: () => queryClient.getQueryState(queryKey)?.dataUpdatedAt,
+    enabled: queryEnabled && poll && query.isSuccess,
+    staleTime: 10_000,
+    refetchInterval: queryEnabled && poll ? 10_000 : false
+  });
+  const lastPageRefresh = useRef(0);
+  const { dataUpdatedAt: pagesUpdatedAt, isFetching: pagesFetching, refetch: refetchPages } = query;
+  const data = useMemo(() => {
+    if (!query.data || !headQuery.data || !poll || headQuery.dataUpdatedAt <= query.dataUpdatedAt) {
+      return query.data;
+    }
+    const firstPage = queryClient.getQueryData<InfiniteData<SessionList>>(queryKey)?.pages[0];
+    if (firstPage && replaceEqualDeep(firstPage, headQuery.data) === firstPage) return query.data;
+    const rows = new Map<string, Session>();
+    for (const session of [...headQuery.data.sessions, ...query.data.sessions]) {
+      if (!rows.has(session.sessionId)) rows.set(session.sessionId, session);
+    }
+    return { ...query.data, sessions: [...rows.values()] };
+  }, [query.data, query.dataUpdatedAt, headQuery.data, headQuery.dataUpdatedAt, poll, queryClient, queryKey]);
+  useEffect(() => {
+    if (!poll || !headQuery.data || headQuery.dataUpdatedAt <= pagesUpdatedAt || pagesFetching) return;
+    const firstPage = queryClient.getQueryData<InfiniteData<SessionList>>(queryKey)?.pages[0];
+    if (!firstPage) return;
+    const previousIds = firstPage.sessions.map((session) => session.sessionId);
+    const currentIds = headQuery.data.sessions.map((session) => session.sessionId);
+    if (previousIds.length !== currentIds.length || previousIds.some((id, index) => id !== currentIds[index])) {
+      if (lastPageRefresh.current === headQuery.dataUpdatedAt) return;
+      lastPageRefresh.current = headQuery.dataUpdatedAt;
+      void refetchPages();
+    }
+  }, [headQuery.data, headQuery.dataUpdatedAt, poll, pagesUpdatedAt, pagesFetching, refetchPages, queryClient, queryKey]);
   return {
     ...query, queryKey,
     // Do not offer rows or a page cursor from the previous search term.
-    data: isDebouncing ? undefined : query.data,
+    data: isDebouncing ? undefined : data,
     isPending: isDebouncing || query.isPending,
     isSuccess: !isDebouncing && query.isSuccess,
     isError: !isDebouncing && query.isError,

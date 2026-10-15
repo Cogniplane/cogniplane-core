@@ -1,3 +1,5 @@
+import type { PoolClient } from "pg";
+
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 
@@ -60,6 +62,21 @@ export type ScheduledJobRecord = {
   updatedAt: string;
 };
 
+/**
+ * Admission limit for a write that can leave a scheduled job enabled.
+ * `maxActive` is the most enabled jobs one user may hold; 0 turns the cap off.
+ */
+export type ScheduledJobAdmission = { maxActive: number };
+
+export type CreateScheduledJobResult =
+  | { status: "created"; job: ScheduledJobRecord }
+  | { status: "limit_reached" };
+
+export type UpdateScheduledJobResult =
+  | { status: "updated"; job: ScheduledJobRecord }
+  | { status: "not_found" }
+  | { status: "limit_reached" };
+
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -116,6 +133,40 @@ function mapScheduledJobRun(row: Record<string, unknown>): ScheduledJobRunRecord
     summary: row.summary ? String(row.summary) : null,
     createdAt: isoTimestamp(row.created_at)
   };
+}
+
+// Every write that can raise a user's enabled-job count takes this
+// transaction lock first. The quota is not stored in a row, so a row lock alone
+// cannot stop two inserts from both passing the count. The key is a JSON array
+// so that two different (tenant, user) pairs cannot build the same key.
+async function lockScheduledJobQuota(
+  client: PoolClient,
+  tenantId: string,
+  userId: string
+): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    JSON.stringify(["scheduled-job-quota", tenantId, userId])
+  ]);
+}
+
+// Only enabled jobs fire recurring synthetic turns, so disabled or parked jobs
+// (invalid cron, poison-disabled) must not count against the cap. Otherwise
+// dead rows could keep a user from creating new jobs.
+async function countEnabledScheduledJobs(
+  client: PoolClient,
+  tenantId: string,
+  userId: string
+): Promise<number> {
+  const result = await client.query(
+    `
+      SELECT COUNT(*) AS count
+      FROM scheduled_jobs
+      WHERE tenant_id = $1 AND user_id = $2 AND enabled = TRUE
+    `,
+    [tenantId, userId]
+  );
+
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 export class UserSettingsStore {
@@ -201,43 +252,39 @@ export class UserSettingsStore {
   }
 
   /**
-   * Count a user's ENABLED scheduled jobs. Used by the active-job cap at
-   * creation time: only enabled jobs fire recurring synthetic turns, so
-   * disabled/parked jobs (invalid cron, poison-disabled) must not count against
-   * the limit — otherwise a user could be wedged out of creating new jobs by
-   * dead rows that no longer do anything.
+   * Create a job. Admission to the per-user active-job cap runs in the same
+   * transaction as the insert, under a per-(tenant, user) lock: only ENABLED
+   * jobs fire recurring synthetic turns, so a disabled job is never counted and
+   * never blocked. Without the lock, two requests could both read 49 enabled
+   * jobs and each insert one more.
    */
-  async countActiveScheduledJobs(tenantId: string, userId: string): Promise<number> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const result = await client.query(
-        `
-          SELECT COUNT(*) AS count
-          FROM scheduled_jobs
-          WHERE tenant_id = $1 AND user_id = $2 AND enabled = TRUE
-        `,
-        [tenantId, userId]
-      );
-
-      return Number(result.rows[0]?.count ?? 0);
-    });
-  }
-
-  async createScheduledJob(input: {
-    tenantId: string;
-    jobId: string;
-    userId: string;
-    jobName: string;
-    description: string | null;
-    cronExpression: string;
-    timeZone: string;
-    targetType: "prompt" | "skill";
-    targetRef: string | null;
-    input: Record<string, unknown>;
-    settingsSnapshot: Record<string, unknown>;
-    enabled: boolean;
-    nextRunAt: string | null;
-  }): Promise<ScheduledJobRecord> {
+  async createScheduledJob(
+    input: {
+      tenantId: string;
+      jobId: string;
+      userId: string;
+      jobName: string;
+      description: string | null;
+      cronExpression: string;
+      timeZone: string;
+      targetType: "prompt" | "skill";
+      targetRef: string | null;
+      input: Record<string, unknown>;
+      settingsSnapshot: Record<string, unknown>;
+      enabled: boolean;
+      nextRunAt: string | null;
+    },
+    admission: ScheduledJobAdmission
+  ): Promise<CreateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
+      if (input.enabled && admission.maxActive > 0) {
+        await lockScheduledJobQuota(client, input.tenantId, input.userId);
+        const active = await countEnabledScheduledJobs(client, input.tenantId, input.userId);
+        if (active >= admission.maxActive) {
+          return { status: "limit_reached" };
+        }
+      }
+
       const result = await client.query(
         `
           INSERT INTO scheduled_jobs (
@@ -276,26 +323,57 @@ export class UserSettingsStore {
         ]
       );
 
-      return mapScheduledJob(result.rows[0]);
+      return { status: "created", job: mapScheduledJob(result.rows[0]) };
     });
   }
 
-  async updateScheduledJob(input: {
-    tenantId: string;
-    jobId: string;
-    userId: string;
-    jobName: string;
-    description: string | null;
-    cronExpression: string;
-    timeZone: string;
-    targetType: "prompt" | "skill";
-    targetRef: string | null;
-    input: Record<string, unknown>;
-    settingsSnapshot: Record<string, unknown>;
-    enabled: boolean;
-    nextRunAt: string | null;
-  }): Promise<ScheduledJobRecord | null> {
+  /**
+   * Update a job. A disabled to enabled change is admitted like a create. The
+   * transition is decided from the job row read under its row lock, not from
+   * a caller's earlier read, so enabling a job that is already enabled never
+   * counts it twice. Lock order is always quota lock, then job row.
+   */
+  async updateScheduledJob(
+    input: {
+      tenantId: string;
+      jobId: string;
+      userId: string;
+      jobName: string;
+      description: string | null;
+      cronExpression: string;
+      timeZone: string;
+      targetType: "prompt" | "skill";
+      targetRef: string | null;
+      input: Record<string, unknown>;
+      settingsSnapshot: Record<string, unknown>;
+      enabled: boolean;
+      nextRunAt: string | null;
+    },
+    admission: ScheduledJobAdmission
+  ): Promise<UpdateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
+      if (input.enabled && admission.maxActive > 0) {
+        await lockScheduledJobQuota(client, input.tenantId, input.userId);
+        const current = await client.query(
+          `
+            SELECT enabled
+            FROM scheduled_jobs
+            WHERE tenant_id = $1 AND job_id = $2 AND user_id = $3
+            FOR UPDATE
+          `,
+          [input.tenantId, input.jobId, input.userId]
+        );
+        if (!current.rows[0]) {
+          return { status: "not_found" };
+        }
+        if (!current.rows[0].enabled) {
+          const active = await countEnabledScheduledJobs(client, input.tenantId, input.userId);
+          if (active >= admission.maxActive) {
+            return { status: "limit_reached" };
+          }
+        }
+      }
+
       const result = await client.query(
         `
           UPDATE scheduled_jobs
@@ -331,7 +409,9 @@ export class UserSettingsStore {
         ]
       );
 
-      return result.rows[0] ? mapScheduledJob(result.rows[0]) : null;
+      return result.rows[0]
+        ? { status: "updated", job: mapScheduledJob(result.rows[0]) }
+        : { status: "not_found" };
     });
   }
 

@@ -2,7 +2,7 @@
 // Runs a real DeepAgentsBrowserAgent through @ag-ui/client against a stubbed
 // 429 response. It checks the error shape from runHttpRequest and the
 // onRunFailed mutation. A fake agent cannot prove either.
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../api-client", () => ({
@@ -12,8 +12,8 @@ vi.mock("../api-client", () => ({
   request: vi.fn()
 }));
 
+import { renderSessionHooks } from "../../test-helpers/agui-session-hooks";
 import { DeepAgentsBrowserAgent, isSessionBusyError } from "./deep-agents-browser-agent";
-import { useAguiCustomEvents } from "./use-agui-custom-events";
 
 afterEach(() => {
   cleanup();
@@ -31,17 +31,14 @@ function stubBusyResponse() {
 }
 
 describe("a send refused as session_busy", () => {
-  it("removes the unsent user message and reports busy, not a failed turn", async () => {
+  it("removes the unsent user message and shows the other turn, not a failed turn", async () => {
     stubBusyResponse();
     // @ag-ui/client logs the rethrown run error; it is expected here.
     vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const agent = new DeepAgentsBrowserAgent({
-      sessionId: "s-1",
-      initialMessages: [{ id: "saved", role: "user", content: "earlier" }]
-    });
-    const onSettled = vi.fn();
-    const onSessionBusy = vi.fn();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { onRunSettled: onSettled, onSessionBusy }));
+    const agent = new DeepAgentsBrowserAgent({ sessionId: "s-1" });
+    // An earlier turn, as the session connection restores it.
+    agent.setMessages([{ id: "saved", role: "user", content: "earlier" }]);
+    const { result, onTurnSettled } = renderSessionHooks(agent);
 
     agent.addMessage({ id: "optimistic", role: "user", content: "second question" });
     let thrown: unknown;
@@ -51,10 +48,11 @@ describe("a send refused as session_busy", () => {
 
     expect(isSessionBusyError(thrown)).toBe(true);
     expect(agent.messages.map((message) => message.id)).toEqual(["saved"]);
-    expect(onSessionBusy).toHaveBeenCalledOnce();
-    expect(onSettled).not.toHaveBeenCalled();
-    expect(result.current.isRunning).toBe(false);
-    expect(result.current.turnActivity).toBeNull();
+    expect(result.current.connection).toMatchObject({
+      busyRefused: true, running: false, remoteRunning: true, activity: null
+    });
+    expect(onTurnSettled).not.toHaveBeenCalled();
+    expect(result.current.events.notices).toEqual([]);
   });
 
   it("keeps pending approvals that belong to the running turn", async () => {
@@ -65,13 +63,13 @@ describe("a send refused as session_busy", () => {
       approvalId: "ap-1", sessionId: "s-1", itemId: "item", kind: "command_execution",
       title: "Run command", summary: "ls", status: "pending", createdAt: "2026-09-22T00:00:00.000Z"
     } as never;
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [approval], onSessionBusy: vi.fn() }));
+    const { result } = renderSessionHooks(agent, { initialApprovals: [approval] });
 
     agent.addMessage({ id: "optimistic", role: "user", content: "hi" });
     await act(async () => {
       await agent.runAgent().catch(() => undefined);
     });
 
-    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["ap-1"]);
+    expect(result.current.events.approvals.map((row) => row.approvalId)).toEqual(["ap-1"]);
   });
 });

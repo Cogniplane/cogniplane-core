@@ -45,6 +45,10 @@ export type IntegrationConnectionProbe = {
   // holding a hardcoded list of connection tables. Returns true when a
   // connection existed and was deleted.
   deleteConnection?(tenantId: string, userId: string): Promise<boolean>;
+  // The upstream account of the stored connection, or null when none is
+  // stored. A turn records it at its start; the gateway refuses a tool call of
+  // that turn when the account changed, for example while an approval waited.
+  connectedAccountId?(tenantId: string, userId: string): Promise<string | null>;
 };
 
 export type IntegrationPlatformStatus = {

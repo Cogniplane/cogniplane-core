@@ -16,7 +16,7 @@
 import { MemorySaver, Command, type BaseCheckpointSaver } from "@langchain/langgraph";
 import { executionAuthorizationMiddleware } from "./execution-authorization-middleware.js";
 import type { ServerTool, StructuredTool } from "@langchain/core/tools";
-import { initChatModel } from "langchain";
+import { initChatModel, createMiddleware } from "langchain";
 import { CompositeBackend, StateBackend, createDeepAgent } from "deepagents";
 import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 
@@ -27,15 +27,13 @@ import { AVAILABLE_MODELS } from "../../domain/models.js";
 import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import { deriveActionSeverity } from "../mcp/policy-gate.js";
 import {
-  POLICY_APPROVAL_MARKER_KEY,
-  createPolicyApprovalProof,
-  policyArgsHash,
-  readPolicyApprovalMarker,
-  withoutPolicyApprovalMetadata,
-  type PolicyApprovalProof
+  stripPolicyApprovalMetadata,
+  withoutPolicyApprovalMetadata
 } from "../policy/policy-approval-proof.js";
 
 import { E2bDeepAgentsSandbox } from "./deep-agents-e2b-backend.js";
+import { PolicyProofLedger } from "./policy-proof-ledger.js";
+import { memoryContextMiddleware, memoryContextSchema } from "./memory-context-middleware.js";
 import { projectInstructionsContextSchema, projectInstructionsMiddleware } from "./project-instructions-middleware.js";
 import { CurrentSkillsCheckpointer } from "./current-skills-checkpointer.js";
 import { SKILLS_LIBRARY_PREFIX, createSkillsLibraryBackend } from "./deep-agents-skills-library.js";
@@ -274,6 +272,10 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     sandboxTimeoutMs: options.sandboxTimeoutMs, executeTimeoutMs: options.executeTimeoutMs,
     workspacePath: init.workspacePath, sessionId: init.sessionId, runtimeId: init.runtimeId,
     onSandboxRecreated: init.onSandboxRecreated, sandboxBinding: init.sandboxBinding,
+    resolveNetworkPolicy: options.resolveNetworkPolicy,
+    networkConfirmTimeoutMs: options.networkConfirmTimeoutMs, networkRequestTimeoutMs: options.networkRequestTimeoutMs,
+    // The session lease is checked in the database before a sandbox that does not match the policy is killed.
+    requireOwnership: init.requireExecution,
     logger: init.logger
   });
   let sandbox = init.e2b ? createSandbox(init.e2b) : null;
@@ -303,10 +305,10 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
 
   const toolContextRef = init.toolContextRef ?? { current: null };
   const policyContextRef = init.policyContextRef ?? { current: null };
-  const policyApprovalProofs = new Map<string, PolicyApprovalProof>();
+  const policyProofs = new PolicyProofLedger();
   const mcpToolNames = new Set<string>();
   const mcpToolServers = new Map<string, string>();
-  const mcpToolFacts = new Map<string, { readOnly: boolean; category: string }>();
+  const mcpToolFacts = new Map<string, { readOnly: boolean; category: string; requiresUserApproval?: boolean }>();
   let mcpClient: MultiServerMCPClient | null = null;
   let mcpToolsPromise: Promise<LangchainToolLike[]> | null = null;
   // Cached compiled agent, keyed by BOTH the model id and the reasoning effort
@@ -315,7 +317,10 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   let compiled: {
     modelId: string;
     effort: RuntimeReasoningEffort | null;
+    // Retries are set on the chat model, so a change of reservation rebuilds too.
+    metered: boolean;
     agent: DeepAgentsGraph;
+    streamingAgent: DeepAgentsGraph;
   } | null = null;
 
   // Path-semantics glue (verified live): the deepagents file tools go through
@@ -354,8 +359,8 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   /**
    * Load gateway tools once per session. The Bearer token is session-scoped;
    * only toolContextId rotates per turn, injected below at call time. A load
-   * failure degrades to "no MCP tools" (logged) rather than failing session
-   * creation, so a gateway hiccup at bootstrap doesn't kill the session.
+   * failure from an individual server logs a warning and skips that server's
+   * tools. Client construction errors still propagate.
    */
   const loadMcpTools = (): Promise<LangchainToolLike[]> => {
     if (mcpToolsPromise) return mcpToolsPromise;
@@ -374,12 +379,14 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       // the gateway then rejects. The backend-held per-turn id is the only
       // trusted source.
       const beforeToolCall = (
-        _request: { args?: unknown },
+        request: { name?: string; args?: unknown; serverName?: string },
         _state: unknown,
         config?: object
       ) => {
         const toolCallId = (config as { toolCallId?: string } | undefined)?.toolCallId;
-        const proof = toolCallId ? policyApprovalProofs.get(toolCallId) : null;
+        const proof = policyProofs.forDispatch(toolCallId, {
+          name: request.name ?? "", serverId: request.serverName, args: (request.args ?? {}) as Record<string, unknown>
+        });
         if (!toolContextRef.current && !proof) return {};
         return {
           args: {
@@ -404,7 +411,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // unknown per-connection keys, silently dropping a per-server hook.
         beforeToolCall,
         // Default is "throw", which would let one unreachable server take
-        // down EVERY gateway tool via the catch below. Log-and-skip degrades
+        // down EVERY gateway tool. Log-and-skip degrades
         // per server instead.
         onConnectionError: ({ serverName, error }) => {
           init.logger.warn(
@@ -455,7 +462,9 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
             server.mode === "managed" ? init.managedToolFacts?.[tool.name] : undefined;
           mcpToolFacts.set(tool.name, {
             readOnly: managedFacts?.readOnly ?? tool.metadata?.annotations?.readOnlyHint === true,
-            category: managedFacts?.category ?? server.id
+            category: managedFacts?.category ?? server.id,
+            // Only our own managed tools can ask for it. A proxy tool that reuses the name cannot.
+            requiresUserApproval: managedFacts?.requiresUserApproval === true
           });
           tools.push(tool);
         }
@@ -475,7 +484,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // the MCP client and sandbox warm, but rebuild the graph for the next
         // turn so a project setting never changes an active graph in place.
         compiled = null;
-        policyApprovalProofs.clear();
+        policyProofs.reset();
       }
       approvals = next;
     },
@@ -493,7 +502,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       mcpToolNames.clear();
       mcpToolServers.clear();
       mcpToolFacts.clear();
-      policyApprovalProofs.clear();
+      policyProofs.reset();
       mcpServers = next.mcpServers;
       if (next.approvals) approvals = next.approvals;
       allowCommandExecution = nextAllowCommandExecution;
@@ -509,8 +518,9 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       effort?: RuntimeReasoningEffort | null
     ): Promise<DeepAgentsGraph> {
       const normalizedEffort = effort ?? null;
-      if (compiled && compiled.modelId === modelId && compiled.effort === normalizedEffort) {
-        return compiled.agent;
+      const metered = init.hasSpendingReservation?.() ?? false;
+      if (compiled && compiled.modelId === modelId && compiled.effort === normalizedEffort && compiled.metered === metered) {
+        return compiled.streamingAgent;
       }
 
       // Provider + init string are known only now (the model is selected
@@ -532,6 +542,9 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       const effectiveBaseUrl = overrideBaseUrl ?? baseUrl;
       const model = await initChatModel(initModelId, {
         apiKey,
+        // Provider retries cannot supply separate usage records for failed attempts.
+        // Turn them off only when a reservation meters this turn.
+        ...(metered ? { maxRetries: 0 } : {}),
         // The in-process loop calls each provider's API DIRECTLY; usage is
         // accounted from stream usage_metadata.
         ...buildProviderBaseUrlOptions(provider, effectiveBaseUrl),
@@ -549,20 +562,34 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         policy: init.policyService
           ? {
               tenantId: init.tenantId,
-              sessionId: init.sessionId,
               policyService: init.policyService,
               contextRef: policyContextRef,
               toolServers: mcpToolServers,
               toolFacts: mcpToolFacts,
-              proofByToolCallId: policyApprovalProofs
+              proofs: policyProofs
             }
-          : undefined
+          : undefined,
+        durableWrites: {
+          toolNames: new Set([...mcpToolFacts].filter(([, facts]) => facts.requiresUserApproval).map(([name]) => name)),
+          toolServers: mcpToolServers,
+          contextRef: policyContextRef,
+          proofs: policyProofs
+        }
       });
 
       // The tools cast bridges our structural LangchainToolLike view back to
       // the library's tool union (the tools really are DynamicStructuredTools
       // from @langchain/mcp-adapters).
       const executionMiddleware = init.requireExecution ? executionAuthorizationMiddleware(init.requireExecution) : null;
+      const spendingMiddleware = init.requireSpendingAllowance ? createMiddleware({
+        name: "ModelSpendingToolGuard",
+        wrapToolCall: async (request, handler) => {
+          request.runtime.signal?.throwIfAborted();
+          init.requireSpendingAllowance!();
+          return handler(request);
+        }
+      }) : null;
+      const guards = [executionMiddleware, spendingMiddleware].filter((guard) => guard !== null);
       const agent = createDeepAgent({
         model,
         checkpointer,
@@ -573,21 +600,30 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // prompt; the model reads SKILL.md (and companions) on demand through
         // the composite backend's /skills/ route.
         skills: [SKILLS_LIBRARY_PREFIX],
-        contextSchema: projectInstructionsContextSchema,
-        middleware: [...(executionMiddleware ? [executionMiddleware] : []), projectInstructionsMiddleware],
-        // deepagents 1.13.3 does not append new custom middleware to its default
-        // general-purpose agent. Supply the guard explicitly for delegated work.
-        ...(executionMiddleware ? { subagents: [{
+        contextSchema: projectInstructionsContextSchema.extend(memoryContextSchema.shape),
+        middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware],
+        // deepagents does not append new custom middleware to its default
+        // general-purpose agent (it merges with `appendNew: false`). Supply the
+        // guards explicitly for delegated work. The override still inherits the
+        // root `interruptOn`: deepagents 1.14.2 sets a custom subagent's
+        // `interruptOn` to `defaultInterruptOn` when the spec omits it.
+        ...(guards.length ? { subagents: [{
           name: "general-purpose", description: "Delegate a task using the current turn's permissions.",
           systemPrompt: systemPrompt ?? "Complete the delegated task using the available tools.",
           tools: mcpTools as unknown as StructuredTool[], skills: [SKILLS_LIBRARY_PREFIX],
-          middleware: [executionMiddleware, projectInstructionsMiddleware]
+          middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware]
         }] } : {}),
         ...(systemPrompt ? { systemPrompt } : {})
       }) as unknown as DeepAgentsGraph;
 
-      compiled = { modelId, effort: normalizedEffort, agent };
-      return agent;
+      const streamingAgent: DeepAgentsGraph = {
+        streamEvents(input, config) {
+          if (!(input instanceof Command)) policyProofs.reset();
+          return agent.streamEvents(input, config);
+        }
+      };
+      compiled = { modelId, effort: normalizedEffort, metered, agent, streamingAgent };
+      return streamingAgent;
     },
     async getPendingActions(threadId: string): Promise<DeepAgentsPendingAction[]> {
       if (!compiled) return [];
@@ -605,11 +641,14 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
             | undefined;
           for (const request of value?.actionRequests ?? []) {
             if (typeof request.name !== "string") continue;
-            const policyApproval = readPolicyApprovalMarker(request.args ?? {});
+            const args = request.args ?? {};
+            const policyApproval = policyProofs.forAction({
+              name: request.name, serverId: mcpToolServers.get(request.name), args, description: request.description
+            });
             actions.push({
               interruptId: typeof interruptEntry.id === "string" ? interruptEntry.id : null,
               name: request.name,
-              args: withoutPolicyApprovalMetadata(request.args ?? {}),
+              args: withoutPolicyApprovalMetadata(args),
               description: request.description,
               ...(policyApproval ? { policyApproval } : {})
             });
@@ -683,11 +722,13 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       runtime.statFile = (filePath) => activeSandbox.statFile(filePath);
       runtime.writeFileBytes = (filePath, data) => activeSandbox.writeFileBytes(filePath, data);
       runtime.extendSandboxTimeout = () => activeSandbox.extendTimeout();
+      runtime.beginSandboxTurn = (signal) => activeSandbox.beginTurn(signal);
     } else {
       delete runtime.readFileBytes;
       delete runtime.statFile;
       delete runtime.writeFileBytes;
       delete runtime.extendSandboxTimeout;
+      delete runtime.beginSandboxTurn;
     }
   }
   syncSandboxAccess();
@@ -703,58 +744,124 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
  * sandbox) are inert. A native `"never"` policy disables native gating, but
  * Policy Center can still add MCP interrupts through its dynamic predicate.
  */
+type PredicateToolCall = { id?: string; name: string; args: Record<string, unknown> };
+
+type InterruptEntry = {
+  allowedDecisions: Array<"approve" | "reject">;
+  when?: (request: { toolCall: PredicateToolCall; state?: unknown }) => Promise<boolean>;
+  description?: (toolCall: { id?: string; args: Record<string, unknown> }) => string;
+};
+
+type DurableWrites = {
+  /** MCP tools that save durable data. Each one always asks the user to approve its exact arguments. */
+  toolNames: ReadonlySet<string>;
+  toolServers: ReadonlyMap<string, string>;
+  contextRef: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["policyContextRef"]>;
+  proofs: PolicyProofLedger;
+};
+
+const DURABLE_WRITE_EXPLANATION =
+  "This action saves data for later sessions, so it always needs your approval of the exact arguments.";
+
+// The message's other tool calls let the ledger detect a repeated call ID.
+function siblingCalls(state: unknown, toolCall: PredicateToolCall): PredicateToolCall[] | undefined {
+  const messages = (state as { messages?: Array<{ tool_calls?: PredicateToolCall[] }> } | undefined)?.messages;
+  return messages?.find((message) => message.tool_calls?.includes(toolCall))?.tool_calls;
+}
+
+/**
+ * The interrupt for a tool that saves durable data. It does not read the tenant
+ * approval policy or Policy Center: the user always approves the exact arguments,
+ * and the approval is bound to them by the same proof that Policy Center uses.
+ * An unattended turn has nobody to ask, so it opens no prompt. The gateway then
+ * refuses the call, because it finds no approval.
+ */
+function durableWriteEntry(durable: DurableWrites): InterruptEntry {
+  return {
+    allowedDecisions: ["approve", "reject"],
+    when: async ({ toolCall, state }) => {
+      // A model cannot bring a proof of its own.
+      stripPolicyApprovalMetadata(toolCall.args);
+      const run = durable.proofs.begin({ ...toolCall, serverId: durable.toolServers.get(toolCall.name) });
+      const context = durable.contextRef.current;
+      if (context?.turnContext !== "interactive") {
+        run.release();
+        return false;
+      }
+      return run.interrupt(siblingCalls(state, toolCall), {
+        toolContextId: context.toolContextId,
+        ruleId: null,
+        explanation: DURABLE_WRITE_EXPLANATION
+      });
+    },
+    description: (toolCall) => durable.proofs.description(toolCall.id)
+  };
+}
+
 export function buildInterruptOn(input: {
   approvals?: { gate: boolean; autoApproveReadOnly: boolean; readOnlyToolNames: string[] };
   mcpToolNames: string[];
   policy?: {
     tenantId: string;
-    sessionId: string;
     policyService: { evaluate: import("../policy/policy-service.js").PolicyService["evaluate"] };
     contextRef: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["policyContextRef"]>;
     toolServers: ReadonlyMap<string, string>;
     toolFacts: ReadonlyMap<string, { readOnly: boolean; category: string }>;
-    proofByToolCallId: Map<string, PolicyApprovalProof>;
+    proofs: PolicyProofLedger;
   };
-}): Record<
-  string,
-  {
-    allowedDecisions: Array<"approve" | "reject">;
-    when?: (request: { toolCall: { id?: string; name: string; args: Record<string, unknown> } }) => Promise<boolean>;
-    description?: (toolCall: { args: Record<string, unknown> }) => string;
-  }
-> | undefined {
-  const { approvals, mcpToolNames, policy } = input;
-  if (!approvals?.gate && !policy) return undefined;
+  durableWrites?: DurableWrites;
+}): Record<string, InterruptEntry> | undefined {
+  const { approvals, mcpToolNames, policy, durableWrites } = input;
+  const durableTools = new Set(mcpToolNames.filter((name) => durableWrites?.toolNames.has(name)));
+  if (!approvals?.gate && !policy && durableTools.size === 0) return undefined;
 
+  // Only catalog read-only IDs skip native approval. A proxy tool's upstream
+  // `readOnlyHint` sets its Policy Center severity (toolFacts) but is not
+  // trusted here: a third-party server can declare it falsely.
   const readOnly = new Set(
     approvals?.autoApproveReadOnly ? approvals.readOnlyToolNames : []
   );
-  const entries: Array<[string, {
-    allowedDecisions: Array<"approve" | "reject">;
-    when?: (request: { toolCall: { id?: string; name: string; args: Record<string, unknown> } }) => Promise<boolean>;
-    description?: (toolCall: { args: Record<string, unknown> }) => string;
-  }]> = [];
+  const entries: Array<[string, InterruptEntry]> = [];
 
+  // Model arguments never carry approval metadata to the tool or checkpoint.
+  // Strip in place, so the checkpoint and the strict tool schema see clean arguments.
   for (const name of mcpToolNames) {
+    if (durableWrites && durableTools.has(name)) {
+      // Not even approvalPolicy "never" removes this prompt.
+      entries.push([name, durableWriteEntry(durableWrites)]);
+      continue;
+    }
     const nativeApproval = Boolean(approvals?.gate && !readOnly.has(name));
     if (!policy && !nativeApproval) continue;
     if (!policy) {
-      entries.push([name, { allowedDecisions: ["approve", "reject"] }]);
+      entries.push([name, {
+        allowedDecisions: ["approve", "reject"],
+        when: async ({ toolCall }) => {
+          stripPolicyApprovalMetadata(toolCall.args);
+          return nativeApproval;
+        }
+      }]);
       continue;
     }
     entries.push([
       name,
       {
         allowedDecisions: ["approve", "reject"],
-        when: async ({ toolCall }) => {
-          if (!policy) return nativeApproval;
+        when: async ({ toolCall, state }) => {
+          stripPolicyApprovalMetadata(toolCall.args);
+          // Fix proof ownership before the policy evaluation below awaits.
+          const run = policy.proofs.begin({ ...toolCall, serverId: policy.toolServers.get(toolCall.name) });
+          const nativeFallback = () => {
+            run.release();
+            return nativeApproval;
+          };
           const context = policy.contextRef.current;
           // A scheduled turn has nobody available to resolve a Policy Center
           // prompt. Let the gateway reject the action with its policy error.
-          if (context?.turnContext === "scheduled") return nativeApproval;
+          if (context?.turnContext === "scheduled") return nativeFallback();
           const serverId = policy.toolServers.get(toolCall.name);
           const facts = policy.toolFacts.get(toolCall.name);
-          if (!context || !serverId || !facts) return nativeApproval;
+          if (!context || !serverId || !facts) return nativeFallback();
           const severity = deriveActionSeverity(toolCall.name, facts.readOnly);
           const evaluation = await policy.policyService.evaluate(policy.tenantId, {
             toolName: toolCall.name,
@@ -767,37 +874,14 @@ export function buildInterruptOn(input: {
             context.enforcementMode === "enforce" &&
             evaluation.gating &&
             evaluation.outcome === "require_approval";
-          if (!requiresPolicyApproval) return nativeApproval;
-          const toolCallId = toolCall.id;
-          if (!toolCallId) return true;
-          const checkpointedProof = readPolicyApprovalMarker(toolCall.args);
-          if (
-            checkpointedProof?.toolCallId === toolCallId &&
-            checkpointedProof.toolName === toolCall.name &&
-            checkpointedProof.serverId === serverId &&
-            checkpointedProof.argsHash === policyArgsHash(toolCall.args)
-          ) {
-            policy.proofByToolCallId.set(toolCallId, checkpointedProof);
-            return true;
-          }
-          const proof = createPolicyApprovalProof({
-            tenantId: policy.tenantId,
-            sessionId: policy.sessionId,
+          if (!requiresPolicyApproval) return nativeFallback();
+          return run.interrupt(siblingCalls(state, toolCall), {
             toolContextId: context.toolContextId,
-            toolCallId,
-            toolName: toolCall.name,
-            serverId,
-            args: toolCall.args,
             ruleId: evaluation.matchedRuleId,
             explanation: evaluation.explanation ?? "Action requires approval."
           });
-          policy.proofByToolCallId.set(toolCallId, proof);
-          toolCall.args[POLICY_APPROVAL_MARKER_KEY] = proof;
-          return true;
         },
-        description: (toolCall) =>
-          readPolicyApprovalMarker(toolCall.args)?.explanation ??
-          `Tool execution requires approval: ${name}`
+        description: (toolCall) => policy.proofs.description(toolCall.id)
       }
     ]);
   }

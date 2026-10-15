@@ -10,7 +10,7 @@ const api = vi.hoisted(() => ({
 vi.mock("../session-api", () => ({ listSessions: api.listSessions, listApprovals: api.listApprovals }));
 vi.mock("../message-api", () => ({ listMessages: api.listMessages }));
 
-import { REMOTE_TURN_POLL_MS, useRemoteTurn } from "./use-remote-turn";
+import { REMOTE_TURN_POLL_MS, useRemoteTurnPoll } from "./use-remote-turn";
 
 function serverReports(running: boolean, content = "partial") {
   api.listSessions.mockResolvedValue({ sessions: [{ sessionId: "s-1", isRunning: running }], trashRetentionDays: 30 });
@@ -35,22 +35,23 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-type Props = { serverRunning: boolean; localRunning: boolean };
+type Props = { active: boolean; refresh: number };
 
-function renderRemoteTurn(initial: Props) {
+// useSessionConnection makes the poll active while the turn runs on the
+// server without a stream in this tab.
+function renderPoll(initial: Props = { active: true, refresh: 0 }) {
   const onSnapshot = vi.fn();
-  const onSettled = vi.fn();
-  const view = renderHook((props: Props) => useRemoteTurn({ sessionId: "s-1", ...props, onSnapshot, onSettled }), {
+  const onEnded = vi.fn();
+  const view = renderHook((props: Props) => useRemoteTurnPoll({ sessionId: "s-1", ...props, onSnapshot, onEnded }), {
     initialProps: initial
   });
-  return { ...view, onSnapshot, onSettled };
+  return { ...view, onSnapshot, onEnded };
 }
 
-describe("useRemoteTurn", () => {
-  it("polls a turn that runs at mount every 3 seconds, then settles once when it ends", async () => {
+describe("useRemoteTurnPoll", () => {
+  it("polls every 3 seconds while active, then reports the end once and stops", async () => {
     serverReports(true);
-    const { result, onSnapshot, onSettled } = renderRemoteTurn({ serverRunning: true, localRunning: false });
-    expect(result.current.isRemoteRunning).toBe(true);
+    const { onSnapshot, onEnded } = renderPoll();
 
     await flushPoll();
     expect(api.listSessions).toHaveBeenCalledWith(expect.objectContaining({ ids: ["s-1"] }));
@@ -73,8 +74,7 @@ describe("useRemoteTurn", () => {
       messages: [expect.objectContaining({ content: "final" })],
       approvals: []
     });
-    expect(result.current.isRemoteRunning).toBe(false);
-    expect(onSettled).toHaveBeenCalledOnce();
+    expect(onEnded).toHaveBeenCalledOnce();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(REMOTE_TURN_POLL_MS * 3);
@@ -82,48 +82,78 @@ describe("useRemoteTurn", () => {
     expect(api.listSessions).toHaveBeenCalledTimes(2);
   });
 
-  it("does not poll while this tab streams the turn", async () => {
-    serverReports(true);
-    const { result } = renderRemoteTurn({ serverRunning: true, localRunning: true });
+  it("reads only the current turn after the first snapshot", async () => {
+    api.listSessions.mockResolvedValue({ sessions: [{ sessionId: "s-1", isRunning: true }] });
+    api.listApprovals.mockResolvedValue([]);
+    api.listMessages
+      .mockResolvedValueOnce({ messages: [
+        { messageId: "old", role: "assistant", content: "old" },
+        { messageId: "user", role: "user", content: "question" },
+        { messageId: "answer", role: "assistant", content: "partial" }
+      ] })
+      .mockResolvedValueOnce({ messages: [
+        { messageId: "user", role: "user", content: "question" },
+        { messageId: "answer", role: "assistant", content: "more" }
+      ] });
+    const { onSnapshot } = renderPoll();
     await flushPoll();
-    expect(result.current.isRemoteRunning).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(REMOTE_TURN_POLL_MS); });
+    await flushPoll();
+    expect(api.listMessages).toHaveBeenNthCalledWith(2, "s-1", expect.any(AbortSignal), { since: "user" });
+    expect(onSnapshot).toHaveBeenLastCalledWith({
+      messages: [
+        expect.objectContaining({ messageId: "old" }),
+        expect.objectContaining({ messageId: "user" }),
+        expect.objectContaining({ content: "more" })
+      ],
+      approvals: []
+    });
+    expect(api.listApprovals).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads the full snapshot if a tail loses its anchor", async () => {
+    api.listSessions.mockResolvedValue({ sessions: [{ sessionId: "s-1", isRunning: true }] });
+    api.listApprovals.mockResolvedValue([]);
+    api.listMessages
+      .mockResolvedValueOnce({ messages: [{ messageId: "user", role: "user" }] })
+      .mockResolvedValueOnce({ messages: [{ messageId: "other", role: "assistant" }] })
+      .mockResolvedValueOnce({ messages: [{ messageId: "final", role: "assistant" }] });
+    const { onSnapshot } = renderPoll();
+    await flushPoll();
+    await act(async () => { await vi.advanceTimersByTimeAsync(REMOTE_TURN_POLL_MS); });
+    await flushPoll();
+    expect(api.listMessages).toHaveBeenCalledTimes(3);
+    expect(onSnapshot).toHaveBeenLastCalledWith({ messages: [expect.objectContaining({ messageId: "final" })], approvals: [] });
+  });
+
+  it("does not poll while inactive, and stops when it becomes inactive", async () => {
+    serverReports(true);
+    const { rerender, onEnded } = renderPoll({ active: false, refresh: 0 });
+    rerender({ active: false, refresh: 1 });
+    await flushPoll();
     expect(api.listSessions).not.toHaveBeenCalled();
-  });
 
-  it("enters when the saved state changes to running, not on a stale steady value", async () => {
-    serverReports(true);
-    const { result, rerender } = renderRemoteTurn({ serverRunning: true, localRunning: true });
-    // This tab's own turn ends while the list still shows it running.
-    rerender({ serverRunning: true, localRunning: false });
-    expect(result.current.isRemoteRunning).toBe(false);
-
-    rerender({ serverRunning: false, localRunning: false });
-    rerender({ serverRunning: true, localRunning: false });
-    expect(result.current.isRemoteRunning).toBe(true);
-  });
-
-  it("enters on request, for a send the backend refused as busy", async () => {
-    serverReports(true);
-    const { result } = renderRemoteTurn({ serverRunning: false, localRunning: false });
-    expect(result.current.isRemoteRunning).toBe(false);
-    act(() => result.current.enterRemoteRunning());
-    expect(result.current.isRemoteRunning).toBe(true);
+    rerender({ active: true, refresh: 1 });
     await flushPoll();
-    expect(api.listMessages).toHaveBeenCalledWith("s-1", expect.any(AbortSignal));
-    expect(api.listApprovals).toHaveBeenCalledWith("s-1", expect.any(AbortSignal));
+    expect(api.listSessions).toHaveBeenCalledOnce();
+    rerender({ active: false, refresh: 1 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_TURN_POLL_MS * 3);
+    });
+    expect(api.listSessions).toHaveBeenCalledOnce();
+    expect(onEnded).not.toHaveBeenCalled();
   });
 
-  it("polls at once on request when the mode is already on", async () => {
+  it("polls at once on a new refresh value, and restarts its interval", async () => {
     serverReports(true);
-    const { result } = renderRemoteTurn({ serverRunning: true, localRunning: false });
+    const { rerender } = renderPoll();
     await flushPoll();
     expect(api.listSessions).toHaveBeenCalledTimes(1);
 
-    act(() => result.current.enterRemoteRunning());
+    rerender({ active: true, refresh: 1 });
     await flushPoll();
     expect(api.listSessions).toHaveBeenCalledTimes(2);
 
-    // The request restarts the interval, so only one poll follows it.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(REMOTE_TURN_POLL_MS);
     });
@@ -131,37 +161,31 @@ describe("useRemoteTurn", () => {
     expect(api.listSessions).toHaveBeenCalledTimes(3);
   });
 
-  it("refreshes at once and settles when the server no longer reports the turn", async () => {
-    serverReports(true);
-    const { result, onSettled } = renderRemoteTurn({ serverRunning: true, localRunning: false });
-    await flushPoll();
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
+  it("ignores a read that returns after a newer poll started", async () => {
+    let answerStale!: (value: unknown) => void;
+    api.listSessions
+      .mockImplementationOnce(() => new Promise((resolve) => { answerStale = resolve; }))
+      .mockResolvedValue({ sessions: [{ sessionId: "s-1", isRunning: true }] });
+    api.listMessages.mockResolvedValue({ messages: [{ messageId: "fresh", role: "assistant" }] });
+    api.listApprovals.mockResolvedValue([]);
+    const { rerender, onSnapshot, onEnded } = renderPoll();
 
-    // The saved list still shows the turn, but the server has no running turn.
-    serverReports(false);
-    act(() => result.current.refreshRemoteTurn());
+    rerender({ active: true, refresh: 1 });
+    await flushPoll();
+    expect(onSnapshot).toHaveBeenCalledOnce();
+    api.listMessages.mockResolvedValue({ messages: [{ messageId: "stale", role: "assistant" }] });
+    await act(async () => { answerStale({ sessions: [{ sessionId: "s-1", isRunning: false }] }); });
     await flushPoll();
 
-    expect(api.listSessions).toHaveBeenCalledTimes(2);
-    expect(result.current.isRemoteRunning).toBe(false);
-    expect(onSettled).toHaveBeenCalledOnce();
-  });
-
-  it("does not enter the mode on a refresh", async () => {
-    serverReports(true);
-    const { result } = renderRemoteTurn({ serverRunning: false, localRunning: false });
-    act(() => result.current.refreshRemoteTurn());
-    await flushPoll();
-    expect(result.current.isRemoteRunning).toBe(false);
-    expect(api.listSessions).not.toHaveBeenCalled();
+    expect(onSnapshot).toHaveBeenCalledOnce();
+    expect(onEnded).not.toHaveBeenCalled();
   });
 
   it("keeps polling after a failed poll", async () => {
     api.listSessions.mockRejectedValueOnce(new Error("network"));
-    const { result, onSnapshot } = renderRemoteTurn({ serverRunning: true, localRunning: false });
+    const { onSnapshot } = renderPoll();
     await flushPoll();
     expect(onSnapshot).not.toHaveBeenCalled();
-    expect(result.current.isRemoteRunning).toBe(true);
 
     serverReports(true);
     await act(async () => {
@@ -171,23 +195,9 @@ describe("useRemoteTurn", () => {
     expect(onSnapshot).toHaveBeenCalledOnce();
   });
 
-  it("polls at once when the saved state changes to done", async () => {
-    serverReports(true);
-    const { result, rerender, onSettled } = renderRemoteTurn({ serverRunning: true, localRunning: false });
-    await flushPoll();
-    expect(api.listSessions).toHaveBeenCalledTimes(1);
-
-    serverReports(false);
-    rerender({ serverRunning: false, localRunning: false });
-    await flushPoll();
-    expect(api.listSessions).toHaveBeenCalledTimes(2);
-    expect(result.current.isRemoteRunning).toBe(false);
-    expect(onSettled).toHaveBeenCalledOnce();
-  });
-
   it("stops polling on unmount", async () => {
     serverReports(true);
-    const { unmount } = renderRemoteTurn({ serverRunning: true, localRunning: false });
+    const { unmount } = renderPoll();
     await flushPoll();
     unmount();
     await act(async () => {

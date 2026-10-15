@@ -66,6 +66,7 @@ export function AdminSkillEditModal({
             <Input
               id="skill-edit-name"
               type="text"
+              maxLength={64}
               value={skillName}
               onChange={(event) => setSkillName(event.target.value)}
             />

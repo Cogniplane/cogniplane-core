@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import type { SkillImportResponse } from "@cogniplane/shared-types";
 
 import {
   emptyInlineSkillDraft,
@@ -47,18 +48,19 @@ export type MarketplaceTabState = {
 
 export function useSkillImports(input: {
   manifestUrl: string | null;
-  onImportZip: (file: File) => Promise<void>;
+  onImportZip: (file: File) => Promise<SkillImportResponse>;
   onImportGithub: (input: {
     githubUrl: string;
     ref?: string;
     subdirectory?: string;
-  }) => Promise<void>;
+  }) => Promise<SkillImportResponse>;
   onImportInline: (input: {
     skillId: string;
     skillName: string;
     description: string;
     instructions: string;
-  }) => Promise<void>;
+  }) => Promise<SkillImportResponse>;
+  onImported: (result: SkillImportResponse) => void;
   onSaveManifestUrl: (url: string | null) => Promise<void>;
 }): {
   panel: ImportPanelState;
@@ -67,10 +69,10 @@ export function useSkillImports(input: {
   inline: InlineImportTabState;
   marketplace: MarketplaceTabState;
 } {
-  const { manifestUrl, onImportZip, onImportGithub, onImportInline, onSaveManifestUrl } = input;
+  const { manifestUrl, onImportZip, onImportGithub, onImportInline, onImported, onSaveManifestUrl } = input;
 
   const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<ImportTab>("marketplace");
+  const [tab, setTab] = useState<ImportTab>("inline");
   const [githubDraft, setGithubDraft] = useState<GithubImportDraft>(emptyGithubImportDraft);
   const [zipFileName, setZipFileName] = useState<string>("");
   const [inlineDraft, setInlineDraft] = useState<InlineSkillDraft>(emptyInlineSkillDraft);
@@ -91,40 +93,42 @@ export function useSkillImports(input: {
       const fileInput = form.elements.namedItem("skill-zip-file");
       if (!(fileInput instanceof HTMLInputElement) || !fileInput.files?.[0]) return;
       try {
-        await onImportZip(fileInput.files[0]);
+        const imported = await onImportZip(fileInput.files[0]);
         setZipFileName("");
         form.reset();
         setOpen(false);
+        onImported(imported);
       } catch {
         return;
       }
     },
-    [onImportZip]
+    [onImportZip, onImported]
   );
 
   const submitGithub = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
       try {
-        await onImportGithub({
+        const imported = await onImportGithub({
           githubUrl: githubDraft.githubUrl,
           ref: githubDraft.ref || undefined,
           subdirectory: githubDraft.subdirectory || undefined
         });
         setGithubDraft(emptyGithubImportDraft);
         setOpen(false);
+        onImported(imported);
       } catch {
         return;
       }
     },
-    [githubDraft, onImportGithub]
+    [githubDraft, onImportGithub, onImported]
   );
 
   const submitInline = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
       try {
-        await onImportInline({
+        const imported = await onImportInline({
           skillId: inlineDraft.skillId.trim(),
           skillName: inlineDraft.skillName.trim(),
           description: inlineDraft.description.trim(),
@@ -132,11 +136,12 @@ export function useSkillImports(input: {
         });
         setInlineDraft(emptyInlineSkillDraft);
         setOpen(false);
+        onImported(imported);
       } catch {
         return;
       }
     },
-    [inlineDraft, onImportInline]
+    [inlineDraft, onImportInline, onImported]
   );
 
   const saveManifestUrl = useCallback(

@@ -33,7 +33,7 @@
 
   --color-on-surface:              #2a3439;
   --color-on-surface-variant:      #566166;
-  --color-on-surface-faint:        #8a9ba8;
+  --color-on-surface-faint:        #52636d;
 
   --color-outline-variant:         rgba(169, 180, 185, 0.15);
   --color-outline:                 #717c82;
@@ -202,6 +202,11 @@
   box-sizing: border-box;
 }
 
+/* Sticky admin save bars sit at the bottom edge. Keep focused controls scrolled above them. */
+html {
+  scroll-padding-bottom: 5rem;
+}
+
 html, body {
   min-height: 100%;
 }
@@ -222,8 +227,10 @@ h1, h2, h3, h4, h5, h6 {
   letter-spacing: -0.02em;
 }
 
-a {
-  color: inherit;
+@layer base {
+  a {
+    color: inherit;
+  }
 }
 
 textarea, input, select {
@@ -233,51 +240,132 @@ textarea, input, select {
 
 /* ============================================================
    COPILOTKIT THEME BRIDGE
-   The <CopilotChat> library ships its own `--copilot-kit-*`
-   palette scoped to :root and flips dark mode via its OWN class,
-   which our app (driven by [data-theme="dark"]) never sets — so
-   left alone it renders its light palette (stark-white bubbles,
-   near-black text) on our dark surfaces. Remap every CK variable
-   onto our editorial tokens; because those tokens already swap
-   under [data-theme="dark"], CopilotKit follows both themes for
-   free. Keep in sync with the CK var list if the SDK is bumped.
-
-   `:root:root` raises specificity above CopilotKit's plain `:root`
-   so these win regardless of stylesheet load order — the CK CSS is
-   imported inside copilot-chat-host.tsx and may emit after globals.
+   CopilotKit V2 styles the chat with shadcn-style variables that it
+   sets on every [data-copilotkit] element. It switches them for dark
+   mode only under a `.dark` ancestor, and some of its parts use fixed
+   colors. This app switches themes through [data-theme="dark"]. Map
+   the variables and those fixed colors onto our tokens. The tokens
+   already switch with the theme, so the chat follows both themes.
+   CopilotKit's stylesheet loads later, with the chat, so these rules
+   win by specificity, not by position. `.chat-surface` is the class
+   that the chat host gives CopilotChat.
    ============================================================ */
-:root:root {
-  /* primary drives the USER message bubble (and send button). Full ink was
-     too aggressive against the light surface, so use the softer container
-     tone with its matching on-color instead of primary/on-primary. */
-  --copilot-kit-primary-color:            var(--color-primary-container);
-  --copilot-kit-contrast-color:           var(--color-on-primary-container);
-  --copilot-kit-background-color:         var(--color-surface);
-  --copilot-kit-input-background-color:   var(--color-surface-container-low);
-  --copilot-kit-secondary-color:          var(--color-surface-container);
-  --copilot-kit-secondary-contrast-color: var(--color-on-surface);
-  --copilot-kit-separator-color:          var(--color-outline-variant);
-  --copilot-kit-muted-color:              var(--color-on-surface-faint);
+.chat-surface[data-copilotkit],
+.chat-surface [data-copilotkit] {
+  --background: var(--color-surface);
+  --foreground: var(--color-on-surface);
+  --card: var(--color-card);
+  --card-foreground: var(--color-card-foreground);
+  --popover: var(--color-popover);
+  --popover-foreground: var(--color-popover-foreground);
+  --primary: var(--color-primary);
+  --primary-foreground: var(--color-on-primary);
+  --secondary: var(--color-surface-container);
+  --secondary-foreground: var(--color-on-surface);
+  --muted: var(--color-surface-container);
+  --muted-foreground: var(--color-on-surface-variant);
+  --accent: var(--color-surface-container-high);
+  --accent-foreground: var(--color-on-surface);
+  --destructive: var(--color-danger);
+  --border: var(--color-outline-variant);
+  --input: var(--color-outline-variant);
+  --ring: var(--color-ring);
+  --radius: var(--radius-lg);
+  font-family: inherit;
 }
 
-/* Drop CopilotKit's "Powered by CopilotKit" footer branding. The tag has no
-   disable prop on <CopilotChat> in this SDK version, and CopilotKit's own
-   stylesheet (@copilotkit/react-ui/styles.css) re-asserts it with
-   `.poweredBy { display: block !important; visibility: visible !important }`.
-   A plain `.poweredBy { ... !important }` rule ties that on specificity and
-   loses on load order (their CSS is imported by the chat host, after this
-   file), so double the class to outrank it — with equal !important flags,
-   higher specificity wins regardless of order. */
-.poweredBy.poweredBy,
-.poweredBy.poweredBy * {
-  display: none !important;
-  visibility: hidden !important;
+/* Reply typography. The typography plugin sets fixed gray colors on
+   each prose element. */
+.chat-surface .cpk\:prose {
+  --tw-prose-body: var(--color-on-surface);
+  --tw-prose-headings: var(--color-on-surface);
+  --tw-prose-lead: var(--color-on-surface-variant);
+  --tw-prose-links: var(--color-brand);
+  --tw-prose-bold: var(--color-on-surface);
+  --tw-prose-counters: var(--color-on-surface-variant);
+  --tw-prose-bullets: var(--color-on-surface-faint);
+  --tw-prose-hr: var(--color-outline-variant);
+  --tw-prose-quotes: var(--color-on-surface-variant);
+  --tw-prose-quote-borders: var(--color-brand-border);
+  --tw-prose-captions: var(--color-on-surface-variant);
+  --tw-prose-kbd: var(--color-on-surface);
+  --tw-prose-code: var(--color-on-surface);
+  --tw-prose-pre-code: var(--color-on-surface);
+  --tw-prose-pre-bg: var(--color-surface-container);
+  --tw-prose-th-borders: var(--color-outline-variant);
+  --tw-prose-td-borders: var(--color-outline-variant);
 }
-/* The unclassed wrapper div immediately preceding the input's send area — no
-   stable hook, so collapse it via its only child being gone above; this rule is
-   a belt-and-suspenders height kill in case the wrapper keeps padding. */
-.poweredByContainer {
-  padding-bottom: 0 !important;
+
+/* Match the app's other markdown: no typographic quotes around a quote and
+   no backticks around inline code. */
+.chat-surface .cpk\:prose :where(blockquote p:first-of-type)::before,
+.chat-surface .cpk\:prose :where(blockquote p:last-of-type)::after,
+.chat-surface .cpk\:prose :where(code)::before,
+.chat-surface .cpk\:prose :where(code)::after {
+  content: none;
+}
+
+/* CopilotKit lays out [data-streamdown="table-wrapper"] as flex. The
+   installed Streamdown puts that attribute on the <table> itself, which then
+   loses its table layout. */
+.chat-surface table[data-streamdown] {
+  display: table;
+}
+
+/* The user's message uses the soft container tone, as before. Full ink is
+   too strong against the light surface. */
+.chat-surface .copilotKitUserMessage .cpk\:prose {
+  --tw-prose-body: var(--color-on-primary-container);
+  background-color: var(--color-primary-container);
+  color: var(--color-on-primary-container);
+}
+
+.chat-surface .copilotKitInput {
+  background-color: var(--color-surface-container-low);
+  box-shadow: 0 0 0 1px var(--color-outline-variant), var(--shadow-sm);
+}
+
+.chat-surface [data-testid="copilot-chat-textarea"] {
+  color: var(--color-on-surface);
+}
+
+.chat-surface [data-testid="copilot-chat-textarea"]::placeholder {
+  color: var(--color-on-surface-faint);
+}
+
+.chat-surface [data-testid="copilot-send-button"] {
+  background-color: var(--color-primary-container);
+  color: var(--color-on-primary-container);
+}
+
+.chat-surface [data-testid="copilot-send-button"]:disabled {
+  background-color: var(--color-surface-container);
+  color: var(--color-on-surface-faint);
+}
+
+.chat-surface [data-testid="copilot-assistant-toolbar"] button,
+.chat-surface [data-testid="copilot-user-toolbar"] button {
+  color: var(--color-on-surface-variant);
+}
+
+.chat-surface [data-testid="copilot-assistant-toolbar"] button:hover,
+.chat-surface [data-testid="copilot-user-toolbar"] button:hover {
+  background-color: var(--color-surface-container);
+  color: var(--color-on-surface);
+}
+
+.chat-surface [data-testid="copilot-scroll-to-bottom"] {
+  background-color: var(--color-surface-container-lowest);
+  border-color: var(--color-outline-variant);
+  color: var(--color-on-surface);
+}
+
+.chat-surface [data-testid="copilot-scroll-to-bottom"]:hover {
+  background-color: var(--color-surface-container);
+}
+
+.chat-surface [data-testid="copilot-scroll-to-bottom"] svg {
+  color: inherit;
 }
 
 /* ============================================================
@@ -285,9 +373,8 @@ textarea, input, select {
    Shared typography for model-generated markdown. Two consumers:
    `.md-body` wraps every <SafeMarkdown> render (plan pane, admin
    chat replay, artifact preview, skill files); `.chat-markdown`
-   scopes the same rules to CopilotChat's built-in renderer, which
-   ships tables/blockquotes with no styling at all — without this,
-   agent tables collapse into unreadable run-together columns.
+   scopes the same rules to CopilotChat's built-in renderer, so agent
+   tables, quotes, links, and inline code match the rest of the app.
    ============================================================ */
 .md-body table,
 .chat-markdown table {

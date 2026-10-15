@@ -1,5 +1,7 @@
 "use client";
 
+import { LastAdminChange } from "../../../components/admin/history/history-widgets";
+
 import { useQuery } from "@tanstack/react-query";
 
 import { TenantSettingsForm } from "../../../components/tenant-settings-form";
@@ -9,25 +11,19 @@ import { useModelPreference } from "../../../hooks/use-model-preference";
 import { useTenantSettings } from "../../../hooks/use-tenant-settings";
 import {
   getAdminModelCatalog,
-  listAdminManagedTools,
-  listAdminMcpServers
+  listAdminManagedTools
 } from "../../../lib/admin-api";
 import { queryKeys } from "../../../lib/query-keys";
 import { useAuth } from "../../../lib/auth-context";
 
 export default function AdminAgentSettingsPage() {
   const { user } = useAuth();
-  const { settings, saving, error, save } = useTenantSettings();
+  const { settings, saving, loadError, saveError, save, reload } = useTenantSettings();
   const { model } = useModelPreference();
 
   const managedToolsQuery = useQuery({
     queryKey: queryKeys.admin.managedTools(),
     queryFn: listAdminManagedTools
-  });
-
-  const mcpServersQuery = useQuery({
-    queryKey: queryKeys.admin.mcpServers(),
-    queryFn: listAdminMcpServers
   });
 
   const modelCatalogQuery = useQuery({
@@ -41,7 +37,9 @@ export default function AdminAgentSettingsPage() {
 
   return (
     <section id="capabilities" className="flex flex-col gap-5 pt-5">
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
+      {loadError ? <p className="text-sm text-danger">{loadError}</p> : null}
+      {!settings && !loadError ? <p role="status">Loading agent settings...</p> : null}
+      {managedToolsQuery.isError ? <p role="alert" className="text-sm text-danger">Could not load the tool catalog. <Button variant="outline" onClick={() => void managedToolsQuery.refetch()}>Retry tools</Button></p> : null}
       {checking ? <p role="status">Checking model availability...</p> : null}
       {modelCatalogQuery.isError && !checking ? (
         <div className="flex flex-col items-start gap-2">
@@ -57,12 +55,14 @@ export default function AdminAgentSettingsPage() {
           settings={settings}
           saving={saving}
           onSave={save}
+          saveError={saveError}
+          onReload={() => void reload()}
           managedTools={managedToolsQuery.data ?? []}
-          mcpServers={mcpServersQuery.data ?? []}
           modelWarning={modelCatalogQuery.isSuccess
             ? modelAvailabilityWarning(model, modelCatalogQuery.data, settings)
             : null}
           isOwner={user?.role === "owner"}
+          meta={<LastAdminChange section="agent" />}
         />
       ) : null}
     </section>

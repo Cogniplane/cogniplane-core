@@ -1,7 +1,15 @@
 import { test, expect, vi } from "vitest";
+import { createServer } from "node:http";
 import type { fetch as undiciFetch } from "undici";
 
-import { forwardRpc } from "./mcp-upstream-client.js";
+import { forwardRpc, isReservedMcpUpstreamHeader } from "./mcp-upstream-client.js";
+
+test("reserves every framework identity and signature header", () => {
+  expect(isReservedMcpUpstreamHeader("X-Framework-Nonce")).toBe(true);
+  expect(isReservedMcpUpstreamHeader("x-framework-body-sha256")).toBe(true);
+  expect(isReservedMcpUpstreamHeader("X-Framework-Signature-Version")).toBe(true);
+  expect(isReservedMcpUpstreamHeader("X-Api-Key")).toBe(false);
+});
 
 // A proxy MCP upstream URL is admin-supplied, and several MCP vendors
 // authenticate by API key in the query string. On a transport failure the
@@ -339,41 +347,20 @@ test("logs the serverId, which is what identifies the upstream once the path is 
   expect(loggedStrings(fields)).not.toContain("SEKRET");
 });
 
-// The FIRST hop was previously unvalidated: scheme, userinfo and
-// private-address checks ran only on redirects. The write path rejects these
-// today, so this layer exists for rows that predate it or were inserted
-// directly against the database — and for literal IPs, which undici never
-// shows to the connect-time DNS guard at all.
-
-test("refuses a stored upstream pointing at a private address", async () => {
-  const neverCalled = vi.fn();
+test.each([
+  "http://127.0.0.1:8080/mcp",
+  "http://10.0.4.17/mcp",
+  "http://100.108.24.234:3108/mcp"
+])("forwards to a configured local address at %s", async (upstreamUrl) => {
+  const reached = vi.fn(async () => new Response(
+    JSON.stringify({ jsonrpc: "2.0", id: 1, result: { ok: true } }),
+    { headers: { "content-type": "application/json" } }
+  ));
   const response = await forwardRpc(
-    "http://127.0.0.1:8080/mcp",
-    payload,
-    {},
-    neverCalled as unknown as typeof undiciFetch,
-    {}
+    upstreamUrl, payload, {}, reached as unknown as typeof undiciFetch
   );
-
-  expect(response.error?.message).toBe(
-    "Upstream MCP URL points to a private or reserved address."
-  );
-  // Blocked before any socket work — not merely failed afterwards.
-  expect(neverCalled).not.toHaveBeenCalled();
-});
-
-test("refuses a stored upstream on an RFC1918 address", async () => {
-  const neverCalled = vi.fn();
-  const response = await forwardRpc(
-    "http://10.0.4.17/mcp",
-    payload,
-    {},
-    neverCalled as unknown as typeof undiciFetch,
-    {}
-  );
-
-  expect(response.error?.message).toMatch(/private or reserved/);
-  expect(neverCalled).not.toHaveBeenCalled();
+  expect(response.result).toEqual({ ok: true });
+  expect(reached).toHaveBeenCalledTimes(1);
 });
 
 test("refuses a stored upstream embedding credentials", async () => {
@@ -405,9 +392,6 @@ test("refuses a non-HTTP scheme", async () => {
 });
 
 test("still allows an ordinary public upstream through to the transport", async () => {
-  // The over-blocking direction: first-hop validation must not break the
-  // normal case. Plain http is permitted because `make dev` runs a loopback
-  // gateway over http — the private-address check is what constrains it.
   const reached = vi.fn(() => Promise.reject(new TypeError("fetch failed")));
   await forwardRpc(
     "https://vendor.example/mcp",
@@ -484,4 +468,146 @@ test("refuses a stored custom auth header that could replace proxy identity", as
 
   expect(response.error?.message).toBe("Upstream MCP authentication is invalid.");
   expect(neverCalled).not.toHaveBeenCalled();
+});
+
+test("reads a matching SSE reply after a notification and closes the stream", async () => {
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(': keepalive\n\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'));
+      controller.enqueue(encoder.encode('event: message\r\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\r\n\r\n'));
+    },
+    cancel() { cancelled = true; }
+  });
+  const request = vi.fn(async (_url: URL, init: { headers: Record<string, string> }) => {
+    expect(init.headers.Accept).toBe("application/json, text/event-stream");
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream; charset=utf-8" } });
+  });
+
+  const response = await forwardRpc("https://vendor.example/mcp", payload, {}, request as never);
+  expect(response.result).toEqual({ ok: true });
+  expect(cancelled).toBe(true);
+});
+
+test("ignores an empty SSE priming event before the reply", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response('id: first\ndata:\n\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n',
+      { headers: { "Content-Type": "text/event-stream" } })) as never
+  );
+  expect(response.result).toEqual({ ok: true });
+});
+
+test("reads an SSE reply with CR-only line endings at EOF", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response('data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\r\r',
+      { headers: { "Content-Type": "text/event-stream" } })) as never
+  );
+  expect(response.result).toEqual({ ok: true });
+});
+
+test("rejects a server-to-client request instead of waiting for its answer", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response('data: {"jsonrpc":"2.0","id":"server-1","method":"sampling/createMessage","params":{}}\n\n',
+      { headers: { "Content-Type": "text/event-stream" } })) as never
+  );
+  expect(response.error?.message).toBe("Upstream MCP requested unsupported server-to-client interaction.");
+});
+
+test("sends an MCP request to a local HTTP server with the production transport", async () => {
+  let receivedMethod: string | undefined;
+  let receivedPath: string | undefined;
+  const server = createServer((request, reply) => {
+    receivedMethod = request.method;
+    receivedPath = request.url;
+    reply.writeHead(200, { "content-type": "application/json" });
+    reply.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { local: true } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server has no port");
+    const response = await forwardRpc(`http://127.0.0.1:${address.port}/mcp`, payload, {});
+    expect(response.result).toEqual({ local: true });
+    expect(receivedMethod).toBe("POST");
+    expect(receivedPath).toBe("/mcp");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("times out an SSE stream that sends keepalives but no reply", async () => {
+  const server = createServer((_request, reply) => {
+    reply.writeHead(200, { "Content-Type": "text/event-stream" });
+    reply.write(": keepalive\n\n");
+    const keepalive = setInterval(() => reply.write(": keepalive\n\n"), 20);
+    reply.on("close", () => clearInterval(keepalive));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server has no port");
+    const response = await forwardRpc(
+      `http://127.0.0.1:${address.port}/mcp`, payload, {}, undefined,
+      { timeoutMs: 180 }
+    );
+    expect(response.error?.message).toBe("Upstream MCP request timed out after 180ms.");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("rejects an SSE reply with a different request id", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response('data: {"jsonrpc":"2.0","id":2,"result":{"secret":true}}\n\n',
+      { headers: { "Content-Type": "text/event-stream" } })) as never
+  );
+  expect(response.error?.message).toBe("Upstream MCP response was not a valid JSON-RPC envelope.");
+});
+
+test("rejects a JSON reply with a different request id", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response('{"jsonrpc":"2.0","id":2,"result":{"secret":true}}',
+      { headers: { "Content-Type": "application/json" } })) as never
+  );
+  expect(response.error?.message).toBe("Upstream MCP response was not a valid JSON-RPC envelope.");
+});
+
+test("caps SSE bytes before accepting a later reply", async () => {
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {},
+    (async () => new Response(`: ${"x".repeat(200)}\n\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n`,
+      { headers: { "Content-Type": "text/event-stream" } })) as never,
+    { maxResponseBytes: 100 }
+  );
+  expect(response.error?.message).toContain("exceeded the maximum size of 100 bytes");
+});
+
+test("cancels an in-flight upstream fetch when the overall test budget ends", async () => {
+  const controller = new AbortController();
+  let observedSignal: AbortSignal | undefined;
+  const diagnostics: Array<{ kind: "http"; status: number } | { kind: "transport" }> = [];
+  const waitingFetch = ((_url: unknown, init: { signal?: AbortSignal }) => {
+    observedSignal = init.signal;
+    return new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+        once: true
+      });
+      controller.abort();
+    });
+  }) as unknown as typeof undiciFetch;
+  const response = await forwardRpc(
+    "https://vendor.example/mcp", payload, {}, waitingFetch,
+    { timeoutMs: 8_000, signal: controller.signal, onDiagnostic: value => diagnostics.push(value) }
+  );
+  expect(observedSignal?.aborted).toBe(true);
+  expect(response.error).toBeDefined();
+  expect(diagnostics).toEqual([{ kind: "transport" }]);
 });

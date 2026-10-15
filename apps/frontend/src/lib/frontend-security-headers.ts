@@ -1,11 +1,15 @@
+import { mcpAppSandboxOrigin } from "./mcp-app-sandbox-origin";
+
 export type FrontendSecurityPolicyInput = {
   nonce: string;
   apiUrl: string;
   development: boolean;
+  appOrigin?: string;
 };
 
 export function buildFrontendContentSecurityPolicy(input: FrontendSecurityPolicyInput): string {
   const apiOrigin = new URL(input.apiUrl).origin;
+  const sandboxOrigin = mcpAppSandboxOrigin(input.appOrigin);
   const scriptSources = ["'self'", `'nonce-${input.nonce}'`];
   const developmentConnectSources = input.development
     ? " http://localhost:8400 ws: wss:"
@@ -19,7 +23,7 @@ export function buildFrontendContentSecurityPolicy(input: FrontendSecurityPolicy
     `img-src 'self' data: blob: ${apiOrigin}`,
     "font-src 'self' data:",
     `connect-src 'self' ${apiOrigin}${developmentConnectSources}`,
-    "frame-src 'self'",
+    `frame-src 'self'${sandboxOrigin ? ` ${sandboxOrigin}` : ""}`,
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",

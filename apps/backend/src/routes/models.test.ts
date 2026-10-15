@@ -5,6 +5,8 @@ import type { EffortLevel, ModelProvider } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import type { TenantSettingsRecord } from "../services/tenant-settings-store.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
+import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 
 import { registerModelRoutes, type ModelRouteStores } from "./models.js";
 
@@ -23,7 +25,9 @@ function settingsWith(overrides: Partial<TenantSettingsRecord> = {}): TenantSett
     enabledMcpServerIds: [],
     enabledProviders: [...MODEL_PROVIDERS],
     enabledModelIds: null,
+    defaultModelId: null,
     modelDefaultEfforts: {},
+    approvedSandboxEgressDomains: [],
     version: 1,
     configHash: "test-config",
     updatedAt: "2026-09-04T00:00:00.000Z",
@@ -77,6 +81,65 @@ test("/models lists only Anthropic models when only the Anthropic key is present
   }
 });
 
+test("/models marks the organization default for the chat picker", async () => {
+  const app = await makeModelsApp(makeStores({
+    dynamicConfig: { async getOrCreateTenantSettings() {
+      return settingsWith({ defaultModelId: "openai/gpt-5.6-sol" });
+    } },
+    configuredProviders: configured("anthropic", "openai")
+  }));
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.statusCode).toBe(200);
+    const defaults = response.json().models.filter((model: { isDefault: boolean }) => model.isDefault);
+    expect(defaults.map((model: { id: string }) => model.id)).toEqual(["openai/gpt-5.6-sol"]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models marks the configured fallback when the saved default has no key", async () => {
+  const settings = settingsWith({ defaultModelId: "openai/gpt-5.6-sol" });
+  const app = await makeModelsApp(makeStores({
+    dynamicConfig: { async getOrCreateTenantSettings() {
+      return settings;
+    } },
+    configuredProviders: configured("anthropic")
+  }));
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.statusCode).toBe(200);
+    const defaults = response.json().models.filter((model: { isDefault: boolean }) => model.isDefault);
+    expect(defaults.map((model: { id: string }) => model.id)).toEqual(["deepagents/claude-haiku-5-5"]);
+    const runtime = await resolveRuntimeModel({
+      tenantId: "t",
+      requestedModel: undefined,
+      requestedEffort: undefined,
+      runtimeAdapter: {} as RuntimeAdapter,
+      stores: {
+        getModelAvailability: async () => settings,
+        hasProviderKey: async (_tenantId, provider) => provider === "anthropic"
+      }
+    });
+    expect(runtime.kind).toBe("ok");
+    if (runtime.kind === "ok") expect(runtime.selectedModel?.id).toBe(defaults[0].id);
+  } finally {
+    await app.close();
+  }
+});
+
+test("/models marks the OpenAI default when only an OpenAI key is configured", async () => {
+  const app = await makeModelsApp(makeStores({ configuredProviders: configured("openai") }));
+  try {
+    const response = await app.inject({ method: "GET", url: "/models" });
+    expect(response.statusCode).toBe(200);
+    const models = response.json().models;
+    expect(models.filter((model: { isDefault: boolean }) => model.isDefault).map((model: { id: string }) => model.id)).toEqual(["openai/gpt-6-luna"]);
+  } finally {
+    await app.close();
+  }
+});
+
 test("/models lists a provider's models when only that provider is configured", async () => {
   const app = await makeModelsApp(
     makeStores({
@@ -106,11 +169,17 @@ test("/models exposes the new provider models with valid effort choices", async 
       defaultEffort: string;
       contextWindow: number;
     }>;
-    const opus = models.find((model) => model.id === "deepagents/claude-opus-5-5");
-    expect(opus).toMatchObject({
+    for (const id of ["deepagents/claude-opus-5-5", "deepagents/claude-sonnet-5-5"]) {
+      expect(models.find((model) => model.id === id)).toMatchObject({
+        supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+        defaultEffort: "medium",
+        contextWindow: 1_000_000
+      });
+    }
+    expect(models.find((model) => model.id === "openai/gpt-6.1-sol")).toMatchObject({
       supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
       defaultEffort: "medium",
-      contextWindow: 1_000_000
+      contextWindow: 1_050_000
     });
     for (const id of ["openai/gpt-6-sol", "openai/gpt-6-luna"]) {
       expect(models.find((model) => model.id === id)).toMatchObject({

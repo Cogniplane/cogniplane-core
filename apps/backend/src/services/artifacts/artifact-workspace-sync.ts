@@ -28,8 +28,8 @@ function safeFileName(artifactName: string): string {
 
 /**
  * Build a unique workspace path for an artifact. When multiple artifacts
- * share the same name, subsequent ones get a short artifact-ID suffix to
- * avoid overwriting each other.
+ * share the same name, subsequent ones get the full artifact-ID suffix. A
+ * UUIDv7 prefix is a timestamp, so a short prefix is not unique.
  */
 function uniqueWorkspacePath(artifact: ArtifactRecord, usedNames: Set<string>): string {
   const safe = safeFileName(artifact.artifactName);
@@ -39,8 +39,9 @@ function uniqueWorkspacePath(artifact: ArtifactRecord, usedNames: Set<string>): 
   }
   const ext = path.extname(safe);
   const stem = safe.slice(0, safe.length - ext.length);
-  const shortId = artifact.artifactId.slice(0, 8);
-  const deduped = `${stem}_${shortId}${ext}`;
+  let deduped = `${stem}_${artifact.artifactId}${ext}`;
+  // A user file can already have this name.
+  for (let n = 2; usedNames.has(deduped); n++) deduped = `${stem}_${artifact.artifactId}_${n}${ext}`;
   usedNames.add(deduped);
   return `./artifacts/${deduped}`;
 }

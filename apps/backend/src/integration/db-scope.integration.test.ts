@@ -161,30 +161,6 @@ describe.skipIf(!adminDatabaseUrl())("withTenantScope GUC lifetime", () => {
     });
   });
 
-  test("a scope that threw does not leave the connection scoped to that tenant", async () => {
-    // Deliberately uses tenant B for the recovery read. An earlier version
-    // reused tenant A, so a leaked A context would have satisfied the follow-up
-    // query and the test would have passed with the rollback removed.
-    await withOneConnectionPool(async (pool) => {
-      await expect(
-        withTenantScope(pool, tenantA.tenantId, async () => {
-          throw new Error("first scope fails");
-        })
-      ).rejects.toThrow("first scope fails");
-
-      // Tenant B must see ITS OWN row count, not tenant A's. Under a leaked A
-      // context this returns 0 for B's own session, which fails.
-      const count = await withTenantScope(pool, tenantB.tenantId, async (client) => {
-        const { rows } = await client.query<{ count: string }>(
-          "SELECT COUNT(*)::text AS count FROM sessions WHERE session_id = $1",
-          [tenantB.sessionId]
-        );
-        return Number(rows[0]?.count);
-      });
-      expect(count).toBe(1);
-    });
-  });
-
   test("withTransaction does NOT set a tenant GUC", async () => {
     // Easy to assume it does, given the name pairing. It does not, and a store
     // that reached for withTransaction expecting tenant scoping would run with

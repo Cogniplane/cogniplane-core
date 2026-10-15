@@ -3,9 +3,17 @@ import { afterEach, expect, test, vi } from "vitest";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
+import { generateSessionTitle } from "../services/session-titler.js";
 import { registerMessageRoutes, type MessageRouteStores } from "./messages.js";
 
+vi.mock("../services/session-titler.js", () => ({ generateSessionTitle: vi.fn(async () => null) }));
+
 const SESSION_ID = "37af657a-2fed-4148-a5fa-ec6b34ccc959";
+
+/** A session that the message route can continue. */
+function readableSession(fields: { sessionId: string; sessionName: string; projectId?: string }) {
+  return { status: "active" as const, transcriptFormat: "current" as const, ...fields };
+}
 
 // The TOCTOU risk sits between the route's busy check and the runtime adapter
 // marking the session busy. Exercise the route with a real ActiveTurnsRegistry
@@ -44,7 +52,7 @@ function makeStores(
           approvalPolicy: "never" as const,
           approvalReviewer: "user" as const,
           sandboxMode: "workspace-write" as const,
-          networkMode: "restricted" as const,
+          sandboxEgressDomains: [],
           allowCommandExecution: false,
           autoApproveReadOnlyTools: false,
           policyEnforcementMode: "monitor" as const,
@@ -77,7 +85,7 @@ function makeStores(
     },
     sessions: {
       async getReadable() {
-        return { sessionId: "session-1", sessionName: "Existing session", status: "active" };
+        return readableSession({ sessionId: "session-1", sessionName: "Existing session" });
       }
     },
     artifacts: {
@@ -109,8 +117,8 @@ function makeStores(
           content: input.content
         };
       },
-      async updateContent() {
-        return null;
+      async updateContent(_tenantId: string, messageId: string, _userId: string, status: string, content: string) {
+        return { messageId, status, content };
       },
       async updateStreamingContent() {
         return null;
@@ -315,6 +323,41 @@ test("returns the resolver's provider-key error without reserving a slot or pers
   expect(harness.createdMessages.length).toBe(0);
 });
 
+test.each([
+  ["legacy", "legacy"],
+  ["unsupported", "unsupported"],
+  ["absent", undefined]
+] as const)("refuses a session with a %s history format before any turn work", async (_, transcriptFormat) => {
+  const harness = makeStores({ gateRuntime: async () => undefined });
+  const getReadable = vi.fn().mockResolvedValue({
+    sessionId: SESSION_ID, sessionName: "Old chat", status: "active", ...(transcriptFormat ? { transcriptFormat } : {})
+  });
+  harness.stores.sessions.getReadable = getReadable;
+  const evaluateText = vi.fn();
+  harness.stores.piiProtection = { evaluateText };
+  const getTenantSettings = vi.spyOn(harness.stores.dynamicConfig, "getOrCreateTenantSettings");
+  const run = vi.spyOn(harness.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(harness.stores);
+
+  const response = await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Continue" } });
+
+  expect(response.statusCode).toBe(409);
+  expect(response.json()).toEqual({
+    error: "unsupported_transcript_format",
+    message: "This version of Cogniplane cannot continue a chat in this history format. Start a new chat."
+  });
+  // Nothing past the session read ran: no model resolution, slot, lease, rate
+  // limit, PII scan, saved prompt, or runtime (which loads the checkpoint).
+  expect(getReadable).toHaveBeenCalledOnce();
+  expect(getTenantSettings).not.toHaveBeenCalled();
+  expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+  expect(harness.stores.executions.acquire).not.toHaveBeenCalled();
+  expect(harness.consumedQuota).toEqual([]);
+  expect(evaluateText).not.toHaveBeenCalled();
+  expect(harness.createdMessages).toEqual([]);
+  expect(run).not.toHaveBeenCalled();
+});
+
 test("hijacked SSE responses set security and no-store cache headers directly", async () => {
   const harness = makeStores({ gateRuntime: async () => undefined });
   const app = await buildApp(harness.stores);
@@ -429,8 +472,7 @@ test("capability mutations block new turns without reporting streaming activity"
 
 test("records the resolved project revision and sends the same snapshot to the runtime", async () => {
   const h = makeStores({ gateRuntime: async () => {} });
-  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
-    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue(readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   const snapshot = { projectId: "project-1", instructions: "Write in French", instructionsRevision: 2 };
   h.stores.projects = { getReadable: vi.fn().mockResolvedValue(snapshot) };
   const create = vi.spyOn(h.stores.messages, "create");
@@ -452,12 +494,8 @@ test("captures selected project files even when project tools are disabled in te
     modelDefaultEfforts: {},
     enabledToolIds: []
   });
-  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({
-    sessionId: SESSION_ID,
-    sessionName: "Proposal",
-    status: "active",
-    projectId: "project-1"
-  });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue(
+    readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   h.stores.projects = {
     getReadable: vi.fn().mockResolvedValue({
       projectId: "project-1",
@@ -507,8 +545,7 @@ test("returns 503 when tenant settings are unavailable during model resolution",
 
 test("blocks project instructions before consuming quota or starting the runtime", async () => {
   const h = makeStores({ gateRuntime: async () => {} });
-  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
-    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue(readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Sensitive instructions", instructionsRevision: 1 }) };
   h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
     .mockResolvedValueOnce({ action: "block", findings: [], blockReason: "Sensitive" }) };
@@ -524,8 +561,7 @@ test("blocks project instructions before consuming quota or starting the runtime
 
 test("uses PII-transformed instructions in both the saved snapshot and model input", async () => {
   const h = makeStores({ gateRuntime: async () => {} });
-  h.stores.sessions.getReadable = vi.fn().mockResolvedValue({ sessionId: SESSION_ID,
-    sessionName: "Proposal", status: "active", projectId: "project-1" });
+  h.stores.sessions.getReadable = vi.fn().mockResolvedValue(readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Private name", instructionsRevision: 1 }) };
   h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
     .mockResolvedValueOnce({ action: "transform", findings: [], transformedText: "[PERSON]" }) };
@@ -583,4 +619,134 @@ test("lost execution releases admission even when runtime abort and streaming ar
     await response;
   }
   expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+});
+
+test("a tenant with a spending limit keeps the local titler but not the paid fallback", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  vi.spyOn(h.stores.sessions, "getReadable").mockResolvedValue(
+    readableSession({ sessionId: "session-1", sessionName: "New session" }) as never);
+  const hasLimit = vi.fn(async () => true);
+  const tenantKey = vi.fn(async () => "sk-tenant");
+  Object.assign(h.stores, { modelSpending: { hasLimit }, getTenantAnthropicApiKey: tenantKey });
+  activeApp = await buildApp(h.stores, { ANTHROPIC_API_KEY: "sk-operator", UTILITY_LLM_ENABLED: true,
+    UTILITY_LLM_BASE_URL: "http://utility.local", UTILITY_LLM_MODEL: "local-model" });
+
+  await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Hello" } });
+
+  await vi.waitFor(() => expect(generateSessionTitle).toHaveBeenCalledTimes(1));
+  expect(hasLimit).toHaveBeenCalledWith("test-tenant");
+  expect(tenantKey).not.toHaveBeenCalled();
+  expect(vi.mocked(generateSessionTitle).mock.calls[0]![0]).toMatchObject({
+    keys: { anthropicApiKey: null }, utilityClient: expect.anything() });
+});
+
+// ─── Session titling (fire-and-forget after the first turn) ───────────────
+
+const titled = {
+  title: "Quarterly plan",
+  modelName: "claude-haiku-4-5",
+  tokenUsage: { inputTokens: 120, cachedInputTokens: 0, outputTokens: 8, reasoningOutputTokens: 0, totalTokens: 128 }
+};
+
+/** Let pending microtasks run, so code that would follow an awaited call has had its chance. */
+const drain = () => new Promise((resolve) => setImmediate(resolve));
+
+async function postFirstTurn(options: {
+  limited?: boolean;
+  tenantKey?: string | null;
+  renamed?: boolean;
+  utilityTitler?: boolean;
+} = {}) {
+  vi.mocked(generateSessionTitle).mockClear();
+  const h = makeStores({ gateRuntime: async () => {} });
+  vi.spyOn(h.stores.sessions, "getReadable").mockResolvedValue(
+    readableSession({ sessionId: "session-1", sessionName: "New session" }) as never);
+  const create = vi.spyOn(h.stores.messages, "create");
+  const renameIfCurrent = vi.fn(async (_tenantId: string, _sessionId: string, _userId: string, _current: string, _title: string) =>
+    options.renamed ?? true);
+  const addTokenUsage = vi.fn(async (_tenantId: string, _messageId: string, _userId: string, _usage: unknown, _model: string) => undefined);
+  const setCostUsd = vi.fn(async (_tenantId: string, _messageId: string, _userId: string, _cost: number | null) => undefined);
+  const hasLimit = vi.fn(async () => options.limited ?? false);
+  const getTenantAnthropicApiKey = vi.fn(async () => options.tenantKey ?? null);
+  Object.assign(h.stores.sessions, { renameIfCurrent });
+  Object.assign(h.stores.messages, { addTokenUsage, setCostUsd });
+  Object.assign(h.stores, { modelSpending: { hasLimit }, getTenantAnthropicApiKey });
+  activeApp = await buildApp(h.stores, {
+    ANTHROPIC_API_KEY: "sk-operator",
+    SESSION_TITLER_CLAUDE_MODEL: "claude-haiku-4-5",
+    SESSION_TITLER_TIMEOUT_MS: 5_000,
+    ...(options.utilityTitler
+      ? { UTILITY_LLM_ENABLED: true, UTILITY_LLM_BASE_URL: "http://utility.local", UTILITY_LLM_MODEL: "local-model" }
+      : {})
+  });
+
+  await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Plan Q4" } });
+  const titlingMessages = () => create.mock.calls.filter(([input]) => (input as { role: string }).role === "system");
+  return { create, titlingMessages, renameIfCurrent, addTokenUsage, setCostUsd, hasLimit, getTenantAnthropicApiKey };
+}
+
+test("titling records the title as a system message with its token usage and cost", async () => {
+  vi.mocked(generateSessionTitle).mockResolvedValueOnce(titled);
+  const t = await postFirstTurn();
+
+  await vi.waitFor(() => expect(t.setCostUsd).toHaveBeenCalled());
+  expect(t.renameIfCurrent).toHaveBeenCalledWith("test-tenant", SESSION_ID, "platform-user", "New session", "Quarterly plan");
+  expect(t.titlingMessages()).toHaveLength(1);
+  expect(t.titlingMessages()[0]![0]).toMatchObject({
+    role: "system", status: "completed", content: "Quarterly plan", detail: { kind: "session_titling" }
+  });
+  const titlingId = (await t.create.mock.results.at(-1)!.value as { messageId: string }).messageId;
+  expect(t.addTokenUsage).toHaveBeenCalledWith("test-tenant", titlingId, "platform-user", titled.tokenUsage, "claude-haiku-4-5");
+  const [, costMessageId, , cost] = t.setCostUsd.mock.calls[0]!;
+  expect(costMessageId).toBe(titlingId);
+  expect(cost).toBeGreaterThan(0);
+});
+
+test("titling prefers the tenant's own Anthropic key, trimmed, over the operator key", async () => {
+  const withTenantKey = await postFirstTurn({ tenantKey: "  sk-tenant  " });
+  await vi.waitFor(() => expect(generateSessionTitle).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(generateSessionTitle).mock.calls[0]![0]).toMatchObject({ keys: { anthropicApiKey: "sk-tenant" } });
+  expect(withTenantKey.getTenantAnthropicApiKey).toHaveBeenCalledWith("test-tenant");
+  await activeApp!.close();
+  activeApp = null;
+
+  await postFirstTurn({ tenantKey: null });
+  await vi.waitFor(() => expect(generateSessionTitle).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(generateSessionTitle).mock.calls[0]![0]).toMatchObject({ keys: { anthropicApiKey: "sk-operator" } });
+});
+
+test("titling is skipped for a tenant over its spending limit when no local titler exists", async () => {
+  const t = await postFirstTurn({ limited: true });
+
+  await vi.waitFor(() => expect(t.hasLimit).toHaveBeenCalledWith("test-tenant"));
+  await drain();
+  expect(generateSessionTitle).not.toHaveBeenCalled();
+  expect(t.getTenantAnthropicApiKey).not.toHaveBeenCalled();
+});
+
+test("titling records nothing when another turn already renamed the session", async () => {
+  vi.mocked(generateSessionTitle).mockResolvedValueOnce(titled);
+  const t = await postFirstTurn({ renamed: false });
+
+  await vi.waitFor(() => expect(t.renameIfCurrent).toHaveBeenCalled());
+  await drain();
+  expect(t.titlingMessages()).toHaveLength(0);
+  expect(t.addTokenUsage).not.toHaveBeenCalled();
+  expect(t.setCostUsd).not.toHaveBeenCalled();
+});
+
+test("a failed titler call is contained and leaves no unhandled rejection", async () => {
+  vi.mocked(generateSessionTitle).mockRejectedValueOnce(new Error("titler down"));
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  try {
+    const t = await postFirstTurn();
+    await vi.waitFor(() => expect(generateSessionTitle).toHaveBeenCalledTimes(1));
+    await drain();
+    await drain();
+    expect(t.renameIfCurrent).not.toHaveBeenCalled();
+  } finally {
+    process.off("unhandledRejection", unhandled);
+  }
+  expect(unhandled).not.toHaveBeenCalled();
 });

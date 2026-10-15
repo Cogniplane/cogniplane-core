@@ -8,6 +8,7 @@ import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
 import { handleAppError } from "../../app.js";
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
+import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type {
@@ -146,6 +147,9 @@ async function registerTestAdminRoutes(
       },
       async list() {
         throw new Error("Unexpected policy decision listing");
+      },
+      async summarizeMonitor() {
+        throw new Error("Unexpected policy monitor summary");
       }
     },
     policyService: {
@@ -184,6 +188,10 @@ async function registerTestAdminRoutes(
 type AdminDynamicConfig = AdminRouteStores["dynamicConfig"];
 
 class InMemoryAdminConfig implements AdminDynamicConfig {
+  // Receives the audit events that the real service writes inside the change
+  // transaction. Routes must not write these events to the route audit store.
+  constructor(readonly transactionAudits?: InMemoryAuditEventStore) {}
+
   skills: Array<{
     skillId: string;
     skillName: string;
@@ -273,6 +281,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
     enabledModelIds: null as string[] | null,
     modelDefaultEfforts: {},
+    approvedSandboxEgressDomains: [],
+    defaultModelId: null,
     version: 1,
     configHash: "hash-tenant-settings",
     updatedAt: new Date().toISOString()
@@ -341,7 +351,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       reviewedAt: null,
       activatedAt: null
     };
-    return { skill, revision, previousActiveRevisionId: 2 };
+    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
   }
 
   async importSkillBundleFromInline(_tenantId: string, input: {
@@ -432,7 +442,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       reviewedAt: null,
       activatedAt: null
     };
-    return { skill, revision, previousActiveRevisionId: 2 };
+    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
   }
 
   async listSkillRevisions(_tenantId: string, skillId: string) {
@@ -506,7 +516,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     const revision = {
       skillRevisionId: 3,
       skillId: "pdf-processing",
-      revisionNumber: 1,
+      revisionNumber: 3,
       sourceType: "github",
       sourceLabel: "example-org/pdf-processing@main",
       bundleName: "pdf-processing",
@@ -528,7 +538,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       activatedAt: new Date().toISOString()
     };
 
-    return { skill, revision, previousActiveRevisionId: 2 };
+    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
   }
 
   async listMcpServers(_tenantId: string) {
@@ -544,6 +554,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
         upstreamAuthType: "none" as const,
         upstreamAuthName: null,
         upstreamAuthConfigured: false,
+      credentialScope: "organization" as const,
+      credentialBindingId: "00000000-0000-0000-0000-000000000001",
         version: 1,
         configHash: "hash-trusted-echo",
         enabled: true,
@@ -555,8 +567,12 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     ];
   }
 
-  async createMcpServer(_tenantId: string) {
-    return {
+  async createMcpServer(
+    _tenantId: string,
+    _input?: unknown,
+    audit?: Parameters<DynamicConfigService["createMcpServer"]>[2]
+  ) {
+    const saved = {
       serverId: "unused",
       serverName: "unused",
       description: null,
@@ -567,6 +583,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       upstreamAuthType: "none" as const,
       upstreamAuthName: null,
       upstreamAuthConfigured: false,
+      credentialScope: "organization" as const,
+      credentialBindingId: "00000000-0000-0000-0000-000000000001",
       version: 1,
       configHash: "unused",
       enabled: true,
@@ -575,6 +593,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
+    if (audit) await this.transactionAudits?.create(audit(saved));
+    return saved;
   }
 
   async updateMcpServer(_tenantId: string) {
@@ -593,6 +613,70 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     return null;
   }
 
+  async saveMcpServerWithAudience(
+    _tenantId: string,
+    input: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[1],
+    audience: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[2],
+    _editingId?: string,
+    audit?: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[4]
+  ) {
+    const saved = {
+      serverId: input.serverId,
+      serverName: input.serverName,
+      description: input.description,
+      transportKind: input.transportKind,
+      mode: input.mode,
+      routePath: input.routePath,
+      upstreamUrl: input.upstreamUrl ?? null,
+      upstreamAuthType: input.upstreamAuthType ?? "none",
+      upstreamAuthName: input.upstreamAuthName ?? null,
+      upstreamAuthConfigured: Boolean(input.upstreamAuthSecret),
+      credentialScope: input.credentialScope ?? "organization",
+      credentialBindingId: "00000000-0000-0000-0000-000000000001",
+      version: 1,
+      configHash: "test",
+      enabled: audience !== "off",
+      isPublished: audience === "members",
+      createdBy: input.actorUserId,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    if (audit) await this.transactionAudits?.create(audit(saved));
+    return saved;
+  }
+
+  async setInheritedMcpAudience(
+    _tenantId: string,
+    _serverId: string,
+    _audience: Parameters<DynamicConfigService["setInheritedMcpAudience"]>[2],
+    audit?: Parameters<DynamicConfigService["setInheritedMcpAudience"]>[3]
+  ) {
+    const server = {
+      serverId: _serverId,
+      ownerTenantId: "system",
+      serverName: "Built-in",
+      description: null,
+      transportKind: "http" as const,
+      mode: "managed" as const,
+      routePath: `/mcp/${_serverId}`,
+      upstreamUrl: null,
+      upstreamAuthType: "none" as const,
+      upstreamAuthName: null,
+      upstreamAuthConfigured: false,
+      credentialScope: "organization" as const,
+      credentialBindingId: "00000000-0000-0000-0000-000000000001",
+      version: 1,
+      configHash: "test",
+      enabled: true,
+      isPublished: true,
+      createdBy: "system",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    if (audit) await this.transactionAudits?.create(audit(server));
+    return server;
+  }
+
   async getOrCreateTenantSettings(_tenantId: string) {
     return {
       ...this.tenantSettings,
@@ -600,9 +684,17 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     };
   }
 
+  async lockTenantSettings(tenantId: string) {
+    return this.getOrCreateTenantSettings(tenantId);
+  }
+
   lastUpdateInput: Record<string, unknown> | null = null;
 
-  async updateTenantSettings(_tenantId: string, input: TenantSettingsInput) {
+  async updateTenantSettings(
+    _tenantId: string,
+    input: TenantSettingsInput,
+    audit?: Parameters<DynamicConfigService["updateTenantSettings"]>[2]
+  ) {
     this.lastUpdateInput = input;
     this.tenantSettings = {
       ...this.tenantSettings,
@@ -611,7 +703,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       version: this.tenantSettings.version + 1,
       updatedAt: new Date().toISOString()
     };
-    return this.getOrCreateTenantSettings(_tenantId);
+    const saved = await this.getOrCreateTenantSettings(_tenantId);
+    if (audit) await this.transactionAudits?.create(audit(saved));
+    return saved;
   }
 }
 
@@ -747,7 +841,8 @@ test("admin routes list, disable skills, and show runtime rollout state", async 
 
   const disableResponse = await app.inject({
     method: "POST",
-    url: "/admin/skills/document-analysis/disable"
+    url: "/admin/skills/document-analysis/disable",
+    payload: { expectedSnapshot: { version: 1, activeRevisionId: null, latestRevisionId: null, enabled: true, isPublished: false } }
   });
   expect(disableResponse.statusCode).toBe(200);
   expect(disableResponse.json().skill.enabled).toBe(false);
@@ -904,7 +999,7 @@ test("admin tenant settings updates are audited", async () => {
   });
 
   const auditEvents = new InMemoryAuditEventStore();
-  const adminConfig = new InMemoryAdminConfig();
+  const adminConfig = new InMemoryAdminConfig(auditEvents);
   await registerTestAdminRoutes(app, {
     dynamicConfig: adminConfig,
     skillMarketplace: createMarketplaceStore(),
@@ -961,11 +1056,37 @@ test("admin tenant settings updates are audited", async () => {
         enabledMcpServerIds: ["managed-session-context"],
         enabledProviders: ["anthropic", "openai", "google", "openrouter", "zai"],
         enabledModelIds: null,
+        defaultModelId: null,
         modelDefaultEfforts: {},
+        approvedSandboxEgressDomains: [],
         runtimeRefresh: "next_turn_in_place",
         version: 2,
         configHash: "hash-tenant-settings"
       });
+
+  adminConfig.tenantSettings.defaultModelId = "openai/gpt-5.6-sol";
+  const providerVersion = adminConfig.tenantSettings.version;
+  const disableProvider = await app.inject({
+    method: "PUT", url: "/admin/tenant-settings",
+    payload: { enabledProviders: ["anthropic"] }
+  });
+  expect(disableProvider.statusCode).toBe(200);
+  expect(disableProvider.json().settings.defaultModelId).toBeNull();
+  expect(adminConfig.lastUpdateInput).toMatchObject({
+    defaultModelId: null, expectedVersion: providerVersion
+  });
+
+  adminConfig.tenantSettings.defaultModelId = "deepagents/claude-sonnet-5";
+  const modelsVersion = adminConfig.tenantSettings.version;
+  const removeModel = await app.inject({
+    method: "PUT", url: "/admin/tenant-settings",
+    payload: { enabledModelIds: ["openai/gpt-5.6-sol"] }
+  });
+  expect(removeModel.statusCode).toBe(200);
+  expect(removeModel.json().settings.defaultModelId).toBeNull();
+  expect(adminConfig.lastUpdateInput).toMatchObject({
+    defaultModelId: null, expectedVersion: modelsVersion
+  });
 
   const forbidden = await app.inject({
     method: "PUT",
@@ -1002,7 +1123,7 @@ test("admin tenant settings updates are audited", async () => {
     payload: { expectedVersion: 1, developerInstructions: "stale draft" } });
   expect(conflict.statusCode).toBe(409);
   expect(conflict.json()).toMatchObject({ error: "settings_conflict", message: expect.stringContaining("Reload") });
-  expect(adminConfig.updateTenantSettings).toHaveBeenLastCalledWith("admin-tenant", expect.objectContaining({ expectedVersion: 1 }));
+  expect(adminConfig.updateTenantSettings).toHaveBeenLastCalledWith("admin-tenant", expect.objectContaining({ expectedVersion: 1 }), expect.any(Function));
   expect(auditEvents.events).toHaveLength(auditCount);
 
   await app.close();
@@ -1024,7 +1145,7 @@ test("admin tenant settings preserve runtime workspaces and refresh in place nex
   const invalidatedTenants: string[] = [];
   const auditEvents = new InMemoryAuditEventStore();
   await registerTestAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig(),
+    dynamicConfig: new InMemoryAdminConfig(auditEvents),
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
@@ -1087,7 +1208,7 @@ test("admin tenant settings do not depend on destructive runtime invalidation", 
 
   const auditEvents = new InMemoryAuditEventStore();
   await registerTestAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig(),
+    dynamicConfig: new InMemoryAdminConfig(auditEvents),
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
@@ -1204,7 +1325,7 @@ test("MCP updates validate body IDs and pass defaulted fields to the store", asy
     serverId: "trusted-echo",
     transportKind: "http",
     enabled: true
-  }));
+  }), expect.any(Function));
 
   await app.close();
 });
@@ -1222,13 +1343,15 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     };
   });
 
-  const dynamicConfig = new InMemoryAdminConfig();
+  const auditEvents = new InMemoryAuditEventStore();
+  const dynamicConfig = new InMemoryAdminConfig(auditEvents);
   const createMcpServer = vi.spyOn(dynamicConfig, "createMcpServer");
+  const saveMcpServerWithAudience = vi.spyOn(dynamicConfig, "saveMcpServerWithAudience");
   await registerTestAdminRoutes(app, {
     dynamicConfig,
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
-    auditEvents: new InMemoryAuditEventStore(),
+    auditEvents,
     runtimeSessions: {
       async listRecent(_tenantId: string) {
         return [];
@@ -1297,7 +1420,140 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     serverId: "defaulted-server",
     transportKind: "http",
     enabled: true
-  }));
+  }), expect.any(Function));
+  // The legacy create audits through the in-transaction builder.
+  expect(auditEvents.events.at(-1)?.type).toBe("admin.mcp_server.created");
+
+  const setupResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers/setup",
+    payload: {
+      serverId: "setup-server",
+      serverName: "Setup server",
+      mode: "proxy",
+      routePath: "/mcp/setup-server",
+      upstreamUrl: "https://vendor.example/mcp",
+      audience: "test_users"
+    }
+  });
+  expect(setupResponse.statusCode).toBe(201);
+  expect(setupResponse.json().mcpServer).toMatchObject({ enabled: true, isPublished: false });
+  expect(saveMcpServerWithAudience).toHaveBeenLastCalledWith(
+    "admin-tenant",
+    expect.objectContaining({
+      serverId: "setup-server",
+      actorUserId: "admin-user",
+      upstreamAuthType: "none",
+      credentialScope: "organization"
+    }),
+    "test_users",
+    undefined,
+    expect.any(Function)
+  );
+  expect(auditEvents.events.at(-1)?.payload).toEqual({
+    serverId: "setup-server",
+    credentialScope: "organization",
+    version: 1,
+    enabled: true,
+    audience: "test_users",
+    isPublished: false,
+    isAllowed: true
+  });
+
+  const offResponse = await app.inject({
+    method: "PUT",
+    url: "/admin/mcp-servers/setup-server/setup",
+    payload: {
+      serverId: "setup-server",
+      serverName: "Setup server",
+      mode: "proxy",
+      routePath: "/mcp/setup-server",
+      upstreamUrl: "https://vendor.example/mcp",
+      audience: "off"
+    }
+  });
+  expect(offResponse.statusCode).toBe(200);
+  expect(offResponse.json().mcpServer).toMatchObject({ enabled: false, isPublished: false });
+  expect(saveMcpServerWithAudience).toHaveBeenLastCalledWith(
+    "admin-tenant",
+    expect.objectContaining({ serverId: "setup-server" }),
+    "off",
+    "setup-server",
+    expect.any(Function)
+  );
+  // An edit parses with the update schema. Omitted auth fields stay omitted,
+  // so the store keeps the stored auth type, secret and credential scope.
+  const editInput = saveMcpServerWithAudience.mock.lastCall?.[1];
+  expect(editInput).not.toHaveProperty("upstreamAuthType");
+  expect(editInput).not.toHaveProperty("credentialScope");
+  expect(editInput).not.toHaveProperty("upstreamAuthName");
+  expect(auditEvents.events.at(-1)?.payload).toEqual({
+    serverId: "setup-server",
+    credentialScope: "organization",
+    version: 1,
+    enabled: false,
+    audience: "off",
+    isPublished: false,
+    isAllowed: false
+  });
+
+  const membersResponse = await app.inject({
+    method: "PUT",
+    url: "/admin/mcp-servers/setup-server/setup",
+    payload: {
+      serverId: "setup-server",
+      serverName: "Setup server",
+      mode: "proxy",
+      routePath: "/mcp/setup-server",
+      upstreamUrl: "https://vendor.example/mcp",
+      audience: "members"
+    }
+  });
+  expect(membersResponse.statusCode).toBe(200);
+  expect(auditEvents.events.at(-1)?.payload).toEqual({
+    serverId: "setup-server",
+    credentialScope: "organization",
+    version: 1,
+    enabled: true,
+    audience: "members",
+    isPublished: true,
+    isAllowed: true
+  });
+
+  const inheritedAudience = vi.spyOn(dynamicConfig, "setInheritedMcpAudience");
+  const inheritedResponse = await app.inject({
+    method: "PUT",
+    url: "/admin/mcp-servers/built-in/inherited-availability",
+    payload: { audience: "off" }
+  });
+  expect(inheritedResponse.statusCode).toBe(200);
+  expect(inheritedResponse.json().mcpServer).toMatchObject({
+    serverId: "built-in", ownerTenantId: "system", isAllowed: false
+  });
+  expect(inheritedAudience).toHaveBeenCalledWith("admin-tenant", "built-in", "off", expect.any(Function));
+  expect(auditEvents.events.at(-1)?.payload).toEqual({
+    serverId: "built-in",
+    version: 1,
+    audience: "off",
+    inherited: true,
+    enabled: true,
+    isPublished: true,
+    isAllowed: false
+  });
+  const inheritedRecord = await dynamicConfig.setInheritedMcpAudience("admin-tenant", "built-in", "members");
+  const leakyRecord = {
+    ...inheritedRecord,
+    upstreamAuth: { type: "bearer", secret: "must-not-leak" }
+  };
+  inheritedAudience.mockResolvedValueOnce(leakyRecord);
+  const redactedResponse = await app.inject({
+    method: "PUT",
+    url: "/admin/mcp-servers/built-in/inherited-availability",
+    payload: { audience: "members" }
+  });
+  expect(redactedResponse.statusCode).toBe(200);
+  expect(redactedResponse.body).not.toContain("must-not-leak");
+  expect(redactedResponse.json().mcpServer).not.toHaveProperty("upstreamAuth");
 
   const authenticatedResponse = await app.inject({
     method: "POST",
@@ -1320,8 +1576,44 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     expect.objectContaining({
       upstreamAuthType: "bearer",
       upstreamAuthSecret: "write-only-secret"
-    })
+    }),
+    expect.any(Function)
   );
+
+  const localResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverId: "local-proxy",
+      serverName: "Local proxy",
+      mode: "proxy",
+      routePath: "/mcp/local-proxy",
+      upstreamUrl: "http://100.108.24.234:3108/mcp"
+    }
+  });
+  expect(localResponse.statusCode).toBe(201);
+  expect(createMcpServer).toHaveBeenLastCalledWith(
+    "admin-tenant",
+    expect.objectContaining({ upstreamUrl: "http://100.108.24.234:3108/mcp" }),
+    expect.any(Function)
+  );
+
+  const managedUrlResponse = await app.inject({
+    method: "POST",
+    url: "/admin/mcp-servers",
+    payload: {
+      serverId: "managed-with-url",
+      serverName: "Managed with URL",
+      mode: "managed",
+      routePath: "/mcp/managed-with-url",
+      upstreamUrl: "http://100.108.24.234:3108/mcp"
+    }
+  });
+  expect(managedUrlResponse.statusCode).toBe(400);
+  expect(managedUrlResponse.json().details).toContainEqual({
+    path: "upstreamUrl",
+    message: "Managed MCP servers cannot configure an upstreamUrl"
+  });
 
   await app.close();
 });
@@ -1774,7 +2066,8 @@ test("admin routes list and activate skill revisions", async () => {
     method: "POST",
     url: "/admin/skills/pdf-processing/revisions/3/activate",
     payload: {
-      reviewNotes: "Looks good"
+      reviewNotes: "Looks good",
+      expectedSnapshot: { version: 1, activeRevisionId: 2, latestRevisionId: 3, enabled: true, isPublished: true }
     }
   });
   expect(activateResponse.statusCode).toBe(200);
@@ -1782,7 +2075,8 @@ test("admin routes list and activate skill revisions", async () => {
   expect(activateResponse.json().revision.reviewStatus).toBe("active");
   expect(auditEvents.events.some((event) => event.type === "admin.skill.reviewed")).toBeTruthy();
   expect(auditEvents.events.some((event) => event.type === "admin.skill.activated")).toBeTruthy();
-  expect(auditEvents.events.some((event) => event.type === "admin.skill.rollback")).toBeTruthy();
+  // Revision 3 replaces revision 2: a forward upgrade, not a rollback.
+  expect(auditEvents.events.some((event) => event.type === "admin.skill.rollback")).toBe(false);
 
   await app.close();
 });

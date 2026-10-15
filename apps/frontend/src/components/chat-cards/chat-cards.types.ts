@@ -5,7 +5,7 @@ import type { Approval } from "@cogniplane/shared-types";
 //
 // These are the row shapes the CopilotKit chat host still renders as cards
 // (approvals, MCP-server status, runtime notices, plan). They outlived the
-// activity-timeline UI removed in the Track B cutover — the timeline's row
+// activity-timeline UI removed in the AG-UI cutover — the timeline's row
 // taxonomy, buildTimeline, and grouping went with it. Fed from custom AG-UI
 // events (`use-agui-custom-events.ts`).
 // ---------------------------------------------------------------------------

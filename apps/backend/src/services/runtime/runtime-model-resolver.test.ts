@@ -20,13 +20,55 @@ function makeInput(overrides: Partial<RuntimeResolutionInput> = {}): RuntimeReso
   };
 }
 
+test.each(["low", "medium", "high", "xhigh", "max"])(
+  "resolveRuntimeModel: GPT-6.1 Sol accepts %s effort",
+  async (requestedEffort) => {
+    const result = await resolveRuntimeModel(makeInput({
+      requestedModel: "openai/gpt-6.1-sol",
+      requestedEffort
+    }));
+    expect(result).toMatchObject({
+      kind: "ok",
+      selectedModel: { id: "openai/gpt-6.1-sol", provider: "openai" },
+      selectedEffort: requestedEffort
+    });
+  }
+);
+
+test.each(["none", "minimal"])(
+  "resolveRuntimeModel: GPT-6.1 Sol rejects %s effort before dispatch",
+  async (requestedEffort) => {
+    const result = await resolveRuntimeModel(makeInput({
+      requestedModel: "openai/gpt-6.1-sol",
+      requestedEffort
+    }));
+    expect(result).toMatchObject({ kind: "error", statusCode: 400 });
+  }
+);
+
 test("resolveRuntimeModel: resolves ok with the adapter and default model", async () => {
   const result = await resolveRuntimeModel(makeInput());
   expect(result.kind).toBe("ok");
   if (result.kind !== "ok") return;
   expect(result.runtimeAdapter).toBe(stubAdapter);
-  // `deepagents/claude-sonnet-5` is the isDefault=true model
-  expect(result.selectedModel?.id).toBe("deepagents/claude-sonnet-5");
+  // `deepagents/claude-haiku-5-5` is the isDefault=true model
+  expect(result.selectedModel?.id).toBe("deepagents/claude-haiku-5-5");
+});
+
+test("resolveRuntimeModel: uses the enabled organization default for implicit turns", async () => {
+  const result = await resolveRuntimeModel(makeInput({
+    stores: {
+      hasProviderKey: async () => true,
+      getModelAvailability: async () => ({
+        enabledProviders: ["anthropic", "openai"],
+        enabledModelIds: null,
+        modelDefaultEfforts: {},
+        defaultModelId: "openai/gpt-5.6-sol"
+      })
+    }
+  }));
+  expect(result.kind).toBe("ok");
+  if (result.kind === "ok") expect(result.selectedModel?.id).toBe("openai/gpt-5.6-sol");
 });
 
 test("resolveRuntimeModel: key-presence lookup error returns 503 runtime_provider_unavailable", async () => {
@@ -55,7 +97,7 @@ test("resolveRuntimeModel: missing key checker skips the key gate (caller wires 
   });
   expect(result.kind).toBe("ok");
   if (result.kind !== "ok") return;
-  expect(result.selectedModel?.id).toBe("deepagents/claude-sonnet-5");
+  expect(result.selectedModel?.id).toBe("deepagents/claude-haiku-5-5");
 });
 
 test("resolveRuntimeModel: no key for the selected model's provider returns provider_api_key_required", async () => {
@@ -85,7 +127,7 @@ test("resolveRuntimeModel: no-model path picks a configured non-Anthropic provid
   );
   expect(result.kind).toBe("ok");
   if (result.kind !== "ok") return;
-  expect(result.selectedModel?.provider).toBe("openai");
+  expect(result.selectedModel?.id).toBe("openai/gpt-6-luna");
 });
 
 test("resolveRuntimeModel: no-model path keeps the Anthropic default when Anthropic is configured", async () => {
@@ -99,7 +141,7 @@ test("resolveRuntimeModel: no-model path keeps the Anthropic default when Anthro
   );
   expect(result.kind).toBe("ok");
   if (result.kind !== "ok") return;
-  expect(result.selectedModel?.id).toBe("deepagents/claude-sonnet-5");
+  expect(result.selectedModel?.id).toBe("deepagents/claude-haiku-5-5");
 });
 
 test("resolveRuntimeModel: no-model path with zero configured providers returns provider_api_key_required for the default", async () => {
@@ -243,7 +285,7 @@ test("resolveRuntimeModel: an explicitly requested model of a disabled provider 
 });
 
 test("resolveRuntimeModel: the no-model default skips disabled providers/models", async () => {
-  // Default (claude-sonnet-5) is disabled → the first enabled+configured model wins.
+  // Anthropic is disabled → the OpenAI default (GPT-6 Luna) wins.
   const result = await resolveRuntimeModel(
     makeInput({
       stores: {
@@ -254,7 +296,7 @@ test("resolveRuntimeModel: the no-model default skips disabled providers/models"
   );
   expect(result.kind).toBe("ok");
   if (result.kind !== "ok") return;
-  expect(result.selectedModel?.provider).toBe("openai");
+  expect(result.selectedModel?.id).toBe("openai/gpt-6-luna");
 });
 
 test("resolveRuntimeModel: availability lookup failure returns 503", async () => {

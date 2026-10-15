@@ -43,7 +43,8 @@ function buildReader(opts: {
     db: {} as Pool,
     artifacts,
     storage,
-    maxBytes: opts.maxBytes
+    maxBytes: opts.maxBytes,
+    extractPdfText: async () => "Quarterly report"
   });
 }
 
@@ -85,4 +86,18 @@ test("readContent allows content exactly at the cap", async () => {
   });
   const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
   expect((await input!.readContent()).length).toBe(100);
+});
+
+test("readContent marks a PDF verdict as text-only", async () => {
+  const reader = buildReader({ artifact: { mimeType: "application/pdf" }, body: Buffer.from("%PDF") });
+  const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
+  expect(await input!.readContent()).toBe("Quarterly report");
+  expect(input!.imagesNotScanned?.()).toBe(true);
+});
+
+test("readContent does not mark a text file", async () => {
+  const reader = buildReader({ artifact: {}, body: Buffer.from("hello") });
+  const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
+  await input!.readContent();
+  expect(input!.imagesNotScanned?.()).toBe(false);
 });

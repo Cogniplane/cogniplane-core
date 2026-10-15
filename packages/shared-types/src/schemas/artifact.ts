@@ -9,7 +9,9 @@ export const ArtifactPiiDetailSchema = z.object({
   scanRunId: z.string().optional(),
   summaryText: z.string().optional(),
   findingsCount: z.number().optional(),
-  blockReason: z.string().optional()
+  blockReason: z.string().optional(),
+  /** The scan read only the text; any images in the file (a PDF) were not scanned. */
+  imagesNotScanned: z.boolean().optional()
 }).passthrough();
 export type ArtifactPiiDetail = z.infer<typeof ArtifactPiiDetailSchema>;
 

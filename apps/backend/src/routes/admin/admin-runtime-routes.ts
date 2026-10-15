@@ -44,6 +44,27 @@ export async function registerAdminRuntimeRoutes(
     });
   }));
 
+  // Build, uptime and runtime activity for operators. The public /health and
+  // /ready answer with a bare status; this is the admin-only detail they used
+  // to carry. The counts cover the caller's tenant only: the in-memory maps
+  // also hold other tenants' sessions, which a tenant admin must not see even
+  // as totals.
+  app.get("/admin/diagnostics", withAdmin(app, async (request) => {
+    const runtimes = stores.deepAgentsAdapter.getRuntimeHealthDetail(request.auth.tenantId);
+    return {
+      status: "ok",
+      uptimeSeconds: Math.round(process.uptime()),
+      version: {
+        sha: process.env.BUILD_SHA ?? "dev",
+        buildDate: process.env.BUILD_DATE ?? ""
+      },
+      runtimes: {
+        activeRuntimeCount: runtimes.length,
+        activeTurnCount: runtimes.filter((runtime) => runtime.hasActiveTurn).length
+      }
+    };
+  }));
+
   // Live in-memory session-runtime detail (active turn, last activity),
   // scoped to the caller's tenant. This is the relocated detail that the
   // unauthenticated /health endpoint used to expose for every tenant.

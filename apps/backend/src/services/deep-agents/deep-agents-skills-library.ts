@@ -1,3 +1,4 @@
+import { hasSkillInstructions } from "../capability-selection.js";
 // Read-only skills library for the Deep Agents runtime (bead kpit).
 //
 // Enabled skills are served to the agent as files under /skills/ via the
@@ -192,7 +193,7 @@ export async function buildSkillsLibraryFiles(input: {
   const usedSlugs = new Set<string>();
 
   for (const skill of skills) {
-    if (!skill.instructions?.trim()) {
+    if (!hasSkillInstructions(skill.instructions)) {
       logger.warn({ skillId: skill.id }, "Skill has no instructions; excluded from skills library");
       continue;
     }

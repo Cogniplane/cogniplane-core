@@ -89,8 +89,8 @@ export class PiiScanJobHandler {
       });
 
       const subject = resolveSubject(job);
-      const decision = await this.evaluate(job, subject);
-      await this.applyDecision(job, decision);
+      const { decision, imagesNotScanned } = await this.evaluate(job, subject);
+      await this.applyDecision(job, decision, imagesNotScanned);
       decisionApplied = true;
       await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
     } catch (error) {
@@ -118,19 +118,37 @@ export class PiiScanJobHandler {
       );
 
       // On terminal failure (permanent OR no attempts left), mirror the state
-      // onto the scan run and subject so callers can see the job gave up.
+      // onto the subject and scan run so callers can see the job gave up. A
+      // write that fails here is retried by the worker's failed-job recovery.
       if (updated && updated.status === "failed") {
-        await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
-          status: "failed",
-          errorMessage: message,
-          completedAt: new Date()
+        await this.finishFailedJob({ ...job, errorMessage: message }).catch((caughtError: unknown) => {
+          this.deps.logger.error(
+            { err: caughtError, jobId: job.jobId },
+            "Failed to close the subject and scan run after terminal job failure"
+          );
         });
-        await this.markSubjectFailed(job);
       }
     }
   }
 
-  private async evaluate(job: PiiScanJobRecord, subject: PiiSubject): Promise<PiiDecision> {
+  /**
+   * Close the scan run and subject of a job that failed without its handler,
+   * for example by the stale-claim sweep. The subject is written first: if
+   * that write fails, the scan run stays open and the next sweep tries again.
+   */
+  async finishFailedJob(job: PiiScanJobRecord): Promise<void> {
+    await this.writeSubjectDetail(job, { status: "failed", modeApplied: job.mode });
+    await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
+      status: "failed",
+      errorMessage: job.errorMessage ?? "PII scan job failed",
+      completedAt: new Date()
+    });
+  }
+
+  private async evaluate(
+    job: PiiScanJobRecord,
+    subject: PiiSubject
+  ): Promise<{ decision: PiiDecision; imagesNotScanned: boolean }> {
     if (job.subjectType === "message") {
       const text = await this.deps.subjectReader.readMessageText({
         tenantId: job.tenantId,
@@ -139,11 +157,12 @@ export class PiiScanJobHandler {
       if (text === null) {
         throw new Error(`message ${job.subjectId} not found for scan job ${job.jobId}`);
       }
-      return this.deps.piiProtection.evaluateText({
+      const decision = await this.deps.piiProtection.evaluateText({
         tenantId: job.tenantId,
         text,
         subject
       });
+      return { decision, imagesNotScanned: false };
     }
 
     const artifact = await this.deps.subjectReader.readArtifact({
@@ -153,18 +172,21 @@ export class PiiScanJobHandler {
     if (artifact === null) {
       throw new Error(`artifact ${job.subjectId} not found for scan job ${job.jobId}`);
     }
-    return this.deps.piiProtection.evaluateArtifact({
+    const decision = await this.deps.piiProtection.evaluateArtifact({
       tenantId: job.tenantId,
       artifact,
       subject
     });
+    return { decision, imagesNotScanned: artifact.imagesNotScanned?.() ?? false };
   }
 
-  private async applyDecision(job: PiiScanJobRecord, decision: PiiDecision): Promise<void> {
+  private async applyDecision(job: PiiScanJobRecord, decision: PiiDecision, imagesNotScanned: boolean): Promise<void> {
     const modeApplied = job.mode;
+    // A clean or redacted verdict on a PDF covers only its text.
+    const coverage = imagesNotScanned ? { imagesNotScanned: true } : {};
 
     if (decision.action === "allow") {
-      await this.writeSubjectDetail(job, { status: "scanned", modeApplied, findingsCount: 0 });
+      await this.writeSubjectDetail(job, { status: "scanned", modeApplied, findingsCount: 0, ...coverage });
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "completed",
         actionTaken: "allow",
@@ -177,7 +199,8 @@ export class PiiScanJobHandler {
       await this.writeSubjectDetail(job, {
         status: "scanned",
         modeApplied,
-        findingsCount: decision.findings.length
+        findingsCount: decision.findings.length,
+        ...coverage
       });
       await this.emitAudit(job, "pii_reported", {
         scanRunId: job.scanRunId,
@@ -233,7 +256,8 @@ export class PiiScanJobHandler {
     await this.writeSubjectDetail(job, {
       status: "transformed",
       modeApplied,
-      findingsCount: decision.findings.length
+      findingsCount: decision.findings.length,
+      ...coverage
     });
     await this.emitAudit(job, "pii_transformed", {
       scanRunId: job.scanRunId,
@@ -318,6 +342,7 @@ export class PiiScanJobHandler {
       modeApplied: PiiScanJobRecord["mode"];
       blockReason?: string;
       findingsCount?: number;
+      imagesNotScanned?: boolean;
     }
   ): Promise<void> {
     if (job.subjectType === "message") {
@@ -340,18 +365,8 @@ export class PiiScanJobHandler {
     if (detail.findingsCount !== undefined) {
       artifactPii.findingsCount = detail.findingsCount;
     }
+    if (detail.imagesNotScanned) artifactPii.imagesNotScanned = true;
     await this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, artifactPii);
-  }
-
-  private async markSubjectFailed(job: PiiScanJobRecord): Promise<void> {
-    try {
-      await this.writeSubjectDetail(job, { status: "failed", modeApplied: job.mode });
-    } catch (caughtError) {
-      this.deps.logger.error(
-        { err: caughtError, jobId: job.jobId },
-        "Failed to mark subject detail as failed after terminal job failure"
-      );
-    }
   }
 }
 
@@ -365,6 +380,7 @@ export const PERMANENT_PII_ERROR_CODES = new Set([
   "artifact_not_found",
   "pii_decode_failed",
   "unsupported_mime",
+  "pdf_extraction_failed",
   "file_too_large"
 ]);
 

@@ -94,19 +94,17 @@ describe("runtime token", () => {
     expect(verifyRuntimeToken("Bearer some-jwt", SECRET).kind).toBe("invalid");
   });
 
-  it("rejects a token whose total length exceeds 2 KiB as invalid", () => {
-    const payload = Buffer.from("x".repeat(2100)).toString("base64url");
-    const tampered = `rt_${payload}.sig`;
-    const result = verifyRuntimeToken(tampered, SECRET);
-    expect(result.kind).toBe("invalid");
-  });
-
-  it("rejects a token whose payload portion exceeds 1 KiB as invalid", () => {
-    // Payload just over the cap, total token still under MAX_TOKEN_LENGTH.
-    const payload = "a".repeat(1100);
-    const tampered = `rt_${payload}.sig`;
-    const result = verifyRuntimeToken(tampered, SECRET);
-    expect(result.kind).toBe("invalid");
+  it("accepts a signed payload at the 1 KiB limit and rejects one just above it", () => {
+    const claims = { ...validClaims(), jti: "fixed", sid: "" };
+    const emptyLength = Buffer.byteLength(JSON.stringify(claims));
+    // 768 JSON bytes encode to exactly 1024 base64url characters.
+    const atLimit = generateRuntimeToken({ ...claims, sid: "s".repeat(768 - emptyLength) }, SECRET);
+    const aboveLimit = generateRuntimeToken({ ...claims, sid: "s".repeat(769 - emptyLength) }, SECRET);
+    expect(atLimit.slice(3).split(".")[0]).toHaveLength(1024);
+    expect(aboveLimit.slice(3).split(".")[0]).toHaveLength(1026);
+    expect(aboveLimit.length).toBeLessThan(2048);
+    expect(verifyRuntimeToken(atLimit, SECRET).kind).toBe("valid");
+    expect(verifyRuntimeToken(aboveLimit, SECRET).kind).toBe("invalid");
   });
 
   it("runtimeTokenExpiry adds the supplied TTL to the current time", () => {

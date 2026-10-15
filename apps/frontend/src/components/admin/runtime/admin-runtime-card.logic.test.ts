@@ -1,4 +1,6 @@
 import { describe, expect, test } from "vitest";
+import { withUtcDateLocale } from "../../../test-helpers/date-locale";
+
 
 import { RuntimeSessionSummarySchema, type RuntimeSessionSummary } from "@cogniplane/shared-types";
 
@@ -7,6 +9,8 @@ import {
   filterRuntimeSessions,
   formatRuntimeTimestamp
 } from "./admin-runtime-card.logic";
+
+withUtcDateLocale();
 
 function makeSession(
   partial: Partial<RuntimeSessionSummary> & { runtimeId: string; sessionId: string }
@@ -81,7 +85,7 @@ describe("formatRuntimeTimestamp", () => {
     expect(formatRuntimeTimestamp(null)).toBe("n/a");
   });
 
-  test("renders something for a valid ISO", () => {
-    expect(formatRuntimeTimestamp("2026-05-09T12:00:00Z")).toMatch(/\d/);
+  test("renders the calendar date and time in en-CA", () => {
+    expect(formatRuntimeTimestamp("2026-05-09T12:00:00Z")).toBe("May 9, 2026, 12:00 p.m.");
   });
 });

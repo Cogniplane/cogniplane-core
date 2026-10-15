@@ -23,7 +23,9 @@ export function AdminSkillMarketplaceTab(props: {
 }) {
   return (
     <div className="flex flex-col gap-4 px-1 py-2">
-      <form onSubmit={props.onSaveManifestUrl} className="flex flex-col gap-3">
+      <details className="rounded-md border border-outline-variant p-3">
+        <summary className="cursor-pointer text-sm font-medium text-on-surface">Marketplace configuration</summary>
+      <form onSubmit={props.onSaveManifestUrl} className="mt-3 flex flex-col gap-3">
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="marketplace-manifest-url">Marketplace manifest URL</Label>
           <Input
@@ -62,6 +64,7 @@ export function AdminSkillMarketplaceTab(props: {
           <code className="font-mono">SKILL_MARKETPLACE_MANIFEST_URL</code> for this organization.
         </p>
       </form>
+      </details>
 
       <div className="h-px bg-outline-variant" />
 
@@ -153,7 +156,7 @@ export function AdminSkillMarketplaceTab(props: {
                       type="button"
                       size="sm"
                       disabled={props.busyKey === busyKey}
-                      onClick={() => void props.onImportMarketplace(entry)}
+                      onClick={() => void props.onImportMarketplace(entry).catch(() => undefined)}
                     >
                       {props.busyKey === busyKey ? "Importing..." : "Import skill"}
                     </Button>

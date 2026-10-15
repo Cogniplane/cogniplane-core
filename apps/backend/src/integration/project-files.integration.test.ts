@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +19,7 @@ import {
   adminDatabaseUrl,
   runAppUserUrl,
   appPool,
+  maintenancePool,
   superuserPool,
 } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
@@ -35,7 +37,7 @@ async function setup() {
   const root = await mkdtemp(join(tmpdir(), "project-versions-"));
   const storage = new LocalArtifactStorage(root);
   const app = Fastify();
-  const files = new ProjectFileStore(appPool(), app.log);
+  const files = new ProjectFileStore(appPool(), app.log, maintenancePool());
   const config = createTestConfig();
   app.decorate("db", appPool());
   app.decorate("config", config);
@@ -121,6 +123,214 @@ async function setup() {
 }
 
 describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
+  test("reaches every folder across pages when the project has more than one page", async () => {
+    const h = await setup();
+    const ids = Array.from({ length: 205 }, () => randomUUID());
+    const names = ids.map((_, index) => `Folder ${String(index).padStart(3, "0")}`);
+    await superuserPool().query(
+      `INSERT INTO project_folders (tenant_id, project_id, folder_id, name)
+       SELECT $1, $2, folder_id, name FROM unnest($3::text[], $4::text[]) AS entry(folder_id, name)`,
+      [h.actor.tenantId, h.actor.projectId, ids, names],
+    );
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const params = new URLSearchParams({ limit: "37" });
+      if (cursor) params.set("cursor", cursor);
+      const response = await h.app.inject(`${h.url}/folders?${params}`);
+      expect(response.statusCode).toBe(200);
+      const page = response.json();
+      expect(page.items.length).toBeLessThanOrEqual(37);
+      for (const item of page.items) seen.add(item.folderId);
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(seen.size).toBe(ids.length);
+    const legacy = await h.app.inject(h.url);
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.json().folders).toHaveLength(100);
+    expect(legacy.headers["x-library-truncated"]).toBe("true");
+    expect((await h.app.inject(`${h.url}/folders?q=Folder%20204`)).json().items[0].folderId)
+      .toBe(ids[204]);
+  });
+
+  test("pages folders and resolves deep paths without a project-wide folder read", async () => {
+    const h = await setup();
+    const alpha = await h.files.createFolder(h.actor, "Alpha", null);
+    const bravo = await h.files.createFolder(h.actor, "Bravo", null);
+    const charlie = await h.files.createFolder(h.actor, "Charlie", null);
+    const rootUrl = `${h.url}/folders?limit=2`;
+    const first = await h.app.inject(rootUrl);
+    expect(first.statusCode).toBe(200);
+    expect(first.json().items.map((item: { folderId: string }) => item.folderId))
+      .toEqual([alpha.folderId, bravo.folderId]);
+    await h.files.createFolder(h.actor, "Aardvark", null);
+    const second = await h.app.inject(`${rootUrl}&cursor=${encodeURIComponent(first.json().nextCursor)}`);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().items.map((item: { folderId: string }) => item.folderId))
+      .toEqual([charlie.folderId]);
+    expect(second.json().nextCursor).toBeNull();
+    expect((await h.app.inject(`${h.url}/folders?parentId=${alpha.folderId}&cursor=${encodeURIComponent(first.json().nextCursor)}`)).statusCode)
+      .toBe(400);
+    expect((await h.app.inject(`${h.url}/folders?parentId=${alpha.folderId}&q=Alpha`)).statusCode).toBe(400);
+
+    let parent = alpha;
+    for (let depth = 0; depth < 9; depth += 1)
+      parent = await h.files.createFolder(h.actor, `Level ${depth}`, parent.folderId);
+    const detail = await h.app.inject(`${h.url}/folders/${parent.folderId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().ancestors).toHaveLength(8);
+    expect(detail.json().ancestorsTruncated).toBe(true);
+    const search = await h.app.inject(`${h.url}/folders?q=Level%208&limit=1`);
+    expect(search.statusCode).toBe(200);
+    expect(search.json().items[0].folderId).toBe(parent.folderId);
+    expect(search.json().items[0].path).toMatch(/^Files \/ … \/ /);
+    const file = await h.add({ name: "Deep.txt", folderId: parent.folderId });
+    const page = await h.app.inject(`${h.url}/files?section=published&folderId=${parent.folderId}`);
+    expect(page.json().items[0].fileId).toBe(file.fileId);
+    expect(page.json().items[0].folderPath).toMatch(/^Files \/ … \/ /);
+    const picker = await h.app.inject(`${h.url}/picker?q=Alpha`);
+    expect(picker.json().items.map((item: { fileId: string }) => item.fileId)).toContain(file.fileId);
+  });
+
+  test("shows a deleted folder's nearest live ancestor and denies folder reads after revocation", async () => {
+    const h = await setup();
+    const parent = await h.files.createFolder(h.actor, "Parent", null);
+    const child = await h.files.createFolder(h.actor, "Child", parent.folderId);
+    await h.files.removeFolder(h.actor, child.folderId);
+    const detail = await h.app.inject(`${h.url}/folders/${child.folderId}`);
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().nearestLiveFolderId).toBe(parent.folderId);
+    expect((await h.app.inject(`${h.url}/folders?parentId=${parent.folderId}`)).json().items).toEqual([]);
+    const outsider = await seedUser();
+    await seedMembership(h.actor.tenantId, outsider);
+    h.setAuth({ tenantId: h.actor.tenantId, userId: outsider, role: "member", isAdmin: false });
+    expect((await h.app.inject(`${h.url}/folders/${parent.folderId}`)).statusCode).toBe(404);
+    expect((await h.app.inject(`${h.url}/folders`)).statusCode).toBe(404);
+    expect((await h.app.inject(`${h.url}/files?section=published`)).statusCode).toBe(404);
+    expect((await h.app.inject(`${h.url}/picker`)).statusCode).toBe(404);
+  });
+
+  test("pages files without shifting unchanged rows when an earlier row is inserted", async () => {
+    const h = await setup();
+    const first = await h.add({ name: "Bravo.txt" });
+    const second = await h.add({ name: "Charlie.txt" });
+    const third = await h.add({ name: "Delta.txt" });
+    const path = `${h.url}/files?section=published&sort=name&limit=2`;
+    const page1 = await h.app.inject(path);
+    expect(page1.statusCode).toBe(200);
+    expect(page1.json().items.map((item: ProjectFile) => item.fileId)).toEqual([first.fileId, second.fileId]);
+    expect(page1.json().nextCursor).toBeTruthy();
+
+    await h.add({ name: "Alpha.txt" });
+    const page2 = await h.app.inject(`${path}&cursor=${encodeURIComponent(page1.json().nextCursor)}`);
+    expect(page2.statusCode).toBe(200);
+    expect(page2.json().items.map((item: ProjectFile) => item.fileId)).toEqual([third.fileId]);
+    expect(page2.json().nextCursor).toBeNull();
+    expect((await h.app.inject(`${h.url}/files?section=draft&cursor=${encodeURIComponent(page1.json().nextCursor)}`)).statusCode).toBe(400);
+    expect((await h.app.inject(`${path}&cursor=not-base64`)).statusCode).toBe(400);
+  });
+
+  test("includes draft target metadata even when the target is outside the file page", async () => {
+    const h = await setup();
+    const target = await h.add({ name: "Published.txt" });
+    const draft = await h.add({ kind: "draft", name: "Revision.txt", target });
+    const page = await h.app.inject(`${h.url}/files?section=draft&limit=1`);
+    expect(page.statusCode).toBe(200);
+    expect(page.json().items[0].fileId).toBe(draft.fileId);
+    expect(page.json().items[0].target).toEqual({
+      fileId: target.fileId, name: target.name,
+      currentVersionId: target.version.versionId, available: true,
+    });
+    await h.files.trash(h.actor, target.fileId);
+    const afterTrash = await h.app.inject(`${h.url}/files?section=draft&limit=1`);
+    expect(afterTrash.json().items[0].target.available).toBe(false);
+  });
+
+  test("keeps an unfetched file that is edited between name-sorted pages", async () => {
+    const h = await setup();
+    const alpha = await h.add({ name: "Alpha.txt" });
+    const edited = await h.add({ name: "Bravo.txt" });
+    const path = `${h.url}/files?section=published&sort=name&limit=1`;
+    const first = await h.app.inject(path);
+    expect(first.json().items.map((item: ProjectFile) => item.fileId)).toEqual([alpha.fileId]);
+    const picker = await h.app.inject(`${h.url}/picker?limit=1`);
+    await superuserPool().query(
+      "UPDATE project_files SET updated_at=clock_timestamp() + interval '1 second' WHERE file_id=$1", [edited.fileId]);
+    const second = await h.app.inject(`${path}&cursor=${encodeURIComponent(first.json().nextCursor)}`);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().items.map((item: ProjectFile) => item.fileId)).toEqual([edited.fileId]);
+    // The edit does not move the file in the name sort, so no reload hint.
+    expect(second.json().listChanged).toBe(false);
+    const pickerSecond = await h.app.inject(
+      `${h.url}/picker?limit=1&cursor=${encodeURIComponent(picker.json().nextCursor)}`);
+    expect(pickerSecond.json().items.map((item: { fileId: string }) => item.fileId)).toEqual([edited.fileId]);
+  });
+
+  test("flags an updated-sorted scroll when an unfetched file is edited between pages", async () => {
+    const h = await setup();
+    const edited = await h.add({ name: "Alpha.txt" });
+    const middle = await h.add({ name: "Bravo.txt" });
+    const newest = await h.add({ name: "Charlie.txt" });
+    const path = `${h.url}/files?section=published&sort=updated&limit=1`;
+    const first = await h.app.inject(path);
+    expect(first.json().items.map((item: ProjectFile) => item.fileId)).toEqual([newest.fileId]);
+    expect(first.json().listChanged).toBe(false);
+    const next = `${path}&cursor=${encodeURIComponent(first.json().nextCursor)}`;
+    const unchanged = await h.app.inject(next);
+    expect(unchanged.json().items.map((item: ProjectFile) => item.fileId)).toEqual([middle.fileId]);
+    expect(unchanged.json().listChanged).toBe(false);
+
+    await superuserPool().query(
+      "UPDATE project_files SET updated_at=clock_timestamp() + interval '1 second' WHERE file_id=$1", [edited.fileId]);
+    const second = await h.app.inject(next);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().items.map((item: ProjectFile) => item.fileId)).toEqual([middle.fileId]);
+    // The edited file moved before the cursor, so the scroll ends without it.
+    // The flag is the client's signal to reload.
+    expect(second.json().nextCursor).toBeNull();
+    expect(second.json().listChanged).toBe(true);
+  });
+
+  test("continues after an unfetched file is removed between pages", async () => {
+    const h = await setup();
+    await h.add({ name: "Alpha.txt" });
+    const removed = await h.add({ name: "Bravo.txt" });
+    const last = await h.add({ name: "Charlie.txt" });
+    const path = `${h.url}/files?section=published&sort=name&limit=1`;
+    const first = await h.app.inject(path);
+    await h.files.trash(h.actor, removed.fileId);
+    const second = await h.app.inject(`${path}&cursor=${encodeURIComponent(first.json().nextCursor)}`);
+    expect(second.statusCode).toBe(200);
+    expect(second.json().items.map((item: ProjectFile) => item.fileId)).toEqual([last.fileId]);
+    expect(second.json().nextCursor).toBeNull();
+  });
+
+  test("returns compact picker rows and validates exact selected IDs", async () => {
+    const h = await setup();
+    const folder = await h.files.createFolder(h.actor, "Research", null);
+    const nested = await h.files.createFolder(h.actor, "Notes", folder.folderId);
+    const published = await h.add({ name: "Brief.txt", folderId: nested.folderId });
+    const draft = await h.add({ kind: "draft", name: "Draft.txt", folderId: nested.folderId });
+    const picker = await h.app.inject(`${h.url}/picker?q=Research&limit=1`);
+    expect(picker.statusCode).toBe(200);
+    expect(picker.json().items).toHaveLength(1);
+    expect(picker.json().items[0].folderPath).toBe("Files / Research / Notes");
+    expect(picker.json().items[0]).not.toHaveProperty("checksumSha256");
+    expect(picker.json().nextCursor).toBeTruthy();
+    expect((await h.app.inject(`${h.url}/picker?q=Files`)).json().items).toHaveLength(2);
+
+    const selection = await h.app.inject(`${h.url}/picker/selection?ids=${published.fileId}&ids=${draft.fileId}`);
+    expect(selection.statusCode).toBe(200);
+    expect(selection.json().items.map((item: { fileId: string }) => item.fileId).sort())
+      .toEqual([published.fileId, draft.fileId].sort());
+    await h.files.trash(h.actor, draft.fileId);
+    const afterTrash = await h.app.inject(`${h.url}/picker/selection?ids=${published.fileId}&ids=${draft.fileId}`);
+    expect(afterTrash.json().items.map((item: { fileId: string }) => item.fileId)).toEqual([published.fileId]);
+    const tooMany = new URLSearchParams();
+    for (let index = 0; index < 21; index += 1) tooMany.append("ids", randomUUID());
+    expect((await h.app.inject(`${h.url}/picker/selection?${tooMany}`)).statusCode).toBe(400);
+  });
+
   test("shares versions and sources with members, denies viewer writes, and revokes access", async () => {
     const h = await setup();
     const members = new ProjectMemberStore(appPool());
@@ -344,6 +554,28 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       message:
         "This PDF could not be previewed. Download it to view its contents.",
     });
+  });
+
+  test("a PDF preview is not returned when the file is trashed during extraction", async () => {
+    const h = await setup();
+    const source = await h.source("%PDF", "application/pdf");
+    const pdf = await h.files.createFromArtifact(
+      h.actor,
+      { artifactId: source.artifactId, name: "Report.pdf", kind: "published", folderId: null,
+        targetFileId: null, baseVersionId: null },
+      h.storage,
+      10000,
+    );
+    // Extraction is slow; another member trashes the file meanwhile.
+    vi.spyOn(h.processor, "extractArtifactText").mockImplementationOnce(async () => {
+      await h.files.trash(h.actor, pdf.fileId);
+      return "Confidential text";
+    });
+    const response = await h.app.inject(
+      `${h.url}/files/${pdf.fileId}/versions/${pdf.version.versionId}/preview-text`,
+    );
+    expect(response.statusCode).toBe(404);
+    expect(response.body).not.toContain("Confidential text");
   });
 
   test("stores independent bytes, survives source deletion, and serves authenticated downloads", async () => {
@@ -576,6 +808,10 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
     await expect(
       h.files.restoreTrash(h.actor, saved.fileId, "Recovered.txt", null),
     ).rejects.toMatchObject({ code: "project_trash_expired" });
+    const removed = await h.files.cleanupExpired(h.storage);
+    expect(removed.deletedFiles).toBeGreaterThanOrEqual(1);
+    expect((await superuserPool().query("SELECT 1 FROM project_files WHERE file_id=$1", [saved.fileId])).rowCount).toBe(0);
+
   });
   test("missing destinations require an explicit replacement when restoring a trashed draft", async () => {
     const h = await setup();
@@ -884,6 +1120,7 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
 
   test("agent drafts enforce the MIME allow-list and PII blocking gate", async () => {
     const h = await setup();
+    const put = vi.spyOn(h.storage, "put");
     const evaluateArtifact = vi.fn().mockResolvedValue({
       action: "block",
       findings: [],
@@ -920,6 +1157,13 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       mimeType: "text/plain"
     })).rejects.toMatchObject({ code: "pii_block", status: 422 });
     expect(evaluateArtifact).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+    expect((await h.files.list(h.actor)).files).toEqual([]);
+    const rows = await superuserPool().query(
+      "SELECT file_id FROM project_files WHERE tenant_id = $1 AND project_id = $2",
+      [h.actor.tenantId, h.actor.projectId]
+    );
+    expect(rows.rows).toEqual([]);
   });
 
   test("PDF preview uses the existing text extractor and version identity", async () => {

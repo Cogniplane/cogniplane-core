@@ -39,7 +39,7 @@ async function setup() {
   const second = await messages.create({ tenantId, userId: viewerId, sessionId, role: "assistant", status: "completed", content: "Shared result" });
   await messages.upsertToolResult({ tenantId, userId: viewerId, sessionId, messageId: second.messageId,
     toolResultId: "tool-" + sessionId, kind: "mcp", title: "Read", status: "completed", command: null,
-    cwd: null, server: "source", toolName: "read", input: "{}", output: "Shared source", exitCode: null, durationMs: 1 });
+    cwd: null, server: "source", toolName: "read", input: "{}", output: "Shared source", exitCode: null, durationMs: 1, textOffset: 0 });
   const artifact = await artifacts.create({ tenantId, userId, sessionId, artifactType: "upload", artifactName: "report.pdf",
     mimeType: "application/pdf", storageBackend: "local", storageKey: "shared/" + sessionId,
     fileSizeBytes: 4, checksumSha256: "test", status: "ready", createdByType: "user", detail: {} });
@@ -56,7 +56,7 @@ async function setup() {
   await registerSessionCapabilityRoutes(app, {
     sessions, activeTurns: new ActiveTurnsRegistry(), runtimeAdapter: { hasActiveTurn: () => false },
     tenantMembers: { isUserBetaTester: async () => false },
-    dynamicConfig: { compileRuntimeConfig: async () => ({ skills: [], mcpServers: [] }), listMcpServers: async () => [] },
+    dynamicConfig: { compileProjectCatalog: async () => ({ skills: [], mcpServers: [] }), compileRuntimeConfig: async () => ({ skills: [], mcpServers: [] }), listMcpServers: async () => [] },
   } as unknown as SessionCapabilityStores);
   await registerAdminArtifactRoutes(app, { auditEvents: new AuditEventStore(appPool()) });
   await registerSessionRoutes(app, { sessions, messages } as unknown as SessionRouteStores);
@@ -88,7 +88,8 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({ sessions: [{ sessionId: h.sessionId }], files: [{ artifactId: h.artifact.artifactId }] });
     expect(await h.projects.getOwned(h.tenantId, h.viewerId, h.actor.projectId)).toBeNull();
-    expect((await h.app.inject({ method: "PUT", url: `/projects/${h.actor.projectId}`, payload: { name: "Denied" } })).statusCode).toBe(404);
+    // A reader without the owner role gets 403, not 404.
+    expect((await h.app.inject({ method: "PUT", url: `/projects/${h.actor.projectId}`, payload: { name: "Denied" } })).statusCode).toBe(403);
     const history = await h.app.inject(`/sessions/${h.sessionId}/messages`);
     expect(history.statusCode).toBe(200);
     expect(history.json().messages).toMatchObject([
@@ -247,6 +248,74 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     const demotedToken = await mintAdminToken();
     await superuserPool().query("UPDATE tenant_memberships SET role='member' WHERE tenant_id=$1 AND user_id=$2", [h.tenantId, adminId]);
     expect((await h.app.inject(`/downloads/${demotedToken}`)).statusCode).toBe(404);
+  });
+
+  // The PII verdict, not the status column, decides: setPiiDetail leaves a ready
+  // record without a pending marker as `ready` even after a block.
+  async function personalArtifact(h: Awaited<ReturnType<typeof setup>>) {
+    const personal = await h.sessions.create(h.tenantId, h.userId, "Personal");
+    return h.artifacts.create({ tenantId: h.tenantId, userId: h.userId,
+      sessionId: personal.sessionId, artifactType: "upload", artifactName: "report.pdf",
+      mimeType: "application/pdf", storageBackend: "local", storageKey: "personal/" + personal.sessionId,
+      fileSizeBytes: 4, checksumSha256: "test", status: "ready", createdByType: "user", detail: {} });
+  }
+
+  test("denies user and admin tokens for a ready artifact with a blocked PII verdict, including a token issued earlier", async () => {
+    const h = await setup();
+    const artifact = await personalArtifact(h);
+    const adminId = await seedUser();
+    await seedMembership(h.tenantId, adminId, "admin");
+    const userMint = () => {
+      h.authenticate(h.userId);
+      return h.app.inject({ method: "POST", url: `/artifacts/${artifact.artifactId}/download-token` });
+    };
+    const adminMint = () => {
+      h.authenticate(adminId, h.tenantId, true);
+      return h.app.inject({ method: "POST", url: `/admin/artifacts/${artifact.artifactId}/download-token` });
+    };
+
+    // Positive control: both mint while the artifact is eligible.
+    const earlier = await userMint();
+    expect(earlier.statusCode).toBe(200);
+    const earlierAdmin = await adminMint();
+    expect(earlierAdmin.statusCode).toBe(200);
+
+    await h.artifacts.setPiiDetail(h.tenantId, artifact.artifactId, { status: "blocked", blockReason: "pii_detected" });
+    const stored = await superuserPool().query("SELECT status FROM artifacts WHERE artifact_id=$1", [artifact.artifactId]);
+    expect(stored.rows[0].status).toBe("ready");
+
+    for (const refused of [await userMint(), await adminMint()]) {
+      expect(refused.statusCode).toBe(409);
+      expect(refused.json().error).toBe("artifact_not_ready");
+    }
+    const tokens = await superuserPool().query("SELECT token FROM artifact_download_tokens WHERE artifact_id=$1", [artifact.artifactId]);
+    expect(tokens.rows).toHaveLength(2);
+
+    // Redemption re-checks: tokens issued before the block no longer download.
+    for (const token of [earlier.json().download.token, earlierAdmin.json().download.token]) {
+      expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
+      const row = await superuserPool().query("SELECT consumed_at FROM artifact_download_tokens WHERE token=$1", [token]);
+      expect(row.rows[0].consumed_at).toBeNull();
+    }
+    expect(h.openReadStream).not.toHaveBeenCalled();
+  });
+
+  test("keeps a ready artifact with a detect-only PII verdict downloadable for user and admin tokens", async () => {
+    const h = await setup();
+    const artifact = await personalArtifact(h);
+    await h.artifacts.setPiiDetail(h.tenantId, artifact.artifactId, { status: "scanned", modeApplied: "detect", findingsCount: 2 });
+    const adminId = await seedUser();
+    await seedMembership(h.tenantId, adminId, "admin");
+
+    h.authenticate(h.userId);
+    const userToken = await h.app.inject({ method: "POST", url: `/artifacts/${artifact.artifactId}/download-token` });
+    expect(userToken.statusCode).toBe(200);
+    h.authenticate(adminId, h.tenantId, true);
+    const adminToken = await h.app.inject({ method: "POST", url: `/admin/artifacts/${artifact.artifactId}/download-token` });
+    expect(adminToken.statusCode).toBe(200);
+
+    expect((await h.app.inject(`/downloads/${userToken.json().download.token}`)).statusCode).toBe(200);
+    expect((await h.app.inject(`/downloads/${adminToken.json().download.token}`)).statusCode).toBe(200);
   });
 
   test("lets members inspect capabilities without granting mutation access", async () => {

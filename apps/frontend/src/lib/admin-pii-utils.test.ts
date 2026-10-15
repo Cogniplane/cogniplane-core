@@ -1,4 +1,7 @@
 import { test, expect } from "vitest";
+import { withUtcDateLocale } from "../test-helpers/date-locale";
+import { queryKeys } from "./query-keys";
+
 import {
   breakerStatePillClass,
   buildMetricsQuery,
@@ -8,6 +11,7 @@ import {
   formatBucketLabel,
   formatLatency,
   formatRelativeTime,
+  isPiiRangeQueryKey,
   readPersistedBoolean,
   shortId,
   sparklineFromTimeSeries,
@@ -15,6 +19,8 @@ import {
   writePersistedBoolean
 } from "./admin-pii-utils";
 import type { PiiActivityTimeSeriesPoint } from "@cogniplane/shared-types";
+
+withUtcDateLocale();
 
 // ─── buildMetricsQuery ──────────────────────────────────────────────────────
 
@@ -94,20 +100,12 @@ test("computeDelta: rounds to one decimal", () => {
 
 // ─── formatBucketLabel ──────────────────────────────────────────────────────
 
-test("formatBucketLabel: hour bucket emits an hour-of-day", () => {
-  // We can't pin the exact locale string (depends on the test runner's
-  // environment), but the result must NOT include the year/date for
-  // hour buckets. Two-digit hour-of-day check is a robust signal.
-  const label = formatBucketLabel("2026-04-30T14:00:00Z", "hour");
-  expect(label).toMatch(/\d/);
-  expect(!label.includes("2026")).toBeTruthy();
+test("formatBucketLabel: hour bucket shows its UTC hour", () => {
+  expect(formatBucketLabel("2026-04-30T14:00:00Z", "hour")).toBe("14");
 });
 
-test("formatBucketLabel: day bucket emits a date, not a time", () => {
-  const label = formatBucketLabel("2026-04-30T00:00:00Z", "day");
-  // Day labels include a month-name fragment ("Apr") regardless of locale.
-  // We don't check the exact string because that depends on env locale.
-  expect(label).toMatch(/\D/);
+test("formatBucketLabel: day bucket shows its calendar date", () => {
+  expect(formatBucketLabel("2026-04-30T00:00:00Z", "day")).toBe("Apr 30");
 });
 
 test("formatBucketLabel: invalid input returns the input verbatim", () => {
@@ -146,40 +144,6 @@ test("sparklineFromTimeSeries: 'failed' reads only the failed stack", () => {
 test("sparklineFromTimeSeries: empty series returns empty array", () => {
   // Consumers should skip rendering rather than compute geometry over nothing.
   expect(sparklineFromTimeSeries([], "scans")).toEqual([]);
-});
-
-// ─── value-leak type guard (compile-time + runtime serializer) ──────────────
-
-test("PiiActivityMetrics never carries a 'value' field on findings", () => {
-  // Runtime check on the shape we hand to consumers. The byEntityType /
-  // byConfidence rows aggregate finding fields but must not leak the raw
-  // `value`. If a future schema change tries to add it, this test fails
-  // at runtime and the type test below fails at compile time.
-  const sample = {
-    range: { preset: "7d" as const, from: "", to: "", bucket: "day" as const },
-    policy: {
-      enabled: true,
-      mode: "detect" as const,
-      rawRetention: "never" as const,
-      scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
-      entityTypes: []
-    },
-    kpis: {
-      scans: { current: 0, previous: 0 },
-      findings: { current: 0, previous: 0 },
-      blocked: { current: 0, previous: 0 },
-      transformed: { current: 0, previous: 0 },
-      failed: { current: 0, previous: 0 }
-    },
-    timeSeries: [],
-    byEntityType: [{ entityType: "email", count: 1 }],
-    byConfidence: [{ entityType: "email", high: 1, medium: 0, low: 0 }],
-    bySubjectType: []
-  };
-  const sampleAsRecord: Record<string, unknown> = sample.byEntityType[0]!;
-  const sampleConfRecord: Record<string, unknown> = sample.byConfidence[0]!;
-  expect("value" in sampleAsRecord).toBe(false);
-  expect("value" in sampleConfRecord).toBe(false);
 });
 
 // ─── entityColor ────────────────────────────────────────────────────────────
@@ -255,12 +219,7 @@ test("formatRelativeTime: <24h shows hours-ago", () => {
 
 test("formatRelativeTime: ≥24h falls back to a locale date", () => {
   const now = Date.parse("2026-04-30T12:00:00Z");
-  // 3 days ago.
-  const out = formatRelativeTime("2026-04-27T12:00:00Z", now);
-  // Locale-dependent format; minimum check: not "h ago" / "m ago" /
-  // "just now". The helper is supposed to bail to an absolute date.
-  expect(!out.endsWith("ago")).toBeTruthy();
-  expect(!out.includes("now")).toBeTruthy();
+  expect(formatRelativeTime("2026-04-27T12:00:00Z", now)).toBe("Apr 27");
 });
 
 test("formatRelativeTime: future timestamp uses 'from now'", () => {
@@ -400,4 +359,28 @@ test("writePersistedBoolean: setItem failures are swallowed (private mode / quot
   };
   // Must not throw to the caller.
   writePersistedBoolean(throwing, "k", true);
+});
+
+test("isPiiRangeQueryKey matches every dashboard query of the active range and nothing else", () => {
+  const week = { range: "7d" };
+  const custom = { range: "custom", from: "2026-09-01", to: "2026-09-30" };
+
+  for (const key of [
+    queryKeys.admin.piiMetrics(week),
+    queryKeys.admin.piiTop({ ...week, groupBy: "user" }),
+    queryKeys.admin.piiRecent({ ...week, limit: 20 }),
+    queryKeys.admin.piiJobsStats(week)
+  ]) {
+    expect(isPiiRangeQueryKey(key, week)).toBe(true);
+    expect(isPiiRangeQueryKey(key, { range: "30d" })).toBe(false);
+  }
+  expect(isPiiRangeQueryKey(queryKeys.admin.piiMetrics(custom), custom)).toBe(true);
+  expect(isPiiRangeQueryKey(queryKeys.admin.piiMetrics(custom), { ...custom, to: "2026-10-01" })).toBe(false);
+  expect(isPiiRangeQueryKey(queryKeys.admin.piiMetrics(custom), { ...custom, from: "2026-08-31" })).toBe(false);
+  // Other admin caches with a matching params object stay untouched.
+  expect(isPiiRangeQueryKey(["admin", "users", "list", week], week)).toBe(false);
+  expect(isPiiRangeQueryKey(["admin", "pii", "settings", week], week)).toBe(false);
+  expect(isPiiRangeQueryKey(["other", "pii", "metrics", week], week)).toBe(false);
+  expect(isPiiRangeQueryKey(["admin", "pii", "metrics"], week)).toBe(false);
+  expect(isPiiRangeQueryKey(["admin", "pii", "metrics", "7d"], week)).toBe(false);
 });

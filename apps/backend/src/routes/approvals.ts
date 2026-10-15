@@ -8,16 +8,19 @@ import { notFoundError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { serialize } from "../lib/serialize-response.js";
+import { canBrowseSessionContent } from "../services/session-access.js";
 
 export function buildApprovalRouteStores(deps: AppDependencies) {
   return {
     approvals: deps.approvals,
+    sessions: deps.sessions,
     runtimeAdapter: deps.runtimeAdapter
   };
 }
 
 export type ApprovalRouteStores = {
   approvals: Pick<AppDependencies["approvals"], "listPending">;
+  sessions: Pick<AppDependencies["sessions"], "getReadable">;
   runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "resolveApproval">;
 };
 
@@ -71,6 +74,13 @@ export async function registerApprovalRoutes(
     }
 
     const { userId, tenantId } = request.auth;
+    // Same read access as the session's messages. The list holds only the
+    // caller's own approvals: those are the ones the caller can decide.
+    const session = await stores.sessions.getReadable(tenantId, paramsResult.value.sessionId, userId);
+    if (!session || !canBrowseSessionContent(session)) {
+      return reply.code(404).send(notFoundError("session_not_found"));
+    }
+    reply.header("cache-control", "private, no-store");
     return serialize(ApprovalsListResponseSchema, {
       approvals: await stores.approvals.listPending(
         tenantId,

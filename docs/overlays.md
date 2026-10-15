@@ -1,6 +1,6 @@
 # Writing an overlay
 
-An **overlay** is a separate workspace package that adds tools, integrations, and routes to the platform without forking core. The platform exposes two extension surfaces — managed-tool registries and the integration registry — and an `attachOverlays(...)` shim that the host calls during dependency construction.
+An overlay is a separate workspace package that adds tools, integrations, and routes to the platform. Core calls its bootstrap through `attachOverlays(...)` during dependency construction. It provides managed-tool registries and an integration registry. Core owns the bootstrap contract in `apps/backend/src/overlay-contracts.ts`.
 
 This is the same mechanism Cogniplane uses for its private SharePoint/Microsoft 365 integration: it lives in a workspace package outside `apps/backend/`, is wired in by a one-file shim, and ships nothing into core's source tree.
 
@@ -22,8 +22,8 @@ The platform has **two** registries the overlay touches. They are intentionally 
 
 ```ts
 input.managedToolCatalog.register([
-  { name: "myint_read_thing", description: "...", readOnly: true,  tenantConfigurable: false },
-  { name: "myint_write_thing", description: "...", readOnly: false, tenantConfigurable: false }
+  { name: "myint_read_thing", description: "...", readOnly: true,  tenantConfigurable: false, category: "myint" },
+  { name: "myint_write_thing", description: "...", readOnly: false, tenantConfigurable: false, category: "myint" }
 ]);
 
 input.managedToolFactoryRegistry.register("myint", (coreDeps) =>
@@ -36,6 +36,8 @@ input.managedToolFactoryRegistry.register("myint", (coreDeps) =>
 ```
 
 The factory key (`"myint"` above) is a domain identifier, not a tool name — one factory typically produces multiple tool definitions. Pick something stable; collisions throw at boot.
+
+Set each catalog entry's `category` to the factory key. The graph evaluates Policy Center rules with the catalog category before a tool call, and the gateway evaluates them again with the factory key. If the two values differ, a `require_approval` rule on that category never shows an approval prompt, and the gateway rejects the call.
 
 ### 2. Static catalog and app-owned integration hooks
 
@@ -87,9 +89,9 @@ Inside `bootstrap(input)`, the order matters:
 2. Register catalog metadata if absent and add it to the app registry.
 3. Attach live hooks with `input.integrationDescriptors.setRuntimeWiring(...)`.
 4. **Register the catalog and factory** on the per-instance registries.
-5. **Return the bootstrap result** — including any services core needs (e.g. for the runtime invalidator) and an `attachOverlayRoutes(app)` callback.
+5. Return `OverlayHandles` with an `attachRoutes(app)` callback and any optional probes core reads. Keep services and stores inside the overlay.
 
-The host's `attachOverlays(...)` shim calls `bootstrap(...)` from `app-dependencies.ts`, then later calls `attachOverlayRoutes(app)` from `app-bootstrap.ts` after every other route group is registered.
+The host's `attachOverlays(...)` shim calls `bootstrap(...)` from `app-dependencies.ts`, then later calls `attachRoutes(app)` from `app-bootstrap.ts` after every other route group is registered.
 
 ## Tenant-configurable tools vs integration-gated tools
 
@@ -109,34 +111,29 @@ When `oauthRoutes.paths` is set, the auth middleware adds those paths to its pub
 
 ## Wiring the host
 
-The host expects an `apps/backend/src/overlays.ts` file that calls every overlay's `bootstrap(...)` and returns an `OverlayHandles` shape:
+`apps/backend/src/overlay-contracts.ts` defines the contract:
+
+- `AttachOverlaysInput` defines what core gives an overlay. Store and registry types expose selected methods, such as `Pick<ArtifactStore, "create">`. `config` holds settings for OAuth state JWTs, secret encryption, and redirects. `loadIntegrationEnablement(tenantId, integrationId)` returns the tenant toggles and platform status.
+- `OverlayHandles` defines what core reads back: `attachRoutes(app)` and the optional `getMicrosoftConfigured` probe.
+- `OverlayBootstrap` has the signature `(input: AttachOverlaysInput) => OverlayHandles`. Core calls it once for each `buildAppDependencies()`. Return handles that belong to that app only.
+
+Your overlay's `bootstrap` implements `OverlayBootstrap`. The host shim at `apps/backend/src/overlays.ts` assigns it to `attachOverlays`:
 
 ```ts
-import {
-  bootstrap as myintBootstrap,
-  type MyintOverlay,
-  type MyintOverlayBootstrapInput
-} from "@your-scope/myint-overlay-backend";
+import { bootstrap as myintBootstrap } from "@your-scope/myint-overlay-backend";
 
-export type AttachOverlaysInput = MyintOverlayBootstrapInput;
+import type { OverlayBootstrap } from "./overlay-contracts.js";
 
-export type OverlayHandles = {
-  attachRoutes: (app: FastifyInstance) => void;
-};
-
-export function attachOverlays(input: AttachOverlaysInput): OverlayHandles {
-  const myint: MyintOverlay = myintBootstrap(input);
-  return {
-    attachRoutes: (app) => {
-      myint.attachOverlayRoutes(app);
-    }
-  };
-}
+export const attachOverlays: OverlayBootstrap = myintBootstrap;
 ```
 
-The OSS distribution ships a no-op stub at this path — your private tree replaces it.
+To combine several overlays, call each `bootstrap` in the shim and return one `OverlayHandles` whose `attachRoutes` calls each overlay's `attachRoutes`.
 
-If your overlay needs to expose a service back to core (e.g. a "Microsoft is configured?" probe used by the tenant settings response), add it as a field on `OverlayHandles`. Core reads it through `deps.overlays.<field>` and treats it as optional — the OSS no-op build leaves it `undefined`.
+The OSS distribution ships a no-op stub at this path. It implements the same `OverlayBootstrap` type, and your private tree replaces it.
+
+If your overlay needs to expose a value back to core (e.g. a "Microsoft is configured?" probe used by the tenant settings response), add an optional field to `OverlayHandles` in `overlay-contracts.ts`. Core reads it through `deps.overlays.<field>`; the OSS no-op build leaves it `undefined`.
+
+The contract types limit what core passes at compile time. They are not a sandbox: an overlay runs in the backend process and can import any backend module. Overlay packages still import some backend helpers directly, such as `withTenantScope`, `requireRole`, `serialize`, the OAuth state helpers, and the static catalog functions `registerIntegration` / `getIntegrationDescriptor`. Until those imports move behind the contract, the contract stays in `apps/backend/src` and is not a separate workspace package.
 
 ## Overlay package layout
 
@@ -163,7 +160,7 @@ Add the package to `pnpm-workspace.yaml` (private tree only — the OSS sync dro
 ## Tests
 
 - Test your overlay's tool factories like core does — colocated `*.test.ts`, in-memory fakes for store-shaped collaborators, Vitest with `expect`/`vi.fn()`.
-- Test `bootstrap(...)` end-to-end by calling it twice with `__resetMyintOverlayForTesting()` between to confirm idempotency.
+- Test `bootstrap(...)` with two separate inputs, as two apps in one process do. Each app registry must get its own probes and OAuth handlers, and the second call must not throw on the static catalog.
 - Add an integration assertion that every tool id in the descriptor's `readToolIds`/`writeToolIds` is actually registered in the catalog with `tenantConfigurable: false`. (See `services/integrations/oss-subset.test.ts` for the shape.)
 
 ## Worth reading
@@ -172,4 +169,5 @@ Add the package to `pnpm-workspace.yaml` (private tree only — the OSS sync dro
 - `apps/backend/src/services/managed-tools/catalog.ts` — same for catalog entries.
 - `apps/backend/src/services/integrations/integration-registry.ts` — the descriptor + runtime wiring API.
 - `apps/backend/src/services/integrations/register-builtin-integrations.ts` — the canonical example: GitHub and Notion descriptors registered the way an overlay would.
+- `apps/backend/src/overlay-contracts.ts` — the bootstrap contract.
 - `apps/backend/src/overlays.ts` — the OSS no-op stub. Replace with your wiring in your private tree.

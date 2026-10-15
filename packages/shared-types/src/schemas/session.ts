@@ -6,6 +6,15 @@ import { MessagesListResponseSchema } from "./message.js";
 
 export const SESSION_TRASH_RETENTION_DAYS = 30;
 
+// The history format of a session's transcript, from the server.
+//   current      the chat can reopen and continue the session.
+//   legacy       saved in the previous history format. The rows stay stored,
+//                and audit and history reads still work, but the chat does
+//                not reopen or continue the session.
+//   unsupported  a later format that this version does not know.
+export const TranscriptFormatSchema = z.enum(["current", "legacy", "unsupported"]);
+export type TranscriptFormat = z.infer<typeof TranscriptFormatSchema>;
+
 export const SessionSchema = z.object({
   sessionId: z.string(),
   projectId: z.string().nullable().optional(),
@@ -26,7 +35,10 @@ export const SessionSchema = z.object({
   activeTurnStartedAt: IsoDateSchema.optional(),
   latestTurnId: z.string().optional(),
   latestTurnSequence: z.number().int().nonnegative().optional(),
-  hasTurnFailed: z.boolean().optional()
+  hasTurnFailed: z.boolean().optional(),
+  // Production rows always carry a value; in-memory test fakes may omit it.
+  // An absent value never means "current": the chat does not continue it.
+  transcriptFormat: TranscriptFormatSchema.optional()
 }).passthrough();
 
 export type Session = z.infer<typeof SessionSchema>;
@@ -70,11 +82,29 @@ export type SessionCapabilitiesUpdate = z.infer<typeof SessionCapabilitiesUpdate
 const SessionCapabilityOptionSchema = z.object({
   id: z.string(),
   name: z.string(),
-  description: z.string()
+  description: z.string(),
+  source: z.enum(["organization", "personal", "project"]).optional(),
+  connectionStatus: z.enum(["not_connected", "connected", "reconnect_required", "organization", "no_auth", "unavailable"]).optional(),
+  accountLabel: z.string().nullable().optional()
 });
 export const SessionCapabilitiesSchema = SessionCapabilitiesUpdateSchema.extend({
   skills: z.array(SessionCapabilityOptionSchema),
   connectors: z.array(SessionCapabilityOptionSchema),
-  canEdit: z.boolean()
+  canEdit: z.boolean(),
+  defaultsSource: z.enum(["organization", "project", "personal"]).default("organization")
 });
 export type SessionCapabilities = z.infer<typeof SessionCapabilitiesSchema>;
+
+export const ProjectCapabilitiesSchema = SessionCapabilitiesSchema.omit({ defaultsSource: true });
+export type ProjectCapabilities = z.infer<typeof ProjectCapabilitiesSchema>;
+export const ProjectCapabilitiesUpdateSchema = SessionCapabilitiesUpdateSchema;
+export type ProjectCapabilitiesUpdate = z.infer<typeof ProjectCapabilitiesUpdateSchema>;
+
+const PersonalCapabilityScopeSchema = z.object({
+  tenantId: z.string().min(1),
+  userId: z.string().min(1)
+}).strict();
+export const PersonalCapabilitiesSchema = ProjectCapabilitiesSchema.extend({ scope: PersonalCapabilityScopeSchema });
+export type PersonalCapabilities = z.infer<typeof PersonalCapabilitiesSchema>;
+export const PersonalCapabilitiesUpdateSchema = SessionCapabilitiesUpdateSchema.extend({ scope: PersonalCapabilityScopeSchema });
+export type PersonalCapabilitiesUpdate = z.infer<typeof PersonalCapabilitiesUpdateSchema>;

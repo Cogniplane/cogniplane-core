@@ -53,10 +53,17 @@ export const TenantSettingsSchema = z.object({
   // admin action; an explicit array is a strict allowlist.
   enabledProviders: z.array(z.enum(MODEL_PROVIDERS)),
   enabledModelIds: z.array(z.string()).nullable(),
+  defaultModelId: z.string().nullable(),
   // Per-model default reasoning effort overriding the catalog default. Applied
   // server-side when a turn omits an explicit effort, and echoed through
   // /models as each model's defaultEffort.
   modelDefaultEfforts: z.record(z.string(), z.enum(EFFORT_LEVELS)),
+  // Hosts that agent-run code in the sandbox may reach (VULN-13). Empty means
+  // the sandbox has no network. Entries follow the rules in
+  // `@cogniplane/shared-types/sandbox-egress`, which the main entry point does
+  // not load. The default keeps a newer client working against a server that
+  // does not send the field yet: it reads as no access.
+  approvedSandboxEgressDomains: z.array(z.string()).default([]),
   version: z.number(),
   configHash: z.string(),
   updatedAt: IsoDateSchema

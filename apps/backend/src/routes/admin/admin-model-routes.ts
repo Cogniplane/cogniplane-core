@@ -16,8 +16,9 @@ import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
+import { AuditEventStore } from "../../services/audit-event-store.js";
 import type { CustomModelStore } from "../../services/custom-model-store.js";
+import type { TenantSettingsRecord } from "../../services/tenant-settings-store.js";
 import { customModelId, toAvailableModel } from "../../services/custom-model-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import type { OpenRouterCatalogFetcher } from "../../services/openrouter-catalog.js";
@@ -25,7 +26,7 @@ import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
 export type ModelAdminRouteStores = {
   customModels: Pick<CustomModelStore, "list" | "create" | "delete">;
-  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
+  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings" | "lockTenantSettings">;
   auditEvents: Pick<AuditEventStore, "create">;
   /** See admin-tenant-settings-routes: tenant/platform/none per provider. */
   providerKeySources: (
@@ -207,38 +208,58 @@ export async function registerAdminModelRoutes(
     const { modelId } = parsed.data;
     const tenantId = request.auth.tenantId;
 
-    const deleted = await stores.customModels.delete(tenantId, modelId);
+    let settings: TenantSettingsRecord | null = null;
+    // The delete, the settings prune and the audit events commit together. The
+    // settings and the model catalog are read under the settings lock, so a
+    // concurrent save, or a model added and enabled meanwhile, is not lost.
+    const deleted = await stores.customModels.delete(tenantId, modelId, async (client) => {
+      const current = await stores.dynamicConfig.lockTenantSettings(tenantId, client);
+      const models = await stores.customModels.list(tenantId, client);
+      // Use the same catalog pruning as GET, including its empty-list policy.
+      const pruned = pruneUnknownModelIds(current, new Set([
+        ...AVAILABLE_MODELS.map((model) => model.id),
+        ...models.filter((model) => model.modelId !== modelId).map((model) => model.modelId)
+      ]));
+      const referencedInEfforts = Object.hasOwn(current.modelDefaultEfforts, modelId);
+      settings = pruned;
+      if (pruned !== current || referencedInEfforts || current.defaultModelId === modelId) {
+        const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;
+        settings = await stores.dynamicConfig.updateTenantSettings(tenantId, {
+          ...(pruned !== current ? { enabledModelIds: pruned.enabledModelIds } : {}),
+          ...(referencedInEfforts ? { modelDefaultEfforts: remainingEfforts } : {}),
+          ...(current.defaultModelId === modelId ? { defaultModelId: null } : {}),
+          expectedVersion: current.version
+        }, (saved) => ({
+          tenantId,
+          sessionId: null,
+          userId: request.auth.userId,
+          type: "admin.tenant_settings.updated",
+          payload: {
+            reason: "custom_model_deleted",
+            modelId,
+            enabledModelIds: saved.enabledModelIds,
+            defaultModelId: saved.defaultModelId,
+            modelDefaultEfforts: saved.modelDefaultEfforts,
+            version: saved.version,
+            configHash: saved.configHash
+          },
+          ipAddress: request.ip,
+          userAgent: request.headers["user-agent"]
+        }), client);
+      }
+      await AuditEventStore.createInTransaction(client, {
+        tenantId,
+        sessionId: null,
+        userId: request.auth.userId,
+        type: "admin.custom_model.deleted",
+        payload: { modelId },
+        ipAddress: request.ip,
+        userAgent: request.headers["user-agent"]
+      });
+    });
     if (!deleted) {
       return reply.status(404).send(apiError("custom_model_not_found"));
     }
-
-    // Use the same catalog pruning as GET, including its empty-list policy.
-    const [current, remainingModels] = await Promise.all([
-      stores.dynamicConfig.getOrCreateTenantSettings(tenantId),
-      stores.customModels.list(tenantId)
-    ]);
-    const pruned = pruneUnknownModelIds(current, new Set([
-      ...AVAILABLE_MODELS.map((model) => model.id),
-      ...remainingModels.map((model) => model.modelId)
-    ]));
-    const referencedInEfforts = Object.hasOwn(current.modelDefaultEfforts, modelId);
-    let settings = pruned;
-    if (pruned !== current || referencedInEfforts) {
-      const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;
-      settings = await stores.dynamicConfig.updateTenantSettings(tenantId, {
-        ...(pruned !== current ? { enabledModelIds: pruned.enabledModelIds } : {}),
-        ...(referencedInEfforts ? { modelDefaultEfforts: remainingEfforts } : {})
-      });
-    }
-
-    await createAdminAuditEvent(stores.auditEvents, {
-      tenantId,
-      userId: request.auth.userId,
-      type: "admin.custom_model.deleted",
-      payload: { modelId },
-      ipAddress: request.ip,
-      userAgent: request.headers["user-agent"]
-    });
 
     return serialize(TenantSettingsEnvelopeSchema, { settings });
   }));

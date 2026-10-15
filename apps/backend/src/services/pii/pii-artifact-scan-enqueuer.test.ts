@@ -11,6 +11,7 @@ import { PiiProtectionServiceError, type PiiDecision } from "./pii-protection-se
 function buildDeps(overrides: {
   settings?: Partial<PiiProtectionSettings>;
   decision?: PiiDecision;
+  imagesNotScanned?: boolean;
   evaluateThrows?: Error;
   readerReturnsNull?: boolean;
   readerThrows?: Error;
@@ -45,7 +46,8 @@ function buildDeps(overrides: {
         entityTypes: [],
         async readContent() {
           return `content for ${tenantId}/${artifactId}`;
-        }
+        },
+        imagesNotScanned: () => overrides.imagesNotScanned ?? false
       };
     }
   };
@@ -177,18 +179,36 @@ test("enqueue returns skipped when the upload scope is disabled", async () => {
 });
 
 test("detect mode stamps pending BEFORE the job is enqueued", async () => {
-  const { deps, jobCalls, piiDetailCalls, artifactUpdateCalls } = buildDeps({
-    settings: { enabled: true, mode: "detect" }
-  });
-  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
-  expect(result.kind).toBe("queued");
-
-  // Pending stamp must happen before job creation so the scheduler worker
-  // can't complete the job between the two writes and get clobbered.
-  expect(piiDetailCalls.length).toBe(1);
-  expect(piiDetailCalls[0].pii.status).toBe("pending");
-  expect(jobCalls.length).toBe(1);
-  expect(artifactUpdateCalls.length).toBe(0);
+  const { deps, jobCalls } = buildDeps({ settings: { enabled: true, mode: "detect" } });
+  let releasePending!: () => void;
+  let pendingEntered!: () => void;
+  const gate = new Promise<void>((resolve) => { releasePending = resolve; });
+  const entered = new Promise<void>((resolve) => { pendingEntered = resolve; });
+  let status = "unscanned";
+  deps.artifacts.setPiiDetail = async (_tenant, _artifact, pii) => {
+    pendingEntered();
+    await gate;
+    status = String(pii.status);
+  };
+  const createJob = deps.piiScanJobs.create;
+  deps.piiScanJobs.create = async (input) => {
+    const job = await createJob(input);
+    // A worker can finish as soon as the queued job is visible.
+    status = "completed";
+    return job;
+  };
+  const pending = new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+  try {
+    await entered;
+    expect(jobCalls).toHaveLength(0);
+    releasePending();
+    await expect(pending).resolves.toMatchObject({ kind: "queued" });
+    expect(jobCalls).toHaveLength(1);
+    expect(status).toBe("completed");
+  } finally {
+    releasePending();
+    await pending;
+  }
 });
 
 test("transform mode queues an async job (artifact transform deferred)", async () => {
@@ -267,6 +287,13 @@ test("block still returns blocked and audits an orphan when object delete fails"
   expect((blockedAudit!.payload as Record<string, unknown>).objectDeleted).toBe(false);
 });
 
+test("block mode records that a clean PDF's images were not scanned", async () => {
+  const { deps, piiDetailCalls } = buildDeps({ settings: { enabled: true, mode: "block" }, imagesNotScanned: true });
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ contentType: "application/pdf" }));
+  expect(result.kind).toBe("allowed");
+  expect(piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "scanned", imagesNotScanned: true });
+});
+
 test("block mode fails closed when the provider throws", async () => {
   const { deps, scanRunUpdateCalls, artifactUpdateCalls, piiDetailCalls, deleteCalls } = buildDeps({
     settings: { enabled: true, mode: "block" },
@@ -284,6 +311,42 @@ test("block mode fails closed when the provider throws", async () => {
   // so the object must NOT be deleted (transient-outage safety).
   expect(deleteCalls).toEqual([]);
 });
+
+test("detect mode rejects an unscannable type at once and deletes its bytes", async () => {
+  const { deps, jobCalls, artifactUpdateCalls, deleteCalls } = buildDeps({
+    settings: { enabled: true, mode: "detect" },
+    evaluateThrows: new PiiProtectionServiceError("unsupported_mime", "cannot scan image/png files")
+  });
+  const input = sampleInput({ contentType: "image/png", storageKey: "users/user-1/session-1/art-1.png" });
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(input);
+  expect(result).toMatchObject({ kind: "failed", errorCode: "unsupported_mime" });
+  expect(jobCalls).toEqual([]);
+  expect(artifactUpdateCalls.at(-1)?.input.status).toBe("failed");
+  expect(deleteCalls).toEqual([input.storageKey]);
+});
+
+test("an unscannable type rejected in detect mode records detect, not block", async () => {
+  const { deps, scanRunCreateCalls, piiDetailCalls } = buildDeps({
+    settings: { enabled: true, mode: "detect" },
+    evaluateThrows: new PiiProtectionServiceError("unsupported_mime", "cannot scan image/png files")
+  });
+  await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ contentType: "image/png" }));
+  expect(scanRunCreateCalls).toEqual([expect.objectContaining({ mode: "detect" })]);
+  expect(piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "failed", modeApplied: "detect" });
+});
+
+test.each(["unsupported_mime", "pdf_extraction_failed", "file_too_large"])(
+  "block mode deletes the bytes of an upload rejected with %s",
+  async (code) => {
+    const { deps, deleteCalls } = buildDeps({
+      settings: { enabled: true, mode: "block" },
+      evaluateThrows: new PiiProtectionServiceError(code, "rejected")
+    });
+    const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+    expect(result).toMatchObject({ kind: "failed", errorCode: code });
+    expect(deleteCalls).toEqual([sampleInput().storageKey]);
+  }
+);
 
 test("block mode fails closed when the artifact is not found by the reader", async () => {
   const { deps, scanRunUpdateCalls, artifactUpdateCalls } = buildDeps({

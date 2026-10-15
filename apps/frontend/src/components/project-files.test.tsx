@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -9,7 +10,14 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, afterEach, it, expect, vi } from "vitest";
-import type { Project, ProjectFile, Artifact } from "@cogniplane/shared-types";
+import type {
+  Artifact,
+  Project,
+  ProjectFile,
+  ProjectFolder,
+  ProjectFolderDetail,
+  ProjectLibraryFile,
+} from "@cogniplane/shared-types";
 import { ProjectFiles } from "./project-files";
 import * as api from "../lib/project-file-api";
 import * as projectApi from "../lib/project-api";
@@ -27,7 +35,11 @@ vi.mock("../lib/api-client", () => ({
   }))
 }));
 vi.mock("../lib/project-file-api", () => ({
-  getProjectLibrary: vi.fn(),
+  listProjectLibraryFiles: vi.fn(),
+  listProjectFolders: vi.fn(),
+  getProjectFolder: vi.fn(),
+  listProjectFilePicker: vi.fn(),
+  getProjectFilePickerSelection: vi.fn(),
   saveProjectFile: vi.fn(),
   promoteProjectDraft: vi.fn(),
   changeProjectFileLocation: vi.fn(),
@@ -40,7 +52,7 @@ vi.mock("../lib/project-file-api", () => ({
   getProjectVersionBlob: vi.fn(),
   getProjectVersionPdfText: vi.fn(),
 }));
-vi.mock("../lib/project-api", () => ({ createProjectSession: vi.fn() }));
+vi.mock("../lib/project-api", () => ({ createProjectSession: vi.fn(), listProjectArtifacts: vi.fn() }));
 vi.mock("./artifact-preview-modal", () => ({
   ArtifactPreviewModal: (props: {
     artifactName: string;
@@ -107,6 +119,124 @@ const source = {
   artifactType: "generated",
   detail: {},
 } as Artifact;
+const research: ProjectFolder = {
+  folderId: "folder",
+  parentId: null,
+  name: "Research",
+  deletedAt: null,
+};
+// In-memory stand-in for the paged library endpoints. It filters, pages, and
+// derives folderPath and target like the server, so the component only sees pages.
+const library = {
+  files: [] as ProjectFile[],
+  folders: [] as ProjectFolder[],
+  pageSize: 50,
+};
+function setLibrary(files: ProjectFile[], folders: ProjectFolder[] = []) {
+  library.files = files;
+  library.folders = folders;
+}
+function page<T>(items: T[], cursor?: string) {
+  const start = Number(cursor ?? 0);
+  const end = start + library.pageSize;
+  return {
+    items: items.slice(start, end),
+    nextCursor: end < items.length ? String(end) : null,
+  };
+}
+function folderDetail(folderId: string): ProjectFolderDetail {
+  const folder = library.folders.find((entry) => entry.folderId === folderId);
+  if (!folder) throw new Error("This folder is unavailable.");
+  const ancestors: ProjectFolderDetail["ancestors"] = [];
+  let nearestLiveFolderId: string | null = folder.deletedAt ? null : folder.folderId;
+  for (let parentId = folder.parentId; parentId; ) {
+    const parent = library.folders.find((entry) => entry.folderId === parentId)!;
+    ancestors.unshift({ folderId: parent.folderId, name: parent.name });
+    if (!nearestLiveFolderId && !parent.deletedAt) nearestLiveFolderId = parent.folderId;
+    parentId = parent.parentId;
+  }
+  return { folder, ancestors, ancestorsTruncated: false, nearestLiveFolderId };
+}
+function folderPath(folderId: string | null) {
+  if (!folderId) return "Files";
+  const detail = folderDetail(folderId);
+  return detail.folder.deletedAt
+    ? "Missing folder"
+    : ["Files", ...detail.ancestors.map((entry) => entry.name), detail.folder.name].join(" / ");
+}
+function row(file: ProjectFile): ProjectLibraryFile {
+  const target = library.files.find((entry) => entry.fileId === file.targetFileId);
+  return {
+    ...file,
+    folderPath: file.folderId && !library.folders.some((entry) => entry.folderId === file.folderId)
+      ? "Missing folder"
+      : folderPath(file.folderId),
+    target: target
+      ? {
+          fileId: target.fileId,
+          name: target.name,
+          currentVersionId: target.version.versionId,
+          available: target.kind === "published" && !target.trashedAt,
+        }
+      : null,
+  };
+}
+function pickerEntry(file: ProjectFile) {
+  return {
+    fileId: file.fileId,
+    name: file.name,
+    kind: file.kind,
+    folderId: file.folderId,
+    folderPath: row(file).folderPath,
+    versionId: file.version.versionId,
+    versionNumber: file.version.versionNumber,
+  };
+}
+function mockLibraryApi() {
+  vi.mocked(api.listProjectLibraryFiles).mockImplementation(async (_projectId, input) => {
+    const q = input.q?.toLowerCase();
+    const matches = library.files.filter((file) => {
+      if (q && !file.name.toLowerCase().includes(q)) return false;
+      if (input.section === "trash") return Boolean(file.trashedAt);
+      if (file.trashedAt || file.kind !== input.section) return false;
+      return input.section === "draft" || Boolean(q) || (file.folderId ?? undefined) === input.folderId;
+    });
+    matches.sort((a, b) =>
+      input.sort === "name"
+        ? a.name.localeCompare(b.name)
+        : Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
+    );
+    return page(matches.map(row), input.cursor);
+  });
+  vi.mocked(api.listProjectFolders).mockImplementation(async (_projectId, input) => {
+    const q = input.q?.toLowerCase();
+    const matches = library.folders.filter((folder) =>
+      !folder.deletedAt &&
+      (q ? folder.name.toLowerCase().includes(q) : folder.parentId === (input.parentId ?? null)),
+    );
+    return page(
+      matches.map((folder) => ({ ...folder, path: folderPath(folder.folderId) })),
+      input.cursor,
+    );
+  });
+  vi.mocked(api.getProjectFolder).mockImplementation(async (_projectId, folderId) =>
+    folderDetail(folderId),
+  );
+  vi.mocked(api.listProjectFilePicker).mockImplementation(async (_projectId, input) => {
+    const q = input.q?.toLowerCase();
+    const matches = library.files.filter((file) =>
+      !file.trashedAt &&
+      (input.kind !== "published" || file.kind === "published") &&
+      (!q || file.name.toLowerCase().includes(q)),
+    );
+    return page(matches.map(pickerEntry), input.cursor);
+  });
+  vi.mocked(api.getProjectFilePickerSelection).mockImplementation(async (_projectId, ids) => ({
+    items: library.files
+      .filter((file) => ids.includes(file.fileId) && !file.trashedAt)
+      .map(pickerEntry),
+  }));
+}
 let client: QueryClient;
 beforeEach(() => {
   vi.resetAllMocks();
@@ -118,22 +248,20 @@ beforeEach(() => {
   client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [published, draft],
-    folders: [
-      { folderId: "folder", parentId: null, name: "Research", deletedAt: null },
-    ],
-  });
+  library.pageSize = 50;
+  setLibrary([published, draft], [research]);
+  mockLibraryApi();
   vi.mocked(api.getProjectFileHistory).mockResolvedValue([published.version]);
 });
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
   client.clear();
 });
 async function open(current = project) {
   render(
     <QueryClientProvider client={client}>
-      <ProjectFiles project={current} sources={[source]} />
+      <ProjectFiles project={current} initialSources={[source]} sourcesUpdatedAt={Date.now()} />
     </QueryClientProvider>,
   );
   await screen.findByText("Brief.txt");
@@ -144,19 +272,20 @@ it("uploads to the project reference session and waits for checks before publish
   vi.mocked(uploadArtifact).mockResolvedValue(pending);
   vi.mocked(api.saveProjectFile).mockResolvedValue(published);
   const view = (sources: Artifact[]) => <QueryClientProvider client={client}>
-    <ProjectFiles project={project} sources={sources} />
+    <ProjectFiles project={project} initialSources={sources} sourcesUpdatedAt={Date.now()} />
   </QueryClientProvider>;
-  const rendered = render(view([]));
+  render(view([]));
   await screen.findByText("Brief.txt");
   fireEvent.click(screen.getByText("Add a file or draft"));
   const file = new File(["Report"], "Report.txt", { type: "text/plain" });
   fireEvent.change(screen.getByLabelText("Upload a file"), { target: { files: [file] } });
   await waitFor(() => expect(uploadArtifact).toHaveBeenCalledWith({ sessionId: "r", file }));
   await screen.findByText(/The selected file is not ready/);
-  rendered.rerender(view([pending]));
+  client.setQueryData(queryKeys.projects.artifacts(project.projectId), [pending]);
   fireEvent.submit(screen.getByRole("form", { name: "Save project file" }));
   expect(api.saveProjectFile).not.toHaveBeenCalled();
-  rendered.rerender(view([{ ...pending, status: "ready", detail: { pii: { status: "scanned" } } }]));
+  client.setQueryData(queryKeys.projects.artifacts(project.projectId),
+    [{ ...pending, status: "ready", detail: { pii: { status: "scanned" } } }]);
   await waitFor(() => expect((screen.getByLabelText("Source file") as HTMLSelectElement).value).toBe("upload"));
   fireEvent.submit(screen.getByRole("form", { name: "Save project file" }));
   await waitFor(() => expect(api.saveProjectFile).toHaveBeenCalledWith("p", expect.objectContaining({
@@ -179,13 +308,10 @@ it("keeps drafts project-wide and promotes only after an explicit action", async
   expect(api.promoteProjectDraft).toHaveBeenCalledWith("p", "d");
 });
 it("offers an agent conflict resolution session only when the published target advanced", async () => {
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [
+  setLibrary([
       { ...draft, baseVersionId: "v1" },
       { ...published, version: { ...published.version, versionId: "v2", versionNumber: 2 } },
-    ],
-    folders: [],
-  });
+    ]);
   const current: Project = { ...project, agentFileMode: "read-write" };
   vi.mocked(projectApi.createProjectSession).mockResolvedValue({ sessionId: "resolve-session" } as never);
   await open(current);
@@ -202,13 +328,10 @@ it("hides conflict resolution when either managed tool is disabled", async () =>
     showEffortSelector: false,
     enabledToolIds: ["project_get_conflict_context"]
   });
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [
+  setLibrary([
       { ...draft, baseVersionId: "v1" },
       { ...published, version: { ...published.version, versionId: "v2", versionNumber: 2 } },
-    ],
-    folders: [],
-  });
+    ]);
   await open({ ...project, agentFileMode: "read-write" });
   fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
   expect(screen.queryByRole("button", { name: "Resolve with agent" })).toBeNull();
@@ -228,8 +351,7 @@ it("opens the existing preview with the selected immutable version", async () =>
   expect(screen.queryByRole("dialog")).toBeNull();
 });
 it("leaves Office files download-only and surfaces preview failures", async () => {
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [
+  setLibrary([
       {
         ...published,
         version: {
@@ -238,9 +360,7 @@ it("leaves Office files download-only and surfaces preview failures", async () =
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         },
       },
-    ],
-    folders: [],
-  });
+    ]);
   await open();
   expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
   expect(screen.getByRole("button", { name: "Download" })).toBeTruthy();
@@ -251,18 +371,20 @@ it("saves updates as drafts with the version selected when the form was filled",
   fireEvent.change(screen.getByLabelText("Source file"), {
     target: { value: "a" },
   });
-  fireEvent.change(screen.getByLabelText("New file or update"), {
+  const targetSelect = screen.getByLabelText("New file or update") as HTMLSelectElement;
+  await waitFor(() => expect(targetSelect.options).toHaveLength(2));
+  fireEvent.change(targetSelect, {
     target: { value: "f" },
   });
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [
+  await waitFor(() =>
+    expect(client.getQueryState(queryKeys.projects.librarySelection("p", ["f"]))?.status).toBe("success"),
+  );
+  setLibrary([
       {
         ...published,
         version: { ...published.version, versionId: "v2", versionNumber: 2 },
       },
-    ],
-    folders: [],
-  });
+    ]);
   await client.invalidateQueries({ queryKey: ["projects"] });
   expect(
     await screen.findByText(/The target changed since you selected it/),
@@ -287,23 +409,22 @@ it("requires confirmation for Trash and a destination choice for restore", async
   await waitFor(() =>
     expect(api.trashProjectFile).toHaveBeenCalledWith("p", "f"),
   );
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [{ ...published, folderId: "deleted", trashedAt: time }],
-    folders: [],
-  });
+  setLibrary([{ ...published, folderId: "deleted", trashedAt: time }]);
   await client.invalidateQueries({ queryKey: ["projects"] });
   fireEvent.click(screen.getByRole("button", { name: "Trash" }));
   fireEvent.click(await screen.findByRole("button", { name: "Restore file" }));
+  const form = screen.getByRole("form", { name: "File location" });
+  await within(form).findByText("Missing folder. Choose a destination.");
   expect(
     screen
       .getByRole("button", { name: "Confirm restore" })
       .hasAttribute("disabled"),
   ).toBe(true);
-  fireEvent.change(
-    within(screen.getByRole("form", { name: "File location" })).getByLabelText(
-      "Destination folder",
-    ),
-    { target: { value: "" } },
+  fireEvent.click(within(form).getByRole("button", { name: "Choose Files" }));
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Confirm restore" }).hasAttribute("disabled"),
+    ).toBe(false),
   );
   fireEvent.click(screen.getByRole("button", { name: "Confirm restore" }));
   await waitFor(() =>
@@ -315,6 +436,49 @@ it("requires confirmation for Trash and a destination choice for restore", async
     ),
   );
 });
+it.each([
+  { case: "a live parent", deleted: "notes", nearest: "Research", folderId: "folder" },
+  { case: "the Files root", deleted: "folder", nearest: "Files", folderId: null },
+])("offers the nearest live folder for a deleted restore destination under $case", async ({ deleted, nearest, folderId }) => {
+  const notes: ProjectFolder = { folderId: "notes", parentId: "folder", name: "Notes", deletedAt: null };
+  const folders = [research, notes].map((folder) =>
+    folder.folderId === deleted ? { ...folder, deletedAt: time } : folder,
+  );
+  setLibrary([{ ...published, folderId: null }], folders);
+  await open();
+  setLibrary([{ ...published, folderId: deleted, trashedAt: time }], folders);
+  await client.invalidateQueries({ queryKey: ["projects"] });
+  fireEvent.click(screen.getByRole("button", { name: "Trash" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Restore file" }));
+  const form = screen.getByRole("form", { name: "File location" });
+  const choose = await within(form).findByRole("button", {
+    name: `Choose nearest folder: ${nearest}`,
+  });
+  const confirm = () => screen.getByRole("button", { name: "Confirm restore" });
+  expect(confirm().hasAttribute("disabled")).toBe(true);
+  fireEvent.click(choose);
+  await waitFor(() => expect(confirm().hasAttribute("disabled")).toBe(false));
+  expect(within(form).queryByRole("button", { name: /Choose nearest folder/ })).toBeNull();
+  fireEvent.click(confirm());
+  await waitFor(() =>
+    expect(api.changeProjectFileLocation).toHaveBeenCalledWith(
+      "p",
+      "f",
+      { name: "Brief.txt", folderId },
+      "restore",
+    ),
+  );
+});
+it("moves focus into the Trash, edit, and history panels when they open", async () => {
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Confirm removal" }));
+  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
+  expect(document.activeElement).toBe(within(screen.getByRole("form", { name: "File location" })).getByLabelText("File name"));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: /History of/ }));
+});
+
 it("keeps archived project files readable while disabling mutations", async () => {
   await open({ ...project, archivedAt: time });
   expect(
@@ -327,8 +491,7 @@ it("keeps archived project files readable while disabling mutations", async () =
   ).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
   expect(
-    screen
-      .getByRole("button", { name: "Promote draft" })
+    (await screen.findByRole("button", { name: "Promote draft" }))
       .hasAttribute("disabled"),
   ).toBe(true);
 });
@@ -337,10 +500,7 @@ it("restores history as a new version using the latest displayed version as a gu
     ...published,
     version: { ...published.version, versionId: "v2", versionNumber: 2 },
   };
-  vi.mocked(api.getProjectLibrary).mockResolvedValue({
-    files: [current],
-    folders: [],
-  });
+  setLibrary([current]);
   vi.mocked(api.getProjectFileHistory).mockResolvedValue([
     current.version,
     published.version,
@@ -358,4 +518,210 @@ it("restores history as a new version using the latest displayed version as a gu
       "v2",
     ),
   );
+});
+
+const publishedFile = (fileId: string, name: string, folderId: string | null = null, updatedAt = time): ProjectFile => ({
+  ...published,
+  fileId,
+  name,
+  folderId,
+  updatedAt,
+  version: { ...published.version, fileId, versionId: `${fileId}-v1` },
+});
+it("loads files one page at a time and resets pages when the sort changes", async () => {
+  library.pageSize = 1;
+  setLibrary([
+    published,
+    publishedFile("g", "Agenda.txt", null, "2026-09-13T00:00:00Z"),
+  ]);
+  await open();
+  expect(screen.queryByText("Agenda.txt")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "More files" }));
+  await screen.findByText("Agenda.txt");
+  expect(screen.queryByRole("button", { name: "More files" })).toBeNull();
+  expect(api.listProjectLibraryFiles).toHaveBeenLastCalledWith(
+    "p",
+    { section: "published", sort: "updated", cursor: "1" },
+    expect.anything(),
+  );
+  fireEvent.change(screen.getByLabelText("Sort project files"), { target: { value: "name" } });
+  await waitFor(() => expect(api.listProjectLibraryFiles).toHaveBeenLastCalledWith(
+    "p",
+    { section: "published", sort: "name", cursor: undefined },
+    expect.anything(),
+  ));
+  await waitFor(() => expect(screen.queryByText("Brief.txt")).toBeNull());
+  expect(screen.getByText("Agenda.txt")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "More files" })).toBeTruthy();
+});
+it("shows each file once when a later page repeats a row", async () => {
+  vi.mocked(api.listProjectLibraryFiles)
+    .mockResolvedValueOnce({ items: [row(published)], nextCursor: "next" })
+    .mockResolvedValueOnce({ items: [row(published), row(publishedFile("g", "Agenda.txt"))], nextCursor: null });
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "More files" }));
+  await screen.findByText("Agenda.txt");
+  expect(screen.getAllByText("Brief.txt")).toHaveLength(1);
+});
+it("offers a reload from the first page when a later page reports a changed list", async () => {
+  vi.mocked(api.listProjectLibraryFiles)
+    .mockResolvedValueOnce({ items: [row(published)], nextCursor: "next" })
+    .mockResolvedValueOnce({ items: [row(publishedFile("g", "Agenda.txt"))], nextCursor: null, listChanged: true })
+    .mockResolvedValueOnce({ items: [row(publishedFile("h", "Minutes.txt")), row(published)], nextCursor: "next" });
+  await open();
+  expect(screen.queryByText("Files changed while you scrolled. Reload the list.")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "More files" }));
+  await screen.findByText("Files changed while you scrolled. Reload the list.");
+  fireEvent.click(screen.getByRole("button", { name: "Reload list" }));
+  await screen.findByText("Minutes.txt");
+  expect(api.listProjectLibraryFiles).toHaveBeenCalledTimes(3);
+  expect(api.listProjectLibraryFiles).toHaveBeenLastCalledWith(
+    "p",
+    { section: "published", sort: "updated", cursor: undefined },
+    expect.anything(),
+  );
+  expect(screen.queryByText("Agenda.txt")).toBeNull();
+  expect(screen.queryByText("Files changed while you scrolled. Reload the list.")).toBeNull();
+});
+it("navigates folders with detail breadcrumbs and pages child folders", async () => {
+  const notes: ProjectFolder = { folderId: "notes", parentId: "folder", name: "Notes", deletedAt: null };
+  const archive: ProjectFolder = { folderId: "archive", parentId: "folder", name: "Archive", deletedAt: null };
+  library.pageSize = 1;
+  setLibrary([published, publishedFile("n", "Minutes.txt", "notes")], [research, archive, notes]);
+  await open();
+  fireEvent.click(await screen.findByRole("button", { name: "Research /" }));
+  const nav = screen.getByRole("navigation", { name: "Project folders" });
+  await within(nav).findByText("/ Research");
+  expect(screen.queryByText("Brief.txt")).toBeNull();
+  await screen.findByRole("button", { name: "Archive /" });
+  expect(screen.queryByRole("button", { name: "Notes /" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "More folders" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Notes /" }));
+  await screen.findByText("Minutes.txt");
+  expect(api.getProjectFolder).toHaveBeenCalledWith("p", "notes", expect.anything());
+  await within(nav).findByText("/ Notes");
+  fireEvent.click(within(nav).getByRole("button", { name: "Research" }));
+  await within(nav).findByText("/ Research");
+  fireEvent.click(within(nav).getByRole("button", { name: "Up one folder" }));
+  await screen.findByText("Brief.txt");
+});
+it("searches file names across folders after a pause in typing", async () => {
+  setLibrary([published, publishedFile("n", "Minutes.txt", "folder")], [research]);
+  await open();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const search = screen.getByLabelText("Search project file names");
+  fireEvent.change(search, { target: { value: "m" } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+  fireEvent.change(search, { target: { value: "min" } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+  expect(api.listProjectLibraryFiles).not.toHaveBeenCalledWith(
+    "p", expect.objectContaining({ q: "m" }), expect.anything(),
+  );
+  expect(api.listProjectLibraryFiles).not.toHaveBeenCalledWith(
+    "p", expect.objectContaining({ q: "min" }), expect.anything(),
+  );
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(api.listProjectLibraryFiles).toHaveBeenCalledWith(
+    "p", expect.objectContaining({ q: "min", folderId: undefined }), expect.anything(),
+  );
+  // Flush the query notification before restoring native timers.
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  vi.useRealTimers();
+  await screen.findByText("Minutes.txt");
+  expect(screen.queryByText("Brief.txt")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Research /" })).toBeNull();
+  expect(api.listProjectLibraryFiles).toHaveBeenCalledWith(
+    "p",
+    expect.objectContaining({ q: "min", folderId: undefined }),
+    expect.anything(),
+  );
+  expect(api.listProjectLibraryFiles).not.toHaveBeenCalledWith(
+    "p",
+    expect.objectContaining({ q: "m" }),
+    expect.anything(),
+  );
+});
+it("offers a way out when the open folder is removed", async () => {
+  await open();
+  fireEvent.click(await screen.findByRole("button", { name: "Research /" }));
+  await screen.findByText("/ Research");
+  setLibrary([published, draft], [{ ...research, deletedAt: time }]);
+  await client.invalidateQueries({ queryKey: ["projects"] });
+  fireEvent.click(await screen.findByRole("button", { name: "Go to nearest folder" }));
+  await screen.findByText("Brief.txt");
+});
+it("labels a draft target from the row even when the target is not loaded", async () => {
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Drafts" }));
+  await screen.findByText("Proposal.txt");
+  expect(screen.getByText("Updates Brief.txt")).toBeTruthy();
+  setLibrary([draft, { ...published, trashedAt: time }], [research]);
+  await client.invalidateQueries({ queryKey: ["projects"] });
+  await screen.findByText("Updates Brief.txt (no longer published)");
+});
+it("moves a file to a folder found by browsing or by searching all folders", async () => {
+  const notes: ProjectFolder = { folderId: "notes", parentId: "folder", name: "Notes", deletedAt: null };
+  setLibrary([published], [research, notes]);
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
+  const form = screen.getByRole("form", { name: "File location" });
+  fireEvent.click(await within(form).findByRole("button", { name: "Open Research" }));
+  fireEvent.click(await within(form).findByRole("button", { name: "Choose Notes" }));
+  await within(form).findByText("Files / Research / Notes");
+  fireEvent.click(within(form).getByRole("button", { name: "Save location" }));
+  await waitFor(() => expect(api.changeProjectFileLocation).toHaveBeenCalledWith(
+    "p", "f", { name: "Brief.txt", folderId: "notes" }, "location",
+  ));
+  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
+  const next = screen.getByRole("form", { name: "File location" });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const search = within(next).getByLabelText("Destination folder search");
+  fireEvent.change(search, { target: { value: "n" } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+  fireEvent.change(search, { target: { value: "not" } });
+  await act(async () => { await vi.advanceTimersByTimeAsync(299); });
+  expect(api.listProjectFolders).not.toHaveBeenCalledWith(
+    "p", expect.objectContaining({ q: "n" }), expect.anything(),
+  );
+  expect(api.listProjectFolders).not.toHaveBeenCalledWith(
+    "p", expect.objectContaining({ q: "not" }), expect.anything(),
+  );
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(api.listProjectFolders).toHaveBeenCalledWith("p", { q: "not", cursor: undefined }, expect.anything());
+  // Flush the query notification before restoring native timers.
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  vi.useRealTimers();
+  fireEvent.click(await within(next).findByRole("button", { name: "Choose Files / Research / Notes" }));
+  expect(api.listProjectFolders).toHaveBeenCalledWith("p", { q: "not", cursor: undefined }, expect.anything());
+  expect(api.listProjectFolders).not.toHaveBeenCalledWith("p", expect.objectContaining({ q: "n" }), expect.anything());
+  fireEvent.change(within(next).getByLabelText("File name"), { target: { value: "Brief notes.txt" } });
+  fireEvent.click(within(next).getByRole("button", { name: "Save location" }));
+  await waitFor(() => expect(api.changeProjectFileLocation).toHaveBeenLastCalledWith(
+    "p", "f", { name: "Brief notes.txt", folderId: "notes" }, "location",
+  ));
+});
+it("finds update targets through the bounded picker search", async () => {
+  library.pageSize = 1;
+  setLibrary([published, publishedFile("g", "Agenda.txt")]);
+  await open();
+  fireEvent.click(screen.getByText("Add a file or draft"));
+  const target = screen.getByLabelText("New file or update") as HTMLSelectElement;
+  await waitFor(() => expect(target.options).toHaveLength(2));
+  fireEvent.click(screen.getByRole("button", { name: "More results" }));
+  await waitFor(() => expect(target.options).toHaveLength(3));
+  fireEvent.change(screen.getByLabelText("Search published files to update"), { target: { value: "agen" } });
+  await waitFor(() => expect(api.listProjectFilePicker).toHaveBeenCalledWith(
+    "p", { q: "agen", kind: "published", cursor: undefined }, expect.anything(),
+  ));
+  fireEvent.change(target, { target: { value: "g" } });
+  expect((screen.getByLabelText("File name") as HTMLInputElement).value).toBe("Agenda.txt");
+  fireEvent.change(screen.getByLabelText("Source file"), { target: { value: "a" } });
+  await waitFor(() =>
+    expect(client.getQueryState(queryKeys.projects.librarySelection("p", ["g"]))?.status).toBe("success"),
+  );
+  expect(screen.getByRole("button", { name: "Save draft" }).hasAttribute("disabled")).toBe(false);
+  setLibrary([published, { ...publishedFile("g", "Agenda.txt"), trashedAt: time }]);
+  await client.invalidateQueries({ queryKey: ["projects"] });
+  await screen.findByText(/The target file is no longer published/);
+  expect(screen.getByRole("button", { name: "Save draft" }).hasAttribute("disabled")).toBe(true);
 });

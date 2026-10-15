@@ -50,7 +50,9 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 ---
 
-## 5. Session runtime — one process per session
+## 5. Session runtime — one process per session (superseded)
+
+**Status:** Superseded by Decision 12. The agent loop now runs in the backend process. E2B provides lazy code execution; it does not host a per-session agent process.
 
 **Decision:** Each active session gets its own `codex app-server` process and workspace. Created on demand, torn down after idle timeout.
 
@@ -58,7 +60,9 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 ---
 
-## 6. Codex protocol — generated schemas from a pinned version
+## 6. Codex protocol — generated schemas from a pinned version (superseded)
+
+**Status:** Superseded by Decisions 12 and 13. The Codex runtime and its generated protocol files were removed. Current browser streams use AG-UI; shared Zod schemas define HTTP contracts.
 
 **Decision:** Pin a Codex version per deployment (`codex-release.json`). Generate TypeScript / JSON schemas from `codex app-server generate-ts` and `generate-json-schema`. Hand-written markdown contracts are not authoritative.
 
@@ -94,7 +98,9 @@ The reasoning behind major architectural choices, after they're resolved. For op
 
 ---
 
-## 10. Second runtime provider — Claude Code behind the same `RuntimeAdapter`
+## 10. Second runtime provider — Claude Code behind the same `RuntimeAdapter` (superseded)
+
+**Status:** Superseded by Decision 12. The Claude Code and Codex adapters were retired. Deep Agents is the sole runtime, with model-provider selection inside that runtime. The original implementation rules below are historical.
 
 **Decision:** Keep `RuntimeAdapter` as the contract. Add a Claude adapter that uses `@anthropic-ai/claude-agent-sdk` `query()` (in-process locally; in-sandbox harness in E2B). Route per tenant via `tenantSettings.runtimeProvider`. **Shipped 2026-04-17.**
 
@@ -147,7 +153,11 @@ The browser and scheduler consume AG-UI events emitted from the existing in-proc
 
 The July evaluation found that the standard LangGraph bridge expected a LangGraph API server, rather than an embedded compiled graph. Adopting that server would have required moving the existing checkpointer and gateway integration. We kept the embedded graph and mapped its events to AG-UI through the agent adapter. The protocol change reduced frontend plumbing without removing the backend event mapper.
 
-Custom events carry application-specific approval, policy, PII and tool metadata. Shared schemas define their payloads. Persisted UI-resource data alone does not provide an interactive MCP Apps host; rendering and tool-action authorization remain separate concerns.
+Custom events carry application-specific approval, policy, PII and tool metadata. Shared schemas define their payloads.
+
+**UI-resource contract, reconciled 2026-10-11:** MCP Apps use `tool_mcp_app` and saved `ToolResult.mcpApp` records. Managed tools declare resources in the trusted catalog; proxy tools declare `_meta.ui.resourceUri` and provide `resources/read`. The host retrieves HTML through the session resource route, which rechecks current access and policy, and renders it on a separate sandbox origin. Widget chat messages require user confirmation through the normal chat path. See [Interactive UI](INTERACTIVE_UI.md#supported-resource-contract).
+
+Generic inline `uiResources` have no frontend renderer and are deprecated. The runtime no longer emits their event or writes them. Keep optional history reads while retained rows need them. Do not add a second renderer that skips the current resource-access and isolation checks.
 
 ## 14. Sandbox isolation applies to code execution
 

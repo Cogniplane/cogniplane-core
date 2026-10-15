@@ -16,3 +16,17 @@ export class GithubConnectionNotConfiguredError extends Error {
     this.name = "GithubConnectionNotConfiguredError";
   }
 }
+
+/**
+ * A settings request cannot continue because of the state of the member's
+ * connection. The routes map `code` to an HTTP status.
+ */
+export class GithubConnectionError extends Error {
+  constructor(
+    readonly code: "not_connected" | "credentials_unusable" | "upstream_unavailable" | "account_changed",
+    message: string
+  ) {
+    super(message);
+    this.name = "GithubConnectionError";
+  }
+}

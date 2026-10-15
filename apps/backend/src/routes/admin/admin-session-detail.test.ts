@@ -426,3 +426,79 @@ test("admin session detail — pii findings non-array fall back to []", async ()
   expect(res.json().piiRuns[0].findings).toEqual([]);
   await app.close();
 });
+
+test("admin session detail — maps each tool result row and fills unset text with empty strings", async () => {
+  const { app } = await buildApp({
+    isAdmin: true,
+    rows: {
+      header: [
+        {
+          session_id: VALID_UUID,
+          user_id: "user-1",
+          user_email: null,
+          tenant_id: "tenant-a",
+          session_name: "Tools",
+          admin_status: "active",
+          runtime_provider: "deep-agents",
+          created_at: new Date("2026-04-20T10:00:00Z"),
+          last_activity_at: new Date("2026-04-20T10:00:00Z"),
+          message_count: 2,
+          total_cost_usd: 0,
+          total_tokens: 0
+        }
+      ],
+      messageToolResults: [
+        {
+          tool_result_id: "tr-1",
+          message_id: "m-1",
+          kind: "command",
+          title: "Run tests",
+          status: "completed",
+          server_name: null,
+          tool_name: null,
+          command_text: "pnpm test",
+          input_text: null,
+          cwd: "/home/user/workspace",
+          output_text: "ok",
+          exit_code: "0",
+          duration_ms: 1250,
+          created_at: new Date("2026-04-20T10:01:00Z")
+        },
+        {
+          tool_result_id: "tr-2",
+          message_id: "m-2",
+          kind: "mcp",
+          title: "Search",
+          status: "failed",
+          server_name: "notion",
+          tool_name: "search",
+          command_text: null,
+          input_text: "{\"q\":\"plan\"}",
+          cwd: null,
+          output_text: null,
+          exit_code: null,
+          duration_ms: "not a number",
+          created_at: "2026-04-20T10:02:00Z"
+        }
+      ]
+    }
+  });
+
+  const res = await app.inject({ method: "GET", url: `/admin/sessions/${VALID_UUID}` });
+
+  expect(res.statusCode).toBe(200);
+  expect(res.json().messageToolResults).toEqual([
+    {
+      toolResultId: "tr-1", messageId: "m-1", kind: "command", title: "Run tests", status: "completed",
+      serverName: "", toolName: "", commandText: "pnpm test", inputText: "", cwd: "/home/user/workspace",
+      outputText: "ok", exitCode: 0, durationMs: 1250, createdAt: "2026-04-20T10:01:00.000Z"
+    },
+    {
+      toolResultId: "tr-2", messageId: "m-2", kind: "mcp", title: "Search", status: "failed",
+      serverName: "notion", toolName: "search", commandText: "", inputText: "{\"q\":\"plan\"}", cwd: "",
+      // A value that is not a number reads as unknown rather than failing the response.
+      outputText: "", exitCode: null, durationMs: null, createdAt: "2026-04-20T10:02:00.000Z"
+    }
+  ]);
+  await app.close();
+});

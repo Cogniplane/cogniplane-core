@@ -5,6 +5,7 @@ import Fastify from "fastify";
 import type {
   PolicyDecision,
   PolicyDecisionFilters,
+  PolicyMonitorSummaryResponse,
   PolicyRule,
   PolicyRuleInput,
   PolicyRulePatch
@@ -126,6 +127,9 @@ type SeededDecision = PolicyDecision & { actionSnapshot?: Record<string, unknown
 
 class InMemoryDecisionStore {
   private decisions: SeededDecision[] = [];
+  lastFilters: PolicyDecisionFilters | null = null;
+  summaryCalls: Array<{ tenantId: string; windowEnd: Date }> = [];
+  summary: PolicyMonitorSummaryResponse | null = null;
 
   seed(decisions: SeededDecision[]): void {
     this.decisions = decisions;
@@ -136,10 +140,12 @@ class InMemoryDecisionStore {
   }
 
   async list(tenantId: string, filters: PolicyDecisionFilters = {}) {
+    this.lastFilters = filters;
     const ONE_DAY = 24 * 60 * 60 * 1000;
     let rows = this.decisions
       .filter((d) => d.tenantId === tenantId)
       .filter((d) => (filters.sessionId ? d.sessionId === filters.sessionId : true))
+      .filter((d) => (filters.matchedRuleId ? d.matchedRuleId === filters.matchedRuleId : true))
       .filter((d) => (filters.outcomes?.length ? filters.outcomes.includes(d.outcome) : true))
       .filter((d) => (filters.enforced === undefined ? true : d.enforced === filters.enforced))
       .filter((d) => (filters.toolNames?.length ? filters.toolNames.includes(d.toolName) : true))
@@ -153,6 +159,12 @@ class InMemoryDecisionStore {
     const offset = Math.min(Math.max(filters.offset ?? 0, 0), 100_000);
     const page = rows.slice(offset, offset + limit).map(({ actionSnapshot: _omit, ...row }) => row);
     return { decisions: page, total, hasMore: offset + page.length < total, limit, offset };
+  }
+
+  async summarizeMonitor(tenantId: string, windowEnd: Date): Promise<PolicyMonitorSummaryResponse> {
+    this.summaryCalls.push({ tenantId, windowEnd });
+    if (!this.summary) throw new Error("No summary seeded");
+    return this.summary;
   }
 
   async get(tenantId: string, decisionId: string) {
@@ -182,7 +194,7 @@ function fakeDecision(overrides: Partial<SeededDecision> & Pick<SeededDecision, 
   };
 }
 
-async function buildApp() {
+async function buildApp(options: { now?: () => Date } = {}) {
   const app = Fastify();
   const ruleStore = new InMemoryRuleStore();
   const decisionStore = new InMemoryDecisionStore();
@@ -208,7 +220,8 @@ async function buildApp() {
     policyRules: ruleStore as unknown as PolicyRuleStore,
     policyDecisions: decisionStore as unknown as PolicyDecisionStore,
     policyService,
-    auditEvents: audit as unknown as AuditEventStore
+    auditEvents: audit as unknown as AuditEventStore,
+    now: options.now
   });
   await app.ready();
   return { app, audit, decisionStore, ruleStore };
@@ -659,6 +672,81 @@ test("decisions endpoint rejects an invalid filter value with 400", async () => 
   expect(badOutcome.statusCode).toBe(400);
   const badEnforced = await app.inject({ method: "GET", url: "/admin/policy/decisions?enforced=maybe" });
   expect(badEnforced.statusCode).toBe(400);
+  await app.close();
+});
+
+test("decisions endpoint forwards the rule, evidence, and exact window filters", async () => {
+  const { app, decisionStore } = await buildApp();
+  decisionStore.seed([
+    fakeDecision({ decisionId: "d1", matchedRuleId: "pol_a", createdAt: "2026-09-26T10:00:00.000Z" }),
+    fakeDecision({ decisionId: "d2", matchedRuleId: "pol_b", createdAt: "2026-09-26T10:00:00.000Z" })
+  ]);
+  const res = await app.inject({
+    method: "GET",
+    url: "/admin/policy/decisions?matchedRuleId=pol_a&evidence=monitor_gateway&from=2026-09-20T12:00:00.000Z&before=2026-09-27T12:00:00.000Z"
+  });
+  expect(res.statusCode).toBe(200);
+  expect(res.json().decisions.map((d: PolicyDecision) => d.decisionId)).toEqual(["d1"]);
+  expect(decisionStore.lastFilters).toMatchObject({
+    matchedRuleId: "pol_a",
+    evidence: "monitor_gateway",
+    from: "2026-09-20T12:00:00.000Z",
+    before: "2026-09-27T12:00:00.000Z"
+  });
+  await app.close();
+});
+
+test("decisions endpoint rejects an unknown evidence set instead of ignoring it", async () => {
+  const { app, decisionStore } = await buildApp();
+  const res = await app.inject({ method: "GET", url: "/admin/policy/decisions?evidence=everything" });
+  expect(res.statusCode).toBe(400);
+  expect(decisionStore.lastFilters).toBeNull();
+  await app.close();
+});
+
+test("monitor summary uses the request clock and the caller's tenant", async () => {
+  const windowEnd = new Date("2026-09-27T12:00:00.000Z");
+  const { app, decisionStore } = await buildApp({ now: () => windowEnd });
+  decisionStore.summary = {
+    windowStart: "2026-09-20T12:00:00.000Z",
+    windowEnd: "2026-09-27T12:00:00.000Z",
+    totals: { block: 3, approvalInteractive: 1, approvalScheduled: 1, approvalUnknownContext: 0, total: 5 },
+    rules: [
+      {
+        ruleId: "pol_a",
+        currentRule: { name: "Block writes", enabled: false, effect: "block" },
+        counts: { block: 2, approvalInteractive: 1, approvalScheduled: 1, approvalUnknownContext: 0, total: 4 },
+        lastRecordedAt: "2026-09-26T10:00:00.000Z"
+      },
+      {
+        ruleId: "pol_deleted",
+        currentRule: null,
+        counts: { block: 1, approvalInteractive: 0, approvalScheduled: 0, approvalUnknownContext: 0, total: 1 },
+        lastRecordedAt: "2026-09-25T10:00:00.000Z"
+      }
+    ],
+    excluded: { resourceChecks: 3, unrecognized: 1 }
+  };
+  const res = await app.inject({ method: "GET", url: "/admin/policy/monitor-summary" });
+  expect(res.statusCode).toBe(200);
+  expect(decisionStore.summaryCalls).toEqual([{ tenantId: "t1", windowEnd }]);
+  expect(res.json()).toEqual(decisionStore.summary);
+  await app.close();
+});
+
+test("monitor summary refuses to send fields outside the contract", async () => {
+  const { app, decisionStore } = await buildApp();
+  decisionStore.summary = {
+    windowStart: "2026-09-20T12:00:00.000Z",
+    windowEnd: "2026-09-27T12:00:00.000Z",
+    totals: { block: 0, approvalInteractive: 0, approvalScheduled: 0, approvalUnknownContext: 0, total: 0 },
+    rules: [],
+    excluded: { resourceChecks: 0, unrecognized: 0 },
+    actionSnapshot: { argumentKeys: ["password"] }
+  } as unknown as PolicyMonitorSummaryResponse;
+  const res = await app.inject({ method: "GET", url: "/admin/policy/monitor-summary" });
+  expect(res.statusCode).toBe(500);
+  expect(res.body).not.toContain("password");
   await app.close();
 });
 

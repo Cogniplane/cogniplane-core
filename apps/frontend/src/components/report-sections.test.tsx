@@ -7,12 +7,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   fetchTokenUsage: vi.fn(),
   fetchPersonalTokenUsage: vi.fn(),
-  fetchMessageFeedback: vi.fn()
+  fetchMessageFeedback: vi.fn(),
+  listAdminUsers: vi.fn()
 }));
 
 vi.mock("../lib/token-usage-api", () => ({ fetchTokenUsage: api.fetchTokenUsage }));
 vi.mock("../lib/settings-api", () => ({ fetchPersonalTokenUsage: api.fetchPersonalTokenUsage }));
 vi.mock("../lib/message-feedback-api", () => ({ fetchMessageFeedback: api.fetchMessageFeedback }));
+vi.mock("../lib/admin-api", () => ({ listAdminUsers: api.listAdminUsers }));
 vi.mock("recharts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("recharts")>();
   return {
@@ -63,7 +65,10 @@ function renderWithQuery(ui: ReactElement, client = new QueryClient({ defaultOpt
   return { client, ...render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>) };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  api.listAdminUsers.mockResolvedValue([]);
+});
 afterEach(cleanup);
 
 describe.each([
@@ -154,7 +159,7 @@ describe("token report presentation", () => {
     await screen.findByText("9");
     fireEvent.click(screen.getByRole("button", { name: "By user" }));
     expect(screen.getByText("User")).toBeTruthy();
-    expect(screen.getAllByText("user-1…7890")).toHaveLength(2);
+    expect(screen.getAllByText("user-1234567890")).toHaveLength(2);
   });
 
   it("renders admin daily and model breakdowns", async () => {
@@ -170,17 +175,16 @@ describe("token report presentation", () => {
     expect(screen.getAllByText("admin-model")).toHaveLength(2);
   });
 
-  it("keeps the personal model label and warning color", async () => {
+  it("renders the personal model breakdown", async () => {
     api.fetchPersonalTokenUsage.mockResolvedValue({
       ...usage(6),
       byModel: [{ modelName: "personal-model", inputTokens: 4, outputTokens: 2, totalTokens: 6, costUsd: 0.1 }]
     });
-    const view = renderWithQuery(<PersonalTokenUsageSection />);
+    renderWithQuery(<PersonalTokenUsageSection />);
     await screen.findByText("6");
     fireEvent.click(screen.getByRole("button", { name: "By model" }));
     expect(screen.getByText("Model")).toBeTruthy();
     expect(screen.getAllByText("personal-model")).toHaveLength(2);
-    expect(view.container.querySelector('[style*="var(--color-warning)"]')).toBeTruthy();
   });
 });
 
@@ -208,7 +212,7 @@ describe("message feedback states", () => {
     await screen.findByText("1 rated responses");
   });
 
-  it("renders both breakdowns and sorts the daily table", async () => {
+  it("switches breakdowns and sorts the daily table", async () => {
     api.fetchMessageFeedback.mockResolvedValue({
       totals: { thumbsUp: 2, thumbsDown: 1, total: 3, ratePercent: 67 },
       daily: [
@@ -218,7 +222,8 @@ describe("message feedback states", () => {
       byModel: [{ modelName: "feedback-model", thumbsUp: 2, thumbsDown: 1, total: 3, ratePercent: 67 }]
     });
     renderWithQuery(<MessageFeedbackSection />);
-    await screen.findByText("feedback-model");
+    await screen.findByText("2026-09-02");
+    expect(screen.queryByText("feedback-model")).toBeNull();
     const dateButton = screen.getByRole("button", { name: /Date/ });
     fireEvent.click(dateButton);
     const dailyTable = dateButton.closest("table");
@@ -228,5 +233,9 @@ describe("message feedback states", () => {
     fireEvent.click(dateButton);
     const sortedRows = within(dailyTable!).getAllByRole("row");
     expect(sortedRows[1]?.textContent).toContain("2026-09-02");
+    fireEvent.click(screen.getByRole("button", { name: "By model" }));
+    await screen.findByText("feedback-model");
+    expect(screen.queryByText("2026-09-02")).toBeNull();
+    expect(screen.getAllByRole("table")).toHaveLength(1);
   });
 });

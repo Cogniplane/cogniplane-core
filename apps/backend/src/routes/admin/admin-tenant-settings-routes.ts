@@ -9,20 +9,17 @@ import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { ManagedToolCatalog } from "../../services/managed-tools/catalog.js";
 import { tenantSettingsBodySchema } from "./admin-route-schemas.js";
 import {
-  createAdminAuditEvent,
   respondAdminMutationError,
   withAdmin
 } from "./admin-route-helpers.js";
 
 export type TenantSettingsRouteStores = {
   dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
-  auditEvents: Pick<AuditEventStore, "create">;
   managedToolCatalog: Pick<ManagedToolCatalog, "listTenantConfigurable">;
   /**
    * The tenant's admin-added custom models (id + supported efforts are all
@@ -32,7 +29,7 @@ export type TenantSettingsRouteStores = {
    */
   listCustomModels?: (
     tenantId: string
-  ) => Promise<{ id: string; supportedEfforts: readonly string[] }[]>;
+  ) => Promise<{ id: string; provider: import("@cogniplane/shared-types").ModelProvider; supportedEfforts: readonly string[] }[]>;
 };
 
 export async function registerAdminTenantSettingsRoutes(
@@ -86,6 +83,12 @@ export async function registerAdminTenantSettingsRoutes(
     const unknownIds = (parseResult.data.enabledModelIds ?? []).filter(
       (id) => !modelsById.has(id)
     );
+    if (parseResult.data.defaultModelId && !modelsById.has(parseResult.data.defaultModelId)) {
+      return reply.status(400).send({
+        error: "validation_error",
+        message: `Unknown default model: ${parseResult.data.defaultModelId}`
+      });
+    }
     if (unknownIds.length > 0) {
       return reply.status(400).send({
         error: "validation_error",
@@ -109,6 +112,34 @@ export async function registerAdminTenantSettingsRoutes(
     }
 
     let updateInput = parseResult.data;
+    if (parseResult.data.enabledProviders !== undefined ||
+        parseResult.data.enabledModelIds !== undefined ||
+        parseResult.data.defaultModelId !== undefined) {
+      const current = await stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId);
+      const enabledProviders = parseResult.data.enabledProviders ?? current.enabledProviders;
+      const enabledModelIds = parseResult.data.enabledModelIds === undefined
+        ? current.enabledModelIds : parseResult.data.enabledModelIds;
+      const effectiveDefaultId = parseResult.data.defaultModelId === undefined
+        ? current.defaultModelId : parseResult.data.defaultModelId;
+      if (effectiveDefaultId) {
+        const provider = AVAILABLE_MODELS.find((item) => item.id === effectiveDefaultId)?.provider
+          ?? customModels.find((item) => item.id === effectiveDefaultId)?.provider;
+        const available = Boolean(provider && enabledProviders.includes(provider) &&
+          (enabledModelIds === null || enabledModelIds.includes(effectiveDefaultId)));
+        if (!available && parseResult.data.defaultModelId !== undefined) {
+          return reply.status(400).send({
+            error: "validation_error",
+            message: "Enable the default model and its provider before selecting it."
+          });
+        }
+        if (!available) {
+          updateInput = { ...updateInput, defaultModelId: null };
+        }
+      }
+      // The effective default was checked against this snapshot. Reject a
+      // concurrent settings change rather than writing a stale decision.
+      updateInput = { ...updateInput, expectedVersion: parseResult.data.expectedVersion ?? current.version };
+    }
     if (request.auth.role !== "owner") {
       const current = await stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId);
       const sensitiveChanges =
@@ -124,43 +155,50 @@ export async function registerAdminTenantSettingsRoutes(
       const {
         allowCommandExecution: _allowCommandExecution,
         ...adminUpdateInput
-      } = parseResult.data;
+      } = updateInput;
       updateInput = adminUpdateInput;
     }
 
     try {
+      // The audit event commits in the same transaction as the change.
       const settings = await stores.dynamicConfig.updateTenantSettings(
         request.auth.tenantId,
-        updateInput
+        updateInput,
+        (saved) => ({
+          tenantId: request.auth.tenantId,
+          sessionId: null,
+          userId: request.auth.userId,
+          type: "admin.tenant_settings.updated",
+          payload: {
+            showEffortSelector: saved.showEffortSelector,
+            webSearchMode: saved.webSearchMode,
+            approvalPolicy: saved.approvalPolicy,
+            approvalReviewer: saved.approvalReviewer,
+            allowCommandExecution: saved.allowCommandExecution,
+            autoApproveReadOnlyTools: saved.autoApproveReadOnlyTools,
+            policyEnforcementMode: saved.policyEnforcementMode,
+            developerInstructions: saved.developerInstructions,
+            enabledToolIds: saved.enabledToolIds,
+            enabledMcpServerIds: saved.enabledMcpServerIds,
+            enabledProviders: saved.enabledProviders,
+            enabledModelIds: saved.enabledModelIds,
+            defaultModelId: saved.defaultModelId,
+            modelDefaultEfforts: saved.modelDefaultEfforts,
+            approvedSandboxEgressDomains: saved.approvedSandboxEgressDomains,
+            // Cached sessions compare the bundle hash and refresh capabilities
+            // in place before their next turn. Do not dispose their E2B sandbox:
+            // that would erase agent-created workspace files for a settings save.
+            // One setting is the exception: the network of a sandbox is fixed when
+            // it is created, so a sandbox that does not match the approved hosts is
+            // replaced by the check at the start of the next turn.
+            runtimeRefresh: "next_turn_in_place",
+            version: saved.version,
+            configHash: saved.configHash
+          },
+          ipAddress: request.ip,
+          userAgent: request.headers["user-agent"]
+        })
       );
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.tenant_settings.updated",
-        payload: {
-          showEffortSelector: settings.showEffortSelector,
-          webSearchMode: settings.webSearchMode,
-          approvalPolicy: settings.approvalPolicy,
-          approvalReviewer: settings.approvalReviewer,
-          allowCommandExecution: settings.allowCommandExecution,
-          autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
-          policyEnforcementMode: settings.policyEnforcementMode,
-          developerInstructions: settings.developerInstructions,
-          enabledToolIds: settings.enabledToolIds,
-          enabledMcpServerIds: settings.enabledMcpServerIds,
-          enabledProviders: settings.enabledProviders,
-          enabledModelIds: settings.enabledModelIds,
-          modelDefaultEfforts: settings.modelDefaultEfforts,
-          // Cached sessions compare the bundle hash and refresh capabilities
-          // in place before their next turn. Do not dispose their E2B sandbox:
-          // that would erase agent-created workspace files for a settings save.
-          runtimeRefresh: "next_turn_in_place",
-          version: settings.version,
-          configHash: settings.configHash
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
       return serialize(TenantSettingsEnvelopeSchema, { settings });
     } catch (error) {
       if (error instanceof TenantSettingsConflictError) {

@@ -21,7 +21,7 @@ If you do not receive an acknowledgement within 5 business days, please follow u
 
 In scope:
 
-- The Cogniplane Core codebase in this repository (backend, frontend, sandbox harness, sync tooling).
+- The Cogniplane Core codebase in this repository (backend, frontend, shared contracts, and code execution sandbox).
 - Vulnerabilities in dependencies that are exposed by how Cogniplane Core uses them.
 
 Out of scope (please do not report):

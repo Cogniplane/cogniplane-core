@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
+import { PiiProtectionServiceError } from "./pii/pii-protection-service.js";
 import {
   MAX_PROJECT_FILE_SELECTIONS,
   MAX_PROJECT_RUNTIME_SNAPSHOT_FILES,
@@ -304,7 +305,7 @@ test("readRuntimeSnapshotFile records an audit event for the file the agent read
       rowCount: 1,
     }))
     .onQuery("INSERT INTO audit_events", (_text, values) => {
-      auditPayload = JSON.parse(String(values[3]));
+      auditPayload = JSON.parse(String(values[5]));
       return { rows: [], rowCount: 1 };
     });
 
@@ -354,7 +355,7 @@ test("readConflictContext reads base, latest, and proposed versions and audits t
   pool
     .onQuery(/FROM project_files draft/, () => ({ rows: [conflictRow()], rowCount: 1 }))
     .onQuery("INSERT INTO audit_events", (_text, values) => {
-      auditPayload = JSON.parse(String(values[3]));
+      auditPayload = JSON.parse(String(values[5]));
       return { rows: [], rowCount: 1 };
     });
   const storage = {
@@ -378,6 +379,11 @@ test("readConflictContext reads base, latest, and proposed versions and audits t
     latestVersionId: "file-a-v2",
   }));
   expect(storage.openReadStream).toHaveBeenCalledTimes(3);
+  // The final conflict check and its audit share one transaction.
+  const texts = pool.queries.map((query) => query.text.trim());
+  const audit = texts.findIndex((text) => text.includes("INSERT INTO audit_events"));
+  const lastCheck = texts.slice(0, audit).map((text) => text.includes("FROM project_files draft")).lastIndexOf(true);
+  expect(texts.slice(lastCheck, audit)).not.toContain("BEGIN");
   expect(auditPayload).toMatchObject({
     projectId: actor.projectId,
     draftId: "draft-a",
@@ -385,6 +391,26 @@ test("readConflictContext reads base, latest, and proposed versions and audits t
     messageId: "message-1",
     versionIds: ["file-a-v1", "file-a-v2", "draft-a-v1"],
   });
+});
+
+test("readConflictContext refuses content when the conflict changed during the reads", async () => {
+  const pool = grantAccess(new FakePool(), "editor");
+  let reads = 0;
+  let audits = 0;
+  pool
+    // A new published version lands while the three versions are read.
+    .onQuery(/FROM project_files draft/, () => ({
+      rows: [reads++ === 0 ? conflictRow() : conflictRow({ latest_version_id: "file-a-v3" })], rowCount: 1,
+    }))
+    .onQuery("INSERT INTO audit_events", () => { audits += 1; return { rows: [], rowCount: 1 }; });
+  const storage = {
+    openReadStream: vi.fn(async () => ({ stream: Readable.from(["text"]), fileSizeBytes: 4 })),
+  };
+
+  await expect(storeWith(pool).readConflictContext({
+    actor, draftId: "draft-a", sessionId: "session-1", messageId: null, storage,
+  })).rejects.toMatchObject({ code: "project_conflict_changed", status: 409 });
+  expect(audits).toBe(0);
 });
 
 test("readConflictMetadata returns fresh version metadata without opening content", async () => {
@@ -542,6 +568,47 @@ test("createAgentDraftFromContent normalizes MIME parameters before the allowlis
       draftInput({ mimeType: "TEXT/Markdown; charset=utf-8" }),
     ),
   ).rejects.toMatchObject({ code: "project_agent_read_only" });
+});
+
+test("createAgentDraftFromContent scans a PDF draft through its extracted text", async () => {
+  const pool = grantAccess(new FakePool());
+  pool.onQuery("SELECT agent_file_mode FROM projects", () => ({
+    rows: [{ agent_file_mode: "create-only" }],
+    rowCount: 1,
+  }));
+  const store = storeWith(pool);
+  const scanned: string[] = [];
+  store.setPiiProtection({
+    evaluateArtifact: async ({ artifact }) => {
+      scanned.push(await artifact.readContent());
+      return { action: "block", reason: "detected", blockReason: "email", findings: [] } as never;
+    },
+  }, async () => "Contact jane@example.com");
+
+  await expect(
+    store.createAgentDraftFromContent(draftInput({ name: "brief.pdf", mimeType: "application/pdf" })),
+  ).rejects.toMatchObject({ code: "pii_block", status: 422 });
+  expect(scanned).toEqual(["Contact jane@example.com"]);
+});
+
+test("createAgentDraftFromContent reports an unscannable draft as a 422 the agent can read", async () => {
+  const pool = grantAccess(new FakePool());
+  pool.onQuery("SELECT agent_file_mode FROM projects", () => ({
+    rows: [{ agent_file_mode: "create-only" }],
+    rowCount: 1,
+  }));
+  const storage = { put: vi.fn(), delete: vi.fn() };
+  const store = storeWith(pool);
+  store.setPiiProtection({
+    evaluateArtifact: async () => {
+      throw new PiiProtectionServiceError("unsupported_mime", "PII protection cannot scan image/png files.");
+    },
+  });
+
+  await expect(
+    store.createAgentDraftFromContent(draftInput({ name: "chart.png", mimeType: "image/png", storage: storage as never })),
+  ).rejects.toMatchObject({ code: "unsupported_mime", status: 422, message: "PII protection cannot scan image/png files." });
+  expect(storage.put).not.toHaveBeenCalled();
 });
 
 test("createAgentDraftFromContent refuses to write when the project is read-only for agents", async () => {

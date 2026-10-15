@@ -35,6 +35,14 @@ export function canBrowseSessionContent(session: {
   return session.status === "active" || (session.status === "archived" && Boolean(session.projectId));
 }
 
+/** The chat reopens and continues only sessions in the current history
+ *  format. Their rows stay readable through the message and audit routes.
+ *  The message fits both a legacy and an unknown format. */
+export const UNSUPPORTED_TRANSCRIPT_ERROR = {
+  error: "unsupported_transcript_format",
+  message: "This version of Cogniplane cannot continue a chat in this history format. Start a new chat."
+} as const;
+
 export function sessionContentReadAccessSql(content: string, user: string): string {
   return `EXISTS (SELECT 1 FROM sessions access_session
     WHERE access_session.tenant_id = ${content}.tenant_id

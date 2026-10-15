@@ -6,10 +6,17 @@ import type { AuditEventStore } from "../../audit-event-store.js";
 import {
   exchangeUserAuthorizationCode,
   fetchUserProfile,
+  GithubApiError,
+  listUserRepositories,
   selectGithubEmail,
-  GITHUB_OAUTH_AUTHORIZE_URL
+  GITHUB_OAUTH_AUTHORIZE_URL,
+  type GithubRepositorySummary
 } from "./github-api-client.js";
-import { GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
+import {
+  GithubConnectionError,
+  GithubConnectionNotConfiguredError
+} from "./github-connection-errors.js";
+import { normalizeAllowedRepositories } from "./github-repository-allowlist.js";
 import type { GithubConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
 import {
   isTokenExpired,
@@ -29,8 +36,9 @@ import {
 import type { RuntimeInvalidator } from "../contracts.js";
 import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
 import { uuidv7 } from "../../../lib/uuid.js";
+import { assertBoundIntegrationAccount } from "../integration-account-binding.js";
 
-export { GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
+export { GithubConnectionError, GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
 
 const GITHUB_USER_STATE_AUDIENCE = "cogniplane-github-user-connect";
 const GITHUB_STATE_ISSUER = "cogniplane";
@@ -52,6 +60,7 @@ export type GithubUserConnectionSummary = {
   githubEmail: string | null;
   githubAvatarUrl: string | null;
   scopes: string[];
+  allowedRepositories: string[];
   accessTokenExpiresAt: string | null;
   refreshTokenExpiresAt: string | null;
   connectedAt: string;
@@ -69,6 +78,9 @@ export type GithubRuntimeCredentials = {
   name: string | null;
   email: string | null;
   token: string;
+  // Repositories the agent may use, lower case. Empty means none. Every tool
+  // that names a repository must check it before the GitHub API call.
+  allowedRepositories: string[];
 };
 
 function isGithubConfigured(config: AppConfig): boolean {
@@ -87,6 +99,7 @@ function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSumm
     githubEmail: record.githubEmail,
     githubAvatarUrl: record.githubAvatarUrl,
     scopes: record.grantedScopes,
+    allowedRepositories: record.allowedRepositories,
     accessTokenExpiresAt: record.accessTokenExpiresAt,
     refreshTokenExpiresAt: record.refreshTokenExpiresAt,
     connectedAt: record.createdAt,
@@ -98,7 +111,10 @@ function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSumm
 export class GithubConnectionService {
   constructor(
     private readonly config: AppConfig,
-    private readonly store: Pick<GithubConnectionStore, "get" | "upsert" | "delete" | "markTokenUsed">,
+    private readonly store: Pick<
+      GithubConnectionStore,
+      "get" | "upsert" | "updateRefreshedToken" | "delete" | "markTokenUsed" | "setAllowedRepositories"
+    >,
     private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
     private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
@@ -112,6 +128,10 @@ export class GithubConnectionService {
       configured: isGithubConfigured(this.config),
       userConnection: userConnection ? toUserSummary(userConnection) : null
     };
+  }
+
+  async connectedAccountId(tenantId: string, userId: string): Promise<string | null> {
+    return (await this.store.get(tenantId, userId))?.githubUserId ?? null;
   }
 
   // Cheap presence check used by IntegrationRegistryService at session start.
@@ -290,16 +310,22 @@ export class GithubConnectionService {
     return removed;
   }
 
-  async getRuntimeCredentials(tenantId: string, userId: string): Promise<GithubRuntimeCredentials | null> {
+  // `expectedAccountId` is the account the turn recorded (see boundIntegrationAccount).
+  async getRuntimeCredentials(tenantId: string, userId: string,
+    expectedAccountId?: string | null): Promise<GithubRuntimeCredentials | null> {
     this.assertConfigured();
 
     const userConnection = await this.store.get(tenantId, userId);
-    if (!userConnection) return null;
+    if (!userConnection) {
+      // No connection, so no token of any account is used.
+      return null;
+    }
+    assertBoundIntegrationAccount("GitHub", expectedAccountId, userConnection.githubUserId);
 
     const refreshed = shouldRefreshToken(userConnection.accessTokenExpiresAt)
       ? await refreshAndPersistAccessToken(this.config, this.store, userConnection)
       : userConnection;
-    if (isTokenExpired(refreshed.accessTokenExpiresAt)) {
+    if (!refreshed || isTokenExpired(refreshed.accessTokenExpiresAt)) {
       return null;
     }
 
@@ -308,8 +334,89 @@ export class GithubConnectionService {
       login: refreshed.githubLogin,
       name: refreshed.githubName,
       email: refreshed.githubEmail,
-      token: decrypt(refreshed.accessTokenEncrypted, this.config.DATA_ENCRYPTION_SECRET)
+      token: decrypt(refreshed.accessTokenEncrypted, this.config.DATA_ENCRYPTION_SECRET),
+      allowedRepositories: refreshed.allowedRepositories
     };
+  }
+
+  /**
+   * The repositories that the member's token can reach, for the settings page
+   * to offer as choices. It lists what GitHub allows the member; it does not
+   * limit what the agent may use. The allowlist does that.
+   */
+  async listAccessibleRepositories(
+    tenantId: string,
+    userId: string
+  ): Promise<{ repositories: GithubRepositorySummary[]; truncated: boolean }> {
+    this.assertConfigured();
+    if (!(await this.store.get(tenantId, userId))) {
+      throw new GithubConnectionError("not_connected", "GitHub is not connected.");
+    }
+    const credentials = await this.getRuntimeCredentials(tenantId, userId);
+    if (!credentials) {
+      throw new GithubConnectionError(
+        "credentials_unusable",
+        "The GitHub authorization expired. Connect GitHub again."
+      );
+    }
+    try {
+      return await listUserRepositories(credentials.token);
+    } catch (err) {
+      if (err instanceof GithubApiError && err.status === 401) {
+        throw new GithubConnectionError(
+          "credentials_unusable",
+          "GitHub rejected the authorization. Connect GitHub again."
+        );
+      }
+      this.logger.warn({ err }, "Failed to list GitHub repositories");
+      throw new GithubConnectionError("upstream_unavailable", "GitHub did not list the repositories. Try again.");
+    }
+  }
+
+  /**
+   * Replace the repositories that the agent may use. Only the member's own
+   * settings request calls this; the model has no tool for it. The tools read
+   * the list on every call, so no runtime restart is needed.
+   * `expectedGithubUserId` is the account that the member saw when they chose
+   * the list. A different connected account refuses the save.
+   */
+  async setAllowedRepositories(
+    tenantId: string,
+    userId: string,
+    repositories: readonly string[],
+    expectedGithubUserId: string
+  ): Promise<string[]> {
+    const normalized = normalizeAllowedRepositories(repositories);
+    const outcome = await this.store.setAllowedRepositories(tenantId, userId, normalized, expectedGithubUserId);
+    if (outcome.status === "not_connected") {
+      throw new GithubConnectionError("not_connected", "GitHub is not connected.");
+    }
+    if (outcome.status === "account_changed") {
+      throw new GithubConnectionError(
+        "account_changed",
+        "The connected GitHub account changed. Reload the page and choose the repositories again."
+      );
+    }
+    const previous = new Set(outcome.previous);
+    const current = new Set(outcome.record.allowedRepositories);
+    const added = outcome.record.allowedRepositories.filter((repo) => !previous.has(repo));
+    const removed = outcome.previous.filter((repo) => !current.has(repo));
+    if (added.length > 0 || removed.length > 0) {
+      await this.auditEvents?.create({
+        tenantId,
+        sessionId: null,
+        userId,
+        type: "user.github.repositories_updated",
+        payload: {
+          githubLogin: outcome.record.githubLogin,
+          githubUserId: outcome.record.githubUserId,
+          added,
+          removed,
+          count: outcome.record.allowedRepositories.length
+        }
+      });
+    }
+    return outcome.record.allowedRepositories;
   }
 
   private assertConfigured(): void {

@@ -34,10 +34,11 @@ const OVERVIEW_GRID =
 // global --color-* design tokens, so ChartContainer can safely emit
 // --color-allow etc. for the stacked bars to reference.
 const ACTION_CHART_CONFIG = {
-  allow: { label: "Allow", color: "var(--chart-2)" },
-  report: { label: "Report", color: "var(--chart-1)" },
-  block: { label: "Block", color: "var(--chart-4)" },
-  transform: { label: "Transform", color: "var(--chart-5)" },
+  // Past-tense results, named after the Settings modes: Detect reports, Block blocks, Transform transforms.
+  allow: { label: "Allowed", color: "var(--chart-2)" },
+  report: { label: "Reported", color: "var(--chart-1)" },
+  block: { label: "Blocked", color: "var(--chart-4)" },
+  transform: { label: "Transformed", color: "var(--chart-5)" },
   failed: { label: "Failed", color: "var(--chart-3)" }
 } satisfies ChartConfig;
 
@@ -55,8 +56,10 @@ export function TimeSeriesChart({
   series: PiiActivityTimeSeriesPoint[];
   bucket: PiiBucketGranularity;
 }) {
-  if (series.length === 0) {
-    return <p className={HINT}>No PII activity in this range.</p>;
+  // The API fills empty buckets with zeros, so an empty chart is all zeros, not an empty list.
+  // The chart counts finished scans only. The Scans tile also counts queued ones.
+  if (series.every((point) => TIME_SERIES_ACTIONS.every((action) => !point[action]))) {
+    return <p className={HINT}>No completed scans in this range.</p>;
   }
 
   return (
@@ -103,6 +106,10 @@ export function FindingsBreakdown({ data }: { data: PiiActivityMetrics }) {
     ])
   );
 
+  // bySubjectType counts scans, not findings, so only the entity counts decide this.
+  const findings = data.byEntityType.reduce((sum, row) => sum + row.count, 0);
+  if (findings === 0) return <p className={HINT}>No findings in this range.</p>;
+
   return (
     <div className={OVERVIEW_GRID}>
       <DonutCard rows={data.byEntityType} allEntities={allEntities} />
@@ -137,9 +144,9 @@ function DonutCard({
 
   return (
     <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>By entity type</p>
+      <h3 className={SECTION_LABEL}>By entity type</h3>
       {slices.length === 0 ? (
-        <p className={`${HINT} mt-2`}>No findings detected in this range.</p>
+        <p className={`${HINT} mt-2`}>No findings in this range.</p>
       ) : (
         <div className="mt-3 flex items-center gap-4">
           <ChartContainer
@@ -186,15 +193,15 @@ function ConfidenceCard({ rows }: { rows: PiiActivityMetrics["byConfidence"] }) 
   if (rows.length === 0) {
     return (
       <article className={STAT_CARD}>
-        <p className={SECTION_LABEL}>By confidence</p>
-        <p className={`${HINT} mt-2`}>No findings detected in this range.</p>
+        <h3 className={SECTION_LABEL}>By confidence</h3>
+        <p className={`${HINT} mt-2`}>No findings in this range.</p>
       </article>
     );
   }
 
   return (
     <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>By confidence</p>
+      <h3 className={SECTION_LABEL}>By confidence</h3>
       <div className="mt-2 flex flex-col gap-2">
         {rows.map((row) => {
           const total = row.high + row.medium + row.low;
@@ -246,24 +253,16 @@ function ConfidenceCard({ rows }: { rows: PiiActivityMetrics["byConfidence"] }) 
 }
 
 function SubjectSplitCard({ rows }: { rows: PiiActivityMetrics["bySubjectType"] }) {
-  const total = rows.reduce((sum, r) => sum + r.count, 0);
-  if (total === 0) {
-    return (
-      <article className={STAT_CARD}>
-        <p className={SECTION_LABEL}>By source</p>
-        <p className={`${HINT} mt-2`}>No PII activity in this range.</p>
-      </article>
-    );
-  }
+  const total = rows.reduce((sum, r) => sum + r.count, 0) || 1;
   const sources = [
     { type: "message", label: "chat", color: "var(--color-accent)" },
-    { type: "artifact", label: "uploads", color: "var(--color-success)" },
+    { type: "artifact", label: "direct uploads", color: "var(--color-success)" },
     { type: "project_instructions", label: "project instructions", color: "var(--color-warning)" }
   ].map((source) => ({ ...source, count: rows.find((r) => r.subjectType === source.type)?.count ?? 0 }));
 
   return (
     <article className={STAT_CARD}>
-      <p className={SECTION_LABEL}>By source</p>
+      <h3 className={SECTION_LABEL}>By source</h3>
       <div className="mt-2 flex flex-wrap gap-4 tabular-nums">
         {sources.map((source) => <div key={source.type} className="flex-1">
           <strong className="block text-[1.4rem] text-on-surface">{source.count}</strong>

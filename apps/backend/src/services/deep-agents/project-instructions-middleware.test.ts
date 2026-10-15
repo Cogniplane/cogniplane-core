@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import type { BaseMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
 import { createDeepAgentsSessionRuntime } from "./deep-agents-graph.js";
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
@@ -22,25 +23,29 @@ it("uses fresh user-level project context without storing it in conversation his
     const graph = await runtime.getAgentForModel("openai/gpt-5.4");
     const config = { version: "v2" as const, configurable: { thread_id: "session" } };
     const turn = async (projectInstructions: ProjectInstructionsSnapshot | null) => {
-      const calls: string[] = [];
+      const calls: Array<{ text: string; messages: BaseMessage[] }> = [];
       for await (const event of graph.streamEvents({ messages: [{ role: "user", content: "Draft a proposal." }] },
         { ...config, context: { projectInstructions } })) {
-        if (event.event === "on_chat_model_start") calls.push(JSON.stringify(event.data));
+        if (event.event === "on_chat_model_start") calls.push({
+          text: JSON.stringify(event.data), messages: (event.data as { input: { messages: BaseMessage[][] } }).input.messages.flat()
+        });
       }
       return calls.at(-1)!;
     };
     const first = await turn({ projectId: "p1", revision: 1, instructions: "Write in French." });
-    expect(first).toContain("Write in French.");
-    expect(first).toContain("Organization rule: never disclose credentials.");
-    // LangChain serializes the inserted instruction as a HumanMessage.
-    expect(first).toMatch(/HumanMessage/);
+    expect(first.text).toContain("Write in French.");
+    expect(first.text).toContain("Organization rule: never disclose credentials.");
+    const instructions = first.messages.filter((message) =>
+      typeof message.content === "string" && message.content.includes("Write in French."));
+    expect(instructions).toHaveLength(1);
+    expect(instructions[0]?.getType()).toBe("human");
     const second = await turn({ projectId: "p1", revision: 2, instructions: "Use Canadian dollars." });
-    expect(second).toContain("Use Canadian dollars.");
-    expect(second).not.toContain("Write in French.");
+    expect(second.text).toContain("Use Canadian dollars.");
+    expect(second.text).not.toContain("Write in French.");
     const cleared = await turn({ projectId: "p1", revision: 3, instructions: "" });
-    expect(cleared).not.toContain("Use Canadian dollars.");
+    expect(cleared.text).not.toContain("Use Canadian dollars.");
     const detached = await turn(null);
-    expect(detached).not.toContain("Saved project instructions");
+    expect(detached.text).not.toContain("Saved project instructions");
     const state = (await checkpointer.getTuple(config))!.checkpoint.channel_values;
     expect(state.messages).toHaveLength(8);
     expect(JSON.stringify(state.messages)).not.toContain("Write in French.");

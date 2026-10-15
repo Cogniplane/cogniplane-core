@@ -25,6 +25,10 @@ export const AVAILABLE_MODELS: readonly {
   // OpenAI reasoning.effort, Gemini thinking budget. See applyReasoningEffort
   // in deep-agents-graph.ts for how each level maps to the client config.
   // contextWindow feeds the composer's context meter.
+  //
+  // isDefault marks at most one default per provider. Callers take the first
+  // default whose provider has a key, so catalog order sets the priority:
+  // Anthropic (Haiku 5.5) first, then OpenAI (GPT-6 Luna).
 
   // Anthropic (initChatModel prefix "anthropic"). Extended thinking maps to
   // none/low/medium/high → a thinking token budget (0 = off). Vendor ids use
@@ -35,21 +39,23 @@ export const AVAILABLE_MODELS: readonly {
   { id: "deepagents/claude-opus-5",              displayName: "Claude Opus 5",    description: "Prior-generation Anthropic model for complex agentic work.", isDefault: false, provider: "anthropic",  supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_000_000 },
   { id: "deepagents/claude-fable-5",             displayName: "Claude Fable 5",   description: "Prior-generation Anthropic frontier model.",           isDefault: false, provider: "anthropic",  supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_000_000 },
   { id: "deepagents/claude-opus-4-8",            displayName: "Claude Opus 4.8",  description: "Prior-generation Anthropic reasoning model.",          isDefault: false, provider: "anthropic",  supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_000_000 },
-  { id: "deepagents/claude-sonnet-5",            displayName: "Claude Sonnet 5",  description: "Fast, intelligent all-round model.",                   isDefault: true,  provider: "anthropic",  supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "none",   contextWindow: 1_000_000 },
+  { id: "deepagents/claude-sonnet-5-5",          displayName: "Claude Sonnet 5.5", description: "Fast, intelligent model for everyday coding and agent work.", isDefault: false, provider: "anthropic", supportedEfforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_000_000 },
+  { id: "deepagents/claude-sonnet-5",            displayName: "Claude Sonnet 5",  description: "Prior-generation fast, all-round model.",                   isDefault: false, provider: "anthropic",  supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "none",   contextWindow: 1_000_000 },
+  { id: "deepagents/claude-haiku-5-5",           displayName: "Claude Haiku 5.5", description: "Fast, low-cost Anthropic model for high-volume work.",  isDefault: true,  provider: "anthropic",  supportedEfforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_000_000 },
   // Haiku 4.5 has extended thinking but NO `effort` parameter — it only takes the
   // legacy `budget_tokens` mode, which our Anthropic path (outputConfig.effort)
   // doesn't emit. So any effort but `none` is rejected by the API; advertise only
   // `none` (the Effort dropdown then hides, since it needs >1 option).
-  { id: "deepagents/claude-haiku-4-5",           displayName: "Claude Haiku 4.5", description: "Fastest Anthropic model.",                             isDefault: false, provider: "anthropic",  supportedEfforts: ["none"], defaultEffort: "none",   contextWindow: 200_000 },
+  { id: "deepagents/claude-haiku-4-5",           displayName: "Claude Haiku 4.5", description: "Prior-generation fast Anthropic model.",               isDefault: false, provider: "anthropic",  supportedEfforts: ["none"], defaultEffort: "none",   contextWindow: 200_000 },
 
-  // OpenAI (initChatModel prefix "openai"). GPT-5.4/5.5 expose reasoning.effort
-  // minimal/low/medium/high; the GPT-5.6 family and GPT-6 models replace
-  // "minimal" with "none" and add xhigh/max — all accept the full
-  // range through the API. Vendor model id follows the "/".
+  // OpenAI (initChatModel prefix "openai"). Each model lists its supported
+  // reasoning efforts. GPT-6.1 Sol starts at low and does not accept none.
+  // Vendor model id follows the "/".
   { id: "openai/gpt-6-astra-pro",                displayName: "GPT-6 Astra Pro",                description: "OpenAI's most capable GPT-6 model for the hardest problems.", isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6-astra",                    displayName: "GPT-6 Astra",                    description: "OpenAI's flagship GPT-6 model.",                       isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
+  { id: "openai/gpt-6.1-sol",                    displayName: "GPT-6.1 Sol",                    description: "OpenAI model for complex coding and agent workflows.",      isDefault: false, provider: "openai",     supportedEfforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6-sol",                      displayName: "GPT-6 Sol",                      description: "OpenAI model for complex coding and agent workflows.",      isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
-  { id: "openai/gpt-6-luna",                     displayName: "GPT-6 Luna",                     description: "OpenAI model for focused, high-volume tasks.",             isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
+  { id: "openai/gpt-6-luna",                     displayName: "GPT-6 Luna",                     description: "OpenAI model for focused, high-volume tasks.",             isDefault: true,  provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-5.6-sol",                    displayName: "GPT-5.6 Sol",                    description: "Prior-generation GPT-5.6 flagship model.",             isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-5.6-terra",                  displayName: "GPT-5.6 Terra",                  description: "Balanced GPT-5.6 model for everyday work.",            isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-5.6-luna",                   displayName: "GPT-5.6 Luna",                   description: "Fast, low-cost GPT-5.6 model.",                        isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "low",    contextWindow: 1_050_000 },
@@ -71,34 +77,40 @@ export const AVAILABLE_MODELS: readonly {
   // splits on the FIRST slash only, preserving "deepseek/deepseek-v4-pro".
   // Reasoning-effort support varies per open model and is not applied here
   // (supportedEfforts: []), so the Effort dropdown stays hidden for these.
-  // Slugs and context windows verified 2026-09-18 against
+  // Slugs and context windows verified 2026-10-08 against
   // https://openrouter.ai/api/v1/models.
-  { id: "openrouter/z-ai/glm-5.3",                    displayName: "GLM 5.3 (OpenRouter)",        description: "Z.AI GLM 5.3 — top open-weight model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_310_720 },
+  { id: "openrouter/z-ai/glm-5.3",                    displayName: "GLM 5.3 (OpenRouter)",        description: "Z.AI GLM 5.3 — top open-weight model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/deepseek/deepseek-v4-pro",        displayName: "DeepSeek V4 Pro (OpenRouter)", description: "DeepSeek V4 Pro reasoning/coding model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
-  { id: "openrouter/deepseek/deepseek-v4-flash",      displayName: "DeepSeek V4 Flash (OpenRouter)", description: "Fast, efficient DeepSeek V4 model via OpenRouter.",   isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/deepseek/deepseek-v4.1-flash",    displayName: "DeepSeek V4.1 Flash (OpenRouter)", description: "Fast, efficient DeepSeek V4.1 model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
 
   // Widely-used open models on OpenRouter (slugs + context windows verified
-  // 2026-09-18 via /api/v1/models). OpenRouter's public API exposes no usage
+  // 2026-10-08 via /api/v1/models). OpenRouter's public API exposes no usage
   // ranking today (the ?order= param is accepted but ignored), so this set is
   // curated by capability tier, not by a live token chart.
   { id: "openrouter/tencent/hy3",                     displayName: "Tencent Hy3 (OpenRouter)",       description: "Tencent Hy3 295B MoE reasoning model.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
-  { id: "openrouter/xiaomi/mimo-v2.5",                displayName: "MiMo V2.5 (OpenRouter)",         description: "Xiaomi MiMo V2.5 — fast, low-cost open reasoning model.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_050_000 },
-  { id: "openrouter/xiaomi/mimo-v2.5-pro",            displayName: "MiMo V2.5 Pro (OpenRouter)",     description: "Xiaomi MiMo V2.5 Pro — stronger MiMo tier for agentic work.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_050_000 },
+  { id: "openrouter/xiaomi/mimo-v2.6-flash",          displayName: "MiMo V2.6 Flash (OpenRouter)",   description: "Xiaomi MiMo V2.6 Flash — fast, low-cost open reasoning model.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_050_000 },
+  { id: "openrouter/xiaomi/mimo-v2.6-pro",            displayName: "MiMo V2.6 Pro (OpenRouter)",     description: "Xiaomi MiMo V2.6 Pro — stronger MiMo tier for agentic work.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_050_000 },
   { id: "openrouter/minimax/minimax-m3",              displayName: "MiniMax M3 (OpenRouter)",        description: "MiniMax M3 open agentic/coding model.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b", displayName: "Nemotron 3 Ultra (OpenRouter)", description: "NVIDIA Nemotron 3 Ultra 550B MoE — strongest open Nemotron.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
   { id: "openrouter/stepfun/step-3.7-flash",          displayName: "Step 3.7 Flash (OpenRouter)",    description: "StepFun Step 3.7 Flash — fast open model for routine work.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
   { id: "openrouter/qwen/qwen3.7-max",                displayName: "Qwen3.7 Max (OpenRouter)",       description: "Alibaba Qwen3.7 Max — flagship Qwen reasoning model.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
+  { id: "openrouter/qwen/qwen3.8-max-0902",           displayName: "Qwen3.8 Max (OpenRouter)",       description: "Alibaba Qwen3.8 Max (0902 snapshot) — newest Qwen flagship.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
+  { id: "openrouter/z-ai/glm-5.3-flashx",             displayName: "GLM 5.3 FlashX (OpenRouter)",    description: "Z.AI GLM 5.3 FlashX — fast, low-cost GLM tier.",       isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/x-ai/grok-4.7",                   displayName: "Grok 4.7 (OpenRouter)",          description: "xAI Grok 4.7 reasoning model.",                        isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 500_000 },
+  { id: "openrouter/mistralai/mistral-large-4-0",     displayName: "Mistral Large 4 (OpenRouter)",   description: "Mistral Large 4 — Mistral's flagship model.",          isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/meta/muse-spark-1.3",             displayName: "Muse Spark 1.3 (OpenRouter)",    description: "Meta Muse Spark 1.3 general model.",                   isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
 
   // OpenRouter free tier (":free" slugs) — for testing without spend. Routes
   // rotate: OpenRouter retires a free variant without notice (the slug then
   // 404s), so every entry here was confirmed live AND tool-calling-capable on
-  // 2026-09-18, and each pairs with a paid slug elsewhere in the catalog or a
+  // 2026-10-08, and each pairs with a paid slug elsewhere in the catalog or a
   // vendor equivalent. Tool support matters: a model with no `tools` parameter
   // cannot drive the agent loop at all.
   // (minimax-m3:free was retired, and glm-5.2:free lost tool support and fell
-  // to a 32k window, since the 2026-09-05 check → both dropped.)
+  // to a 32k window, since the 2026-09-05 check → both dropped.
+  // deepseek-v4-flash-0731:free was retired after the 2026-09-18 check, and no
+  // free DeepSeek route is left → dropped.)
   { id: "openrouter/thinkingmachines/inkling:free",         displayName: "Inkling (free)",             description: "Free Thinking Machines Inkling for testing.",         isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
-  { id: "openrouter/deepseek/deepseek-v4-flash-0731:free",  displayName: "DeepSeek V4 Flash (free)",   description: "Free DeepSeek V4 Flash snapshot for testing.",        isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", displayName: "Nemotron 3 Ultra (free)",   description: "Free NVIDIA Nemotron 3 Ultra for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/nvidia/nemotron-3.5-lightning:free",    displayName: "Nemotron 3.5 Lightning (free)", description: "Free NVIDIA Nemotron 3.5 Lightning for testing.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/nvidia/nemotron-3-super-120b-a12b:free", displayName: "Nemotron 3 Super (free)",   description: "Free NVIDIA Nemotron 3 Super for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },

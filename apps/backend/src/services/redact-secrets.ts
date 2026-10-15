@@ -1,9 +1,11 @@
-import { SENSITIVE_QUERY_PARAM_PATTERN } from "../lib/sensitive-query-params.js";
+import { isSensitiveQueryParameterName } from "../lib/sensitive-query-params.js";
 
 // Matches anywhere in the key (`accessToken`, `x-api-key`, `passwordHash`);
 // what happens to a matched value depends on its type — see redactSecretValue.
-const SECRET_KEY_PATTERN = /(authorization|token|secret|api[_-]?key|password)/i;
-const BEARER_TOKEN_PATTERN = /(\bBearer\s+)([^\s"',;]+)/gi;
+const SECRET_KEY_PATTERN = /(authorization|token|secret|credential|api[_-]?key|password)/i;
+const APP_PAGING_KEY_PATTERN = /^(?:pageToken|nextPageToken|previousPageToken|prevPageToken)$/i;
+const isCredentialKey = (key: string) => SECRET_KEY_PATTERN.test(key) && !APP_PAGING_KEY_PATTERN.test(key);
+const BEARER_TOKEN_PATTERN = /(\bBearer\s+)(?!\$\{)([^\s"',;]+)/gi;
 const GITHUB_TOKEN_PATTERN =
   /\b(?:gh(?:o|u|s|r|p)_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g;
 
@@ -33,15 +35,21 @@ const TWILIO_SECRET_ASSIGNMENT_PATTERN =
   /(TWILIO_(?:AUTH_TOKEN|API_KEY_SECRET)\s*[:=]\s*["']?)[A-Za-z0-9]{20,}/gi;
 const SENDGRID_KEY_PATTERN = /\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}\b/g;
 
-// URL query parameters carrying tokens, so a `?token=`/`?apiKey=` inside a
+// URL query parameters carrying tokens, so a `?token=`/`?api-key=` inside a
 // string body (e.g. a tool result echoing a URL) is redacted before
 // persistence. Stops at whitespace, `&`, quote, `;`, or `#` to preserve
-// surrounding text. The key list is shared with sanitize-url.ts — the two
-// copies used to drift.
-const URL_QUERY_SECRET_PATTERN = new RegExp(
-  `([?&])(${SENSITIVE_QUERY_PARAM_PATTERN})=[^\\s&"';#]+`,
-  "gi"
-);
+// surrounding text. The name check is shared with sanitize-url.ts and
+// url-validation.ts — the copies used to drift.
+const URL_QUERY_PARAMETER_PATTERN = /([?&])([^=&\s"';#?]+)=(?!\$\{)([^\s&"';#]+)/g;
+
+// A non-credential value can hold a nested URL (`?next=https://x/?token=…`),
+// so it is scanned again. Replacer calls run after all outer matches are
+// found, so reusing the global pattern here is safe.
+function redactQueryParameter(_match: string, separator: string, name: string, value: string): string {
+  return isSensitiveQueryParameterName(name)
+    ? `${separator}${name}=REDACTED`
+    : `${separator}${name}=${value.replace(URL_QUERY_PARAMETER_PATTERN, redactQueryParameter)}`;
+}
 
 function redactInlineSecrets(value: string): string {
   return value
@@ -62,7 +70,7 @@ function redactInlineSecrets(value: string): string {
     .replace(TWILIO_API_KEY_PATTERN, "[REDACTED]")
     .replace(TWILIO_SECRET_ASSIGNMENT_PATTERN, "$1[REDACTED]")
     .replace(SENDGRID_KEY_PATTERN, "[REDACTED]")
-    .replace(URL_QUERY_SECRET_PATTERN, "$1$2=REDACTED");
+    .replace(URL_QUERY_PARAMETER_PATTERN, redactQueryParameter);
 }
 
 /**
@@ -111,6 +119,11 @@ function redactSecretValue(value: unknown): unknown {
   // keep them. Plain objects recurse so telemetry like
   // `tokenUsage: { inputTokens: 12 }` survives while a composite under e.g.
   // `credentials` still has its inner secret-keyed strings redacted.
+  //
+  // The credential context deliberately ends at a nested object: tool schemas
+  // (`maxTokens: { type: "integer" }`) and telemetry share these key names,
+  // so `{ secret: { value: "raw" } }` is not redacted by key. Pattern rules
+  // and the gateway's upstream-secret scrub still apply to its strings.
   if (typeof value === "string" || Array.isArray(value)) {
     return "[REDACTED]";
   }
@@ -147,7 +160,7 @@ export function redactSecrets<T>(input: T): T {
   }
 
   const entries = Object.entries(input as Record<string, unknown>).map(([key, value]) => {
-    if (SECRET_KEY_PATTERN.test(key)) {
+    if (isCredentialKey(key)) {
       return [key, redactSecretValue(value)];
     }
 
@@ -155,4 +168,19 @@ export function redactSecrets<T>(input: T): T {
   });
 
   return Object.fromEntries(entries) as T;
+}
+
+/** Redact credential strings in app data without changing object or array types. */
+export function redactAppData<T>(input: T): T {
+  const visit = (value: unknown, credential = false): unknown => {
+    if (typeof value === "string") return credential ? "[REDACTED]" : redactInlineSecrets(value);
+    if (Array.isArray(value)) return value.map((item) => visit(item, credential));
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+        [key, visit(item, credential || isCredentialKey(key))]
+      ));
+    }
+    return value;
+  };
+  return visit(input) as T;
 }

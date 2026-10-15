@@ -1,9 +1,9 @@
 "use client";
 // ─────────────────────────────────────────────────────────────────────────────
-// Track B — DeepAgentsBrowserAgent (CopilotKit frontend swap, slice A)
+// DeepAgentsBrowserAgent connects CopilotKit to the backend AG-UI stream.
 //
 // A thin @ag-ui/client `HttpAgent` subclass that lets CopilotKit talk to our
-// EXISTING backend without changing the verified contract. The backend's
+// backend through the application request contract. The backend's
 // `POST /messages?format=agui` endpoint takes our own `{ sessionId, text, model }`
 // body (not AG-UI's standard `RunAgentInput`) and streams AG-UI `BaseEvent`s.
 //
@@ -13,27 +13,27 @@
 //      message AG-UI hands us), instead of the default `JSON.stringify(input)`.
 //   2. the `fetch` fn — reuse the app's auth (dev-headers or JWT + 401 refresh)
 //      via `createApiHeaders`/`refreshAccessToken`, so auth logic stays centralized.
-//   3. `connect` — attach to the turn that runs on the server through
-//      `GET /sessions/:id/events`, so a returning tab shows it live.
+//   3. `connect` — load the session through `GET /sessions/:id/connect`: the
+//      saved history, then the turn that runs on the server, replayed and live.
 //
-// The AG-UI `threadId` IS our session id (matches the backend, where thread_id
-// === sessionId). Version note: CopilotKit 1.70.1 bundles @ag-ui/client@0.0.59 +
-// rxjs@7.8.1 — the same versions the backend uses — so there is no Observable
-// type-identity skew between this agent and CopilotKit's runtime.
+// A built-in subscriber keeps the transcript equal to what the backend saved
+// (TRANSCRIPT_SUBSCRIBER). The AG-UI `threadId` IS our session id (matches the
+// backend, where thread_id === sessionId). CopilotKit 1.78 pins @ag-ui/client
+// 1.0.2 exactly; the workspace manifests must pin the same version, or this
+// class extends a second HttpAgent copy.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
   HttpAgent,
+  randomUUID,
   runHttpRequest,
   transformHttpEventStream,
   type AgentSubscriber,
-  type Message as AGUIMessage,
   type RunAgentInput,
   type RunAgentParameters,
-  type RunAgentResult,
-  type State
+  type RunAgentResult
 } from "@ag-ui/client";
-import type { EffortLevel } from "@cogniplane/shared-types";
+import { CogniplaneCustomEventSchema, type EffortLevel } from "@cogniplane/shared-types";
 
 import { API_URL, createApiHeaders, refreshAccessToken } from "../api-client";
 
@@ -69,66 +69,87 @@ function latestUserText(input: RunAgentInput): string {
   return "";
 }
 
-/** True when the backend refused the send because this session already runs a
- *  turn. @ag-ui/client's runHttpRequest puts the HTTP status and the parsed
- *  JSON body on the error it throws. The message route returns 429. A project
- *  execution lease reports the same code with 409. */
-export function isSessionBusyError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
+export type HttpFailure = { status: number; body: { error?: unknown; message?: unknown } };
+
+/** The HTTP status and the parsed JSON body of a refused request, or null for
+ *  any other error. @ag-ui/client's runHttpRequest puts `status` and `payload`
+ *  on the error that it throws for a non-OK response. A body that is not a
+ *  JSON object reads as empty. */
+export function httpFailure(error: unknown): HttpFailure | null {
+  if (!(error instanceof Error)) return null;
   const { status, payload } = error as Error & { status?: unknown; payload?: unknown };
-  if (status !== 429 && status !== 409) return false;
-  return typeof payload === "object" && payload !== null &&
-    (payload as { error?: unknown }).error === "session_busy";
+  if (typeof status !== "number") return null;
+  return { status, body: typeof payload === "object" && payload !== null ? payload : {} };
+}
+
+/** True when the backend refused the send because this session already runs a
+ *  turn. The message route returns 429. A project execution lease reports the
+ *  same code with 409. */
+export function isSessionBusyError(error: unknown): boolean {
+  const failure = httpFailure(error);
+  return failure !== null && (failure.status === 429 || failure.status === 409) && failure.body.error === "session_busy";
 }
 
 // Marks the input of a connectAgent() run. The connect request sends no body,
 // so this value stays in the browser.
 const RECONNECT_PROP = "cogniplaneReconnect";
 
-/** True for a run that attaches to a turn on the server (connectAgent), false
- *  for a run that sends a message (runAgent). */
+/** True for a run that loads the session through `GET /sessions/:id/connect`
+ *  (connectAgent), false for a run that sends a message (runAgent). */
 export function isReconnectRun(input: RunAgentInput): boolean {
   const props = input.forwardedProps as Record<string, unknown> | undefined;
   return props?.[RECONNECT_PROP] === true;
 }
 
-// `after` is the last event sequence that this tab has. 0 asks for the full
-// turn. A partial replay does not work here: @ag-ui/client rejects a run that
-// does not start with RUN_STARTED.
-const REPLAY_FROM_START = 0;
-
-function emptyEventStream(): Response {
-  return new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } });
-}
-
-/** 204 (no running turn) and 409 `replay_gap` (the event log no longer holds
- *  the full turn) are expected results. Change them to a stream without events,
- *  so the run ends without an error and without a terminal event. The caller
- *  then reads the saved turn state. Other responses stay as they are. */
-async function withExpectedEndsAsEmpty(response: Response): Promise<Response> {
-  if (response.status === 204) return emptyEventStream();
-  if (response.status !== 409) return response;
-  const text = await response.text();
-  try {
-    if ((JSON.parse(text) as { error?: unknown }).error === "replay_gap") return emptyEventStream();
-  } catch {
-    // Not JSON. Report it as an HTTP error below.
+// Keeps the run's transcript equal to what the backend saved. Each handler
+// returns a mutation, so @ag-ui/client folds it into the run's own message
+// buffer: a direct setMessages() would be overwritten by the next event of
+// the run. The buffer merge needs a new array.
+const TRANSCRIPT_SUBSCRIBER: AgentSubscriber = {
+  // A connection sends the complete saved history. @ag-ui/client 1.0 merges a
+  // snapshot into the messages that it has: it updates messages with the same
+  // id in place, adds the other ones at the end, and keeps reasoning that the
+  // snapshot does not have. After a reconnect, a reply that grew would then
+  // show its new parts after its old end, and a replayed reasoning block would
+  // show twice. Start the merge from no messages: the snapshot then replaces
+  // the transcript.
+  onMessagesSnapshotEvent({ input }) {
+    return isReconnectRun(input) ? { messages: [] } : undefined;
+  },
+  onCustomEvent({ event, messages, input }) {
+    const parsed = CogniplaneCustomEventSchema.safeParse(event);
+    if (!parsed.success) return undefined;
+    const customEvent = parsed.data;
+    if (customEvent.name === "user_message_persisted") {
+      // The session can become "running" before its prompt row is saved, so
+      // the history of a connection can lack the prompt of the turn that it
+      // replays. Add the saved prompt before the reply events. The sending
+      // tab already shows its own message.
+      const { messageId, text } = customEvent.value;
+      if (!isReconnectRun(input) || messages.some((message) => message.id === messageId)) return undefined;
+      return { messages: [...messages, { id: messageId, role: "user" as const, content: text }] };
+    }
+    if (customEvent.name === "user_message_replaced") {
+      // The PII policy changed the prompt before the backend saved and sent
+      // it. Show the saved text in the newest user message. The position
+      // finds it: the optimistic message of the sending tab has a browser id,
+      // not the saved one.
+      const { text } = customEvent.value;
+      let index = messages.length - 1;
+      while (index >= 0 && messages[index]?.role !== "user") index -= 1;
+      const current = messages[index];
+      if (current?.role !== "user" || current.content === text) return undefined;
+      const patched = messages.slice();
+      patched[index] = { ...current, content: text };
+      return { messages: patched };
+    }
+    return undefined;
   }
-  // runHttpRequest reads the body again to build its error.
-  return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
-}
+};
 
 export interface DeepAgentsBrowserAgentConfig {
   /** Backend session id; also the AG-UI threadId. */
   sessionId: string;
-  /** Persisted history to seed CopilotChat with on mount (reload / session
-   *  switch). CopilotKit renders `agent.messages`, which HttpAgent's base
-   *  constructor populates from `initialMessages`. */
-  initialMessages?: AGUIMessage[];
-  /** Persisted agent state to seed on mount — currently the plan pane (`plan`),
-   *  which rides agent state (STATE_DELTA `/plan`) rather than the message list,
-   *  so reload has to seed it here or the plan pane stays blank. */
-  initialState?: State;
   // Per-turn inputs are read via getters at send time (not captured at
   // construction) so model/effort/artifact-selection changes between turns are
   // picked up WITHOUT reconstructing the agent — a reconstruction would rebind
@@ -151,46 +172,87 @@ export class DeepAgentsBrowserAgent extends HttpAgent {
   private readonly getEffort?: () => EffortLevel | null | undefined;
   private readonly getArtifactIds?: () => string[];
   private readonly getProjectFileIds?: () => string[];
+  /** The latest session connection: its run, and the controller of its fetch. */
+  private connection: { runId: string; controller: AbortController } | null = null;
 
   constructor(config: DeepAgentsBrowserAgentConfig) {
     super({
       url: `${API_URL}/messages?format=agui`,
       fetch: authedAgentFetch,
-      threadId: config.sessionId,
-      ...(config.initialMessages ? { initialMessages: config.initialMessages } : {}),
-      ...(config.initialState ? { initialState: config.initialState } : {})
+      threadId: config.sessionId
     });
     this.sessionId = config.sessionId;
     this.getModel = config.getModel;
     this.getEffort = config.getEffort;
     this.getArtifactIds = config.getArtifactIds;
     this.getProjectFileIds = config.getProjectFileIds;
+    this.subscribe(TRANSCRIPT_SUBSCRIBER);
   }
 
-  /** Attach to the turn that runs on the server. The replayed events go
-   *  through the same pipeline and subscribers as a sent message. The caller
-   *  must leave the saved in-progress reply out of the transcript first, or
-   *  the replay shows it twice. Do not use CopilotKit's `core.connectAgent`:
-   *  it clears the messages and the state first. */
+  /** Loads the session: the saved history, then the turn that runs on the
+   *  server, if any. CopilotChat calls this through CopilotKit's connection
+   *  path when it mounts, and the chat host calls it the same way to load the
+   *  session again. CopilotKit waits until the previous run ends before it
+   *  calls this.
+   *
+   *  The caller owns `abortController`, and its abort closes this connection.
+   *  A message run replaces that controller, so the connection fetch uses its
+   *  own controller. A new connection, Stop (abortRun), and CopilotKit's detach
+   *  also close it: @ag-ui/client does not cancel a fetch that waits for its
+   *  response headers. */
   connectAgent(parameters?: RunAgentParameters, subscriber?: AgentSubscriber): Promise<RunAgentResult> {
-    // AbstractAgent.connectAgent keeps the current controller, and an earlier
-    // abortRun() can have aborted it. HttpAgent.runAgent also sets a new one.
-    this.abortController = new AbortController();
+    this.connection?.controller.abort();
+    const runId = parameters?.runId ?? randomUUID();
+    const controller = new AbortController();
+    this.connection = { runId, controller };
+    const caller = this.abortController.signal;
+    if (caller.aborted) {
+      controller.abort();
+      return Promise.resolve({ result: undefined, newMessages: [] });
+    }
+    const close = () => controller.abort();
+    caller.addEventListener("abort", close, { once: true });
     return super.connectAgent(
-      { ...parameters, forwardedProps: { ...parameters?.forwardedProps, [RECONNECT_PROP]: true } },
+      { ...parameters, runId, forwardedProps: { ...parameters?.forwardedProps, [RECONNECT_PROP]: true } },
       subscriber
-    );
+    ).finally(() => caller.removeEventListener("abort", close));
   }
 
-  protected connect(_input: RunAgentInput): ReturnType<HttpAgent["run"]> {
-    const url = `${API_URL}/sessions/${encodeURIComponent(this.sessionId)}/events?after=${REPLAY_FROM_START}`;
-    const init: RequestInit = {
-      method: "GET",
-      headers: { ...this.headers, Accept: "text/event-stream" },
-      signal: this.abortController.signal
-    };
+  /** True when this tab closed the connection of a connect run: its caller, a
+   *  newer connection, Stop, or CopilotKit's detach. Such a run did not lose
+   *  its stream. */
+  isClosedByClient(input: RunAgentInput): boolean {
+    return this.connection?.runId !== input.runId || this.connection.controller.signal.aborted;
+  }
+
+  /** Closes this tab's stream: the running message or the connection. The
+   *  turn continues on the server. Only an interrupt request stops it. */
+  abortRun(): void {
+    this.connection?.controller.abort();
+    super.abortRun();
+  }
+
+  /** CopilotKit detaches the active run before a new run or connection. A
+   *  detached connection must also close its fetch, or its stream stays
+   *  open until the server ends it. */
+  async detachActiveRun(): Promise<void> {
+    const detached = super.detachActiveRun();
+    this.connection?.controller.abort();
+    await detached;
+  }
+
+  protected connect(input: RunAgentInput): ReturnType<HttpAgent["run"]> {
+    const url = `${API_URL}/sessions/${encodeURIComponent(this.sessionId)}/connect`;
+    // @ag-ui/client calls this after an await in connectAgent. A newer
+    // connection can start in that time; this one then must not fetch.
+    const current = this.connection;
+    const signal = current?.runId === input.runId ? current.controller.signal : AbortSignal.abort();
     return transformHttpEventStream(
-      runHttpRequest(async () => withExpectedEndsAsEmpty(await this.fetch(url, init))),
+      runHttpRequest(() => this.fetch(url, {
+        method: "GET",
+        headers: { ...this.headers, Accept: "text/event-stream" },
+        signal
+      })),
       this.debugLogger
     );
   }

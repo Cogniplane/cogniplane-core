@@ -6,6 +6,7 @@ import {
   type PolicyRulePatch
 } from "@cogniplane/shared-types";
 
+import type { PoolClient } from "pg";
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
@@ -114,11 +115,13 @@ export class PolicyRuleStore {
     createdBy: string | null
   ): Promise<PolicyRule> {
     const ruleId = `pol_${uuidv7()}`;
-    // No explicit priority → append to the end of the current evaluation order
-    // (max+10) rather than a fixed 100, so a new rule never lands mid-list after
-    // a drag-reorder rewrote priorities to index*10.
-    const priority = input.priority ?? (await this.nextAppendPriority(tenantId));
     return withTenantScope(this.db, tenantId, async (client) => {
+      await lockPolicyRules(client, tenantId);
+      // No explicit priority → append to the end of the current evaluation order
+      // (max+10) rather than a fixed 100, so a new rule never lands mid-list after
+      // a drag-reorder rewrote priorities to index*10. Read under the lock, so
+      // two concurrent creates do not take the same priority.
+      const priority = input.priority ?? (await appendPriority(client, tenantId));
       const result = await client.query(
         `
           INSERT INTO policy_rule (
@@ -151,20 +154,27 @@ export class PolicyRuleStore {
     ruleId: string,
     input: PolicyRulePatch
   ): Promise<PolicyRule | null> {
-    const existing = await this.get(tenantId, ruleId);
-    if (!existing) return null;
-
-    const next = {
-      name: input.name ?? existing.name,
-      description: input.description !== undefined ? input.description : existing.description,
-      priority: input.priority ?? existing.priority,
-      enabled: input.enabled ?? existing.enabled,
-      effect: input.effect ?? existing.effect,
-      conditions: input.conditions ?? existing.conditions,
-      reason: input.reason !== undefined ? input.reason : existing.reason
-    };
-
+    // Read and write in one locked transaction, so two partial updates (or an
+    // update and a reorder) cannot overwrite each other's fields.
     return withTenantScope(this.db, tenantId, async (client) => {
+      await lockPolicyRules(client, tenantId);
+      const current = await client.query(
+        `SELECT * FROM policy_rule WHERE tenant_id = $1 AND rule_id = $2`,
+        [tenantId, ruleId]
+      );
+      if (!current.rows[0]) return null;
+      const existing = mapRow(current.rows[0]);
+
+      const next = {
+        name: input.name ?? existing.name,
+        description: input.description !== undefined ? input.description : existing.description,
+        priority: input.priority ?? existing.priority,
+        enabled: input.enabled ?? existing.enabled,
+        effect: input.effect ?? existing.effect,
+        conditions: input.conditions ?? existing.conditions,
+        reason: input.reason !== undefined ? input.reason : existing.reason
+      };
+
       const result = await client.query(
         `
           UPDATE policy_rule SET
@@ -197,6 +207,7 @@ export class PolicyRuleStore {
 
   async delete(tenantId: string, ruleId: string): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      await lockPolicyRules(client, tenantId);
       const result = await client.query(
         `DELETE FROM policy_rule WHERE tenant_id = $1 AND rule_id = $2`,
         [tenantId, ruleId]
@@ -222,6 +233,7 @@ export class PolicyRuleStore {
       throw new PolicyReorderMismatchError("ruleIds must not contain duplicates.");
     }
     return withTenantScope(this.db, tenantId, async (client) => {
+      await lockPolicyRules(client, tenantId);
       const existing = await client.query(
         `SELECT rule_id FROM policy_rule WHERE tenant_id = $1`,
         [tenantId]
@@ -255,14 +267,22 @@ export class PolicyRuleStore {
    * the middle of a reordered list (which uses index*10 priorities).
    */
   async nextAppendPriority(tenantId: string): Promise<number> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const result = await client.query(
-        `SELECT COALESCE(MAX(priority), -10) + 10 AS next FROM policy_rule WHERE tenant_id = $1`,
-        [tenantId]
-      );
-      return Number(result.rows[0]?.next ?? 0);
-    });
+    return withTenantScope(this.db, tenantId, (client) => appendPriority(client, tenantId));
   }
+}
+
+// Every policy rule write of a tenant takes this transaction lock first, so a
+// create, update, delete and reorder see each other's committed result.
+async function lockPolicyRules(client: PoolClient, tenantId: string): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended('policy_rule:' || $1, 0))", [tenantId]);
+}
+
+async function appendPriority(client: PoolClient, tenantId: string): Promise<number> {
+  const result = await client.query(
+    `SELECT COALESCE(MAX(priority), -10) + 10 AS next FROM policy_rule WHERE tenant_id = $1`,
+    [tenantId]
+  );
+  return Number(result.rows[0]?.next ?? 0);
 }
 
 // Raised by reorder() when the supplied rule-ID set doesn't match the tenant's

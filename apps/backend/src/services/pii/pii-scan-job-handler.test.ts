@@ -40,6 +40,24 @@ test("a failed subject update cannot publish a terminal scan run", async () => {
   expect(h.completedCalls).toEqual([]);
 });
 
+test("finishFailedJob marks the subject failed before it closes the scan run", async () => {
+  const h = buildDeps();
+  await new PiiScanJobHandler(h.deps).finishFailedJob(sampleJob({ status: "failed", errorMessage: "claim expired" }));
+  expect(h.artifactPiiCalls.map((call) => call.pii.status)).toEqual(["failed"]);
+  expect(h.updateCalls.map((call) => call.patch)).toEqual([
+    expect.objectContaining({ status: "failed", errorMessage: "claim expired" })
+  ]);
+});
+
+test("finishFailedJob leaves the scan run open when the subject write fails", async () => {
+  // The worker lists failed jobs with an open scan run, so it tries again.
+  const h = buildDeps();
+  h.deps.artifacts.setPiiDetail = async () => { throw new Error("subject write unavailable"); };
+  await expect(new PiiScanJobHandler(h.deps).finishFailedJob(sampleJob({ status: "failed" })))
+    .rejects.toThrow("subject write unavailable");
+  expect(h.updateCalls).toEqual([]);
+});
+
 type UpdateScanRunCall = { tenantId: string; scanRunId: string; patch: Record<string, unknown> };
 type SetMessagePiiCall = { tenantId: string; messageId: string; pii: Record<string, unknown> };
 type SetArtifactPiiCall = { tenantId: string; artifactId: string; pii: Record<string, unknown> };
@@ -218,6 +236,26 @@ test("PiiScanJobHandler completes an allow decision and records a scanned detail
   expect(completedCalls.length).toBe(1);
 });
 
+test.each([
+  [{ action: "allow", reason: "no_findings" }, "scanned"],
+  [{ action: "transform", findings: [], transformedText: "", providerType: "rules", providerModel: null }, "transformed"]
+] as const)("PiiScanJobHandler marks a %j verdict whose PDF images were not scanned", async (decision, status) => {
+  const { deps, artifactPiiCalls } = buildDeps({
+    decision: decision as unknown as PiiDecision,
+    reader: {
+      readArtifact: async ({ artifactId }) => ({
+        artifactId, contentType: "application/pdf", entityTypes: [],
+        readContent: async () => "Quarterly report",
+        imagesNotScanned: () => true
+      })
+    }
+  });
+
+  await new PiiScanJobHandler(deps).execute(sampleJob());
+
+  expect(artifactPiiCalls.at(-1)?.pii).toMatchObject({ status, imagesNotScanned: true });
+});
+
 test("PiiScanJobHandler persists report findings and attaches findingsCount", async () => {
   const { deps, updateCalls, artifactPiiCalls } = buildDeps({
     decision: {
@@ -292,6 +330,19 @@ test("PiiScanJobHandler marks subject failed when the job runs out of attempts",
   expect(scanRunUpdates).toEqual(["processing", "failed"]);
   expect(helper.artifactPiiCalls.length).toBe(1);
   expect(helper.artifactPiiCalls[0].pii.status).toBe("failed");
+});
+
+test("a terminal failure whose subject write fails leaves the scan run open for recovery", async () => {
+  const helper = buildDeps({
+    evaluateThrows: new PiiProtectionServiceError("pii_provider_unavailable", "timeout")
+  });
+  helper.setFailureReturn({ status: "failed" });
+  helper.deps.artifacts.setPiiDetail = async () => { throw new Error("subject write unavailable"); };
+
+  await new PiiScanJobHandler(helper.deps).execute(sampleJob());
+
+  // The worker lists failed jobs with an open scan run and finishes them.
+  expect(helper.updateCalls.map((call) => call.patch.status)).toEqual(["processing"]);
 });
 
 test("PiiScanJobHandler emits pii_reported audit event for report decisions", async () => {

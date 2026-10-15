@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { AdminSessionsListResponseSchema } from "@cogniplane/shared-types";
 
 import { withTenantScope } from "../../lib/db.js";
+import { utcMicrosText } from "../../lib/db-mappers.js";
 import { apiError } from "../../lib/http-errors.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
 import { serialize } from "../../lib/serialize-response.js";
@@ -90,6 +91,7 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
                 ELSE 'active'
               END AS admin_status,
               COALESCE(m.last_activity_at, s.created_at) AS last_activity_at,
+              ${utcMicrosText("COALESCE(m.last_activity_at, s.created_at)")} AS cursor_last_activity_at,
               COALESCE(m.message_count, 0)::int AS message_count,
               rs.runtime_provider,
               m.last_model_name
@@ -258,7 +260,7 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
 
       const nextCursor = hasMore && items.length > 0
         ? encodeCursor({
-            lastActivityAt: items[items.length - 1].lastActivityAt,
+            lastActivityAt: String(pageRows[pageRows.length - 1].cursor_last_activity_at),
             sessionId: items[items.length - 1].sessionId
           })
         : null;

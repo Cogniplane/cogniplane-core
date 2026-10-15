@@ -11,12 +11,11 @@
 // must keep working — don't collapse them into one path.
 
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import type { AppDependencies } from "../app-dependencies.js";
-import { proxySignatureSecret } from "../lib/derived-secrets.js";
 import { clientSafeToolErrorMessage, ToolCallError } from "../lib/tool-call-error.js";
-import { signProxyHeaders } from "../lib/mcp-proxy-signature.js";
 import {
   forwardRpc,
   type ForwardRpcLimits,
@@ -33,20 +32,29 @@ import {
   type ResolvedRuntimePolicy
 } from "../services/admin-config-records.js";
 import type { ManagedToolFactoryDeps } from "../services/managed-tools/factory.js";
-import type { ManagedToolDefinition } from "../services/managed-tools/types.js";
+import type { ManagedToolApproval, ManagedToolDefinition } from "../services/managed-tools/types.js";
 import { PolicyBlockedError, type PolicyService } from "../services/policy/policy-service.js";
+import { AdminConfigError } from "../services/admin-config-error.js";
+import { MemberMcpAccessError } from "../services/member-mcp-credential-store.js";
 import { withoutPolicyApprovalMetadata } from "../services/policy/policy-approval-proof.js";
 import type {
   ToolExecutionContext,
   ToolExecutionContextStore
 } from "../services/auth/tool-execution-context-store.js";
+import type { IntegrationRegistryService } from "../services/integrations/integration-registry-service.js";
 import {
   enforcePolicyCenter,
   getRuntimePolicySnapshot,
-  type PolicyGate
+  type PolicyGate,
+  type PolicyGateOutcome
 } from "../services/mcp/policy-gate.js";
 import { resolveBoundToolContext } from "../services/mcp/tool-context-binder.js";
+import { forwardSignedProxyRpc, proxySigningSecret, proxyUpstreamLimits } from "../services/mcp/proxy-forward.js";
 import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
+import {
+  scrubUpstreamCredential,
+  scrubUpstreamCredentialValues
+} from "../services/mcp/scrub-upstream-credential.js";
 import { redactSecrets } from "../services/redact-secrets.js";
 import type {
   ProxyToolMetadata,
@@ -101,6 +109,7 @@ export function buildMcpRouteStores(
     toolContexts: deps.toolContexts,
     githubConnections: deps.githubConnectionService,
     notionConnections: deps.notionConnectionService,
+    jiraConnections: deps.jiraConnectionService,
     piiProtection: deps.piiProtection,
     managedToolFactoryRegistry: deps.managedToolFactoryRegistry,
     managedToolCatalog: deps.managedToolCatalog,
@@ -114,20 +123,23 @@ export function buildMcpRouteStores(
     limits: deps.limits,
     runtimeTokenSecret: extras.runtimeTokenSecret,
     proxyToolMetadataCache: deps.proxyToolMetadataCache,
-    activationTracker: deps.activationTracker
+    activationTracker: deps.activationTracker,
+    integrationToolCalls: deps.integrationRegistry
   };
 }
 
 export type McpRouteStores = Omit<ManagedToolFactoryDeps, "dynamicConfig"> & {
-  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getMcpServer" | "listSkills">;
+  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getMcpServerForUser" | "listSkills">;
   toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">;
   managedToolFactoryRegistry: AppDependencies["managedToolFactoryRegistry"];
   managedToolCatalog: AppDependencies["managedToolCatalog"];
   policyService: Pick<PolicyService, "gateAction" | "evaluate">;
-  approvals: Pick<AppDependencies["approvals"], "get">;
+  approvals: Pick<AppDependencies["approvals"], "get" | "consume">;
   runtimeTokenSecret: string;
   proxyToolMetadataCache: AppDependencies["proxyToolMetadataCache"];
   activationTracker?: Pick<ActivationTracker, "recordFailure" | "recordInvocation" | "recordSkillInvocationsForTool">;
+  // Checks an integration tool call against live toggles and the turn's account.
+  integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">;
 };
 
 export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteStores): Promise<void> {
@@ -142,6 +154,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     auditEvents: stores.auditEvents,
     githubConnections: stores.githubConnections,
     notionConnections: stores.notionConnections,
+    jiraConnections: stores.jiraConnections,
     piiProtection: stores.piiProtection,
     readRuntimeFile: stores.readRuntimeFile,
     statRuntimeFile: stores.statRuntimeFile,
@@ -204,13 +217,28 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     const sessionIdFromRuntimeToken = runtimeTokenClaims.sid;
     const tenantId = runtimeTokenClaims.tid;
 
-    let server: Awaited<ReturnType<typeof stores.dynamicConfig.getMcpServer>>;
+    let server: Awaited<ReturnType<typeof stores.dynamicConfig.getMcpServerForUser>>;
     try {
-      server = await stores.dynamicConfig.getMcpServer(tenantId, serverId);
+      server = await stores.dynamicConfig.getMcpServerForUser(tenantId, serverId, runtimeTokenClaims.uid);
     } catch (error) {
-      request.log.warn({ err: error, serverId, tenantId }, "MCP server lookup failed");
-      reply.code(500);
-      return failure(rpc.id, -32603, "Internal error.");
+      if (!(error instanceof AdminConfigError || error instanceof MemberMcpAccessError)) {
+        request.log.error({ err: error, serverId, tenantId }, "MCP server lookup failed");
+        reply.code(500);
+        return failure(rpc.id, -32603, "Internal error.");
+      }
+      request.log.warn({ serverId, tenantId }, "MCP server unavailable for member");
+      reply.code(403);
+      return failure(rpc.id, -32000, "MCP server unavailable.");
+    }
+    if (server.credentialScope === "personal" && rpc.method === "initialize") {
+      const context = await stores.toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
+      if (context && (context.tenantId !== runtimeTokenClaims.tid ||
+          context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid ||
+          context.runtimeId !== runtimeTokenClaims.rid ||
+          !matchesBoundServerSource(server, context))) {
+        reply.code(403);
+        return failure(rpc.id, -32000, "MCP server changed during this turn.");
+      }
     }
 
     // Some runtimes may embed the per-turn toolContextId in the MCP URL as
@@ -230,19 +258,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     // party on the critical path of a turn: without a timeout it can hold the
     // turn open until the watchdog fires, and without a byte cap it can OOM
     // the shared backend with one oversized body.
-    const upstreamLimits: ForwardRpcLimits = {
-      timeoutMs: app.config.MCP_UPSTREAM_TIMEOUT_MS,
-      maxResponseBytes: app.config.MCP_UPSTREAM_MAX_RESPONSE_BYTES,
-      // The client-visible RPC error is a fixed string; this is where the real
-      // transport failure lands.
-      logger: request.log,
-      // Integration tests run a real upstream on 127.0.0.1, which the
-      // first-hop private-address check correctly refuses. Vitest sets
-      // NODE_ENV=test; production never has it, so the guard is unconditional
-      // where it matters. Keyed off the environment rather than a config flag
-      // so there is no operator-settable switch that can disable it.
-      allowPrivateUpstreamForTests: process.env.NODE_ENV === "test"
-    };
+    const upstreamLimits = proxyUpstreamLimits(app.config, request.log);
 
     request.log.debug(
       {
@@ -272,6 +288,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           managedTools,
           toolContexts: stores.toolContexts,
           sessionIdFromRuntimeToken,
+          runtimeTokenClaims,
           listingId: runtimeTokenClaims.jti,
           proxyToolMetadataCache: stores.proxyToolMetadataCache,
           upstreamLimits,
@@ -292,11 +309,9 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           policyService: stores.policyService,
           approvals: stores.approvals,
           proxyToolMetadataCache: stores.proxyToolMetadataCache,
-          upstreamSignatureSecret: proxySignatureSecret(
-            app.config.DATA_ENCRYPTION_SECRET,
-            app.config.MCP_UPSTREAM_SIGNING_ROOT_SECRET
-          ),
+          upstreamSignatureSecret: proxySigningSecret(app.config),
           upstreamLimits,
+          integrationToolCalls: stores.integrationToolCalls,
           logger: request.log
         });
       }
@@ -326,6 +341,22 @@ function handleInitialize(
   });
 }
 
+function proxyMetadataScope(server: McpServerRegistration, userId: string): string {
+  return JSON.stringify([server.hash, server.credentialBindingId ?? "",
+    server.credentialScope === "personal" ? userId : "organization",
+    server.credentialScope === "personal" ? server.credentialVersion ?? null : null]);
+}
+
+function matchesBoundServerSource(server: McpServerRegistration, context: ToolExecutionContext): boolean {
+  const sources = context.metadata.mcpServerSources;
+  if (!Array.isArray(sources)) return server.credentialScope !== "personal";
+  const source = sources.find((item): item is { id: string; hash: string; credentialVersion?: number | null } =>
+    isPlainObject(item) && item.id === server.id && typeof item.hash === "string");
+  if (!source) return false;
+  return source.hash === server.hash && (server.credentialScope !== "personal" ||
+    source.credentialVersion === server.credentialVersion);
+}
+
 async function handleToolsList(input: {
   rpc: z.infer<typeof rpcRequestSchema>;
   server: McpServerRegistration;
@@ -333,6 +364,7 @@ async function handleToolsList(input: {
   managedTools: ManagedToolDefinition[];
   toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">;
   sessionIdFromRuntimeToken: string;
+  runtimeTokenClaims: RuntimeTokenClaims;
   listingId: string;
   proxyToolMetadataCache: ProxyToolMetadataCache;
   upstreamLimits: ForwardRpcLimits;
@@ -345,19 +377,27 @@ async function handleToolsList(input: {
     managedTools,
     toolContexts,
     sessionIdFromRuntimeToken,
+    runtimeTokenClaims,
     listingId,
     proxyToolMetadataCache,
     upstreamLimits,
     logger
   } = input;
+  const context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
+  if (!context || context.tenantId !== runtimeTokenClaims.tid ||
+      context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid ||
+      context.runtimeId !== runtimeTokenClaims.rid) {
+    return ok(rpc.id, { tools: [] });
+  }
+  const runtimePolicy = getRuntimePolicySnapshot(context);
+  if (!runtimePolicy.enabledMcpServers.includes(server.id)) return ok(rpc.id, { tools: [] });
+  if (server.mode === "proxy" && !matchesBoundServerSource(server, context)) return ok(rpc.id, { tools: [] });
   const managedToolsForRequest =
     server.mode === "managed"
       ? await getVisibleManagedTools({
-          tenantId,
           serverId: server.id,
           managedTools,
-          toolContexts,
-          sessionIdFromRuntimeToken
+          context
         })
       : null;
 
@@ -383,6 +423,7 @@ async function handleToolsList(input: {
         description: tool.description,
         inputSchema: tool.inputSchema,
         ...(tool.outputSchema ? { outputSchema: tool.outputSchema } : {}),
+        ...(tool.appResource ? { _meta: { ui: { resourceUri: tool.appResource.uri } } } : {}),
         annotations: { readOnlyHint: tool.readOnly }
       }))
     });
@@ -394,15 +435,7 @@ async function handleToolsList(input: {
   // is probed by every SDK at startup, so we return an empty list instead of
   // throwing (mirrors getVisibleManagedTools). Tool *calls* are still gated by
   // requireMcpServerAllowed in handleForwardedToolCall.
-  if (sessionIdFromRuntimeToken) {
-    const context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
-    if (context) {
-      const runtimePolicy = getRuntimePolicySnapshot(context);
-      if (!runtimePolicy.enabledMcpServers.includes(server.id)) {
-        return ok(rpc.id, { tools: [] });
-      }
-    }
-  }
+  const cacheScope = proxyMetadataScope(server, runtimeTokenClaims.uid);
 
   const response = await forwardRpc(
     server.upstreamUrl,
@@ -415,27 +448,28 @@ async function handleToolsList(input: {
     server.upstreamAuth ?? null
   );
 
+  const safeResponse = scrubRpcPayload(response, server.upstreamAuth?.secret);
   if (
-    !response.error &&
-    response.result &&
-    typeof response.result === "object" &&
-    "tools" in response.result &&
-    Array.isArray((response.result as { tools?: unknown }).tools)
+    !safeResponse.error &&
+    safeResponse.result &&
+    typeof safeResponse.result === "object" &&
+    "tools" in safeResponse.result &&
+    Array.isArray((safeResponse.result as { tools?: unknown }).tools)
   ) {
     // The runtime token's unique jti stays constant across this client's
     // pagination sequence. It isolates staging from other sessions even when
     // their upstream cursors happen to have the same value. An error or
     // malformed body skips this call and keeps the last complete listing.
-    const result = response.result as { tools: readonly ProxyToolMetadata[]; nextCursor?: unknown };
+    const result = safeResponse.result as { tools: readonly ProxyToolMetadata[]; nextCursor?: unknown };
     const requestCursor = (rpc.params as { cursor?: unknown } | undefined)?.cursor;
     proxyToolMetadataCache.recordToolsPage(tenantId, server.id, listingId, {
       requestCursor: typeof requestCursor === "string" ? requestCursor : null,
       nextCursor: typeof result.nextCursor === "string" ? result.nextCursor : null,
       tools: result.tools
-    });
+    }, cacheScope);
   }
 
-  return response;
+  return redactRpcEnvelope(safeResponse);
 }
 
 async function handleToolsCall(input: {
@@ -449,10 +483,11 @@ async function handleToolsCall(input: {
   runtimeTokenClaims: RuntimeTokenClaims;
   activationTracker?: Pick<ActivationTracker, "recordFailure" | "recordInvocation" | "recordSkillInvocationsForTool">;
   policyService: Pick<PolicyService, "gateAction" | "evaluate">;
-  approvals: Pick<ApprovalStore, "get">;
+  approvals: Pick<ApprovalStore, "get" | "consume">;
   proxyToolMetadataCache: ProxyToolMetadataCache;
   upstreamSignatureSecret: string;
   upstreamLimits: ForwardRpcLimits;
+  integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">;
   logger: Pick<FastifyBaseLogger, "debug" | "warn">;
 }): Promise<RpcResponse> {
   const {
@@ -470,6 +505,7 @@ async function handleToolsCall(input: {
     proxyToolMetadataCache,
     upstreamSignatureSecret,
     upstreamLimits,
+    integrationToolCalls,
     logger
   } = input;
 
@@ -510,6 +546,7 @@ async function handleToolsCall(input: {
           sessionIdFromRuntimeToken,
           runtimeTokenClaims,
           policyGate,
+          integrationToolCalls,
           logger,
           captureContext
         )
@@ -529,35 +566,58 @@ async function handleToolsCall(input: {
           captureContext
         );
 
+  // Redact before telemetry too: an upstream error can echo its credential,
+  // and telemetry metadata is stored.
+  const safeResponse = redactRpcEnvelope(scrubRpcPayload(response, server.upstreamAuth?.secret));
   await recordToolCallTelemetry({
     activationTracker,
     tenantId,
     sessionIdFromRuntimeToken,
     server,
     rpc,
-    response,
+    response: safeResponse,
     messageId
   });
 
-  // Strip credentials from a successful tool result at the gateway boundary,
-  // BEFORE it reaches the runtime. The transcript/tool-result stores already
-  // run redactSecrets(), but the LangGraph result is separately persisted into
-  // the durable checkpointer as a ToolMessage and restored into model context
-  // on later turns — a path the store-layer redaction never touches. Redacting
-  // here covers both: a managed tool echoing a token or a proxy upstream
-  // returning auth material can't land a live credential in checkpoint state.
-  // Errors carry only a message (already generic) and are left untouched.
-  //
-  // The managed path also redacts its handler result before serialising it
-  // into content[0].text, because key-based redaction cannot reach a value
-  // that is already inside a JSON string. This pass is what covers the
-  // *forwarded* path, whose result never goes through that function, and it
-  // is idempotent over the managed one.
-  if (response.error === undefined && response.result !== undefined) {
-    return { ...response, result: redactSecrets(response.result) };
-  }
+  return safeResponse;
+}
 
-  return response;
+/**
+ * Redact credentials in a tool response at the gateway boundary, BEFORE it
+ * reaches the runtime or telemetry. The transcript/tool-result stores already
+ * run redactSecrets(), but the LangGraph result is separately persisted into
+ * the durable checkpointer as a ToolMessage and restored into model context
+ * on later turns — a path the store-layer redaction never touches. A proxy
+ * upstream's JSON-RPC error envelope is forwarded as-is (message, data and
+ * extension members), so it is redacted like a result.
+ *
+ * The managed path also redacts its handler result before serialising it
+ * into content[0].text, because key-based redaction cannot reach a value
+ * that is already inside a JSON string. This pass is what covers the
+ * *forwarded* path, whose result never goes through that function, and it
+ * is idempotent over the managed one.
+ */
+// Scrub the upstream secret from a response's result and error, never from the
+// JSON-RPC envelope (`jsonrpc`, `id`) or the field names of the result and
+// error themselves: a short secret must not corrupt the protocol.
+function scrubRpcPayload(response: RpcResponse, secret: string | null | undefined): RpcResponse {
+  if (!secret) return response;
+  const { result, error } = response;
+  return {
+    ...response,
+    ...(result !== undefined ? {
+      result: isPlainObject(result) ? scrubUpstreamCredentialValues(result, secret) : scrubUpstreamCredential(result, secret)
+    } : {}),
+    ...(error !== undefined ? { error: scrubUpstreamCredentialValues(error, secret) } : {})
+  };
+}
+
+function redactRpcEnvelope(response: RpcResponse): RpcResponse {
+  return {
+    ...response,
+    ...(response.result !== undefined ? { result: redactSecrets(response.result) } : {}),
+    ...(response.error !== undefined ? { error: redactSecrets(response.error) } : {})
+  };
 }
 
 /**
@@ -634,6 +694,7 @@ async function handleManagedToolCall(
   sessionIdFromRuntimeToken: string,
   runtimeTokenClaims: RuntimeTokenClaims,
   policyGate: PolicyGate,
+  integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">,
   logger: Pick<FastifyBaseLogger, "debug" | "warn">,
   captureContext: (context: ToolExecutionContext) => void
 ): Promise<RpcResponse> {
@@ -674,6 +735,25 @@ async function handleManagedToolCall(
     if (isProjectToolUnavailableInTurn(tool, context)) {
       throw new ToolCallError("Project tools are only available during interactive project turns.");
     }
+    // The runtime policy is a snapshot from the turn start. An integration
+    // toggle or the connected account can change while the turn runs or waits
+    // for an approval, so check both again for each call.
+    const integrationRefusal = await integrationToolCalls.checkToolCall({
+      tenantId: context.tenantId,
+      userId: context.userId,
+      toolName: tool.name,
+      boundAccounts: isPlainObject(context.metadata.integrationAccounts)
+        ? context.metadata.integrationAccounts : undefined
+    });
+    if (integrationRefusal) throw new ToolCallError(integrationRefusal);
+    // A tool that saves durable data never runs on the model's word. A scheduled
+    // run has nobody to approve it, so refuse before anything is claimed or saved.
+    if (tool.requiresUserApproval && context.metadata.turnContext === "scheduled") {
+      return toolRefusal(
+        rpc.id,
+        `${tool.name} saves data that a user must approve, and a scheduled run has nobody to ask. Nothing was saved.`
+      );
+    }
     // Native approval for managed tool calls is NOT enforced here. The
     // deep-agents HITL interceptor gates every tool call (including MCP)
     // in-process before the HTTP request is made, where
@@ -686,7 +766,7 @@ async function handleManagedToolCall(
     // approval proof or throws PolicyBlockedError (block / approval denied —
     // surfaced as a distinct RPC error below). Severity is derived from the
     // managed tool's readOnly flag.
-    await enforcePolicyCenter(
+    const policyOutcome = await enforcePolicyCenter(
       policyGate,
       context,
       tool.name,
@@ -698,10 +778,22 @@ async function handleManagedToolCall(
       // call arrived through a different enabled managed server's URL.
       tool.category ?? serverId
     );
+    // The tenant approval policy and Policy Center rules never lower this check.
+    // The approval came from the graph's interrupt, belongs to this exact call
+    // and was claimed above, so a replay or a changed value finds none.
+    let approval: ManagedToolApproval | undefined;
+    if (tool.requiresUserApproval) {
+      const checked = checkUserApproval(policyOutcome);
+      if ("refusal" in checked) {
+        return toolRefusal(rpc.id, `${tool.name} saves data that the user must approve. ${checked.refusal} Nothing was saved.`);
+      }
+      approval = checked.approval;
+    }
     const handlerArgs = withoutPolicyApprovalMetadata(args);
     const rawResult = await tool.handler({
       context,
-      arguments: handlerArgs
+      arguments: handlerArgs,
+      ...(approval ? { approval } : {})
     });
 
     // Redact BEFORE serialising, not after. The outer gateway-boundary pass
@@ -724,7 +816,8 @@ async function handleManagedToolCall(
         }
       ],
       structuredContent: result,
-      isError: false
+      isError: false,
+      ...(tool.appResource ? { _meta: mcpAppResultMeta(tool.appResource.uri, tool.readOnly, context) } : {})
     });
   } catch (error) {
     if (error instanceof PolicyBlockedError) {
@@ -737,27 +830,79 @@ async function handleManagedToolCall(
   }
 }
 
+/**
+ * A refusal that the model reads as the tool result, as the GitHub and Jira tools
+ * return theirs. A JSON-RPC error would reach the graph as a thrown tool exception,
+ * which ends the turn, so the model could not tell the user that nothing was saved.
+ */
+function toolRefusal(id: z.infer<typeof rpcRequestSchema>["id"], message: string): RpcResponse {
+  return ok(id, {
+    content: [{ type: "text", text: JSON.stringify({ error: message }, null, 2) }],
+    structuredContent: { error: message },
+    isError: false
+  });
+}
+
+/**
+ * The proof that a user approved this exact call, for a tool with
+ * `requiresUserApproval`, or the reason why there is none.
+ */
+function checkUserApproval(
+  outcome: PolicyGateOutcome
+): { approval: ManagedToolApproval } | { refusal: string } {
+  const { approval, approvalDisposition } = outcome;
+  if (approvalDisposition === "approve" && approval) {
+    const bound = approval.requestPayload.bound;
+    return {
+      approval: {
+        approvalId: approval.approvalId,
+        approvedByUserId: approval.userId,
+        approvedAt: approval.resolvedAt ?? approval.updatedAt,
+        bound: isPlainObject(bound) ? bound : {}
+      }
+    };
+  }
+  return {
+    refusal:
+      approvalDisposition === "consumed" ? "That approval was already used."
+      : approvalDisposition === "reject" ? "The user declined it."
+      : approvalDisposition === "expired" ? "The approval request expired."
+      : "No approval for this exact call was recorded."
+  };
+}
+
+// The MCP App keys that the runtime reads from a tool result. Only the gateway
+// sets them; the proxy path strips upstream copies first.
+function mcpAppResultMeta(
+  resourceUri: string,
+  readOnly: boolean,
+  context: Pick<ToolExecutionContext, "metadata">
+): Record<string, unknown> {
+  const turnContext = context.metadata.turnContext;
+  return {
+    cogniplaneAppResourceUri: resourceUri,
+    cogniplaneAppReadOnly: readOnly,
+    cogniplaneAppTurnContext: turnContext === "interactive" || turnContext === "scheduled" ? turnContext : null
+  };
+}
+
+// Project tools need the project snapshot that an interactive project turn
+// writes into the tool context. Hide them from scheduled turns and from
+// standalone chats, where the handler can only fail.
 function isProjectToolUnavailableInTurn(
   tool: ManagedToolDefinition,
   context: Pick<ToolExecutionContext, "metadata">
 ): boolean {
-  return tool.category === "project" && context.metadata.turnContext === "scheduled";
+  return tool.category === "project" &&
+    (context.metadata.turnContext === "scheduled" || !context.metadata.projectContext);
 }
 
 async function getVisibleManagedTools(input: {
-  tenantId: string;
   serverId: string;
   managedTools: ManagedToolDefinition[];
-  toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">;
-  sessionIdFromRuntimeToken: string;
+  context: ToolExecutionContext;
 }): Promise<ManagedToolDefinition[]> {
-  const context = await input.toolContexts.findLatestActiveBySession(
-    input.tenantId,
-    input.sessionIdFromRuntimeToken
-  );
-  if (!context) {
-    return input.managedTools;
-  }
+  const context = input.context;
 
   // If the runtime policy forbids this MCP server, advertise no tools
   // rather than throwing — `tools/list` is probed by every SDK at startup and
@@ -838,8 +983,14 @@ async function handleForwardedToolCall(
 
   try {
     requireMcpServerAllowed(server.id, context);
+    if (!matchesBoundServerSource(server, context)) {
+      throw new ToolCallError(`MCP server ${server.id} changed during this turn.`);
+    }
     const toolName = String(params.name ?? "");
-    const isReadOnly = proxyToolMetadataCache.isReadOnly(tenantId, server.id, toolName) ?? null;
+    const cacheScope = proxyMetadataScope(server, context.userId);
+    await proxyToolMetadataCache.refreshMissing(tenantId, server.id, toolName,
+      () => refreshProxyToolMetadata(tenantId, server, proxyToolMetadataCache, upstreamLimits, logger, cacheScope), cacheScope);
+    const isReadOnly = proxyToolMetadataCache.isReadOnly(tenantId, server.id, toolName, cacheScope) ?? null;
     await enforcePolicyCenter(
       policyGate,
       context,
@@ -863,31 +1014,82 @@ async function handleForwardedToolCall(
   const forwardArgs = withoutPolicyApprovalMetadata(args);
   delete forwardArgs.toolContextId;
 
-  return forwardRpc(
-    server.upstreamUrl,
-    {
+  const response = await forwardSignedProxyRpc({
+    server,
+    rpc: {
       ...rpc,
       params: {
         ...params,
         arguments: forwardArgs
       }
     },
-    // forwardRpc serializes the payload once and passes those bytes here, so
-    // the signed body hash covers exactly what is sent. The tenant ID comes
-    // from the runtime token and the server ID from the tenant's server
-    // registration, never from the model or the request body.
-    (body) =>
-      signProxyHeaders({
-        tenantId,
-        serverId: server.id,
-        userId: context.userId,
-        sessionId: context.sessionId,
-        runtimeId: context.runtimeId,
-        body,
-        secret: upstreamSignatureSecret
-      }),
-    undefined,
-    { ...upstreamLimits, serverId: server.id },
-    server.upstreamAuth ?? null
-  );
+    tenantId,
+    userId: context.userId,
+    sessionId: context.sessionId,
+    runtimeId: context.runtimeId,
+    signingSecret: upstreamSignatureSecret,
+    limits: upstreamLimits
+  });
+  const toolName = String(params.name ?? "");
+  const cacheScope = proxyMetadataScope(server, context.userId);
+  const resourceUri = proxyToolMetadataCache.appResourceUri(tenantId, server.id, toolName, cacheScope);
+  if (!isPlainObject(response.result)) {
+    return response;
+  }
+  const result = response.result;
+  const meta = isPlainObject(result._meta) ? result._meta : {};
+  const { cogniplaneAppResourceUri: _untrusted, cogniplaneAppReadOnly: _untrustedReadOnly,
+    cogniplaneAppTurnContext: _untrustedTurnContext, ...upstreamMeta } = meta;
+  if (response.error || !Array.isArray(result.content) || !resourceUri) {
+    const hadUntrusted = _untrusted !== undefined || _untrustedReadOnly !== undefined || _untrustedTurnContext !== undefined;
+    return hadUntrusted ? { ...response, result: { ...result, _meta: upstreamMeta } } : response;
+  }
+  const readOnly = proxyToolMetadataCache.isReadOnly(tenantId, server.id, toolName, cacheScope) === true;
+  return {
+    ...response,
+    result: { ...result, _meta: { ...upstreamMeta, ...mcpAppResultMeta(resourceUri, readOnly, context) } }
+  };
+}
+
+async function refreshProxyToolMetadata(
+  tenantId: string,
+  server: McpServerRegistration,
+  cache: ProxyToolMetadataCache,
+  limits: ForwardRpcLimits,
+  logger: Pick<FastifyBaseLogger, "warn">,
+  cacheScope: string
+): Promise<void> {
+  if (!server.upstreamUrl) return;
+  const listingId = randomUUID();
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  const deadline = Date.now() + 5_000;
+  for (let page = 0; page < 20; page += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const response = await forwardRpc(
+      server.upstreamUrl,
+      { jsonrpc: "2.0", id: `${listingId}:${page}`, method: "tools/list", ...(cursor ? { params: { cursor } } : {}) },
+      { "X-Forwarded-By": "cogniplane-core" },
+      undefined,
+      { ...limits, timeoutMs: Math.min(limits.timeoutMs ?? remaining, remaining) },
+      server.upstreamAuth ?? null
+    );
+    const safeResult = scrubRpcPayload(response, server.upstreamAuth?.secret).result;
+    if (response.error || !isPlainObject(safeResult) || !Array.isArray(safeResult.tools)) {
+      logger.warn({ serverId: server.id }, "Could not refresh proxy tool metadata");
+      return;
+    }
+    const nextCursor = typeof safeResult.nextCursor === "string" ? safeResult.nextCursor : null;
+    cache.recordToolsPage(tenantId, server.id, listingId, {
+      requestCursor: cursor,
+      nextCursor,
+      tools: safeResult.tools as ProxyToolMetadata[]
+    }, cacheScope);
+    if (nextCursor === null) return;
+    if (seen.has(nextCursor)) break;
+    seen.add(nextCursor);
+    cursor = nextCursor;
+  }
+  logger.warn({ serverId: server.id }, "Proxy tool metadata listing did not complete");
 }

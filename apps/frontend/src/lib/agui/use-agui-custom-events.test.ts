@@ -1,85 +1,47 @@
 // @vitest-environment jsdom
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Approval } from "@cogniplane/shared-types";
+import type { Approval, McpAppCall } from "@cogniplane/shared-types";
 import type { AbstractAgent } from "@ag-ui/client";
 
 import * as sessionApi from "../session-api";
 import type { RuntimeNoticeRow } from "../../components/chat-cards/chat-cards.types";
-import { isStreamLossError, useAguiCustomEvents } from "./use-agui-custom-events";
+import { useAguiCustomEvents } from "./use-agui-custom-events";
 
 // vitest runs with globals:false, so RTL cannot auto-register its cleanup.
 afterEach(cleanup);
 
 // Minimal fake agent: captures the subscriber so a test can drive custom events
-// the way the real AG-UI run would. Only the members the hook touches.
-function makeFakeAgent(initialMessages: Array<{ id: string; role: string; content: string }> = []) {
-  type FakeMessages = Array<{ id: string; role: string; content: string }>;
+// the way the real AG-UI run would. Only the members the hook touches. The
+// real library runs in copilot-chat-host.test.tsx.
+function makeFakeAgent() {
+  type RunInput = { runId: string; forwardedProps: Record<string, unknown>; messages: [] };
   let sub:
     | {
-        onRunInitialized?: (arg: { input: { forwardedProps: Record<string, unknown> } }) => void;
-        onRunFinishedEvent?: () => void;
-        onRunErrorEvent?: () => void;
-        onRunFinalized?: () => void;
-        onRunFailed?: (arg: { error: Error; messages: FakeMessages; input: { messages: FakeMessages } }) => void;
-        onCustomEvent?: (arg: {
-          event: { name: string; value?: Record<string, unknown> };
-          messages: FakeMessages;
-        }) => { messages?: FakeMessages } | void;
+        onRunInitialized?: (arg: { input: RunInput }) => void;
+        onCustomEvent?: (arg: { event: { name: string; value?: Record<string, unknown> }; input: RunInput }) => void;
       }
     | null = null;
   const unsubscribe = vi.fn();
-  // Two distinct buffers, mirroring @ag-ui/client:
-  //  - `runBuffer` is what defaultApplyEvents/processApplyEvents own during a run;
-  //    only a subscriber's RETURNED { messages } folds into it.
-  //  - `agent.messages` is what processApplyEvents OVERWRITES from runBuffer on
-  //    every event. A direct setMessages() writes here but is clobbered by the
-  //    next event's overwrite — exactly the bug the fix addresses.
-  let runBuffer = initialMessages;
-  let published = initialMessages;
+  let runs = 0;
+  let input: RunInput = { runId: "run-0", forwardedProps: {}, messages: [] };
   const agent = {
     threadId: "s-1",
-    get messages() {
-      return published;
-    },
-    setMessages(next: FakeMessages) {
-      published = next; // NOT folded into runBuffer — reverted on the next event.
-    },
     subscribe(s: NonNullable<typeof sub>) {
       sub = s;
       return { unsubscribe };
     }
   } as unknown as AbstractAgent;
   const run = {
-    init: (reconnect = false) => act(() => sub?.onRunInitialized?.({
-      input: { forwardedProps: reconnect ? { cogniplaneReconnect: true } : {} }
-    })),
-    // A clean end: RUN_FINISHED, then the stream completes.
-    finalize: () => act(() => {
-      sub?.onRunFinishedEvent?.();
-      sub?.onRunFinalized?.();
-    }),
-    // The stream completes without a terminal event.
-    closeStream: () => act(() => sub?.onRunFinalized?.()),
-    // The backend reports a graph failure, then the stream completes.
-    runError: () => act(() => {
-      sub?.onRunErrorEvent?.();
-      sub?.onRunFinalized?.();
-    }),
-    // @ag-ui/client always passes the error and the run input. The default is
-    // a refused request: runHttpRequest puts the status on the error.
-    fail: (error: Error = Object.assign(new Error("HTTP 500"), { status: 500 })) => act(() => sub?.onRunFailed?.({
-      error, messages: runBuffer, input: { messages: runBuffer }
-    }))
+    // A sent message, or a session connection.
+    init: (reconnect = false) => act(() => {
+      runs += 1;
+      input = { runId: `run-${runs}`, forwardedProps: reconnect ? { cogniplaneReconnect: true } : {}, messages: [] };
+      sub?.onRunInitialized?.({ input });
+    })
   };
   const emit = (name: string, value?: Record<string, unknown>) =>
-    act(() => {
-      const result = sub?.onCustomEvent?.({ event: { name, value }, messages: runBuffer });
-      if (result && result.messages !== undefined) runBuffer = result.messages;
-      // processApplyEvents overwrites the published messages from the run buffer
-      // after the event — this is what reverts a stray setMessages().
-      published = runBuffer;
-    });
+    act(() => sub?.onCustomEvent?.({ event: { name, value }, input }));
   return { agent, emit, run, unsubscribe };
 }
 
@@ -200,69 +162,6 @@ describe("useAguiCustomEvents — tool_status side-channel (R8)", () => {
   });
 });
 
-describe("useAguiCustomEvents — user_message_replaced (F8 — PII transform)", () => {
-  const readMessages = (agent: AbstractAgent) =>
-    (agent as unknown as { messages: Array<{ id: string; role: string; content: string }> }).messages;
-
-  it("patches the last user message via a RETURNED mutation folded into the run buffer", () => {
-    // The emit helper mirrors AG-UI: it folds a returned { messages } back into
-    // the buffer. A direct setMessages would NOT survive the run (see handler).
-    const { agent, emit } = makeFakeAgent([
-      { id: "u1", role: "user", content: "first" },
-      { id: "a1", role: "assistant", content: "reply" },
-      { id: "u2", role: "user", content: "my card is 4111 1111 1111 1111" }
-    ]);
-    renderHook(() => useAguiCustomEvents(agent));
-
-    emit("user_message_replaced", { messageId: "server-id", text: "my card is [REDACTED]" });
-
-    // Only the LAST user message is patched; earlier messages are untouched.
-    expect(readMessages(agent)).toEqual([
-      { id: "u1", role: "user", content: "first" },
-      { id: "a1", role: "assistant", content: "reply" },
-      { id: "u2", role: "user", content: "my card is [REDACTED]" }
-    ]);
-  });
-
-  it("is a no-op when the last user message already holds the transformed text", () => {
-    const original = [{ id: "u1", role: "user", content: "already [REDACTED]" }];
-    const { agent, emit } = makeFakeAgent(original);
-    renderHook(() => useAguiCustomEvents(agent));
-    const before = readMessages(agent);
-
-    emit("user_message_replaced", { messageId: "x", text: "already [REDACTED]" });
-
-    // Handler returned no mutation → the buffer is untouched (same reference).
-    expect(readMessages(agent)).toBe(before);
-  });
-
-  it("is a no-op when there is no user message to patch", () => {
-    const { agent, emit } = makeFakeAgent([{ id: "a1", role: "assistant", content: "hi" }]);
-    renderHook(() => useAguiCustomEvents(agent));
-    const before = readMessages(agent);
-
-    emit("user_message_replaced", { messageId: "x", text: "whatever" });
-
-    expect(readMessages(agent)).toBe(before);
-  });
-});
-
-describe("useAguiCustomEvents — prompt replay", () => {
-  it("adds a user prompt missed by the initial history read before reply events", () => {
-    const { agent, emit, run } = makeFakeAgent([{ id: "older", role: "assistant", content: "Earlier reply" }]);
-    renderHook(() => useAguiCustomEvents(agent));
-    run.init(true);
-
-    emit("user_message_persisted", { messageId: "question", text: "What happened?" });
-    emit("user_message_persisted", { messageId: "question", text: "What happened?" });
-
-    expect(agent.messages).toEqual([
-      { id: "older", role: "assistant", content: "Earlier reply" },
-      { id: "question", role: "user", content: "What happened?" }
-    ]);
-  });
-});
-
 describe("useAguiCustomEvents — approvals (R19)", () => {
   const approvalEvent = (approvalId: string) => ({
     approvalId,
@@ -323,7 +222,7 @@ describe("useAguiCustomEvents — approvals (R19)", () => {
     expect(result.current.approvals).toHaveLength(1);
   });
 
-  it("clears pending approvals when the run finishes cleanly", () => {
+  it("clears pending approvals when the connection reports a clean end of the turn", () => {
     const { agent, emit, run } = makeFakeAgent();
     const { result } = renderHook(() => useAguiCustomEvents(agent));
 
@@ -331,58 +230,23 @@ describe("useAguiCustomEvents — approvals (R19)", () => {
     emit("approval_required", approvalEvent("ap-1"));
     expect(result.current.approvals).toHaveLength(1);
 
-    run.finalize();
-
     // A clean run holds open until every decision lands, so anything still
     // here is stale.
+    act(() => result.current.clearApprovals());
     expect(result.current.approvals).toEqual([]);
-    expect(result.current.isRunning).toBe(false);
   });
 
-  it("KEEPS a pending approval when the run fails", () => {
+  it("keeps a pending approval when a new run starts", () => {
     const { agent, emit, run } = makeFakeAgent();
     const { result } = renderHook(() => useAguiCustomEvents(agent));
 
     run.init();
     emit("approval_required", approvalEvent("ap-1"));
-
-    // The stream dropped mid-interrupt. The backend row is still pending and
-    // the graph is still paused until its TTL, so the card has to stay
-    // actionable — the REST snapshot only feeds an attention count.
-    run.fail();
-    run.finalize();
+    // The stream dropped mid-interrupt and the connection started again. The
+    // backend row is still pending until its TTL, so the card stays.
+    run.init(true);
 
     expect(result.current.approvals.map((a) => a.approvalId)).toEqual(["ap-1"]);
-    expect(result.current.isRunning).toBe(false);
-  });
-});
-
-describe("useAguiCustomEvents — settlement (double-settle on failure)", () => {
-  it("settles once when a failed run fires both onRunFailed and onRunFinalized", () => {
-    const { agent, run } = makeFakeAgent();
-    const onRunSettled = vi.fn();
-    renderHook(() => useAguiCustomEvents(agent, { onRunSettled }));
-
-    run.init();
-    // @ag-ui/client's runAgent: catchError → onRunFailed, then finalize →
-    // onRunFinalized. Both reach the subscriber for the same failed run.
-    run.fail();
-    run.finalize();
-
-    expect(onRunSettled).toHaveBeenCalledTimes(1);
-  });
-
-  it("settles again on the next run", () => {
-    const { agent, run } = makeFakeAgent();
-    const onRunSettled = vi.fn();
-    renderHook(() => useAguiCustomEvents(agent, { onRunSettled }));
-
-    run.init();
-    run.finalize();
-    run.init();
-    run.finalize();
-
-    expect(onRunSettled).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -451,6 +315,8 @@ describe("custom event validation", () => {
     const { agent, emit } = makeFakeAgent();
     const { result } = renderHook(() => useAguiCustomEvents(agent));
     emit("third_party_event", { approvalId: "unrelated" });
+    // Retired backend event; an older backend or replay can still send it.
+    emit("tool_ui_resources", { toolCallId: "call-1", uiResources: [{ uri: "ui://card", mimeType: "text/html" }] });
     expect(result.current.approvals).toEqual([]);
     expect(result.current.notices).toEqual([]);
     expect(result.current.toolStatuses).toEqual([]);
@@ -481,39 +347,22 @@ describe("persisted approval seeds", () => {
     rerender({ seed: [approval] });
     expect(result.current.approvals).toEqual([]);
   });
-
-  it("takes only the new session's pending seed when the agent changes", () => {
-    const first = makeFakeAgent();
-    const second = makeFakeAgent();
-    const { result, rerender } = renderHook(
-      ({ agent, seed }) => useAguiCustomEvents(agent, { initialApprovals: seed }),
-      { initialProps: { agent: first.agent, seed: [approval] } }
-    );
-    rerender({ agent: second.agent, seed: [{ ...approval, approvalId: "other", status: "approved" }] });
-    expect(result.current.approvals).toEqual([]);
-    expect(first.unsubscribe).toHaveBeenCalledOnce();
-  });
 });
 
-it("publishes turn start, keeps failure through finalization, and clears it on retry", () => {
-  const { agent, run, emit } = makeFakeAgent();
-  const { result } = renderHook(() => useAguiCustomEvents(agent));
-  expect(result.current.turnActivity).toBeNull();
-  run.init();
-  const startedAt = result.current.turnActivity?.startedAt;
-  expect(startedAt).toBeTruthy();
-  expect(result.current.turnActivity?.isRunning).toBe(true);
-  emit("turn_started", { messageId: "persisted-turn", sequence: 42 });
-  run.fail();
-  run.finalize();
-  expect(result.current.turnActivity).toMatchObject({ startedAt, isRunning: false, failed: true });
-  expect(result.current.turnActivity).toMatchObject({ turnId: "persisted-turn", turnSequence: 42, failed: true });
-  run.init();
-  expect(result.current.turnActivity).toMatchObject({ isRunning: true, failed: false });
-  expect(result.current.turnActivity?.turnSequence).toBeUndefined();
-  run.finalize();
-  expect(result.current.turnActivity).toMatchObject({ isRunning: false, failed: false });
-});
+// Saved rows as `GET /sessions/:id/messages` returns them.
+function savedReply(fields: Record<string, unknown>) {
+  return {
+    messageId: "a-1", sessionId: "s-1", role: "assistant", status: "completed", content: "Reply",
+    createdAt: "2026-09-22T00:00:00.000Z", updatedAt: "2026-09-22T00:00:00.000Z", ...fields
+  } as never;
+}
+function savedTool(toolResultId: string, status: "completed" | "failed", mcpApp?: McpAppCall) {
+  return {
+    toolResultId, kind: "mcp", title: "search", toolName: "search", status, command: null, cwd: null,
+    server: null, input: "{}", output: "", exitCode: null, durationMs: null, textOffset: 0,
+    ...(mcpApp ? { mcpApp } : {})
+  };
+}
 
 describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
   const pending = (approvalId: string) => ({
@@ -548,8 +397,7 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
     emit("approval_required", {
       approvalId: "ap-1", itemId: "item-ap-1", kind: "command_execution", title: "Run command", summary: "ls"
     });
-    act(() => result.current.syncServerState({ approvals: [], toolStatuses: [], notices: [] }));
-    run.finalize();
+    act(() => result.current.syncServerState({ messages: [], approvals: [] }));
     await act(async () => finishRead([pending("ap-1")]));
 
     expect(result.current.approvals).toEqual([]);
@@ -566,9 +414,8 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
 
     act(() => result.current.onApprovalDecision("ap-1", { decision: "approve" }));
     act(() => result.current.syncServerState({
-      approvals: [pending("ap-1"), pending("ap-2")],
-      toolStatuses: [{ type: "tool-status", rowId: "tool:t-1", toolCallId: "t-1", toolName: "search", status: "failed", server: null, durationMs: null }],
-      notices: []
+      messages: [savedReply({ toolResults: [savedTool("t-1", "failed")] })],
+      approvals: [pending("ap-1"), pending("ap-2")]
     }));
 
     expect(result.current.approvals.map((row) => [row.approvalId, row.decisionState])).toEqual([
@@ -577,80 +424,133 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
     ]);
     expect(result.current.toolStatuses.map((row) => row.toolCallId)).toEqual(["t-1"]);
 
-    act(() => result.current.syncServerState({ approvals: [], toolStatuses: [], notices: [] }));
+    act(() => result.current.syncServerState({ messages: [], approvals: [] }));
     expect(result.current.approvals).toEqual([]);
     await act(async () => resolveDecision());
     decision.mockRestore();
   });
 });
 
-describe("useAguiCustomEvents — stream loss", () => {
-  function renderWithCallbacks() {
-    const { agent, emit, run } = makeFakeAgent();
-    const onRunSettled = vi.fn();
-    const onStreamLost = vi.fn();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { onRunSettled, onStreamLost }));
-    return { emit, run, result, onRunSettled, onStreamLost };
+// A connection replays approval B and reads the pending approvals. Approval A
+// expires or gets a decision while that read runs. The backend publishes an
+// expiry notice before its database update commits, so a read can still list
+// A as pending.
+describe("useAguiCustomEvents — approval reads during other approval changes", () => {
+  const pending = (approvalId: string) => ({
+    approvalId, sessionId: "s-1", itemId: `item-${approvalId}`, kind: "command_execution",
+    title: `Run ${approvalId}`, summary: "ls", status: "pending", createdAt: "2026-10-12T00:00:00.000Z"
+  }) as unknown as Approval;
+  const request = (approvalId: string) => ({
+    approvalId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "ls"
+  });
+  const expiry = (noticeId: string) => ({
+    noticeId, level: "warning", title: "Approval expired", message: "No decision in time", createdAt: "2026-10-12T00:00:00.000Z"
+  });
+
+  /** Each read waits until the test answers it. */
+  function heldReads() {
+    const answers: Array<(approvals: Approval[]) => void> = [];
+    const list = vi.spyOn(sessionApi, "listApprovals").mockImplementation(
+      () => new Promise<Approval[]>((resolve) => { answers.push(resolve); })
+    );
+    const answer = (index: number, approvals: Approval[]) => act(async () => answers[index]!(approvals));
+    return { list, answer };
   }
 
-  it("reports a network drop as a lost stream, keeps approvals, and does not refresh", () => {
-    const { emit, run, result, onRunSettled, onStreamLost } = renderWithCallbacks();
+  afterEach(() => vi.restoreAllMocks());
 
-    run.init();
-    emit("approval_required", { approvalId: "ap-1", itemId: "item", kind: "command_execution", title: "Approve", summary: "Run" });
-    run.fail(new TypeError("network error"));
-    run.finalize();
+  it.each(["approval-expired:", "policy-approval-expired:"])(
+    "keeps B from a read when A expires (%s) during it",
+    async (prefix) => {
+      const { answer } = heldReads();
+      const { agent, run, emit } = makeFakeAgent();
+      const { result } = renderHook(() => useAguiCustomEvents(agent));
 
-    expect(onStreamLost).toHaveBeenCalledOnce();
-    expect(onRunSettled).not.toHaveBeenCalled();
-    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["ap-1"]);
-    expect(result.current.isRunning).toBe(false);
-    expect(result.current.turnActivity).toBeNull();
+      run.init(true);
+      emit("approval_required", request("B"));
+      emit("runtime_notice", expiry(`${prefix}A`));
+      await answer(0, [pending("B")]);
+
+      expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B"]);
+    }
+  );
+
+  it("does not bring back A when a read during or after its expiry still lists it", async () => {
+    const { answer } = heldReads();
+    const { agent, run, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    run.init(true);
+    emit("approval_required", request("B"));
+    emit("runtime_notice", expiry("approval-expired:A"));
+    await answer(0, [pending("A"), pending("B")]);
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B"]);
+
+    // A read that starts after the notice can also run before the update.
+    emit("approval_required", request("C"));
+    await answer(1, [pending("A"), pending("B"), pending("C")]);
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B", "C"]);
   });
 
-  it("reports a stream that closes without a terminal event as lost", () => {
-    const { run, onRunSettled, onStreamLost } = renderWithCallbacks();
+  it("keeps B and drops A when A gets a decision during the read", async () => {
+    const { answer } = heldReads();
+    const decision = vi.spyOn(sessionApi, "resolveApproval").mockResolvedValue(undefined);
+    const { agent, run, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
 
-    run.init();
-    run.closeStream();
+    run.init(true);
+    emit("approval_required", request("B"));
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    expect(decision).toHaveBeenCalledWith("A", "approve", undefined);
+    await answer(0, [pending("A"), pending("B")]);
 
-    expect(onStreamLost).toHaveBeenCalledOnce();
-    expect(onRunSettled).not.toHaveBeenCalled();
+    expect(result.current.approvals.map((row) => [row.approvalId, row.decisionState])).toEqual([["B", "pending"]]);
   });
 
-  it("settles a graph failure that the backend reports with RUN_ERROR", () => {
-    const { run, onRunSettled, onStreamLost } = renderWithCallbacks();
+  it.each([
+    ["a clean end of the turn", (current: ReturnType<typeof useAguiCustomEvents>) => current.clearApprovals()],
+    ["a newer snapshot", (current: ReturnType<typeof useAguiCustomEvents>) =>
+      current.syncServerState({ messages: [], approvals: [pending("C")] })]
+  ])("lets %s outrank an older read", async (_, replace) => {
+    const { answer } = heldReads();
+    const { agent, run, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
 
-    run.init();
-    run.runError();
+    run.init(true);
+    emit("approval_required", request("B"));
+    act(() => replace(result.current));
+    const after = result.current.approvals.map((row) => row.approvalId);
+    await answer(0, [pending("B")]);
 
-    expect(onRunSettled).toHaveBeenCalledOnce();
-    expect(onStreamLost).not.toHaveBeenCalled();
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(after);
+    expect(after).not.toContain("B");
   });
 
-  it("settles a refused request and this tab's abort without a stream loss", () => {
-    const { run, onRunSettled, onStreamLost } = renderWithCallbacks();
+  it("ignores a read of an earlier run", async () => {
+    const { answer } = heldReads();
+    const { agent, run, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
 
-    run.init();
-    run.fail();
-    run.finalize();
-    run.init();
-    run.fail(new DOMException("The operation was aborted.", "AbortError"));
-    run.finalize();
+    run.init(true);
+    emit("approval_required", request("B"));
+    run.init(true);
+    await answer(0, [pending("B")]);
 
-    expect(onRunSettled).toHaveBeenCalledTimes(2);
-    expect(onStreamLost).not.toHaveBeenCalled();
+    expect(result.current.approvals).toEqual([]);
   });
-});
 
-describe("isStreamLossError", () => {
-  it("matches errors from the stream, not refusals or aborts", () => {
-    expect(isStreamLossError(new TypeError("network error"))).toBe(true);
-    expect(isStreamLossError(new Error("Cannot send event type 'TEXT_MESSAGE_CONTENT'"))).toBe(true);
-    expect(isStreamLossError(Object.assign(new Error("HTTP 500"), { status: 500 }))).toBe(false);
-    expect(isStreamLossError(new DOMException("aborted", "AbortError"))).toBe(false);
-    expect(isStreamLossError(new Error("signal is aborted without reason"))).toBe(false);
-    expect(isStreamLossError("component unmounted")).toBe(false);
+  it("ignores a read that returns after a session switch", async () => {
+    const { answer } = heldReads();
+    const first = makeFakeAgent();
+    const second = makeFakeAgent();
+    const { result, rerender } = renderHook(({ agent }) => useAguiCustomEvents(agent), { initialProps: { agent: first.agent } });
+
+    first.run.init(true);
+    first.emit("approval_required", request("B"));
+    rerender({ agent: second.agent });
+    await answer(0, [pending("B")]);
+
+    expect(result.current.approvals).toEqual([]);
   });
 });
 
@@ -679,7 +579,10 @@ describe("useAguiCustomEvents — saved runtime notices", () => {
   it("adds polled notices once, keeps live ones, and does not bring back dismissed ones", () => {
     const { agent, emit } = makeFakeAgent();
     const { result } = renderHook(() => useAguiCustomEvents(agent));
-    const snapshot = (notices: RuntimeNoticeRow[]) => ({ approvals: [], toolStatuses: [], notices });
+    const snapshot = (notices: RuntimeNoticeRow[]) => ({
+      messages: [savedReply({ detail: { runtimeNotices: notices.map(({ noticeId, level, title, message, createdAt }) => ({ noticeId, level, title, message, createdAt })) } })],
+      approvals: []
+    });
 
     emit("runtime_notice", liveNotice("n-1"));
     act(() => result.current.syncServerState(snapshot([notice("n-1", "Saved"), notice("n-2")])));
@@ -694,18 +597,39 @@ describe("useAguiCustomEvents — saved runtime notices", () => {
     emit("runtime_notice", liveNotice("n-2"));
     expect(result.current.notices.map((row) => row.noticeId)).toEqual(["n-3"]);
   });
+});
 
-  it("takes the new session's saved notices when the agent changes", () => {
-    const first = makeFakeAgent();
-    const second = makeFakeAgent();
-    const { result, rerender } = renderHook(
-      ({ agent, seed }) => useAguiCustomEvents(agent, { initialNotices: seed }),
-      { initialProps: { agent: first.agent, seed: [notice("old")] } }
-    );
-    act(() => result.current.dismissStatusRows());
+describe("useAguiCustomEvents — MCP apps", () => {
+  const app = (uri: string) => ({ resourceUri: uri, result: { content: [] } }) as unknown as McpAppCall;
 
-    rerender({ agent: second.agent, seed: [notice("new"), notice("old")] });
+  it("keeps saved apps and adds live and polled ones", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialMcpApps: { "tc-1": app("ui://saved") } }));
 
-    expect(result.current.notices.map((row) => row.noticeId)).toEqual(["new", "old"]);
+    emit("tool_mcp_app", { toolCallId: "tc-2", app: app("ui://live") });
+    act(() => result.current.syncServerState({
+      messages: [savedReply({ toolResults: [savedTool("tc-3", "completed", app("ui://polled"))] })],
+      approvals: []
+    }));
+    expect(Object.keys(result.current.mcpApps)).toEqual(["tc-1", "tc-2", "tc-3"]);
+  });
+});
+
+describe("useAguiCustomEvents — refused sends", () => {
+  const refusal: RuntimeNoticeRow = {
+    type: "runtime-notice", rowId: "notice:send-refused:1", noticeId: "send-refused:1", level: "error",
+    title: "Your message was not sent", message: "Limit", createdAt: "2026-09-22T00:00:00.000Z"
+  };
+
+  it("shows a refusal until the next send, and keeps it while a connection loads", () => {
+    const { agent, run } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
+
+    act(() => result.current.addNotice(refusal));
+    run.init(true);
+    expect(result.current.notices.map((row) => row.noticeId)).toEqual(["send-refused:1"]);
+
+    run.init();
+    expect(result.current.notices).toEqual([]);
   });
 });

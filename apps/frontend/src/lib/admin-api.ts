@@ -1,14 +1,18 @@
 import {
   AdminManagedToolsListResponseSchema,
   AdminMcpServerEnvelopeSchema,
+  AdminMcpConnectionTestResponseSchema,
   AdminModelCatalogResponseSchema,
   CustomModelEnvelopeSchema,
   OpenRouterModelsResponseSchema,
   AdminMcpServersListResponseSchema,
+  AdminMcpWidgetDomainsResponseSchema,
   AdminRuntimeConfigSchema,
   AdminSessionDetailResponseSchema,
   AdminSessionsListResponseSchema,
   AdminSkillEnvelopeSchema,
+  AdminPersonAccessResponseSchema,
+  AdminSkillReleaseImpactResponseSchema,
   AdminSkillsListResponseSchema,
   AdminUserEnvelopeSchema,
   AdminUsersListResponseSchema,
@@ -21,6 +25,7 @@ import {
   PolicyDecisionDetailResponseSchema,
   PolicyDecisionsListResponseSchema,
   PolicyLintResponseSchema,
+  PolicyMonitorSummaryResponseSchema,
   PolicyRuleEnvelopeSchema,
   PolicyRulesListResponseSchema,
   PolicySimulateResponseSchema,
@@ -45,13 +50,19 @@ import { parseResponse } from "./validate-response";
 
 import type {
   AdminMcpServer,
+  AdminMcpConnectionTest,
   AdminMcpServerCreateRequest,
   AdminMcpServerUpdateRequest,
+  AdminMcpWidgetDomainChangeRequest,
+  AdminMcpWidgetDomains,
   AdminRuntimeConfig,
   AdminSessionDetailResponse,
   AdminSessionsListParams,
   AdminSessionsListResponse,
   AdminSkill,
+  AdminPersonAccessResponse,
+  AdminSkillReleaseImpact,
+  AdminSkillReleaseSnapshot,
   AdminUser,
   ApprovalPolicy,
   PiiActivityMetrics,
@@ -68,6 +79,7 @@ import type {
   PolicyDecisionsListResponse,
   PolicyEnforcementMode,
   PolicyLintWarning,
+  PolicyMonitorSummaryResponse,
   PolicyRule,
   PolicyRuleInput,
   PolicyRulePatch,
@@ -95,6 +107,21 @@ export type {
 
 import type { ModelProvider } from "@cogniplane/shared-types";
 
+/**
+ * Build "?a=1&b=x,y" from list filters. Empty strings, empty arrays, null, and
+ * undefined are left out; false and 0 are sent. Arrays are comma-separated, and
+ * the backend splits them back into arrays.
+ */
+function toQueryString(params: Record<string, string | number | boolean | readonly string[] | null | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value == null || value === "" || (Array.isArray(value) && value.length === 0)) continue;
+    search.set(key, Array.isArray(value) ? value.join(",") : String(value));
+  }
+  const qs = search.toString();
+  return qs ? `?${qs}` : "";
+}
+
 export async function listAdminSkills(): Promise<AdminSkill[]> {
   const raw = await request<unknown>("/admin/skills");
   return parseResponse(AdminSkillsListResponseSchema, raw, "GET /admin/skills").skills;
@@ -106,18 +133,28 @@ export async function getSkillMarketplace(): Promise<SkillMarketplaceCatalog> {
     .marketplace;
 }
 
-export async function disableAdminSkill(skillId: string): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/disable`, { method: "POST" });
+export async function previewAdminSkillRelease(skillId: string, input: {
+  action: "activate" | "audience";
+  revisionId: number | null;
+  audience: "off" | "test-users" | "members";
+}): Promise<AdminSkillReleaseImpact> {
+  const path = `/admin/skills/${encodeURIComponent(skillId)}/release-impact`;
+  return parseResponse(AdminSkillReleaseImpactResponseSchema,
+    await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+}
+
+export async function disableAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
+  const raw = await request<unknown>(`/admin/skills/${skillId}/disable`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
   return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/disable").skill;
 }
 
-export async function publishAdminSkill(skillId: string): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/publish`, { method: "POST" });
+export async function publishAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
+  const raw = await request<unknown>(`/admin/skills/${skillId}/publish`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
   return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/publish").skill;
 }
 
-export async function unpublishAdminSkill(skillId: string): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/unpublish`, { method: "POST" });
+export async function unpublishAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
+  const raw = await request<unknown>(`/admin/skills/${skillId}/unpublish`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
   return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/unpublish").skill;
 }
 
@@ -183,12 +220,14 @@ export async function activateSkillRevision(input: {
   skillId: string;
   skillRevisionId: number;
   reviewNotes?: string | null;
+  audience?: "test-users" | "members";
+  expectedSnapshot: AdminSkillReleaseSnapshot;
 }): Promise<SkillImportResponse> {
   const raw = await request<unknown>(
     `/admin/skills/${input.skillId}/revisions/${input.skillRevisionId}/activate`,
     {
       method: "POST",
-      body: JSON.stringify({ reviewNotes: input.reviewNotes ?? null })
+      body: JSON.stringify({ reviewNotes: input.reviewNotes ?? null, audience: input.audience, expectedSnapshot: input.expectedSnapshot })
     }
   );
   return parseResponse(
@@ -201,6 +240,31 @@ export async function activateSkillRevision(input: {
 export async function listAdminMcpServers(): Promise<AdminMcpServer[]> {
   const raw = await request<unknown>("/admin/mcp-servers");
   return parseResponse(AdminMcpServersListResponseSchema, raw, "GET /admin/mcp-servers").mcpServers;
+}
+
+export async function testAdminMcpConnection(serverId: string, input: {
+  expectedVersion: number;
+  expectedConfigHash: string;
+}): Promise<AdminMcpConnectionTest> {
+  const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/connection-test`;
+  const raw = await request<unknown>(path, { method: "POST", body: JSON.stringify(input) });
+  return parseResponse(AdminMcpConnectionTestResponseSchema, raw, `POST ${path}`).connectionTest;
+}
+
+export async function getAdminMcpWidgetDomains(serverId: string): Promise<AdminMcpWidgetDomains> {
+  const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/widget-domains`;
+  const raw = await request<unknown>(path);
+  return parseResponse(AdminMcpWidgetDomainsResponseSchema, raw, `GET ${path}`).widgetDomains;
+}
+
+export async function changeAdminMcpWidgetDomain(
+  serverId: string,
+  action: "approve" | "revoke",
+  input: AdminMcpWidgetDomainChangeRequest
+): Promise<AdminMcpWidgetDomains> {
+  const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/widget-domains/${action}`;
+  const raw = await request<unknown>(path, { method: "POST", body: JSON.stringify(input) });
+  return parseResponse(AdminMcpWidgetDomainsResponseSchema, raw, `POST ${path}`).widgetDomains;
 }
 
 export async function listAdminManagedTools() {
@@ -216,6 +280,35 @@ export async function createAdminMcpServer(
     body: JSON.stringify(input)
   });
   return parseResponse(AdminMcpServerEnvelopeSchema, raw, "POST /admin/mcp-servers").mcpServer;
+}
+
+export type McpAudience = "off" | "test_users" | "members";
+
+export async function saveAdminMcpConnection(
+  input: AdminMcpServerCreateRequest & { audience: McpAudience },
+  editingId: string | null
+): Promise<AdminMcpServer> {
+  const path = editingId
+    ? `/admin/mcp-servers/${encodeURIComponent(editingId)}/setup`
+    : "/admin/mcp-servers/setup";
+  const raw = await request<unknown>(path, {
+    method: editingId ? "PUT" : "POST",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(AdminMcpServerEnvelopeSchema, raw, `${editingId ? "PUT" : "POST"} ${path}`)
+    .mcpServer;
+}
+
+export async function setInheritedAdminMcpAudience(
+  serverId: string,
+  audience: McpAudience
+): Promise<AdminMcpServer> {
+  const raw = await request<unknown>(
+    `/admin/mcp-servers/${encodeURIComponent(serverId)}/inherited-availability`,
+    { method: "PUT", body: JSON.stringify({ audience }) }
+  );
+  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "PUT /admin/mcp-servers/:id/inherited-availability")
+    .mcpServer;
 }
 
 export async function updateAdminMcpServer(
@@ -250,19 +343,7 @@ export async function unpublishAdminMcpServer(serverId: string): Promise<AdminMc
 export async function listAdminSessions(
   params: AdminSessionsListParams = {}
 ): Promise<AdminSessionsListResponse> {
-  const search = new URLSearchParams();
-  if (params.userId) search.set("userId", params.userId);
-  if (params.from) search.set("from", params.from);
-  if (params.to) search.set("to", params.to);
-  if (params.status) search.set("status", params.status);
-  if (params.alert && params.alert.length > 0) {
-    search.set("alert", params.alert.join(","));
-  }
-  if (params.cursor) search.set("cursor", params.cursor);
-  if (params.limit != null) search.set("limit", String(params.limit));
-
-  const qs = search.toString();
-  const raw = await request<unknown>(`/admin/sessions${qs ? `?${qs}` : ""}`);
+  const raw = await request<unknown>(`/admin/sessions${toQueryString(params)}`);
   return parseResponse(AdminSessionsListResponseSchema, raw, "GET /admin/sessions");
 }
 
@@ -298,6 +379,37 @@ export async function setUserBetaTester(
     body: JSON.stringify({ isBetaTester })
   });
   return parseResponse(AdminUserEnvelopeSchema, raw, "POST /admin/users/:id/set-beta-tester").user;
+}
+
+/**
+ * Organization skills and connections for one member's new standalone chat.
+ * The result must name the requested tenant and member; a mismatch is an
+ * error, so a stale or misrouted response never shows as this person's access.
+ */
+export async function getAdminPersonAccess(
+  userId: string,
+  expected: { tenantId: string }
+): Promise<AdminPersonAccessResponse> {
+  const path = `/admin/users/${encodeURIComponent(userId)}/skills-connections`;
+  const result = parseResponse(AdminPersonAccessResponseSchema, await request<unknown>(path), "GET /admin/users/:id/skills-connections");
+  if (result.userId !== userId || result.tenantId !== expected.tenantId) {
+    throw new Error("The server returned a result for a different person or organization.");
+  }
+  return result;
+}
+
+// Member role and removal live on the tenant routes. The backend enforces who
+// may change what (apps/backend/src/routes/tenant.ts); callers show only the
+// permitted actions and map the error codes for the rest.
+export async function changeMemberRole(userId: string, role: AdminUser["role"]): Promise<void> {
+  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}/role`, {
+    method: "PUT",
+    body: JSON.stringify({ role })
+  });
+}
+
+export async function removeMember(userId: string): Promise<void> {
+  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
 }
 
 export async function getTenantSettings(): Promise<TenantSettings> {
@@ -338,9 +450,12 @@ export async function deleteCustomModel(modelId: string): Promise<TenantSettings
  * concurrent edits to the broader Agent Settings form.
  */
 export async function updateTenantModelAvailability(input: {
+  expectedVersion: number;
   enabledProviders?: ModelProvider[];
   enabledModelIds?: string[] | null;
+  defaultModelId?: string | null;
   modelDefaultEfforts?: Record<string, EffortLevel>;
+  showEffortSelector?: boolean;
 }): Promise<TenantSettings> {
   const raw = await request<unknown>("/admin/tenant-settings", {
     method: "PUT",
@@ -351,6 +466,7 @@ export async function updateTenantModelAvailability(input: {
 
 export async function updateTenantAgentSettings(input: {
   expectedVersion: number;
+} & Partial<{
   showEffortSelector: boolean;
   webSearchMode: WebSearchMode;
   approvalPolicy: ApprovalPolicy;
@@ -361,7 +477,8 @@ export async function updateTenantAgentSettings(input: {
   developerInstructions: string | null;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
-}): Promise<TenantSettings> {
+  approvedSandboxEgressDomains: string[];
+}>): Promise<TenantSettings> {
   const raw = await request<unknown>("/admin/tenant-settings", {
     method: "PUT",
     body: JSON.stringify(input)
@@ -386,6 +503,19 @@ export async function rolloutRuntimeSessions(action: "drain_idle" | "refresh_idl
 export async function getRuntimeConfig(): Promise<AdminRuntimeConfig> {
   const raw = await request<unknown>("/admin/runtime-config");
   return parseResponse(AdminRuntimeConfigSchema, raw, "GET /admin/runtime-config");
+}
+
+export type BackendBuild = { sha: string; buildDate: string };
+
+/** The backend build, from the admin-only diagnostics. The public health
+ *  check does not report it. */
+export async function getBackendBuild(): Promise<BackendBuild> {
+  const raw = await request<unknown>("/admin/diagnostics");
+  const version = (raw as { version?: Partial<BackendBuild> } | null)?.version;
+  if (typeof version?.sha !== "string" || typeof version.buildDate !== "string") {
+    throw new Error("GET /admin/diagnostics returned no build.");
+  }
+  return { sha: version.sha, buildDate: version.buildDate };
 }
 
 export async function getTenantDetails(): Promise<TenantDetails> {
@@ -552,26 +682,30 @@ export async function simulatePolicy(input: PolicySimulateRequest): Promise<Poli
 // as comma-separated query values (the backend splits them back into arrays).
 export type PolicyDecisionsListParams = Pick<
   PolicyDecisionFilters,
-  "sessionId" | "outcomes" | "enforced" | "toolNames" | "severities" | "from" | "to" | "before" | "limit" | "offset"
+  | "sessionId"
+  | "matchedRuleId"
+  | "evidence"
+  | "outcomes"
+  | "enforced"
+  | "toolNames"
+  | "severities"
+  | "from"
+  | "to"
+  | "before"
+  | "limit"
+  | "offset"
 >;
 
 export async function listPolicyDecisions(
   params: PolicyDecisionsListParams = {}
 ): Promise<PolicyDecisionsListResponse> {
-  const search = new URLSearchParams();
-  if (params.sessionId) search.set("sessionId", params.sessionId);
-  if (params.outcomes?.length) search.set("outcomes", params.outcomes.join(","));
-  if (params.enforced !== undefined) search.set("enforced", String(params.enforced));
-  if (params.toolNames?.length) search.set("toolNames", params.toolNames.join(","));
-  if (params.severities?.length) search.set("severities", params.severities.join(","));
-  if (params.from) search.set("from", params.from);
-  if (params.to) search.set("to", params.to);
-  if (params.before) search.set("before", params.before);
-  if (params.limit !== undefined) search.set("limit", String(params.limit));
-  if (params.offset !== undefined) search.set("offset", String(params.offset));
-  const qs = search.toString();
-  const raw = await request<unknown>(`/admin/policy/decisions${qs ? `?${qs}` : ""}`);
+  const raw = await request<unknown>(`/admin/policy/decisions${toQueryString(params)}`);
   return parseResponse(PolicyDecisionsListResponseSchema, raw, "GET /admin/policy/decisions");
+}
+
+export async function getPolicyMonitorSummary(): Promise<PolicyMonitorSummaryResponse> {
+  const raw = await request<unknown>("/admin/policy/monitor-summary");
+  return parseResponse(PolicyMonitorSummaryResponseSchema, raw, "GET /admin/policy/monitor-summary");
 }
 
 export async function getPolicyDecision(decisionId: string): Promise<PolicyDecisionDetail> {

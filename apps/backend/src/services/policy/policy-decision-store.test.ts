@@ -1,6 +1,10 @@
 import { test, expect } from "vitest";
 
-import { POLICY_DECISIONS_MAX_LIMIT, POLICY_DECISIONS_PAGE_SIZE } from "@cogniplane/shared-types";
+import {
+  POLICY_DECISIONS_MAX_LIMIT,
+  POLICY_DECISIONS_PAGE_SIZE,
+  type PolicyDecisionFilters
+} from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 
@@ -52,7 +56,9 @@ class InMemoryDecisionDatabase {
         enforced: params[11],
         explanation: params[12],
         action_snapshot_json: JSON.parse(String(params[13])),
-        created_at: now
+        created_at: now,
+        // The store selects created_at as UTC ISO text with microseconds.
+        created_at_iso: now.replace("Z", "000Z")
       };
       this.rows.push(row);
       return { rows: [row], rowCount: 1 };
@@ -62,12 +68,12 @@ class InMemoryDecisionDatabase {
       return { rows: [{ total: this.rows.length }], rowCount: 1 };
     }
 
-    if (sql.includes("SELECT * FROM policy_decision") && sql.includes("decision_id = $2")) {
+    if (sql.includes("FROM policy_decision WHERE") && sql.includes("decision_id = $2")) {
       const row = this.rows.find((r) => r.tenant_id === params[0] && r.decision_id === params[1]);
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
 
-    if (sql.includes("SELECT * FROM policy_decision")) {
+    if (sql.includes("FROM policy_decision WHERE")) {
       // page query — capture the LIMIT/OFFSET (last two params) for assertions
       this.lastPageSql = sql;
       this.lastPageParams = params;
@@ -151,6 +157,15 @@ test("list short-circuits an inverted date range without querying", async () => 
   expect(db.lastPageSql).toBe("");
 });
 
+test("list queries a range whose from time is on the same day as a date-only to", async () => {
+  const { db, store } = makeStore();
+  await store.record("t1", baseInput());
+  db.lastPageSql = "";
+  // `to` is a whole day (exclusive end the next day), so this range is not empty.
+  await store.list("t1", { from: "2026-10-13T15:30:00.000Z", to: "2026-10-13" });
+  expect(db.lastPageSql).not.toBe("");
+});
+
 test("list builds filter predicates for outcomes, tool names and severities", async () => {
   const { db, store } = makeStore();
   await store.record("t1", baseInput());
@@ -166,6 +181,38 @@ test("list builds filter predicates for outcomes, tool names and severities", as
   expect(db.lastPageSql).toContain("severity = ANY");
   expect(db.lastPageSql).toContain("enforced =");
   expect(db.lastPageSql).toContain("session_id =");
+});
+
+test("record and list return createdAt with the microseconds that the query selects", async () => {
+  const { store } = makeStore();
+  const recorded = await store.record("t1", baseInput());
+  expect(recorded.createdAt).toBe("2026-05-31T00:00:00.000000Z");
+  expect((await store.list("t1")).decisions[0]?.createdAt).toBe(recorded.createdAt);
+});
+
+// Real PostgreSQL rows with these bounds: policy-decision-paging.integration.test.ts.
+test("list keeps the microseconds of ISO from and before bounds in UTC", async () => {
+  const { db, store } = makeStore();
+  const bounds = async (filters: PolicyDecisionFilters) => {
+    await store.list("t1", filters);
+    // Drop the tenant ID and the trailing LIMIT/OFFSET.
+    return db.lastPageParams.slice(1, -2);
+  };
+  expect(await bounds({ before: "2026-09-26T12:00:00.123456Z" })).toEqual(["2026-09-26T12:00:00.123456Z"]);
+  expect(await bounds({ before: "2026-09-26T14:00:00.123456+02:00" })).toEqual(["2026-09-26T12:00:00.123456Z"]);
+  expect(await bounds({ before: "2026-09-26T12:00:00.1234Z" })).toEqual(["2026-09-26T12:00:00.123400Z"]);
+  // timestamptz stores microseconds. Digits after the sixth are ignored.
+  expect(await bounds({ before: "2026-09-26T12:00:00.1234569Z" })).toEqual(["2026-09-26T12:00:00.123456Z"]);
+  // A monitor summary window keeps its millisecond form.
+  expect(await bounds({ from: "2026-09-20T12:00:00.000Z", before: "2026-09-27T12:00:00.000Z" })).toEqual([
+    "2026-09-20T12:00:00.000Z",
+    "2026-09-27T12:00:00.000Z"
+  ]);
+  expect(await bounds({ from: "2026-09-20T11:59:59.999999Z" })).toEqual(["2026-09-20T11:59:59.999999Z"]);
+  expect(await bounds({ from: "2026-09-20" })).toEqual(["2026-09-20T00:00:00.000Z"]);
+  // An unparseable bound adds no condition, as before.
+  expect(await bounds({ before: "not-a-date" })).toEqual([]);
+  expect(db.lastPageSql).not.toContain("created_at <=");
 });
 
 test("get re-redacts secrets in the action snapshot on read", async () => {
@@ -185,4 +232,82 @@ test("get re-redacts secrets in the action snapshot on read", async () => {
 test("get returns null for a missing decision", async () => {
   const { store } = makeStore();
   expect(await store.get("t1", "pdc_missing")).toBe(null);
+});
+
+// A fake that answers only the two summary queries, to check the mapping. The
+// SQL itself runs against real Postgres in policy-monitor-summary.integration.test.ts.
+function makeSummaryStore(groupRows: Record<string, unknown>[], excludedRow: Record<string, unknown>) {
+  const calls: Array<{ sql: string; params: unknown[] }> = [];
+  const query = async (sql: string, params: unknown[] = []) => {
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.startsWith("SELECT set_config")) {
+      return { rows: [], rowCount: 0 };
+    }
+    calls.push({ sql, params });
+    return sql.includes("GROUP BY")
+      ? { rows: groupRows, rowCount: groupRows.length }
+      : { rows: [excludedRow], rowCount: 1 };
+  };
+  const db = { connect: async () => ({ query, release: () => {} }), query };
+  return { calls, store: new PolicyDecisionStore(db as unknown as Pool) };
+}
+
+test("summarizeMonitor maps grouped rows, sums totals, and keeps deleted rules", async () => {
+  const { calls, store } = makeSummaryStore(
+    [
+      {
+        matched_rule_id: "pol_a",
+        block_count: "2",
+        approval_interactive_count: "1",
+        approval_scheduled_count: "1",
+        approval_unknown_count: "0",
+        total_count: "4",
+        last_recorded_at: new Date("2026-09-26T10:00:00.000Z"),
+        current_rule_id: "pol_a",
+        current_name: "Block writes",
+        current_enabled: false,
+        current_effect: "block"
+      },
+      {
+        matched_rule_id: "pol_gone",
+        block_count: "0",
+        approval_interactive_count: "0",
+        approval_scheduled_count: "0",
+        approval_unknown_count: "1",
+        total_count: "1",
+        last_recorded_at: "2026-09-25T10:00:00.000Z",
+        current_rule_id: null,
+        current_name: null,
+        current_enabled: null,
+        current_effect: null
+      }
+    ],
+    { resource_checks: "3", unrecognized: "1" }
+  );
+
+  const summary = await store.summarizeMonitor("t1", new Date("2026-09-27T12:00:00.000Z"));
+
+  expect(summary).toEqual({
+    windowStart: "2026-09-20T12:00:00.000Z",
+    windowEnd: "2026-09-27T12:00:00.000Z",
+    totals: { block: 2, approvalInteractive: 1, approvalScheduled: 1, approvalUnknownContext: 1, total: 5 },
+    rules: [
+      {
+        ruleId: "pol_a",
+        currentRule: { name: "Block writes", enabled: false, effect: "block" },
+        counts: { block: 2, approvalInteractive: 1, approvalScheduled: 1, approvalUnknownContext: 0, total: 4 },
+        lastRecordedAt: "2026-09-26T10:00:00.000Z"
+      },
+      {
+        ruleId: "pol_gone",
+        currentRule: null,
+        counts: { block: 0, approvalInteractive: 0, approvalScheduled: 0, approvalUnknownContext: 1, total: 1 },
+        lastRecordedAt: "2026-09-25T10:00:00.000Z"
+      }
+    ],
+    excluded: { resourceChecks: 3, unrecognized: 1 }
+  });
+  // Both queries are tenant-scoped and use the same exact window.
+  for (const call of calls) {
+    expect(call.params.slice(0, 3)).toEqual(["t1", "2026-09-20T12:00:00.000Z", "2026-09-27T12:00:00.000Z"]);
+  }
 });

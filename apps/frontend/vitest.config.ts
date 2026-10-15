@@ -41,6 +41,10 @@ export default defineConfig({
     environment: "node",
     globals: false,
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    // @copilotkit/react-core/v2 imports a .css file from its dist. Node cannot
+    // load that file when Vitest externalizes the package, so Vite processes
+    // the package and its CSS import instead.
+    server: { deps: { inline: [/@copilotkit\//] } },
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "json-summary"],

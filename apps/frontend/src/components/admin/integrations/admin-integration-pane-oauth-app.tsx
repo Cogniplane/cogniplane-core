@@ -13,37 +13,25 @@ const PASSWORD_PLACEHOLDER = "••••••••";
 type Props = {
   integration: AdminIntegrationView;
   busy: boolean;
+  error: string | null;
   onSave: (config: Record<string, string>) => Promise<void>;
   onClear: () => Promise<void>;
 };
 
-function emptyValuesFor(fields: readonly IntegrationConfigField[]): Record<string, string> {
-  return Object.fromEntries(fields.map((f) => [f.key, ""]));
+/** Form values from the saved summary. Secrets are never echoed back, so passwords start empty. */
+function savedValuesFor(fields: readonly IntegrationConfigField[], summary: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(fields.map((f) => [f.key, f.type === "password" ? "" : summary[f.key] || ""]));
 }
 
 export function AdminIntegrationPaneOauthApp(props: Props) {
-  const { integration, busy, onSave, onClear } = props;
+  const { integration, busy, error, onSave, onClear } = props;
   const fields = useMemo(() => integration.configFields ?? [], [integration.configFields]);
-  const [values, setValues] = useState<Record<string, string>>(() => {
-    const initial = emptyValuesFor(fields);
-    for (const field of fields) {
-      if (field.type === "password") continue;
-      const summary = integration.configSummary[field.key];
-      if (summary) initial[field.key] = summary;
-    }
-    return initial;
-  });
+  const [values, setValues] = useState(() => savedValuesFor(fields, integration.configSummary));
 
   useEffect(() => {
-    const next = emptyValuesFor(fields);
-    for (const field of fields) {
-      if (field.type === "password") continue;
-      const summary = integration.configSummary[field.key];
-      if (summary) next[field.key] = summary;
-    }
     // Resync the form draft when the integration row changes (e.g., after save).
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setValues(next);
+    setValues(savedValuesFor(fields, integration.configSummary));
   }, [integration.id, integration.updatedAt, integration.configSummary, fields]);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -109,6 +97,8 @@ export function AdminIntegrationPaneOauthApp(props: Props) {
           </div>
         );
       })}
+
+      {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
 
       <div className="flex flex-wrap items-center gap-2">
         <Button type="submit" disabled={busy}>

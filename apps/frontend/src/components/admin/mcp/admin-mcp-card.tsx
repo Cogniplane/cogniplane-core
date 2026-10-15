@@ -1,10 +1,9 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 
 import type { AdminMcpServer } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -15,7 +14,11 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { PILL_GRAY, PILL_GREEN, LIST_ITEM, SECTION_LABEL } from "../../../lib/ui-tokens";
+import { useAuth } from "@/lib/auth-context";
+import { DisclosureRow } from "../overview-row";
+import type { McpAudience } from "../../../lib/admin-api";
+import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings } from "./admin-mcp-card.logic";
+import { AdminMcpConnectionTestCard, reachabilityLabel } from "./admin-mcp-connection-test";
 
 const CHIP =
   "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
@@ -28,27 +31,54 @@ type McpDraft = {
   routePath: string;
   upstreamUrl: string;
   upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+  credentialScope: "organization" | "personal";
   upstreamAuthName: string;
   upstreamAuthSecret: string;
-  enabled: boolean;
+  audience: McpAudience;
+  customId: boolean;
+  customRoute: boolean;
 };
 
 const emptyMcpDraft: McpDraft = {
   serverId: "",
   serverName: "",
   description: "",
-  mode: "managed",
+  mode: "proxy",
   routePath: "/mcp/",
   upstreamUrl: "",
   upstreamAuthType: "none",
+  credentialScope: "organization",
   upstreamAuthName: "",
   upstreamAuthSecret: "",
-  enabled: true
+  audience: "off",
+  customId: false,
+  customRoute: false
 };
 
+function draftForServer(server: AdminMcpServer): McpDraft {
+  return {
+    serverId: server.serverId,
+    serverName: server.serverName,
+    description: server.description ?? "",
+    mode: server.mode,
+    routePath: server.routePath,
+    upstreamUrl: server.upstreamUrl ?? "",
+    upstreamAuthType: server.upstreamAuthType,
+    credentialScope: server.credentialScope ?? "organization",
+    upstreamAuthName: server.upstreamAuthName ?? "",
+    upstreamAuthSecret: "",
+    audience: getMcpAvailability(server).audience,
+    customId: true,
+    customRoute: true
+  };
+}
+
 export function AdminMcpCard(props: {
+  targetServerId?: string | null;
   mcpServers: AdminMcpServer[];
+  listGeneration?: number;
   busyKey: string | null;
+  saveError?: string | null;
   onSubmit: (
     input: {
       serverId: string;
@@ -58,19 +88,31 @@ export function AdminMcpCard(props: {
       routePath: string;
       upstreamUrl: string | null;
       upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+      credentialScope: "organization" | "personal";
       upstreamAuthName: string | null;
       upstreamAuthSecret?: string | null;
-      enabled: boolean;
+      audience: McpAudience;
     },
     editingId: string | null
   ) => Promise<void>;
-  onDisable: (serverId: string) => void;
-  onPublish: (serverId: string) => void;
-  onUnpublish: (serverId: string) => void;
+  onSetInheritedAudience: (serverId: string, audience: McpAudience) => Promise<void>;
+  onTested?: () => void;
+  onReload?: () => void;
+  /** More content for the open row of a connection. `open` is true while its row is open. */
+  renderServerExtras?: (server: AdminMcpServer, open: boolean) => ReactNode;
 }) {
-  const [mcpDraft, setMcpDraft] = useState<McpDraft>(emptyMcpDraft);
-  const [editingMcpServerId, setEditingMcpServerId] = useState<string | null>(null);
-  const [showForm, setShowForm] = useState(false);
+  const targetServer = props.mcpServers.find((server) => server.serverId === props.targetServerId);
+  const [mcpDraft, setMcpDraft] = useState<McpDraft>(() => targetServer ? draftForServer(targetServer) : emptyMcpDraft);
+  const [editingMcpServerId, setEditingMcpServerId] = useState<string | null>(targetServer?.serverId ?? null);
+  const [showForm, setShowForm] = useState(Boolean(targetServer));
+  // The open row. It stays open after a save, so the admin can test the saved version.
+  const [expandedId, setExpandedId] = useState<string | null>(targetServer?.serverId ?? null);
+  const { user } = useAuth();
+  const upstreamWarnings = getMcpUpstreamWarnings(mcpDraft.upstreamUrl);
+  const formRef = useRef<HTMLFormElement>(null);
+  const inheritedServer = props.mcpServers.find((server) =>
+    server.serverId === editingMcpServerId && server.ownerTenantId === "system"
+  );
 
   function handleCancel() {
     setShowForm(false);
@@ -80,46 +122,48 @@ export function AdminMcpCard(props: {
 
   function handleEdit(server: AdminMcpServer) {
     setEditingMcpServerId(server.serverId);
-    setMcpDraft({
-      serverId: server.serverId,
-      serverName: server.serverName,
-      description: server.description ?? "",
-      mode: server.mode,
-      routePath: server.routePath,
-      upstreamUrl: server.upstreamUrl ?? "",
-      upstreamAuthType: server.upstreamAuthType,
-      upstreamAuthName: server.upstreamAuthName ?? "",
-      upstreamAuthSecret: "",
-      enabled: server.enabled
-    });
+    setMcpDraft(draftForServer(server));
     setShowForm(true);
   }
+
+  useEffect(() => {
+    if (showForm && editingMcpServerId === props.targetServerId) {
+      formRef.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+      formRef.current?.focus();
+    }
+  }, [showForm, editingMcpServerId, props.targetServerId]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     try {
-      await props.onSubmit(
+      if (inheritedServer) {
+        await props.onSetInheritedAudience(inheritedServer.serverId, mcpDraft.audience);
+      } else {
+        await props.onSubmit(
         {
           serverId: mcpDraft.serverId,
           serverName: mcpDraft.serverName,
           description: mcpDraft.description || null,
           mode: mcpDraft.mode,
           routePath: mcpDraft.routePath,
-          upstreamUrl: mcpDraft.upstreamUrl || null,
+          upstreamUrl: mcpDraft.mode === "proxy" ? mcpDraft.upstreamUrl || null : null,
           upstreamAuthType: mcpDraft.mode === "proxy" ? mcpDraft.upstreamAuthType : "none",
+          credentialScope: mcpDraft.mode === "proxy" ? mcpDraft.credentialScope : "organization",
           upstreamAuthName:
             mcpDraft.mode === "proxy" &&
             (mcpDraft.upstreamAuthType === "header" || mcpDraft.upstreamAuthType === "query")
               ? mcpDraft.upstreamAuthName || null
               : null,
           upstreamAuthSecret:
-            mcpDraft.mode !== "proxy" || mcpDraft.upstreamAuthType === "none"
+            mcpDraft.mode !== "proxy" || mcpDraft.credentialScope === "personal" || mcpDraft.upstreamAuthType === "none"
               ? null
               : mcpDraft.upstreamAuthSecret || (editingMcpServerId ? undefined : null),
-          enabled: mcpDraft.enabled
+          audience: mcpDraft.audience
         },
         editingMcpServerId
-      );
+        );
+      }
+      setExpandedId(inheritedServer?.serverId ?? mcpDraft.serverId);
       setEditingMcpServerId(null);
       setMcpDraft(emptyMcpDraft);
       setShowForm(false);
@@ -128,63 +172,53 @@ export function AdminMcpCard(props: {
     }
   }
 
-  return (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <p className={SECTION_LABEL}>Gateway</p>
-            <h2 className="text-lg font-semibold text-on-surface">MCP infrastructure</h2>
-            <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-              Register managed or proxied servers, set path routing, and keep inbound headers
-              under explicit control.
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className={PILL_GRAY}>{props.mcpServers.length} total</span>
-            <span className={PILL_GRAY}>
-              {props.mcpServers.filter((s) => s.enabled).length} enabled
-            </span>
-            <Button
-              type="button"
-              onClick={() => {
-                setShowForm((v) => !v);
-                setEditingMcpServerId(null);
-                setMcpDraft(emptyMcpDraft);
-              }}
-            >
-              {showForm && !editingMcpServerId ? "Cancel" : "New server"}
-            </Button>
-          </div>
-        </div>
-      </CardHeader>
-
-      <CardContent className="flex flex-col gap-4">
-        {showForm ? (
+  const form = showForm ? (
           <form
+            ref={formRef}
+            tabIndex={-1}
+            aria-label={editingMcpServerId ? `Manage ${mcpDraft.serverName}` : "Add connection"}
             onSubmit={(event) => void handleSubmit(event)}
             className="flex flex-col gap-4 rounded-lg border border-outline-variant bg-surface-container-low p-4"
           >
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-server-id">Server ID</Label>
-                <Input
-                  id="mcp-server-id"
-                  value={mcpDraft.serverId}
-                  onChange={(e) => setMcpDraft((c) => ({ ...c, serverId: e.target.value }))}
-                  placeholder="server-id"
-                  disabled={Boolean(editingMcpServerId)}
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-server-name">Server name</Label>
+                <Label htmlFor="mcp-server-name">Name</Label>
                 <Input
                   id="mcp-server-name"
                   value={mcpDraft.serverName}
-                  onChange={(e) => setMcpDraft((c) => ({ ...c, serverName: e.target.value }))}
-                  placeholder="Server name"
+                  readOnly={Boolean(inheritedServer)}
+                  onChange={(e) => setMcpDraft((current) => {
+                    const serverName = e.target.value;
+                    const serverId = current.customId
+                      ? current.serverId
+                      : deriveMcpServerId(serverName, props.mcpServers.map((server) => server.serverId));
+                    return {
+                      ...current,
+                      serverName,
+                      serverId,
+                      routePath: current.customRoute ? current.routePath : `/mcp/${serverId}`
+                    };
+                  })}
+                  placeholder="Research database"
+                  required
                 />
               </div>
+              {mcpDraft.mode === "proxy" ? (
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="mcp-upstream">URL</Label>
+                  <Input
+                    id="mcp-upstream"
+                    type="url"
+                    value={mcpDraft.upstreamUrl}
+                    onChange={(e) => setMcpDraft((c) => ({ ...c, upstreamUrl: e.target.value }))}
+                    placeholder="https://example.com/mcp"
+                    required
+                    readOnly={Boolean(inheritedServer)}
+                  />
+                  {upstreamWarnings.http ? <p role="status" className="text-sm text-warning">HTTP sends requests without encryption and can expose credentials.</p> : null}
+                  {upstreamWarnings.privateNetwork ? <p role="status" className="text-sm text-warning">This address appears to be on a local or shared network. The backend will send requests to it.</p> : null}
+                </div>
+              ) : null}
             </div>
 
             <div className="flex flex-col gap-1.5">
@@ -195,14 +229,28 @@ export function AdminMcpCard(props: {
                 onChange={(e) => setMcpDraft((c) => ({ ...c, description: e.target.value }))}
                 placeholder="What capability boundary does this server expose?"
                 rows={2}
+                readOnly={Boolean(inheritedServer)}
               />
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <details className="rounded-md border border-outline-variant p-3">
+              <summary className="cursor-pointer text-sm font-medium text-on-surface">Advanced settings</summary>
+              <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="mcp-server-id">Server ID</Label>
+                  <Input
+                    id="mcp-server-id"
+                    value={mcpDraft.serverId}
+                    onChange={(e) => setMcpDraft((c) => ({ ...c, serverId: e.target.value, customId: true, routePath: c.customRoute ? c.routePath : `/mcp/${e.target.value}` }))}
+                    disabled={Boolean(editingMcpServerId)}
+                    required
+                  />
+                </div>
               <div className="flex flex-col gap-1.5">
                 <Label htmlFor="mcp-mode">Mode</Label>
                 <Select
                   value={mcpDraft.mode}
+                  disabled={Boolean(inheritedServer)}
                   onValueChange={(v) =>
                     setMcpDraft((c) => ({ ...c, mode: v as McpDraft["mode"] }))
                   }
@@ -222,24 +270,24 @@ export function AdminMcpCard(props: {
                 <Input
                   id="mcp-route"
                   value={mcpDraft.routePath}
-                  onChange={(e) => setMcpDraft((c) => ({ ...c, routePath: e.target.value }))}
+                  onChange={(e) => setMcpDraft((c) => ({ ...c, routePath: e.target.value, customRoute: true }))}
                   placeholder="/mcp/example"
-                />
-              </div>
-
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="mcp-upstream">Upstream URL</Label>
-                <Input
-                  id="mcp-upstream"
-                  value={mcpDraft.upstreamUrl}
-                  onChange={(e) => setMcpDraft((c) => ({ ...c, upstreamUrl: e.target.value }))}
-                  placeholder="https://example.com/mcp"
+                  required
+                  readOnly={Boolean(inheritedServer)}
                 />
               </div>
             </div>
+            </details>
 
-            {mcpDraft.mode === "proxy" ? (
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            {mcpDraft.mode === "proxy" && !inheritedServer ? (
+              <div className="space-y-4">
+                <fieldset className="space-y-2">
+                  <legend className="text-sm font-medium">Account for this connection</legend>
+                  <label className="flex items-center gap-2 text-sm"><input type="radio" name="mcp-credential-scope" checked={mcpDraft.credentialScope === "organization"} onChange={() => setMcpDraft((current) => ({ ...current, credentialScope: "organization", upstreamAuthSecret: "" }))} />Organization account</label>
+                  <label className="flex items-center gap-2 text-sm"><input type="radio" name="mcp-credential-scope" checked={mcpDraft.credentialScope === "personal"} onChange={() => setMcpDraft((current) => ({ ...current, credentialScope: "personal", upstreamAuthSecret: "" }))} />Each member connects</label>
+                  <p className="text-xs text-on-surface-variant">Members use their own credentials when this connection is available to them. Changing the URL or authentication method requires members to reconnect.</p>
+                </fieldset>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div className="flex flex-col gap-1.5">
                   <Label htmlFor="mcp-upstream-auth-type">Upstream authentication</Label>
                   <Select
@@ -288,7 +336,7 @@ export function AdminMcpCard(props: {
                   </div>
                 ) : null}
 
-                {mcpDraft.upstreamAuthType !== "none" ? (
+                {mcpDraft.credentialScope === "organization" && mcpDraft.upstreamAuthType !== "none" ? (
                   <div className="flex flex-col gap-1.5">
                     <Label htmlFor="mcp-upstream-auth-secret">Secret</Label>
                     <Input
@@ -310,114 +358,106 @@ export function AdminMcpCard(props: {
                     />
                   </div>
                 ) : null}
+                </div>
+                {mcpDraft.credentialScope === "personal" && mcpDraft.upstreamAuthType === "none" ? <p role="alert" className="text-sm text-danger">Choose bearer token, header, or query authentication so each member can connect.</p> : null}
               </div>
             ) : null}
 
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <label className="inline-flex items-center gap-2 text-sm text-on-surface">
-                <input
-                  type="checkbox"
-                  checked={mcpDraft.enabled}
-                  onChange={(e) =>
-                    setMcpDraft((c) => ({ ...c, enabled: e.target.checked }))
-                  }
-                  className="size-4 rounded border-outline-variant accent-primary"
-                />
-                <span>Enabled</span>
-              </label>
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="mcp-audience">Availability</Label>
+                <Select value={mcpDraft.audience} onValueChange={(value) => setMcpDraft((current) => ({ ...current, audience: value as McpAudience }))}>
+                  <SelectTrigger id="mcp-audience" className="w-56"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="off">Off</SelectItem>
+                    {!inheritedServer || !inheritedServer.isPublished ? <SelectItem value="test_users">Test users</SelectItem> : null}
+                    {!inheritedServer || inheritedServer.isPublished ? <SelectItem value="members">All members</SelectItem> : null}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-on-surface-variant">
+                  {inheritedServer
+                    ? "This built-in connection is managed by the system. You can change its tenant availability."
+                    : "Test users can use this before it is available to all members."}
+                </p>
+              </div>
 
               <div className="flex flex-wrap items-center gap-2">
                 <Button type="button" variant="ghost" onClick={handleCancel}>
                   Cancel
                 </Button>
-                <Button type="submit" disabled={props.busyKey === "mcp"}>
-                  {editingMcpServerId ? "Update server" : "Create server"}
+                <Button type="submit" disabled={props.busyKey === "mcp" || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "personal" && mcpDraft.upstreamAuthType === "none") || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "organization" && mcpDraft.upstreamAuthType !== "none" && !mcpDraft.upstreamAuthSecret && (!editingMcpServerId || props.mcpServers.find((server) => server.serverId === editingMcpServerId)?.credentialScope === "personal"))}>
+                  {inheritedServer ? "Save availability" : editingMcpServerId ? "Save connection" : "Add connection"}
                 </Button>
               </div>
             </div>
+            {props.saveError ? <p role="alert" className="text-sm text-danger">{props.saveError}</p> : null}
           </form>
-        ) : null}
+  ) : null;
+  const targetMissing = Boolean(props.targetServerId) && !props.mcpServers.some((server) => server.serverId === props.targetServerId);
 
-        <div className="flex flex-col gap-2">
-          {props.mcpServers.map((server) => (
-            <div className={`${LIST_ITEM} flex flex-col gap-3 sm:flex-row sm:justify-between`} key={server.serverId}>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <strong className="text-sm font-semibold text-on-surface">
-                    {server.serverName}
-                  </strong>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className={PILL_GRAY}>{server.mode}</span>
-                    <span className={server.enabled ? PILL_GREEN : PILL_GRAY}>
-                      {server.enabled ? "enabled" : "disabled"}
-                    </span>
-                    <span className={server.isPublished ? PILL_GREEN : PILL_GRAY}>
-                      {server.isPublished ? "published" : "draft"}
-                    </span>
-                    <span
-                      className={PILL_GRAY}
-                      title="Distinct sessions in the last 30 days where this MCP server received a JSON-RPC tool call."
-                    >
-                      Used {server.invokedSessions30d ?? 0}
-                    </span>
-                    <span
-                      className={PILL_GRAY}
-                      title="Distinct sessions in the last 30 days where this MCP server was offered to the agent (regardless of whether it was used)."
-                    >
-                      Available {server.materializedSessions30d ?? 0}
-                    </span>
-                  </div>
-                </div>
-                <p className="mt-1 text-xs text-on-surface-faint">
-                  {server.serverId} · route {server.routePath} · v{server.version}
-                </p>
-                <p className="mt-1 text-sm text-on-surface-variant">
-                  {server.description ?? "No description"}
-                </p>
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <span className={CHIP}>transport {server.transportKind}</span>
-                  {server.upstreamUrl ? <span className={CHIP}>proxy upstream</span> : null}
-                  {server.upstreamAuthConfigured ? (
-                    <span className={CHIP}>auth {server.upstreamAuthType}</span>
-                  ) : null}
-                </div>
+  return (
+    <section aria-labelledby="mcp-heading">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="mcp-heading" className="text-lg font-semibold text-on-surface">MCP connections</h2>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-expanded={showForm && !editingMcpServerId}
+          aria-controls="mcp-add-form"
+          onClick={() => {
+            setShowForm(!(showForm && !editingMcpServerId));
+            setEditingMcpServerId(null);
+            setMcpDraft(emptyMcpDraft);
+          }}
+        >
+          {showForm && !editingMcpServerId ? "Cancel" : "Add connection"}
+        </Button>
+      </div>
+      {targetMissing ? <p role="alert" className="mt-2 text-sm text-on-surface-variant">This connection is no longer available. Choose a connection below.</p> : null}
+      <div id="mcp-add-form" hidden={!(showForm && !editingMcpServerId)} className="mt-4">{showForm && !editingMcpServerId ? form : null}</div>
+
+      <div className="mt-2 divide-y divide-outline-variant border-t border-outline-variant">
+        {props.mcpServers.length === 0 ? <p className="py-4 text-sm text-on-surface-variant">No connections yet.</p> : null}
+        {props.mcpServers.map((server) => {
+          const availability = getMcpAvailability(server);
+          const editing = showForm && editingMcpServerId === server.serverId;
+          const unsavedChanges = editing && JSON.stringify(mcpDraft) !== JSON.stringify(draftForServer(server));
+          const check = server.connectionTest;
+          const tested = check && check.configVersion === server.version && check.configHash === server.configHash
+            && (server.credentialScope !== "personal" || check.testedUserId === user?.userId);
+          return (
+            <DisclosureRow
+              key={server.serverId}
+              title={server.serverName}
+              status={<>{availability.label}.{availability.blocker ? <span className="text-warning"> {availability.blocker}</span> : null}{" "}
+                {tested ? `Last test: ${reachabilityLabel[check.reachability].toLowerCase()}.` : "Not tested since the last save."}</>}
+              action="Manage"
+              actionLabel={`Manage ${server.serverName}`}
+              open={expandedId === server.serverId}
+              disabled={props.busyKey !== null}
+              onOpenChange={(next) => {
+                if (next) { setExpandedId(server.serverId); handleEdit(server); }
+                else { setExpandedId(null); if (editing) handleCancel(); }
+              }}
+            >
+              {editing ? form : <Button type="button" variant="outline" size="sm" className="self-start" onClick={() => handleEdit(server)} disabled={props.busyKey !== null}>Edit settings</Button>}
+              <div className="flex flex-wrap gap-2 text-xs text-on-surface-variant">
+                <span className={CHIP}>ID {server.serverId}</span>
+                <span className={CHIP}>route {server.routePath}</span>
+                <span className={CHIP}>version {server.version}</span>
+                <span className={CHIP}>{server.mode} · {server.transportKind}</span>
+                <span className={CHIP}>authentication {server.credentialScope === "personal" || server.upstreamAuthConfigured ? server.upstreamAuthType : "none"}</span>
+                {server.mode === "proxy" ? <span className={CHIP}>{server.credentialScope === "personal" ? "Each member connects" : "Organization account"}</span> : null}
+                <span className={CHIP} title="Distinct sessions in the last 30 days where this server received a tool call.">Used in {server.invokedSessions30d ?? 0} sessions</span>
+                <span className={CHIP} title="Distinct sessions in the last 30 days where this server was offered to the agent.">Offered in {server.materializedSessions30d ?? 0} sessions</span>
               </div>
-              <div className="flex flex-wrap items-center gap-2 sm:flex-col sm:items-stretch">
-                <Button type="button" variant="outline" size="sm" onClick={() => handleEdit(server)}>
-                  Edit
-                </Button>
-                {server.isPublished ? (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => props.onUnpublish(server.serverId)}
-                  >
-                    Unpublish
-                  </Button>
-                ) : (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => props.onPublish(server.serverId)}
-                  >
-                    Publish
-                  </Button>
-                )}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => props.onDisable(server.serverId)}
-                >
-                  Disable
-                </Button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </CardContent>
-    </Card>
+              <AdminMcpConnectionTestCard key={`${server.serverId}:${server.version}:${server.configHash}`} server={server} listGeneration={props.listGeneration ?? 0} unsavedChanges={unsavedChanges} onTested={props.onTested} onReload={props.onReload} />
+              {props.renderServerExtras?.(server, expandedId === server.serverId)}
+            </DisclosureRow>
+          );
+        })}
+      </div>
+    </section>
   );
 }

@@ -1,9 +1,22 @@
 import { SessionListCursorSchema } from "../services/session-store.js";
-import { canBrowseSessionContent } from "../services/session-access.js";
+import { canBrowseSessionContent, UNSUPPORTED_TRANSCRIPT_ERROR } from "../services/session-access.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { SessionExecutionError } from "../services/session-execution-store.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { deriveActionSeverity } from "../services/mcp/policy-gate.js";
+import { forwardSignedProxyRpc, proxySigningSecret, proxyUpstreamLimits } from "../services/mcp/proxy-forward.js";
+import { PolicyBlockedError } from "../services/policy/policy-service.js";
+import { scrubUpstreamCredentialValues } from "../services/mcp/scrub-upstream-credential.js";
+import type { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
+import type { ManagedToolAppResource } from "../services/managed-tools/types.js";
+import type { McpAppCspStore } from "../services/mcp/mcp-app-csp-store.js";
+import {
+  groupCspEntries,
+  intersectCspDeclarations,
+  parseCspDeclarations,
+  type CspDeclarationEntry
+} from "@cogniplane/shared-types/csp-sources";
 
 import {
   SESSION_TRASH_RETENTION_DAYS,
@@ -19,9 +32,19 @@ import { sessionIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import { openSseResponse } from "../lib/open-sse-response.js";
+import { uuidv7 } from "../lib/uuid.js";
+import { hasReplyAfterLastPrompt, historyRunEvents } from "../services/agui-history.js";
 import { SseWriter } from "../services/sse-writer.js";
-import type { SequencedTurnEvent } from "../services/turn-event-log.js";
 import type { TurnCoordinationBus } from "../services/turn-coordination-bus.js";
+import {
+  capturedEvents,
+  catchUpRemote,
+  closeTurnSource,
+  openTurnSource,
+  streamLocalTurn,
+  streamRemoteTurn,
+  turnStartedRowId
+} from "./session-turn-stream.js";
 
 const createSessionSchema = z.object({
   name: z.string().trim().min(1).max(120).optional()
@@ -48,14 +71,29 @@ const listSessionsQuerySchema = z.object({
   personalOnly: z.enum(["true", "false"]).transform((value) => value === "true").optional()
 });
 
-const turnEventsQuerySchema = z.object({
-  after: z.coerce.number().int().min(0).safe().default(0)
-});
+const mcpAppParamsSchema = sessionIdParams.extend({ toolCallId: z.string().min(1).max(200) });
+
+/**
+ * The content security policy metadata that a widget gets. The server's own
+ * declaration is input, not policy. A widget gets the declared sources that an
+ * administrator approved for this server in this tenant, so a server with no
+ * approvals gets none. The approved sources go with them, so the sandbox can
+ * check the same limit again.
+ */
+function appResourceCsp(declared: unknown, approved: readonly CspDeclarationEntry[]): Record<string, unknown> | undefined {
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return undefined;
+  return { ...intersectCspDeclarations(declared, approved), approvedDomains: groupCspEntries(approved) };
+}
 
 export function buildSessionRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
     messages: deps.messages,
+    dynamicConfig: deps.dynamicConfig,
+    tenantMembers: deps.tenantMembers,
+    policyService: deps.policyService,
+    managedToolCatalog: deps.managedToolCatalog,
+    mcpAppCsp: deps.mcpAppCsp,
     runtimeAdapter: deps.runtimeAdapter,
     limits: deps.limits,
     activeTurns: deps.activeTurns,
@@ -68,7 +106,12 @@ export function buildSessionRouteStores(deps: AppDependencies) {
 export type SessionRouteStores = {
   sessions: Pick<AppDependencies["sessions"], "listPage" | "create" | "rename" | "getReadable" | "getOwned" | "remove" | "setArchived" | "restoreDeleted">
     & { getRetentionDays?: () => number };
-  messages: Pick<AppDependencies["messages"], "listBySession">;
+  messages: Pick<AppDependencies["messages"], "listBySession" | "getMcpAppCall">;
+  dynamicConfig?: Pick<AppDependencies["dynamicConfig"], "getMcpServerForUser" | "compileRuntimeConfig">;
+  tenantMembers?: Pick<AppDependencies["tenantMembers"], "isUserBetaTester">;
+  policyService?: Pick<AppDependencies["policyService"], "gateCompletedToolResource">;
+  managedToolCatalog?: Pick<ManagedToolCatalog, "get">;
+  mcpAppCsp?: Pick<McpAppCspStore, "listApproved" | "recordRequested">;
   runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "id" | "hasActiveTurn" | "abortSession" | "purgeSessionData" | "interruptTurn">;
   limits: AppDependencies["limits"];
   activeTurns: AppDependencies["activeTurns"];
@@ -96,146 +139,217 @@ async function registerScopedSessionRoutes(
   app: FastifyInstance,
   stores: SessionRouteStores
 ): Promise<void> {
-  app.get("/sessions/:sessionId/events", async (request, reply) => {
-    const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
-    if (!paramsResult.ok) return paramsResult.response;
-    const queryResult = parseRequestInput(reply, turnEventsQuerySchema, request.query ?? {});
-    if (!queryResult.ok) return queryResult.response;
-
+  app.get("/sessions/:sessionId/mcp-apps/:toolCallId", async (request, reply) => {
+    const params = parseRequestInput(reply, mcpAppParamsSchema, request.params);
+    if (!params.ok) return params.response;
     const { tenantId, userId } = request.auth;
-    const { sessionId } = paramsResult.value;
+    const { sessionId, toolCallId } = params.value;
     const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
     if (!session || !canBrowseSessionContent(session)) {
       return reply.code(404).send(notFoundError("session_not_found"));
     }
-    const log = stores.activeTurns?.eventLog(sessionId, tenantId);
-    if (!log) {
-      const owner = await stores.executions?.currentOwner?.(tenantId, sessionId);
-      if (!owner || !stores.turnBus) return reply.code(204).send();
-      const turn = { tenantId, sessionId, executionId: owner.executionId };
-      let replay: SequencedTurnEvent[] | null;
-      try { replay = await stores.turnBus.replay(turn, queryResult.value.after); }
-      catch (error) {
-        request.log.warn({ err: error, sessionId }, "Remote event replay unavailable");
-        return reply.code(204).send();
+    const call = await stores.messages.getMcpAppCall(tenantId, sessionId, toolCallId);
+    if (!call) return reply.code(404).send(notFoundError("mcp_app_not_found"));
+    let appInput: Record<string, unknown>;
+    try {
+      const value: unknown = call.app.input ?? JSON.parse(call.input);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid app input");
+      appInput = value as Record<string, unknown>;
+    } catch {
+      return reply.code(502).send(apiError("mcp_app_input_invalid"));
+    }
+    if (!stores.dynamicConfig || !stores.tenantMembers || !stores.policyService) {
+      return reply.code(404).send(notFoundError("mcp_app_not_found"));
+    }
+    let managedResource: ManagedToolAppResource | undefined;
+    try {
+      const isBetaTester = await stores.tenantMembers.isUserBetaTester(tenantId, userId);
+      const bundle = await stores.dynamicConfig.compileRuntimeConfig(tenantId, isBetaTester, { sessionId, userId });
+      const selectedServer = bundle.mcpServers.find((server) => server.id === call.serverId);
+      if (!bundle.runtimePolicy.enabledMcpServers.includes(call.serverId) ||
+          !selectedServer || !["proxy", "managed"].includes(selectedServer.mode)) {
+        return reply.code(404).send(notFoundError("mcp_app_not_found"));
       }
-      if (!replay) return reply.code(409).send(apiError("replay_gap"));
-      openSseResponse(app, request, reply);
-      const writer = new SseWriter(reply.raw);
-      const reader = stores.turnBus.reader();
-      let after = queryResult.value.after;
-      let closed = false;
-      writer.onClose(() => { closed = true; reader.disconnect(); });
-      try {
-        while (!closed) {
-          const current = await stores.sessions.getReadable(tenantId, sessionId, userId);
-          if (!current || !canBrowseSessionContent(current)) break;
-          for (const entry of replay) {
-            if (entry.sequence <= after) continue;
-            await writer.write(`id: ${entry.sequence}\ndata: ${JSON.stringify(entry.event)}\n\n`);
-            after = entry.sequence;
-            if (entry.event.type === "RUN_FINISHED" || entry.event.type === "RUN_ERROR") {
-              closed = true;
-              break;
-            }
-          }
-          if (closed || writer.isClosed) break;
-          replay = await stores.turnBus.waitForEvents(reader, turn, after);
-          if (!replay) break;
-          if (replay.length === 0) {
-            const live = await stores.executions.currentOwner?.(tenantId, sessionId);
-            if (!live || live.executionId !== owner.executionId) break;
-            await writer.write(": keep-alive\n\n");
-          }
+      const managedTool = selectedServer.mode === "managed" ? stores.managedToolCatalog?.get(call.toolName) : undefined;
+      if (selectedServer.mode === "managed") {
+        if (!managedTool?.appResource || managedTool.appResource.uri !== call.app.resourceUri ||
+            !bundle.runtimePolicy.enabledToolIds.includes(call.toolName)) {
+          return reply.code(404).send(notFoundError("mcp_app_not_found"));
         }
-      } catch (error) {
-        if (!closed) request.log.warn({ err: error, sessionId }, "Remote event stream ended");
-      } finally {
-        reader.disconnect();
-        writer.end();
+        managedResource = managedTool.appResource;
       }
-      return;
+      await stores.policyService.gateCompletedToolResource({
+        tenantId,
+        sessionId,
+        userId,
+        runtimeId: null,
+        toolName: call.toolName,
+        category: managedTool?.category ?? call.serverId,
+        severity: deriveActionSeverity(call.toolName, managedTool?.readOnly ?? call.app.readOnly ?? null),
+        serverId: call.serverId,
+        turnContext: call.app.turnContext ?? null,
+        enforcementMode: bundle.runtimePolicy.policyEnforcementMode,
+        actionSnapshot: { resourceUri: call.app.resourceUri, toolCallId }
+      });
+    } catch (error) {
+      if (!(error instanceof PolicyBlockedError)) {
+        request.log.warn({ err: error, serverId: call.serverId }, "MCP App policy check failed");
+      }
+      return reply.code(404).send(notFoundError("mcp_app_not_found"));
+    }
+    if (managedResource) {
+      let text: string;
+      try {
+        text = managedResource.render(appInput);
+      } catch {
+        return reply.code(502).send(apiError("mcp_app_input_invalid"));
+      }
+      reply.header("cache-control", "private, no-store");
+      return { resource: { uri: managedResource.uri, mimeType: managedResource.mimeType, text },
+        input: appInput, result: call.app.result };
+    }
+    let server: Awaited<ReturnType<typeof stores.dynamicConfig.getMcpServerForUser>>;
+    try {
+      server = await stores.dynamicConfig.getMcpServerForUser(tenantId, call.serverId, userId);
+    } catch {
+      return reply.code(404).send(notFoundError("mcp_app_not_found"));
+    }
+    if (server.mode !== "proxy" || !server.upstreamUrl) {
+      return reply.code(404).send(notFoundError("mcp_app_not_found"));
+    }
+    const response = await forwardSignedProxyRpc({
+      server,
+      rpc: { jsonrpc: "2.0", id: toolCallId, method: "resources/read", params: { uri: call.app.resourceUri } },
+      tenantId,
+      userId,
+      sessionId,
+      runtimeId: `mcp-app-resource:${toolCallId}`,
+      signingSecret: proxySigningSecret(app.config),
+      limits: proxyUpstreamLimits(app.config, request.log)
+    });
+    if (response.error || !response.result || typeof response.result !== "object") {
+      return reply.code(502).send(apiError("mcp_app_resource_failed"));
+    }
+    const contents = (response.result as { contents?: unknown }).contents;
+    const resource = Array.isArray(contents) ? contents.find((entry) =>
+      entry && typeof entry === "object" && entry.uri === call.app.resourceUri &&
+      typeof entry.mimeType === "string" && entry.mimeType.toLowerCase().startsWith("text/html") &&
+      typeof entry.text === "string"
+    ) : undefined;
+    if (!resource) return reply.code(502).send(apiError("mcp_app_resource_invalid"));
+    const meta = resource._meta && typeof resource._meta === "object" ? resource._meta as Record<string, unknown> : {};
+    const ui = meta.ui && typeof meta.ui === "object" ? meta.ui as Record<string, unknown> : {};
+    let approved: CspDeclarationEntry[] = [];
+    if (stores.mcpAppCsp) {
+      // A failed read approves nothing, so the widget loses its outside domains
+      // and still opens.
+      try {
+        approved = await stores.mcpAppCsp.listApproved(tenantId, call.serverId);
+      } catch (error) {
+        request.log.warn({ err: error, serverId: call.serverId }, "MCP App approved domains could not be read");
+      }
+      // The record only helps an administrator choose. Losing it changes no policy.
+      const requested = parseCspDeclarations(ui.csp);
+      if (requested.length > 0) {
+        try {
+          await stores.mcpAppCsp.recordRequested(tenantId, call.serverId, requested);
+        } catch (error) {
+          request.log.warn({ err: error, serverId: call.serverId }, "MCP App requested domains could not be recorded");
+        }
+      }
+    }
+    const csp = appResourceCsp(ui.csp, approved);
+    reply.header("cache-control", "private, no-store");
+    return scrubUpstreamCredentialValues({
+      resource: {
+        uri: resource.uri,
+        mimeType: resource.mimeType,
+        text: resource.text,
+        ...(csp ? { _meta: { ui: { csp } } } : {})
+      },
+      input: appInput,
+      result: call.app.result
+    }, server.upstreamAuth?.secret);
+  });
+
+  // The whole conversation for CopilotKit's connection: the saved history as a
+  // finished run, then the turn that runs now, replayed from its start and
+  // then live. One connection gives the browser one ordered event stream, so
+  // the browser does not merge a separate history read with the replay.
+  app.get("/sessions/:sessionId/connect", async (request, reply) => {
+    const paramsResult = parseRequestInput(reply, sessionIdParams, request.params);
+    if (!paramsResult.ok) return paramsResult.response;
+
+    const { tenantId, userId } = request.auth;
+    const { sessionId } = paramsResult.value;
+    const readSession = async () => {
+      const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
+      return session && canBrowseSessionContent(session) ? session : null;
+    };
+    const canRead = async () => Boolean(await readSession());
+    const session = await readSession();
+    if (!session) return reply.code(404).send(notFoundError("session_not_found"));
+    // The converter reads only the current history format. An older session
+    // stays readable through the message and audit routes.
+    if (session.transcriptFormat !== "current") {
+      return reply.code(409).send({ ...UNSUPPORTED_TRANSCRIPT_ERROR });
     }
 
-    const maxPendingBytes = 1_000_000;
-    const frameFor = (entry: SequencedTurnEvent) =>
-      `id: ${entry.sequence}\ndata: ${JSON.stringify(entry.event)}\n\n`;
-    const pending: SequencedTurnEvent[] = [];
-    let queuedBytes = 0;
-    let closing = false;
-    let overflowed = false;
-    let finish: (() => void) | undefined;
-    let pump: (() => void) | undefined;
-    const enqueue = (entry: SequencedTurnEvent) => {
-      const frameBytes = Buffer.byteLength(frameFor(entry));
-      if (queuedBytes + frameBytes > maxPendingBytes) {
-        overflowed = true;
-        pending.length = 0;
-        queuedBytes = 0;
-        subscription?.unsubscribe();
-        finish?.();
-        return;
-      }
-      pending.push(entry);
-      queuedBytes += frameBytes;
-    };
-    const subscription = log.subscribe(queryResult.value.after, (entry) => {
-      if (overflowed) return;
-      if (entry) enqueue(entry);
-      else closing = true;
-      pump?.();
-    });
-    if (!subscription) return reply.code(409).send(apiError("replay_gap"));
-    for (const entry of subscription.replay) {
-      enqueue(entry);
-      if (overflowed) return reply.code(409).send(apiError("replay_gap"));
+    // Capture the turn before the history read. A local capture holds every
+    // event from the start of the turn; a remote replay reads the bus again
+    // below. The history read can then miss no event, and an event that the
+    // read already reflects is identified by its turn_started row.
+    let source = await openTurnSource(stores, { tenantId, sessionId }, request.log);
+    let history: Awaited<ReturnType<typeof stores.messages.listBySession>>;
+    try {
+      history = await stores.messages.listBySession(tenantId, sessionId, userId);
+    } catch (error) {
+      closeTurnSource(source);
+      throw error;
     }
+    if (source.kind === "remote" && stores.turnBus) await catchUpRemote(stores.turnBus, source);
+    if (source.kind === "local" && source.queue.overflowed) source = { kind: "unavailable" };
+
+    // The replay rebuilds the reply of the running turn under new message
+    // ids, so leave its saved row out. turn_started names that row, also when
+    // the turn finished during the history read.
+    //
+    // Without turn_started, the connection cannot name the row. A local
+    // capture holds every event up to the end of the read, and the turn adds
+    // turn_started to its log before it writes text, tools, or a plan to its
+    // row. So that row was still empty, and the converter leaves it out.
+    // The owner of a remote turn mirrors its log to the bus later than it
+    // writes rows, so the read can already hold the reply. Attach only when no
+    // saved row after the newest prompt adds to the history. Otherwise send
+    // the history as it is and report the turn as unavailable: the browser
+    // polls its end and then loads the final state.
+    const replayedRowId = turnStartedRowId(capturedEvents(source));
+    if (source.kind === "remote" && !replayedRowId && hasReplyAfterLastPrompt(history.messages)) {
+      source = { kind: "unavailable" };
+    }
+    const attached = source.kind === "local" || source.kind === "remote";
+    const messages = attached && replayedRowId
+      ? history.messages.filter((message) => message.messageId !== replayedRowId)
+      : history.messages;
 
     openSseResponse(app, request, reply);
     const writer = new SseWriter(reply.raw);
-    await new Promise<void>((resolve) => {
-      let done = false;
-      let writing = false;
-      let checkingAccess = false;
-      finish = () => {
-        if (done) return;
-        done = true;
-        clearInterval(heartbeat);
-        subscription.unsubscribe();
-        writer.end();
-        resolve();
-      };
-      const heartbeat = setInterval(() => {
-        void writer.write(": keep-alive\n\n");
-        if (checkingAccess || done) return;
-        checkingAccess = true;
-        void stores.sessions.getReadable(tenantId, sessionId, userId)
-          .then((current) => { if (!current || !canBrowseSessionContent(current)) finish?.(); })
-          .catch(() => finish?.())
-          .finally(() => { checkingAccess = false; });
-      }, 20_000);
-      heartbeat.unref?.();
-      writer.onClose(finish);
-      pump = () => {
-        if (writing || done) return;
-        writing = true;
-        void (async () => {
-          try {
-            while (pending.length && !writer.isClosed) {
-              const entry = pending.shift()!;
-              const frame = frameFor(entry);
-              queuedBytes -= Buffer.byteLength(frame);
-              await writer.write(frame);
-            }
-          } finally {
-            writing = false;
-            if (closing || writer.isClosed) finish?.();
-            else if (pending.length) pump?.();
-          }
-        })();
-      };
-      pump();
-    });
+    for (const event of historyRunEvents({
+      threadId: sessionId,
+      runId: `history:${uuidv7()}`,
+      messages,
+      connection: {
+        activeTurn: attached ? "attached" : source.kind === "none" ? "none" : "unavailable",
+        hasMoreHistory: history.hasMore
+      }
+    })) {
+      await writer.write(`data: ${JSON.stringify(event)}\n\n`);
+    }
+    const options = { writer, canRead, log: request.log, sessionId };
+    if (source.kind === "local") await streamLocalTurn(source.queue, options);
+    else if (source.kind === "remote" && stores.turnBus) {
+      await streamRemoteTurn(source, { turnBus: stores.turnBus, executions: stores.executions }, options);
+    } else writer.end();
   });
 
   app.get("/sessions", async (request, reply) => {
@@ -555,6 +669,9 @@ async function registerScopedSessionRoutes(
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
+    const queryResult = parseRequestInput(reply,
+      z.object({ since: z.string().uuid().optional() }).strict(), request.query);
+    if (!queryResult.ok) return queryResult.response;
 
     const { userId, tenantId } = request.auth;
     const { sessionId } = paramsResult.value;
@@ -568,7 +685,8 @@ async function registerScopedSessionRoutes(
     // Bounded read: newest-N messages with tool text truncated in the
     // projection (see MessageStore.listBySession). `hasMore` tells the client
     // older turns were withheld rather than silently dropping them.
-    const { messages, hasMore } = await stores.messages.listBySession(tenantId, sessionId, userId);
+    const { messages, hasMore } = await stores.messages.listBySession(tenantId, sessionId, userId,
+      { sinceMessageId: queryResult.value.since });
 
     reply.header("cache-control", "private, no-store");
     return serialize(SessionMessagesResponseSchema, {

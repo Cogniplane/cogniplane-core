@@ -10,8 +10,9 @@ export function aggregateFindings(findings: unknown[]): AggregatedFinding[] {
   for (const finding of findings) {
     if (typeof finding !== "object" || finding === null) continue;
     const f = finding as Record<string, unknown>;
-    const labelRaw = f.kind ?? f.type ?? f.entityType;
-    const label = typeof labelRaw === "string" && labelRaw.length > 0 ? labelRaw : "finding";
+    // The first non-empty name wins, so an empty or non-string `kind` does not hide `entityType`.
+    const labelRaw = [f.kind, f.type, f.entityType].find((name) => typeof name === "string" && name.length > 0);
+    const label = typeof labelRaw === "string" ? labelRaw : "finding";
     const countRaw = typeof f.count === "number" ? f.count : 1;
     buckets.set(label, (buckets.get(label) ?? 0) + countRaw);
   }

@@ -20,13 +20,15 @@ const PILL_PLANNED =
 type Props = {
   integration: AdminIntegrationView;
   busy: boolean;
+  /** The failure of this integration's last configuration save or clear. */
+  error: string | null;
   onClose: () => void;
   onSaveConfig: (config: Record<string, string>) => Promise<void>;
   onClearConfig: () => Promise<void>;
 };
 
 export function AdminIntegrationPane(props: Props) {
-  const { integration, busy, onClose, onSaveConfig, onClearConfig } = props;
+  const { integration, busy, error, onClose, onSaveConfig, onClearConfig } = props;
 
   return (
     <Dialog
@@ -101,6 +103,7 @@ export function AdminIntegrationPane(props: Props) {
             <AdminIntegrationPaneOauthApp
               integration={integration}
               busy={busy}
+              error={error}
               onSave={onSaveConfig}
               onClear={onClearConfig}
             />

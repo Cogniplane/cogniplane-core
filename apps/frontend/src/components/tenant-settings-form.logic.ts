@@ -7,6 +7,12 @@ import type {
   WebSearchMode
 } from "@cogniplane/shared-types";
 import { isModelEnabled } from "@cogniplane/shared-types";
+// Loads a public suffix list, so it is a separate entry point of the package.
+import {
+  normalizeSandboxEgressDomains,
+  parseSandboxEgressDomain,
+  SANDBOX_EGRESS_DOMAINS_MAX
+} from "@cogniplane/shared-types/sandbox-egress";
 
 export function modelAvailabilityWarning(
   modelId: string,
@@ -18,14 +24,14 @@ export function modelAvailabilityWarning(
     return "Your selected chat model is no longer available. Choose another model in chat.";
   }
   if (!isModelEnabled(model, settings)) {
-    return `${model.displayName} is disabled for this organization. Choose another model in chat or enable it in Organization settings.`;
+    return `${model.displayName} is disabled for this organization. Choose another model in chat or enable it in Models.`;
   }
 
   // /admin/models always returns every provider, so a miss here is not a state
   // worth a message of its own — treat it as "nothing to warn about".
   const provider = catalog.providers.find((entry) => entry.id === model.provider);
   if (!provider || provider.keySource !== "none") return null;
-  return `No ${provider.label} API key is configured for your selected chat model, ${model.displayName}. Add one in Organization settings or choose another model in chat.`;
+  return `No ${provider.label} API key is configured for your selected chat model, ${model.displayName}. Add one in Models or choose another model in chat.`;
 }
 
 export type ApprovalPolicyKind = "never" | "on-request" | "granular";
@@ -50,6 +56,12 @@ export type FormDraft = {
   developerInstructions: string;
   enabledToolIds: string[];
   enabledMcpServerIds: string[];
+  /**
+   * The approved sandbox hosts as the administrator types them: one per line.
+   * The draft keeps the text, so that a half-typed line is not rewritten under
+   * the cursor. parseSandboxEgressText turns it into the list that is saved.
+   */
+  sandboxEgressText: string;
 };
 
 export const defaultGranularFlags: GranularFlags = {
@@ -106,8 +118,47 @@ export function buildDraft(settings: TenantSettings): FormDraft {
     policyEnforcementMode: settings.policyEnforcementMode,
     developerInstructions: settings.developerInstructions ?? "",
     enabledToolIds: [...settings.enabledToolIds],
-    enabledMcpServerIds: [...settings.enabledMcpServerIds]
+    enabledMcpServerIds: [...settings.enabledMcpServerIds],
+    sandboxEgressText: [...settings.approvedSandboxEgressDomains].sort().join("\n")
   };
+}
+
+export type SandboxEgressLineError = {
+  /** Line of the text, counted from 1. */
+  line: number;
+  entry: string;
+  message: string;
+};
+
+export type ParsedSandboxEgress = {
+  /** The hosts that pass the check, sorted and without duplicates. This is what is saved. */
+  domains: string[];
+  errors: SandboxEgressLineError[];
+  /** More hosts than one organization can approve. */
+  tooMany: boolean;
+};
+
+/**
+ * Reads the approved-host text: one host per line, and commas also separate.
+ * Spaces around a host and upper case are fixed here, as a paste often has
+ * them. Everything else is checked by the rules that the server applies, so
+ * that a host is refused here before the server refuses it. The server stays
+ * the authority.
+ */
+export function parseSandboxEgressText(text: string): ParsedSandboxEgress {
+  const hosts: string[] = [];
+  const errors: SandboxEgressLineError[] = [];
+  text.split(/\r?\n/).forEach((line, index) => {
+    for (const piece of line.split(",")) {
+      const entry = piece.trim();
+      if (entry === "") continue;
+      const result = parseSandboxEgressDomain(entry.toLowerCase());
+      if (result.ok) hosts.push(result.value.domain);
+      else errors.push({ line: index + 1, entry, message: result.message });
+    }
+  });
+  const domains = normalizeSandboxEgressDomains(hosts);
+  return { domains, errors, tooMany: domains.length > SANDBOX_EGRESS_DOMAINS_MAX };
 }
 
 /** Toggle a string id in or out of an array. Idempotent. */

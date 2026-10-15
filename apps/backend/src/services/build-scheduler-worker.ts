@@ -12,64 +12,29 @@ import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { buildApiKeyPresenceCheckers } from "./runtime/api-key-presence.js";
 import type { ProviderCredentials } from "./runtime/provider-credentials.js";
 import { resolveRuntimeModel } from "./runtime/runtime-model-resolver.js";
-import { SchedulerWorker, type SchedulerRuntimeResolution } from "./scheduler-worker.js";
+import { SchedulerWorker, type SchedulerRuntimeResolution, type SchedulerWorkerDeps } from "./scheduler-worker.js";
 import type { SessionStore } from "./session-store.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { UserSettingsStore } from "./user-settings-store.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 
-export function buildSchedulerWorker(
-  config: AppConfig,
-  input: {
-    userSettings: UserSettingsStore;
-    sessions: SessionStore;
-    messages: MessageStore;
-    toolContexts: ToolExecutionContextStore;
-    runtimeAdapter: RuntimeAdapter;
-    dynamicConfig: DynamicConfigService;
-    customModels: CustomModelStore;
-    providerCredentials: ProviderCredentials;
-    auditEvents: AuditEventStore;
-    piiScanJobs?: PiiScanJobStore;
-    piiScanJobHandler?: PiiScanJobHandler;
-    projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
-    projectFileStorage?: Pick<ArtifactStorage, "delete">;
-    sessionTrash?: Pick<SessionStore, "cleanupExpired">;
-    sessionStorage?: Pick<ArtifactStorage, "delete">;
-    logger: FastifyBaseLogger;
-  }
-) {
-  // The worker drives independent workloads: the cron scheduler, the async
-  // PII scan-job drain, project-file retention, and session Trash retention.
-  // Any one alone is reason enough to run it.
-  //
-  // The PII drain claims jobs cross-tenant through the privileged (BYPASSRLS)
-  // pool. That pool's BYPASSRLS contract is asserted at boot ONLY when
-  // PII_PROVIDER_ENABLED (or SCHEDULER_ENABLED / workos) is set — see the
-  // privilegedNeedsBypassRls check in app.ts. So the drain is only safe to run
-  // when PII_PROVIDER_ENABLED is true; running it otherwise would query an
-  // RLS-bound pool and silently claim zero rows, leaving jobs queued forever.
-  // We therefore gate the PII half on PII_PROVIDER_ENABLED, not merely on the
-  // deps being present (they always are). This keeps boot-time validation and
-  // the worker's runtime behavior in lockstep.
-  const piiDrainEnabled =
-    config.PII_PROVIDER_ENABLED && Boolean(input.piiScanJobs && input.piiScanJobHandler);
-  const projectRetentionEnabled =
-    config.PROJECT_FILE_RETENTION_ENABLED &&
-    Boolean(input.projectFiles && input.projectFileStorage);
-  const sessionRetentionEnabled =
-    config.SESSION_TRASH_RETENTION_ENABLED &&
-    Boolean(input.sessionTrash && input.sessionStorage);
-  if (!config.SCHEDULER_ENABLED && !piiDrainEnabled && !projectRetentionEnabled && !sessionRetentionEnabled) {
-    return null;
-  }
-
+/**
+ * Resolve the runtime and model for a scheduled turn the way an interactive
+ * turn does: the tenant's default model, its availability settings, and the
+ * provider keys that are configured.
+ */
+export function schedulerRuntimeResolver(input: {
+  runtimeAdapter: RuntimeAdapter;
+  dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings">;
+  customModels: Pick<CustomModelStore, "list">;
+  providerCredentials: ProviderCredentials;
+}): (tenantId: string) => Promise<SchedulerRuntimeResolution> {
   const { hasProviderKey } = buildApiKeyPresenceCheckers({
     credentials: input.providerCredentials
   });
 
-  const resolveRuntime = async (tenantId: string): Promise<SchedulerRuntimeResolution> => {
+  return async (tenantId: string): Promise<SchedulerRuntimeResolution> => {
     const resolution = await resolveRuntimeModel({
       tenantId,
       // Scheduled jobs use the tenant's default model; the resolver gates on
@@ -107,6 +72,52 @@ export function buildSchedulerWorker(
       effort: resolution.selectedEffort
     };
   };
+}
+
+export function buildSchedulerWorker(
+  config: AppConfig,
+  input: {
+    userSettings: UserSettingsStore;
+    sessions: SessionStore;
+    messages: MessageStore;
+    toolContexts: ToolExecutionContextStore;
+    runtimeAdapter: RuntimeAdapter;
+    dynamicConfig: DynamicConfigService;
+    customModels: CustomModelStore;
+    providerCredentials: ProviderCredentials;
+    auditEvents: AuditEventStore;
+    piiProtection?: SchedulerWorkerDeps["piiProtection"];
+    piiScanRuns?: SchedulerWorkerDeps["piiScanRuns"];
+    piiScanJobs?: PiiScanJobStore;
+    piiScanJobHandler?: PiiScanJobHandler;
+    projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
+    projectFileStorage?: Pick<ArtifactStorage, "delete">;
+    sessionTrash?: Pick<SessionStore, "cleanupExpired">;
+    sessionStorage?: Pick<ArtifactStorage, "delete">;
+    logger: FastifyBaseLogger;
+  }
+) {
+  // The worker drives independent workloads: the cron scheduler, the async
+  // PII scan-job drain, project-file retention, and session Trash retention.
+  // Any one alone is reason enough to run it.
+  //
+  // The PII drain runs whenever its deps exist. The rule detector queues
+  // artifact scans without the remote provider, so gating on
+  // PII_PROVIDER_ENABLED would leave those uploads pending forever. The drain
+  // claims jobs through the privileged pool, whose BYPASSRLS role app.ts
+  // asserts at every boot.
+  const piiDrainEnabled = Boolean(input.piiScanJobs && input.piiScanJobHandler);
+  const projectRetentionEnabled =
+    config.PROJECT_FILE_RETENTION_ENABLED &&
+    Boolean(input.projectFiles && input.projectFileStorage);
+  const sessionRetentionEnabled =
+    config.SESSION_TRASH_RETENTION_ENABLED &&
+    Boolean(input.sessionTrash && input.sessionStorage);
+  if (!config.SCHEDULER_ENABLED && !piiDrainEnabled && !projectRetentionEnabled && !sessionRetentionEnabled) {
+    return null;
+  }
+
+  const resolveRuntime = schedulerRuntimeResolver(input);
 
   return new SchedulerWorker(
     {
@@ -116,9 +127,9 @@ export function buildSchedulerWorker(
       toolContexts: input.toolContexts,
       resolveRuntime,
       auditEvents: input.auditEvents,
-      // Only thread the PII drain in when it's safe to run (see above); when
-      // disabled, the worker's drainPiiScanJobs no-ops because the deps are
-      // absent, so a scheduler-only worker never touches the PII queue.
+      piiProtection: input.piiProtection,
+      piiScanRuns: input.piiScanRuns,
+      // Without both PII deps, drainPiiScanJobs no-ops.
       piiScanJobs: piiDrainEnabled ? input.piiScanJobs : undefined,
       piiScanJobHandler: piiDrainEnabled ? input.piiScanJobHandler : undefined,
       projectFiles: projectRetentionEnabled ? input.projectFiles : undefined,

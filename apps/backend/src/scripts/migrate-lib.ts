@@ -166,8 +166,9 @@ function assertSafeRoleName(role: string): void {
  * the class of failure the harness exists to catch.
  *
  * Idempotent, and safe to re-run: the role may be absent if migrations were
- * previously applied without it, and the grants must be re-applied every time
- * because a later migration can add tables the earlier grant never covered.
+ * previously applied without it. Each call reapplies grants because a later
+ * migration can add tables the earlier grant never covered. The production
+ * runner skips this helper when it cannot derive an app_user password.
  *
  * Runs on ONE pinned client. `pool.query()` checks out a connection per call,
  * so a separate `SET standard_conforming_strings` could land on a different

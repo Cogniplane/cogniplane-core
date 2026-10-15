@@ -1,6 +1,6 @@
 import { isTextReadableArtifact, readStreamAsBoundedText } from "../artifacts/artifact-helpers.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
-import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
+import { type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible } from "../artifacts/artifact-store.js";
 import type { MessageStore } from "../message-store.js";
 import type { SessionStore } from "../session-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
@@ -80,7 +80,10 @@ async function resolveReadableArtifact(input: {
   artifactId: string;
 }): Promise<ArtifactRecord> {
   const artifact = await input.artifacts.getReadable(input.context.tenantId, input.artifactId, input.context.userId);
-  if (!artifact || artifact.sessionId !== input.context.sessionId || artifact.status !== "ready") {
+  // Same eligibility as downloads and chat context: ready, and no pending,
+  // scanning, or blocked PII verdict. The answer does not say which, so a
+  // blocked artifact looks the same as a missing one.
+  if (!artifact || artifact.sessionId !== input.context.sessionId || !isArtifactPiiEligible(artifact)) {
     throw new ToolCallError("Artifact not found for tool context.");
   }
 
@@ -96,7 +99,7 @@ async function resolveReadableArtifact(input: {
     artifact.artifactId,
     input.context.userId
   );
-  if (!derivedArtifact) {
+  if (!derivedArtifact || !isArtifactPiiEligible(derivedArtifact)) {
     throw new ToolCallError(`Artifact ${artifact.artifactName} is not a text-readable MIME type.`);
   }
   return derivedArtifact;

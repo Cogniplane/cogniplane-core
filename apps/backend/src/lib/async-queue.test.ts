@@ -111,11 +111,12 @@ test("setError() unblocks a for-await consumer instead of hanging", async () => 
   await expect(consumer).rejects.toBe(boom);
 });
 
-test("setError() is terminal: first error wins, end()/push() are no-ops after", () => {
+test("setError() is terminal: first error wins, end()/push() are no-ops after", async () => {
   const q = new AsyncQueue<number>();
   const first = new Error("first");
   q.setError(first);
   q.setError(new Error("second"));
   q.end();
   expect(q.push(99)).toBe(false);
+  await expect(q.next()).rejects.toBe(first);
 });

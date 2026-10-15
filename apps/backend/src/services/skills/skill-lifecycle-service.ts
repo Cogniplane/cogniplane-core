@@ -5,6 +5,7 @@ import type {
   SkillRevisionCleanupReport
 } from "../admin-config-records.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
+import type { AdminSkillReleaseSnapshot } from "@cogniplane/shared-types";
 
 type AuditEventStore = {
   create(input: {
@@ -44,6 +45,7 @@ export class SkillLifecycleService {
       type: "admin.skill.imported",
       payload: {
         skillId: imported.skill.skillId,
+        version: imported.skill.version,
         skillRevisionId: imported.revision.skillRevisionId,
         sourceType: imported.revision.sourceType,
         reviewStatus: imported.revision.reviewStatus,
@@ -71,6 +73,7 @@ export class SkillLifecycleService {
       type: "admin.skill.imported",
       payload: {
         skillId: imported.skill.skillId,
+        version: imported.skill.version,
         skillRevisionId: imported.revision.skillRevisionId,
         sourceType: imported.revision.sourceType,
         reviewStatus: imported.revision.reviewStatus,
@@ -99,6 +102,7 @@ export class SkillLifecycleService {
       type: "admin.skill.imported",
       payload: {
         skillId: imported.skill.skillId,
+        version: imported.skill.version,
         skillRevisionId: imported.revision.skillRevisionId,
         sourceType: imported.revision.sourceType,
         reviewStatus: imported.revision.reviewStatus,
@@ -114,6 +118,8 @@ export class SkillLifecycleService {
     skillRevisionId: number;
     actorUserId: string;
     reviewNotes?: string | null;
+    audience?: "test-users" | "members";
+    expectedSnapshot?: AdminSkillReleaseSnapshot;
   }): Promise<ActivatedSkillRevisionRecord | null> {
     const activated = await this.dynamicConfig.activateSkillRevision(tenantId, input);
     if (!activated) {
@@ -127,6 +133,7 @@ export class SkillLifecycleService {
       type: "admin.skill.reviewed",
       payload: {
         skillId: activated.skill.skillId,
+        version: activated.skill.version,
         skillRevisionId: activated.revision.skillRevisionId,
         reviewStatus: activated.revision.reviewStatus,
         reviewNotes: input.reviewNotes ?? null
@@ -140,14 +147,19 @@ export class SkillLifecycleService {
       type: "admin.skill.activated",
       payload: {
         skillId: activated.skill.skillId,
+        version: activated.skill.version,
         skillRevisionId: activated.revision.skillRevisionId,
-        reviewStatus: activated.revision.reviewStatus
+        reviewStatus: activated.revision.reviewStatus,
+        audience: activated.skill.isPublished ? "members" : "test-users",
+        isPublished: activated.skill.isPublished,
+        enabled: activated.skill.enabled
       }
     });
 
+    // A rollback is a move to an older revision, not every change of the active one.
     if (
-      activated.previousActiveRevisionId &&
-      activated.previousActiveRevisionId !== activated.revision.skillRevisionId
+      activated.previousActiveRevisionNumber !== null &&
+      activated.revision.revisionNumber < activated.previousActiveRevisionNumber
     ) {
       await this.auditEvents.create({
         tenantId,
@@ -156,6 +168,7 @@ export class SkillLifecycleService {
         type: "admin.skill.rollback",
         payload: {
           skillId: activated.skill.skillId,
+        version: activated.skill.version,
           fromSkillRevisionId: activated.previousActiveRevisionId,
           toSkillRevisionId: activated.revision.skillRevisionId
         }

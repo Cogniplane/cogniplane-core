@@ -44,6 +44,7 @@ export type AdminSkillRecord = {
   // a tenant's perspective: tenants must use the import flows (zip / github /
   // inline paste) to create their own copy before they can edit it.
   isInherited: boolean;
+  pendingRevisionCount?: number;
 };
 
 export type AdminSkillRevisionRecord = {
@@ -76,6 +77,7 @@ export type ActivatedSkillRevisionRecord = {
   skill: AdminSkillRecord;
   revision: AdminSkillRevisionRecord;
   previousActiveRevisionId: number | null;
+  previousActiveRevisionNumber: number | null;
 };
 
 export type ActiveRuntimeSkillReference = {
@@ -87,6 +89,7 @@ export type ActiveRuntimeSkillReference = {
 
 export type AdminMcpServerRecord = {
   serverId: string;
+  ownerTenantId?: string;
   serverName: string;
   description: string | null;
   transportKind: "http";
@@ -96,6 +99,8 @@ export type AdminMcpServerRecord = {
   upstreamAuthType: "none" | "bearer" | "header" | "query";
   upstreamAuthName: string | null;
   upstreamAuthConfigured: boolean;
+  credentialScope: "organization" | "personal";
+  credentialBindingId: string;
   version: number;
   configHash: string;
   enabled: boolean;
@@ -131,7 +136,7 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
     approvalPolicy: settings.approvalPolicy,
     approvalReviewer: settings.approvalReviewer,
     sandboxMode: "workspace-write",
-    networkMode: "restricted",
+    sandboxEgressDomains: [...settings.approvedSandboxEgressDomains],
     allowCommandExecution: settings.allowCommandExecution,
     autoApproveReadOnlyTools: settings.autoApproveReadOnlyTools,
     policyEnforcementMode: settings.policyEnforcementMode,
@@ -162,12 +167,16 @@ function parseSnapshotApprovalPolicy(value: unknown): ApprovalPolicy {
  * enum values land on the conservative default (`approvalReviewer: "user"`,
  * `approvalPolicy: "never"`).
  *
- * `sandboxMode` and `networkMode` are single-valued literal types on
- * `ResolvedRuntimePolicy` today (`"workspace-write"` and `"restricted"`).
- * They're emitted by `tenantSettingsToRuntimePolicy` and never read back
- * differently. When the type is widened to allow more values, both this
- * parser and `tenantSettingsToRuntimePolicy` need to thread the actual
- * setting through. Keep the literals here as the single source of fallback.
+ * `sandboxMode` is a single-valued literal type on `ResolvedRuntimePolicy`
+ * today (`"workspace-write"`). It's emitted by `tenantSettingsToRuntimePolicy`
+ * and never read back differently. When the type is widened to allow more
+ * values, both this parser and `tenantSettingsToRuntimePolicy` need to thread
+ * the actual setting through. Keep the literal here as the single source of
+ * fallback.
+ *
+ * `sandboxEgressDomains` falls back to an empty list, which is the strictest
+ * policy: a snapshot that predates the field, or one that is malformed, gives
+ * the sandbox no network.
  */
 export function parseRuntimePolicySnapshot(
   value: unknown,
@@ -195,7 +204,9 @@ export function parseRuntimePolicySnapshot(
     approvalPolicy: parseSnapshotApprovalPolicy(profile.approvalPolicy),
     approvalReviewer: (profile.approvalReviewer === "guardian_subagent" ? "guardian_subagent" : "user") as ApprovalReviewer,
     sandboxMode: "workspace-write",
-    networkMode: "restricted",
+    sandboxEgressDomains: Array.isArray(profile.sandboxEgressDomains)
+      ? profile.sandboxEgressDomains.filter((entry): entry is string => typeof entry === "string")
+      : [],
     allowCommandExecution: Boolean(profile.allowCommandExecution),
     autoApproveReadOnlyTools: Boolean(profile.autoApproveReadOnlyTools),
     // Default a missing/stale snapshot to "monitor" — fail-safe (never gate
@@ -236,6 +247,9 @@ export type McpServerRegistration = {
   transportKind: "http";
   version: number;
   hash: string;
+  credentialScope?: "organization" | "personal";
+  credentialBindingId?: string;
+  credentialVersion?: number | null;
 };
 
 export type ResolvedRuntimePolicy = {
@@ -246,7 +260,12 @@ export type ResolvedRuntimePolicy = {
   approvalPolicy: ApprovalPolicy;
   approvalReviewer: ApprovalReviewer;
   sandboxMode: "workspace-write";
-  networkMode: "restricted";
+  /**
+   * Hosts that the sandbox may reach (VULN-13), from the tenant's approved
+   * list. Empty means no network. The sandbox network policy and the recorded
+   * network mode both come from this list, so they cannot disagree.
+   */
+  sandboxEgressDomains: string[];
   allowCommandExecution: boolean;
   autoApproveReadOnlyTools: boolean;
   /**
@@ -285,8 +304,10 @@ export type RuntimeConfigBundle = {
       id: string;
       version: number;
       hash: string;
+      credentialVersion?: number | null;
     }>;
     integrationToolIds?: string[];
+    integrationAccounts?: Record<string, string>;
   };
 };
 

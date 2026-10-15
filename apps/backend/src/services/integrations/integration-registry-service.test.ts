@@ -8,6 +8,7 @@ import {
 } from "./integration-registry-service.js";
 import {
   getIntegrationDescriptor,
+  IntegrationRegistry,
   registerIntegration,
   type IntegrationConnectionProbe
 } from "./integration-registry.js";
@@ -336,3 +337,117 @@ test("resolveSessionToolIds with sharepoint writes enabled includes sharepoint_i
   expect(ids.includes("sharepoint_import_file_to_session")).toBe(true);
   expect(ids.includes("sharepoint_upload_file")).toBe(true);
 });
+
+// ── Per-call integration checks (H10) ────────────────────────────────────────
+
+function accountProbe(accountId: string | null): IntegrationConnectionProbe {
+  return {
+    async hasConnection() { return accountId !== null; },
+    async connectedAccountId() { return accountId; }
+  };
+}
+
+test("resolveSessionIntegrations records the account of each integration that grants tools", async () => {
+  const store = new FakeStateStore([
+    makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true }),
+    makeState({ tenantId: "tenant-1", integrationId: "notion", writesEnabled: true }),
+    // Off: no tools and no account.
+    makeState({ tenantId: "tenant-1", integrationId: "microsoft" })
+  ]);
+  const service = new IntegrationRegistryService(buildConfig(), store, {
+    github: accountProbe("gh-1"),
+    notion: accountProbe(null),
+    microsoft: accountProbe("ms-1")
+  });
+
+  await expect(service.resolveSessionIntegrations("tenant-1", "user-1"))
+    .resolves.toEqual({ toolIds: ["github_read_file"], accounts: { github: "gh-1" } });
+});
+
+test("resolveSessionIntegrations grants no tools when a binding probe names no account", async () => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true })]);
+  // The connection disappears between the presence check and the account read.
+  const service = new IntegrationRegistryService(buildConfig(), store, {
+    github: { async hasConnection() { return true; }, async connectedAccountId() { return null; } }
+  });
+
+  await expect(service.resolveSessionIntegrations("tenant-1", "user-1")).resolves.toEqual({ toolIds: [], accounts: {} });
+});
+
+test("checkToolCall allows a tool that belongs to no integration", async () => {
+  const service = new IntegrationRegistryService(buildConfig(), new FakeStateStore([]), probes);
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "write_artifact",
+    boundAccounts: {} })).resolves.toBeNull();
+});
+
+test.each([
+  ["reads are off", { readsEnabled: false, writesEnabled: true }, "github_read_file", "GitHub reads are disabled for this organization."],
+  ["only reads are on", { readsEnabled: true, writesEnabled: false }, "github_write_file", "GitHub writes are disabled for this organization."]
+])("checkToolCall refuses a call when %s now", async (_name, toggles, toolName, message) => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", ...toggles })]);
+  const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-1") });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName,
+    boundAccounts: { github: "gh-1" } })).resolves.toBe(message);
+});
+
+test("checkToolCall refuses a call when the integration state row is gone", async () => {
+  const service = new IntegrationRegistryService(buildConfig(), new FakeStateStore([]), { github: accountProbe("gh-1") });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
+    boundAccounts: { github: "gh-1" } })).resolves.toMatch(/disabled/);
+});
+
+test.each([
+  ["the same account", "gh-1", null],
+  ["another account", "gh-2", "Your GitHub account changed during this turn. Send a new message to use the connected account."],
+  ["no account", null, "Your GitHub account changed during this turn. Send a new message to use the connected account."]
+])("checkToolCall compares the turn's account with %s", async (_name, current, expected) => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true })]);
+  const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe(current) });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
+    boundAccounts: { github: "gh-1" } })).resolves.toBe(expected);
+});
+
+test("checkToolCall skips the account comparison for a context without a record", async () => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true })]);
+  const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-2") });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
+    boundAccounts: undefined })).resolves.toBeNull();
+});
+
+test("checkToolCall refuses a turn that recorded accounts but none for the integration", async () => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true })]);
+  const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-1") });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
+    boundAccounts: { notion: "n-1" } })).resolves.toMatch(/account changed/);
+});
+
+test("checkToolCall does not compare accounts for a probe that cannot name one", async () => {
+  const store = new FakeStateStore([makeState({ tenantId: "tenant-1", integrationId: "github", readsEnabled: true })]);
+  const service = new IntegrationRegistryService(buildConfig(), store, { github: probe(true) });
+
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
+    boundAccounts: {} })).resolves.toBeNull();
+});
+
+test.each([["first", ["shared-on", "shared-off"]], ["second", ["shared-off", "shared-on"]]])(
+  "checkToolCall refuses a tool that a disabled integration also lists, registered %s", async (_order, ids) => {
+    const registry = new IntegrationRegistry([]);
+    for (const id of ids) {
+      registry.register({ id, name: id, description: "", longDescription: "", logoSlug: id, status: "available",
+        category: "Test", readToolIds: ["shared_tool"], writeToolIds: [], configMode: "none" });
+    }
+    const store = new FakeStateStore([
+      makeState({ tenantId: "tenant-1", integrationId: "shared-on", readsEnabled: true }),
+      makeState({ tenantId: "tenant-1", integrationId: "shared-off" })
+    ]);
+    const service = new IntegrationRegistryService(buildConfig(), store, {}, registry);
+
+    await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "shared_tool",
+      boundAccounts: undefined })).resolves.toBe("shared-off reads are disabled for this organization.");
+  });

@@ -51,7 +51,10 @@ export type RuntimeManifest = {
     hash: string;
     approvalPolicy: string;
     sandboxMode: string;
+    /** `deny-all` or `allowlist`, as resolved for the sandbox provider (see sandbox-network-policy.ts). */
     networkMode: string;
+    /** Hash of the sandbox network policy. Optional: manifests saved before the policy do not have it. */
+    networkPolicyHash?: string;
     allowCommandExecution: boolean;
     autoApproveReadOnlyTools: boolean;
     webSearchMode: string;

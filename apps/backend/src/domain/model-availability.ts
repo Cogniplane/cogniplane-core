@@ -7,7 +7,7 @@ import { AVAILABLE_MODELS } from "./models.js";
 export type ModelAvailabilitySettings = Pick<
   TenantSettings,
   "enabledProviders" | "enabledModelIds" | "modelDefaultEfforts"
->;
+> & Partial<Pick<TenantSettings, "defaultModelId">>;
 
 /**
  * Filters `models` (defaults to the static catalog; pass the tenant-merged

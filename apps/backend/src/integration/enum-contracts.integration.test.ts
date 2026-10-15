@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  MEMORY_PROVENANCES,
   MessageFeedbackRatingSchema,
   PolicyEnforcementModeSchema,
   ProjectAgentFileModeSchema,
@@ -18,7 +19,8 @@ const contracts = [
   { table: "projects", column: "agent_file_mode", values: ProjectAgentFileModeSchema.options },
   { table: "messages", column: "feedback_rating", values: MessageFeedbackRatingSchema.options },
   { table: "tenant_settings", column: "policy_enforcement_mode", values: PolicyEnforcementModeSchema.options },
-  { table: "tenant_settings", column: "web_search_mode", values: WEB_SEARCH_MODES }
+  { table: "tenant_settings", column: "web_search_mode", values: WEB_SEARCH_MODES },
+  { table: "agent_memories", column: "provenance", values: MEMORY_PROVENANCES }
 ];
 
 describe.skipIf(!adminDatabaseUrl())("database enum contracts", () => {

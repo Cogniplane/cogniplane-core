@@ -6,7 +6,8 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertCircleIcon, ArchiveIcon, ChevronDownIcon, ChevronRightIcon, FolderIcon, PinIcon, PlusIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
 import { useAuth } from "../lib/auth-context";
-import { API_URL } from "../lib/api-client";
+import { getBackendBuild, type BackendBuild } from "../lib/admin-api";
+import { SHORTCUTS, ariaKeyShortcut, useApplePlatform, useShortcut } from "../lib/keyboard-shortcuts";
 import { SESSION_TRASH_RETENTION_DAYS, type Project, type Session } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -87,12 +88,15 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createProjectId, setCreateProjectId] = useState("personal");
   const [createError, setCreateError] = useState<string | null>(null);
+  const openCreateDialog = () => { setCreateError(null); setCreateProjectId("personal"); setCreateDialogOpen(true); };
+  useShortcut(SHORTCUTS.newSession, openCreateDialog);
+  const apple = useApplePlatform();
   const [addSessionId, setAddSessionId] = useState<string | null>(null);
   const [addProjectId, setAddProjectId] = useState("");
   const [addError, setAddError] = useState<string | null>(null);
   const [isAddingSession, setIsAddingSession] = useState(false);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
-  const [backendVersion, setBackendVersion] = useState<{ sha: string; buildDate: string } | null>(null);
+  const [fetchedBackendBuild, setFetchedBackendBuild] = useState<BackendBuild | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
   const serverSearch = Boolean(list.onSearch);
   const activeProjects = useMemo(
@@ -100,14 +104,18 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
     [projects]
   );
 
+  // The public health check no longer reports the build. Admin diagnostics do,
+  // so only an admin or owner asks, and a failed request shows nothing.
+  const canSeeBackendBuild = user?.role === "admin" || user?.role === "owner";
   useEffect(() => {
-    fetch(`${API_URL}/health`)
-      .then((r) => r.json())
-      .then((data: { version?: { sha: string; buildDate: string } }) => {
-        if (data.version) setBackendVersion(data.version);
-      })
+    if (!canSeeBackendBuild) return;
+    let cancelled = false;
+    getBackendBuild()
+      .then((build) => { if (!cancelled) setFetchedBackendBuild(build); })
       .catch(() => {});
-  }, []);
+    return () => { cancelled = true; };
+  }, [canSeeBackendBuild]);
+  const backendVersion = canSeeBackendBuild ? fetchedBackendBuild : null;
 
   const feSha = (process.env.NEXT_PUBLIC_BUILD_SHA ?? "dev").slice(0, 7);
   const feDate = (process.env.NEXT_PUBLIC_BUILD_DATE ?? "").slice(0, 10);
@@ -270,7 +278,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
       </div>
 
       <div className="px-3 pb-2">
-        <Button type="button" className="w-full" onClick={() => { setCreateError(null); setCreateProjectId("personal"); setCreateDialogOpen(true); }}>
+        <Button type="button" className="w-full" aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.newSession, apple)} onClick={openCreateDialog}>
           New session
         </Button>
       </div>

@@ -48,9 +48,15 @@ export async function registerModelRoutes(app: FastifyInstance, stores: ModelRou
       stores.customModels ? stores.customModels.list(tenantId) : Promise.resolve([])
     ]);
     const catalog = [...AVAILABLE_MODELS, ...customs.map(toAvailableModel)];
-    const models = listEnabledModels(settings, catalog)
-      .filter((model) => configured.has(model.provider))
-      .map((model) => withEffectiveDefaultEffort(model, settings));
+    const usableModels = listEnabledModels(settings, catalog)
+      .filter((model) => configured.has(model.provider));
+    const effectiveDefault = usableModels.find((model) => model.id === settings.defaultModelId)
+      ?? usableModels.find((model) => model.isDefault)
+      ?? usableModels[0];
+    const models = usableModels.map((model) => ({
+        ...withEffectiveDefaultEffort(model, settings),
+        isDefault: model.id === effectiveDefault?.id
+      }));
 
     return serialize(ModelsListResponseSchema, {
       models,

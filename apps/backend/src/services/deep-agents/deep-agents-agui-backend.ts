@@ -1,3 +1,4 @@
+import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 // Adapts a session graph to the AG-UI driver. Graph resolution and MCP metadata
 // stay session-scoped; the runtime adapter supplies the approval decision loop.
@@ -49,6 +50,7 @@ export interface AGUITurnBackend {
 }
 
 export interface SessionAGUITurnBackendParams {
+  callbacks?: BaseCallbackHandler[];
   threadId: string;
   runtime: DeepAgentsSessionRuntime;
   /** The graph's shared tool-context ref (the same object beforeToolCall reads). */
@@ -59,6 +61,8 @@ export interface SessionAGUITurnBackendParams {
   promptText: string;
   conversationMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   projectInstructions?: ProjectInstructionsSnapshot | null;
+  /** Recalled memories as a labelled data message, loaded once for the turn. */
+  memoryContext?: string | null;
   signal?: AbortSignal;
   /** Records availability after the graph and its tools have loaded. */
   onGraphReady?: () => Promise<void>;
@@ -109,8 +113,12 @@ export function createSessionAGUITurnBackend(
       const g = await resolveGraph();
       yield* g.streamEvents(input, {
         version: "v2",
+        callbacks: params.callbacks,
         configurable: { thread_id: threadId },
-        context: { projectInstructions: params.projectInstructions ?? null },
+        context: {
+          projectInstructions: params.projectInstructions ?? null,
+          memoryContext: params.memoryContext ?? null
+        },
         signal
       });
     },

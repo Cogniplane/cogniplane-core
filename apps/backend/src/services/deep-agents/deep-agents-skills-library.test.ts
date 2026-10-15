@@ -1,5 +1,5 @@
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -121,6 +121,24 @@ describe("buildSkillsLibraryFiles", () => {
       expect(logo.mimeType).toBe("image/png");
       expect(logo.content).toBeInstanceOf(Uint8Array);
       expect([...(logo.content as Uint8Array)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    });
+
+    it("excludes an external-file symlink while serving a regular companion", async () => {
+      bundleDir = await mkdtemp(path.join(os.tmpdir(), "skill-bundle-"));
+      const root = path.join(bundleDir, "bundle");
+      await mkdir(root);
+      await writeFile(path.join(bundleDir, "private.txt"), "private content");
+      await writeFile(path.join(root, "notes.txt"), "allowed content");
+      await symlink(path.join(bundleDir, "private.txt"), path.join(root, "linked.txt"));
+      const files = await buildSkillsLibraryFiles({
+        skills: [makeSkill({ bundleStorageUri: "file:///fixture" })],
+        bundles: { materializeBundle: async () => ({ localPath: root }) },
+        logger: fakeLog
+      });
+      expect(Object.keys(files).sort()).toEqual([
+        "/write-artifact/SKILL.md", "/write-artifact/notes.txt"
+      ]);
+      expect(files["/write-artifact/notes.txt"]?.content).toBe("allowed content");
     });
 
     it("skips a companion over the 10MB cap while keeping SKILL.md and small companions", async () => {

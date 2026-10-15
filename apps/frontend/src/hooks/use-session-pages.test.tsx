@@ -47,3 +47,37 @@ it.each([
   expect(load).toHaveBeenCalledTimes(2);
   client.clear();
 });
+
+it("polls the first session page without repeatedly loading older pages", async () => {
+  api.listSessions.mockImplementation(async ({ cursor }: { cursor?: string }) => ({
+    sessions: [{ sessionId: cursor ? "older" : "recent", sessionName: "Result" } as Session],
+    trashRetentionDays: 30,
+    nextCursor: cursor ? null : "older-page"
+  }));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const wrapper = ({ children }: { children: ReactNode }) => createElement(QueryClientProvider, { client }, children);
+  const { result } = renderHook(() => useSessionPages({ poll: true }), { wrapper });
+  await waitFor(() => expect(result.current.data?.sessions).toHaveLength(1));
+  await act(async () => { await result.current.fetchNextPage(); });
+  await waitFor(() => expect(result.current.data?.sessions).toHaveLength(2));
+  const olderCalls = api.listSessions.mock.calls.filter(([options]) => options.cursor === "older-page").length;
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ["session-list-head", "active", "", false] });
+  });
+  expect(api.listSessions.mock.calls.filter(([options]) => options.cursor === "older-page")).toHaveLength(olderCalls);
+  expect(api.listSessions.mock.lastCall?.[0].cursor).toBeUndefined();
+  api.listSessions.mockImplementation(async ({ cursor }: { cursor?: string }) => ({
+    sessions: cursor
+      ? [{ sessionId: "older", sessionName: "Older" } as Session]
+      : [{ sessionId: "new", sessionName: "New" } as Session],
+    trashRetentionDays: 30,
+    nextCursor: cursor ? null : "older-page"
+  }));
+  await act(async () => {
+    await client.refetchQueries({ queryKey: ["session-list-head", "active", "", false] });
+  });
+  await waitFor(() => expect(api.listSessions.mock.calls.filter(([options]) => options.cursor === "older-page"))
+    .toHaveLength(olderCalls + 1));
+  expect(result.current.data?.sessions.map((session) => session.sessionId)).toEqual(["new", "older"]);
+  client.clear();
+});

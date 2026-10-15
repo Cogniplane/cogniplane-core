@@ -110,11 +110,13 @@ function makeSessionStore() {
     async getReadable() {
       return {
         sessionId: "session-1",
+        projectId: null,
         sessionName: "test",
         status: "active" as const,
         userId: "user-1",
         createdAt: "",
-        updatedAt: ""
+        updatedAt: "",
+        transcriptFormat: "current" as const
       };
     }
   };
@@ -160,6 +162,7 @@ function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
     auditEvents: makeAuditEventStore(),
     githubConnections: makeGithubConnections(githubCreds),
     notionConnections: makeNotionConnections(),
+    jiraConnections: { async read() { return { ok: false as const, error: "No Jira connection found." }; } },
     artifactMaxBytes: 10_000_000,
     limits: {
       async consumeRateLimit() { return null; }
@@ -179,6 +182,7 @@ function makeValidCreds(overrides: Partial<GithubRuntimeCredentials> = {}): Gith
     name: "The Octocat",
     email: "octocat@github.com",
     token: "ghu_test_token",
+    allowedRepositories: ["org/repo"],
     ...overrides
   };
 }
@@ -195,6 +199,16 @@ function requireRecordField(
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+test("every built-in catalog entry has the category of its factory definition", () => {
+  // The graph evaluates Policy Center with the catalog category before a call,
+  // and the gateway evaluates it again with the definition category.
+  const definitions = createManagedToolDefinitions(makeDeps(null));
+  expect(definitions.map((definition) => definition.name).sort()).toEqual(listManagedToolIds().sort());
+  for (const definition of definitions) {
+    expect(sharedCatalog.get(definition.name)?.category, definition.name).toBe(definition.category);
+  }
+});
 
 test("github_read_file — returns file content when credentials valid", async () => {
   const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
@@ -229,6 +243,28 @@ test("managed tools expose output schemas for typed structured results", () => {
   expect(tools.length).toBe(listManagedToolIds().length);
   for (const tool of tools) {
     expect(tool.outputSchema).toBeTruthy();
+  }
+});
+
+test("github tools built by the factory deny a repository that the user did not allow", async () => {
+  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const fake = createFakeFetch(() => Response.json({}));
+
+  try {
+    for (const [name, args] of [
+      ["github_read_file", { repo: "org/other", path: "a.ts" }],
+      ["github_write_file", { repo: "org/other", path: "a.ts", branch: "main", content: "x", message: "m" }],
+      ["github_create_pr", { repo: "org/other", title: "t", head: "h", base: "main" }]
+    ] as const) {
+      const result = await tools.find((t) => t.name === name)!.handler({
+        context: makeContext(),
+        arguments: { toolContextId: "ctx-1", ...args }
+      });
+      expect(String(result["error"]), name).toMatch(/not on the user's list of allowed GitHub repositories/);
+    }
+    expect(fake.calls).toEqual([]);
+  } finally {
+    fake.restore();
   }
 });
 

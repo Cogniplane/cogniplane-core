@@ -144,7 +144,7 @@ publishes on loopback unless you explicitly change `POSTGRES_BIND_ADDR`.
 
 **Backend exits with `E2B_API_KEY is required` or `E2B_TEMPLATE_ID is not configured`.** Both are mandatory at boot — there is no local execution fallback. Sign up at [e2b.dev](https://e2b.dev), run `make e2b-build`, and export both vars (or put them in `.env`) before `docker compose up`.
 
-**Backend exits with `MIGRATION_DATABASE_URL is required` or similar.** Make sure you ran `docker compose up`, not `docker compose run backend` — the latter doesn't apply the `environment:` block from the compose file. The compose-up path provisions the env correctly.
+**Backend exits with a maintenance database error.** Set a separate `MAINTENANCE_USER_PASSWORD` in the Compose environment and run `docker compose up --build`. The `migrate` service must finish before the backend starts. Do not use the migration owner as the maintenance login.
 
 **`http://localhost:3000` shows "Could not load the model list" or auth errors.** The backend probably failed to boot. Check `docker compose logs backend` — common causes: missing `E2B_*` vars (see above), Postgres not yet healthy (the backend retries; wait 30s and refresh), or the host's port 3001 was already in use (the backend bound but the frontend can't reach it through the mapped port).
 

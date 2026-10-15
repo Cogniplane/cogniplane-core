@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
+import { listAdminUsers } from "../lib/admin-api";
 import { fetchTokenUsage } from "../lib/token-usage-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
@@ -20,10 +21,6 @@ import { HINT } from "../lib/ui-tokens";
 const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
 
-function shortUserId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
-}
-
 type View = "day" | "user" | "model";
 
 const VIEW_OPTIONS: Array<{ id: View; label: string }> = [
@@ -40,6 +37,14 @@ export function TokenUsageSection() {
     queryFn: () => fetchTokenUsage(days),
     placeholderData: keepPreviousData
   });
+  const users = useQuery({
+    queryKey: queryKeys.admin.users(),
+    queryFn: listAdminUsers,
+    enabled: view === "user"
+  });
+  const names = new Map((users.data ?? []).map((user) => [user.userId,
+    user.displayName && user.email ? `${user.displayName} (${user.email})` : user.displayName || user.email || user.userId
+  ]));
   const usage = query.data;
   const available = !isRouteNotFoundError(query.error, "GET", "/admin/token-usage");
   const error = query.error
@@ -59,16 +64,27 @@ export function TokenUsageSection() {
   const totals = usage?.totals;
 
   return (
-    <section id="token-usage" className="flex flex-col gap-5 pt-5">
+    <section id="token-reports" aria-labelledby="token-reports-heading" className="flex flex-col gap-5 pt-5">
+      <div>
+        <h2 id="token-reports-heading" className="text-lg font-semibold text-on-surface">Token reports</h2>
+        <p className="mt-1 text-sm text-on-surface-variant">
+          Estimated from recorded messages in the selected period. The period does not change the model budget.
+        </p>
+      </div>
       {available ? (
-        <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
-          <DayRangePicker value={days} onChange={setDays} />
+        <div className="flex flex-wrap items-center gap-3 pb-1">
+          <div role="group" aria-label="Report period" className="flex items-center gap-2">
+            <span aria-hidden="true" className="text-xs text-on-surface-variant">Last</span>
+            <DayRangePicker value={days} onChange={setDays} />
+          </div>
           <ViewToggle options={VIEW_OPTIONS} value={view} onChange={setView} />
           {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
         </div>
       ) : null}
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
+
+      {view === "user" && users.isError ? <p className="text-sm text-on-surface-variant">Names could not be loaded. Showing user IDs where needed.</p> : null}
 
       {available && !totals && query.isPending ? <TokenUsageSkeleton /> : null}
 
@@ -100,7 +116,7 @@ export function TokenUsageSection() {
                 firstColumnLabel="User"
                 rows={usage.byUser.map((u) => ({
                   key: u.userId,
-                  label: shortUserId(u.userId),
+                  label: names.get(u.userId) ?? u.userId,
                   inputTokens: u.inputTokens,
                   outputTokens: u.outputTokens,
                   totalTokens: u.totalTokens,

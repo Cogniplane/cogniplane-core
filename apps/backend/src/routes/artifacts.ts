@@ -2,10 +2,11 @@ import { canBrowseSessionContent } from "../services/session-access.js";
 import { Readable } from "node:stream";
 import { z } from "zod";
 import { ArtifactListQuerySchema } from "@cogniplane/shared-types";
-import { buildArtifactStorageKey } from "../services/artifacts/artifact-storage-key.js";
-import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
+import { attachmentContentDisposition, validateArtifactFilename } from "../services/artifacts/artifact-filename.js";
+import { ArtifactCursorError, isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
+import { UploadAdmission } from "../services/artifacts/upload-admission.js";
 
 import type { FastifyInstance } from "fastify";
 
@@ -50,12 +51,6 @@ function getUploadFields(
   return values;
 }
 
-function contentDispositionFileName(fileName: string): string {
-  const sanitized = fileName.replace(/["\\\r\n;]/g, "_");
-  const encoded = encodeURIComponent(fileName);
-  return `filename="${sanitized}"; filename*=UTF-8''${encoded}`;
-}
-
 export function buildArtifactRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
@@ -92,6 +87,8 @@ export async function registerArtifactRoutes(
   app: FastifyInstance,
   stores: ArtifactRouteStores
 ): Promise<void> {
+  const admission = new UploadAdmission({ ...stores, logger: app.log });
+
   // Cross-session artifact browser for the authenticated user. Read-only,
   // no role gate (own artifacts only); user isolation lives in the store's
   // `user_id` predicate. Keyset-paginated via an opaque `cursor`.
@@ -235,101 +232,40 @@ export async function registerArtifactRoutes(
     }
 
     const fields = fieldsResult.value;
-    const expectedProjectId = await stores.sessions.requireUploadAccess(tenantId, fields.sessionId, userId);
-
+    // The file is already drained above, so refusing the name here leaves the
+    // request cleanly consumed. Nothing is stored or inserted before this check.
     const artifactName = fields.name ?? file.filename ?? "upload.bin";
-    const stored = await stores.storage.put({
-      storageKey: buildArtifactStorageKey({
-        userId,
-        sessionId: fields.sessionId,
-        artifactName
-      }),
-      stream: Readable.from([buffer])
-    });
-
-    let artifact;
-    try {
-      artifact = await stores.artifacts.createUpload({
-        expectedProjectId,
-        tenantId,
-        sessionId: fields.sessionId,
-        userId,
-        artifactName,
-        mimeType: file.mimetype,
-        storageBackend: stored.storageBackend,
-        storageKey: stored.storageKey,
-        fileSizeBytes: stored.fileSizeBytes,
-        checksumSha256: stored.checksumSha256,
-        detail: {
-          fieldName: file.fieldname,
-          encoding: file.encoding
-        }
-      });
-    } catch (error) {
-      // Access and lifecycle are rechecked in the insert transaction after I/O.
-      // Preserve the actionable request error if object cleanup also fails.
-      try {
-        await stores.storage.delete(stored.storageKey);
-      } catch (cleanupError) {
-        request.log.error({ err: cleanupError, tenantId, sessionId: fields.sessionId, storageKey: stored.storageKey },
-          "Failed to delete rejected artifact upload");
-      }
-      throw error;
+    const nameProblem = validateArtifactFilename(artifactName);
+    if (nameProblem) {
+      reply.code(400);
+      return apiError("invalid_filename", nameProblem);
     }
-
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: fields.sessionId,
-      userId,
-      type: "artifact_uploaded",
-      payload: {
-        artifactId: artifact.artifactId,
-        artifactType: artifact.artifactType,
-        artifactName: artifact.artifactName,
-        mimeType: artifact.mimeType,
-        fileSizeBytes: artifact.fileSizeBytes
+    const ticket = await admission.begin({ tenantId, sessionId: fields.sessionId, userId });
+    const result = await admission.admit(ticket, {
+      artifactName,
+      mimeType: file.mimetype,
+      stream: Readable.from([buffer]),
+      source: "upload",
+      detail: {
+        fieldName: file.fieldname,
+        encoding: file.encoding
       }
     });
-
-    if (stores.piiScanEnqueuer) {
-      const scanResult = await stores.piiScanEnqueuer.enqueue({
-        tenantId,
-        sessionId: fields.sessionId,
-        userId,
-        artifactId: artifact.artifactId,
-        contentType: artifact.mimeType,
-        storageKey: artifact.storageKey,
-        source: "upload"
-      });
-      if (scanResult.kind === "blocked") {
-        reply.code(422);
-        return apiError(
-          "pii_block",
-          `Upload blocked by organization policy (${scanResult.blockReason}).`
-        );
-      }
-      if (scanResult.kind === "failed") {
-        // Permanent client-side errors (oversize, unsupported MIME, missing
-        // artifact) should NOT use 503 — that signals a transient provider
-        // problem. Use 422 so the client knows retrying won't help.
-        const isClientError = PERMANENT_PII_ERROR_CODES.has(scanResult.errorCode);
-        reply.code(isClientError ? 422 : 503);
-        return apiError(scanResult.errorCode, scanResult.errorMessage);
-      }
-      if (scanResult.kind === "skipped" || scanResult.kind === "allowed") {
-        await stores.artifacts.update(tenantId, artifact.artifactId, { status: "ready" });
-      }
-    } else {
-      await stores.artifacts.update(tenantId, artifact.artifactId, { status: "ready" });
+    if (result.kind === "blocked") {
+      reply.code(422);
+      return apiError("pii_block", `Upload blocked by organization policy (${result.blockReason}).`);
     }
-
-    // Return the persisted PII state, and do not return a stale response if the
-    // uploader lost project access while a synchronous scan was running.
-    const current = await stores.artifacts.getReadable(tenantId, artifact.artifactId, userId);
-    if (!current) return reply.code(404).send(notFoundError("artifact_not_found"));
+    if (result.kind === "scan_failed") {
+      // Permanent client-side errors (oversize, unsupported MIME, missing
+      // artifact) should NOT use 503 — that signals a transient provider
+      // problem. Use 422 so the client knows retrying won't help.
+      const isClientError = PERMANENT_PII_ERROR_CODES.has(result.errorCode);
+      reply.code(isClientError ? 422 : 503);
+      return apiError(result.errorCode, result.errorMessage);
+    }
     reply.code(201);
     reply.header("cache-control", "private, no-store");
-    return { artifact: current };
+    return { artifact: result.artifact };
   });
 
   app.post("/artifacts/:artifactId/download-token", async (request, reply) => {
@@ -345,7 +281,10 @@ export async function registerArtifactRoutes(
       return notFoundError("artifact_not_found");
     }
 
-    if (artifact.artifactType !== "upload" && artifact.status !== "ready") {
+    // An upload stays pending until its PII scan completes, and a blocked
+    // verdict can sit on a record that is already ready. Its raw bytes must not
+    // leave the store in either case.
+    if (!isArtifactPiiEligible(artifact)) {
       reply.code(409);
       return apiError("artifact_not_ready");
     }
@@ -387,7 +326,9 @@ export async function registerArtifactRoutes(
       reply.code(422);
       return apiError("not_a_pdf");
     }
-    if (artifact.status !== "ready") {
+    // Extracted text is the file's content: apply the download rule, so a
+    // blocked or unscanned verdict on a ready record withholds it too.
+    if (!isArtifactPiiEligible(artifact)) {
       reply.code(422);
       return apiError("artifact_not_ready");
     }
@@ -400,7 +341,8 @@ export async function registerArtifactRoutes(
 
     const current = await stores.artifacts.getReadable(tenantId, artifact.artifactId, userId);
     if (!current) return reply.code(404).send(notFoundError("artifact_not_found"));
-    if (current.status !== "ready") return reply.code(422).send(apiError("artifact_not_ready"));
+    // A block can land while the text is being extracted.
+    if (!isArtifactPiiEligible(current)) return reply.code(422).send(apiError("artifact_not_ready"));
     reply.header("cache-control", "private, no-store");
     return { text };
   });
@@ -481,10 +423,7 @@ export async function registerArtifactRoutes(
     reply.header("x-content-type-options", "nosniff");
     reply.header("referrer-policy", "no-referrer");
     reply.header("content-type", token.contentType);
-    reply.header(
-      "content-disposition",
-      `attachment; ${contentDispositionFileName(token.fileName)}`
-    );
+    reply.header("content-disposition", attachmentContentDisposition(token.fileName));
     reply.header("content-length", String(streamHandle.fileSizeBytes));
     return reply.send(streamHandle.stream);
   });

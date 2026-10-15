@@ -16,12 +16,15 @@ import {
   registerNotionOAuthRoutes
 } from "./notion/notion-oauth-routes.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
+import { JIRA_READ_TOOL_IDS } from "../managed-tools/jira-tools.js";
+import { readPipedreamSettings } from "./pipedream/pipedream-client.js";
 
 // The catalog contains static descriptors. Each app attaches its own live hooks.
 
 export type BuiltinIntegrationProbes = {
   notion?: IntegrationConnectionProbe;
   github?: IntegrationConnectionProbe;
+  jira?: IntegrationConnectionProbe;
 };
 
 export type BuiltinIntegrationOAuthCallbacks = {
@@ -44,6 +47,7 @@ export function registerBuiltinIntegrations(): void {
 
   registerNotionDescriptor();
   registerGithubDescriptor();
+  registerJiraDescriptor();
   registerComingSoonIntegrations();
 }
 
@@ -62,6 +66,8 @@ export function attachBuiltinIntegrationRuntime(
     connectionProbe: probes.github,
     oauthRoutes: buildGithubOAuthRoutes(oauth.github, options.limits)
   });
+  // Pipedream hosts the Jira authorization callback, so there is no OAuth route.
+  registry.setRuntimeWiring("jira", { connectionProbe: probes.jira });
 }
 
 function buildNotionOAuthRoutes(
@@ -126,7 +132,7 @@ function registerGithubDescriptor(): void {
     name: "GitHub",
     description: "Read and write files, open PRs in connected repositories.",
     longDescription:
-      "Each user connects their own GitHub account via OAuth. The agent can read files, write files, and open pull requests scoped to whatever repositories the connected user can access on GitHub.",
+      "Each user connects their own GitHub account via OAuth. The agent can read files, write files, and open pull requests, but only in the repositories that the user selects in their GitHub settings. Until the user selects a repository, the agent cannot use any.",
     logoSlug: "github",
     status: "available",
     category: "Code",
@@ -145,6 +151,31 @@ function registerGithubDescriptor(): void {
               "Set GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, and GITHUB_OAUTH_REDIRECT_URI in the backend environment to enable GitHub."
           },
     oauthCallbackPaths: GITHUB_OAUTH_CALLBACK_PATHS
+  });
+}
+
+function registerJiraDescriptor(): void {
+  registerIntegration({
+    id: "jira",
+    name: "Jira",
+    description: "Search issues and read issue details and history in Jira Cloud.",
+    longDescription:
+      "Each user connects their own Jira Cloud account through Pipedream Connect and selects one Jira site. The agent can list sites, search issues with JQL, read issue details, and read issue change history. Read-only: the agent cannot create, edit, or comment on issues.",
+    logoSlug: "jira",
+    status: "available",
+    category: "Productivity",
+    readToolIds: [...JIRA_READ_TOOL_IDS],
+    writeToolIds: [],
+    configMode: "none",
+    docsUrl: "https://pipedream.com/docs/connect",
+    platformStatus: (config: AppConfig) =>
+      readPipedreamSettings(config)
+        ? { configured: true, message: null }
+        : {
+            configured: false,
+            message:
+              "Set PIPEDREAM_CLIENT_ID, PIPEDREAM_CLIENT_SECRET, and PIPEDREAM_PROJECT_ID in the backend environment to enable Jira."
+          }
   });
 }
 
@@ -176,19 +207,10 @@ function registerComingSoonIntegrations(): void {
       category: "Communication"
     },
     {
-      id: "jira",
-      name: "Jira",
-      description: "Query and update issues across Jira projects.",
-      longDescription:
-        "Coming soon. Connects via Atlassian OAuth; the agent can search, transition, comment, and create issues.",
-      logoSlug: "jira",
-      category: "Productivity"
-    },
-    {
       id: "confluence",
       name: "Confluence",
       description: "Search pages and create new pages in Confluence spaces.",
-      longDescription: "Coming soon. Atlassian OAuth shared with Jira.",
+      longDescription: "Coming soon.",
       logoSlug: "confluence",
       category: "Productivity"
     },

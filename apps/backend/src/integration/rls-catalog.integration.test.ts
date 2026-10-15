@@ -10,8 +10,10 @@
 // a policy can name the right GUC and still be wrong. A permissive
 // `USING (true)` added alongside a correct policy ORs with it and lets
 // everything through; `OR true` or `<>` inside the expression passes a
-// substring check too. Actual row-visibility behaviour is
-// `rls-isolation.integration.test.ts`, and that covers the seeded tables only.
+// substring check too. Actual row-visibility behaviour is in
+// `rls-write-paths.integration.test.ts` (every tenant table, through its
+// production write path, except the declared exception that file lists) and
+// `rls-isolation.integration.test.ts` (audit trail, unscoped pool, system rows).
 
 import { describe, expect, test } from "vitest";
 

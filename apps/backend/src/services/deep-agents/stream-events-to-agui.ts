@@ -1,9 +1,10 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import type { UiResource } from "@cogniplane/shared-types";
+import type { McpAppCall } from "@cogniplane/shared-types";
 
 import { uuidv7 } from "../../lib/uuid.js";
 import { customEvent } from "./agui-events.js";
 import { withoutPolicyApprovalMetadata } from "../policy/policy-approval-proof.js";
+import { redactAppData, redactSecrets } from "../redact-secrets.js";
 
 export type DeepAgentsStreamEvent = Record<string, unknown>;
 
@@ -21,7 +22,7 @@ type PendingToolCall = {
   input: string;
   output: string;
   durationMs: number | null;
-  uiResources?: UiResource[];
+  mcpApp?: McpAppCall;
   startedAt: number;
 };
 
@@ -149,7 +150,7 @@ function mapToolStart(
     command: extractShellCommand(name, input),
     server: isMcp ? (options.mcpToolServers?.get(name) ?? null) : null,
     toolName: name,
-    input: JSON.stringify(input ?? {}),
+    input: JSON.stringify(isMcp ? redactAppData(input ?? {}) : input ?? {}),
     output: "",
     durationMs: null,
     startedAt: Date.now()
@@ -169,15 +170,14 @@ function mapToolEnd(state: StreamEventsToAGUIState, event: DeepAgentsStreamEvent
   state.pendingToolCalls.delete(runId);
 
   const data = event.data as Record<string, unknown> | undefined;
-  const { output, isError, uiResources } = extractToolOutput(data?.output);
+  const { output, isError, mcpApp } = extractToolOutput(data?.output, call.kind === "mcp");
   call.status = isError ? "failed" : "completed";
-  call.output =
-    output ||
-    (uiResources.length > 0
-      ? uiResources.map((resource) => `[interactive UI: ${resource.uri}]`).join("\n")
-      : "");
+  call.output = output;
   call.durationMs = Math.max(0, Date.now() - call.startedAt);
-  if (uiResources.length > 0) call.uiResources = uiResources;
+  if (mcpApp && call.kind === "mcp" && !isError) {
+    call.mcpApp = { ...mcpApp, input: JSON.parse(call.input) as Record<string, unknown>,
+      result: redactAppData(mcpApp.result) };
+  }
   return completeTool(call);
 }
 
@@ -277,13 +277,8 @@ function completeTool(call: PendingToolCall): BaseEvent[] {
       })
     );
   }
-  if (call.uiResources && call.uiResources.length > 0) {
-    events.push(
-      customEvent("tool_ui_resources", {
-        toolCallId: call.itemId,
-        uiResources: call.uiResources
-      })
-    );
+  if (call.status === "completed" && call.mcpApp) {
+    events.push(customEvent("tool_mcp_app", { toolCallId: call.itemId, app: call.mcpApp }));
   }
   return events;
 }
@@ -360,33 +355,41 @@ function extractShellCommand(name: string, input: Record<string, unknown> | null
   return typeof command === "string" && command.trim() ? command : null;
 }
 
-type ExtractedOutput = { output: string; isError: boolean; uiResources: UiResource[] };
+type ExtractedOutput = { output: string; isError: boolean; mcpApp?: McpAppCall };
 
-function extractToolOutput(raw: unknown): ExtractedOutput {
-  const result = extractToolOutputUnsanitized(raw);
+function extractToolOutput(raw: unknown, isMcp: boolean): ExtractedOutput {
+  const result = extractToolOutputUnsanitized(raw, isMcp);
   return result.output.includes("\u0000")
     ? { ...result, output: result.output.replaceAll("\u0000", "\uFFFD") }
     : result;
 }
 
-function toUiResource(block: Record<string, unknown>): UiResource | null {
-  const resource = block.resource;
-  if (typeof resource !== "object" || resource === null) return null;
-  const record = resource as Record<string, unknown>;
-  if (typeof record.uri !== "string" || !record.uri.startsWith("ui://")) return null;
-  if (typeof record.mimeType !== "string") return null;
-  return {
-    uri: record.uri,
-    mimeType: record.mimeType,
-    ...(typeof record.text === "string" ? { text: record.text } : {}),
-    ...(typeof record.blob === "string" ? { blob: record.blob } : {})
-  };
+// Embedded resource blocks have no renderer; MCP Apps use gateway resource
+// metadata instead. A raw MCP result keeps these blocks in `content`. The
+// LangChain MCP adapter moves them to the ToolMessage `artifact` and can leave
+// the content empty. When a result has no other text, name each resource so the
+// tool card says what the tool returned. Never copy its text or blob.
+function describeResourceBlocks(...lists: unknown[]): string {
+  const lines: string[] = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const block of list) {
+      if (typeof block !== "object" || block === null) continue;
+      const item = block as Record<string, unknown>;
+      if (item.type !== "resource" || typeof item.resource !== "object" || item.resource === null) continue;
+      const { uri, mimeType } = item.resource as Record<string, unknown>;
+      if (typeof uri !== "string") continue;
+      const type = typeof mimeType === "string" ? ` (${mimeType})` : "";
+      lines.push(`[Embedded resource not displayed: ${uri}${type}]`);
+    }
+  }
+  return lines.join("\n");
 }
 
-function extractToolOutputUnsanitized(raw: unknown): ExtractedOutput {
-  if (raw === undefined || raw === null) return { output: "", isError: false, uiResources: [] };
-  if (typeof raw === "string") return { output: raw, isError: false, uiResources: [] };
-  if (typeof raw !== "object") return { output: String(raw), isError: false, uiResources: [] };
+function extractToolOutputUnsanitized(raw: unknown, isMcp: boolean): ExtractedOutput {
+  if (raw === undefined || raw === null) return { output: "", isError: false };
+  if (typeof raw === "string") return { output: raw, isError: false };
+  if (typeof raw !== "object") return { output: String(raw), isError: false };
 
   const record = raw as Record<string, unknown>;
   if (record.lg_name === "Command" || (record.update && typeof record.update === "object")) {
@@ -404,33 +407,68 @@ function extractToolOutputUnsanitized(raw: unknown): ExtractedOutput {
     }
     return {
       output: parts.length > 0 ? parts.join("\n") : safeJsonStringify(update ?? record),
-      isError,
-      uiResources: []
+      isError
     };
   }
 
   const isError = record.status === "error";
   const content = "content" in record ? record.content : record;
-  if (typeof content === "string") return { output: content, isError, uiResources: [] };
+  const app = isMcp && !isError ? extractMcpApp(record, content, isError) : null;
+  if (typeof content === "string") {
+    return { output: content || describeResourceBlocks(record.artifact), isError, ...(app ? { mcpApp: app } : {}) };
+  }
   if (!Array.isArray(content)) {
-    return { output: safeJsonStringify(content), isError, uiResources: [] };
+    const output = isMcp && app && typeof content === "object" && content !== null && typeof (content as { text?: unknown }).text === "string"
+      ? (content as { text: string }).text
+      : safeJsonStringify(content);
+    return { output, isError, ...(app ? { mcpApp: app } : {}) };
   }
 
   const parts: string[] = [];
-  const uiResources: UiResource[] = [];
   for (const block of content) {
     if (typeof block === "string") parts.push(block);
     else if (typeof block === "object" && block !== null) {
       const item = block as Record<string, unknown>;
       if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
       else if (item.type === "image") parts.push("[image]");
-      else if (item.type === "resource") {
-        const resource = toUiResource(item);
-        if (resource) uiResources.push(resource);
-      }
     }
   }
-  return { output: parts.join(""), isError, uiResources };
+  const output = parts.join("") || describeResourceBlocks(content, record.artifact);
+  return { output, isError, ...(app ? { mcpApp: app } : {}) };
+}
+
+function extractMcpApp(record: Record<string, unknown>, content: unknown, isError: boolean): McpAppCall | null {
+  const contentRecord = content && typeof content === "object" && !Array.isArray(content)
+    ? content as Record<string, unknown> : null;
+  const artifacts = Array.isArray(record.artifact) ? record.artifact as Array<Record<string, unknown>> : [];
+  const metaArtifact = artifacts.find((entry) => entry?.type === "mcp_meta")?.data;
+  const meta = [contentRecord?.meta, metaArtifact, record.meta].find(
+    (value): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value) &&
+      typeof (value as Record<string, unknown>).cogniplaneAppResourceUri === "string"
+  );
+  const resourceUri = meta?.cogniplaneAppResourceUri;
+  if (typeof resourceUri !== "string" || !resourceUri.startsWith("ui://") || redactSecrets(resourceUri) !== resourceUri) return null;
+  const structuredArtifact = artifacts.find((entry) => entry?.type === "mcp_structured_content")?.data;
+  const structuredContent = [contentRecord?.structuredContent, structuredArtifact, record.structuredContent].find(
+    (value): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
+  );
+  const blocks = Array.isArray(content)
+    ? content.filter((block): block is { type: string; [key: string]: unknown } =>
+        typeof block === "object" && block !== null && typeof block.type === "string")
+    : contentRecord?.type === "text" && typeof contentRecord.text === "string"
+      ? [{ type: "text", text: contentRecord.text }]
+      : typeof content === "string" ? [{ type: "text", text: content }] : [];
+  return {
+    resourceUri,
+    readOnly: meta?.cogniplaneAppReadOnly === true,
+    turnContext: meta?.cogniplaneAppTurnContext === "interactive" || meta?.cogniplaneAppTurnContext === "scheduled"
+      ? meta.cogniplaneAppTurnContext : null,
+    result: {
+      content: blocks,
+      ...(structuredContent ? { structuredContent } : {}),
+      ...(isError ? { isError: true } : {})
+    }
+  };
 }
 
 function safeJsonStringify(value: unknown): string {

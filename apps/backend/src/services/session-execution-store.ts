@@ -48,23 +48,39 @@ export function interactiveContextExecutionSql(context: string): string {
 export class SessionExecutionStore {
   constructor(private readonly pool: Pool, readonly ownerId = uuidv7()) {}
 
-  async sandboxId(execution: SessionExecution): Promise<string | null> {
+  /**
+   * The sandbox saved for the session, with the hash of the network policy
+   * that it was created under. The record of the policy names its sandbox, so
+   * it counts only while `sandbox_id` is still that sandbox. An older replica
+   * that replaces the sandbox without writing the record leaves one that no
+   * longer matches, and the hash then reads as unknown. The hash is for audits.
+   * It is never proof of the live network: the runtime reads that from the
+   * provider at the start of every turn.
+   */
+  async sandboxBinding(execution: SessionExecution): Promise<{ sandboxId: string; networkPolicyHash: string | null } | null> {
     return withTenantScope(this.pool, execution.tenantId, async db => {
-      const result = await db.query(`SELECT s.sandbox_id FROM sessions s
+      const result = await db.query(`SELECT s.sandbox_id, s.sandbox_network_policy FROM sessions s
         JOIN session_executions e ON e.tenant_id=s.tenant_id AND e.session_id=s.session_id
         WHERE s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
           AND e.owner_id=$4 AND e.user_id=$5 AND e.status='active'
           AND e.expires_at>clock_timestamp() AND s.project_id IS NULL
           AND s.status='active' AND ${sessionExecutionAccessSql("s", "e.user_id")}`,
       [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId, execution.userId]);
-      if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
-      return result.rows[0].sandbox_id ?? null;
+      const row = result.rows[0];
+      if (!row) throw new SessionExecutionError("execution_stopped", 403);
+      if (!row.sandbox_id) return null;
+      const policy = row.sandbox_network_policy as { sandboxId?: unknown; hash?: unknown } | null;
+      const networkPolicyHash = policy && policy.sandboxId === row.sandbox_id && typeof policy.hash === "string"
+        ? policy.hash : null;
+      return { sandboxId: row.sandbox_id, networkPolicyHash };
     });
   }
 
-  async bindSandboxId(execution: SessionExecution, previousId: string | null, sandboxId: string): Promise<void> {
+  async bindSandboxId(
+    execution: SessionExecution, previousId: string | null, sandboxId: string, networkPolicyHash: string
+  ): Promise<void> {
     await withTenantScope(this.pool, execution.tenantId, async db => {
-      const result = await db.query(`UPDATE sessions s SET sandbox_id=$6
+      const result = await db.query(`UPDATE sessions s SET sandbox_id=$6, sandbox_network_policy=$8::jsonb
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
           AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
           AND e.owner_id=$4 AND e.user_id=$5 AND e.status='active'
@@ -73,7 +89,7 @@ export class SessionExecutionStore {
           AND ${sessionExecutionAccessSql("s", "e.user_id")}
         RETURNING s.session_id`,
       [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId,
-        execution.userId, sandboxId, previousId]);
+        execution.userId, sandboxId, previousId, JSON.stringify({ sandboxId, hash: networkPolicyHash })]);
       if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
     });
   }

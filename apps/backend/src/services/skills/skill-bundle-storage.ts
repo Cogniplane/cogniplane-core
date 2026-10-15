@@ -1,4 +1,4 @@
-import { access, cp, mkdir, rename, rm } from "node:fs/promises";
+import { access, cp, mkdir, realpath, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -47,6 +47,56 @@ async function pathExists(targetPath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+// A bundle path must stay strictly inside its root. Storage URIs are written by
+// the server, but a crafted or corrupted row must never read or `rm -rf` a path
+// outside the bundle directory, or the root itself. If the root changes, move
+// the bundles and rewrite their stored URIs: paths under an old root are refused.
+const OUTSIDE_ROOT = "Skill bundle path is outside the bundle storage root.";
+
+function isStrictlyInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  // A name such as "..legacy" is inside; only a ".." segment leaves the root.
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+// Lexical check: `..` segments cannot leave the root.
+function containedPath(root: string, candidate: string): string {
+  const resolvedRoot = path.resolve(root);
+  const resolved = path.resolve(resolvedRoot, candidate);
+  if (!isStrictlyInside(resolvedRoot, resolved)) throw new Error(OUTSIDE_ROOT);
+  return resolved;
+}
+
+async function existingRealPath(candidate: string): Promise<string | null> {
+  try {
+    return await realpath(candidate);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Filesystem check, after the lexical one: a symlink inside the root must not
+ * lead out of it. `leaf` also checks the bundle itself (for reads); a delete
+ * checks only its parent, because `rm` on a symlink removes the link only.
+ * Every existing directory from `target` up to the root must resolve inside
+ * the real root.
+ */
+async function assertRealContainment(root: string, target: string, leaf: boolean): Promise<void> {
+  const resolvedRoot = path.resolve(root);
+  const realRoot = await existingRealPath(resolvedRoot);
+  if (realRoot === null) return; // Nothing exists under a missing root.
+  let current = leaf ? target : path.dirname(target);
+  while (isStrictlyInside(resolvedRoot, current)) {
+    const real = await existingRealPath(current);
+    if (real !== null) {
+      if (!isStrictlyInside(realRoot, real)) throw new Error(OUTSIDE_ROOT);
+      return;
+    }
+    current = path.dirname(current);
   }
 }
 
@@ -110,13 +160,15 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
     // tenant, so a shared path would let one tenant's cleanup rm a bundle
     // another tenant still uses. Mirrors the bucket backend's
     // `skills/<tenantId>/...` layout.
-    const bundlePath = path.join(this.rootPath, input.tenantId, input.bundleName, input.contentHash);
+    const bundlePath = containedPath(this.rootPath, path.join(input.tenantId, input.bundleName, input.contentHash));
+    await assertRealContainment(this.rootPath, bundlePath, true);
     if (await pathExists(bundlePath)) {
       return { storageUri: `file://${bundlePath}` };
     }
 
     const parentPath = path.dirname(bundlePath);
-    const tempPath = path.join(parentPath, `${input.contentHash}.tmp-${uuidv7()}`);
+    // Built from the checked path, never from the raw hash.
+    const tempPath = path.join(parentPath, `${path.basename(bundlePath)}.tmp-${uuidv7()}`);
     await mkdir(parentPath, { recursive: true });
 
     try {
@@ -134,7 +186,9 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
   }
 
   async materializeBundle(storageUri: string): Promise<{ localPath: string }> {
-    const localPath = parseFileUri(storageUri);
+    // A relative stored path was always read from the working directory.
+    const localPath = containedPath(this.rootPath, path.resolve(parseFileUri(storageUri)));
+    await assertRealContainment(this.rootPath, localPath, true);
     if (!(await pathExists(localPath))) {
       throw new Error(`Skill bundle not found on disk: ${localPath}`);
     }
@@ -142,7 +196,8 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
   }
 
   async deleteBundle(storageUri: string): Promise<void> {
-    const bundlePath = parseFileUri(storageUri);
+    const bundlePath = containedPath(this.rootPath, path.resolve(parseFileUri(storageUri)));
+    await assertRealContainment(this.rootPath, bundlePath, false);
     await rm(bundlePath, { recursive: true, force: true });
   }
 }
@@ -239,7 +294,7 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
         : key;
     // Strip the trailing `.tar.gz` so the cache dir name is just `<rev>-<hash>`.
     const withoutSuffix = withoutPrefix.replace(/\.tar\.gz$/, "");
-    return path.join(this.deps.cacheRoot, bucketName, withoutSuffix);
+    return containedPath(this.deps.cacheRoot, path.join(bucketName, withoutSuffix));
   }
 
   async materializeBundle(storageUri: string): Promise<{ localPath: string }> {
@@ -250,6 +305,7 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
     const parsed = parseS3Uri(storageUri);
 
     const cachePath = this.cachePathFor(parsed.bucketName, parsed.key);
+    await assertRealContainment(this.deps.cacheRoot, cachePath, true);
     if (await pathExists(cachePath)) {
       return { localPath: cachePath };
     }
@@ -307,6 +363,9 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
 
   async deleteBundle(storageUri: string): Promise<void> {
     const parsed = parseS3Uri(storageUri);
+    // Validate the local cache path before any remote side effect.
+    const cachePath = this.cachePathFor(parsed.bucketName, parsed.key);
+    await assertRealContainment(this.deps.cacheRoot, cachePath, false);
     await this.deps.client.send(
       new DeleteObjectCommand({
         Bucket: parsed.bucketName,
@@ -314,7 +373,6 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
       })
     );
 
-    const cachePath = this.cachePathFor(parsed.bucketName, parsed.key);
     await rm(cachePath, { recursive: true, force: true });
   }
 }

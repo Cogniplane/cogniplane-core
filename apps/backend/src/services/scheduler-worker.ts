@@ -1,19 +1,35 @@
-import { EventType } from "@ag-ui/client";
 import { uuidv7 } from "../lib/uuid.js";
 
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { AuditEventStore } from "./audit-event-store.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
+import { gateChatPrompt, type ChatPromptGateStores } from "./pii/chat-prompt-pii.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
-import { isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore } from "./session-store.js";
-import { clientSafeFailureMessage } from "./sse-writer.js";
+import { redactSecrets } from "./redact-secrets.js";
+import {
+  GENERIC_TURN_FAILURE,
+  TurnTranscript,
+  classifyTurnFailure,
+  type TurnOutcome,
+  type TurnTranscriptMessages
+} from "./turn-transcript.js";
 import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
+
+/** The text a scheduled job sends to the model. */
+export function scheduledJobPrompt(input: ScheduledJobRecord["input"]): string {
+  return typeof input.prompt === "string" ? input.prompt : JSON.stringify(input);
+}
+
+// 4xx so classifyTurnFailure passes the message through to the job owner.
+function jobOwnerError(message: string): Error {
+  return Object.assign(new Error(message), { statusCode: 400 });
+}
 
 /**
  * Per-job runtime resolution, mirroring the interactive /messages path
@@ -43,22 +59,25 @@ export type SchedulerWorkerDeps = {
     | "sweepStaleJobRuns"
   >;
   sessions: Pick<SessionStore, "create">;
-  messages: Pick<MessageStore, "create" | "getOwned" | "updateContent">;
+  messages: Pick<MessageStore, "create" | "getOwned"> & TurnTranscriptMessages;
   toolContexts: Pick<ToolExecutionContextStore, "create">;
   runtimeAdapter: SchedulerRuntimeAdapter;
   resolveRuntime: (tenantId: string) => Promise<SchedulerRuntimeResolution>;
   auditEvents: Pick<AuditEventStore, "create">;
   /**
+   * Chat-prompt PII policy for scheduled prompts, the same gate interactive
+   * messages use. Absent when PII protection is not configured.
+   */
+  piiProtection?: ChatPromptGateStores["piiProtection"];
+  piiScanRuns?: ChatPromptGateStores["piiScanRuns"];
+  /**
    * Optional PII scan subsystem. When both are provided, each worker tick also
    * drains up to `maxConcurrentPiiJobs` queued `pii_scan_jobs` in parallel with
-   * scheduled cron jobs. `buildSchedulerWorker` only threads these in when the
-   * PII drain is safe to run (PII_PROVIDER_ENABLED — which guarantees the boot
-   * guard asserted a BYPASSRLS pool for the cross-tenant claim); otherwise they
-   * are left undefined and the drain no-ops. Kept optional so bootstrap paths
-   * and tests that don't care about PII don't have to wire it.
+   * scheduled cron jobs. Kept optional so bootstrap paths and tests that don't
+   * care about PII don't have to wire it.
    */
-  piiScanJobs?: Pick<PiiScanJobStore, "claimDueJobs" | "sweepStaleClaims">;
-  piiScanJobHandler?: Pick<PiiScanJobHandler, "execute">;
+  piiScanJobs?: Pick<PiiScanJobStore, "claimDueJobs" | "sweepStaleClaims" | "listUnfinishedFailures">;
+  piiScanJobHandler?: Pick<PiiScanJobHandler, "execute" | "finishFailedJob">;
   /** Best-effort retention sweep for project files and their stored objects. */
   projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
   projectFileStorage?: Pick<ArtifactStorage, "delete">;
@@ -141,6 +160,8 @@ const STALE_RUN_SWEEP_BUFFER_MS = 60_000;
 
 /** Max orphaned run rows recovered per tick; the rest drain on later ticks. */
 const STALE_RUN_SWEEP_BATCH_SIZE = 100;
+// Failed PII scan jobs whose scan run each tick closes. Later ticks take the rest.
+const UNFINISHED_PII_FAILURE_BATCH = 50;
 
 export class SchedulerWorker {
   private interval: ReturnType<typeof setInterval> | null = null;
@@ -148,6 +169,16 @@ export class SchedulerWorker {
   private activePiiCount = 0;
   private projectCleanupInFlight = false;
   private sessionCleanupInFlight = false;
+  // Set by stop(): no new job or PII scan is claimed after it.
+  private stopping = false;
+  // Set by refuseNewTurns(): a claimed job still preparing fails instead of
+  // starting a turn on a runtime that is closing.
+  private turnsRefused = false;
+  // Every tick, job, PII scan and background cleanup still running. drain()
+  // waits for them, so shutdown does not close the database pools under a
+  // job's outcome write. A job is tracked apart from its tick, because the
+  // tick or the job's timeout wrapper can settle before the job does.
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(
     private readonly deps: SchedulerWorkerDeps,
@@ -167,17 +198,54 @@ export class SchedulerWorker {
   }
 
   stop(): void {
+    this.stopping = true;
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
     }
   }
 
-  async tick(): Promise<void> {
+  /** Call before the runtimes close at shutdown. */
+  refuseNewTurns(): void {
+    this.stopping = true;
+    this.turnsRefused = true;
+  }
+
+  /**
+   * Waits up to `budgetMs` for the ticks, jobs and cleanups in flight. Returns
+   * true when none is left. Call it after stop().
+   */
+  async drain(budgetMs: number): Promise<boolean> {
+    const deadline = Date.now() + budgetMs;
+    while (this.inFlight.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.inFlight]),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, remaining); })
+      ]);
+      clearTimeout(timer);
+    }
+    return true;
+  }
+
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.inFlight.add(work);
+    void work.then(() => this.inFlight.delete(work), () => this.inFlight.delete(work));
+    return work;
+  }
+
+  tick(): Promise<void> {
+    return this.track(this.runTick());
+  }
+
+  private async runTick(): Promise<void> {
+    if (this.stopping) return;
     const executions: Promise<void>[] = [];
 
-    void this.cleanupExpiredProjectFiles();
-    void this.cleanupExpiredSessions();
+    void this.track(this.cleanupExpiredProjectFiles());
+    void this.track(this.cleanupExpiredSessions());
 
     const schedulingEnabled = this.options.schedulingEnabled ?? true;
     if (schedulingEnabled) {
@@ -212,7 +280,7 @@ export class SchedulerWorker {
         // between makes over-admission impossible; the reservation is
         // released when the claim loses or throws. Unclaimed due jobs stay
         // due and are picked up by a later tick.
-        if (this.activeCount >= this.options.maxConcurrentJobs) {
+        if (this.stopping || this.activeCount >= this.options.maxConcurrentJobs) {
           break;
         }
         this.activeCount += 1;
@@ -401,6 +469,27 @@ export class SchedulerWorker {
     }
   }
 
+  // A failed job must not leave its upload or message pending forever.
+  private async finishFailedPiiScanJobs(
+    piiScanJobs: Pick<PiiScanJobStore, "listUnfinishedFailures">,
+    handler: Pick<PiiScanJobHandler, "finishFailedJob">
+  ): Promise<void> {
+    let jobs: PiiScanJobRecord[];
+    try {
+      jobs = await piiScanJobs.listUnfinishedFailures(UNFINISHED_PII_FAILURE_BATCH);
+    } catch (error) {
+      this.deps.logger.error({ error }, "Failed to list failed PII scan jobs with open scan runs");
+      return;
+    }
+    for (const job of jobs) {
+      try {
+        await handler.finishFailedJob(job);
+      } catch (error) {
+        this.deps.logger.error({ error, jobId: job.jobId }, "Failed to close the scan run of a failed PII scan job");
+      }
+    }
+  }
+
   private async drainPiiScanJobs(executions: Promise<void>[]): Promise<void> {
     const { piiScanJobs, piiScanJobHandler } = this.deps;
     if (!piiScanJobs || !piiScanJobHandler) {
@@ -423,10 +512,11 @@ export class SchedulerWorker {
     } catch (error) {
       this.deps.logger.error({ error }, "Failed to sweep stale PII scan job claims");
     }
+    await this.finishFailedPiiScanJobs(piiScanJobs, piiScanJobHandler);
 
     const limit = this.options.maxConcurrentPiiJobs ?? this.options.maxConcurrentJobs;
     const available = limit - this.activePiiCount;
-    if (available <= 0) {
+    if (this.stopping || available <= 0) {
       return;
     }
 
@@ -450,8 +540,7 @@ export class SchedulerWorker {
 
     for (const job of claimed) {
       executions.push(
-        piiScanJobHandler
-          .execute(job)
+        this.track(piiScanJobHandler.execute(job))
           .catch((error) => {
             // `PiiScanJobHandler.execute` already records failure state; this
             // catch is a last-resort guard so a raised error doesn't crash the
@@ -474,7 +563,9 @@ export class SchedulerWorker {
     // so the same promise settles with status="failed" and records the outcome.
     // We therefore never need to invent a second completeJobRun here.
     const turn: ScheduledTurnHandle = { sessionId: null, adapter: null, timedOut: false };
-    const execution = this.executeJob(job, turn);
+    // Tracked on its own: after the abort grace this wrapper returns and frees
+    // the slot, but the job can still be writing its outcome.
+    const execution = this.track(this.executeJob(job, turn));
 
     let timer: ReturnType<typeof setTimeout> | null = null;
     const timeout = new Promise<void>((resolve) => {
@@ -546,11 +637,28 @@ export class SchedulerWorker {
     const runId = uuidv7();
     const startTime = Date.now();
     let sessionId: string | null = null;
-    let status: "completed" | "failed" = "completed";
-    let errorMessage: string | null = null;
-    let responseText = "";
-    let inputTokens = 0;
-    let outputTokens = 0;
+    // Created with the assistant row; it classifies the turn and writes the
+    // final transcript exactly as the interactive writer does.
+    let transcript: TurnTranscript | null = null;
+    let failure: TurnOutcome | undefined;
+    // False only for a PII provider outage: it is not the job's fault, and
+    // counting it would disable every job during a long outage.
+    let countsTowardDisable = true;
+    // A watchdog timeout wins over the stream's own terminal event, because
+    // the abort race can let a stray event look like success. The transcript
+    // reads it until finalization ends, so the row and the run agree. A
+    // timeout during cleanup after that does not change the saved outcome.
+    const timeoutFailure = (): TurnOutcome | undefined =>
+      turn.timedOut
+        ? { status: "error", message: `Scheduled job timed out after ${this.options.jobTimeoutMs}ms` }
+        : undefined;
+    // The watchdog aborts only a session that exists. If it fired before that,
+    // stop here so the job does not start a turn or take a reservation.
+    const stopIfTimedOut = () => {
+      if (turn.timedOut) throw new Error("Scheduled job timed out before its turn started");
+      // The runtimes close at shutdown; a job still preparing must not start a turn.
+      if (this.turnsRefused) throw new Error("Scheduler shut down before the job's turn started");
+    };
 
     try {
       // Why: scheduled jobs replay the full interactive /messages pipeline
@@ -580,7 +688,7 @@ export class SchedulerWorker {
       // before the message rows so it leaves no dangling pending assistant.
       const resolution = await this.deps.resolveRuntime(job.tenantId);
       if (resolution.kind === "error") {
-        // 400 (statusCode) so clientSafeFailureMessage passes this through to
+        // 400 (statusCode) so classifyTurnFailure passes this through to
         // the job owner. The resolver's message is written for a user
         // ("configure a model provider key"), unlike the SDK and driver errors
         // that reach the same catch and are deliberately collapsed there.
@@ -593,7 +701,47 @@ export class SchedulerWorker {
       // Expose the adapter so the timeout watchdog aborts via the owning runtime.
       turn.adapter = runtime;
 
-      const prompt = typeof job.input.prompt === "string" ? job.input.prompt : JSON.stringify(job.input);
+      // Apply the current policy at every run: it can change after the job was
+      // saved. Nothing is saved or sent to the model before this check.
+      const pii = await gateChatPrompt(
+        {
+          piiProtection: this.deps.piiProtection,
+          piiScanRuns: this.deps.piiScanRuns,
+          auditEvents: this.deps.auditEvents,
+          logger: this.deps.logger
+        },
+        { tenantId: job.tenantId, sessionId, userId: job.userId, rawText: scheduledJobPrompt(job.input) }
+      );
+      if (pii.kind === "unavailable") {
+        // A permanent error fails every run, so it still counts.
+        countsTowardDisable = pii.permanent;
+        throw jobOwnerError(
+          pii.permanent
+            ? `The scheduled prompt could not be checked for sensitive data: ${pii.error.message}`
+            : "PII protection was unavailable, so the prompt was not sent. The job runs again at its next scheduled time."
+        );
+      }
+      if (pii.kind === "block") {
+        // Same record as an interactive block: the raw prompt is not saved.
+        await this.deps.messages.create({
+          tenantId: job.tenantId,
+          sessionId,
+          userId: job.userId,
+          role: "system",
+          status: "completed",
+          content: "Message blocked by organization policy.",
+          detail: {
+            pii: {
+              status: "blocked",
+              modeApplied: "block",
+              blockReason: pii.blockReason,
+              ...(pii.scanRunId ? { scanRunId: pii.scanRunId } : {})
+            }
+          }
+        });
+        throw jobOwnerError(`The scheduled prompt was blocked by organization policy (${pii.blockReason}).`);
+      }
+      const prompt = pii.runtimePrompt;
 
       await this.deps.messages.create({
         tenantId: job.tenantId,
@@ -601,7 +749,8 @@ export class SchedulerWorker {
         userId: job.userId,
         role: "user",
         status: "completed",
-        content: prompt
+        content: pii.persistedText,
+        ...(pii.userDetail ? { detail: pii.userDetail } : {})
       });
 
       const assistantMessage = await this.deps.messages.create({
@@ -612,7 +761,18 @@ export class SchedulerWorker {
         status: "pending",
         content: ""
       });
+      const scheduledTurn = new TurnTranscript({
+        messages: this.deps.messages,
+        tenantId: job.tenantId,
+        sessionId,
+        userId: job.userId,
+        messageId: assistantMessage.messageId,
+        logger: this.deps.logger,
+        lateFailure: timeoutFailure
+      });
+      transcript = scheduledTurn;
 
+      stopIfTimedOut();
       const runtimeSession = await runtime.createSession({
         tenantId: job.tenantId,
         sessionId,
@@ -630,7 +790,10 @@ export class SchedulerWorker {
         // scheduled actions more strictly. Keep the same runtimePolicy snapshot
         // as interactive turns so the MCP gateway can enforce enabled tools and
         // servers for scheduled tool calls.
-        metadata: { runtimePolicy: runtimeSession.runtimePolicy, turnContext: "scheduled" },
+        metadata: { runtimePolicy: runtimeSession.runtimePolicy,
+          ...(runtimeSession.mcpServerSources ? { mcpServerSources: runtimeSession.mcpServerSources } : {}),
+          ...(runtimeSession.integrationAccounts ? { integrationAccounts: runtimeSession.integrationAccounts } : {}),
+          turnContext: "scheduled" },
         // Outlive the job watchdog by a margin — a context TTL equal to the
         // timeout would let a tool call near the deadline race context expiry
         // and fail with -32000 instead of running to the watchdog.
@@ -642,6 +805,7 @@ export class SchedulerWorker {
       // rejects gated tool calls at once for `turnContext: "scheduled"`. Policy
       // Center still receives the scheduled turn context through the tool
       // execution metadata above.
+      stopIfTimedOut();
       const stream = runtime.runMessageAGUI(runtimeSession, {
         prompt,
         toolContextId: toolContext.toolContextId,
@@ -651,83 +815,87 @@ export class SchedulerWorker {
         effort: resolution.effort
       });
 
+      // No mid-turn progress writes: nobody watches a scheduled turn live, so
+      // the transcript is written once at the end.
       for await (const event of stream) {
-        if (event.type === EventType.TEXT_MESSAGE_CONTENT) {
-          responseText += event.delta;
-        } else if (event.type === EventType.RUN_ERROR) {
-          status = "failed";
-          errorMessage =
-            typeof event.message === "string" ? event.message : "The assistant run failed.";
-        } else if (isAGUIInterruptedFinish(event)) {
-          status = "failed";
-          errorMessage = "Scheduled job was interrupted.";
-        }
-      }
-
-      await this.deps.messages.updateContent(
-        job.tenantId,
-        assistantMessage.messageId,
-        job.userId,
-        status === "completed" ? "completed" : "error",
-        responseText
-      );
-
-      // Recover real token usage. AG-UI events carry no usage. The in-process
-      // runtime adapter persists it onto the assistant message row mid-turn —
-      // so re-read the row instead of recording 0 (the old behavior lied to the
-      // job-run ledger that backs the scheduler's separate usage accounting).
-      try {
-        const persisted = await this.deps.messages.getOwned(
-          job.tenantId,
-          assistantMessage.messageId,
-          job.userId
-        );
-        if (persisted?.tokenUsage) {
-          inputTokens = persisted.tokenUsage.inputTokens;
-          outputTokens = persisted.tokenUsage.outputTokens;
-        }
-      } catch (usageError) {
-        this.deps.logger.warn(
-          { error: usageError, jobId: job.jobId },
-          "Failed to read scheduled-turn token usage; recording 0"
-        );
+        scheduledTurn.apply(event);
       }
     } catch (error) {
-      status = "failed";
-      // Classify before persisting. `errorMessage` is written to
-      // scheduled_job_runs, put into the scheduler.job.run.failed audit
+      // Classify before persisting. The message is written to the assistant
+      // row and scheduled_job_runs, put into the scheduler.job.run.failed audit
       // payload, and returned to the job owner by
       // GET /me/scheduled-jobs/:jobId/runs — so a raw exception puts Postgres
       // connection strings, E2B sandbox ids and internal hostnames in front of
-      // a user. The interactive path already classifies through the same
-      // helper; this path did not. The full error still reaches the logger
-      // line below, which is where an operator should read it.
-      errorMessage = clientSafeFailureMessage(error);
+      // a user. The full error still reaches the logger line below, which is
+      // where an operator should read it.
+      failure = classifyTurnFailure(error, false);
       this.deps.logger.error({ error, jobId: job.jobId }, "Scheduled job execution failed");
     }
 
-    // If the watchdog tripped, force a failed outcome with a timeout message
-    // even if the abort race let a stray terminal event mark the turn complete.
-    if (turn.timedOut) {
-      status = "failed";
-      errorMessage = `Scheduled job timed out after ${this.options.jobTimeoutMs}ms`;
+    let outcome: TurnOutcome = timeoutFailure() ?? failure ?? { status: "error", message: GENERIC_TURN_FAILURE };
+    let responseText = "";
+    let inputTokens = 0;
+    let outputTokens = 0;
+    if (transcript) {
+      // Read usage first, so a timeout during the read still fails the turn.
+      ({ inputTokens, outputTokens } = await this.readTurnUsage(job, transcript));
+      const finalized = await transcript.finalize(failure);
+      outcome = finalized.outcome;
+      responseText = finalized.text;
     }
 
     await this.reclaimScheduledSession(job, sessionId, turn.adapter);
 
     const durationMs = Date.now() - startTime;
-    const summary = responseText.length > 0 ? responseText.slice(0, 500) : null;
+    // The job owner reads the summary from the run ledger. Redact the full
+    // text before the cut, so a secret across the 500-character limit still
+    // matches. `responseText` stays raw for the transcript offsets.
+    const summary = responseText.length > 0 ? redactSecrets(responseText).slice(0, 500) : null;
 
     await this.recordJobOutcome(job, {
       runId,
       sessionId,
-      status,
+      status: outcome.status === "completed" ? "completed" : "failed",
       durationMs,
-      errorMessage,
+      errorMessage:
+        outcome.status === "error"
+          ? outcome.message
+          : outcome.status === "interrupted"
+            ? "Scheduled job was interrupted."
+            : null,
       summary,
       inputTokens,
-      outputTokens
+      outputTokens,
+      countsTowardDisable
     });
+  }
+
+  /**
+   * Recover real token usage. AG-UI events carry no usage. The in-process
+   * runtime adapter saves it on the assistant row during the turn, so read the
+   * row instead of recording 0. The job-run ledger backs the scheduler's
+   * separate usage accounting. Also read after a failed turn, because the
+   * provider may have charged for part of it.
+   */
+  private async readTurnUsage(
+    job: ScheduledJobRecord,
+    transcript: TurnTranscript
+  ): Promise<{ inputTokens: number; outputTokens: number }> {
+    try {
+      const persisted = await this.deps.messages.getOwned(job.tenantId, transcript.messageId, job.userId);
+      if (persisted?.tokenUsage) {
+        return {
+          inputTokens: persisted.tokenUsage.inputTokens,
+          outputTokens: persisted.tokenUsage.outputTokens
+        };
+      }
+    } catch (usageError) {
+      this.deps.logger.warn(
+        { error: usageError, jobId: job.jobId },
+        "Failed to read scheduled-turn token usage; recording 0"
+      );
+    }
+    return { inputTokens: 0, outputTokens: 0 };
   }
 
   /**
@@ -807,6 +975,7 @@ export class SchedulerWorker {
       summary: string | null;
       inputTokens: number;
       outputTokens: number;
+      countsTowardDisable: boolean;
     }
   ): Promise<void> {
     const { runId, sessionId, status, durationMs, errorMessage, summary, inputTokens, outputTokens } =
@@ -847,7 +1016,9 @@ export class SchedulerWorker {
     // Poison-job guard: update the consecutive-failure counter (reset on
     // success) and auto-disable a job that has failed too many times in a row,
     // so a perpetually-failing per-minute cron can't re-fire every tick forever.
-    await this.updatePoisonState(job, status === "completed");
+    if (status === "completed" || outcome.countsTowardDisable) {
+      await this.updatePoisonState(job, status === "completed");
+    }
   }
 
   /**

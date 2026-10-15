@@ -99,14 +99,23 @@ export function createDatabase(config: AppConfig): Pool {
  * `pg_stat_activity` — which is the first thing anyone looks at when
  * connections pile up.
  */
+export function createMaintenanceDatabase(connectionString: string): Pool {
+  return createOperationalDatabase(connectionString, "cogniplane-backend-maintenance");
+}
+
+// Reserved for explicit operator commands such as tenant offboarding.
 export function createPrivilegedDatabase(connectionString: string): Pool {
+  return createOperationalDatabase(connectionString, "cogniplane-operator");
+}
+
+function createOperationalDatabase(connectionString: string, applicationName: string): Pool {
   return new Pool({
     connectionString,
     max: POOL_MAX,
     connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
     statement_timeout: POOL_STATEMENT_TIMEOUT_MS,
     idle_in_transaction_session_timeout: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-    application_name: "cogniplane-backend-privileged"
+    application_name: applicationName
   });
 }
 

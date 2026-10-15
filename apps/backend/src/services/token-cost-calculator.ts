@@ -12,6 +12,7 @@ type PricingTier = {
 type ModelPricing = {
   short: PricingTier;
   long: PricingTier | null; // null = no long-context pricing (same as short)
+  longThreshold?: number;   // input tokens above which `long` applies; default LONG_CONTEXT_THRESHOLD
 };
 
 const PRICING: Record<string, ModelPricing> = {
@@ -22,6 +23,10 @@ const PRICING: Record<string, ModelPricing> = {
   "gpt-6-astra": {
     short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
     long:  null
+  },
+  "gpt-6.1-sol": {
+    short: { input:  2.00, cachedInput: 0.10,  output: 10.00 },
+    long:  { input:  4.00, cachedInput: 0.20,  output: 15.00 }
   },
   "gpt-6-sol": {
     short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
@@ -81,16 +86,27 @@ const PRICING: Record<string, ModelPricing> = {
     long:  null
   },
   "claude-fable-5": {
-    short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
+    short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
     long:  null
   },
   "claude-opus-4-8": {
     short: { input:  5.00, cachedInput: 0.50,  output: 25.00 },
     long:  null
   },
-  "claude-sonnet-5": {
-    short: { input:  3.00, cachedInput: 0.30,  output: 15.00 },
+  "claude-sonnet-5-5": {
+    short: { input:  2.00, cachedInput: 0.10,  output: 10.00 },
     long:  null
+  },
+  "claude-sonnet-5": {
+    short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
+    long:  null
+  },
+  // Haiku 5.5 is priced by prompt length: above 100K input tokens (cache reads
+  // included) the whole request pays the higher rates.
+  "claude-haiku-5-5": {
+    short: { input:  0.10, cachedInput: 0.01,  output:  0.50 },
+    long:  { input:  0.50, cachedInput: 0.05,  output:  2.50 },
+    longThreshold: 100_000
   },
   // Retired from the model picker but kept for billing history on past messages.
   "claude-opus-4-7": {
@@ -160,11 +176,11 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0.132, cachedInput: 0.033,  output: 0.528 },
     long:  null
   },
-  "xiaomi/mimo-v2.5": {
+  "xiaomi/mimo-v2.6-flash": {
     short: { input: 0.14,  cachedInput: 0.0028, output: 0.28 },
     long:  null
   },
-  "xiaomi/mimo-v2.5-pro": {
+  "xiaomi/mimo-v2.6-pro": {
     short: { input: 0.435, cachedInput: 0.0036, output: 0.87 },
     long:  null
   },
@@ -173,7 +189,7 @@ const PRICING: Record<string, ModelPricing> = {
     long:  null
   },
   "nvidia/nemotron-3-ultra-550b-a55b": {
-    short: { input: 0.625, cachedInput: 0.1875, output: 3.125 },
+    short: { input: 0.60,  cachedInput: 0.12,   output: 2.40 },
     long:  null
   },
   "stepfun/step-3.7-flash": {
@@ -184,16 +200,36 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 1.475, cachedInput: 0.295,  output: 4.425 },
     long:  null
   },
+  "qwen/qwen3.8-max-0902": {
+    short: { input: 2.00,  cachedInput: 0.25,   output: 6.00 },
+    long:  null
+  },
+  "z-ai/glm-5.3-flashx": {
+    short: { input: 0.37,  cachedInput: 0.09,   output: 1.25 },
+    long:  null
+  },
+  "x-ai/grok-4.7": {
+    short: { input: 2.00,  cachedInput: 0.50,   output: 6.00 },
+    long:  null
+  },
+  "mistralai/mistral-large-4-0": {
+    short: { input: 0.68,  cachedInput: 0.07,   output: 2.09 },
+    long:  null
+  },
+  "meta/muse-spark-1.3": {
+    short: { input: 1.25,  cachedInput: 0.15,   output: 4.25 },
+    long:  null
+  },
   "z-ai/glm-5.2": {
     short: { input: 0.9086, cachedInput: 0.1687, output: 2.8556 },
     long:  null
   },
   "deepseek/deepseek-v4-pro": {
-    short: { input: 0.435, cachedInput: 0.0036, output: 0.87 },
+    short: { input: 1.30,  cachedInput: 0.135,  output: 3.20 },
     long:  null
   },
-  "deepseek/deepseek-v4-flash": {
-    short: { input: 0.09,  cachedInput: 0.018,  output: 0.18 },
+  "deepseek/deepseek-v4.1-flash": {
+    short: { input: 0.30,  cachedInput: 0.006,  output: 1.20 },
     long:  null
   },
   "nvidia/nemotron-3-super-120b-a12b:free": {
@@ -208,10 +244,6 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "deepseek/deepseek-v4-flash-0731:free": {
-    short: { input: 0, cachedInput: 0, output: 0 },
-    long:  null
-  },
   "nvidia/nemotron-3-ultra-550b-a55b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
@@ -220,9 +252,27 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  // Retired free routes kept for billing history on past messages. As of
+  // Retired routes kept for billing history on past messages. As of
   // 2026-09-18 gpt-oss-120b:free, tencent/hy3:free and minimax-m3:free 404 on
-  // OpenRouter, and glm-5.2:free no longer accepts tools.
+  // OpenRouter, and glm-5.2:free no longer accepts tools. On 2026-10-08
+  // deepseek-v4-flash-0731:free was gone, and V4.1 Flash and MiMo V2.6
+  // replaced their predecessors in the catalog.
+  "deepseek/deepseek-v4-flash-0731:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "deepseek/deepseek-v4-flash": {
+    short: { input: 0.09,  cachedInput: 0.018,  output: 0.18 },
+    long:  null
+  },
+  "xiaomi/mimo-v2.5": {
+    short: { input: 0.14,  cachedInput: 0.0028, output: 0.28 },
+    long:  null
+  },
+  "xiaomi/mimo-v2.5-pro": {
+    short: { input: 0.435, cachedInput: 0.0036, output: 0.87 },
+    long:  null
+  },
   "openai/gpt-oss-120b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
@@ -266,13 +316,23 @@ const PRICING: Record<string, ModelPricing> = {
   }
 };
 
+/** Reads own keys only, so a name such as "constructor" has no price. */
+function pricingFor(model: string): ModelPricing | undefined {
+  return Object.hasOwn(PRICING, model) ? PRICING[model] : undefined;
+}
+
+/** True when `model` (a vendor model name) has a price. Uses the same lookup as `calculateCostUsd`. */
+export function hasModelPrice(model: string): boolean {
+  return pricingFor(model) !== undefined;
+}
+
 export function calculateCostUsd(model: string, tokenUsage: TokenUsageRecord): number | null {
-  const pricing = PRICING[model];
+  const pricing = pricingFor(model);
   if (!pricing) {
     return null;
   }
 
-  const isLongContext = tokenUsage.inputTokens > LONG_CONTEXT_THRESHOLD;
+  const isLongContext = tokenUsage.inputTokens > (pricing.longThreshold ?? LONG_CONTEXT_THRESHOLD);
   const tier = (isLongContext && pricing.long) ? pricing.long : pricing.short;
 
   const billableInput = tokenUsage.inputTokens - tokenUsage.cachedInputTokens;

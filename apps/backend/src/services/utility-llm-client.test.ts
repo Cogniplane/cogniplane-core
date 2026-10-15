@@ -1,13 +1,14 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import { UtilityLlmClient } from "./utility-llm-client.js";
 
-type Captured = { url: string; body: Record<string, unknown> };
+type Captured = { headers: Headers; url: string; body: Record<string, unknown> };
 
 function fakeFetch(payload: unknown, opts: { ok?: boolean; capture?: Captured[] } = {}): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     opts.capture?.push({
       url: String(input),
+      headers: new Headers(init?.headers),
       body: typeof init?.body === "string" ? JSON.parse(init.body) : {}
     });
     return {
@@ -82,6 +83,7 @@ test("openai wire format posts to /chat/completions with bearer auth and maps us
 
   expect(capture[0].url).toBe("http://vllm.local/v1/chat/completions");
   expect(capture[0].body.max_completion_tokens).toBe(16);
+  expect(capture[0].headers.get("authorization")).toBe("Bearer k-1");
   expect(result?.text).toBe("A Title");
   expect(result?.tokenUsage.cachedInputTokens).toBe(5);
   expect(result?.tokenUsage.totalTokens).toBe(24);
@@ -98,4 +100,30 @@ test("returns null on HTTP error, empty content, and thrown fetch", async () => 
     throw new Error("boom");
   }) as unknown as typeof fetch;
   expect(await buildClient(throwing).completeText({ system: "s", user: "u", maxOutputTokens: 8 })).toBeNull();
+});
+
+
+test("returns null when its timeout aborts a pending fetch", async () => {
+  vi.useFakeTimers();
+  let signal: AbortSignal | null | undefined;
+  const fetchImpl: typeof fetch = async (_input, init) => {
+    signal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
+    });
+  };
+  try {
+    let settled = false;
+    const pending = buildClient(fetchImpl).completeText({ system: "s", user: "u", maxOutputTokens: 8 })
+      .then((result) => { settled = true; return result; });
+    expect(signal).toBeDefined();
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(signal?.aborted).toBe(false);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal?.aborted).toBe(true);
+    await expect(pending).resolves.toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
 });

@@ -94,7 +94,7 @@ describe("useSessionList: deleting the selected session", () => {
 
     await waitFor(() => expect(result.current.selectedSessionId).toBe("s-2"));
     // Persisted too, so a reload doesn't reopen the session that's gone.
-    expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBe("s-2");
+    expect(window.localStorage.getItem("cogniplane:selected-session-id:v2:t-1:u-1")).toBe("s-2");
     expect(result.current.sessions.map((s) => s.sessionId)).toEqual(["s-2"]);
   });
 
@@ -110,7 +110,7 @@ describe("useSessionList: deleting the selected session", () => {
     });
 
     await waitFor(() => expect(result.current.selectedSessionId).toBeNull());
-    expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBeNull();
+    expect(window.localStorage.getItem("cogniplane:selected-session-id:v2:t-1:u-1")).toBeNull();
   });
 
   it("leaves the selection alone when a different session is deleted", async () => {
@@ -185,7 +185,7 @@ describe("archiving sessions", () => {
     expect(window.history.length).toBe(historyLength);
     expect(window.location.search).toBe(last ? "" : "?session=s-2");
     expect(result.current.selectedSessionId).toBe(last ? null : "s-2");
-    expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBe(last ? null : "s-2");
+    expect(window.localStorage.getItem("cogniplane:selected-session-id:v2:t-1:u-1")).toBe(last ? null : "s-2");
   });
 
   it("keeps the session and selection on archive failure", async () => {
@@ -201,7 +201,7 @@ describe("archiving sessions", () => {
 });
 
 it("opens a linked session before the stored selection and updates the link when switching", async () => {
-  window.localStorage.setItem("cogniplane:selected-session-id:v1", "s-1");
+  window.localStorage.setItem("cogniplane:selected-session-id:v2:t-1:u-1", "s-1");
   window.history.replaceState(null, "", "/?session=s-2");
   const { result } = renderSessionList();
   await waitFor(() => expect(result.current.selectedSessionId).toBe("s-2"));
@@ -298,8 +298,8 @@ it("loads older pages, retains rows on failure, retries and deduplicates session
 
 it.each(["url", "storage"])("restores an older %s selection and pins outside the first page, preserving them through search", async (source) => {
   if (source === "url") window.history.replaceState(null, "", "/?session=old");
-  else window.localStorage.setItem("cogniplane:selected-session-id:v1", "old");
-  window.localStorage.setItem("cogniplane:pinned-sessions:v1:u-1", JSON.stringify(["pinned"]));
+  else window.localStorage.setItem("cogniplane:selected-session-id:v2:t-1:u-1", "old");
+  window.localStorage.setItem("cogniplane:pinned-sessions:v2:t-1:u-1", JSON.stringify(["pinned"]));
   api.listSessions.mockImplementation(async ({ ids, search }: { ids?: string[]; search?: string } = {}) => ({
     sessions: ids ? ids.filter((id) => ["old", "pinned", "found-old"].includes(id)).map(makeSession) : search ? [makeSession("found-old")] : [makeSession("recent")],
     nextCursor: null, trashRetentionDays: 7
@@ -318,6 +318,37 @@ it.each(["url", "storage"])("restores an older %s selection and pins outside the
   act(() => result.current.setSearch(""));
   await waitFor(() => expect(result.current.selectedSession?.sessionId).toBe("found-old"));
   expect(window.location.search).toBe("?session=found-old");
+});
+
+it("does not load or poll another organization's saved selection and pins", async () => {
+  // The same user in organization t-2 saved these; the signed-in organization is t-1.
+  window.localStorage.setItem("cogniplane:selected-session-id:v2:t-2:u-1", "other-org-selected");
+  window.localStorage.setItem("cogniplane:pinned-sessions:v2:t-2:u-1", JSON.stringify(["other-org-pinned"]));
+  // Keys from the earlier, unscoped format are not read either.
+  window.localStorage.setItem("cogniplane:selected-session-id:v1", "legacy-selected");
+  window.localStorage.setItem("cogniplane:pinned-sessions:v1:u-1", JSON.stringify(["legacy-pinned"]));
+  api.listSessions.mockImplementation(async () => ({
+    sessions: [makeSession("recent")], nextCursor: null, trashRetentionDays: 7
+  }));
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSessionId).toBe("recent"));
+  const requestedIds = (api.listSessions.mock.calls as Array<[{ ids?: string[] }?]>).flatMap(([input]) => input?.ids ?? []);
+  expect(requestedIds).toEqual([]);
+  // The unscoped keys are removed; they mixed organizations.
+  expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBeNull();
+  expect(window.localStorage.getItem("cogniplane:pinned-sessions:v1:u-1")).toBeNull();
+});
+
+it("writes pins only under the signed-in organization's key", async () => {
+  window.localStorage.setItem("cogniplane:pinned-sessions:v2:t-2:u-1", JSON.stringify(["other-org-pinned"]));
+  api.listSessions.mockImplementation(async () => ({
+    sessions: [makeSession("s-1")], nextCursor: null, trashRetentionDays: 7
+  }));
+  const { result } = renderSessionList();
+  await waitFor(() => expect(result.current.selectedSessionId).toBe("s-1"));
+  act(() => result.current.togglePinSession("s-1"));
+  expect(JSON.parse(window.localStorage.getItem("cogniplane:pinned-sessions:v2:t-1:u-1") ?? "[]")).toEqual(["s-1"]);
+  expect(window.localStorage.getItem("cogniplane:pinned-sessions:v2:t-2:u-1")).toBe(JSON.stringify(["other-org-pinned"]));
 });
 
 it("keeps a saved URL on lookup failure and restores it after retry", async () => {
@@ -357,7 +388,7 @@ it("resolves an older history link and falls back when the server no longer gran
 
 it("resolves more than one page of saved pins through bounded requests", async () => {
   const pins = Array.from({ length: 105 }, (_, index) => `pin-${index}`);
-  window.localStorage.setItem("cogniplane:pinned-sessions:v1:u-1", JSON.stringify(pins));
+  window.localStorage.setItem("cogniplane:pinned-sessions:v2:t-1:u-1", JSON.stringify(pins));
   api.listSessions.mockImplementation(async ({ ids }: { ids?: string[] } = {}) => ({
     sessions: (ids ?? ["recent"]).map(makeSession), nextCursor: null, trashRetentionDays: 7
   }));
@@ -413,7 +444,7 @@ it.each(["delete", "archive"])("excludes search-only hits after clearing and fro
 
 it.each([false, true])("restores only base or saved sessions when search finishes before the initial list, base exists: %s", async (hasBase) => {
   window.history.replaceState(null, "", "/?session=missing");
-  window.localStorage.setItem("cogniplane:selected-session-id:v1", "also-missing");
+  window.localStorage.setItem("cogniplane:selected-session-id:v2:t-1:u-1", "also-missing");
   let resolveBase!: (page: { sessions: Session[]; trashRetentionDays: number }) => void;
   api.listSessions.mockImplementation(async ({ search, ids }: { search?: string; ids?: string[] } = {}) => {
     if (ids) return { sessions: [], trashRetentionDays: 7 };
@@ -428,6 +459,6 @@ it.each([false, true])("restores only base or saved sessions when search finishe
   await act(async () => { resolveBase({ sessions: hasBase ? [makeSession("recent")] : [], trashRetentionDays: 7 }); });
   await waitFor(() => expect(window.location.search).toBe(hasBase ? "?session=recent" : ""));
   expect(result.current.selectedSessionId).toBe(hasBase ? "recent" : null);
-  expect(window.localStorage.getItem("cogniplane:selected-session-id:v1")).toBe(hasBase ? "recent" : null);
+  expect(window.localStorage.getItem("cogniplane:selected-session-id:v2:t-1:u-1")).toBe(hasBase ? "recent" : null);
   expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only");
 });

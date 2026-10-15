@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 
 import type {
   AdminModelCatalogResponse,
-  AdminProviderStatus,
   CustomModelCreateRequest,
   EffortLevel,
   Model,
@@ -15,7 +14,6 @@ import type {
 import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -25,70 +23,48 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { CHIP, HINT, PILL_AMBER, PILL_BLUE, PILL_GRAY, PILL_GREEN, SECTION_LABEL } from "../../lib/ui-tokens";
+import { useConfirmLeave } from "../../hooks/use-confirm-leave";
+import { CHIP, HINT, PILL_GRAY } from "../../lib/ui-tokens";
+import { ProviderKeyRows } from "./provider-key-rows";
+import { DisclosureRow } from "./overview-row";
+import { SaveBar } from "./save-bar";
 
 export type ModelAvailabilityInput = {
+  expectedVersion: number;
   enabledProviders: ModelProvider[];
   enabledModelIds: string[] | null;
+  defaultModelId: string | null;
   modelDefaultEfforts: Record<string, EffortLevel>;
+  showEffortSelector: boolean;
 };
 
+/**
+ * The result of a save. `conflict` means that other settings were saved first,
+ * and holds the settings that the page loaded again.
+ */
+export type ModelAvailabilitySaveResult = boolean | { conflict: TenantSettings };
+
 type Draft = {
+  expectedVersion: number;
   enabledProviders: ModelProvider[];
   // "all" keeps enabledModelIds null server-side; "custom" persists the list.
   modelSelectionMode: "all" | "custom";
   enabledModelIds: string[];
+  defaultModelId: string | null;
   modelDefaultEfforts: Record<string, EffortLevel>;
+  showEffortSelector: boolean;
 };
 
 function buildDraft(settings: TenantSettings): Draft {
   return {
+    expectedVersion: settings.version,
     enabledProviders: settings.enabledProviders,
     modelSelectionMode: settings.enabledModelIds === null ? "all" : "custom",
     enabledModelIds: settings.enabledModelIds ?? [],
-    modelDefaultEfforts: { ...settings.modelDefaultEfforts }
+    defaultModelId: settings.defaultModelId,
+    modelDefaultEfforts: { ...settings.modelDefaultEfforts },
+    showEffortSelector: settings.showEffortSelector
   };
-}
-
-function keySourcePill(status: AdminProviderStatus) {
-  switch (status.keySource) {
-    case "tenant":
-      return <span className={PILL_GREEN}>organization key</span>;
-    case "platform":
-      return <span className={PILL_BLUE}>platform key</span>;
-    default:
-      return <span className={PILL_GRAY}>no key</span>;
-  }
-}
-
-function ProviderRow(props: {
-  status: AdminProviderStatus;
-  enabled: boolean;
-  modelCount: number;
-  onToggle: (enabled: boolean) => void;
-}) {
-  const { status, enabled } = props;
-  return (
-    <label className="flex flex-wrap items-center gap-3 rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2.5">
-      <input
-        type="checkbox"
-        checked={enabled}
-        onChange={(e) => props.onToggle(e.target.checked)}
-        className="size-4 rounded border-outline-variant accent-primary"
-      />
-      <span className="min-w-28 text-sm font-semibold text-on-surface">{status.label}</span>
-      {keySourcePill(status)}
-      {enabled && status.keySource === "none" ? (
-        <span className={PILL_AMBER}>models hidden until a key is configured</span>
-      ) : null}
-      {!enabled ? (
-        <span className="text-xs text-on-surface-faint">disabled — models hidden even with a key</span>
-      ) : null}
-      <span className="ml-auto text-xs text-on-surface-faint">
-        {props.modelCount} model{props.modelCount === 1 ? "" : "s"}
-      </span>
-    </label>
-  );
 }
 
 function EffortSelect(props: {
@@ -108,7 +84,7 @@ function EffortSelect(props: {
       disabled={props.disabled}
       onValueChange={(next) => props.onChange(next as EffortLevel)}
     >
-      <SelectTrigger size="sm" className="h-7 w-32 text-xs">
+      <SelectTrigger size="sm" aria-label={`Default effort for ${model.displayName}`} className="h-7 w-32 text-xs">
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
@@ -122,6 +98,8 @@ function EffortSelect(props: {
     </Select>
   );
 }
+
+const ROW = "flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between";
 
 /**
  * "Add custom model" form. OpenRouter gets a type-ahead over the server-
@@ -313,19 +291,30 @@ export function AdminModelAvailabilityCard(props: {
   catalog: AdminModelCatalogResponse | null;
   settings: TenantSettings | null;
   saving: boolean;
-  onSave: (input: ModelAvailabilityInput) => Promise<boolean>;
+  onSave: (input: ModelAvailabilityInput) => Promise<ModelAvailabilitySaveResult>;
   adding: boolean;
   addError: string | null;
   openRouterModels: OpenRouterModelOption[] | null;
   openRouterLoadError: string | null;
   onNeedOpenRouterModels: () => void;
   onAddModel: (input: CustomModelCreateRequest) => Promise<boolean>;
-  onRemoveModel: (modelId: string) => Promise<boolean>;
+  /** Returns the saved settings after the removal, or null when it failed. */
+  onRemoveModel: (modelId: string) => Promise<TenantSettings | null>;
+  /** The provider key forms. Each shares its row with the provider on/off choice in this draft. */
+  providerKeys: Omit<ComponentProps<typeof ProviderKeyRows>, "providerStatuses" | "status" | "actions">;
+  saveError: string | null;
 }) {
   const { catalog, settings } = props;
   const [draft, setDraft] = useState<Draft | null>(null);
   const [isDirty, setIsDirty] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [customModelOpen, setCustomModelOpen] = useState(false);
+  const statusRef = useRef<HTMLDivElement>(null);
+  // The page keeps the last mutation error. Show it only for this draft's last save.
+  const [saveFailed, setSaveFailed] = useState(false);
+  // The newer version that the draft moved to after a save conflict.
+  const [rebasedVersion, setRebasedVersion] = useState<number | null>(null);
+  useConfirmLeave(isDirty);
 
   // Seed/resync the draft from the server state unless the admin has local
   // edits in flight.
@@ -353,12 +342,15 @@ export function AdminModelAvailabilityCard(props: {
   function updateDraft(recipe: (current: Draft) => Draft): void {
     setIsDirty(true);
     setShowSuccess(false);
+    setSaveFailed(false);
     setDraft((current) => (current ? recipe(current) : current));
   }
 
   const toggleProvider = (provider: ModelProvider, enabled: boolean) =>
     updateDraft((current) => ({
       ...current,
+      defaultModelId: !enabled && catalog.models.some((model) => model.id === current.defaultModelId && model.provider === provider)
+        ? null : current.defaultModelId,
       enabledProviders: enabled
         ? [...current.enabledProviders, provider]
         : current.enabledProviders.filter((p) => p !== provider)
@@ -367,25 +359,29 @@ export function AdminModelAvailabilityCard(props: {
   const toggleModel = (modelId: string, enabled: boolean) =>
     updateDraft((current) => ({
       ...current,
+      defaultModelId: !enabled && current.defaultModelId === modelId ? null : current.defaultModelId,
       enabledModelIds: enabled
         ? [...current.enabledModelIds, modelId]
         : current.enabledModelIds.filter((id) => id !== modelId)
     }));
 
   const handleRemoveModel = async (modelId: string) => {
-    const removed = await props.onRemoveModel(modelId);
-    if (!removed) return;
+    const updated = await props.onRemoveModel(modelId);
+    if (!updated) return;
     // The backend scrubbed the deleted model from tenant_settings, but the
     // resync effect deliberately ignores server state while the draft is
     // dirty — strip the id locally so a later Save can't submit a reference
     // to the deleted model (the PUT rejects unknown ids with a 400). Plain
     // setDraft, NOT updateDraft: removal alone must not mark a clean draft
-    // dirty (server state already matches).
+    // dirty (server state already matches). The removal saved a new settings
+    // version, so a later Save must expect that version.
     setDraft((current) => {
       if (!current) return current;
       const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;
       return {
         ...current,
+        expectedVersion: updated.version,
+        defaultModelId: current.defaultModelId === modelId ? null : current.defaultModelId,
         enabledModelIds: current.enabledModelIds.filter((id) => id !== modelId),
         modelDefaultEfforts: remainingEfforts
       };
@@ -407,47 +403,68 @@ export function AdminModelAvailabilityCard(props: {
 
   const customEmpty =
     draft.modelSelectionMode === "custom" && draft.enabledModelIds.length === 0;
+  const usableModels = catalog.models.filter((model) =>
+    draft.enabledProviders.includes(model.provider) &&
+    catalog.providers.some((provider) => provider.id === model.provider && provider.keySource !== "none") &&
+    (draft.modelSelectionMode === "all" || draft.enabledModelIds.includes(model.id))
+  );
+  const effectiveDefault = usableModels.find((model) => model.id === draft.defaultModelId)
+    ?? usableModels.find((model) => model.isDefault)
+    ?? usableModels[0];
+  const usableProviderCount = new Set(usableModels.map((model) => model.provider)).size;
+  const customCount = catalog.models.filter((model) => model.source === "custom").length;
 
   const handleSave = async () => {
     const saved = await props.onSave({
+      expectedVersion: draft.expectedVersion,
       enabledProviders: draft.enabledProviders,
       enabledModelIds: draft.modelSelectionMode === "all" ? null : draft.enabledModelIds,
-      modelDefaultEfforts: draft.modelDefaultEfforts
+      defaultModelId: draft.defaultModelId,
+      modelDefaultEfforts: draft.modelDefaultEfforts,
+      showEffortSelector: draft.showEffortSelector
     });
+    if (typeof saved === "object") {
+      // This page saves only the fields in the draft. So keep them all and move
+      // the draft to the newer version. The administrator saves again.
+      setDraft((current) => (current ? { ...current, expectedVersion: saved.conflict.version } : current));
+      setRebasedVersion(saved.conflict.version);
+      setSaveFailed(false);
+      return;
+    }
+    setSaveFailed(!saved);
     if (saved) {
       setIsDirty(false);
       setShowSuccess(true);
+      setRebasedVersion(null);
+      statusRef.current?.focus();
     }
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <p className={SECTION_LABEL}>Model Availability</p>
-        <h2 className="text-lg font-semibold text-on-surface">Providers &amp; Models</h2>
-        <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-          Choose which providers and models members can use, and the default reasoning effort per
-          model. A model is selectable only when its provider is enabled here and has an API key.
-        </p>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-6">
-        <section className="flex flex-col gap-2">
-          <p className={SECTION_LABEL}>Providers</p>
-          {catalog.providers.map((status) => (
-            <ProviderRow
-              key={status.id}
-              status={status}
-              enabled={draft.enabledProviders.includes(status.id)}
-              modelCount={modelsByProvider.get(status.id)?.length ?? 0}
-              onToggle={(enabled) => toggleProvider(status.id, enabled)}
-            />
-          ))}
-        </section>
-
+    <div>
+    <section aria-labelledby="models-heading">
+      <h2 id="models-heading" className="text-lg font-semibold text-on-surface">Model settings</h2>
+      <div className="mt-2 divide-y divide-outline-variant border-t border-outline-variant">
+        <div className={ROW}>
+          <div className="min-w-0">
+            <h3 id="default-model-heading" className="font-medium">Default model</h3>
+            <p className="mt-1 text-sm text-on-surface-variant" role={draft.defaultModelId && !usableModels.some((model) => model.id === draft.defaultModelId) ? "status" : undefined}>
+              {draft.defaultModelId && !usableModels.some((model) => model.id === draft.defaultModelId)
+                ? `The saved default is unavailable. New chats use ${effectiveDefault?.displayName ?? "no model"} until you choose an available default.`
+                : `New chats start with ${effectiveDefault?.displayName ?? "no model"}.`}
+            </p>
+          </div>
+          <select id="organization-default-model" aria-labelledby="default-model-heading" className="h-8 rounded-md border border-outline-variant bg-surface-container-lowest px-2 text-sm sm:w-64" value={draft.defaultModelId ?? ""} onChange={(event) => updateDraft((current) => ({ ...current, defaultModelId: event.target.value || null }))}>
+            <option value="">Catalog default</option>
+            {usableModels.map((model) => <option key={model.id} value={model.id}>{model.displayName} · {MODEL_PROVIDER_META[model.provider].label}</option>)}
+          </select>
+        </div>
+        <DisclosureRow title="Available models" action="Choose models" status={customEmpty ? "No models selected. Members have nothing to pick."
+          : usableModels.length === 0 ? "No usable models yet. Set up a provider key below, then enable its models."
+            : `${usableModels.length} of ${catalog.models.length} models available from ${usableProviderCount} provider${usableProviderCount === 1 ? "" : "s"}.`}>
         <section className="flex flex-col gap-3">
           <div>
-            <p className={SECTION_LABEL}>Models</p>
-            <div className="mt-2 flex flex-col gap-1.5">
+            <div className="flex flex-col gap-1.5">
               <label className="flex items-center gap-2 text-sm text-on-surface">
                 <input
                   type="radio"
@@ -506,7 +523,8 @@ export function AdminModelAvailabilityCard(props: {
                 <div key={status.id} className={providerEnabled ? "" : "opacity-50"}>
                   <div className="mb-1.5 flex items-center gap-2">
                     <span className="text-sm font-semibold text-on-surface">{status.label}</span>
-                    {!providerEnabled ? <span className={PILL_GRAY}>provider disabled</span> : null}
+                    {!providerEnabled ? <span className={PILL_GRAY}>provider off</span>
+                      : status.keySource === "none" ? <span className={PILL_GRAY}>hidden until a key is set up</span> : null}
                   </div>
                   <div className="flex flex-col gap-1.5">
                     {models.map((model) => {
@@ -520,6 +538,7 @@ export function AdminModelAvailabilityCard(props: {
                         >
                           <input
                             type="checkbox"
+                            aria-label={model.displayName}
                             checked={checked}
                             disabled={draft.modelSelectionMode === "all" || !providerEnabled}
                             onChange={(e) => toggleModel(model.id, e.target.checked)}
@@ -540,12 +559,6 @@ export function AdminModelAvailabilityCard(props: {
                             {model.supportedEfforts.length >= 2 ? (
                               <span className="text-xs text-on-surface-faint">effort</span>
                             ) : null}
-                            <EffortSelect
-                              model={model}
-                              value={draft.modelDefaultEfforts[model.id] ?? null}
-                              disabled={!providerEnabled || !checked}
-                              onChange={(effort) => setModelEffort(model, effort)}
-                            />
                             {model.source === "custom" ? (
                               <Button
                                 type="button"
@@ -567,26 +580,69 @@ export function AdminModelAvailabilityCard(props: {
             })}
           </div>
 
-          <AddCustomModelForm
+          </section>
+        </DisclosureRow>
+        <DisclosureRow title="Reasoning effort" action="Edit effort" status={draft.showEffortSelector ? "Members can choose the effort in the chat picker." : "Chats use each model's default effort."}>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={draft.showEffortSelector} onChange={(event) => updateDraft((current) => ({ ...current, showEffortSelector: event.target.checked }))} /> Show reasoning effort in the chat picker</label>
+          {catalog.models.filter((model) => model.supportedEfforts.length > 1).map((model) => <div key={model.id} className="flex items-center justify-between gap-2 text-sm"><span>{model.displayName}</span><EffortSelect model={model} value={draft.modelDefaultEfforts[model.id] ?? null} disabled={false} onChange={(effort) => setModelEffort(model, effort)} /></div>)}
+        </DisclosureRow>
+        <DisclosureRow title="Custom models" action="Add model" status={customCount ? `${customCount} custom model${customCount === 1 ? "" : "s"}. Remove them in Choose models.` : "No custom models."} onOpenChange={setCustomModelOpen}>
+          {customModelOpen ? <AddCustomModelForm
             adding={props.adding}
             addError={props.addError}
             openRouterModels={props.openRouterModels}
             openRouterLoadError={props.openRouterLoadError}
             onNeedOpenRouterModels={props.onNeedOpenRouterModels}
             onAdd={props.onAddModel}
-          />
-        </section>
+          /> : null}
+        </DisclosureRow>
+      </div>
+    </section>
 
-        <div className="flex items-center gap-3">
-          <Button type="button" onClick={handleSave} disabled={props.saving || !isDirty}>
-            {props.saving ? "Saving..." : "Save model availability"}
-          </Button>
-          {showSuccess ? (
-            <span className="text-sm text-success">Model availability saved.</span>
-          ) : null}
-          {isDirty && !props.saving ? <span className={HINT}>Unsaved changes</span> : null}
-        </div>
-      </CardContent>
-    </Card>
+    <section aria-labelledby="providers-heading" className="mt-10">
+      <h2 id="providers-heading" className="text-lg font-semibold text-on-surface">Providers</h2>
+      <div className="mt-2">
+        <ProviderKeyRows
+          {...props.providerKeys}
+          providerStatuses={catalog.providers}
+          status={(provider) => {
+            const selected = (modelsByProvider.get(provider) ?? []).filter((model) => draft.modelSelectionMode === "all" || draft.enabledModelIds.includes(model.id)).length;
+            const models = `${selected} model${selected === 1 ? "" : "s"}`;
+            if (!draft.enabledProviders.includes(provider)) return selected ? `Off. Tick Use and save to show its ${models}.` : "Off.";
+            if (!catalog.providers.some((status) => status.id === provider && status.keySource !== "none")) {
+              return selected ? `On, but its ${models} ${selected === 1 ? "stays" : "stay"} hidden until a key is set up.` : "On, but it needs a key.";
+            }
+            return `On. ${models} available.`;
+          }}
+          actions={(provider) => (
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                aria-label={`Use ${MODEL_PROVIDER_META[provider].label}`}
+                checked={draft.enabledProviders.includes(provider)}
+                onChange={(event) => toggleProvider(provider, event.target.checked)}
+                className="size-4 accent-primary"
+              />
+              Use
+            </label>
+          )}
+        />
+      </div>
+    </section>
+
+      <SaveBar
+        dirty={isDirty || props.saving}
+        busy={props.saving}
+        status={props.saving ? null : isDirty ? (rebasedVersion !== null
+          ? <span className="text-warning">Settings changed to v{rebasedVersion} before your save. Your model changes are kept. Save again to apply them.</span>
+          : <span className={HINT}>Unsaved changes</span>) : showSuccess ? <span className="text-success">Model availability saved.</span> : null}
+        error={saveFailed ? props.saveError : null}
+        submitLabel="Save model availability"
+        busyLabel="Saving..."
+        onSubmit={() => void handleSave()}
+        onCancel={() => { setDraft(buildDraft(settings)); setIsDirty(false); setShowSuccess(false); setSaveFailed(false); setRebasedVersion(null); statusRef.current?.focus(); }}
+        statusRef={statusRef}
+      />
+    </div>
   );
 }

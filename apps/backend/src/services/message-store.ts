@@ -1,10 +1,10 @@
 import { sessionContentReadAccessSql } from "./session-access.js";
-import { ProjectInstructionsSnapshotSchema, type ProjectInstructionsSnapshot, type UiResource } from "@cogniplane/shared-types";
+import { McpAppCallSchema, ProjectInstructionsSnapshotSchema, type McpAppCall, type ProjectInstructionsSnapshot, type UiResource } from "@cogniplane/shared-types";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
-import { redactSecrets } from "./redact-secrets.js";
+import { redactAppData, redactSecrets } from "./redact-secrets.js";
 
 export type ToolResultRecord = {
   id: number;
@@ -27,7 +27,9 @@ export type ToolResultRecord = {
   // started — lets a reload interleave the card back into the right spot in the
   // turn's text. Null on legacy rows.
   textOffset: number | null;
+  // Legacy inline resources from retained rows. New writes never set them.
   uiResources?: UiResource[];
+  mcpApp?: McpAppCall;
   createdAt: string;
   updatedAt: string;
 };
@@ -88,8 +90,9 @@ export type MessageRecord = {
   content: string;
   reasoningContent: string;
   // Reasoning bursts positioned by their offset into the assistant text, for
-  // reload interleaving (AG-UI turns). Null on legacy rows, where reload falls
-  // back to the single `reasoningContent` block.
+  // reload interleaving (AG-UI turns). Null on legacy rows. `reasoningContent`
+  // is the flat copy that the admin replay shows. Chat history reads
+  // `reasoningSegments`.
   reasoningSegments: ReasoningSegmentRecord[] | null;
   planContent: string;
   tokenUsage: TokenUsageRecord | null;
@@ -105,6 +108,7 @@ export type MessageRecord = {
 };
 
 function mapToolResult(row: Record<string, unknown>): ToolResultRecord {
+  const mcpApp = McpAppCallSchema.safeParse(row.mcp_app);
   return {
     id: Number(row.id),
     toolResultId: String(row.tool_result_id),
@@ -130,6 +134,7 @@ function mapToolResult(row: Record<string, unknown>): ToolResultRecord {
     textOffset: row.text_offset == null ? null : Number(row.text_offset),
     // jsonb → node-pg hands back a parsed array; keep only well-formed arrays.
     ...(Array.isArray(row.ui_resources) ? { uiResources: row.ui_resources as UiResource[] } : {}),
+    ...(mcpApp.success ? { mcpApp: mcpApp.data } : {}),
     createdAt: isoTimestamp(row.created_at),
     updatedAt: isoTimestamp(row.updated_at)
   };
@@ -223,8 +228,8 @@ export type UpsertToolResultInput = {
   output: string;
   exitCode: number | null;
   durationMs: number | null;
-  textOffset?: number | null;
-  uiResources?: UiResource[];
+  textOffset: number;
+  mcpApp?: McpAppCall;
 };
 
 /**
@@ -315,6 +320,7 @@ export type ListBySessionOptions = {
   limit?: number | null;
   /** Per-field cap on tool input/output text in this projection. */
   toolTextMaxChars?: number;
+  sinceMessageId?: string;
 };
 
 export type ListBySessionResult = {
@@ -351,28 +357,29 @@ const TOOL_RESULT_RETURNING_COLUMNS = `id,
           duration_ms,
           text_offset,
           ui_resources,
+          mcp_app,
           created_at,
           updated_at`;
 
-// UI resources are untrusted proxy-MCP content (HTML/base64), so they get the
-// same persistence-boundary treatment as input/output tool text:
-//   - `redactSecrets` strips credentials from every nested string (a widget can
-//     echo a Bearer token / API key into its HTML) so they aren't stored and
-//     replayed on reload.
+// MCP App input and results are untrusted tool data, so they get the same
+// persistence-boundary treatment as input/output tool text:
+//   - `redactAppData` strips credentials from nested strings and secret-named
+//     keys so they aren't stored and replayed on reload.
 //   - NUL bytes are neutralized: Postgres jsonb REJECTS a serialized NUL escape,
 //     which would fail the whole turn. stripNulBytes runs on each string VALUE
 //     via the stringify replacer (not against the serialized JSON) so only a
-//     real NUL char is rewritten to U+FFFD — a widget whose source legitimately
+//     real NUL char is rewritten to U+FFFD — a result that legitimately
 //     contains the literal text backslash-u-0000 is left intact.
-// Finally the array is dropped whole if it blows past the tool-text cap so a
-// hostile server can't balloon a row. Returns null for the common no-UI case.
-export const MAX_UI_RESOURCES_JSON_LENGTH = MAX_TOOL_RESULT_TEXT_LENGTH;
-function serializeUiResources(uiResources: UiResource[] | undefined): string | null {
-  if (!uiResources || uiResources.length === 0) return null;
-  const json = JSON.stringify(redactSecrets(uiResources), (_key, value) =>
+// Finally the call is dropped whole if it blows past the tool-text cap so a
+// hostile server can't balloon a row. Returns null for the common no-app case.
+export const MAX_MCP_APP_JSON_LENGTH = MAX_TOOL_RESULT_TEXT_LENGTH;
+function serializeMcpApp(mcpApp: McpAppCall | undefined): string | null {
+  if (!mcpApp) return null;
+  if (redactSecrets(mcpApp.resourceUri) !== mcpApp.resourceUri) return null;
+  const json = JSON.stringify(redactAppData(mcpApp), (_key, value) =>
     typeof value === "string" ? stripNulBytes(value) : value
   );
-  return json.length > MAX_UI_RESOURCES_JSON_LENGTH ? null : json;
+  return json.length > MAX_MCP_APP_JSON_LENGTH ? null : json;
 }
 
 function truncateForStorage(value: string, max: number): string {
@@ -386,6 +393,27 @@ function truncateForStorage(value: string, max: number): string {
 
 export class MessageStore {
   constructor(private readonly db: Pool) {}
+
+  async getMcpAppCall(tenantId: string, sessionId: string, toolCallId: string): Promise<{
+    app: McpAppCall;
+    serverId: string;
+    toolName: string;
+    input: string;
+  } | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `SELECT mcp_app, server_name, tool_name, input_text FROM message_tool_results
+         WHERE tenant_id = $1 AND session_id = $2 AND tool_result_id = $3
+           AND kind = 'mcp' AND status = 'completed' LIMIT 1`,
+        [tenantId, sessionId, toolCallId]
+      );
+      const row = result.rows[0];
+      const app = McpAppCallSchema.safeParse(row?.mcp_app);
+      return row && typeof row.server_name === "string" && typeof row.tool_name === "string" && app.success
+        ? { app: app.data, serverId: row.server_name, toolName: row.tool_name, input: String(row.input_text ?? "{}") }
+        : null;
+    });
+  }
 
   async getOwned(tenantId: string, messageId: string, userId: string): Promise<MessageRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -444,6 +472,15 @@ export class MessageStore {
     );
 
     return withTenantScope(this.db, tenantId, async (client) => {
+      const params: (string | number)[] = [tenantId, sessionId, userId];
+      const sinceClause = options.sinceMessageId
+        ? `AND (created_at, id) >= (
+             SELECT anchor.created_at, anchor.id FROM messages anchor
+             WHERE anchor.tenant_id = $1 AND anchor.session_id = $2 AND anchor.message_id = $4
+           )`
+        : "";
+      if (options.sinceMessageId) params.push(options.sinceMessageId);
+      if (limit != null) params.push(limit + 1);
       const messageResult = await client.query(
         `
             SELECT id, message_id, session_id, user_id, role, status, content_text,
@@ -455,10 +492,11 @@ export class MessageStore {
             FROM messages
             WHERE tenant_id = $1 AND session_id = $2 AND ${sessionContentReadAccessSql("messages", "$3")}
               AND COALESCE(detail_json->>'kind', '') <> 'session_titling'
+              ${sinceClause}
             ORDER BY created_at DESC, id DESC
-            ${limit == null ? "" : "LIMIT $4"}
+            ${limit == null ? "" : `LIMIT $${params.length}`}
           `,
-        limit == null ? [tenantId, sessionId, userId] : [tenantId, sessionId, userId, limit + 1]
+        params
       );
 
       // The +1 probe row proves older messages exist; drop it before mapping.
@@ -497,6 +535,7 @@ export class MessageStore {
               duration_ms,
               text_offset,
               ui_resources,
+              mcp_app,
               created_at,
               updated_at
             FROM message_tool_results
@@ -712,21 +751,6 @@ export class MessageStore {
     });
   }
 
-  async deleteToolResult(
-    tenantId: string,
-    messageId: string,
-    userId: string,
-    toolResultId: string
-  ): Promise<void> {
-    await withTenantScope(this.db, tenantId, async (client) => {
-      await client.query(
-        `DELETE FROM message_tool_results
-         WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND tool_result_id = $4`,
-        [tenantId, messageId, userId, toolResultId]
-      );
-    });
-  }
-
   /**
    * Atomically add the given usage to the message's running totals and
    * return the new cumulative usage so the caller can compute a fresh
@@ -743,7 +767,10 @@ export class MessageStore {
     messageId: string,
     userId: string,
     delta: TokenUsageRecord,
-    modelName: string | null
+    modelName: string | null,
+    // When given, added to cost_usd. Null marks the cost unknown. Once unknown,
+    // the cost stays null: a known part alone would understate it.
+    costUsd?: number | null
   ): Promise<TokenUsageRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query<{
@@ -761,6 +788,12 @@ export class MessageStore {
               reasoning_output_tokens = COALESCE(reasoning_output_tokens, 0) + $7,
               total_tokens            = COALESCE(total_tokens, 0)            + $8,
               model_name              = COALESCE($9, model_name),
+              cost_usd                = CASE
+                WHEN NOT $10::boolean THEN cost_usd
+                WHEN $11::numeric IS NULL THEN NULL
+                WHEN COALESCE(total_tokens, 0) > 0 AND cost_usd IS NULL THEN NULL
+                ELSE COALESCE(cost_usd, 0) + $11::numeric
+              END,
               updated_at              = NOW()
           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
           RETURNING input_tokens, cached_input_tokens, output_tokens,
@@ -775,7 +808,9 @@ export class MessageStore {
           delta.outputTokens,
           delta.reasoningOutputTokens,
           delta.totalTokens,
-          modelName
+          modelName,
+          costUsd !== undefined,
+          costUsd ?? null
         ]
       );
       const row = result.rows[0];
@@ -831,11 +866,12 @@ export class MessageStore {
           exit_code,
           duration_ms,
           text_offset,
-          ui_resources
+          mcp_app
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb)
         ON CONFLICT (tool_result_id)
         DO UPDATE SET
+          kind = EXCLUDED.kind,
           title = EXCLUDED.title,
           status = EXCLUDED.status,
           command_text = EXCLUDED.command_text,
@@ -846,10 +882,11 @@ export class MessageStore {
           output_text = EXCLUDED.output_text,
           exit_code = EXCLUDED.exit_code,
           duration_ms = EXCLUDED.duration_ms,
-          -- Preserve an earlier non-null value: tool.started upserts NULL before
-          -- tool.completed carries the resources, so COALESCE stops the first
+          -- ui_resources is not written. A retained legacy value stays as it is.
+          -- Preserve an earlier non-null value: an in-progress upsert writes NULL
+          -- before completion carries the app call, so COALESCE stops the first
           -- write from clobbering the second on the conflict path.
-          ui_resources = COALESCE(EXCLUDED.ui_resources, message_tool_results.ui_resources),
+          mcp_app = COALESCE(EXCLUDED.mcp_app, message_tool_results.mcp_app),
           text_offset = COALESCE(EXCLUDED.text_offset, message_tool_results.text_offset),
           updated_at = NOW()
         RETURNING
@@ -875,8 +912,8 @@ export class MessageStore {
         truncateForStorage(redactSecrets(ensureNonNullText(input.output)), MAX_TOOL_RESULT_TEXT_LENGTH),
         input.exitCode,
         input.durationMs,
-        input.textOffset ?? null,
-        serializeUiResources(input.uiResources)
+        input.textOffset,
+        serializeMcpApp(input.mcpApp)
       ]
     );
 

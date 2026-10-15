@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { calculateCostUsd } from "./token-cost-calculator.js";
+import { AVAILABLE_MODELS } from "../domain/models.js";
+import { resolveModelConstruction } from "./deep-agents/deep-agents-graph.js";
+import { calculateCostUsd, hasModelPrice } from "./token-cost-calculator.js";
 import type { TokenUsageRecord } from "./message-store.js";
 
 function usage(partial: Partial<TokenUsageRecord>): TokenUsageRecord {
@@ -20,12 +22,12 @@ describe("calculateCostUsd", () => {
   });
 
   it("bills a Claude model at the flat short-context rate", () => {
-    // claude-sonnet-5: input 3.00, output 15.00 per 1M.
+    // claude-sonnet-5: input 2.00, output 10.00 per 1M.
     const cost = calculateCostUsd(
       "claude-sonnet-5",
       usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 })
     );
-    expect(cost).toBeCloseTo(3.0 + 15.0, 6);
+    expect(cost).toBeCloseTo(2.0 + 10.0, 6);
   });
 
   it("discounts cached input tokens at the cachedInput rate", () => {
@@ -52,12 +54,12 @@ describe("calculateCostUsd", () => {
   });
 
   it("prices an OpenRouter model keyed with its inner slash", () => {
-    // deepseek/deepseek-v4-pro: input 0.435, output 0.87 per 1M.
+    // deepseek/deepseek-v4-pro: input 1.30, output 3.20 per 1M.
     const cost = calculateCostUsd(
       "deepseek/deepseek-v4-pro",
       usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 })
     );
-    expect(cost).toBeCloseTo(0.435 + 0.87, 6);
+    expect(cost).toBeCloseTo(1.30 + 3.20, 6);
   });
 
   it("returns zero for a :free OpenRouter route", () => {
@@ -78,6 +80,26 @@ describe("calculateCostUsd", () => {
     expect(cost).toBeCloseTo(expected, 6);
   });
 
+  it.each([
+    { inputTokens: 272_000, cachedInputTokens: 50_000, expected: 0.222 * 2 + 0.05 * 0.1 + 0.05 * 10 },
+    { inputTokens: 272_001, cachedInputTokens: 50_000, expected: 0.222001 * 4 + 0.05 * 0.2 + 0.05 * 15 }
+  ])("prices GPT-6.1 Sol at $inputTokens input tokens", ({ inputTokens, cachedInputTokens, expected }) => {
+    expect(calculateCostUsd("gpt-6.1-sol", usage({
+      inputTokens,
+      cachedInputTokens,
+      outputTokens: 50_000
+    }))).toBeCloseTo(expected, 6);
+  });
+
+  it("applies Haiku 5.5's long-context tier above 100K input tokens, cache reads included", () => {
+    // 100K prompt tokens (half cached) stays on the short tier.
+    expect(calculateCostUsd("claude-haiku-5-5", usage({ inputTokens: 100_000, cachedInputTokens: 50_000, outputTokens: 10_000 })))
+      .toBeCloseTo(0.05 * 0.10 + 0.05 * 0.01 + 0.01 * 0.50, 6);
+    // 150K prompt tokens (100K cached) pays the long tier on every bucket.
+    expect(calculateCostUsd("claude-haiku-5-5", usage({ inputTokens: 150_000, cachedInputTokens: 100_000, outputTokens: 10_000 })))
+      .toBeCloseTo(0.05 * 0.50 + 0.1 * 0.05 + 0.01 * 2.50, 6);
+  });
+
   it("prices new models with cached input and long-context rates", () => {
     const shortUsage = usage({ inputTokens: 200_000, cachedInputTokens: 50_000, outputTokens: 50_000 });
     expect(calculateCostUsd("gpt-6-sol", shortUsage)).toBeCloseTo(
@@ -88,6 +110,12 @@ describe("calculateCostUsd", () => {
     );
     expect(calculateCostUsd("claude-opus-5-5", shortUsage)).toBeCloseTo(
       0.15 * 4 + 0.05 * 0.2 + 0.05 * 20, 6
+    );
+    expect(calculateCostUsd("claude-fable-5", shortUsage)).toBeCloseTo(
+      0.15 * 10 + 0.05 * 1 + 0.05 * 50, 6
+    );
+    expect(calculateCostUsd("claude-sonnet-5-5", shortUsage)).toBeCloseTo(
+      0.15 * 2 + 0.05 * 0.1 + 0.05 * 10, 6
     );
 
     const longUsage = usage({ inputTokens: 300_000, outputTokens: 50_000 });
@@ -102,5 +130,20 @@ describe("calculateCostUsd", () => {
     expect(calculateCostUsd("gpt-6-sol", shortInputWithLargeOutput)).toBeCloseTo(
       0.25 * 2 + 0.1 * 10, 6
     );
+  });
+});
+
+describe("hasModelPrice", () => {
+  // A catalog model without a price is refused at reserve() while spending
+  // limits are on, so a catalog edit must add its price.
+  it("every catalog model has a price", () => {
+    const unpriced = AVAILABLE_MODELS.map((model) => resolveModelConstruction(model.id).vendorModel)
+      .filter((vendorModel) => !hasModelPrice(vendorModel));
+    expect(unpriced).toEqual([]);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])("has no price for the inherited name %s", (name) => {
+    expect(hasModelPrice(name)).toBe(false);
+    expect(calculateCostUsd(name, { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0, totalTokens: 2 })).toBeNull();
   });
 });

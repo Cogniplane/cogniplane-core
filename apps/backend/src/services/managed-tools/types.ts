@@ -1,9 +1,30 @@
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 
+/**
+ * Proof that a user approved this exact call. Only the gateway builds it, from an
+ * approval row that it checked and claimed. Nothing the model sends can fill it.
+ */
+export type ManagedToolApproval = {
+  approvalId: string;
+  /** The user who decided. The approval route accepts only the session's own user. */
+  approvedByUserId: string;
+  approvedAt: string;
+  /** What the server stored beside the approval row when it asked. */
+  bound: Record<string, unknown>;
+};
+
 export type ManagedToolHandler = (input: {
   context: ToolExecutionContext;
   arguments: Record<string, unknown>;
+  /** Present only for a tool with `requiresUserApproval`, after the gateway checked the approval. */
+  approval?: ManagedToolApproval;
 }) => Promise<Record<string, unknown>>;
+
+export type ManagedToolAppResource = {
+  uri: string;
+  mimeType: string;
+  render: (input: Record<string, unknown>) => string;
+};
 
 export type ManagedToolDefinition = {
   name: string;
@@ -12,6 +33,14 @@ export type ManagedToolDefinition = {
   inputSchema: Record<string, unknown>;
   outputSchema?: Record<string, unknown>;
   handler: ManagedToolHandler;
+  appResource?: ManagedToolAppResource;
+  /**
+   * The tool saves durable data. In every interactive turn the user must approve
+   * its exact arguments, whatever the tenant approval policy and Policy Center say.
+   * A scheduled run has nobody to ask, so the gateway refuses the call. The
+   * gateway passes the checked approval to the handler as `approval`.
+   */
+  requiresUserApproval?: boolean;
   /**
    * Domain the tool belongs to (e.g. "github", "notion", "session"), stamped by
    * the factory registry from the factory's registration key. Used as the

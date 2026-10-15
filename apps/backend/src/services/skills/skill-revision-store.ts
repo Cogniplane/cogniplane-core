@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import type { AdminSkillReleaseSnapshot } from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 import { withTenantScope } from "../../lib/db.js";
@@ -12,7 +13,10 @@ import {
   type AdminSkillRevisionRecord,
   type ImportedSkillBundleRecord
 } from "../admin-config-records.js";
-import { mapSkillRevision, parseSkillActivationMetadata } from "../admin-config-store-mappers.js";
+import { mapSkillRevision, parseSkillActivationMetadata, skillReferencesFromManifest } from "../admin-config-store-mappers.js";
+import { lockOrganizationSkillNames } from "./organization-skill-name-lock.js";
+import { insertAuthorUpdate } from "./organization-skill-submission-store.js";
+import { assertSkillReleaseSnapshot, latestSkillRevisionId, skillReleaseSnapshot } from "./skill-release-impact-store.js";
 
 export class SkillRevisionStore {
   constructor(
@@ -37,13 +41,14 @@ export class SkillRevisionStore {
     });
   }
 
+  // Tenant-owned revisions only: cleanup can never delete inherited `system` revisions.
   async listAllSkillRevisions(tenantId: string): Promise<AdminSkillRevisionRecord[]> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const revisionRows = await client.query(
         `
           SELECT *
           FROM admin_skill_revisions
-          WHERE tenant_id IN ($1::text, 'system')
+          WHERE tenant_id = $1
           ORDER BY skill_id ASC, revision_number DESC, created_at DESC
         `,
         [tenantId]
@@ -162,6 +167,7 @@ export class SkillRevisionStore {
     let allocatedRevisionNumber: number | null = null;
 
     await withTenantScope(this.db, tenantId, async (client) => {
+      await lockOrganizationSkillNames(client, tenantId);
       // Scope the existence check to THIS tenant only. Including the 'system'
       // row here would make a tenant import whose skillId collides with a
       // platform-default skill skip the per-tenant INSERT below, so the
@@ -231,6 +237,35 @@ export class SkillRevisionStore {
       const revisionNumber = Number(revisionNumberResult.rows[0]?.next_revision_number ?? 1);
       allocatedRevisionNumber = revisionNumber;
 
+      const metadata = { ...input.metadata };
+      delete metadata.organizationSubmissionId;
+      delete metadata.organizationSubmissionAttempt;
+      if (input.sourceType === "inline") {
+        const previous = await client.query(`SELECT revision_number,review_status,source_type,metadata
+          FROM admin_skill_revisions WHERE tenant_id=$1 AND skill_id=$2
+          ORDER BY revision_number DESC LIMIT 1 FOR UPDATE`,[tenantId,input.skillId]);
+        const parent = previous.rows[0];
+        const parentMetadata = parent?.metadata as Record<string, unknown> | undefined;
+        if (parent?.review_status === "pending_review" && parent.source_type === "inline" &&
+            Number(parent.revision_number) === revisionNumber-1 &&
+            typeof parentMetadata?.organizationSubmissionId === "string" &&
+            Number.isInteger(parentMetadata.organizationSubmissionAttempt)) {
+          const linked = await client.query(`SELECT 1 FROM organization_skill_submissions s
+            JOIN organization_skill_submission_attempts a ON a.tenant_id=s.tenant_id
+              AND a.submission_id=s.submission_id AND a.attempt=$4
+            JOIN admin_skill_revisions accepted ON accepted.tenant_id=s.tenant_id
+              AND accepted.skill_revision_id=a.accepted_revision_id
+            WHERE s.tenant_id=$1 AND s.submission_id::text=$2 AND s.accepted_skill_id=$3
+              AND s.status='accepted' AND accepted.revision_number<=$5`,
+          [tenantId,parentMetadata.organizationSubmissionId,input.skillId,
+            parentMetadata.organizationSubmissionAttempt,parent.revision_number]);
+          if (linked.rowCount) {
+            metadata.organizationSubmissionId=parentMetadata.organizationSubmissionId;
+            metadata.organizationSubmissionAttempt=parentMetadata.organizationSubmissionAttempt;
+          }
+        }
+      }
+
       const { storageUri } = await input.storeBundle({ revisionNumber });
 
       await this.insertSkillRevision(client, tenantId, {
@@ -246,7 +281,7 @@ export class SkillRevisionStore {
         reviewStatus: "pending_review",
         reviewNotes: null,
         metadata: {
-          ...input.metadata,
+          ...metadata,
           skillName: input.skillName,
           description: input.description,
           instructions: input.instructions
@@ -277,26 +312,46 @@ export class SkillRevisionStore {
     skillRevisionId: number;
     reviewedBy: string;
     reviewNotes: string | null;
+    audience?: "test-users" | "members";
+    expectedSnapshot?: AdminSkillReleaseSnapshot;
   }): Promise<ActivatedSkillRevisionRecord | null> {
-    const existingSkill = await this.skillStore.getSkill(tenantId, input.skillId);
-    const revision = await this.getSkillRevision(tenantId, input.skillId, input.skillRevisionId);
-    if (!revision) {
-      return null;
-    }
-
-    if (!canActivateRevision(revision.validationStatus)) {
-      throw new AdminConfigError(`Skill revision ${input.skillRevisionId} is not valid for activation.`);
-    }
-
-    const parsed = parseSkillActivationMetadata(revision.metadata);
-    if (!parsed.ok) {
-      throw new AdminConfigError(
-        `Skill revision ${input.skillRevisionId} is missing activation metadata: ${parsed.missing.join(", ")}.`
+    return withTenantScope(this.db, tenantId, async (client) => {
+      await lockOrganizationSkillNames(client, tenantId);
+      const existing = await client.query(
+        `SELECT version,active_revision_id,enabled,is_published FROM admin_skills
+         WHERE tenant_id = $1 AND skill_id = $2 FOR UPDATE`,
+        [tenantId, input.skillId]
       );
-    }
-    const { skillName, description } = parsed.value;
+      if (!existing.rows[0]) return null;
+      assertSkillReleaseSnapshot(skillReleaseSnapshot(existing.rows[0],
+        await latestSkillRevisionId(client,tenantId,input.skillId)),input.expectedSnapshot);
 
-    await withTenantScope(this.db, tenantId, async (client) => {
+      const previousActiveRevisionId = existing.rows[0].active_revision_id === null
+        ? null : Number(existing.rows[0].active_revision_id);
+      const previous = previousActiveRevisionId === null ? null : await client.query(
+        `SELECT revision_number FROM admin_skill_revisions
+         WHERE tenant_id = $1 AND skill_id = $2 AND skill_revision_id = $3`,
+        [tenantId, input.skillId, previousActiveRevisionId]
+      );
+
+      const selected = await client.query(
+        `SELECT * FROM admin_skill_revisions
+         WHERE tenant_id = $1 AND skill_id = $2 AND skill_revision_id = $3 FOR UPDATE`,
+        [tenantId, input.skillId, input.skillRevisionId]
+      );
+      if (!selected.rows[0]) return null;
+      const revision = mapSkillRevision(selected.rows[0]);
+      if (!canActivateRevision(revision.validationStatus)) {
+        throw new AdminConfigError(`Skill revision ${input.skillRevisionId} is not valid for activation.`);
+      }
+      const parsed = parseSkillActivationMetadata(revision.metadata);
+      if (!parsed.ok) {
+        throw new AdminConfigError(
+          `Skill revision ${input.skillRevisionId} is missing activation metadata: ${parsed.missing.join(", ")}.`
+        );
+      }
+      const { skillName, description } = parsed.value;
+
       await client.query(
         `
           UPDATE admin_skill_revisions
@@ -322,28 +377,53 @@ export class SkillRevisionStore {
           SET
             skill_name = $2,
             description = $3,
-            version = $4,
+            version = version + 1,
             enabled = TRUE,
-            active_revision_id = $5,
+            is_published = COALESCE($6::boolean, is_published),
+            active_revision_id = $4,
             updated_at = NOW()
           WHERE skill_id = $1
-            AND tenant_id = $6
+            AND tenant_id = $5
         `,
-        [input.skillId, skillName, description, revision.revisionNumber, input.skillRevisionId, tenantId]
+        [input.skillId, skillName, description, input.skillRevisionId, tenantId,
+          input.audience === undefined ? null : input.audience === "members"]
       );
+      const submissionId = revision.metadata.organizationSubmissionId;
+      const submissionAttempt = revision.metadata.organizationSubmissionAttempt;
+      if (typeof submissionId === "string" && Number.isInteger(submissionAttempt)) {
+        const linked = await client.query(`SELECT s.author_user_id,s.submission_id,a.attempt,sk.is_published
+        FROM organization_skill_submissions s
+        JOIN organization_skill_submission_attempts a ON a.tenant_id=s.tenant_id
+          AND a.submission_id=s.submission_id AND a.attempt=$4
+        JOIN admin_skill_revisions accepted_revision ON accepted_revision.tenant_id=s.tenant_id
+          AND accepted_revision.skill_revision_id=a.accepted_revision_id
+        JOIN admin_skills sk ON sk.tenant_id=s.tenant_id AND sk.skill_id=s.accepted_skill_id
+        WHERE s.tenant_id=$1 AND s.submission_id::text=$2 AND s.accepted_skill_id=$3
+          AND s.status='accepted' AND accepted_revision.revision_number<=$5`,
+        [tenantId,submissionId,input.skillId,submissionAttempt,revision.revisionNumber]);
+        if (linked.rowCount) {
+          await insertAuthorUpdate(client,{tenantId,recipientUserId:String(linked.rows[0].author_user_id),
+            submissionId,attempt:Number(submissionAttempt),kind:"released",skillName,
+            feedback:null,organizationSkillId:input.skillId,organizationRevisionId:input.skillRevisionId,
+            audience:linked.rows[0].is_published ? "members" : "test-users"});
+        }
+      }
+      const skill = await this.skillStore.getSkill(tenantId, input.skillId, client);
+      const active = await client.query(
+        `SELECT * FROM admin_skill_revisions
+         WHERE tenant_id = $1 AND skill_id = $2 AND skill_revision_id = $3`,
+        [tenantId, input.skillId, input.skillRevisionId]
+      );
+      if (!skill || !active.rows[0]) {
+        throw new Error(`Failed to load activated skill revision ${input.skillRevisionId}.`);
+      }
+      return {
+        skill,
+        revision: mapSkillRevision(active.rows[0]),
+        previousActiveRevisionId,
+        previousActiveRevisionNumber: previous?.rows[0] ? Number(previous.rows[0].revision_number) : null
+      };
     });
-
-    const skill = await this.skillStore.getSkill(tenantId, input.skillId);
-    const activeRevision = await this.getSkillRevision(tenantId, input.skillId, input.skillRevisionId);
-    if (!skill || !activeRevision) {
-      throw new Error(`Failed to load activated skill revision ${input.skillRevisionId}.`);
-    }
-
-    return {
-      skill,
-      revision: activeRevision,
-      previousActiveRevisionId: existingSkill?.activeRevisionId ?? null
-    };
   }
 
   async listActiveRuntimeSkillReferences(tenantId: string): Promise<ActiveRuntimeSkillReference[]> {
@@ -358,43 +438,31 @@ export class SkillRevisionStore {
         [tenantId]
       );
 
-      const references: ActiveRuntimeSkillReference[] = [];
-      for (const row of runtimeSessionRows.rows) {
-        const manifestMetadata =
-          row.manifest_metadata && typeof row.manifest_metadata === "object"
-            ? (row.manifest_metadata as Record<string, unknown>)
-            : {};
-        const skills = Array.isArray(manifestMetadata.skills) ? manifestMetadata.skills : [];
-
-        for (const skill of skills) {
-          if (typeof skill !== "object" || skill === null) {
-            continue;
-          }
-
-          const record = skill as Record<string, unknown>;
-          references.push({
-            sessionId: String(row.session_id),
-            skillId: typeof record.id === "string" ? record.id : "",
-            revisionId: typeof record.revisionId === "number" ? record.revisionId : null,
-            bundleHash: typeof record.bundleHash === "string" ? record.bundleHash : null
-          });
-        }
-      }
-
-      return references;
+      return runtimeSessionRows.rows.flatMap((row) =>
+        skillReferencesFromManifest(String(row.session_id), row.manifest_metadata));
     });
   }
 
   async deleteSkillRevision(tenantId: string, skillId: string, skillRevisionId: number): Promise<AdminSkillRevisionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      // Lock the skill row as activateSkillRevision does, so a revision that a
+      // concurrent activation makes active is never deleted.
+      const skill = await client.query(
+        `SELECT active_revision_id FROM admin_skills
+         WHERE tenant_id = $1 AND skill_id = $2 FOR UPDATE`,
+        [tenantId, skillId]
+      );
+      if (!skill.rowCount) return null;
       const deletedRevisionRows = await client.query(
         `
           DELETE FROM admin_skill_revisions
           WHERE skill_id = $1 AND skill_revision_id = $2
             AND tenant_id = $3
+            AND review_status <> 'active'
+            AND skill_revision_id IS DISTINCT FROM $4::bigint
           RETURNING *
         `,
-        [skillId, skillRevisionId, tenantId]
+        [skillId, skillRevisionId, tenantId, skill.rows[0].active_revision_id]
       );
 
       return deletedRevisionRows.rows[0] ? mapSkillRevision(deletedRevisionRows.rows[0]) : null;

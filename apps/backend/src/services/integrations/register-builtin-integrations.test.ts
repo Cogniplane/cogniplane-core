@@ -119,3 +119,35 @@ test("registerBuiltinIntegrations is idempotent across repeated calls", () => {
   // not registered by `registerBuiltinIntegrations`.
   expect(getIntegrationDescriptor("microsoft")).toBe(null);
 });
+
+test("Jira tools reach a session only with reads enabled and a stored connection", async () => {
+  registerBuiltinIntegrations();
+  const registry = new IntegrationRegistry();
+  let connected = true;
+  attachBuiltinIntegrationRuntime(registry, { probes: { jira: { async hasConnection() { return connected; } } } });
+  const descriptor = registry.get("jira");
+  expect(descriptor).toMatchObject({ status: "available", writeToolIds: [] });
+  expect(descriptor?.oauthRoutes).toBeUndefined();
+  expect(descriptor?.platformStatus?.(createTestConfig())).toMatchObject({ configured: false });
+
+  let readsEnabled = true;
+  const store = {
+    async get() { return null; },
+    async list() {
+      return [{
+        tenantId: "tenant", integrationId: "jira", readsEnabled, writesEnabled: true,
+        config: {}, createdAt: "2026-09-30T00:00:00.000Z", updatedAt: "2026-09-30T00:00:00.000Z", updatedBy: "admin"
+      }];
+    }
+  };
+  const service = new IntegrationRegistryService(createTestConfig(), store, {}, registry);
+  expect(await service.resolveSessionToolIds("tenant", "user")).toEqual([
+    "jira_list_sites", "jira_search_issues", "jira_get_issue", "jira_get_issue_changelog"
+  ]);
+  connected = false;
+  expect(await service.resolveSessionToolIds("tenant", "user")).toEqual([]);
+  connected = true;
+  readsEnabled = false;
+  // A stored write toggle adds nothing: Jira has no write tools.
+  expect(await service.resolveSessionToolIds("tenant", "user")).toEqual([]);
+});

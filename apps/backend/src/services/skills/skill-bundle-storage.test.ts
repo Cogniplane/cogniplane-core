@@ -1,8 +1,21 @@
 import os from "node:os";
 import path from "node:path";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { Readable } from "node:stream";
-import { test, expect, onTestFinished } from "vitest";
+import { test, expect, onTestFinished, vi } from "vitest";
+
+// Records where the storage copies a bundle, to check the temporary path.
+const copyDestinations = vi.hoisted(() => [] as string[]);
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    cp: (async (source: string, destination: string, options?: unknown) => {
+      copyDestinations.push(String(destination));
+      return actual.cp(source, destination, options as never);
+    }) as typeof actual.cp
+  };
+});
 
 import * as tar from "tar";
 
@@ -361,4 +374,163 @@ test("bucket skill bundle storage applies the configured key prefix", async () =
   expect(objects.has("my-bucket/env/demo/skills/t1/s1/7-h.tar.gz")).toBeTruthy();
 
   await rm(tmpRoot, { recursive: true, force: true });
+});
+
+test("local skill bundle storage never reads or deletes outside its root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-contain-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const cacheRoot = path.join(root, "cache");
+  const outside = path.join(root, "outside");
+  await mkdir(outside, { recursive: true });
+  await writeFile(path.join(outside, "keep.txt"), "keep");
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+
+  for (const uri of [`file://${outside}`, `file://${cacheRoot}/../outside`, `file://${cacheRoot}`]) {
+    await expect(storage.deleteBundle(uri)).rejects.toThrow("outside the bundle storage root");
+    await expect(storage.materializeBundle(uri)).rejects.toThrow("outside the bundle storage root");
+  }
+  await expect(storage.storeBundle({ tenantId: "t1", skillId: "s", revisionNumber: 1,
+    bundleName: "../../outside", contentHash: "x", sourcePath: outside })).rejects.toThrow("outside the bundle storage root");
+  expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+});
+
+test("bucket skill bundle storage keeps its cache path inside the cache root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-contain-bucket-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const outside = path.join(root, "outside");
+  await mkdir(outside, { recursive: true });
+  await writeFile(path.join(outside, "keep.txt"), "keep");
+  const objects = new Map<string, Buffer>();
+  const storage = new BucketSkillBundleStorage({
+    client: createFakeS3Client(objects), bucketName: "skill-bucket", keyPrefix: "",
+    cacheRoot: path.join(root, "cache"), uploader: createFakeUploader(objects)
+  });
+
+  // A key that climbs out of the cache would make deleteBundle rm the target.
+  await expect(storage.deleteBundle("s3://skill-bucket/../../outside")).rejects.toThrow("outside the bundle storage root");
+  expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+});
+
+test("local skill bundle storage refuses a symlinked directory that leads outside its root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-symlink-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const cacheRoot = path.join(root, "cache");
+  const outside = path.join(root, "outside");
+  await mkdir(path.join(outside, "victim"), { recursive: true });
+  await writeFile(path.join(outside, "victim", "keep.txt"), "keep");
+  await mkdir(cacheRoot, { recursive: true });
+  await symlink(outside, path.join(cacheRoot, "link"));
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+
+  const uri = `file://${path.join(cacheRoot, "link", "victim")}`;
+  await expect(storage.deleteBundle(uri)).rejects.toThrow("outside the bundle storage root");
+  await expect(storage.materializeBundle(uri)).rejects.toThrow("outside the bundle storage root");
+  await expect(storage.storeBundle({ tenantId: "link", skillId: "s", revisionNumber: 1,
+    bundleName: "victim", contentHash: "h", sourcePath: outside })).rejects.toThrow("outside the bundle storage root");
+  expect(await readFile(path.join(outside, "victim", "keep.txt"), "utf8")).toBe("keep");
+});
+
+test("local skill bundle storage builds its temporary path from the checked path", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-temp-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const cacheRoot = path.join(root, "cache");
+  const sourcePath = path.join(root, "source");
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "skill");
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+
+  // Contained destination cache/t1/victim, but a raw-hash temp path would be outside.
+  copyDestinations.length = 0;
+  const stored = await storage.storeBundle({ tenantId: "t1", skillId: "s", revisionNumber: 1,
+    bundleName: "a/b", contentHash: "../../victim", sourcePath });
+  expect(stored.storageUri).toBe(`file://${path.join(cacheRoot, "t1", "victim")}`);
+  expect(copyDestinations).toHaveLength(1);
+  expect(copyDestinations[0]!.startsWith(`${cacheRoot}${path.sep}`)).toBe(true);
+  expect((await readdir(root)).sort()).toEqual(["cache", "source"]);
+});
+
+test("local skill bundle storage still reads a relative stored path from the working directory", async () => {
+  const root = await mkdtemp(path.join(process.cwd(), ".skill-relative-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const relativeRoot = path.relative(process.cwd(), root);
+  await mkdir(path.join(root, "t1", "skill", "hash"), { recursive: true });
+  const storage = new LocalSkillBundleStorage(relativeRoot);
+
+  await expect(storage.materializeBundle(`file://${path.join(relativeRoot, "t1", "skill", "hash")}`))
+    .resolves.toEqual({ localPath: path.join(root, "t1", "skill", "hash") });
+});
+
+test("bucket skill bundle storage refuses a traversal before it deletes the object", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-bucket-order-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const objects = new Map<string, Buffer>([["skill-bucket/env/demo/../../../outside.tar.gz", Buffer.from("x")]]);
+  const client = createFakeS3Client(objects);
+  const storage = new BucketSkillBundleStorage({
+    client, bucketName: "skill-bucket", keyPrefix: "env/demo",
+    cacheRoot: path.join(root, "cache"), uploader: createFakeUploader(objects)
+  });
+
+  await expect(storage.deleteBundle("s3://skill-bucket/env/demo/../../../outside.tar.gz"))
+    .rejects.toThrow("outside the bundle storage root");
+  expect(objects.size).toBe(1);
+});
+
+test("bucket skill bundle storage refuses a cache path through a symlink", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-bucket-link-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const cacheRoot = path.join(root, "cache");
+  const outside = path.join(root, "outside");
+  await mkdir(path.join(outside, "x"), { recursive: true });
+  await mkdir(cacheRoot, { recursive: true });
+  await symlink(outside, path.join(cacheRoot, "skill-bucket"));
+  const objects = new Map<string, Buffer>();
+  const storage = new BucketSkillBundleStorage({
+    client: createFakeS3Client(objects), bucketName: "skill-bucket", keyPrefix: "",
+    cacheRoot, uploader: createFakeUploader(objects)
+  });
+
+  await expect(storage.materializeBundle("s3://skill-bucket/x.tar.gz")).rejects.toThrow("outside the bundle storage root");
+  await expect(storage.deleteBundle("s3://skill-bucket/x.tar.gz")).rejects.toThrow("outside the bundle storage root");
+});
+
+test("a bundle path that is itself a symlink is never read, and deleting it removes only the link", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-leaf-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const outside = path.join(root, "outside");
+  await mkdir(outside, { recursive: true });
+  await writeFile(path.join(outside, "keep.txt"), "keep");
+
+  const cacheRoot = path.join(root, "cache");
+  await mkdir(path.join(cacheRoot, "t1", "skill"), { recursive: true });
+  const leaf = path.join(cacheRoot, "t1", "skill", "hash");
+  await symlink(outside, leaf);
+  const local = new LocalSkillBundleStorage(cacheRoot);
+  await expect(local.materializeBundle(`file://${leaf}`)).rejects.toThrow("outside the bundle storage root");
+  await local.deleteBundle(`file://${leaf}`);
+  await expect(lstat(leaf)).rejects.toThrow();
+  expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+
+  const bucketCache = path.join(root, "bucket-cache");
+  await mkdir(path.join(bucketCache, "skill-bucket"), { recursive: true });
+  const bucketLeaf = path.join(bucketCache, "skill-bucket", "x");
+  await symlink(outside, bucketLeaf);
+  const objects = new Map<string, Buffer>();
+  const bucket = new BucketSkillBundleStorage({
+    client: createFakeS3Client(objects), bucketName: "skill-bucket", keyPrefix: "",
+    cacheRoot: bucketCache, uploader: createFakeUploader(objects)
+  });
+  await expect(bucket.materializeBundle("s3://skill-bucket/x.tar.gz")).rejects.toThrow("outside the bundle storage root");
+  await bucket.deleteBundle("s3://skill-bucket/x.tar.gz");
+  await expect(lstat(bucketLeaf)).rejects.toThrow();
+  expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
+});
+
+test("a name that starts with two dots stays inside the root", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-dots-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const cacheRoot = path.join(root, "cache");
+  await mkdir(path.join(cacheRoot, "..legacy", "hash"), { recursive: true });
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+  await expect(storage.materializeBundle(`file://${path.join(cacheRoot, "..legacy", "hash")}`))
+    .resolves.toEqual({ localPath: path.join(cacheRoot, "..legacy", "hash") });
 });

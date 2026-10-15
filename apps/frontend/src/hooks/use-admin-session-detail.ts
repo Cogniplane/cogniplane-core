@@ -3,6 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { getAdminSessionDetail } from "../lib/admin-api";
+import { ApiError } from "../lib/api-client";
 import {
   isRouteNotFoundError,
   toErrorMessage,
@@ -11,9 +12,10 @@ import {
 import { queryKeys } from "../lib/query-keys";
 import type { AdminSessionDetailResponse } from "@cogniplane/shared-types";
 
+// Match the error code, not the message: the backend may add a readable
+// message to this 404 later.
 function isSessionNotFound(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.message === "session_not_found";
+  return error instanceof ApiError && error.code === "session_not_found";
 }
 
 export function useAdminSessionDetailData(sessionId: string | null) {

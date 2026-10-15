@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { PiiRecentRowSchema } from "@cogniplane/shared-types";
-import { handlePiiDecision } from "../routes/messages-pii-handler.js";
+import { handlePiiDecision } from "../services/pii/chat-prompt-pii.js";
 import { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 import { PiiAnalyticsStore } from "../services/pii/pii-analytics-store.js";
 import { AuditEventStore } from "../services/audit-event-store.js";

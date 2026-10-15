@@ -220,7 +220,7 @@ async function collectBundleFiles(
   return files;
 }
 
-function parseSkillMarkdown(content: string, messages: SkillBundleValidationMessage[]) {
+export function parseSkillMarkdown(content: string, messages: SkillBundleValidationMessage[]) {
   const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) {
     messages.push({

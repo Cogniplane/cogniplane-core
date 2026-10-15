@@ -127,7 +127,8 @@ test("cleanupInactiveSkillRevisions: dry-run reports candidate deletions without
 test("cleanupInactiveSkillRevisions: keeps the active revision", async () => {
   const stores = captureStores();
   stores.skillRevisions.listAllSkillRevisions = async () => [
-    rev({ skillRevisionId: 1 }) // matches activeRevisionId=1
+    rev({ skillRevisionId: 1, revisionNumber: 1 }),
+    rev({ skillRevisionId: 2, revisionNumber: 2, bundleStorageUri: "s3://bkt/sk1/v2" })
   ];
 
   const report = await cleanupInactiveSkillRevisions({
@@ -139,7 +140,11 @@ test("cleanupInactiveSkillRevisions: keeps the active revision", async () => {
     dryRun: false
   });
   expect(report.deletedRevisionIds).toEqual([]);
-  expect(report.keptRevisionDecisions.length).toBe(1);
+  expect(report.keptRevisionDecisions).toContainEqual({
+    skillRevisionId: 1, reason: "active_registry_revision"
+  });
+  expect(stores.deletedRevisions).toEqual([]);
+  expect(stores.deletedBundles).toEqual([]);
 });
 
 test("cleanupInactiveSkillRevisions: deletes inactive revision and removes bundle when last reference", async () => {
@@ -257,4 +262,23 @@ test("cleanupInactiveSkillRevisions: deletedBundleStorageUris are deduped and so
     dryRun: false
   });
   expect(report.deletedBundleStorageUris).toEqual(["s3://bkt/a", "s3://bkt/b"]);
+});
+
+
+test("cleanupInactiveSkillRevisions keeps an old revision used only by a running runtime", async () => {
+  const stores = captureStores();
+  stores.skills.listSkills = async () => [skill({ activeRevisionId: 2 })];
+  stores.skillRevisions.listAllSkillRevisions = async () => [
+    rev({ skillRevisionId: 1, revisionNumber: 1 }),
+    rev({ skillRevisionId: 2, revisionNumber: 2, bundleStorageUri: "s3://bkt/sk1/v2" })
+  ];
+  stores.skillRevisions.listActiveRuntimeSkillReferences = async () => [
+    { sessionId: "running-session", skillId: "sk1", revisionId: 1, bundleHash: "h" }
+  ];
+  const report = await cleanupInactiveSkillRevisions({ tenantId: "t", config, ...stores, dryRun: false });
+  expect(report.keptRevisionDecisions).toContainEqual({
+    skillRevisionId: 1, reason: "active_runtime_reference:running-session"
+  });
+  expect(stores.deletedRevisions).toEqual([]);
+  expect(stores.deletedBundles).toEqual([]);
 });

@@ -43,11 +43,14 @@ function renderPage(initialCatalog?: AdminModelCatalogResponse) {
   return render(<QueryClientProvider client={client}><Page /></QueryClientProvider>);
 }
 
+vi.mock("../../../lib/admin-history-api", () => ({ listAdminHistory: async () => ({ items: [], nextCursor: null }) }));
+
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
   vi.mocked(useTenantSettings).mockReturnValue({
-    settings, saving: false, error: null, save: async () => true, reload: async () => {}
+    settings, saving: false, error: null, loadError: null, saveError: null,
+    save: async () => true, saveWithResult: async () => ({ ok: true as const }), resetSaveError: () => {}, reload: async () => {}
   });
 });
 afterEach(() => {
@@ -97,8 +100,9 @@ describe("Agent settings model warning", () => {
     { enabledModelIds: ["anthropic/test-model"] }
   ])("reports disabled selection separately from credentials: %j", async (availability) => {
     vi.mocked(useTenantSettings).mockReturnValue({
-      settings: { ...settings, ...availability }, saving: false, error: null,
-      save: async () => true, reload: async () => {}
+      settings: { ...settings, ...availability }, saving: false, error: null, loadError: null,
+      saveError: null, save: async () => true, saveWithResult: async () => ({ ok: true as const }), resetSaveError: () => {},
+      reload: async () => {}
     });
     localStorage.setItem("cogniplane:model", "openai/test-model");
     vi.mocked(getAdminModelCatalog).mockResolvedValue(catalog("openai", "platform"));
@@ -118,7 +122,7 @@ describe("Agent settings model warning", () => {
     vi.mocked(getAdminModelCatalog).mockReturnValue(new Promise((done) => { resolve = done; }));
     localStorage.setItem("cogniplane:model", "openai/test-model");
     renderPage();
-    expect(screen.getByRole("status").textContent).toContain("Checking");
+    expect(screen.getByText("Checking model availability...").textContent).toContain("Checking");
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.queryByText(/No .* API key is configured/)).toBeNull();
     resolve(catalog("openai", "platform"));

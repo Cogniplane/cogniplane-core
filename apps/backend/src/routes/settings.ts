@@ -3,9 +3,14 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 
 import {
+  GithubAllowedRepositoriesRequestSchema,
+  GithubAllowedRepositoriesResponseSchema,
   GithubConnectionStatusSchema,
+  GithubRepositoryListResponseSchema,
   NotionConnectionStatusSchema,
   ScheduledJobEnvelopeSchema,
+  ScheduledJobPreviewRequestSchema,
+  ScheduledJobPreviewResponseSchema,
   ScheduledJobRequestSchema,
   ScheduledJobRunsListResponseSchema,
   ScheduledJobsListResponseSchema,
@@ -23,7 +28,11 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import { GithubConnectionNotConfiguredError } from "../services/integrations/github/github-connection-service.js";
+import {
+  GithubConnectionError,
+  GithubConnectionNotConfiguredError
+} from "../services/integrations/github/github-connection-service.js";
+import { InvalidGithubRepositoryListError } from "../services/integrations/github/github-repository-allowlist.js";
 import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
 import { NotionConnectionNotConfiguredError } from "../services/integrations/notion/notion-connection-service.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
@@ -32,8 +41,12 @@ import type { IntegrationStateStore } from "../services/integrations/integration
 import type { IntegrationRegistryService } from "../services/integrations/integration-registry-service.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
+import type { ChatPromptGateStores } from "../services/pii/chat-prompt-pii.js";
+import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
+import { scheduledJobPrompt } from "../services/scheduler-worker.js";
 import {
   userSettingsSectionKeys,
+  type ScheduledJobRecord,
   type UserSettingsStore
 } from "../services/user-settings-store.js";
 
@@ -113,6 +126,61 @@ async function resolveScheduledJobPersistenceInput(
   }
 }
 
+// Tell the owner at save time that the policy blocks the prompt. This is a
+// convenience only: the worker checks again at every run, because the policy
+// can change. An outage does not stop the save for the same reason.
+async function rejectBlockedScheduledPrompt(
+  reply: FastifyReply,
+  piiProtection: ChatPromptGateStores["piiProtection"],
+  tenantId: string,
+  job: { enabled: boolean; input: ScheduledJobRecord["input"] }
+): Promise<unknown | null> {
+  // A disabled job does not run, and the owner must be able to disable a
+  // job whose prompt a new policy blocks.
+  if (!piiProtection || !job.enabled) return null;
+  try {
+    const decision = await piiProtection.evaluateText({
+      tenantId,
+      text: scheduledJobPrompt(job.input),
+      subject: { kind: "chat_prompt" }
+    });
+    if (decision.action !== "block") return null;
+    reply.code(422);
+    return apiError(
+      "pii_block",
+      `The prompt is blocked by organization policy (${decision.blockReason}). Edit it before you save the job.`
+    );
+  } catch (error) {
+    if (error instanceof PiiProtectionServiceError) return null;
+    throw error;
+  }
+}
+
+const GITHUB_CONNECTION_ERROR_STATUS: Record<GithubConnectionError["code"], number> = {
+  not_connected: 404,
+  credentials_unusable: 409,
+  upstream_unavailable: 502,
+  account_changed: 409
+};
+
+// Maps the failures of a GitHub repository settings request to a response.
+// Anything else is a bug and rethrows to the global error handler.
+function sendGithubRepositoryError(reply: FastifyReply, error: unknown) {
+  if (error instanceof GithubConnectionNotConfiguredError) {
+    reply.code(503);
+    return notFoundError("github_integration_not_configured");
+  }
+  if (error instanceof GithubConnectionError) {
+    reply.code(GITHUB_CONNECTION_ERROR_STATUS[error.code]);
+    return apiError(`github_${error.code}`, error.message);
+  }
+  if (error instanceof InvalidGithubRepositoryListError) {
+    reply.code(400);
+    return apiError("invalid_request", error.message);
+  }
+  throw error;
+}
+
 export function buildSettingsRouteStores(deps: AppDependencies, extras: { config: AppConfig }) {
   return {
     settings: deps.userSettings,
@@ -122,7 +190,8 @@ export function buildSettingsRouteStores(deps: AppDependencies, extras: { config
     config: extras.config,
     integrationStates: deps.integrationStates,
     integrationRegistry: deps.integrationRegistry,
-    limits: deps.limits
+    limits: deps.limits,
+    piiProtection: deps.piiProtection
   };
 }
 
@@ -133,7 +202,6 @@ export type SettingsRouteStores = {
     | "upsertSection"
     | "listScheduledJobs"
     | "getScheduledJob"
-    | "countActiveScheduledJobs"
     | "createScheduledJob"
     | "updateScheduledJob"
     | "deleteScheduledJob"
@@ -142,7 +210,11 @@ export type SettingsRouteStores = {
   auditEvents: Pick<AuditEventStore, "create">;
   githubConnections: Pick<
     GithubConnectionService,
-    "getConnectionStatus" | "getAuthorizationUrl" | "disconnect"
+    | "getConnectionStatus"
+    | "getAuthorizationUrl"
+    | "disconnect"
+    | "listAccessibleRepositories"
+    | "setAllowedRepositories"
   >;
   notionConnections: Pick<
     NotionConnectionService,
@@ -152,6 +224,7 @@ export type SettingsRouteStores = {
   integrationStates: Pick<IntegrationStateStore, "get">;
   integrationRegistry: Pick<IntegrationRegistryService, "getIntegrationsForUser">;
   limits: RequestLimitsInterface;
+  piiProtection?: ChatPromptGateStores["piiProtection"];
 };
 
 export async function registerSettingsRoutes(
@@ -241,6 +314,41 @@ export async function registerSettingsRoutes(
     }
   });
 
+  // The choices for the allowed-repository list: what GitHub lets the member
+  // reach. The model has no tool that calls this.
+  app.get("/me/github-connection/repositories", async (request, reply) => {
+    const { userId, tenantId } = request.auth;
+    await ensureUser(app.db, userId);
+    try {
+      const listing = await stores.githubConnections.listAccessibleRepositories(tenantId, userId);
+      return serialize(GithubRepositoryListResponseSchema, listing);
+    } catch (error) {
+      return sendGithubRepositoryError(reply, error);
+    }
+  });
+
+  // Tenant and user come from `request.auth`. The browser sends the list and
+  // the GitHub account it chose the list for. The service validates and
+  // normalizes the list, and answers 409 `github_account_changed` when another
+  // account is connected now.
+  app.put("/me/github-connection/repositories", async (request, reply) => {
+    const { userId, tenantId } = request.auth;
+    await ensureUser(app.db, userId);
+    const body = parseRequestInput(reply, GithubAllowedRepositoriesRequestSchema, request.body);
+    if (!body.ok) return body.response;
+    try {
+      const allowedRepositories = await stores.githubConnections.setAllowedRepositories(
+        tenantId,
+        userId,
+        body.value.repositories,
+        body.value.githubUserId
+      );
+      return serialize(GithubAllowedRepositoriesResponseSchema, { allowedRepositories });
+    } catch (error) {
+      return sendGithubRepositoryError(reply, error);
+    }
+  });
+
   app.delete("/me/github-connection", async (request, reply) => {
     const { userId, tenantId } = request.auth;
     await ensureUser(app.db, userId);
@@ -320,6 +428,20 @@ export async function registerSettingsRoutes(
     });
   });
 
+  app.post("/me/scheduled-jobs/preview", async (request, reply) => {
+    await ensureUser(app.db, request.auth.userId);
+    const result = parseRequestInput(reply, ScheduledJobPreviewRequestSchema, request.body);
+    if (!result.ok) return result.response;
+    try {
+      return serialize(ScheduledJobPreviewResponseSchema, {
+        nextRunAt: computeNextCronRunAt(result.value.cronExpression, result.value.timeZone)
+      });
+    } catch (error) {
+      reply.code(400);
+      return buildInvalidScheduledJobConfigError(error);
+    }
+  });
+
   app.post("/me/scheduled-jobs", async (request, reply) => {
     const { userId, tenantId } = request.auth;
     await ensureUser(app.db, userId);
@@ -350,26 +472,28 @@ export async function registerSettingsRoutes(
     if (!persistenceInputResult.ok) {
       return persistenceInputResult.response;
     }
+    const blocked = await rejectBlockedScheduledPrompt(
+      reply, stores.piiProtection, tenantId, persistenceInputResult.value
+    );
+    if (blocked) return blocked;
 
     // Total-active-job cap: only ENABLED jobs fire turns, so a request creating a
     // disabled job must NOT be blocked even when the user is already at the cap.
-    // Enforced after body parse so we know whether this creation is enabled.
+    // The store counts and inserts in one locked transaction, so concurrent
+    // requests cannot pass the check together.
     const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
-    if (maxActive > 0 && persistenceInputResult.value.enabled) {
-      const activeCount = await stores.settings.countActiveScheduledJobs(tenantId, userId);
-      if (activeCount >= maxActive) {
-        reply.code(409);
-        return apiError(
-          "scheduled_job_limit_reached",
-          `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before creating a new one.`
-        );
-      }
+    const created = await stores.settings.createScheduledJob(
+      { jobId: uuidv7(), ...persistenceInputResult.value },
+      { maxActive }
+    );
+    if (created.status === "limit_reached") {
+      reply.code(409);
+      return apiError(
+        "scheduled_job_limit_reached",
+        `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before creating a new one.`
+      );
     }
-
-    const job = await stores.settings.createScheduledJob({
-      jobId: uuidv7(),
-      ...persistenceInputResult.value
-    });
+    const job = created.job;
 
     // sessionId: null — this is a non-interactive (route-driven) audit event.
     await stores.auditEvents.create({
@@ -412,6 +536,10 @@ export async function registerSettingsRoutes(
       reply.code(404);
       return notFoundError("scheduled_job_not_found");
     }
+    const blocked = await rejectBlockedScheduledPrompt(
+      reply, stores.piiProtection, tenantId, persistenceInputResult.value
+    );
+    if (blocked) return blocked;
 
     // Enabling a previously-disabled job is what makes it start firing turns,
     // so treat the disabled→enabled transition exactly like creating an
@@ -431,29 +559,29 @@ export async function registerSettingsRoutes(
         reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
         return rateLimitError;
       }
-
-      const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
-      if (maxActive > 0) {
-        const activeCount = await stores.settings.countActiveScheduledJobs(tenantId, userId);
-        if (activeCount >= maxActive) {
-          reply.code(409);
-          return apiError(
-            "scheduled_job_limit_reached",
-            `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before enabling this one.`
-          );
-        }
-      }
     }
 
-    const job = await stores.settings.updateScheduledJob({
-      jobId: paramsResult.value.jobId,
-      ...persistenceInputResult.value
-    });
+    // The store applies the active-job cap to a disabled to enabled change in
+    // one locked transaction. It decides the transition from the job row it
+    // locks, not from the `existing` read above, which can be stale.
+    const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
+    const updated = await stores.settings.updateScheduledJob(
+      { jobId: paramsResult.value.jobId, ...persistenceInputResult.value },
+      { maxActive }
+    );
 
-    if (!job) {
+    if (updated.status === "not_found") {
       reply.code(404);
       return notFoundError("scheduled_job_not_found");
     }
+    if (updated.status === "limit_reached") {
+      reply.code(409);
+      return apiError(
+        "scheduled_job_limit_reached",
+        `You have reached the maximum of ${maxActive} active scheduled jobs. Delete or disable an existing job before enabling this one.`
+      );
+    }
+    const job = updated.job;
 
     // sessionId: null — this is a non-interactive (route-driven) audit event.
     await stores.auditEvents.create({
@@ -538,7 +666,8 @@ export async function registerSettingsRoutes(
         client.query(
           `
             SELECT
-              DATE(created_at AT TIME ZONE 'UTC') AS date,
+              -- As text: node-postgres turns a DATE into a JS Date at local midnight.
+              DATE(created_at AT TIME ZONE 'UTC')::text AS date,
               COALESCE(SUM(input_tokens), 0)::bigint  AS input_tokens,
               COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
               COALESCE(SUM(total_tokens), 0)::bigint  AS total_tokens,

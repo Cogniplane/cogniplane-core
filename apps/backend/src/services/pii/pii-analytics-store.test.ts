@@ -11,6 +11,8 @@ import { PiiAnalyticsStore } from "./pii-analytics-store.js";
 
 class CaptureDatabase {
   queries: { text: string; values: unknown[] }[] = [];
+  /** Rows the recent-activity query returns. */
+  recentRows: Record<string, unknown>[] = [];
 
   async connect() {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
@@ -18,7 +20,8 @@ class CaptureDatabase {
     return {
       async query(text: string, values: unknown[] = []) {
         self.queries.push({ text, values });
-        return { rows: [], rowCount: 0 };
+        const rows = text.includes("AS entity_types") ? self.recentRows : [];
+        return { rows, rowCount: rows.length };
       },
       async release() {}
     };
@@ -70,6 +73,61 @@ test("getRecentActivity threads action filter + limit through positional params"
   expect(aggregateQuery).toBeTruthy();
   // [from, to, actionTakenValues (without 'failed'), includeFailed=true, limit, tenantId]
   expect(aggregateQuery!.values).toEqual([from, to, ["block"], true, 25, "tenant-1"]);
+});
+
+function recentRow(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    scan_run_id: "run-1", created_at: new Date("2026-01-10T10:00:00.000Z"), completed_at: null,
+    subject_type: "message", subject_id: "msg-1", instructions_revision: null, source_session_id: null,
+    source_user_id: null, mode: "detect", action_taken: null, status: "completed", provider_type: null,
+    provider_model: null, findings_count: 2, error_message: null, entity_types: [], ...overrides
+  };
+}
+
+async function recent(rows: Record<string, unknown>[]) {
+  const db = new CaptureDatabase();
+  db.recentRows = rows;
+  return new PiiAnalyticsStore(db as unknown as Pool)
+    .getRecentActivity("tenant-1", new Date("2026-01-01"), new Date("2026-02-01"), ["block"], 25);
+}
+
+test("getRecentActivity maps each row, with optional fields set or null", async () => {
+  const rows = await recent([
+    recentRow({
+      scan_run_id: "run-1", completed_at: "2026-01-10T10:00:05Z", subject_type: "project_instructions",
+      subject_id: "proj-1", instructions_revision: 0, source_session_id: "session-1", source_user_id: "user-1",
+      action_taken: "block", provider_type: "openai", provider_model: "gpt", error_message: "late",
+      entity_types: ["email", "phone"]
+    }),
+    recentRow({ scan_run_id: "run-2", source_session_id: "", findings_count: undefined, status: "failed" })
+  ]);
+
+  expect(rows).toEqual([
+    {
+      scanRunId: "run-1", createdAt: "2026-01-10T10:00:00.000Z", completedAt: "2026-01-10T10:00:05.000Z",
+      subjectType: "project_instructions", subjectId: "proj-1", instructionsRevision: 0, sessionId: "session-1",
+      userId: "user-1", mode: "detect", actionTaken: "block", status: "completed", providerType: "openai",
+      providerModel: "gpt", findingsCount: 2, errorMessage: "late", entityTypes: ["email", "phone"]
+    },
+    {
+      scanRunId: "run-2", createdAt: "2026-01-10T10:00:00.000Z", completedAt: null, subjectType: "message",
+      subjectId: "msg-1", instructionsRevision: null, sessionId: null, userId: null, mode: "detect",
+      actionTaken: null, status: "failed", providerType: null, providerModel: null, findingsCount: 0,
+      errorMessage: null, entityTypes: []
+    }
+  ]);
+});
+
+test.each([
+  ["a JSON array", ["email"], ["email"]],
+  ["JSON array text", '["email","phone"]', ["email", "phone"]],
+  ["invalid JSON text", "[email", []],
+  ["JSON text that is not an array", '{"email":1}', []],
+  ["null", null, []]
+])("getRecentActivity reads entity types from %s", async (_case, entityTypes, expected) => {
+  const [row] = await recent([recentRow({ entity_types: entityTypes })]);
+
+  expect(row!.entityTypes).toEqual(expected);
 });
 
 // The isolation guard, applied to every method rather than a chosen few.

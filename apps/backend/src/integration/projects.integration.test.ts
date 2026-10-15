@@ -17,7 +17,7 @@ import { registerProjectRoutes, type ProjectRouteStores } from "../routes/projec
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { withTenantScope } from "../lib/db.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
-import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
+import { seedApproval, seedRuntimeSession, seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
 
 async function setup() {
   const tenantId = await seedTenant(),
@@ -317,6 +317,73 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
     const scheduled = await h.sessions.create(h.tenantId, h.userId, "Scheduled", { purpose: "scheduled" });
     expect(await h.projects.setSession(h.tenantId, h.userId, h.project.projectId, scheduled.sessionId)).toBe(false);
   });
+
+  test.each(["execution", "approval"])("rejects an assignment while another replica holds the session's %s", async (holder) => {
+    const h = await setup();
+    const session = await h.sessions.create(h.tenantId, h.userId, "Running elsewhere");
+    if (holder === "execution") {
+      await superuserPool().query(
+        `INSERT INTO session_executions (tenant_id, session_id, execution_id, user_id, status, expires_at)
+         VALUES ($1, $2, $3, $4, 'active', NOW() + INTERVAL '1 minute')`,
+        [h.tenantId, session.sessionId, `exec-${session.sessionId}`, h.userId]);
+    } else {
+      await seedApproval({ tenantId: h.tenantId, userId: h.userId, sessionId: session.sessionId,
+        runtimeId: await seedRuntimeSession(h.tenantId, h.userId, session.sessionId) });
+    }
+    // This process has no active turn for the session; only the database knows.
+    const response = await h.app.inject({ method: "PUT", url: `/projects/${h.project.projectId}/sessions`,
+      payload: { sessionId: session.sessionId, confirmAudience: true } });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("session_busy");
+    expect((await h.sessions.getReadable(h.tenantId, session.sessionId, h.userId))?.projectId ?? null).toBeNull();
+  });
+
+  test("answers a member without the role with 403 and a stranger with 404", async () => {
+    const h = await setup();
+    const viewer = await seedUser();
+    await seedMembership(h.tenantId, viewer);
+    await new ProjectMemberStore(appPool()).setMember(
+      { tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, viewer, "viewer");
+    const stranger = await seedUser();
+    await seedMembership(h.tenantId, stranger);
+    const url = `/projects/${h.project.projectId}/instructions`;
+    const payload = { instructions: "changed", expectedRevision: 0 };
+
+    h.setAuth({ tenantId: h.tenantId, userId: viewer, role: "member", isAdmin: false });
+    const forbidden = await h.app.inject({ method: "PUT", url, payload });
+    expect(forbidden.statusCode).toBe(403);
+    expect(forbidden.json().error).toBe("project_role_required");
+    h.setAuth({ tenantId: h.tenantId, userId: stranger, role: "member", isAdmin: false });
+    expect((await h.app.inject({ method: "PUT", url, payload })).statusCode).toBe(404);
+  });
+
+  test("marks a session with a pending approval for every member who sees it", async () => {
+    const h = await setup();
+    const editor = await seedUser();
+    await seedMembership(h.tenantId, editor);
+    await new ProjectMemberStore(appPool()).setMember(
+      { tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, editor, "editor");
+    await seedApproval({ tenantId: h.tenantId, userId: h.userId, sessionId: h.first.sessionId,
+      runtimeId: await seedRuntimeSession(h.tenantId, h.userId, h.first.sessionId) });
+
+    const flag = async (userId: string) => (await h.sessions.listPage(h.tenantId, userId, { projectId: h.project.projectId }))
+      .sessions.find((session) => session.sessionId === h.first.sessionId)?.hasPendingApprovals;
+    expect(await flag(h.userId)).toBe(true);
+    // The flag means "this session waits for an approval": it drives Archive and
+    // Delete for every member, while the approvals list holds only the caller's own.
+    expect(await flag(editor)).toBe(true);
+  });
+
+  test("answers 404, not 500, when ownership ends between the update and the re-read", async () => {
+    const h = await setup();
+    const getOwned = h.projects.getOwned.bind(h.projects);
+    vi.spyOn(h.projects, "getOwned")
+      .mockImplementationOnce(getOwned)
+      .mockImplementationOnce(async () => null);
+    const response = await h.app.inject({ method: "PUT", url: `/projects/${h.project.projectId}/instructions`,
+      payload: { instructions: "saved", expectedRevision: 0 } });
+    expect(response.statusCode).toBe(404);
+  });
 });
 
 test.skipIf(!adminDatabaseUrl())(
@@ -595,8 +662,9 @@ describe.skipIf(!adminDatabaseUrl())("project approval settings", () => {
       visibility: "organization", organizationRole: "viewer", confirmAudience: true
     });
     h.setAuth({ tenantId: h.tenantId, userId: viewerId, role: "member", isAdmin: false });
-    expect((await h.app.inject({ method: "PUT", url, payload: { approvalMode: "manual" } })).statusCode).toBe(404);
-    expect((await h.app.inject({ method: "PUT", url, payload: { approvalMode: "automatic" } })).statusCode).toBe(404);
+    // The viewer can read the project, so the refusal names the missing role.
+    expect((await h.app.inject({ method: "PUT", url, payload: { approvalMode: "manual" } })).statusCode).toBe(403);
+    expect((await h.app.inject({ method: "PUT", url, payload: { approvalMode: "automatic" } })).statusCode).toBe(403);
   });
 });
 

@@ -62,11 +62,7 @@ describe("serialize", () => {
   test("uses '<root>' for top-level path errors", () => {
     process.env.NODE_ENV = "production";
     const schema = z.string();
-    try {
-      serialize(schema, 42);
-    } catch (e) {
-      expect((e as Error).message).toContain("<root>");
-    }
+    expect(() => serialize(schema, 42)).toThrow(/<root>/);
   });
 
   test("mirrors contract violation summary to console.error in non-production", () => {

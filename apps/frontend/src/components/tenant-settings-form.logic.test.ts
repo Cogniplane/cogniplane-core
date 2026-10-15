@@ -2,10 +2,13 @@ import { describe, expect, test } from "vitest";
 
 import type { ApprovalPolicy, TenantSettings } from "@cogniplane/shared-types";
 
+import { SANDBOX_EGRESS_DOMAINS_MAX } from "@cogniplane/shared-types/sandbox-egress";
+
 import {
   buildDraft,
   defaultGranularFlags,
   formatRelativeTime,
+  parseSandboxEgressText,
   toApprovalPolicy,
   toApprovalPolicyKind,
   toggleInArray,
@@ -118,5 +121,50 @@ describe("formatRelativeTime", () => {
   test("falls back to a locale date for >30d deltas", () => {
     const out = formatRelativeTime("2026-01-01T12:00:00Z", now);
     expect(out).not.toMatch(/ago$/);
+  });
+});
+
+describe("approved sandbox hosts text", () => {
+  test("the draft starts from the saved list, one host per line", () => {
+    const draft = buildDraft(makeTenantSettings({ approvedSandboxEgressDomains: ["*.example.com", "pypi.org"] }));
+    expect(draft.sandboxEgressText).toBe("*.example.com\npypi.org");
+    expect(buildDraft(makeTenantSettings()).sandboxEgressText).toBe("");
+  });
+
+  test("reads one host per line, and fixes spaces and upper case that a paste brings", () => {
+    expect(parseSandboxEgressText("  PyPI.org \r\n\n*.Example.com\npypi.org\n")).toEqual({
+      domains: ["*.example.com", "pypi.org"],
+      errors: [],
+      tooMany: false
+    });
+    expect(parseSandboxEgressText("")).toEqual({ domains: [], errors: [], tooMany: false });
+  });
+
+  test("also reads a comma-separated paste", () => {
+    expect(parseSandboxEgressText("pypi.org, files.pythonhosted.org,registry.npmjs.org").domains)
+      .toEqual(["files.pythonhosted.org", "pypi.org", "registry.npmjs.org"]);
+  });
+
+  test("names the line and the entry of every host that the server would refuse", () => {
+    const parsed = parseSandboxEgressText("pypi.org\n*.com\nhttps://example.org\n\n93.184.216.34\nbad host");
+    expect(parsed.domains).toEqual(["pypi.org"]);
+    expect(parsed.errors.map((error) => [error.line, error.entry])).toEqual([
+      [2, "*.com"],
+      [3, "https://example.org"],
+      [5, "93.184.216.34"],
+      [6, "bad host"]
+    ]);
+    expect(parsed.errors[0]!.message).toContain("public suffix");
+    expect(parsed.errors[1]!.message).toContain("scheme");
+  });
+
+  test("keeps the entry as typed in the error, with its upper case", () => {
+    expect(parseSandboxEgressText("HTTPS://Example.org").errors[0]!.entry).toBe("HTTPS://Example.org");
+  });
+
+  test("flags a list over the limit, counted after duplicates are removed", () => {
+    const many = Array.from({ length: SANDBOX_EGRESS_DOMAINS_MAX + 1 }, (_, i) => `host${i}.example.com`);
+    expect(parseSandboxEgressText(many.join("\n")).tooMany).toBe(true);
+    expect(parseSandboxEgressText([...many.slice(0, SANDBOX_EGRESS_DOMAINS_MAX), many[0]].join("\n")).tooMany).toBe(false);
   });
 });

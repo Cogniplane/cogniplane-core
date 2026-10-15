@@ -69,6 +69,9 @@ async function callAnthropic(
       body: JSON.stringify({
         model,
         max_tokens: MAX_OUTPUT_TOKENS,
+        // Haiku 5.5 thinks by default; thinking would use the small output
+        // budget before any title text.
+        thinking: { type: "disabled" },
         system: SYSTEM_PROMPT,
         messages: [
           { role: "user", content: USER_PROMPT_PREFIX + truncatePrompt(firstMessage) }

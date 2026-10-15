@@ -12,7 +12,7 @@ import {
   presetRange,
   type SessionsFilterState
 } from "./admin-sessions-filters.logic";
-import type { AdminSessionAlertKind } from "@cogniplane/shared-types";
+import { AdminSessionAlertKindSchema, type AdminSessionAlertKind } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -45,14 +45,19 @@ const STATUS_OPTIONS: Array<{ value: SessionsFilterState["status"] | "all"; labe
   { value: "errored", label: "Errored" }
 ];
 
+// A Record makes TypeScript require a label for every alert kind in the shared schema.
+const ALERT_LABELS: Record<AdminSessionAlertKind, string> = {
+  "pii-blocked": "PII blocked",
+  "pii-transformed": "PII transformed",
+  "pii-detected": "PII detected",
+  "approval-rejected": "Approval rejected",
+  "approval-pending": "Approval pending",
+  errored: "Errored"
+};
+
 const ALERT_OPTIONS: Array<{ value: AdminSessionAlertKind | "all"; label: string }> = [
   { value: "all", label: "All alerts" },
-  { value: "pii-blocked", label: "PII blocked" },
-  { value: "pii-transformed", label: "PII transformed" },
-  { value: "pii-detected", label: "PII detected" },
-  { value: "approval-rejected", label: "Approval rejected" },
-  { value: "approval-pending", label: "Approval pending" },
-  { value: "errored", label: "Errored" }
+  ...AdminSessionAlertKindSchema.options.map((value) => ({ value, label: ALERT_LABELS[value] }))
 ];
 
 export function AdminSessionsFilters(props: {
@@ -69,7 +74,9 @@ export function AdminSessionsFilters(props: {
   };
 
   const chips = activeFilterChips(state);
-  const alertSelectValue = state.alert.length === 1 ? state.alert[0] : "all";
+  // Several alerts (from a URL) have no single option: an empty value shows the
+  // "Multiple (n)" placeholder instead of a misleading "All alerts".
+  const alertSelectValue = state.alert.length === 1 ? state.alert[0] : state.alert.length === 0 ? "all" : "";
 
   return (
     <Card>

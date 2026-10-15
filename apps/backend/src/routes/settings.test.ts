@@ -6,15 +6,26 @@ import Fastify from "fastify";
 import { registerSettingsRoutes, type SettingsRouteStores } from "./settings.js";
 import type { Pool } from "../lib/db.js";
 import { FakeDatabase } from "../test-helpers/fake-database.js";
+import { FakePool, type QueryResultRow } from "../test-helpers/fake-pool.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
+import { computeNextCronRunAt } from "../lib/cron.js";
+import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import type {
+  CreateScheduledJobResult,
+  ScheduledJobAdmission,
   ScheduledJobRecord,
   ScheduledJobRunRecord,
+  UpdateScheduledJobResult,
   UserSettingsSectionKey,
   UserSettingsSectionRecord
 } from "../services/user-settings-store.js";
 import type { NotionUserConnectionSummary } from "../services/integrations/notion/notion-connection-service.js";
+import {
+  GithubConnectionError,
+  GithubConnectionNotConfiguredError
+} from "../services/integrations/github/github-connection-service.js";
+import { InvalidGithubRepositoryListError } from "../services/integrations/github/github-repository-allowlist.js";
 
 class InMemoryGithubConnectionService {
   userConnection: {
@@ -24,6 +35,7 @@ class InMemoryGithubConnectionService {
     githubEmail: string | null;
     githubAvatarUrl: string | null;
     scopes: string[];
+    allowedRepositories: string[];
     accessTokenExpiresAt: string | null;
     refreshTokenExpiresAt: string | null;
     connectedAt: string;
@@ -31,12 +43,35 @@ class InMemoryGithubConnectionService {
     lastUsedAt: string | null;
   } | null = null;
   authorizeRequested = false;
+  listing = { repositories: [{ fullName: "Acme/App", private: true, archived: false }], truncated: false };
+  savedLists: string[][] = [];
+  failure: Error | null = null;
 
   async getConnectionStatus() {
     return {
       configured: true,
       userConnection: this.userConnection
     };
+  }
+
+  async listAccessibleRepositories() {
+    if (this.failure) throw this.failure;
+    return this.listing;
+  }
+
+  async setAllowedRepositories(
+    _tenantId: string,
+    _userId: string,
+    repositories: readonly string[],
+    expectedGithubUserId: string
+  ) {
+    if (this.failure) throw this.failure;
+    // The real store checks the same thing under the row lock.
+    if (expectedGithubUserId !== this.userConnection?.githubUserId) {
+      throw new GithubConnectionError("account_changed", "The connected GitHub account changed.");
+    }
+    this.savedLists.push([...repositories]);
+    return repositories.map((repository) => repository.toLowerCase()).sort();
   }
 
   async getAuthorizationUrl() {
@@ -65,6 +100,23 @@ class InMemoryGithubConnectionService {
     this.userConnection = null;
     return true;
   }
+}
+
+function connectedAs(githubUserId: string) {
+  return {
+    githubUserId,
+    githubLogin: `login-${githubUserId}`,
+    githubName: null,
+    githubEmail: null,
+    githubAvatarUrl: null,
+    scopes: [],
+    allowedRepositories: [] as string[],
+    accessTokenExpiresAt: null,
+    refreshTokenExpiresAt: null,
+    connectedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    lastUsedAt: null
+  };
 }
 
 class InMemoryNotionConnectionService {
@@ -143,9 +195,14 @@ class InMemoryUserSettingsStore {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
-  async countActiveScheduledJobs(_tenantId: string, userId: string): Promise<number> {
+  // The real store counts and writes in one locked transaction; this fake is
+  // single-threaded, so it only needs to apply the same admission rule.
+  private activeCount(userId: string): number {
     return [...this.jobs.values()].filter((job) => job.userId === userId && job.enabled).length;
   }
+
+  // Recorded so route tests can check what limit the route hands to the store.
+  readonly admissions: ScheduledJobAdmission[] = [];
 
   async getScheduledJob(
     _tenantId: string,
@@ -170,7 +227,11 @@ class InMemoryUserSettingsStore {
     settingsSnapshot: Record<string, unknown>;
     enabled: boolean;
     nextRunAt: string | null;
-  }): Promise<ScheduledJobRecord> {
+  }, admission: ScheduledJobAdmission): Promise<CreateScheduledJobResult> {
+    this.admissions.push(admission);
+    if (input.enabled && admission.maxActive > 0 && this.activeCount(input.userId) >= admission.maxActive) {
+      return { status: "limit_reached" };
+    }
     const now = new Date().toISOString();
     const job: ScheduledJobRecord = {
       tenantId: input.tenantId,
@@ -193,7 +254,7 @@ class InMemoryUserSettingsStore {
       updatedAt: now
     };
     this.jobs.set(job.jobId, job);
-    return job;
+    return { status: "created", job };
   }
 
   async updateScheduledJob(input: {
@@ -210,10 +271,17 @@ class InMemoryUserSettingsStore {
     settingsSnapshot: Record<string, unknown>;
     enabled: boolean;
     nextRunAt: string | null;
-  }): Promise<ScheduledJobRecord | null> {
+  }, admission: ScheduledJobAdmission): Promise<UpdateScheduledJobResult> {
+    this.admissions.push(admission);
     const current = this.jobs.get(input.jobId);
     if (!current || current.userId !== input.userId) {
-      return null;
+      return { status: "not_found" };
+    }
+    if (
+      input.enabled && !current.enabled && admission.maxActive > 0 &&
+      this.activeCount(input.userId) >= admission.maxActive
+    ) {
+      return { status: "limit_reached" };
     }
 
     const next: ScheduledJobRecord = {
@@ -231,7 +299,7 @@ class InMemoryUserSettingsStore {
       updatedAt: new Date().toISOString()
     };
     this.jobs.set(input.jobId, next);
-    return next;
+    return { status: "updated", job: next };
   }
 
   async deleteScheduledJob(_tenantId: string, jobId: string, userId: string): Promise<boolean> {
@@ -252,6 +320,8 @@ async function createApp(overrides: {
   integrationRegistry?: SettingsRouteStores["integrationRegistry"];
   config?: SettingsRouteStores["config"];
   limits?: SettingsRouteStores["limits"];
+  piiProtection?: SettingsRouteStores["piiProtection"];
+  db?: Pool;
 } = {}) {
   const app = Fastify();
   await app.register(cookie);
@@ -261,7 +331,7 @@ async function createApp(overrides: {
   const notionConnections = new InMemoryNotionConnectionService();
 
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "settings-user" }));
-  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.decorate("db", overrides.db ?? new FakeDatabase() as unknown as Pool);
   app.addHook("preHandler", async (request) => {
     request.auth = {
       userId: request.headers["x-user-id"]?.toString() || "settings-user",
@@ -295,7 +365,8 @@ async function createApp(overrides: {
         return null;
       },
       sweepExpired() {}
-    }
+    },
+    piiProtection: overrides.piiProtection
   });
   await app.ready();
 
@@ -415,6 +486,70 @@ test("scheduled jobs routes create, update, validate, and delete jobs", async ()
   expect(auditEvents.events.length).toBe(3);
 
   await app.close();
+});
+
+test("saving an enabled job rejects a prompt the PII policy blocks", async () => {
+  let outage = false;
+  const { app, settings } = await createApp({
+    piiProtection: {
+      async evaluateText({ text }) {
+        if (outage) throw new PiiProtectionServiceError("pii_provider_unavailable", "down");
+        return text.includes("@")
+          ? { action: "block", findings: [], blockReason: "email", providerType: null, providerModel: null }
+          : { action: "allow", reason: "no_findings" };
+      }
+    }
+  });
+  const job = (prompt: string, enabled: boolean) => ({
+    jobName: "Job", cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt", input: { prompt }, enabled
+  });
+
+  const blocked = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: job("Mail jane@example.com", true) });
+  expect(blocked.statusCode).toBe(422);
+  expect(blocked.json().error).toBe("pii_block");
+
+  const created = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: job("Daily report", true) });
+  expect(created.statusCode).toBe(201);
+  const url = `/me/scheduled-jobs/${created.json().scheduledJob.jobId}`;
+  expect((await app.inject({ method: "PUT", url, payload: job("Mail jane@example.com", true) })).statusCode).toBe(422);
+  // A disabled job does not run, so the owner can always save it.
+  expect((await app.inject({ method: "PUT", url, payload: job("Mail jane@example.com", false) })).statusCode).toBe(200);
+
+  // An outage does not stop the save: the run-time check still applies.
+  outage = true;
+  expect((await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: job("Mail jane@example.com", true) })).statusCode).toBe(201);
+  expect((await settings.listScheduledJobs("settings-tenant", "settings-user")).length).toBe(2);
+
+  await app.close();
+});
+
+test("scheduled job preview uses the scheduler parser without saving a job", async () => {
+  const { app, auditEvents } = await createApp();
+  try {
+    const before = new Date();
+    const response = await app.inject({
+      method: "POST",
+      url: "/me/scheduled-jobs/preview",
+      payload: { cronExpression: "30 9 * * 1", timeZone: "America/Toronto" }
+    });
+    const after = new Date();
+    expect(response.statusCode).toBe(200);
+    expect([
+      computeNextCronRunAt("30 9 * * 1", "America/Toronto", before),
+      computeNextCronRunAt("30 9 * * 1", "America/Toronto", after)
+    ]).toContain(response.json().nextRunAt);
+
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/me/scheduled-jobs/preview",
+      payload: { cronExpression: "bad cron", timeZone: "America/Toronto" }
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/me/scheduled-jobs" })).json().scheduledJobs).toEqual([]);
+    expect(auditEvents.events).toHaveLength(0);
+  } finally {
+    await app.close();
+  }
 });
 
 test("scheduled job request defaults reach create and update persistence", async () => {
@@ -605,6 +740,121 @@ test("PUT cannot bypass the active-job cap by enabling a disabled job", async ()
   await app.close();
 });
 
+test("scheduled job writes pass the configured cap to the store and keep the 409 messages", async () => {
+  const { app, settings } = await createApp({
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 1 })
+  });
+  const jobPayload = (enabled: boolean) => ({
+    jobName: "Cap probe",
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    targetType: "prompt",
+    input: { prompt: "Test prompt." },
+    enabled
+  });
+
+  const first = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(true) });
+  expect(first.statusCode).toBe(201);
+  const create = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(true) });
+  expect(create.statusCode).toBe(409);
+  expect(create.json()).toMatchObject({ error: "scheduled_job_limit_reached" });
+  expect(create.json().message).toContain("before creating a new one");
+
+  const parked = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(false) });
+  const enable = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${parked.json().scheduledJob.jobId}`,
+    payload: jobPayload(true)
+  });
+  expect(enable.statusCode).toBe(409);
+  expect(enable.json()).toMatchObject({ error: "scheduled_job_limit_reached" });
+  expect(enable.json().message).toContain("before enabling this one");
+
+  // Every write hands the store the cap; the route no longer counts itself.
+  expect(settings.admissions).toEqual(Array(4).fill({ maxActive: 1 }));
+
+  await app.close();
+});
+
+test("a cap of 0 disables the active-job cap for creates and enables", async () => {
+  const { app, settings } = await createApp({
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 0 })
+  });
+  const jobPayload = (enabled: boolean) => ({
+    jobName: "Uncapped",
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    targetType: "prompt",
+    input: { prompt: "Test prompt." },
+    enabled
+  });
+
+  for (let index = 0; index < 3; index += 1) {
+    const created = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(true) });
+    expect(created.statusCode).toBe(201);
+  }
+  const parked = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(false) });
+  const enable = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${parked.json().scheduledJob.jobId}`,
+    payload: jobPayload(true)
+  });
+  expect(enable.statusCode).toBe(200);
+  expect(settings.admissions.every((admission) => admission.maxActive === 0)).toBe(true);
+
+  await app.close();
+});
+
+test("PUT enable meets the cap even when the route's earlier read of the job is stale", async () => {
+  const consumed: string[] = [];
+  const { app, settings } = await createApp({
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 1 }),
+    limits: {
+      async consumeRateLimit(input: { resource: string }) {
+        consumed.push(input.resource);
+        return null;
+      },
+      async consumeTurnQuota() {
+        return null;
+      },
+      sweepExpired() {}
+    } as SettingsRouteStores["limits"]
+  });
+  const jobPayload = (enabled: boolean) => ({
+    jobName: "Stale read",
+    cronExpression: "0 9 * * 1-5",
+    timeZone: "UTC",
+    targetType: "prompt",
+    input: { prompt: "Test prompt." },
+    enabled
+  });
+
+  await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(true) });
+  const parked = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: jobPayload(false) });
+  const parkedId = parked.json().scheduledJob.jobId as string;
+  consumed.length = 0;
+
+  // The job is disabled in the store, but the read before the write still says
+  // enabled, as if another request disabled it in between. With that stale
+  // read the route sees no transition, so only the store can enforce the cap.
+  const realGet = settings.getScheduledJob.bind(settings);
+  settings.getScheduledJob = async (...args) => {
+    const job = await realGet(...args);
+    return job ? { ...job, enabled: true } : null;
+  };
+
+  const response = await app.inject({
+    method: "PUT",
+    url: `/me/scheduled-jobs/${parkedId}`,
+    payload: jobPayload(true)
+  });
+  expect(response.statusCode).toBe(409);
+  expect(response.json()).toMatchObject({ error: "scheduled_job_limit_reached" });
+  expect(consumed).toEqual([]);
+
+  await app.close();
+});
+
 test("PUT enable transition consumes the scheduled_job_create rate limit; other updates do not", async () => {
   const consumed: string[] = [];
   let rejectNext = false;
@@ -689,6 +939,7 @@ test("github connection routes expose status, authorization URL, and disconnect 
     githubEmail: "octocat@example.com",
     githubAvatarUrl: "https://avatars.githubusercontent.com/u/1?v=4",
     scopes: [],
+    allowedRepositories: ["octocat/hello-world"],
     accessTokenExpiresAt: null,
     refreshTokenExpiresAt: null,
     connectedAt: new Date().toISOString(),
@@ -702,6 +953,7 @@ test("github connection routes expose status, authorization URL, and disconnect 
   });
   expect(statusResponse.statusCode).toBe(200);
   expect(statusResponse.json().userConnection.githubLogin).toBe("octocat");
+  expect(statusResponse.json().userConnection.allowedRepositories).toEqual(["octocat/hello-world"]);
 
   const authorizeResponse = await app.inject({
     method: "POST",
@@ -727,6 +979,101 @@ test("github connection routes expose status, authorization URL, and disconnect 
   expect(disconnectResponse.statusCode).toBe(204);
   expect(githubConnections.userConnection).toBe(null);
 
+  await app.close();
+});
+
+test("github repository routes list the choices and save the allowed list for the signed-in user", async () => {
+  const { app, githubConnections } = await createApp();
+  githubConnections.userConnection = connectedAs("12345");
+
+  const listing = await app.inject({ method: "GET", url: "/me/github-connection/repositories" });
+  expect(listing.statusCode).toBe(200);
+  expect(listing.json()).toEqual({
+    repositories: [{ fullName: "Acme/App", private: true, archived: false }],
+    truncated: false
+  });
+
+  const saved = await app.inject({
+    method: "PUT",
+    url: "/me/github-connection/repositories",
+    payload: { githubUserId: "12345", repositories: ["  Acme/App ", "octocat/Hello-World"] }
+  });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.json()).toEqual({ allowedRepositories: ["acme/app", "octocat/hello-world"] });
+  expect(githubConnections.savedLists).toEqual([["Acme/App", "octocat/Hello-World"]]);
+
+  const cleared = await app.inject({
+    method: "PUT",
+    url: "/me/github-connection/repositories",
+    payload: { githubUserId: "12345", repositories: [] }
+  });
+  expect(cleared.statusCode).toBe(200);
+  expect(cleared.json()).toEqual({ allowedRepositories: [] });
+
+  await app.close();
+});
+
+test("github repository update for another GitHub account answers 409 and saves nothing", async () => {
+  const { app, githubConnections } = await createApp();
+  // A tab prepared the list for account A. Account B is connected now.
+  githubConnections.userConnection = connectedAs("B");
+
+  const response = await app.inject({
+    method: "PUT",
+    url: "/me/github-connection/repositories",
+    payload: { githubUserId: "A", repositories: ["a-org/secret"] }
+  });
+
+  expect(response.statusCode).toBe(409);
+  expect(response.json().error).toBe("github_account_changed");
+  expect(githubConnections.savedLists).toEqual([]);
+  expect(githubConnections.userConnection?.allowedRepositories).toEqual([]);
+  await app.close();
+});
+
+test.each([
+  ["a name without an owner", { githubUserId: "12345", repositories: ["app"] }],
+  ["a path segment", { githubUserId: "12345", repositories: ["acme/app/contents"] }],
+  ["a dot segment", { githubUserId: "12345", repositories: ["acme/.."] }],
+  ["a value that is not a string", { githubUserId: "12345", repositories: [42] }],
+  ["more than 200 entries", { githubUserId: "12345", repositories: Array.from({ length: 201 }, (_, i) => `acme/repo-${i}`) }],
+  ["an unknown field", { githubUserId: "12345", repositories: ["acme/app"], userId: "someone-else" }],
+  ["no GitHub account", { repositories: ["acme/app"] }],
+  ["an empty GitHub account", { githubUserId: "", repositories: ["acme/app"] }],
+  ["no list", { githubUserId: "12345" }]
+])("github repository update rejects %s without saving", async (_label, payload) => {
+  const { app, githubConnections } = await createApp();
+
+  const response = await app.inject({ method: "PUT", url: "/me/github-connection/repositories", payload });
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json().error).toBe("invalid_request");
+  expect(githubConnections.savedLists).toEqual([]);
+  await app.close();
+});
+
+test.each([
+  ["no connection", new GithubConnectionError("not_connected", "GitHub is not connected."), 404, "github_not_connected"],
+  ["an unusable token", new GithubConnectionError("credentials_unusable", "Connect GitHub again."), 409, "github_credentials_unusable"],
+  ["a changed account", new GithubConnectionError("account_changed", "Reload the page."), 409, "github_account_changed"],
+  ["a GitHub failure", new GithubConnectionError("upstream_unavailable", "Try again."), 502, "github_upstream_unavailable"],
+  ["a missing GitHub OAuth app", new GithubConnectionNotConfiguredError(), 503, "github_integration_not_configured"],
+  ["a list that the service rejects", new InvalidGithubRepositoryListError("Each repository must use the form owner/name."), 400, "invalid_request"]
+])("github repository routes answer %s with a typed error", async (_label, failure, status, code) => {
+  const { app, githubConnections } = await createApp();
+  githubConnections.failure = failure;
+
+  const listing = await app.inject({ method: "GET", url: "/me/github-connection/repositories" });
+  const saved = await app.inject({
+    method: "PUT",
+    url: "/me/github-connection/repositories",
+    payload: { githubUserId: "12345", repositories: ["acme/app"] }
+  });
+
+  for (const response of [listing, saved]) {
+    expect(response.statusCode).toBe(status);
+    expect(response.json().error).toBe(code);
+  }
   await app.close();
 });
 
@@ -849,3 +1196,72 @@ test("/me/integrations-availability returns the user's enabled integrations", as
 
   await app.close();
 });
+
+// ─── GET /me/token-usage ────────────────────────────────────────────────────
+
+function tokenUsagePool(rows: { daily?: QueryResultRow[]; byModel?: QueryResultRow[]; totals?: QueryResultRow[] } = {}) {
+  const pick = (list: QueryResultRow[] = []) => () => ({ rows: list, rowCount: list.length });
+  // The grouped queries first: the totals pattern also matches them.
+  return new FakePool()
+    .onQuery(/INSERT INTO users/, () => ({ rows: [], rowCount: 1 }))
+    .onQuery(/GROUP BY DATE\(/, pick(rows.daily))
+    .onQuery(/GROUP BY COALESCE\(model_name/, pick(rows.byModel))
+    .onQuery(/COUNT\(\*\)::bigint\s+AS message_count/, pick(rows.totals));
+}
+
+const usageQueryValues = (pool: FakePool) =>
+  pool.queries.filter((query) => query.text.includes("FROM messages")).map((query) => query.values);
+
+test.each([
+  [undefined, 30],
+  ["1", 1],
+  ["7", 7],
+  ["365", 365],
+  ["0", 30],
+  ["366", 30],
+  ["soon", 30]
+])("token usage reads days=%s as a %i-day window for the caller's own tenant and user", async (days, window) => {
+  const pool = tokenUsagePool();
+  const { app } = await createApp({ db: pool.asPool() });
+
+  const response = await app.inject({
+    method: "GET",
+    url: days === undefined ? "/me/token-usage" : `/me/token-usage?days=${days}&userId=someone-else`,
+    headers: { "x-user-id": "user-1", "x-tenant-id": "tenant-A" }
+  });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json().days).toBe(window);
+  expect(usageQueryValues(pool)).toEqual([
+    ["tenant-A", "user-1", window],
+    ["tenant-A", "user-1", window],
+    ["tenant-A", "user-1", window]
+  ]);
+});
+
+test("token usage maps database numbers and reports zeros without usage", async () => {
+  const pool = tokenUsagePool({
+    daily: [{ date: "2026-10-01", input_tokens: "10", output_tokens: "5", total_tokens: "15", cost_usd: 0.25 }],
+    byModel: [{ model_name: "model-a", input_tokens: "10", output_tokens: "5", total_tokens: "15", cost_usd: 0.25 }]
+  });
+  const { app } = await createApp({ db: pool.asPool() });
+
+  const { usage } = (await app.inject({ method: "GET", url: "/me/token-usage" })).json();
+
+  expect(usage).toEqual({
+    daily: [{ date: "2026-10-01", inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0.25 }],
+    byModel: [{ modelName: "model-a", inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0.25 }],
+    totals: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, messageCount: 0 }
+  });
+});
+
+test("token usage rejects a repeated days parameter", async () => {
+  const pool = tokenUsagePool();
+  const { app } = await createApp({ db: pool.asPool() });
+
+  const response = await app.inject({ method: "GET", url: "/me/token-usage?days=7&days=30" });
+
+  expect(response.statusCode).toBe(400);
+  expect(usageQueryValues(pool)).toEqual([]);
+});
+

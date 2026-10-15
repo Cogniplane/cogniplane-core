@@ -19,7 +19,7 @@ function workosConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     AUTH_MODE: "workos",
     DATABASE_URL: "postgres://app_user:pw@localhost:5432/cogniplane",
-    MIGRATION_DATABASE_URL: "postgres://postgres:pw@localhost:5432/cogniplane",
+    MAINTENANCE_DATABASE_URL: "postgres://maintenance_user:pw@localhost:5432/cogniplane",
     WORKOS_API_KEY: "sk_test_123",
     WORKOS_CLIENT_ID: "client_123",
     WORKOS_REDIRECT_URI: "http://localhost:3000/auth/callback",
@@ -64,16 +64,16 @@ test("loadConfig rejects WorkOS mode without WORKOS_REDIRECT_URI", () => {
   expect(() => loadConfig(workosConfig({ WORKOS_REDIRECT_URI: undefined }))).toThrow(/WORKOS_REDIRECT_URI is required when AUTH_MODE=workos/);
 });
 
-test("loadConfig rejects WorkOS mode without MIGRATION_DATABASE_URL", () => {
-  expect(() => loadConfig(workosConfig({ MIGRATION_DATABASE_URL: undefined }))).toThrow(/MIGRATION_DATABASE_URL is required when AUTH_MODE=workos/);
+test("loadConfig rejects WorkOS mode without MAINTENANCE_DATABASE_URL", () => {
+  expect(() => loadConfig(workosConfig({ MAINTENANCE_DATABASE_URL: undefined }))).toThrow(/MAINTENANCE_DATABASE_URL is required when AUTH_MODE=workos/);
 });
 
-test("loadConfig rejects WorkOS mode when MIGRATION_DATABASE_URL equals DATABASE_URL", () => {
+test("loadConfig rejects WorkOS mode when MAINTENANCE_DATABASE_URL equals DATABASE_URL", () => {
   const same = "postgres://app_user:pw@localhost:5432/cogniplane";
   expect(() =>
           loadConfig(
-            workosConfig({ DATABASE_URL: same, MIGRATION_DATABASE_URL: same })
-          )).toThrow(/MIGRATION_DATABASE_URL must use a privileged connection/);
+            workosConfig({ DATABASE_URL: same, MAINTENANCE_DATABASE_URL: same })
+          )).toThrow(/MAINTENANCE_DATABASE_URL must use a separate maintenance role/);
 });
 
 test("loadConfig rejects WorkOS mode when JWT_SECRET is left at the default", () => {
@@ -515,4 +515,47 @@ test("loadConfig refuses the v1 upstream signing override, which upstreams held"
     .toThrow(/MCP_UPSTREAM_SIGNING_SECRET is the v1 upstream signing key/);
   expect(loadConfig(devConfig({ MCP_UPSTREAM_SIGNING_ROOT_SECRET: "y".repeat(40) })).MCP_UPSTREAM_SIGNING_ROOT_SECRET)
     .toBe("y".repeat(40));
+});
+
+
+test("runtime WorkOS config does not require migration credentials", () => {
+  expect(loadConfig(workosConfig({ MIGRATION_DATABASE_URL: undefined })).MAINTENANCE_DATABASE_URL).toBeDefined();
+});
+
+test("migration config does not require runtime maintenance credentials", () => {
+  expect(loadConfig(workosConfig({ MAINTENANCE_DATABASE_URL: undefined }), undefined, { skipRuntimeChecks: true }).MAINTENANCE_DATABASE_URL).toBeUndefined();
+});
+
+test("migration credentials cannot replace missing runtime maintenance credentials", () => {
+  expect(() => loadConfig(workosConfig({
+    MAINTENANCE_DATABASE_URL: undefined,
+    MIGRATION_DATABASE_URL: "postgres://postgres:pw@localhost:5432/cogniplane"
+  }))).toThrow("MAINTENANCE_DATABASE_URL is required");
+});
+
+test("model spending defaults are optional and reject negative or zero reservations", () => {
+  expect(loadConfig(devConfig()).MODEL_SPENDING_MONTHLY_LIMIT_USD).toBeUndefined();
+  expect(loadConfig(devConfig()).MODEL_SPENDING_TURN_RESERVATION_USD).toBe(1);
+  expect(loadConfig(devConfig({ MODEL_SPENDING_MONTHLY_LIMIT_USD: "0" })).MODEL_SPENDING_MONTHLY_LIMIT_USD).toBe(0);
+  expect(() => loadConfig(devConfig({ MODEL_SPENDING_MONTHLY_LIMIT_USD: "-1" }))).toThrow();
+  expect(() => loadConfig(devConfig({ MODEL_SPENDING_TURN_RESERVATION_USD: "0" }))).toThrow();
+});
+
+test("the sandbox network check limits default to 20 s and 5 s, can be set, and must be positive integers", () => {
+  // VULN-13: one deadline for the check of the network of a sandbox, and
+  // one timeout for each E2B request inside it. The SDK default of 60 s per
+  // request would let four reads in a row block a call for minutes.
+  const defaults = loadConfig(devConfig());
+  expect(defaults.E2B_NETWORK_CONFIRM_TIMEOUT_MS).toBe(20_000);
+  expect(defaults.E2B_NETWORK_REQUEST_TIMEOUT_MS).toBe(5_000);
+
+  const custom = loadConfig(devConfig({ E2B_NETWORK_CONFIRM_TIMEOUT_MS: "30000", E2B_NETWORK_REQUEST_TIMEOUT_MS: "2500" }));
+  expect(custom.E2B_NETWORK_CONFIRM_TIMEOUT_MS).toBe(30_000);
+  expect(custom.E2B_NETWORK_REQUEST_TIMEOUT_MS).toBe(2_500);
+
+  // A zero or negative limit would fail every confirmation at once, or never.
+  for (const invalid of ["0", "-1", "1.5", "soon"]) {
+    expect(() => loadConfig(devConfig({ E2B_NETWORK_CONFIRM_TIMEOUT_MS: invalid }))).toThrow();
+    expect(() => loadConfig(devConfig({ E2B_NETWORK_REQUEST_TIMEOUT_MS: invalid }))).toThrow();
+  }
 });

@@ -487,8 +487,8 @@ test("evaluateArtifact throws unsupported_mime for binary content types", async 
       tenantId: "t1",
       artifact: {
         artifactId: "art_1",
-        contentType: "application/pdf",
-        readContent: async () => "%PDF-1.4 ...",
+        contentType: "image/png",
+        readContent: async () => "\x89PNG ...",
         entityTypes: []
       },
       subject: { kind: "upload" }
@@ -511,6 +511,9 @@ test("evaluateArtifact accepts text/* and a small allowlist of structured format
     "text/csv",
     "application/json",
     "application/xml",
+    "application/x-sh",
+    // Callers pass a PDF as its extracted text (scannable-text.ts).
+    "application/pdf",
     "text/html; charset=utf-8" // params should be stripped
   ]) {
     const decision = await service.evaluateArtifact({
@@ -525,6 +528,31 @@ test("evaluateArtifact accepts text/* and a small allowlist of structured format
     });
     expect(decision.action).toBe("allow");
   }
+});
+
+test("evaluateArtifact aborts the content read when its timeout fires", async () => {
+  // The read covers PDF text extraction, which must stop with the evaluation.
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "detect" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 20
+  });
+  let readSignal: AbortSignal | undefined;
+  const err = await service.evaluateArtifact({
+    tenantId: "t1",
+    artifact: {
+      artifactId: "art_1",
+      contentType: "application/pdf",
+      readContent: (signal) => {
+        readSignal = signal;
+        return new Promise<string>(() => {});
+      },
+      entityTypes: []
+    },
+    subject: { kind: "upload" }
+  }).catch((e: unknown) => e);
+  expect((err as PiiProtectionServiceError).code).toBe("pii_timeout");
+  expect(readSignal?.aborted).toBe(true);
 });
 
 test("evaluateArtifact throws file_too_large when content exceeds the cap", async () => {

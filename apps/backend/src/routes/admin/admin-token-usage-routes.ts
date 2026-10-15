@@ -3,14 +3,7 @@ import { z } from "zod";
 
 import { withTenantScope } from "../../lib/db.js";
 import { apiError } from "../../lib/http-errors.js";
-import { withAdmin } from "./admin-route-helpers.js";
-
-function toIsoDate(value: unknown): string {
-  if (value instanceof Date) {
-    return value.toISOString().slice(0, 10);
-  }
-  return String(value).slice(0, 10);
-}
+import { adminIdSchema, withAdmin } from "./admin-route-helpers.js";
 
 const querySchema = z.object({
   days: z
@@ -20,8 +13,24 @@ const querySchema = z.object({
       const n = parseInt(v ?? "30", 10);
       return Number.isFinite(n) && n >= 1 && n <= 365 ? n : 30;
     }),
-  groupBy: z.enum(["day", "user", "model"]).optional().default("day")
+  groupBy: z.enum(["day", "user", "model"]).optional().default("day"),
+  // Optional filters for one person's page. Without them the response is the
+  // tenant-wide rolling window, unchanged for existing callers.
+  userId: adminIdSchema.optional(),
+  period: z.literal("current_month").optional()
 });
+
+/** The UTC calendar month that contains `now`, as a half-open range [from, to). */
+export function currentUtcMonth(now: Date): { from: Date; to: Date } {
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  return {
+    from: new Date(Date.UTC(year, month, 1)),
+    to: new Date(Date.UTC(year, month + 1, 1))
+  };
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export type TokenUsageDayPoint = {
   date: string;
@@ -60,7 +69,12 @@ export type TokenUsageSeries = {
   };
 };
 
-export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promise<void> {
+export async function registerAdminTokenUsageRoutes(
+  app: FastifyInstance,
+  options: { now?: () => Date } = {}
+): Promise<void> {
+  const now = options.now ?? (() => new Date());
+
   app.get(
     "/admin/token-usage",
     withAdmin(app, async (request, reply) => {
@@ -70,8 +84,27 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
         return apiError("invalid_query", "The token-usage query parameters are invalid.");
       }
 
-      const { days } = parsed.data;
+      const { userId, period } = parsed.data;
       const { tenantId } = request.auth;
+      const range = period === "current_month" ? currentUtcMonth(now()) : null;
+      const days = range ? Math.round((range.to.getTime() - range.from.getTime()) / DAY_MS) : parsed.data.days;
+
+      // Every aggregation below shares this filter, so a user or month filter
+      // scopes the daily series, the breakdowns, and the totals together.
+      const values: unknown[] = [tenantId];
+      const conditions = ["tenant_id = $1", "role = 'assistant'", "total_tokens IS NOT NULL"];
+      if (range) {
+        values.push(range.from.toISOString(), range.to.toISOString());
+        conditions.push("created_at >= $2::timestamptz", "created_at < $3::timestamptz");
+      } else {
+        values.push(days);
+        conditions.push("created_at >= NOW() - ($2 || ' days')::interval");
+      }
+      if (userId) {
+        values.push(userId);
+        conditions.push(`user_id = $${values.length}`);
+      }
+      const where = conditions.join("\n                AND ");
 
       const usage = await withTenantScope(app.db, tenantId, async (client) => {
         const [dailyResult, userResult, modelResult, totalsResult] = await Promise.all([
@@ -79,21 +112,20 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
           client.query(
             `
               SELECT
-                DATE(created_at AT TIME ZONE 'UTC') AS date,
+                -- As text: node-postgres would turn a DATE into a Date at local
+                -- midnight, which is the previous UTC day east of UTC.
+                DATE(created_at AT TIME ZONE 'UTC')::text AS date,
                 COALESCE(SUM(input_tokens), 0)::bigint  AS input_tokens,
                 COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
                 COALESCE(SUM(total_tokens), 0)::bigint  AS total_tokens,
                 COALESCE(SUM(cost_usd), 0)::float       AS cost_usd
               FROM messages
               WHERE
-                tenant_id = $1
-                AND role = 'assistant'
-                AND total_tokens IS NOT NULL
-                AND created_at >= NOW() - ($2 || ' days')::interval
+                ${where}
               GROUP BY DATE(created_at AT TIME ZONE 'UTC')
               ORDER BY date ASC
             `,
-            [tenantId, days]
+            values
           ),
 
           // Per-user aggregation
@@ -107,15 +139,12 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
                 COALESCE(SUM(cost_usd), 0)::float       AS cost_usd
               FROM messages
               WHERE
-                tenant_id = $1
-                AND role = 'assistant'
-                AND total_tokens IS NOT NULL
-                AND created_at >= NOW() - ($2 || ' days')::interval
+                ${where}
               GROUP BY user_id
               ORDER BY total_tokens DESC
               LIMIT 50
             `,
-            [tenantId, days]
+            values
           ),
 
           // Per-model aggregation
@@ -129,14 +158,11 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
                 COALESCE(SUM(cost_usd), 0)::float       AS cost_usd
               FROM messages
               WHERE
-                tenant_id = $1
-                AND role = 'assistant'
-                AND total_tokens IS NOT NULL
-                AND created_at >= NOW() - ($2 || ' days')::interval
+                ${where}
               GROUP BY COALESCE(model_name, 'unknown')
               ORDER BY total_tokens DESC
             `,
-            [tenantId, days]
+            values
           ),
 
           // Overall totals
@@ -150,17 +176,14 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
                 COUNT(*)::bigint                         AS message_count
               FROM messages
               WHERE
-                tenant_id = $1
-                AND role = 'assistant'
-                AND total_tokens IS NOT NULL
-                AND created_at >= NOW() - ($2 || ' days')::interval
+                ${where}
             `,
-            [tenantId, days]
+            values
           )
         ]);
 
         const daily: TokenUsageDayPoint[] = dailyResult.rows.map((row) => ({
-          date: toIsoDate(row.date),
+          date: String(row.date),
           inputTokens: Number(row.input_tokens),
           outputTokens: Number(row.output_tokens),
           totalTokens: Number(row.total_tokens),
@@ -195,7 +218,14 @@ export async function registerAdminTokenUsageRoutes(app: FastifyInstance): Promi
         return { daily, byUser, byModel, totals };
       });
 
-      return { usage, days };
+      return {
+        usage,
+        days,
+        ...(range
+          ? { period: "current_month" as const, range: { from: range.from.toISOString(), to: range.to.toISOString() } }
+          : {}),
+        ...(userId ? { userId } : {})
+      };
     })
   );
 }

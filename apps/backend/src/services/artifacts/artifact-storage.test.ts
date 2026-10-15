@@ -1,8 +1,8 @@
 import { Readable } from "node:stream";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test, expect, onTestFinished } from "vitest";
+import { test, expect, onTestFinished, vi } from "vitest";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 
 import { BucketArtifactStorage, LocalArtifactStorage } from "./artifact-storage.js";
@@ -109,17 +109,20 @@ test("local storage cleans up partial file on stream error during put", async ()
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const storage = new LocalArtifactStorage(root);
 
-  const failingStream = new Readable({
-    read() {
-      this.destroy(new Error("source failed"));
-    }
-  });
-
-  await expect(() =>
-        storage.put({
-          storageKey: "user/s/broken.txt",
-          stream: failingStream
-        })).rejects.toThrow(/source failed/);
+  const target = path.join(root, "user/s/broken.txt");
+  const failingStream = new Readable({ read() {} });
+  const pending = storage.put({ storageKey: "user/s/broken.txt", stream: failingStream });
+  const rejected = expect(pending).rejects.toThrow(/source failed/);
+  try {
+    failingStream.push("partial content");
+    await vi.waitFor(async () => expect(await readFile(target, "utf8")).toBe("partial content"));
+    failingStream.destroy(new Error("source failed"));
+    await rejected;
+    await expect(stat(target)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    failingStream.destroy(new Error("source failed"));
+    await pending.catch(() => undefined);
+  }
 });
 
 test("bucket storage uploads under bucketName when no key prefix is set", async () => {

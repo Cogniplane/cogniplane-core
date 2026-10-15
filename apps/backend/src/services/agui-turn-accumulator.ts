@@ -18,14 +18,14 @@
 //   STATE_DELTA /plan         → plan markdown (JSON-Patch add/replace value)
 //   CUSTOM tool_meta          → kind / server / command for a call
 //   CUSTOM tool_status        → failed|declined + durationMs for a call
-//   CUSTOM text_retracted     → drop assistant text streamed so far
-//   CUSTOM tool_retracted     → drop the named tool calls (refusal fallback)
+//   CUSTOM tool_mcp_app       → the linked MCP App call for a tool
+// Any other CUSTOM name, including the retired tool_ui_resources, is ignored.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import type { ToolResultRecord } from "./message-store.js";
-import type { UiResource } from "@cogniplane/shared-types";
+import type { McpAppCall } from "@cogniplane/shared-types";
 
 /** The subset of an UpsertToolResultInput this accumulator can derive from the
  *  wire — the writer fills in tenant/message/session/user before persisting. */
@@ -43,7 +43,7 @@ export type AccumulatedToolResult = {
   exitCode: number | null;
   durationMs: number | null;
   textOffset: number;
-  uiResources?: UiResource[];
+  mcpApp?: McpAppCall;
 };
 
 type PendingCall = {
@@ -59,8 +59,7 @@ type PendingCall = {
   durationMs: number | null;
   /** Length of assistantText when this call started — its slot in the turn. */
   textOffset: number;
-  /** MCP Apps UI resource blocks, carried on a tool_ui_resources CUSTOM event. */
-  uiResources?: UiResource[];
+  mcpApp?: McpAppCall;
 };
 
 /** A reasoning burst positioned in the turn: `text` is the burst's content and
@@ -73,7 +72,6 @@ export type ReasoningSegment = {
 
 export class AguiTurnAccumulator {
   assistantText = "";
-  reasoningText = "";
   planMarkdown = "";
 
   private readonly calls = new Map<string, PendingCall>();
@@ -83,6 +81,11 @@ export class AguiTurnAccumulator {
   // each START is a distinct positioned burst); content appends to the open one.
   private readonly reasoningSegmentList: ReasoningSegment[] = [];
   private openReasoning: ReasoningSegment | null = null;
+
+  /** All reasoning of the turn as one flat string, in stream order. */
+  get reasoningText(): string {
+    return this.reasoningSegmentList.map((segment) => segment.text).join("");
+  }
 
   apply(event: BaseEvent): void {
     switch (event.type) {
@@ -99,7 +102,6 @@ export class AguiTurnAccumulator {
 
       case EventType.REASONING_MESSAGE_CONTENT: {
         const delta = (event as { delta?: string }).delta ?? "";
-        this.reasoningText += delta;
         // Guard: content without a preceding START (defensive) opens a segment
         // at the current offset so the delta is still captured positionally.
         if (!this.openReasoning) {
@@ -176,21 +178,6 @@ export class AguiTurnAccumulator {
 
       case EventType.CUSTOM: {
         const e = event as { name?: string; value?: Record<string, unknown> };
-        if (e.name === "text_retracted") {
-          this.assistantText = "";
-          // Reasoning bursts belong to the retracted content; drop them and the
-          // flat blob too so a refusal fallback doesn't leave orphaned reasoning
-          // whose offsets point into text that no longer exists.
-          this.reasoningText = "";
-          this.reasoningSegmentList.length = 0;
-          this.openReasoning = null;
-          return;
-        }
-        if (e.name === "tool_retracted") {
-          const ids = (e.value?.itemIds as string[] | undefined) ?? [];
-          for (const id of ids) this.calls.delete(id);
-          return;
-        }
         if (e.name === "tool_meta" && e.value) {
           const call = this.calls.get(e.value.toolCallId as string);
           if (call) {
@@ -209,11 +196,10 @@ export class AguiTurnAccumulator {
           }
           return;
         }
-        if (e.name === "tool_ui_resources" && e.value) {
+        if (e.name === "tool_mcp_app" && e.value) {
           const call = this.calls.get(e.value.toolCallId as string);
-          const resources = e.value.uiResources;
-          if (call && Array.isArray(resources) && resources.length > 0) {
-            call.uiResources = resources as UiResource[];
+          if (call && e.value.app && typeof e.value.app === "object") {
+            call.mcpApp = e.value.app as McpAppCall;
           }
           return;
         }
@@ -243,9 +229,7 @@ export class AguiTurnAccumulator {
         exitCode: null,
         durationMs: call.durationMs,
         textOffset: call.textOffset,
-        ...(call.uiResources && call.uiResources.length > 0
-          ? { uiResources: call.uiResources }
-          : {})
+        ...(call.mcpApp ? { mcpApp: call.mcpApp } : {})
       }));
   }
 

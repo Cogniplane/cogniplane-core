@@ -19,7 +19,7 @@ E2B provides a **code-execution sandbox**: a per-session Firecracker VM created 
 | Runtime | LangChain [deepagentsjs](https://reference.langchain.com/javascript/deepagents) (LangGraph agent loop, in-process) | Multi-provider via `initChatModel` (Anthropic/OpenAI/Google/OpenRouter/Z.AI); per-provider tenant key or platform env fallback |
 | Agent state | LangGraph `PostgresSaver` checkpointer | Postgres schema `deep_agents`; `thread_id` == session id |
 | Sandbox | E2B Firecracker VM (`deep-agents-runtime-dev` template) | Lazy, per-session, code-execution only — no agent CLIs or SDKs inside |
-| Database | PostgreSQL with Row-Level Security | One DB pool for `app_user` (RLS-active), one for migrations (superuser); the checkpointer manages its own named `app_user` pool |
+| Database | PostgreSQL with Row-Level Security | Request pool: `app_user` under RLS. Cross-tenant pool: `maintenance_user` with explicit DML grants. Migrations run separately. The checkpointer has its own `app_user` pool |
 | Cache / coordination | Redis (optional) | When configured: shared rate limits, refresh token `jti` revocation, turn quotas. Without it, rate limits are per-process. |
 | Object storage | S3-compatible bucket (production), local filesystem (dev) | Artifacts and skill bundles share `ARTIFACT_BUCKET_*` credentials |
 | Auth | WorkOS (SAML / OIDC / AuthKit) or `dev-headers` mode for local hacking | HS256 JWT access tokens (15 min) + httpOnly refresh cookies (7 day, Redis-revocable) |
@@ -102,6 +102,10 @@ sequenceDiagram
 
 `POST /messages` (`routes/messages.ts`) validates input, resolves the model via `resolveRuntimeModel`, then hijacks the raw socket, sets SSE headers, and delegates to `streamAssistantReplyAGUI` (`services/sse-stream-writer-agui.ts`). The writer builds a `ToolExecutionContext` and calls `runtimeAdapter.runMessageAGUI`. There is a single runtime adapter, with no provider map or provider-resolution step.
 
+`TurnTranscript` (`services/turn-transcript.ts`) finalizes the assistant row for interactive and scheduled turns. It reads runtime AG-UI events and classifies the outcome as completed, interrupted, or error. Thrown errors get client-safe messages. It saves text and status first. A failed write or a write that updates no row prevents a successful completion result. Reasoning, plan, runtime notices, and tool results follow as best-effort writes, including after a thrown error.
+
+The SSE writer owns wire output, mid-turn checkpoints, and MCP App publication. It asks for progress writes and decides when to await them; `TurnTranscript` selects, orders, and saves them. The writer releases turn admission once, after finalization and before the terminal event. A failed release is logged; it does not change the saved outcome or the terminal event. The scheduler owns its job ledger, timeout, usage read, and session cleanup. Finalization does not retry runtime or tool actions or recover execution after a process stops. Existing stale-message sweeps close abandoned rows when enabled. If the final status write and its retry both fail, the stored row can retain an earlier status; the caller still reports a failed or interrupted outcome.
+
 ## Runtime Architecture
 
 ### Single-runtime model
@@ -125,18 +129,60 @@ Agent construction lives in `deep-agents-graph.ts`:
 
 The template (`docker/template.ts`, name `deep-agents-runtime-dev`, built by `make e2b-build`, id wired via `E2B_TEMPLATE_ID`) is deliberately a dumb code-execution box: the stock `e2bdev/base` image plus Python 3 with a pinned knowledge-worker data stack (pandas, openpyxl, matplotlib, jinja2), ripgrep/sqlite3/git — **no agent CLIs or SDKs**. Building under the same name updates the template in place, preserving its id; cutover/rollback is an `E2B_TEMPLATE_ID` env change.
 
+**Network policy.** A sandbox has no network unless the tenant approves hosts. The approved list (`tenant_settings.approved_sandbox_egress_domains`, edited on Admin → Agent behavior) becomes one `SandboxNetworkPolicy` (`services/runtime/sandbox-network-policy.ts`). The network of a sandbox is fixed when it is created, and the backend never changes it: `Sandbox.create` gets `network: { denyOut: ["0.0.0.0/0"], allowOut: <hosts>, allowPublicTraffic: false }`, built from the policy as it is read from the tenant settings at that moment, and `Sandbox.getInfo` reads it back before any command runs. A sandbox that fails the check is killed and not used. At the first use of each turn or job, and at a reconnect, one live read compares the sandbox with the policy as it is then. A match holds for the turn. A mismatch (a changed list of hosts, a sandbox from before the policy, unexpected rules or settings that were not requested, such as request rules or an egress proxy) replaces the sandbox with a notice. The old sandbox is killed with up to four tries, and the session lease is checked in the database before each try. No command and no file operation runs in a sandbox that was not confirmed in the current turn. An operation belongs to the turn that was current when it was called, every step of a method that has several (a file edit is a download and an upload) belongs to the turn of the call, and it runs only while that turn is live: a turn that ended, was cancelled or was replaced by the next one, and a runtime that was disposed, run nothing more, and a creation that an earlier turn began stops before its first command. `Sandbox.create` is sent once, because the SDK would send it again after a 503. Every provider request has a timeout and is tried again when it fails, and one deadline (`E2B_NETWORK_CONFIRM_TIMEOUT_MS`) covers the check. If the sandbox cannot be read in time, the call fails and the sandbox is kept. A kill that still fails after all tries is logged as an error with the sandbox id, and the sandbox is replaced all the same. The old sandbox then runs until the provider expires it (`E2B_SANDBOX_TIMEOUT_MS`), with the network that it was created with. The lease check before a kill cannot be atomic with the kill request, so an owner whose kill is delayed can destroy a sandbox that the next owner adopted under an unchanged policy. The network stays restricted, and files that only existed in that sandbox are lost. The hash of the policy that a sandbox was created under is saved with its id as a record. The template also removes the guest's passwordless root (`sudo` and the empty root password) in its start command.
+
 ### Session lifecycle
 
 - One session runtime per active session, created on demand, torn down after `RUNTIME_IDLE_TIMEOUT_MS` (`services/runtime/idle-teardown.ts`). Teardown kills the sandbox but leaves the checkpointer thread — conversations resume across teardowns and process restarts.
 - Runtimes emit lifecycle audit events (start, resume, idle teardown, interrupt).
 - A per-turn watchdog (`RUNTIME_TURN_TIMEOUT_MS`, default 20 min) aborts a wedged turn via the graph's abort signal; it is disarmed while an approval prompt is pending, and config validation pins it above `APPROVAL_REQUEST_TTL_MS` and below `E2B_SANDBOX_TIMEOUT_MS`.
-- Turn failures surface client-safe messages: 4xx provider errors pass through; internals collapse to a generic message.
+- Turn failures pass through messages from `Error` instances with a 4xx status; other failures use a generic message, with a fixed translation for `GraphRecursionError`. A 4xx status alone does not prove provider text is safe. Review passthrough classification and redaction before relying on it to prevent disclosure.
+
+## Personal defaults and private skills
+
+Settings at `/settings/capabilities` lets members choose defaults for their normal
+standalone chats. The API stores these choices by tenant and user. A null selection
+inherits organization defaults and includes the member's released private skills.
+An empty custom selection selects nothing. Project and scheduled chats do not use
+personal defaults. A chat's own saved selection can further narrow its defaults.
+
+Members can write a private skill or import a single `SKILL.md`. They save a draft,
+review its instructions and validation warnings, and explicitly make it available.
+Edits create revisions without changing the active instructions. Release activates
+the latest revision and adds it to custom personal defaults in one transaction.
+Every write checks the account scope, current membership, and saved version.
+
+Migration `052_personal_skills.sql` adds separate tables for these skills and their
+revisions. Queries filter on tenant and owner; tenant RLS and membership cascades
+provide further isolation. Each member can keep 100 skills with unique names and
+up to 50 revisions per skill. Revision cleanup preserves the active revision.
+Audit events omit instruction contents.
+
+Only the owner's normal standalone runtime loads released personal skills. Project,
+scheduled, and skill-improvement sessions do not load them. Release, disable, and
+delete change the runtime bundle on the next turn. Draft edits do not. Personal
+skills cannot grant tools or override organization policy. Imports save instructions
+only; companion files and remote imports are not supported. Sharing a conversation
+can share messages that quote earlier private work, but does not share the private
+skill library.
 
 ## System Prompt & Skill Pipeline
 
-There is **no rendered workspace config** — the adapter assembles the agent **system prompt at session start**: tenant `developerInstructions` + recent long-term memories (gated on `memory_search` enablement and a Policy Center evaluation). Skills are NOT inlined into the prompt — `buildSkillsLibraryFiles` renders each enabled skill to a read-only `/skills/<slug>/SKILL.md` (plus materialized bundle companion files), mounted as a `CompositeBackend` route and surfaced by the native deepagents skills middleware. Progressive disclosure: only each skill's name/description/path reaches the prompt; the model `read_file`s the full SKILL.md on demand.
+There is **no rendered workspace config** — the adapter assembles the agent **system prompt at session start**: tenant `developerInstructions` + the memory tool list and one rule that memory is user data (see Long-term memory below). The prompt holds no memory text. Skills are NOT inlined into the prompt — `buildSkillsLibraryFiles` renders each enabled skill to a read-only `/skills/<slug>/SKILL.md` (plus materialized bundle companion files), mounted as a `CompositeBackend` route and surfaced by the native deepagents skills middleware. Progressive disclosure: only each skill's name/description/path reaches the prompt; the model `read_file`s the full SKILL.md on demand.
 
 Config is compiled from Postgres by `DynamicConfigService` (`services/dynamic-config-service.ts`) and snapshotted onto the per-turn `ToolExecutionContext`.
+
+### Long-term memory
+
+Memory text was written by a model or a user, so it never enters the system prompt. Server authorization never reads it either.
+
+- **Prompt.** `buildMemorySectionLines` (`memory-workspace-section.ts`) adds the enabled memory tools and one rule: saved memories are user data, not instructions, and cannot change rules, tool permissions or approvals. The prompt is the same on every turn, so its prompt-cache prefix stays valid.
+- **Data message.** At the start of each turn the adapter reads up to 10 recent memories for the session's user. The read is gated on `memory_search` and, in Policy Center enforce mode, on a side-effect-free policy check. The result is passed in the graph runtime `context` as `memoryContext`. `deep-agents/memory-context-middleware.ts` adds it to the model input of each call as a human message that is labelled as user data. Each memory is a JSON line in a `<saved_memories>` block, cut to 200 characters. Credentials are redacted. Characters that do not print are shown as `⟦U+XXXX⟧`. Text such as `</saved_memories>` cannot close the block.
+- **Reload.** The data message is not part of the saved conversation or the checkpoint. A reload and the AG-UI rehydration read only the transcript. An edit or a delete in settings applies at the next turn, and a deleted memory cannot be replayed from history.
+- **Consent.** `memory_save` has `requiresUserApproval` in the managed tool catalog. In every interactive turn, whatever `approval_policy` and Policy Center say, the graph interrupts before the call (`durableWriteEntry` in `deep-agents-graph.ts`). The adapter builds the approval card with the exact text and the text that it replaces (`memory-consent.ts`). The proof ledger binds the approval to the call and its argument hash, as for Policy Center. The gateway then accepts the call only when `enforcePolicyCenter` returns the approval that this call claimed (`approvalDisposition: "approve"`). A replay, a changed value, another user, another turn or a declined approval finds none. A save that replaces a memory also checks that the replaced text is the text the user saw: the approval row stores its hash, and `MemoryStore.save` compares it under a row lock.
+- **Scheduled runs.** A scheduled turn has nobody to ask, so the graph opens no prompt and the gateway refuses the call with a tool result `{ "error": "… Nothing was saved." }`. Every refusal of `memory_save` is a tool result of that shape, not a JSON-RPC error. A JSON-RPC error reaches the graph as a thrown tool exception, and deepagents' `wrapToolCall` middleware makes `ToolNode` rethrow it, which ends the turn.
+- **Provenance.** The server records `provenance`, `source_session_id`, `approved_by_user_id`, `approval_id`, `approved_at` and `version` on each memory (migration `068_memory_provenance.sql`). Rows from before the migration read as `unverified`. Model-supplied `metadata` is plain data and never proof of approval. The agent refuses text that holds a credential.
+- **User view.** `/settings/memories` lists, edits and deletes the signed-in user's memories through `/me/memories` (`routes/memories.ts`). Routes use the tenant and user from the request and address a memory by its id. An edit sends the account scope and the `version` that the editor started from, even if the page read the list again since. If the memory changed after that version, the server refuses the edit (`memory_conflict`). The page then keeps the user's text in the editor, shows the latest saved text beside it, and lets the user reapply their text to the latest version or discard it.
 
 ### Skill data flow
 
@@ -171,6 +217,30 @@ Every tool call requires a `toolContextId` resolved against `ToolExecutionContex
 
 Tool results pass through `redactSecrets()` (`services/redact-secrets.ts`) before persistence to strip auth headers and tokens.
 
+### Member credentials for approved connections
+
+Admins choose whether a proxy MCP connection uses one organization credential or
+requires each member to connect. Members enter bearer tokens, header secrets, or
+query secrets at `/settings/connections`, after reviewing the destination and auth
+method. An optional account label is supplied by the member; it is not verified
+provider identity. This flow does not register private MCP URLs or perform OAuth.
+
+Migration `053_member_mcp_credentials.sql` stores encrypted credentials by tenant,
+member, and connection. Reads and writes check current membership and connection
+availability. Saves compare both connection and credential versions. Removing a
+credential clears its secret and keeps a versioned tombstone to reject stale saves.
+Audit events contain IDs and versions, never secrets or account labels.
+
+Endpoint, authentication, and credential-scope changes replace the connection's
+credential binding. Old member credentials then require reconnection, even if an
+admin changes the endpoint back. Runtime calls use the acting member's credential;
+project access never lends another member's account. Missing credentials remain
+visible in selection screens with a connection prompt, but are excluded from runtime
+tools. Tool metadata caches include member and credential version so one account's
+tool permissions cannot affect another account. Each turn records connection hashes
+and credential versions in its trusted tool context. A pending approval cannot send
+a call through a changed endpoint or newly saved account.
+
 ### Trust boundary
 
 ```
@@ -203,7 +273,9 @@ Native runtime approvals and Policy Center approvals share one checkpointed grap
 
 The frontend calls `POST /approvals/:approvalId/decision` with `{ decision: "approve" | "reject", rememberForTurn?: boolean }` (`routes/approvals.ts`), which persists the decision and resumes the paused graph.
 
-Policy Center `require_approval` is folded into the runtime's checkpointed graph interrupt. Once approved, the runtime injects a deterministic `policyApprovalId`; the gateway proceeds only when the row matches the same session, user, tool, server, tool context, and canonical argument hash. This keeps the gateway fail-closed without a held HTTP response or second coordinator, and scheduled turns use the same durable interrupt.
+Policy Center `require_approval` is folded into the runtime's checkpointed graph interrupt on interactive turns. The runtime keeps a proof with a random approval ID in backend memory, keyed by tool-call ID; the proof never enters tool arguments. Once approved, the runtime injects its `policyApprovalId`; the gateway proceeds only when the row matches the same session, user, tool, server, tool context, and canonical argument hash, and it claims the approval once (`consumed_at`) before dispatch. The argument hash (`policyArgsHash`) leaves out `toolContextId`, `policyApprovalId` and the marker key at the root of the arguments only, because the runtime and the gateway add them there. A nested key with one of those names is data that the user approved, so it is hashed. This keeps the gateway fail-closed without a held HTTP response or second coordinator. Scheduled turns are unattended: the graph does not pause for Policy Center approval, and the gateway denies an enforced `require_approval` match.
+
+A managed tool with `requiresUserApproval` (today `memory_save`) uses the same proof for a stronger rule. Its interrupt does not read `approval_policy` or Policy Center, so `never` does not remove it. The gateway passes the handler the approval that it claimed, and the handler refuses to save without it. See Long-term memory.
 
 MCP elicitation is not a separate confirmation plane in Cogniplane: authorization and human confirmation are enforced at the Cogniplane MCP gateway through native HITL and Policy Center. Configured upstream MCP tools must not rely on elicitation as their only guardrail.
 
@@ -252,6 +324,7 @@ Owners exclusively control `allowCommandExecution`. Admins may update the remain
 | `auto_approve_read_only_tools` | Bypass approval for read-only tools |
 | `policy_enforcement_mode` | Policy Center mode: `"monitor"` or `"enforce"` |
 | `allow_command_execution` | Gate on shell/exec tools — when off, no sandbox is attached at all |
+| `approved_sandbox_egress_domains` | Hosts that agent-run code in the sandbox may reach; empty (the default) means no network |
 | `developer_instructions` | Extra system prompt content per tenant |
 | `web_search_mode` | Web search availability for the agent |
 | `show_effort_selector` | Frontend feature flag |
@@ -292,11 +365,13 @@ Two paths:
 - **Sync** — message text passes through `PiiProtectionService.evaluateText` (`services/pii/pii-protection-service.ts`, invoked from `routes/messages.ts`) before being forwarded to the runtime. Detect/block/transform actions are configured per tenant.
 - **Async** — `pii_scan_runs` + `pii_scan_jobs` queue scans of stored content (artifacts, message history). Findings persisted with severity and category.
 
+Uploads and project drafts stay `pending` until the scan verdict, and no download token is issued before the artifact is `ready`. The scan reads text, structured text (CSV, JSON, XML, YAML) and shell scripts as UTF-8, and a PDF through its `pdftotext` output (`services/pii/scannable-text.ts`). A PDF with no extractable text, such as a scan, is rejected. Images inside a PDF are not scanned, and image detection in PDFs is not reliable, so every PDF verdict stores `imagesNotScanned: true` in the artifact's PII detail and the UI shows it as "(text only)". Project drafts that the agent writes as PDFs are scanned the same way but carry no such label yet (bead `koiz`). When the uploads scope is on, the upload rejects images and Office files at once with `unsupported_mime`, in every mode, and deletes their bytes. A failed PII job always closes its scan run and its upload or message: the scheduler worker closes jobs that the stale-claim sweep failed.
+
 Configuration knobs: `PII_LLM_API_KEY`, `PII_LLM_MODEL`, `PII_LLM_BASE_URL`, `PII_LLM_WIRE_FORMAT`, `PII_PROVIDER_TIMEOUT_MS`.
 
 ## Scheduler
 
-`services/scheduler-worker.ts` polls `scheduled_jobs` every `SCHEDULER_POLL_INTERVAL_MS` (default 30s), claims due jobs atomically, and runs them as synthetic agent turns. Results land in `scheduled_job_runs`. Concurrency capped by `SCHEDULER_MAX_CONCURRENT_JOBS`; per-job hard timeout via `SCHEDULER_JOB_TIMEOUT_MS`.
+`services/scheduler-worker.ts` polls `scheduled_jobs` every `SCHEDULER_POLL_INTERVAL_MS` (default 30s), claims due jobs atomically, and runs them as synthetic agent turns. Results land in `scheduled_job_runs`. Concurrency capped by `SCHEDULER_MAX_CONCURRENT_JOBS`; per-job hard timeout via `SCHEDULER_JOB_TIMEOUT_MS`. Scheduled turns use the same `TurnTranscript` but write no mid-turn progress. An interrupted scheduled turn keeps its partial text with the `interrupted` row status, as a stopped interactive turn does. Its job run records `failed` with the error `Scheduled job was interrupted.`, because the job did not complete. The run summary is the first 500 characters of the response after secret redaction. A job timeout fails the row and the run when it fires before `TurnTranscript.finalize` resolves. This includes the usage read and the final writes: a timeout during those writes replaces the saved status with the timeout error. A timeout during session cleanup, after finalization, does not change the saved outcome.
 
 Each job carries a `settings_snapshot_json` so executions remain auditable even after the user later changes their preferences.
 
@@ -308,7 +383,7 @@ Each job carries a `settings_snapshot_json` so executions remain auditable even 
 
 Two DB pools:
 - `db` — `app_user` (non-superuser, RLS-active).
-- `privilegedDb` — superuser for migrations and the small set of explicitly reviewed cross-tenant or token-authorized operations. Tenant content paths use the RLS-active pool unless their authorization design requires otherwise.
+- `privilegedDb` uses `MAINTENANCE_DATABASE_URL`, a dedicated BYPASSRLS role with explicit DML grants and no schema ownership. Migrations use a separate process and credential. Tenant content paths use the RLS-active pool unless their authorization design requires otherwise.
 
 The Deep Agents checkpointer additionally manages its own named `app_user` pool. Its tables (schema `deep_agents`) have **no RLS** — isolation is app-layer via the RLS-scoped `sessions` table (see Runtime Architecture).
 
@@ -352,7 +427,16 @@ member → create and use sessions
 
 `POST /messages` streams native AG-UI `BaseEvent` values as data-only SSE frames. The backend does not emit separate `event:` lines or the retired `response.*` and `framework:*` envelopes.
 
-The stream uses native AG-UI lifecycle, text, reasoning, tool-call, tool-result, and state-delta events. Cogniplane-specific approval, runtime-notice, tool metadata, tool status, and UI-resource payloads use AG-UI `CUSTOM` events. `write_todos` updates `/plan` through `STATE_DELTA`.
+The stream uses native AG-UI lifecycle, text, reasoning, tool-call, tool-result, and state-delta events. Cogniplane-specific approval, runtime-notice, tool metadata, tool status, and MCP Apps payloads use AG-UI `CUSTOM` events. `write_todos` updates `/plan` through `STATE_DELTA`.
+
+Supported widgets use `tool_mcp_app` and saved `ToolResult.mcpApp`. Proxy tools
+declare `_meta.ui.resourceUri` and serve HTML through `resources/read`; managed
+tools declare resources in the trusted catalog. The backend no longer emits the
+retired `tool_ui_resources` event or writes inline `ToolResult.uiResources`.
+History reads still return that field from retained rows; no frontend renders
+it. See
+[Interactive UI](INTERACTIVE_UI.md#supported-resource-contract) for the contract,
+enablement, isolation, and action limits.
 
 Active stream event names and payload shapes follow AG-UI `BaseEvent` schemas from `@ag-ui/client`, not hand-maintained markdown.
 
@@ -424,6 +508,7 @@ The authoritative schema is `apps/backend/db/migrations/`. `001_init.sql` is the
 | Table | Notes |
 |---|---|
 | `user_settings_sections` | Sectioned per-user preferences (`scheduled_jobs`, `skills`, `mcp`, `model`, etc.) |
+| `agent_memories` | Long-term memories, unique per `(tenant_id, user_id, slug)`; server-written `provenance`, `source_session_id`, `approved_by_user_id`, `approval_id`, `approved_at`, `version` (migration 068) |
 
 ### Audit
 
@@ -473,3 +558,13 @@ Earlier versions of Cogniplane ran two sandbox-hosted runtimes. OpenAI's `codex 
 - [DECISIONS.md](DECISIONS.md) — architectural decision records
 - <https://reference.langchain.com/javascript/deepagents> — official deepagentsjs API reference
 - `apps/backend/db/migrations/` — authoritative schema
+
+
+### Tenant model spending
+
+Interactive and scheduled turns reserve estimated model cost through the same
+tenant-scoped PostgreSQL ledger. Each admitted turn shares its reservation with
+subagents and summarization. Calls run one at a time within that turn; missing
+usage retains credit and blocks further admission for the month until an
+administrator reconciles it. See [model spending](MODEL_SPENDING.md) for policy,
+overrun limits, recovery, and accounting exclusions.

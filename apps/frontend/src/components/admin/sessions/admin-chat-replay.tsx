@@ -17,9 +17,9 @@ const MESSAGE_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4 transition-colors";
 
 const STATUS_BORDER: Record<string, string> = {
-  pending: "border-l-4 border-l-accent",
-  streaming: "border-l-4 border-l-accent",
-  error: "border-l-4 border-l-danger",
+  pending: "border-accent",
+  streaming: "border-accent",
+  error: "border-danger",
   completed: ""
 };
 

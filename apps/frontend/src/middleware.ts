@@ -23,6 +23,7 @@ import {
   applyFrontendSecurityHeaders,
   buildFrontendContentSecurityPolicy
 } from "./lib/frontend-security-headers";
+import { sandboxSecurityHeaders } from "./lib/mcp-app-sandbox-headers";
 
 const PUBLIC_PATHS = ["/login", "/auth/callback"];
 const SESSION_HINT_COOKIE = "cogniplane_session_hint";
@@ -35,7 +36,8 @@ function createSecurityContext(request: NextRequest) {
   const csp = buildFrontendContentSecurityPolicy({
     nonce,
     apiUrl: API_URL,
-    development: IS_DEVELOPMENT
+    development: IS_DEVELOPMENT,
+    appOrigin: request.nextUrl.origin
   });
   const requestHeaders = new Headers(request.headers);
   requestHeaders.set("content-security-policy", csp);
@@ -51,6 +53,9 @@ function secureResponse(response: NextResponse, csp: string): NextResponse {
 
 export default function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
+  if (pathname === "/mcp-app-sandbox.html") {
+    return NextResponse.next({ headers: sandboxSecurityHeaders(process.env.MCP_APP_PARENT_ORIGIN) });
+  }
   const { csp, requestHeaders } = createSecurityContext(request);
   const next = () =>
     secureResponse(

@@ -9,6 +9,7 @@ import { apiError, notFoundError } from "../../lib/http-errors.js";
 import { artifactIdParams } from "../../lib/route-schemas.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
 import { serialize } from "../../lib/serialize-response.js";
+import { isArtifactPiiEligible } from "../../services/artifacts/artifact-store.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
@@ -33,7 +34,8 @@ export async function registerAdminArtifactRoutes(
         const artifactRow = await client.query(
           `
             SELECT a.artifact_id, a.session_id, a.user_id, a.artifact_type,
-              a.artifact_name, a.mime_type, a.storage_backend, a.storage_key, a.status
+              a.artifact_name, a.mime_type, a.storage_backend, a.storage_key, a.status,
+              a.detail_json
             FROM artifacts a
             JOIN sessions s ON s.tenant_id = a.tenant_id AND s.session_id = a.session_id
             WHERE a.tenant_id = $1 AND a.artifact_id = $2 AND s.project_id IS NULL
@@ -47,7 +49,9 @@ export async function registerAdminArtifactRoutes(
           return { kind: "not_found" as const };
         }
 
-        if (artifact.artifact_type !== "upload" && artifact.status !== "ready") {
+        // Same rule as user minting and token redemption: a blocked or
+        // unscanned artifact is not downloadable, even when status is ready.
+        if (!isArtifactPiiEligible({ status: artifact.status, detail: artifact.detail_json ?? {} })) {
           return { kind: "not_ready" as const };
         }
 

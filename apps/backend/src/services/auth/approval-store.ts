@@ -192,6 +192,26 @@ export class ApprovalStore {
     });
   }
 
+  /**
+   * Claim an approved decision for one dispatch. Returns false when the row is
+   * not approved or another dispatch already claimed it.
+   */
+  async consume(tenantId: string, approvalId: string, userId: string): Promise<boolean> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          UPDATE approvals
+          SET consumed_at = clock_timestamp(), updated_at = NOW()
+          WHERE tenant_id = $1 AND approval_id = $2 AND user_id = $3
+            AND status = 'approved' AND decision = 'approve' AND consumed_at IS NULL
+          RETURNING approval_id
+        `,
+        [tenantId, approvalId, userId]
+      );
+      return result.rowCount === 1;
+    });
+  }
+
   async expire(tenantId: string, approvalId: string): Promise<ApprovalRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(

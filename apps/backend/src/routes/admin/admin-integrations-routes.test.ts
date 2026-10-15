@@ -531,3 +531,54 @@ test("DELETE /admin/integrations/microsoft/config clears the integration row", a
   expect(row!.readsEnabled).toBe(false);
   expect(row!.writesEnabled).toBe(false);
 });
+
+function jiraState(readsEnabled: boolean, writesEnabled: boolean): IntegrationStateRecord {
+  return {
+    tenantId: "tenant-1",
+    integrationId: "jira",
+    readsEnabled,
+    writesEnabled,
+    config: {},
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    updatedBy: "admin-user"
+  };
+}
+
+const PIPEDREAM = { PIPEDREAM_CLIENT_ID: "c", PIPEDREAM_CLIENT_SECRET: "s", PIPEDREAM_PROJECT_ID: "proj_abc123" };
+
+test("PUT /admin/integrations/jira rejects writes because Jira has no write tools", async () => {
+  const { app, stateStore } = await buildApp({ config: PIPEDREAM });
+  onTestFinished(() => app.close());
+
+  for (const payload of [{ writesEnabled: true }, { readsEnabled: true, writesEnabled: true }]) {
+    const response = await app.inject({ method: "PUT", url: "/admin/integrations/jira", payload });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: "integration_writes_unsupported" });
+  }
+  expect(stateStore.upsertCalls).toEqual([]);
+});
+
+test("PUT /admin/integrations/jira enables reads", async () => {
+  const { app, stateStore } = await buildApp({ config: PIPEDREAM });
+  onTestFinished(() => app.close());
+
+  const response = await app.inject({ method: "PUT", url: "/admin/integrations/jira", payload: { readsEnabled: true } });
+  expect(response.statusCode).toBe(200);
+  expect(stateStore.records).toEqual([expect.objectContaining({ integrationId: "jira", readsEnabled: true, writesEnabled: false })]);
+});
+
+test("PUT /admin/integrations/jira clears a writes flag that an earlier version accepted", async () => {
+  const { app, stateStore } = await buildApp({ config: PIPEDREAM, states: [jiraState(false, true)] });
+  onTestFinished(() => app.close());
+
+  // An update that does not ask for writes is not blocked by the old flag.
+  const reads = await app.inject({ method: "PUT", url: "/admin/integrations/jira", payload: { readsEnabled: true } });
+  expect(reads.statusCode).toBe(200);
+  const reaffirm = await app.inject({ method: "PUT", url: "/admin/integrations/jira", payload: { writesEnabled: true } });
+  expect(reaffirm.statusCode).toBe(400);
+
+  const cleared = await app.inject({ method: "PUT", url: "/admin/integrations/jira", payload: { writesEnabled: false } });
+  expect(cleared.statusCode).toBe(200);
+  expect(stateStore.records).toEqual([expect.objectContaining({ integrationId: "jira", readsEnabled: true, writesEnabled: false })]);
+});

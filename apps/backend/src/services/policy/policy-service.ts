@@ -17,7 +17,7 @@ import type { PolicyDecisionStore } from "./policy-decision-store.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
 import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
 
-type PolicyApprovalDisposition = "approve" | "reject" | "expired";
+type PolicyApprovalDisposition = "approve" | "reject" | "expired" | "consumed";
 
 // Raised when an enforce-mode rule refuses the action: a `block`, or a
 // `require_approval` without a matching approved graph-interrupt proof. The MCP gateway
@@ -223,6 +223,8 @@ export class PolicyService {
       const why =
         disposition === "expired"
           ? "Approval request expired before a decision was made."
+          : disposition === "consumed"
+            ? "This approval was already used for an earlier call."
           : input.approvalDisposition === "reject"
             ? "Action denied by approver."
             : "No matching approved graph action was provided.";
@@ -233,6 +235,25 @@ export class PolicyService {
     }
 
     // Defensive: an enforced outcome we don't have a branch for. Proceed.
+    return { evaluation, enforced };
+  }
+
+  /** Recheck access to a resource from a completed tool call and record matched rules. */
+  async gateCompletedToolResource(input: PolicyGateInput): Promise<PolicyGateResult> {
+    const evaluation = evaluatePolicy(await this.loadRules(input.tenantId), {
+      toolName: input.toolName,
+      category: input.category,
+      severity: input.severity,
+      serverId: input.serverId,
+      turnContext: input.turnContext
+    });
+    const enforced = input.enforcementMode === "enforce" && evaluation.outcome === "block";
+    if (evaluation.matchedRuleId !== null) {
+      await this.recordEvidence(input, evaluation, enforced, null);
+    }
+    if (enforced) {
+      throw new PolicyBlockedError(evaluation.explanation ?? "Action blocked by policy.", evaluation.matchedRuleId);
+    }
     return { evaluation, enforced };
   }
 

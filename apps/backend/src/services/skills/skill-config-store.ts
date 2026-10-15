@@ -1,3 +1,8 @@
+import type { PoolClient } from "pg";
+import type { AdminSkillReleaseSnapshot } from "@cogniplane/shared-types";
+import { assertSkillReleaseSnapshot, latestSkillRevisionId, skillReleaseSnapshot } from "./skill-release-impact-store.js";
+import { lockOrganizationSkillNames } from "./organization-skill-name-lock.js";
+
 import { type Pool, withTenantScope } from "../../lib/db.js";
 
 import type { AdminSkillRecord } from "../admin-config-records.js";
@@ -36,6 +41,17 @@ const skillVisibilityOrderSql = `
   skill.updated_at DESC
 `;
 
+async function checkReleaseSnapshot(client: PoolClient, tenantId: string, skillId: string,
+  expectedSnapshot?: AdminSkillReleaseSnapshot) {
+  if (!expectedSnapshot) return;
+  await lockOrganizationSkillNames(client, tenantId);
+  const current = await client.query(`SELECT version,active_revision_id,enabled,is_published FROM admin_skills
+    WHERE tenant_id=$1 AND skill_id=$2 FOR UPDATE`,[tenantId,skillId]);
+  if (!current.rowCount) return;
+  assertSkillReleaseSnapshot(skillReleaseSnapshot(current.rows[0],
+    await latestSkillRevisionId(client,tenantId,skillId)),expectedSnapshot);
+}
+
 export class SkillConfigStore {
   constructor(private readonly db: Pool) {}
 
@@ -65,7 +81,12 @@ export class SkillConfigStore {
               revision.bundle_hash AS active_bundle_hash,
               revision.validation_status AS active_validation_status,
               revision.review_status AS active_review_status,
-              revision.metadata -> 'associatedToolIds' AS active_associated_tool_ids
+              revision.metadata -> 'associatedToolIds' AS active_associated_tool_ids,
+              (SELECT COUNT(*) FROM admin_skill_revisions AS pending
+                WHERE pending.tenant_id = skill.tenant_id
+                  AND pending.tenant_id = $2::text
+                  AND pending.skill_id = skill.skill_id
+                  AND pending.review_status = 'pending_review') AS pending_revision_count
             FROM admin_skills AS skill
             LEFT JOIN admin_skill_revisions AS revision
               ON revision.skill_revision_id = skill.active_revision_id
@@ -83,8 +104,8 @@ export class SkillConfigStore {
     });
   }
 
-  async getSkill(tenantId: string, skillId: string): Promise<AdminSkillRecord | null> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+  async getSkill(tenantId: string, skillId: string, client?: PoolClient): Promise<AdminSkillRecord | null> {
+    const read = async (client: PoolClient) => {
       const result = await client.query(
         `
           ${skillSelectSql}
@@ -97,23 +118,26 @@ export class SkillConfigStore {
       );
 
       return result.rows[0] ? mapSkill(result.rows[0], tenantId) : null;
-    });
+    };
+    return client ? read(client) : withTenantScope(this.db, tenantId, read);
   }
 
-  async disableSkill(tenantId: string, skillId: string): Promise<AdminSkillRecord | null> {
+  async disableSkill(tenantId: string, skillId: string,
+    expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      await checkReleaseSnapshot(client,tenantId,skillId,expectedSnapshot);
       const result = await client.query(
         `
           UPDATE admin_skills
           SET enabled = FALSE, version = version + 1, updated_at = NOW()
           WHERE skill_id = $1
             AND tenant_id = $2
-          RETURNING *
         `,
         [skillId, tenantId]
       );
 
-      return result.rows[0] ? mapSkill(result.rows[0], tenantId) : null;
+      // admin_skills has no instructions or content hash; read them from the active revision.
+      return result.rowCount ? this.getSkill(tenantId, skillId, client) : null;
     });
   }
 
@@ -139,20 +163,21 @@ export class SkillConfigStore {
     });
   }
 
-  async setSkillPublished(tenantId: string, skillId: string, isPublished: boolean): Promise<AdminSkillRecord | null> {
+  async setSkillPublished(tenantId: string, skillId: string, isPublished: boolean,
+    expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
+      await checkReleaseSnapshot(client,tenantId,skillId,expectedSnapshot);
       const result = await client.query(
         `
           UPDATE admin_skills
           SET is_published = $3, version = version + 1, updated_at = NOW()
           WHERE skill_id = $1
             AND tenant_id = $2
-          RETURNING *
         `,
         [skillId, tenantId, isPublished]
       );
 
-      return result.rows[0] ? mapSkill(result.rows[0], tenantId) : null;
+      return result.rowCount ? this.getSkill(tenantId, skillId, client) : null;
     });
   }
 }

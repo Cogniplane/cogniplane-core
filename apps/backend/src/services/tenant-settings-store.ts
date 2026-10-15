@@ -1,5 +1,7 @@
 import { type Pool, withTenantScope } from "../lib/db.js";
+import type { PoolClient } from "pg";
 import { computeConfigHash } from "../lib/crypto-utils.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 
 import type { EffortLevel, ModelProvider, PolicyEnforcementMode, WebSearchMode } from "@cogniplane/shared-types";
 import { EFFORT_LEVELS, MODEL_PROVIDERS } from "@cogniplane/shared-types";
@@ -51,8 +53,16 @@ export type TenantSettingsRecord = {
   enabledProviders: ModelProvider[];
   /** null = all catalog models; an array is a strict allowlist of model ids. */
   enabledModelIds: string[] | null;
+  defaultModelId: string | null;
   /** Per-model default reasoning effort overriding the catalog default. */
   modelDefaultEfforts: Record<string, EffortLevel>;
+  /**
+   * Hosts that agent-run code in the sandbox may reach (VULN-13), sorted and
+   * without duplicates. Empty means no network. The admin route checks each
+   * entry before it reaches the store; resolveSandboxNetworkPolicy checks it
+   * again before it reaches the provider.
+   */
+  approvedSandboxEgressDomains: string[];
   version: number;
   configHash: string;
   updatedAt: string;
@@ -86,6 +96,10 @@ function toNullableStringArray(value: unknown): string[] | null {
     : null;
 }
 
+function normalizeEgressDomains(domains: readonly string[]): string[] {
+  return [...new Set(domains)].sort();
+}
+
 function toEffortMap(value: unknown): Record<string, EffortLevel> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const efforts: Record<string, EffortLevel> = {};
@@ -112,7 +126,9 @@ function mapRow(row: Record<string, unknown>): TenantSettingsRecord {
     enabledMcpServerIds: toStringArray(row.enabled_mcp_server_ids),
     enabledProviders: toProviderArray(row.enabled_providers),
     enabledModelIds: toNullableStringArray(row.enabled_model_ids),
+    defaultModelId: typeof row.default_model_id === "string" ? row.default_model_id : null,
     modelDefaultEfforts: toEffortMap(row.model_default_efforts),
+    approvedSandboxEgressDomains: normalizeEgressDomains(toStringArray(row.approved_sandbox_egress_domains)),
     version: Number(row.version),
     configHash: String(row.config_hash),
     updatedAt: isoTimestamp(row.updated_at)
@@ -138,7 +154,9 @@ export type TenantSettingsInput = {
   enabledMcpServerIds?: string[];
   enabledProviders?: ModelProvider[];
   enabledModelIds?: string[] | null;
+  defaultModelId?: string | null;
   modelDefaultEfforts?: Record<string, EffortLevel>;
+  approvedSandboxEgressDomains?: string[];
 };
 
 export function buildDefaultTenantSettingsInput(): Required<Omit<TenantSettingsInput, "expectedVersion">> {
@@ -160,25 +178,56 @@ export function buildDefaultTenantSettingsInput(): Required<Omit<TenantSettingsI
     enabledProviders: [...MODEL_PROVIDERS],
     // null = every catalog model, so newly shipped models appear automatically.
     enabledModelIds: null,
-    modelDefaultEfforts: {}
+    defaultModelId: null,
+    modelDefaultEfforts: {},
+    // The sandbox has no network until a tenant approves hosts.
+    approvedSandboxEgressDomains: []
   };
 }
 
 export class TenantSettingsStore {
   constructor(private readonly db: Pool) {}
 
-  async get(tenantId: string): Promise<TenantSettingsRecord | null> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+  async get(tenantId: string, transactionClient?: PoolClient): Promise<TenantSettingsRecord | null> {
+    const read = async (client: PoolClient) => {
       const result = await client.query(
         `SELECT * FROM tenant_settings WHERE tenant_id = $1`,
         [tenantId]
       );
       return result.rows[0] ? mapRow(result.rows[0]) : null;
-    });
+    };
+    return transactionClient ? read(transactionClient) : withTenantScope(this.db, tenantId, read);
   }
 
-  async upsert(tenantId: string, input: TenantSettingsInput): Promise<TenantSettingsRecord> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+  async setMcpServerAllowed(
+    tenantId: string,
+    serverId: string,
+    allowed: boolean,
+    client: PoolClient
+  ): Promise<TenantSettingsRecord> {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended('tenant_settings:' || $1, 0))`,
+      [tenantId]
+    );
+    const settings = await this.get(tenantId, client);
+    const current = settings?.enabledMcpServerIds ?? buildDefaultTenantSettingsInput().enabledMcpServerIds;
+    const next = allowed
+      ? [...new Set([...current, serverId])]
+      : current.filter((id) => id !== serverId);
+    if (settings && next.length === current.length && next.every((id, index) => id === current[index])) {
+      return settings;
+    }
+    return this.upsert(tenantId, { enabledMcpServerIds: next }, client);
+  }
+
+  // The audit event, when given, commits in the same transaction as the change.
+  async upsert(
+    tenantId: string,
+    input: TenantSettingsInput,
+    transactionClient?: PoolClient,
+    audit?: (settings: TenantSettingsRecord) => AuditEventInput
+  ): Promise<TenantSettingsRecord> {
+    const write = async (client: PoolClient) => {
       // Serialize upserts per tenant: the merge below is a read-modify-write,
       // and a row lock alone cannot cover the first-insert race (no row to
       // lock). The advisory lock is transaction-scoped and released on
@@ -235,9 +284,17 @@ export class TenantSettingsStore {
       const resolvedModelIds = Object.hasOwn(input, "enabledModelIds")
         ? (input.enabledModelIds ?? null)
         : (existing?.enabledModelIds ?? defaults.enabledModelIds);
+      const resolvedDefaultModelId = Object.hasOwn(input, "defaultModelId")
+        ? (input.defaultModelId ?? null)
+        : (existing?.defaultModelId ?? defaults.defaultModelId);
       const resolvedModelEfforts = Object.hasOwn(input, "modelDefaultEfforts")
         ? (input.modelDefaultEfforts ?? defaults.modelDefaultEfforts)
         : (existing?.modelDefaultEfforts ?? defaults.modelDefaultEfforts);
+      const resolvedEgressDomains = normalizeEgressDomains(
+        Object.hasOwn(input, "approvedSandboxEgressDomains")
+          ? (input.approvedSandboxEgressDomains ?? defaults.approvedSandboxEgressDomains)
+          : (existing?.approvedSandboxEgressDomains ?? defaults.approvedSandboxEgressDomains)
+      );
 
       const configHash = computeConfigHash({
         tenantId,
@@ -253,7 +310,9 @@ export class TenantSettingsStore {
         enabledMcpServerIds: resolvedMcpIds,
         enabledProviders: resolvedProviders,
         enabledModelIds: resolvedModelIds,
-        modelDefaultEfforts: resolvedModelEfforts
+        defaultModelId: resolvedDefaultModelId,
+        modelDefaultEfforts: resolvedModelEfforts,
+        approvedSandboxEgressDomains: resolvedEgressDomains
       });
 
       const result = await client.query(
@@ -272,12 +331,14 @@ export class TenantSettingsStore {
             enabled_mcp_server_ids,
             enabled_providers,
             enabled_model_ids,
+            default_model_id,
             model_default_efforts,
+            approved_sandbox_egress_domains,
             version,
             config_hash,
             updated_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, 1, $15, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15::jsonb, $16::jsonb, 1, $17, NOW())
           ON CONFLICT (tenant_id) DO UPDATE SET
             show_effort_selector = EXCLUDED.show_effort_selector,
             web_search_mode = EXCLUDED.web_search_mode,
@@ -291,7 +352,9 @@ export class TenantSettingsStore {
             enabled_mcp_server_ids = EXCLUDED.enabled_mcp_server_ids,
             enabled_providers = EXCLUDED.enabled_providers,
             enabled_model_ids = EXCLUDED.enabled_model_ids,
+            default_model_id = EXCLUDED.default_model_id,
             model_default_efforts = EXCLUDED.model_default_efforts,
+            approved_sandbox_egress_domains = EXCLUDED.approved_sandbox_egress_domains,
             version = tenant_settings.version + 1,
             config_hash = EXCLUDED.config_hash,
             updated_at = NOW()
@@ -311,12 +374,17 @@ export class TenantSettingsStore {
           JSON.stringify(resolvedMcpIds),
           JSON.stringify(resolvedProviders),
           resolvedModelIds === null ? null : JSON.stringify(resolvedModelIds),
+          resolvedDefaultModelId,
           JSON.stringify(resolvedModelEfforts),
+          JSON.stringify(resolvedEgressDomains),
           configHash
         ]
       );
 
-      return mapRow(result.rows[0]);
-    });
+      const saved = mapRow(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(saved));
+      return saved;
+    };
+    return transactionClient ? write(transactionClient) : withTenantScope(this.db, tenantId, write);
   }
 }

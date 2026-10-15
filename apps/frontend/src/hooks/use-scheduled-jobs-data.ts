@@ -15,6 +15,7 @@ import {
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import type { ScheduledJob } from "@cogniplane/shared-types";
+import { inferScheduleMode } from "../lib/scheduled-job-schedule";
 import {
   defaultJobDraft,
   readScheduledJobDefaults,
@@ -56,7 +57,7 @@ export function useScheduledJobsData() {
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const editingJobIdRef = useRef<string | null>(null);
   const [expandedRunsJobId, setExpandedRunsJobId] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{ scope: "defaults" | "job" | "list"; message: string; jobId?: string } | null>(null);
 
   useEffect(() => {
     editingJobIdRef.current = editingJobId;
@@ -145,7 +146,7 @@ export function useScheduledJobsData() {
       try {
         await saveDefaultsMutation.mutateAsync(defaultsDraft);
       } catch (error) {
-        setActionError(toErrorMessage(error, "Failed to save defaults."));
+        setActionError({ scope: "defaults", message: toErrorMessage(error, "Failed to save defaults.") });
       }
     },
     [defaultsDraft, saveDefaultsMutation]
@@ -159,14 +160,17 @@ export function useScheduledJobsData() {
         await submitJobMutation.mutateAsync({ editingId: editingJobId, draft: jobDraft });
         setEditingJobId(null);
         setJobDraft(defaultJobDraft(defaultsDraft));
+        return true;
       } catch (error) {
-        setActionError(toErrorMessage(error, "Failed to save scheduled job."));
+        setActionError({ scope: "job", message: toErrorMessage(error, "Failed to save scheduled job.") });
+        return false;
       }
     },
     [defaultsDraft, editingJobId, jobDraft, submitJobMutation]
   );
 
   const handleCancelEdit = useCallback(() => {
+    setActionError(null);
     setEditingJobId(null);
     setJobDraft(defaultJobDraft(defaultsDraft));
   }, [defaultsDraft]);
@@ -177,6 +181,7 @@ export function useScheduledJobsData() {
       jobName: job.jobName,
       description: job.description ?? "",
       cronExpression: job.cronExpression,
+      scheduleMode: inferScheduleMode(job.cronExpression),
       timeZone: job.timeZone,
       prompt: job.input.prompt,
       enabled: job.enabled
@@ -191,7 +196,7 @@ export function useScheduledJobsData() {
           if (editingJobId === jobId) handleCancelEdit();
         },
         onError: (error) =>
-          setActionError(toErrorMessage(error, "Failed to delete scheduled job."))
+          setActionError({ scope: "list", jobId, message: toErrorMessage(error, "Failed to delete scheduled job.") })
       });
     },
     [deleteJobMutation, editingJobId, handleCancelEdit]
@@ -202,7 +207,7 @@ export function useScheduledJobsData() {
       setActionError(null);
       toggleJobMutation.mutate(job, {
         onError: (error) =>
-          setActionError(toErrorMessage(error, "Failed to update scheduled job."))
+          setActionError({ scope: "list", jobId: job.jobId, message: toErrorMessage(error, "Failed to update scheduled job.") })
       });
     },
     [toggleJobMutation]
@@ -225,13 +230,23 @@ export function useScheduledJobsData() {
     busyKey = `toggle-${toggleJobMutation.variables.jobId}`;
   else if (runsQuery.isFetching && expandedRunsJobId) busyKey = `runs-${expandedRunsJobId}`;
 
-  const loadError = jobsQuery.error ?? sectionsQuery.error;
   const runsError = runsQuery.error
     ? toErrorMessage(runsQuery.error, "Failed to load job runs.")
     : null;
 
   return {
     scheduledJobs,
+    jobsLoading: jobsQuery.isPending,
+    jobsLoadFailed: jobsQuery.isError,
+    retryJobs: () => { void jobsQuery.refetch(); },
+    defaultsDirty: JSON.stringify(defaultsDraft) !== JSON.stringify(defaultsFromSections),
+    resetDefaults: () => { setDefaultsDraft(defaultsFromSections); setActionError(null); },
+    defaultsError: actionError?.scope === "defaults" ? actionError.message : sectionsQuery.error
+      ? toErrorMessage(sectionsQuery.error, "Failed to load job defaults.") : null,
+    defaultsLoadFailed: sectionsQuery.isError,
+    retryDefaults: () => { void sectionsQuery.refetch(); },
+    jobError: actionError?.scope === "job" ? actionError.message : null,
+    listActionError: actionError?.scope === "list" ? actionError : null,
     defaultsDraft,
     setDefaultsDraft,
     jobDraft,
@@ -239,11 +254,10 @@ export function useScheduledJobsData() {
     editingJobId,
     expandedRunsJobId,
     jobRuns: runsQuery.data ?? [],
+    runsLoading: runsQuery.isPending && expandedRunsJobId !== null,
+    runsError,
+    retryRuns: () => { void runsQuery.refetch(); },
     busyKey,
-    error:
-      actionError ??
-      runsError ??
-      (loadError ? toErrorMessage(loadError, "Failed to load scheduled jobs.") : null),
     handleDefaultsSubmit,
     handleJobSubmit,
     handleEditJob,

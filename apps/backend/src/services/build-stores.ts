@@ -1,4 +1,11 @@
+import { envSchema } from "../config.js";
+import { ModelSpendingStore } from "./model-spending-store.js";
 import { ProjectStore } from "./project-store.js";
+import { PersonalCapabilityStore } from "./personal-capability-store.js";
+import { PersonalSkillStore } from "./skills/personal-skill-store.js";
+import { OrganizationSkillSubmissionStore } from "./skills/organization-skill-submission-store.js";
+import { SkillReleaseImpactStore } from "./skills/skill-release-impact-store.js";
+import { ProjectSkillStore } from "./skills/project-skill-store.js";
 import { ProjectMemberStore } from "./project-member-store.js";
 import { SessionExecutionStore } from "./session-execution-store.js";
 import type { FastifyBaseLogger } from "fastify";
@@ -14,9 +21,12 @@ import { CustomModelStore } from "./custom-model-store.js";
 import { GithubConnectionStore } from "./integrations/github/github-connection-store.js";
 import { IntegrationStateStore } from "./integrations/integration-state-store.js";
 import { NotionConnectionStore } from "./integrations/notion/notion-connection-store.js";
+import { JiraConnectionStore } from "./integrations/pipedream/jira-connection-store.js";
 import { MemoryStore } from "./memory-store.js";
 import { MessageStore } from "./message-store.js";
+import { MemberMcpCredentialStore } from "./member-mcp-credential-store.js";
 import { McpServerStore } from "./mcp-server-store.js";
+import { McpAppCspStore } from "./mcp/mcp-app-csp-store.js";
 import { PiiAnalyticsStore } from "./pii/pii-analytics-store.js";
 import { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "./pii/pii-scan-run-store.js";
@@ -46,6 +56,8 @@ export function buildStores(
     TOOL_CONTEXT_TTL_MS: number;
     SESSION_TRASH_RETENTION_DAYS?: number;
     DATA_ENCRYPTION_SECRET: string;
+    MODEL_SPENDING_MONTHLY_LIMIT_USD?: number;
+    MODEL_SPENDING_TURN_RESERVATION_USD?: number;
   }
 ) {
   const sessions = new SessionStore(db, schedulerDb, {
@@ -71,6 +83,7 @@ export function buildStores(
   const tenantMembers = new TenantMemberStore(db);
   const githubConnections = new GithubConnectionStore(db);
   const notionConnections = new NotionConnectionStore(db);
+  const jiraConnections = new JiraConnectionStore(db);
   const approvals = new ApprovalStore(db);
   const auditEvents = new AuditEventStore(db);
   const platformEvents = new PlatformEventStore(db);
@@ -82,8 +95,17 @@ export function buildStores(
   const policyDecisions = new PolicyDecisionStore(db);
 
   return {
+    modelSpending: new ModelSpendingStore(db, {
+      monthlyLimitUsd: timers?.MODEL_SPENDING_MONTHLY_LIMIT_USD ?? null,
+      turnReservationUsd: timers?.MODEL_SPENDING_TURN_RESERVATION_USD ?? envSchema.shape.MODEL_SPENDING_TURN_RESERVATION_USD.parse(undefined)
+    }),
     executions: new SessionExecutionStore(db),
     projects: new ProjectStore(db),
+    personalCapabilities: new PersonalCapabilityStore(db),
+    personalSkills: new PersonalSkillStore(db),
+    organizationSkillSubmissions: new OrganizationSkillSubmissionStore(db),
+    skillReleaseImpact: new SkillReleaseImpactStore(db),
+    projectSkills: new ProjectSkillStore(db),
     projectFiles: new ProjectFileStore(db, logger, privilegedDb),
     projectMembers: new ProjectMemberStore(db),
     sessions,
@@ -98,12 +120,15 @@ export function buildStores(
     skills,
     skillRevisions,
     mcpServers,
+    mcpAppCsp: new McpAppCspStore(db),
+    memberMcpCredentials: new MemberMcpCredentialStore(db, timers.DATA_ENCRYPTION_SECRET),
     tenantSettings,
     customModels,
     userSettings,
     tenantMembers,
     githubConnections,
     notionConnections,
+    jiraConnections,
     approvals,
     auditEvents,
     platformEvents,

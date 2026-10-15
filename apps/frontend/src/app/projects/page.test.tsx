@@ -22,6 +22,8 @@ vi.mock("../../components/console-page-header", () => ({
 vi.mock("../../lib/project-api", () => ({
   listProjects: vi.fn(),
   getProject: vi.fn(),
+  getProjectCapabilities: vi.fn(),
+  updateProjectCapabilities: vi.fn(),
   getProjectAccess: vi.fn(),
   archiveProject: vi.fn(),
   createProject: vi.fn()
@@ -60,6 +62,9 @@ beforeEach(() => {
     files: [],
     canManage: true
   }));
+  vi.mocked(api.getProjectCapabilities).mockResolvedValue({
+    selection: null, version: 1, canEdit: true, skills: [], connectors: []
+  });
   vi.mocked(api.getProjectAccess).mockResolvedValue({
     visibility: "private",
     organizationRole: "viewer",

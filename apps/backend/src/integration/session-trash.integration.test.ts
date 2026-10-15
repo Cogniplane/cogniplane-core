@@ -2,7 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 
 import { withTenantScope } from "../lib/db.js";
 import { SessionStore } from "../services/session-store.js";
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import {
   seedArtifact,
   seedDownloadToken,
@@ -30,7 +30,7 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
     await superuserPool().query("UPDATE artifacts SET storage_key=$1 WHERE artifact_id=$2", [storageKey, artifactId]);
     await superuserPool().query("UPDATE artifacts SET storage_key=$1 WHERE artifact_id=$2", [storageKey, otherArtifactId]);
 
-    const store = new SessionStore(appPool(), superuserPool());
+    const store = new SessionStore(appPool(), maintenancePool());
     expect(await store.remove(tenant, sessionId, user)).toBe(true);
     expect((await store.listPage(tenant, user, { status: "deleted" })).sessions).toHaveLength(1);
     expect((await store.listPage(otherTenant, otherUser, { status: "deleted" })).sessions).toEqual([]);
@@ -80,7 +80,7 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
     const tenant = await seedTenant();
     const user = await seedUser();
     const sessionId = await seedSession(tenant, user);
-    const store = new SessionStore(appPool(), superuserPool());
+    const store = new SessionStore(appPool(), maintenancePool());
 
     expect((await store.setArchived(tenant, sessionId, user, true))?.status).toBe("archived");
     expect(await store.remove(tenant, sessionId, user)).toBe(true);

@@ -13,20 +13,19 @@ import { useFileSources } from "../hooks/use-file-sources";
 import { useModelPreference } from "../hooks/use-model-preference";
 import { useAuth } from "../lib/auth-context";
 import { fetchModels } from "../lib/api-client";
+import { SHORTCUTS, useShortcut } from "../lib/keyboard-shortcuts";
 import { queryKeys } from "../lib/query-keys";
 import { listProjects, setProjectSession } from "../lib/project-api";
 
-import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus } from "./session-status.logic";
-import type { AguiCustomEvents } from "../lib/agui/use-agui-custom-events";
+import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus, type LiveTurnActivity } from "./session-status.logic";
 import { SessionSidebar } from "./session-sidebar";
 import { ArtifactPanel } from "./artifact-panel";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { FileSourcePicker } from "./file-source-picker";
+import { TranscriptFormatNotice } from "./transcript-format-notice";
 import { WorkspaceHeader } from "./workspace-header";
-import { getProjectLibrary } from "../lib/project-file-api";
-import type { ProjectLibrary } from "@cogniplane/shared-types";
-import { Input } from "./ui/input";
-import { projectFolderPath } from "./project-files.logic";
+import { useProjectFileSelection } from "../hooks/use-project-library";
+import { MAX_PROJECT_FILE_SELECTIONS, ProjectFileSelection } from "./project-file-selection";
 
 // CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
 // live HttpAgent in the browser — it never needs to server-render). Loading it
@@ -38,11 +37,9 @@ const CopilotChatHost = dynamic(
   { ssr: false }
 );
 import {
-  planStateFromMessages,
+  mcpAppsFromMessages,
   runtimeNoticesFromMessages,
-  toAguiInitialMessages,
-  toolStatusesFromMessages,
-  withoutInProgressReply
+  toolStatusesFromMessages
 } from "./agui-transcript";
 import {
   ARTIFACT_PANE_WIDTH,
@@ -55,9 +52,6 @@ import {
   deriveStreamingSessionIds
 } from "./session-list-derivations";
 import { contextWindowForModel, latestContextTokens, sessionCostUsd } from "./session-usage";
-
-const MAX_PROJECT_FILE_SELECTIONS = 20;
-const PROJECT_LIBRARY_DISABLED_QUERY_KEY = ["projects", "chat-project-library-disabled"] as const;
 
 export function ChatShell() {
   const { isLoading: authIsLoading, user } = useAuth();
@@ -92,9 +86,8 @@ export function ChatShell() {
   // Live signals lifted from CopilotChatHost (the AG-UI stream) for the active
   // session — the shell renders the sidebar/header but the running/approval
   // state lives inside the host's agent subscription.
-  const [turnActivity, setTurnActivity] = useState<AguiCustomEvents["turnActivity"]>(null);
-  const [liveIsRunning, setLiveIsRunning] = useState(false);
-  const [remoteIsRunning, setRemoteIsRunning] = useState(false);
+  const [turnActivity, setTurnActivity] = useState<LiveTurnActivity | null>(null);
+  const [turnRunning, setTurnRunning] = useState(false);
   // True from the end of a turn until the session list reloads. In that time
   // the saved approval flag can still show an approval that was answered.
   const [isReloadingAfterTurn, setIsReloadingAfterTurn] = useState(false);
@@ -115,34 +108,31 @@ export function ChatShell() {
     sessionId: string;
     draftId: string;
   } | null>(null);
-  const projectQuery = useQuery({
-    queryKey: projectId ? queryKeys.projects.library(projectId) : PROJECT_LIBRARY_DISABLED_QUERY_KEY,
-    queryFn: () => getProjectLibrary(projectId!),
-    enabled: Boolean(projectId)
-  });
-  const projectLibrary = projectQuery.data;
-  const availableProjectFileIds = useMemo(
-    () => new Set(projectLibrary?.files
-      .filter((file) => file.trashedAt === null)
-      .map((file) => file.fileId) ?? []),
-    [projectLibrary]
+  const [unavailableSelections, setUnavailableSelections] = useState<{
+    projectId: string | null;
+    count: number;
+  }>({ projectId: null, count: 0 });
+  const selectedProjectFileIds = useMemo(
+    () => (selectedProjectFiles.projectId === projectId ? selectedProjectFiles.ids : [])
+      .slice(0, MAX_PROJECT_FILE_SELECTIONS),
+    [projectId, selectedProjectFiles]
   );
-  const selectedProjectFileIds = useMemo(() => {
-    const ids = selectedProjectFiles.projectId === projectId
-      ? selectedProjectFiles.ids
-      : [];
-    return ids
-      .filter((fileId) => availableProjectFileIds.has(fileId))
-      .slice(0, MAX_PROJECT_FILE_SELECTIONS);
-  }, [availableProjectFileIds, projectId, selectedProjectFiles]);
+  // Loads exactly the selected files, so selections outlive picker searches
+  // and pages, and deleted or inaccessible files can be detected.
+  const selectionQuery = useProjectFileSelection(projectId, selectedProjectFileIds);
+  const resolveDraftQuery = useProjectFileSelection(
+    projectId,
+    resolveDraftId && sessionId ? [resolveDraftId] : []
+  );
 
   useEffect(() => {
-    if (!resolveDraftId || !projectId || !sessionId || !projectQuery.isSuccess) return;
-    // Wait for the library query before consuming the URL intent. This keeps a
-    // valid draft from being filtered out while the library is still loading.
+    if (!resolveDraftId || !projectId || !sessionId || resolveDraftQuery.isPlaceholderData) return;
+    // Wait for the draft lookup before consuming the URL intent. This keeps a
+    // valid draft from being dropped while the lookup is still loading.
+    if (!resolveDraftQuery.isSuccess && !resolveDraftQuery.isError) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setConsumedResolveDraftId(resolveDraftId);
-    if (availableProjectFileIds.has(resolveDraftId)) {
+    if (resolveDraftQuery.data?.items.some((file) => file.fileId === resolveDraftId)) {
       setResolveDraftIntent({ sessionId, draftId: resolveDraftId });
       const currentIds = selectedProjectFiles.projectId === projectId
         ? selectedProjectFiles.ids
@@ -157,7 +147,7 @@ export function ChatShell() {
     const url = new URL(window.location.href);
     url.searchParams.delete("resolveDraft");
     window.history.replaceState(window.history.state, "", url);
-  }, [availableProjectFileIds, projectId, projectQuery.isSuccess, resolveDraftId, selectedProjectFiles.ids, selectedProjectFiles.projectId, sessionId]);
+  }, [projectId, resolveDraftId, resolveDraftQuery.data, resolveDraftQuery.isError, resolveDraftQuery.isPlaceholderData, resolveDraftQuery.isSuccess, selectedProjectFiles.ids, selectedProjectFiles.projectId, sessionId]);
 
   useEffect(() => {
     if (!resolveDraftIntent || resolveDraftIntent.sessionId === sessionId) return;
@@ -168,16 +158,39 @@ export function ChatShell() {
   }, [resolveDraftIntent, sessionId]);
 
   useEffect(() => {
-    if (selectedProjectFiles.projectId !== projectId) return;
-    const reconciledIds = selectedProjectFiles.ids
-      .filter((fileId) => availableProjectFileIds.has(fileId))
-      .slice(0, MAX_PROJECT_FILE_SELECTIONS);
-    if (reconciledIds.length === selectedProjectFiles.ids.length &&
-        reconciledIds.every((fileId, index) => fileId === selectedProjectFiles.ids[index])) return;
+    if (!projectId || selectedProjectFiles.projectId !== projectId) return;
+    // Placeholder data belongs to the previous ID list. Only a response for the
+    // current list proves that a missing ID is deleted or inaccessible.
+    if (!selectionQuery.isSuccess || selectionQuery.isPlaceholderData) return;
+    const available = new Set(selectionQuery.data.items.map((file) => file.fileId));
+    const reconciledIds = selectedProjectFileIds.filter((fileId) => available.has(fileId));
+    if (reconciledIds.length === selectedProjectFiles.ids.length) return;
     // The query is the source of truth after trash/restore/promotion changes.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedProjectFiles({ projectId, ids: reconciledIds });
-  }, [availableProjectFileIds, projectId, selectedProjectFiles]);
+    setUnavailableSelections({
+      projectId,
+      count: selectedProjectFiles.ids.length - reconciledIds.length
+    });
+  }, [projectId, selectedProjectFileIds, selectedProjectFiles, selectionQuery.data, selectionQuery.isPlaceholderData, selectionQuery.isSuccess]);
+
+  // A turn gets the selected IDs that a lookup confirmed. Placeholder data is
+  // the result for the previous ID list. It still confirms the IDs that stay
+  // selected, so a checkbox toggle does not drop them while the new lookup
+  // runs. The server filters the IDs again when it captures the snapshot.
+  const confirmedProjectFileIds = useMemo(() => {
+    const confirmed = new Set(selectionQuery.data?.items.map((file) => file.fileId) ?? []);
+    // The resolve-draft lookup confirmed its draft. Keep it for the handoff
+    // turn while the lookup for the full list is still loading.
+    if (resolveDraftIntent?.sessionId === sessionId) confirmed.add(resolveDraftIntent.draftId);
+    return selectedProjectFileIds.filter((fileId) => confirmed.has(fileId));
+  }, [resolveDraftIntent, selectedProjectFileIds, selectionQuery.data, sessionId]);
+  // Newly added IDs wait for the lookup. The picker tells the user that a turn
+  // sent now does not include them.
+  const checkingProjectFileCount = !selectionQuery.isError &&
+    (!selectionQuery.isSuccess || selectionQuery.isPlaceholderData)
+    ? selectedProjectFileIds.length - confirmedProjectFileIds.length
+    : 0;
 
   const selectSession = useCallback(
     (sessionId: string) => {
@@ -186,6 +199,18 @@ export function ChatShell() {
     },
     [sessionList]
   );
+
+  // Quick jump opens a session with a link to "/?session=<id>". On this page the link
+  // changes only the URL, so select the session when the link changes.
+  const linkedSessionId = searchParams?.get("session") ?? null;
+  const previousLinkedSessionId = useRef(linkedSessionId);
+  useEffect(() => {
+    if (linkedSessionId === previousLinkedSessionId.current) return;
+    previousLinkedSessionId.current = linkedSessionId;
+    // The URL is the external source. Selecting also writes storage and history, so it cannot run during render.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (linkedSessionId && linkedSessionId !== sessionList.selectedSessionId) selectSession(linkedSessionId);
+  }, [linkedSessionId, selectSession, sessionList.selectedSessionId]);
 
   const addSessionToProject = useCallback(async (sessionId: string, projectId: string) => {
     await setProjectSession(projectId, sessionId);
@@ -224,6 +249,8 @@ export function ChatShell() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [isArtifactPaneOpen, isSidebarOpen]);
+  useShortcut(SHORTCUTS.toggleSidebar, () => setIsSidebarOpen((open) => !open));
+  useShortcut(SHORTCUTS.toggleArtifacts, () => setIsArtifactPaneOpen((open) => !open), Boolean(sessionList.selectedSession));
 
   const { model, setModel } = useModelPreference(allModels);
   const selectedModel = allModels.find((entry) => entry.id === model) ?? null;
@@ -261,8 +288,7 @@ export function ChatShell() {
     // is gated on isSessionDataReady below, so this transient shell state is
     // safe while the new session data loads.
     setSignalSessionId(sessionList.selectedSessionId);
-    setLiveIsRunning(false);
-    setRemoteIsRunning(false);
+    setTurnRunning(false);
     setIsReloadingAfterTurn(false);
     // Reset activity with its session identity so it cannot describe the next selection.
     setTurnActivity(null);
@@ -333,50 +359,37 @@ export function ChatShell() {
       displaySessions,
       sessionList.selectedSessionId,
       liveApprovalCount,
-      liveIsRunning || remoteIsRunning || isReloadingAfterTurn
+      turnRunning || isReloadingAfterTurn
     ),
-    [displaySessions, sessionList.selectedSessionId, liveApprovalCount, liveIsRunning, remoteIsRunning, isReloadingAfterTurn]
+    [displaySessions, sessionList.selectedSessionId, liveApprovalCount, turnRunning, isReloadingAfterTurn]
   );
 
-  // Only the selected session has a live host, so it's the only one that can be
-  // streaming — map the lifted boolean onto its id (the faithful replacement for
-  // the retired SSE streamingSessionId). A turn the host polls counts too.
-  const selectedIsRunning = liveIsRunning || remoteIsRunning;
+  // Only the selected session has a host, so it is the only one that can
+  // stream. Map the lifted running state onto its id. A turn that the host
+  // polls counts too.
   const streamingSessionIds = useMemo(
     () =>
       deriveStreamingSessionIds(
         displaySessions,
-        selectedIsRunning ? sessionList.selectedSessionId : null
+        turnRunning ? sessionList.selectedSessionId : null
       ),
-    [displaySessions, selectedIsRunning, sessionList.selectedSessionId]
+    [displaySessions, turnRunning, sessionList.selectedSessionId]
   );
 
   const contextTokens = latestContextTokens(chatWorkspace.messages);
   const contextWindow = contextWindowForModel(selectedModel);
   const sessionCost = sessionCostUsd(chatWorkspace.messages);
-  // Seed the CopilotChat transcript with persisted history. Recomputed on
-  // message change, but CopilotChatHost only reads it at mount (agent
-  // construction), so post-turn refreshes don't reconstruct the live agent.
-  // For a running turn, the host attaches to the turn at mount, and the replay
-  // adds the reply. So leave the saved in-progress reply out.
+  // CopilotChat loads the transcript and plan through the session connection.
+  // The saved messages here only seed the side state: failed or declined tool
+  // calls, MCP apps, and runtime notices. The hook re-seeds them when the
+  // session changes.
   const selectedIsServerRunning = sessionList.selectedSession?.isRunning === true;
-  const initialMessages = useMemo(
-    () => toAguiInitialMessages(
-      selectedIsServerRunning ? withoutInProgressReply(chatWorkspace.messages) : chatWorkspace.messages
-    ),
-    [chatWorkspace.messages, selectedIsServerRunning]
-  );
-  // Plan pane rides agent state, not messages; seed it from persisted plan
-  // markdown so reload restores it (CopilotChatHost reads both only at mount).
-  const initialState = useMemo(
-    () => planStateFromMessages(chatWorkspace.messages),
-    [chatWorkspace.messages]
-  );
-  // Failed/declined tool calls the native card can't render as failures; seeded
-  // into the tool-status side-channel so a reloaded session shows them. Unlike
-  // initialMessages, the hook re-seeds this on session re-key.
   const initialToolStatuses = useMemo(
     () => toolStatusesFromMessages(chatWorkspace.messages),
+    [chatWorkspace.messages]
+  );
+  const initialMcpApps = useMemo(
+    () => mcpAppsFromMessages(chatWorkspace.messages),
     [chatWorkspace.messages]
   );
   // Saved runtime notices, re-seeded on session re-key like the tool failures.
@@ -530,20 +543,20 @@ export function ChatShell() {
                     No models are available
                   </h2>
                   {/* AuthGuard sends a member straight back here from
-                      /admin/organization, so offering them the link is a
+                      /admin/models, so offering them the link is a
                       redirect loop. `noModelsAvailable` does not narrow
                       `user` for TypeScript, hence the optional chain. */}
                   {user?.role === "admin" || user?.role === "owner" ? (
                     <>
                       <p className="max-w-md text-sm text-on-surface-variant">
-                        Check provider credentials and enable at least one model in Organization
-                        settings to start a conversation.
+                        Set up provider credentials and enable at least one model in Models
+                        to start a conversation.
                       </p>
                       <a
-                        href="/admin/organization"
+                        href="/admin/models"
                         className="inline-flex items-center rounded-md border border-outline-variant bg-surface px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container"
                       >
-                        Open admin settings
+                        Open Models
                       </a>
                     </>
                   ) : (
@@ -554,29 +567,24 @@ export function ChatShell() {
                   )}
                 </div>
               </section>
+            ) : selectedRawSession && selectedRawSession.transcriptFormat !== "current" ? (
+              // The chat reopens only sessions in the current history format.
+              <TranscriptFormatNotice
+                format={selectedRawSession.transcriptFormat}
+                isCreating={sessionList.isCreatingSession}
+                onNewSession={() => {
+                  void sessionList.createSession(selectedRawSession.canEdit === false ? null : projectId).catch(() => {});
+                }}
+              />
             ) : sessionList.selectedSessionId && chatWorkspace.isSessionDataReady ? (
-              <>
-              {/* The backend caps a transcript at its newest N messages. Say so
-                  explicitly — a clipped history is indistinguishable from a
-                  complete one, and there is no load-older flow to reach the rest. */}
-              {chatWorkspace.hasMoreMessages ? (
-                <div
-                  role="status"
-                  className="border-b border-outline-variant bg-surface-container-low px-6 py-2 text-center text-xs text-on-surface-variant"
-                >
-                  Older messages in this session aren&apos;t shown. The most recent history is
-                  displayed below.
-                </div>
-              ) : null}
               <CopilotChatHost
-                // Key on session so switching sessions remounts the host with
-                // that session's history seeded at construction.
+                // Key on session so switching sessions remounts the host. The
+                // new host connects and loads that session's history.
                 key={sessionList.selectedSessionId}
                 session={{
                   id: sessionList.selectedSessionId,
-                  initialMessages,
-                  initialState,
                   initialToolStatuses,
+                  initialMcpApps,
                   initialApprovals: chatWorkspace.initialApprovals,
                   initialNotices,
                   isRunning: selectedIsServerRunning,
@@ -595,7 +603,7 @@ export function ChatShell() {
                 }}
                 usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
                 artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
-                projectFileIds={selectedProjectFileIds}
+                projectFileIds={confirmedProjectFileIds}
                 events={{
                   onInitialPromptSent: () => setResolveDraftIntent(null),
                   onTurnSettled: () => {
@@ -611,12 +619,10 @@ export function ChatShell() {
                     }
                   },
                   onTurnActivityChange: setTurnActivity,
-                  onRunningChange: setLiveIsRunning,
-                  onRemoteRunningChange: setRemoteIsRunning,
+                  onTurnRunningChange: setTurnRunning,
                   onPendingApprovalsChange: setLiveApprovalCount
                 }}
               />
-              </>
             ) : null}
           </div>
 
@@ -646,22 +652,31 @@ export function ChatShell() {
                   showArtifactPane ? "translate-x-0" : "translate-x-full md:translate-x-0"
                 }`}
               >
-                <ProjectFileSelection
-                  library={projectLibrary}
-                  selectedIds={selectedProjectFileIds}
-                  onToggle={(fileId) => setSelectedProjectFiles((current) =>
-                    {
-                      const validIds = current.projectId === projectId
-                        ? current.ids.filter((id) => availableProjectFileIds.has(id))
-                        : [];
-                      if (validIds.includes(fileId)) {
-                        return { projectId, ids: validIds.filter((id) => id !== fileId) };
-                      }
-                      if (validIds.length >= MAX_PROJECT_FILE_SELECTIONS) return current;
-                      return { projectId, ids: [...validIds, fileId] };
-                    }
-                  )}
-                />
+                {projectId ? (
+                  <ProjectFileSelection
+                    key={projectId}
+                    projectId={projectId}
+                    selectedIds={selectedProjectFileIds}
+                    selectedEntries={selectionQuery.data?.items ?? []}
+                    unavailableCount={unavailableSelections.projectId === projectId ? unavailableSelections.count : 0}
+                    checkingCount={checkingProjectFileCount}
+                    lookupFailed={selectionQuery.isError}
+                    // A failed refetch keeps the last result, and a turn still sends those files.
+                    lookupKeptLastCheck={selectionQuery.data !== undefined}
+                    onRetryLookup={() => void selectionQuery.refetch()}
+                    onToggle={(fileId) => {
+                      setUnavailableSelections({ projectId: null, count: 0 });
+                      setSelectedProjectFiles((current) => {
+                        const ids = current.projectId === projectId ? current.ids : [];
+                        if (ids.includes(fileId)) {
+                          return { projectId, ids: ids.filter((id) => id !== fileId) };
+                        }
+                        if (ids.length >= MAX_PROJECT_FILE_SELECTIONS) return current;
+                        return { projectId, ids: [...ids, fileId] };
+                      });
+                    }}
+                  />
+                ) : null}
                 <ArtifactPanel
                   inventory={{
                     artifacts: chatWorkspace.artifacts
@@ -713,82 +728,5 @@ export function ChatShell() {
         />
       )}
     </div>
-  );
-}
-
-function ProjectFileSelection({
-  library,
-  selectedIds,
-  onToggle
-}: {
-  library?: ProjectLibrary;
-  selectedIds: string[];
-  onToggle: (fileId: string) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const normalizedQuery = query.trim().toLowerCase();
-  const groups = useMemo(() => {
-    const files = library?.files.filter((file) => file.trashedAt === null) ?? [];
-    const folders = library?.folders ?? [];
-    const grouped = new Map<string, typeof files>();
-    for (const file of files) {
-      const folder = projectFolderPath(folders, file.folderId);
-      const searchable = `${file.name} ${folder}`.toLowerCase();
-      if (normalizedQuery && !searchable.includes(normalizedQuery)) continue;
-      const group = grouped.get(folder) ?? [];
-      group.push(file);
-      grouped.set(folder, group);
-    }
-    return [...grouped.entries()]
-      .map(([folder, entries]) => [
-        folder,
-        entries.sort((a, b) => a.name.localeCompare(b.name) || a.fileId.localeCompare(b.fileId))
-      ] as const)
-      .sort(([a], [b]) => a.localeCompare(b));
-  }, [library, normalizedQuery]);
-  if (!library || !library.files.some((file) => file.trashedAt === null)) return null;
-  return (
-    <section aria-labelledby="project-file-selection-title" className="border-b border-outline-variant p-4">
-      <h2 id="project-file-selection-title" className="text-sm font-semibold">Project files</h2>
-      <p className="mt-1 text-xs text-on-surface-variant">
-        Prioritize up to {MAX_PROJECT_FILE_SELECTIONS} files for this turn. Other published files remain available when they are in the captured snapshot.
-      </p>
-      <Input
-        aria-label="Search project files"
-        className="mt-3"
-        placeholder="Search project files"
-        value={query}
-        onChange={(event) => setQuery(event.target.value)}
-      />
-      <p className="mt-2 text-xs text-on-surface-variant">
-        {selectedIds.length}/{MAX_PROJECT_FILE_SELECTIONS} prioritized
-      </p>
-      <div className="mt-3 max-h-[min(38vh,22rem)] space-y-4 overflow-y-auto pr-1">
-        {groups.map(([folder, entries]) => (
-          <section key={folder} aria-label={folder}>
-            <h3 className="mb-2 text-xs font-medium text-on-surface-variant">{folder}</h3>
-            <div className="space-y-2">
-              {entries.map((file) => (
-                <label key={file.fileId} className="flex items-start gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.includes(file.fileId)}
-                    onChange={() => onToggle(file.fileId)}
-                    disabled={!selectedIds.includes(file.fileId) && selectedIds.length >= MAX_PROJECT_FILE_SELECTIONS}
-                    className="mt-0.5"
-                  />
-                  <span className="min-w-0 break-words">
-                    {file.name}{file.kind === "draft" ? " (draft)" : ""}
-                  </span>
-                </label>
-              ))}
-            </div>
-          </section>
-        ))}
-        {groups.length === 0 ? (
-          <p className="text-sm text-on-surface-variant">No project files match this search.</p>
-        ) : null}
-      </div>
-    </section>
   );
 }

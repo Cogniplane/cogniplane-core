@@ -55,6 +55,7 @@ export function buildRuntimeAdapter(input: {
       // In-process usage/cost accounting (each provider's API is called
       // directly from the backend).
       messages: stores.messages,
+      modelSpending: stores.modelSpending,
       // Materializes bundle companion files into the /skills/ library.
       skillBundles: skillBundleStorage,
       tenantMembers: stores.tenantMembers,

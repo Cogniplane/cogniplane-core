@@ -23,6 +23,9 @@ import { Input } from "@/components/ui/input";
 import { ProjectFiles } from "./project-files";
 import { ProjectInstructionsEditor } from "./project-instructions-editor";
 import { ProjectSharing } from "./project-sharing";
+import { ProjectCapabilities } from "./project-capabilities";
+import { ProjectSkills } from "./project-skills";
+import { useAuth } from "@/lib/auth-context";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PROJECT_SELECT } from "@/lib/project-ui";
 const APPROVAL_MODE_HELP: Record<Project["approvalMode"], string> = {
@@ -45,6 +48,8 @@ export function ProjectWorkspace({
   view?: ProjectWorkspaceView;
 }) {
   const client = useQueryClient();
+  const { user } = useAuth();
+  const [skillsRevision, setSkillsRevision] = useState(0);
   const router = useRouter();
   const [name, setName] = useState(project.name);
   const [renaming, setRenaming] = useState(false);
@@ -56,15 +61,7 @@ export function ProjectWorkspace({
   const [fileModeDraft, setFileModeDraft] = useState<Project["agentFileMode"] | null>(null);
   const detail = useQuery({
     queryKey: ["projects", project.projectId],
-    queryFn: () => getProject(project.projectId),
-    refetchInterval: (query) =>
-      query.state.data?.files.some(
-        (file) =>
-          ["pending", "processing"].includes(file.status) ||
-          ["pending", "scanning"].includes(file.detail?.pii?.status ?? "")
-      )
-        ? 10000
-        : false
+    queryFn: () => getProject(project.projectId)
   });
   const canManageProject = detail.data?.canManage === true;
   const canEditProject = detail.data?.canEdit === true || canManageProject;
@@ -207,11 +204,19 @@ export function ProjectWorkspace({
             <div>
               <h3 className="text-lg font-semibold">Project settings</h3>
               <p className="mt-1 text-sm text-on-surface-variant">
-                Manage the project name, instructions, access, and agent behavior.
+                Manage the project name, access, skills, connections, and agent behavior.
               </p>
             </div>
             <ProjectInstructionsEditor key={project.projectId} project={currentProject} canManage={canManageProject} />
-            <ProjectSharing project={currentProject} canManage={canManageProject} />
+            <ProjectSharing project={currentProject} canManage={canManageProject} currentUserId={user?.userId} />
+            {user ? <ProjectSkills key={`${user.tenantId}:${user.userId}:${project.projectId}`}
+              scope={{ tenantId: user.tenantId, userId: user.userId, projectId: project.projectId }}
+              projectName={currentProject.name} archived={Boolean(currentProject.archivedAt)}
+              canManage={canManageProject} onChanged={() => setSkillsRevision((value) => value + 1)}
+              onAccessFailure={detail.refetch} /> : null}
+            <ProjectCapabilities projectId={project.projectId} archived={Boolean(currentProject.archivedAt)}
+              refreshRevision={skillsRevision}
+              canManage={canManageProject} onAccessFailure={() => detail.refetch()} />
             {canManageProject ? <section aria-labelledby="project-approval-title" className="rounded-lg border border-outline-variant bg-surface-container-low p-5">
               <h3 id="project-approval-title" className="font-semibold">Agent approvals</h3>
               <p id="project-approval-help" className="mt-1 text-sm text-on-surface-variant">
@@ -509,7 +514,8 @@ export function ProjectWorkspace({
               </ul>
             </details>
           ) : null}
-          <ProjectFiles project={currentProject} sources={detail.data.files} canEdit={detail.data.canEdit ?? canManageProject} />
+          <ProjectFiles project={currentProject} initialSources={detail.data.files} sourcesUpdatedAt={detail.dataUpdatedAt}
+            canEdit={detail.data.canEdit ?? canManageProject} />
           </>
         )
       ) : null}

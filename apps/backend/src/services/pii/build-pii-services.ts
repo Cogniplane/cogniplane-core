@@ -19,6 +19,7 @@ import { PiiArtifactScanEnqueuer } from "./pii-artifact-scan-enqueuer.js";
 import { PiiScanJobHandler } from "./pii-scan-job-handler.js";
 import { DatabasePiiScanSubjectReader } from "./pii-scan-subject-reader.js";
 import { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
+import type { PdfTextExtractor } from "./scannable-text.js";
 
 import type { Stores } from "../build-stores.js";
 
@@ -30,8 +31,9 @@ export function buildPiiServices(input: {
   artifactStorage: ArtifactStorage;
   tenantOrgSettingsPrivileged: TenantOrgSettingsStore;
   redis: ReturnType<typeof getRedis>;
+  extractPdfText: PdfTextExtractor;
 }) {
-  const { config, logger, db, stores, artifactStorage, tenantOrgSettingsPrivileged, redis } = input;
+  const { config, logger, db, stores, artifactStorage, tenantOrgSettingsPrivileged, redis, extractPdfText } = input;
 
   const piiCircuitBreaker: PiiCircuitBreaker = config.PII_BREAKER_ENABLED
     ? createPiiCircuitBreaker({
@@ -63,7 +65,8 @@ export function buildPiiServices(input: {
     storage: artifactStorage,
     // Same source as the service-level cap, so the stream-time guard never
     // rejects an artifact the configured policy would otherwise allow.
-    maxBytes: config.PII_ARTIFACT_MAX_BYTES
+    maxBytes: config.PII_ARTIFACT_MAX_BYTES,
+    extractPdfText
   });
 
   const findingEncryptor = config.PII_RETENTION_KEK

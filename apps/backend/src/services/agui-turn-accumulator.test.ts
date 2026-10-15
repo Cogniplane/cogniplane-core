@@ -25,49 +25,6 @@ describe("AguiTurnAccumulator", () => {
     expect(turn.assistantText).toBe("hello");
   });
 
-  test("text_retracted drops assistant text streamed so far, keeps later text", () => {
-    const turn = feed([
-      e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "refused" }),
-      e({ type: EventType.CUSTOM, name: "text_retracted", value: {} }),
-      e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "real answer" })
-    ]);
-    expect(turn.assistantText).toBe("real answer");
-  });
-
-  test("text_retracted keeps a tool call that already ran, with its recorded offset", () => {
-    // Refusal-fallback (output_text.replace → text_retracted) after a tool call
-    // that actually executed. text_retracted is a TEXT-only retraction: the
-    // mapper emits it independently of tool_retracted, so a call that ran before
-    // the draft was replaced is legitimately retained — dropping it would lose a
-    // real executed action. Its textOffset is recorded at TOOL_CALL_START and is
-    // NOT rewritten by the retraction (the accumulator only touches text and
-    // reasoning here), so it stays at the length of the now-retracted draft.
-    // That stale offset is safe on reload: the interleaver walks insertions in
-    // ascending-offset order and slices text with `content.slice(cursor, offset)`
-    // (JS tolerates an offset past the end), so a card whose offset exceeds the
-    // replacement text simply renders at the end — never lost, never duplicated.
-    // This test pins the accumulator's raw recorded offset (the value the reload
-    // path receives); the placement itself is exercised by the interleave tests
-    // in chat-shell.logic.test.ts.
-    const turn = feed([
-      e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "refused draft " }),
-      e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
-      e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ran" }),
-      e({ type: EventType.CUSTOM, name: "text_retracted", value: {} }),
-      e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "real answer" })
-    ]);
-
-    expect(turn.assistantText).toBe("real answer");
-    const [result] = turn.toolResults();
-    // The executed call survives the retraction (unlike reasoning, which is dropped).
-    expect(result?.toolResultId).toBe("c1");
-    expect(result?.status).toBe("completed");
-    expect(result?.output).toBe("ran");
-    // Offset stays where TOOL_CALL_START recorded it — the length of the now-gone
-    // "refused draft " prefix (14), NOT re-anchored to the replacement text.
-    expect(result?.textOffset).toBe("refused draft ".length);
-  });
-
   test("takes the last STATE_DELTA /plan value as the plan markdown", () => {
     const turn = feed([
       e({ type: EventType.STATE_DELTA, delta: [{ op: "add", path: "/plan", value: "step 1" }] }),
@@ -224,22 +181,17 @@ describe("AguiTurnAccumulator", () => {
     expect(result.server).toBe("github");
   });
 
-  test("captures uiResources from a tool_ui_resources custom event (F7)", () => {
-    const uiResources = [{ uri: "ui://card", mimeType: "text/html", text: "<b>hi</b>" }];
-    const turn = feed([
+  test("ignores a retired tool_ui_resources event from an older runtime", () => {
+    const events = [
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "render" }),
-      e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" }),
-      e({ type: EventType.CUSTOM, name: "tool_ui_resources", value: { toolCallId: "c1", uiResources } })
-    ]);
-    expect(turn.toolResults()[0].uiResources).toEqual(uiResources);
-  });
-
-  test("a tool with no uiResources omits the field", () => {
-    const turn = feed([
-      e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "t" }),
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" })
-    ]);
-    expect(turn.toolResults()[0].uiResources).toBeUndefined();
+    ];
+    const legacy = e({ type: EventType.CUSTOM, name: "tool_ui_resources", value: {
+      toolCallId: "c1", uiResources: [{ uri: "ui://card", mimeType: "text/html", text: "<b>hi</b>" }]
+    } });
+    const turn = feed([...events, legacy]);
+    expect(turn.toolResults()).toEqual(feed(events).toolResults());
+    expect(turn.toolResults()[0]).not.toHaveProperty("uiResources");
   });
 
   test("preserves tool call order across interleaved calls", () => {
@@ -250,15 +202,6 @@ describe("AguiTurnAccumulator", () => {
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "a", content: "1" })
     ]);
     expect(turn.toolResults().map((r) => r.toolResultId)).toEqual(["a", "b"]);
-  });
-
-  test("tool_retracted removes the named calls (refusal fallback)", () => {
-    const turn = feed([
-      e({ type: EventType.TOOL_CALL_START, toolCallId: "a", toolCallName: "keep" }),
-      e({ type: EventType.TOOL_CALL_START, toolCallId: "b", toolCallName: "drop" }),
-      e({ type: EventType.CUSTOM, name: "tool_retracted", value: { itemIds: ["b"] } })
-    ]);
-    expect(turn.toolResults().map((r) => r.toolResultId)).toEqual(["a"]);
   });
 
   test("empty args default to {} at reconstruction time via the frontend, stored as-is here", () => {
@@ -285,7 +228,7 @@ describe("AguiTurnAccumulator", () => {
         { offset: 0, text: "first" },
         { offset: 5, text: "second" }
       ]);
-      // The flat fallback still concatenates every burst.
+      // The flat copy concatenates every burst.
       expect(turn.reasoningText).toBe("firstsecond");
     });
 
@@ -296,18 +239,6 @@ describe("AguiTurnAccumulator", () => {
         e({ type: EventType.REASONING_MESSAGE_END, messageId: "r1" })
       ]);
       expect(turn.reasoningSegments()).toEqual([]);
-    });
-
-    test("text_retracted drops reasoning segments (refusal fallback)", () => {
-      const turn = feed([
-        e({ type: EventType.REASONING_MESSAGE_START, messageId: "r1" }),
-        e({ type: EventType.REASONING_MESSAGE_CONTENT, messageId: "r1", delta: "refused reasoning" }),
-        e({ type: EventType.REASONING_MESSAGE_END, messageId: "r1" }),
-        e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "refused" }),
-        e({ type: EventType.CUSTOM, name: "text_retracted" })
-      ]);
-      expect(turn.reasoningSegments()).toEqual([]);
-      expect(turn.reasoningText).toBe("");
     });
 
     test("no reasoning → empty segment list", () => {

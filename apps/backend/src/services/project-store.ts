@@ -4,7 +4,15 @@ import { uuidv7 } from "../lib/uuid.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
 import { ProjectAccessError, projectRoleSql, requireProjectAccess } from "./project-access.js";
 import type { PoolClient } from "pg";
-import { ProjectApprovalModeSchema, type Project, type ProjectAgentFileMode, type ProjectApprovalMode } from "@cogniplane/shared-types";
+import { ProjectApprovalModeSchema, SessionCapabilitySelectionSchema, type SessionCapabilitySelection, type Project, type ProjectAgentFileMode, type ProjectApprovalMode, type ProjectCapabilitiesUpdate } from "@cogniplane/shared-types";
+import { hasUnavailableAdditions } from "./capability-selection.js";
+
+export const projectCapabilityIdleSql = `NOT EXISTS (SELECT 1 FROM session_executions e
+  WHERE e.tenant_id=p.tenant_id AND e.project_id=p.project_id AND e.status='active' AND e.expires_at>clock_timestamp())
+  AND NOT EXISTS (SELECT 1 FROM approvals a JOIN sessions s ON s.tenant_id=a.tenant_id AND s.session_id=a.session_id
+    WHERE s.tenant_id=p.tenant_id AND s.project_id=p.project_id AND a.status='pending')
+  AND NOT EXISTS (SELECT 1 FROM messages m JOIN sessions s ON s.tenant_id=m.tenant_id AND s.session_id=m.session_id
+    WHERE s.tenant_id=p.tenant_id AND s.project_id=p.project_id AND m.role='assistant' AND m.status='streaming')`;
 
 // Conversation activity and new files count as project activity, without
 // touching a project row on every message or scan-progress write.
@@ -34,6 +42,55 @@ function map(row: Record<string, unknown>): Project {
 }
 export class ProjectStore {
   constructor(private readonly db: Pool) {}
+
+  async getCapabilities(tenantId: string, userId: string, projectId: string) {
+    return withTenantScope(this.db, tenantId, async (db) => {
+      const result = await db.query(
+        `SELECT p.capability_selection, p.capability_version,
+          (${projectRoleSql("p", "$2")} = 'owner' AND p.archived_at IS NULL AND ${projectCapabilityIdleSql}) AS can_edit
+         FROM projects p WHERE p.tenant_id=$1 AND p.project_id=$3
+           AND ${projectRoleSql("p", "$2")} IS NOT NULL`,
+        [tenantId, userId, projectId]
+      );
+      const row = result.rows[0];
+      if (!row) throw new ProjectAccessError("project_not_found", "This project is unavailable.", 404);
+      return {
+        selection: SessionCapabilitySelectionSchema.nullable().parse(row.capability_selection),
+        version: Number(row.capability_version),
+        canEdit: row.can_edit === true
+      };
+    });
+  }
+
+  async setCapabilities(tenantId: string, userId: string, projectId: string, input: ProjectCapabilitiesUpdate,
+    available?: SessionCapabilitySelection) {
+    return withTenantScope(this.db, tenantId, async (db) => {
+      await this.authorize(db, tenantId, userId, projectId, "owner", true);
+      const current = await db.query(
+        "SELECT capability_selection, capability_version FROM projects WHERE tenant_id=$1 AND project_id=$2",
+        [tenantId, projectId]
+      );
+      if (Number(current.rows[0]?.capability_version) !== input.version) return false;
+      const saved = SessionCapabilitySelectionSchema.nullable().parse(current.rows[0].capability_selection);
+      if (available && hasUnavailableAdditions(input.selection, saved, available)) return false;
+      const result = await db.query(
+        `UPDATE projects p SET capability_selection=$4::jsonb, capability_version=capability_version+1
+         WHERE p.tenant_id=$1 AND p.project_id=$3 AND ${projectRoleSql("p", "$2")} = 'owner'
+           AND p.archived_at IS NULL AND p.capability_version=$5 AND ${projectCapabilityIdleSql}
+         RETURNING p.capability_version`,
+        [tenantId, userId, projectId, input.selection === null ? null : JSON.stringify(input.selection), input.version]
+      );
+      if (!result.rowCount) {
+        await requireProjectAccess(db, { tenantId, userId, projectId }, "owner", { active: true });
+        return false;
+      }
+      await AuditEventStore.createInTransaction(db, {
+        tenantId, userId, sessionId: null, type: "project_capabilities_changed",
+        payload: { projectId, selection: input.selection, version: Number(result.rows[0].capability_version) }
+      });
+      return true;
+    });
+  }
 
   private async authorize(db: PoolClient, tenantId: string, userId: string,
     projectId: string, minimum: "owner" | "editor", active = true) {
@@ -268,6 +325,18 @@ export class ProjectStore {
       if (previous.rows[0].project_id !== null) {
         return previous.rows[0].project_id === projectId;
       }
+      // The route's busy check sees only this process. A turn on another replica
+      // holds an execution row, and a paused turn holds a pending approval.
+      const busy = await db.query(
+        `SELECT 1 FROM session_executions
+         WHERE tenant_id = $1 AND session_id = $2 AND status = 'active' AND expires_at > clock_timestamp()
+         UNION ALL
+         SELECT 1 FROM approvals
+         WHERE tenant_id = $1 AND session_id = $2 AND status = 'pending' AND expires_at > clock_timestamp()
+         LIMIT 1`,
+        [tenantId, sessionId]
+      );
+      if (busy.rowCount) return "busy" as const;
       const result = await db.query(
         `UPDATE sessions SET project_id = $3
          WHERE tenant_id = $1 AND user_id = $2 AND session_id = $4

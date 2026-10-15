@@ -6,9 +6,12 @@
 // for the wrong reason and the test would pass. Superuser inserts put the row
 // there unconditionally, so a zero under tenant B is RLS and nothing else.
 //
-// The flip side, stated so nobody misreads green CI: this suite therefore does
-// NOT exercise any store's insert path. A tenant-scoped store that stopped
-// calling `withTenantScope` on writes would not be caught here.
+// The flip side: these factories do NOT exercise any store's insert path.
+// rls-write-paths.integration.test.ts does, for every tenant table whose writer
+// is in the core backend. It checks the superuser and owner counts first, so a
+// store that wrote nothing cannot pass as isolation. The one exception is
+// user_microsoft_connections: its writer is in the private SharePoint overlay,
+// and a companion test in the private repository runs it.
 //
 // Ids are UUIDs, not a counter. A counter resets every process run and every
 // worker starts at the same value, so it collides on exactly the dirty-database

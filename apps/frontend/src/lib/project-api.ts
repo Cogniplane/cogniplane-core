@@ -6,13 +6,26 @@ import {
   SessionEnvelopeSchema,
   SessionsListResponseSchema,
   SESSION_TRASH_RETENTION_DAYS,
-  ProjectMembersResponseSchema
+  ProjectMembersResponseSchema,
+  ProjectMemberUpdateResponseSchema
 } from "@cogniplane/shared-types";
+import { ProjectCapabilitiesSchema, type ProjectCapabilitiesUpdate } from "@cogniplane/shared-types";
+import { ArtifactsListResponseSchema } from "@cogniplane/shared-types";
 import type { ProjectAgentFileMode, ProjectApprovalMode } from "@cogniplane/shared-types";
 import { request } from "./api-client";
 import { parseResponse } from "./validate-response";
 import type { SessionList } from "./session-api";
 const projectPath = (id: string) => `/projects/${encodeURIComponent(id)}`;
+export async function getProjectCapabilities(id: string) {
+  return parseResponse(ProjectCapabilitiesSchema,
+    await request<unknown>(`${projectPath(id)}/capabilities`), "GET /projects/:id/capabilities");
+}
+export async function updateProjectCapabilities(id: string, input: ProjectCapabilitiesUpdate) {
+  return parseResponse(ProjectCapabilitiesSchema,
+    await request<unknown>(`${projectPath(id)}/capabilities`, {
+      method: "PUT", body: JSON.stringify(input)
+    }), "PUT /projects/:id/capabilities");
+}
 export async function listProjectSessions(id: string, options: {
   status: "active" | "archived" | "deleted";
   cursor?: string;
@@ -49,6 +62,13 @@ export async function getProject(id: string) {
     await request<unknown>(projectPath(id)),
     "GET /projects/:id"
   );
+}
+export async function listProjectArtifacts(id: string, signal?: AbortSignal) {
+  return parseResponse(
+    ArtifactsListResponseSchema,
+    await request<unknown>(projectPath(id) + "/artifacts", { signal }),
+    "GET /projects/:id/artifacts"
+  ).artifacts;
 }
 export async function renameProject(id: string, name: string) {
   return parseResponse(
@@ -117,4 +137,22 @@ export async function updateProjectSharing(id: string, input: {
     method: "PUT",
     body: JSON.stringify({ ...input, confirmAudience: input.confirmAudience ?? false })
   });
+}
+
+/** Sets the explicit role of a member, or removes it with a null role. A member
+ *  can remove their own role. The backend allows the last owner to leave or lose
+ *  the role (decision D13j), so the caller warns first. `confirmRetainedRole`
+ *  confirms the access that organization sharing still gives afterwards. */
+export async function updateProjectMember(id: string, userId: string, input: {
+  role: "owner" | "editor" | "viewer" | null;
+  confirmRetainedRole?: "viewer" | "editor";
+}) {
+  return parseResponse(
+    ProjectMemberUpdateResponseSchema,
+    await request<unknown>(`${projectPath(id)}/members/${encodeURIComponent(userId)}`, {
+      method: "PUT",
+      body: JSON.stringify(input)
+    }),
+    "PUT /projects/:id/members/:userId"
+  );
 }

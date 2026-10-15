@@ -16,7 +16,7 @@ import type {
 } from "@cogniplane/shared-types";
 import { queryKeys } from "../../../lib/query-keys";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, SECTION_LABEL, LIST_ITEM } from "../../../lib/ui-tokens";
+import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
 type RangeProps = { range: PiiRangePreset; from?: string; to?: string };
 
@@ -39,11 +39,11 @@ export function TopOffenders(props: RangeProps) {
   const data = topQuery.data ?? null;
 
   return (
-    <Card aria-label="pii-top">
+    <Card>
       <CardHeader>
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className={SECTION_LABEL}>Top offenders</p>
-          <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="group by">
+          <h2 id="pii-top-title" className="text-base font-semibold text-on-surface">Most findings</h2>
+          <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Group by">
             {(["user", "session"] as PiiTopGroupBy[]).map((tab) => (
               <button
                 key={tab}
@@ -65,8 +65,8 @@ export function TopOffenders(props: RangeProps) {
         ) : !data || data.rows.length === 0 ? (
           <p className={HINT}>
             {groupBy === "user"
-              ? "No high-volume users in this range."
-              : "No high-activity sessions in this range."}
+              ? "No users with findings in this range."
+              : "No sessions with findings in this range."}
           </p>
         ) : data.groupBy === "user" ? (
           <TopUserTable rows={data.rows} />
@@ -83,9 +83,7 @@ function TopUserTable({ rows }: { rows: PiiTopUserRow[] }) {
     <div className="flex flex-col gap-2">
       {rows.map((row) => (
         <Link
-          // The admin users page reads `?userId=` to scroll the matching
-          // row into view; that wiring lives in admin-users-section.tsx.
-          href={`/admin/users?userId=${encodeURIComponent(row.userId)}`}
+          href={`/admin/users/${encodeURIComponent(row.userId)}`}
           key={row.userId}
           className={LIST_ITEM_LINK}
         >
@@ -173,9 +171,9 @@ export function RecentActivityFeed(props: RangeProps) {
   const data: PiiRecentResponse | null = recentQuery.data ?? null;
 
   return (
-    <Card aria-label="pii-recent">
+    <Card>
       <CardHeader>
-        <p className={SECTION_LABEL}>Recent activity</p>
+        <h2 id="pii-recent-title" className="text-base font-semibold text-on-surface">Recent activity</h2>
       </CardHeader>
       <CardContent>
         {recentQuery.isLoading ? (

@@ -8,7 +8,7 @@ import { ProjectStore } from "../services/project-store.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
 import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { ApprovalStore } from "../services/auth/approval-store.js";
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership, seedSession, seedRuntimeSession, seedApproval } from "./support/fixtures.js";
 
 async function setup() {
@@ -34,16 +34,71 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     const first = new SessionExecutionStore(appPool(), "replica-a");
     const second = new SessionExecutionStore(appPool(), "replica-b");
     const firstTurn = await first.acquire(actor, 30_000);
-    expect(await first.sandboxId(firstTurn)).toBeNull();
-    await first.bindSandboxId(firstTurn, null, "sandbox-one");
+    expect(await first.sandboxBinding(firstTurn)).toBeNull();
+    await first.bindSandboxId(firstTurn, null, "sandbox-one", "policy-a");
     await first.release(firstTurn);
     const secondTurn = await second.acquire(actor, 30_000);
-    expect(await second.sandboxId(secondTurn)).toBe("sandbox-one");
-    await expect(first.bindSandboxId(firstTurn, "sandbox-one", "stale-sandbox"))
+    expect(await second.sandboxBinding(secondTurn)).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+    await expect(first.bindSandboxId(firstTurn, "sandbox-one", "stale-sandbox", "policy-a"))
       .rejects.toMatchObject({ code: "execution_stopped" });
-    await second.bindSandboxId(secondTurn, "sandbox-one", "sandbox-two");
-    expect(await second.sandboxId(secondTurn)).toBe("sandbox-two");
+    // A replacement is written with the policy that it was created under.
+    await second.bindSandboxId(secondTurn, "sandbox-one", "sandbox-two", "policy-c");
+    expect(await second.sandboxBinding(secondTurn)).toEqual({ sandboxId: "sandbox-two", networkPolicyHash: "policy-c" });
   });
+  // The runtime saves the sandbox of a session with the same lease that admitted its turn. The unit test
+  // of the store uses a fake that repeats these rules, so only this test shows that the SQL itself refuses
+  // a replica that does not own the lease, a lease that ran out, and a sandbox that is not the saved one.
+  test("the sandbox record is written only by the owner of a current lease, over the sandbox that it expects", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const owner = new SessionExecutionStore(appPool(), "replica-a");
+    const execution = await owner.acquire({ tenantId, sessionId, userId }, 30_000);
+    const record = async () => (await superuserPool().query(
+      "SELECT sandbox_id, sandbox_network_policy FROM sessions WHERE tenant_id=$1 AND session_id=$2",
+      [tenantId, sessionId])).rows[0];
+    const saved = (sandboxId: string, hash: string) =>
+      ({ sandbox_id: sandboxId, sandbox_network_policy: { sandboxId, hash } });
+
+    // The owner writes the first record: nothing is saved yet, so it expects no sandbox.
+    await owner.bindSandboxId(execution, null, "sandbox-one", "policy-a");
+    expect(await record()).toEqual(saved("sandbox-one", "policy-a"));
+
+    // A replica that has the execution but is not the owner of the lease.
+    await expect(owner.bindSandboxId({ ...execution, ownerId: "replica-b" }, "sandbox-one", "sandbox-b", "policy-b"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    await expect(owner.sandboxBinding({ ...execution, ownerId: "replica-b" }))
+      .rejects.toMatchObject({ code: "execution_stopped" });
+    expect(await record()).toEqual(saved("sandbox-one", "policy-a"));
+
+    // The owner, but it expects another sandbox than the saved one: none, or one that was replaced.
+    await expect(owner.bindSandboxId(execution, null, "sandbox-c", "policy-c"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    await expect(owner.bindSandboxId(execution, "sandbox-zero", "sandbox-d", "policy-d"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    expect(await record()).toEqual(saved("sandbox-one", "policy-a"));
+
+    // And a record that is empty is not written by an owner that expects a sandbox in it.
+    const otherSession = await seedSession(tenantId, userId);
+    const otherExecution = await owner.acquire({ tenantId, sessionId: otherSession, userId }, 30_000);
+    await expect(owner.bindSandboxId(otherExecution, "sandbox-ghost", "sandbox-e", "policy-e"))
+      .rejects.toMatchObject({ code: "execution_stopped" });
+    expect(await owner.sandboxBinding(otherExecution)).toBeNull();
+
+    // The same owner, with the right sandbox, writes: the refusals above are not a write that always fails.
+    await owner.bindSandboxId(execution, "sandbox-one", "sandbox-two", "policy-b");
+    expect(await record()).toEqual(saved("sandbox-two", "policy-b"));
+
+    // The lease runs out. The owner is the same, the sandbox is the right one, and the write is refused.
+    await superuserPool().query(
+      "UPDATE session_executions SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1",
+      [execution.executionId]);
+    await expect(owner.bindSandboxId(execution, "sandbox-two", "sandbox-late", "policy-late"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    await expect(owner.sandboxBinding(execution)).rejects.toMatchObject({ code: "execution_stopped" });
+    expect(await record()).toEqual(saved("sandbox-two", "policy-b"));
+  });
+
   test("standalone admission, owner lookup, and limits work across replicas", async () => {
     const tenantId = await seedTenant(), userId = await seedUser();
     await seedMembership(tenantId, userId);
@@ -99,7 +154,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
       [`reply-${execution.executionId}`]);
     await superuserPool().query(`UPDATE session_executions
       SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1`, [execution.executionId]);
-    const sweeper = new SessionExecutionStore(superuserPool());
+    const sweeper = new SessionExecutionStore(maintenancePool());
     expect(await sweeper.sweepExpired()).toBeGreaterThanOrEqual(1);
     expect(await owner.currentOwner(tenantId, sessionId)).toBeNull();
     const reply = await superuserPool().query("SELECT status FROM messages WHERE message_id=$1", [`reply-${execution.executionId}`]);
@@ -139,7 +194,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
       .toBe("failed");
     expect((await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId])).rows[0].status)
       .toBe("expired");
-    await new SessionExecutionStore(superuserPool()).sweepExpired();
+    await new SessionExecutionStore(maintenancePool()).sweepExpired();
     expect(await first.isCurrent(next)).toBe(true);
   });
 

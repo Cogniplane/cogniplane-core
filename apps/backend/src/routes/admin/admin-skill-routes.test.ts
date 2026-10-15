@@ -103,17 +103,17 @@ function createFakeDynamicConfig(
       return null;
     },
     async importSkillBundleFromZip(_tenantId: string, _input: unknown) {
-      return { skill: makeSkillRecord(), revision: makeRevisionRecord("test-skill"), previousActiveRevisionId: null };
+      return { skill: makeSkillRecord(), revision: makeRevisionRecord("test-skill"), previousActiveRevisionId: null, previousActiveRevisionNumber: null };
     },
     async importSkillBundleFromGithub(_tenantId: string, input: GithubImportInput) {
       onGithubImport?.(input);
-      return { skill: makeSkillRecord(), revision: makeRevisionRecord("test-skill"), previousActiveRevisionId: null };
+      return { skill: makeSkillRecord(), revision: makeRevisionRecord("test-skill"), previousActiveRevisionId: null, previousActiveRevisionNumber: null };
     },
     async importSkillBundleFromInline(_tenantId: string, _input: unknown) {
       return {
         skill: makeSkillRecord(),
         revision: makeRevisionRecord("test-skill"),
-        previousActiveRevisionId: null
+        previousActiveRevisionId: null, previousActiveRevisionNumber: null
       };
     },
     async listSkillRevisions(_tenantId: string, _skillId: string) {
@@ -212,6 +212,37 @@ test("GET /admin/skills/marketplace falls back to platform catalog when org mani
   expect(capturedCatalogOpts).toBe(undefined);
 });
 
+test("release-impact route validates the target and returns a private snapshot", async () => {
+  const app=Fastify();
+  onTestFinished(()=>app.close());
+  app.decorate("config",createTestConfig({LOCAL_DEV_USER_ID:"admin-user"}));
+  app.decorate("db",new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler",async request=>{
+    request.auth={userId:"admin-user",tenantId:"tenant-1",isAdmin:true,role:"owner"};
+  });
+  const snapshot={version:1,activeRevisionId:null,latestRevisionId:2,enabled:false,isPublished:false};
+  let called=false;
+  await registerAdminSkillRoutes(app,{dynamicConfig:createFakeDynamicConfig(),skillMarketplace:createFakeMarketplace(),
+    auditEvents:new InMemoryAuditEventStore(),skillBundleStorage:noopSkillBundleStorage,
+    skillReleaseImpact:{async preview(tenantId,skillId,input){
+      called=true;
+      expect([tenantId,skillId,input]).toEqual(["tenant-1","test-skill",
+        {action:"activate",revisionId:2,audience:"members"}]);
+      return {skillId,snapshot,current:{revisionId:null,revisionNumber:null,audience:"off"},
+        proposed:{revisionId:2,revisionNumber:1,audience:"members"},members:{total:3,testUsers:1,gaining:3,losing:0},
+        configuredReferences:{projects:{inherited:0,explicitSelected:1},
+          personalDefaults:{inherited:2,explicitSelected:0},sessions:{inherited:1,explicitSelected:0}}};
+    }}});
+  const response=await app.inject({method:"POST",url:"/admin/skills/test-skill/release-impact",
+    payload:{action:"activate",revisionId:2,audience:"members"}});
+  expect(response.statusCode).toBe(200);
+  expect(response.headers["cache-control"]).toBe("private, no-store");
+  expect(response.json().snapshot).toEqual(snapshot);
+  expect(called).toBe(true);
+  expect((await app.inject({method:"POST",url:"/admin/skills/test-skill/release-impact",
+    payload:{action:"activate",revisionId:null,audience:"off"}})).statusCode).toBe(400);
+});
+
 test("github import route passes installation token to lifecycle service", async () => {
   const app = Fastify();
   onTestFinished(() => app.close());
@@ -243,7 +274,8 @@ test("github import route passes installation token to lifecycle service", async
           login: "octocat",
           name: "The Octocat",
           email: null,
-          token: "ghtoken-abc123"
+          token: "ghtoken-abc123",
+          allowedRepositories: []
         };
       }
     }
@@ -479,4 +511,59 @@ test("admin skill routes reject non-admin callers with 403", async () => {
   });
   expect(revisionFile.statusCode).toBe(403);
   expect(revisionFile.json()).toEqual({ error: "admin_required" });
+});
+
+test("skill activation passes the selected audience to the transaction and audits the result", async () => {
+  const app = Fastify();
+  onTestFinished(() => app.close());
+  app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
+  app.decorate("db", new FakeDatabase() as unknown as Pool);
+  app.addHook("preHandler", async (request) => {
+    request.auth = { userId: "admin-user", tenantId: "tenant-1", isAdmin: true, role: "owner" };
+  });
+  const dynamicConfig = createFakeDynamicConfig();
+  const calls: unknown[] = [];
+  dynamicConfig.activateSkillRevision = async (tenantId, input) => {
+    calls.push({ tenantId, ...input });
+    return {
+      skill: { ...makeSkillRecord(), enabled: true, isPublished: input.audience === "members" },
+      revision: { ...makeRevisionRecord("test-skill"), reviewStatus: "active" },
+      previousActiveRevisionId: null, previousActiveRevisionNumber: null
+    };
+  };
+  const auditEvents = new InMemoryAuditEventStore();
+  await registerAdminSkillRoutes(app, {
+    dynamicConfig, auditEvents, skillMarketplace: createFakeMarketplace(), skillBundleStorage: noopSkillBundleStorage
+  });
+  const expectedSnapshot = { version: 1, activeRevisionId: null, latestRevisionId: 1, enabled: false, isPublished: false };
+  for (const audience of ["members", "test-users"] as const) {
+    const response = await app.inject({
+      method: "POST", url: "/admin/skills/test-skill/revisions/1/activate",
+      payload: { audience, reviewNotes: "Approved", expectedSnapshot }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(calls.at(-1)).toEqual({
+      tenantId: "tenant-1", skillId: "test-skill", skillRevisionId: 1,
+      actorUserId: "admin-user", reviewNotes: "Approved", audience, expectedSnapshot
+    });
+    expect(auditEvents.events.at(-1)?.payload).toMatchObject({ audience, isPublished: audience === "members", enabled: true });
+  }
+  const invalid = await app.inject({
+    method: "POST", url: "/admin/skills/test-skill/revisions/1/activate", payload: { audience: "anyone", expectedSnapshot }
+  });
+  expect(invalid.statusCode).toBe(400);
+  const unreviewed = await app.inject({
+    method: "POST", url: "/admin/skills/test-skill/revisions/1/activate", payload: { audience: "members" }
+  });
+  expect(unreviewed.statusCode).toBe(400);
+  for (const action of ["publish", "unpublish", "disable"]) {
+    expect((await app.inject({ method: "POST", url: `/admin/skills/test-skill/${action}` })).statusCode).toBe(400);
+  }
+  expect(calls).toHaveLength(2);
+  dynamicConfig.activateSkillRevision = async () => null;
+  const missing = await app.inject({
+    method: "POST", url: "/admin/skills/test-skill/revisions/1/activate", payload: { audience: "members", expectedSnapshot }
+  });
+  expect(missing.statusCode).toBe(404);
+  expect(auditEvents.events).toHaveLength(4);
 });

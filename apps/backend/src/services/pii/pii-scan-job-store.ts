@@ -260,6 +260,40 @@ export class PiiScanJobStore {
     return (completed.rowCount ?? 0) + (result.rowCount ?? 0);
   }
 
+  /**
+   * Failed jobs whose scan run or subject is still open. The stale-claim sweep
+   * fails a job without touching either, and a failed write can stop the
+   * handler between them. The worker finishes these rows; it reads them again
+   * on each tick until both are closed. A subject with a newer queued or
+   * claimed job is left to that job.
+   */
+  async listUnfinishedFailures(limit: number): Promise<PiiScanJobRecord[]> {
+    const result = await this.schedulerDb.query(
+      `SELECT j.* FROM pii_scan_jobs j
+       JOIN pii_scan_runs r ON r.tenant_id = j.tenant_id AND r.scan_run_id = j.scan_run_id
+       WHERE j.status = 'failed'
+         AND (
+           r.status IN ('pending', 'processing')
+           OR (j.subject_type = 'artifact' AND EXISTS (
+             SELECT 1 FROM artifacts a
+             WHERE a.tenant_id = j.tenant_id AND a.artifact_id = j.subject_id
+               AND a.status = 'pending'))
+           OR (j.subject_type = 'message' AND EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.tenant_id = j.tenant_id AND m.message_id = j.subject_id
+               AND m.detail_json->'pii'->>'status' IN ('pending', 'scanning')))
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM pii_scan_jobs newer
+           WHERE newer.tenant_id = j.tenant_id AND newer.subject_type = j.subject_type
+             AND newer.subject_id = j.subject_id AND newer.status IN ('queued', 'claimed'))
+       ORDER BY j.updated_at
+       LIMIT $1`,
+      [limit]
+    );
+    return result.rows.map((row) => mapRow(row as Record<string, unknown>));
+  }
+
   async getById(tenantId: string, jobId: string): Promise<PiiScanJobRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(

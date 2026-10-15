@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import Link from "next/link";
 
 import { SECTION_LABEL } from "../lib/ui-tokens";
 
@@ -28,7 +29,10 @@ export function OAuthSettingsPage(input: {
   return (
     <section id={input.id} className="flex flex-col gap-5">
       <div>
-        <p className={SECTION_LABEL}>Live module</p>
+        <Link href="/settings/connections" className="text-sm text-on-surface-variant underline underline-offset-4 hover:text-on-surface focus-visible:outline-2 focus-visible:outline-primary">
+          Connected accounts
+        </Link>
+        <p className={`${SECTION_LABEL} mt-4`}>Account details</p>
         <h3 className="text-lg font-semibold text-on-surface">{input.provider}</h3>
       </div>
       <p className="text-sm text-on-surface-faint">

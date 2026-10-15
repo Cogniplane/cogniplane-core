@@ -80,14 +80,10 @@ test("builds a worker when scheduler is disabled but the PII drain is enabled", 
   expect(buildSchedulerWorker(config, input)).not.toBeNull();
 });
 
-test("does NOT run the PII drain when PII_PROVIDER_ENABLED is false, even if deps are present", async () => {
-  // Regression guard (Codex review): the PII deps are ALWAYS constructed and
-  // passed, so the worker must not run the cross-tenant drain unless
-  // PII_PROVIDER_ENABLED is set — otherwise it queries an RLS-bound pool
-  // (boot also asserts BYPASSRLS for project retention) and silently
-  // claims zero rows. With scheduler on + PII off, the worker exists for cron
-  // but must leave the PII queue untouched.
-  const config = createTestConfig({ SCHEDULER_ENABLED: true, PII_PROVIDER_ENABLED: false });
+test("runs the PII drain without the remote provider", async () => {
+  // Rules-only detect still queues artifact scans. Without a drain, those
+  // uploads stay pending forever.
+  const config = createTestConfig({ SCHEDULER_ENABLED: false, PII_PROVIDER_ENABLED: false });
   const pii = makePiiSubsystem();
   const { input } = makeInput({
     piiScanJobs: pii.piiScanJobs,
@@ -98,19 +94,7 @@ test("does NOT run the PII drain when PII_PROVIDER_ENABLED is false, even if dep
   expect(worker).not.toBeNull();
   await worker!.tick();
 
-  expect(pii.claimDueJobs).not.toHaveBeenCalled();
-});
-
-test("returns null when scheduler is off and PII provider is off, even with deps present", () => {
-  // The exact silent-starvation config Codex flagged: deps present (they always
-  // are), but neither workload is enabled. No worker, no RLS-bound drain.
-  const config = createTestConfig({ SCHEDULER_ENABLED: false, PII_PROVIDER_ENABLED: false });
-  const pii = makePiiSubsystem();
-  const { input } = makeInput({
-    piiScanJobs: pii.piiScanJobs,
-    piiScanJobHandler: pii.piiScanJobHandler
-  });
-  expect(buildSchedulerWorker(config, input)).toBeNull();
+  expect(pii.claimDueJobs).toHaveBeenCalledTimes(1);
 });
 
 test("a partially-wired PII subsystem does not enable the drain", () => {

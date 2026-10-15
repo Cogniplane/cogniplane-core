@@ -6,6 +6,7 @@ import { IntegrationOAuthStateStore } from "./integration-oauth-state-store.js";
 import { GithubConnectionService } from "./github/github-connection-service.js";
 import { IntegrationRegistryService } from "./integration-registry-service.js";
 import { NotionConnectionService } from "./notion/notion-connection-service.js";
+import { JiraConnectionService } from "./pipedream/jira-connection-service.js";
 import {
   attachBuiltinIntegrationRuntime,
   registerBuiltinIntegrations
@@ -42,12 +43,22 @@ export function buildIntegrationServices(
     logger
   );
 
+  const jiraConnectionService = new JiraConnectionService(
+    config,
+    stores.jiraConnections,
+    stores.integrationStates,
+    stores.auditEvents,
+    runtimeInvalidator,
+    logger
+  );
+
   registerBuiltinIntegrations();
   const integrationDescriptors = new IntegrationRegistry();
   attachBuiltinIntegrationRuntime(integrationDescriptors, {
     probes: {
       notion: notionConnectionService,
-      github: githubConnectionService
+      github: githubConnectionService,
+      jira: jiraConnectionService
     },
     oauth: {
       notion: notionConnectionService,
@@ -64,6 +75,7 @@ export function buildIntegrationServices(
     oauthStates,
     githubConnectionService,
     notionConnectionService,
+    jiraConnectionService,
     integrationRegistry
   };
 }

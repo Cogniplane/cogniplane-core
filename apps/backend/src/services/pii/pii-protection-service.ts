@@ -284,15 +284,12 @@ export class PiiProtectionService {
     // Reject binary content types up front — the rule detector and the LLM both
     // produce noise on binary bytes decoded as UTF-8, and we'd waste tokens.
     if (!isScannableContentType(input.artifact.contentType)) {
-      throw new PiiProtectionServiceError(
-        "unsupported_mime",
-        `PII scan does not support content type '${input.artifact.contentType}'`
-      );
+      throw unsupportedPiiContentTypeError(input.artifact.contentType);
     }
 
     // Always run rule-based detection first — it catches obvious PII deterministically
     // and keeps the detect/block policies working even when the provider is disabled.
-    const content = await input.artifact.readContent();
+    const content = await input.artifact.readContent(signal);
     const maxBytes = this.options.artifactMaxBytes ?? 5 * 1024 * 1024;
     if (Buffer.byteLength(content, "utf8") > maxBytes) {
       throw new PiiProtectionServiceError(
@@ -587,18 +584,28 @@ function isCsvContentType(contentType: string): boolean {
   return normalized === "text/csv" || normalized === "application/csv";
 }
 
-// Content types we'll attempt to scan as text. Binary formats (PDF, Office,
-// images, archives) are rejected with `unsupported_mime` so the job
-// terminates instead of producing nonsense findings on garbled UTF-8.
+// Content types we scan. Callers pass a PDF as its extracted text (see
+// scannable-text.ts). Other binary formats (Office, images, archives) are
+// rejected with `unsupported_mime` instead of producing nonsense findings on
+// garbled UTF-8.
 const SCANNABLE_NON_TEXT_TYPES = new Set<string>([
   "application/csv",
   "application/json",
+  "application/pdf",
   "application/xml",
+  "application/x-sh",
   "application/x-yaml",
   "application/yaml"
 ]);
 
-function isScannableContentType(contentType: string): boolean {
+export function unsupportedPiiContentTypeError(contentType: string): PiiProtectionServiceError {
+  return new PiiProtectionServiceError(
+    "unsupported_mime",
+    `PII protection is on for this organization and cannot scan ${contentType || "this type of"} files. Upload a text or PDF version instead.`
+  );
+}
+
+export function isScannableContentType(contentType: string): boolean {
   const normalized = contentType.toLowerCase().split(";")[0]?.trim() ?? "";
   if (!normalized) return false;
   if (normalized.startsWith("text/")) return true;

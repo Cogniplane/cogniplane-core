@@ -40,7 +40,7 @@ cp apps/frontend/.env.example apps/frontend/.env.local
 The defaults in `.env.example` are tuned for the make-dev flow: dev-headers auth (no SSO required), local Postgres on the standard port. Open `apps/backend/.env` and confirm:
 
 - `AUTH_MODE=dev-headers` — bypasses WorkOS for local hacking.
-- `DATABASE_URL` and `MIGRATION_DATABASE_URL` — the make target stands these up automatically.
+- `DATABASE_URL`, `MAINTENANCE_DATABASE_URL`, and `MIGRATION_DATABASE_URL` — the make target stands these up automatically.
 - `ANTHROPIC_API_KEY=sk-ant-...` — the model key for agent turns.
 - `E2B_API_KEY` and `E2B_TEMPLATE_ID` — from your E2B account and the `make e2b-build` output.
 

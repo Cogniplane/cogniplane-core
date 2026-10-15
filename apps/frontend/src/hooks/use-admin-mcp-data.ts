@@ -3,14 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdminMcpServer } from "@cogniplane/shared-types";
 
-import {
-  createAdminMcpServer,
-  disableAdminMcpServer,
-  listAdminMcpServers,
-  publishAdminMcpServer,
-  unpublishAdminMcpServer,
-  updateAdminMcpServer
-} from "../lib/admin-api";
+import { listAdminMcpServers, saveAdminMcpConnection, setInheritedAdminMcpAudience, type McpAudience } from "../lib/admin-api";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
@@ -22,15 +15,20 @@ type SubmitInput = {
   routePath: string;
   upstreamUrl: string | null;
   upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+  credentialScope: "organization" | "personal";
   upstreamAuthName: string | null;
   upstreamAuthSecret?: string | null;
-  enabled: boolean;
+  audience: McpAudience;
 };
 
 export function useAdminMcpData() {
   const queryClient = useQueryClient();
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: queryKeys.admin.mcpServers() });
+  const invalidate = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: queryKeys.admin.mcpServers() }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.admin.tenantSettings() }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeConfig() }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() })
+  ]);
 
   const serversQuery = useQuery({
     queryKey: queryKeys.admin.mcpServers(),
@@ -39,66 +37,40 @@ export function useAdminMcpData() {
 
   const submitMutation = useMutation({
     mutationFn: async ({ input, editingId }: { input: SubmitInput; editingId: string | null }) => {
-      if (editingId) {
-        const { serverId, ...payload } = input;
-        void serverId;
-        await updateAdminMcpServer(editingId, payload);
-      } else {
-        await createAdminMcpServer(input);
-      }
+      await saveAdminMcpConnection(input, editingId);
     },
-    onSuccess: () => invalidate()
+    // Refresh the effective state after an error too. Another admin may have changed it.
+    onSettled: () => invalidate()
   });
-
-  const publishMutation = useMutation({
-    mutationFn: publishAdminMcpServer,
-    onSuccess: () => invalidate()
-  });
-
-  const unpublishMutation = useMutation({
-    mutationFn: unpublishAdminMcpServer,
-    onSuccess: () => invalidate()
-  });
-
-  const disableMutation = useMutation({
-    mutationFn: disableAdminMcpServer,
-    onSuccess: () => invalidate()
+  const inheritedMutation = useMutation({
+    mutationFn: ({ serverId, audience }: { serverId: string; audience: McpAudience }) =>
+      setInheritedAdminMcpAudience(serverId, audience),
+    onSettled: () => invalidate()
   });
 
   let busyKey: string | null = null;
-  if (submitMutation.isPending) busyKey = "mcp";
-  else if (publishMutation.isPending && publishMutation.variables)
-    busyKey = `publish-mcp-${publishMutation.variables}`;
-  else if (unpublishMutation.isPending && unpublishMutation.variables)
-    busyKey = `unpublish-mcp-${unpublishMutation.variables}`;
-  else if (disableMutation.isPending && disableMutation.variables)
-    busyKey = `disable-mcp-${disableMutation.variables}`;
+  if (submitMutation.isPending || inheritedMutation.isPending) busyKey = "mcp";
 
-  const firstError =
-    submitMutation.error ??
-    publishMutation.error ??
-    unpublishMutation.error ??
-    disableMutation.error ??
-    serversQuery.error;
-  const errorFallback = submitMutation.error
-    ? "Failed to save MCP server."
-    : publishMutation.error
-      ? "Failed to publish MCP server."
-      : unpublishMutation.error
-        ? "Failed to unpublish MCP server."
-        : disableMutation.error
-          ? "Failed to disable MCP server."
-          : "Failed to load MCP servers.";
+  const saveError = submitMutation.error ?? inheritedMutation.error;
 
   return {
     mcpServers: serversQuery.data ?? [],
+    listGeneration: serversQuery.dataUpdatedAt,
+    loading: serversQuery.isPending,
+    loaded: serversQuery.data !== undefined,
+    reload: () => serversQuery.refetch(),
     busyKey,
-    error: firstError ? toErrorMessage(firstError, errorFallback) : null,
+    loadError: serversQuery.error ? toErrorMessage(serversQuery.error, "Failed to load MCP connections.") : null,
+    saveError: saveError ? toErrorMessage(saveError, "Failed to save MCP availability.") : null,
+    // The page shows one save error for both actions, so starting one action
+    // clears the other's old error.
     handleSubmit: async (input: SubmitInput, editingId: string | null): Promise<void> => {
+      inheritedMutation.reset();
       await submitMutation.mutateAsync({ input, editingId });
     },
-    handlePublish: (serverId: string) => publishMutation.mutate(serverId),
-    handleUnpublish: (serverId: string) => unpublishMutation.mutate(serverId),
-    handleDisable: (serverId: string) => disableMutation.mutate(serverId)
+    handleSetInheritedAudience: async (serverId: string, audience: McpAudience): Promise<void> => {
+      submitMutation.reset();
+      await inheritedMutation.mutateAsync({ serverId, audience });
+    }
   };
 }

@@ -2,10 +2,12 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import Link from "next/link";
 
 import { getAdminPiiMetrics } from "../../../lib/admin-api";
 import {
   computeDelta,
+  isPiiRangeQueryKey,
   sparklineFromTimeSeries,
   type PiiKpiKey
 } from "../../../lib/admin-pii-utils";
@@ -18,6 +20,8 @@ import { PiiProviderStatusPill } from "../../pii-provider-status-pill";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
+
+const MODE_LABELS = { off: "Off", detect: "Detect", block: "Block", transform: "Transform" } as const;
 
 type RangeState =
   | { preset: "24h" | "7d" | "30d" }
@@ -55,133 +59,96 @@ export function AdminPiiDashboard() {
     queryKey: queryKeys.admin.piiMetrics(params),
     queryFn: () => getAdminPiiMetrics(params),
     // Dashboard polls on focus — overrides the global default of false.
-    refetchOnWindowFocus: true
+    refetchOnWindowFocus: true,
+    // Keep the last range on screen while the next one loads, so the page does not flash.
+    placeholderData: (previous) => previous
   });
 
-  // Surgical refresh: invalidate only entries scoped to the current range.
-  // The predicate matches any cache key whose params object carries the
-  // active range — preserves cached data for inactive ranges so toggling
-  // the time selector doesn't refetch from a Refresh click on a different
-  // range. groupBy / actions / limit live inside the params object and
-  // are matched by prefix automatically.
+  // Surgical refresh: invalidate only entries scoped to the current range, so
+  // cached data for other ranges survives a Refresh click.
   const refresh = () => {
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey;
-        if (!Array.isArray(key) || key.length < 4) return false;
-        if (key[0] !== "admin" || key[1] !== "pii") return false;
-        if (
-          key[2] !== "metrics" &&
-          key[2] !== "top" &&
-          key[2] !== "recent" &&
-          key[2] !== "jobs/stats"
-        ) {
-          return false;
-        }
-        const keyParams = key[key.length - 1] as { range?: string; from?: string; to?: string } | undefined;
-        if (!keyParams || typeof keyParams !== "object") return false;
-        return (
-          keyParams.range === params.range &&
-          keyParams.from === params.from &&
-          keyParams.to === params.to
-        );
-      }
-    });
+    void queryClient.invalidateQueries({ predicate: (query) => isPiiRangeQueryKey(query.queryKey, params) });
   };
 
   const data = metricsQuery.data ?? null;
   const isLoading = metricsQuery.isLoading;
 
+  const policy = data?.policy;
+  const off = Boolean(policy) && (!policy!.enabled || policy!.mode === "off");
+  // With protection off and no scans in the range, every number is zero. Say why instead.
+  const nothingToShow = off && (data?.kpis.scans.current ?? 0) === 0;
+
   return (
     <section id="pii" className="flex flex-col gap-5 pt-5">
-      <div className="flex justify-end">
-        <Button type="button" variant="ghost" onClick={refresh}>
-          Refresh
-        </Button>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm text-on-surface-variant">
+          <p>{policy ? policySentence(policy) : isLoading ? "Loading activity..." : ""}</p>
+          <PiiProviderStatusPill />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <RangeSelector range={range} onChange={setRange} disabled={isLoading} />
+          <Button type="button" variant="ghost" size="sm" onClick={refresh}>
+            Refresh
+          </Button>
+        </div>
       </div>
 
-      <HeaderStrip
-        data={data}
-        range={range}
-        onRangeChange={setRange}
-        loading={isLoading}
-      />
-
       {metricsQuery.error ? (
-        <p className="text-sm text-danger">{(metricsQuery.error as Error).message}</p>
+        <p role="alert" className="text-sm text-danger">{(metricsQuery.error as Error).message}</p>
       ) : null}
 
-      <KpiRow data={data} loading={isLoading} />
+      {nothingToShow ? (
+        <p className="border-y border-outline-variant py-4 text-sm text-on-surface-variant">
+          Protection is off, so nothing is scanned.{" "}
+          <Link href="/admin/privacy" className="underline underline-offset-4">Turn it on in Settings</Link>.
+        </p>
+      ) : (
+        <>
+          <KpiRow data={data} loading={isLoading} />
 
-      <Card aria-label="pii-time-series">
-        <CardHeader>
-          <p className={SECTION_LABEL}>Activity over time</p>
-        </CardHeader>
-        <CardContent>
-          {data ? (
-            <TimeSeriesChart series={data.timeSeries} bucket={data.range.bucket} />
-          ) : (
-            <p className={HINT}>Loading…</p>
-          )}
-        </CardContent>
-      </Card>
+          <Card>
+            <CardHeader>
+              <h2 id="pii-time-series-title" className="text-base font-semibold text-on-surface">Activity over time</h2>
+            </CardHeader>
+            <CardContent>
+              {data ? (
+                <TimeSeriesChart series={data.timeSeries} bucket={data.range.bucket} />
+              ) : (
+                <p className={HINT}>Loading…</p>
+              )}
+            </CardContent>
+          </Card>
 
-      <Card aria-label="pii-findings">
-        <CardHeader>
-          <p className={SECTION_LABEL}>Findings breakdown</p>
-        </CardHeader>
-        <CardContent>
-          {data ? <FindingsBreakdown data={data} /> : <p className={HINT}>Loading…</p>}
-        </CardContent>
-      </Card>
+          <Card>
+            <CardHeader>
+              <h2 id="pii-findings-title" className="text-base font-semibold text-on-surface">Findings breakdown</h2>
+            </CardHeader>
+            <CardContent>
+              {data ? <FindingsBreakdown data={data} /> : <p className={HINT}>Loading…</p>}
+            </CardContent>
+          </Card>
 
-      <TopOffenders {...params} />
-      <RecentActivityFeed {...params} />
-      <OpsHealthPanel {...params} />
+          <TopOffenders {...params} />
+          <RecentActivityFeed {...params} />
+          <OpsHealthPanel {...params} />
+        </>
+      )}
     </section>
   );
 }
 
-function HeaderStrip(props: {
-  data: PiiActivityMetrics | null;
-  range: RangeState;
-  onRangeChange: (next: RangeState) => void;
-  loading: boolean;
-}) {
-  const policy = props.data?.policy;
-  const modeLabel = policy?.enabled ? policy.mode : "off";
-  const modePill = policy?.enabled && policy.mode !== "off" ? PILL_GREEN : PILL_GRAY;
-
-  return (
-    <Card>
-      <CardContent className="pt-6">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={modePill}>mode: {modeLabel}</span>
-            <PiiProviderStatusPill />
-            {policy ? <ScopesPill policy={policy} /> : null}
-          </div>
-          <RangeSelector
-            range={props.range}
-            onChange={props.onRangeChange}
-            disabled={props.loading}
-          />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function ScopesPill({ policy }: { policy: NonNullable<PiiActivityMetrics["policy"]> }) {
-  const enabled: string[] = [];
-  if (policy.scopes.chatPrompts) enabled.push("chat");
-  if (policy.scopes.uploads) enabled.push("uploads");
-  if (policy.scopes.microsoftImports) enabled.push("microsoft");
-  return (
-    <span className={PILL_GRAY}>
-      scopes: {enabled.length > 0 ? enabled.join(" • ") : "none"}
-    </span>
-  );
+/** "Detect mode. Scans chat prompts and uploads." in the words the Settings tab uses. */
+function policySentence(policy: NonNullable<PiiActivityMetrics["policy"]>): string {
+  if (!policy.enabled || policy.mode === "off") return "Protection is off.";
+  const sources = [
+    policy.scopes.chatPrompts ? "chat prompts" : null,
+    policy.scopes.uploads ? "direct uploads" : null,
+    policy.scopes.microsoftImports ? "Microsoft imports" : null
+  ].filter((source): source is string => source !== null);
+  const scans = sources.length === 0
+    ? "No chat prompts, uploads, or imports are scanned."
+    : `Scans ${sources.join(", ").replace(/, ([^,]*)$/, " and $1")}.`;
+  return `${MODE_LABELS[policy.mode]} mode. ${scans}`;
 }
 
 function RangeSelector(props: {
@@ -190,12 +157,11 @@ function RangeSelector(props: {
   disabled: boolean;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="time range">
+    <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Time range">
       {PRESET_OPTIONS.map((opt) => {
         const active = props.range.preset === opt.value;
-        // Reuses the existing pill primitives. The active preset shows a
-        // saturated green pill; inactive presets render in the gray
-        // variant — same convention as the mode/scopes pills.
+        // Reuses the pill primitives. The active preset shows a green pill;
+        // inactive presets render in gray.
         return (
           <button
             key={opt.value}

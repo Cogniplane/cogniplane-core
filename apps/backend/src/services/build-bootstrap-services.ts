@@ -40,9 +40,13 @@ export function buildBootstrapServices(input: {
     config,
     {
       skills: stores.skills,
+      personalSkills: stores.personalSkills,
+      projectSkills: stores.projectSkills,
       sessions: stores.sessions,
       skillRevisions: stores.skillRevisions,
       mcpServers: stores.mcpServers,
+      memberMcpCredentials: stores.memberMcpCredentials,
+      tenantMembers: stores.tenantMembers,
       tenantSettings: stores.tenantSettings
     },
     skillBundleStorage,

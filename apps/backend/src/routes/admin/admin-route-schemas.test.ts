@@ -8,6 +8,7 @@ import {
   mcpCreateBodySchema,
   mcpUpdateBodySchema,
   githubImportBodySchema,
+  inlineSkillImportBodySchema,
   tenantSettingsBodySchema
 } from "./admin-route-schemas.js";
 
@@ -21,22 +22,39 @@ describe.each([
   ["create", AdminMcpServerCreateRequestSchema, mcpCreateBodySchema],
   ["update", AdminMcpServerUpdateRequestSchema, mcpUpdateBodySchema]
 ])("MCP %s URL validation", (_operation, sharedSchema, routeSchema) => {
-  it("validates URL syntax in the shared contract and enforces URL policy at the route", () => {
+  it("accepts HTTP and private MCP upstreams while rejecting URL credentials", () => {
     const body = { ...validBase, serverId: "test" };
     expect(sharedSchema.safeParse({ ...body, upstreamUrl: "not a URL" }).success).toBe(false);
     for (const upstreamUrl of [
       "http://example.com/mcp",
+      "http://100.108.24.234:3108/mcp",
+      "http://10.0.4.17/mcp",
       "https://127.0.0.1/mcp",
-      "https://user:password@example.com/mcp"
+      "http://localhost:3108/mcp"
     ]) {
       expect(sharedSchema.safeParse({ ...body, upstreamUrl }).success).toBe(true);
+      expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(true);
+    }
+    for (const upstreamUrl of [
+      "https://user:password@example.com/mcp",
+      "http://example.com/mcp?api_key=secret",
+      "file:///etc/passwd"
+    ]) {
       expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(false);
     }
-    expect(routeSchema.safeParse({ ...body, upstreamUrl: "https://example.com/mcp" }).success).toBe(true);
+  });
+
+  it("rejects an upstream URL in managed mode", () => {
+    expect(routeSchema.safeParse({
+      ...validBase,
+      serverId: "managed",
+      mode: "managed",
+      upstreamUrl: "http://100.108.24.234:3108/mcp"
+    }).success).toBe(false);
   });
 });
 
-describe("httpsUrlSchema — SSRF IP block list", () => {
+describe("httpsUrlSchema on GitHub imports", () => {
   const blocked: Array<[string, string]> = [
     ["loopback IPv4", "https://127.0.0.1/"],
     ["loopback IPv4 alt", "https://127.1.2.3/"],
@@ -57,16 +75,13 @@ describe("httpsUrlSchema — SSRF IP block list", () => {
 
   for (const [label, url] of blocked) {
     it(`rejects ${label}: ${url}`, () => {
-      const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: url });
+      const result = githubImportBodySchema.safeParse({ githubUrl: url });
       expect(result.success).toBe(false);
     });
   }
 
   it("accepts a valid external HTTPS URL", () => {
-    const result = mcpUpdateBodySchema.safeParse({
-      ...validBase,
-      upstreamUrl: "https://api.example.com/mcp"
-    });
+    const result = githubImportBodySchema.safeParse({ githubUrl: "https://api.example.com/repo" });
     expect(result.success).toBe(true);
   });
 
@@ -76,10 +91,7 @@ describe("httpsUrlSchema — SSRF IP block list", () => {
   });
 
   it("rejects http:// scheme", () => {
-    const result = mcpUpdateBodySchema.safeParse({
-      ...validBase,
-      upstreamUrl: "http://api.example.com/mcp"
-    });
+    const result = githubImportBodySchema.safeParse({ githubUrl: "http://api.example.com/repo" });
     expect(result.success).toBe(false);
   });
 
@@ -91,7 +103,7 @@ describe("httpsUrlSchema — SSRF IP block list", () => {
   });
 });
 
-describe("httpsUrlSchema — IPv4 numeric-format bypass", () => {
+describe("httpsUrlSchema on GitHub imports — IPv4 numeric-format bypass", () => {
   // Each of these resolves to 127.0.0.1 via the OS resolver but evades a
   // naive dotted-decimal check. The hardened guard treats numeric-shaped
   // hostnames that aren't canonical IPv4 as private/reserved.
@@ -107,26 +119,23 @@ describe("httpsUrlSchema — IPv4 numeric-format bypass", () => {
 
   for (const [label, url] of bypassed) {
     it(`rejects ${label}: ${url}`, () => {
-      const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: url });
+      const result = githubImportBodySchema.safeParse({ githubUrl: url });
       expect(result.success).toBe(false);
     });
   }
 
   it("rejects octets greater than 255", () => {
-    const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: "https://999.0.0.1/" });
+    const result = githubImportBodySchema.safeParse({ githubUrl: "https://999.0.0.1/" });
     expect(result.success).toBe(false);
   });
 
   it("still accepts canonical external IPv4 addresses", () => {
-    const result = mcpUpdateBodySchema.safeParse({ ...validBase, upstreamUrl: "https://8.8.8.8/" });
+    const result = githubImportBodySchema.safeParse({ githubUrl: "https://8.8.8.8/" });
     expect(result.success).toBe(true);
   });
 
   it("still accepts normal hostnames containing the letter x", () => {
-    const result = mcpUpdateBodySchema.safeParse({
-      ...validBase,
-      upstreamUrl: "https://x.example.com/mcp"
-    });
+    const result = githubImportBodySchema.safeParse({ githubUrl: "https://x.example.com/repo" });
     expect(result.success).toBe(true);
   });
 });
@@ -165,5 +174,29 @@ describe("tenantSettingsBodySchema", () => {
     });
 
     expect(result.success).toBe(false);
+  });
+});
+
+
+describe("MCP credential ownership", () => {
+  it("defaults new connections to organization credentials and preserves omitted edits", () => {
+    expect(mcpCreateBodySchema.parse({ ...validBase, serverId: "docs" }).credentialScope).toBe("organization");
+    expect(mcpUpdateBodySchema.parse(validBase).credentialScope).toBeUndefined();
+    const personal = mcpCreateBodySchema.parse({ ...validBase, serverId: "docs", credentialScope: "personal",
+      upstreamAuthType: "bearer", upstreamUrl: "https://example.test/mcp" });
+    expect(personal.credentialScope).toBe("personal");
+    expect(personal.upstreamAuthSecret).toBeUndefined();
+    expect(mcpUpdateBodySchema.safeParse({ ...validBase, credentialScope: "creator" }).success).toBe(false);
+  });
+});
+
+describe("inlineSkillImportBodySchema", () => {
+  const body = (skillName: string) => ({ skillId: "notes", skillName, description: "d", instructions: "i" });
+
+  it("accepts a 64-character name and rejects a longer one", () => {
+    // organization_skill_author_updates.skill_name allows 64 characters, so a
+    // longer name would fail with a 500 when an edited submission is released.
+    expect(inlineSkillImportBodySchema.safeParse(body("a".repeat(64))).success).toBe(true);
+    expect(inlineSkillImportBodySchema.safeParse(body("a".repeat(65))).success).toBe(false);
   });
 });

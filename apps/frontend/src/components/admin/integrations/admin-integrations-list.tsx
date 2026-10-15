@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { useAdminIntegrations } from "../../../hooks/use-integrations";
 import { AdminIntegrationRow } from "./admin-integration-row";
 import { AdminIntegrationPane } from "./admin-integration-pane";
-import { HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
+import { HINT } from "../../../lib/ui-tokens";
 
 export function AdminIntegrationsList() {
   const {
@@ -13,6 +13,7 @@ export function AdminIntegrationsList() {
     isLoading,
     activeId,
     error,
+    configError,
     flashMessage,
     update,
     clearConfig
@@ -20,36 +21,39 @@ export function AdminIntegrationsList() {
 
   const [openId, setOpenId] = useState<string | null>(null);
 
+  // A "#integrations" link scrolls before the lists above have loaded. Scroll again once they have.
+  useEffect(() => {
+    if (!isLoading && window.location.hash === "#integrations") {
+      document.getElementById("integrations")?.scrollIntoView?.({ block: "start" });
+    }
+  }, [isLoading]);
+
   const sorted = useMemo(
     () => [...integrations].sort((a, b) => a.name.localeCompare(b.name)),
     [integrations]
   );
+
+  const available = sorted.filter((entry) => entry.status !== "coming_soon");
+  const planned = sorted.filter((entry) => entry.status === "coming_soon");
 
   const openIntegration = openId
     ? sorted.find((entry) => entry.id === openId) ?? null
     : null;
 
   return (
-    <section id="integrations" className="flex flex-col gap-4 pt-5">
-      <div>
-        <p className={SECTION_LABEL}>Connected services</p>
-        <h3 className="text-lg font-semibold text-on-surface">Integrations</h3>
-        <p className={`${HINT} mt-1`}>
-          Toggle reads and writes per integration. Users connect their own accounts after you
-          enable an integration here.
-        </p>
-      </div>
+    <section id="integrations" aria-labelledby="integrations-heading" className="flex flex-col gap-2">
+      <h2 id="integrations-heading" className="text-lg font-semibold text-on-surface">Built-in integrations</h2>
 
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       {flashMessage ? <p className={HINT}>{flashMessage}</p> : null}
 
       {isLoading ? (
         <p className={HINT}>Loading integrations...</p>
-      ) : sorted.length === 0 ? (
-        <p className={HINT}>No integrations available.</p>
+      ) : available.length === 0 ? (
+        <p className={HINT}>No integrations available yet.</p>
       ) : (
-        <div className="flex flex-col overflow-hidden rounded-lg border border-outline-variant bg-surface-container-lowest">
-          {sorted.map((integration) => (
+        <div className="divide-y divide-outline-variant border-t border-outline-variant">
+          {available.map((integration) => (
             <AdminIntegrationRow
               key={integration.id}
               integration={integration}
@@ -62,10 +66,15 @@ export function AdminIntegrationsList() {
         </div>
       )}
 
+      {planned.length ? (
+        <p className={HINT}>Coming soon: {planned.map((integration) => integration.name).join(", ")}.</p>
+      ) : null}
+
       {openIntegration ? (
         <AdminIntegrationPane
           integration={openIntegration}
           busy={activeId === openIntegration.id}
+          error={configError?.integrationId === openIntegration.id ? configError.message : null}
           onClose={() => setOpenId(null)}
           onSaveConfig={async (config) => {
             await update(openIntegration.id, { config });

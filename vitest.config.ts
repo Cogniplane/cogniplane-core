@@ -18,7 +18,10 @@ export default defineConfig({
           name: "scripts",
           environment: "node",
           globals: false,
-          include: ["scripts/*.test.ts"]
+          include: ["scripts/*.test.ts"],
+          // These tests spawn shell scripts with freshly written shims. Endpoint
+          // security can add about 1 s to the first launch of each new executable.
+          testTimeout: 30_000
         }
       }
     ]

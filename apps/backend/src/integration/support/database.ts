@@ -8,12 +8,9 @@
 // ENABLE ROW LEVEL SECURITY, or a store method that skips `withTenantScope`
 // all pass the unit suite silently.
 //
-// Two pools, mirroring production:
-//   - superuserPool() bypasses RLS. Stands in for `privilegedDb` and seeds
-//     fixtures directly (bypassing store insert paths on purpose, so a policy
-//     failure is never masked by a store bug).
-//   - appPool() connects as `app_user`, which is subject to RLS. Every
-//     assertion about isolation runs here.
+// appPool() runs tenant queries under RLS. maintenancePool() uses the same
+// explicit grants as production for cross-tenant work. superuserPool() seeds
+// fixtures and inspects results; it does not stand in for runtime maintenance.
 //
 // Each run gets a THROWAWAY database AND a throwaway role. Both matter more
 // locally than in CI:
@@ -33,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 
 import { setupDeepAgentsCheckpointer } from "../../services/deep-agents/deep-agents-checkpointer.js";
+import { ensureMaintenanceRole } from "../../scripts/maintenance-role.js";
 import { applyMigrations, ensureAppUserRole } from "../../scripts/migrate-lib.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -116,6 +114,16 @@ export function runAppUserUrl(): string {
 // used while leaving the real ones open, and Vitest would hang on exit.
 let superuser: pg.Pool | undefined;
 let appUser: pg.Pool | undefined;
+let maintenance: pg.Pool | undefined;
+
+export function runMaintenanceUrl(): string {
+  return withUser(runSuperuserUrl(), runRoleName().replace("_role_", "_maint_"), APP_USER_PASSWORD);
+}
+
+export function maintenancePool(): pg.Pool {
+  maintenance ??= new pg.Pool({ connectionString: runMaintenanceUrl(), max: 5 });
+  return maintenance;
+}
 
 export function superuserPool(): pg.Pool {
   superuser ??= new pg.Pool({
@@ -136,9 +144,10 @@ export function appPool(): pg.Pool {
 }
 
 export async function closePools(): Promise<void> {
-  await Promise.all([superuser?.end(), appUser?.end()]);
+  await Promise.all([superuser?.end(), appUser?.end(), maintenance?.end()]);
   superuser = undefined;
   appUser = undefined;
+  maintenance = undefined;
 }
 
 /**
@@ -155,7 +164,7 @@ export async function closePools(): Promise<void> {
  * lives at the point of use rather than resting on the caller.
  */
 function assertHarnessIdentifier(name: string): void {
-  if (!/^cogniplane_it_(role_)?[0-9a-f]{32}$/.test(name)) {
+  if (!/^cogniplane_it_((role|maint)_)?[0-9a-f]{32}$/.test(name)) {
     throw new Error(
       `Refusing to interpolate "${name}": not a harness-generated identifier. ` +
         "Expected cogniplane_it_<32 hex> or cogniplane_it_role_<32 hex>."
@@ -200,6 +209,7 @@ export async function createRunDatabase(): Promise<
       // grants here would let through. Only the role NAME differs, because
       // roles are cluster-wide.
       await ensureAppUserRole(client, APP_USER_PASSWORD, role);
+      await ensureMaintenanceRole(client, APP_USER_PASSWORD, role.replace("_role_", "_maint_"));
     } finally {
       client.release();
     }
@@ -238,6 +248,7 @@ export async function dropRunDatabase(database: string, role: string): Promise<v
     await adminPool.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
     // The role owns nothing outside the dropped database, but its grants are
     // recorded per-database and went with it, so this is unconditional.
+    await adminPool.query(`DROP ROLE IF EXISTS ${role.replace("_role_", "_maint_")}`);
     await adminPool.query(`DROP ROLE IF EXISTS ${role}`);
   } finally {
     await adminPool.end();
@@ -291,10 +302,10 @@ export async function dropOrphanedRunDatabases(): Promise<string[]> {
     const { rows: roles } = await adminPool.query<{ rolname: string }>(
       `SELECT r.rolname
          FROM pg_roles r
-        WHERE r.rolname ~ '^cogniplane_it_role_[0-9a-f]{32}$'
+        WHERE r.rolname ~ '^cogniplane_it_(role|maint)_[0-9a-f]{32}$'
           AND NOT EXISTS (
                 SELECT 1 FROM pg_database d
-                 WHERE d.datname = replace(r.rolname, 'cogniplane_it_role_', 'cogniplane_it_')
+                 WHERE d.datname = regexp_replace(r.rolname, '^cogniplane_it_(role|maint)_', 'cogniplane_it_')
               )`
     );
     for (const row of roles) {

@@ -7,30 +7,16 @@ import { NotionConnectionStore } from "../services/integrations/notion/notion-co
 import { NotionConnectionService } from "../services/integrations/notion/notion-connection-service.js";
 import { encrypt } from "../lib/crypto-utils.js";
 import { runtimeTokenSecret } from "../lib/derived-secrets.js";
-import { AVAILABLE_MODELS } from "../domain/models.js";
 import { describe, expect, onTestFinished, test, vi } from "vitest";
-import { registerApprovalRoutes } from "../routes/approvals.js";
-import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessions.js";
-import { registerMessageRoutes, type MessageRouteStores } from "../routes/messages.js";
-import { SessionStore } from "../services/session-store.js";
-import { ProjectStore } from "../services/project-store.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
-import { MessageStore } from "../services/message-store.js";
-import { SessionExecutionStore } from "../services/session-execution-store.js";
-import { ToolExecutionContextStore } from "../services/auth/tool-execution-context-store.js";
-import { ApprovalStore } from "../services/auth/approval-store.js";
-import { AuditEventStore } from "../services/audit-event-store.js";
-import { RuntimeSessionStore } from "../services/runtime/runtime-session-store.js";
-import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
-import { DeepAgentsRuntimeAdapter } from "../services/deep-agents/deep-agents-runtime-adapter.js";
 import { createDeepAgentsSessionRuntime } from "../services/deep-agents/deep-agents-graph.js";
-import type { DeepAgentsRuntimeFactory } from "../services/deep-agents/deep-agents-types.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
+import { buildMessageApp } from "./support/message-app.js";
 
-const modelControl = vi.hoisted(() => ({ writeFile: false, notion: false, afterOutput: undefined as (() => Promise<void>) | undefined }));
+const modelControl = vi.hoisted(() => ({ writeFile: false, notion: false, notionCalls: 0, afterOutput: undefined as (() => Promise<void>) | undefined }));
 
 vi.mock("langchain", async importOriginal => {
   const actual = await importOriginal<typeof import("langchain")>();
@@ -40,6 +26,13 @@ vi.mock("langchain", async importOriginal => {
     override bindTools() { return this.withConfig({}); }
     override async *_streamResponseChunks(...args: Parameters<InstanceType<typeof FakeStreamingChatModel>["_streamResponseChunks"]>) {
       if (!modelControl.writeFile && !modelControl.notion) this.chunks = [];
+      if (modelControl.notion) {
+        modelControl.notionCalls += 1;
+        this.chunks = [new AIMessageChunk({ content: "", tool_calls: [{
+          name: "notion_search", id: `notion-${modelControl.notionCalls}`,
+          args: { query: "Project source", toolContextId: "model-supplied-wrong-context" }
+        }] })];
+      }
       yield* super._streamResponseChunks(...args);
       await modelControl.afterOutput?.();
     }
@@ -56,107 +49,80 @@ vi.mock("langchain", async importOriginal => {
 
 async function setup(personalNotion = false) {
   modelControl.notion = false;
+  modelControl.notionCalls = 0;
   modelControl.writeFile = false;
   modelControl.afterOutput = undefined;
   const tenantId = await seedTenant(), ownerId = await seedUser(), editorId = await seedUser(), viewerId = await seedUser();
   for (const userId of [ownerId, editorId, viewerId]) await seedMembership(tenantId, userId);
-  const projects = new ProjectStore(appPool()), members = new ProjectMemberStore(appPool());
+  const auth = { userId: editorId };
+  const config = createTestConfig({ NOTION_OAUTH_CLIENT_ID: "test-notion-client", NOTION_OAUTH_CLIENT_SECRET: "test-notion-secret", NOTION_OAUTH_REDIRECT_URI: "http://localhost/notion/callback" });
+  const notionServer = { id: "managed-notion", description: "Personal Notion", mode: "managed" as const,
+    routePath: "/mcp/managed-notion", upstreamUrl: null, transportKind: "http" as const, version: 1, hash: "test" };
+  const runtimePolicy = { ...testRuntimePolicy, enabledMcpServers: personalNotion ? [notionServer.id] : [],
+    enabledToolIds: personalNotion ? ["notion_search"] : [] };
+  const catalog = new ManagedToolCatalog();
+  // Vitest runs these hooks in reverse order, so the app's cleanup runs first.
+  const gateway = Fastify();
+  onTestFinished(() => gateway.close());
+  const inputs: unknown[] = [];
+  const toolsStarted: string[] = [];
+  const messageApp = await buildMessageApp({
+    tenantId, auth, config, managedToolCatalog: catalog,
+    compileRuntimeConfig: ({ sessions }) => async (_tenant, _beta, session) => {
+      if (session) await sessions.getCapabilitySelection(tenantId, session.sessionId, session.userId);
+      // Like the integration registry, record the participant's connected Notion
+      // account in the pass that grants the tool. The gateway binds calls to it.
+      const notionAccount = personalNotion && session
+        ? await notionConnections.connectedAccountId(tenantId, session.userId) : null;
+      return { runtimePolicy, skills: [], mcpServers: personalNotion ? [notionServer] : [], hash: "shared-runtime-test", sources: {
+        runtimePolicy: { id: "test", version: 1, hash: "test" }, skills: [], mcpServers: [],
+        ...(notionAccount ? { integrationAccounts: { notion: notionAccount } } : {})
+      } };
+    },
+    runtimeFactory: init => {
+      const runtime = createDeepAgentsSessionRuntime(init);
+      return { ...runtime, async getAgentForModel(...args) {
+        const graph = await runtime.getAgentForModel(...args);
+        return { ...graph, async *streamEvents(input, options) {
+          inputs.push(input);
+          for await (const event of graph.streamEvents(input, options)) {
+            if (event.event === "on_tool_start") toolsStarted.push(String(event.name));
+            yield event;
+          }
+        } };
+      } };
+    }
+  });
+  const { app, created, quota } = messageApp;
+  const { sessions, messages, executions, toolContexts, projects, approvals, auditEvents } = messageApp.stores;
+  const { app: replica } = await messageApp.addServer();
+  const members = new ProjectMemberStore(appPool());
   const project = await projects.create(tenantId, ownerId, "Shared runtime");
   const actor = { tenantId, userId: ownerId, projectId: project.projectId };
   await members.setMember(actor, editorId, "editor");
   await members.setMember(actor, viewerId, "viewer");
   const sessionId = (await projects.createSession(tenantId, ownerId, project.projectId, "Shared conversation"))!;
-  const sessions = new SessionStore(appPool()), messages = new MessageStore(appPool());
-  const executions = new SessionExecutionStore(appPool()), toolContexts = new ToolExecutionContextStore(appPool());
-  const auditEvents = new AuditEventStore(appPool());
-  const app = Fastify();
-  const config = createTestConfig({ NOTION_OAUTH_CLIENT_ID: "test-notion-client", NOTION_OAUTH_CLIENT_SECRET: "test-notion-secret", NOTION_OAUTH_REDIRECT_URI: "http://localhost/notion/callback" });
-  app.decorate("config", config);
-  app.decorate("db", appPool());
-  let userId = editorId;
-  app.addHook("preHandler", async request => { request.auth = { tenantId, userId, role: "member", isAdmin: false }; });
-  const notionServer = { id: "managed-notion", description: "Personal Notion", mode: "managed" as const,
-    routePath: "/mcp/managed-notion", upstreamUrl: null, transportKind: "http" as const, version: 1, hash: "test" };
-  const runtimePolicy = { ...testRuntimePolicy, enabledMcpServers: personalNotion ? [notionServer.id] : [],
-    enabledToolIds: personalNotion ? ["notion_search"] : [] };
-  const dynamicConfig = {
-    async compileRuntimeConfig(_tenant: string, _beta: boolean, session?: { sessionId: string; userId: string }) {
-      if (session) await sessions.getCapabilitySelection(tenantId, session.sessionId, session.userId);
-      return { runtimePolicy, skills: [], mcpServers: personalNotion ? [notionServer] : [], hash: "shared-runtime-test", sources: {
-        runtimePolicy: { id: "test", version: 1, hash: "test" }, skills: [], mcpServers: []
-      } };
-    },
-    async getOrCreateTenantSettings() { return { enabledProviders: ["openai"], enabledModelIds: null, modelDefaultEfforts: {} }; }
-  };
   const notionStore = new NotionConnectionStore(appPool());
   const notionConnections = new NotionConnectionService(config, notionStore, auditEvents);
-  const gateway = Fastify();
-  const catalog = new ManagedToolCatalog();
   if (personalNotion) {
     gateway.decorate("config", config);
-    gateway.addHook("preHandler", async request => { request.auth = { tenantId, userId, role: "member", isAdmin: false }; });
-    catalog.register(NOTION_TOOL_CATALOG.map(tool => ({ ...tool, tenantConfigurable: false })));
+    gateway.addHook("preHandler", async request => { request.auth = { tenantId, userId: auth.userId, role: "member", isAdmin: false }; });
+    catalog.register(NOTION_TOOL_CATALOG.map(tool => ({ ...tool, tenantConfigurable: false, category: "notion" })));
     const registry = new ManagedToolFactoryRegistry();
     registry.register("notion", () => createNotionTools({ notionConnections }).filter(tool => tool.name === "notion_search"));
     await registerMcpRoutes(gateway, {
       db: appPool(), sessions, messages, auditEvents, toolContexts, notionConnections,
-      dynamicConfig: { getMcpServer: async () => notionServer, listSkills: async () => [] },
+      dynamicConfig: { getMcpServerForUser: async () => notionServer, listSkills: async () => [] },
       managedToolCatalog: catalog, managedToolFactoryRegistry: registry,
-      policyService: { gateAction: async () => {} }, approvals: new ApprovalStore(appPool()),
+      policyService: { gateAction: async () => {} }, approvals,
+      integrationToolCalls: { checkToolCall: async () => null },
       runtimeTokenSecret: runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET)
     } as unknown as McpRouteStores);
     config.RUNTIME_GATEWAY_BASE_URL = await gateway.listen({ port: 0, host: "127.0.0.1" });
   }
-  const created: Parameters<DeepAgentsRuntimeFactory>[0][] = [];
-  const inputs: unknown[] = [];
-  const toolsStarted: string[] = [];
-  const runtimeFactory: DeepAgentsRuntimeFactory = init => {
-    created.push(init);
-    const runtime = createDeepAgentsSessionRuntime(init);
-    return { ...runtime, async getAgentForModel(...args) {
-      const graph = await runtime.getAgentForModel(...args);
-      return { ...graph, async *streamEvents(input, options) {
-        inputs.push(input);
-        for await (const event of graph.streamEvents(input, options)) {
-          if (event.event === "on_tool_start") toolsStarted.push(String(event.name));
-          yield event;
-        }
-      } };
-    } };
-  };
-  const approvals = new ApprovalStore(appPool());
-  const makeRuntime = () => new DeepAgentsRuntimeAdapter(config, dynamicConfig, app.log, {
-    sessions, messages, conversationMessages: messages, executions, auditEvents,
-    approvals, runtimeSessions: new RuntimeSessionStore(appPool()),
-    tenantMembers: { isUserBetaTester: async () => false } as never
-  } as ConstructorParameters<typeof DeepAgentsRuntimeAdapter>[3], {
-    hasKey: async () => true, resolveKey: async () => "fake-provider-key", platformProviders: new Set()
-  }, runtimeFactory, catalog);
-  const runtimeAdapter = makeRuntime();
-  const replicaRuntime = makeRuntime();
-  const replica = Fastify();
-  replica.decorate("config", config);
-  replica.decorate("db", appPool());
-  replica.addHook("preHandler", async request => { request.auth = { tenantId, userId, role: "member", isAdmin: false }; });
-  const quota = vi.fn(async () => null);
-  const messageStores = {
-    sessions, projects, messages, executions, toolContexts, auditEvents, dynamicConfig,
-    runtimeAdapter, activeTurns: new ActiveTurnsRegistry(), hasProviderKey: async () => true,
-    limits: { consumeRateLimit: async () => null, consumeTurnQuota: quota },
-    customModels: { list: async () => [] }, artifacts: { listBySession: async () => [] },
-    piiProtection: { evaluateText: async () => ({ action: "allow", reason: "no_findings" }) }
-  } as unknown as MessageRouteStores;
-  for (const [server, runtime] of [[app, runtimeAdapter], [replica, replicaRuntime]] as const) {
-    const activeTurns = new ActiveTurnsRegistry();
-    await registerMessageRoutes(server, { ...messageStores, runtimeAdapter: runtime, activeTurns });
-    await registerApprovalRoutes(server, { approvals, runtimeAdapter: runtime });
-    await registerSessionRoutes(server, { sessions, messages, executions, auditEvents, activeTurns,
-      runtimeAdapter: runtime, limits: messageStores.limits } as SessionRouteStores);
-  }
-  onTestFinished(async () => { await Promise.all([runtimeAdapter.close(), replicaRuntime.close()]); await Promise.all([app.close(), replica.close(), gateway.close()]); });
-  const send = (text: string, server = app) => server.inject({ method: "POST", url: "/messages", payload: { sessionId, text, model: AVAILABLE_MODELS.find(model => model.provider === "openai")!.id } });
+  const send = (text: string, server = app) => messageApp.send(sessionId, text, server);
   return { app, replica, approvals, notionStore, config, tenantId, ownerId, editorId, viewerId, sessionId, sessions, messages, executions, toolContexts, projects, project,
-    created, inputs, toolsStarted, members, actor, send, quota, authenticate(next: string) { userId = next; } };
+    created, inputs, toolsStarted, members, actor, send, quota, authenticate(next: string) { auth.userId = next; } };
 }
 
 describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
@@ -267,15 +233,6 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
 
   test("an approval-mode change mid-turn does not alter the running turn", async () => {
     const h = await setup(true);
-    // D10g: a turn captures the project's approval mode at start and keeps it
-    // for the whole turn, including approval resumes.
-    //
-    // The observable difference between the modes is autoApproveReadOnly:
-    // manual forces it false, automatic inherits the tenant policy (true in
-    // testRuntimePolicy). "gate" is identical under both, because automatic
-    // cannot weaken a native policy of "on-request". So the assertion below
-    // uses a READ-ONLY tool: under the captured manual mode it must stop for
-    // approval even after the project flips to automatic.
     expect(await h.projects.setApprovalMode(h.tenantId, h.ownerId, h.project.projectId, "manual")).toBe(true);
     await h.notionStore.upsert({ tenantId: h.tenantId, userId: h.editorId, notionUserId: "notion-editor",
       notionWorkspaceId: "workspace", notionWorkspaceName: "Test workspace", notionWorkspaceIcon: null,
@@ -285,7 +242,21 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
       tokenLastRefreshedAt: null });
     h.authenticate(h.editorId);
     modelControl.notion = true;
-    modelControl.afterOutput = async () => { modelControl.notion = false; };
+    modelControl.afterOutput = async () => {
+      if (modelControl.notionCalls === 2) modelControl.notion = false;
+    };
+    const realFetch = globalThis.fetch;
+    const notionRequests: string[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).startsWith("https://api.notion.com/")) {
+        notionRequests.push(String(options?.body));
+        return Response.json({ results: [{ id: "source-page", object: "page", properties: {
+          title: { type: "title", title: [{ plain_text: "Controlled source result" }] }
+        } }], has_more: false, next_cursor: null });
+      }
+      return realFetch(input, options);
+    });
+    onTestFinished(() => fetch.mockRestore());
     const turn = h.send("Search the shared source").then(response => response);
     let approvalId = "";
     await vi.waitFor(async () => {
@@ -300,20 +271,29 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     expect((await h.projects.getOwned(h.tenantId, h.ownerId, h.project.projectId))?.approvalMode)
       .toBe("automatic");
 
-    // The running turn is unchanged: its approval is still pending and the
-    // read-only tool has still not run. A turn that re-read the project setting
-    // would auto-approve it and proceed.
-    expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("pending");
-    expect(h.toolsStarted).not.toContain("notion_search");
-
-    // It still resolves through its captured manual mode, by explicit approval.
+    expect(notionRequests).toHaveLength(0);
     expect((await h.app.inject({
       method: "POST",
       url: `/approvals/${approvalId}/decision`,
       payload: { decision: "approve" }
     })).statusCode).toBe(200);
-    await turn;
-    expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("approved");
+    let secondApprovalId = "";
+    await vi.waitFor(async () => {
+      const pending = await h.approvals.listPending(h.tenantId, h.sessionId, h.editorId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.approvalId).not.toBe(approvalId);
+      secondApprovalId = pending[0]!.approvalId;
+    }, { timeout: 5000 });
+    expect(notionRequests).toHaveLength(1);
+    expect((await h.app.inject({ method: "POST", url: `/approvals/${secondApprovalId}/decision`,
+      payload: { decision: "approve" } })).statusCode).toBe(200);
+    const response = await turn;
+    expect(response.statusCode).toBe(200);
+    expect(notionRequests).toHaveLength(2);
+    expect(response.body).toContain("Controlled source result");
+    expect(response.body).toContain("RUN_FINISHED");
+    expect(response.body).not.toContain("RUN_ERROR");
+    expect((await h.approvals.get(h.tenantId, secondApprovalId, h.editorId))?.status).toBe("approved");
   });
 
   test("MCP uses each participant's encrypted personal connection without inheriting the previous user's credentials", async () => {

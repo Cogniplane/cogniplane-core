@@ -18,12 +18,32 @@
 // AuditEventType` and still get the discipline at consumption.
 
 export const AUDIT_EVENT_TYPES = [
+  "personal_capabilities_changed",
+  "member.mcp_credential.saved",
+  "member.mcp_credential.removed",
+  "personal.skill.created",
+  "personal.skill.draft_saved",
+  "personal.skill.released",
+  "personal.skill.disabled",
+  "personal.skill.deleted",
+  "organization.skill_submission.created",
+  "organization.skill_submission.withdrawn",
+  "organization.skill_submission.resubmitted",
+  "organization.skill_submission.changes_requested",
+  "organization.skill_submission.declined",
+  "organization.skill_submission.accepted",
+  "organization.skill_submission.released",
+  "model_spending_policy_updated",
+  "model_spending_closed",
+  "model_spending_reconciled",
   // Admin — MCP servers (emitted by admin-mcp-server-routes.ts).
   "admin.mcp_server.created",
   "admin.mcp_server.updated",
   "admin.mcp_server.disabled",
   "admin.mcp_server.published",
   "admin.mcp_server.unpublished",
+  "admin.mcp_server.widget_domain_approved",
+  "admin.mcp_server.widget_domain_revoked",
   "admin.artifact.download_token_minted",
   // Admin — custom models (emitted by admin-model-routes.ts).
   "admin.custom_model.created",
@@ -65,6 +85,13 @@ export const AUDIT_EVENT_TYPES = [
   "project_reference_storage_deletion_failed",
   "project_approval_mode_changed",
   "project_agent_file_mode_changed",
+  "project_capabilities_changed",
+  "project.skill.created",
+  "project.skill.copied",
+  "project.skill.draft_saved",
+  "project.skill.released",
+  "project.skill.disabled",
+  "project.skill.deleted",
   "project_file_read",
   "project_file_created",
   "project_folder_created",
@@ -146,8 +173,13 @@ export const AUDIT_EVENT_TYPES = [
   // User-driven integration connections.
   "user.github.connected",
   "user.github.disconnected",
+  "user.github.repositories_updated",
   "user.notion.connected",
   "user.notion.disconnected",
+  "user.jira.connected",
+  "user.jira.disconnected",
+  "user.jira.cleanup_completed",
+  "user.jira.cleanup_failed",
   // Microsoft is wired through the SharePoint overlay (private/) but emits
   // through the same audit pipeline; central enum includes it so the
   // overlay's call sites typecheck.
@@ -158,6 +190,10 @@ export const AUDIT_EVENT_TYPES = [
   "user.scheduled_job.created",
   "user.scheduled_job.updated",
   "user.scheduled_job.deleted",
+
+  // User edits and deletes of their own long-term memories (routes/memories.ts).
+  "user.memory.updated",
+  "user.memory.deleted",
 
   // User-driven setting changes.
   "user.settings.updated"

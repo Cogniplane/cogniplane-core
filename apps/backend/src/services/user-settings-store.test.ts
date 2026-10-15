@@ -359,3 +359,185 @@ describe("UserSettingsStore – scheduler methods", () => {
     });
   });
 });
+
+describe("UserSettingsStore – scheduled job admission", () => {
+  const quotaLock = `lock:${JSON.stringify(["scheduled-job-quota", "tenant-1", "user-1"])}`;
+
+  const jobInput = (overrides: { enabled?: boolean } = {}) => ({
+    tenantId: "tenant-1",
+    jobId: "job-1",
+    userId: "user-1",
+    jobName: "Daily digest",
+    description: null,
+    cronExpression: "0 9 * * *",
+    timeZone: "UTC",
+    targetType: "prompt" as const,
+    targetRef: null,
+    input: { prompt: "Digest." },
+    settingsSnapshot: {},
+    enabled: overrides.enabled ?? true,
+    nextRunAt: "2026-03-18T09:00:00.000Z"
+  });
+
+  // A scripted database: `activeJobs` answers the count, `rowEnabled` answers
+  // the locked job row (undefined means the row does not exist).
+  function scriptedStore(options: { activeJobs?: number; rowEnabled?: boolean }) {
+    const db = new FakeDatabase();
+    db.onQuery((sql) => {
+      if (sql.includes("COUNT(*)")) {
+        return { rows: [{ count: String(options.activeJobs ?? 0) }], rowCount: 1 };
+      }
+      if (sql.includes("FOR UPDATE")) {
+        return options.rowEnabled === undefined
+          ? { rows: [], rowCount: 0 }
+          : { rows: [{ enabled: options.rowEnabled }], rowCount: 1 };
+      }
+      if (sql.includes("INSERT INTO scheduled_jobs") || sql.includes("UPDATE scheduled_jobs")) {
+        return { rows: [fakeJobRow({ tenant_id: "tenant-1" })], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    // Statement kinds in order, to check what runs in the one transaction.
+    const statements = () =>
+      db.calls
+        .map(({ sql, params }) => {
+          const text = sql.trim();
+          if (text.startsWith("SELECT set_config")) return null;
+          if (text.startsWith("SELECT pg_advisory_xact_lock")) return `lock:${String(params[0])}`;
+          if (text.includes("COUNT(*)")) return "count";
+          if (text.includes("FOR UPDATE")) return "job-row-lock";
+          return text.split(/\s+/)[0]!.toUpperCase();
+        })
+        .filter((kind): kind is string => kind !== null);
+    return { store: new UserSettingsStore(db as never), statements };
+  }
+
+  describe("createScheduledJob", () => {
+    it("takes the user's quota lock, then counts, then inserts in one transaction", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 49 });
+
+      const result = await store.createScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result.status).toBe("created");
+      expect(statements()).toEqual(["BEGIN", quotaLock, "count", "INSERT", "COMMIT"]);
+    });
+
+    it("reports limit_reached at the cap and inserts nothing", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 50 });
+
+      const result = await store.createScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result).toEqual({ status: "limit_reached" });
+      expect(statements()).toEqual(["BEGIN", quotaLock, "count", "COMMIT"]);
+    });
+
+    it("does not lock or count for a disabled job, even at the cap", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 50 });
+
+      const result = await store.createScheduledJob(jobInput({ enabled: false }), { maxActive: 50 });
+
+      expect(result.status).toBe("created");
+      expect(statements()).toEqual(["BEGIN", "INSERT", "COMMIT"]);
+    });
+
+    it("does not lock or count when the cap is 0 (disabled)", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 500 });
+
+      const result = await store.createScheduledJob(jobInput(), { maxActive: 0 });
+
+      expect(result.status).toBe("created");
+      expect(statements()).toEqual(["BEGIN", "INSERT", "COMMIT"]);
+    });
+
+    it("fails closed when the quota read fails: rolls back and inserts nothing", async () => {
+      const db = new FakeDatabase();
+      db.onQuery((sql) => {
+        if (sql.includes("COUNT(*)")) throw new Error("count unavailable");
+        return { rows: [], rowCount: 0 };
+      });
+      const store = new UserSettingsStore(db as never);
+
+      await expect(store.createScheduledJob(jobInput(), { maxActive: 50 })).rejects.toThrow("count unavailable");
+
+      const kinds = db.calls.map(({ sql }) => sql.trim().split(/\s+/)[0]!.toUpperCase());
+      expect(kinds).toContain("ROLLBACK");
+      expect(kinds).not.toContain("INSERT");
+      expect(kinds).not.toContain("COMMIT");
+    });
+
+    it("locks per (tenant, user), so another user's key differs", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 0 });
+
+      await store.createScheduledJob({ ...jobInput(), userId: "user-2" }, { maxActive: 5 });
+
+      expect(statements()[1]).toBe(`lock:${JSON.stringify(["scheduled-job-quota", "tenant-1", "user-2"])}`);
+    });
+  });
+
+  describe("updateScheduledJob", () => {
+    it("locks the quota first, then the job row, and counts before enabling a disabled job", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 49, rowEnabled: false });
+
+      const result = await store.updateScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result.status).toBe("updated");
+      expect(statements()).toEqual(["BEGIN", quotaLock, "job-row-lock", "count", "UPDATE", "COMMIT"]);
+    });
+
+    it("reports limit_reached for a disabled job at the cap and writes nothing", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 50, rowEnabled: false });
+
+      const result = await store.updateScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result).toEqual({ status: "limit_reached" });
+      expect(statements()).toEqual(["BEGIN", quotaLock, "job-row-lock", "count", "COMMIT"]);
+    });
+
+    it("does not count a job that the locked read shows as already enabled", async () => {
+      // The caller's earlier read may be stale. The row read under the lock
+      // decides, so enabling an enabled job at the cap must not count it twice.
+      const { store, statements } = scriptedStore({ activeJobs: 50, rowEnabled: true });
+
+      const result = await store.updateScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result.status).toBe("updated");
+      expect(statements()).toEqual(["BEGIN", quotaLock, "job-row-lock", "UPDATE", "COMMIT"]);
+    });
+
+    it("reports not_found when the locked read finds no row", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 0 });
+
+      const result = await store.updateScheduledJob(jobInput(), { maxActive: 50 });
+
+      expect(result).toEqual({ status: "not_found" });
+      expect(statements()).toEqual(["BEGIN", quotaLock, "job-row-lock", "COMMIT"]);
+    });
+
+    it("does not lock or count when the update disables the job", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 50, rowEnabled: true });
+
+      const result = await store.updateScheduledJob(jobInput({ enabled: false }), { maxActive: 50 });
+
+      expect(result.status).toBe("updated");
+      expect(statements()).toEqual(["BEGIN", "UPDATE", "COMMIT"]);
+    });
+
+    it("does not lock or count when the cap is 0 (disabled)", async () => {
+      const { store, statements } = scriptedStore({ activeJobs: 500, rowEnabled: false });
+
+      const result = await store.updateScheduledJob(jobInput(), { maxActive: 0 });
+
+      expect(result.status).toBe("updated");
+      expect(statements()).toEqual(["BEGIN", "UPDATE", "COMMIT"]);
+    });
+
+    it("reports not_found when an unlocked update matches no row", async () => {
+      const db = new FakeDatabase();
+      const store = new UserSettingsStore(db as never);
+
+      const result = await store.updateScheduledJob(jobInput({ enabled: false }), { maxActive: 50 });
+
+      expect(result).toEqual({ status: "not_found" });
+    });
+  });
+});

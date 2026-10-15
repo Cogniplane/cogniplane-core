@@ -6,6 +6,19 @@ import { ScheduledJobsSection } from "../../../components/scheduled-jobs-section
 export default function SettingsScheduledJobsPage() {
   const {
     scheduledJobs,
+    jobsLoading,
+    jobsLoadFailed,
+    retryJobs,
+    defaultsDirty,
+    resetDefaults,
+    defaultsError,
+    defaultsLoadFailed,
+    retryDefaults,
+    jobError,
+    listActionError,
+    runsLoading,
+    runsError,
+    retryRuns,
     defaultsDraft,
     setDefaultsDraft,
     jobDraft,
@@ -14,7 +27,6 @@ export default function SettingsScheduledJobsPage() {
     expandedRunsJobId,
     jobRuns,
     busyKey,
-    error: jobsError,
     handleDefaultsSubmit,
     handleJobSubmit,
     handleEditJob,
@@ -25,10 +37,21 @@ export default function SettingsScheduledJobsPage() {
   } = useScheduledJobsData();
 
   return (
-    <>
-      {jobsError ? <p className="text-sm text-danger">{jobsError}</p> : null}
-      <ScheduledJobsSection
+    <ScheduledJobsSection
         busyKey={busyKey}
+        jobsLoading={jobsLoading}
+        jobsLoadFailed={jobsLoadFailed}
+        retryJobs={retryJobs}
+        defaultsDirty={defaultsDirty}
+        resetDefaults={resetDefaults}
+        defaultsError={defaultsError}
+        defaultsLoadFailed={defaultsLoadFailed}
+        retryDefaults={retryDefaults}
+        jobError={jobError}
+        listActionError={listActionError}
+        runsLoading={runsLoading}
+        runsError={runsError}
+        retryRuns={retryRuns}
         defaultsDraft={defaultsDraft}
         editingJobId={editingJobId}
         expandedRunsJobId={expandedRunsJobId}
@@ -44,7 +67,6 @@ export default function SettingsScheduledJobsPage() {
         scheduledJobs={scheduledJobs}
         setDefaultsDraft={setDefaultsDraft}
         setJobDraft={setJobDraft}
-      />
-    </>
+    />
   );
 }

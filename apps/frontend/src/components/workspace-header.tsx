@@ -7,11 +7,14 @@ import { CheckIcon, ClipboardIcon, PanelLeftIcon, PanelRightIcon } from "lucide-
 
 import { useAuth } from "../lib/auth-context";
 import { useOrganizations } from "../hooks/use-organizations";
+import { SHORTCUTS, ariaKeyShortcut, useApplePlatform } from "../lib/keyboard-shortcuts";
 import { SessionActionMenu, type SessionActionMenuProps } from "./session-action-menu";
 import { SessionStatusIndicator } from "./session-status";
 import { ProjectInstructionsIndicator } from "./project-instructions-indicator";
 import { SessionCapabilitiesButton } from "./session-capabilities";
 import type { CompletedTurn, SessionStatus } from "./session-status.logic";
+import { openKeyboardShortcuts } from "./keyboard-shortcuts-dialog";
+import { QuickJump } from "./quick-jump/quick-jump";
 import { ThemeToggle } from "./theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -119,6 +122,7 @@ export function WorkspaceHeader(props: {
 
   const isTitleEditable = Boolean(onRenameSession);
   const initials = avatarInitials(user?.displayName, user?.email);
+  const apple = useApplePlatform();
 
   return (
     <header className="flex min-h-14 items-center gap-2 border-b border-outline-variant bg-surface-container-lowest px-2 py-2 sm:gap-4 sm:px-4">
@@ -129,6 +133,7 @@ export function WorkspaceHeader(props: {
             variant="ghost"
             size="icon-sm"
             aria-label={props.isSidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleSidebar, apple)}
             onClick={props.onToggleSidebar}
           >
             <PanelLeftIcon />
@@ -173,6 +178,7 @@ export function WorkspaceHeader(props: {
           {...props.sessionActions}
           onRename={props.sessionActions.onRename ?? (onRenameSession ? focusTitleForRename : undefined)}
         /> : null}
+        <QuickJump />
         <ThemeToggle />
 
         {onCopySession ? (
@@ -195,6 +201,7 @@ export function WorkspaceHeader(props: {
               variant="ghost"
               size="icon-sm"
               aria-label={props.isArtifactPaneOpen ? "Hide artifacts panel" : "Show artifacts panel"}
+              aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleArtifacts, apple)}
               onClick={props.onToggleArtifactPane}
             >
               <PanelRightIcon />
@@ -243,6 +250,10 @@ export function WorkspaceHeader(props: {
               </DropdownMenuItem>
             ))}
             <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={openKeyboardShortcuts} className="flex flex-col items-start gap-0.5">
+              <span className="font-medium">Keyboard shortcuts</span>
+              <span className="text-xs text-muted-foreground">Press ? on any page</span>
+            </DropdownMenuItem>
             <DropdownMenuItem
               onSelect={() => void logout()}
               className="flex flex-col items-start gap-0.5"

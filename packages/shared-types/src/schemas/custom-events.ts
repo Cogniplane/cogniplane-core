@@ -1,9 +1,10 @@
 import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
-import { ApprovalSchema, UiResourceSchema } from "./message.js";
+import { ApprovalSchema, McpAppCallSchema } from "./message.js";
 
 // AG-UI's CUSTOM envelope is open-ended. These are the payloads Cogniplane owns.
+// The retired `tool_ui_resources` event is not listed. Consumers ignore it.
 export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
   z.object({
     name: z.literal("turn_started"),
@@ -59,10 +60,10 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
     })
   }),
   z.object({
-    name: z.literal("tool_ui_resources"),
+    name: z.literal("tool_mcp_app"),
     value: z.object({
       toolCallId: z.string().min(1),
-      uiResources: z.array(UiResourceSchema)
+      app: McpAppCallSchema
     })
   }),
   z.object({
@@ -75,6 +76,20 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
       messageId: z.string().min(1),
       text: z.string(),
       scanRunId: z.string().nullable().optional()
+    })
+  }),
+  // Sent once by `GET /sessions/:id/connect`, inside the run that carries the
+  // saved history. `activeTurn` tells the browser what follows that run:
+  // - "none": no turn runs, and the stream ends.
+  // - "attached": the running turn follows as a second run, replay then live.
+  // - "unavailable": a turn runs, but this connection cannot replay it. The
+  //   stream ends, and the browser must confirm the end of the turn itself.
+  // `hasMoreHistory` is true when older messages were left out of the history.
+  z.object({
+    name: z.literal("session_connection"),
+    value: z.object({
+      activeTurn: z.enum(["none", "attached", "unavailable"]),
+      hasMoreHistory: z.boolean()
     })
   })
 ]);

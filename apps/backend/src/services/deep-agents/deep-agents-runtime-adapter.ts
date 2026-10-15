@@ -1,3 +1,5 @@
+import type { ModelSpendingStore } from "../model-spending-store.js";
+import { ModelSpendingCallback } from "./model-spending-callback.js";
 import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "../session-execution-store.js";
 // Sole runtime provider (bead im5e.1, then quap.4): the agent loop runs IN
@@ -39,19 +41,24 @@ import type { MemoryStore } from "../memory-store.js";
 import type { MessageStore, TokenUsageRecord } from "../message-store.js";
 import { calculateCostUsd } from "../token-cost-calculator.js";
 import type { PolicyService } from "../policy/policy-service.js";
-import { POLICY_APPROVAL_REQUEST_METHOD } from "../policy/policy-approval-proof.js";
 import type { RuntimeSessionStore } from "../runtime/runtime-session-store.js";
 import type { TenantMemberStore } from "../tenant-member-store.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "../auth/runtime-token.js";
 import type { ManagedToolCatalog } from "../managed-tools/catalog.js";
-import { redactSecrets } from "../redact-secrets.js";
-import { cancelPendingApprovals, expireApprovalById } from "../runtime/approval-cleanup.js";
+import {
+  ApprovalCoordinator,
+  type ApprovalPublish,
+  type ApprovalRequest,
+  type ApprovalTurn
+} from "../runtime/approval-coordinator.js";
 import {
   clearIdleTimer,
   scheduleIdleTeardown
 } from "../runtime/idle-teardown.js";
 import { createStageTimer } from "../runtime/startup-timing.js";
+import { MEMORY_SAVE_TOOL, prepareMemorySaveApproval, type DurableWriteApproval } from "../memory-consent.js";
 import {
+  buildMemoryDataContext,
   buildMemorySectionLines,
   loadWorkspaceMemories
 } from "../memory-workspace-section.js";
@@ -74,6 +81,7 @@ import type {
   DeepAgentsSessionState
 } from "./deep-agents-types.js";
 import { E2B_WORKSPACE_BASE } from "../runtime/e2b-sandbox.js";
+import { resolveSandboxNetworkPolicy } from "../runtime/sandbox-network-policy.js";
 
 const PROVIDER_ID = "deep-agents";
 
@@ -116,42 +124,14 @@ function withUsageFlushDeadline(flush: Promise<void>): Promise<void> {
   });
 }
 
-/**
- * A native HITL approval awaiting a human decision. The interrupt itself is
- * checkpointed inside LangGraph; this entry only bridges the decision route
- * to the in-process turn loop that will resume the graph.
- */
-/**
- * What one native approval round resolved to. `"unavailable"` is a fail-closed
- * denial the human never made (the approval row could not be written), kept
- * distinct from `"reject"` so the model is not told the user refused.
- */
-type NativeApprovalOutcome = RuntimeApprovalDecision | "unavailable" | "expired";
-
-type PendingDeepAgentsApproval = {
-  sessionId: string;
-  kind: RuntimeApprovalKind;
-  /**
-   * The "remember for this turn" key for this action. Equals `kind` except for
-   * MCP tools, where it is scoped to the tool name so remembering one MCP tool
-   * does not auto-approve every other MCP tool this turn (see
-   * autoApprovedKindsForTurn / rememberKeyFor).
-   */
-  rememberKey: string;
-  /** Settles the turn loop's decision promise. Idempotent. */
-  settle: (decision: NativeApprovalOutcome) => void;
-  /** The originating turn's remember-set instance (see autoApprovedKindsForTurn). */
-  autoApprovedKinds: Set<string>;
-  requiresDurableProof: boolean;
-};
-
 export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   readonly id = PROVIDER_ID;
 
+  private readonly spending = new Map<string, ModelSpendingCallback>();
   private readonly sessions = new Map<string, DeepAgentsSessionState>();
   private readonly activeTurns = new Set<string>();
   private readonly pendingIntegrationInvalidations = new Set<string>();
-  private readonly pendingApprovals = new Map<string, PendingDeepAgentsApproval>();
+  private readonly approvalCoordinator: ApprovalCoordinator;
   private readonly pendingWorkspaceResetNotices = new Map<
     string,
     { noticeId: string; message: string; expiryTimer: NodeJS.Timeout }
@@ -174,12 +154,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly dynamicConfig: Pick<DynamicConfigService, "compileRuntimeConfig">,
+    private readonly dynamicConfig: Pick<DynamicConfigService, "compileRuntimeConfig" | "getRuntimePolicy">,
     private readonly log: FastifyBaseLogger,
     private readonly stores: {
       approvals: ApprovalStore;
       executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime"> &
-        Partial<Pick<SessionExecutionStore, "sandboxId" | "bindSandboxId">>;
+        Partial<Pick<SessionExecutionStore, "sandboxBinding" | "bindSandboxId">>;
       conversationMessages?: Pick<MessageStore, "listBySession">;
       sessions: Pick<import("../session-store.js").SessionStore, "getReadable">;
       auditEvents: AuditEventStore;
@@ -200,7 +180,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        * writes through the same store
        * methods. Optional so unit tests can opt out.
        */
-      messages?: Pick<MessageStore, "addTokenUsage" | "setCostUsd">;
+      messages?: Pick<MessageStore, "addTokenUsage">;
+      modelSpending?: ModelSpendingStore;
       /**
        * Skill bundle storage for materializing companion files into the
        * /skills/ library at session start. Optional: without it, bundle-backed
@@ -226,7 +207,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     private readonly runtimeFactory: DeepAgentsRuntimeFactory = createDeepAgentsSessionRuntime,
     /** Read-only tool classification for autoApproveReadOnlyTools. Optional in unit tests. */
     private readonly managedToolCatalog?: Pick<ManagedToolCatalog, "listIds" | "listReadOnlyIds" | "get">
-  ) {}
+  ) {
+    this.approvalCoordinator = new ApprovalCoordinator({
+      approvals: stores.approvals, auditEvents: stores.auditEvents, logger: log,
+      ttlMs: config.APPROVAL_REQUEST_TTL_MS
+    });
+  }
 
   hasActiveTurn(sessionId: string): boolean {
     return this.activeTurns.has(sessionId);
@@ -281,7 +267,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       const previous = this.sessions.get(sessionId);
       if (previous && previous.tenantId !== input.tenantId) throw sessionOwnershipMismatch();
       if (previous?.execution?.executionId === input.execution.executionId && !previous.abortController.signal.aborted) {
-        return { sessionId, runtimeId: previous.runtimeId, runtimePolicy: previous.configBundle.runtimePolicy };
+        return { sessionId, runtimeId: previous.runtimeId, runtimePolicy: previous.configBundle.runtimePolicy,
+          mcpServerSources: previous.configBundle.sources.mcpServers,
+          integrationAccounts: previous.configBundle.sources.integrationAccounts ?? {} };
       }
       if (input.execution.projectId) {
         // Shared project turns rebuild the graph from the saved transcript.
@@ -318,20 +306,17 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           exp: runtimeTokenExpiry(this.config.RUNTIME_TOKEN_TTL_MS)
         }, runtimeTokenSecret(this.config.DATA_ENCRYPTION_SECRET));
         const gatewayBase = this.config.RUNTIME_GATEWAY_BASE_URL.replace(/\/$/, "");
-        const memories = await loadWorkspaceMemories(this.stores.memories, {
-          tenantId: input.tenantId, userId: input.userId, enabledToolIds: bundle.runtimePolicy.enabledToolIds,
-          readPolicy: this.stores.policyService ? {
-            policy: this.stores.policyService, enforcementMode: bundle.runtimePolicy.policyEnforcementMode
-          } : undefined
-        }, this.log);
-        const memoryLines = buildMemorySectionLines(memories, bundle.runtimePolicy.enabledToolIds);
+        const memoryLines = buildMemorySectionLines(bundle.runtimePolicy.enabledToolIds);
         await existing.runtime.refreshCapabilities({
           skillsLibraryFiles,
           allowCommandExecution: bundle.runtimePolicy.allowCommandExecution && Boolean(this.config.E2B_API_KEY),
           e2b: this.config.E2B_API_KEY ? {
             apiKey: this.config.E2B_API_KEY, templateId: this.config.E2B_TEMPLATE_ID,
             sandboxTimeoutMs: this.config.E2B_SANDBOX_TIMEOUT_MS,
-            executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS
+            executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS,
+            resolveNetworkPolicy: () => this.resolveSandboxPolicy(input.tenantId, sessionId),
+            networkConfirmTimeoutMs: this.config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
+            networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS
           } : null,
           approvals: {
             ...resolveTurnApprovalSettings(bundle.runtimePolicy),
@@ -348,11 +333,25 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       return {
         sessionId,
         runtimeId: existing.runtimeId,
-        runtimePolicy: existing.configBundle.runtimePolicy
+        runtimePolicy: existing.configBundle.runtimePolicy,
+        mcpServerSources: existing.configBundle.sources.mcpServers,
+        integrationAccounts: existing.configBundle.sources.integrationAccounts ?? {}
       };
     }
 
     return this.buildSession(input);
+  }
+
+  /**
+   * The network policy that a sandbox of this session must have, read from the
+   * tenant settings now. The sandbox asks every time it creates a sandbox and
+   * at the start of every turn, so a change of the approved hosts applies at the
+   * next turn without a refresh of the runtime. Hosts that fail the host check
+   * are dropped, which approves less; the drop is logged.
+   */
+  private async resolveSandboxPolicy(tenantId: string, sessionId: string) {
+    const policy = await this.dynamicConfig.getRuntimePolicy(tenantId);
+    return sandboxNetworkPolicyFor(policy.sandboxEgressDomains, this.log, sessionId);
   }
 
   private async buildSession(input: {
@@ -410,28 +409,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       runtimeTokenSecret(this.config.DATA_ENCRYPTION_SECRET)
     );
 
-    // Phase 1 parity: recent long-term memories are injected into the system
-    // prompt at session start, gated on memory_search enablement and (in
-    // enforce mode) a side-effect-free Policy Center evaluation — the same
-    // guard the other adapters apply so prompt injection can't bypass policy.
-    const memories = await startupTimer.time("memoryLoadMs", () =>
-      loadWorkspaceMemories(
-        this.stores.memories,
-        {
-          tenantId,
-          userId,
-          enabledToolIds: runtimePolicy.enabledToolIds,
-          readPolicy: this.stores.policyService
-            ? {
-                policy: this.stores.policyService,
-                enforcementMode: runtimePolicy.policyEnforcementMode
-              }
-            : undefined
-        },
-        this.log
-      )
-    );
-    const memoryLines = buildMemorySectionLines(memories, runtimePolicy.enabledToolIds);
+    // The system prompt names the memory tools and states the rule that memory
+    // is user data. The memories themselves are read at the start of each turn
+    // and sent as a data message (see loadMemoryContext).
+    const memoryLines = buildMemorySectionLines(runtimePolicy.enabledToolIds);
     // Enabled skills (bead kpit): served as a read-only /skills/ file library
     // through the native deepagents skills middleware (progressive
     // disclosure) instead of the retired "## Skill:" system-prompt inlining.
@@ -469,7 +450,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const managedToolFacts = Object.fromEntries(
       (this.managedToolCatalog?.listIds() ?? []).map((toolName) => {
         const entry = this.managedToolCatalog?.get(toolName);
-        return [toolName, { readOnly: entry?.readOnly ?? false, category: entry?.category ?? null }];
+        return [toolName, {
+          readOnly: entry?.readOnly ?? false, category: entry?.category ?? null,
+          requiresUserApproval: entry?.requiresUserApproval ?? false
+        }];
       })
     );
     // Member removal can race the asynchronous setup above. Re-check after
@@ -478,6 +462,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     await this.requireRuntimeSessionAccess(input);
 
     const runtime = this.runtimeFactory({
+      ...(this.stores.modelSpending ? {
+        requireSpendingAllowance: () => this.spending.get(runtimeId)?.assertAllowance(),
+        hasSpendingReservation: () => this.spending.has(runtimeId)
+      } : {}),
       ...(input.execution ? { requireExecution: async () => {
         const current = this.sessions.get(sessionId);
         if (!current || current.runtimeId !== runtimeId || !current.execution)
@@ -521,28 +509,31 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               apiKey: this.config.E2B_API_KEY,
               templateId: this.config.E2B_TEMPLATE_ID,
               sandboxTimeoutMs: this.config.E2B_SANDBOX_TIMEOUT_MS,
-              executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS
+              executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS,
+              resolveNetworkPolicy: () => this.resolveSandboxPolicy(tenantId, sessionId),
+              networkConfirmTimeoutMs: this.config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
+              networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS
             }
           : null,
       ...(input.execution && !input.execution.projectId &&
-        this.stores.executions.sandboxId && this.stores.executions.bindSandboxId
+        this.stores.executions.sandboxBinding && this.stores.executions.bindSandboxId
         ? { sandboxBinding: {
             load: async () => {
               const current = this.sessions.get(sessionId)?.execution;
               if (!current) throw new SessionExecutionError("execution_stopped", 403);
-              return this.stores.executions.sandboxId!(current);
+              return this.stores.executions.sandboxBinding!(current);
             },
-            save: async (previousId: string | null, sandboxId: string) => {
+            save: async (previousId: string | null, sandboxId: string, networkPolicyHash: string) => {
               const current = this.sessions.get(sessionId)?.execution;
               if (!current) throw new SessionExecutionError("execution_stopped", 403);
-              await this.stores.executions.bindSandboxId!(current, previousId, sandboxId);
+              await this.stores.executions.bindSandboxId!(current, previousId, sandboxId, networkPolicyHash);
             }
           } } : {}),
       // Surface a transparently replaced sandbox: at that moment every file
       // the agent wrote and every artifact synced into the workspace is gone,
       // and without a notice the model just meets file_not_found on its own
       // work. Best-effort — no active turn means nowhere to show it.
-      onSandboxRecreated: ({ previousSandboxId }) => {
+      onSandboxRecreated: ({ previousSandboxId, reason }) => {
         const sessionState = this.sessions.get(sessionId);
         if (!sessionState) return;
         const responseId = sessionState.activeTurnResponseId.current;
@@ -565,7 +556,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           level: "warning",
           title: "Workspace reset",
           message:
-            "The execution sandbox expired and was replaced. Files written earlier in this session, " +
+            (reason === "network_policy"
+              ? "The execution sandbox did not match the current network policy and was replaced. "
+              : "The execution sandbox expired and was replaced. ") +
+            "Files written earlier in this session, " +
             "and artifacts synced into the workspace, are no longer on disk and need to be recreated.",
           createdAt: new Date().toISOString()
         }));
@@ -591,8 +585,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       activeTurnResponseId: { current: null },
       pendingTurnEvents: [],
       toolContextRef,
-      policyContextRef,
-      autoApprovedKindsForTurn: new Set()
+      policyContextRef
     };
     this.sessions.set(sessionId, state);
 
@@ -648,7 +641,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     return {
       sessionId,
       runtimeId,
-      runtimePolicy: configBundle.runtimePolicy
+      runtimePolicy: configBundle.runtimePolicy,
+      mcpServerSources: configBundle.sources.mcpServers,
+      integrationAccounts: configBundle.sources.integrationAccounts ?? {}
     };
   }
 
@@ -679,7 +674,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         statusCode: 409
       });
     }
-    await this.requireRuntimeSessionAccess(state);
+    const projectId = await this.requireRuntimeSessionAccess(state);
     if (state.execution && !await this.stores.executions!.isCurrent(state.execution, state.runtimeId)) {
       throw new SessionExecutionError("execution_stopped", 403);
     }
@@ -714,7 +709,23 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
       turnAbort
     );
+    const responseId = input.assistantMessageId ?? uuidv7();
+    const modelId = input.model ?? defaultDeepAgentsModelId();
+    let spending: ModelSpendingCallback | undefined;
+    const finishSpending = async () => {
+      try { await spending?.finish(); }
+      catch (err) { this.log.error({ err, responseId }, "Failed to settle model spending; reservation retained"); }
+    };
+    // The closed callback must not stay in the map after its turn.
+    const forgetSpending = () => {
+      if (spending && this.spending.get(state.runtimeId) === spending) this.spending.delete(state.runtimeId);
+    };
+    // Ends the turn in the sandbox. It is set when the turn begins there, and every exit below calls it.
+    let endSandboxTurn: () => void = () => {};
     const releaseTurnSlot = async () => {
+      endSandboxTurn();
+      await finishSpending();
+      forgetSpending();
       disarmWatchdog();
       state.abortController.signal.removeEventListener("abort", onSessionAbort);
       input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
@@ -725,6 +736,39 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       await this.finishIntegrationInvalidation(state);
     };
     armWatchdog();
+    try {
+      const vendorModel = resolveModelConstruction(modelId).vendorModel;
+      const reservation = await this.stores.modelSpending?.reserve({
+        tenantId: state.tenantId, userId: state.userId, sessionId: state.sessionId,
+        reservationId: responseId, turnContext: input.turnContext ?? "interactive", modelName: vendorModel
+      });
+      this.spending.delete(state.runtimeId);
+      if (reservation && this.stores.modelSpending) {
+        spending = new ModelSpendingCallback(this.stores.modelSpending, reservation,
+          vendorModel, turnAbort.signal);
+        this.spending.set(state.runtimeId, spending);
+      }
+    } catch (error) {
+      await releaseTurnSlot();
+      throw error;
+    }
+
+    // A turn starts in the sandbox here, for an interactive turn and for a
+    // scheduled job alike. The admin may have changed the approved hosts since
+    // the last turn, and the network of a sandbox is fixed when it is created.
+    // What was confirmed in an earlier turn must not carry over, so the first
+    // operation of this turn reads the live network of the sandbox once and
+    // replaces it if it does not match the policy as it is now. It is
+    // synchronous and must not throw. If it does, the turn fails rather than run
+    // on a confirmation that may be stale. The sandbox ends the turn when the
+    // turn is cancelled, and every exit of this method ends it too, so that
+    // nothing the turn asked of the sandbox runs after it.
+    try {
+      endSandboxTurn = state.runtime.beginSandboxTurn?.(turnAbort.signal) ?? endSandboxTurn;
+    } catch (error) {
+      await releaseTurnSlot();
+      throw error;
+    }
 
     // Push the sandbox lifetime back out before anything touches it (artifact
     // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
@@ -752,7 +796,6 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
     // Claim the response id before artifact sync. A sandbox replacement during
     // sync may emit a notice that needs the id before the push hook exists.
-    const responseId = input.assistantMessageId ?? uuidv7();
     state.activeTurnResponseId.current = responseId;
     state.pendingTurnEvents = [];
 
@@ -813,6 +856,14 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       }
     }
 
+    // Recent memories enter model input as a labelled data message. They are read
+    // for every turn, so an edit or a delete in settings applies at once.
+    let memoryContext: string | null = null;
+    await this.waitForTurnSetup(
+      this.loadMemoryContext(state, session.runtimePolicy).then((text) => { memoryContext = text; }),
+      turnAbort.signal
+    );
+
     // An abort raised during onBeforeTurn (client disconnect, session teardown)
     // is NOT short-circuited here: the run is still started so the stream leads
     // with RUN_STARTED and then terminates through the subscription's abort
@@ -871,9 +922,22 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           enforcementMode: session.runtimePolicy.policyEnforcementMode
         }
       : null;
-    state.autoApprovedKindsForTurn = new Set();
+    const approvalTurn = this.approvalCoordinator.openTurn({
+      identity: { tenantId: state.tenantId, userId: state.userId, sessionId: state.sessionId,
+        runtimeId: state.runtimeId, turnId: responseId },
+      projectId, durableNative: Boolean(state.execution), signal: turnAbort.signal,
+      hasLocalActor: (actor) => {
+        const current = this.sessions.get(state.sessionId);
+        return current?.tenantId === actor.tenantId && current.userId === actor.userId;
+      },
+      validateLocalDecision: async (actor) => {
+        const current = this.sessions.get(state.sessionId);
+        if (!current || current.tenantId !== actor.tenantId || current.userId !== actor.userId)
+          throw sessionOwnershipMismatch();
+        await this.requireCurrentExecution(current);
+      }
+    });
 
-    const modelId = input.model ?? defaultDeepAgentsModelId();
     const effort = input.effort ?? defaultEffortForModel(modelId);
 
     // Record per-turn usage and cost on the assistant row keyed by responseId. The raw
@@ -881,8 +945,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // to accumulate usage in-band without the driver needing to know.
     const usageTotals = createEmptyUsage();
     const usageModelName = resolveModelConstruction(modelId).vendorModel;
+    // Priced per call: a long-context tier applies to one call's input, not to
+    // the sum of the turn. Null when any call has no price.
+    const usageCost: { usd: number | null } = { usd: 0 };
 
     const rawBackend = createSessionAGUITurnBackend({
+      callbacks: spending ? [spending] : undefined,
       threadId: state.threadId,
       runtime: state.runtime,
       toolContextRef: state.toolContextRef,
@@ -891,6 +959,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       promptText,
       conversationMessages,
       projectInstructions: input.projectInstructions,
+      memoryContext,
       signal: turnAbort.signal,
       onGraphReady: async () => {
         // Availability is recorded once per turn, after MCP loading succeeds.
@@ -929,19 +998,15 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
             message: "This action needs approval. A scheduled job cannot ask for approval, so the action was not run."
           }));
         }
-        const sink = {
-          push: emit
-        };
         // Human approval latency is bounded by APPROVAL_REQUEST_TTL_MS, not the
         // turn watchdog. Disarm while the prompt is pending, re-arm after.
         disarmWatchdog();
         try {
           return await this.collectApprovalDecisions({
             state,
-            eventQueue: sink,
-            responseId,
+            approvalTurn,
             actions,
-            turnAbort
+            emit
           });
         } finally {
           if (!turnAbort.signal.aborted) armWatchdog();
@@ -953,7 +1018,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       ...rawBackend,
       async *streamTurn(streamInput) {
         for await (const rawEvent of rawBackend.streamTurn(streamInput)) {
-          accumulateUsageFromStreamEvent(usageTotals, rawEvent);
+          spending?.observeEvent(rawEvent);
+          const callUsage = usageFromStreamEvent(rawEvent);
+          if (callUsage) {
+            addUsage(usageTotals, callUsage);
+            const callCost = calculateCostUsd(usageModelName, callUsage);
+            usageCost.usd = usageCost.usd === null || callCost === null ? null : usageCost.usd + callCost;
+          }
           yield rawEvent;
         }
       }
@@ -1089,7 +1160,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const flushUsage = (): Promise<void> => {
       // Share the write and its deadline across terminal-event and final cleanup.
       usageFlush ??= withUsageFlushDeadline(
-        this.persistTurnUsage(state, responseId, usageTotals, usageModelName)
+        Promise.all([finishSpending(), this.persistTurnUsage(state, responseId, usageTotals, usageModelName, usageCost.usd)]).then(() => undefined)
       );
       return usageFlush;
     };
@@ -1102,10 +1173,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         yield event;
       }
     } finally {
+      endSandboxTurn();
       disarmWatchdog();
       subscription.unsubscribe();
       const wasAborted = turnAbort.signal.aborted;
       turnAbort.abort();
+      if (wasAborted) approvalTurn.cancelAndExpire("turn_interrupted");
+      else approvalTurn.cancelLocal();
       state.abortController.signal.removeEventListener("abort", onSessionAbort);
       input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
       state.activeTurnInterrupt.current = null;
@@ -1113,12 +1187,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       state.activeTurnResponseId.current = null;
       state.pendingTurnEvents = [];
       state.policyContextRef.current = null;
-      // A stopped/failed turn must not leave stale approval prompts behind; a
-      // clean completion has none pending, so skip the DB round-trip.
-      if (wasAborted) this.cancelSessionApprovals(state, "turn_interrupted");
       // Record token usage + cumulative cost onto the assistant row (no-ops when
       // the turn consumed nothing or the writer created no backing row).
       await flushUsage();
+      forgetSpending();
       this.activeTurns.delete(session.sessionId);
       await this.finishIntegrationInvalidation(state);
     }
@@ -1128,25 +1200,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     state: DeepAgentsSessionState,
     responseId: string,
     usage: TokenUsageRecord,
-    modelName: string | null
+    modelName: string | null,
+    costUsd: number | null
   ): Promise<void> {
     if (!this.stores.messages || usage.totalTokens === 0) return;
     try {
-      const cumulative = await this.stores.messages.addTokenUsage(
+      // A resumed turn writes to the same message, so the cost is added too.
+      await this.stores.messages.addTokenUsage(
         state.tenantId,
         responseId,
         state.userId,
         usage,
-        modelName
+        modelName,
+        costUsd
       );
-      if (cumulative && modelName) {
-        await this.stores.messages.setCostUsd(
-          state.tenantId,
-          responseId,
-          state.userId,
-          calculateCostUsd(modelName, cumulative)
-        );
-      }
     } catch (err) {
       this.log.warn(
         { err, sessionId: state.sessionId, responseId },
@@ -1225,7 +1292,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     this.clearIdleTimer(state);
     state.abortController.abort();
 
-    this.cancelSessionApprovals(state, "runtime_terminated");
+    void this.approvalCoordinator.cancelPending({
+      tenantId: state.tenantId, sessionId: state.sessionId, userId: state.userId, runtimeId: state.runtimeId
+    }, "runtime_terminated");
 
     await state.runtime.dispose().catch((err: unknown) => {
       this.log.warn({ err, sessionId: input.sessionId }, "Failed to dispose Deep Agents session runtime");
@@ -1251,6 +1320,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // Guard against deleting a replacement session created during the awaits.
     if (this.sessions.get(input.sessionId) === state) {
       this.sessions.delete(input.sessionId);
+      this.spending.delete(state.runtimeId);
     }
   }
 
@@ -1282,6 +1352,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         })
       )
     );
+    this.approvalCoordinator.close();
     for (const sessionId of this.pendingWorkspaceResetNotices.keys()) {
       this.clearPendingWorkspaceResetNotice(sessionId);
     }
@@ -1446,101 +1517,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
   }): Promise<"resolved" | "missing"> {
-    const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
-    const entry = this.pendingApprovals.get(approvalId);
-    if (entry) {
-      const state = this.sessions.get(entry.sessionId);
-      if (!state || state.tenantId !== tenantId || state.userId !== userId) return "missing";
-      try { await this.requireCurrentExecution(state); } catch { return "missing"; }
-    }
-    if (entry && !entry.requiresDurableProof) {
-      const state = this.sessions.get(entry.sessionId);
-      if (!state || state.tenantId !== tenantId || state.userId !== userId) return "missing";
-      if (rememberForTurn && decision === "approve") {
-        entry.autoApprovedKinds.add(entry.rememberKey);
-      }
-      entry.settle(decision);
-      try {
-        const approval = await this.stores.approvals.resolve(tenantId, approvalId, userId, decision,
-          rememberForTurn === true);
-        if (approval) {
-          await this.stores.auditEvents.create({
-            tenantId,
-            sessionId: approval.sessionId,
-            userId: approval.userId,
-            approvalId: approval.approvalId,
-            type: decision === "approve" ? "approval.approved" : "approval.rejected",
-            payload: { itemId: approval.itemId, kind: approval.kind }
-          });
-        }
-      } catch (err) {
-        this.log.error({ err, approvalId, tenantId }, "failed to persist native approval decision");
-      }
-      return "resolved";
-    }
-    // The approvals row is the ownership check and the cross-replica rendezvous.
-    // Persist first: a Policy Center proof is valid only after this transition,
-    // so the graph must never resume before the gateway can observe it.
-    let approval: Awaited<ReturnType<ApprovalStore["resolve"]>>;
-    try {
-      approval = await this.stores.approvals.resolve(
-        tenantId,
-        approvalId,
-        userId,
-        decision === "approve" ? "approve" : "reject",
-        rememberForTurn === true
-      );
-    } catch (err) {
-      this.log.error(
-        { err, approvalId, tenantId },
-        "failed to persist approval decision"
-      );
-      throw err;
-    }
-    if (!approval) return "missing";
-
-    if (entry) {
-      const state = this.sessions.get(entry.sessionId);
-      if (state?.tenantId === tenantId && state.userId === userId) {
-        if (rememberForTurn && decision === "approve") {
-          entry.autoApprovedKinds.add(entry.rememberKey);
-        }
-        entry.settle(decision);
-      }
-    }
-    try {
-      await this.stores.auditEvents.create({
-        tenantId,
-        sessionId: approval.sessionId,
-        userId: approval.userId,
-        approvalId: approval.approvalId,
-        type: decision === "approve" ? "approval.approved" : "approval.rejected",
-        payload: { itemId: approval.itemId, kind: approval.kind }
-      });
-    } catch (err) {
-      this.log.warn({ err, approvalId }, "failed to write approval decision audit event");
-    }
-    return "resolved";
-  }
-
-  private cancelSessionApprovals(
-    state: DeepAgentsSessionState,
-    reason: "turn_interrupted" | "runtime_terminated"
-  ): void {
-    void cancelPendingApprovals({
-      tenantId: state.tenantId,
-      sessionId: state.sessionId,
-      userId: state.userId,
-      reason,
-      approvals: this.stores.approvals,
-      auditEvents: this.stores.auditEvents,
-      logger: this.log,
-      onCancelLocal: (approvalId) => {
-        // Settle any native HITL wait so the turn loop cannot hang.
-        this.pendingApprovals.get(approvalId)?.settle("reject");
-        return undefined;
-      }
-    });
+    return this.approvalCoordinator.decide(input);
   }
 
   /**
@@ -1648,18 +1625,34 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
    */
   private async collectApprovalDecisions(input: {
     state: DeepAgentsSessionState;
-    eventQueue: { push: (event: BaseEvent) => void };
-    responseId: string;
+    approvalTurn: ApprovalTurn;
     actions: DeepAgentsPendingAction[];
-    turnAbort: AbortController;
+    emit: (event: BaseEvent) => void;
   }): Promise<Array<{ type: "approve" } | { type: "reject"; message?: string }>> {
-    const { state, eventQueue, responseId, actions, turnAbort } = input;
+    const { state, approvalTurn, actions, emit } = input;
+    const publish: ApprovalPublish = (notice) => emit(notice.name === "approval_required"
+      ? approvalRequiredEvent(notice.value) : runtimeNoticeEvent(notice.value));
+    // A tool that saves durable data is never asked about blind. Its card shows the
+    // exact value, or the call is refused here with the reason and nobody is asked.
+    const refusals = new Map<number, string>();
     const decisions = await Promise.all(
-      actions.map((action) =>
-        this.requestNativeApproval({ state, eventQueue, responseId, action, turnAbort })
-      )
+      actions.map(async (action, index) => {
+        const serverId = state.runtime.getMcpToolServers().get(action.name);
+        const server = state.configBundle.mcpServers.find((candidate) => candidate.id === serverId);
+        const request: ApprovalRequest = { ...action, kind: this.classifyApprovalKind(state, action.name),
+          server: server ? { id: server.id, mode: server.mode } : undefined };
+        const durable = await this.prepareDurableWrite(state, request);
+        if (durable.refusal !== undefined) {
+          refusals.set(index, durable.refusal);
+          return "reject" as const;
+        }
+        return approvalTurn.request(
+          durable.durableWrite ? { ...request, durableWrite: durable.durableWrite } : request, publish);
+      })
     );
-    return decisions.map((decision) => {
+    return decisions.map((decision, index) => {
+      const refusal = refusals.get(index);
+      if (refusal !== undefined) return { type: "reject" as const, message: refusal };
       if (decision === "approve") return { type: "approve" as const };
       // The message goes to the MODEL as the tool result. A denial nobody made
       // must not read as one: told "User denied permission" for an approval that
@@ -1677,216 +1670,72 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     });
   }
 
+  /**
+   * Recalled memories for one turn as a labelled data message, or null. Memory is
+   * a convenience: a failed read shows none and never fails the turn.
+   */
+  private async loadMemoryContext(
+    state: DeepAgentsSessionState,
+    runtimePolicy: RuntimeSessionRef["runtimePolicy"]
+  ): Promise<string | null> {
+    const memories = await loadWorkspaceMemories(this.stores.memories, {
+      tenantId: state.tenantId,
+      userId: state.userId,
+      enabledToolIds: runtimePolicy.enabledToolIds,
+      readPolicy: this.stores.policyService
+        ? { policy: this.stores.policyService, enforcementMode: runtimePolicy.policyEnforcementMode }
+        : undefined
+    }, this.log);
+    return buildMemoryDataContext(memories, runtimePolicy.enabledToolIds);
+  }
+
+  /**
+   * For a managed tool that saves durable data (catalog flag `requiresUserApproval`),
+   * builds the approval card with the exact value, or the reason to refuse the call.
+   * Other tools pass through. Only a proof from the graph binds an approval to the
+   * exact arguments. Without one, for example after a restart, the gateway would
+   * refuse the call after the user approved it, so the user is not asked.
+   */
+  private async prepareDurableWrite(
+    state: DeepAgentsSessionState,
+    request: ApprovalRequest
+  ): Promise<{ durableWrite?: DurableWriteApproval; refusal?: string }> {
+    if (request.server?.mode !== "managed" || !this.managedToolCatalog?.get(request.name)?.requiresUserApproval) {
+      return {};
+    }
+    if (!request.policyApproval) {
+      return { refusal: "Nothing was saved: the approval could not be tied to this exact call. Ask again." };
+    }
+    if (request.name !== MEMORY_SAVE_TOOL || !this.stores.memories) {
+      return { refusal: "Nothing was saved: this tool cannot show its exact value for approval." };
+    }
+    try {
+      const prepared = await prepareMemorySaveApproval({
+        memories: this.stores.memories, tenantId: state.tenantId, userId: state.userId, args: request.args
+      });
+      return prepared.ok
+        ? { durableWrite: prepared.approval }
+        : { refusal: `Nothing was saved: ${prepared.reason}` };
+    } catch (err) {
+      this.log.warn({ err, sessionId: state.sessionId, toolName: request.name },
+        "Could not prepare the approval for a durable write; refusing it");
+      return { refusal: "Nothing was saved: the approval request could not be prepared." };
+    }
+  }
+
   private classifyApprovalKind(
     state: DeepAgentsSessionState,
     toolName: string
   ): RuntimeApprovalKind {
     if (state.runtime.getMcpToolNames().has(toolName)) return "mcp_tool";
     if (toolName === "execute") return "command_execution";
-    if (toolName === "write_file" || toolName === "edit_file") return "file_change";
+    if (toolName === "write_file" || toolName === "edit_file" || toolName === "delete") return "file_change";
     return "permissions";
-  }
-
-  /**
-   * "Remember for this turn" key. For every kind except `mcp_tool` the kind
-   * alone is the right granularity (there is one built-in tool per kind). MCP
-   * tools all share the `mcp_tool` kind, so keying the remember-set by kind
-   * would let approving a read-only Notion search auto-approve a destructive
-   * GitHub write later in the same turn — scope those to the tool name instead.
-   */
-  private rememberKeyFor(kind: RuntimeApprovalKind, toolName: string): string {
-    return kind === "mcp_tool" ? `mcp_tool:${toolName}` : kind;
-  }
-
-  private async requestNativeApproval(input: {
-    state: DeepAgentsSessionState;
-    eventQueue: { push: (event: BaseEvent) => void };
-    responseId: string;
-    action: DeepAgentsPendingAction;
-    turnAbort: AbortController;
-  }): Promise<NativeApprovalOutcome> {
-    const { state, eventQueue, responseId, action, turnAbort } = input;
-    // Belt-and-braces vs the pre-collection abort check in the turn loop: an
-    // already-aborted turn gets an immediate reject — the abort listener
-    // below only fires on FUTURE aborts, so without this the wait would hang
-    // until the approval TTL.
-    if (turnAbort.signal.aborted) return "reject";
-    const kind = this.classifyApprovalKind(state, action.name);
-    const rememberKey = this.rememberKeyFor(kind, action.name);
-
-    // "Remember for this turn": answer without a DB row or prompt, but leave
-    // an audit trail.
-    if (!action.policyApproval && state.autoApprovedKindsForTurn.has(rememberKey)) {
-      try {
-        await this.stores.auditEvents.create({
-          tenantId: state.tenantId,
-          sessionId: state.sessionId,
-          userId: state.userId,
-          approvalId: null,
-          type: "approval.auto_approved",
-          payload: { toolName: action.name, kind }
-        });
-      } catch (err) {
-        this.log.warn({ err, toolName: action.name }, "Failed to write auto-approval audit event");
-      }
-      return "approve";
-    }
-
-    const approvalId = action.policyApproval?.approvalId ?? `daapr_${uuidv7()}`;
-    const redactedArgs = redactSecrets(action.args);
-    let approval = action.policyApproval
-      ? await this.stores.approvals.get(state.tenantId, approvalId, state.userId)
-      : null;
-    if (approval?.status === "approved") return "approve";
-    if (approval?.status === "rejected") return "reject";
-    if (approval?.status === "expired") return "expired";
-    try {
-      approval ??= await this.stores.approvals.create({
-          tenantId: state.tenantId,
-          approvalId,
-          sessionId: state.sessionId,
-          userId: state.userId,
-          runtimeId: state.runtimeId,
-          turnId: responseId,
-          itemId: approvalId,
-          requestMethod: action.policyApproval
-            ? POLICY_APPROVAL_REQUEST_METHOD
-            : `deepagents/${action.name}`,
-          requestId: approvalId,
-          kind,
-          title: `Approve ${action.name}`,
-          summary: JSON.stringify(redactedArgs),
-          status: "pending",
-          decision: null,
-          requestPayload: action.policyApproval
-            ? { ...redactedArgs, policyApproval: action.policyApproval }
-            : redactedArgs,
-          expiresAt: new Date(Date.now() + this.config.APPROVAL_REQUEST_TTL_MS).toISOString()
-        });
-    } catch (err) {
-      // A replay on another replica can race the original insert. The
-      // deterministic policy approval id makes that safe: reuse the winner.
-      if (action.policyApproval) {
-        approval = await this.stores.approvals.get(state.tenantId, approvalId, state.userId);
-        if (approval?.status === "approved") return "approve";
-        if (approval?.status === "rejected") return "reject";
-        if (approval?.status === "expired") return "expired";
-      }
-      if (approval?.status === "pending") {
-        this.log.debug({ approvalId }, "Reusing checkpointed Policy Center approval");
-      } else {
-        // Fail closed. Without the row there is no approval to decide: the sweep
-        // and a restart cannot see the prompt, `resolveApproval` has nothing to
-        // settle, and no approval decision audit event can be written.
-        this.log.error(
-          { err, approvalId, sessionId: state.sessionId, toolName: action.name },
-          "Failed to persist Deep Agents approval to store — denying"
-        );
-        eventQueue.push(runtimeNoticeEvent({
-          noticeId: `approval-unavailable:${approvalId}`,
-          level: "warning",
-          title: "Approval unavailable",
-          message: `The approval request for ${action.name} could not be recorded, so it was denied.`,
-          createdAt: new Date().toISOString()
-        }));
-        return "unavailable";
-      }
-    }
-
-    eventQueue.push(approvalRequiredEvent({
-      approvalId,
-      itemId: approvalId,
-      kind,
-      title: `Approve ${action.name}`,
-      summary: JSON.stringify(redactedArgs),
-      availableDecisions: ["approve", "reject"],
-      command: action.name === "execute" && typeof action.args.command === "string"
-        ? action.args.command
-        : action.name,
-      cwd: null
-    }));
-
-    return new Promise<NativeApprovalOutcome>((resolve) => {
-      let settled = false;
-      let pollTimer: ReturnType<typeof setTimeout> | undefined;
-      const settle = (decision: NativeApprovalOutcome) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(ttlTimer);
-        if (pollTimer) clearTimeout(pollTimer);
-        turnAbort.signal.removeEventListener("abort", onAbort);
-        this.pendingApprovals.delete(approvalId);
-        resolve(decision);
-      };
-      const onAbort = () => settle("reject");
-      const remainingTtlMs = Math.max(
-        0,
-        new Date(approval?.expiresAt ?? Date.now() + this.config.APPROVAL_REQUEST_TTL_MS).getTime() -
-          Date.now()
-      );
-      const ttlTimer = setTimeout(() => {
-        // TTL expiry moves the DB row to expired and resumes the graph.
-        void expireApprovalById({
-          tenantId: state.tenantId,
-          sessionId: state.sessionId,
-          userId: state.userId,
-          approvalId,
-          reason: "ttl_expired",
-          approvals: this.stores.approvals,
-          auditEvents: this.stores.auditEvents,
-          logger: this.log,
-          onCancelLocal: () => undefined
-        });
-        eventQueue.push(runtimeNoticeEvent({
-          noticeId: `approval-expired:${approvalId}`,
-          level: "warning",
-          title: "Approval expired",
-          message: `The approval request for ${action.name} expired without an answer.`,
-          createdAt: new Date().toISOString()
-        }));
-        settle("expired");
-      }, remainingTtlMs);
-      ttlTimer.unref?.();
-      let pollDelayMs = 1_000;
-      const poll = () => {
-        if (settled) return;
-        void this.stores.approvals
-          .get(state.tenantId, approvalId, state.userId)
-          .then((row) => {
-            if (row?.status === "approved") {
-              if (row.rememberForTurn) state.autoApprovedKindsForTurn.add(rememberKey);
-              settle("approve");
-            }
-            else if (row?.status === "rejected") settle("reject");
-            else if (row?.status === "expired") settle("expired");
-          })
-          .catch((err) => this.log.warn({ err, approvalId }, "Failed to poll approval status"))
-          .finally(() => {
-            if (settled) return;
-            pollDelayMs = Math.min(pollDelayMs * 2, 8_000);
-            pollTimer = setTimeout(poll, pollDelayMs);
-            pollTimer.unref?.();
-          });
-      };
-      pollTimer = setTimeout(poll, pollDelayMs);
-      pollTimer.unref?.();
-      turnAbort.signal.addEventListener("abort", onAbort, { once: true });
-      this.pendingApprovals.set(approvalId, {
-        sessionId: state.sessionId,
-        kind,
-        rememberKey,
-        settle,
-        // Capture THIS turn's remember-set so a late decision can't pollute
-        // the next turn's set.
-        autoApprovedKinds: state.autoApprovedKindsForTurn,
-        requiresDurableProof: Boolean(action.policyApproval || state.execution)
-      });
-    });
   }
 
   private async requireRuntimeSessionAccess(input: {
     tenantId: string; sessionId: string; userId: string; execution?: SessionExecution;
-  }): Promise<void> {
+  }): Promise<string | null> {
     const [session, membershipRole] = await Promise.all([
       this.stores.sessions.getReadable(input.tenantId, input.sessionId, input.userId),
       this.stores.tenantMembers.getRole?.(input.tenantId, input.userId) ?? Promise.resolve("member")
@@ -1895,6 +1744,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         (session.projectId ? input.execution?.projectId !== session.projectId : Boolean(input.execution?.projectId))) {
       throw new SessionExecutionError("session_unavailable", 403);
     }
+    return session.projectId;
   }
 
   private async requireCurrentExecution(state: DeepAgentsSessionState): Promise<void> {
@@ -1939,12 +1789,26 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }
 }
 
+/**
+ * The sandbox network policy for a tenant's approved hosts. Entries that fail
+ * the host check are dropped, which approves less; the drop is logged.
+ */
+function sandboxNetworkPolicyFor(
+  domains: readonly string[],
+  log: FastifyBaseLogger,
+  sessionId: string
+) {
+  return resolveSandboxNetworkPolicy(domains, (rejected) =>
+    log.warn({ sessionId, rejected }, "Dropped approved sandbox hosts that fail the host check"));
+}
+
 function buildDeepAgentsRuntimeManifest(
   configBundle: DeepAgentsSessionState["configBundle"],
   sessionId: string,
   userId: string
 ): RuntimeManifest {
   const { runtimePolicy, skills, mcpServers, sources } = configBundle;
+  const sandboxNetworkPolicy = resolveSandboxNetworkPolicy(runtimePolicy.sandboxEgressDomains);
   return {
     manifestVersion: "1",
     manifestHash: configBundle.hash,
@@ -1965,7 +1829,11 @@ function buildDeepAgentsRuntimeManifest(
           ? runtimePolicy.approvalPolicy
           : "on-request",
       sandboxMode: runtimePolicy.sandboxMode,
-      networkMode: runtimePolicy.networkMode,
+      // What the provider is asked to enforce for this tenant's sandboxes, from
+      // the same resolver that builds the sandbox options. The hash is the one
+      // that is saved next to each sandbox id.
+      networkMode: sandboxNetworkPolicy.mode,
+      networkPolicyHash: sandboxNetworkPolicy.hash,
       allowCommandExecution: runtimePolicy.allowCommandExecution,
       autoApproveReadOnlyTools: runtimePolicy.autoApproveReadOnlyTools,
       webSearchMode: runtimePolicy.webSearchMode,
@@ -1999,11 +1867,11 @@ function buildDeepAgentsRuntimeManifest(
 
 /**
  * Client-facing text for a failed turn (persisted to the transcript). Mirrors
- * sse-writer's clientSafeFailureMessage: 4xx provider errors (invalid
- * key, overloaded model, bad request) are user-actionable and pass through;
- * everything else — pg/checkpointer failures, network errors — collapses to a
- * generic message so internals never reach the client. GraphRecursionError is
- * classified by name to keep this module free of LangChain imports.
+ * turn-transcript's classifyTurnFailure: Error instances with a 4xx status
+ * pass through their message; other failures use a generic message. Review
+ * classification and redaction separately: status alone does not prove that
+ * the text is safe. GraphRecursionError has a fixed translation, selected by
+ * name to keep this module free of LangChain imports.
  */
 function clientSafeTurnFailureMessage(err: unknown): string {
   if (err instanceof Error && err.name === "GraphRecursionError") {
@@ -2030,31 +1898,38 @@ function createEmptyUsage(): TokenUsageRecord {
 }
 
 /**
- * Adds a stream event's model-completion usage to the turn totals. LangChain
+ * Returns the usage of one model call from a stream event, or null. LangChain
  * puts `usage_metadata` on the AIMessage in `on_chat_model_end` envelopes
  * (`{ input_tokens, output_tokens, total_tokens, input_token_details?,
  * output_token_details? }`).
  */
-function accumulateUsageFromStreamEvent(
-  totals: TokenUsageRecord,
-  rawEvent: Record<string, unknown>
-): void {
-  if (rawEvent.event !== "on_chat_model_end") return;
+function usageFromStreamEvent(rawEvent: Record<string, unknown>): TokenUsageRecord | null {
+  if (rawEvent.event !== "on_chat_model_end") return null;
   const data = rawEvent.data as Record<string, unknown> | undefined;
   const output = data?.output as Record<string, unknown> | undefined;
   const usage = output?.usage_metadata as Record<string, unknown> | undefined;
-  if (!usage) return;
+  if (!usage) return null;
 
   const input = numberOrZero(usage.input_tokens);
   const outputTokens = numberOrZero(usage.output_tokens);
   const inputDetails = usage.input_token_details as Record<string, unknown> | undefined;
   const outputDetails = usage.output_token_details as Record<string, unknown> | undefined;
 
-  totals.inputTokens += input;
-  totals.outputTokens += outputTokens;
-  totals.cachedInputTokens += numberOrZero(inputDetails?.cache_read);
-  totals.reasoningOutputTokens += numberOrZero(outputDetails?.reasoning);
-  totals.totalTokens += numberOrZero(usage.total_tokens) || input + outputTokens;
+  return {
+    inputTokens: input,
+    outputTokens,
+    cachedInputTokens: numberOrZero(inputDetails?.cache_read),
+    reasoningOutputTokens: numberOrZero(outputDetails?.reasoning),
+    totalTokens: numberOrZero(usage.total_tokens) || input + outputTokens
+  };
+}
+
+function addUsage(totals: TokenUsageRecord, call: TokenUsageRecord): void {
+  totals.inputTokens += call.inputTokens;
+  totals.outputTokens += call.outputTokens;
+  totals.cachedInputTokens += call.cachedInputTokens;
+  totals.reasoningOutputTokens += call.reasoningOutputTokens;
+  totals.totalTokens += call.totalTokens;
 }
 
 function numberOrZero(value: unknown): number {

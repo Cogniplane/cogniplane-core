@@ -12,21 +12,25 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { openSseResponse } from "../lib/open-sse-response.js";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { uuidv7 } from "../lib/uuid.js";
-import type { ArtifactRecord } from "../services/artifacts/artifact-store.js";
+import { isArtifactPiiEligible, type ArtifactRecord } from "../services/artifacts/artifact-store.js";
 import { toAvailableModel } from "../services/custom-model-store.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
-import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
 import type { TurnEventLog } from "../services/turn-event-log.js";
 import { SessionExecutionError, type SessionExecution } from "../services/session-execution-store.js";
 import { ProjectAccessError } from "../services/project-access.js";
+import { UNSUPPORTED_TRANSCRIPT_ERROR } from "../services/session-access.js";
 import { ProjectFileError, type ProjectRuntimeFileSnapshot } from "../services/project-file-store.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { UtilityLlmClient } from "../services/utility-llm-client.js";
 import { calculateCostUsd } from "../services/token-cost-calculator.js";
-import { handlePiiDecision, type PiiHandlerOutcome, type PiiHandlerStores } from "./messages-pii-handler.js";
-import { PERMANENT_PII_ERROR_CODES } from "../services/pii/pii-scan-job-handler.js";
+import {
+  gateChatPrompt,
+  type ChatPromptGateResult,
+  type PiiHandlerOutcome,
+  type PiiHandlerStores
+} from "../services/pii/chat-prompt-pii.js";
 import { AVAILABLE_MODELS } from "../domain/models.js";
 
 // Wire shape lives in `@cogniplane/shared-types`. `model` is a bounded string
@@ -52,6 +56,7 @@ export function buildMessageRouteStores(
     storage: deps.artifactStorage,
     limits: deps.limits,
     messages: deps.messages,
+    modelSpending: deps.modelSpending,
     toolContexts: deps.toolContexts,
     dynamicConfig: deps.dynamicConfig,
     customModels: deps.customModels,
@@ -75,7 +80,8 @@ export type MessageRouteStores = {
   artifactProcessor: Pick<AppDependencies["artifactProcessor"], "extractArtifactText">;
   storage: AppDependencies["artifactStorage"];
   limits: AppDependencies["limits"];
-  messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices" | "deleteToolResult">;
+  modelSpending?: Pick<AppDependencies["modelSpending"], "hasLimit">;
+  messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices">;
   toolContexts: Pick<AppDependencies["toolContexts"], "create">;
   dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getOrCreateTenantSettings">;
   customModels: Pick<AppDependencies["customModels"], "list">;
@@ -119,6 +125,13 @@ export async function registerMessageRoutes(
     if (!session || session.status !== "active" || session.purpose === "project_reference") {
       reply.code(404);
       return notFoundError("session_not_found");
+    }
+    // Only a session in the current history format continues. For an older
+    // one, nothing below runs: no prompt is saved, scanned, or sent, and its
+    // checkpoint is not loaded. Its rows stay stored and readable.
+    if (session.transcriptFormat !== "current") {
+      reply.code(409);
+      return { ...UNSUPPORTED_TRANSCRIPT_ERROR };
     }
 
     const resolution = await resolveRuntimeModel({
@@ -293,25 +306,22 @@ export async function registerMessageRoutes(
         return rateLimitError;
       }
 
-      const piiEvaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
-        tenantId,
-        sessionId: input.sessionId,
-        text: input.text
+      const piiStores = {
+        piiProtection: stores.piiProtection,
+        piiScanRuns: stores.piiScanRuns,
+        auditEvents: stores.auditEvents,
+        logger: request.log
+      };
+      const piiOutcome = await gateChatPrompt(piiStores, {
+        tenantId, sessionId: input.sessionId, userId, rawText: input.text
       });
-      if (!piiEvaluation.ok) {
-        return piiEvaluation.response;
+      if (piiOutcome.kind === "unavailable") {
+        return failClosed(request, reply, input.sessionId, tenantId, piiOutcome);
       }
-      const { piiDecision } = piiEvaluation;
 
       const scopedArtifacts = selectedArtifactIds
         .map((artifactId) => readyArtifactById.get(artifactId))
         .filter((artifact): artifact is ArtifactRecord => Boolean(artifact));
-
-      const piiOutcome = await handlePiiDecision(
-        piiDecision,
-        { tenantId, sessionId: input.sessionId, userId, rawText: input.text },
-        { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents, logger: request.log }
-      );
 
       if (piiOutcome.kind === "block") {
         return respondWithPiiBlock({
@@ -325,16 +335,16 @@ export async function registerMessageRoutes(
           outcome: piiOutcome
         });
       }
+      const piiDecision = piiOutcome.decision;
 
       if (projectInstructions?.instructions) {
-        const evaluation = await evaluatePiiDecisionOrFailClosed(request, reply, stores, {
-          tenantId, sessionId: input.sessionId, text: projectInstructions.instructions
-        });
-        if (!evaluation.ok) return evaluation.response;
-        const outcome = await handlePiiDecision(evaluation.piiDecision, {
+        const outcome = await gateChatPrompt(piiStores, {
           tenantId, sessionId: input.sessionId, userId, rawText: projectInstructions.instructions,
           projectInstructions: { projectId: projectInstructions.projectId, revision: projectInstructions.revision }
-        }, { piiScanRuns: stores.piiScanRuns, auditEvents: stores.auditEvents, logger: request.log });
+        });
+        if (outcome.kind === "unavailable") {
+          return failClosed(request, reply, input.sessionId, tenantId, outcome);
+        }
         if (outcome.kind === "block") {
           return reply.code(422).send(apiError("project_instructions_blocked",
             "Project instructions were blocked by organization policy. Edit them before sending another message."));
@@ -447,11 +457,7 @@ async function resolveEligibleArtifacts(
     input.sessionId,
     input.userId
   );
-  const readyArtifacts = sessionArtifacts.filter((artifact) => {
-    if (artifact.status !== "ready") return false;
-    const piiStatus = (artifact.detail?.pii as { status?: string } | undefined)?.status;
-    return piiStatus !== "pending" && piiStatus !== "scanning" && piiStatus !== "blocked";
-  });
+  const readyArtifacts = sessionArtifacts.filter(isArtifactPiiEligible);
   const readyArtifactById = new Map(
     readyArtifacts.map((artifact) => [artifact.artifactId, artifact])
   );
@@ -478,35 +484,17 @@ async function resolveEligibleArtifacts(
 }
 
 // Fail closed when the PII provider is unavailable: a 503 is returned rather
-// than letting an unscanned prompt through. A null decision means PII
-// protection is not configured for this deployment.
-async function evaluatePiiDecisionOrFailClosed(
+// than letting an unscanned prompt through.
+function failClosed(
   request: FastifyRequest,
   reply: FastifyReply,
-  stores: MessageRouteStores,
-  input: { tenantId: string; sessionId: string; text: string }
-): Promise<{ ok: false; response: unknown } | { ok: true; piiDecision: PiiDecision | null }> {
-  if (!stores.piiProtection) {
-    return { ok: true, piiDecision: null };
-  }
-  try {
-    const piiDecision = await stores.piiProtection.evaluateText({
-      tenantId: input.tenantId,
-      text: input.text,
-      subject: { kind: "chat_prompt" }
-    });
-    return { ok: true, piiDecision };
-  } catch (error) {
-    if (error instanceof PiiProtectionServiceError) {
-      request.log.warn(
-        { err: error, tenantId: input.tenantId, sessionId: input.sessionId },
-        "PII provider unavailable; failing closed"
-      );
-      reply.code(PERMANENT_PII_ERROR_CODES.has(error.code) ? 422 : 503);
-      return { ok: false, response: apiError(error.code, error.message) };
-    }
-    throw error;
-  }
+  sessionId: string,
+  tenantId: string,
+  outcome: Extract<ChatPromptGateResult, { kind: "unavailable" }>
+) {
+  request.log.warn({ err: outcome.error, tenantId, sessionId }, "PII provider unavailable; failing closed");
+  reply.code(outcome.permanent ? 422 : 503);
+  return apiError(outcome.error.code, outcome.error.message);
 }
 
 async function respondWithPiiBlock(args: {
@@ -612,10 +600,13 @@ async function titleSessionAsync(input: {
   const { app, stores, tenantId, userId, sessionId, currentSessionName, firstMessage, logger } = input;
 
   try {
-    const tenantKey = stores.getTenantAnthropicApiKey
+    // Optional title calls have no reservation. Under a limit, skip the paid
+    // provider fallback. The operator-run local titler stays available.
+    const limited = stores.modelSpending ? await stores.modelSpending.hasLimit(tenantId) : false;
+    const tenantKey = !limited && stores.getTenantAnthropicApiKey
       ? (await stores.getTenantAnthropicApiKey(tenantId))?.trim() ?? null
       : null;
-    const anthropicApiKey = tenantKey || app.config.ANTHROPIC_API_KEY || null;
+    const anthropicApiKey = limited ? null : tenantKey || app.config.ANTHROPIC_API_KEY || null;
 
     // Local-first titling: when UTILITY_LLM_* is configured (the homelab demo
     // points it at the local Gemma on Ollama), the raw first message goes to
@@ -634,6 +625,7 @@ async function titleSessionAsync(input: {
             disableThinking: app.config.UTILITY_LLM_DISABLE_THINKING
           })
         : undefined;
+    if (limited && !utilityClient) return;
 
     const result = await generateSessionTitle({
       firstMessage,

@@ -3,6 +3,7 @@
 import { useState, useMemo, useCallback } from "react";
 
 import { uploadArtifact } from "../lib/artifact-api";
+import { ApiError } from "../lib/api-client";
 import type { Artifact } from "@cogniplane/shared-types";
 import { isArtifactEligibleForChatContext } from "../lib/artifact-eligibility";
 import { useArtifactActions } from "./use-artifact-actions";
@@ -90,8 +91,12 @@ export function useArtifacts(input: {
     try {
       await uploadArtifact({ sessionId: selectedSessionId, file });
       await onRefresh();
-    } catch {
-      onError("Failed to upload artifact.");
+    } catch (error) {
+      // A 4xx message is written for the user, for example why PII protection
+      // refused the file. Other failures keep the generic text.
+      onError(error instanceof ApiError && error.status >= 400 && error.status < 500
+        ? error.message
+        : "Failed to upload artifact.");
     } finally {
       setIsUploadingArtifact(false);
     }

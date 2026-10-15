@@ -218,3 +218,48 @@ test("fetchUserProfile: throws on non-2xx", async () => {
     stub.restore();
   }
 });
+
+// Gateway failures, timeouts
+
+test("refreshUserAccessToken: returns null for a non-JSON gateway error", async () => {
+  const stub = stubFetch(() => new Response("<html>502 Bad Gateway</html>", { status: 502 }));
+  try {
+    await expect(refreshUserAccessToken(cfg, "r-tok")).resolves.toBeNull();
+  } finally {
+    stub.restore();
+  }
+});
+
+test("refreshUserAccessToken: returns null when the request fails or times out", async () => {
+  const stub = stubFetch(() => { throw new DOMException("The operation timed out.", "TimeoutError"); });
+  try {
+    await expect(refreshUserAccessToken(cfg, "r-tok")).resolves.toBeNull();
+  } finally {
+    stub.restore();
+  }
+});
+
+test("exchangeUserAuthorizationCode: reports a non-JSON gateway error as a failed exchange", async () => {
+  const stub = stubFetch(() => new Response("<html>503</html>", { status: 503 }));
+  try {
+    await expect(exchangeUserAuthorizationCode(cfg, "code")).rejects.toThrow("github_token_exchange_failed");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("every GitHub OAuth and profile request has a timeout signal", async () => {
+  const stub = stubFetch((url) => url.endsWith("/user/emails")
+    ? jsonResponse([{ email: "a@b.c", verified: true, primary: true }])
+    : jsonResponse({ access_token: "t", id: 1, login: "octocat", name: null, email: null, avatar_url: null }));
+  try {
+    await exchangeUserAuthorizationCode(cfg, "code");
+    await refreshUserAccessToken(cfg, "r-tok");
+    await selectGithubEmail("tok");
+    await fetchUserProfile("tok");
+    expect(stub.calls).toHaveLength(4);
+    for (const call of stub.calls) expect(call.init?.signal).toBeInstanceOf(AbortSignal);
+  } finally {
+    stub.restore();
+  }
+});

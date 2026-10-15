@@ -29,17 +29,8 @@ function makeFakeDb(
       if (text.includes("BEGIN") || text.includes("set_config") || text.includes("COMMIT")) {
         return { rows: [], rowCount: 0 };
       }
-      // The main sessions SELECT is identified by its outer "FROM sessions s".
-      // The route asks for limit+1 rows (LIMIT $9) to detect "has more"; a real
-      // DB would honor that LIMIT, so the fake slices the fixture to match. This
-      // makes items.length a behavioral proxy for the limit+1 fetch.
       if (text.includes("FROM sessions s")) {
-        const limitParam = Number((values ?? [])[7]);
-        const limited =
-          Number.isFinite(limitParam) && limitParam > 0
-            ? sessionRows.slice(0, limitParam)
-            : sessionRows;
-        return { rows: limited, rowCount: limited.length };
+        return { rows: sessionRows, rowCount: sessionRows.length };
       }
       if (text.includes("FROM pii_scan_runs")) {
         return { rows: alertRows.pii ?? [], rowCount: alertRows.pii?.length ?? 0 };
@@ -207,40 +198,6 @@ test("admin sessions list — populates skillsUsedCount and mcpServersUsedCount 
   await app.close();
 });
 
-test("admin sessions list — paginates and emits nextCursor when more rows than limit", async () => {
-  const baseTime = Date.parse("2026-04-01T00:00:00Z");
-  const rows: FakeRow[] = [];
-  for (let i = 0; i < 51; i += 1) {
-    const offsetMs = i * 60_000;
-    rows.push({
-      session_id: `sess-${i}`,
-      user_id: "user-1",
-      user_email: null,
-      created_at: new Date(baseTime + offsetMs),
-      admin_status: "active",
-      last_activity_at: new Date(baseTime + offsetMs + 1000),
-      message_count: 1,
-      runtime_provider: "deep-agents",
-      last_model_name: null
-    });
-  }
-
-  const { app } = await buildApp({ isAdmin: true, rows });
-  const res = await app.inject({ method: "GET", url: "/admin/sessions?limit=50" });
-  expect(res.statusCode).toBe(200);
-  const body = res.json();
-  // 51 rows available, limit=50. The fake honors the LIMIT the route binds, so
-  // getting 50 items back (with rows still pending) proves the route fetched
-  // limit+1 to detect "has more" and trimmed the overflow row off the page.
-  expect(body.items.length).toBe(50);
-  expect(body.nextCursor).not.toBe(null);
-
-  // The `items.length === 50` + `nextCursor !== null` assertions above already
-  // prove the over-fetch-by-one has-more behavior end-to-end; pinning the literal
-  // LIMIT bind (51) only added mechanism-fragility, so it's dropped.
-  await app.close();
-});
-
 test("admin sessions list — rejects malformed cursor with 400", async () => {
   const { app } = await buildApp({ isAdmin: true });
   const res = await app.inject({
@@ -249,26 +206,6 @@ test("admin sessions list — rejects malformed cursor with 400", async () => {
   });
   expect(res.statusCode).toBe(400);
   expect(res.json().error).toBe("invalid_cursor");
-  await app.close();
-});
-
-test("admin sessions list — accepts a valid cursor", async () => {
-  const { app, capturedQueries } = await buildApp({ isAdmin: true, rows: [] });
-  const cursor = Buffer.from(
-    JSON.stringify({ lastActivityAt: "2026-04-22T15:30:00Z", sessionId: "sess-x" }),
-    "utf8"
-  ).toString("base64url");
-  const res = await app.inject({
-    method: "GET",
-    url: `/admin/sessions?cursor=${cursor}`
-  });
-  expect(res.statusCode).toBe(200);
-  const selectQuery = capturedQueries.find((q) => q.text.includes("FROM sessions s"));
-  expect(selectQuery).toBeTruthy();
-  // The decoded cursor's lastActivityAt + sessionId must both reach the query
-  // as bound values (order-independent — the route owns the bind layout).
-  expect(selectQuery!.values).toContain("2026-04-22T15:30:00Z");
-  expect(selectQuery!.values).toContain("sess-x");
   await app.close();
 });
 

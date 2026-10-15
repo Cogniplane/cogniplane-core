@@ -8,6 +8,7 @@ import {
   type IntegrationPlatformStatus
 } from "./integration-registry.js";
 import type { IntegrationStateRecord, IntegrationStateStore } from "./integration-state-store.js";
+import { boundIntegrationAccount, integrationAccountChangedMessage } from "./integration-account-binding.js";
 
 // Optional override map keyed by integration id. When a probe is supplied
 // here it takes precedence over the descriptor-attached probe — handy for
@@ -191,23 +192,78 @@ export class IntegrationRegistryService {
   //   writes_enabled AND user has connection => include writeToolIds
   // Coming-soon integrations contribute nothing (their tool id arrays are empty).
   async resolveSessionToolIds(tenantId: string, userId: string): Promise<string[]> {
-    const states = await this.stateStore.list(tenantId);
-    if (states.length === 0) return [];
+    return (await this.resolveSessionIntegrations(tenantId, userId)).toolIds;
+  }
 
+  /**
+   * The integration tools a session may use, and the upstream account of each
+   * integration that grants them. One pass decides both: an integration whose
+   * probe can name its account grants tools only with that account recorded,
+   * so a turn never holds tools without the account they were granted for.
+   * `checkToolCall` and the credential lookups compare later calls with it.
+   */
+  async resolveSessionIntegrations(tenantId: string, userId: string): Promise<{
+    toolIds: string[];
+    accounts: Record<string, string>;
+  }> {
     const collected: string[] = [];
-    for (const state of states) {
+    const accounts: Record<string, string> = {};
+    for (const state of await this.stateStore.list(tenantId)) {
       if (!state.readsEnabled && !state.writesEnabled) continue;
       const descriptor = this.descriptors.get(state.integrationId);
       if (!descriptor || descriptor.status !== "available") continue;
 
       const probe = this.resolveProbe(descriptor);
-      const connected = probe ? await probe.hasConnection(tenantId, userId) : true;
-      if (!connected) continue;
+      if (probe?.connectedAccountId) {
+        const accountId = await probe.connectedAccountId(tenantId, userId);
+        if (!accountId || !await probe.hasConnection(tenantId, userId)) continue;
+        accounts[descriptor.id] = accountId;
+      } else if (probe && !await probe.hasConnection(tenantId, userId)) {
+        continue;
+      }
 
       if (state.readsEnabled) collected.push(...descriptor.readToolIds);
       if (state.writesEnabled) collected.push(...descriptor.writeToolIds);
     }
 
-    return Array.from(new Set(collected));
+    return { toolIds: Array.from(new Set(collected)), accounts };
+  }
+
+  /**
+   * Checks an integration tool call when it runs, not only when the turn
+   * started: the tenant toggle for the tool's access must still be on, and the
+   * connected account must be the one the turn recorded. A turn can wait for
+   * an approval while an administrator turns the integration off or the user
+   * connects another account. Returns the refusal message, or null when the
+   * call may run or the tool belongs to no integration.
+   */
+  async checkToolCall(input: {
+    tenantId: string;
+    userId: string;
+    toolName: string;
+    boundAccounts: Readonly<Record<string, unknown>> | undefined;
+  }): Promise<string | null> {
+    // Every integration that lists the tool must allow it, so the result never
+    // depends on the order in which descriptors were registered.
+    const owners = this.descriptors.list().filter((entry) =>
+      entry.readToolIds.includes(input.toolName) || entry.writeToolIds.includes(input.toolName));
+    for (const descriptor of owners) {
+      const write = descriptor.writeToolIds.includes(input.toolName);
+      const state = await this.stateStore.get(input.tenantId, descriptor.id);
+      if (descriptor.status !== "available" || !(write ? state?.writesEnabled : state?.readsEnabled)) {
+        return `${descriptor.name} ${write ? "writes" : "reads"} are disabled for this organization.`;
+      }
+
+      // An early refusal: the credential lookup compares the same account
+      // again on the row that holds the token.
+      const probe = this.resolveProbe(descriptor);
+      const expected = boundIntegrationAccount(
+        input.boundAccounts ? { integrationAccounts: input.boundAccounts } : undefined, descriptor.id);
+      if (expected === undefined || !probe?.connectedAccountId) continue;
+      if (await probe.connectedAccountId(input.tenantId, input.userId) !== expected) {
+        return integrationAccountChangedMessage(descriptor.name);
+      }
+    }
+    return null;
   }
 }

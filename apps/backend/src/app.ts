@@ -11,7 +11,8 @@ import { loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { workosAuth } from "./lib/auth-workos.js";
 import { CORS_ALLOWED_METHODS, isCorsOriginAllowed } from "./lib/cors.js";
-import { createDatabase, createPrivilegedDatabase } from "./lib/db.js";
+import { createDatabase, createMaintenanceDatabase } from "./lib/db.js";
+import { assertApplicationRole, assertMaintenanceRole } from "./lib/maintenance-db.js";
 import { getRedis } from "./lib/redis.js";
 import { sanitizeUrl } from "./lib/sanitize-url.js";
 import { registerSecurityHeaders } from "./lib/security-headers.js";
@@ -44,7 +45,8 @@ export function handleAppError(
   }
   const statusCode = error.statusCode ?? 500;
   if (statusCode >= 400 && statusCode < 500) {
-    // Client errors (validation, bad input, explicit 4xx) are safe to surface.
+    // This branch passes through 4xx messages. Review their source and
+    // classification; status alone does not prove that the text is safe.
     reply.code(statusCode).send({
       error: error.code ?? "bad_request",
       message: error.message
@@ -95,6 +97,11 @@ export function parseTrustProxy(raw: string): boolean | string {
 
 export async function buildApp() {
   const config = loadConfig();
+  // All instances run cross-tenant recovery and token lookup, even when the
+  // scheduler and retention flags are off. Never fall back to the app pool.
+  if (!config.MAINTENANCE_DATABASE_URL) {
+    throw new Error("MAINTENANCE_DATABASE_URL is required for runtime maintenance.");
+  }
   const app = Fastify({
     // Resolve `request.ip` from X-Forwarded-For per the deployment's proxy
     // topology, so logs and rate limits see the real client rather than the
@@ -163,77 +170,17 @@ export async function buildApp() {
 
   app.decorate("config", config);
   app.decorate("db", createDatabase(config));
+
+  const privilegedDb = createMaintenanceDatabase(config.MAINTENANCE_DATABASE_URL);
+  try {
+    await assertApplicationRole(app.db);
+    await assertMaintenanceRole(privilegedDb);
+  } catch (error) {
+    await Promise.all([privilegedDb.end(), app.db.end()]);
+    throw error;
+  }
+
   app.decorate("redis", getRedis(config, app.log));
-
-  const privilegedConnectionString = config.MIGRATION_DATABASE_URL ?? config.DATABASE_URL;
-  const privilegedDb =
-    privilegedConnectionString === config.DATABASE_URL
-      ? app.db
-      : createPrivilegedDatabase(privilegedConnectionString);
-
-  // Fail fast if Postgres is unavailable so the app does not boot into a half-working state.
-  await app.db.query("SELECT 1");
-
-  // The privileged pool is, by definition, the RLS-bypassing superuser pool:
-  // background work that must read across tenants (scheduler claiming due jobs,
-  // PII scan jobs, project-file retention) and getDownloadToken depend on it. If
-  // MIGRATION_DATABASE_URL is unset, privilegedDb silently falls back to the
-  // RLS-bound app_user pool, and those cross-tenant queries return zero rows
-  // with no error — a near-invisible failure. Verify the pool's contract at boot
-  // so the misconfiguration surfaces immediately rather than as mysteriously
-  // empty job queues in production. Fail-closed on two axes:
-  //   1. If a distinct privileged pool exists, it MUST actually bypass RLS —
-  //      asserted unconditionally, never gated on feature flags, so a flag
-  //      flipping on later can't be the first thing to reveal a broken pool.
-  //   2. If no distinct pool exists (fell back to app.db) but an enabled
-  //      feature needs cross-tenant reads, that's fatal — boot would silently
-  //      return no rows. Retention can be disabled explicitly for deployments
-  //      that do not provide its privileged maintenance pool.
-  const privilegedNeedsBypassRls =
-    config.PROJECT_FILE_RETENTION_ENABLED ||
-    config.SESSION_TRASH_RETENTION_ENABLED ||
-    config.SCHEDULER_ENABLED ||
-    config.PII_PROVIDER_ENABLED ||
-    config.AUTH_MODE === "workos";
-  if (privilegedDb !== app.db) {
-    const { rows } = await privilegedDb.query<{ bypassrls: boolean }>(
-      "SELECT rolbypassrls AS bypassrls FROM pg_roles WHERE rolname = current_user"
-    );
-    if (!rows[0]?.bypassrls) {
-      throw new Error(
-        "Privileged database pool must use a role with BYPASSRLS (e.g. a superuser). " +
-          "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
-          "Without it, scheduler/PII/project-retention queries silently return zero rows under RLS."
-      );
-    }
-  } else if (privilegedNeedsBypassRls) {
-    throw new Error(
-      "Project retention or another cross-tenant workload is enabled but no distinct privileged (BYPASSRLS) database pool is configured. " +
-        "Set MIGRATION_DATABASE_URL to a privileged connection distinct from DATABASE_URL. " +
-        "Without it, cross-tenant background queries silently return zero rows under RLS."
-    );
-  }
-
-  // The mirror of the assertion above, and the more security-relevant of the
-  // two: the app pool must NOT bypass RLS. Row-Level Security is the tenant
-  // isolation boundary for every request path, and a superuser or BYPASSRLS
-  // role silently ignores every policy — `withTenantScope` would still set the
-  // GUC, every query would still look correct, and each tenant would quietly
-  // see all the others' rows. Nothing else in the system would report a fault.
-  // Checked in workos mode only: local dev routinely points DATABASE_URL at a
-  // superuser, and there is no tenant isolation to protect there.
-  if (config.AUTH_MODE === "workos") {
-    const { rows } = await app.db.query<{ bypassrls: boolean; superuser: boolean }>(
-      "SELECT rolbypassrls AS bypassrls, rolsuper AS superuser FROM pg_roles WHERE rolname = current_user"
-    );
-    if (rows[0]?.bypassrls || rows[0]?.superuser) {
-      throw new Error(
-        "The application database pool must NOT bypass Row-Level Security. " +
-          "DATABASE_URL is connecting as a superuser or a BYPASSRLS role, which disables every tenant " +
-          "isolation policy. Point DATABASE_URL at the unprivileged application role (app_user)."
-      );
-    }
-  }
 
   await registerSecurityHeaders(app);
 
@@ -333,6 +280,8 @@ export async function buildApp() {
     customModels: deps.customModels,
     providerCredentials: deps.providerCredentials,
     auditEvents: deps.auditEvents,
+    piiProtection: deps.piiProtection,
+    piiScanRuns: deps.piiScanRuns,
     piiScanJobs: deps.piiScanJobs,
     piiScanJobHandler: deps.piiScanJobHandler,
     projectFiles: deps.projectFiles,

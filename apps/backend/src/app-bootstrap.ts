@@ -9,7 +9,7 @@ import { closeRedis } from "./lib/redis.js";
 import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
 import { buildArtifactRouteStores, registerArtifactRoutes } from "./routes/artifacts.js";
-import { buildHealthRouteStores, registerHealthRoutes } from "./routes/health.js";
+import { registerHealthRoutes } from "./routes/health.js";
 import { buildModelRouteStores, registerModelRoutes } from "./routes/models.js";
 import { buildMessageRouteStores, registerMessageRoutes } from "./routes/messages.js";
 import {
@@ -19,7 +19,15 @@ import {
 import { buildMcpRouteStores, registerMcpRoutes } from "./routes/mcp.js";
 import { buildSessionRouteStores, registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionCapabilityRoutes } from "./routes/session-capabilities.js";
+import { registerProjectCapabilityRoutes } from "./routes/project-capabilities.js";
+import { registerPersonalCapabilityRoutes } from "./routes/personal-capabilities.js";
+import { registerMemberMcpRoutes } from "./routes/member-mcp.js";
+import { registerMemoryRoutes } from "./routes/memories.js";
+import { registerPersonalSkillRoutes } from "./routes/personal-skills.js";
+import { registerOrganizationSkillSubmissionRoutes } from "./routes/organization-skill-submissions.js";
+import { registerProjectSkillRoutes } from "./routes/project-skills.js";
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
+import { registerJiraConnectionRoutes } from "./services/integrations/pipedream/jira-connection-routes.js";
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
 import type { SessionExecutionStore } from "./services/session-execution-store.js";
@@ -50,7 +58,7 @@ export async function registerAppRoutes(
     });
     app.addHook("onClose", () => deps.turnBus!.close());
   }
-  await registerHealthRoutes(app, buildHealthRouteStores(deps));
+  await registerHealthRoutes(app);
   const { hasProviderKey, configuredProviders } = buildApiKeyPresenceCheckers({
     credentials: deps.providerCredentials
   });
@@ -63,10 +71,22 @@ export async function registerAppRoutes(
   await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config }));
   await registerSessionRoutes(app, buildSessionRouteStores(deps));
   await registerSessionCapabilityRoutes(app, deps);
+  await registerProjectCapabilityRoutes(app, deps);
+  await registerPersonalCapabilityRoutes(app, deps);
+  await registerPersonalSkillRoutes(app, deps);
+  await registerOrganizationSkillSubmissionRoutes(app, deps);
+  await registerProjectSkillRoutes(app, deps);
+  await registerMemberMcpRoutes(app, deps);
+  await registerMemoryRoutes(app, deps);
   await registerProjectRoutes(app, deps);
   await registerProjectMemberRoutes(app, deps.projectMembers);
   await registerProjectFileRoutes(app, deps);
   await registerSettingsRoutes(app, buildSettingsRouteStores(deps, { config: app.config }));
+  await registerJiraConnectionRoutes(app, {
+    jiraConnections: deps.jiraConnectionService,
+    integrationStates: deps.integrationStates,
+    config: app.config
+  });
   await registerArtifactRoutes(app, buildArtifactRouteStores(deps));
   await registerMessageRoutes(
     app,
@@ -118,6 +138,8 @@ export function registerAppLifecycle(input: {
   messages?: Pick<AppDependencies["messages"], "markInterruptedIfActive">;
   /** Shorter drain wait for lifecycle tests. */
   turnDrainWaitMs?: number;
+  // Wait for aborted scheduled jobs to write their outcome before the pools close.
+  schedulerDrainWaitMs?: number;
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /**
@@ -143,6 +165,7 @@ export function registerAppLifecycle(input: {
     activeTurns,
     messages,
     turnDrainWaitMs = 5_000,
+    schedulerDrainWaitMs = 15_000,
     privilegedDb,
     schedulerWorker,
     staleApprovalSweeper,
@@ -223,7 +246,19 @@ export function registerAppLifecycle(input: {
         app.log.error({ err, sessionId: owner.sessionId }, "Failed to mark draining turn interrupted");
       });
     }
+    // Scheduled turns are not in activeTurns. Let them finish within the same
+    // budget, then abort the rest with the runtimes and wait again, so their
+    // outcome writes finish before onClose closes the database pools.
+    if (schedulerWorker && !(await schedulerWorker.drain(turnDrainWaitMs))) {
+      app.log.warn("Scheduled jobs still running at shutdown; aborting them with the runtimes");
+    }
+    schedulerWorker?.refuseNewTurns();
     await runtimeAdapter.close();
+    // An aborted job still flushes usage (up to USAGE_FLUSH_DEADLINE_MS) and then
+    // writes its transcript and outcome, so this wait has its own, longer budget.
+    if (schedulerWorker && !(await schedulerWorker.drain(schedulerDrainWaitMs))) {
+      app.log.error("Scheduled jobs did not settle after their runtimes closed; the next start marks their runs orphaned");
+    }
   });
 
   app.addHook("onClose", async () => {

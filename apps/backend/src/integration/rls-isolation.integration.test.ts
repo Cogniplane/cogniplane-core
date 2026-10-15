@@ -1,19 +1,15 @@
-// Row-visibility behaviour: the policies actually isolate rows.
+// Row-visibility cases that rls-write-paths.integration.test.ts does not cover.
 //
-// The catalog test proves RLS is switched on. This one proves it works. Two
-// tenants get a full object graph each, and for every seeded table we assert
-// the same three facts:
+// The catalog test proves RLS is switched on. rls-write-paths.integration.test.ts
+// proves it works for every tenant table: row visibility, the peer's UPDATE and
+// DELETE, and WITH CHECK, all through the production write path. This file keeps
+// the cases that file does not probe:
 //
-//   - under tenant B's scope, tenant A's row is invisible (count 0)
-//   - under tenant A's scope, it is visible (count 1)
-//   - on the superuser pool, it is visible (count 1)
+//   - the audit trail is append-only, even for the owning tenant;
+//   - the application pool without withTenantScope sees nothing;
+//   - system-tenant defaults are readable by every tenant and writable by none.
 //
-// That third assertion is what makes the first one mean something. Without it a
-// zero under B could just as easily be a fixture that never inserted anything.
-//
-// Coverage limit, stated so green here is not over-read: this covers the eight
-// seeded tables, not all 31. Widening it to every table through the store
-// insert paths is bead 58mh.
+// Fixtures are seeded on the superuser pool, so no store runs here.
 
 import { beforeAll, describe, expect, test } from "vitest";
 
@@ -26,153 +22,10 @@ import { seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
 const INSUFFICIENT_PRIVILEGE = "42501";
 
 describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
-  let tenantA: TenantFixture;
-  let tenantB: TenantFixture;
+  let tenant: TenantFixture;
 
   beforeAll(async () => {
-    tenantA = await seedTenantGraph();
-    tenantB = await seedTenantGraph();
-  });
-
-  /**
-   * One case per seeded table: where the row lives and how to find it again.
-   * `column`/`value` are read off the fixture at assert time so each case
-   * stays a plain data row.
-   */
-  const cases: Array<{
-    table: string;
-    column: string;
-    idOf: (fixture: TenantFixture) => string;
-  }> = [
-    { table: "sessions", column: "session_id", idOf: (f) => f.sessionId },
-    { table: "runtime_sessions", column: "runtime_id", idOf: (f) => f.runtimeId },
-    { table: "messages", column: "message_id", idOf: (f) => f.messageId },
-    { table: "artifacts", column: "artifact_id", idOf: (f) => f.artifactId },
-    { table: "approvals", column: "approval_id", idOf: (f) => f.approvalId },
-    { table: "agent_memories", column: "memory_id", idOf: (f) => f.memoryId },
-    { table: "scheduled_jobs", column: "job_id", idOf: (f) => f.jobId },
-    { table: "tenant_memberships", column: "user_id", idOf: (f) => f.userId }
-  ];
-
-  async function countUnderScope(
-    tenantId: string,
-    table: string,
-    column: string,
-    value: string
-  ): Promise<number> {
-    return withTenantScope(appPool(), tenantId, async (client) => {
-      const { rows } = await client.query<{ count: string }>(
-        // Identifiers come from the `cases` table above, never from input.
-        `SELECT COUNT(*)::text AS count FROM ${table} WHERE ${column} = $1`,
-        [value]
-      );
-      return Number(rows[0]?.count ?? "0");
-    });
-  }
-
-  test.each(cases)(
-    "$table: tenant A's row is invisible to tenant B, visible to A, and present for superuser",
-    async ({ table, column, idOf }) => {
-      const value = idOf(tenantA);
-
-      // Present in the database at all — otherwise the zero below proves nothing.
-      const { rows } = await superuserPool().query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM ${table} WHERE ${column} = $1`,
-        [value]
-      );
-      expect(Number(rows[0]?.count), `fixture for ${table} did not insert`).toBe(1);
-
-      expect(await countUnderScope(tenantA.tenantId, table, column, value)).toBe(1);
-      expect(await countUnderScope(tenantB.tenantId, table, column, value)).toBe(0);
-    }
-  );
-
-  test.each(cases)(
-    "$table: tenant B cannot UPDATE tenant A's row",
-    async ({ table, column, idOf }) => {
-      // Separate from the DELETE case below, on purpose. UPDATE and DELETE are
-      // distinct policy commands: a permissive `FOR UPDATE USING (true)` added
-      // next to a correct policy leaves DELETE untouched, so a test that only
-      // issued DELETE would stay green while any tenant could rewrite any
-      // other tenant's rows. All eight tables carry `updated_at`, which is the
-      // safe column to poke.
-      const value = idOf(tenantA);
-
-      const { rows: before } = await superuserPool().query<{ updated_at: string }>(
-        `SELECT updated_at::text AS updated_at FROM ${table} WHERE ${column} = $1`,
-        [value]
-      );
-      const originalUpdatedAt = before[0]?.updated_at;
-      expect(originalUpdatedAt, `fixture for ${table} did not insert`).toBeDefined();
-
-      const affected = await withTenantScope(appPool(), tenantB.tenantId, async (client) => {
-        const updated = await client.query(
-          `UPDATE ${table} SET updated_at = NOW() + INTERVAL '1 day' WHERE ${column} = $1`,
-          [value]
-        );
-        return updated.rowCount ?? 0;
-      });
-      expect(affected).toBe(0);
-
-      // The row is untouched on the pool that can see everything. Checking the
-      // VALUE, not just the row count: a permissive UPDATE policy would report
-      // rowCount 1, but a policy that matched and then wrote nothing would not
-      // be caught by rowCount alone.
-      const { rows: after } = await superuserPool().query<{ updated_at: string }>(
-        `SELECT updated_at::text AS updated_at FROM ${table} WHERE ${column} = $1`,
-        [value]
-      );
-      expect(after[0]?.updated_at).toBe(originalUpdatedAt);
-    }
-  );
-
-  test.each(cases)(
-    "$table: tenant B cannot DELETE tenant A's row",
-    async ({ table, column, idOf }) => {
-      const value = idOf(tenantA);
-
-      const affected = await withTenantScope(appPool(), tenantB.tenantId, async (client) => {
-        const deleted = await client.query(`DELETE FROM ${table} WHERE ${column} = $1`, [value]);
-        return deleted.rowCount ?? 0;
-      });
-      expect(affected).toBe(0);
-
-      // Still there, on the pool that can see everything.
-      const { rows } = await superuserPool().query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM ${table} WHERE ${column} = $1`,
-        [value]
-      );
-      expect(Number(rows[0]?.count)).toBe(1);
-    }
-  );
-
-  test("an INSERT naming another tenant is rejected by WITH CHECK, with SQLSTATE 42501", async () => {
-    // The SQLSTATE assertion is the point. A bare "it throws" would also pass
-    // on a foreign-key violation or a duplicate key, so it would go green
-    // against a broken fixture and prove nothing about the policy.
-    const attempt = withTenantScope(appPool(), tenantB.tenantId, async (client) => {
-      await client.query(
-        `INSERT INTO sessions (session_id, tenant_id, user_id, session_name)
-         VALUES ($1, $2, $3, 'smuggled')`,
-        [`smuggled_${Date.now()}`, tenantA.tenantId, tenantB.userId]
-      );
-    });
-
-    await expect(attempt).rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
-  });
-
-  test("an UPDATE moving a row to another tenant is rejected by WITH CHECK", async () => {
-    // The read side of the policy finds the row (it is B's), but WITH CHECK
-    // rejects the new tenant_id. Without this, a tenant could hand its own
-    // rows to a peer.
-    const attempt = withTenantScope(appPool(), tenantB.tenantId, async (client) => {
-      await client.query(`UPDATE sessions SET tenant_id = $1 WHERE session_id = $2`, [
-        tenantA.tenantId,
-        tenantB.sessionId
-      ]);
-    });
-
-    await expect(attempt).rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
+    tenant = await seedTenantGraph();
   });
 
   test("audit_events cannot be updated or deleted, even by the owning tenant", async () => {
@@ -185,13 +38,13 @@ describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
       `INSERT INTO audit_events (tenant_id, session_id, user_id, event_type)
        VALUES ($1, $2, $3, 'test.event')
        RETURNING id::text AS id`,
-      [tenantA.tenantId, tenantA.sessionId, tenantA.userId]
+      [tenant.tenantId, tenant.sessionId, tenant.userId]
     );
     const eventId = inserted[0]!.id;
 
     const { updated, deleted } = await withTenantScope(
       appPool(),
-      tenantA.tenantId,
+      tenant.tenantId,
       async (client) => {
         const u = await client.query(
           `UPDATE audit_events SET event_type = 'tampered' WHERE id = $1::bigint`,
@@ -224,7 +77,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
     // the query itself), or app.ts wiring a store to the wrong pool.
     const { rows } = await appPool().query<{ count: string }>(
       `SELECT COUNT(*)::text AS count FROM sessions WHERE session_id = $1`,
-      [tenantA.sessionId]
+      [tenant.sessionId]
     );
     expect(Number(rows[0]?.count)).toBe(0);
   });
@@ -235,8 +88,8 @@ describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
 // Three admin tables carry a read policy shaped
 // `tenant_id = current_setting(...) OR tenant_id = 'system'`, plus
 // tenant-only INSERT/UPDATE/DELETE policies. That is how platform defaults
-// reach every tenant. It is materially different from the generic single-clause
-// policy on the other 28 tables, and nothing tested it.
+// reach every tenant. It is materially different from the single-clause policy
+// on most other tenant tables, and nothing tested it.
 describe.skipIf(!adminDatabaseUrl())("system-tenant defaults", () => {
   const SYSTEM_TABLES = ["admin_skills", "admin_skill_revisions", "admin_mcp_servers"] as const;
 
@@ -298,8 +151,8 @@ describe.skipIf(!adminDatabaseUrl())("system-tenant defaults", () => {
     }),
     // `skill_revision_id` is sequence-backed, so it is omitted. The parent
     // skill is seeded first by the caller: the FK here is
-    // (tenant_id, skill_id) -> admin_skills, which IS tenant-scoped, unlike
-    // artifacts.session_id (see bead 700o).
+    // (tenant_id, skill_id) -> admin_skills, which is tenant-scoped. Session
+    // references also use composite tenant/session keys after migration 036.
     admin_skill_revisions: (tenantId, id) => ({
       sql: `INSERT INTO admin_skill_revisions
               (tenant_id, skill_id, revision_number, source_type, bundle_hash, created_by)

@@ -3,7 +3,7 @@
 import { useState } from "react";
 
 import { ImageLightbox } from "./image-lightbox";
-import { describeImageHost, isTrustedImageSource } from "./safe-markdown.logic";
+import { describeImageHost, isLinkableImageSource, isTrustedImageSource } from "./safe-markdown.logic";
 
 // The image renderer shared by every markdown surface: our own SafeMarkdown and
 // CopilotChat's built-in renderer, which sanitizes with rehype's default schema
@@ -19,10 +19,13 @@ export function MarkdownImage({ src, alt }: { src?: string | Blob; alt?: string 
   if (!isTrustedImageSource(src)) {
     // External images never auto-fetch: rendering them would let a
     // prompt-injected agent exfiltrate data through the URL the moment the
-    // message is displayed. Show a click-through link instead.
+    // message is displayed. Show a click-through link instead, and plain text
+    // for a URL that is not HTTP(S).
+    const label = `[External image${altText ? `: ${altText}` : ""} (${describeImageHost(src)})]`;
+    if (!isLinkableImageSource(src)) return <span>{label}</span>;
     return (
       <a href={src} target="_blank" rel="noopener noreferrer">
-        [External image{altText ? `: ${altText}` : ""} ({describeImageHost(src)})]
+        {label}
       </a>
     );
   }

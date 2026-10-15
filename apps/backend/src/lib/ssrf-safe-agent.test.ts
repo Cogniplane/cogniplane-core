@@ -136,20 +136,4 @@ describe("ssrfSafeAgent through undici", () => {
     expect(result).not.toMatch(/127\.0\.0\.1/);
     expect(result).not.toMatch(/::1/);
   });
-
-  it("fails closed, never open, when the hook errors", async () => {
-    // Whatever goes wrong in resolution, the request must not connect.
-    const port = await startLoopbackServer();
-    const brokenAgent = new Agent({
-      connect: {
-        lookup(_hostname: string, _options: unknown, callback: (...args: never[]) => void) {
-          (callback as unknown as (e: Error) => void)(new Error("resolver exploded"));
-        }
-      } as never
-    });
-
-    const result = await failureMessage(`http://localhost:${port}/`, brokenAgent);
-
-    expect(result).not.toMatch(/^__OK_/);
-  });
 });

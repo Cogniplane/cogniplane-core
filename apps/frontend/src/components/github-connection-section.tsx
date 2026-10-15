@@ -4,6 +4,7 @@ import {
   OAuthConnectionActions,
   OAuthConnectionSectionHeading
 } from "./oauth-connection-presentation";
+import { GithubRepositoryPicker, type GithubRepositoryPickerProps } from "./github-repository-picker";
 import { formatMediumDateTime } from "../lib/time-format";
 import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
@@ -14,6 +15,8 @@ type GithubConnectionSectionProps = {
   busyKey: string | null;
   onConnect: () => void;
   onDisconnect: () => void;
+  /** The repository choice. Shown while the member is connected. */
+  repositorySelection: Omit<GithubRepositoryPickerProps, "allowed" | "githubUserId">;
 };
 
 function getConnectionHeadline(status: GithubConnectionStatus | null): string {
@@ -24,7 +27,7 @@ function getConnectionHeadline(status: GithubConnectionStatus | null): string {
 }
 
 export function GithubConnectionSection(input: GithubConnectionSectionProps) {
-  const { status, error, flashMessage, busyKey, onConnect, onDisconnect } = input;
+  const { status, error, flashMessage, busyKey, onConnect, onDisconnect, repositorySelection } = input;
   const userConnection = status?.userConnection ?? null;
 
   return (
@@ -41,8 +44,8 @@ export function GithubConnectionSection(input: GithubConnectionSectionProps) {
                   Connect your GitHub account
                 </h2>
                 <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-                  Authorize GitHub so the agent can read repositories, write files, and open pull
-                  requests on your behalf — using whatever access your GitHub account already has.
+                  Authorize GitHub so the agent can read files, write files, and open pull requests
+                  on your behalf. After you connect, choose the repositories it may use.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
@@ -91,17 +94,14 @@ export function GithubConnectionSection(input: GithubConnectionSectionProps) {
               <>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className={CHIP}>login {userConnection.githubLogin}</span>
-                  <span className={CHIP}>
-                    connected {formatMediumDateTime(userConnection.connectedAt, "Not available")}
-                  </span>
-                  <span className={CHIP}>
-                    last used {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}
-                  </span>
                 </div>
-                <p className={`${HINT} mt-2`}>
-                  Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}. Refresh
-                  expiry: {formatMediumDateTime(userConnection.refreshTokenExpiresAt, "Not available")}.
-                </p>
+                <details className="mt-3 text-sm text-on-surface-variant">
+                  <summary className="cursor-pointer font-medium text-on-surface">Connection diagnostics</summary>
+                  <p className="mt-2">Connected: {formatMediumDateTime(userConnection.connectedAt, "Not available")}</p>
+                  <p>Last used: {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}</p>
+                  <p>Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}</p>
+                  <p>Refresh expiry: {formatMediumDateTime(userConnection.refreshTokenExpiresAt, "Not available")}</p>
+                </details>
               </>
             ) : (
               <p className={HINT}>
@@ -112,6 +112,14 @@ export function GithubConnectionSection(input: GithubConnectionSectionProps) {
           </CardContent>
         </Card>
       </div>
+
+      {userConnection ? (
+        <GithubRepositoryPicker
+          githubUserId={userConnection.githubUserId}
+          allowed={userConnection.allowedRepositories}
+          {...repositorySelection}
+        />
+      ) : null}
     </section>
   );
 }

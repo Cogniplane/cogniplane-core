@@ -88,3 +88,42 @@ test("SkillRevisionStore rejects imports that reuse a system skill ID", async ()
 
   expect(pool.queries.some((query) => query.text.includes("INSERT INTO admin_skills"))).toBe(false);
 });
+
+test.each([
+  ["disableSkill", (store: SkillConfigStore) => store.disableSkill("tenant-1", "notes")],
+  ["setSkillPublished", (store: SkillConfigStore) => store.setSkillPublished("tenant-1", "notes", true)]
+])("SkillConfigStore.%s returns the active revision content", async (_name, run) => {
+  // The UPDATE returns a bare admin_skills row, which has no instructions or
+  // content hash. The store must read the joined row again.
+  const pool = new FakePool()
+    .onQuery("UPDATE admin_skills", () => ({
+      rows: [{ tenant_id: "tenant-1", skill_id: "notes", skill_name: "Notes", version: 2,
+        enabled: false, is_published: true, active_revision_id: 9 }],
+      rowCount: 1
+    }))
+    .onQuery("FROM admin_skills AS skill", () => ({
+      rows: [{
+        tenant_id: "tenant-1", skill_id: "notes", skill_name: "Notes", description: null,
+        instructions: "Active instructions", version: 2, content_hash: "active-hash",
+        enabled: false, is_published: true, created_by: "admin",
+        created_at: "2026-10-13T00:00:00.000Z", updated_at: "2026-10-13T00:00:00.000Z",
+        active_revision_id: 9, active_source_type: "inline", active_bundle_name: "notes",
+        active_bundle_storage_uri: null, active_bundle_hash: "active-hash",
+        active_validation_status: "valid", active_review_status: "active", active_associated_tool_ids: []
+      }],
+      rowCount: 1
+    }));
+
+  const skill = await run(new SkillConfigStore(pool.asPool()));
+
+  expect(skill).toMatchObject({
+    instructions: "Active instructions", contentHash: "active-hash",
+    activeRevisionId: 9, activeReviewStatus: "active"
+  });
+});
+
+test("SkillConfigStore.disableSkill returns null when the tenant does not own the skill", async () => {
+  const pool = new FakePool().onQuery("UPDATE admin_skills", () => ({ rows: [], rowCount: 0 }));
+
+  await expect(new SkillConfigStore(pool.asPool()).disableSkill("tenant-1", "system-skill")).resolves.toBeNull();
+});

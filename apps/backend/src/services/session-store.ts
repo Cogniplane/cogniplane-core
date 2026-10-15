@@ -1,3 +1,4 @@
+import { intersectCapabilities } from "./capability-selection.js";
 
 import { z } from "zod";
 import { type Pool, withTenantScope, withTransaction } from "../lib/db.js";
@@ -8,16 +9,19 @@ import type { PoolClient } from "pg";
 import { sessionReadAccessSql, sessionTrashAccessSql } from "./session-access.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 import { uuidv7 } from "../lib/uuid.js";
-import { isoTimestamp } from "../lib/db-mappers.js";
+import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
 import {
   SESSION_TRASH_RETENTION_DAYS,
   SessionCapabilitySelectionSchema,
-  type SessionCapabilitiesUpdate
+  type SessionCapabilitySelection,
+  type SessionCapabilitiesUpdate,
+  type TranscriptFormat
 } from "@cogniplane/shared-types";
+import { hasUnavailableAdditions } from "./capability-selection.js";
 
 export type SessionRecord = {
   sessionId: string;
-  projectId?: string | null;
+  projectId: string | null;
   userId: string;
   sessionName: string;
   status: "active" | "archived" | "deleted";
@@ -38,7 +42,32 @@ export type SessionRecord = {
   latestTurnId?: string;
   latestTurnSequence?: number;
   hasTurnFailed?: boolean;
+  transcriptFormat: TranscriptFormat;
 };
+
+// The history format that this version writes and converts
+// (sessions.transcript_format, migration 064). The column default gives it to
+// every new session.
+export const CURRENT_TRANSCRIPT_FORMAT = 2;
+
+// The columns that mapSession reads. Every query that returns a session
+// selects them through SESSION_COLUMNS or sessionColumns(alias).
+const SESSION_COLUMN_NAMES = [
+  "session_id", "user_id", "session_name", "status", "archived_at", "deleted_at",
+  "purpose", "project_id", "transcript_format", "created_at", "updated_at"
+] as const;
+const SESSION_COLUMNS = SESSION_COLUMN_NAMES.join(", ");
+
+function sessionColumns(alias: string): string {
+  return SESSION_COLUMN_NAMES.map((column) => `${alias}.${column}`).join(", ");
+}
+
+// NULL marks a session from before the format column. Any other value than
+// the current one is a format that this version cannot read.
+function transcriptFormat(value: unknown): TranscriptFormat {
+  if (value === null) return "legacy";
+  return Number(value) === CURRENT_TRANSCRIPT_FORMAT ? "current" : "unsupported";
+}
 
 export const SessionListCursorSchema = z.object({
   updatedAt: z.string().datetime({ offset: true }),
@@ -75,10 +104,21 @@ type SessionRuntimeGcRow = {
   user_id: string;
 };
 
+
+function sessionDefaults(row: Record<string, unknown>) {
+  const source = row.project_id ? "project" : row.purpose === "normal" ? "personal" : "organization";
+  const raw = source === "project" ? row.project_selection : source === "personal" ? row.personal_selection : null;
+  return { source, selection: SessionCapabilitySelectionSchema.nullable().parse(raw ?? null) } as const;
+}
+
 function mapSession(row: Record<string, unknown>): SessionRecord {
   const status = row.status;
   if (status !== "active" && status !== "archived" && status !== "deleted") {
     throw new Error("Invalid session status in database");
+  }
+  // A projection without the column would make every session look legacy.
+  if (!Object.hasOwn(row, "transcript_format")) {
+    throw new Error("Session projection lacks transcript_format");
   }
   const record: SessionRecord = {
     sessionId: String(row.session_id),
@@ -88,7 +128,8 @@ function mapSession(row: Record<string, unknown>): SessionRecord {
     status,
     purpose: row.purpose ? String(row.purpose) : "normal",
     createdAt: isoTimestamp(row.created_at),
-    updatedAt: isoTimestamp(row.updated_at)
+    updatedAt: isoTimestamp(row.updated_at),
+    transcriptFormat: transcriptFormat(row.transcript_format)
   };
   if (row.archived_at) record.archivedAt = isoTimestamp(row.archived_at);
   if (row.deleted_at) record.deletedAt = isoTimestamp(row.deleted_at);
@@ -142,7 +183,7 @@ export class SessionStore {
     if (projectId) await requireProjectAccess(client, { tenantId, projectId, userId }, "editor", { lock: true, active: options.active ?? true });
     else if (initial.rows[0].user_id !== userId) return false;
     // Admission and assignment also lock project before session.
-    const current = await client.query("SELECT project_id, status FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
+    const current = await client.query("SELECT project_id, status, purpose, user_id, capability_selection, capability_version FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
     if (!current.rows[0] || current.rows[0].project_id !== projectId) return false;
     if (projectId && options.checkBusy !== false) {
       const busy = await client.query(`SELECT 1 WHERE EXISTS (
@@ -152,53 +193,117 @@ export class SessionStore {
       [tenantId, sessionId]);
       if (busy.rowCount) throw new SessionExecutionError("session_busy", 409);
     }
-    return { projectId, status: current.rows[0].status as SessionRecord["status"] };
+    return { projectId, status: current.rows[0].status as SessionRecord["status"],
+      purpose: current.rows[0].purpose as string, ownerId: current.rows[0].user_id as string,
+      capabilitySelection: current.rows[0].capability_selection as unknown,
+      capabilityVersion: current.rows[0].capability_version as unknown };
   }
 
   // Capability selection is readable project metadata, including for viewers.
   // Runtime admission separately requires an active editor execution; this read
   // grants no execution authority and skips the UI's pending-work probes.
   async getCapabilitySelection(tenantId: string, sessionId: string, userId: string) {
+    return (await this.getRuntimeCapabilities(tenantId, sessionId, userId)).selection;
+  }
+
+  // projectId is set only when the acting member can currently execute in the
+  // project. Viewers keep read access to the selection but get no project skills.
+  async getRuntimeCapabilities(tenantId: string, sessionId: string, userId: string): Promise<{
+    selection: SessionCapabilitySelection | null;
+    personalUserId: string | null;
+    projectId: string | null;
+  }> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `SELECT capability_selection FROM sessions s
-         WHERE tenant_id = $1 AND session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
+        `SELECT s.capability_selection, s.project_id, s.purpose, s.user_id,
+           p.capability_selection AS project_selection, d.capability_selection AS personal_selection,
+           ${projectRoleSql("p", "$3")} AS project_role
+         FROM sessions s LEFT JOIN projects p ON p.tenant_id=s.tenant_id AND p.project_id=s.project_id
+           LEFT JOIN personal_capability_defaults d ON d.tenant_id=s.tenant_id AND d.user_id=s.user_id
+         WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
         [tenantId, sessionId, userId]
       );
       if (!result.rows[0]) throw new Error("Session not found while resolving capabilities");
-      return SessionCapabilitySelectionSchema.nullable().parse(result.rows[0].capability_selection);
+      const selection = SessionCapabilitySelectionSchema.nullable().parse(result.rows[0].capability_selection);
+      const row = result.rows[0];
+      return {
+        selection: intersectCapabilities(selection, sessionDefaults(row).selection),
+        personalUserId: row.project_id === null && row.purpose === "normal" && row.user_id === userId
+          ? userId : null,
+        projectId: row.project_id !== null && row.purpose === "normal" &&
+          (row.project_role === "owner" || row.project_role === "editor") ? String(row.project_id) : null
+      };
     });
   }
 
-  async getCapabilities(tenantId: string, sessionId: string, userId: string): Promise<SessionCapabilitiesUpdate & { canEdit: boolean }> {
+  async getCapabilities(tenantId: string, sessionId: string, userId: string): Promise<SessionCapabilitiesUpdate & {
+    canEdit: boolean;
+    defaultsSource: "organization" | "project" | "personal";
+    defaultsSelection: SessionCapabilitySelection | null;
+    personalUserId: string | null;
+    projectId: string | null;
+  }> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `SELECT capability_selection, capability_version,
+        `SELECT s.capability_selection, s.capability_version, s.project_id, s.purpose, s.user_id,
+           p.capability_selection AS project_selection, d.capability_selection AS personal_selection,
            (${sessionLifecycleAccessSql("s", "$3")} AND s.status = 'active'
             AND NOT EXISTS (SELECT 1 FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active' AND e.expires_at>clock_timestamp())
             AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.tenant_id = s.tenant_id
               AND a.session_id = s.session_id AND a.status = 'pending')
             AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.tenant_id = s.tenant_id
               AND m.session_id = s.session_id AND m.role = 'assistant' AND m.status = 'streaming')) AS can_edit
-         FROM sessions s WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
+         FROM sessions s LEFT JOIN projects p ON p.tenant_id=s.tenant_id AND p.project_id=s.project_id
+           LEFT JOIN personal_capability_defaults d ON d.tenant_id=s.tenant_id AND d.user_id=s.user_id
+         WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
         [tenantId, sessionId, userId]
       );
       if (!result.rows[0]) throw Object.assign(new Error("Session not found while resolving capabilities"), { statusCode: 404 });
+      const defaults = sessionDefaults(result.rows[0]);
       return {
         selection: SessionCapabilitySelectionSchema.nullable().parse(result.rows[0].capability_selection),
         version: Number(result.rows[0].capability_version),
-        canEdit: Boolean(result.rows[0].can_edit)
+        canEdit: Boolean(result.rows[0].can_edit),
+        defaultsSource: defaults.source,
+        defaultsSelection: defaults.selection,
+        personalUserId: result.rows[0].project_id === null && result.rows[0].purpose === "normal" &&
+          result.rows[0].user_id === userId ? userId : null,
+        // Catalog context only. Runtime execution rechecks the member's current role.
+        projectId: result.rows[0].project_id !== null && result.rows[0].purpose === "normal"
+          ? String(result.rows[0].project_id) : null
       };
     });
   }
 
   async setCapabilities(
-    tenantId: string, sessionId: string, userId: string, input: SessionCapabilitiesUpdate
+    tenantId: string, sessionId: string, userId: string, input: SessionCapabilitiesUpdate,
+    available?: SessionCapabilitySelection
   ): Promise<boolean> {
     // Preferences do not change conversation recency or move the sidebar row.
     // capability_version tracks these changes independently of updated_at.
     return withTenantScope(this.db, tenantId, async (client) => {
-      if (!await this.lockLifecycleSession(client, tenantId, sessionId, userId)) return false;
+      const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId);
+      if (!locked) return false;
+      if (Number(locked.capabilityVersion) !== input.version) return false;
+      const saved = SessionCapabilitySelectionSchema.nullable().parse(locked.capabilitySelection);
+      if (available && hasUnavailableAdditions(input.selection, saved, available)) return false;
+      if (input.selection) {
+        let limit: SessionCapabilitySelection | null = null;
+        if (locked.projectId) {
+          const project = await client.query(
+            "SELECT capability_selection FROM projects WHERE tenant_id=$1 AND project_id=$2",
+            [tenantId, locked.projectId]
+          );
+          limit = SessionCapabilitySelectionSchema.nullable().parse(project.rows[0]?.capability_selection ?? null);
+        } else if (locked.purpose === "normal") {
+          const personal = await client.query(
+            "SELECT capability_selection FROM personal_capability_defaults WHERE tenant_id=$1 AND user_id=$2",
+            [tenantId, locked.ownerId]
+          );
+          limit = SessionCapabilitySelectionSchema.nullable().parse(personal.rows[0]?.capability_selection ?? null);
+        }
+        if (limit && hasUnavailableAdditions(input.selection, saved, limit)) return false;
+      }
       const result = await client.query(
         `UPDATE sessions s SET capability_selection = $4::jsonb,
            capability_version = capability_version + 1
@@ -272,17 +377,8 @@ export class SessionStore {
       const sessionRows = await client.query(
         `
           SELECT
-            s.session_id,
-            s.user_id,
-            s.session_name,
-            s.status,
-            s.archived_at,
-            s.deleted_at,
-            s.purpose,
-            s.project_id,
-            s.created_at,
-            s.updated_at,
-            to_char(s.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_updated_at,
+            ${sessionColumns("s")},
+            ${utcMicrosText("s.updated_at")} AS cursor_updated_at,
             latest_turn.message_id AS latest_turn_id,
             latest_turn.id AS latest_turn_sequence,
             latest_turn.status AS latest_turn_status,
@@ -353,7 +449,7 @@ export class SessionStore {
         `
           INSERT INTO sessions (session_id, tenant_id, user_id, session_name, purpose)
           VALUES ($1, $2, $3, $4, $5)
-          RETURNING session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at
+          RETURNING ${SESSION_COLUMNS}
         `,
         [sessionId, tenantId, userId, sessionName, purpose]
       );
@@ -364,8 +460,7 @@ export class SessionStore {
   async getReadable(tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `SELECT s.session_id, s.project_id, s.user_id, s.session_name, s.status,
-                s.archived_at, s.deleted_at, s.purpose, s.created_at, s.updated_at,
+        `SELECT ${sessionColumns("s")},
                 (${sessionLifecycleAccessSql("s", "$3")}) AS can_edit FROM sessions s
          WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
         [tenantId, sessionId, userId]
@@ -383,7 +478,7 @@ export class SessionStore {
     return withTenantScope(this.db, tenantId, async (client) => {
       const sessionRows = await client.query(
         `
-          SELECT session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at,
+          SELECT ${SESSION_COLUMNS},
                  TRUE AS can_edit
           FROM sessions
           WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3
@@ -402,7 +497,7 @@ export class SessionStore {
           UPDATE sessions s
           SET session_name = $4, updated_at = NOW()
           WHERE tenant_id = $1 AND session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")} AND status = 'active'
-          RETURNING session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at
+          RETURNING ${SESSION_COLUMNS}
         `,
         [tenantId, sessionId, userId, sessionName]
       );
@@ -424,7 +519,7 @@ export class SessionStore {
           SET session_name = $5, updated_at = NOW()
           WHERE tenant_id = $1 AND session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")} AND status = 'active'
             AND session_name = $4
-          RETURNING session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at
+          RETURNING ${SESSION_COLUMNS}
         `,
         [tenantId, sessionId, userId, expectedCurrentName, newName]
       );
@@ -441,7 +536,7 @@ export class SessionStore {
       const targetStatus = archived ? "archived" : "active";
       if (locked.status === targetStatus) {
         const current = await client.query(
-          `SELECT session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at
+          `SELECT ${SESSION_COLUMNS}
            FROM sessions WHERE tenant_id=$1 AND session_id=$2`,
           [tenantId, sessionId]
         );
@@ -468,7 +563,7 @@ export class SessionStore {
              SELECT 1 FROM approvals a WHERE a.tenant_id = s.tenant_id
                AND a.session_id = s.session_id AND a.status = 'pending'
            ))
-         RETURNING session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at`,
+         RETURNING ${SESSION_COLUMNS}`,
         [tenantId, sessionId, userId, archived ? "archived" : "active", archived ? "active" : "archived"]
       );
       return result.rows[0] ? mapSession(result.rows[0]) : null;
@@ -504,7 +599,7 @@ export class SessionStore {
              deleted_at=NULL, updated_at=NOW()
          WHERE tenant_id=$1 AND session_id=$2 AND status='deleted'
            AND deleted_at > NOW() - ($3 * INTERVAL '1 day')
-         RETURNING session_id, user_id, session_name, status, archived_at, deleted_at, purpose, project_id, created_at, updated_at`,
+         RETURNING ${SESSION_COLUMNS}`,
         [tenantId, sessionId, this.retentionDays],
       );
       return restored.rows[0] ? mapSession(restored.rows[0]) : null;

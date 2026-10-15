@@ -1,9 +1,12 @@
+import multipart from "@fastify/multipart";
 import Fastify from "fastify";
-import { test, expect } from "vitest";
+import { describe, test, expect } from "vitest";
 
 import { registerArtifactRoutes } from "./artifacts.js";
 import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
+import { FakePool } from "../test-helpers/fake-pool.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
+import { createTestConfig } from "../test-helpers/test-config.js";
 
 type FakeTokenRow = {
   token: string;
@@ -414,4 +417,368 @@ test("GET /artifacts returns 400 when the store rejects a sort/filter-mismatched
   expect(res.json().error).toBe("cursor_sort_filter_mismatch");
 
   await app.close();
+});
+
+// ── GET /downloads/:token (Content-Disposition) ──────────────────────────────
+
+describe("GET /downloads/:token Content-Disposition", () => {
+  async function downloadHeader(fileName: string) {
+    const { app, stores } = buildApp({
+      initialRows: [makeRow({ fileName })],
+      auth: { userId: "user-1", tenantId: "tenant-A", role: "member" }
+    });
+    await registerArtifactRoutes(app, stores as never);
+    await app.ready();
+    const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
+    await app.close();
+    return response;
+  }
+
+  test.each([
+    ["a relative path", "../../etc/passwd", `attachment; filename="passwd"; filename*=UTF-8''passwd`],
+    ["an absolute path", "/etc/shadow", `attachment; filename="shadow"; filename*=UTF-8''shadow`],
+    ["a Windows path", "C:\\Users\\bob\\evil.exe", `attachment; filename="evil.exe"; filename*=UTF-8''evil.exe`],
+    ["quotes", 'say "hi".txt', `attachment; filename="say _hi_.txt"; filename*=UTF-8''say%20%22hi%22.txt`],
+    ["Unicode", "日本語.pdf", `attachment; filename="___.pdf"; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.pdf`],
+    ["an empty name", "", `attachment; filename="download"; filename*=UTF-8''download`],
+    ["a dot-only name", "..", `attachment; filename="download"; filename*=UTF-8''download`]
+  ])("names the same safe file in both parameters for %s", async (_label, fileName, expected) => {
+    const response = await downloadHeader(fileName);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-disposition"]).toBe(expected);
+  });
+
+  test("a CRLF in a stored name cannot inject a header", async () => {
+    const response = await downloadHeader("evil\r\nX-Injected: yes.txt");
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["x-injected"]).toBeUndefined();
+    expect(response.headers["content-disposition"]).toBe(
+      `attachment; filename="evilX-Injected: yes.txt"; filename*=UTF-8''evilX-Injected%3A%20yes.txt`
+    );
+  });
+});
+
+// ── POST /artifacts/:artifactId/download-token (PII eligibility) ─────────────
+
+describe("POST /artifacts/:artifactId/download-token", () => {
+  const artifactId = "0196f7ca-8d4b-7a70-9f3f-111111111111";
+
+  async function issue(artifact: { status: string; detail: Record<string, unknown> }) {
+    const issued: unknown[] = [];
+    const stores = {
+      sessions: { async requireUploadAccess() { return null; }, async getReadable() { return null; } },
+      artifacts: {
+        async getReadable() {
+          return {
+            artifactId,
+            sessionId: "session-1",
+            storageBackend: "local",
+            storageKey: "user-1/session-1/report.txt",
+            artifactName: "report.txt",
+            mimeType: "text/plain",
+            ...artifact
+          };
+        },
+        async createDownloadToken(input: unknown) {
+          issued.push(input);
+          return { token: "tok-new", expiresAt: new Date(Date.now() + 60_000).toISOString() };
+        }
+      },
+      auditEvents: new InMemoryAuditEventStore(),
+      storage: {},
+      processor: {},
+      limits: { async consumeRateLimit() { return null; } }
+    };
+    const app = Fastify();
+    app.decorate("config", createTestConfig());
+    app.addHook("preHandler", async (request) => {
+      request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+    });
+    await registerArtifactRoutes(app, stores as never);
+    await app.ready();
+    const response = await app.inject({ method: "POST", url: `/artifacts/${artifactId}/download-token` });
+    await app.close();
+    return { response, issued };
+  }
+
+  test.each(["blocked", "pending", "scanning"])(
+    "refuses a ready artifact whose PII verdict is %s",
+    async (piiStatus) => {
+      // The status column says ready; only the PII verdict says otherwise.
+      const { response, issued } = await issue({ status: "ready", detail: { pii: { status: piiStatus } } });
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toBe("artifact_not_ready");
+      expect(issued).toEqual([]);
+    }
+  );
+
+  test.each([
+    ["a detect-only verdict with findings", { pii: { status: "scanned", modeApplied: "detect", findingsCount: 4 } }],
+    ["a transformed verdict", { pii: { status: "transformed" } }],
+    ["no verdict", {}]
+  ])("issues a token for a ready artifact with %s", async (_label, detail) => {
+    const { response, issued } = await issue({ status: "ready", detail });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().download.url).toBe("/downloads/tok-new");
+    expect(issued).toHaveLength(1);
+  });
+
+  test("refuses an artifact that is not ready, whatever its PII verdict", async () => {
+    const { response, issued } = await issue({ status: "pending", detail: { pii: { status: "scanned" } } });
+
+    expect(response.statusCode).toBe(409);
+    expect(issued).toEqual([]);
+  });
+});
+
+// ── GET /artifacts/:artifactId/preview-text (PII eligibility) ────────────────
+
+describe("GET /artifacts/:artifactId/preview-text", () => {
+  const artifactId = "0196f7ca-8d4b-7a70-9f3f-333333333333";
+
+  type Version = { status: string; detail: Record<string, unknown> };
+
+  // `reads` are what getReadable returns on each call: the first read gates the
+  // request, the second is the re-check after extraction.
+  async function preview(reads: Version[]) {
+    let extractions = 0;
+    let readCount = 0;
+    const stores = {
+      sessions: { async requireUploadAccess() { return null; }, async getReadable() { return null; } },
+      artifacts: {
+        async getReadable() {
+          const version = reads[Math.min(readCount, reads.length - 1)] as Version;
+          readCount += 1;
+          return { artifactId, mimeType: "application/pdf", ...version };
+        }
+      },
+      auditEvents: new InMemoryAuditEventStore(),
+      storage: {},
+      processor: {
+        async extractArtifactText() {
+          extractions += 1;
+          return "EXTRACTED TEXT";
+        }
+      },
+      limits: { async consumeRateLimit() { return null; } }
+    };
+    const app = Fastify();
+    app.decorate("config", createTestConfig());
+    app.addHook("preHandler", async (request) => {
+      request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+    });
+    await registerArtifactRoutes(app, stores as never);
+    await app.ready();
+    const response = await app.inject({ method: "GET", url: `/artifacts/${artifactId}/preview-text` });
+    await app.close();
+    return { response, extractions: () => extractions };
+  }
+
+  const ready = (detail: Record<string, unknown>): Version => ({ status: "ready", detail });
+
+  test.each(["blocked", "pending", "scanning"])(
+    "withholds the text of a ready artifact whose PII verdict is %s, without extracting it",
+    async (piiStatus) => {
+      const { response, extractions } = await preview([ready({ pii: { status: piiStatus } })]);
+
+      expect(response.statusCode).toBe(422);
+      expect(response.json().error).toBe("artifact_not_ready");
+      expect(response.body).not.toContain("EXTRACTED TEXT");
+      expect(extractions()).toBe(0);
+    }
+  );
+
+  test("withholds the text when a block lands while it is being extracted", async () => {
+    const { response, extractions } = await preview([
+      ready({}),
+      ready({ pii: { status: "blocked" } })
+    ]);
+
+    expect(extractions()).toBe(1);
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toBe("artifact_not_ready");
+    expect(response.body).not.toContain("EXTRACTED TEXT");
+  });
+
+  test.each([
+    ["a detect-only verdict with findings", { pii: { status: "scanned", modeApplied: "detect", findingsCount: 4 } }],
+    ["no verdict", {}]
+  ])("returns the text of a ready artifact with %s", async (_label, detail) => {
+    const { response } = await preview([ready(detail)]);
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ text: "EXTRACTED TEXT" });
+  });
+
+  test("still refuses an artifact that is not ready", async () => {
+    const { response, extractions } = await preview([{ status: "pending", detail: {} }]);
+
+    expect(response.statusCode).toBe(422);
+    expect(extractions()).toBe(0);
+  });
+});
+
+// ── POST /artifacts (file name validation) ───────────────────────────────────
+
+describe("POST /artifacts file name validation", () => {
+  const sessionId = "0196f7ca-8d4b-7a70-9f3f-222222222222";
+  const boundary = "----cogniplane-upload-boundary";
+
+  // Raw bytes, so a NUL really reaches the multipart parser.
+  function multipartBody(input: { fields?: Record<string, string>; filename: string; content?: string }) {
+    const chunks: Buffer[] = [];
+    for (const [name, value] of Object.entries({ sessionId, ...input.fields })) {
+      chunks.push(
+        Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n`),
+        Buffer.from(value),
+        Buffer.from("\r\n")
+      );
+    }
+    chunks.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${input.filename}"\r\n` +
+          "Content-Type: text/plain\r\n\r\n"
+      ),
+      Buffer.from(input.content ?? "artifact body"),
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    );
+    return Buffer.concat(chunks);
+  }
+
+  async function buildUploadApp(maxUploadBytes?: number) {
+    const calls = {
+      requireUploadAccess: 0,
+      put: [] as string[],
+      createUpload: [] as Array<{ artifactName: string }>
+    };
+    const record = (artifactName: string) => ({
+      artifactId: "artifact-1",
+      sessionId,
+      userId: "user-1",
+      artifactType: "upload",
+      artifactName,
+      mimeType: "text/plain",
+      status: "pending",
+      detail: {}
+    });
+    let lastName = "";
+    const stores = {
+      sessions: {
+        async requireUploadAccess() {
+          calls.requireUploadAccess += 1;
+          return null;
+        },
+        async getReadable() { return null; }
+      },
+      artifacts: {
+        async createUpload(input: { artifactName: string }) {
+          calls.createUpload.push({ artifactName: input.artifactName });
+          lastName = input.artifactName;
+          return record(input.artifactName);
+        },
+        async update() { return null; },
+        async getReadable() { return record(lastName); }
+      },
+      auditEvents: new InMemoryAuditEventStore(),
+      storage: {
+        async put(input: { storageKey: string; stream: AsyncIterable<Buffer> }) {
+          calls.put.push(input.storageKey);
+          let size = 0;
+          for await (const chunk of input.stream) size += chunk.length;
+          return { storageBackend: "local", storageKey: input.storageKey, fileSizeBytes: size, checksumSha256: "sum" };
+        },
+        async delete() {}
+      },
+      processor: {},
+      limits: { async consumeRateLimit() { return null; } }
+    };
+    const config = createTestConfig(maxUploadBytes ? { ARTIFACT_MAX_UPLOAD_BYTES: maxUploadBytes } : {});
+    const app = Fastify();
+    app.decorate("config", config);
+    app.decorate("db", new FakePool().onQuery(/INSERT INTO users/, () => ({ rows: [], rowCount: 1 })).asPool());
+    await app.register(multipart, { limits: { fileSize: config.ARTIFACT_MAX_UPLOAD_BYTES, files: 1 } });
+    app.addHook("preHandler", async (request) => {
+      request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+    });
+    await registerArtifactRoutes(app, stores as never);
+    await app.ready();
+    const upload = (body: Buffer) =>
+      app.inject({
+        method: "POST",
+        url: "/artifacts",
+        headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+        payload: body
+      });
+    return { app, calls, upload };
+  }
+
+  test("stores an upload with a valid name (positive control)", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "notes.txt" }));
+
+    expect(response.statusCode).toBe(201);
+    expect(calls.put).toHaveLength(1);
+    expect(calls.createUpload).toEqual([{ artifactName: "notes.txt" }]);
+    await app.close();
+  });
+
+  test.each([
+    ["NUL", "a\0b.txt"],
+    ["a control character", "a\tb.txt"],
+    ["a C1 control character", "a\u0085b.txt"],
+    ["a bidirectional override", "invoice\u202Etxt.exe"]
+  ])("rejects a custom name field with %s before storing anything", async (_label, name) => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ fields: { name }, filename: "notes.txt" }));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("invalid_filename");
+    expect(response.body).not.toContain("invoice");
+    expect(calls.put).toEqual([]);
+    expect(calls.createUpload).toEqual([]);
+    expect(calls.requireUploadAccess).toBe(0);
+    await app.close();
+  });
+
+  test("rejects a NUL in the multipart filename before storing anything", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "no\0tes.txt" }));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("invalid_filename");
+    expect(response.json().message).toMatch(/NUL/);
+    expect(calls.put).toEqual([]);
+    expect(calls.createUpload).toEqual([]);
+    expect(calls.requireUploadAccess).toBe(0);
+    await app.close();
+  });
+
+  test("keeps serving uploads after refusing a bad name", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    expect((await upload(multipartBody({ filename: "no\0tes.txt" }))).statusCode).toBe(400);
+    const next = await upload(multipartBody({ filename: "notes.txt" }));
+
+    expect(next.statusCode).toBe(201);
+    expect(calls.put).toHaveLength(1);
+    await app.close();
+  });
+
+  test("still enforces the upload size limit before the name check", async () => {
+    const { app, calls, upload } = await buildUploadApp(8);
+
+    const response = await upload(multipartBody({ filename: "no\0tes.txt", content: "far more than eight bytes" }));
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json().error).toBe("artifact_too_large");
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
 });

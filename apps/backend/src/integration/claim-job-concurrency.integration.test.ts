@@ -17,7 +17,7 @@ import pg from "pg";
 
 import { UserSettingsStore } from "../services/user-settings-store.js";
 
-import { adminDatabaseUrl, runSuperuserUrl, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, runMaintenanceUrl, superuserPool } from "./support/database.js";
 import { seedScheduledJob, seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
@@ -45,7 +45,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
     const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
     const poolA = new pg.Pool({
-      connectionString: runSuperuserUrl(),
+      connectionString: runMaintenanceUrl(),
       max: 1,
       // Bound the row-lock wait. Without it a stalled database turns a blocked
       // claim into a hang that outlives Vitest's own timeout and then blocks
@@ -54,7 +54,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       application_name: "cogniplane-integration-claim-a"
     });
     const poolB = new pg.Pool({
-      connectionString: runSuperuserUrl(),
+      connectionString: runMaintenanceUrl(),
       max: 1,
       statement_timeout: 10_000,
       application_name: "cogniplane-integration-claim-b"
@@ -97,7 +97,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
 
     const blocker = await superuserPool().connect();
     const loserPool = new pg.Pool({
-      connectionString: runSuperuserUrl(),
+      connectionString: runMaintenanceUrl(),
       max: 1,
       // Two independent bounds on the blocked claim. `lock_timeout` caps the
       // row-lock wait specifically; `statement_timeout` caps the statement

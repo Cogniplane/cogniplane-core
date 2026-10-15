@@ -1,4 +1,14 @@
-import type { GithubConnectionService } from "../integrations/github/github-connection-service.js";
+import { parseGithubRepositoryName } from "@cogniplane/shared-types";
+
+import { GITHUB_API_URL } from "../integrations/github/github-api-client.js";
+import type {
+  GithubConnectionService,
+  GithubRuntimeCredentials
+} from "../integrations/github/github-connection-service.js";
+import {
+  isRepositoryAllowed,
+  repositoryKey
+} from "../integrations/github/github-repository-allowlist.js";
 import {
   allRequiredObjectSchema,
   genericObjectSchema,
@@ -7,6 +17,7 @@ import {
   withManagedToolErrorSchema,
   type ManagedToolDefinition
 } from "./types.js";
+import { boundIntegrationAccount } from "../integrations/integration-account-binding.js";
 
 type GithubToolDeps = {
   githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
@@ -16,20 +27,7 @@ type GithubToolDeps = {
 // from LLM-supplied tool arguments, which can be influenced by prompt
 // injection in any document or prior message — so they must be validated
 // before becoming part of the URL or the agent could pivot to other GitHub
-// API endpoints under the user's PAT (e.g. `/user`, other repos).
-const REPO_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-
-function parseRepo(repo: string): { owner: string; name: string } | null {
-  if (!REPO_PATTERN.test(repo)) return null;
-  const [owner, name] = repo.split("/", 2) as [string, string];
-  // The character class permits a segment that is entirely dots, so `repo`
-  // like "../name" or "owner/.." passes the regex. The WHATWG URL parser then
-  // resolves the `..` and the request lands on a different api.github.com
-  // endpoint under the user's PAT. Reject `.`/`..` segments outright (mirrors
-  // encodeRepoPath's per-segment guard).
-  if (owner === "." || owner === ".." || name === "." || name === "..") return null;
-  return { owner, name };
-}
+// API endpoints under the user's token (e.g. `/user`, other repos).
 
 function encodeRepoPath(input: string): string | null {
   const trimmed = input.replace(/^\/+/, "");
@@ -39,6 +37,75 @@ function encodeRepoPath(input: string): string | null {
     if (segment === "" || segment === "." || segment === "..") return null;
   }
   return segments.map(encodeURIComponent).join("/");
+}
+
+// ── Repository gate ──────────────────────────────────────────────────────────
+//
+// The OAuth token reaches every repository that the user can reach, so the
+// user's allowed-repository list narrows what the agent can use. This is the
+// one place that applies the list. Every GitHub API call that names a
+// repository goes through `authorizeRepository` and then `fetchRepositoryApi`.
+// `fetchRepositoryApi` accepts only the value that `authorizeRepository`
+// returns, so a tool cannot reach a repository without the check.
+// The model cannot change the list: it lives in the user's connection, and
+// only the user's settings request writes it.
+
+declare const authorizedRepositoryBrand: unique symbol;
+type AuthorizedRepository = {
+  readonly owner: string;
+  readonly name: string;
+  readonly [authorizedRepositoryBrand]: true;
+};
+
+const SETTINGS_HINT = "The user can choose repositories in Settings > GitHub.";
+
+function authorizeRepository(
+  credentials: Pick<GithubRuntimeCredentials, "allowedRepositories">,
+  repoArgument: unknown
+): { repo: AuthorizedRepository } | { error: string } {
+  const parsed = parseGithubRepositoryName(String(repoArgument));
+  if (!parsed) return { error: "Invalid repo. Must match the pattern owner/name." };
+  if (credentials.allowedRepositories.length === 0) {
+    return {
+      error: `The user has not allowed the agent to use any GitHub repository yet. ${SETTINGS_HINT}`
+    };
+  }
+  if (!isRepositoryAllowed(credentials.allowedRepositories, parsed)) {
+    return {
+      error: `The repository ${repositoryKey(parsed)} is not on the user's list of allowed GitHub repositories. ${SETTINGS_HINT}`
+    };
+  }
+  return { repo: parsed as AuthorizedRepository };
+}
+
+function fetchRepositoryApi(
+  credentials: Pick<GithubRuntimeCredentials, "token">,
+  repo: AuthorizedRepository,
+  subPath: string,
+  init: { method?: string; body?: string; headers?: Record<string, string> } = {}
+): Promise<Response> {
+  return fetch(`${GITHUB_API_URL}/repos/${repo.owner}/${repo.name}${subPath}`, {
+    method: init.method,
+    body: init.body,
+    // A renamed or moved repository answers with a redirect to its new
+    // location. Following it would leave the repository that the user allowed.
+    redirect: "manual",
+    signal: AbortSignal.timeout(30_000),
+    headers: {
+      Authorization: `Bearer ${credentials.token}`,
+      Accept: "application/vnd.github+json",
+      ...init.headers
+    }
+  });
+}
+
+async function githubApiError(res: Response): Promise<{ error: string; detail?: Record<string, unknown> }> {
+  if (res.status >= 300 && res.status < 400) {
+    return {
+      error: `GitHub moved this repository (renamed or transferred). The allowed repository list uses the old name. ${SETTINGS_HINT}`
+    };
+  }
+  return { error: `GitHub API error ${res.status}`, detail: await safeJsonBody(res) };
 }
 
 // ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
@@ -51,7 +118,8 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
 }> = [
   {
     name: "github_read_file",
-    description: "Read the contents of a file from a GitHub repository using the connected GitHub account.",
+    description:
+      "Read the contents of a file from a GitHub repository using the connected GitHub account. Works only in repositories that the user allowed in Settings > GitHub.",
     readOnly: true,
     inputSchema: {
       type: "object",
@@ -67,7 +135,8 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
   },
   {
     name: "github_write_file",
-    description: "Create or update a file in a GitHub repository branch using the connected GitHub account.",
+    description:
+      "Create or update a file in a GitHub repository branch using the connected GitHub account. Works only in repositories that the user allowed in Settings > GitHub.",
     readOnly: false,
     inputSchema: {
       type: "object",
@@ -86,7 +155,8 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
   },
   {
     name: "github_create_pr",
-    description: "Open a pull request in a GitHub repository using the connected GitHub account.",
+    description:
+      "Open a pull request in a GitHub repository using the connected GitHub account. Works only in repositories that the user allowed in Settings > GitHub.",
     readOnly: false,
     inputSchema: {
       type: "object",
@@ -95,7 +165,7 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
         repo: { type: "string", description: "Full repo name, e.g. org/repo" },
         title: { type: "string" },
         body: { type: "string" },
-        head: { type: "string", description: "Source branch (the branch with changes)" },
+        head: { type: "string", description: "Source branch in the same repository (the branch with changes)" },
         base: { type: "string", description: "Target branch (e.g. main)" },
         draft: { type: "boolean", description: "Open as draft PR (default: false)" }
       },
@@ -120,23 +190,30 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
         })
       ),
       handler: async ({ context, arguments: args }) => {
-        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId);
+        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId,
+          boundIntegrationAccount(context.metadata, "github"));
         if (!creds) return { error: "No GitHub connection found. Connect your GitHub account in settings." };
 
-        const parsedRepo = parseRepo(String(args.repo));
-        if (!parsedRepo) return { error: "Invalid repo. Must match the pattern owner/name." };
+        const access = authorizeRepository(creds, args.repo);
+        if ("error" in access) return access;
         const encodedPath = encodeRepoPath(String(args.path));
         if (!encodedPath) return { error: "Invalid path. Must not contain '..' segments." };
         const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
 
-        const res = await fetch(
-          `https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/contents/${encodedPath}${ref}`,
-          { signal: AbortSignal.timeout(30_000), headers: { Authorization: `Bearer ${creds.token}`, Accept: "application/vnd.github+json" } }
-        );
+        const res = await fetchRepositoryApi(creds, access.repo, `/contents/${encodedPath}${ref}`);
 
-        if (!res.ok) return { error: `GitHub API error ${res.status}`, detail: await safeJsonBody(res) };
+        if (!res.ok) return githubApiError(res);
 
-        const data = (await res.json()) as Record<string, unknown>;
+        const body = (await res.json()) as unknown;
+        if (Array.isArray(body)) {
+          // The contents API returns an array for a directory.
+          const entries = body.slice(0, 200).map((entry) => String((entry as Record<string, unknown>)["path"] ?? ""));
+          return { error: "The path is a directory. Read one of its files instead.", detail: { entries } };
+        }
+        const data = body as Record<string, unknown>;
+        if (data["type"] !== undefined && data["type"] !== "file") {
+          return { error: `The path is a ${String(data["type"])}, not a file.` };
+        }
         if (data["encoding"] === "base64") {
           const content = Buffer.from(String(data["content"]).replace(/\n/g, ""), "base64").toString("utf-8");
           return { path: data["path"], sha: data["sha"], size: data["size"], content };
@@ -157,11 +234,12 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
         })
       ),
       handler: async ({ context, arguments: args }) => {
-        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId);
+        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId,
+          boundIntegrationAccount(context.metadata, "github"));
         if (!creds) return { error: "No GitHub connection found. Connect your GitHub account in settings." };
 
-        const parsedRepo = parseRepo(String(args.repo));
-        if (!parsedRepo) return { error: "Invalid repo. Must match the pattern owner/name." };
+        const access = authorizeRepository(creds, args.repo);
+        if ("error" in access) return access;
         const encodedPath = encodeRepoPath(String(args.path));
         if (!encodedPath) return { error: "Invalid path. Must not contain '..' segments." };
         const content = Buffer.from(String(args.content), "utf-8").toString("base64");
@@ -176,22 +254,14 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
         };
         if (args.sha) body["sha"] = String(args.sha);
 
-        const res = await fetch(
-          `https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/contents/${encodedPath}`,
-          {
-            method: "PUT",
-            signal: AbortSignal.timeout(30_000),
-            headers: {
-              Authorization: `Bearer ${creds.token}`,
-              Accept: "application/vnd.github+json",
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify(body)
-          }
-        );
+        const res = await fetchRepositoryApi(creds, access.repo, `/contents/${encodedPath}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
 
+        if (!res.ok) return githubApiError(res);
         const data = (await safeJsonBody(res)) as Record<string, Record<string, unknown>>;
-        if (!res.ok) return { error: `GitHub API error ${res.status}`, detail: data };
 
         return {
           path: data["content"]?.["path"],
@@ -217,32 +287,38 @@ export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[]
         })
       ),
       handler: async ({ context, arguments: args }) => {
-        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId);
+        const creds = await deps.githubConnections.getRuntimeCredentials(context.tenantId, context.userId,
+          boundIntegrationAccount(context.metadata, "github"));
         if (!creds) return { error: "No GitHub connection found. Connect your GitHub account in settings." };
 
-        const parsedRepo = parseRepo(String(args.repo));
-        if (!parsedRepo) return { error: "Invalid repo. Must match the pattern owner/name." };
+        const access = authorizeRepository(creds, args.repo);
+        if ("error" in access) return access;
+        // `owner:branch` names a branch in a fork. The fork is a second
+        // repository that the list does not cover, so only the owner of the
+        // allowed repository itself is accepted as a prefix.
+        const head = String(args.head);
+        const headOwner = head.includes(":") ? head.split(":", 1)[0]! : null;
+        if (headOwner !== null && headOwner.toLowerCase() !== access.repo.owner.toLowerCase()) {
+          return {
+            error: "Invalid head. Use a branch name of the repository, not a branch of another owner's fork."
+          };
+        }
         const body = {
           title: String(args.title),
           body: args.body ? String(args.body) : "",
-          head: String(args.head),
+          head,
           base: String(args.base),
           draft: args.draft === true
         };
 
-        const res = await fetch(`https://api.github.com/repos/${parsedRepo.owner}/${parsedRepo.name}/pulls`, {
+        const res = await fetchRepositoryApi(creds, access.repo, "/pulls", {
           method: "POST",
-          signal: AbortSignal.timeout(30_000),
-          headers: {
-            Authorization: `Bearer ${creds.token}`,
-            Accept: "application/vnd.github+json",
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
         });
 
+        if (!res.ok) return githubApiError(res);
         const data = await safeJsonBody(res);
-        if (!res.ok) return { error: `GitHub API error ${res.status}`, detail: data };
 
         return {
           number: data["number"],

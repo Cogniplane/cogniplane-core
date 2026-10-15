@@ -1,21 +1,20 @@
 "use client";
 
-import { useAdminUsersData } from "../../../hooks/use-admin-users-data";
-import { AdminUsersSection } from "../../../components/admin/admin-users-section";
+import { useEffect } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+
+import { PeopleDirectory, personHref } from "../../../components/admin/people/people-directory";
 
 export default function AdminUsersPage() {
-  const { users, busyKey, error, available, handleSetBetaTester } = useAdminUsersData();
+  const router = useRouter();
+  // Older links (for example from Privacy activity) point at `?userId=`.
+  // Send them to that person's page instead of the directory.
+  const legacyUserId = useSearchParams().get("userId");
 
-  return (
-    <section id="users" className="flex flex-col gap-5 pt-5">
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
-      {available ? (
-        <AdminUsersSection
-          users={users}
-          busyKey={busyKey}
-          onSetBetaTester={handleSetBetaTester}
-        />
-      ) : null}
-    </section>
-  );
+  useEffect(() => {
+    if (legacyUserId) router.replace(personHref(legacyUserId));
+  }, [legacyUserId, router]);
+
+  if (legacyUserId) return <p role="status" className="pt-5 text-sm text-on-surface-faint">Opening person…</p>;
+  return <PeopleDirectory />;
 }

@@ -1,7 +1,6 @@
 import { test, expect } from "vitest";
 import {
   classifyPackageLicense,
-  FORBIDDEN_LICENSES,
   INVALID_LICENSE_EXPRESSION,
   isForbidden
 } from "./license-check.js";
@@ -84,9 +83,7 @@ test("isForbidden: unreviewed custom license references fail closed", () => {
   expect(isForbidden("MIT AND LicenseRef-Proprietary")).toBe(INVALID_LICENSE_EXPRESSION);
 });
 
-test("isForbidden: all canonical GPL/AGPL variants are in FORBIDDEN_LICENSES", () => {
-  // Catches the case where someone removes a variant from the set: regression
-  // guard for the strict-id list.
+test("isForbidden: rejects all canonical GPL/AGPL variants", () => {
   for (const id of [
     "GPL-2.0",
     "GPL-2.0-only",
@@ -98,7 +95,7 @@ test("isForbidden: all canonical GPL/AGPL variants are in FORBIDDEN_LICENSES", (
     "AGPL-3.0-only",
     "AGPL-3.0-or-later"
   ]) {
-    expect(FORBIDDEN_LICENSES.has(id)).toBe(true);
+    expect(isForbidden(id)).toBe(id);
   }
 });
 

@@ -4,6 +4,7 @@ import { API_URL } from "../lib/api-client";
 import {
   classifyMarkdownLink,
   describeImageHost,
+  isLinkableImageSource,
   isTrustedImageSource
 } from "./safe-markdown.logic";
 
@@ -84,5 +85,27 @@ describe("describeImageHost", () => {
 
   it("falls back for unparseable sources", () => {
     expect(describeImageHost("not a url")).toBe("unknown host");
+  });
+
+  it("falls back for a URL without a host", () => {
+    expect(describeImageHost("data:image/png;base64,AAAA")).toBe("unknown host");
+  });
+});
+
+describe("isLinkableImageSource", () => {
+  it("accepts only HTTP(S) URLs", () => {
+    expect(isLinkableImageSource("https://example.com/x.png")).toBe(true);
+    expect(isLinkableImageSource("http://example.com/x.png")).toBe(true);
+    expect(isLinkableImageSource("data:image/png;base64,AAAA")).toBe(false);
+    expect(isLinkableImageSource("javascript:alert(1)")).toBe(false);
+    expect(isLinkableImageSource("not a url")).toBe(false);
+    expect(isLinkableImageSource("HTTPS://Example.com/x.png")).toBe(true);
+    expect(isLinkableImageSource("\tjava\nscript:alert(1)")).toBe(false);
+    expect(isLinkableImageSource("blob:https://a.com/x")).toBe(false);
+  });
+
+  it("resolves a protocol-relative source as HTTPS, like a markdown link", () => {
+    expect(isLinkableImageSource("//evil.example/a.png")).toBe(true);
+    expect(describeImageHost("//evil.example/a.png")).toBe("evil.example");
   });
 });

@@ -6,13 +6,8 @@ import type { SkillRevision } from "@cogniplane/shared-types";
 
 export function useSkillRevisions(input: {
   onListRevisions: (skillId: string) => Promise<SkillRevision[]>;
-  onActivateRevision: (input: {
-    skillId: string;
-    skillRevisionId: number;
-    reviewNotes?: string | null;
-  }) => Promise<void>;
 }) {
-  const { onListRevisions, onActivateRevision } = input;
+  const { onListRevisions } = input;
 
   const [revisionMap, setRevisionMap] = useState<Record<string, SkillRevision[]>>({});
   const [expandedSkillId, setExpandedSkillId] = useState<string | null>(null);
@@ -62,28 +57,22 @@ export function useSkillRevisions(input: {
     [expandedSkillId, refresh, revisionMap, setLoadErrorFor]
   );
 
-  const activate = useCallback(
-    async (skillId: string, skillRevisionId: number, reviewNotes: string | null) => {
-      try {
-        await onActivateRevision({ skillId, skillRevisionId, reviewNotes });
-        await refresh(skillId);
-        setLoadErrorFor(skillId, null);
-      } catch (caughtError) {
-        console.error("Failed to activate skill revision", caughtError);
-        const message =
-          caughtError instanceof Error ? caughtError.message : "Failed to activate revision.";
-        setLoadErrorFor(skillId, message);
-      }
-    },
-    [onActivateRevision, refresh, setLoadErrorFor]
-  );
+  const open = useCallback(async (skillId: string) => {
+    try {
+      await refresh(skillId);
+      setLoadErrorFor(skillId, null);
+      setExpandedSkillId(skillId);
+    } catch (caughtError) {
+      setLoadErrorFor(skillId, caughtError instanceof Error ? caughtError.message : "Failed to load revisions.");
+    }
+  }, [refresh, setLoadErrorFor]);
 
   return {
     revisionMap,
     expandedSkillId,
     loadError,
     toggle,
-    activate,
+    open,
     refresh
   };
 }

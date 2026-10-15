@@ -13,10 +13,14 @@ import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import type { AdminIntegrationView } from "@cogniplane/shared-types";
 
+const ignore = () => undefined;
+
 export function useAdminIntegrations() {
   const queryClient = useQueryClient();
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [mutationError, setMutationError] = useState<string | null>(null);
+  // `config` marks a configuration save or clear. The open dialog shows only
+  // its own integration's configuration error.
+  const [mutationError, setMutationError] = useState<{ integrationId: string; config: boolean; message: string } | null>(null);
   const [flashMessage, setFlashMessage] = useState<string | null>(null);
   // One handle for the flash timer. Back-to-back saves would otherwise let the
   // first mutation's timer erase the second one's message, and an unmount
@@ -76,12 +80,16 @@ export function useAdminIntegrations() {
       }
       return { previous };
     },
-    onError: (error, _vars, context) => {
+    onError: (error, { integrationId, input }, context) => {
       const ctx = context as { previous: AdminIntegrationView[] | null } | undefined;
       if (ctx?.previous) {
         queryClient.setQueryData(queryKeys.admin.integrations(), ctx.previous);
       }
-      setMutationError(toErrorMessage(error, "Failed to update integration."));
+      setMutationError({
+        integrationId,
+        config: Boolean(input.config),
+        message: toErrorMessage(error, "Failed to update integration.")
+      });
     },
     onSuccess: (integration) => {
       const previous = queryClient.getQueryData<AdminIntegrationView[]>(
@@ -107,8 +115,12 @@ export function useAdminIntegrations() {
       setActiveId(integrationId);
       setMutationError(null);
     },
-    onError: (error) => {
-      setMutationError(toErrorMessage(error, "Failed to clear integration configuration."));
+    onError: (error, integrationId) => {
+      setMutationError({
+        integrationId,
+        config: true,
+        message: toErrorMessage(error, "Failed to clear integration configuration.")
+      });
     },
     onSuccess: (integration) => {
       const previous = queryClient.getQueryData<AdminIntegrationView[]>(
@@ -134,11 +146,15 @@ export function useAdminIntegrations() {
     integrations: listQuery.data ?? [],
     isLoading: listQuery.isLoading,
     activeId,
-    error: mutationError ?? loadError,
+    error: mutationError?.message ?? loadError,
+    configError: mutationError?.config ? mutationError : null,
     flashMessage,
-    update: (integrationId: string, input: UpdateIntegrationInput) =>
-      updateMutation.mutateAsync({ integrationId, input }),
-    clearConfig: (integrationId: string) => clearMutation.mutateAsync(integrationId),
+    // A failure already shows through `error` or `configError`, so these resolve either way.
+    // Callers fire them from event handlers, where a rejection would go unhandled.
+    update: (integrationId: string, input: UpdateIntegrationInput): Promise<void> =>
+      updateMutation.mutateAsync({ integrationId, input }).then(ignore, ignore),
+    clearConfig: (integrationId: string): Promise<void> =>
+      clearMutation.mutateAsync(integrationId).then(ignore, ignore),
     dismissError: () => setMutationError(null)
   };
 }

@@ -80,6 +80,15 @@ describe("lintRules — shadowing", () => {
     });
   });
 
+  it("compares tool names without regard to case, like the engine", () => {
+    const high = rule({ ruleId: "pol_high", priority: 10, conditions: { toolNames: ["GitHub_Write_File"] } });
+    const low = rule({ ruleId: "pol_low", priority: 20, conditions: { toolNames: ["github_write_file"] } });
+    // The engine matches both rules for the same call, so the second never fires.
+    expect(lintRules([high, low])).toEqual([
+      expect.objectContaining({ kind: "duplicate", ruleId: "pol_low", conflictsWithRuleId: "pol_high" })
+    ]);
+  });
+
   it("is effect-agnostic: structural subset at higher priority shadows regardless of effect", () => {
     // The engine returns the first matching ENABLED rule regardless of effect —
     // an earlier 'allow' consumes the match before a later 'block'. The lint

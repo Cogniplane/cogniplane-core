@@ -7,7 +7,8 @@ import {
   mapTenantMember,
   parseApprovalPolicy,
   parseApprovalReviewer,
-  parseSkillActivationMetadata
+  parseSkillActivationMetadata,
+  skillReferencesFromManifest
 } from "./admin-config-store-mappers.js";
 
 describe("parseApprovalPolicy", () => {
@@ -350,4 +351,29 @@ describe("mapTenantMember", () => {
     expect(m.email).toBeNull();
     expect(m.displayName).toBeNull();
   });
+});
+
+describe("skillReferencesFromManifest", () => {
+  test("reads each skill a runtime loaded, keeping only well-typed fields", () => {
+    expect(skillReferencesFromManifest("s1", {
+      skills: [
+        { id: "pdf", revisionId: 3, bundleHash: "abc" },
+        { id: 7, revisionId: "3", bundleHash: null },
+        null,
+        "pdf",
+        {}
+      ]
+    })).toEqual([
+      { sessionId: "s1", skillId: "pdf", revisionId: 3, bundleHash: "abc" },
+      { sessionId: "s1", skillId: "", revisionId: null, bundleHash: null },
+      { sessionId: "s1", skillId: "", revisionId: null, bundleHash: null }
+    ]);
+  });
+
+  test.each([null, "skills", [], {}, { skills: "pdf" }, { skills: null }])(
+    "returns nothing for metadata without a skills list: %j",
+    (metadata) => {
+      expect(skillReferencesFromManifest("s1", metadata)).toEqual([]);
+    }
+  );
 });

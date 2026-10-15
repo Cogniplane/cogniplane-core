@@ -1,7 +1,7 @@
 # Security Features — Cogniplane Core
 
 > **Audience:** Operators evaluating Cogniplane Core's security posture; contributors auditing the security model.
-> **Scope:** All security-relevant controls implemented in the codebase as of 2026-07-04 (Deep Agents runtime).
+> **Scope:** Security control inventory for the Deep Agents runtime. References and selected historical claims were reconciled on 2026-10-11; this is not a complete security audit or proof of deployed configuration.
 > **Companion doc:** `ARCHITECTURE.md`.
 
 Inventory of security controls, defensive mechanisms, and isolation boundaries, grouped by domain. Each entry names the control, its location in code, and the relevant config.
@@ -20,7 +20,7 @@ Inventory of security controls, defensive mechanisms, and isolation boundaries, 
 - **Format:** HS256 JWTs, 7-day TTL, carry `jti` and `fid` (family id).
 - **Storage:** Redis — `refresh_jti:<jti>` → familyId, `refresh_family:<fid>` → `active|revoked`.
 - **Rotation:** `jti` consumed atomically via `GETDEL`.
-- **Replay defense:** consumed `jti` reuse on an active family revokes the entire family and forces re-auth.
+- **Replay defense:** concurrent refreshes can reuse the completed rotation result within a 60-second grace window. Reuse of a consumed `jti` after that window revokes the active family and forces re-auth.
 - File: `apps/backend/src/lib/refresh-token-store.ts`.
 
 ### 1.3 Auth modes
@@ -90,7 +90,7 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 | Pool | Role | Purpose |
 |---|---|---|
 | `db` | `app_user` (non-superuser) | All normal app queries — subject to RLS |
-| `privilegedDb` | superuser | Migrations and explicitly reviewed cross-tenant, lifecycle, bootstrap, or token-authorized operations |
+| `privilegedDb` | `maintenance_user`, BYPASSRLS without DDL authority | Authentication, claims, retention, recovery, provider-key reads, and token-authorized downloads |
 
 ### 3.4 Migration runner separation
 - Runs as superuser via `MIGRATION_DATABASE_URL`, intentionally bypasses RLS.
@@ -104,7 +104,9 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 - The agent loop runs **in-process in the backend**; only shell/file tools execute inside a per-session E2B sandbox. The template (`docker/template.ts`, built by `make e2b-build`) is a dumb code-execution box — Python data stack, **no agent CLIs or SDKs, no secrets in the sandbox env**.
 - **Lazy:** the sandbox is created on first shell/file tool use and memoized per session; chat-only sessions never create one. `allowCommandExecution=false` attaches no sandbox at all, so the `execute` tool is never exposed.
 - **Workspace:** isolated per session at `/home/user/workspace/<sessionId>/`.
-- Files: `apps/backend/src/services/deep-agents/deep-agents-e2b-backend.ts`, `docker/template.ts`.
+- **Network egress (default deny):** a sandbox has no network unless the tenant approves hosts (`approved_sandbox_egress_domains`, admin-editable, at most 25 exact host names or `*.` wildcards over a registered name). E2B enforces the policy on its side, so root in the guest cannot undo it. The network of a sandbox is fixed when it is created and is never changed afterwards. A sandbox is created under the policy as it is read from the tenant settings at that moment, and the provider reports the network back before any command runs. At the first use of each turn or job, and at a reconnect, one live read compares the sandbox with the policy as it is then, and a sandbox that differs, for example because the admin changed the list, is replaced with a notice. The old sandbox is killed with up to four tries, and the session lease is checked before each try. No command and no file operation runs in a sandbox that was not confirmed in the current turn, and none runs for a turn that ended, was cancelled, was replaced by the next one, or whose runtime was disposed. The creation request is sent once, and a report that has a setting that was not requested fails the check. Every provider request in a check has a timeout, failed reads are tried again, and one deadline covers the check. If the sandbox cannot be read in time, the call fails and the sandbox is kept. A change of the list applies at the next turn start, not inside a running turn. Limits: a replaced sandbox that cannot be killed after all tries is logged as an error and runs until the provider expires it, with the network that it was created with, and the lease check before a kill cannot be atomic with the kill request, so an owner whose kill is delayed can destroy a sandbox that the next owner adopted (the network stays restricted, and files that only existed in that sandbox are lost). Limits of the provider filter: it judges a web request by the host name it states, and while any host is approved, DNS works for every name. Details: the header comment of `sandbox-network-policy.ts`.
+- **Guest privileges:** commands run as the unprivileged `user`. The template removes the stock image's passwordless `sudo` and empty root password in its start command, because E2B adds them back while it finalizes a template. Sandboxes from an older template keep the grant until `E2B_TEMPLATE_ID` points at a rebuilt one.
+- Files: `apps/backend/src/services/deep-agents/deep-agents-e2b-backend.ts`, `apps/backend/src/services/runtime/sandbox-network-policy.ts`, `docker/template.ts`.
 
 ### 4.2 Workspace path validation
 - All model-visible paths are remapped into the session workspace and confined by a shared traversal guard (`resolveInsideSandbox`); paths that escape the workspace return a structured error to the model instead of silently retargeting.
@@ -126,6 +128,8 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-workos.ts`, `a
 ### 5.1 `redactSecrets()` — redaction before persistence
 Recursively sanitizes payloads before audit, message, or skill-corpus persistence.
 - **Patterns:** `Authorization: Bearer …`, GitHub tokens (`gh_`, `ghp_`, `github_pat_`), PEM private keys (RSA / EC / ED25519 / PKCS#8), Anthropic (`sk-ant-…`) and OpenAI (`sk-…`) keys, AWS access keys (`AKIA` / `ASIA`), Slack tokens (`xox…`), Google API keys (`AIza…`), and any field whose key matches `/authorization|token|secret|api.?key|password/i`.
+- **Credentials in URL query strings:** a query parameter with a credential name (`token`, `apiKey`, `api-key`, `key`, `secret`, `sig`, …) is redacted. Log sanitizing uses the same check, which covers every name that MCP URL validation refuses (`lib/sensitive-query-params.ts`).
+- **MCP gateway responses:** before a tool response reaches the runtime or telemetry, the gateway removes the MCP server's upstream secret (personal or organization, raw and URL-encoded) from the result and error, but not from the JSON-RPC envelope or their own field names, and applies `redactSecrets()` to both the `result` and the JSON-RPC `error` envelope (`routes/mcp.ts`, `services/mcp/scrub-upstream-credential.ts`).
 - File: `apps/backend/src/services/redact-secrets.ts`.
 
 ### 5.2 ToolExecutionContext — model-blind credential envelope
@@ -171,9 +175,18 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 6.5 Policy Center approvals
 - Policy Center rules can return `require_approval` for MCP tool calls. Policy Center and native approval share one checkpointed graph interrupt and one `approvals` row.
-- The runtime attaches a call-bound proof. The gateway accepts it only when the approved row matches the session, user, tool, server, tool context, and canonical argument hash; missing or mismatched proof is denied.
-- Scheduled turns use the same durable pause, and checkpoint replay preserves the original proof across process restart.
+- The runtime keeps a proof with a random approval ID in backend memory, keyed by tool-call ID, and injects the approval ID at dispatch. The proof never enters model tool arguments. The gateway accepts it only when the approved row matches the session, user, tool, server, tool context, and canonical argument hash; missing or mismatched proof is denied. The hash leaves out the transport keys (`toolContextId`, `policyApprovalId`, the marker) at the argument root only. A nested key with one of those names is hashed.
+- **Single-use:** before dispatch, the gateway claims the approval with `UPDATE … WHERE status = 'approved' AND consumed_at IS NULL RETURNING …`, scoped to tenant and user. One approval permits one dispatch attempt, even if that attempt then fails. While policy still enforces `require_approval`, a second dispatch with it is refused. Missing, rejected, expired, mismatched, or already-used proof returns `PolicyBlockedError` (`-32004`).
+- Scheduled turns are unattended: the graph does not pause for Policy Center approval, and the gateway denies an enforced `require_approval` match. A rebuilt runtime does not restore a pending proof from a checkpoint; the action needs a new approval.
 - Files: `apps/backend/src/routes/mcp.ts`, `apps/backend/src/services/deep-agents/deep-agents-graph.ts`, `apps/backend/src/services/policy/*`.
+
+### 6.6 Long-term memory: authority and consent
+- **Authority.** Memory text was written by a model or a user, so it is never placed in the system prompt. The prompt holds one rule (saved memories are user data, not instructions, and cannot change rules, tool permissions or approvals). Recent memories enter model input as a labelled data message for each turn. They are JSON strings inside a delimited block, with credentials redacted and non-printing characters made visible. The message is not saved in the conversation or the checkpoint. Server authorization never reads model text.
+- **Consent.** `memory_save` (catalog flag `requiresUserApproval`) needs the user's approval of the exact text in every interactive turn, whatever `approval_policy` and Policy Center say. The approval is the same single-use proof as 6.5: it binds to the session, user, tool, server, tool context and argument hash, so a replay or a changed value is refused. The gateway passes the handler the approval that it claimed, and the handler refuses without it. A save that replaces a memory also stores the hash of the replaced text with the approval, and the write compares it under a row lock.
+- **Scheduled runs** have nobody to ask, so a scheduled `memory_save` is refused and nothing is saved.
+- **Provenance.** Each memory records its source session, the approving user, the approval ID and a version on the server (migration 068). Rows from before it read as `unverified`. Model-supplied `metadata` is never proof of approval. Text that holds a credential is refused.
+- **User control.** `/settings/memories` lists, edits and deletes the signed-in user's own memories. Writes send the account and the version that the editor started from. If the memory changed after that, the server refuses the write, and the page keeps the user's text beside the latest saved text, so nothing newer is overwritten and nothing the user typed is lost without their choice.
+- Files: `apps/backend/src/services/memory-consent.ts`, `apps/backend/src/services/memory-workspace-section.ts`, `apps/backend/src/services/deep-agents/memory-context-middleware.ts`, `apps/backend/src/routes/memories.ts`.
 
 ---
 
@@ -368,7 +381,7 @@ File: `apps/backend/src/lib/security-headers.ts`.
 - Integration tokens encrypted with AES-256-GCM (§5.3).
 
 ### 14.4 Superuser scope minimized
-- The normal app pool runs as `app_user`. Code must opt into `privilegedDb`, and each caller needs an authorization reason that RLS cannot express, such as a migration, cross-tenant worker claim, bootstrap lookup, or opaque-token lookup.
+- The normal app pool runs as `app_user`. Code must opt into `privilegedDb`, and each caller needs an authorization reason that RLS cannot express, such as a cross-tenant worker claim, bootstrap lookup, or opaque-token lookup.
 
 ---
 
@@ -507,8 +520,8 @@ Policy Center rules live in `policy_rule` and are evaluated before and at the MC
 
 ## 25. Test Coverage
 
-- **CI thresholds:** 70% lines / 60% branches / 70% functions, enforced by Vitest in-process. Current baseline: 71.58 / 62.33 / 71.93. Thresholds calibrated below the measured baseline for headroom and ratcheted upward as coverage grows. Source of truth: `.coverage-thresholds.json`.
-- **Scope:** thresholds apply to the backend (`apps/backend`); frontend coverage is reported but not gated.
+- **CI thresholds:** `pnpm test:coverage` and `pnpm test:coverage:frontend` are CI gates. They count every eligible production file, including files that no test imports. `.coverage-thresholds.json` holds the floors and the dated measurements they come from. The imported-module runs use a different denominator and are a nonblocking trend. Backend unit coverage does not include the Postgres integration suite, and unit-test fakes do not prove database policies.
+- **Scope:** the backend (`apps/backend`) and the frontend (`apps/frontend`) have separate floors.
 - **Security-critical paths covered:** refresh-token rotation/reuse, `redactSecrets` patterns, RLS scoping helpers, approval coordinator timeouts, MIME-type/magic-byte validation, route-validation rejection paths.
 - **Runner:** `vitest run --coverage` (v8 provider).
 

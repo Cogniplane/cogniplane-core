@@ -215,3 +215,87 @@ test("PiiScanJobStore.sweepStaleClaims requeues/fails claimed rows past the cuto
   expect(db.lastQuery!.values).toContain(120_000);
   expect(swept).toBe(1);
 });
+
+async function mapped(overrides: Record<string, unknown>) {
+  const db = new CaptureDatabase();
+  db.selectReturn = [sampleRow(overrides)];
+  return new PiiScanJobStore(db as unknown as Pool).getById("tenant-1", "job-1");
+}
+
+test.each([
+  ["an object", { storageKey: "s3://bucket/key" }, { storageKey: "s3://bucket/key" }],
+  ["a JSON string", JSON.stringify({ text: "hello", entityTypes: ["EMAIL"] }), { text: "hello", entityTypes: ["EMAIL"] }],
+  ["invalid JSON", "{not json", {}],
+  ["a JSON array", JSON.stringify(["text"]), {}],
+  ["a JSON null", "null", {}],
+  ["an array", ["text"], {}],
+  ["null", null, {}]
+])("reads a payload stored as %s", async (_case, payload_json, expected) => {
+  expect((await mapped({ payload_json }))?.payload).toEqual(expected);
+});
+
+test.each([
+  ["artifact", "artifact"],
+  ["message", "message"],
+  // Jobs only scan messages and artifacts; anything else reads as a message.
+  ["project_instructions", "message"]
+])("reads subject type %s as %s", async (subject_type, expected) => {
+  expect((await mapped({ subject_type }))?.subjectType).toBe(expected);
+});
+
+test("maps a finished job's optional fields and normalizes timestamps", async () => {
+  const at = new Date("2026-10-01T10:00:00.000Z");
+  const record = await mapped({
+    source_session_id: "session-1",
+    attempts: "2",
+    max_attempts: "5",
+    run_after: at,
+    claimed_at: at,
+    completed_at: "2026-10-01T10:05:00Z",
+    error_message: "provider timeout",
+    created_at: at.getTime(),
+    updated_at: "2026-10-01T10:06:00Z"
+  });
+
+  expect(record).toMatchObject({
+    sourceSessionId: "session-1",
+    sourceUserId: "user-1",
+    attempts: 2,
+    maxAttempts: 5,
+    runAfter: "2026-10-01T10:00:00.000Z",
+    claimedAt: "2026-10-01T10:00:00.000Z",
+    completedAt: "2026-10-01T10:05:00.000Z",
+    errorMessage: "provider timeout",
+    createdAt: "2026-10-01T10:00:00.000Z",
+    updatedAt: "2026-10-01T10:06:00.000Z"
+  });
+});
+
+test("leaves unset fields null and defaults missing attempt counts", async () => {
+  const record = await mapped({ source_user_id: null, attempts: null, max_attempts: undefined });
+
+  expect(record).toMatchObject({
+    sourceSessionId: null,
+    sourceUserId: null,
+    attempts: 0,
+    maxAttempts: 3,
+    claimedAt: null,
+    completedAt: null,
+    errorMessage: null
+  });
+});
+
+test("maps each claimed row to its own job", async () => {
+  const db = new CaptureDatabase();
+  db.claimReturn = [
+    sampleRow({ job_id: "job-1", scan_run_id: "scan-1", subject_id: "art-1" }),
+    sampleRow({ job_id: "job-2", scan_run_id: "scan-2", subject_type: "message", subject_id: "msg-2", mode: "block" })
+  ];
+
+  const claimed = await new PiiScanJobStore(db as unknown as Pool).claimDueJobs(5);
+
+  expect(claimed.map(({ jobId, scanRunId, subjectType, subjectId, mode }) => ({ jobId, scanRunId, subjectType, subjectId, mode }))).toEqual([
+    { jobId: "job-1", scanRunId: "scan-1", subjectType: "artifact", subjectId: "art-1", mode: "detect" },
+    { jobId: "job-2", scanRunId: "scan-2", subjectType: "message", subjectId: "msg-2", mode: "block" }
+  ]);
+});

@@ -5,6 +5,7 @@ import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
 import type { GithubConnectionService } from "../integrations/github/github-connection-service.js";
 import type { NotionConnectionService } from "../integrations/notion/notion-connection-service.js";
+import type { JiraConnectionService } from "../integrations/pipedream/jira-connection-service.js";
 import type { MemoryStore } from "../memory-store.js";
 import type { MessageStore } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
@@ -30,6 +31,7 @@ export type ManagedToolFactoryDeps = {
   auditEvents: Pick<AuditEventStore, "create">;
   githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
   notionConnections: Pick<NotionConnectionService, "getRuntimeCredentials">;
+  jiraConnections: Pick<JiraConnectionService, "read">;
   /** Optional — forwarded to tools that aggregate cross-session content. */
   piiProtection?: PiiProtectionService;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;

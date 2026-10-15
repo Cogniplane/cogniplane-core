@@ -4,6 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   params: new URLSearchParams(),
+  githubSelection: vi.fn((_githubUserId: string | null) => ({
+    repositories: [],
+    truncated: false,
+    isLoading: false,
+    loadError: null,
+    isSaving: false,
+    saveError: null,
+    saved: false,
+    reload: () => {},
+    save: () => {}
+  })),
   github: {
     status: null as null | Record<string, unknown>,
     busyKey: null as "connect" | "disconnect" | null,
@@ -22,7 +33,8 @@ const state = vi.hoisted(() => ({
 
 vi.mock("next/navigation", () => ({ useSearchParams: () => state.params }));
 vi.mock("../../hooks/use-github-connection", () => ({
-  useGithubConnection: () => state.github
+  useGithubConnection: () => state.github,
+  useGithubRepositorySelection: (githubUserId: string | null) => state.githubSelection(githubUserId)
 }));
 vi.mock("../../hooks/use-notion-connection", () => ({
   useNotionConnection: () => state.notion
@@ -53,7 +65,7 @@ describe.each([
     success: "GitHub personal authorization connected.",
     connectLabel: "Connect GitHub",
     reconnectLabel: "Reconnect GitHub",
-    consentText: /read repositories, write files, and open pull requests/,
+    consentText: /read files, write files, and open pull requests/,
     notConfiguredText: "GitHub OAuth is not configured on this deployment yet.",
     connectedStatus: {
       configured: true,
@@ -65,6 +77,7 @@ describe.each([
         githubEmail: "octo@example.com",
         githubAvatarUrl: null,
         scopes: ["repo"],
+        allowedRepositories: ["octocat/hello-world"],
         accessTokenExpiresAt: null,
         refreshTokenExpiresAt: null,
         connectedAt: "2026-09-04T12:00:00.000Z",
@@ -141,6 +154,7 @@ describe.each([
     render(<Page />);
 
     expect(screen.getByRole("heading", { name: testCase.identityText })).toBeTruthy();
+    expect(screen.getByText("Connection diagnostics").closest("details")?.open).toBe(false);
     expect(screen.getByRole("button", { name: testCase.reconnectLabel })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
     expect(state[stateKey].disconnect).toHaveBeenCalledOnce();
@@ -181,5 +195,46 @@ describe.each([
     render(<Page />);
 
     expect(screen.getByText(`${provider} connection failed.`)).toBeTruthy();
+  });
+});
+
+describe("GitHub repository selection", () => {
+  const connected = {
+    configured: true,
+    tenantEnabled: true,
+    userConnection: {
+      githubUserId: "gh-1",
+      githubLogin: "octocat",
+      githubName: null,
+      githubEmail: null,
+      githubAvatarUrl: null,
+      scopes: [],
+      allowedRepositories: [],
+      accessTokenExpiresAt: null,
+      refreshTokenExpiresAt: null,
+      connectedAt: "2026-09-04T12:00:00.000Z",
+      updatedAt: "2026-09-04T12:00:00.000Z",
+      lastUsedAt: null
+    }
+  };
+
+  it("loads and saves repositories for the account that the status shows", () => {
+    state.github.status = connected;
+    render(<SettingsGithubPage />);
+
+    expect(state.githubSelection).toHaveBeenLastCalledWith("gh-1");
+    expect(screen.getByText("Repositories the agent can use")).toBeTruthy();
+    expect(screen.getByText("none selected")).toBeTruthy();
+  });
+
+  it("does not load repositories without a connection or when the organization turned GitHub off", () => {
+    state.github.status = { configured: true, tenantEnabled: true, userConnection: null };
+    const { rerender } = render(<SettingsGithubPage />);
+    expect(state.githubSelection).toHaveBeenLastCalledWith(null);
+    expect(screen.queryByText("Repositories the agent can use")).toBeNull();
+
+    state.github.status = { ...connected, tenantEnabled: false };
+    rerender(<SettingsGithubPage />);
+    expect(state.githubSelection).toHaveBeenLastCalledWith(null);
   });
 });

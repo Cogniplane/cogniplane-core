@@ -56,6 +56,19 @@ export function isTrustedImageSource(src: string): boolean {
 
 // Best-effort host label for the click-through link shown in place of an
 // untrusted image. The caller never renders this as a URL, only as text.
+// Protocol-relative ("//host/path") resolves as HTTPS, as classifyMarkdownLink does.
+function parseImageSource(src: string): URL | null {
+  return parseUrl(src.startsWith("//") ? `https:${src}` : src);
+}
+
 export function describeImageHost(src: string): string {
-  return parseUrl(src)?.host ?? "unknown host";
+  // A data: or other host-less URL parses with an empty host.
+  return parseImageSource(src)?.host || "unknown host";
+}
+
+// Only an HTTP(S) URL may become a click-through link. Other schemes (data:,
+// blob:, javascript:, …) are shown as text.
+export function isLinkableImageSource(src: string): boolean {
+  const protocol = parseImageSource(src)?.protocol;
+  return protocol === "http:" || protocol === "https:";
 }

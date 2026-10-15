@@ -6,7 +6,7 @@ import { formatCostUsd, formatTokenCount } from "./context-window-meter.logic";
 // on the most recent assistant turn's total token count, plus the session's
 // running cost. Gracefully renders nothing until there's a real reading.
 //
-// The ring fills clockwise; it tints amber past 75% and red past 90% so the
+// The ring fills clockwise; it tints amber from 75% and red from 90% so the
 // user sees compaction/limit pressure coming before it bites.
 export function ContextWindowMeter({
   usedTokens,

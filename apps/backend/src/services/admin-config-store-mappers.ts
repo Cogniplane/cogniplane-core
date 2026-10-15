@@ -1,4 +1,5 @@
 import type {
+  ActiveRuntimeSkillReference,
   AdminMcpServerRecord,
   AdminSkillRecord,
   AdminSkillRevisionRecord,
@@ -7,6 +8,26 @@ import type {
   TenantMemberRecord
 } from "./admin-config-records.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
+
+/**
+ * Read the skills a runtime loaded from its manifest metadata. The metadata is
+ * free-form JSON, so a malformed entry is skipped and a malformed field becomes
+ * empty rather than failing the whole list.
+ */
+export function skillReferencesFromManifest(sessionId: string, manifestMetadata: unknown): ActiveRuntimeSkillReference[] {
+  const skills = manifestMetadata && typeof manifestMetadata === "object"
+    ? (manifestMetadata as { skills?: unknown }).skills
+    : undefined;
+  if (!Array.isArray(skills)) return [];
+  return skills
+    .filter((skill): skill is Record<string, unknown> => typeof skill === "object" && skill !== null)
+    .map((skill) => ({
+      sessionId,
+      skillId: typeof skill.id === "string" ? skill.id : "",
+      revisionId: typeof skill.revisionId === "number" ? skill.revisionId : null,
+      bundleHash: typeof skill.bundleHash === "string" ? skill.bundleHash : null
+    }));
+}
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -82,7 +103,8 @@ export function mapSkill(row: Record<string, unknown>, requestTenantId?: string)
     activeValidationStatus: toNullableString(row.active_validation_status),
     activeReviewStatus: toNullableString(row.active_review_status),
     associatedToolIds: toStringArray(row.active_associated_tool_ids),
-    isInherited: ownerTenantId === "system" && requestTenantId !== undefined && requestTenantId !== "system"
+    isInherited: ownerTenantId === "system" && requestTenantId !== undefined && requestTenantId !== "system",
+    pendingRevisionCount: row.pending_revision_count === undefined ? undefined : Number(row.pending_revision_count)
   };
 }
 
@@ -153,6 +175,7 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
   );
   return {
     serverId: String(row.server_id),
+    ownerTenantId: String(row.tenant_id),
     serverName: String(row.server_name),
     description: row.description ? String(row.description) : null,
     transportKind: "http",
@@ -162,6 +185,8 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
     upstreamAuthType,
     upstreamAuthName: row.upstream_auth_name ? String(row.upstream_auth_name) : null,
     upstreamAuthConfigured: Boolean(row.upstream_auth_secret_encrypted),
+    credentialScope: row.credential_scope === "personal" ? "personal" : "organization",
+    credentialBindingId: row.credential_binding_id ? String(row.credential_binding_id) : "",
     version: Number(row.version),
     configHash: String(row.config_hash),
     enabled: Boolean(row.enabled),

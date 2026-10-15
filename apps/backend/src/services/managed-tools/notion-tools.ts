@@ -12,6 +12,7 @@ import {
   type ManagedToolDefinition,
   type ManagedToolHandler
 } from "./types.js";
+import { boundIntegrationAccount } from "../integrations/integration-account-binding.js";
 
 // Notion's REST API requires a pinned version header. 2025-09-03 introduced
 // data sources as a new top-level abstraction, but the page/block/database
@@ -76,7 +77,8 @@ function withNotionAuth(
   ) => Promise<Record<string, unknown>>
 ): ManagedToolHandler {
   return async ({ context, arguments: args }) => {
-    const creds = await deps.notionConnections.getRuntimeCredentials(context.tenantId, context.userId);
+    const creds = await deps.notionConnections.getRuntimeCredentials(context.tenantId, context.userId,
+      boundIntegrationAccount(context.metadata, "notion"));
     if (!creds) {
       return { error: "No Notion connection found. Connect your Notion account in settings." };
     }

@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { test, expect, vi } from "vitest";
+import { test, expect } from "vitest";
 
 import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
@@ -130,6 +130,46 @@ test("write_artifact: requires name", async () => {
   await expect(() => tool(deps).handler({ context: ctx(), arguments: { content: "x" } })).rejects.toThrow(/name is required/);
 });
 
+test.each([
+  ["NUL", "report\0.txt"],
+  ["a control character", "re\nport.txt"],
+  ["a C1 control character", "re\u0085port.txt"],
+  ["a bidirectional override", "report\u202Etxt.exe"]
+])("write_artifact: rejects a name with %s before reading or storing anything", async (_label, name) => {
+  let readCalls = 0;
+  const { deps, storageCalls, artifactCalls, auditCalls } = makeDeps({
+    readRuntimeFile: async () => {
+      readCalls += 1;
+      return new TextEncoder().encode("from-disk");
+    }
+  });
+
+  // The error is a ToolCallError, so the gateway relays its message to the model.
+  await expect(() =>
+    tool(deps).handler({ context: ctx(), arguments: { name, content: "hi" } })
+  ).rejects.toMatchObject({ name: "ToolCallError", message: expect.stringContaining("Artifact name must not contain") });
+  await expect(() =>
+    tool(deps).handler({ context: ctx(), arguments: { name, filePath: "./x" } })
+  ).rejects.toMatchObject({ name: "ToolCallError" });
+
+  expect(readCalls).toBe(0);
+  expect(storageCalls).toEqual([]);
+  expect(artifactCalls).toEqual([]);
+  expect(auditCalls).toEqual([]);
+});
+
+test("write_artifact: accepts a Unicode name and one with a directory part", async () => {
+  // The validator refuses controls, not characters or separators: the download
+  // path reduces a name to its basename.
+  const { deps, artifactCalls } = makeDeps();
+  await tool(deps).handler({ context: ctx(), arguments: { name: "résumé 日本語.txt", content: "x" } });
+  await tool(deps).handler({ context: ctx(), arguments: { name: "out/report.txt", content: "x" } });
+  expect(artifactCalls.map((call) => (call as { artifactName: string }).artifactName)).toEqual([
+    "résumé 日本語.txt",
+    "out/report.txt"
+  ]);
+});
+
 test("write_artifact: requires either content or filePath", async () => {
   const { deps } = makeDeps();
   await expect(() => tool(deps).handler({ context: ctx(), arguments: { name: "x.txt" } })).rejects.toThrow(/Either content or filePath is required/);
@@ -200,16 +240,11 @@ test("write_artifact: removes the stored object when the artifact insert fails",
   expect(deleteCalls).toEqual([storageCalls[0]?.storageKey]);
 });
 
-test("write_artifact: saves a permitted project output as a draft while keeping the session artifact", async () => {
-  const { deps } = makeDeps({ artifactMaxBytes: 7 });
-  const createAgentDraftFromContent = vi.fn().mockResolvedValue({
-    fileId: "project-draft-1",
-    targetFileId: null
-  });
-  const result = await tool({
-    ...deps,
-    projectFiles: { createAgentDraftFromContent }
-  }).handler({
+test("write_artifact: saves only the session artifact in a project turn", async () => {
+  // Project drafts come only from project_write_file, so the gateway checks
+  // Policy Center for that tool and its "project" category before any draft.
+  const { deps, artifactCalls } = makeDeps();
+  const result = await tool(deps).handler({
     context: ctx({
       metadata: {
         projectContext: { projectId: "project-1", agentFileMode: "create-only" },
@@ -219,95 +254,14 @@ test("write_artifact: saves a permitted project output as a draft while keeping 
     arguments: { name: "report.md", content: "draft" }
   });
 
-  expect(result).toMatchObject({ artifactId: "a-1", projectDraftId: "project-draft-1" });
-  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({
-    actor: { tenantId: "t", userId: "u", projectId: "project-1" },
-    name: "report.md",
-    targetFileId: null,
-    baseVersionId: null,
-    mimeType: "text/markdown",
-    maxBytes: 7
-  }));
-});
-
-test("write_artifact: keeps the session artifact when the automatic project draft fails", async () => {
-  const { deps, auditCalls, artifactCalls } = makeDeps();
-  const createAgentDraftFromContent = vi.fn().mockRejectedValue(new Error("project draft failed"));
-  const result = await tool({
-    ...deps,
-    projectFiles: { createAgentDraftFromContent }
-  }).handler({
-    context: ctx({
-      metadata: {
-        projectContext: { projectId: "project-1", agentFileMode: "create-only" },
-        runtimePolicy: { enabledToolIds: ["project_write_file"] }
-      }
-    }),
-    arguments: { name: "report.md", content: "draft" }
-  });
-
-  expect(result).toMatchObject({
-    artifactId: "a-1",
-    projectDraftId: null,
-    projectDraftError: "The session artifact was saved, but the project draft could not be created."
-  });
   expect(artifactCalls).toHaveLength(1);
-  expect(auditCalls).toHaveLength(1);
-});
-
-test("write_artifact: does not create a project draft when the project tool is disabled", async () => {
-  const { deps } = makeDeps();
-  const createAgentDraftFromContent = vi.fn();
-  const result = await tool({
-    ...deps,
-    projectFiles: { createAgentDraftFromContent }
-  }).handler({
-    context: ctx({
-      metadata: {
-        projectContext: { projectId: "project-1", agentFileMode: "create-only" },
-        runtimePolicy: { enabledToolIds: [] }
-      }
-    }),
-    arguments: { name: "report.md", content: "draft" }
+  expect(result).toEqual({
+    artifactId: "a-1",
+    artifactName: expect.any(String),
+    mimeType: expect.any(String),
+    fileSizeBytes: expect.any(Number),
+    status: expect.any(String)
   });
-
-  expect(result).toMatchObject({ artifactId: "a-1", projectDraftId: null });
-  expect(createAgentDraftFromContent).not.toHaveBeenCalled();
-});
-
-test("write_artifact: read-write mode updates a matching published file draft", async () => {
-  const { deps } = makeDeps();
-  const createAgentDraftFromContent = vi.fn().mockResolvedValue({ fileId: "draft-1" });
-  await tool({
-    ...deps,
-    projectFiles: { createAgentDraftFromContent }
-  }).handler({
-    context: ctx({
-      metadata: {
-        projectContext: {
-          projectId: "project-1",
-          agentFileMode: "read-write",
-          snapshot: {
-            files: [{
-              fileId: "file-1",
-              versionId: "version-7",
-              name: "Report.md",
-              folderId: null,
-              kind: "published"
-            }]
-          }
-        },
-        runtimePolicy: { enabledToolIds: ["project_write_file"] }
-      }
-    }),
-    arguments: { name: "report.md", content: "draft" }
-  });
-
-  expect(createAgentDraftFromContent).toHaveBeenCalledWith(expect.objectContaining({
-    targetFileId: "file-1",
-    baseVersionId: "version-7",
-    stored: expect.objectContaining({ storageKey: expect.any(String) })
-  }));
 });
 
 test("write_artifact: explicit mimeType overrides extension inference", async () => {

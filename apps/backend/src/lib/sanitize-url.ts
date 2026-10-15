@@ -2,7 +2,7 @@
 // defense in depth so a caller-supplied `?token=`/`?apiKey=` never lands in
 // long-term log retention (CloudWatch, Datadog).
 
-import { SENSITIVE_QUERY_PARAMS } from "./sensitive-query-params.js";
+import { isSensitiveQueryParameterName } from "./sensitive-query-params.js";
 
 export function sanitizeUrl(url: string): string {
   const queryStart = url.indexOf("?");
@@ -17,9 +17,7 @@ export function sanitizeUrl(url: string): string {
     .map((pair) => {
       const eq = pair.indexOf("=");
       const key = eq < 0 ? pair : pair.slice(0, eq);
-      // Case-insensitive: the key comes from the caller, so `?API_KEY=` must
-      // redact exactly like `?api_key=`.
-      if (SENSITIVE_QUERY_PARAMS.has(key.toLowerCase())) {
+      if (isSensitiveQueryParameterName(key)) {
         return `${key}=REDACTED`;
       }
       return pair;

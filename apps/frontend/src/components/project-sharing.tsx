@@ -19,12 +19,18 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Project } from "@cogniplane/shared-types";
 import { PROJECT_SELECT } from "@/lib/project-ui";
+import { ProjectMembers } from "./project-members";
 type SharingDraft = {
   visibility: "private" | "organization";
   organizationRole: "viewer" | "editor";
 };
 
-export function ProjectSharing({ project, canManage = true }: { project: Project; canManage?: boolean }) {
+export function ProjectSharing({ project, canManage = true, currentUserId }: {
+  project: Project;
+  canManage?: boolean;
+  /** The person at the page. Their row in the member list says Leave. */
+  currentUserId?: string;
+}) {
   const client = useQueryClient();
   const access = useQuery({
     queryKey: ["projects", project.projectId, "access"],
@@ -176,31 +182,13 @@ export function ProjectSharing({ project, canManage = true }: { project: Project
               </Button>
             </div>
           ) : null}
-          <div className="border-t border-outline-variant pt-4">
-            <h4 className="text-sm font-medium">Project members</h4>
-            {access.data.members.length ? (
-              <ul className="mt-2 divide-y divide-outline-variant text-sm">
-                {access.data.members.map((member) => (
-                  <li key={member.userId} className="flex flex-wrap items-center justify-between gap-2 py-2">
-                    <span>
-                      {member.displayName ?? member.email ?? member.userId}
-                      {member.displayName && member.email ? (
-                        <span className="ml-2 text-on-surface-variant">{member.email}</span>
-                      ) : null}
-                    </span>
-                    <span className="text-on-surface-variant">{member.role}</span>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="mt-2 text-sm text-on-surface-variant">No explicit project members.</p>
-            )}
-            {visibility === "organization" ? (
-              <p className="mt-2 text-xs text-on-surface-variant">
-                Organization sharing also gives every current organization member the selected access above.
-              </p>
-            ) : null}
-          </div>
+          <ProjectMembers
+            projectId={project.projectId}
+            access={access.data}
+            canManage={canManage && !project.archivedAt}
+            currentUserId={currentUserId}
+            organizationNote={visibility === "organization"}
+          />
           {save.isError && !changedElsewhere ? <p role="alert" className="text-sm text-danger">{save.error.message}</p> : null}
           <Button type="submit" disabled={!canManage || !changed || changedElsewhere || Boolean(project.archivedAt) || save.isPending}>
             {save.isPending ? "Saving access..." : "Save access"}

@@ -1,12 +1,22 @@
 "use client";
-// CopilotKit hooks register the tool cards and plan renderer inside its provider.
-// Custom event cards are owned by useAguiCustomEvents.
+// CopilotKit renderers for the tool call card and the plan. They run inside
+// the CopilotKit provider. Custom event cards are owned by useAguiCustomEvents.
 
-import { useCoAgentStateRender, useDefaultTool } from "@copilotkit/react-core";
-import { useState } from "react";
+import { UseAgentUpdate, useAgent, useDefaultRenderTool } from "@copilotkit/react-core/v2";
+import { createContext, useContext, useState } from "react";
 import { ChevronDownIcon, WrenchIcon } from "lucide-react";
 
 import { PlanRowView } from "./chat-cards/plan-row";
+
+/** A tool call that did not complete normally. A failed or declined call
+ *  comes from a `tool_status` event or saved history. An interrupted call
+ *  comes from saved history: the turn stopped before the call returned. */
+export type ToolOutcome = "failed" | "declined" | "interrupted";
+
+/** Outcomes by tool call ID. The chat message list provides them. */
+export const ToolOutcomeContext = createContext<ReadonlyMap<string, ToolOutcome>>(new Map());
+
+type ToolStatus = "inProgress" | "executing" | "complete";
 
 function stringify(value: unknown): string {
   if (value == null) return "";
@@ -18,21 +28,31 @@ function stringify(value: unknown): string {
   }
 }
 
-function ToolCard({
+const OUTCOME_LABEL: Record<ToolOutcome, string> = {
+  failed: "failed",
+  declined: "declined",
+  interrupted: "interrupted"
+};
+
+export function ToolCard({
   name,
-  args,
+  parameters,
   status,
-  result
+  result,
+  outcome
 }: {
   name: string;
-  args: unknown;
-  status: "inProgress" | "executing" | "complete";
+  parameters: unknown;
+  status: ToolStatus;
   result: unknown;
+  outcome?: ToolOutcome;
 }) {
   const [open, setOpen] = useState(false);
-  const running = status !== "complete";
-  const argsText = stringify(args);
+  const running = status !== "complete" && !outcome;
+  const argsText = stringify(parameters);
   const resultText = stringify(result);
+  const label = outcome ? OUTCOME_LABEL[outcome] : running ? "running…" : "done";
+  const dot = outcome ? "bg-danger" : running ? "animate-pulse bg-brand" : "bg-success";
 
   return (
     <article className="card-enter rounded-md border border-outline-variant bg-surface-container-low px-3 py-2 text-sm">
@@ -47,14 +67,11 @@ function ToolCard({
         <span className="font-mono font-medium text-on-surface">{name}</span>
         <span
           className={`ml-auto inline-flex items-center gap-1.5 text-xs ${
-            running ? "text-brand" : "text-on-surface-faint"
+            outcome ? "text-danger" : running ? "text-brand" : "text-on-surface-faint"
           }`}
         >
-          <span
-            aria-hidden="true"
-            className={`size-1.5 rounded-full ${running ? "animate-pulse bg-brand" : "bg-success"}`}
-          />
-          {running ? "running…" : "done"}
+          <span aria-hidden="true" className={`size-1.5 rounded-full ${dot}`} />
+          {label}
         </span>
       </button>
       {open ? (
@@ -75,22 +92,29 @@ function ToolCard({
   );
 }
 
-export function CopilotRenderSlots({ agentName }: { agentName: string }) {
-  useDefaultTool({
-    render: ({ name, args, status, result }) => (
-      <ToolCard name={name} args={args} status={status} result={result} />
+function ToolCallCard(props: { name: string; toolCallId: string; parameters: unknown; status: ToolStatus; result: unknown }) {
+  const outcome = useContext(ToolOutcomeContext).get(props.toolCallId);
+  return <ToolCard name={props.name} parameters={props.parameters} status={props.status} result={props.result} outcome={outcome} />;
+}
+
+/** Registers the card for every tool call. CopilotKit renders a tool call
+ *  without a registered renderer as nothing. */
+export function CopilotRenderSlots() {
+  useDefaultRenderTool({
+    render: ({ name, toolCallId, parameters, status, result }) => (
+      <ToolCallCard name={name} toolCallId={toolCallId} parameters={parameters} status={status} result={result} />
     )
   });
-
-  useCoAgentStateRender({
-    name: agentName,
-    render: ({ state }) => {
-      const plan = (state as { plan?: string } | undefined)?.plan?.trim();
-      return plan
-        ? <PlanRowView row={{ type: "plan", rowId: "plan", messageId: "plan", text: plan }} />
-        : null;
-    }
-  });
-
   return null;
+}
+
+const STATE_UPDATES = [UseAgentUpdate.OnStateChanged];
+
+/** The agent's plan (`write_todos`). It is agent state at `/plan`: the
+ *  session connection restores it, and STATE_DELTA events change it live. */
+export function AgentPlan({ agentId }: { agentId: string }) {
+  const { agent } = useAgent({ agentId, updates: STATE_UPDATES });
+  const plan = (agent.state as { plan?: unknown } | undefined)?.plan;
+  const text = typeof plan === "string" ? plan.trim() : "";
+  return text ? <PlanRowView row={{ type: "plan", rowId: "plan", messageId: "plan", text }} /> : null;
 }

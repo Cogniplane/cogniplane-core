@@ -406,7 +406,9 @@ test("importSkillBundleFromZip rejects a bomb whose header also lies about its s
         originalFileName: "bomb.zip",
         actorUserId: "admin-user"
       })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
-});
+  // That inflation takes about a second alone and more on a loaded runner, so
+  // this test gets the same limit as the bomb test above.
+}, 30_000);
 
 test("importSkillBundleFromZip accepts a bundle with ordinary text compression", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-ratio-ok-"));
@@ -441,66 +443,6 @@ test("importSkillBundleFromZip accepts a bundle with ordinary text compression",
         actorUserId: "admin-user"
       })).resolves.toBeDefined();
 });
-
-test("importSkillBundleFromZip bounds ALLOCATION, not just retention, on a lying zip bomb", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-oom-"));
-  onTestFinished(async () => {
-        await rm(root, { recursive: true, force: true });
-      });
-
-  // The assertion that distinguishes a real fix from a plausible one. Every
-  // earlier attempt — trusting the declared size, streaming with a counting
-  // cap, a ratio computed from the declared size — also REJECTED this archive,
-  // but only after decompressing the whole thing. That reports the OOM instead
-  // of preventing it, so "it throws" proves nothing on its own.
-  //
-  // What is asserted instead: the rejection names the byte limit and the
-  // COMPRESSED size it was derived from. Only a check that runs on the
-  // compressed bytes can produce that message; every design that inflates
-  // first reports a declared-vs-actual mismatch, or jszip's own post-hoc
-  // "uncompressed data size mismatch", neither of which matches here.
-  //
-  // (A heap-delta assertion was tried and removed: it failed about two runs in
-  // three from unrelated GC timing. A flaky test is worse than none. The
-  // payload is 60 MB rather than the 600 MB used when measuring by hand,
-  // because building the archive dominates the runtime and the property does
-  // not depend on the size.)
-  const archive = new JSZip();
-  archive.file(
-    "test-skill/SKILL.md",
-    "---\nname: test-skill\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n"
-  );
-  archive.file("test-skill/references/bomb.txt", Buffer.alloc(60_000_000, 0x41));
-  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-
-  // Rewrite every declared uncompressed size to 64 bytes, so nothing that
-  // reads the header can tell this apart from a trivial file.
-  const LOCAL_SIG = 0x04034b50;
-  const CENTRAL_SIG = 0x02014b50;
-  const lie = 64;
-  for (let i = 0; i + 4 <= archiveBuffer.byteLength; i += 1) {
-    const sig = archiveBuffer.readUInt32LE(i);
-    if (sig === LOCAL_SIG && i + 26 <= archiveBuffer.byteLength) {
-      archiveBuffer.writeUInt32LE(lie, i + 22);
-    } else if (sig === CENTRAL_SIG && i + 28 <= archiveBuffer.byteLength) {
-      archiveBuffer.writeUInt32LE(lie, i + 24);
-    }
-  }
-
-  await expect(importSkillBundleFromZip({
-        tenantId: "test-tenant",
-        config: createTestConfig({
-          SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache")
-        }),
-        skillRevisions: buildFakeSkillRevisions(),
-        skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
-        archiveBuffer,
-        originalFileName: "bomb.zip",
-        actorUserId: "admin-user"
-      })).rejects.toThrow(/expands past the \d+-byte limit allowed for its \d+ compressed bytes/);
-  // Generous: building a 60 MB archive dominates the runtime and slows further
-  // under coverage instrumentation. The assertion itself is instant.
-}, 30_000);
 
 test("importSkillBundleFromZip handles STORE-compressed (uncompressed) entries", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-store-"));

@@ -17,7 +17,7 @@ import type { RequestLimitsInterface } from "../request-limits.js";
 export async function enforceOAuthCallbackRateLimit(
   request: FastifyRequest,
   reply: FastifyReply,
-  limits: RequestLimitsInterface | undefined
+  limits: Pick<RequestLimitsInterface, "consumeRateLimit"> | undefined
 ): Promise<boolean> {
   if (!limits) return false;
 

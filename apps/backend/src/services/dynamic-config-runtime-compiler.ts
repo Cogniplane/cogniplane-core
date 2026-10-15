@@ -1,3 +1,4 @@
+import { connectionInclusion, isCapabilitySelected } from "./capability-selection.js";
 import { computeConfigHash, unique } from "../lib/crypto-utils.js";
 
 import type {
@@ -25,7 +26,9 @@ export function normalizeMcpServer(
     upstreamAuth: "upstreamAuth" in record ? record.upstreamAuth : null,
     transportKind: "http",
     version: record.version,
-    hash: record.configHash
+    hash: record.configHash,
+    credentialScope: record.credentialScope ?? "organization",
+    credentialBindingId: record.credentialBindingId ?? ""
   };
 }
 
@@ -55,12 +58,20 @@ export async function compileRuntimeConfig(input: {
   runtimePolicy: ResolvedRuntimePolicy;
   isBetaTester: boolean;
   selection?: SessionCapabilitySelection | null;
+  personalSkills?: RuntimeSkillDefinition[];
+  /** Released skills owned by the session's project. */
+  projectSkills?: RuntimeSkillDefinition[];
+  /** Connected personal credentials for an executing session. Omit for catalogs. */
+  personalCredentialVersions?: ReadonlyMap<string, number>;
+  executingSession?: boolean;
   /**
    * Integration tool IDs this session may use (integration toggle on and user
    * connected). The caller removes integration IDs from
    * `runtimePolicy.enabledToolIds` first; the toggles are their only source.
    */
   integrationToolIds?: readonly string[];
+  /** Connected upstream account per integration id, recorded for the turn. */
+  integrationAccounts?: Readonly<Record<string, string>>;
 }): Promise<RuntimeConfigBundle> {
   const isBetaTester = input.isBetaTester;
   const profile = input.runtimePolicy;
@@ -70,13 +81,24 @@ export async function compileRuntimeConfig(input: {
     input.mcpServers.listMcpServers(input.tenantId, false, isBetaTester)
   ]);
 
-  const enabledSkills = allSkills
-    .filter((skill) => !input.selection || input.selection.skillIds.includes(skill.skillId))
+  const organizationSkills = allSkills
+    .filter((skill) => isCapabilitySelected(input.selection, "skill", skill.skillId))
     .map((skill) => normalizeSkill(skill));
+  const organizationIds = new Set(allSkills.map((skill) => skill.skillId));
+  const ownedSkills = [...(input.personalSkills ?? []), ...(input.projectSkills ?? [])]
+    .filter((skill) => !organizationIds.has(skill.id) &&
+      isCapabilitySelected(input.selection, "skill", skill.id));
+  const enabledSkills = [...organizationSkills, ...ownedSkills];
   const enabledMcpServerIds = new Set<string>();
   const enabledMcpServers = allMcpServers.flatMap((server) => {
-    if (!profile.enabledMcpServers.includes(server.serverId) || enabledMcpServerIds.has(server.serverId) ||
-        (input.selection && !input.selection.connectorIds.includes(server.serverId))) {
+    const checks = connectionInclusion({
+      serverId: server.serverId, credentialScope: server.credentialScope,
+      allowedServerIds: profile.enabledMcpServers, selection: input.selection,
+      executingSession: Boolean(input.executingSession),
+      hasPersonalCredential: input.personalCredentialVersions?.has(server.serverId) ?? false
+    });
+    if (!checks.allowedForOrganization || !checks.inSelection || !checks.personalCredentialAccepted ||
+        enabledMcpServerIds.has(server.serverId)) {
       return [];
     }
 
@@ -105,11 +127,17 @@ export async function compileRuntimeConfig(input: {
     mcpServers: enabledMcpServers.map((server) => ({
       id: server.id,
       version: server.version,
-      hash: server.hash
+      hash: server.hash,
+      ...(server.credentialScope === "personal" && input.executingSession
+        ? { credentialVersion: input.personalCredentialVersions?.get(server.id) ?? null } : {})
     })),
     // The tenant settings hash does not cover the integration toggles or the
     // user's connections, so the resolved IDs are part of the hash.
-    integrationToolIds
+    integrationToolIds,
+    // A changed account rebuilds the runtime too. Omitted when empty, so a
+    // session without connections keeps its earlier hash.
+    ...(input.integrationAccounts && Object.keys(input.integrationAccounts).length > 0
+      ? { integrationAccounts: sortedRecord(input.integrationAccounts) } : {})
   };
 
   return {
@@ -123,4 +151,8 @@ export async function compileRuntimeConfig(input: {
     hash: computeConfigHash(sources),
     sources
   };
+}
+
+function sortedRecord(record: Readonly<Record<string, string>>): Record<string, string> {
+  return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
 }

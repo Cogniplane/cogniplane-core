@@ -36,6 +36,13 @@ const PROJECT_ACTIVITY_PROJECT_EVENT_TYPES = [
   "project_reference_storage_deletion_failed",
   "project_approval_mode_changed",
   "project_agent_file_mode_changed",
+  "project_capabilities_changed",
+  "project.skill.created",
+  "project.skill.copied",
+  "project.skill.draft_saved",
+  "project.skill.released",
+  "project.skill.disabled",
+  "project.skill.deleted",
   "project_file_copied",
   "project_file_read",
   "project_file_created",
@@ -106,7 +113,9 @@ export class AuditEventStore {
 
   // The caller must supply its tenant-scoped transaction so evidence commits
   // or rolls back with the protected change.
-  static async createInTransaction(client: PoolClient, input: AuditEventInput): Promise<void> {
+  // `userId` is null for a system action, such as a retention sweep.
+  static async createInTransaction(client: PoolClient,
+    input: Omit<AuditEventInput, "userId"> & { userId: string | null }): Promise<void> {
     await client.query(
       `
         INSERT INTO audit_events (

@@ -4,6 +4,7 @@ import Fastify from "fastify";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import { registerTenantRoutes } from "./tenant.js";
+import { FakePool } from "../test-helpers/fake-pool.js";
 import { parsePiiProtection } from "../services/pii/pii-policy.js";
 import type { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import type { AuditEventInput } from "../services/audit-event-store.js";
@@ -429,6 +430,33 @@ test("DELETE member: removing an owner returns 403 cannot_remove_owner and never
   expect(response.statusCode).toBe(403);
   expect(response.json()).toEqual({ error: "cannot_remove_owner" });
   expect(tracked.deleteCalled).toBe(false);
+});
+
+test("DELETE member: an admin cannot remove another admin, but an owner can", async () => {
+  const { db, tracked } = makeMembersDb("admin");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/other-admin" });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toEqual({ error: "only_owner_can_remove_admin" });
+  expect(tracked.deleteCalled).toBe(false);
+  expect(tracked.disableJobsCalled).toBe(false);
+  expect(tracked.audits).toEqual([]);
+
+  const owner = makeMembersDb("admin");
+  const ownerApp = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => ownerApp.close());
+  await registerTenantRoutes(ownerApp, { db: owner.db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await ownerApp.ready();
+
+  const ownerResponse = await ownerApp.inject({ method: "DELETE", url: "/tenant/members/other-admin" });
+
+  expect(ownerResponse.statusCode).toBe(200);
+  expect(owner.tracked.deleteCalled).toBe(true);
 });
 
 test("DELETE member: unknown member returns 404 member_not_found and never issues a DELETE", async () => {
@@ -1132,3 +1160,59 @@ test("PUT /tenant/settings/pii rejects missing required fields", async () => {
   expect(response.statusCode).toBe(400);
   expect(response.json().error).toBe("validation_error");
 });
+
+// ---------------------------------------------------------------------------
+// PUT /tenant (owner only)
+// ---------------------------------------------------------------------------
+
+async function renameTenant(role: Role, payload: Record<string, unknown>) {
+  const pool = new FakePool().onQuery(/UPDATE tenants SET/, (_text, values) => ({
+    rows: [{ tenant_id: values.at(-1), tenant_name: values[0], slug: "test", plan: "free", updated_at: "2026-10-03T00:00:00.000Z" }],
+    rowCount: 1
+  }));
+  const app = makeOrgSettingsApp(role);
+  onTestFinished(async () => {
+    await app.close();
+  });
+  await registerTenantRoutes(app, { db: pool.asPool(), tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  const response = await app.inject({ method: "PUT", url: "/tenant", payload });
+  const updates = pool.queries.filter((query) => query.text.includes("UPDATE tenants"));
+  return { response, updates };
+}
+
+test("PUT /tenant: an owner renames their own tenant, whatever tenant the body names", async () => {
+  const { response, updates } = await renameTenant("owner", { tenantName: "  Acme Inc.  ", tenantId: "tenant-2" });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toMatchObject({ tenant_id: "tenant-1", tenant_name: "Acme Inc." });
+  expect(updates).toHaveLength(1);
+  expect(updates[0]!.values).toEqual(["Acme Inc.", "tenant-1"]);
+});
+
+test.each(["admin", "member"] as const)("PUT /tenant: refuses a tenant %s before any write", async (role) => {
+  const { response, updates } = await renameTenant(role, { tenantName: "Acme Inc." });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toEqual({ error: "forbidden", message: "Insufficient permissions" });
+  expect(updates).toEqual([]);
+});
+
+test("PUT /tenant: answers no_updates when the body changes nothing", async () => {
+  const { response, updates } = await renameTenant("owner", {});
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({ error: "no_updates" });
+  expect(updates).toEqual([]);
+});
+
+test.each([
+  ["a blank name", { tenantName: "   " }],
+  ["a name over 200 characters", { tenantName: "x".repeat(201) }]
+])("PUT /tenant: rejects %s before any write", async (_case, payload) => {
+  const { response, updates } = await renameTenant("owner", payload);
+
+  expect(response.statusCode).toBe(400);
+  expect(response.json().error).not.toBe("no_updates");
+  expect(updates).toEqual([]);
+});
+

@@ -5,7 +5,7 @@ export const testRuntimePolicy = {
   webSearchMode: "disabled" as const,
   approvalPolicy: "on-request" as const,
   sandboxMode: "workspace-write" as const,
-  networkMode: "restricted" as const,
+  sandboxEgressDomains: [],
   allowCommandExecution: false,
   autoApproveReadOnlyTools: true,
   policyEnforcementMode: "monitor" as const,

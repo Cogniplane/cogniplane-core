@@ -1,7 +1,8 @@
-import type {
-  AdminSessionAlertKind,
-  AdminSessionRow,
-  AdminSessionsListParams
+import {
+  AdminSessionAlertKindSchema,
+  type AdminSessionAlertKind,
+  type AdminSessionRow,
+  type AdminSessionsListParams
 } from "@cogniplane/shared-types";
 
 export type SessionsFilterState = {
@@ -114,4 +115,53 @@ export function filterStateToParams(state: SessionsFilterState): AdminSessionsLi
   if (state.status) params.status = state.status;
   if (state.alert.length > 0) params.alert = state.alert;
   return params;
+}
+
+const FILTER_KEYS: Array<keyof SessionsFilterState> = [
+  "userId",
+  "from",
+  "to",
+  "status",
+  "alert"
+];
+
+// From the shared schema, so a new alert kind is accepted in the URL without a second list here.
+const ALERT_KINDS: readonly AdminSessionAlertKind[] = AdminSessionAlertKindSchema.options;
+
+/** Read the list's filter state from its URL. Unknown status and alert values are dropped. */
+export function parseStateFromSearchParams(params: URLSearchParams): SessionsFilterState {
+  const status = params.get("status");
+  const alert = params.get("alert");
+  const alertTokens =
+    alert
+      ?.split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0)
+      .filter((t): t is AdminSessionAlertKind =>
+        ALERT_KINDS.includes(t as AdminSessionAlertKind)
+      ) ?? [];
+
+  return {
+    userId: params.get("userId") ?? "",
+    from: params.get("from") ?? "",
+    to: params.get("to") ?? "",
+    status:
+      status === "active" || status === "errored" ? status : "",
+    alert: alertTokens
+  };
+}
+
+/** The list's URL query for a filter state. Empty fields are left out. */
+export function stateToSearchString(state: SessionsFilterState): string {
+  const params = new URLSearchParams();
+  if (state.userId) params.set("userId", state.userId);
+  if (state.from) params.set("from", state.from);
+  if (state.to) params.set("to", state.to);
+  if (state.status) params.set("status", state.status);
+  if (state.alert.length > 0) params.set("alert", state.alert.join(","));
+  return params.toString();
+}
+
+export function searchParamsHaveAnyFilter(params: URLSearchParams): boolean {
+  return FILTER_KEYS.some((key) => params.has(key));
 }

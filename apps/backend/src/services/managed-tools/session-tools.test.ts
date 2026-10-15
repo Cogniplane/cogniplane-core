@@ -52,11 +52,13 @@ function makeArtifact(o: Partial<ArtifactRecord> = {}): ArtifactRecord {
 function makeSession(status: SessionRecord["status"] = "active"): SessionRecord {
   return {
     sessionId: "s",
+    projectId: null,
     userId: "u",
     sessionName: "Sess",
     status,
     createdAt: "2026-01-01",
-    updatedAt: "2026-01-01"
+    updatedAt: "2026-01-01",
+    transcriptFormat: "current"
   };
 }
 
@@ -131,7 +133,7 @@ test("session_context throws when session is deleted", async () => {
 });
 
 test("session_context: clamps recentMessageCount and returns the trailing N messages", async () => {
-  const allMessages = Array.from({ length: 6 }, (_, i) => makeMessage(i));
+  const allMessages = Array.from({ length: 13 }, (_, i) => makeMessage(i));
   const deps = {
     ...baseDeps,
     // session_context now pushes the tail-slice down into the store as `limit`
@@ -146,9 +148,10 @@ test("session_context: clamps recentMessageCount and returns the trailing N mess
     context: ctx(),
     arguments: { recentMessageCount: 999 } // over-the-cap clamps to 10
   });
-  // We only have 6 messages so all 6 are returned.
-  const recentMessages = (result as { recentMessages: unknown[] }).recentMessages;
-  expect(recentMessages.length).toBe(6);
+  const recentMessages = (result as { recentMessages: Array<{ content: string }> }).recentMessages;
+  expect(recentMessages.map((message) => message.content)).toEqual(
+    allMessages.slice(-10).map((message) => message.content)
+  );
 });
 
 test("session_context: invalid recentMessageCount falls back to 4", async () => {
@@ -403,4 +406,102 @@ test("read_text_artifact: caps maxChars at 20000 when given an absurd value", as
   })) as { content: string; truncated: boolean };
   expect(r.content.length).toBe(20_000);
   expect(r.truncated).toBe(true);
+});
+
+// read_text_artifact follows the same PII eligibility as downloads (VULN-08).
+
+for (const piiStatus of ["blocked", "pending", "scanning"] as const) {
+  test(`read_text_artifact: a ready artifact with a ${piiStatus} PII verdict is not read`, async () => {
+    let opened = false;
+    const deps = {
+      ...baseDeps,
+      artifacts: {
+        ...baseDeps.artifacts,
+        async getReadable() {
+          return makeArtifact({ detail: { pii: { status: piiStatus } } });
+        }
+      },
+      storage: {
+        async openReadStream() {
+          opened = true;
+          return { stream: Readable.from([Buffer.from("secret")]), fileSizeBytes: 6 };
+        }
+      }
+    };
+    const tool = findTool(deps, "read_text_artifact");
+    await expect(() => tool.handler({ context: ctx(), arguments: { artifactId: "a1" } })).rejects.toThrow(/Artifact not found/);
+    expect(opened).toBe(false);
+  });
+}
+
+test("read_text_artifact: a detect-only PII verdict is still read", async () => {
+  const deps = {
+    ...baseDeps,
+    artifacts: {
+      ...baseDeps.artifacts,
+      async getReadable() {
+        return makeArtifact({ detail: { pii: { status: "scanned", findingsCount: 2 } } });
+      }
+    },
+    storage: {
+      async openReadStream() {
+        return { stream: Readable.from([Buffer.from("body")]), fileSizeBytes: 4 };
+      }
+    }
+  };
+  const tool = findTool(deps, "read_text_artifact");
+  const r = (await tool.handler({ context: ctx(), arguments: { artifactId: "a1" } })) as { content: string };
+  expect(r.content).toBe("body");
+});
+
+test("read_text_artifact: a blocked derived text artifact is not read", async () => {
+  let opened = false;
+  const deps = {
+    ...baseDeps,
+    artifacts: {
+      ...baseDeps.artifacts,
+      async getReadable() {
+        return makeArtifact({ artifactId: "z", mimeType: "application/pdf", storageKey: "k-pdf" });
+      },
+      async findLatestReadableDerived() {
+        return makeArtifact({
+          artifactId: "z-derived",
+          sourceArtifactId: "z",
+          storageKey: "k-derived",
+          detail: { pii: { status: "blocked" } }
+        });
+      }
+    },
+    storage: {
+      async openReadStream() {
+        opened = true;
+        return { stream: Readable.from([Buffer.from("secret")]), fileSizeBytes: 6 };
+      }
+    }
+  };
+  const tool = findTool(deps, "read_text_artifact");
+  await expect(() => tool.handler({ context: ctx(), arguments: { artifactId: "z" } })).rejects.toThrow(/not a text-readable/);
+  expect(opened).toBe(false);
+});
+
+test("read_text_artifact: a block that lands during the read withholds the text", async () => {
+  let reads = 0;
+  const deps = {
+    ...baseDeps,
+    artifacts: {
+      ...baseDeps.artifacts,
+      async getReadable() {
+        reads += 1;
+        return reads === 1 ? makeArtifact() : makeArtifact({ detail: { pii: { status: "blocked" } } });
+      }
+    },
+    storage: {
+      async openReadStream() {
+        return { stream: Readable.from([Buffer.from("secret")]), fileSizeBytes: 6 };
+      }
+    }
+  };
+  const tool = findTool(deps, "read_text_artifact");
+  await expect(() => tool.handler({ context: ctx(), arguments: { artifactId: "a1" } })).rejects.toThrow(/Artifact not found/);
+  expect(reads).toBe(2);
 });

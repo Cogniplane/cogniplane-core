@@ -4,10 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import type { Model } from "@cogniplane/shared-types";
 
 const STORAGE_KEY = "cogniplane:model";
-// Catalog ids are namespaced "<catalog>/<vendorModel>". This is the pre-fetch
-// placeholder only; once /models resolves, the effect below auto-corrects to
-// the server's actual default (isDefault) if this id isn't in the list.
-const DEFAULT_MODEL = "deepagents/claude-sonnet-5";
+// Used until the model list arrives. A saved choice takes precedence.
+const DEFAULT_MODEL = "deepagents/claude-haiku-5-5";
 
 export function useModelPreference(filteredModels?: Model[]) {
   const [model, setModelState] = useState<string>(() => {
@@ -20,20 +18,21 @@ export function useModelPreference(filteredModels?: Model[]) {
     setModelState(next);
   }, []);
 
-  // Auto-correct when the stored model is not in the filtered list
+  // Follow the organization default when no saved choice remains available.
   useEffect(() => {
     if (!filteredModels || filteredModels.length === 0) return;
     const storedModelExists = filteredModels.some((m) => m.id === model);
-    if (storedModelExists) return;
+    const hasExplicitChoice = typeof window !== "undefined" && localStorage.getItem(STORAGE_KEY) === model;
+    if (storedModelExists && hasExplicitChoice) return;
     const fallback =
       filteredModels.find((m) => m.isDefault) ?? filteredModels[0];
     if (fallback) {
-      // Auto-correct stored model when filtered list no longer contains it;
-      // setModel also persists to localStorage (external system sync).
+      // A missing or unavailable preference follows the organization default.
+      // Keep this fallback out of storage so later admin changes take effect.
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setModel(fallback.id);
+      setModelState(fallback.id);
     }
-  }, [filteredModels, model, setModel]);
+  }, [filteredModels, model]);
 
   return { model, setModel };
 }

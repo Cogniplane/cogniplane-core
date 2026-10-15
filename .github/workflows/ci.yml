@@ -1,7 +1,7 @@
 name: CI
 
-# Lint, typecheck, unit tests, full-source coverage, and the Postgres-backed RLS
-# suite for every PR and every push to main.
+# Lint, typecheck, unit tests, full-source coverage, and the Postgres/Redis
+# integration suite for every PR and every push to main.
 # License compatibility is checked in the main CI job below.
 # CLA signing is gated separately by cla.yml.
 
@@ -21,7 +21,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so the scan covers every commit, not just HEAD.
           fetch-depth: 0
@@ -46,15 +46,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: 'pnpm'
@@ -95,6 +95,9 @@ jobs:
         env:
           NEXT_PUBLIC_API_URL: https://api.example.com
 
+      - name: Cloudflare frontend runtime check
+        run: pnpm test:frontend-worker
+
       - name: Tests
         run: pnpm test:all
 
@@ -134,9 +137,10 @@ jobs:
     # schema.
     #
     # What it does NOT prove: it catches a missing `withTenantScope` only in the
-    # store methods it explicitly tests, not in arbitrary new code, and its
-    # row-visibility cases cover eight tables rather than every tenant table.
-    # See the header of rls-isolation.integration.test.ts.
+    # store methods it explicitly tests, not in arbitrary new code. Its
+    # row-visibility cases cover every tenant table through its production
+    # write path, except the one exception that rls-write-paths lists. See the
+    # header of rls-write-paths.integration.test.ts.
     services:
       postgres:
         # Matches compose.yaml. The suite reads pg_class/pg_policies and uses
@@ -153,17 +157,28 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        # Matches compose.yaml. turn-coordination-bus.integration.test.ts runs
+        # the cross-replica Stop, replay, and trimming paths against it.
+        image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: 'pnpm'
@@ -176,7 +191,12 @@ jobs:
       # through the same code path `pnpm db:migrate` uses, and drops it in
       # teardown. Without INTEGRATION_DATABASE_URL the whole project skips,
       # which is what keeps `pnpm test:all` green on a machine with no Postgres.
+      #
+      # The Redis suite skips without INTEGRATION_REDIS_URL for the same reason.
+      # INTEGRATION_REQUIRE_REDIS makes a missing URL fail here instead.
       - name: Integration tests
         run: pnpm test:integration
         env:
           INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          INTEGRATION_REDIS_URL: redis://localhost:6379
+          INTEGRATION_REQUIRE_REDIS: '1'

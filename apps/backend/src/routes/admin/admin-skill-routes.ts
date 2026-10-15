@@ -4,6 +4,9 @@ import { z } from "zod";
 
 import {
   AdminSkillEnvelopeSchema,
+  AdminSkillReleaseImpactRequestSchema,
+  AdminSkillReleaseImpactResponseSchema,
+  AdminSkillReleaseSnapshotRequestSchema,
   AdminSkillsListResponseSchema,
   SkillMarketplaceResponseSchema
 } from "@cogniplane/shared-types";
@@ -36,6 +39,8 @@ import {
 import type { SkillMarketplaceService } from "../../services/skills/skill-marketplace-service.js";
 import type { SkillBundleStorage } from "../../services/skills/skill-bundle-storage.js";
 import { SkillLifecycleService } from "../../services/skills/skill-lifecycle-service.js";
+import { SkillReleaseImpactNotFoundError, SkillReleaseSnapshotConflictError,
+  type SkillReleaseImpactStore } from "../../services/skills/skill-release-impact-store.js";
 import {
   SKILL_FILE_PREVIEW_LIMIT_BYTES,
   readSkillRevisionFile
@@ -46,6 +51,9 @@ const skillRevisionFileQuerySchema = z.object({
 });
 
 function respondSkillConfigError(reply: FastifyReply, error: unknown) {
+  if (error instanceof SkillReleaseSnapshotConflictError) {
+    return reply.code(409).send(apiError("skill_release_conflict",error.message));
+  }
   if (error instanceof AdminConfigError) {
     reply.code(400);
     return configError(error.message);
@@ -75,6 +83,7 @@ function respondSkillUploadTooLarge(reply: FastifyReply) {
 }
 
 export type AdminSkillRouteStores = {
+    skillReleaseImpact?: Pick<SkillReleaseImpactStore,"preview">;
     dynamicConfig: Pick<
       DynamicConfigService,
       | "listSkills"
@@ -107,6 +116,23 @@ export async function registerAdminSkillRoutes(
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
   const skillLifecycle = new SkillLifecycleService(stores.dynamicConfig, stores.auditEvents);
+
+  app.post("/admin/skills/:skillId/release-impact", withAdmin(app, async (request,reply) => {
+    const params=parseRequestInput(reply,skillIdParamsSchema,request.params);
+    if (!params.ok) return params.response;
+    const body=parseRequestInput(reply,AdminSkillReleaseImpactRequestSchema,request.body);
+    if (!body.ok) return body.response;
+    if (!stores.skillReleaseImpact) throw new Error("Skill release impact store is unavailable.");
+    try {
+      const impact=await stores.skillReleaseImpact.preview(request.auth.tenantId,params.value.skillId,body.value);
+      reply.header("cache-control","private, no-store");
+      return serialize(AdminSkillReleaseImpactResponseSchema,impact);
+    } catch(error) {
+      if (error instanceof SkillReleaseImpactNotFoundError) return reply.code(404).send(apiError("skill_not_found",error.message));
+      if (error instanceof SkillReleaseSnapshotConflictError) return reply.code(409).send(apiError("skill_release_conflict",error.message));
+      throw error;
+    }
+  }));
 
   app.get("/admin/skills", withAdmin(app, async (request) => {
     const skills = await stores.dynamicConfig.listSkills(request.auth.tenantId, true);
@@ -172,9 +198,12 @@ export async function registerAdminSkillRoutes(
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
+    const bodyResult=parseRequestInput(reply,AdminSkillReleaseSnapshotRequestSchema,request.body ?? {});
+    if (!bodyResult.ok) return bodyResult.response;
 
     try {
-      const skill = await stores.dynamicConfig.disableSkill(request.auth.tenantId, paramsResult.value.skillId);
+      const skill = await stores.dynamicConfig.disableSkill(request.auth.tenantId, paramsResult.value.skillId,
+        bodyResult.value.expectedSnapshot);
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
@@ -193,6 +222,7 @@ export async function registerAdminSkillRoutes(
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {
+      if (error instanceof SkillReleaseSnapshotConflictError) return respondSkillConfigError(reply,error);
       return respondAdminMutationError(reply, error, "Skill cannot be disabled.");
     }
   }));
@@ -403,7 +433,9 @@ export async function registerAdminSkillRoutes(
           skillId: paramsResult.value.skillId,
           skillRevisionId: paramsResult.value.skillRevisionId,
           actorUserId: request.auth.userId,
-          reviewNotes: bodyResult.value.reviewNotes ?? null
+          reviewNotes: bodyResult.value.reviewNotes ?? null,
+          audience: bodyResult.value.audience,
+          expectedSnapshot: bodyResult.value.expectedSnapshot
         });
 
         if (!activated) {
@@ -422,9 +454,12 @@ export async function registerAdminSkillRoutes(
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
+    const bodyResult=parseRequestInput(reply,AdminSkillReleaseSnapshotRequestSchema,request.body ?? {});
+    if (!bodyResult.ok) return bodyResult.response;
 
     try {
-      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, true);
+      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, true,
+        bodyResult.value.expectedSnapshot);
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
@@ -440,6 +475,7 @@ export async function registerAdminSkillRoutes(
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {
+      if (error instanceof SkillReleaseSnapshotConflictError) return respondSkillConfigError(reply,error);
       return respondAdminMutationError(reply, error, "Skill cannot be published.");
     }
   }));
@@ -449,9 +485,12 @@ export async function registerAdminSkillRoutes(
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
+    const bodyResult=parseRequestInput(reply,AdminSkillReleaseSnapshotRequestSchema,request.body ?? {});
+    if (!bodyResult.ok) return bodyResult.response;
 
     try {
-      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, false);
+      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, false,
+        bodyResult.value.expectedSnapshot);
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
@@ -467,6 +506,7 @@ export async function registerAdminSkillRoutes(
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {
+      if (error instanceof SkillReleaseSnapshotConflictError) return respondSkillConfigError(reply,error);
       return respondAdminMutationError(reply, error, "Skill cannot be unpublished.");
     }
   }));

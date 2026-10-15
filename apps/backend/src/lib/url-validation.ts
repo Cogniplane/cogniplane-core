@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 
 import { Agent } from "undici";
 import { z } from "zod";
+import { isCredentialQueryParameterName } from "./sensitive-query-params.js";
 
 // Strict canonical dotted-decimal IPv4 (each octet 1-3 decimal digits).
 const CANONICAL_IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -318,9 +319,9 @@ export async function ssrfSafeLookup(
 /**
  * Singleton undici Agent that re-validates every outbound DNS lookup against
  * the private/reserved-IP block list and pins the connection to the resolved
- * address. Pass via `dispatcher: ssrfSafeAgent` on any `fetch()` call whose
- * URL is admin- or tenant-supplied (MCP proxy upstreams, marketplace manifest
- * URLs, GitHub-archive imports for arbitrary hosts).
+ * address. Use it for outbound URLs that must stay on public addresses,
+ * such as marketplace manifests and GitHub archive imports. MCP proxy
+ * upstreams use a separate policy that permits local addresses.
  *
  * Use of this agent closes the DNS-rebinding TOCTOU window between
  * `httpsUrlSchema`'s write-time validation and the actual fetch — without
@@ -328,9 +329,7 @@ export async function ssrfSafeLookup(
  * 127.0.0.1 / 169.254.169.254 at connect time.
  *
  * The hook returns every record that passed validation, so Node's own
- * address failover still works — the guard costs no availability. Note this
- * agent is on the hot path for EVERY forwarded MCP tool call, not only
- * occasional admin actions, so that matters.
+ * address failover still works.
  */
 export const ssrfSafeAgent = new Agent({
   connect: {
@@ -398,12 +397,39 @@ export const httpsUrlSchema = z
     { message: "URL must not carry credentials in query parameters" }
   );
 
-const CREDENTIAL_QUERY_NAME =
-  /(?:^|[^a-z0-9])(?:api[-_]?key|access[-_]?token|auth(?:orization)?|bearer|client[-_]?secret|key|password|secret|sig(?:nature)?|token)(?=$|[^a-z0-9])/i;
+// MCP upstreams may run on the same host, a LAN, or a tailnet. The admin UI
+// warns about HTTP and private addresses, while the write path still rejects
+// URL credentials because the URL is stored and returned in plaintext.
+export const mcpUpstreamUrlSchema = z
+  .string()
+  .url()
+  .refine((url) => {
+    try {
+      const protocol = new URL(url).protocol;
+      return protocol === "http:" || protocol === "https:";
+    } catch {
+      return false;
+    }
+  }, { message: "URL must use the http:// or https:// scheme" })
+  .refine((url) => {
+    try {
+      const parsed = new URL(url);
+      return parsed.username === "" && parsed.password === "";
+    } catch {
+      return false;
+    }
+  }, { message: "URL must not embed credentials (user:password@)" })
+  .refine(
+    (url) => {
+      try {
+        return ![...new URL(url).searchParams.keys()].some(isCredentialQueryParameterName);
+      } catch {
+        return false;
+      }
+    },
+    { message: "URL must not carry credentials in query parameters" }
+  );
 
-export function isCredentialQueryParameterName(name: string): boolean {
-  return CREDENTIAL_QUERY_NAME.test(name);
-}
 
 /**
  * Reduce an outbound URL to origin + pathname for logging.

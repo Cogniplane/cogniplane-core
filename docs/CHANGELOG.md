@@ -1,6 +1,6 @@
 # Change Log
 
-Date-based project history while Cogniplane has no formal versioning.
+Selected project history through 2026-09-04. This file is not a complete release ledger or evidence of what is deployed. Use Git history for subsequent changes and verify deployment status separately.
 
 How to update this file:
 1. Add a new section at the top using `## YYYY-MM-DD`.

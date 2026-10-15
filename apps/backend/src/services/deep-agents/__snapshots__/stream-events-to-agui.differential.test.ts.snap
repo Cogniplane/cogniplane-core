@@ -104,20 +104,6 @@ exports[`streamEventsToAGUI > maps the captured streamEvents corpus directly to 
     "type": "TOOL_CALL_RESULT",
   },
   {
-    "name": "tool_ui_resources",
-    "type": "CUSTOM",
-    "value": {
-      "toolCallId": "tool-mcp",
-      "uiResources": [
-        {
-          "mimeType": "text/html",
-          "text": "<p>chart</p>",
-          "uri": "ui://sales/chart",
-        },
-      ],
-    },
-  },
-  {
     "delta": [
       {
         "op": "add",

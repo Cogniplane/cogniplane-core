@@ -1,12 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, test, beforeAll, afterAll, expect, onTestFinished } from "vitest";
+import { test, expect, onTestFinished } from "vitest";
 import { uuidv7 } from "../lib/uuid.js";
 
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 import { EventType, type BaseEvent } from "@ag-ui/client";
+import { MessagePostRequestSchema } from "@cogniplane/shared-types";
 import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 
 import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
@@ -18,6 +19,7 @@ import {
 } from "../test-helpers/routes-test-support.js";
 import { registerArtifactRoutes } from "../routes/artifacts.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
+import { isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
 import { generateRuntimeToken } from "../services/auth/runtime-token.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 
@@ -43,148 +45,127 @@ function mcpAuthHeaders(claims: { sid?: string; uid?: string; rid?: string } = {
 }
 
 
-describe("session lifecycle: create, stream, replay", () => {
-  let app: Awaited<ReturnType<typeof createTestApp>>["app"];
-  let runtimeManager: Awaited<ReturnType<typeof createTestApp>>["runtimeManager"];
-  // Phases share state via this closure: each step depends on the previous.
-  // Subtests give each phase a specific failure label without duplicating setup.
-  let sessionId = "";
-
-  beforeAll(async () => {
-    const built = await createTestApp();
-    app = built.app;
-    runtimeManager = built.runtimeManager;
+test("session lifecycle: create, stream, replay persisted history", async () => {
+  const { app, runtimeManager } = await createTestApp();
+  onTestFinished(() => app.close());
+  const createResponse = await app.inject({
+    method: "POST",
+    url: "/sessions",
+    headers: {
+      "x-user-id": "platform-user"
+    },
+    payload: {
+      name: "Regression session"
+    }
   });
 
-  afterAll(async () => {
-    await app.close();
-  });
-
-  test("creates a session via POST /sessions", async () => {
-    const createResponse = await app.inject({
-      method: "POST",
-      url: "/sessions",
-      headers: {
-        "x-user-id": "platform-user"
-      },
-      payload: {
-        name: "Regression session"
-      }
-    });
-
-    expect(createResponse.statusCode).toBe(201);
-    const createPayload = createResponse.json();
-    sessionId = createPayload.session.sessionId as string;
-  });
-
-  test("streams assistant response over SSE", async () => {
-    runtimeManager.queueEvents(sessionId, [
-      { type: "response.created", responseId: "resp-1" },
-      {
-        type: "response.tool.started",
-        responseId: "resp-1",
-        toolCall: {
-          itemId: "cmd-1",
-          kind: "command",
-          title: "Shell command",
-          status: "in_progress",
-          command: "pwd",
-          cwd: "/tmp/cogniplane-tests",
-          server: null,
-          toolName: null,
-          input: "pwd",
-          output: "",
-          exitCode: null,
-          durationMs: null
-        }
-      },
-      {
-        type: "response.tool.output.delta",
-        responseId: "resp-1",
+  expect(createResponse.statusCode).toBe(201);
+  const createPayload = createResponse.json();
+  const sessionId = createPayload.session.sessionId as string;
+  runtimeManager.queueEvents(sessionId, [
+    { type: "response.created", responseId: "resp-1" },
+    {
+      type: "response.tool.started",
+      responseId: "resp-1",
+      toolCall: {
         itemId: "cmd-1",
-        delta: "/tmp/cogniplane-tests\n"
-      },
-      {
-        type: "response.tool.completed",
-        responseId: "resp-1",
-        toolCall: {
-          itemId: "cmd-1",
-          kind: "command",
-          title: "Shell command",
-          status: "completed",
-          command: "pwd",
-          cwd: "/tmp/cogniplane-tests",
-          server: null,
-          toolName: null,
-          input: "pwd",
-          output: "/tmp/cogniplane-tests\n",
-          exitCode: 0,
-          durationMs: 42
-        }
-      },
-      { type: "response.output_text.delta", responseId: "resp-1", delta: "Hello" },
-      { type: "response.output_text.delta", responseId: "resp-1", delta: " world" },
-      { type: "response.output_item.done", responseId: "resp-1" },
-      { type: "response.completed", responseId: "resp-1" }
-    ]);
-
-    const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
-
-    const messageResponse = await fetch(`${baseUrl}/messages`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "http://localhost:3000",
-        "x-user-id": "platform-user"
-      },
-      body: JSON.stringify({
-        sessionId,
-        text: "Say hello"
-      })
-    });
-
-    expect(messageResponse.status).toBe(200);
-    expect(messageResponse.headers.get("access-control-allow-origin")).toBe("http://localhost:3000");
-
-    const streamedBody = await messageResponse.text();
-    const streamedEvents = parseAguiEvents(streamedBody);
-
-    expect(streamedEvents[0]?.type).toBe(EventType.RUN_STARTED);
-    expect(streamedEvents.at(-1)?.type).toBe(EventType.RUN_FINISHED);
-    expect(
-      streamedEvents.find((event) => event.type === EventType.TOOL_CALL_START)
-    ).toMatchObject({ toolCallId: "cmd-1" });
-    expect(
-      streamedEvents.find((event) => event.type === EventType.TOOL_CALL_RESULT)
-    ).toMatchObject({ toolCallId: "cmd-1", content: "/tmp/cogniplane-tests\n" });
-    expect(
-      streamedEvents
-        .filter((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)
-        .map((event) => event.delta)
-    ).toEqual(["Hello", " world"]);
-  });
-
-  test("replays persisted history via GET /sessions/:id/messages", async () => {
-    const replayResponse = await app.inject({
-      method: "GET",
-      url: `/sessions/${sessionId}/messages`,
-      headers: {
-        "x-user-id": "platform-user"
+        kind: "command",
+        title: "Shell command",
+        status: "in_progress",
+        command: "pwd",
+        cwd: "/tmp/cogniplane-tests",
+        server: null,
+        toolName: null,
+        input: "pwd",
+        output: "",
+        exitCode: null,
+        durationMs: null
       }
-    });
+    },
+    {
+      type: "response.tool.output.delta",
+      responseId: "resp-1",
+      itemId: "cmd-1",
+      delta: "/tmp/cogniplane-tests\n"
+    },
+    {
+      type: "response.tool.completed",
+      responseId: "resp-1",
+      toolCall: {
+        itemId: "cmd-1",
+        kind: "command",
+        title: "Shell command",
+        status: "completed",
+        command: "pwd",
+        cwd: "/tmp/cogniplane-tests",
+        server: null,
+        toolName: null,
+        input: "pwd",
+        output: "/tmp/cogniplane-tests\n",
+        exitCode: 0,
+        durationMs: 42
+      }
+    },
+    { type: "response.output_text.delta", responseId: "resp-1", delta: "Hello" },
+    { type: "response.output_text.delta", responseId: "resp-1", delta: " world" },
+    { type: "response.output_item.done", responseId: "resp-1" },
+    { type: "response.completed", responseId: "resp-1" }
+  ]);
 
-    expect(replayResponse.statusCode).toBe(200);
-    const replayPayload = replayResponse.json();
-    expect(replayPayload.messages.length).toBe(2);
-    expect(replayPayload.messages[0].role).toBe("user");
-    expect(replayPayload.messages[0].content).toBe("Say hello");
-    expect(replayPayload.messages[1].role).toBe("assistant");
-    expect(replayPayload.messages[1].status).toBe("completed");
-    expect(replayPayload.messages[1].content).toBe("Hello world");
-    expect(replayPayload.messages[1].toolResults.length).toBe(1);
-    expect(replayPayload.messages[1].toolResults[0].command).toBe("pwd");
-    expect(replayPayload.messages[1].toolResults[0].output).toBe("/tmp/cogniplane-tests\n");
+  const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
+
+  const messageResponse = await fetch(`${baseUrl}/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "http://localhost:3000",
+      "x-user-id": "platform-user"
+    },
+    body: JSON.stringify({
+      sessionId,
+      text: "Say hello"
+    })
   });
+
+  expect(messageResponse.status).toBe(200);
+  expect(messageResponse.headers.get("access-control-allow-origin")).toBe("http://localhost:3000");
+
+  const streamedBody = await messageResponse.text();
+  const streamedEvents = parseAguiEvents(streamedBody);
+
+  expect(streamedEvents[0]?.type).toBe(EventType.RUN_STARTED);
+  expect(streamedEvents.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+  expect(
+    streamedEvents.find((event) => event.type === EventType.TOOL_CALL_START)
+  ).toMatchObject({ toolCallId: "cmd-1" });
+  expect(
+    streamedEvents.find((event) => event.type === EventType.TOOL_CALL_RESULT)
+  ).toMatchObject({ toolCallId: "cmd-1", content: "/tmp/cogniplane-tests\n" });
+  expect(
+    streamedEvents
+      .filter((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)
+      .map((event) => event.delta)
+  ).toEqual(["Hello", " world"]);
+
+  const replayResponse = await app.inject({
+    method: "GET",
+    url: `/sessions/${sessionId}/messages`,
+    headers: {
+      "x-user-id": "platform-user"
+    }
+  });
+
+  expect(replayResponse.statusCode).toBe(200);
+  const replayPayload = replayResponse.json();
+  expect(replayPayload.messages.length).toBe(2);
+  expect(replayPayload.messages[0].role).toBe("user");
+  expect(replayPayload.messages[0].content).toBe("Say hello");
+  expect(replayPayload.messages[1].role).toBe("assistant");
+  expect(replayPayload.messages[1].status).toBe("completed");
+  expect(replayPayload.messages[1].content).toBe("Hello world");
+  expect(replayPayload.messages[1].toolResults.length).toBe(1);
+  expect(replayPayload.messages[1].toolResults[0].command).toBe("pwd");
+  expect(replayPayload.messages[1].toolResults[0].output).toBe("/tmp/cogniplane-tests\n");
 });
 
 test("rejects concurrent turns on the same session", async () => {
@@ -220,26 +201,33 @@ test("rejects concurrent turns on the same session", async () => {
 });
 
 test("omitted artifact scope leaves the turn unscoped by default", async () => {
-  const { app, sessions, runtimeManager, toolContexts } = await createTestApp();
+  const { app, sessions, artifacts, runtimeManager, toolContexts } = await createTestApp();
   onTestFinished(async () => {
         await app.close();
       });
 
   const session = await sessions.create("test-tenant", "platform-user", "Scoped artifacts");
-  const baseUrl = await app.listen({ port: 0, host: "127.0.0.1" });
-  const form = new FormData();
-  form.set("sessionId", session.sessionId);
-  form.set("file", new Blob(["Executive summary line one."], { type: "text/plain" }), "document.txt");
-
-  const uploadResponse = await fetch(`${baseUrl}/artifacts`, {
-    method: "POST",
-    headers: {
-      origin: "http://localhost:3000",
-      "x-user-id": "platform-user"
-    },
-    body: form
+  // A PDF goes through the fake processor and needs no storage read, so a
+  // default-all scope would reach the runtime as artifact userInputs.
+  const artifact = await artifacts.create({
+    artifactType: "upload",
+    sessionId: session.sessionId,
+    userId: "platform-user",
+    artifactName: "document.pdf",
+    mimeType: "application/pdf",
+    storageBackend: "local",
+    storageKey: "artifacts/document.pdf",
+    fileSizeBytes: 2_048,
+    checksumSha256: "checksum",
+    status: "ready",
+    createdByType: "user"
   });
-  await uploadResponse.json();
+  // The route reads this list to find eligible artifacts. The test is only
+  // meaningful if the seeded upload is in the list and eligible.
+  const sessionArtifacts = await artifacts.listBySession("test-tenant", session.sessionId, "platform-user");
+  expect(sessionArtifacts.map((candidate) => candidate.artifactId)).toEqual([artifact.artifactId]);
+  expect(sessionArtifacts[0]).toMatchObject({ sessionId: session.sessionId, userId: "platform-user", status: "ready" });
+  expect(isArtifactPiiEligible(artifact)).toBe(true);
 
   runtimeManager.queueEvents(session.sessionId, [
     { type: "response.created", responseId: "resp-artifact-default" },
@@ -248,26 +236,41 @@ test("omitted artifact scope leaves the turn unscoped by default", async () => {
     { type: "response.completed", responseId: "resp-artifact-default" }
   ]);
 
+  const payload = {
+    sessionId: session.sessionId,
+    text: "Summarize the uploaded document."
+  };
+  // The wire schema must keep an omitted scope omitted, not default it.
+  expect(MessagePostRequestSchema.parse(payload)).not.toHaveProperty("artifactIds");
+
   const response = await app.inject({
     method: "POST",
     url: "/messages",
     headers: {
       "x-user-id": "platform-user"
     },
-    payload: {
-      sessionId: session.sessionId,
-      text: "Summarize the uploaded document."
-    }
+    payload
   });
 
   expect(response.statusCode).toBe(200);
-  const defaultScopedContext = toolContexts.createdContexts.at(-1)?.metadata as {
+  const streamedEvents = parseAguiEvents(response.body);
+  expect(streamedEvents[0]?.type).toBe(EventType.RUN_STARTED);
+  expect(streamedEvents.at(-1)?.type).toBe(EventType.RUN_FINISHED);
+  expect(
+    streamedEvents
+      .filter((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)
+      .map((event) => event.delta)
+  ).toEqual(["Summary"]);
+
+  expect(toolContexts.createdContexts).toHaveLength(1);
+  const defaultScopedContext = toolContexts.createdContexts[0]?.metadata as {
     selectedArtifactIds: string[];
     runtimePolicy: { id: string };
   };
   expect(defaultScopedContext.selectedArtifactIds).toEqual([]);
   expect(defaultScopedContext.runtimePolicy.id).toBe("tenant-settings:test-tenant");
-  expect(runtimeManager.runMessageInputs.at(-1)?.userInputs).toBe(undefined);
+  expect(runtimeManager.runMessageInputs).toHaveLength(1);
+  expect(runtimeManager.runMessageInputs[0]?.userInputs).toBe(undefined);
 });
 
 test("preserves an explicit empty artifact scope on a message turn", async () => {
@@ -657,13 +660,14 @@ test("uploads a PDF as a single visible artifact and keeps conversion on demand"
 });
 
 test("lists pending approvals and resolves a decision", async () => {
-  const { app, approvals, runtimeManager } = await createTestApp();
-  const sessionId = uuidv7();
+  const { app, approvals, runtimeManager, sessions } = await createTestApp();
+  // The approvals list needs read access to an existing session.
+  const sessionId = (await sessions.create("test-tenant", "test-user", "Approvals")).sessionId;
   onTestFinished(async () => {
         await app.close();
       });
 
-  approvals.approvals.push({
+  approvals.rows.set("approval-1", {
     approvalId: "approval-1",
     tenantId: "test-tenant",
     sessionId,
@@ -691,7 +695,12 @@ test("lists pending approvals and resolves a decision", async () => {
   });
 
   expect(listResponse.statusCode).toBe(200);
+  expect(listResponse.headers["cache-control"]).toBe("private, no-store");
   expect(listResponse.json().approvals.length).toBe(1);
+
+  // A session the caller cannot read gives no list, even for its own approval rows.
+  const hidden = await sessions.create("test-tenant", "another-user", "Hidden");
+  expect((await app.inject({ method: "GET", url: `/sessions/${hidden.sessionId}/approvals` })).statusCode).toBe(404);
 
   const decisionResponse = await app.inject({
     method: "POST",
@@ -757,7 +766,11 @@ test("serves the managed MCP tool and resolves context from toolContextId", asyn
 });
 
 test("managed MCP tools/list advertises output schemas accepted by the current client", async () => {
-  const { app } = await createTestApp();
+  const { app, toolContexts } = await createTestApp();
+  await createTestToolContext(toolContexts, { metadata: { runtimePolicy: {
+    ...testRuntimePolicy, enabledMcpServers: ["managed-session-context"],
+    enabledToolIds: [...testRuntimePolicy.enabledToolIds, "write_artifact"]
+  } } });
   const baseUrl = await app.listen({ host: "127.0.0.1", port: 0 });
   const client = new MultiServerMCPClient({
     mcpServers: {
@@ -805,6 +818,7 @@ test("managed MCP tools/list only exposes tools enabled by the active runtime po
   const sessionId = "session-filtered-tools";
   await createTestToolContext(toolContexts, {
     sessionId,
+    runtimeId: "runtime-session-filtered-tools",
     metadata: {
       runtimePolicy: {
         ...testRuntimePolicy,
@@ -1148,7 +1162,8 @@ test("forwards proxy MCP calls with validated context headers", async () => {
   });
 
   expect(response.statusCode).toBe(200);
-  expect(upstreamRequests.length).toBe(1);
+  const toolRequests = upstreamRequests.filter((request) => request.body.method === "tools/call");
+  expect(toolRequests).toHaveLength(1);
   expect(response.json()).toEqual({
         jsonrpc: "2.0",
         id: 1,
@@ -1161,7 +1176,7 @@ test("forwards proxy MCP calls with validated context headers", async () => {
           }
         }
       });
-  expect(upstreamRequests[0].body).toEqual({
+  expect(toolRequests[0].body).toEqual({
         jsonrpc: "2.0",
         id: 1,
         method: "tools/call",
@@ -1172,13 +1187,13 @@ test("forwards proxy MCP calls with validated context headers", async () => {
           }
         }
       });
-  expect(upstreamRequests[0].headers["x-framework-user-id"]).toBe("test-user");
-  expect(upstreamRequests[0].headers["x-framework-session-id"]).toBe("session-1");
-  expect(upstreamRequests[0].headers["x-framework-runtime-id"]).toBe("runtime-session-1");
+  expect(toolRequests[0].headers["x-framework-user-id"]).toBe("test-user");
+  expect(toolRequests[0].headers["x-framework-session-id"]).toBe("session-1");
+  expect(toolRequests[0].headers["x-framework-runtime-id"]).toBe("runtime-session-1");
 
-  expect(upstreamRequests[0].headers["x-framework-signature-version"]).toBe("v2");
-  expect(upstreamRequests[0].headers["x-framework-tenant-id"]).toBe("test-tenant");
-  expect(upstreamRequests[0].headers["x-framework-server-id"]).toBe("test-proxy");
+  expect(toolRequests[0].headers["x-framework-signature-version"]).toBe("v2");
+  expect(toolRequests[0].headers["x-framework-tenant-id"]).toBe("test-tenant");
+  expect(toolRequests[0].headers["x-framework-server-id"]).toBe("test-proxy");
 
   // The signature must verify under the per-server key derived for
   // (test-tenant, test-proxy), over the raw body the upstream received. It must
@@ -1196,7 +1211,7 @@ test("forwards proxy MCP calls with validated context headers", async () => {
     tenantId: "test-tenant",
     serverId: "test-proxy"
   });
-  const { headers, rawBody } = upstreamRequests[0];
+  const { headers, rawBody } = toolRequests[0];
   const options = { serverId: "test-proxy", maxAgeMs: 60_000 };
 
   const verified = verifyProxyHeaders(headers, rawBody, serverKey, options);
@@ -1480,10 +1495,10 @@ test("GET /models returns the hardcoded model list", async () => {
   if (!defaultModel) {
     throw new Error("Expected the model catalog to include a default model");
   }
-  expect(defaultModel.id).toBe("deepagents/claude-sonnet-5");
+  expect(defaultModel.id).toBe("deepagents/claude-haiku-5-5");
   // Reasoning-capable models now advertise effort levels (bead i52g); the
-  // Anthropic default supports the none/low/medium/high scale.
-  expect(defaultModel.supportedEfforts).toEqual(["none", "low", "medium", "high"]);
+  // Anthropic default supports the low/medium/high/xhigh/max scale.
+  expect(defaultModel.supportedEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
 });
 
 // Per-provider filtering of /models is covered comprehensively by
@@ -1693,6 +1708,40 @@ test("GET /artifacts/:id/preview-text returns 422 artifact_not_ready for a pendi
   expect(response.statusCode).toBe(422);
   expect(response.json().error).toBe("artifact_not_ready");
 });
+
+test.each(["pending", "failed"] as const)(
+  "POST /artifacts/:id/download-token refuses a %s upload until its PII scan makes it ready",
+  async (status) => {
+    const { app, sessions, artifacts } = await createTestApp();
+    onTestFinished(async () => {
+      await app.close();
+    });
+
+    const session = await sessions.create("test-tenant", "platform-user", "Download pending upload");
+    const artifact = await artifacts.create({
+      artifactType: "upload",
+      sessionId: session.sessionId,
+      userId: "platform-user",
+      artifactName: "notes.txt",
+      mimeType: "text/plain",
+      storageBackend: "local",
+      storageKey: "platform-user/session/notes.txt",
+      fileSizeBytes: 12,
+      checksumSha256: "abc123",
+      status,
+      createdByType: "user"
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/artifacts/${artifact.artifactId}/download-token`,
+      headers: { "x-user-id": "platform-user" }
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("artifact_not_ready");
+  }
+);
 
 test("GET /artifacts/:id/preview-text returns 422 pdf_extraction_failed when processor returns null", async () => {
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-pdf-extract-null-test-"));

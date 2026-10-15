@@ -61,6 +61,7 @@ export function AdminSkillInlineTab(props: {
           name="skill-inline-name"
           type="text"
           placeholder="My Skill"
+          maxLength={64}
           value={props.draft.skillName}
           onChange={(event) =>
             props.onDraftChange({ ...props.draft, skillName: event.target.value })

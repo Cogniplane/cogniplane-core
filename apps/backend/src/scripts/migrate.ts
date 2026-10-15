@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
 
+import { ensureMaintenanceRole, DEFAULT_MAINTENANCE_ROLE } from "./maintenance-role.js";
 import { applyMigrations, ensureAppUserRole } from "./migrate-lib.js";
 import {
   DEEP_AGENTS_CHECKPOINT_SCHEMA,
@@ -38,17 +39,28 @@ const db = createDatabase(migrationConfig);
 // DATABASE_URL at runtime.
 function extractPassword(databaseUrl: string): string | null {
   try {
-    return new URL(databaseUrl).password || null;
+    return decodeURIComponent(new URL(databaseUrl).password) || null;
   } catch {
     return null;
   }
 }
 
 async function run() {
+  if (!config.MAINTENANCE_DATABASE_URL) {
+    throw new Error("MAINTENANCE_DATABASE_URL is required to provision the runtime maintenance role.");
+  }
+  const maintenanceUrl = new URL(config.MAINTENANCE_DATABASE_URL);
+  const maintenancePassword = extractPassword(config.MAINTENANCE_DATABASE_URL);
+  if (decodeURIComponent(maintenanceUrl.username) !== DEFAULT_MAINTENANCE_ROLE || !maintenancePassword) {
+    throw new Error("MAINTENANCE_DATABASE_URL must name maintenance_user and include its password.");
+  }
   await applyMigrations(db, migrationsDir, console.log, async (client) => {
     // Checkpointer DDL and role setup share the numbered migrations' lock.
     await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
     console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
+
+    await ensureMaintenanceRole(client, maintenancePassword);
+    console.log("Ensured maintenance_user with explicit runtime grants.");
 
     const appUserPassword = process.env.APP_USER_PASSWORD || extractPassword(config.DATABASE_URL);
     if (appUserPassword) {

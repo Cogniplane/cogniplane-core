@@ -47,6 +47,8 @@ paths = [
   # An earlier commit uses a synthetic PEM-shaped redaction fixture here.
   '''apps/backend/src/services/turn-event-log\.test\.ts''',
   '''apps/backend/src/routes/mcp\.test\.ts''',
+  # Approval card text redacts a credential-shaped filename.
+  '''apps/backend/src/services/runtime/approval-presentation\.test\.ts''',
 ]
 
 # Stopwords that gitleaks should treat as non-secret regardless of where they

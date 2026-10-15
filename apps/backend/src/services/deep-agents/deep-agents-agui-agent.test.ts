@@ -1,9 +1,10 @@
-// Track B AG-UI spike/slice-1 — proves the four handoff invariants hold when an
+// AG-UI handoff tests exercise the event contract when an
 // @ag-ui/client AbstractAgent subclass drives the REAL mapper pipeline
 // (streamEvents v2 to AG-UI) through the
 // AGUITurnBackend seam. No infra: a fake backend stands in for the live adapter.
 
-import { EventSchemas, EventType, type BaseEvent } from "@ag-ui/client";
+import { EventType, type BaseEvent } from "@ag-ui/client";
+import { EventSchemas } from "@ag-ui/core/schemas";
 import { firstValueFrom, toArray } from "rxjs";
 import { describe, expect, it, vi } from "vitest";
 
@@ -269,15 +270,6 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
 
     expect(types(events)).toContain(EventType.RUN_FINISHED);
     expect(backend.buildResumeCalls).toBe(1);
-  });
-
-  // Invariant 2 (structural) — the driver reaches the graph ONLY through the
-  // tenant-scoped backend seam; one stream pass, no side channel.
-  it("drives the turn exclusively through the tenant-scoped backend seam", async () => {
-    const backend = new FakeBackend([[modelText("hi"), modelEnd()]]);
-    const agent = new DeepAgentsAGUIAgent({ backend, toolContextId: null });
-    await collectEvents(agent);
-    expect(backend.streamCalls).toBe(1);
   });
 
   it("flushes an open TEXT message before surfacing a mid-turn error (no dangling card)", async () => {

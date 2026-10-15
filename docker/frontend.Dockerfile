@@ -34,6 +34,8 @@ COPY packages/shared-types packages/shared-types
 # layout matches the workspace.
 COPY privat[e] private/
 
+COPY patches patches
+
 RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build

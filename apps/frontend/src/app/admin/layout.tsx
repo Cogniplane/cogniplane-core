@@ -7,44 +7,34 @@ import { AuthGuard } from "../../lib/auth-guard";
 import { ConsoleNavigation } from "../../components/console-navigation";
 import { ConsolePageHeader } from "../../components/console-page-header";
 import { useAdminOverviewData } from "../../hooks/use-admin-overview-data";
-import { ADMIN_LIVE_SECTIONS, ADMIN_NAVIGATION_ITEMS } from "./admin-sections";
+import { ADMIN_NAVIGATION_ITEMS, adminSectionForPath, type AdminSectionId } from "./admin-sections";
 
-const ADMIN_SECTION_TITLES: Record<string, { title: string; subtitle: string }> = {
-  overview: {
-    title: "Control plane",
-    subtitle: "Design the operating surface for the runtime, not just a config form."
-  },
+const ADMIN_SECTION_TITLES: Record<AdminSectionId, { title: string; subtitle?: string }> = {
+  overview: { title: "Overview" },
+  models: { title: "Models", subtitle: "Set up providers, choose available models, and set the organization default." },
+  connections: { title: "Connections", subtitle: "Manage connections and who can use them. Members connect their own accounts for built-in services." },
   privacy: {
     title: "Privacy",
-    subtitle: "PII detection and transformation policy applied before the runtime sees user content."
+    subtitle: "Choose whether personal data is detected, blocked, or redacted before the agent uses it, and review scan results."
   },
-  pii: {
-    title: "PII activity",
-    subtitle: "Detection scans, findings, and outcomes across the tenant."
-  },
-  organization: { title: "Organization", subtitle: "Tenant profile and platform defaults." },
-  skills: { title: "Skills", subtitle: "Manage the skill library exposed to the runtime." },
-  mcp: { title: "MCP servers", subtitle: "Register and configure gateway routes." },
-  integrations: {
-    title: "Integrations",
-    subtitle: "Enable third-party services for your tenant. Users connect their own accounts after you toggle an integration on."
-  },
-  capabilities: { title: "Agent settings", subtitle: "Tune tools, approvals, and guardrails per profile." },
+  skills: { title: "Skills", subtitle: "Review, release, and limit the skills people can use." },
+  capabilities: { title: "Agent behavior", subtitle: "Set approvals, command execution, built-in tools, and organization instructions." },
   policy: {
-    title: "Policy Center",
-    subtitle: "Risk-adaptive rules for agent tool actions, a simulator, and recent decisions."
+    title: "Policies",
+    subtitle: "Write rules for agent tool actions, test them in the simulator, and review recent decisions."
   },
-  runtime: { title: "Runtime rollout", subtitle: "Control provider selection and runtime configuration." },
-  users: { title: "Users", subtitle: "Members, roles, and access management." },
-  sessions: { title: "Sessions", subtitle: "Review and investigate chat sessions across the tenant." },
-  "token-usage": { title: "Token usage", subtitle: "Consumption across the tenant." },
+  runtime: { title: "Runtime diagnostics", subtitle: "Check runtime sessions and backend keys, and refresh or drain idle sessions." },
+  users: { title: "People", subtitle: "See what each person does and manage their role and access." },
+  "project-owners": { title: "Project owners", subtitle: "Find projects that have no owner and choose a new one. This gives you no access to project content." },
+  history: { title: "Change history", subtitle: "See who changed what and compare recorded settings." },
+  sessions: { title: "Sessions", subtitle: "Review and investigate chat sessions across the organization." },
+  "token-usage": { title: "Usage", subtitle: "Model budget and token consumption across the organization." },
   "message-feedback": { title: "Message feedback", subtitle: "Ratings and notes from conversations." }
 };
 
 export default function AdminLayout({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const activeSectionId =
-    ADMIN_LIVE_SECTIONS.find((item) => pathname.startsWith(`/admin/${item.id}`))?.id ?? "overview";
+  const activeSectionId = adminSectionForPath(pathname);
 
   const { skillsCount, mcpServersCount } = useAdminOverviewData();
 
@@ -52,7 +42,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
     () =>
       ADMIN_NAVIGATION_ITEMS.map((item) => {
         if (item.id === "skills") return { ...item, count: skillsCount };
-        if (item.id === "mcp") return { ...item, count: mcpServersCount };
+        if (item.id === "connections") return { ...item, count: mcpServersCount };
         return item;
       }),
     [skillsCount, mcpServersCount]
@@ -60,7 +50,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
   return (
     <AuthGuard requiredRoles={["admin", "owner"]}>
-      <main className="grid min-h-screen grid-cols-1 bg-background md:grid-cols-[200px_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)]">
+      <main className="grid min-h-screen grid-cols-1 grid-rows-[auto_1fr] bg-background md:grid-rows-1 md:grid-cols-[200px_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)]">
         <ConsoleNavigation
           sectionLabel="Admin"
           ariaLabel="Admin sections"
@@ -72,8 +62,8 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
         <div className="mx-auto w-full min-w-0 max-w-6xl px-4 pb-10 pt-4 md:px-8 md:pt-6">
           <ConsolePageHeader
             eyebrow="Admin"
-            title={ADMIN_SECTION_TITLES[activeSectionId]?.title ?? "Control plane"}
-            subtitle={ADMIN_SECTION_TITLES[activeSectionId]?.subtitle}
+            title={ADMIN_SECTION_TITLES[activeSectionId].title}
+            subtitle={ADMIN_SECTION_TITLES[activeSectionId].subtitle}
             menuLinks={[
               { href: "/", label: "Chat", description: "Return to the live workspace" },
               { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },

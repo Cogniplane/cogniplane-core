@@ -9,64 +9,15 @@ import {
   EMPTY_FILTER_STATE,
   defaultLast7dRange,
   filterStateToParams,
+  parseStateFromSearchParams,
+  searchParamsHaveAnyFilter,
+  stateToSearchString,
   type SessionsFilterState
 } from "../../../components/admin/sessions/admin-sessions-filters.logic";
 import { AdminSessionsPresets } from "../../../components/admin/sessions/admin-sessions-presets";
 import { useAdminSessionsData } from "../../../hooks/use-admin-sessions-data";
-import type { AdminSessionAlertKind, AdminSessionRow } from "@cogniplane/shared-types";
-
-const FILTER_KEYS: Array<keyof SessionsFilterState> = [
-  "userId",
-  "from",
-  "to",
-  "status",
-  "alert"
-];
-
-const ALERT_KINDS: AdminSessionAlertKind[] = [
-  "pii-blocked",
-  "pii-transformed",
-  "pii-detected",
-  "approval-rejected",
-  "approval-pending",
-  "errored"
-];
-
-function parseStateFromSearchParams(params: URLSearchParams): SessionsFilterState {
-  const status = params.get("status");
-  const alert = params.get("alert");
-  const alertTokens =
-    alert
-      ?.split(",")
-      .map((t) => t.trim())
-      .filter((t) => t.length > 0)
-      .filter((t): t is AdminSessionAlertKind =>
-        ALERT_KINDS.includes(t as AdminSessionAlertKind)
-      ) ?? [];
-
-  return {
-    userId: params.get("userId") ?? "",
-    from: params.get("from") ?? "",
-    to: params.get("to") ?? "",
-    status:
-      status === "active" || status === "errored" ? status : "",
-    alert: alertTokens
-  };
-}
-
-function stateToSearchString(state: SessionsFilterState): string {
-  const params = new URLSearchParams();
-  if (state.userId) params.set("userId", state.userId);
-  if (state.from) params.set("from", state.from);
-  if (state.to) params.set("to", state.to);
-  if (state.status) params.set("status", state.status);
-  if (state.alert.length > 0) params.set("alert", state.alert.join(","));
-  return params.toString();
-}
-
-function searchParamsHaveAnyFilter(params: URLSearchParams): boolean {
-  return FILTER_KEYS.some((key) => params.has(key));
-}
+import { sessionDetailHref } from "../../../lib/admin-session-links";
+import type { AdminSessionRow } from "@cogniplane/shared-types";
 
 export default function AdminSessionsPage() {
   const router = useRouter();
@@ -119,9 +70,7 @@ export default function AdminSessionsPage() {
   };
 
   const handleRowClick = (sessionId: string) => {
-    const qs = stateToSearchString(state);
-    const fromParam = qs ? `?from=${encodeURIComponent(qs)}` : "";
-    router.push(`/admin/sessions/${sessionId}${fromParam}`);
+    router.push(sessionDetailHref(sessionId, stateToSearchString(state)));
   };
 
   return (

@@ -134,6 +134,21 @@ export function toggleInList<T>(list: T[], value: T, on: boolean): T[] {
   return list.filter((entry) => entry !== value);
 }
 
+/**
+ * The rule order after a drag moves `activeId` onto `overId`'s place, or null
+ * when the drop changes nothing (dropped on itself or outside a known rule).
+ */
+export function reorderedRuleIds(rules: readonly PolicyRule[], activeId: unknown, overId: unknown): string[] | null {
+  if (activeId === overId) return null;
+  const oldIndex = rules.findIndex((r) => r.ruleId === activeId);
+  const newIndex = rules.findIndex((r) => r.ruleId === overId);
+  if (oldIndex === -1 || newIndex === -1) return null;
+  const ids = rules.map((r) => r.ruleId);
+  const [moved] = ids.splice(oldIndex, 1);
+  ids.splice(newIndex, 0, moved!);
+  return ids;
+}
+
 /** A draft is submittable with a non-empty name. */
 export function isDraftValid(draft: PolicyRuleDraft): boolean {
   return draft.name.trim().length > 0;

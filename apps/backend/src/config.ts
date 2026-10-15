@@ -49,6 +49,9 @@ export const envSchema = z.object({
     .string()
     .min(1)
     .default("postgres://app_user:app_user_password@localhost:5432/cogniplane"),
+  // Unset leaves new tenants unlimited until an admin configures a policy.
+  MODEL_SPENDING_MONTHLY_LIMIT_USD: z.coerce.number().min(0).max(1_000_000).optional(),
+  MODEL_SPENDING_TURN_RESERVATION_USD: z.coerce.number().min(0.000001).max(1_000_000).default(1),
   LOCAL_DEV_USER_ID: z.string().min(1).default("local-dev-user"),
   ADMIN_USER_IDS: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().trim().min(1).optional(),
@@ -75,7 +78,10 @@ export const envSchema = z.object({
   // Numeric hop counts ("1", "2") are REJECTED at boot. Fastify removed them
   // as spoofable (GHSA-3m5p-2c4r-xxw2) and fails closed on them at runtime.
   TRUST_PROXY: z.string().trim().default("false"),
-  SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-4-5-20251001"),
+  // The titler turns thinking off, so this must be a model that accepts
+  // `thinking: {type: "disabled"}` (Haiku 5.5 and 4.5 do; Opus 5.5 and
+  // Sonnet 5.5 do not).
+  SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-5-5"),
   SESSION_TITLER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   // Optional operator-run endpoint for small background LLM jobs (session
   // titling today). When enabled, these jobs try the local endpoint FIRST and
@@ -192,7 +198,7 @@ export const envSchema = z.object({
   // Artifact upload (multipart POST /artifacts) — real storage + scan cost.
   ARTIFACT_UPLOAD_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   ARTIFACT_UPLOAD_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
-  // Agent project-draft creation, including the write_artifact auto-draft path.
+  // Agent project-draft creation (project_write_file and conflict drafts).
   PROJECT_FILE_WRITE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   // Scheduled-job creation (POST /me/scheduled-jobs) — each job later runs as a
@@ -266,6 +272,8 @@ export const envSchema = z.object({
   // past the cap, so a hostile or broken upstream cannot OOM the shared
   // backend with a multi-GB body. JSON-RPC tool results are kilobytes.
   MCP_UPSTREAM_MAX_RESPONSE_BYTES: z.coerce.number().int().positive().default(4 * 1024 * 1024),
+  // One budget for every page and redirect in an admin connection check.
+  MCP_CONNECTION_TEST_TIMEOUT_MS: z.coerce.number().int().positive().max(30_000).default(8_000),
   WORKOS_API_KEY: z.string().trim().min(1).optional(),
   WORKOS_CLIENT_ID: z.string().trim().min(1).optional(),
   WORKOS_REDIRECT_URI: z.string().url().optional(),
@@ -275,7 +283,17 @@ export const envSchema = z.object({
   NOTION_OAUTH_CLIENT_ID: z.string().trim().min(1).optional(),
   NOTION_OAUTH_CLIENT_SECRET: z.string().trim().min(1).optional(),
   NOTION_OAUTH_REDIRECT_URI: z.string().url().optional(),
+  // Pipedream Connect project for vendor-managed personal connections (Jira).
+  // The free plan supports the development environment only; production
+  // needs a paid Pipedream plan.
+  PIPEDREAM_CLIENT_ID: z.string().trim().min(1).optional(),
+  PIPEDREAM_CLIENT_SECRET: z.string().trim().min(1).optional(),
+  PIPEDREAM_PROJECT_ID: z.string().trim().regex(/^proj_[A-Za-z0-9]+$/).optional(),
+  PIPEDREAM_PROJECT_ENVIRONMENT: z.enum(["development", "production"]).default("development"),
+  // Migration credentials belong to the one-shot migration process.
   MIGRATION_DATABASE_URL: z.string().url().optional(),
+  // Dedicated BYPASSRLS role with explicit DML grants and no schema ownership.
+  MAINTENANCE_DATABASE_URL: z.string().url().optional(),
   JWT_SECRET: z.string().min(32).default(DEFAULT_JWT_SECRET),
   // Active signing key id plus additional verification-only keys retained
   // during zero-downtime rotation. JWT_VERIFICATION_KEYS is a JSON object.
@@ -293,6 +311,22 @@ export const envSchema = z.object({
   // fork bomb) must be bounded at OUR layer — the sandbox-level
   // E2B_SANDBOX_TIMEOUT_MS is a lifetime cap, not a per-command one.
   DEEP_AGENTS_EXECUTE_TIMEOUT_MS: z.coerce.number().int().positive().default(2 * 60 * 1000),
+  // Network policy of a sandbox (VULN-13). The network of a sandbox is fixed when it
+  // is created. A new sandbox is read back from E2B before any command runs in it,
+  // and at the first use of each turn the backend reads the live network of a sandbox
+  // that it did not create in that turn and compares it with the policy as it is then.
+  // This is the ONE deadline for the reads of that check, with their retries, and for
+  // the read of the policy. When it passes, the call fails and the sandbox is kept, so
+  // no command and no file operation runs on an unchecked network. Calls that arrive
+  // meanwhile share the same check, so the wait does not multiply with the number of calls.
+  // The kill of a sandbox that does not match has a deadline of the same length: its tries
+  // (the lease is checked before each) stop there, a kill that still fails is logged as an
+  // error, and the sandbox is replaced all the same.
+  E2B_NETWORK_CONFIRM_TIMEOUT_MS: z.coerce.number().int().positive().default(20 * 1000),
+  // Timeout of one E2B API request inside that check. The E2B SDK default is 60 s,
+  // which four reads in a row would multiply to minutes. A request never gets more
+  // time than the check has left.
+  E2B_NETWORK_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(5 * 1000),
   PII_PROVIDER_ENABLED: booleanFromEnvSchema.default(false),
   // OpenAI-compatible /chat/completions endpoint for the PII detection model.
   // Two intended deployments share this one contract:
@@ -552,11 +586,11 @@ export function loadConfig(
     if (!parsed.WORKOS_API_KEY) throw new Error("WORKOS_API_KEY is required when AUTH_MODE=workos.");
     if (!parsed.WORKOS_CLIENT_ID) throw new Error("WORKOS_CLIENT_ID is required when AUTH_MODE=workos.");
     if (!parsed.WORKOS_REDIRECT_URI) throw new Error("WORKOS_REDIRECT_URI is required when AUTH_MODE=workos.");
-    if (!parsed.MIGRATION_DATABASE_URL) {
-      throw new Error("MIGRATION_DATABASE_URL is required when AUTH_MODE=workos.");
+    if (!opts.skipRuntimeChecks && !parsed.MAINTENANCE_DATABASE_URL) {
+      throw new Error("MAINTENANCE_DATABASE_URL is required when AUTH_MODE=workos.");
     }
-    if (parsed.MIGRATION_DATABASE_URL === parsed.DATABASE_URL) {
-      throw new Error("MIGRATION_DATABASE_URL must use a privileged connection distinct from DATABASE_URL when AUTH_MODE=workos.");
+    if (!opts.skipRuntimeChecks && parsed.MAINTENANCE_DATABASE_URL === parsed.DATABASE_URL) {
+      throw new Error("MAINTENANCE_DATABASE_URL must use a separate maintenance role from DATABASE_URL.");
     }
     if (!parsed.REDIS_URL) {
       throw new Error("REDIS_URL is required when AUTH_MODE=workos.");
@@ -690,6 +724,16 @@ export function loadConfig(
     parsed.NOTION_OAUTH_CLIENT_SECRET,
     parsed.NOTION_OAUTH_REDIRECT_URI
   );
+  const pipedreamFields = {
+    PIPEDREAM_CLIENT_ID: parsed.PIPEDREAM_CLIENT_ID,
+    PIPEDREAM_CLIENT_SECRET: parsed.PIPEDREAM_CLIENT_SECRET,
+    PIPEDREAM_PROJECT_ID: parsed.PIPEDREAM_PROJECT_ID
+  };
+  if (Object.values(pipedreamFields).some(Boolean)) {
+    for (const [key, value] of Object.entries(pipedreamFields)) {
+      if (!value) throw new Error(`${key} is required when Pipedream Connect is configured.`);
+    }
+  }
 
   // Set E2B_TEMPLATE_ID via env after running `make e2b-build` — booting
   // against E2B with the placeholder default would fail opaquely in

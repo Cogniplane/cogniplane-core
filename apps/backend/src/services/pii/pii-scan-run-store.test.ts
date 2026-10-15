@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../../lib/db.js";
 
+import type { PiiFinding } from "./pii-provider.js";
 import { PiiScanRunStore } from "./pii-scan-run-store.js";
 
 class CaptureDatabase {
@@ -208,4 +209,79 @@ test("mapRow preserves canonical action_taken values", async () => {
   const store = new PiiScanRunStore(db as unknown as Pool);
   const record = await store.getById("tenant-1", "scan-1");
   expect(record?.actionTaken).toBe("report");
+});
+
+async function mapped(overrides: Record<string, unknown>) {
+  const db = new CaptureDatabase();
+  db.selectReturn = [sampleRow(overrides)];
+  return new PiiScanRunStore(db as unknown as Pool).getById("tenant-1", "scan-1");
+}
+
+const finding: PiiFinding = { entityType: "email", value: "ana@example.com", start: 3, end: 18, confidence: "high" };
+
+test.each([
+  ["an array", [finding], [finding]],
+  ["a JSON string", JSON.stringify([finding]), [finding]],
+  ["invalid JSON", "[not json", []],
+  ["a JSON object", JSON.stringify({ findings: [finding] }), []],
+  ["an object", { findings: [finding] }, []],
+  ["null", null, []]
+])("reads findings stored as %s", async (_case, findings_json, expected) => {
+  expect((await mapped({ findings_json }))?.findings).toEqual(expected);
+});
+
+test.each([
+  ["message", "message"],
+  ["artifact", "artifact"],
+  ["project_instructions", "project_instructions"],
+  ["unknown", "message"]
+])("reads subject type %s as %s", async (subject_type, expected) => {
+  expect((await mapped({ subject_type }))?.subjectType).toBe(expected);
+});
+
+test("maps a finished run's optional fields and normalizes timestamps", async () => {
+  const at = new Date("2026-10-01T10:00:00.000Z");
+  const record = await mapped({
+    subject_type: "project_instructions",
+    instructions_revision: "4",
+    status: "blocked",
+    summary_text: "1 email",
+    action_taken: "block",
+    error_message: "partial",
+    created_at: at,
+    updated_at: at.getTime(),
+    completed_at: "2026-10-01T10:05:00Z"
+  });
+
+  expect(record).toMatchObject({
+    instructionsRevision: 4,
+    sourceSessionId: "session-1",
+    providerType: "openai-compatible",
+    providerModel: "google/gemini-2.5-flash",
+    status: "blocked",
+    summaryText: "1 email",
+    actionTaken: "block",
+    errorMessage: "partial",
+    createdAt: "2026-10-01T10:00:00.000Z",
+    updatedAt: "2026-10-01T10:00:00.000Z",
+    completedAt: "2026-10-01T10:05:00.000Z"
+  });
+});
+
+test("leaves unset fields null", async () => {
+  const record = await mapped({
+    source_session_id: null, source_user_id: null, provider_type: null, provider_model: null
+  });
+
+  expect(record).toMatchObject({
+    instructionsRevision: null,
+    sourceSessionId: null,
+    sourceUserId: null,
+    providerType: null,
+    providerModel: null,
+    summaryText: null,
+    actionTaken: null,
+    errorMessage: null,
+    completedAt: null
+  });
 });

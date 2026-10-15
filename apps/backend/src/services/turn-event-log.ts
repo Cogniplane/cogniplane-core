@@ -9,6 +9,112 @@ const MAX_TEXT_BUFFER = 16_384;
 // Secrets can span several AG-UI text deltas. Keep recent words until the
 // redactor sees the complete value and its delimiter.
 const HELD_WORDS = 8;
+// A private-key block never enters the replay log. From a BEGIN header on, all
+// text is dropped up to the block's END line, also across deltas, and the log
+// gets one marker instead. No END line means the rest of the message is left
+// out of the live replay; the saved message keeps it. Nothing else is safe:
+// valid PEM bodies can have spaces, tabs and header lines, so no rule can tell
+// a quoted header followed by prose from key material.
+const PEM_BEGIN = /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----/;
+const PEM_ANY_END_LINE = /^-----END [A-Z0-9 ]*PRIVATE KEY-----$/;
+const REDACTED_PRIVATE_KEY = "[REDACTED PRIVATE KEY]";
+// An END line is short. A longer line is key material and is not kept. The
+// limit fits the expected END line plus this margin for spacing; a line over
+// it only makes the drop continue, it can never release key bytes.
+const PEM_END_LINE_MARGIN = 512;
+
+function pemEndLineLimit(label: string | null): number {
+  return (label === null ? PEM_HEADER_CANDIDATE_LIMIT : `-----END ${label}-----`.length) + PEM_END_LINE_MARGIN;
+}
+
+// Drop state of one key block: its label, when known, and the current line.
+// `lineTooLong` also starts true: the rest of the BEGIN header line is never an
+// END line, even when it holds an END marker.
+type PemDrop = { label: string | null; line: string; lineTooLong: boolean };
+
+// Only a complete line that is exactly the block's END line ends the block.
+function isPemEndLine(line: string, label: string | null): boolean {
+  const trimmed = line.trim();
+  return label === null ? PEM_ANY_END_LINE.test(trimmed) : trimmed === `-----END ${label}-----`;
+}
+
+/**
+ * Feeds dropped text to a key block, line by line across deltas. Returns the
+ * text after the block's END line, or null while the block continues.
+ */
+function feedPemDrop(drop: PemDrop, text: string): string | null {
+  let index = 0;
+  while (index <= text.length) {
+    const newline = text.indexOf("\n", index);
+    const segment = text.slice(index, newline < 0 ? text.length : newline);
+    if (!drop.lineTooLong) {
+      drop.line += segment;
+      if (drop.line.length > pemEndLineLimit(drop.label)) {
+        drop.line = "";
+        drop.lineTooLong = true;
+      }
+    }
+    if (newline < 0) return null;
+    if (!drop.lineTooLong && isPemEndLine(drop.line, drop.label)) return text.slice(newline + 1);
+    drop.line = "";
+    drop.lineTooLong = false;
+    index = newline + 1;
+  }
+  return null;
+}
+
+// A header can arrive split across deltas, with a label longer than the word
+// hold. Text from a possible, still incomplete header on is never released.
+// Real labels are short; a longer candidate is treated as a header.
+const PEM_HEADER_CANDIDATE_LIMIT = 256;
+const PEM_BEGIN_LITERAL = "-----BEGIN";
+const PEM_HEADER_PREFIX = /^-----BEGIN[ A-Z0-9]*-{0,4}$/;
+
+// Start of a trailing text that can still become a BEGIN header, or -1.
+function headerCandidateStart(text: string): number {
+  const start = text.lastIndexOf(PEM_BEGIN_LITERAL);
+  if (start >= 0 && PEM_HEADER_PREFIX.test(text.slice(start))) return start;
+  for (let length = PEM_BEGIN_LITERAL.length - 1; length > 0; length -= 1) {
+    if (text.endsWith(PEM_BEGIN_LITERAL.slice(0, length))) return text.length - length;
+  }
+  return -1;
+}
+
+type PemSplit = { emit: string; rest: string; drop?: PemDrop };
+
+/**
+ * Removes every private-key block from `text`, in order. `emit` is redacted
+ * text before and between the blocks, `rest` is text after the last complete
+ * block, and `drop` is set when the last block has no END line yet: the
+ * caller then drops input until it does.
+ */
+function removePemBlocks(text: string): PemSplit {
+  let emit = "";
+  let rest = text;
+  for (;;) {
+    const begin = PEM_BEGIN.exec(rest);
+    let start: number;
+    let drop: PemDrop;
+    let body: string;
+    if (begin) {
+      start = begin.index;
+      drop = { label: begin[1]!, line: "", lineTooLong: true };
+      body = rest.slice(begin.index + begin[0].length);
+    } else {
+      const candidate = headerCandidateStart(rest);
+      if (candidate < 0 || rest.length - candidate <= PEM_HEADER_CANDIDATE_LIMIT) return { emit, rest };
+      // Fail closed: drop it like a header whose key may follow. Its label is
+      // unknown, so any END line ends it.
+      start = candidate;
+      drop = { label: null, line: "", lineTooLong: true };
+      body = rest.slice(candidate);
+    }
+    emit += redactSecrets(rest.slice(0, start)) + REDACTED_PRIVATE_KEY;
+    const after = feedPemDrop(drop, body);
+    if (after === null) return { emit, rest: "", drop };
+    rest = after;
+  }
+}
 
 function safeTextCutoff(text: string): number {
   let words = 0;
@@ -26,14 +132,6 @@ function safeTextCutoff(text: string): number {
       words += 1;
     }
   }
-  const pemStart = text.search(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/);
-  if (pemStart >= 0) {
-    const remainder = text.slice(pemStart);
-    const end = /-----END [A-Z0-9 ]*PRIVATE KEY-----/.exec(remainder);
-    if (!end || cutoff < pemStart + end.index + end[0].length) {
-      cutoff = Math.min(cutoff, pemStart);
-    }
-  }
   return cutoff;
 }
 
@@ -45,8 +143,22 @@ function safeToolArgs(text: string): string {
   }
 }
 
+// The held text at the end of a message or run. Key blocks were removed as
+// they arrived; a block without an END line was being dropped.
+function finalText(state: BufferedContent): string {
+  if (state.overflow || state.pemDrop || !state.text) return "";
+  return redactSecrets(state.text);
+}
+
 export type SequencedTurnEvent = { sequence: number; event: BaseEvent; bytes: number };
-type BufferedContent = { text: string; overflow: boolean; messageId: string; contentType: EventType };
+type BufferedContent = {
+  text: string;
+  overflow: boolean;
+  messageId: string;
+  contentType: EventType;
+  // Set while input is dropped up to the END line of a key block.
+  pemDrop?: PemDrop;
+};
 
 /** A process-local replay window for one interactive turn. */
 export class TurnEventLog {
@@ -73,9 +185,6 @@ export class TurnEventLog {
 
   append(event: BaseEvent): void {
     if (this.closed) return;
-    if (event.type === EventType.CUSTOM && event.name === "text_retracted") {
-      this.textBuffers.clear();
-    }
     if (event.type === EventType.TOOL_CALL_START && typeof event.toolCallId === "string") {
       this.toolArgs.set(event.toolCallId, { text: "", overflow: false });
     }
@@ -116,19 +225,37 @@ export class TurnEventLog {
       };
       this.textBuffers.set(key, state);
       if (state.overflow) return;
-      state.text += event.delta;
+      if (state.pemDrop) {
+        // Inside a key block: drop input until its END line.
+        const after = feedPemDrop(state.pemDrop, event.delta);
+        if (after === null) return;
+        state.pemDrop = undefined;
+        state.text = after;
+      } else {
+        state.text += event.delta;
+      }
+      // Before the word cutoff and the size limit, so no part of a block is
+      // released and a held block never fills the buffer.
+      const split = removePemBlocks(state.text);
+      state.text = split.rest;
+      state.pemDrop = split.drop;
+      if (split.emit) this.appendEntry({ ...event, delta: split.emit });
+      // Release complete words first, so only text that cannot be released yet
+      // (one unbroken token, or a key block being held) counts toward the limit.
+      if (/\s/.test(event.delta)) {
+        const candidate = headerCandidateStart(state.text);
+        const words = safeTextCutoff(state.text);
+        const cutoff = candidate >= 0 ? Math.min(words, candidate) : words;
+        if (cutoff > 0) {
+          const safe = redactSecrets(state.text.slice(0, cutoff));
+          state.text = state.text.slice(cutoff);
+          if (safe) this.appendEntry({ ...event, delta: safe });
+        }
+      }
       if (state.text.length > MAX_TEXT_BUFFER) {
         state.text = "";
         state.overflow = true;
         this.appendEntry({ ...event, delta: "[Reply text exceeds live replay limit]" });
-        return;
-      }
-      if (!/\s/.test(event.delta)) return;
-      const cutoff = safeTextCutoff(state.text);
-      if (cutoff > 0) {
-        const safe = redactSecrets(state.text.slice(0, cutoff));
-        state.text = state.text.slice(cutoff);
-        if (safe) this.appendEntry({ ...event, delta: safe });
       }
       return;
     }
@@ -139,18 +266,14 @@ export class TurnEventLog {
       const key = `${contentType}:${event.messageId}`;
       const state = this.textBuffers.get(key);
       this.textBuffers.delete(key);
-      if (state && !state.overflow && state.text) {
-        this.appendEntry({ type: contentType, messageId: event.messageId,
-          delta: redactSecrets(state.text) } as BaseEvent);
-      }
+      const delta = state ? finalText(state) : "";
+      if (delta) this.appendEntry({ type: contentType, messageId: event.messageId, delta } as BaseEvent);
     }
     if (event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR) {
       this.toolArgs.clear();
       for (const state of this.textBuffers.values()) {
-        if (!state.overflow && state.text) {
-          this.appendEntry({ type: state.contentType, messageId: state.messageId,
-            delta: redactSecrets(state.text) } as BaseEvent);
-        }
+        const delta = finalText(state);
+        if (delta) this.appendEntry({ type: state.contentType, messageId: state.messageId, delta } as BaseEvent);
       }
       this.textBuffers.clear();
     }

@@ -4,17 +4,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { API_URL } from "./api-client";
 import { AuthProvider, useAuth } from "./auth-context";
+import { useAgentBehaviorDraftStore } from "../components/agent-behavior-draft-provider";
+import { buildDraft } from "../components/tenant-settings-form.logic";
+import { makeTenantSettings } from "../test-helpers/tenant-settings";
 
 // vitest runs with globals:false, so RTL cannot auto-register its cleanup.
 afterEach(cleanup);
 
 type AuthApi = ReturnType<typeof useAuth>;
+type DraftStore = NonNullable<ReturnType<typeof useAgentBehaviorDraftStore>>;
 
 // Surfaces the context so a test can call refreshToken()/login() directly and
 // read back what the provider decided about the session.
-function Probe({ onReady }: { onReady: (auth: AuthApi) => void }) {
+function Probe({ onReady, onDraftReady }: { onReady: (auth: AuthApi) => void; onDraftReady?: (store: DraftStore) => void }) {
   const auth = useAuth();
+  const store = useAgentBehaviorDraftStore();
   onReady(auth);
+  if (store) onDraftReady?.(store);
   return <div data-testid="user">{auth.user ? auth.user.email : "none"}</div>;
 }
 
@@ -56,9 +62,11 @@ async function renderSignedIn() {
   vi.stubGlobal("fetch", fetchMock);
 
   let auth: AuthApi | null = null;
+  let draftStore: DraftStore | null = null;
   render(
     <AuthProvider>
       <Probe
+        onDraftReady={(store) => { draftStore = store; }}
         onReady={(value) => {
           auth = value;
         }}
@@ -68,8 +76,44 @@ async function renderSignedIn() {
 
   await waitFor(() => expect(screen.getByTestId("user").textContent).toBe(SIGNED_IN_USER.email));
   fetchMock.mockReset();
-  return { getAuth: () => auth as AuthApi, fetchMock };
+  return { getAuth: () => auth as AuthApi, getDraftStore: () => draftStore as DraftStore, fetchMock };
 }
+
+describe("Agent behavior draft identity boundary", () => {
+  it.each(["organization", "person", "revoked session"])("clears the draft after a change to %s", async (change) => {
+    const { getAuth, getDraftStore, fetchMock } = await renderSignedIn();
+    const baseline = makeTenantSettings({ tenantId: SIGNED_IN_USER.tenantId });
+    const draft = { ...buildDraft(baseline), developerInstructions: "Unfinished organization instructions" };
+    getDraftStore().write({ baseline, draft });
+    expect(getDraftStore().read()?.draft.developerInstructions).toBe(draft.developerInstructions);
+
+    if (change === "revoked session") {
+      fetchMock.mockResolvedValue(jsonResponse(401, { error: "invalid_refresh_token" }));
+      await act(async () => { await getAuth().refreshToken(); });
+    } else {
+      fetchMock.mockResolvedValue(jsonResponse(200, {
+        ...SIGNED_IN_USER,
+        ...(change === "organization" ? { tenantId: "t-2" } : { userId: "u-2" })
+      }));
+      await act(async () => { await getAuth().completeLogin("new-token"); });
+    }
+    expect(getDraftStore().read()).toBeNull();
+
+    fetchMock.mockResolvedValue(jsonResponse(200, SIGNED_IN_USER));
+    await act(async () => { await getAuth().completeLogin("back-to-first-identity"); });
+    expect(getDraftStore().read()).toBeNull();
+  });
+
+  it("keeps the draft when refreshing the same signed-in session", async () => {
+    const { getAuth, getDraftStore, fetchMock } = await renderSignedIn();
+    const baseline = makeTenantSettings({ tenantId: SIGNED_IN_USER.tenantId });
+    const draft = { ...buildDraft(baseline), developerInstructions: "Keep this draft" };
+    getDraftStore().write({ baseline, draft });
+    fetchMock.mockResolvedValue(jsonResponse(200, { accessToken: "refreshed-token" }));
+    await act(async () => { await getAuth().refreshToken(); });
+    expect(getDraftStore().read()?.draft).toBe(draft);
+  });
+});
 
 beforeEach(() => {
   document.cookie = "cogniplane_session_hint=1; Path=/";

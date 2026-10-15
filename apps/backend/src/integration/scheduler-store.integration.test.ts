@@ -3,10 +3,30 @@ import { describe, expect, test } from "vitest";
 
 import { UserSettingsStore } from "../services/user-settings-store.js";
 import { TenantSettingsStore, TenantSettingsConflictError } from "../services/tenant-settings-store.js";
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedScheduledJob, seedTenantGraph } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
+  test("organization default model survives partial updates and enforces the settings version", async () => {
+    const { tenantId } = await seedTenantGraph();
+    const store = new TenantSettingsStore(appPool());
+    const initial = await store.upsert(tenantId, { defaultModelId: "openai/gpt-5.6-sol" });
+    expect(initial.defaultModelId).toBe("openai/gpt-5.6-sol");
+
+    const updated = await store.upsert(tenantId, {
+      expectedVersion: initial.version,
+      showEffortSelector: true
+    });
+    expect(updated.defaultModelId).toBe("openai/gpt-5.6-sol");
+    expect(updated.version).toBe(initial.version + 1);
+    expect((await store.get(tenantId))?.defaultModelId).toBe("openai/gpt-5.6-sol");
+
+    await expect(store.upsert(tenantId, {
+      expectedVersion: initial.version,
+      defaultModelId: null
+    })).rejects.toBeInstanceOf(TenantSettingsConflictError);
+  });
+
   test("only one concurrent tenant settings save can use the same version", async () => {
     const { tenantId } = await seedTenantGraph();
     const store = new TenantSettingsStore(appPool());
@@ -29,7 +49,7 @@ describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
     await superuserPool().query("UPDATE scheduled_jobs SET enabled = FALSE WHERE job_id = $1", [disabled]);
     await superuserPool().query("UPDATE scheduled_jobs SET next_run_at = NULL WHERE job_id = $1", [unscheduled]);
 
-    const store = new UserSettingsStore(appPool(), superuserPool());
+    const store = new UserSettingsStore(appPool(), maintenancePool());
     const jobs = await store.listDueJobs(10_000);
     const ownJobIds = jobs.filter((job) => job.tenantId === tenant.tenantId).map((job) => job.jobId);
     expect(ownJobIds).toEqual([due]);
@@ -39,7 +59,7 @@ describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
   test.each(["completed", "failed"])("persists a pending run and its %s outcome", async (status) => {
     const tenant = await seedTenantGraph();
     const runId = randomUUID();
-    const store = new UserSettingsStore(appPool(), superuserPool());
+    const store = new UserSettingsStore(appPool(), maintenancePool());
     await store.createJobRun({ ...tenant, runId });
 
     const pending = await superuserPool().query("SELECT * FROM scheduled_job_runs WHERE run_id = $1", [runId]);

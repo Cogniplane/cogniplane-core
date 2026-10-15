@@ -5,9 +5,8 @@ import { uuidv7 } from "../../lib/uuid.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
-import { ProjectFileError, type ProjectFileStore } from "../project-file-store.js";
-import type { RequestLimitsInterface } from "../request-limits.js";
 import { ToolCallError } from "../../lib/tool-call-error.js";
+import { validateArtifactFilename } from "../artifacts/artifact-filename.js";
 import { strictObjectSchema, withManagedToolErrorSchema, type ManagedToolDefinition } from "./types.js";
 
 type WriteArtifactDeps = {
@@ -21,8 +20,6 @@ type WriteArtifactDeps = {
     filePath: string
   ) => Promise<{ sizeBytes: number }>;
   artifactMaxBytes: number;
-  limits?: Pick<RequestLimitsInterface, "consumeRateLimit" | "refundRateLimit">;
-  projectFiles?: Pick<ProjectFileStore, "createAgentDraftFromContent">;
 };
 
 // ── MIME type inference ───────────────────────────────────────────────────────
@@ -70,7 +67,7 @@ export const WRITE_ARTIFACT_CATALOG: ReadonlyArray<{
   {
     name: "write_artifact",
     description:
-      "Save a file as a session artifact so the user can view and download it from the Artifacts panel. Call this for every file you create. In a project turn with create-only or read-write agent file mode, this also creates a project draft for human review; use project_write_file for an intentional project-file update. Provide either content (inline text) or filePath (workspace path to read the file from the sandbox).",
+      "Save a file as a session artifact so the user can view and download it from the Artifacts panel. Call this for every file you create. To add the file to a project library, call project_write_file. Provide either content (inline text) or filePath (workspace path to read the file from the sandbox).",
     readOnly: false,
     inputSchema: {
       type: "object",
@@ -106,22 +103,21 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
           artifactName: { type: "string" },
           mimeType: { type: "string" },
           fileSizeBytes: { type: "number" },
-          status: { type: "string" },
-          projectDraftId: { type: ["string", "null"] },
-          projectDraftError: { type: ["string", "null"] }
+          status: { type: "string" }
         }, [
           "artifactId",
           "artifactName",
           "mimeType",
           "fileSizeBytes",
-          "status",
-          "projectDraftId",
-          "projectDraftError"
+          "status"
         ])
       ),
       handler: async ({ context, arguments: args }) => {
         const name = String(args.name ?? "").trim();
         if (!name) throw new ToolCallError("name is required.");
+        // Refuse before any bytes are read or stored. The message reaches the model.
+        const nameProblem = validateArtifactFilename(name);
+        if (nameProblem) throw new ToolCallError(`${nameProblem} Use a plain file name such as report.csv.`);
 
         const hasContent = args.content != null && String(args.content) !== "";
         const hasFilePath = args.filePath != null && String(args.filePath).trim() !== "";
@@ -186,77 +182,6 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
           throw error;
         }
 
-        let projectDraftId: string | null = null;
-        let projectDraftError: string | null = null;
-        const projectContext = context.metadata.projectContext;
-        const project = projectContext && typeof projectContext === "object"
-          ? projectContext as { projectId?: unknown; agentFileMode?: unknown; snapshot?: unknown }
-          : null;
-        const runtimePolicy = context.metadata.runtimePolicy;
-        const enabledToolIds = runtimePolicy && typeof runtimePolicy === "object"
-          ? (runtimePolicy as { enabledToolIds?: unknown }).enabledToolIds
-          : null;
-        const projectWriteEnabled = Array.isArray(enabledToolIds) && enabledToolIds.includes("project_write_file");
-        if (deps.projectFiles && project?.projectId &&
-            projectWriteEnabled &&
-            (project.agentFileMode === "create-only" || project.agentFileMode === "read-write")) {
-          const rateLimitInput = {
-            resource: "project_file_write" as const,
-            userId: context.userId,
-            tenantId: context.tenantId
-          };
-          let projectWriteRateCharged = false;
-          try {
-            const limitError = await deps.limits?.consumeRateLimit(rateLimitInput);
-            if (limitError) {
-              projectDraftError = limitError.message;
-            } else {
-              projectWriteRateCharged = Boolean(deps.limits);
-              const snapshot = project.snapshot && typeof project.snapshot === "object"
-                ? project.snapshot as { files?: unknown }
-                : null;
-              const target = project.agentFileMode === "read-write" && snapshot && Array.isArray(snapshot.files)
-                ? snapshot.files.find((entry): entry is { fileId: string; versionId: string; name: string; folderId: string | null; kind: string } =>
-                    Boolean(entry) && typeof entry === "object" &&
-                    (entry as Record<string, unknown>).kind === "published" &&
-                    (entry as Record<string, unknown>).folderId === null &&
-                    typeof (entry as Record<string, unknown>).fileId === "string" &&
-                    typeof (entry as Record<string, unknown>).versionId === "string" &&
-                    typeof (entry as Record<string, unknown>).name === "string" &&
-                    (entry as Record<string, string>).name.toLowerCase() === name.toLowerCase())
-                : undefined;
-              const draft = await deps.projectFiles.createAgentDraftFromContent({
-                actor: {
-                  tenantId: context.tenantId,
-                  userId: context.userId,
-                  projectId: String(project.projectId)
-                },
-                name,
-                folderId: null,
-                targetFileId: target?.fileId ?? null,
-                baseVersionId: target?.versionId ?? null,
-                mimeType,
-                content: new Uint8Array(contentBuffer),
-                storage: deps.storage,
-                maxBytes: deps.artifactMaxBytes,
-                createdByType: "agent",
-                stored
-              });
-              projectDraftId = draft.fileId;
-            }
-          } catch (error) {
-            if (projectWriteRateCharged) {
-              const refund = deps.limits?.refundRateLimit?.(rateLimitInput);
-              if (refund) await refund.catch(() => undefined);
-            }
-            // The session artifact is already committed. Preserve that useful
-            // result and tell the model why the optional project copy failed.
-            projectDraftError = error instanceof ProjectFileError
-              ? error.message
-              : "The session artifact was saved, but the project draft could not be created.";
-          }
-        }
-
         await deps.auditEvents.create({
           tenantId: context.tenantId,
           sessionId: context.sessionId,
@@ -277,9 +202,7 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
           artifactName: artifact.artifactName,
           mimeType: artifact.mimeType,
           fileSizeBytes: artifact.fileSizeBytes,
-          status: artifact.status,
-          projectDraftId,
-          projectDraftError
+          status: artifact.status
         };
       }
     }

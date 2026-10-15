@@ -4,13 +4,16 @@ import type { Pool } from "../lib/db.js";
 
 import {
   MAX_MESSAGE_CONTENT_LENGTH,
+  MAX_MCP_APP_JSON_LENGTH,
   MAX_TOOL_RESULT_TEXT_LENGTH,
-  MAX_UI_RESOURCES_JSON_LENGTH,
-  MessageStore
+  MessageStore,
+  type UpsertToolResultInput
 } from "./message-store.js";
 
 class CaptureMessageDatabase {
   lastValues: unknown[] | null = null;
+  // The ui_resources value an existing row returns. Only retained rows have one.
+  retainedUiResources: unknown = null;
 
   async connect() {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
@@ -95,7 +98,8 @@ class CaptureMessageDatabase {
             exit_code: values[14],
             duration_ms: values[15],
             text_offset: values[16],
-            ui_resources: values[17] == null ? null : JSON.parse(String(values[17])),
+            ui_resources: this.retainedUiResources,
+            mcp_app: values[17] == null ? null : JSON.parse(String(values[17])),
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           }
@@ -132,7 +136,7 @@ test("MessageStore.upsertToolResult normalizes nullable tool fields for persiste
     input: "",
     output: "",
     exitCode: null,
-    durationMs: null
+    durationMs: null, textOffset: 0
   });
 
   expect(db.lastValues).toBeTruthy();
@@ -151,12 +155,9 @@ test("MessageStore.upsertToolResult normalizes nullable tool fields for persiste
   expect(result.cwd).toBe(null);
 });
 
-test("MessageStore.upsertToolResult round-trips MCP UI resources as jsonb", async () => {
-  const db = new CaptureMessageDatabase();
-  const store = new MessageStore(db as unknown as Pool);
-
-  const uiResources = [{ uri: "ui://card", mimeType: "text/html", text: "<b>hi</b>" }];
-  const result = await store.upsertToolResult({
+function legacyResourceInput(uiResources: unknown[]): UpsertToolResultInput {
+  // A caller built for the retired contract can still pass the old field.
+  return {
     tenantId: "test-tenant",
     toolResultId: "tool-1",
     messageId: "message-1",
@@ -170,111 +171,113 @@ test("MessageStore.upsertToolResult round-trips MCP UI resources as jsonb", asyn
     server: "widgets",
     toolName: "render_card",
     input: "",
-    output: "",
+    output: "[Embedded resource not displayed: ui://card (text/html)]",
     exitCode: null,
-    durationMs: 1,
+    durationMs: 1, textOffset: 0,
     uiResources
-  });
+  } as UpsertToolResultInput;
+}
 
-  // $18 is bound as a jsonb string, not a raw JS array (node-pg would coerce an
-  // array to Postgres array syntax otherwise). ($17 is the nullable text_offset.)
-  expect(db.lastValues![17]).toBe(JSON.stringify(uiResources));
-  expect(result.uiResources).toEqual(uiResources);
+test("MessageStore.upsertToolResult does not persist legacy UI resources from an older caller", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  const result = await store.upsertToolResult(
+    legacyResourceInput([{ uri: "ui://card", mimeType: "text/html", text: "<b>legacy-html</b>", blob: "bGVnYWN5" }])
+  );
+
+  const bound = JSON.stringify(db.lastValues);
+  expect(bound).not.toContain("legacy-html");
+  expect(bound).not.toContain("bGVnYWN5");
+  expect(result.uiResources).toBeUndefined();
+  expect(result.output).toBe("[Embedded resource not displayed: ui://card (text/html)]");
 });
 
-test("MessageStore.upsertToolResult redacts secrets and neutralizes NUL bytes in UI resources", async () => {
+test("MessageStore.upsertToolResult returns retained legacy UI resources from the saved row", async () => {
+  const db = new CaptureMessageDatabase();
+  const retained = [{ uri: "ui://card", mimeType: "text/html", text: "<b>retained</b>" }];
+  db.retainedUiResources = retained;
+  const store = new MessageStore(db as unknown as Pool);
+
+  const result = await store.upsertToolResult(
+    legacyResourceInput([{ uri: "ui://replacement", mimeType: "text/html", text: "<b>replacement</b>" }])
+  );
+
+  expect(JSON.stringify(db.lastValues)).not.toContain("replacement</b>");
+  expect(result.uiResources).toEqual(retained);
+});
+
+function appInput(text: string): UpsertToolResultInput {
+  return {
+    tenantId: "test-tenant", toolResultId: "call-1", messageId: "message-1",
+    sessionId: "session-1", userId: "user-1", kind: "mcp", title: "Quotes",
+    status: "completed", command: null, cwd: null, server: "quote-server", toolName: "show_quote_picker",
+    input: "{}", output: "Quotes", exitCode: null, durationMs: 1, textOffset: 0,
+    mcpApp: { resourceUri: "ui://quote-picker/app.html", result: { content: [{ type: "text", text }] } }
+  };
+}
+
+test("MessageStore.upsertToolResult neutralizes NUL bytes in an MCP App result", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
 
   const NUL = String.fromCharCode(0);
-  const result = await store.upsertToolResult({
-    tenantId: "test-tenant",
-    toolResultId: "tool-1",
-    messageId: "message-1",
-    sessionId: "session-1",
-    userId: "user-1",
-    kind: "mcp",
-    title: "MCP tool",
-    status: "completed",
-    command: null,
-    cwd: null,
-    server: "widgets",
-    toolName: "render_card",
-    input: "",
-    output: "",
-    exitCode: null,
-    durationMs: 1,
-    // A hostile/buggy widget echoes a Bearer token and a raw NUL byte into its HTML.
-    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: `Authorization: Bearer sekret-abc${NUL}end` }]
-  });
+  const result = await store.upsertToolResult(appInput(`before${NUL}after`));
 
-  const persistedJson = String(db.lastValues![17]);
   // Postgres jsonb rejects a backslash-u-0000 escape — the serialized value must not carry one.
-  expect(persistedJson).not.toContain("\\u0000");
-  // The credential is stripped from what actually reaches storage.
-  expect(persistedJson).not.toContain("sekret-abc");
-  expect(result.uiResources![0].text).toContain("[REDACTED]");
-  expect(result.uiResources![0].text).not.toContain(NUL);
+  expect(String(db.lastValues![17])).not.toContain("\\u0000");
+  expect(result.mcpApp?.result.content[0]).toEqual({ type: "text", text: "before\uFFFDafter" });
 });
 
-test("MessageStore.upsertToolResult preserves literal backslash-u-0000 text in UI resources", async () => {
+test("MessageStore.upsertToolResult preserves literal backslash-u-0000 text in an MCP App result", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
 
-  // The widget source legitimately contains the six-character escape sequence
-  // (backslash u 0 0 0 0) as TEXT, not a raw NUL byte, so it must round-trip
-  // unchanged; only real NUL chars are neutralized.
+  // The six-character escape sequence is TEXT, not a raw NUL byte, so it must
+  // round-trip unchanged; only real NUL chars are neutralized.
   const literal = "example: \\u0000 in a code block";
-  const result = await store.upsertToolResult({
-    tenantId: "test-tenant",
-    toolResultId: "tool-1",
-    messageId: "message-1",
-    sessionId: "session-1",
-    userId: "user-1",
-    kind: "mcp",
-    title: "MCP tool",
-    status: "completed",
-    command: null,
-    cwd: null,
-    server: "widgets",
-    toolName: "render_card",
-    input: "",
-    output: "",
-    exitCode: null,
-    durationMs: 1,
-    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: literal }]
-  });
+  const result = await store.upsertToolResult(appInput(literal));
 
-  expect(result.uiResources![0].text).toBe(literal);
+  expect(result.mcpApp?.result.content[0]).toEqual({ type: "text", text: literal });
 });
 
+test("MessageStore.upsertToolResult saves a linked app result with secrets removed", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+  const result = await store.upsertToolResult({
+    tenantId: "test-tenant", toolResultId: "call-1", messageId: "message-1",
+    sessionId: "session-1", userId: "user-1", kind: "mcp", title: "Quotes",
+    status: "completed", command: null, cwd: null, server: "quote-server", toolName: "show_quote_picker",
+    input: "{}", output: "Three quotes", exitCode: null, durationMs: 1, textOffset: 0,
+    mcpApp: { resourceUri: "ui://quote-picker/app.html", input: {
+      seats: 80, tokenLimits: [100, 200], token: "private-token", idToken: "private-id-token",
+      "x-api-key": "private-header", credentials: { sessionToken: "private-session" }
+    }, result: {
+      content: [{ type: "text", text: "Bearer secret-value" }],
+      structuredContent: { quotes: [1, 2, 3], tokenLimits: [100, 200], apiKey: "private-key",
+        token: "private-token", idToken: "private-id-token", "x-api-key": "private-header",
+        credentials: { sessionToken: "private-session" } }
+    } }
+  });
+  expect(result.mcpApp).toMatchObject({ resourceUri: "ui://quote-picker/app.html",
+    input: { seats: 80, tokenLimits: [100, 200], token: "[REDACTED]", idToken: "[REDACTED]",
+      "x-api-key": "[REDACTED]", credentials: { sessionToken: "[REDACTED]" } },
+    result: { structuredContent: { quotes: [1, 2, 3], tokenLimits: [100, 200], apiKey: "[REDACTED]",
+      token: "[REDACTED]", idToken: "[REDACTED]", "x-api-key": "[REDACTED]",
+      credentials: { sessionToken: "[REDACTED]" } } } });
+  expect(JSON.stringify(db.lastValues![17])).not.toContain("private-key");
+  expect(JSON.stringify(db.lastValues![17])).not.toContain("secret-value");
+  expect(JSON.stringify(db.lastValues![17])).not.toContain("private-session");
+});
 
-test("MessageStore.upsertToolResult drops oversized UI resources instead of persisting them", async () => {
+test("MessageStore.upsertToolResult drops an oversized MCP App call instead of persisting it", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
 
-  const result = await store.upsertToolResult({
-    tenantId: "test-tenant",
-    toolResultId: "tool-1",
-    messageId: "message-1",
-    sessionId: "session-1",
-    userId: "user-1",
-    kind: "mcp",
-    title: "MCP tool",
-    status: "completed",
-    command: null,
-    cwd: null,
-    server: "widgets",
-    toolName: "render_card",
-    input: "",
-    output: "",
-    exitCode: null,
-    durationMs: 1,
-    uiResources: [{ uri: "ui://card", mimeType: "text/html", text: "x".repeat(MAX_UI_RESOURCES_JSON_LENGTH) }]
-  });
+  const result = await store.upsertToolResult(appInput("x".repeat(MAX_MCP_APP_JSON_LENGTH)));
 
   expect(db.lastValues![17]).toBe(null);
-  expect(result.uiResources).toBeUndefined();
+  expect(result.mcpApp).toBeUndefined();
 });
 
 test("MessageStore.upsertToolResult truncates oversized tool output before persistence", async () => {
@@ -298,7 +301,7 @@ test("MessageStore.upsertToolResult truncates oversized tool output before persi
     input: "",
     output: huge,
     exitCode: 0,
-    durationMs: 1
+    durationMs: 1, textOffset: 0
   });
 
   // The fake's RETURNING echoes the persisted output_text, so the mapped
@@ -332,7 +335,7 @@ test("MessageStore.upsertToolResult redacts secrets in tool input/output before 
     input: "curl -H 'Authorization: Bearer sekret-input-token' https://api.example.com",
     output: "cloned via https://x-access-token:ghp_FAKE_not_a_real_pat_for_tests@github.com/acme/repo",
     exitCode: 0,
-    durationMs: 1
+    durationMs: 1, textOffset: 0
   });
 
   // The fake's RETURNING echoes the persisted input_text/output_text (indices
@@ -371,7 +374,7 @@ test("MessageStore.upsertToolResult strips NUL bytes from tool text before persi
     input: '{"path":"chart\u0000.png"}',
     output: "PNG\u0000\u0000header",
     exitCode: 0,
-    durationMs: 1
+    durationMs: 1, textOffset: 0
   });
 
   expect(result.input).toBe('{"path":"chart\uFFFD.png"}');
@@ -1032,6 +1035,8 @@ test("MessageStore.addTokenUsage increments token columns and returns the new to
   expect(captured![3]).toBe(1); // delta inputTokens
   expect(captured![7]).toBe(10); // delta totalTokens
   expect(captured![8]).toBe("claude-haiku");
+  // No cost given: the cost column is left as it is.
+  expect(captured![9]).toBe(false);
   // RETURNING surfaces the post-UPDATE cumulative totals.
   expect(result).toEqual({
     inputTokens: 11,
@@ -1136,7 +1141,7 @@ test("mapToolResult: unknown status falls back to in_progress", async () => {
   const r = await store.upsertToolResult({
     tenantId: "t", toolResultId: "tr", messageId: "m", sessionId: "s", userId: "u",
     kind: "command", title: "", status: "completed", command: null, cwd: null,
-    server: null, toolName: null, input: "", output: "x", exitCode: null, durationMs: null
+    server: null, toolName: null, input: "", output: "x", exitCode: null, durationMs: null, textOffset: 0
   });
   expect(r).toBeTruthy();
   expect(r!.kind).toBe("command");

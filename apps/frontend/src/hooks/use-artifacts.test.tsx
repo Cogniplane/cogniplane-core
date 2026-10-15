@@ -3,7 +3,14 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Artifact } from "@cogniplane/shared-types";
 
+import { ApiError } from "../lib/api-client";
+import { uploadArtifact } from "../lib/artifact-api";
 import { useArtifacts } from "./use-artifacts";
+
+vi.mock("../lib/artifact-api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/artifact-api")>()),
+  uploadArtifact: vi.fn()
+}));
 
 afterEach(cleanup);
 
@@ -107,5 +114,38 @@ describe("chat artifact selection", () => {
     expect(result.current.visibleSelectedArtifactIds).toEqual(["a"]);
     rerender({ selectedSessionId: "s-1", artifacts: [a, b] });
     expect(result.current.visibleSelectedArtifactIds).toEqual(["a", "b"]);
+  });
+});
+
+describe("chat artifact upload errors", () => {
+  function renderUpload() {
+    // Stable props: the hook derives state from them on every render.
+    const props = {
+      selectedSessionId: "s-1", artifacts: [] as Artifact[], onError: vi.fn(), onRefresh: vi.fn(async () => undefined)
+    };
+    const hook = renderHook(() => useArtifacts(props));
+    return { hook, onError: props.onError };
+  }
+  const file = new File(["x"], "chart.png", { type: "image/png" });
+
+  it("shows why the server refused the file", async () => {
+    vi.mocked(uploadArtifact).mockRejectedValueOnce(new ApiError({
+      status: 422, code: "unsupported_mime", method: "POST", path: "/artifacts",
+      message: "PII protection is on for this organization and cannot scan image/png files. Upload a text or PDF version instead."
+    }));
+    const { hook, onError } = renderUpload();
+    await act(() => hook.result.current.handleUploadArtifact(file));
+    expect(onError).toHaveBeenCalledWith(
+      "PII protection is on for this organization and cannot scan image/png files. Upload a text or PDF version instead."
+    );
+  });
+
+  it("keeps a generic message for a server failure", async () => {
+    vi.mocked(uploadArtifact).mockRejectedValueOnce(new ApiError({
+      status: 503, code: "pii_provider_unavailable", method: "POST", path: "/artifacts", message: "provider timeout"
+    }));
+    const { hook, onError } = renderUpload();
+    await act(() => hook.result.current.handleUploadArtifact(file));
+    expect(onError).toHaveBeenCalledWith("Failed to upload artifact.");
   });
 });

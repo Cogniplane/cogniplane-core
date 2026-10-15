@@ -15,7 +15,7 @@ import { ChevronDown, ChevronUp, ChevronsUpDown } from "lucide-react";
 import { fetchMessageFeedback } from "../lib/message-feedback-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
-import { DayRangePicker, type Days } from "./token-usage-chart-primitives";
+import { DayRangePicker, ViewToggle, type Days } from "./token-usage-chart-primitives";
 import { ReportStatCard } from "./token-usage-chart-primitives";
 import { HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
@@ -23,6 +23,7 @@ const STAT_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4";
 
 export function MessageFeedbackSection() {
+  const [view, setView] = useState<"day" | "model">("day");
   const [days, setDays] = useState<Days>(30);
   const query = useQuery({
     queryKey: queryKeys.admin.messageFeedback(days),
@@ -42,6 +43,7 @@ export function MessageFeedbackSection() {
       {available ? (
         <div className="flex flex-wrap items-center gap-3 pt-2 pb-1">
           <DayRangePicker value={days} onChange={setDays} />
+          <ViewToggle options={[{ id: "day", label: "Over time" }, { id: "model", label: "By model" }]} value={view} onChange={setView} />
           {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
         </div>
       ) : null}
@@ -68,19 +70,7 @@ export function MessageFeedbackSection() {
             />
           </div>
 
-          {totals.total > 0 ? (
-            <div className={`${STAT_CARD} p-5`}>
-              <p className={`${SECTION_LABEL} mb-2`}>Positive rate</p>
-              <div className="h-3 overflow-hidden rounded-full bg-surface-container">
-                <div
-                  className="h-full rounded-full bg-accent transition-[width] duration-300"
-                  style={{ width: `${totals.ratePercent}%` }}
-                />
-              </div>
-            </div>
-          ) : null}
-
-          {stats && stats.daily.length > 0 ? (
+          {view === "day" && stats && stats.daily.length > 0 ? (
             <div className={`${STAT_CARD} overflow-auto p-5`}>
               <p className={`${SECTION_LABEL} mb-3`}>Daily breakdown</p>
               <FeedbackTable
@@ -99,7 +89,7 @@ export function MessageFeedbackSection() {
             </div>
           ) : null}
 
-          {stats && stats.byModel.length > 0 ? (
+          {view === "model" && stats && stats.byModel.length > 0 ? (
             <div className={`${STAT_CARD} overflow-auto p-5`}>
               <p className={`${SECTION_LABEL} mb-3`}>By model</p>
               <FeedbackTable

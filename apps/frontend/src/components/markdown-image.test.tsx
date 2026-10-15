@@ -29,6 +29,20 @@ describe("MarkdownImage", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 
+  it("renders a non-HTTP(S) image source as text, never a link", () => {
+    render(<MarkdownImage src="data:image/png;base64,AAAA" alt="inline" />);
+
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(screen.getByText("[External image: inline (unknown host)]")).toBeTruthy();
+  });
+
+  it("renders a javascript: image source as text, never a link", () => {
+    render(<MarkdownImage src="javascript:alert(1)" alt="x" />);
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.getByText("[External image: x (unknown host)]")).toBeTruthy();
+  });
+
   it("renders nothing without a usable src", () => {
     const { container } = render(<MarkdownImage src="" alt="empty" />);
     expect(container.innerHTML).toBe("");
