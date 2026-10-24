@@ -18,6 +18,7 @@ jobs:
   gitleaks:
     name: Secret scan
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -31,17 +32,39 @@ jobs:
       # private). The CLI has no such gate.
       - name: Install gitleaks
         run: |
-          GITLEAKS_VERSION=8.21.2
+          GITLEAKS_VERSION=8.30.1
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             -o /tmp/gitleaks.tar.gz
-          echo "5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba  /tmp/gitleaks.tar.gz" | sha256sum --check
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum --check
           tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
           gitleaks version
       - name: Scan for secrets
         run: gitleaks detect --config .gitleaks.toml --log-opts='--all' --no-banner --redact
 
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          # This job runs no `pnpm install`. With a pnpm cache enabled, the
+          # post-job cache save fails the job because the store is empty.
+          package-manager-cache: false
+      # The full audit, not `--prod`: dev-only advisories count too.
+      # pnpm-workspace.yaml lists the advisories that are ignored, and why.
+      - run: pnpm audit
+
   ci:
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     permissions:
       contents: read
     steps:
@@ -145,7 +168,7 @@ jobs:
       postgres:
         # Matches compose.yaml. The suite reads pg_class/pg_policies and uses
         # DROP DATABASE ... WITH (FORCE), so the major version matters.
-        image: postgres:17
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: postgres
@@ -160,7 +183,7 @@ jobs:
       redis:
         # Matches compose.yaml. turn-coordination-bus.integration.test.ts runs
         # the cross-replica Stop, replay, and trimming paths against it.
-        image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
+        image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
         ports:
           - 6379:6379
         options: >-

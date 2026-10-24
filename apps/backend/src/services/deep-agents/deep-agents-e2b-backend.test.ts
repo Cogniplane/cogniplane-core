@@ -1816,6 +1816,77 @@ describe("E2bDeepAgentsSandbox network policy", () => {
   describe("turns", () => {
     afterEach(() => { vi.useRealTimers(); });
 
+    describe("lifetime extension at turn start", () => {
+      it("extends a sandbox that matches the policy, and the first operation of the turn reads nothing again", async () => {
+        const r = reconnect({ live: DENY_ALL_NETWORK });
+        await r.backend.execute("echo turn1");
+        expect(r.provider.getInfo).toHaveBeenCalledTimes(1);
+
+        r.backend.beginTurn();
+        await r.backend.extendTimeout();
+        expect(r.saved.setTimeoutCalls).toEqual([60_000]);
+        expect(r.provider.getInfo).toHaveBeenCalledTimes(2);
+
+        await r.backend.execute("echo turn2");
+        // The check of the extension holds for the turn.
+        expect(r.provider.getInfo).toHaveBeenCalledTimes(2);
+        expect(r.saved.runCalls.map((call) => call.command)).toEqual(["echo turn1", "echo turn2"]);
+      });
+
+      it("kills a sandbox that the narrowed policy no longer matches, instead of keeping it alive", async () => {
+        // A turn that uses no tool runs no other check. Without this one, every
+        // such turn would keep the old network, and what runs in it, alive.
+        const r = reconnect({ live: APPROVED_NETWORK, policy: approved });
+        await r.backend.execute("echo turn1");
+
+        r.settings.state.current = denyAll;
+        r.backend.beginTurn();
+        await r.backend.extendTimeout();
+
+        expect(r.saved.setTimeoutCalls).toEqual([]);
+        expect(r.saved.killed).toHaveBeenCalledTimes(1);
+        expect(r.onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "sbx-old", reason: "network_policy" });
+        // Laziness holds: nothing is created until an operation needs a sandbox.
+        expect(r.provider.create).not.toHaveBeenCalled();
+
+        await r.backend.execute("echo turn2");
+        expect(r.provider.create).toHaveBeenCalledTimes(1);
+        expect(r.provider.create.mock.calls[0]![1].network).toEqual(DENY_ALL_NETWORK);
+        expect(r.saved.runCalls.map((call) => call.command)).toEqual(["echo turn1"]);
+        expect(r.replacement.runCalls.at(-1)?.command).toBe("echo turn2");
+      });
+
+      it("does not extend a sandbox whose network cannot be read, and keeps it", async () => {
+        const r = reconnect({ live: DENY_ALL_NETWORK });
+        await r.backend.execute("echo turn1");
+
+        r.backend.beginTurn();
+        const reads = breakReads(r.provider);
+        await expect(r.backend.extendTimeout()).resolves.toBeUndefined();
+        expect(r.saved.setTimeoutCalls).toEqual([]);
+        expect(r.saved.killed).not.toHaveBeenCalled();
+
+        // The next operation asks again, and runs in the kept sandbox.
+        reads.heal();
+        await r.backend.execute("echo turn2");
+        expect(r.saved.runCalls.map((call) => call.command)).toEqual(["echo turn1", "echo turn2"]);
+        expect(r.provider.create).not.toHaveBeenCalled();
+      });
+
+      it("drops a sandbox that the provider no longer has without creating one", async () => {
+        const r = reconnect({ live: DENY_ALL_NETWORK });
+        await r.backend.execute("echo turn1");
+
+        r.backend.beginTurn();
+        r.provider.getInfo.mockImplementation(async () => { throw gone(); });
+        await r.backend.extendTimeout();
+
+        expect(r.saved.setTimeoutCalls).toEqual([]);
+        expect(r.onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "sbx-old", reason: "expired" });
+        expect(r.provider.create).not.toHaveBeenCalled();
+      });
+    });
+
     it("does not let a check that an earlier turn started confirm the next turn", async () => {
       const r = reconnect({ live: DENY_ALL_NETWORK });
       let release!: () => void;

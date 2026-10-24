@@ -37,6 +37,9 @@ export default defineConfig({
     }
   },
   test: {
+    execArgv: process.env.VITEST_DISABLE_CONCURRENT_RECOMPILATION === "1"
+      ? ["--no-concurrent-recompilation", "--no-maglev"]
+      : [],
     name: "frontend",
     environment: "node",
     globals: false,

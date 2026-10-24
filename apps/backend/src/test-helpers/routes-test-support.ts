@@ -672,10 +672,11 @@ class InMemoryArtifactStore {
     if (!downloadToken) return null;
     const artifact = this.artifacts.get(downloadToken.artifactId);
     const session = await this.sessions.getOwned(downloadToken.tenantId, downloadToken.sessionId, downloadToken.userId);
-    if (!artifact || artifact.status === "deleted" || !session || session.status !== "active") {
-      return null;
-    }
-    if (artifact.artifactType !== "upload" && artifact.status !== "ready") {
+    // As DOWNLOAD_TOKEN_GATING in artifact-store.ts: a personal artifact survives
+    // the deletion of its chat, a project session must not be deleted, and the
+    // artifact must be download-eligible now, an upload included.
+    if (!artifact || !session || (session.projectId && session.status === "deleted") ||
+        !isArtifactPiiEligible(artifact)) {
       return null;
     }
     return downloadToken;

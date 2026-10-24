@@ -1,4 +1,4 @@
-FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS builder
+FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS builder
 
 WORKDIR /workspace
 
@@ -25,13 +25,12 @@ COPY patches patches
 RUN pnpm install --frozen-lockfile
 
 COPY apps/backend apps/backend
-# Legacy deploy checks workspace patches against production dependencies.
-# OpenNext is a frontend build dependency and is absent from the backend image.
+# These renderer patches are absent from the backend production dependencies.
 RUN pnpm --filter @cogniplane/backend build:bundle \
-  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); delete pkg.pnpm.patchedDependencies["@opennextjs/cloudflare@1.20.9"]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
+  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); for (const name of ["@a2ui/web_core@0.10.4", "@copilotkit/a2ui-renderer@1.79.1"]) delete pkg.pnpm.patchedDependencies[name]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
   && pnpm --filter @cogniplane/backend deploy --prod --no-optional --legacy /opt/backend
 
-FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS runtime
+FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runtime
 
 ARG BUILD_SHA=""
 ARG BUILD_DATE=""

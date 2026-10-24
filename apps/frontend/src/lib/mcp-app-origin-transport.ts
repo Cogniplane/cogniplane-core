@@ -3,7 +3,7 @@ import { PostMessageTransport } from "@modelcontextprotocol/ext-apps";
 type MessageListener = (event: MessageEvent) => void;
 
 /**
- * The host side of the bridge to the sandbox proxy. ext-apps 1.7.5
+ * The host side of the bridge to the sandbox proxy. ext-apps
  * PostMessageTransport checks `event.source` and sends with the target origin
  * "*". This subclass also drops a message whose `event.origin` is not the
  * sandbox origin, and sends only to that origin. It keeps the JSON-RPC

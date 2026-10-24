@@ -90,7 +90,7 @@ export class PolicyProofLedger {
     return id && this.pending.has(id) && this.owns({ ...action, id }) ? this.proofs.get(id) : undefined;
   }
 
-  /** Proof to inject at dispatch. The gateway checks the same tool, server and arguments. */
+  /** Proof to send at dispatch, in the request `_meta`. The gateway checks the same tool, server and arguments. */
   forDispatch(toolCallId: string | undefined, call: LedgerCall): PolicyApprovalProof | undefined {
     return toolCallId && this.owns({ ...call, id: toolCallId }) ? this.proofs.get(toolCallId) : undefined;
   }

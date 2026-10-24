@@ -57,12 +57,12 @@ describe("policy approval proof", () => {
     expect(policyArgsHash({})).toBe("44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a");
   });
 
-  it("matches the call as approved when the runtime adds transport keys at the root, and no other call", () => {
+  it("matches the call as approved with transport keys at the root, and no other call", () => {
     const approvedArgs = { name: "units", metadata: { toolContextId: "nested data", inner: { policyApprovalId: "nested id" } } };
     const proof = createPolicyApprovalProof({ toolContextId: "ctx", toolCallId: "call-1", toolName: "memory_save",
       serverId: "managed", args: approvedArgs, ruleId: null, explanation: "Saves data." });
     const action = (args: Record<string, unknown>) => ({ toolName: "memory_save", serverId: "managed", args });
-    // The dispatch hook adds the context and the approval id at the root, as the gateway does.
+    // A model can write these keys at the root, and the gateway stamps the context there.
     const dispatched = { ...approvedArgs, toolContextId: "backend ctx", policyApprovalId: proof.approvalId };
 
     expect(matchesPolicyApprovalAction(proof, action(dispatched))).toBe(true);

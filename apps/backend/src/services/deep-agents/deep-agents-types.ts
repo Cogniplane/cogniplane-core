@@ -246,7 +246,7 @@ export type DeepAgentsRuntimeFactory = (init: {
   checkpointer?: DeepAgentsCheckpointSaver;
   /**
    * MCP gateway servers for this session (compiled config). The graph module
-   * connects a MultiServerMCPClient with the Bearer runtime token and exposes
+   * connects a GatewayMcpClient with the Bearer runtime token and exposes
    * the tools to the agent.
    */
   mcpServers?: Array<{
@@ -256,9 +256,9 @@ export type DeepAgentsRuntimeFactory = (init: {
     authorization: string;
   }>;
   /**
-   * Per-turn tool-context id, read at tool-call time and injected into
-   * managed MCP tool inputs (the gateway resolves it against
-   * ToolExecutionContextStore). The adapter updates `current` at turn start.
+   * Per-turn tool-context id, read at tool-call time and sent in the MCP
+   * request's `_meta`, never in the tool arguments (the gateway resolves it
+   * against ToolExecutionContextStore). The adapter updates `current` at turn start.
    */
   toolContextRef?: { current: string | null };
   /** Per-turn Policy Center facts used by the dynamic MCP approval predicate. */

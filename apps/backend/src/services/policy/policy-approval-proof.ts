@@ -2,14 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 
 export const POLICY_APPROVAL_REQUEST_METHOD = "policy/toolApproval";
 export const POLICY_APPROVAL_MARKER_KEY = "__cogniplanePolicyApproval";
-// Gateway metadata in tool arguments. The marker has no reader now. It is
-// stripped as a guard against model-supplied or old checkpointed values.
+// Approval metadata in tool arguments. Nothing reads either key as a proof.
+// The runtime sends its proof in the request `_meta`. The runtime and the
+// gateway strip both keys as a guard against model-supplied or old
+// checkpointed values.
 const POLICY_APPROVAL_METADATA_KEYS = [POLICY_APPROVAL_MARKER_KEY, "policyApprovalId"];
-// Transport keys. The runtime and the gateway put these on the ROOT of a call's
-// arguments only: the dispatch hook adds `toolContextId` and `policyApprovalId`,
-// and the gateway stamps `toolContextId`. A model may also send a `toolContextId`
-// of its own. So the hash leaves them out at the root and nowhere else. A nested
-// key with one of these names is data that the user approved, and it is hashed.
+// Transport keys, at the ROOT of a call's arguments only. A model writes a
+// `toolContextId`, because the managed schemas require one, and it can write
+// the approval keys. The gateway stamps `toolContextId` for the handler. So the
+// hash leaves them out at the root and nowhere else. A nested key with one of
+// these names is data that the user approved, and the hash includes it.
 const TRANSPORT_KEYS: readonly string[] = ["toolContextId", ...POLICY_APPROVAL_METADATA_KEYS];
 
 export type PolicyApprovalProof = {

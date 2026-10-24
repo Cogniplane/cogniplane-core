@@ -8,7 +8,7 @@ import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { MessagePostRequestSchema } from "@cogniplane/shared-types";
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+import { GatewayMcpClient } from "../services/deep-agents/gateway-mcp-client.js";
 
 import { testRuntimePolicy } from "../test-helpers/test-runtime-policy.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
@@ -541,7 +541,10 @@ test("a download token is the credential: it works without identity headers, onc
   expect(replay.statusCode).toBe(404);
 });
 
-test("download tokens stop working after the backing session is deleted", async () => {
+// Personal artifacts survive the deletion of their chat (artifactReadAccessSql):
+// the owner can mint a new token for the artifact, so an outstanding token keeps
+// working too. DOWNLOAD_TOKEN_GATING checks no session status for a personal session.
+test("a download token for a personal artifact keeps working after its chat is deleted", async () => {
   const { app, sessions } = await createTestApp();
   onTestFinished(async () => {
         await app.close();
@@ -595,8 +598,8 @@ test("download tokens stop working after the backing session is deleted", async 
     url: tokenUrl
   });
 
-  expect(downloadResponse.statusCode).toBe(404);
-  expect(downloadResponse.json().error).toBe("download_not_found");
+  expect(downloadResponse.statusCode).toBe(200);
+  expect(downloadResponse.body).toBe("artifact body");
 });
 
 test("uploads a PDF as a single visible artifact and keeps conversion on demand", async () => {
@@ -772,14 +775,11 @@ test("managed MCP tools/list advertises output schemas accepted by the current c
     enabledToolIds: [...testRuntimePolicy.enabledToolIds, "write_artifact"]
   } } });
   const baseUrl = await app.listen({ host: "127.0.0.1", port: 0 });
-  const client = new MultiServerMCPClient({
-    mcpServers: {
-      managed: {
-        transport: "http",
-        url: `${baseUrl}/mcp/managed-session-context`,
-        headers: mcpAuthHeaders()
-      }
-    }
+  const client = new GatewayMcpClient({
+    servers: [{ id: "managed", url: `${baseUrl}/mcp/managed-session-context`, authorization: mcpAuthHeaders().authorization }],
+    resolveInvocation: () => undefined,
+    logger: { warn: () => {} },
+    sessionId: "test-session"
   });
 
   try {
@@ -801,8 +801,8 @@ test("managed MCP tools/list advertises output schemas accepted by the current c
     expect(advertisedTool.outputSchema.type).toBe("object");
     expect(advertisedTool.outputSchema.oneOf).toHaveLength(2);
 
-    const loadedTools = await client.getTools("managed");
-    expect(loadedTools.map((tool) => tool.name)).toContain("write_artifact");
+    const [toolset] = await client.loadTools();
+    expect(toolset?.tools.map((tool) => tool.name)).toContain("write_artifact");
   } finally {
     await client.close();
     await app.close();

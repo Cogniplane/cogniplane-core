@@ -2,11 +2,11 @@
 // initChatModel, the shared Postgres checkpointer, the lazy E2B sandbox
 // backend, MCP gateway tools, and interrupt-based HITL approvals.
 //
-// MCP (bead im5e.4): a MultiServerMCPClient speaks streamable HTTP to the
-// platform gateway (/mcp/:serverId) with the session's Bearer rt_* token —
-// header auth only, never `?token=`. The per-turn toolContextId is injected
-// into managed tool inputs at CALL time via a mutable ref, so the client
-// never needs rebuilding between turns.
+// MCP (bead im5e.4): GatewayMcpClient speaks streamable HTTP to the platform
+// gateway (/mcp/:serverId) with the session's Bearer rt_* token, in a header
+// only, never in `?token=`. The client reads the per-turn toolContextId and any
+// approval proof from backend refs at CALL time and sends them in the
+// request's `_meta`, so it never needs rebuilding between turns.
 //
 // Approvals (bead im5e.4): `interruptOn` (langchain humanInTheLoopMiddleware)
 // pauses BEFORE tool execution and checkpoints — no held promise, no
@@ -18,7 +18,6 @@ import { executionAuthorizationMiddleware } from "./execution-authorization-midd
 import type { ServerTool, StructuredTool } from "@langchain/core/tools";
 import { initChatModel, createMiddleware } from "langchain";
 import { CompositeBackend, StateBackend, createDeepAgent } from "deepagents";
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 
 import type { ModelProvider } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
@@ -32,6 +31,7 @@ import {
 } from "../policy/policy-approval-proof.js";
 
 import { E2bDeepAgentsSandbox } from "./deep-agents-e2b-backend.js";
+import { GatewayMcpClient } from "./gateway-mcp-client.js";
 import { PolicyProofLedger } from "./policy-proof-ledger.js";
 import { memoryContextMiddleware, memoryContextSchema } from "./memory-context-middleware.js";
 import { projectInstructionsContextSchema, projectInstructionsMiddleware } from "./project-instructions-middleware.js";
@@ -309,7 +309,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   const mcpToolNames = new Set<string>();
   const mcpToolServers = new Map<string, string>();
   const mcpToolFacts = new Map<string, { readOnly: boolean; category: string; requiresUserApproval?: boolean }>();
-  let mcpClient: MultiServerMCPClient | null = null;
+  let mcpClient: GatewayMcpClient | null = null;
   let mcpToolsPromise: Promise<LangchainToolLike[]> | null = null;
   // Cached compiled agent, keyed by BOTH the model id and the reasoning effort
   // — effort is baked into the chat model at construction, so a change to
@@ -358,7 +358,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
 
   /**
    * Load gateway tools once per session. The Bearer token is session-scoped;
-   * only toolContextId rotates per turn, injected below at call time. A load
+   * only toolContextId rotates per turn, read below at call time. A load
    * failure from an individual server logs a warning and skips that server's
    * tools. Client construction errors still propagate.
    */
@@ -369,73 +369,32 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       mcpToolsPromise = Promise.resolve([]);
       return mcpToolsPromise;
     }
+    // The trusted values of one call, read when the call runs. A proof binds the
+    // exact tool, server, arguments and call ID, and it carries the tool context
+    // that it was made in. Without a proof, the CURRENT turn's context applies.
+    // The managed schemas expose `toolContextId`, so the model writes one into
+    // the arguments. That value stays a plain argument. The gateway takes the
+    // context from `_meta`, never from the model.
+    mcpClient = new GatewayMcpClient({
+      servers,
+      resolveInvocation: ({ name, serverId, args, toolCallId }) => {
+        const proof = policyProofs.forDispatch(toolCallId, { name, serverId, args });
+        const toolContextId = proof?.toolContextId ?? toolContextRef.current;
+        if (!toolContextId) return undefined;
+        return { toolContextId, ...(proof ? { policyApprovalId: proof.approvalId } : {}) };
+      },
+      logger: init.logger,
+      sessionId: init.sessionId
+    });
+    const client = mcpClient;
     mcpToolsPromise = (async () => {
-      // Per-call arg injection via the adapter library's beforeToolCall hook
-      // (NOT a tool re-wrap, which would degrade the tools' schemas): the
-      // CURRENT turn's toolContextId is merged into managed tool args at call
-      // time. ALWAYS
-      // overrides any model-supplied value: the managed tool schemas expose
-      // the field, and models hallucinate ids into it (observed live), which
-      // the gateway then rejects. The backend-held per-turn id is the only
-      // trusted source.
-      const beforeToolCall = (
-        request: { name?: string; args?: unknown; serverName?: string },
-        _state: unknown,
-        config?: object
-      ) => {
-        const toolCallId = (config as { toolCallId?: string } | undefined)?.toolCallId;
-        const proof = policyProofs.forDispatch(toolCallId, {
-          name: request.name ?? "", serverId: request.serverName, args: (request.args ?? {}) as Record<string, unknown>
-        });
-        if (!toolContextRef.current && !proof) return {};
-        return {
-          args: {
-            ...(toolContextRef.current ? { toolContextId: toolContextRef.current } : {}),
-            ...(proof ? { toolContextId: proof.toolContextId } : {}),
-            ...(proof ? { policyApprovalId: proof.approvalId } : {})
-          }
-        };
-      };
-      mcpClient = new MultiServerMCPClient({
-        mcpServers: Object.fromEntries(
-          servers.map((server) => [
-            server.id,
-            {
-              transport: "http" as const,
-              url: server.url,
-              headers: { Authorization: server.authorization }
-            }
-          ])
-        ),
-        // Top-level, NOT per-server: the client's zod config parse strips
-        // unknown per-connection keys, silently dropping a per-server hook.
-        beforeToolCall,
-        // Default is "throw", which would let one unreachable server take
-        // down EVERY gateway tool. Log-and-skip degrades
-        // per server instead.
-        onConnectionError: ({ serverName, error }) => {
-          init.logger.warn(
-            { err: error, serverName, sessionId: init.sessionId },
-            "Deep Agents MCP server connection failed; its tools are skipped"
-          );
-        },
-        throwOnLoadError: false
-      });
       const tools: LangchainToolLike[] = [];
       // Per-server loads so (a) tool→server attribution is recorded (the
       // adapter library does not put the server name anywhere on the tool)
       // and (b) one broken server degrades to a warning, not zero MCP tools.
+      const toolsets = new Map((await client.loadTools()).map(({ serverId, tools }) => [serverId, tools]));
       for (const server of servers) {
-        let serverTools: LangchainToolLike[];
-        try {
-          serverTools = (await mcpClient.getTools(server.id)) as unknown as LangchainToolLike[];
-        } catch (err) {
-          init.logger.warn(
-            { err, serverId: server.id, sessionId: init.sessionId },
-            "Failed to load MCP tools from gateway server for Deep Agents session"
-          );
-          continue;
-        }
+        const serverTools = (toolsets.get(server.id) ?? []) as unknown as LangchainToolLike[];
         for (const tool of serverTools) {
           if (RESERVED_BUILTIN_TOOL_NAMES.has(tool.name)) {
             init.logger.warn(
@@ -579,7 +538,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
 
       // The tools cast bridges our structural LangchainToolLike view back to
       // the library's tool union (the tools really are DynamicStructuredTools
-      // from @langchain/mcp-adapters).
+      // from @langchain/mcp-adapters' loadMcpTools).
       const executionMiddleware = init.requireExecution ? executionAuthorizationMiddleware(init.requireExecution) : null;
       const spendingMiddleware = init.requireSpendingAllowance ? createMiddleware({
         name: "ModelSpendingToolGuard",
@@ -604,15 +563,16 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware],
         // deepagents does not append new custom middleware to its default
         // general-purpose agent (it merges with `appendNew: false`). Supply the
-        // guards explicitly for delegated work. The override still inherits the
-        // root `interruptOn`: deepagents 1.14.2 sets a custom subagent's
-        // `interruptOn` to `defaultInterruptOn` when the spec omits it.
-        ...(guards.length ? { subagents: [{
+        // guards, the project instructions and the memory context explicitly for
+        // delegated work, also when there are no guards. The override still
+        // inherits the root `interruptOn`: deepagents 1.14.2 sets a custom
+        // subagent's `interruptOn` to `defaultInterruptOn` when the spec omits it.
+        subagents: [{
           name: "general-purpose", description: "Delegate a task using the current turn's permissions.",
           systemPrompt: systemPrompt ?? "Complete the delegated task using the available tools.",
           tools: mcpTools as unknown as StructuredTool[], skills: [SKILLS_LIBRARY_PREFIX],
           middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware]
-        }] } : {}),
+        }],
         ...(systemPrompt ? { systemPrompt } : {})
       }) as unknown as DeepAgentsGraph;
 
@@ -760,6 +720,34 @@ type DurableWrites = {
   proofs: PolicyProofLedger;
 };
 
+type PolicyGating = {
+  tenantId: string;
+  policyService: { evaluate: import("../policy/policy-service.js").PolicyService["evaluate"] };
+  contextRef: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["policyContextRef"]>;
+  toolServers: ReadonlyMap<string, string>;
+  toolFacts: ReadonlyMap<string, { readOnly: boolean; category: string }>;
+  proofs: PolicyProofLedger;
+};
+
+type PolicyTurnContext = NonNullable<PolicyGating["contextRef"]["current"]>;
+
+/**
+ * The Policy Center result for one call, from the same facts that the gateway
+ * uses. Null when the tool has no server or no facts: nothing can be evaluated.
+ */
+async function evaluatePolicyCenter(policy: PolicyGating, toolName: string, context: PolicyTurnContext) {
+  const serverId = policy.toolServers.get(toolName);
+  const facts = policy.toolFacts.get(toolName);
+  if (!serverId || !facts) return null;
+  return policy.policyService.evaluate(policy.tenantId, {
+    toolName,
+    category: facts.category,
+    severity: deriveActionSeverity(toolName, facts.readOnly),
+    serverId,
+    turnContext: context.turnContext
+  });
+}
+
 const DURABLE_WRITE_EXPLANATION =
   "This action saves data for later sessions, so it always needs your approval of the exact arguments.";
 
@@ -770,21 +758,32 @@ function siblingCalls(state: unknown, toolCall: PredicateToolCall): PredicateToo
 }
 
 /**
- * The interrupt for a tool that saves durable data. It does not read the tenant
- * approval policy or Policy Center: the user always approves the exact arguments,
- * and the approval is bound to them by the same proof that Policy Center uses.
- * An unattended turn has nobody to ask, so it opens no prompt. The gateway then
- * refuses the call, because it finds no approval.
+ * The interrupt for a tool that saves durable data. The tenant approval policy
+ * and Policy Center never remove it: the user always approves the exact
+ * arguments, and the approval is bound to them by the same proof that Policy
+ * Center uses. An unattended turn has nobody to ask, so it opens no prompt. The
+ * gateway then refuses the call, because it finds no approval.
+ *
+ * An enforced Policy Center block also opens no prompt. The gateway refuses a
+ * blocked call before it reads the approval, so the user would approve an
+ * action that cannot run. The gateway evaluates the policy again, and a call
+ * without an approval is refused, so this check cannot let a save through.
  */
-function durableWriteEntry(durable: DurableWrites): InterruptEntry {
+function durableWriteEntry(durable: DurableWrites, policy: PolicyGating | undefined): InterruptEntry {
   return {
     allowedDecisions: ["approve", "reject"],
     when: async ({ toolCall, state }) => {
       // A model cannot bring a proof of its own.
       stripPolicyApprovalMetadata(toolCall.args);
+      // Fix proof ownership before the policy evaluation below awaits.
       const run = durable.proofs.begin({ ...toolCall, serverId: durable.toolServers.get(toolCall.name) });
       const context = durable.contextRef.current;
       if (context?.turnContext !== "interactive") {
+        run.release();
+        return false;
+      }
+      const evaluation = policy ? await evaluatePolicyCenter(policy, toolCall.name, context) : null;
+      if (evaluation && context.enforcementMode === "enforce" && evaluation.gating && evaluation.outcome === "block") {
         run.release();
         return false;
       }
@@ -801,14 +800,7 @@ function durableWriteEntry(durable: DurableWrites): InterruptEntry {
 export function buildInterruptOn(input: {
   approvals?: { gate: boolean; autoApproveReadOnly: boolean; readOnlyToolNames: string[] };
   mcpToolNames: string[];
-  policy?: {
-    tenantId: string;
-    policyService: { evaluate: import("../policy/policy-service.js").PolicyService["evaluate"] };
-    contextRef: NonNullable<Parameters<DeepAgentsRuntimeFactory>[0]["policyContextRef"]>;
-    toolServers: ReadonlyMap<string, string>;
-    toolFacts: ReadonlyMap<string, { readOnly: boolean; category: string }>;
-    proofs: PolicyProofLedger;
-  };
+  policy?: PolicyGating;
   durableWrites?: DurableWrites;
 }): Record<string, InterruptEntry> | undefined {
   const { approvals, mcpToolNames, policy, durableWrites } = input;
@@ -828,7 +820,7 @@ export function buildInterruptOn(input: {
   for (const name of mcpToolNames) {
     if (durableWrites && durableTools.has(name)) {
       // Not even approvalPolicy "never" removes this prompt.
-      entries.push([name, durableWriteEntry(durableWrites)]);
+      entries.push([name, durableWriteEntry(durableWrites, policy)]);
       continue;
     }
     const nativeApproval = Boolean(approvals?.gate && !readOnly.has(name));
@@ -859,17 +851,9 @@ export function buildInterruptOn(input: {
           // A scheduled turn has nobody available to resolve a Policy Center
           // prompt. Let the gateway reject the action with its policy error.
           if (context?.turnContext === "scheduled") return nativeFallback();
-          const serverId = policy.toolServers.get(toolCall.name);
-          const facts = policy.toolFacts.get(toolCall.name);
-          if (!context || !serverId || !facts) return nativeFallback();
-          const severity = deriveActionSeverity(toolCall.name, facts.readOnly);
-          const evaluation = await policy.policyService.evaluate(policy.tenantId, {
-            toolName: toolCall.name,
-            category: facts.category,
-            severity,
-            serverId,
-            turnContext: context.turnContext
-          });
+          if (!context) return nativeFallback();
+          const evaluation = await evaluatePolicyCenter(policy, toolCall.name, context);
+          if (!evaluation) return nativeFallback();
           const requiresPolicyApproval =
             context.enforcementMode === "enforce" &&
             evaluation.gating &&

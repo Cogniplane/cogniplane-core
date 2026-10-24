@@ -145,7 +145,7 @@ Recursively sanitizes payloads before audit, message, or skill-corpus persistenc
 
 ### 5.4 Boot-time secret validation (Zod)
 - `config.ts` fails fast on missing required secrets.
-- **Requirements:** `E2B_API_KEY` + a real `E2B_TEMPLATE_ID` (unconditional — the runtime executes shell/file tools inside E2B; the migration runner is exempt), `PII_LLM_API_KEY` when `PII_PROVIDER_ENABLED=true`, GitHub app credentials when the GitHub integration is configured. At least one model-provider key (Anthropic / OpenAI / Google / OpenRouter / Z.AI — per-tenant or the matching platform env var) is validated at session start.
+- **Requirements:** `E2B_API_KEY` + a real `E2B_TEMPLATE_ID` (unconditional — the runtime executes shell/file tools inside E2B; the migration runner is exempt), `PII_LLM_API_KEY` when `PII_PROVIDER_ENABLED=true`, all three `GITHUB_OAUTH_*` values when any one is set (the GitHub integration is a GitHub OAuth App). At least one model-provider key (Anthropic / OpenAI / Google / OpenRouter / Z.AI — per-tenant or the matching platform env var) is validated at session start.
 
 ### 5.5 URL sanitization for logging
 - `sanitizeUrl()` strips `token`, `toolContextId`, etc. from any URL logged at warn/error.
@@ -255,9 +255,12 @@ File: `apps/backend/src/routes/mcp.ts`.
 - File: `apps/backend/src/lib/auth-runtime-token.ts`.
 
 ### 9.3 `toolContextId` resolution chain
-1. Explicit `toolContextId` in request params.
-2. `toolContextId` in the URL.
-3. Session fallback via `findLatestActiveBySession()` keyed on the runtime token's `sid` claim.
+1. `toolContextId` in the request's trusted `params._meta["cogniplane.ai/invocation"]` entry — the primary path. The runtime attaches it at call time, outside the tool arguments. When this entry is present, the gateway ignores a `toolContextId` in the arguments, because the model wrote that value.
+2. `toolContextId` in the RPC args (older callers).
+3. `toolContextId` in the URL.
+4. Session fallback via `findLatestActiveBySession()` keyed on the runtime token's `sid` claim.
+
+Every path binds the resolved context to the tenant, session, user and runtime of the runtime token. The gateway reads an approval proof only from the trusted `_meta` entry.
 
 ### 9.4 Proxy signature (v2)
 - Each request to a proxy upstream carries HMAC-SHA256 signed headers: `X-Framework-Signature-Version` (`v2`), `X-Framework-Tenant-Id`, `X-Framework-Server-Id`, `X-Framework-User-Id`, `X-Framework-Session-Id`, `X-Framework-Runtime-Id`, `X-Framework-Timestamp`, `X-Framework-Nonce` (128 random bits, base64url), `X-Framework-Body-Sha256` (base64url SHA-256 of the exact body bytes sent) and `X-Framework-Signature`.

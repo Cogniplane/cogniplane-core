@@ -37,6 +37,9 @@ const thresholds =
 // Discovery matches the existing `tsx --test "src/**/*.test.ts"` glob.
 export default defineConfig({
   test: {
+    execArgv: process.env.VITEST_DISABLE_CONCURRENT_RECOMPILATION === "1"
+      ? ["--no-concurrent-recompilation", "--no-maglev"]
+      : [],
     name: "backend",
     environment: "node",
     globals: false,

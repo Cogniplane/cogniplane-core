@@ -1,15 +1,3 @@
 packages:
   - apps/*
   - packages/*
-
-auditConfig:
-  ignoreGhsas:
-    # braces <=3.0.3 stack exhaustion: no fixed release exists. Reached only
-    # through @next/eslint-plugin-next > fast-glob > micromatch at lint time,
-    # on repository-controlled glob patterns. Remove when braces ships a fix.
-    - GHSA-vfj7-8cjw-p6xm
-    # katex <0.18.2 low: needs existing prototype pollution to bypass `trust`.
-    # The fix is outside the ^0.16 range of @copilotkit/react-core, streamdown
-    # and rehype-katex, and 0.18 renames KaTeX's CSS classes, which could break
-    # chat math rendering. Remove when CopilotKit depends on katex >=0.18.2.
-    - GHSA-238p-pmpm-9mq7

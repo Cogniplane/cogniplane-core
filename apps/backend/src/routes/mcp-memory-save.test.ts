@@ -31,6 +31,7 @@ import {
 } from "../services/policy/policy-approval-proof.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
+import { MCP_INVOCATION_META_KEY } from "../services/mcp/invocation-metadata.js";
 import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import type { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 
@@ -116,11 +117,14 @@ async function setup(options: { policyService?: NonNullable<Parameters<typeof cr
       metadata: { runtimePolicy: policySnapshot(input.runtimePolicy),
         ...(input.turnContext === null ? {} : { turnContext: input.turnContext ?? "interactive" }) }
     });
-    const call = (name: string, args: Record<string, unknown>) => app.inject({
+    // The runtime sends an approval in the request `_meta`, with the tool context it was made in.
+    const call = (name: string, args: Record<string, unknown>, policyApprovalId?: string) => app.inject({
       method: "POST", url: "/mcp/managed-session-context",
       headers: { authorization: `Bearer ${runtimeToken({ sid: input.sessionId, uid: userId, rid: runtimeId })}` },
       payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
-        params: { name, arguments: { toolContextId: context.toolContextId, ...args } } }
+        params: { name, arguments: { toolContextId: context.toolContextId, ...args },
+          ...(policyApprovalId ? { _meta: { [MCP_INVOCATION_META_KEY]: {
+            toolContextId: context.toolContextId, policyApprovalId } } } : {}) } }
     });
     return { context, userId, call };
   }
@@ -174,11 +178,28 @@ test("without an approval nothing is saved, whatever the tenant approval policy 
   expect(injected).toMatch(/must approve/);
   expect(injected).toMatch(/Nothing was saved/);
 
-  // An approval id that the model made up is not an approval.
-  expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: "polapr_made_up" })))
+  // An approval id that no approval row has is not an approval.
+  expect(refusal(await call("memory_save", { ...TEXT }, "polapr_made_up")))
     .toMatch(/No approval for this exact call was recorded/);
   expect(memories.rows.size).toBe(0);
   expect(memories.saves).toEqual([]);
+});
+
+test("an approval id in the tool arguments is not checked and does not use the approval up", async () => {
+  const { memories, session, approve, approvals } = await setup();
+  const { context, call } = await session({ sessionId: "session-a" });
+  const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT });
+
+  // The model writes the arguments. Even the id of a real approval of this exact text is only data there.
+  expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId })))
+    .toMatch(/No approval for this exact call was recorded/);
+  expect(approvals.get).not.toHaveBeenCalled();
+  expect(approvals.consumed.size).toBe(0);
+  expect(memories.rows.size).toBe(0);
+
+  // The same id in the request `_meta` is the runtime's proof.
+  expect((await call("memory_save", TEXT, proof.approvalId)).json().result.structuredContent.saved).toBeDefined();
+  expect(approvals.consumed.has(proof.approvalId)).toBe(true);
 });
 
 test("an approved save is stored with server-side provenance and recalled in another session", async () => {
@@ -187,7 +208,7 @@ test("an approved save is stored with server-side provenance and recalled in ano
   const args = { ...TEXT, metadata: { source: "chat" } };
   const proof = approve({ toolContextId: first.context.toolContextId, sessionId: "session-a", args });
 
-  const saved = await first.call("memory_save", { ...args, policyApprovalId: proof.approvalId });
+  const saved = await first.call("memory_save", { ...args }, proof.approvalId);
   expect(saved.json().error).toBeUndefined();
   expect(saved.json().result.structuredContent.error).toBeUndefined();
   expect(saved.json().result.structuredContent.saved).toMatchObject({ name: "units", content: TEXT.content });
@@ -214,7 +235,7 @@ test("metadata from the model never becomes the provenance", async () => {
     approvalId: "polapr_forged", approvedByUserId: "other-user", approved: true } };
   const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args });
 
-  await call("memory_save", { ...args, policyApprovalId: proof.approvalId });
+  await call("memory_save", { ...args }, proof.approvalId);
 
   const [row] = memories.forUser("test-tenant", "test-user");
   expect(row).toMatchObject({ provenance: "agent_approved", sourceSessionId: "session-a",
@@ -228,11 +249,11 @@ test("one approval saves one text: a replay is refused", async () => {
   const { context, call } = await session({ sessionId: "session-a" });
   const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT });
 
-  expect((await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId })).json().result.structuredContent.saved)
+  expect((await call("memory_save", { ...TEXT }, proof.approvalId)).json().result.structuredContent.saved)
     .toBeDefined();
   memories.rows.clear();
 
-  expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId }))).toMatch(/already used/);
+  expect(refusal(await call("memory_save", { ...TEXT }, proof.approvalId))).toMatch(/already used/);
   expect(memories.rows.size).toBe(0);
 });
 
@@ -246,13 +267,13 @@ test("an approval of one text cannot save another, and it stays usable for the a
     { ...TEXT, name: "other-name" },
     { ...TEXT, metadata: { added: "after approval" } }
   ]) {
-    expect(refusal(await call("memory_save", { ...changed, policyApprovalId: proof.approvalId })))
+    expect(refusal(await call("memory_save", { ...changed }, proof.approvalId)))
       .toMatch(/No approval for this exact call was recorded/);
   }
   expect(memories.rows.size).toBe(0);
   // The mismatched calls did not use the approval up.
   expect(approvals.consumed.has(proof.approvalId)).toBe(false);
-  expect((await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId })).json().result.structuredContent.saved)
+  expect((await call("memory_save", { ...TEXT }, proof.approvalId)).json().result.structuredContent.saved)
     .toBeDefined();
   expect(memories.rows.size).toBe(1);
 });
@@ -272,14 +293,14 @@ test.each(["toolContextId", "policyApprovalId", "__cogniplanePolicyApproval"])(
       { note: "approved", nested: { [key]: "approved value" }, list: [{}] },
       { note: "approved", nested: { [key]: "approved value" }, list: [{ [key]: "one" }], extra: { [key]: "added" } }
     ]) {
-      expect(refusal(await call("memory_save", { ...TEXT, metadata, policyApprovalId: proof.approvalId })))
+      expect(refusal(await call("memory_save", { ...TEXT, metadata }, proof.approvalId)))
         .toMatch(/No approval for this exact call was recorded/);
     }
     expect(memories.rows.size).toBe(0);
     expect(approvals.consumed.has(proof.approvalId)).toBe(false);
 
     // The metadata as approved is saved whole, nested keys included.
-    const saved = await call("memory_save", { ...approved, policyApprovalId: proof.approvalId });
+    const saved = await call("memory_save", { ...approved }, proof.approvalId);
     expect(saved.json().result.structuredContent.saved).toBeDefined();
     expect(memories.forUser("test-tenant", "test-user")[0]!.metadata).toEqual(approved.metadata);
   }
@@ -296,7 +317,7 @@ test("another user's approval, another turn's approval and an unanswered approva
   const declined = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT, status: "rejected" });
 
   for (const proof of [foreignUser, earlierTurn, unanswered, declined]) {
-    expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId }))).toMatch(/Nothing was saved/);
+    expect(refusal(await call("memory_save", { ...TEXT }, proof.approvalId))).toMatch(/Nothing was saved/);
   }
   expect(memories.rows.size).toBe(0);
 });
@@ -306,7 +327,7 @@ test("a scheduled run never saves, even with an approval row, and the approval s
   const { context, call } = await session({ sessionId: "session-job", turnContext: "scheduled" });
   const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-job", args: TEXT });
 
-  const message = refusal(await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId }));
+  const message = refusal(await call("memory_save", { ...TEXT }, proof.approvalId));
 
   expect(message).toMatch(/scheduled run has nobody to ask/);
   expect(message).toMatch(/Nothing was saved/);
@@ -333,14 +354,14 @@ test("an overwrite replaces only the text that the user was shown", async () => 
   // The memory was edited after the approval card was shown.
   memories.seed("test-tenant", "test-user", "units", "User prefers feet and inches, and Celsius.");
   const stale = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT, bound });
-  expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: stale.approvalId })))
+  expect(refusal(await call("memory_save", { ...TEXT }, stale.approvalId)))
     .toMatch(/changed after the user approved the text/);
   expect(memories.forUser("test-tenant", "test-user")[0]!.content).toBe("User prefers feet and inches, and Celsius.");
 
   // The text that was approved as replaced is still there: the overwrite goes through.
   memories.seed("test-tenant", "test-user", "units", "User prefers imperial units.");
   const fresh = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT, bound });
-  expect((await call("memory_save", { ...TEXT, policyApprovalId: fresh.approvalId })).json().result.structuredContent.saved)
+  expect((await call("memory_save", { ...TEXT }, fresh.approvalId)).json().result.structuredContent.saved)
     .toBeDefined();
   expect(memories.forUser("test-tenant", "test-user")[0]).toMatchObject({ content: TEXT.content, version: 2 });
 });
@@ -350,7 +371,7 @@ test("an approval that does not record the replaced text saves nothing", async (
   const { context, call } = await session({ sessionId: "session-a" });
   const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT, bound: {} });
 
-  expect(refusal(await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId })))
+  expect(refusal(await call("memory_save", { ...TEXT }, proof.approvalId)))
     .toMatch(/does not record the text it replaces/);
   expect(memories.rows.size).toBe(0);
 });
@@ -373,7 +394,7 @@ test("a Policy Center approval rule on the tool is satisfied by the same single 
   expect(memories.rows.size).toBe(0);
 
   const proof = approve({ toolContextId: context.toolContextId, sessionId: "session-a", args: TEXT });
-  const saved = await call("memory_save", { ...TEXT, policyApprovalId: proof.approvalId });
+  const saved = await call("memory_save", { ...TEXT }, proof.approvalId);
   expect(saved.json().error).toBeUndefined();
   expect(saved.json().result.structuredContent.saved).toBeDefined();
   expect(memories.rows.size).toBe(1);

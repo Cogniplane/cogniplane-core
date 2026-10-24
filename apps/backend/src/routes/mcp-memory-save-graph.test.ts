@@ -2,8 +2,9 @@
 // MCP gateway, with only the model and the stores faked. The unit tests check each
 // side of the approval proof on its own. This file checks that the proof that the
 // graph makes is the proof that the gateway accepts: the argument hash, the
-// injected approval id, the single use and the stored provenance all have to agree
-// after the arguments have gone through the model, the checkpoint and the wire.
+// approval id in the request `_meta`, the single use and the stored provenance all
+// have to agree after the arguments have gone through the model, the checkpoint and
+// the wire.
 
 import { afterEach, expect, it, vi } from "vitest";
 import { MemorySaver } from "@langchain/langgraph";
@@ -77,7 +78,8 @@ afterEach(async () => {
 });
 
 // What the model asked to save. The tool schema requires `toolContextId`, so a model
-// always sends one. The backend replaces it at dispatch. The metadata has nested keys
+// always sends one. The gateway ignores it, because the backend sends the turn's
+// context in the request `_meta`. The metadata has nested keys
 // in a non-sorted order, a number and non-ASCII text, which is what changes shape on
 // the way through JSON.
 const ARGS = {

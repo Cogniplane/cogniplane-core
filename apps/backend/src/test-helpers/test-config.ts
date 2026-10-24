@@ -10,7 +10,7 @@ const baseTestConfig: AppConfig = {
   ADMIN_USER_IDS: ["test-user"],
   LOG_LEVEL: "info",
   PIPEDREAM_PROJECT_ENVIRONMENT: "development",
-  TRUST_PROXY: "1",
+  TRUST_PROXY: "false",
   SESSION_TITLER_CLAUDE_MODEL: "claude-haiku-5-5",
   SESSION_TITLER_TIMEOUT_MS: 2000,
   RUNTIME_GATEWAY_BASE_URL: "http://localhost:3001",

@@ -223,6 +223,7 @@ describe("streamEventsToAGUI", () => {
       // The installed adapter converts a real tools/call result. Inline
       // resources go to the ToolMessage artifact and the content stays empty.
       const client = {
+        getProtocolEra: () => "legacy",
         listTools: async () => ({ tools: [{ name: "legacy_widget", inputSchema: { type: "object", properties: {} } }] }),
         callTool: async () => ({ content: resourceBlocks })
       };

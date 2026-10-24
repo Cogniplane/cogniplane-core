@@ -19,6 +19,9 @@ import { defineConfig } from "vitest/config";
 // with no Postgres would try to CREATE DATABASE and fail the workspace run.
 export default defineConfig({
   test: {
+    execArgv: process.env.VITEST_DISABLE_CONCURRENT_RECOMPILATION === "1"
+      ? ["--no-concurrent-recompilation", "--no-maglev"]
+      : [],
     name: "backend-integration",
     environment: "node",
     globals: false,

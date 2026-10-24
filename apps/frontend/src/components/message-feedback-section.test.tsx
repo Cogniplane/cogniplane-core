@@ -63,6 +63,22 @@ it("sorts model rates in both directions with unrated models last", async () => 
   expect(within(table).getByText("—")).toBeTruthy();
 });
 
+it("sorts model names ignoring case and comparing digit runs as numbers", async () => {
+  const byModel = ["alpha", "Beta", "model 10", "model 2"].map(modelName => ({ modelName, ...summary }));
+  api.fetch.mockResolvedValue({ ...stats, byModel });
+  mount();
+  await screen.findByText("4 rated responses");
+  fireEvent.click(screen.getByRole("button", { name: "By model" }));
+  const table = await screen.findByRole("table");
+  const label = within(table).getByRole("button", { name: "Model" });
+  const names = () => within(table).getAllByRole("row").slice(1)
+    .map(row => within(row).getAllByRole("cell")[0].textContent);
+  fireEvent.click(label);
+  expect(names()).toEqual(["alpha", "Beta", "model 2", "model 10"]);
+  fireEvent.click(label);
+  expect(names()).toEqual(["model 10", "model 2", "Beta", "alpha"]);
+});
+
 it("shows a request failure and can recover by selecting another period", async () => {
   api.fetch.mockRejectedValueOnce(new Error("Reporting unavailable"));
   mount();

@@ -38,7 +38,7 @@ describe("PolicyProofLedger", () => {
     expect(ledger.begin(nested).interrupt([nested], evaluated)).toBe(true);
     const proof = ledger.forAction({ ...nested, description: ledger.description(nested.id) })!;
 
-    // The dispatch hook sees the root keys that it adds itself. The nested ones are the call's own.
+    // Root transport keys, such as the model's own `toolContextId`, do not change the match. The nested ones are the call's own.
     const dispatched = { ...nested.args, toolContextId: "backend context", policyApprovalId: proof.approvalId };
     expect(ledger.forDispatch(nested.id, { ...nested, args: dispatched })).toBe(proof);
     for (const metadata of [
@@ -102,7 +102,7 @@ describe("PolicyProofLedger", () => {
     expect(ledger.begin(call).interrupt([call], evaluated)).toBe(true);
   });
 
-  it("injects a proof at dispatch only for the same tool, server and arguments", () => {
+  it("gives a proof at dispatch only for the same tool, server and arguments", () => {
     const { ledger, proof } = interrupted();
     expect(ledger.forDispatch("call-1", call)).toBe(proof);
     expect(ledger.forDispatch("call-1", { ...call, args: { name: "other.md" } })).toBeUndefined();
