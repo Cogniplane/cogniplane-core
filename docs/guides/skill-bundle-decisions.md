@@ -30,11 +30,14 @@ Store bundle-backed skill changes as immutable entries in `admin_skill_revisions
 
 ## ADR-002 (partially superseded): Treat full bundle directories as the unit of runtime installation
 
-> **Status note (2026-07):** bundle storage and revisions still work this way,
-> but the deep-agents runtime currently inlines only the SKILL.md instructions
-> text into the agent system prompt — companion files (`references/`,
-> `assets/`, `scripts/`) are not yet staged into the sandbox. Re-materializing
-> full bundles for the lazy sandbox is a tracked follow-up.
+> **Status note (2026-10):** bundle storage and revisions still work this way.
+> The deep-agents runtime does not inline skills into the system prompt. It
+> serves each enabled skill, `SKILL.md` and its companion files (`references/`,
+> `assets/`, `scripts/`), as read-only files under `/skills/<slug>/`
+> (`services/deep-agents/deep-agents-skills-library.ts`). This library is a
+> backend route of the agent file tools, not a copy in the E2B sandbox: the
+> file tools can read it, but `execute` shell commands cannot. See
+> [architecture](../ARCHITECTURE.md#system-prompt--skill-pipeline).
 
 ### Context
 

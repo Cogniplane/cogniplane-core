@@ -158,7 +158,7 @@ The backend runtime image contains only production dependencies and is about
 114 MB with the current lockfile.
 
 **`pnpm install` fails inside the build with `EBADENGINE`.** The Dockerfiles pin
-Node 24.11.1. Update that immutable base reference together with the workspace's
+Node 24.22.1. Update that immutable base reference together with the workspace's
 Node requirement, then rebuild.
 
 ## What's next

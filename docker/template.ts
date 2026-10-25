@@ -22,7 +22,7 @@ const INSTALL_APT_BASE =
 // Excel; matplotlib for chart generation.
 const INSTALL_PYTHON_PACKAGES =
   'pip3 install --no-cache-dir --break-system-packages ' +
-  'pandas==2.2.3 openpyxl==3.1.5 matplotlib==3.9.2 jinja2==3.1.4';
+  'pandas==2.2.3 openpyxl==3.1.5 matplotlib==3.9.2 jinja2==3.1.6';
 
 // Session workspaces are rooted at /home/user/workspace/<sessionId>/ — the
 // backend uploads files there at turn start.

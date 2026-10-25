@@ -5,10 +5,13 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   type ColumnDef,
   type SortingState,
+  createSortedRowModel,
   flexRender,
-  getCoreRowModel,
-  getSortedRowModel,
-  useReactTable
+  rowSortingFeature,
+  sortFn_alphanumeric,
+  sortFn_text,
+  tableFeatures,
+  useTable
 } from "@tanstack/react-table";
 import { ChevronDown, ChevronUp, ChevronsUpDown } from "lucide-react";
 
@@ -122,10 +125,19 @@ type FeedbackRow = {
   rate: number | null;
 };
 
+// The label column uses the default "auto" sort. In v9 "auto" picks only registered
+// functions: alphanumeric for dates and names with digits, text for other strings.
+// Number columns use the built-in basic comparator, which needs no registration.
+const feedbackTableFeatures = tableFeatures({
+  rowSortingFeature,
+  sortedRowModel: createSortedRowModel(),
+  sortFns: { alphanumeric: sortFn_alphanumeric, text: sortFn_text }
+});
+
 function FeedbackTable(props: { rows: FeedbackRow[]; firstColLabel: string }) {
   const [sorting, setSorting] = useState<SortingState>([]);
 
-  const columns = useMemo<ColumnDef<FeedbackRow>[]>(
+  const columns = useMemo<ColumnDef<typeof feedbackTableFeatures, FeedbackRow>[]>(
     () => [
       {
         accessorKey: "label",
@@ -158,18 +170,13 @@ function FeedbackTable(props: { rows: FeedbackRow[]; firstColLabel: string }) {
     [props.firstColLabel]
   );
 
-  // TanStack Table returns functions React Compiler can't memoize, so it skips
-  // compiling this component. That's expected and harmless here — the table is
-  // small and re-renders are cheap. Silence the known-incompatibility warning.
-  // eslint-disable-next-line react-hooks/incompatible-library
-  const table = useReactTable({
+  const table = useTable({
+    features: feedbackTableFeatures,
     data: props.rows,
     columns,
     state: { sorting },
     onSortingChange: setSorting,
-    getRowId: (row) => row.key,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel()
+    getRowId: (row) => row.key
   });
 
   return (
@@ -204,7 +211,7 @@ function FeedbackTable(props: { rows: FeedbackRow[]; firstColLabel: string }) {
       <tbody>
         {table.getRowModel().rows.map((row) => (
           <tr key={row.id} className="border-t border-outline-variant">
-            {row.getVisibleCells().map((cell) => (
+            {row.getAllCells().map((cell) => (
               <td key={cell.id} className="pr-3 py-1.5">
                 {flexRender(cell.column.columnDef.cell, cell.getContext())}
               </td>

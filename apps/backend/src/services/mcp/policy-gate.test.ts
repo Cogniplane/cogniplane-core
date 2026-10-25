@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createPolicyApprovalProof, POLICY_APPROVAL_REQUEST_METHOD } from "../policy/policy-approval-proof.js";
 import { approvalDispositionForToolCall, enforcePolicyCenter, type PolicyGate } from "./policy-gate.js";
@@ -115,18 +115,19 @@ describe("enforcePolicyCenter outcome", () => {
           return { outcome: "allow", matchedRuleId: null, matchedRuleName: null, gating: false, explanation: null };
         }
       },
-      approvals: { get: async () => input.approval, consume },
+      approvals: { get: vi.fn(async () => input.approval), consume },
       logger: { warn() {} }
     };
     return gate;
   }
   const policySnapshot = { policyEnforcementMode: "monitor" };
 
-  function run(input: ReturnType<typeof approvedCall>, gate: PolicyGate) {
+  // The approval id comes from the request's trusted `_meta`, which the gateway passes apart from the arguments.
+  function run(input: ReturnType<typeof approvedCall>, gate: PolicyGate, approvalId: string | null = input.approval.approvalId) {
     return enforcePolicyCenter(
       gate,
       { ...input.context, metadata: { runtimePolicy: { ...policySnapshot, id: "p", version: 1, hash: "h", enabledToolIds: [], enabledMcpServers: [] } } } as never,
-      input.toolName, input.serverId, { readOnly: false }, input.args
+      input.toolName, input.serverId, { readOnly: false }, input.args, approvalId
     );
   }
 
@@ -155,7 +156,17 @@ describe("enforcePolicyCenter outcome", () => {
     const input = approvedCall();
     const { policyApprovalId: _dropped, ...args } = input.args;
 
-    expect(await run({ ...input, args }, gateFor(input))).toEqual({ approvalDisposition: undefined, approval: null });
+    expect(await run({ ...input, args }, gateFor(input), null)).toEqual({ approvalDisposition: undefined, approval: null });
+  });
+
+  it("does not read an approval id from the arguments, which the model writes", async () => {
+    const input = approvedCall();
+    const gate = gateFor(input);
+
+    // `input.args.policyApprovalId` names the real approval of this exact call.
+    expect(await run(input, gate, null)).toEqual({ approvalDisposition: undefined, approval: null });
+    expect(gate.approvals.get).not.toHaveBeenCalled();
+    expect((await run(input, gate)).approvalDisposition).toBe("approve");
   });
 
   it("does not hand over a declined approval", async () => {

@@ -1,0 +1,50 @@
+diff --git a/dist/react-renderer/catalog-utils.cjs b/dist/react-renderer/catalog-utils.cjs
+--- a/dist/react-renderer/catalog-utils.cjs
++++ b/dist/react-renderer/catalog-utils.cjs
+@@ -4 +4,17 @@
+-let zod_to_json_schema = require("zod-to-json-schema");
++const { z } = require('zod');
++function zodToJsonSchema(schema, options) {
++    const result = z.toJSONSchema(schema, {
++        target: 'draft-7',
++        io: 'input',
++        override: ({ zodSchema, jsonSchema }) => {
++            if (zodSchema.type === 'object' && !zodSchema.def.catchall) {
++                jsonSchema.additionalProperties = false;
++            }
++        },
++    });
++    if (options?.target === 'jsonSchema2019-09') {
++        result.$schema = 'https://json-schema.org/draft/2019-09/schema#';
++    }
++    return result;
++}
++
+@@ -54 +70 @@
+-		const jsonSchema = (0, zod_to_json_schema.zodToJsonSchema)(comp.schema);
++		const jsonSchema = zodToJsonSchema(comp.schema);
+@@ -78 +94 @@
+-		const zodSchema = (0, zod_to_json_schema.zodToJsonSchema)(comp.schema, { target: "jsonSchema2019-09" });
++		const zodSchema = zodToJsonSchema(comp.schema, { target: "jsonSchema2019-09" });
+diff --git a/dist/react-renderer/catalog-utils.mjs b/dist/react-renderer/catalog-utils.mjs
+--- a/dist/react-renderer/catalog-utils.mjs
++++ b/dist/react-renderer/catalog-utils.mjs
+@@ -3 +3,17 @@
+-import { zodToJsonSchema } from "zod-to-json-schema";
++import { z } from 'zod';
++function zodToJsonSchema(schema, options) {
++    const result = z.toJSONSchema(schema, {
++        target: 'draft-7',
++        io: 'input',
++        override: ({ zodSchema, jsonSchema }) => {
++            if (zodSchema.type === 'object' && !zodSchema.def.catchall) {
++                jsonSchema.additionalProperties = false;
++            }
++        },
++    });
++    if (options?.target === 'jsonSchema2019-09') {
++        result.$schema = 'https://json-schema.org/draft/2019-09/schema#';
++    }
++    return result;
++}
++

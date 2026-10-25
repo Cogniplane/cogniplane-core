@@ -88,7 +88,7 @@ sequenceDiagram
     DA->>SB: execute() / uploadFiles() / downloadFiles()
 
     Note over DA,MCP: MCP tool → gateway call from the backend
-    DA->>MCP: JSON-RPC 2.0 (Authorization: Bearer rt_..., toolContextId in args)
+    DA->>MCP: JSON-RPC 2.0 (Authorization: Bearer rt_..., toolContextId in params._meta)
     MCP->>TB: Resolve trusted context
     TB->>Ext: Inject service auth + forwarded user token
     Ext-->>TB: Result
@@ -116,7 +116,7 @@ Agent construction lives in `deep-agents-graph.ts`:
 - **Model** — multi-provider `initChatModel` via `resolveModelConstruction` (maps a catalog id to `<initPrefix>:<vendorModel>` + base URL per `MODEL_PROVIDER_META`): Anthropic, OpenAI, Google (`google-genai`), OpenRouter and Z.AI (both via the OpenAI client with a custom base URL). The key is resolved per-provider for the selected model (`provider-credentials.ts`): the tenant's stored key first, then the platform env fallback. Reasoning effort is baked in per provider by `applyReasoningEffort`. The in-process loop calls each provider's API directly. Token usage is captured from stream `usage_metadata` and persisted per turn.
 - **State** — the shared Postgres checkpointer (below); `thread_id` is the session id, so multi-turn resume is a checkpointer read, and threads survive process restarts.
 - **Sandbox** — the lazy E2B backend (below) when `allowCommandExecution` is on; otherwise no sandbox, no `execute` tool, and file tools fall back to deepagents' checkpointed StateBackend.
-- **MCP tools** — a `MultiServerMCPClient` (`@langchain/mcp-adapters`) speaking streamable HTTP from the backend to the platform's own `/mcp/:serverId` gateway, authenticated with a session-scoped `Authorization: Bearer rt_...` header (URLs never carry `?token=`; the gateway rejects query-param tokens). The per-turn `toolContextId` is injected into managed tool args at call time via the client's top-level `beforeToolCall` hook, always overriding any model-supplied value. Tools load per-server with degradation (one broken server skips its tools, not all), and names colliding with deepagents built-ins (`RESERVED_BUILTIN_TOOL_NAMES`) or duplicated across servers are dropped with a warning.
+- **MCP tools** — a `GatewayMcpClient` (one `@langchain/mcp-adapters` `MCPAdapter` per server) speaking streamable HTTP from the backend to the platform's own `/mcp/:serverId` gateway, authenticated with a session-scoped `Authorization: Bearer rt_...` header (URLs never carry `?token=`; the gateway rejects query-param tokens). The per-turn `toolContextId` and any approval proof travel at call time in the request's trusted `params._meta["cogniplane.ai/invocation"]` entry, outside the tool arguments, so the gateway ignores a model-supplied value. Tools load per-server, in parallel, with degradation (one broken server skips its tools, not all), and names colliding with deepagents built-ins (`RESERVED_BUILTIN_TOOL_NAMES`) or duplicated across servers are dropped with a warning.
 - **Approvals** — an `interruptOn` map (LangGraph human-in-the-loop middleware) built from the tenant's approval settings; see Approval Flow.
 
 ### Durable state (checkpointer)
@@ -208,7 +208,7 @@ Each `admin_skill_revisions` row stores the canonical `bundle_storage_uri` (`fil
 
 ## MCP Gateway & Tool Security
 
-`/mcp/:serverId` (`routes/mcp.ts`) receives JSON-RPC 2.0 from the runtime's `MultiServerMCPClient`. Two modes per server:
+`/mcp/:serverId` (`routes/mcp.ts`) receives JSON-RPC 2.0 from the runtime's MCP client (`GatewayMcpClient`, one `MCPAdapter` per server). Two modes per server:
 
 - **managed** — the call dispatches to the `ManagedToolFactoryRegistry` (`services/managed-tools/factory.ts`, `createDefinitions`). The `ManagedToolCatalog` (`services/managed-tools/catalog.ts`, registered in `register-builtin-managed-tools.ts`) aggregates per-domain catalogs: session tools, `write_artifact`, memory tools, the skill-corpus tool, GitHub tools, Notion tools.
 - **proxy** — forwarded to an upstream URL with framework context headers injected.
@@ -257,7 +257,7 @@ Frontend --[JWT]--> Backend --+-- Deep Agents loop (in-process; toolContextId on
 
 Rules:
 1. Never give user JWTs or bearer tokens to the model. The agent loop receives only `toolContextId` and compiled policy.
-2. Never trust model-supplied identity fields. The model cannot author `user_id`, `session_id`, or `auth_token` in tool arguments — `beforeToolCall` overwrites `toolContextId` on every managed call.
+2. Never trust model-supplied identity fields. The model cannot author `user_id`, `session_id`, or `auth_token` in tool arguments. The runtime sends `toolContextId` in the trusted `params._meta` entry on every call, and the gateway then ignores a `toolContextId` in the arguments.
 3. Validate provenance server-side on every tool call. Verify session ownership before routing.
 4. Authorization stays at the service boundary. Managed tools enforce downstream access via the tool broker; enterprise MCP servers enforce their own.
 5. Sandbox workspaces are isolated per session. File tools remap "/"-rooted paths into the session workspace and refuse escapes.
@@ -345,7 +345,7 @@ Admin endpoints live under `routes/admin/admin-*.ts`. Authorization uses `requir
 
 ### Integrations registry
 
-`tenant_integrations` + `IntegrationRegistry` track which third-party integrations a tenant has enabled (GitHub App, Notion). `routes/admin/admin-integrations-routes.ts` exposes the management CRUD; per-user OAuth tokens land in `user_github_connections`, `user_notion_connections`.
+`tenant_integrations` + `IntegrationRegistry` track which third-party integrations a tenant has enabled (GitHub OAuth App, Notion). `routes/admin/admin-integrations-routes.ts` exposes the management CRUD; per-user OAuth tokens land in `user_github_connections`, `user_notion_connections`.
 
 ### Skill marketplace
 

@@ -138,6 +138,9 @@ export async function enforcePolicyCenter(
   serverId: string,
   facts: PolicyToolFacts,
   args: Record<string, unknown>,
+  // From the request's trusted `_meta`, never from `args`. The model writes the
+  // arguments, so an approval ID there is not a proof. The gate does not check it.
+  approvalId: string | null,
   // Policy Center `category` the rule engine matches on. For managed tools this
   // is the tool's bound domain (github/notion/session), NOT the URL serverId —
   // so a `categories` rule can't be dodged by calling the tool through another
@@ -153,7 +156,6 @@ export async function enforcePolicyCenter(
   // The tenant-level monitor/enforce switch rides on the runtime-policy snapshot
   // already on the context — no extra DB call.
   const enforcementMode = getRuntimePolicySnapshot(context).policyEnforcementMode;
-  const approvalId = typeof args.policyApprovalId === "string" ? args.policyApprovalId : null;
   const approval = approvalId
     ? await gate.approvals.get(context.tenantId, approvalId, context.userId)
     : null;

@@ -87,12 +87,12 @@ DATA_ENCRYPTION_SECRET=<32+ random bytes>  # AES-256-GCM key for OAuth-token at-
 
 WORKOS_API_KEY=<from WorkOS dashboard>
 WORKOS_CLIENT_ID=<from WorkOS dashboard>
-WORKOS_REDIRECT_URI=https://your-backend-host/auth/callback
+WORKOS_REDIRECT_URI=https://your-frontend-host/auth/callback
 ```
 
 `JWT_SECRET` and `DATA_ENCRYPTION_SECRET` MUST differ from the placeholder values in `.env.example`. The boot-time validator will reject placeholders in production.
 
-The WorkOS redirect URI must match exactly what's registered in your WorkOS dashboard. The backend handles the OAuth code exchange in `POST /auth/callback`.
+The WorkOS redirect URI must match exactly what's registered in your WorkOS dashboard. It points to the **frontend**: WorkOS sends the browser to the frontend page `/auth/callback`, which posts the code and state to the backend `POST /auth/callback` for the exchange. The backend has no `GET /auth/callback`, so a redirect URI on the backend host fails with 404.
 
 ### Redis
 

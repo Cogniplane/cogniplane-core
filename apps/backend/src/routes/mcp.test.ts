@@ -26,14 +26,15 @@ import { deriveActionSeverity } from "../services/mcp/policy-gate.js";
 import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
 import { forwardRpc } from "../lib/mcp-upstream-client.js";
 import { MCP_REQUEST_BODY_LIMIT_BYTES } from "./mcp.js";
+import { MCP_INVOCATION_META_KEY, type McpInvocationMetadata } from "../services/mcp/invocation-metadata.js";
 import { AdminConfigError } from "../services/admin-config-error.js";
 import { INTERACTIVE_UI_RESOURCE_URI } from "../services/managed-tools/interactive-ui.js";
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+import { GatewayMcpClient } from "../services/deep-agents/gateway-mcp-client.js";
 import { EventType } from "@ag-ui/client";
 import { createStreamEventsToAGUIState, streamEventsToAGUI } from "../services/deep-agents/stream-events-to-agui.js";
 import { AguiTurnAccumulator } from "../services/agui-turn-accumulator.js";
 
-test("carries a managed widget through the real MCP adapter into a saved AG-UI tool result", async () => {
+test("carries a managed widget through the runtime's real MCP client into a saved AG-UI tool result", async () => {
   const { app, toolContexts } = await createTestApp();
   const sessionId = "managed-widget-transport";
   const context = await createTestToolContext(toolContexts, { sessionId, metadata: {
@@ -41,12 +42,14 @@ test("carries a managed widget through the real MCP adapter into a saved AG-UI t
     turnContext: "interactive"
   } });
   const url = await app.listen({ host: "127.0.0.1", port: 0 });
-  const client = new MultiServerMCPClient({
-    mcpServers: { widgets: { transport: "http", url: `${url}/mcp/managed-session-context`,
-      headers: { authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "test-user", rid: context.runtimeId })}` } } }
+  const client = new GatewayMcpClient({
+    servers: [{ id: "widgets", url: `${url}/mcp/managed-session-context`,
+      authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "test-user", rid: context.runtimeId })}` }],
+    resolveInvocation: () => ({ toolContextId: context.toolContextId }),
+    logger: { warn: () => {} }, sessionId
   });
   onTestFinished(async () => { await client.close(); await app.close(); });
-  const tool = (await client.getTools("widgets")).find((tool) => tool.name === "render_interactive_ui")!;
+  const tool = (await client.loadTools()).flatMap((toolset) => toolset.tools).find((tool) => tool.name === "render_interactive_ui")!;
   expect(tool).toBeDefined();
   const input = { toolContextId: context.toolContextId, title: "Spending", description: "Travel is the largest category.",
     html: '<button id="filter">Filter</button><script>document.querySelector("#filter").onclick = () => {};</script>' };
@@ -300,18 +303,25 @@ function runtimeToken(claims: { sid: string; uid: string; rid?: string; tid?: st
   );
 }
 
+/** The request `_meta` that the runtime sends with a call's trusted values. */
+function invocationMeta(metadata: McpInvocationMetadata) {
+  return { _meta: { [MCP_INVOCATION_META_KEY]: metadata } };
+}
+
 /** Calls a managed tool through the gateway with a runtime token for `claims`. */
 function callManagedTool(
   app: { inject: ReturnType<typeof Fastify>["inject"] },
   claims: Parameters<typeof runtimeToken>[0],
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  invocation?: McpInvocationMetadata
 ) {
   return app.inject({
     method: "POST",
     url: "/mcp/managed-session-context",
     headers: { authorization: `Bearer ${runtimeToken(claims)}` },
-    payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name, arguments: args, ...(invocation ? invocationMeta(invocation) : {}) } }
   });
 }
 
@@ -1466,6 +1476,139 @@ test("strips policy approval metadata before forwarding proxy tool arguments", a
     .toEqual({ query: "hello" });
 });
 
+function captureArgumentsTool(received: Record<string, unknown>[]) {
+  return {
+    name: "capture_arguments",
+    description: "Captures its arguments.",
+    readOnly: false,
+    inputSchema: { type: "object", properties: {}, additionalProperties: true },
+    handler: async (input: { arguments: Record<string, unknown> }) => {
+      received.push(input.arguments);
+      return { captured: true };
+    }
+  } as never;
+}
+
+const captureRuntimePolicy = {
+  ...testRuntimePolicy,
+  enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "managed-session-context"],
+  enabledToolIds: [...testRuntimePolicy.enabledToolIds, "capture_arguments"]
+};
+
+test("the request metadata names the tool context; a context id in the arguments is the model's and is ignored", async () => {
+  const received: Record<string, unknown>[] = [];
+  const { app, toolContexts } = await createTestApp({ extraManagedTools: [captureArgumentsTool(received)] });
+  onTestFinished(async () => {
+    await app.close();
+  });
+  const claims = { sid: "session-invocation", uid: "invocation-user", rid: "runtime-invocation" };
+  const contextFor = (userId: string, runtimeId: string) => createTestToolContext(toolContexts, {
+    sessionId: claims.sid, userId, runtimeId, metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const current = await contextFor(claims.uid, claims.rid);
+  const otherUser = await contextFor("other-user", claims.rid);
+  const retiredRuntime = await contextFor(claims.uid, "runtime-retired");
+
+  // The model wrote a context id that does not exist. The gateway uses the runtime's id in `_meta`.
+  const response = await callManagedTool(app, claims, "capture_arguments",
+    { toolContextId: "ctx_made_up_by_model", query: "hello" }, { toolContextId: current.toolContextId });
+  expect(response.json().error).toBeUndefined();
+  expect(received).toEqual([{ toolContextId: current.toolContextId, query: "hello" }]);
+
+  // The metadata grants nothing itself. Its context must belong to the token's user and runtime.
+  for (const context of [otherUser, retiredRuntime]) {
+    const denied = await callManagedTool(app, claims, "capture_arguments",
+      { toolContextId: current.toolContextId, query: "hello" }, { toolContextId: context.toolContextId });
+    expect(denied.json().error).toEqual({ code: -32000, message: "Tool context does not belong to the authenticated runtime session." });
+  }
+  expect(received).toHaveLength(1);
+});
+
+test("refuses a call whose URL and request metadata name different tool contexts", async () => {
+  const received: Record<string, unknown>[] = [];
+  const { app, toolContexts } = await createTestApp({ extraManagedTools: [captureArgumentsTool(received)] });
+  onTestFinished(async () => {
+    await app.close();
+  });
+  const claims = { sid: "session-conflict", uid: "conflict-user", rid: "runtime-conflict" };
+  const contextFor = () => createTestToolContext(toolContexts, {
+    sessionId: claims.sid, userId: claims.uid, runtimeId: claims.rid, metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const [first, second] = [await contextFor(), await contextFor()];
+  const call = (urlContext: string) => app.inject({
+    method: "POST", url: `/mcp/managed-session-context?toolContextId=${urlContext}`,
+    headers: { authorization: `Bearer ${runtimeToken(claims)}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "capture_arguments", arguments: { query: "hello" }, ...invocationMeta({ toolContextId: first.toolContextId }) } }
+  });
+
+  expect((await call(second.toolContextId)).json().error)
+    .toEqual({ code: -32602, message: "Invalid params: conflicting tool contexts." });
+  expect(received).toEqual([]);
+  expect((await call(first.toolContextId)).json().error).toBeUndefined();
+  expect(received).toEqual([{ toolContextId: first.toolContextId, query: "hello" }]);
+});
+
+test.each([
+  ["a _meta that is not an object", "ctx_test-1"],
+  ["a _meta that is an array", [{ toolContextId: "ctx_test-1" }]],
+  ["an entry that is not an object", { [MCP_INVOCATION_META_KEY]: "ctx_test-1" }],
+  ["a context id that is not a string", { [MCP_INVOCATION_META_KEY]: { toolContextId: 7 } }],
+  ["a context id of another format", { [MCP_INVOCATION_META_KEY]: { toolContextId: "rejected-context-value" } }],
+  ["an unknown field", { [MCP_INVOCATION_META_KEY]: { toolContextId: "ctx_test-1", userId: "rejected-user-value" } }],
+  ["an approval without its tool context", { [MCP_INVOCATION_META_KEY]: { policyApprovalId: "polapr_rejected_value" } }],
+  ["an approval id of another format", { [MCP_INVOCATION_META_KEY]: { toolContextId: "ctx_test-1", policyApprovalId: "rejected-approval-value" } }]
+])("refuses %s in the trusted invocation metadata without repeating it", async (_case, meta) => {
+  const received: Record<string, unknown>[] = [];
+  const { app, toolContexts } = await createTestApp({ extraManagedTools: [captureArgumentsTool(received)] });
+  onTestFinished(async () => {
+    await app.close();
+  });
+  const claims = { sid: "session-malformed", uid: "malformed-user", rid: "runtime-malformed" };
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: claims.sid, userId: claims.uid, runtimeId: claims.rid, metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const response = await app.inject({
+    method: "POST", url: "/mcp/managed-session-context",
+    headers: { authorization: `Bearer ${runtimeToken(claims)}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "capture_arguments", arguments: { toolContextId: context.toolContextId, query: "hello" }, _meta: meta } }
+  });
+
+  expect(response.json().error).toEqual({ code: -32602, message: "Invalid params: malformed invocation metadata." });
+  expect(response.body).not.toMatch(/rejected-|polapr_/);
+  expect(received).toEqual([]);
+});
+
+test("removes the trusted entry from the proxied request and keeps other request metadata", async () => {
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts } = await createTestApp({ proxyUpstreamUrl: `${upstreamUrl}/` });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+  const claims = { sid: "session-proxy-meta", uid: "meta-user", rid: "runtime-proxy-meta" };
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: claims.sid, userId: claims.uid, runtimeId: claims.rid,
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "test-proxy"] } }
+  });
+
+  const response = await app.inject({
+    method: "POST", url: "/mcp/test-proxy",
+    headers: { authorization: `Bearer ${runtimeToken(claims)}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "echo", arguments: { query: "hello" },
+      _meta: { progressToken: 7, "example.com/trace": { span: "s-1" }, [MCP_INVOCATION_META_KEY]: { toolContextId: context.toolContextId } }
+    } }
+  });
+
+  expect(response.json().error).toBeUndefined();
+  const [forwarded] = toolCallRequests(upstreamRequests);
+  expect(forwarded!.body.params).toEqual({ name: "echo", arguments: { query: "hello" },
+    _meta: { progressToken: 7, "example.com/trace": { span: "s-1" } } });
+  expect(forwarded!.rawBody).not.toContain(MCP_INVOCATION_META_KEY);
+  expect(forwarded!.rawBody).not.toContain(context.toolContextId);
+});
+
 test("redacts a managed tool result in content[0].text, not only structuredContent", async () => {
   // R15. handleManagedToolCall used to build content[0].text by
   // JSON.stringify-ing the RAW handler output, and only the finished envelope
@@ -1906,7 +2049,11 @@ async function buildProxyApp(
   return { app, upstream, upstreamRequests, approvals, toolContext };
 }
 
-function callProxyTool(app: Awaited<ReturnType<typeof buildProxyApp>>["app"], args: Record<string, unknown>) {
+function callProxyTool(
+  app: Awaited<ReturnType<typeof buildProxyApp>>["app"],
+  args: Record<string, unknown>,
+  invocation?: McpInvocationMetadata
+) {
   return app.inject({
     method: "POST",
     url: "/mcp/test-proxy",
@@ -1915,9 +2062,14 @@ function callProxyTool(app: Awaited<ReturnType<typeof buildProxyApp>>["app"], ar
       jsonrpc: "2.0",
       id: 1,
       method: "tools/call",
-      params: { name: "echo", arguments: args }
+      params: { name: "echo", arguments: args, ...(invocation ? invocationMeta(invocation) : {}) }
     }
   });
+}
+
+/** The trusted values that the runtime sends with an approved call. */
+function approvalMeta(proof: ReturnType<typeof createPolicyApprovalProof>): McpInvocationMetadata {
+  return { toolContextId: proof.toolContextId, policyApprovalId: proof.approvalId };
 }
 
 function policyApprovalRecord(input: {
@@ -1971,20 +2123,20 @@ test("enforce-mode require_approval → APPROVE forwards the call", async () => 
     explanation: "Approval required"
   });
   approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
-  const response = await callProxyTool(app, { query: "hello", policyApprovalId: proof.approvalId });
+  const response = await callProxyTool(app, { query: "hello" }, approvalMeta(proof));
   expect(response.statusCode).toBe(200);
   expect(response.json().error).toBeUndefined();
   expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
+  // The proof is for the gateway only. The upstream gets neither the entry nor an empty `_meta`.
+  expect(toolCallRequests(upstreamRequests)[0]!.body.params).toEqual({ name: "echo", arguments: { query: "hello" } });
+  expect(toolCallRequests(upstreamRequests)[0]!.rawBody).not.toContain(proof.approvalId);
 
-  const replay = await callProxyTool(app, {
-    query: "different",
-    policyApprovalId: proof.approvalId
-  });
+  const replay = await callProxyTool(app, { query: "different" }, approvalMeta(proof));
   expect(replay.json().error.code).toBe(-32004);
   expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
 
   // The same approved call cannot run twice on one approval.
-  const reuse = await callProxyTool(app, { query: "hello", policyApprovalId: proof.approvalId });
+  const reuse = await callProxyTool(app, { query: "hello" }, approvalMeta(proof));
   expect(reuse.json().error.code).toBe(-32004);
   expect(reuse.json().error.message).toMatch(/already used/i);
   expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
@@ -2023,7 +2175,7 @@ test("managed tools consume an approval once and a mismatched call leaves it unu
   approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
   const call = (query: string) => callManagedTool(app,
     { sid: "policy-session", uid: "test-user", rid: "runtime-policy-session" }, "capture_arguments",
-    { toolContextId: toolContext.toolContextId, query, policyApprovalId: proof.approvalId });
+    { toolContextId: toolContext.toolContextId, query }, approvalMeta(proof));
 
   expect((await call("different")).json().error.code).toBe(-32004);
   expect(handled).toEqual([]);
@@ -2061,12 +2213,53 @@ test.each([
   });
   approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status, decision }));
 
-  const response = await callProxyTool(app, {
-    query: "hello",
-    policyApprovalId: proof.approvalId
-  });
+  const response = await callProxyTool(app, { query: "hello" }, approvalMeta(proof));
   expect(response.json().error.code).toBe(-32004);
   expect(response.json().error.message).toMatch(message);
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+});
+
+test("an approval id in proxy tool arguments is not a proof: the call is denied and the approval stays unused", async () => {
+  const { service } = makePolicyService([makePolicyRule({ effect: "require_approval" })]);
+  const { app, upstream, upstreamRequests, approvals, toolContext } = await buildProxyApp(service, { enforcementMode: "enforce" });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+  const proof = createPolicyApprovalProof({
+    toolContextId: toolContext.toolContextId, toolCallId: "call-1", toolName: "echo", serverId: "test-proxy",
+    args: { query: "hello" }, ruleId: "pol_test", explanation: "Approval required"
+  });
+  approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
+
+  // The model writes the arguments, so even the id of a real approval of this exact call is only data there.
+  const forged = await callProxyTool(app, { query: "hello", policyApprovalId: proof.approvalId });
+  expect(forged.json().error.code).toBe(-32004);
+  expect(approvals.get).not.toHaveBeenCalled();
+  expect(approvals.consumed.size).toBe(0);
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+
+  expect((await callProxyTool(app, { query: "hello" }, approvalMeta(proof))).json().error).toBeUndefined();
+  expect(approvals.consumed.has(proof.approvalId)).toBe(true);
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
+});
+
+test("an approval made in another tool context does not approve the call", async () => {
+  const { service } = makePolicyService([makePolicyRule({ effect: "require_approval" })]);
+  const { app, upstream, upstreamRequests, approvals, toolContext } = await buildProxyApp(service, { enforcementMode: "enforce" });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+  const proof = createPolicyApprovalProof({
+    toolContextId: "ctx_an_earlier_turn", toolCallId: "call-1", toolName: "echo", serverId: "test-proxy",
+    args: { query: "hello" }, ruleId: "pol_test", explanation: "Approval required"
+  });
+  approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
+
+  // The metadata names the current context and the earlier turn's approval.
+  const response = await callProxyTool(app, { query: "hello" },
+    { toolContextId: toolContext.toolContextId, policyApprovalId: proof.approvalId });
+  expect(response.json().error.code).toBe(-32004);
+  expect(approvals.consumed.size).toBe(0);
   expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
 });
 

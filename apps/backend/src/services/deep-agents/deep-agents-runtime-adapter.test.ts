@@ -1955,6 +1955,29 @@ describe("sandbox lifetime and workspace-loss notice", () => {
     expect(extendSandboxTimeout).toHaveBeenCalledTimes(2);
   });
 
+  it("shows the workspace-reset notice when the extension replaces the sandbox", async () => {
+    // The extension checks the sandbox against the current network policy and
+    // kills one that does not match. The notice of that loss is sent before the
+    // turn has a push hook, so the response id must be claimed by then.
+    let notify: ((info: { previousSandboxId: string | null; reason?: "expired" | "network_policy" }) => void) | undefined;
+    const adapter = makeAdapter({
+      factory: makeSandboxFactory({
+        onFactoryInit: (init) => { notify = init.onSandboxRecreated; },
+        extendSandboxTimeout: async () => { notify?.({ previousSandboxId: "sbx-old", reason: "network_policy" }); }
+      })
+    });
+    const session = await adapter.createSession(sessionInput);
+
+    const events = await collect(adapter.runMessageAGUI(session, runMessageInput()));
+
+    const notice = events.find((event) => event.type === AGUIEventType.CUSTOM &&
+      (event as { name?: string }).name === "runtime_notice");
+    expect(notice).toMatchObject({
+      value: expect.objectContaining({ title: "Workspace reset", noticeId: "sandbox-recreated:sbx-old" })
+    });
+    await adapter.close();
+  });
+
   it("does not leak the turn slot when the sandbox extension rejects", async () => {
     // The slot is already reserved when the extension runs, so an unguarded
     // rejection would pin the session busy (429 on every later message) for

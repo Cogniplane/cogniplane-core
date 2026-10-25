@@ -770,12 +770,20 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       throw error;
     }
 
+    // Claim the response id before the sandbox renewal and artifact sync. Both
+    // can replace the sandbox, and the notice of a replacement needs the id
+    // before the push hook exists.
+    state.activeTurnResponseId.current = responseId;
+    state.pendingTurnEvents = [];
+
     // Push the sandbox lifetime back out before anything touches it (artifact
     // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
     // FIRST tool use and is never renewed, so an active session eventually
     // crosses it mid-turn and silently loses its whole workspace. Extending at
     // each turn start makes the cap idle-based instead. No-op (and no sandbox
-    // creation) when the session has never used one.
+    // creation) when the session has never used one. The E2B sandbox checks its
+    // network against the current policy first, and replaces nothing itself: a
+    // sandbox that does not match is killed instead of kept alive.
     //
     // Guarded rather than trusted: the slot is already reserved here, so an
     // implementation that rejects would leak the session busy forever. The
@@ -793,11 +801,6 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         "Failed to extend the sandbox lifetime at turn start; continuing"
       );
     }
-
-    // Claim the response id before artifact sync. A sandbox replacement during
-    // sync may emit a notice that needs the id before the push hook exists.
-    state.activeTurnResponseId.current = responseId;
-    state.pendingTurnEvents = [];
 
     // Project approval mode is read before dispatch and belongs to this turn,
     // not to the warm session. Reconfigure the graph before artifact sync or

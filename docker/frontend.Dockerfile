@@ -1,4 +1,9 @@
-FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS builder
+FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS builder
+
+# OpenNext starts workerd during builds, which reads the system CA store.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 # NEXT_PUBLIC_* values are baked into the client bundle by `next build`, so
 # they MUST be set as ENV before the build step. Compose passes them as
@@ -40,7 +45,7 @@ RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build
 
-FROM node:24.11.1-trixie-slim@sha256:4623e8ac1eb5f35b0a91b85424283c1b97a416a77375dfa6a2e9bfb0b2c351c9 AS runner
+FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production

@@ -3,12 +3,13 @@
 // Handles JSON-RPC 2.0 traffic from the agent runtime's MCP client and
 // dispatches to managed tools or proxies to upstream servers.
 //
-// Per-turn `toolContextId` resolution has three fallbacks — args, URL query
-// param, and session-scoped lookup via the runtime token's `sid` claim.
-// The deep-agents loop injects the id into args at call time; the URL
-// query-param path is a defensive fallback some transports use, and the
-// session-scoped lookup covers a runtime that omits the argument. All three
-// must keep working — don't collapse them into one path.
+// The gateway resolves the per-turn `toolContextId` from four sources, in this
+// order. The deep-agents loop sends the id and any approval proof in the
+// request's trusted `params._meta` entry (services/mcp/invocation-metadata.ts).
+// Older callers put the id in the args or in the URL query param. When none of
+// these is present, the gateway looks up the latest context of the session in
+// the runtime token's `sid` claim. Keep all four paths. Do not collapse them
+// into one. The gateway reads an approval proof from `_meta` only.
 
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
@@ -37,6 +38,11 @@ import { PolicyBlockedError, type PolicyService } from "../services/policy/polic
 import { AdminConfigError } from "../services/admin-config-error.js";
 import { MemberMcpAccessError } from "../services/member-mcp-credential-store.js";
 import { withoutPolicyApprovalMetadata } from "../services/policy/policy-approval-proof.js";
+import {
+  readInvocationMetadata,
+  withoutInvocationMetadata,
+  type McpInvocationMetadata
+} from "../services/mcp/invocation-metadata.js";
 import type {
   ToolExecutionContext,
   ToolExecutionContextStore
@@ -527,6 +533,11 @@ async function handleToolsCall(input: {
   if (rpc.params?.arguments !== undefined && !isPlainObject(rpc.params.arguments)) {
     return failure(rpc.id, -32602, "Invalid params: 'arguments' must be an object.");
   }
+  // The error does not repeat the rejected values.
+  const invocation = readInvocationMetadata(rpc.params);
+  if (!invocation.ok) {
+    return failure(rpc.id, -32602, "Invalid params: malformed invocation metadata.");
+  }
 
   const policyGate: PolicyGate = { policyService, approvals, logger };
   let messageId: string | null = null;
@@ -542,6 +553,7 @@ async function handleToolsCall(input: {
           server.id,
           managedTools,
           toolContexts,
+          invocation.metadata,
           urlToolContextId,
           sessionIdFromRuntimeToken,
           runtimeTokenClaims,
@@ -555,6 +567,7 @@ async function handleToolsCall(input: {
           tenantId,
           server,
           toolContexts,
+          invocation.metadata,
           urlToolContextId,
           sessionIdFromRuntimeToken,
           runtimeTokenClaims,
@@ -665,14 +678,17 @@ async function recordToolCallTelemetry(input: {
  * the runtime token's identity.
  *
  * Resolution order:
- *   1. toolContextId in the RPC args (primary path — injected at call time
- *      by the deep-agents loop).
+ *   0. toolContextId in the request's trusted `_meta` entry. This is the
+ *      primary path. The deep-agents loop sends it at call time. When it is
+ *      present, the gateway ignores a toolContextId in the args, because the
+ *      model wrote that value.
+ *   1. toolContextId in the RPC args (older callers).
  *   2. toolContextId in the MCP URL query string.
  *   3. Active session fallback — look up the latest non-expired context for the
  *      sessionId carried by the runtime token. Resilience path when a runtime
- *      omits the argument.
+ *      sends no id.
  *
- * SECURITY (paths 1 and 2): an arg/URL-supplied toolContextId is otherwise
+ * SECURITY (paths 0 to 2): a metadata/arg/URL-supplied toolContextId is otherwise
  * resolved by TENANT only, which would let a same-tenant attacker substitute
  * another user's or session's context id into a tool call — for proxy mode that
  * means the gateway would sign identity headers for the substituted identity.
@@ -690,6 +706,7 @@ async function handleManagedToolCall(
   serverId: string,
   managedTools: ManagedToolDefinition[],
   toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">,
+  invocation: McpInvocationMetadata | null,
   urlToolContextId: string | null,
   sessionIdFromRuntimeToken: string,
   runtimeTokenClaims: RuntimeTokenClaims,
@@ -714,6 +731,7 @@ async function handleManagedToolCall(
     rpc,
     tenantId,
     args,
+    metadataToolContextId: invocation?.toolContextId ?? null,
     urlToolContextId,
     sessionIdFromRuntimeToken,
     runtimeTokenClaims,
@@ -773,6 +791,7 @@ async function handleManagedToolCall(
       serverId,
       { readOnly: tool.readOnly },
       args,
+      invocation?.policyApprovalId ?? null,
       // Category is the tool's bound domain, not the URL serverId — so a
       // `categories` policy rule matches the tool's true domain even if the
       // call arrived through a different enabled managed server's URL.
@@ -946,6 +965,7 @@ async function handleForwardedToolCall(
   tenantId: string,
   server: McpServerRegistration,
   toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">,
+  invocation: McpInvocationMetadata | null,
   urlToolContextId: string | null,
   sessionIdFromRuntimeToken: string,
   runtimeTokenClaims: RuntimeTokenClaims,
@@ -970,6 +990,7 @@ async function handleForwardedToolCall(
     rpc,
     tenantId,
     args,
+    metadataToolContextId: invocation?.toolContextId ?? null,
     urlToolContextId,
     sessionIdFromRuntimeToken,
     runtimeTokenClaims,
@@ -997,7 +1018,8 @@ async function handleForwardedToolCall(
       toolName,
       server.id,
       { readOnly: isReadOnly },
-      args
+      args,
+      invocation?.policyApprovalId ?? null
     );
   } catch (error) {
     if (error instanceof PolicyBlockedError) {
@@ -1009,8 +1031,9 @@ async function handleForwardedToolCall(
     );
     return failure(rpc.id, -32000, clientSafeToolErrorMessage(error, "Tool call failed."));
   }
-  // The runtime token's toolContextId is a gateway concern — never forward it
-  // upstream.
+  // The toolContextId and the approval proof are for the gateway only. Never
+  // forward them upstream, in the arguments or in `_meta`. Other `_meta`
+  // entries, such as a progress token, go through.
   const forwardArgs = withoutPolicyApprovalMetadata(args);
   delete forwardArgs.toolContextId;
 
@@ -1019,7 +1042,7 @@ async function handleForwardedToolCall(
     rpc: {
       ...rpc,
       params: {
-        ...params,
+        ...withoutInvocationMetadata(params),
         arguments: forwardArgs
       }
     },

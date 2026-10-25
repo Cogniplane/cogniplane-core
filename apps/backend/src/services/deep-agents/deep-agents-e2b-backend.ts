@@ -1100,12 +1100,21 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   /**
    * Push the sandbox's lifetime cap back out to the full `sandboxTimeoutMs`,
    * making it an IDLE timeout instead of an absolute one. Called at each turn
-   * start.
+   * start, after beginTurn.
    *
    * Without this the cap runs from first tool use of the session and is never
    * touched again, so a session that stays active past it loses its whole
    * workspace mid-turn — every agent-written file and every synced artifact —
    * and the model only sees `file_not_found`.
+   *
+   * The sandbox is first compared with the network policy as it is now
+   * (checkAtTurnStart), as the first operation of a turn does. A turn that uses
+   * no tool does not run that check, and without it each such turn would keep a
+   * sandbox alive, with the processes that run in it, on a network that the
+   * tenant has since narrowed. A sandbox that matches is confirmed for this turn,
+   * so the first operation reads nothing again. A sandbox that does not match is
+   * killed and not replaced: the next operation creates its replacement. When
+   * the check cannot be made, the lifetime is not extended.
    *
    * Deliberately a no-op when the sandbox has not been created: extending
    * would force creation and destroy the laziness that keeps chat-only
@@ -1116,9 +1125,22 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   async extendTimeout(): Promise<void> {
     if (this.killed) return;
     try {
+      const turn = this.currentTurn();
       await this.reconcileSandbox();
-      if (!this.sandboxPromise) return;
-      const sandbox = await this.sandboxPromise;
+      this.requireLive(turn);
+      const bound = this.sandboxPromise;
+      if (!bound) return;
+      const sandbox = await bound;
+      this.requireLive(turn);
+      if (this.confirmed?.sandbox !== sandbox || this.confirmed.turn !== turn) {
+        const verdict = await this.checkAtTurnStart(sandbox, turn);
+        this.requireLive(turn);
+        if (verdict !== "match") {
+          await this.retireSandbox(bound, sandbox, verdict === "gone" ? "expired" : "network_policy", turn);
+          return;
+        }
+        this.confirmed = { sandbox, turn };
+      }
       await sandbox.setTimeout(this.options.sandboxTimeoutMs);
     } catch (err: unknown) {
       this.options.logger.warn(
