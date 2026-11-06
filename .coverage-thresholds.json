@@ -7,7 +7,7 @@
     "branches": 73,
     "functions": 79
   },
-  "backendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 82.51 lines, 74.53 branches, 78.60 functions. These legacy floors measure only modules loaded by tests. CI reports this scope as a nonblocking trend because adding or removing an import changes its denominator.",
+  "backendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 82.51 lines, 74.53 branches, 78.60 functions. These legacy floors measure only modules loaded by tests. CI does not run this scope. Run pnpm test:coverage:imported for a manual diagnostic. Adding or removing an import changes its denominator.",
   "importedThresholds": {
     "lines": 75,
     "branches": 68,
@@ -19,7 +19,7 @@
     "branches": 87,
     "functions": 86
   },
-  "frontendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 71.63 lines, 70.70 branches, 57.16 functions. CI reports this scope as a nonblocking trend.",
+  "frontendImportedComment": "Secondary imported-module baseline measured 2026-09-04: 71.63 lines, 70.70 branches, 57.16 functions. CI does not run this scope. Run pnpm test:coverage:frontend:imported for a manual diagnostic.",
   "frontendImportedThresholds": {
     "lines": 69,
     "branches": 69,

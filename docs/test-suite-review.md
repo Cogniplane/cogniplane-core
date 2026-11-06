@@ -106,9 +106,10 @@ the manual inspection.
 - Removed an obsolete 180 ms focus wait from the model availability card.
   The production blur handler is synchronous.
 - The initial full run failed once while the view suite waited for an old
-  transcript message. Its helper now waits for the side-panel title, which is
-  the state those tests exercise. The original suite passed in a focused
-  rerun, so the initial failure is not evidence of a product defect.
+  transcript message. The helper already waited for the side-panel title.
+  It no longer also waits for an earlier transcript message that these tests
+  do not use. Focused runs and the final full-source coverage run passed.
+  These checks do not prove that the suite cannot fail under load.
 
 ### Observe database races and release locks after failure
 
