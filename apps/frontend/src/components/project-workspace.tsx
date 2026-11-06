@@ -35,7 +35,7 @@ import { PROJECT_SELECT } from "@/lib/project-ui";
 const APPROVAL_MODE_HELP: Record<Project["approvalMode"], string> = {
   organization_default: "Uses your organization's approval behavior. Denials and mandatory approvals still apply.",
   manual: "Ask for approval before approval-governed actions. Organization denials still apply.",
-  automatic: "Uses the organization's approval policy and cannot bypass it. In the current runtime, this has the same effective behavior as Organization default. Required approvals and denials still apply."
+  automatic: "This project has the legacy Automatic approval setting. It uses the same approval behavior as Organization default. Denials and mandatory approvals still apply."
 };
 const AGENT_FILE_MODE_HELP = {
   "read-only": "The agent can read published files but cannot save project drafts.",
@@ -271,7 +271,8 @@ export function ProjectWorkspace({
                 aria-busy={approvalDraft !== null && mutate.isPending}
                 disabled={!canManageProject || Boolean(currentProject.archivedAt) || mutate.isPending}
                 onChange={(event) => {
-                  const approvalMode = event.target.value as Project["approvalMode"];
+                  const approvalMode = event.target.value;
+                  if (approvalMode !== "organization_default" && approvalMode !== "manual") return;
                   setApprovalDraft(approvalMode);
                   mutate.mutate(async () => {
                     try {
@@ -286,7 +287,9 @@ export function ProjectWorkspace({
               >
                 <option value="organization_default">Organization default</option>
                 <option value="manual">Manual approval</option>
-                <option value="automatic">Automatic approval</option>
+                {currentProject.approvalMode === "automatic" ? (
+                  <option value="automatic" disabled>Automatic approval, legacy</option>
+                ) : null}
               </select>
               <p id="project-approval-mode-help" className="mt-2 max-w-2xl text-sm text-on-surface-variant">
                 {APPROVAL_MODE_HELP[approvalDraft ?? currentProject.approvalMode]} Changes apply to new turns.
