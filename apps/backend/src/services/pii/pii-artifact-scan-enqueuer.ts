@@ -17,6 +17,8 @@ import { PERMANENT_PII_ERROR_CODES } from "./pii-scan-job-handler.js";
 import type { PiiScanJobMode, PiiScanJobStore } from "./pii-scan-job-store.js";
 import type { PiiScanRunStore } from "./pii-scan-run-store.js";
 
+const PII_ENQUEUE_FAILED = "pii_enqueue_failed";
+
 // "upload" for a direct upload, or the subject kind of a registered import
 // source (see pii-import-scopes.ts). Stored as the job `subjectKind` and the
 // audit `source`.
@@ -77,6 +79,8 @@ type PiiArtifactScanLogger = {
  *
  * The async pending stamp is written **before** the job is enqueued so the
  * scheduler worker cannot overwrite a completed status with our later update.
+ * If the job cannot be enqueued, no worker can finish the scan, so the
+ * artifact, its PII detail and the scan run are marked failed.
  */
 export class PiiArtifactScanEnqueuer {
 
@@ -346,6 +350,7 @@ export class PiiArtifactScanEnqueuer {
     mode: PiiScanJobMode,
     entityTypes: string[]
   ): Promise<PiiArtifactScanResult> {
+    let scanRunId: string | null = null;
     try {
       const scanRun = await this.deps.piiScanRuns.create({
         tenantId: input.tenantId,
@@ -356,6 +361,7 @@ export class PiiArtifactScanEnqueuer {
         mode,
         status: "pending"
       });
+      scanRunId = scanRun.scanRunId;
 
       // Stamp pending BEFORE creating the job so the scheduler worker cannot
       // complete and then have this setPiiDetail() overwrite the final status.
@@ -388,16 +394,59 @@ export class PiiArtifactScanEnqueuer {
           err: error,
           tenantId: input.tenantId,
           artifactId: input.artifactId,
+          scanRunId,
           source: input.source
         },
         "Failed to enqueue PII scan for artifact"
       );
+      await this.closeFailedEnqueue(input, mode, scanRunId);
       return {
         kind: "failed",
-        scanRunId: "",
-        errorCode: "pii_enqueue_failed",
-        errorMessage: error instanceof Error ? error.message : String(error)
+        scanRunId: scanRunId ?? "",
+        errorCode: PII_ENQUEUE_FAILED,
+        errorMessage: "The file scan could not be queued. Try again later."
       };
+    }
+  }
+
+  /**
+   * No job exists to finish the scan, so the worker cannot close the pending
+   * state. Mark the artifact, its PII detail and the scan run (if created)
+   * failed. The bytes stay, because the content was not scanned. A failed
+   * artifact is not eligible for downloads, chat context or workspaces
+   * (isArtifactPiiEligible). Each write runs even if an earlier one fails;
+   * a failed write is logged.
+   */
+  private async closeFailedEnqueue(
+    input: EnqueueArtifactPiiScanInput,
+    mode: PiiScanJobMode,
+    scanRunId: string | null
+  ): Promise<void> {
+    const writes: Array<[string, () => Promise<unknown>]> = [
+      ["artifact_status", () => this.deps.artifacts.update(input.tenantId, input.artifactId, { status: "failed" })],
+      ["artifact_pii_detail", () => this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
+        status: "failed",
+        modeApplied: mode,
+        ...(scanRunId ? { scanRunId } : {}),
+        summaryText: PII_ENQUEUE_FAILED
+      })]
+    ];
+    if (scanRunId) {
+      writes.push(["scan_run", () => this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
+        status: "failed",
+        errorMessage: PII_ENQUEUE_FAILED,
+        completedAt: new Date()
+      })]);
+    }
+    for (const [write, run] of writes) {
+      try {
+        await run();
+      } catch (error) {
+        this.deps.logger?.error?.(
+          { err: error, tenantId: input.tenantId, artifactId: input.artifactId, scanRunId, write },
+          "Failed to close PII scan state after a failed enqueue"
+        );
+      }
     }
   }
 
