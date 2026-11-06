@@ -1,6 +1,7 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import Link from "next/link";
 
 import type {
   PolicySeverity,
@@ -19,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { DisclosureRow } from "../overview-row";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { focusIfOwned } from "@/lib/focus-ownership";
 import {
   Select,
   SelectContent,
@@ -42,6 +44,15 @@ type Props = {
 };
 
 export function AdminPolicySimulator({ result, simulating, onSimulate, error, onInputChange }: Props) {
+  const [open, setOpen] = useState(false);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const toolRef = useRef<HTMLInputElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    if (open) focusIfOwned(toolRef.current, { origins: [buttonRef.current] });
+  }, [open]);
+
   const [toolName, setToolName] = useState("");
   const [category, setCategory] = useState("");
   const [severity, setSeverity] = useState<PolicySeverity | "any">("any");
@@ -60,11 +71,11 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
     onInputChange?.();
   }
   const currentResult = edited || simulating || error ? null : result;
-  let status = "Check which rule matches a tool call. Nothing is recorded or blocked.";
+  let status = "Check which Policy Center rule matches a tool call. Nothing is recorded or blocked.";
   if (currentResult) {
     status = currentResult.matchedRuleName
       ? `${EFFECT_LABELS[currentResult.outcome]}. Matched "${currentResult.matchedRuleName}".`
-      : "Allowed. No rule matched.";
+      : "No Policy Center rule matched these inputs.";
     // The result does not depend on the mode, so say what each mode does with it.
     if (currentResult.outcome === "block") status += " In Enforce, the call is blocked. In Monitor, it is only recorded.";
     if (currentResult.outcome === "require_approval") {
@@ -80,12 +91,44 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
   else if (error && !edited) status = "Test failed. This call has no test result.";
   else if (edited) status = "Inputs changed. Run a test for this tool call.";
 
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (simulating || runLock.current || !toolName.trim()) return;
+    runLock.current = true;
+    const sequence = ++runSequence.current;
+    setEdited(false);
+    setTestedTurn(turnContext);
+    setTestedInput(`${toolName.trim()} · ${category.trim() || "no category"} · ${severity === "any" ? "no severity" : `${severity} severity`} · ${turnContext === "any" ? "no turn context" : `${turnContext} turn`}`);
+    try { await onSimulate({
+      toolName: toolName.trim(),
+      category: category.trim() || null,
+      severity: severity === "any" ? undefined : severity,
+      serverId: category.trim() || null,
+      turnContext: turnContext === "any" ? null : turnContext
+    }); } finally { if (sequence === runSequence.current) runLock.current = false; }
+  }
+
   return (
-    <DisclosureRow title="Test a tool call" action="Test" actionLabel="Test a tool call" status={<span role="status">{status}</span>}>
+    <DisclosureRow
+      title="Test a tool call" action="Test" actionLabel="Test a tool call"
+      open={open} buttonRef={buttonRef}
+      onOpenChange={(next) => {
+        if (!next) focusIfOwned(buttonRef.current, { scope: formRef.current });
+        setOpen(next);
+      }}
+      status={<>
+        <span role="status">{status}</span>{" "}
+        This test checks Policy Center rules only. Other approval settings still apply.{" "}
+        Rules that need a missing category, severity, or turn context are skipped.{" "}
+        <Link href="/admin/capabilities" className="underline">Review approval settings in Agent behavior</Link>.
+      </>}
+    >
+      <form ref={formRef} aria-label="Test a tool call" className="flex flex-col gap-4" onSubmit={submit}>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="sim-tool">Tool name</Label>
             <Input
+              ref={toolRef}
               id="sim-tool"
               value={toolName}
               onChange={(e) => { setToolName(e.target.value); inputChanged(); }}
@@ -108,7 +151,7 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="any">Any</SelectItem>
+                <SelectItem value="any">Not supplied</SelectItem>
                 {ALL_SEVERITIES.map((s) => (
                   <SelectItem key={s} value={s}>
                     {SEVERITY_LABELS[s]}
@@ -124,7 +167,7 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="any">Any</SelectItem>
+                <SelectItem value="any">Not supplied</SelectItem>
                 {ALL_TURN_CONTEXTS.map((tc) => (
                   <SelectItem key={tc} value={tc}>
                     {TURN_CONTEXT_LABELS[tc]}
@@ -137,25 +180,10 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
 
         <div>
           <Button
-            type="button"
+            type="submit"
             disabled={toolName.trim().length === 0}
             aria-disabled={simulating || toolName.trim().length === 0}
             aria-busy={simulating}
-            onClick={async () => {
-              if (simulating || runLock.current || !toolName.trim()) return;
-              runLock.current = true;
-              const sequence = ++runSequence.current;
-              setEdited(false);
-              setTestedTurn(turnContext);
-              setTestedInput(`${toolName.trim()} · ${category.trim() || "any category"} · ${severity} severity · ${turnContext} turn`);
-              try { await onSimulate({
-                toolName: toolName.trim(),
-                category: category.trim() || null,
-                severity: severity === "any" ? undefined : severity,
-                serverId: category.trim() || null,
-                turnContext: turnContext === "any" ? null : turnContext
-              }); } finally { if (sequence === runSequence.current) runLock.current = false; }
-            }}
           >
             {simulating ? "Testing…" : error && !edited ? "Retry test" : "Run test"}
           </Button>
@@ -164,6 +192,7 @@ export function AdminPolicySimulator({ result, simulating, onSimulate, error, on
         {testedInput && !edited ? <p className="break-words text-sm text-on-surface-variant">Tested input: {testedInput}</p> : null}
         {error && !edited ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
         {currentResult?.explanation ? <p className="text-sm text-on-surface-variant">{currentResult.explanation}</p> : null}
+      </form>
     </DisclosureRow>
   );
 }
