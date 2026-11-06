@@ -34,6 +34,7 @@ permissions:
 
 jobs:
   cla-check:
+    name: CLA Assistant
     runs-on: ubuntu-24.04
     # Only run when a contributor types `I have read the CLA Document and I
     # hereby sign the CLA` (the action's signature trigger phrase) OR on
@@ -51,12 +52,12 @@ jobs:
           path-to-signatures: signatures/version1/cla.json
           path-to-document: https://github.com/Cogniplane/cogniplane-core/blob/main/CLA.md
           branch: main
-          # `mathd1` is the maintainer's personal GitHub username so the bot
+          # `mathd` is the maintainer's personal GitHub username so the bot
           # doesn't prompt the maintainer to sign their own CLA. Replace with
           # `cogniplane-bot` (or similar) once a dedicated maintainer-bot
           # identity is provisioned. The handle is already public via commit
           # history and the COPYRIGHT file, so listing it here is not a leak.
-          allowlist: dependabot[bot],mathd1,renovate[bot]
+          allowlist: dependabot[bot],mathd,renovate[bot]
           remote-organization-name: Cogniplane
           remote-repository-name: cla-signatures
           custom-notsigned-prcomment: >

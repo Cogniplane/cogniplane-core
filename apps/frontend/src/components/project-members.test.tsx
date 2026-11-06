@@ -170,3 +170,21 @@ it("shows the empty state", () => {
   renderMembers({ access: { members: [] } });
   expect(screen.getByText("No explicit project members.")).toBeTruthy();
 });
+
+
+it("reports the effective organization access after removing an explicit membership", async () => {
+  vi.mocked(updateProjectMember).mockResolvedValue({ role: null, effectiveRole: "editor" });
+  renderMembers({ access: { visibility: "organization", organizationRole: "editor" } });
+  fireEvent.click(screen.getByRole("button", { name: "Remove Bo" }));
+  fireEvent.click(within(await dialog()).getByRole("button", { name: "Remove member" }));
+  await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Bo's explicit role was removed. Organization sharing still gives edit access."));
+  expect(updateProjectMember).toHaveBeenCalledWith("p1", "bo", { role: null, confirmRetainedRole: "editor" });
+});
+
+it("reports the effective organization baseline after an explicit demotion", async () => {
+  vi.mocked(updateProjectMember).mockResolvedValue({ role: "viewer", effectiveRole: "editor" });
+  renderMembers({ access: { visibility: "organization", organizationRole: "editor" } });
+  fireEvent.change(screen.getByLabelText("Role of Bo"), { target: { value: "viewer" } });
+  fireEvent.click(within(await dialog()).getByRole("button", { name: "Change role" }));
+  await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Bo's explicit role is now viewer. Organization sharing still gives edit access."));
+});

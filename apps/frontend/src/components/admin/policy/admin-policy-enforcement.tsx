@@ -17,8 +17,20 @@ export function AdminPolicyEnforcement({ meta }: { meta?: ReactNode } = {}) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const reviewButtonRef = useRef<HTMLButtonElement>(null);
+  const switchButtonRef = useRef<HTMLButtonElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
   const focusStatusOnCloseRef = useRef(false);
+  const focusSwitchResultRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusSwitchResultRef.current || !notice || enforcement.saving || enforcement.reloading) return;
+    focusSwitchResultRef.current = false;
+    // React can reuse the switch as the review button when the mode changes.
+    // Focus its result after rendering, unless another control owns focus.
+    if (document.activeElement === document.body || document.activeElement === switchButtonRef.current || document.activeElement === reviewButtonRef.current) {
+      statusRef.current?.focus();
+    }
+  }, [notice, enforcement.saving, enforcement.reloading]);
 
   // The Overview links here with ?review=enforcement. Open the review once
   // the mode is known, then drop the parameter so a reload does not reopen it.
@@ -118,15 +130,15 @@ export function AdminPolicyEnforcement({ meta }: { meta?: ReactNode } = {}) {
           ) : null}
           {enforcing ? (
             <Button
+              ref={switchButtonRef}
               type="button"
               variant="outline"
               size="sm"
               disabled={busy || enforcement.settingsUncertain}
               aria-describedby={enforcement.settingsUncertain ? "policy-settings-uncertain" : undefined}
               onClick={async () => {
+                focusSwitchResultRef.current = true;
                 await enforcement.switchToMonitor();
-                // The button goes away with the mode, so focus the result.
-                statusRef.current?.focus();
               }}
             >
               {enforcement.saving ? "Switching..." : "Switch to Monitor"}

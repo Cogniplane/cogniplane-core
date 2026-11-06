@@ -8,6 +8,7 @@ import { mcpUpstreamUrlSchema } from "../lib/url-validation.js";
 import type { AdminMcpServerRecord } from "./admin-config-records.js";
 import { mapMcpServer } from "./admin-config-store-mappers.js";
 import { AuditEventStore } from "./audit-event-store.js";
+import { ownerSecurityVersionSql } from "./auth/security-change.js";
 import { DEFAULT_TENANT_MCP_SERVER_IDS } from "./tenant-settings-store.js";
 
 export class MemberMcpAccessError extends Error {
@@ -29,8 +30,16 @@ type CredentialRow = {
   account_label: string | null;
   version: number;
   updated_at: Date | string;
+  // A security change of the member's local account after the session that
+  // saved the credential (see services/auth/security-change.ts).
+  suspended: boolean;
 };
 type MemberState = { beta: boolean; allowedServerIds: Set<string> };
+
+// The columns of a CredentialRow. The suspension check names the table, so
+// every statement that selects these reads member_mcp_credentials without an alias.
+const CREDENTIAL_COLUMNS = `credential_binding_id, secret_encrypted, account_label, version, updated_at,
+  NOT (${ownerSecurityVersionSql("member_mcp_credentials")}) AS suspended`;
 
 // remove() writes this binding. Server bindings are random v4 UUIDs, so it
 // never matches one. It tells a removal apart from a binding rotation.
@@ -74,6 +83,11 @@ function status(server: AdminMcpServerRecord | null, row: CredentialRow | null, 
     return { status: "reconnect_required", credentialVersion, accountLabel };
   }
   if (!row.secret_encrypted) return { status: "not_connected", credentialVersion, accountLabel: null };
+  // A security change of the member's account after the save. The member saves
+  // a new secret or removes it. There is no confirm: the label is free text that
+  // the saver chose, and the page cannot show which account the secret belongs
+  // to. So the label is not sent either.
+  if (row.suspended) return { status: "reconnect_required", credentialVersion, accountLabel: null, suspended: true };
   return { status: "connected", credentialVersion, accountLabel };
 }
 function approved(server: AdminMcpServerRecord, state: MemberState): boolean {
@@ -127,7 +141,7 @@ export class MemberMcpCredentialStore {
       `UPDATE member_mcp_credentials SET secret_encrypted=NULL, version=version+1, updated_at=now()
        WHERE tenant_id=$1 AND user_id=$2 AND server_id=$3 AND credential_binding_id=$4::uuid
          AND secret_encrypted IS NOT NULL
-       RETURNING credential_binding_id, secret_encrypted, account_label, version, updated_at`,
+       RETURNING ${CREDENTIAL_COLUMNS}`,
       [tenantId, userId, serverId, row.credential_binding_id]);
     return cleared.rows[0] as CredentialRow | undefined
       ?? await this.credential(client, tenantId, userId, serverId, false)
@@ -160,7 +174,7 @@ export class MemberMcpCredentialStore {
 
   private async credential(client: PoolClient, tenantId: string, userId: string, serverId: string, lock: boolean): Promise<CredentialRow | null> {
     const result = await client.query(
-      `SELECT credential_binding_id, secret_encrypted, account_label, version, updated_at
+      `SELECT ${CREDENTIAL_COLUMNS}
        FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2 AND server_id=$3 ${lock ? "FOR UPDATE" : ""}`,
       [tenantId, userId, serverId]);
     return result.rows[0] as CredentialRow | undefined ?? null;
@@ -176,7 +190,7 @@ export class MemberMcpCredentialStore {
            ORDER BY server_id, (tenant_id=$1::text) DESC) selected
            ORDER BY server_name, server_id`, [tenantId]),
         client.query(
-          `SELECT server_id, credential_binding_id, secret_encrypted, account_label, version, updated_at
+          `SELECT server_id, ${CREDENTIAL_COLUMNS}
            FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2`, [tenantId, userId])
       ]);
       const saved = new Map<string, CredentialRow>(credentials.rows.map(row => [String(row.server_id), row as CredentialRow]));
@@ -213,7 +227,7 @@ export class MemberMcpCredentialStore {
            WHERE tenant_id IN ($1::text, 'system') AND server_id = ANY($2::text[])
            ORDER BY server_id, (tenant_id=$1::text) DESC) selected`, [tenantId, ids]),
         client.query(
-          `SELECT server_id, credential_binding_id, secret_encrypted, account_label, version, updated_at
+          `SELECT server_id, ${CREDENTIAL_COLUMNS}
            FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2 AND server_id = ANY($3::text[])`,
           [tenantId, userId, ids])
       ]);
@@ -249,6 +263,8 @@ export class MemberMcpCredentialStore {
         : null;
       if (!canConnect(current, state) || current.credentialBindingId !== server.credentialBindingId) return null;
       if (!row?.secret_encrypted || String(row.credential_binding_id) !== current.credentialBindingId) return null;
+      // Suspended after a security change of the member's account: not for use.
+      if (row.suspended) return null;
       const secret = decrypt(row.secret_encrypted, this.encryptionSecret);
       const auth: McpUpstreamAuth = current.upstreamAuthType === "bearer"
         ? { type: "bearer", secret }
@@ -257,8 +273,11 @@ export class MemberMcpCredentialStore {
     });
   }
 
+  // `ownerSecurityVersion` is the security version of the requesting session
+  // (requestSecurityVersion).
   async save(tenantId: string, userId: string, serverId: string,
-    input: { version: number; serverVersion: number; secret: string; accountLabel: string | null }): Promise<McpConnection> {
+    input: { version: number; serverVersion: number; secret: string; accountLabel: string | null },
+    ownerSecurityVersion: number | null): Promise<McpConnection> {
     validInput(input);
     return withTenantScope(this.db, tenantId, async client => {
       const state = await this.memberState(client, tenantId, userId, true);
@@ -273,14 +292,14 @@ export class MemberMcpCredentialStore {
       const encrypted = encrypt(input.secret, this.encryptionSecret);
       const saved = await client.query(
         `INSERT INTO member_mcp_credentials
-         (tenant_id,user_id,server_id,credential_binding_id,secret_encrypted,account_label,version)
-         VALUES ($1,$2,$3,$4::uuid,$5,$6,$7)
+         (tenant_id,user_id,server_id,credential_binding_id,secret_encrypted,account_label,version,owner_security_version)
+         VALUES ($1,$2,$3,$4::uuid,$5,$6,$7,$8)
          ON CONFLICT (tenant_id,user_id,server_id) DO UPDATE SET
            credential_binding_id=EXCLUDED.credential_binding_id,
            secret_encrypted=EXCLUDED.secret_encrypted, account_label=EXCLUDED.account_label,
-           version=EXCLUDED.version, updated_at=now()
-         RETURNING credential_binding_id, secret_encrypted, account_label, version, updated_at`,
-        [tenantId, userId, serverId, server.credentialBindingId, encrypted, label, input.version + 1]);
+           version=EXCLUDED.version, owner_security_version=EXCLUDED.owner_security_version, updated_at=now()
+         RETURNING ${CREDENTIAL_COLUMNS}`,
+        [tenantId, userId, serverId, server.credentialBindingId, encrypted, label, input.version + 1, ownerSecurityVersion]);
       await AuditEventStore.createInTransaction(client, { tenantId, userId, sessionId: null,
         type: "member.mcp_credential.saved", payload: { serverId, version: input.version + 1, serverVersion: server.version } });
       return connection(server, serverId, saved.rows[0] as CredentialRow, state);

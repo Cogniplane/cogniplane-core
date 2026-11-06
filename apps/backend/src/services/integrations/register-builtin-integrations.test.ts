@@ -4,26 +4,24 @@ import { IntegrationRegistryService } from "./integration-registry-service.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import { test, expect } from "vitest";
 
+import { Pool } from "../../lib/db.js";
+import type { BuiltinConnectorInput } from "../connectors/connector-module.js";
+import { registerConnectorIntegration } from "../connectors/connector-module.js";
+import { ManagedToolCatalog } from "../managed-tools/catalog.js";
+import { ManagedToolFactoryRegistry } from "../managed-tools/factory.js";
+import { GITHUB_INTEGRATION_DESCRIPTOR, attachGithubConnector } from "./github/github-connector.js";
+import { registerGithubOAuthRoutes } from "./github/github-oauth-routes.js";
+import { IntegrationOAuthStateStore } from "./integration-oauth-state-store.js";
 import {
   IntegrationRegistry,
   __resetIntegrationRegistryForTesting,
   getIntegrationDescriptor,
+  listIntegrationDescriptors,
   listIntegrationOAuthCallbackPaths
 } from "./integration-registry.js";
-import {
-  __resetBuiltinIntegrationsRegistrationForTesting,
-  attachBuiltinIntegrationRuntime,
-  registerBuiltinIntegrations
-} from "./register-builtin-integrations.js";
-
-function fakeProbe(label: string) {
-  return {
-    label,
-    async hasConnection(): Promise<boolean> {
-      return true;
-    }
-  };
-}
+import { JIRA_INTEGRATION_DESCRIPTOR } from "./pipedream/jira-connector.js";
+import { registerBuiltinIntegrations } from "./register-builtin-integrations.js";
+import { PiiImportScopeRegistry } from "../pii/pii-import-scopes.js";
 
 function fakeOAuthHandler(label: string) {
   return {
@@ -34,48 +32,103 @@ function fakeOAuthHandler(label: string) {
   };
 }
 
-test("attaches app hooks without changing the static catalog", () => {
+function connectorInput(
+  integrationDescriptors: IntegrationRegistry,
+  managedToolCatalog = new ManagedToolCatalog()
+): BuiltinConnectorInput {
+  return {
+    config: createTestConfig(),
+    logger: { warn() {} },
+    db: new Pool(),
+    uploadAdmission: {
+      async begin() { throw new Error("unexpected upload"); },
+      async admit() { throw new Error("unexpected upload"); }
+    },
+    stores: {
+      auditEvents: { async create() {} },
+      integrationStates: { async get() { return null; }, async upsert() { throw new Error("unexpected write"); } }
+    },
+    integrationDescriptors,
+    loadIntegrationEnablement: async () => {
+      throw new Error("unexpected enablement read");
+    },
+    oauthStates: new IntegrationOAuthStateStore(),
+    runtimeInvalidator: {
+      async invalidateRuntimesForIntegration() { return []; },
+      async invalidateTenantRuntimes() { return []; }
+    },
+    managedToolCatalog,
+    managedToolFactoryRegistry: new ManagedToolFactoryRegistry(),
+    piiImportScopes: new PiiImportScopeRegistry()
+  };
+}
+
+test("the static catalog keeps its order, holds no app services, and allows a second call", () => {
   __resetIntegrationRegistryForTesting();
-  __resetBuiltinIntegrationsRegistrationForTesting();
 
-  // Registering the static catalog must not capture app services.
   registerBuiltinIntegrations();
-  const registry = new IntegrationRegistry();
+  // A second call must not throw "Integration already registered".
+  registerBuiltinIntegrations();
 
-  const githubBefore = getIntegrationDescriptor("github");
-  if (!githubBefore) throw new Error("Expected GitHub integration descriptor.");
-  expect(githubBefore.connectionProbe).toBe(undefined);
-  expect(githubBefore.oauthCallbackPaths).toContain("/auth/github/user/callback");
-
-  // Live wiring attaches only to this app's registry.
-  const probe = fakeProbe("github-probe");
-  const oauth = fakeOAuthHandler("github-oauth");
-  attachBuiltinIntegrationRuntime(registry, {
-    probes: { github: probe },
-    oauth: { github: oauth }
-  });
-
-  const githubAfter = registry.get("github");
-  if (!githubAfter) throw new Error("Expected rewired GitHub integration descriptor.");
-  expect(githubAfter.connectionProbe).toBe(probe);
+  expect(listIntegrationDescriptors().map((descriptor) => descriptor.id)).toEqual([
+    "notion", "github", "jira",
+    "linear", "slack", "confluence", "asana", "salesforce", "hubspot", "google-drive", "gmail", "google-calendar"
+  ]);
+  const github = getIntegrationDescriptor("github");
+  expect(github?.connectionProbe).toBeUndefined();
+  expect(github?.oauthRoutes).toBeUndefined();
+  // Microsoft 365 ships from the SharePoint private overlay package and is
+  // not registered by `registerBuiltinIntegrations`.
+  expect(getIntegrationDescriptor("microsoft")).toBe(null);
 
   const callbackPaths = listIntegrationOAuthCallbackPaths();
-  expect(callbackPaths.includes("/auth/github/user/callback")).toBeTruthy();
-  expect(callbackPaths.includes("/auth/github/install/callback")).toBeFalsy();
-  expect(callbackPaths.includes("/integrations/notion/callback")).toBeTruthy();
+  expect(callbackPaths).toContain("/auth/github/user/callback");
+  expect(callbackPaths).toContain("/integrations/notion/callback");
+  expect(callbackPaths).not.toContain("/auth/github/install/callback");
+});
+
+test("a connector module registers its descriptor once and attaches hooks to its own app", () => {
+  __resetIntegrationRegistryForTesting();
+  // An app registry that took its snapshot before the static catalog had GitHub.
+  const registry = new IntegrationRegistry();
+  const catalog = new ManagedToolCatalog();
+
+  const handles = attachGithubConnector(connectorInput(registry, catalog));
+
+  expect(getIntegrationDescriptor("github")?.connectionProbe).toBeUndefined();
+  const github = registry.get("github");
+  expect(github?.connectionProbe).toBe(handles.services.connections);
+  expect(github?.oauthRoutes?.paths).toEqual(["/auth/github/user/callback"]);
+  expect(registry.oauthCallbackPaths()).toEqual(["/auth/github/user/callback"]);
+
+  // The tools are integration-gated and use the factory key as the Policy
+  // Center category.
+  expect(catalog.listIds()).toEqual(["github_read_file", "github_write_file", "github_create_pr"]);
+  for (const id of catalog.listIds()) {
+    expect(catalog.get(id)).toMatchObject({ tenantConfigurable: false, category: "github" });
+  }
+
+  // A second app in the same process: no duplicate registration error.
+  const secondRegistry = new IntegrationRegistry();
+  const second = attachGithubConnector(connectorInput(secondRegistry));
+  expect(secondRegistry.get("github")?.connectionProbe).toBe(second.services.connections);
+  expect(second.services.connections).not.toBe(handles.services.connections);
+  expect(registry.get("github")?.connectionProbe).toBe(handles.services.connections);
 });
 
 test("independent apps retain their own probes and OAuth handlers", async () => {
   registerBuiltinIntegrations();
   const firstRegistry = new IntegrationRegistry();
   const secondRegistry = new IntegrationRegistry();
-  attachBuiltinIntegrationRuntime(firstRegistry, {
-    probes: { github: { async hasConnection() { return true; } } },
-    oauth: { github: fakeOAuthHandler("first") }
+  const firstOAuth = fakeOAuthHandler("first");
+  const secondOAuth = fakeOAuthHandler("second");
+  registerConnectorIntegration(firstRegistry, GITHUB_INTEGRATION_DESCRIPTOR, {
+    connectionProbe: { async hasConnection() { return true; } },
+    oauthRoutes: { paths: ["/auth/github/user/callback"], register: (app) => registerGithubOAuthRoutes(app, firstOAuth) }
   });
-  attachBuiltinIntegrationRuntime(secondRegistry, {
-    probes: { github: { async hasConnection() { return false; } } },
-    oauth: { github: fakeOAuthHandler("second") }
+  registerConnectorIntegration(secondRegistry, GITHUB_INTEGRATION_DESCRIPTOR, {
+    connectionProbe: { async hasConnection() { return false; } },
+    oauthRoutes: { paths: ["/auth/github/user/callback"], register: (app) => registerGithubOAuthRoutes(app, secondOAuth) }
   });
   const state = {
     tenantId: "tenant", integrationId: "github", readsEnabled: true, writesEnabled: false,
@@ -105,26 +158,13 @@ test("independent apps retain their own probes and OAuth handlers", async () => 
   expect(getIntegrationDescriptor("github")?.connectionProbe).toBeUndefined();
 });
 
-test("registerBuiltinIntegrations is idempotent across repeated calls", () => {
-  __resetIntegrationRegistryForTesting();
-  __resetBuiltinIntegrationsRegistrationForTesting();
-
-  registerBuiltinIntegrations();
-  // A second call must not throw "Integration already registered".
-  registerBuiltinIntegrations();
-
-  expect(getIntegrationDescriptor("github")).toBeTruthy();
-  expect(getIntegrationDescriptor("notion")).toBeTruthy();
-  // Microsoft 365 ships from the SharePoint private overlay package and is
-  // not registered by `registerBuiltinIntegrations`.
-  expect(getIntegrationDescriptor("microsoft")).toBe(null);
-});
-
 test("Jira tools reach a session only with reads enabled and a stored connection", async () => {
   registerBuiltinIntegrations();
   const registry = new IntegrationRegistry();
   let connected = true;
-  attachBuiltinIntegrationRuntime(registry, { probes: { jira: { async hasConnection() { return connected; } } } });
+  registerConnectorIntegration(registry, JIRA_INTEGRATION_DESCRIPTOR, {
+    connectionProbe: { async hasConnection() { return connected; } }
+  });
   const descriptor = registry.get("jira");
   expect(descriptor).toMatchObject({ status: "available", writeToolIds: [] });
   expect(descriptor?.oauthRoutes).toBeUndefined();

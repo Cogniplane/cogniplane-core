@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/auth-context";
 import { ApiError } from "@/lib/api-client";
 import { testAdminMcpConnection } from "@/lib/admin-api";
 import { Button } from "@/components/ui/button";
+import { MCP_TEXT_FOCUS } from "./admin-mcp-focus";
 
 export const reachabilityLabel: Record<AdminMcpConnectionTest["reachability"], string> = {
   reachable: "Reachable", unreachable: "Unreachable", unknown: "Not confirmed"
@@ -46,6 +47,7 @@ export function AdminMcpConnectionTestCard({ server, listGeneration = 0, unsaved
   const currentConfig = useRef(`${server.serverId}:${server.version}:${server.configHash}`);
   const currentListGeneration = useRef(listGeneration);
   const testButton = useRef<HTMLButtonElement>(null);
+  const pendingTarget = useRef<HTMLParagraphElement>(null);
   const resultHeading = useRef<HTMLHeadingElement>(null);
   const errorMessage = useRef<HTMLParagraphElement>(null);
   const focusResult = useRef(false);
@@ -71,13 +73,13 @@ export function AdminMcpConnectionTestCard({ server, listGeneration = 0, unsaved
   useEffect(() => {
     if (result && focusResult.current) {
       focusResult.current = false;
-      if (document.activeElement === document.body || document.activeElement === testButton.current) resultHeading.current?.focus();
+      if (document.activeElement === pendingTarget.current || document.activeElement === testButton.current) resultHeading.current?.focus();
     }
   }, [result]);
   useEffect(() => {
     if (errorText && focusError.current) {
       focusError.current = false;
-      if (document.activeElement === document.body || document.activeElement === testButton.current) errorMessage.current?.focus();
+      if (document.activeElement === pendingTarget.current || document.activeElement === testButton.current) errorMessage.current?.focus();
     }
   }, [errorText]);
 
@@ -88,6 +90,7 @@ export function AdminMcpConnectionTestCard({ server, listGeneration = 0, unsaved
     const testedScope = scopeKey;
     const testedConfig = `${server.serverId}:${server.version}:${server.configHash}`;
     const keepFocus = document.activeElement === testButton.current;
+    if (keepFocus) pendingTarget.current?.focus({ preventScroll: true });
     setBusy(true); setError(null); setLocal(null);
     try {
       const checked = await testAdminMcpConnection(server.serverId, { expectedVersion: server.version, expectedConfigHash: server.configHash });
@@ -107,11 +110,11 @@ export function AdminMcpConnectionTestCard({ server, listGeneration = 0, unsaved
   };
 
   return <div className="w-full border-t border-outline-variant pt-3 text-sm">
-    <div className="flex flex-wrap items-center gap-2"><Button ref={testButton} type="button" size="sm" variant="outline" disabled={busy || unsavedChanges || !user} onClick={() => void test()}>{busy ? "Testing connection…" : `Test saved version ${server.version}`}</Button><span className="text-xs text-on-surface-variant">Discovery only. No tools run.</span></div>
-    {unsavedChanges ? <p className="mt-2 text-xs text-on-surface-variant">Save or discard your edits before testing this connection.</p> : null}
-    {personal ? <p className="mt-2 text-xs text-on-surface-variant">This checks your saved credential only. Each member needs their own credential.</p> : <p className="mt-2 text-xs text-on-surface-variant">This checks the saved organization connection.</p>}
+    <div className="flex flex-wrap items-center gap-2"><Button ref={testButton} type="button" size="sm" variant="outline" disabled={busy || unsavedChanges || !user} onClick={() => void test()}>{busy ? "Testing connection…" : `Test saved version ${server.version}`}</Button><span className="text-sm text-on-surface-variant">Discovery only. No tools run.</span></div>
+    {unsavedChanges ? <p className="mt-2 text-sm text-on-surface-variant">Save or discard your edits before testing this connection.</p> : null}
+    <p ref={pendingTarget} tabIndex={-1} className={`mt-2 text-sm text-on-surface-variant ${MCP_TEXT_FOCUS}`}>{personal ? "This checks your saved credential only. Each member needs their own credential." : "This checks the saved organization connection."}</p>
     {busy ? <p role="status" className="mt-2 text-on-surface-variant">Checking reachability, authentication, and tool discovery…</p> : null}
-    {errorText ? <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-danger-surface p-3"><p ref={errorMessage} tabIndex={-1} role="alert" className="text-danger">{errorText}</p>{onReload && /Reload connections/.test(errorText) ? <Button type="button" size="sm" variant="outline" onClick={onReload}>Reload connections</Button> : null}</div> : null}
-    {!busy && result ? <div className="mt-3 rounded-md border border-outline-variant bg-surface p-3"><h4 ref={resultHeading} tabIndex={-1} className="font-semibold">{personal ? "Your credential check" : "Organization connection check"}</h4><p className="mt-1 text-xs text-on-surface-variant">Saved version {result.configVersion} · checked {new Date(result.checkedAt).toLocaleString()}</p><dl className="mt-3 grid gap-2 sm:grid-cols-3"><div><dt className="text-xs text-on-surface-variant">Reachability</dt><dd>{reachabilityLabel[result.reachability]}</dd></div><div><dt className="text-xs text-on-surface-variant">Authentication</dt><dd>{authenticationLabel[result.authentication]}</dd></div><div><dt className="text-xs text-on-surface-variant">Tool discovery</dt><dd>{discoveryLabel[result.toolDiscovery]}{result.toolCount === null ? "" : ` · ${result.toolCount} tools seen`}</dd></div></dl><p className="mt-3 text-sm text-on-surface-variant">{result.message}</p></div> : !busy && !errorText ? <p className="mt-2 text-xs text-on-surface-variant">Test needed for saved version {server.version}.</p> : null}
+    {errorText ? <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-danger-surface p-3"><p ref={errorMessage} tabIndex={-1} role="alert" className={`text-danger ${MCP_TEXT_FOCUS}`}>{errorText}</p>{onReload && /Reload connections/.test(errorText) ? <Button type="button" size="sm" variant="outline" onClick={onReload}>Reload connections</Button> : null}</div> : null}
+    {!busy && result ? <div className="mt-3 rounded-md border border-outline-variant bg-surface p-3"><h4 ref={resultHeading} tabIndex={-1} className={`font-semibold ${MCP_TEXT_FOCUS}`}>{personal ? "Your credential check" : "Organization connection check"}</h4><p className="mt-1 text-xs text-on-surface-variant">Saved version {result.configVersion} · checked {new Date(result.checkedAt).toLocaleString()}</p><dl className="mt-3 grid gap-2 sm:grid-cols-3"><div><dt className="text-xs text-on-surface-variant">Reachability</dt><dd>{reachabilityLabel[result.reachability]}</dd></div><div><dt className="text-xs text-on-surface-variant">Authentication</dt><dd>{authenticationLabel[result.authentication]}</dd></div><div><dt className="text-xs text-on-surface-variant">Tool discovery</dt><dd>{discoveryLabel[result.toolDiscovery]}{result.toolCount === null ? "" : ` · ${result.toolCount} ${result.toolCount === 1 ? "tool" : "tools"} seen`}</dd></div></dl><p className="mt-3 text-sm text-on-surface-variant">{result.message}</p></div> : !busy && !errorText ? <p className="mt-2 text-sm text-on-surface-variant">Test needed for saved version {server.version}.</p> : null}
   </div>;
 }

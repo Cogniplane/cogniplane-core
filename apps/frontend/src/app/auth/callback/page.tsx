@@ -5,29 +5,22 @@ export const dynamic = "force-dynamic";
 import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { API_URL } from "../../../lib/api-client";
+import { exchangeCodeOnce, type OrganizationOption } from "../../../lib/auth-callback-exchange";
 import { useAuth } from "../../../lib/auth-context";
-import { Button } from "@/components/ui/button";
-
-type OrganizationOption = { id: string; name: string };
+import { CallbackView, ORGANIZATION_RESTART_ERROR } from "../../../components/auth/callback-view";
 
 function AuthCallbackInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [error, setError] = useState<string | null>(null);
   const [organizations, setOrganizations] = useState<OrganizationOption[]>([]);
+  const [selectedOrganization, setSelectedOrganization] = useState<string | null>(null);
   const [isRedirecting, setIsRedirecting] = useState(false);
+  // A synchronous guard: a second choice in the same frame cannot start a second login.
+  const restarting = useRef(false);
   const { completeLogin, login } = useAuth();
-  // A WorkOS authorization code is single-use: a second exchange fails and the
-  // page shows "Authentication failed" on a sign-in that actually worked.
-  // StrictMode replays this effect on the same instance in development, so the
-  // latch has to be a ref, checked before the effect reads anything.
-  const exchangeStartedRef = useRef(false);
 
   useEffect(() => {
-    if (exchangeStartedRef.current) return;
-    exchangeStartedRef.current = true;
-
     const code = searchParams.get("code");
     const state = searchParams.get("state");
     if (!code) {
@@ -42,106 +35,51 @@ function AuthCallbackInner() {
       return;
     }
 
-    (async () => {
-      try {
-        const response = await fetch(`${API_URL}/auth/callback`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ code, state })
-        });
-
-        if (!response.ok) {
-          const data = (await response.json()) as {
-            error?: string;
-            organizations?: OrganizationOption[];
-          };
-          if (
-            response.status === 409 &&
-            data.error === "organization_selection_required" &&
-            data.organizations?.length
-          ) {
-            setOrganizations(data.organizations);
-            return;
-          }
-          setError(data.error ?? "Authentication failed");
+    // The code is single-use, and this page can mount more than once for it.
+    // All mounts share one exchange (lib/auth-callback-exchange.ts); only a
+    // page that is still mounted acts on its outcome.
+    let mounted = true;
+    void exchangeCodeOnce(code, state, completeLogin).then((outcome) => {
+      if (!mounted) return;
+      switch (outcome.kind) {
+        // Both outcomes go home. The home page checks the current session.
+        case "signed_in":
+        case "already_used":
+          router.replace("/");
           return;
-        }
-
-        const data = (await response.json()) as { accessToken: string };
-        const ok = await completeLogin(data.accessToken);
-        if (!ok) {
-          setError("Authentication succeeded but user bootstrap failed");
+        case "select_organization":
+          setOrganizations(outcome.organizations);
           return;
-        }
-        router.replace("/");
-      } catch {
-        setError("Authentication request failed");
+        case "failed":
+          setError(outcome.message);
       }
-    })();
+    });
+    return () => {
+      mounted = false;
+    };
   }, [searchParams, router, completeLogin]);
 
   const selectOrganization = async (organizationId: string) => {
+    if (restarting.current) return;
+    restarting.current = true;
+    setError(null);
+    setSelectedOrganization(organizationId);
     setIsRedirecting(true);
     try {
       await login({ organization: organizationId });
     } catch {
+      restarting.current = false;
       setIsRedirecting(false);
-      setError("Could not restart sign in for that organization");
+      setError(ORGANIZATION_RESTART_ERROR);
     }
   };
 
-  if (organizations.length > 0) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background p-6">
-        <div className="w-full max-w-md rounded-2xl border border-outline-variant bg-surface p-8 shadow-sm">
-          <h1 className="text-xl font-semibold text-on-surface">Choose an organization</h1>
-          <p className="mt-2 text-sm text-on-surface-variant">
-            Your account belongs to multiple organizations. Select the workspace to open.
-          </p>
-          <div className="mt-6 flex flex-col gap-3">
-            {organizations.map((organization) => (
-              <Button
-                key={organization.id}
-                type="button"
-                variant="outline"
-                disabled={isRedirecting}
-                onClick={() => void selectOrganization(organization.id)}
-                className="h-auto justify-start px-4 py-3 text-left"
-              >
-                <span className="flex flex-col items-start">
-                  <span>{organization.name}</span>
-                  <span className="text-xs font-normal text-on-surface-variant">
-                    {organization.id}
-                  </span>
-                </span>
-              </Button>
-            ))}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-background p-6">
-        <p className="text-sm text-danger">{error}</p>
-        <a href="/login" className="text-sm text-info hover:underline">Back to login</a>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-background text-on-surface-variant">
-      Completing sign in...
-    </div>
-  );
+  return <CallbackView organizations={organizations} error={error} isRedirecting={isRedirecting} selectedOrganization={selectedOrganization} selectOrganization={selectOrganization} />;
 }
 
 export default function AuthCallbackPage() {
   return (
-    <Suspense fallback={<div className="flex min-h-screen items-center justify-center bg-background text-on-surface-variant">Completing sign in...</div>}>
+    <Suspense fallback={<CallbackView organizations={[]} error={null} isRedirecting={false} selectOrganization={async () => {}} />}>
       <AuthCallbackInner />
     </Suspense>
   );

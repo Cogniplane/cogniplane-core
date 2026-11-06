@@ -1,21 +1,22 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import { listAdminUsers } from "../lib/admin-api";
 import { fetchTokenUsage } from "../lib/token-usage-api";
 import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import {
-  BarChart,
+  DailyTokenUsage,
+  UsageReportStatus,
   DayRangePicker,
-  type Days,
   TokenBreakdown,
   TokenUsageSkeleton,
   TokenUsageSummary,
   ViewToggle
 } from "./token-usage-chart-primitives";
+import { useUsageReport } from "./use-usage-report";
 import { HINT } from "../lib/ui-tokens";
 
 const STAT_CARD =
@@ -30,13 +31,8 @@ const VIEW_OPTIONS: Array<{ id: View; label: string }> = [
 ];
 
 export function TokenUsageSection() {
-  const [days, setDays] = useState<Days>(30);
   const [view, setView] = useState<View>("day");
-  const query = useQuery({
-    queryKey: queryKeys.admin.tokenUsage(days),
-    queryFn: () => fetchTokenUsage(days),
-    placeholderData: keepPreviousData
-  });
+  const { days, changeDays, query, report } = useUsageReport(queryKeys.admin.tokenUsage, fetchTokenUsage);
   const users = useQuery({
     queryKey: queryKeys.admin.users(),
     queryFn: listAdminUsers,
@@ -45,21 +41,11 @@ export function TokenUsageSection() {
   const names = new Map((users.data ?? []).map((user) => [user.userId,
     user.displayName && user.email ? `${user.displayName} (${user.email})` : user.displayName || user.email || user.userId
   ]));
-  const usage = query.data;
+  const usage = report?.usage;
   const available = !isRouteNotFoundError(query.error, "GET", "/admin/token-usage");
   const error = query.error
     ? toRouteUnavailableMessage(query.error, { method: "GET", pathPrefix: "/admin/token-usage", featureName: "Token usage reporting", fallback: "Failed to load token usage." })
     : null;
-
-  const dailyBars = useMemo(
-    () =>
-      (usage?.daily ?? []).map((d) => ({
-        label: d.date,
-        inputSeries: d.inputTokens,
-        outputSeries: d.outputTokens
-      })),
-    [usage]
-  );
 
   const totals = usage?.totals;
 
@@ -73,38 +59,33 @@ export function TokenUsageSection() {
       </div>
       {available ? (
         <div className="flex flex-wrap items-center gap-3 pb-1">
-          <div role="group" aria-label="Report period" className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
             <span aria-hidden="true" className="text-xs text-on-surface-variant">Last</span>
-            <DayRangePicker value={days} onChange={setDays} />
+            <DayRangePicker value={days} onChange={changeDays} />
           </div>
           <ViewToggle options={VIEW_OPTIONS} value={view} onChange={setView} />
-          {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
         </div>
       ) : null}
 
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
+      <UsageReportStatus days={days} report={report} fetching={query.isFetching} error={error} unavailable={!available} onRetry={() => { void query.refetch(); }} />
 
-      {view === "user" && users.isError ? <p className="text-sm text-on-surface-variant">Names could not be loaded. Showing user IDs where needed.</p> : null}
+      {view === "user" && users.isError ? <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-on-surface-variant"><p>Names could not be loaded. Showing user IDs where needed.</p><button type="button" className="rounded-sm p-2 underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-brand" onClick={() => { void users.refetch(); }}>Retry names</button></div> : null}
+      {view === "user" && users.isFetching ? <p role="status" className="text-sm text-on-surface-variant">Loading names. User IDs remain available.</p> : null}
+      {view === "user" ? <p className="text-sm text-on-surface-variant">By user shows up to 50 users with the most tokens in this period. Totals and daily and model reports include all recorded usage in the organization.</p> : null}
 
       {available && !totals && query.isPending ? <TokenUsageSkeleton /> : null}
 
-      {available && totals ? (
-        <TokenUsageSummary totals={totals} days={days} />
+      {totals && report ? (
+        <TokenUsageSummary totals={totals} days={report.days} />
       ) : null}
 
-      {available && usage && !query.isFetching ? (
-        <div className={`${STAT_CARD} overflow-hidden p-5`}>
+      {usage ? (
+        <div className={`${STAT_CARD} min-w-0 p-4 sm:p-5`}>
           {view === "day" ? (
-            dailyBars.length === 0 ? (
+            usage.daily.length === 0 ? (
               <p className={HINT}>No token data recorded in this period.</p>
             ) : (
-              <BarChart
-                data={dailyBars}
-                primaryColor="var(--chart-1)"
-                secondaryColor="var(--chart-2)"
-                primaryLabel="Input tokens"
-                secondaryLabel="Output tokens"
-              />
+              <DailyTokenUsage daily={usage.daily} />
             )
           ) : null}
 
@@ -123,8 +104,6 @@ export function TokenUsageSection() {
                   costUsd: u.costUsd
                 }))}
                 barColor="var(--chart-1)"
-                chartPrimaryColor="var(--chart-1)"
-                chartSecondaryColor="var(--chart-2)"
               />
             )
           ) : null}
@@ -144,8 +123,6 @@ export function TokenUsageSection() {
                   costUsd: m.costUsd
                 }))}
                 barColor="var(--chart-3)"
-                chartPrimaryColor="var(--chart-3)"
-                chartSecondaryColor="var(--chart-2)"
               />
             )
           ) : null}

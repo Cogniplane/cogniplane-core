@@ -13,3 +13,7 @@ docker-compose.override.yaml
 # No Docker build copies env files. Exclude every one of them.
 .env*
 **/.env*
+
+# Local SharePoint workspace dependencies and build output.
+private/*/node_modules
+private/*/dist

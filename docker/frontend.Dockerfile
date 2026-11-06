@@ -31,13 +31,10 @@ RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json eslint.config.mjs ./
 COPY apps/frontend apps/frontend
 COPY packages/shared-types packages/shared-types
-# Private overlays may or may not exist in the build context. On the private
-# tree they're real workspace packages; on the public mirror they're stubbed
-# out via the rewrite of apps/frontend/src/overlays.ts. The Dockerfile must
-# work on both. The bracket-pattern matches "private" if it exists and
-# silently no-ops if not. The destination is named verbatim so the image
-# layout matches the workspace.
-COPY privat[e] private/
+# Next typechecks the host tests, which import the shared AG-UI history fixtures.
+COPY test-fixtures/agui test-fixtures/agui
+# Include the bundled SharePoint workspace packages.
+COPY private private/
 
 COPY patches patches
 

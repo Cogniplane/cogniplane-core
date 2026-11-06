@@ -9,6 +9,7 @@ import { listAdminSkillSubmissions } from "@/lib/organization-skill-submissions-
 import { queryKeys } from "@/lib/query-keys";
 import { useAdminSkillsData } from "../../../hooks/use-admin-skills-data";
 import { AdminSkillCard } from "../../../components/admin/skills/admin-skill-card";
+import type { AcceptedSkillDraft } from "../../../components/admin/skills/accepted-skill-draft";
 import { OrganizationSkillReview } from "../../../components/admin/skills/organization-skill-review";
 
 export default function AdminSkillsPage() {
@@ -19,6 +20,7 @@ export default function AdminSkillsPage() {
   const targetSkillId = params.get("skill");
   const [viewOverride, setView] = useState<{ urlKey: string; view: "library" | "review" } | null>(null);
   const view = viewOverride?.urlKey === urlKey ? viewOverride.view : urlView;
+  const [draftRequest, setDraftRequest] = useState<{ urlKey: string; draft: AcceptedSkillDraft } | null>(null);
   const [reviewCountResult, setReviewCount] = useState<{ scope: string; count: number | null } | null>(null);
   const queryClient = useQueryClient();
   const { user } = useAuth();
@@ -43,6 +45,9 @@ export default function AdminSkillsPage() {
   const {
     skills,
     skillsLoaded,
+    libraryState,
+    catalogState,
+    manifestState,
     marketplace,
     manifestUrl,
     busyKey,
@@ -65,7 +70,8 @@ export default function AdminSkillsPage() {
         <button type="button" aria-pressed={view === "library"} onClick={() => setView({ urlKey, view: "library" })} className={`border-b-2 px-4 py-2 text-sm font-medium ${view === "library" ? "border-primary text-primary" : "border-transparent text-on-surface-variant hover:text-on-surface"}`}>Library</button>
         <button type="button" aria-pressed={view === "review"} onClick={() => setView({ urlKey, view: "review" })} className={`border-b-2 px-4 py-2 text-sm font-medium ${view === "review" ? "border-primary text-primary" : "border-transparent text-on-surface-variant hover:text-on-surface"}`}>Review{reviewCount ? <span className="ml-2 rounded bg-warning-surface px-1.5 py-0.5 text-xs text-warning">{reviewCount}</span> : null}</button>
       </div>
-      {view === "review" ? <OrganizationSkillReview requestedSubmissionId={submissionId} key={`${tenantId ?? ""}:${userId ?? ""}:${submissionId ?? ""}`} onQueueChanged={() => { void refreshCount(); void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skills() }); if (tenantId && userId) void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skillSubmissions(tenantId, userId) }); }} onOpenLibrary={() => { void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skills() }); setView({ urlKey, view: "library" }); }} /> : <>
+      {view === "review" ? <OrganizationSkillReview requestedSubmissionId={submissionId} key={`${tenantId ?? ""}:${userId ?? ""}:${submissionId ?? ""}`} onQueueChanged={() => { void refreshCount(); void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skills() }); if (tenantId && userId) void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skillSubmissions(tenantId, userId) }); }} onOpenLibrary={(draft) => { setDraftRequest({ urlKey, draft }); void queryClient.invalidateQueries({ queryKey: queryKeys.admin.skills() }); setView({ urlKey, view: "library" }); }} /> : null}
+      <div hidden={view !== "library"}>
       {error ? <p className="text-sm text-danger">{error}</p> : null}
       {targetSkillId && skillsLoaded && !skills.some((skill) => skill.skillId === targetSkillId) ? (
         <div role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-outline-variant bg-surface-container-low px-4 py-3 text-sm">
@@ -74,6 +80,11 @@ export default function AdminSkillsPage() {
         </div>
       ) : null}
       <AdminSkillCard
+        key={scopeKey}
+        acceptedDraft={draftRequest?.urlKey === urlKey && draftRequest.draft.scope.tenantId === tenantId && draftRequest.draft.scope.userId === userId ? draftRequest.draft : null}
+        libraryState={libraryState}
+        catalogState={catalogState}
+        manifestState={manifestState}
         targetSkillId={targetSkillId}
         skills={skills}
         marketplace={marketplace}
@@ -90,7 +101,7 @@ export default function AdminSkillsPage() {
         onActivateRevision={handleActivateRevision}
         onSaveManifestUrl={handleSaveManifestUrl}
       />
-      </>}
+      </div>
     </section>
   );
 }

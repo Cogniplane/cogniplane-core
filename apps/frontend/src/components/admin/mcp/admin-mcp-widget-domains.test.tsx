@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AdminMcpServer, AdminMcpWidgetDomains as WidgetDomainsView } from "@cogniplane/shared-types";
 import { CSP_SOURCE_VECTORS } from "@cogniplane/shared-types/csp-source-vectors";
@@ -37,6 +37,23 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
+it("preserves a later domain and directive while an earlier manual approval finishes", async () => {
+  let finish!: (value: WidgetDomainsView) => void;
+  vi.mocked(changeAdminMcpWidgetDomain).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderDomains();
+  await screen.findByRole("list", { name: "Widget domains" });
+  fireEvent.change(screen.getByLabelText("Domain"), { target: { value: "https://first.example.com" } });
+  fireEvent.click(screen.getByRole("button", { name: "Approve domain" }));
+  await waitFor(() => expect(changeAdminMcpWidgetDomain).toHaveBeenCalledExactlyOnceWith("research", "approve", { directive: "connectDomains", source: "https://first.example.com" }));
+  fireEvent.change(screen.getByLabelText("Domain"), { target: { value: "https://later.example.com" } });
+  fireEvent.change(screen.getByLabelText("Used for"), { target: { value: "frameDomains" } });
+  finish(asked);
+  await waitFor(() => expect((screen.getByRole("button", { name: "Approve domain" }) as HTMLButtonElement).disabled).toBe(false));
+  expect((screen.getByLabelText("Domain") as HTMLInputElement).value).toBe("https://later.example.com");
+  expect((screen.getByLabelText("Used for") as HTMLSelectElement).value).toBe("frameDomains");
+  expect(screen.getByRole("status").textContent).toBe("Approved https://first.example.com for network requests. Later input stays in the form.");
+});
+
 it("makes no request while the row is closed, and loads when it opens", async () => {
   const { reopen } = renderDomains(false);
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -44,6 +61,17 @@ it("makes no request while the row is closed, and loads when it opens", async ()
   reopen();
   expect(await screen.findByRole("list", { name: "Widget domains" })).toBeTruthy();
   expect(getAdminMcpWidgetDomains).toHaveBeenCalledExactlyOnceWith("research");
+});
+
+it("keeps Base URL capitalized in the approval confirmation and row action", async () => {
+  vi.mocked(changeAdminMcpWidgetDomain).mockResolvedValue({ ...empty, approved: [{ directive: "baseUriDomains", source: "https://example.com:8443", approvedBy: "admin-a", approvedAt: "2026-11-04T12:00:00.000Z" }] });
+  renderDomains();
+  await screen.findByRole("list", { name: "Widget domains" });
+  fireEvent.change(screen.getByLabelText("Used for"), { target: { value: "baseUriDomains" } });
+  fireEvent.change(screen.getByLabelText("Domain"), { target: { value: "https://example.com:8443" } });
+  fireEvent.click(screen.getByRole("button", { name: "Approve domain" }));
+  await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Approved https://example.com:8443 for Base URL."));
+  expect(screen.getByRole("button", { name: "Remove https://example.com:8443 for Base URL" })).toBeTruthy();
 });
 
 it("says that nothing is approved at the start and that a request appears after a view opens", async () => {
@@ -102,8 +130,10 @@ it("disables the buttons while a change is saving, then shows the saved list", a
   vi.mocked(changeAdminMcpWidgetDomain).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
   renderDomains();
   const button = await screen.findByRole("button", { name: "Approve https://api.vendor.com for network requests" });
+  button.focus();
   fireEvent.click(button);
   await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(true));
+  expect(document.activeElement?.textContent).toContain("Saving this domain decision");
   expect((screen.getByRole("button", { name: "Approve domain" }) as HTMLButtonElement).disabled).toBe(true);
   finish(asked);
   await waitFor(() => expect((screen.getByRole("button", { name: "Approve domain" }) as HTMLButtonElement).disabled).toBe(false));
@@ -116,7 +146,57 @@ it("shows the server's message when a change fails, and reloads the saved list",
   renderDomains();
   fireEvent.click(await screen.findByRole("button", { name: "Approve https://api.vendor.com for network requests" }));
   expect((await screen.findByRole("alert")).textContent).toContain("at most 200 approved domains");
+  expect(screen.getByRole("alert").closest("li")).toBeTruthy();
   await waitFor(() => expect(getAdminMcpWidgetDomains).toHaveBeenCalledTimes(2));
+});
+
+it.each([false, true])("reveals clipped row feedback after failure only while it owns focus, outside=%s", async (outside) => {
+  let fail!: (reason: Error) => void;
+  vi.mocked(changeAdminMcpWidgetDomain).mockReturnValue(new Promise((_resolve, reject) => { fail = reject; }));
+  renderDomains();
+  const button = await screen.findByRole("button", { name: "Approve https://api.vendor.com for network requests" });
+  const feedback = button.closest("li")!.querySelector("p")!;
+  const scroll = vi.fn();
+  feedback.scrollIntoView = scroll;
+  let top = 20;
+  vi.spyOn(feedback, "getBoundingClientRect").mockImplementation(() => ({ top, bottom: top + 64 }) as DOMRect);
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callback(0); return 1; });
+  try {
+    button.focus(); fireEvent.click(button);
+    expect(document.activeElement).toBe(feedback);
+    expect(scroll).not.toHaveBeenCalled();
+    const field = screen.getByLabelText("Domain");
+    if (outside) field.focus();
+    top = -6;
+    await act(async () => { fail(new Error("Sample decision failed")); });
+    await screen.findByRole("alert");
+    expect(document.activeElement).toBe(outside ? field : feedback);
+    if (outside) expect(scroll).not.toHaveBeenCalled();
+    else expect(scroll).toHaveBeenCalledWith({ block: "nearest", behavior: "instant" });
+  } finally {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  }
+});
+
+it.each([false, true])("names a removed approval and preserves later input and focus, outside=%s", async (outside) => {
+  const invalid = { directive: "connectDomains" as const, source: "https://old.example", approvedBy: "admin-a", approvedAt: "2026-11-04T12:00:00.000Z" };
+  vi.mocked(getAdminMcpWidgetDomains).mockResolvedValue({ ...empty, approved: [invalid] });
+  let finish!: (value: WidgetDomainsView) => void;
+  vi.mocked(changeAdminMcpWidgetDomain).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  renderDomains();
+  const button = await screen.findByRole("button", { name: "Remove https://old.example for network requests" });
+  button.focus(); fireEvent.click(button);
+  await waitFor(() => expect(changeAdminMcpWidgetDomain).toHaveBeenCalledExactlyOnceWith("research", "revoke", { directive: "connectDomains", source: "https://old.example" }));
+  const field = screen.getByLabelText("Domain");
+  if (outside) field.focus();
+  fireEvent.change(field, { target: { value: "https://later.example.com" } });
+  await act(async () => { finish(empty); });
+  const result = screen.getByRole("status");
+  await waitFor(() => expect(result.textContent).toBe("Removed approval for https://old.example for network requests."));
+  expect(document.activeElement).toBe(outside ? field : result);
+  expect((field as HTMLInputElement).value).toBe("https://later.example.com");
+  expect(screen.queryByRole("list", { name: "Widget domains" })).toBeNull();
 });
 
 it("adds a domain that was not requested, in normal form, for the chosen source list", async () => {

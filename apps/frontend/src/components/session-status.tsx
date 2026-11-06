@@ -21,11 +21,13 @@ function TurnTimer({ startedAt }: { startedAt: string }) {
   return <span className="whitespace-nowrap tabular-nums">{elapsed === null ? "Running · time unavailable" : `Running for ${elapsed}`}</span>;
 }
 
-export function SessionStatusIndicator({ status, startedAt, completedTurn, showLabel = false }: {
+export function SessionStatusIndicator({ status, startedAt, completedTurn, showLabel = false, labelClassName = "" }: {
   status: SessionStatus;
   startedAt?: string;
   completedTurn?: CompletedTurn;
   showLabel?: boolean;
+  /** Classes for the visible text, such as `sr-only` when space is short. */
+  labelClassName?: string;
 }) {
   const duration = completedTurn ? formatTurnDuration(completedTurn.durationMs) : null;
   const completedLabel = completedTurn && duration !== null && (status === "ready" || status === "failed")
@@ -39,7 +41,7 @@ export function SessionStatusIndicator({ status, startedAt, completedTurn, showL
   return (
     <span className={`inline-flex shrink-0 items-center gap-1.5 text-xs ${color}`} title={completedLabel ? `${completedLabel}. Elapsed time includes setup and approval waits.` : label}>
       <Icon aria-label={label} role="img" className={`size-3.5 shrink-0 ${status === "running" ? "motion-safe:animate-spin" : ""}`} />
-      {status === "running" && startedAt ? <TurnTimer key={startedAt} startedAt={startedAt} /> : completedLabel ? <span className="whitespace-nowrap tabular-nums">{completedLabel}</span> : showLabel ? <span>{label}</span> : null}
+      {status === "running" && startedAt ? <span className={labelClassName}><TurnTimer key={startedAt} startedAt={startedAt} /></span> : completedLabel ? <span className={`whitespace-nowrap tabular-nums ${labelClassName}`}>{completedLabel}</span> : showLabel ? <span className={`whitespace-nowrap ${labelClassName}`}>{label}</span> : null}
     </span>
   );
 }

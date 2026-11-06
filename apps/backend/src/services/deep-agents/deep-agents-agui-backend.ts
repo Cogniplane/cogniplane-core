@@ -6,6 +6,7 @@ import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import { ToolCallIdTracker } from "./tool-call-id-tracker.js";
 import type {
   DeepAgentsGraph,
   DeepAgentsPendingAction,
@@ -30,6 +31,12 @@ export interface AGUITurnBackend {
   buildInitialInput(): unknown;
   /** One `streamEvents(input, {version:"v2"})` pass over the in-process graph. */
   streamTurn(input: unknown): AsyncIterable<Record<string, unknown>>;
+  /**
+   * The model's call ID of a tool run of this turn, by the run ID of its
+   * `on_tool_start` event. The event does not carry it. Recorded before the
+   * event reaches the driver.
+   */
+  modelCallIdOf?(runId: string): string | undefined;
   /** Native HITL interrupts pending after the last stream pass (empty ⇒ done). */
   getPendingActions(): Promise<DeepAgentsPendingAction[]>;
   /**
@@ -63,6 +70,8 @@ export interface SessionAGUITurnBackendParams {
   projectInstructions?: ProjectInstructionsSnapshot | null;
   /** Recalled memories as a labelled data message, loaded once for the turn. */
   memoryContext?: string | null;
+  generativeUiContext?: string | null;
+  generativeUiTransport?: "tool";
   signal?: AbortSignal;
   /** Records availability after the graph and its tools have loaded. */
   onGraphReady?: () => Promise<void>;
@@ -83,6 +92,9 @@ export function createSessionAGUITurnBackend(
 ): AGUITurnBackend {
   const { threadId, runtime, toolContextRef, modelId, effort, promptText, signal } = params;
   let graph: DeepAgentsGraph | null = null;
+  // Child runs inherit the turn's callbacks, so delegated tools report too.
+  const callIds = new ToolCallIdTracker();
+  const callbacks = [...(params.callbacks ?? []), callIds];
 
   const resolveGraph = async (): Promise<DeepAgentsGraph> => {
     if (graph === null) {
@@ -113,14 +125,20 @@ export function createSessionAGUITurnBackend(
       const g = await resolveGraph();
       yield* g.streamEvents(input, {
         version: "v2",
-        callbacks: params.callbacks,
+        callbacks,
         configurable: { thread_id: threadId },
         context: {
           projectInstructions: params.projectInstructions ?? null,
-          memoryContext: params.memoryContext ?? null
+          memoryContext: params.memoryContext ?? null,
+          generativeUiContext: params.generativeUiContext ?? null,
+          generativeUiTransport: params.generativeUiTransport
         },
         signal
       });
+    },
+
+    modelCallIdOf(runId) {
+      return callIds.modelCallIdOf(runId);
     },
 
     async getPendingActions() {

@@ -45,6 +45,24 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
   }
 
   async eval(script: string, numberOfKeys: number, ...args: string[]): Promise<unknown> {
+    if (script.includes("login-flow-put-back-v1") && numberOfKeys === 2) {
+      const [flowKey, failureKey, json, ttl, countFailure, max] = args;
+      if (!flowKey || !failureKey || !json || !ttl || !countFailure || !max) throw new Error("Invalid login flow put-back script arguments");
+      if (countFailure === "1") {
+        const failures = Number(this.store.get(failureKey) ?? "0") + 1;
+        this.store.set(failureKey, String(failures));
+        this.ttlMs.set(failureKey, Number(ttl) * 1000);
+        if (failures >= Number(max)) {
+          this.store.delete(flowKey);
+          this.store.delete(failureKey);
+          return 0;
+        }
+      }
+      this.store.set(flowKey, json);
+      this.ttlMs.set(flowKey, Number(ttl) * 1000);
+      return 1;
+    }
+
     if (script.includes("refresh-token-issue-v1") && numberOfKeys === 3) {
       const [jtiKey, familyKey, loginAtKey, familyId, revoked, loginAt, absoluteTtl, ttl, active] =
         args;
@@ -142,6 +160,11 @@ export class FakeRefreshTokenRedis implements RefreshTokenRedis {
     this.store.set(key, value);
     this.ttlMs.set(key, ttlSeconds * 1000);
     return "OK";
+  }
+
+  async del(key: string): Promise<number> {
+    this.ttlMs.delete(key);
+    return this.store.delete(key) ? 1 : 0;
   }
 
   /**

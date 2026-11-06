@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
 
-import { PiiProtectionSettingsSchema } from "./pii.js";
+import { PiiPolicyHealthSchema, PiiProtectionSettingsSchema } from "./pii.js";
 import { PolicyEnforcementModeSchema } from "./policy.js";
 
 import { EFFORT_LEVELS, MODEL_PROVIDERS, WEB_SEARCH_MODES } from "../primitives.js";
@@ -99,10 +99,15 @@ export const TenantDetailsSchema = z.object({
     providerKeys: z.record(z.enum(MODEL_PROVIDERS), z.boolean()),
     skillMarketplaceManifestUrl: z.string().nullable(),
     piiProtection: PiiProtectionSettingsSchema,
+    // Send it back as `expectedRevision` when you save the PII settings.
+    // Optional: a server older than this field does not send it.
+    piiProtectionRevision: z.number().int().nonnegative().optional(),
+    // What the server did with the stored PII policy. When it is not ok,
+    // `piiProtection` shows safe values that are not stored, and an admin save
+    // stores them. Only owners and admins get it. Optional: a server older
+    // than this field does not send it.
+    piiProtectionHealth: PiiPolicyHealthSchema.optional(),
     github: z.object({
-      configured: z.boolean()
-    }).passthrough(),
-    microsoftOAuth: z.object({
       configured: z.boolean()
     }).passthrough()
   }).passthrough(),
@@ -140,7 +145,10 @@ export type TenantMarketplaceManifestUrlUpdateResponse = z.infer<typeof TenantMa
 
 export const TenantPiiProtectionUpdateResponseSchema = z.object({
   ok: z.boolean(),
-  piiProtection: PiiProtectionSettingsSchema
+  piiProtection: PiiProtectionSettingsSchema,
+  // The revision of the saved settings. Optional: a server older than this
+  // field does not send it.
+  piiProtectionRevision: z.number().int().nonnegative().optional()
 }).passthrough();
 export type TenantPiiProtectionUpdateResponse = z.infer<typeof TenantPiiProtectionUpdateResponseSchema>;
 

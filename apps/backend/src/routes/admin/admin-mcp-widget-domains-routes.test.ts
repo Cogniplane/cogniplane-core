@@ -8,6 +8,7 @@ import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventInput } from "../../services/audit-event-store.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { registerAdminMcpServerRoutes } from "./admin-mcp-server-routes.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
 
 const server: AdminMcpServerRecord = {
   serverId: "research", ownerTenantId: "tenant-a", serverName: "Research", description: null,
@@ -51,7 +52,7 @@ async function setup(isAdmin = true) {
     createMcpServer: vi.fn(), updateMcpServer: vi.fn(), disableMcpServer: vi.fn(),
     setMcpServerPublished: vi.fn(), saveMcpServerWithAudience: vi.fn(), setInheritedMcpAudience: vi.fn()
   };
-  await registerAdminMcpServerRoutes(app, { dynamicConfig, mcpAppCsp });
+  await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig, mcpAppCsp });
   return { app, mcpAppCsp, audits, dynamicConfig };
 }
 

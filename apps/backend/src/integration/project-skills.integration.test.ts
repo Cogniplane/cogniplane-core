@@ -10,6 +10,8 @@ import {
   ProjectSkillConflictError, ProjectSkillLimitError, ProjectSkillNotFoundError,
   ProjectSkillSelectionFullError, ProjectSkillSourceError, ProjectSkillStore
 } from "../services/skills/project-skill-store.js";
+import { DataRouteControl } from "../services/data-route-control.js";
+import { MailOutbox } from "../services/mail/mail-outbox.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedApproval, seedMembership, seedRuntimeSession, seedTenant, seedUser } from "./support/fixtures.js";
 
@@ -244,5 +246,36 @@ describe.skipIf(!adminDatabaseUrl())("project skills", () => {
     await expect(store.create(tenant, owner, projectId, { ...source, name: "over-limit" })).rejects.toBeInstanceOf(ProjectSkillLimitError);
     const other = await new ProjectStore(appPool()).create(tenant, owner, "Other");
     expect((await store.create(tenant, owner, other.projectId, source)).latest.content.name).toBe(source.name);
+  });
+
+  // A release makes the skill live for the project's editors, so its owner
+  // notice runs in the release's transaction: both commit, or neither does.
+  test("a release and its owner notice commit together; a failed notice rolls the release back", async () => {
+    const { tenant, owner, editor, projectId } = await projectWithRoles();
+    const tenantOwner = await seedUser();
+    await seedMembership(tenant, tenantOwner, "owner");
+    const store = skills();
+    const notices = new DataRouteControl({ authMode: "jwt", ownerNotices: new MailOutbox({ secret: "integration-project-release-notice-value" }) });
+    const notice = () => notices.ownerNotice({ auth: { tenantId: tenant, userId: owner } } as never,
+      { setting: "skill_release", skillId: "skill", change: "project_released", audience: null, projectId });
+    const outbox = async () => (await superuserPool().query(
+      "SELECT user_id FROM email_outbox WHERE tenant_id=$1 AND kind='tenant_setting_changed'", [tenant])).rows;
+
+    const first = await store.create(tenant, owner, projectId, source);
+    await expect(store.action(tenant, owner, projectId, first.id, "release", 1, {
+      alsoInTransaction: async (client) => {
+        await notice()!(client);
+        throw new Error("the notice insert failed");
+      }
+    })).rejects.toThrow("the notice insert failed");
+    expect(await store.get(tenant, owner, projectId, first.id)).toMatchObject({ version: 1, enabled: false, active: null });
+    expect(await store.listRuntimeSkills(tenant, projectId, editor, true)).toEqual([]);
+    expect((await auditPayloads(tenant, projectId)).map((row) => row.event_type)).not.toContain("project.skill.released");
+    expect(await outbox()).toEqual([]);
+
+    const released = await store.action(tenant, owner, projectId, first.id, "release", 1, { alsoInTransaction: notice() });
+    expect(released).toMatchObject({ enabled: true, active: { revision: 1 } });
+    expect((await store.listRuntimeSkills(tenant, projectId, editor, true)).map((item) => item.id)).toEqual([first.id]);
+    expect(await outbox()).toEqual([{ user_id: tenantOwner }]);
   });
 });

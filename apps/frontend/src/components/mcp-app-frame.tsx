@@ -2,7 +2,7 @@
 
 import { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
 import type { McpAppCall } from "@cogniplane/shared-types";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { fetchWithAuthRetry } from "../lib/api-client";
 import { OriginBoundPostMessageTransport } from "../lib/mcp-app-origin-transport";
@@ -36,7 +36,7 @@ function isAppResource(value: unknown, uri: string): value is AppResource {
 // box as a draft (see widget-draft.tsx). The user reads it and sends it with the
 // normal Send button. The answer to the tool view means: `{}` the draft is in
 // the box, `{ isError: true }` it is not. It never says whether the user sends.
-export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEdit, busy }: {
+type McpAppFrameProps = {
   sessionId: string;
   toolCallId: string;
   /** The tool that made this view. The notice by the message box names it. */
@@ -45,6 +45,17 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
   draft: WidgetDraftSeam;
   canEdit: boolean;
   busy: boolean;
+};
+
+export function McpAppFrame(props: McpAppFrameProps) {
+  const [attempt, setAttempt] = useState(0);
+  return <McpAppFrameAttempt key={`${props.sessionId}:${props.toolCallId}:${props.app.resourceUri}:${attempt}`}
+    {...props} focusOnLoad={attempt > 0} onReload={() => setAttempt(value => value + 1)} />;
+}
+
+function McpAppFrameAttempt({ sessionId, toolCallId, toolName, app, draft, canEdit, busy, focusOnLoad, onReload }: McpAppFrameProps & {
+  focusOnLoad: boolean;
+  onReload: () => void;
 }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const canEditRef = useRef(canEdit);
@@ -61,7 +72,19 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
   const [result, setResult] = useState<McpAppCall["result"] | null>(null);
   const [height, setHeight] = useState(560);
   const [error, setError] = useState<string | null>(null);
+  const statusRef = useRef<HTMLParagraphElement>(null);
   const frameUrl = sandboxUrl();
+
+  // A reload moves focus through its own status to the view. It stops when the
+  // user puts focus anywhere else while the view loads.
+  const reloadOwnsFocus = useCallback(() => {
+    const active = document.activeElement;
+    return focusOnLoad && (!active || active === document.body || active === statusRef.current || active === iframeRef.current);
+  }, [focusOnLoad]);
+
+  useEffect(() => {
+    if ((error || !resource) && reloadOwnsFocus()) statusRef.current?.focus();
+  }, [error, reloadOwnsFocus, resource]);
 
   useEffect(() => {
     canEditRef.current = canEdit;
@@ -71,7 +94,7 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
   }, [canEdit, busy, draft, source]);
 
   useEffect(() => {
-    if (!frameUrl) return;
+    if (error || !frameUrl) return;
     const controller = new AbortController();
     const load = async () => {
       try {
@@ -87,6 +110,7 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
             !value.input || typeof value.input !== "object" || Array.isArray(value.input)) {
           throw new Error("The server returned an invalid tool view.");
         }
+        if (controller.signal.aborted) return;
         setResource(value.resource);
         setInput(value.input as Record<string, unknown>);
         setResult(value.result as McpAppCall["result"]);
@@ -98,38 +122,41 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
     return () => {
       controller.abort();
     };
-  }, [sessionId, toolCallId, app.resourceUri, frameUrl]);
+  }, [sessionId, toolCallId, app.resourceUri, error, frameUrl]);
 
   useEffect(() => {
     const iframe = iframeRef.current;
     const frameWindow = iframe?.contentWindow;
-    if (!frameUrl || !resource || !result || !iframe || !frameWindow) return;
+    if (error || !frameUrl || !resource || !result || !iframe || !frameWindow) return;
     let closed = false;
     const theme = () => document.documentElement.dataset.theme === "dark" ? "dark" as const : "light" as const;
     const bridge = new AppBridge(null, { name: "Cogniplane", version: "0.1.0" }, {}, {
       hostContext: { theme: theme() }
     });
-    const themeObserver = new MutationObserver(() => bridge.setHostContext({ theme: theme() }));
+    const themeObserver = new MutationObserver(() => { if (!closed) bridge.setHostContext({ theme: theme() }); });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     bridge.onsandboxready = () => {
       if (!closed) void bridge.sendSandboxResourceReady({
         html: resource.text,
         csp: resource._meta?.ui?.csp as Parameters<typeof bridge.sendSandboxResourceReady>[0]["csp"]
-      }).catch(() => setError("The tool view could not start."));
+      }).catch(() => { if (!closed) setError("The tool view could not start."); });
     };
     bridge.oninitialized = () => {
       if (closed) return;
+      if (reloadOwnsFocus()) iframe.focus();
       void (async () => {
         await bridge.sendToolInput({ arguments: input });
+        if (closed) return;
         await bridge.sendToolResult(result as Parameters<typeof bridge.sendToolResult>[0]);
-      })().catch(() => setError("The tool view could not receive its data."));
+      })().catch(() => { if (!closed) setError("The tool view could not receive its data."); });
     };
     bridge.onsizechange = ({ height: requestedHeight }) => {
-      if (typeof requestedHeight === "number" && Number.isFinite(requestedHeight)) {
+      if (!closed && typeof requestedHeight === "number" && Number.isFinite(requestedHeight)) {
         setHeight(Math.max(280, Math.min(900, requestedHeight)));
       }
     };
     bridge.onmessage = async ({ role, content }) => {
+      if (closed) return { isError: true };
       const check = checkAppUserMessage(role, content, canEditRef.current, busyRef.current);
       if (!check.ok) {
         const refusal = refusedMessageText(check);
@@ -155,7 +182,7 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
     void (async () => {
       await bridge.connect(new OriginBoundPostMessageTransport(frameWindow, sandboxOrigin));
       if (!closed) iframe.src = frameUrl;
-    })().catch(() => setError("The tool view could not connect."));
+    })().catch(() => { if (!closed) setError("The tool view could not connect."); });
     return () => {
       closed = true;
       themeObserver.disconnect();
@@ -165,7 +192,7 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
       void bridge.close();
       iframe.removeAttribute("src");
     };
-  }, [frameUrl, input, resource, result]);
+  }, [error, frameUrl, input, reloadOwnsFocus, resource, result]);
 
   const dismissWaitingMessage = () => {
     const pending = pendingRequestRef.current;
@@ -189,8 +216,16 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
     pending.resolve(placement === "placed" ? {} : { isError: true });
   };
 
-  if (!frameUrl) return <p role="alert" className="text-sm text-on-surface-variant">Interactive tool views need a separate sandbox origin.</p>;
-  if (error) return <p role="alert" className="text-sm text-danger">{error}</p>;
+  if (!frameUrl) return <p role="alert" className="text-sm text-on-surface-variant">Interactive tool views need a separate sandbox origin. Ask an administrator to check the tool view setup.</p>;
+  if (error) return (
+    <div className="my-2 rounded-md border border-outline-variant bg-surface-container-low p-4 text-sm">
+      <p className="font-semibold text-on-surface">Tool view unavailable</p>
+      <p className="mt-1 break-words text-xs text-on-surface-variant [overflow-wrap:anywhere]">{toolName}</p>
+      <p ref={statusRef} role="alert" tabIndex={-1} className="mt-2 break-words rounded-sm text-danger outline-none focus:ring-[3px] focus:ring-ring/50 [overflow-wrap:anywhere]">{error}</p>
+      <p className="mt-2 text-xs leading-relaxed text-on-surface-variant">Reload the saved view. This does not run the tool again or send a message.</p>
+      <Button type="button" size="sm" variant="outline" className="mt-3" onClick={onReload}>Reload tool view</Button>
+    </div>
+  );
   return (
     <div className="my-2 overflow-hidden rounded-md border border-outline-variant bg-surface-container-low">
       {resource ? (
@@ -202,7 +237,7 @@ export function McpAppFrame({ sessionId, toolCallId, toolName, app, draft, canEd
           className="block w-full"
           style={{ height }}
         />
-      ) : <p role="status" className="p-4 text-sm text-on-surface-variant">Loading tool view…</p>}
+      ) : <p ref={statusRef} role="status" tabIndex={-1} className="rounded-sm p-4 text-sm text-on-surface-variant outline-none focus:ring-[3px] focus:ring-inset focus:ring-ring/50">Loading tool view…</p>}
       {pendingText !== null && (
         <div role="group" aria-label="Tool view message waiting" className="border-t border-outline-variant p-4">
           <p className="text-sm font-medium">This tool view wants to add text to your message box.</p>

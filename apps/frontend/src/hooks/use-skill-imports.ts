@@ -1,175 +1,122 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
-import type { SkillImportResponse } from "@cogniplane/shared-types";
+import { FormEvent, useRef, useState } from "react";
+import type { SkillImportResponse, SkillMarketplaceEntry } from "@cogniplane/shared-types";
 
-import {
-  emptyInlineSkillDraft,
-  type InlineSkillDraft
-} from "../components/admin/skills/admin-skill-inline-tab";
-import {
-  emptyGithubImportDraft,
-  type GithubImportDraft
-} from "../components/admin/skills/admin-skill-card-utils";
+import { emptyInlineSkillDraft, type InlineSkillDraft } from "../components/admin/skills/admin-skill-inline-tab";
+import { emptyGithubImportDraft, type GithubImportDraft } from "../components/admin/skills/admin-skill-card-utils";
+import { useConfirmLeave } from "./use-confirm-leave";
+import { toErrorMessage } from "../lib/error-utils";
 
 export type ImportTab = "marketplace" | "github" | "zip" | "inline";
 
-export type ImportPanelState = {
-  open: boolean;
-  toggle: () => void;
-  tab: ImportTab;
-  setTab: (tab: ImportTab) => void;
-};
-
-export type GithubImportTabState = {
-  draft: GithubImportDraft;
-  setDraft: (updater: (current: GithubImportDraft) => GithubImportDraft) => void;
-  submit: (event: FormEvent<HTMLFormElement>) => void;
-};
-
-export type ZipImportTabState = {
-  zipFileName: string;
-  setZipFileName: (value: string) => void;
-  submit: (event: FormEvent<HTMLFormElement>) => void;
-};
-
-export type InlineImportTabState = {
-  draft: InlineSkillDraft;
-  setDraft: (draft: InlineSkillDraft) => void;
-  submit: (event: FormEvent<HTMLFormElement>) => void;
-};
-
-export type MarketplaceTabState = {
-  manifestUrlDraft: string;
-  setManifestUrlDraft: (value: string) => void;
-  saveManifestUrl: (event: FormEvent<HTMLFormElement>) => void;
-  clearManifestUrl: () => void;
-};
-
 export function useSkillImports(input: {
-  manifestUrl: string | null;
+  manifestUrl: string | null | undefined;
+  busyKey?: string | null;
   onImportZip: (file: File) => Promise<SkillImportResponse>;
-  onImportGithub: (input: {
-    githubUrl: string;
-    ref?: string;
-    subdirectory?: string;
-  }) => Promise<SkillImportResponse>;
-  onImportInline: (input: {
-    skillId: string;
-    skillName: string;
-    description: string;
-    instructions: string;
-  }) => Promise<SkillImportResponse>;
+  onImportGithub: (input: { githubUrl: string; ref?: string; subdirectory?: string }) => Promise<SkillImportResponse>;
+  onImportInline: (input: InlineSkillDraft) => Promise<SkillImportResponse>;
+  onImportMarketplace?: (entry: SkillMarketplaceEntry) => Promise<SkillImportResponse>;
   onImported: (result: SkillImportResponse) => void;
   onSaveManifestUrl: (url: string | null) => Promise<void>;
-}): {
-  panel: ImportPanelState;
-  github: GithubImportTabState;
-  zip: ZipImportTabState;
-  inline: InlineImportTabState;
-  marketplace: MarketplaceTabState;
-} {
-  const { manifestUrl, onImportZip, onImportGithub, onImportInline, onImported, onSaveManifestUrl } = input;
-
+}) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ImportTab>("inline");
-  const [githubDraft, setGithubDraft] = useState<GithubImportDraft>(emptyGithubImportDraft);
-  const [zipFileName, setZipFileName] = useState<string>("");
-  const [inlineDraft, setInlineDraft] = useState<InlineSkillDraft>(emptyInlineSkillDraft);
-  const [manifestUrlDraft, setManifestUrlDraft] = useState<string>(manifestUrl ?? "");
+  const [githubDraft, setGithubDraft] = useState(emptyGithubImportDraft);
+  const [zipFileName, setZipFileName] = useState("");
+  const [inlineDraft, setInlineDraft] = useState(emptyInlineSkillDraft);
+  const [manifestEdit, setManifestEdit] = useState<{ value: string; base: string | null | undefined } | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Partial<Record<ImportTab | "manifest", string>>>({});
+  const pending = useRef(false);
+  const versions = useRef({ github: 0, zip: 0, inline: 0, manifest: 0 });
+  const manifestUrlDraft = manifestEdit?.value ?? input.manifestUrl ?? "";
+  const dirty = Boolean(zipFileName || Object.values(githubDraft).some(Boolean) || Object.values(inlineDraft).some(Boolean)
+    || manifestUrlDraft.trim() !== (input.manifestUrl ?? ""));
+  useConfirmLeave(dirty || busyKey !== null);
 
-  useEffect(() => {
-    // Resync draft when the persisted manifest URL changes.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setManifestUrlDraft(manifestUrl ?? "");
-  }, [manifestUrl]);
-
-  const toggle = useCallback(() => setOpen((v) => !v), []);
-
-  const submitZip = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const form = event.currentTarget;
-      const fileInput = form.elements.namedItem("skill-zip-file");
-      if (!(fileInput instanceof HTMLInputElement) || !fileInput.files?.[0]) return;
-      try {
-        const imported = await onImportZip(fileInput.files[0]);
-        setZipFileName("");
-        form.reset();
-        setOpen(false);
-        onImported(imported);
-      } catch {
-        return;
-      }
-    },
-    [onImportZip, onImported]
-  );
-
-  const submitGithub = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      try {
-        const imported = await onImportGithub({
-          githubUrl: githubDraft.githubUrl,
-          ref: githubDraft.ref || undefined,
-          subdirectory: githubDraft.subdirectory || undefined
-        });
-        setGithubDraft(emptyGithubImportDraft);
-        setOpen(false);
-        onImported(imported);
-      } catch {
-        return;
-      }
-    },
-    [githubDraft, onImportGithub, onImported]
-  );
-
-  const submitInline = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      try {
-        const imported = await onImportInline({
-          skillId: inlineDraft.skillId.trim(),
-          skillName: inlineDraft.skillName.trim(),
-          description: inlineDraft.description.trim(),
-          instructions: inlineDraft.instructions
-        });
-        setInlineDraft(emptyInlineSkillDraft);
-        setOpen(false);
-        onImported(imported);
-      } catch {
-        return;
-      }
-    },
-    [inlineDraft, onImportInline, onImported]
-  );
-
-  const saveManifestUrl = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const trimmed = manifestUrlDraft.trim();
-      try {
-        await onSaveManifestUrl(trimmed === "" ? null : trimmed);
-      } catch {
-        return;
-      }
-    },
-    [manifestUrlDraft, onSaveManifestUrl]
-  );
-
-  const clearManifestUrl = useCallback(async () => {
-    try {
-      await onSaveManifestUrl(null);
-    } catch {
-      return;
-    }
-  }, [onSaveManifestUrl]);
+  async function run<T>(key: string, kind: ImportTab | "manifest", action: () => Promise<T>, success: (result: T) => void) {
+    if (pending.current || input.busyKey) return;
+    pending.current = true;
+    setBusyKey(key);
+    setErrors(current => ({ ...current, [kind]: undefined }));
+    try { success(await action()); }
+    catch (error) { setErrors(current => ({ ...current, [kind]: toErrorMessage(error, "Could not save this draft. Try again.") })); }
+    finally { pending.current = false; setBusyKey(null); }
+  }
 
   return {
-    panel: { open, toggle, tab, setTab },
-    github: { draft: githubDraft, setDraft: setGithubDraft, submit: submitGithub },
-    zip: { zipFileName, setZipFileName, submit: submitZip },
-    inline: { draft: inlineDraft, setDraft: setInlineDraft, submit: submitInline },
-    marketplace: { manifestUrlDraft, setManifestUrlDraft, saveManifestUrl, clearManifestUrl }
+    busyKey,
+    errors,
+    panel: { open, toggle: () => setOpen(value => !value), tab, setTab },
+    github: {
+      draft: githubDraft,
+      setDraft: (update: (current: GithubImportDraft) => GithubImportDraft) => { versions.current.github++; setGithubDraft(update); },
+      submit: (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const version = versions.current.github;
+        return run("skill-import-github", "github", () => input.onImportGithub({
+          githubUrl: githubDraft.githubUrl, ref: githubDraft.ref || undefined, subdirectory: githubDraft.subdirectory || undefined
+        }), result => {
+          if (versions.current.github === version) setGithubDraft(emptyGithubImportDraft);
+          input.onImported(result);
+        });
+      }
+    },
+    zip: {
+      zipFileName,
+      setZipFileName: (value: string) => { versions.current.zip++; setZipFileName(value); },
+      submit: (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const fileInput = event.currentTarget.elements.namedItem("skill-zip-file");
+        if (!(fileInput instanceof HTMLInputElement) || !fileInput.files?.[0]) return;
+        const file = fileInput.files[0];
+        const version = versions.current.zip;
+        return run("skill-import-zip", "zip", () => input.onImportZip(file), result => {
+          if (versions.current.zip === version && fileInput.files?.[0] === file) { setZipFileName(""); fileInput.value = ""; }
+          input.onImported(result);
+        });
+      }
+    },
+    inline: {
+      draft: inlineDraft,
+      setDraft: (draft: InlineSkillDraft) => { versions.current.inline++; setInlineDraft(draft); },
+      submit: (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const version = versions.current.inline;
+        return run("skill-import-inline", "inline", () => input.onImportInline({
+          skillId: inlineDraft.skillId.trim(), skillName: inlineDraft.skillName.trim(),
+          description: inlineDraft.description.trim(), instructions: inlineDraft.instructions
+        }), result => {
+          if (versions.current.inline === version) setInlineDraft(emptyInlineSkillDraft);
+          input.onImported(result);
+        });
+      }
+    },
+    marketplace: {
+      manifestUrlDraft,
+      changedSavedUrl: manifestEdit !== null && manifestEdit.base !== input.manifestUrl,
+      setManifestUrlDraft: (value: string) => {
+        versions.current.manifest++;
+        setManifestEdit(current => value === (input.manifestUrl ?? "") ? null : { value, base: current ? current.base : input.manifestUrl });
+      },
+      saveManifestUrl: (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        if (input.manifestUrl === undefined) return;
+        const version = versions.current.manifest;
+        return run("skill-marketplace-manifest-url", "manifest", () => input.onSaveManifestUrl(manifestUrlDraft.trim() || null), () => {
+          if (versions.current.manifest === version) setManifestEdit(null);
+        });
+      },
+      clearManifestUrl: () => {
+        if (input.manifestUrl === undefined) return;
+        // Unsaved text stays. The user's own clear is not an outside change of the saved URL.
+        return run("skill-marketplace-manifest-url", "manifest", () => input.onSaveManifestUrl(null), () => {
+          setManifestEdit(current => current && { ...current, base: null });
+        });
+      },
+      importEntry: (entry: SkillMarketplaceEntry) => run(`skill-import-marketplace-${entry.slug}`, "marketplace",
+        () => { if (!input.onImportMarketplace) throw new Error("Marketplace import unavailable."); return input.onImportMarketplace(entry); }, input.onImported)
+    }
   };
 }

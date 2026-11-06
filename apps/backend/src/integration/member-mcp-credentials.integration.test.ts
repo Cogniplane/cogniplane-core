@@ -40,11 +40,11 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     expect((await members.list(tenant, first))[0]).toMatchObject({ serverId, status: "not_connected", canConnect: true });
     expect((await members.list(tenant, second))[0]).toMatchObject({ serverId, status: "not_connected" });
     const firstSaved = await members.save(tenant, first, serverId, {
-      version: 0, serverVersion: server.version, secret: "first-secret", accountLabel: "First account" });
+      version: 0, serverVersion: server.version, secret: "first-secret", accountLabel: "First account" }, null);
     expect(firstSaved).toMatchObject({ status: "connected", credentialVersion: 1, accountLabel: "First account", hasCredential: true });
     expect(JSON.stringify(firstSaved)).not.toContain("first-secret");
     await members.save(tenant, second, serverId, {
-      version: 0, serverVersion: server.version, secret: "second-secret", accountLabel: "Second account" });
+      version: 0, serverVersion: server.version, secret: "second-secret", accountLabel: "Second account" }, null);
     expect((await members.getRuntimeCredential(tenant, first, server))?.auth).toEqual({
       type: "header", name: "X-API-Key", secret: "first-secret" });
     expect((await members.getRuntimeCredential(tenant, second, server))?.auth).toEqual({
@@ -77,7 +77,7 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     const { tenant, first, serverId, server } = await setup();
     const members = memberStore(), servers = serverStore();
     await members.save(tenant, first, serverId, {
-      version: 0, serverVersion: server.version, secret: "bound-secret", accountLabel: null });
+      version: 0, serverVersion: server.version, secret: "bound-secret", accountLabel: null }, null);
     const display = await servers.updateMcpServer(tenant, { serverId, serverName: "Renamed", description: "New description",
       transportKind: "http", mode: "proxy", routePath: server.routePath, enabled: true });
     expect(display?.credentialBindingId).toBe(server.credentialBindingId);
@@ -96,9 +96,9 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     expect(restored?.credentialBindingId).not.toBe(server.credentialBindingId);
     expect(await members.getRuntimeCredential(tenant, first, restored!)).toBeNull();
     await expect(members.save(tenant, first, serverId, { version: 2, serverVersion: server.version,
-      secret: "new-secret", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpConflictError);
+      secret: "new-secret", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpConflictError);
     const reconnected = await members.save(tenant, first, serverId, { version: 2, serverVersion: restored!.version,
-      secret: "new-secret", accountLabel: null });
+      secret: "new-secret", accountLabel: null }, null);
     expect(reconnected).toMatchObject({ status: "connected", credentialVersion: 3 });
     expect((await members.getRuntimeCredential(tenant, first, restored!))?.auth).toMatchObject({ secret: "new-secret" });
     expect(await members.getStatus(tenant, first, server)).toMatchObject({ status: "reconnect_required", credentialVersion: 3 });
@@ -108,14 +108,14 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     const { tenant, first, second, serverId, server } = await setup();
     const members = memberStore();
     await members.save(tenant, first, serverId, { version: 0, serverVersion: server.version,
-      secret: "secret-long", accountLabel: "Account" });
+      secret: "secret-long", accountLabel: "Account" }, null);
     await new TenantSettingsStore(appPool()).upsert(tenant, { enabledMcpServerIds: [] });
     expect(await members.getRuntimeCredential(tenant, first, server)).toBeNull();
     expect((await members.list(tenant, first))[0]).toMatchObject({ status: "unavailable", canConnect: false,
       hasCredential: true, accountLabel: null });
     expect(await members.list(tenant, second)).toEqual([]);
     await expect(members.save(tenant, first, serverId, { version: 1, serverVersion: server.version,
-      secret: "new-secret", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpNotFoundError);
+      secret: "new-secret", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpNotFoundError);
     await members.remove(tenant, first, serverId, 1);
     const tombstone = await superuserPool().query("SELECT version,secret_encrypted,account_label FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2 AND server_id=$3",
       [tenant, first, serverId]);
@@ -123,7 +123,7 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     expect((await members.list(tenant, first))[0]).toMatchObject({ hasCredential: false, credentialVersion: 2 });
     await new TenantSettingsStore(appPool()).upsert(tenant, { enabledMcpServerIds: [serverId] });
     await expect(members.save(tenant, first, serverId, { version: 1, serverVersion: server.version,
-      secret: "stale-secret", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpConflictError);
+      secret: "stale-secret", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpConflictError);
     expect(await members.getRuntimeCredential(tenant, first, server)).toBeNull();
     await superuserPool().query("DELETE FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2", [tenant, first]);
     expect((await superuserPool().query("SELECT * FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2", [tenant, first])).rows).toEqual([]);
@@ -133,13 +133,13 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     const { tenant, first, serverId, server } = await setup();
     const members = memberStore();
     await expect(members.save(tenant, first, serverId, { version: 0, serverVersion: server.version,
-      secret: "bad\nsecret", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpValidationError);
+      secret: "bad\nsecret", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpValidationError);
     await expect(members.save(tenant, first, serverId, { version: 0, serverVersion: server.version,
-      secret: "short", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpValidationError);
+      secret: "short", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpValidationError);
     const auditFailure = vi.spyOn(AuditEventStore, "createInTransaction").mockRejectedValueOnce(new Error("audit failed"));
     try {
       await expect(members.save(tenant, first, serverId, { version: 0, serverVersion: server.version,
-        secret: "valid-secret", accountLabel: null })).rejects.toThrow("audit failed");
+        secret: "valid-secret", accountLabel: null }, null)).rejects.toThrow("audit failed");
     } finally { auditFailure.mockRestore(); }
     expect(await members.getStatus(tenant, first, server)).toMatchObject({ status: "not_connected", credentialVersion: 0 });
     expect((await superuserPool().query("SELECT * FROM member_mcp_credentials WHERE tenant_id=$1 AND user_id=$2", [tenant, first])).rows).toEqual([]);
@@ -160,7 +160,7 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     if (!record) throw new Error("Missing system proxy");
     const members = memberStore();
     const saved = await members.save(tenant, user, serverId, { version: 0, serverVersion: record.version,
-      secret: "system-personal-secret", accountLabel: null });
+      secret: "system-personal-secret", accountLabel: null }, null);
     expect(saved).toMatchObject({ status: "connected", credentialVersion: 1 });
     expect((await members.getRuntimeCredential(tenant, user, record))?.auth).toMatchObject({ secret: "system-personal-secret" });
     // A system binding rotation cannot revoke this tenant's row. The next
@@ -223,7 +223,7 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     const personalCurrent = await servers.getAdminMcpServer(tenant, serverId);
     if (!personalCurrent) throw new Error("Missing personal proxy");
     await memberStore().save(tenant, user, serverId, { version: 0, serverVersion: personalCurrent.version,
-      secret: "member-secret", accountLabel: "Member account" });
+      secret: "member-secret", accountLabel: "Member account" }, null);
     const stored = await superuserPool().query(
       "SELECT upstream_auth_secret_encrypted FROM admin_mcp_servers WHERE tenant_id=$1 AND server_id=$2", [tenant, serverId]);
     expect(stored.rows[0].upstream_auth_secret_encrypted).toBeNull();
@@ -246,13 +246,13 @@ describe.skipIf(!adminDatabaseUrl())("member MCP credentials", () => {
     const { tenant, first, serverId, server } = await setup();
     const members = memberStore();
     const attempts = await Promise.allSettled([
-      members.save(tenant, first, serverId, { version: 0, serverVersion: server.version, secret: "first-secret", accountLabel: null }),
-      members.save(tenant, first, serverId, { version: 0, serverVersion: server.version, secret: "second-secret", accountLabel: null })
+      members.save(tenant, first, serverId, { version: 0, serverVersion: server.version, secret: "first-secret", accountLabel: null }, null),
+      members.save(tenant, first, serverId, { version: 0, serverVersion: server.version, secret: "second-secret", accountLabel: null }, null)
     ]);
     expect(attempts.filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter(result => result.status === "rejected" && result.reason instanceof MemberMcpConflictError)).toHaveLength(1);
     expect((await members.getStatus(tenant, first, server)).credentialVersion).toBe(1);
     await expect(members.save(tenant, first, serverId, { version: 1, serverVersion: server.version - 1,
-      secret: "third-secret", accountLabel: null })).rejects.toBeInstanceOf(MemberMcpConflictError);
+      secret: "third-secret", accountLabel: null }, null)).rejects.toBeInstanceOf(MemberMcpConflictError);
   });
 });

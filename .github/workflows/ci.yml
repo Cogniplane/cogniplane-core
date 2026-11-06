@@ -1,26 +1,95 @@
 name: CI
 
-# Lint, typecheck, unit tests, full-source coverage, and the Postgres/Redis
-# integration suite for every PR and every push to main.
-# License compatibility is checked in the main CI job below.
-# CLA signing is gated separately by cla.yml.
-
+# Product checks for pushes to main and pull requests.
 on:
-  pull_request:
+  push:
     branches:
       - main
-  push:
+  pull_request:
     branches:
       - main
   workflow_dispatch:
 
+# Least privilege: every job here only reads the repo. Jobs that need more
+# must opt in explicitly at the job level.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  ci:
+    name: ci
+    if: ${{ !cancelled() }}
+    needs: [frontend-build, dependency-audit, gitleaks, lint, typecheck, test, integration, license-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every product check to pass
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          failed = {name: job["result"] for name, job in jobs.items() if job["result"] != "success"}
+          if failed:
+              raise SystemExit(f"Product checks did not all pass: {failed}")
+          PY
+
+  frontend-build:
+    name: Cloudflare frontend build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-workspace
+      - run: pnpm --filter @cogniplane/shared-types build
+      - run: pnpm --filter @cogniplane/frontend cf:build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.example.com
+          NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN: https://sandbox.example.com
+      - run: pnpm test:frontend-worker
+      - run: pnpm --filter @cogniplane/frontend sandbox:typecheck
+      - run: pnpm --filter @cogniplane/frontend sandbox:test
+      - run: pnpm exec eslint sandbox-worker/worker.ts sandbox-worker/worker.test.ts
+        working-directory: apps/frontend
+      - run: pnpm exec wrangler types sandbox-worker/worker-env.d.ts --config wrangler.sandbox.jsonc --include-runtime false --env-file /dev/null --check
+        working-directory: apps/frontend
+      - run: pnpm exec wrangler deploy --config wrangler.sandbox.jsonc --env-file /dev/null --dry-run
+        working-directory: apps/frontend
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          # No dependencies are installed, so no pnpm store is cached.
+          package-manager-cache: false
+      # Install pnpm with the pinned Node, not the runner's bundled npm.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+      # NOT `--prod`. At the workspace root that resolution reported 0
+      # vulnerabilities while the full audit found 4, including a high-severity
+      # lodash-es code-injection advisory reached through
+      # @copilotkit/react-core, a shipped frontend dependency. Dev-only
+      # advisories count too: the @vitest/mocker path traversal below 4.1.11
+      # also went unseen here.
+      - run: pnpm audit
+
   gitleaks:
     name: Secret scan
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,112 +100,55 @@ jobs:
       # requires a paid GITLEAKS_LICENSE for any org-owned repo (public or
       # private). The CLI has no such gate.
       - name: Install gitleaks
-        run: |
-          GITLEAKS_VERSION=8.30.1
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            -o /tmp/gitleaks.tar.gz
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum --check
-          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
-          gitleaks version
+        uses: ./.github/actions/install-gitleaks
       - name: Scan for secrets
         run: gitleaks detect --config .gitleaks.toml --log-opts='--all' --no-banner --redact
 
-  dependency-audit:
-    name: Dependency audit
+  lint:
+    name: Lint
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          run_install: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-          # This job runs no `pnpm install`. With a pnpm cache enabled, the
-          # post-job cache save fails the job because the store is empty.
-          package-manager-cache: false
-      # The full audit, not `--prod`: dev-only advisories count too.
-      # pnpm-workspace.yaml lists the advisories that are ignored, and why.
-      - run: pnpm audit
+      - uses: ./.github/actions/setup-workspace
+      - run: pnpm lint
 
-  ci:
+  typecheck:
+    name: Typecheck
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    permissions:
-      contents: read
+    timeout-minutes: 20
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: License check
-        run: pnpm license:check
-
-      # Run semantic checks in separate processes and keep the heap below the
-      # runner's memory budget. Each step reports peak RSS for future regressions.
-      - name: Typecheck shared types and frontend
-        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm --filter @cogniplane/shared-types --filter @cogniplane/frontend --workspace-concurrency=1 typecheck
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-workspace
+      - run: pnpm typecheck
         env:
-          NODE_OPTIONS: --max-old-space-size=4096
+          NODE_OPTIONS: --max-old-space-size=8192
 
-      - name: Typecheck backend production
-        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm --filter @cogniplane/backend typecheck
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
-
-      - name: Typecheck backend tests
-        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm typecheck:tests
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
-
-      - name: Typecheck scripts
-        run: /usr/bin/time -f 'Peak RSS %M KiB' pnpm typecheck:scripts
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
-
-      - name: Cloudflare frontend build
-        run: pnpm --filter @cogniplane/frontend cf:build
-        env:
-          NEXT_PUBLIC_API_URL: https://api.example.com
-
-      - name: Cloudflare frontend runtime check
-        run: pnpm test:frontend-worker
-
-      - name: Tests
-        run: pnpm test:all
-
-      # Default coverage counts all production source files. Imported-module
-      # coverage retains the former measurement for comparison, but it cannot
-      # act as a gate because removing an import changes its denominator.
+  test:
+    name: Test + Coverage
+    runs-on: ubuntu-24.04
+    # The full pass took 34 minutes on 2026-11-01. Allow room for runner variance.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-workspace
+      # `test:all` runs the workspace Vitest projects. Coverage runs per package
+      # because a root Vitest projects run does not inherit package coverage
+      # settings or thresholds.
+      #
+      # The default coverage commands count all production source files and
+      # enforce the floors in .coverage-thresholds.json. The imported-module
+      # runs preserve the old denominator as a diagnostic. They remain
+      # nonblocking because deleting an import can change that measurement
+      # without changing the amount of production code under test.
+      - run: pnpm test:all
       - name: Backend full-source coverage
         run: pnpm test:coverage
-
       - name: Frontend full-source coverage
         run: pnpm test:coverage:frontend
-
       - name: Backend imported-module coverage trend
         continue-on-error: true
         run: pnpm test:coverage:imported
-
       - name: Frontend imported-module coverage trend
         continue-on-error: true
         run: pnpm test:coverage:frontend:imported
@@ -145,36 +157,38 @@ jobs:
     name: Integration (Postgres RLS)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    permissions:
-      contents: read
-    # Executes the Row-Level Security policies against a real Postgres. RLS is
-    # the tenant-isolation boundary for every request path, and the unit suite
-    # cannot exercise it: the in-memory pool fake answers
+    # The first tests in this repo that touch a real database. Row-Level
+    # Security is the tenant-isolation boundary for every request path, and the
+    # unit suite cannot execute a policy: `test-helpers/fake-pool.ts` answers
     # BEGIN/COMMIT/set_config well enough that `withTenantScope` works against
     # it, so a table with no ENABLE ROW LEVEL SECURITY, a policy naming the
     # wrong GUC, or a store method skipping `withTenantScope` on a tested path all pass
-    # unit tests silently.
+    # unit tests silently. This job is what catches those.
     #
-    # If you self-host Cogniplane, this is the job to keep green: it is the one
-    # that proves one tenant cannot read another's rows in YOUR deployment's
-    # schema.
+    # Its own job, not a step in `test`, for three reasons: it needs Postgres
+    # and Redis service containers; it keeps the `test` job's runtime
+    # unchanged; and it fails independently, so a dependency failure reads as
+    # "integration red" rather than "tests red".
     #
     # What it does NOT prove: it catches a missing `withTenantScope` only in the
     # store methods it explicitly tests, not in arbitrary new code. Its
     # row-visibility cases cover every tenant table through its production
     # write path, except the one exception that rls-write-paths lists. See the
-    # header of rls-write-paths.integration.test.ts.
+    # header of rls-write-paths.integration.test.ts and docs/LEARNINGS.md.
+    #
     services:
       postgres:
         # Matches compose.yaml. The suite reads pg_class/pg_policies and uses
-        # DROP DATABASE ... WITH (FORCE), so the major version matters.
+        # DROP DATABASE ... WITH (FORCE), so the major version is not incidental.
         image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_DB: postgres
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
+        # Container port only: Docker picks a free host port, so two integration
+        # jobs on one self-hosted host (or its own Postgres) cannot collide.
         ports:
-          - 5432:5432
+          - 5432
         options: >-
           --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
@@ -185,41 +199,48 @@ jobs:
         # the cross-replica Stop, replay, and trimming paths against it.
         image: redis:7.4.11-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541
         ports:
-          - 6379:6379
+          - 6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          run_install: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .nvmrc
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      # A SUPERUSER connection to the server, not to a fixed database: the suite
-      # creates a throwaway database per run, migrates it, creates `app_user`
-      # through the same code path `pnpm db:migrate` uses, and drops it in
-      # teardown. Without INTEGRATION_DATABASE_URL the whole project skips,
-      # which is what keeps `pnpm test:all` green on a machine with no Postgres.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-workspace
+      # The DSN is a SUPERUSER connection to the server, not to a fixed
+      # database: the suite creates a throwaway database per run, migrates it,
+      # creates `app_user` through the same code path `pnpm db:migrate` uses,
+      # and drops it in teardown. Without INTEGRATION_DATABASE_URL the whole
+      # project skips, which is what keeps `pnpm test:all` green elsewhere.
       #
       # The Redis suite skips without INTEGRATION_REDIS_URL for the same reason.
       # INTEGRATION_REQUIRE_REDIS makes a missing URL fail here instead.
-      - name: Integration tests
-        run: pnpm test:integration
+      - run: pnpm test:integration
         env:
-          INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          INTEGRATION_REDIS_URL: redis://localhost:6379
+          INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/postgres
+          INTEGRATION_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
           INTEGRATION_REQUIRE_REDIS: '1'
+      # Advisory trend, never a gate. The blocking floor in the `test` job
+      # measures the unit suite alone, so a store whose only tests need Postgres
+      # reports near zero there: project-store.ts reads 4.1% while this suite
+      # covers every line. This step prints both numbers so the real figure is
+      # visible without making the threshold depend on a database.
+      #
+      # It runs the unit coverage pass too, because the merge needs both
+      # reports and jobs do not share a filesystem.
+      - name: Unit + integration coverage trend
+        continue-on-error: true
+        run: pnpm test:coverage && pnpm test:coverage:merged
+        env:
+          INTEGRATION_DATABASE_URL: postgres://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/postgres
+          INTEGRATION_REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
+
+  license-check:
+    name: License check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-workspace
+      - run: pnpm license:check

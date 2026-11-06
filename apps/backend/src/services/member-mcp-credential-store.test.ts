@@ -78,7 +78,7 @@ test("refuses a departed member before reading settings or credentials", async (
   await expect(store.list(tenantId, userId)).rejects.toBeInstanceOf(MemberMcpAccessError);
   await expect(store.getStatus(tenantId, userId, server())).rejects.toBeInstanceOf(MemberMcpAccessError);
   await expect(store.getRuntimeCredential(tenantId, userId, server())).rejects.toBeInstanceOf(MemberMcpAccessError);
-  await expect(store.save(tenantId, userId, serverId, saveInput)).rejects.toBeInstanceOf(MemberMcpAccessError);
+  await expect(store.save(tenantId, userId, serverId, saveInput, null)).rejects.toBeInstanceOf(MemberMcpAccessError);
   await expect(store.remove(tenantId, userId, serverId, 0)).rejects.toBeInstanceOf(MemberMcpAccessError);
   expect(pool.queries.some(query => query.text.includes("FROM tenant_settings"))).toBe(false);
   expect(pool.queries.some(query => query.text.includes("member_mcp_credentials"))).toBe(false);
@@ -86,7 +86,7 @@ test("refuses a departed member before reading settings or credentials", async (
 
 test("saves encrypted credentials, returns owner-safe status, and checks versions", async () => {
   const { state, pool, store, server } = setup();
-  const saved = await store.save(tenantId, userId, serverId, saveInput);
+  const saved = await store.save(tenantId, userId, serverId, saveInput, null);
   expect(saved).toMatchObject({ status: "connected", credentialVersion: 1, accountLabel: "My account",
     hasCredential: true, canConnect: true });
   expect(JSON.stringify(saved)).not.toContain(saveInput.secret);
@@ -101,10 +101,10 @@ test("saves encrypted credentials, returns owner-safe status, and checks version
   });
   const savedCredential = { ...state.credentials.get(userId) };
   const insertCount = pool.queries.filter(query => query.text.includes("INSERT INTO member_mcp_credentials")).length;
-  await expect(store.save(tenantId, userId, serverId, saveInput)).rejects.toBeInstanceOf(MemberMcpConflictError);
+  await expect(store.save(tenantId, userId, serverId, saveInput, null)).rejects.toBeInstanceOf(MemberMcpConflictError);
   expect(state.credentials.get(userId)).toEqual(savedCredential);
   expect(pool.queries.filter(query => query.text.includes("INSERT INTO member_mcp_credentials"))).toHaveLength(insertCount);
-  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1, serverVersion: 3 }))
+  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1, serverVersion: 3 }, null))
     .rejects.toBeInstanceOf(MemberMcpConflictError);
   expect(state.credentials.get(userId)).toEqual(savedCredential);
   expect(pool.queries.filter(query => query.text.includes("INSERT INTO member_mcp_credentials"))).toHaveLength(insertCount);
@@ -116,7 +116,7 @@ test("saves encrypted credentials, returns owner-safe status, and checks version
 
 test("requires current approval and binding before runtime use or a new save", async () => {
   const { state, store, server } = setup();
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   const oldServer = server();
   state.server.credential_binding_id = "00000000-0000-4000-8000-000000000002";
   // The read clears the secret for the old binding and bumps the version.
@@ -125,14 +125,14 @@ test("requires current approval and binding before runtime use or a new save", a
   expect(await store.getRuntimeCredential(tenantId, userId, oldServer)).toBeNull();
   expect(await store.getRuntimeCredential(tenantId, userId, server())).toBeNull();
   await store.save(tenantId, userId, serverId, { ...saveInput, version: 2, serverVersion: 4,
-    secret: "new-personal-secret" });
+    secret: "new-personal-secret" }, null);
   expect(await store.getStatus(tenantId, userId, oldServer)).toMatchObject({ status: "reconnect_required" });
   expect(state.credentials.get(userId)?.version).toBe(3);
   state.allowed = [];
   expect(await store.getRuntimeCredential(tenantId, userId, server())).toBeNull();
   expect((await store.list(tenantId, userId))[0]).toMatchObject({ status: "unavailable", accountLabel: null,
     upstreamUrl: null, hasCredential: true });
-  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 3 }))
+  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 3 }, null))
     .rejects.toBeInstanceOf(MemberMcpNotFoundError);
   state.allowed = [serverId];
   state.server.is_published = false;
@@ -143,7 +143,7 @@ test("requires current approval and binding before runtime use or a new save", a
 
 test("denies a disabled or managed server even when a credential was saved", async () => {
   const { state, pool, store, server } = setup();
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   const savedCredential = { ...state.credentials.get(userId) };
   for (const change of [{ enabled: false }, { mode: "managed" }]) {
     state.server.enabled = true;
@@ -153,7 +153,7 @@ test("denies a disabled or managed server even when a credential was saved", asy
     expect((await store.list(tenantId, userId))[0]).toMatchObject({
       status: "unavailable", canConnect: false, upstreamUrl: null, hasCredential: true
     });
-    await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1 }))
+    await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1 }, null))
       .rejects.toBeInstanceOf(MemberMcpNotFoundError);
     expect(state.credentials.get(userId)).toEqual(savedCredential);
   }
@@ -165,7 +165,7 @@ test("uses bearer auth for a current inherited system proxy", async () => {
   state.server.tenant_id = "system";
   state.server.upstream_auth_type = "bearer";
   state.server.upstream_auth_name = null;
-  const saved = await store.save(tenantId, userId, serverId, saveInput);
+  const saved = await store.save(tenantId, userId, serverId, saveInput, null);
   expect(saved).toMatchObject({ status: "connected", credentialScope: "personal", authType: "bearer" });
   expect(await store.getRuntimeCredential(tenantId, userId, server())).toEqual({
     auth: { type: "bearer", secret: saveInput.secret }, version: 1
@@ -177,7 +177,7 @@ test("uses bearer auth for a current inherited system proxy", async () => {
 test("keeps tombstone versions and rejects stale removal and save", async () => {
   const { state, pool, store, server } = setup();
   await expect(store.remove(tenantId, userId, serverId, 0)).rejects.toBeInstanceOf(MemberMcpNotFoundError);
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   await expect(store.remove(tenantId, userId, serverId, 0)).rejects.toBeInstanceOf(MemberMcpConflictError);
   state.allowed = [];
   await store.remove(tenantId, userId, serverId, 1);
@@ -188,9 +188,9 @@ test("keeps tombstone versions and rejects stale removal and save", async () => 
   state.allowed = [serverId];
   expect(await store.getStatus(tenantId, userId, server())).toEqual({
     status: "not_connected", credentialVersion: 2, accountLabel: null });
-  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1 }))
+  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: 1 }, null))
     .rejects.toBeInstanceOf(MemberMcpConflictError);
-  const connected = await store.save(tenantId, userId, serverId, { ...saveInput, version: 2 });
+  const connected = await store.save(tenantId, userId, serverId, { ...saveInput, version: 2 }, null);
   expect(connected.credentialVersion).toBe(3);
   expect(state.audit.map(event => event.type)).toEqual([
     "member.mcp_credential.saved", "member.mcp_credential.removed", "member.mcp_credential.saved"
@@ -199,7 +199,7 @@ test("keeps tombstone versions and rejects stale removal and save", async () => 
 
 test("hides a stale personal label and legacy URL secret after organization scope change", async () => {
   const { state, store } = setup();
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   state.server.credential_scope = "organization";
   state.server.upstream_auth_type = "none";
   state.server.upstream_auth_name = null;
@@ -217,12 +217,12 @@ test("hides a stale personal label and legacy URL secret after organization scop
 test("rejects invalid inputs before transaction or encryption", async () => {
   const { pool, store } = setup();
   for (const secret of ["short", "bad\nsecret", "x".repeat(8193)]) {
-    await expect(store.save(tenantId, userId, serverId, { ...saveInput, secret }))
+    await expect(store.save(tenantId, userId, serverId, { ...saveInput, secret }, null))
       .rejects.toBeInstanceOf(MemberMcpValidationError);
   }
-  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: -1 }))
+  await expect(store.save(tenantId, userId, serverId, { ...saveInput, version: -1 }, null))
     .rejects.toBeInstanceOf(MemberMcpValidationError);
-  await expect(store.save(tenantId, userId, serverId, { ...saveInput, accountLabel: "x".repeat(121) }))
+  await expect(store.save(tenantId, userId, serverId, { ...saveInput, accountLabel: "x".repeat(121) }, null))
     .rejects.toBeInstanceOf(MemberMcpValidationError);
   await expect(store.remove(tenantId, userId, serverId, -1)).rejects.toBeInstanceOf(MemberMcpValidationError);
   expect(pool.queries).toEqual([]);
@@ -230,7 +230,7 @@ test("rejects invalid inputs before transaction or encryption", async () => {
 
 test("reads the status of several servers in one transaction", async () => {
   const { pool, store, server } = setup();
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   const missing = { ...server(), serverId: "removed-proxy" };
   const before = pool.queries.length;
   const statuses = await store.listStatuses(tenantId, userId, [server(), missing]);
@@ -242,7 +242,7 @@ test("reads the status of several servers in one transaction", async () => {
 
 test("tells a member removal apart from a binding rotation", async () => {
   const { state, store, server } = setup();
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   await store.remove(tenantId, userId, serverId, 1);
   state.server.credential_binding_id = "00000000-0000-4000-8000-000000000002";
   expect(await store.getStatus(tenantId, userId, server())).toEqual({
@@ -250,7 +250,7 @@ test("tells a member removal apart from a binding rotation", async () => {
   expect((await store.list(tenantId, userId))[0]).toMatchObject({ status: "not_connected", hasCredential: false });
 
   // A rotation that revokes the secret keeps the old binding and the label.
-  await store.save(tenantId, userId, serverId, { ...saveInput, version: 2 });
+  await store.save(tenantId, userId, serverId, { ...saveInput, version: 2 }, null);
   const revoked = state.credentials.get(userId)!;
   revoked.secret_encrypted = null;
   revoked.version += 1;
@@ -262,7 +262,7 @@ test("tells a member removal apart from a binding rotation", async () => {
 test("clears a secret for an old system binding when a read sees it", async () => {
   const { state, pool, store, server } = setup();
   state.server.tenant_id = "system";
-  await store.save(tenantId, userId, serverId, saveInput);
+  await store.save(tenantId, userId, serverId, saveInput, null);
   // The system server rotates. Its revoke cannot reach this tenant's row.
   state.server.credential_binding_id = "00000000-0000-4000-8000-000000000002";
   expect(await store.getRuntimeCredential(tenantId, userId, server())).toBeNull();

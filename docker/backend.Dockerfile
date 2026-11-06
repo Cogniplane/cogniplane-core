@@ -14,11 +14,8 @@ COPY apps/backend/package.json apps/backend/package.json
 # `tsc -p tsconfig.json`, so the source must be present before install
 # rather than copied after.
 COPY packages/shared-types packages/shared-types
-# Private overlay packages may or may not exist in the build context. On
-# the private tree they're real workspace packages; on the public mirror
-# they're stubbed out via the rewrite of apps/backend/src/overlays.ts.
-# The bracket-pattern silently no-ops on the public tree.
-COPY privat[e] private/
+# Include the bundled SharePoint workspace packages.
+COPY private private/
 
 COPY patches patches
 
@@ -27,7 +24,7 @@ RUN pnpm install --frozen-lockfile
 COPY apps/backend apps/backend
 # These renderer patches are absent from the backend production dependencies.
 RUN pnpm --filter @cogniplane/backend build:bundle \
-  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); for (const name of ["@a2ui/web_core@0.10.4", "@copilotkit/a2ui-renderer@1.79.1"]) delete pkg.pnpm.patchedDependencies[name]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
+  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); for (const name of ["@a2ui/web_core@0.10.4", "@copilotkit/a2ui-renderer@1.83.0"]) delete pkg.pnpm.patchedDependencies[name]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
   && pnpm --filter @cogniplane/backend deploy --prod --no-optional --legacy /opt/backend
 
 FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runtime

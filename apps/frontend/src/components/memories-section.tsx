@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -24,16 +24,17 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
+import { useConfirmLeave } from "@/hooks/use-confirm-leave";
 import { memoriesKey, MemoriesScopeError, useMemories } from "@/hooks/use-memories";
 import { ApiError } from "@/lib/api-client";
 import { deleteMemory, updateMemory } from "@/lib/memories-api";
 import { formatMediumDateTime } from "@/lib/time-format";
-import { PILL_AMBER, PILL_GRAY, PILL_GREEN } from "@/lib/ui-tokens";
+import { PILL_AMBER, PILL_BASE, PILL_GRAY } from "@/lib/ui-tokens";
 
 const PROVENANCE: Record<MemoryProvenance, { label: string; pill: string; detail: (memory: Memory) => string }> = {
   agent_approved: {
     label: "Approved by you",
-    pill: PILL_GREEN,
+    pill: `${PILL_BASE} bg-success-surface text-on-surface`,
     detail: (memory) => `The agent proposed this text and you approved it on ${formatMediumDateTime(memory.approvedAt, "an earlier date")}.`
   },
   user_authored: {
@@ -73,20 +74,69 @@ type EditState = { id: string; draft: string; baseVersion: number; baseContent: 
  */
 export function MemoriesSection({ scope }: { scope: MemoryScope }) {
   const queryClient = useQueryClient();
-  const list = useMemories(scope);
   const [editing, setEditing] = useState<EditState | null>(null);
   const [deleting, setDeleting] = useState<Memory | null>(null);
   const [error, setError] = useState<string | null>(null);
   // A failed delete is shown inside the dialog, because the dialog covers the page.
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [locked, setLocked] = useState(false);
+  const list = useMemories(locked ? null : scope);
+  const [discard, setDiscard] = useState<{ from: Memory; next: Memory | null } | null>(null);
+  const section = useRef<HTMLElement>(null);
+  const deleteDialog = useRef<HTMLDivElement>(null);
+  const deleteConfirm = useRef<HTMLButtonElement>(null);
+  const writePending = useRef(false);
+  const dialogReturn = useRef<() => void>(() => {});
+  const focusRequest = useRef<{ id: string | null; control: "edit" | "delete" | "editor" } | null>(null);
   const key = memoriesKey(scope);
+
+  const applyFocus = () => {
+    if (!focusRequest.current) return;
+    const { id, control } = focusRequest.current;
+    const row = Array.from(section.current?.querySelectorAll<HTMLElement>("[data-memory-id]") ?? [])
+      .find((item) => item.dataset.memoryId === id);
+    const target = control === "editor" ? row?.querySelector<HTMLTextAreaElement>("textarea")
+      : row?.querySelector<HTMLButtonElement>(`[data-memory-action="${control}"]`);
+    // A completed read or save can precede the render of its enabled control.
+    if (id !== null && (!target || target.disabled)) return;
+    const destination = target ?? section.current?.querySelector<HTMLElement>("#memories-title");
+    destination?.focus();
+    destination?.scrollIntoView?.({ block: "nearest" });
+    focusRequest.current = null;
+  };
+  const focusMemory = (id: string | null, control: "edit" | "delete" | "editor" = "edit") => {
+    focusRequest.current = { id, control };
+    requestAnimationFrame(applyFocus);
+  };
+  useEffect(() => { applyFocus(); });
+
+  const beginEdit = (memory: Memory) => {
+    setError(null);
+    setEditing({ id: memory.id, draft: memory.content, baseVersion: memory.version, baseContent: memory.content, conflict: false });
+  };
+
+  const leaveEdit = (next: Memory | null, deliberateDiscard = false) => {
+    if (busy || mustLock) return;
+    const from = memories.find((memory) => memory.id === editing?.id);
+    if (editing && from && editing.draft !== editing.baseContent && !deliberateDiscard) {
+      dialogReturn.current = () => focusMemory(editing.id, "editor");
+      setDiscard({ from, next });
+      return;
+    }
+    setError(null);
+    if (next) beginEdit(next);
+    else { setEditing(null); focusMemory(editing?.id ?? null); }
+  };
 
   const lock = () => {
     queryClient.removeQueries({ queryKey: key, exact: true });
     setEditing(null);
     setDeleting(null);
+    setDiscard(null);
+    setError(null);
+    setDeleteError(null);
     setLocked(true);
+    focusMemory(null);
   };
 
   const update = useMutation({
@@ -99,6 +149,7 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
         : current);
       setEditing(null);
       setError(null);
+      focusMemory(result.memory.id);
       toast.success(`Memory "${result.memory.name}" was updated.`);
     },
     onError: (cause, variables) => {
@@ -109,22 +160,30 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
         // so the card can show the latest saved text beside it.
         setEditing((current) => current?.id === variables.memory.id ? { ...current, conflict: true } : current);
         setError(null);
+        focusMemory(variables.memory.id, "editor");
         void queryClient.invalidateQueries({ queryKey: key });
         return;
       }
       if (cause instanceof ApiError && cause.status === 404) {
         setEditing(null);
+        focusMemory(null);
         setError("This memory no longer exists.");
         void queryClient.invalidateQueries({ queryKey: key });
         return;
       }
       setError(messageOf(cause, "The memory could not be saved. Try again."));
-    }
+      focusMemory(variables.memory.id, "editor");
+    },
+    onSettled: () => { writePending.current = false; }
   });
 
   const remove = useMutation({
     mutationFn: (memory: Memory) => deleteMemory(memory.id, scope),
     onSuccess: (_void, memory) => {
+      const current = queryClient.getQueryData<MemoriesResponse>(key)?.memories ?? [];
+      const index = current.findIndex((item) => item.id === memory.id);
+      const next = current[index + 1] ?? current[index - 1];
+      dialogReturn.current = () => focusMemory(next?.id ?? null, "delete");
       queryClient.setQueryData<MemoriesResponse>(key, (current) => current
         ? { ...current, total: Math.max(0, current.total - 1), memories: current.memories.filter((item) => item.id !== memory.id) }
         : current);
@@ -137,22 +196,44 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
       if (isScopeProblem(cause)) { lock(); return; }
       if (cause instanceof ApiError && cause.status === 404) {
         setDeleting(null);
+        dialogReturn.current = () => focusMemory(null);
         void queryClient.invalidateQueries({ queryKey: key });
         return;
       }
       setDeleteError(messageOf(cause, "The memory could not be deleted. Try again."));
-    }
+    },
+    onSettled: () => { writePending.current = false; }
   });
 
   const busy = update.isPending || remove.isPending;
+  useEffect(() => {
+    if (remove.isPending) deleteDialog.current?.focus();
+    else if (deleteError) deleteConfirm.current?.focus();
+  }, [remove.isPending, deleteError]);
   const loadFailure = list.isError ? list.error : null;
   const mustLock = locked || isScopeProblem(loadFailure);
   const memories = list.data?.memories ?? [];
+  useConfirmLeave(!mustLock && editing !== null && editing.draft !== editing.baseContent);
+  const retryList = () => {
+    void list.refetch().then((result) => {
+      if (isScopeProblem(result.error)) return;
+      focusMemory(editing?.id ?? result.data?.memories[0]?.id ?? null, editing ? "editor" : "edit");
+    });
+  };
+
+  useEffect(() => {
+    if (!isScopeProblem(loadFailure) || locked) return;
+    let cancelled = false;
+    // The render hides the data immediately. Then unsubscribe and clear the account's cache.
+    queueMicrotask(() => { if (!cancelled) lock(); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadFailure, locked]);
 
   return (
-    <section className="space-y-4 pt-5" aria-labelledby="memories-title">
+    <section ref={section} className="min-w-0 space-y-4 pt-5" aria-labelledby="memories-title">
       <div>
-        <h2 id="memories-title" className="text-lg font-semibold">What the agent remembers about you</h2>
+        <h2 id="memories-title" tabIndex={-1} className="text-lg font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring">What the agent remembers about you</h2>
         <p className="mt-1 text-sm text-on-surface-variant">
           The agent reads your most recent memories at the start of every turn. It can only propose a new one:
           nothing is saved until you approve the exact text in the chat. Edit or delete anything here.
@@ -160,6 +241,12 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
       </div>
 
       {error ? <p role="alert" className="rounded-md bg-danger-surface p-3 text-sm text-danger">{error}</p> : null}
+      {!mustLock && list.isError && list.data ? (
+        <div role="alert" className="rounded-md bg-warning-surface p-3 text-sm text-on-surface">
+          <p>Could not refresh your memories. Showing the last loaded list. Your draft is kept.</p>
+          <Button className="mt-2" size="sm" variant="outline" disabled={list.isFetching} onClick={retryList}>{list.isFetching ? "Retrying…" : "Retry"}</Button>
+        </div>
+      ) : null}
 
       {mustLock ? (
         <p role="alert" className="rounded-lg border border-outline-variant p-5 text-sm">
@@ -168,13 +255,13 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
       ) : list.isError && !list.data ? (
         <div role="alert" className="rounded-lg border border-outline-variant p-5 text-sm">
           <p>Could not load your memories.</p>
-          <Button className="mt-3" size="sm" variant="outline" onClick={() => void list.refetch()}>Retry</Button>
+          <Button className="mt-3" size="sm" variant="outline" onClick={retryList}>Retry</Button>
         </div>
       ) : list.isPending ? (
         <div aria-label="Loading memories" className="space-y-2"><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
       ) : memories.length === 0 ? (
         <p className="rounded-lg border border-dashed border-outline-variant p-6 text-sm text-on-surface-variant">
-          No saved memories yet. When the agent proposes one, you approve its exact text in the chat, and it appears here.
+          {list.isError ? "The last loaded list had no saved memories. Retry to check for changes." : "No saved memories yet. When the agent proposes one, you approve its exact text in the chat, and it appears here."}
         </p>
       ) : (
         <>
@@ -187,21 +274,29 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
                 busy={busy}
                 saving={update.isPending && editing?.id === memory.id}
                 loadingLatest={list.isFetching}
-                onEdit={() => {
-                  setError(null);
-                  setEditing({ id: memory.id, draft: memory.content, baseVersion: memory.version, baseContent: memory.content, conflict: false });
-                }}
+                latestReadFailed={list.isError}
+                onEdit={() => leaveEdit(memory)}
                 onDraft={(draft) => setEditing((current) => current?.id === memory.id ? { ...current, draft } : current)}
-                onCancel={() => { setEditing(null); setError(null); }}
+                onCancel={() => leaveEdit(null, editing?.conflict)}
                 onSave={() => {
-                  if (editing?.id === memory.id) update.mutate({ memory, content: editing.draft, version: editing.baseVersion });
+                  if (!writePending.current && !mustLock && editing?.id === memory.id && !editing.conflict && editing.draft.trim() && editing.draft !== editing.baseContent) {
+                    writePending.current = true;
+                    update.mutate({ memory, content: editing.draft, version: editing.baseVersion });
+                  }
                 }}
                 // The user has read the latest text in the conflict panel. Their text now builds on that version.
-                onReapply={() => setEditing((current) => current?.id === memory.id
-                  ? { ...current, baseVersion: memory.version, baseContent: memory.content, conflict: false }
-                  : current)}
-                onReload={() => void list.refetch()}
-                onDelete={() => { setError(null); setDeleteError(null); setDeleting(memory); }}
+                onReapply={() => {
+                  if (list.isError || list.isFetching || mustLock) return;
+                  setEditing((current) => current?.id === memory.id && memory.version !== current.baseVersion
+                    ? { ...current, baseVersion: memory.version, baseContent: memory.content, conflict: false } : current);
+                  focusMemory(memory.id, "editor");
+                }}
+                onReload={retryList}
+                onDelete={() => {
+                  setError(null); setDeleteError(null);
+                  dialogReturn.current = () => focusMemory(memory.id, "delete");
+                  setDeleting(memory);
+                }}
               />
             ))}
           </ul>
@@ -213,8 +308,30 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
         </>
       )}
 
-      <AlertDialog open={deleting !== null} onOpenChange={(next) => { if (!next && !remove.isPending) setDeleting(null); }}>
-        <AlertDialogContent>
+      <AlertDialog open={discard !== null && !mustLock} onOpenChange={(next) => { if (!next) setDiscard(null); }}>
+        <AlertDialogContent onCloseAutoFocus={(event) => { event.preventDefault(); dialogReturn.current(); }}>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="wrap-anywhere">Discard your edit to &ldquo;{discard?.from.name}&rdquo;?</AlertDialogTitle>
+            <AlertDialogDescription className="wrap-anywhere">
+              Your unsaved text will be lost. The saved memory will stay unchanged.
+              {discard?.next ? ` Then the editor will open "${discard.next.name}".` : " The editor will close."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+            <Button type="button" variant="destructive" onClick={() => {
+              if (!discard || mustLock) return;
+              const { from, next } = discard;
+              dialogReturn.current = () => focusMemory(next?.id ?? from.id, next ? "editor" : "edit");
+              setDiscard(null);
+              setError(null);
+              if (next) beginEdit(next); else setEditing(null);
+            }}>Discard edit</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={deleting !== null && !mustLock} onOpenChange={(next) => { if (!next && !remove.isPending) setDeleting(null); }}>
+        <AlertDialogContent ref={deleteDialog} onCloseAutoFocus={(event) => { event.preventDefault(); dialogReturn.current(); }}>
           <AlertDialogHeader>
             <AlertDialogTitle className="wrap-anywhere">Delete memory &ldquo;{deleting?.name}&rdquo;?</AlertDialogTitle>
             <AlertDialogDescription>
@@ -225,11 +342,12 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
           <AlertDialogFooter>
             <AlertDialogCancel disabled={remove.isPending}>Cancel</AlertDialogCancel>
             <Button
+              ref={deleteConfirm}
               type="button"
               variant="destructive"
               disabled={remove.isPending}
               aria-busy={remove.isPending}
-              onClick={() => { if (deleting) remove.mutate(deleting); }}
+              onClick={() => { if (deleting && !writePending.current && !mustLock) { writePending.current = true; remove.mutate(deleting); } }}
             >
               {remove.isPending ? "Deleting…" : "Delete memory"}
             </Button>
@@ -240,7 +358,7 @@ export function MemoriesSection({ scope }: { scope: MemoryScope }) {
   );
 }
 
-function MemoryCard({ memory, edit, busy, saving, loadingLatest, onEdit, onDraft, onCancel, onSave, onReapply, onReload, onDelete }: {
+function MemoryCard({ memory, edit, busy, saving, loadingLatest, latestReadFailed, onEdit, onDraft, onCancel, onSave, onReapply, onReload, onDelete }: {
   /** The memory as the list holds it now, which is the latest saved text. */
   memory: Memory;
   /** The editor, or null when the memory is not being edited. */
@@ -249,6 +367,7 @@ function MemoryCard({ memory, edit, busy, saving, loadingLatest, onEdit, onDraft
   saving: boolean;
   /** The list is being read again. */
   loadingLatest: boolean;
+  latestReadFailed: boolean;
   onEdit: () => void;
   onDraft: (draft: string) => void;
   onCancel: () => void;
@@ -266,12 +385,20 @@ function MemoryCard({ memory, edit, busy, saving, loadingLatest, onEdit, onDraft
   const empty = edit !== null && edit.draft.trim().length === 0;
   const conflict = edit?.conflict === true;
   // The list holds a newer version than the one that the editor started from.
-  const latestLoaded = edit !== null && memory.version !== edit.baseVersion;
+  const latestLoaded = !latestReadFailed && edit !== null && memory.version !== edit.baseVersion;
+
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const editing = edit !== null;
+  useEffect(() => { if (editing && !saving) textarea.current?.focus(); }, [editing, saving]);
+  useLayoutEffect(() => {
+    const field = textarea.current;
+    if (editing && field === document.activeElement) field?.scrollIntoView?.({ block: "nearest" });
+  }, [editing, shown, latestLoaded, loadingLatest]);
 
   return (
-    <li className="rounded-lg border border-outline-variant bg-surface p-4">
+    <li data-memory-id={memory.id} className="min-w-0 rounded-lg border border-outline-variant bg-surface p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="flex flex-wrap items-center gap-2">
+        <span className="flex min-w-0 flex-wrap items-center gap-2">
           <code className="text-sm font-medium text-on-surface [overflow-wrap:anywhere]">{memory.name}</code>
           <span className={provenance.pill}>{provenance.label}</span>
         </span>
@@ -304,19 +431,20 @@ function MemoryCard({ memory, edit, busy, saving, loadingLatest, onEdit, onDraft
             </div>
           ) : null}
           <Textarea
+            ref={textarea}
             aria-label={`Text of memory ${memory.name}`}
             value={edit.draft}
             maxLength={MEMORY_CONTENT_MAX_LENGTH}
             disabled={saving}
             onChange={(event) => onDraft(event.target.value)}
-            className="min-h-24"
+            className="min-h-28 text-base sm:text-sm"
           />
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs text-on-surface-variant">{edit.draft.length} / {MEMORY_CONTENT_MAX_LENGTH}</span>
             {conflict ? (
-              <span className="flex gap-2">
-                <Button type="button" size="sm" variant="outline" onClick={onCancel}>Discard my edit</Button>
-                <Button type="button" size="sm" disabled={!latestLoaded || loadingLatest} onClick={onReapply}>
+              <span className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
+                <Button type="button" size="sm" className="h-auto min-h-10 whitespace-normal py-2" variant="outline" onClick={onCancel}>Discard my edit</Button>
+                <Button type="button" size="sm" className="h-auto min-h-10 whitespace-normal py-2" disabled={!latestLoaded || loadingLatest} onClick={onReapply}>
                   Reapply my text to the latest version
                 </Button>
               </span>
@@ -344,10 +472,10 @@ function MemoryCard({ memory, edit, busy, saving, loadingLatest, onEdit, onDraft
             </p>
           ) : null}
           <div className="mt-3 flex gap-2">
-            <Button type="button" size="sm" variant="outline" disabled={busy} aria-label={`Edit memory ${memory.name}`} onClick={onEdit}>
+            <Button data-memory-action="edit" type="button" size="sm" variant="outline" disabled={busy} aria-label={`Edit memory ${memory.name}`} onClick={onEdit}>
               Edit
             </Button>
-            <Button type="button" size="sm" variant="outline" disabled={busy} aria-label={`Delete memory ${memory.name}`} onClick={onDelete}>
+            <Button data-memory-action="delete" type="button" size="sm" variant="outline" disabled={busy} aria-label={`Delete memory ${memory.name}`} onClick={onDelete}>
               Delete
             </Button>
           </div>

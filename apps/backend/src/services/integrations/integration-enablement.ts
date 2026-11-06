@@ -5,7 +5,7 @@ import type { IntegrationStateStore } from "./integration-state-store.js";
 // Resolves the per-tenant integration row + the platform-configuration
 // status into the shape the connection-status endpoints (`/me/<x>-connection`)
 // merge into their response. Shared between core (GitHub, Notion) and the
-// SharePoint private overlay (Microsoft).
+// private overlays.
 
 export type IntegrationEnablement = {
   tenantEnabled: boolean;

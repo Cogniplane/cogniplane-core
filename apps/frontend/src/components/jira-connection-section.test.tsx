@@ -11,7 +11,7 @@ const beta = { siteId: "99999999-2222-4333-8444-555555555555", name: "Beta", url
 const notConnected: JiraConnectionStatus = {
   configured: true, userConnection: null, tenantReadsEnabled: true, authorizationStarted: false, cleanupPending: false
 };
-const connection = { accountId: "apn_1", accountName: null, site: acme, connectedAt: "2026-09-30T12:00:00Z", updatedAt: "2026-09-30T12:00:00Z" };
+const connection = { accountId: "apn_1", accountName: null, site: acme, connectedAt: "2026-09-30T12:00:00Z", updatedAt: "2026-09-30T12:00:00Z", suspended: false };
 
 function mount(
   status: JiraConnectionStatus | null,
@@ -89,7 +89,7 @@ it("disables site choice and disconnect while a site is being saved", async () =
 it("does not offer to connect when the platform is not configured", () => {
   mount({ configured: false, userConnection: null, authorizationStarted: false, cleanupPending: false });
   expect((screen.getByRole("button", { name: "Connect my Jira account" }) as HTMLButtonElement).disabled).toBe(true);
-  expect(screen.getByText(/Contact your organization administrator/)).toBeTruthy();
+  expect(screen.getByText(/Ask an administrator/)).toBeTruthy();
   expect(screen.queryByText(/PIPEDREAM_/)).toBeNull();
   expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
 });
@@ -100,7 +100,7 @@ it("keeps disconnect but not connect or site choice when the organization turns 
   });
   expect(screen.getByText("Connected to Acme")).toBeTruthy();
   expect(screen.queryByText(/Reading/)).toBeNull();
-  expect(screen.getByText(/has not enabled Jira/)).toBeTruthy();
+  expect(screen.getByText("Jira is disabled by your organization")).toBeTruthy();
   expect((screen.getByRole("button", { name: "Connect another Jira account" }) as HTMLButtonElement).disabled).toBe(true);
   expect(screen.queryByText("Jira accounts")).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
@@ -124,4 +124,30 @@ it("asks to retry a removal that did not finish", () => {
 it("does not offer disconnect when nothing was authorized", () => {
   mount(notConnected);
   expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
+});
+
+// q4w0.8: a security change of the owner's account suspended the connection.
+// There is no confirm for Jira: the Pipedream account ID is opaque and the
+// account name is chosen by whoever authorized the account. Choosing a site
+// again restores it; Disconnect removes all accounts.
+it("shows a suspended connection with no confirm and no account name", async () => {
+  const accounts = [{ ...healthy("apn_1", "Someone"), accountName: "Someone" }];
+  mount({ ...notConnected, userConnection: { ...connection, accountName: "Someone", suspended: true }, authorizationStarted: true },
+    accounts, { onLoadSites: async () => [acme] });
+  expect(screen.getByText("Suspended: Acme")).toBeTruthy();
+  expect(screen.getByText("suspended")).toBeTruthy();
+  expect(screen.getByText("Suspended because your account security changed")).toBeTruthy();
+  expect(screen.getByText(/The agent does not use this connection\. Connect again, or disconnect it\./)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /Confirm/ })).toBeNull();
+  // The name that whoever authorized the account chose is not shown, also not in the account list.
+  expect(screen.queryByText("Someone")).toBeNull();
+  expect(screen.getByText("Jira account apn_1")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Connect another Jira account" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+  cleanup();
+
+  mount({ ...notConnected, userConnection: { ...connection, accountName: "Someone" }, authorizationStarted: true },
+    accounts, { onLoadSites: async () => [acme] });
+  expect(screen.queryByText("Suspended because your account security changed")).toBeNull();
+  expect(screen.getAllByText("Someone").length).toBeGreaterThan(0);
 });

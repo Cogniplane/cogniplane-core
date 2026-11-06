@@ -2,12 +2,15 @@ import * as React from "react"
 
 import { cn } from "@/lib/cn"
 
+// A static container: one faint perimeter, 12px corners, and no shadow
+// (DESIGN.md, Layer-Before-Shadow and One Boundary rules). Elevation is for
+// menus, dialogs, and drawers.
 function Card({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="card"
       className={cn(
-        "flex flex-col gap-6 rounded-xl border bg-card py-6 text-card-foreground shadow-sm",
+        "flex flex-col gap-6 rounded-lg border bg-card py-6 text-card-foreground",
         className
       )}
       {...props}
@@ -32,7 +35,7 @@ function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="card-title"
-      className={cn("leading-none font-semibold", className)}
+      className={cn("text-base leading-snug font-semibold", className)}
       {...props}
     />
   )

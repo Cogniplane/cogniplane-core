@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, render, waitFor, screen, fireEvent, within } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { lazy, useEffect, type ComponentType, type ReactNode } from "react";
-import type { Approval, ProjectFilePickerEntry, Session } from "@cogniplane/shared-types";
+import type { Approval, Artifact, ProjectFilePickerEntry, Session } from "@cogniplane/shared-types";
 
 // @ag-ui/client always passes the error and the run input to onRunFailed. A
 // status on the error means the backend refused the request.
@@ -14,6 +14,7 @@ const runFailure = {
   input: runStart.input
 };
 type FakeSubscriber = {
+  onToolCallResultEvent?: (params: { event: { toolCallId: string }; messages: unknown[] }) => void;
   onRunInitialized?: (params: { input: object }) => void;
   onRunFailed?: (params: typeof runFailure) => void;
   onRunFinishedEvent?: (params: { event: object; input: object }) => void;
@@ -57,13 +58,25 @@ const shellState = vi.hoisted(() => ({
   lastConfirmedSelection: [] as string[],
   messages: [{ marker: "history-1" }] as Array<{ marker: string } & Partial<import("@cogniplane/shared-types").Message>>,
   initialApprovals: [] as Approval[],
-  serverActivity: {} as Partial<Session>
+  serverActivity: {} as Partial<Session>,
+  artifacts: [] as Artifact[],
+  // The session query: loaded, first load running, first load failed with
+  // nothing cached, or a failed refetch that kept the cached data.
+  sessionData: "ready" as "ready" | "loading" | "error" | "cached-error",
+  isLoadingSessions: false,
+  // The artifacts panel stand-in renders a nested Radix dialog.
+  nestedDialog: false,
+  pendingDeleteId: null as string | null
 }));
+const artifactPanelProps = vi.hoisted(() => ({ values: [] as Array<{ inventory: { status?: string; onRetry?: () => void; retrying?: boolean } }> }));
+const workspaceActions = vi.hoisted(() => ({ openPreview: vi.fn() }));
+// What the chat host gives the ArtifactCards. The cards render in the real host test.
+const cardProviders = vi.hoisted(() => ({ props: [] as Array<{ sessionId: string; inventory?: { artifacts: readonly unknown[]; onOpenPreview: (artifactId: string) => void } }> }));
 const eventSeeds = vi.hoisted(() => ({ values: [] as unknown[][] }));
-const sessionListActions = vi.hoisted(() => ({ reload: vi.fn(async () => undefined), select: vi.fn(), create: vi.fn(async () => undefined) }));
+const sessionListActions = vi.hoisted(() => ({ reload: vi.fn(async () => undefined), select: vi.fn(), create: vi.fn(async () => undefined), confirmDelete: vi.fn(), cancelDelete: vi.fn() }));
 const queryActions = vi.hoisted(() => ({ invalidate: vi.fn(), projectRefetch: vi.fn(), refresh: vi.fn(async () => {}) }));
 const hostLifecycle = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }));
-const copilotkitCore = vi.hoisted(() => ({ connectAgent: vi.fn(async () => undefined) }));
+const copilotkitCore = vi.hoisted(() => ({ runAgent: vi.fn(({ agent }: { agent: { runAgent: () => Promise<unknown> } }) => agent.runAgent()), connectAgent: vi.fn(async () => undefined), getContextForAgent: vi.fn(() => []) }));
 const navigationState = vi.hoisted(() => ({ resolveDraftId: null as string | null, sessionId: null as string | null }));
 const projectApi = vi.hoisted(() => ({
   listProjects: vi.fn(async () => []),
@@ -141,44 +154,75 @@ vi.mock("../hooks/use-session-list", () => ({
       sessions,
       selectedSessionId: shellState.selectedId,
       selectedSession: sessions.find((session) => session.sessionId === shellState.selectedId),
-      isLoadingSessions: false,
+      isLoadingSessions: shellState.isLoadingSessions,
+      isCreatingSession: false,
       busySessionId: shellState.busyId,
       error: shellState.error,
       renameSessionId: null,
       renameDraft: "",
       pinnedSessionIds: new Set<string>(),
-      pendingDeleteSessionId: null,
+      pendingDeleteSessionId: shellState.pendingDeleteId,
       reload: sessionListActions.reload, setError: vi.fn(), selectSession: sessionListActions.select, createSession: sessionListActions.create, startRename: vi.fn(),
       cancelRename: vi.fn(), confirmRename: vi.fn(), setRenameDraft: vi.fn(), deleteSession: vi.fn(),
-      archiveSession: vi.fn(), togglePinSession: vi.fn(), confirmDelete: vi.fn(), cancelDelete: vi.fn(), renameSessionDirect: vi.fn()
+      archiveSession: vi.fn(), togglePinSession: vi.fn(), confirmDelete: sessionListActions.confirmDelete, cancelDelete: sessionListActions.cancelDelete, renameSessionDirect: vi.fn()
     };
   }
 }));
 vi.mock("../hooks/use-chat-workspace", () => ({
   useChatWorkspace: () => ({
     messages: shellState.messages,
-    artifacts: [],
+    artifacts: shellState.artifacts,
     initialApprovals: shellState.initialApprovals,
-    isSessionDataReady: true,
+    isSessionDataReady: shellState.sessionData === "ready" || shellState.sessionData === "cached-error",
+    hasSessionData: shellState.sessionData === "ready" || shellState.sessionData === "cached-error",
+    loadError: shellState.sessionData === "error" || shellState.sessionData === "cached-error" ? "HTTP 503" : null,
     refreshSessionData: queryActions.refresh,
     artifactState: {
       visibleSelectedArtifactIds: [], isUploadingArtifact: false, downloadArtifactId: null,
       previewArtifactId: null, isLoadingPreview: false, toggleArtifactSelection: vi.fn(),
-      handleUploadArtifact: vi.fn(), handleDownloadArtifact: vi.fn(), openPreview: vi.fn()
+      handleUploadArtifact: vi.fn(), handleDownloadArtifact: vi.fn(), openPreview: workspaceActions.openPreview
     }
   })
 }));
 vi.mock("./agui-transcript", async (importOriginal) => ({
   toolStatusesFromMessages: (messages: unknown[]) => [{ rowId: (messages[0] as { marker: string }).marker }],
   mcpAppsFromMessages: (await importOriginal<typeof import("./agui-transcript")>()).mcpAppsFromMessages,
-  runtimeNoticesFromMessages: (await importOriginal<typeof import("./agui-transcript")>()).runtimeNoticesFromMessages
+  runtimeNoticesFromMessages: (await importOriginal<typeof import("./agui-transcript")>()).runtimeNoticesFromMessages,
+  turnStoppedNotice: (await importOriginal<typeof import("./agui-transcript")>()).turnStoppedNotice,
+  turnStopReasonOfResult: (await importOriginal<typeof import("./agui-transcript")>()).turnStopReasonOfResult
+}));
+vi.mock("./artifact-card", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./artifact-card")>(),
+  ArtifactCardProvider: (props: (typeof cardProviders.props)[number] & { children: ReactNode }) => {
+    cardProviders.props.push(props);
+    return props.children;
+  }
 }));
 vi.mock("./session-sidebar", () => ({ SessionSidebar: () => null }));
-vi.mock("./artifact-panel", () => ({ ArtifactPanel: () => null }));
+vi.mock("./artifact-panel", async () => {
+  const { useState } = await import("react");
+  const { Dialog, DialogContent, DialogTitle } = await import("./ui/dialog");
+  function NestedDialog() {
+    const [open, setOpen] = useState(true);
+    return (
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent aria-describedby={undefined}><DialogTitle>Nested preview</DialogTitle></DialogContent>
+      </Dialog>
+    );
+  }
+  return {
+    ArtifactPanel: (props: (typeof artifactPanelProps.values)[number]) => {
+      artifactPanelProps.values.push(props);
+      return shellState.nestedDialog ? <NestedDialog /> : null;
+    }
+  };
+});
 vi.mock("./artifact-preview-modal", () => ({ ArtifactPreviewModal: () => null }));
 vi.mock("./file-source-picker", () => ({ FileSourcePicker: () => null }));
 vi.mock("./workspace-header", () => ({
-  WorkspaceHeader: ({ hasPendingApprovals, sessionStatus, sessionActions, completedTurn, isSidebarOpen, isArtifactPaneOpen, onCopySession }: {
+  WorkspaceHeader: ({ hasPendingApprovals, sessionStatus, sessionActions, completedTurn, isSidebarOpen, isArtifactPaneOpen, onCopySession, artifactToggleRef, onToggleArtifactPane }: {
+    artifactToggleRef?: import("react").Ref<HTMLButtonElement>;
+    onToggleArtifactPane?: () => void;
     hasPendingApprovals: boolean;
     onCopySession?: () => string | undefined;
     isSidebarOpen: boolean;
@@ -187,6 +231,7 @@ vi.mock("./workspace-header", () => ({
     sessionStatus: string;
     sessionActions?: Omit<SessionActionMenuProps, "onRename">;
   }) => <>
+    <button ref={artifactToggleRef} onClick={onToggleArtifactPane} aria-label={isArtifactPaneOpen ? "Hide artifacts panel" : "Show artifacts panel"} />
     <span data-testid="panes">{`sidebar:${isSidebarOpen} artifacts:${isArtifactPaneOpen}`}</span>
     <span data-testid="completed-duration">{completedTurn?.durationMs}</span>
     <span data-testid="approval-attention" data-session-status={sessionStatus}>{hasPendingApprovals ? "pending" : "clear"}</span>
@@ -218,6 +263,20 @@ vi.mock("./copilot-render-slots", async () => ({
 }));
 vi.mock("./model-effort-selector", () => ({ ModelEffortSelector: () => null }));
 vi.mock("./context-window-meter", () => ({ ContextWindowMeter: () => null }));
+// The provider above is a stand-in without a generative UI runtime. The host
+// test covers the side panel with the real provider.
+vi.mock("./generative-ui-side-panel", () => ({
+  GenerativeUiSidePanel: () => null,
+  SidePanelToggle: () => null,
+  SidePanelNotice: () => null,
+  transcriptRows: (messages: unknown[]) => messages,
+  useSidePanel: () => ({
+    state: { hasView: false, streaming: false, incomplete: false, failed: false, views: [], selected: undefined, browsing: false },
+    open: false, waiting: false, announcement: "", narrow: false, focusRequest: 0,
+    toggle: () => undefined, show: () => undefined, close: () => undefined,
+    select: () => undefined, showLatest: () => undefined
+  })
+}));
 vi.mock("../lib/agui/use-agui-custom-events", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/agui/use-agui-custom-events")>();
   return {
@@ -260,7 +319,7 @@ vi.mock("../lib/agui/deep-agents-browser-agent", async (importOriginal) => ({
       };
       return {
         onRunInitialized: call("onRunInitialized"), onRunFailed: call("onRunFailed"),
-        onRunFinishedEvent: call("onRunFinishedEvent"), onRunFinalized: call("onRunFinalized"), onCustomEvent: call("onCustomEvent")
+        onToolCallResultEvent: call("onToolCallResultEvent"), onRunFinishedEvent: call("onRunFinishedEvent"), onRunFinalized: call("onRunFinalized"), onCustomEvent: call("onCustomEvent")
       };
     }
     subscribe(subscriber: FakeSubscriber) {
@@ -272,6 +331,7 @@ vi.mock("../lib/agui/deep-agents-browser-agent", async (importOriginal) => ({
 }));
 
 import { SessionActionMenu, type SessionActionMenuProps } from "./session-action-menu";
+import { otherOverlayOpen } from "../lib/keyboard-shortcuts";
 
 import { ChatShell } from "./chat-shell";
 
@@ -282,6 +342,15 @@ function pickerEntry(fileId: string, name: string, kind: "published" | "draft" =
 beforeAll(async () => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   await import("./copilot-chat-host");
+});
+beforeEach(() => {
+  // Notification overflow is measured in the real host. jsdom has no layout;
+  // frame geometry tests below install their own observer and measurements.
+  vi.stubGlobal("ResizeObserver", class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
 });
 afterEach(() => {
   cleanup();
@@ -301,11 +370,22 @@ afterEach(() => {
   shellState.messages = [{ marker: "history-1" }];
   shellState.initialApprovals = [];
   shellState.serverActivity = {};
+  shellState.artifacts = [];
+  shellState.sessionData = "ready";
+  shellState.isLoadingSessions = false;
+  shellState.nestedDialog = false;
+  shellState.pendingDeleteId = null;
+  artifactPanelProps.values = [];
+  window.localStorage.clear();
+  workspaceActions.openPreview.mockReset();
+  cardProviders.props = [];
   shellState.busyId = null;
   navigationState.resolveDraftId = null;
   navigationState.sessionId = null;
   sessionListActions.select.mockClear();
   sessionListActions.create.mockClear();
+  sessionListActions.confirmDelete.mockClear();
+  sessionListActions.cancelDelete.mockClear();
   projectApi.listProjects.mockClear();
   queryActions.invalidate.mockClear();
   queryActions.projectRefetch.mockClear();
@@ -370,6 +450,34 @@ describe("ChatShell session host boundary", () => {
     expect(first.abortRun).toHaveBeenCalledOnce();
     expect(agents.instances[1].options.sessionId).toBe("session-2");
     expect(eventSeeds.values.at(-1)).toEqual([{ rowId: "history-2" }]);
+  });
+
+  it("gives the chat's ArtifactCards the session's artifacts and the shared preview, and keeps the agent when the list refreshes", async () => {
+    const artifact = (status: Artifact["status"]) => ({ artifactId: "a-1", sessionId: "session-1", status } as Artifact);
+    shellState.artifacts = [artifact("pending")];
+    const view = render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    act(() => agents.instances[0].subscriber?.onToolCallResultEvent?.({
+      event: { toolCallId: "write-1" },
+      messages: [{ role: "assistant", toolCalls: [{ id: "write-1", function: { name: "write_artifact" } }] }]
+    }));
+    await waitFor(() => expect(queryActions.refresh).toHaveBeenCalledWith("session-1"));
+    const first = cardProviders.props.at(-1)!;
+    expect(first.sessionId).toBe("session-1");
+    expect(first.inventory?.artifacts).toBe(shellState.artifacts);
+    // The agent reads no inventory.
+    expect(Object.keys(agents.instances[0].options)).not.toContain("artifacts");
+
+    shellState.artifacts = [artifact("ready")];
+    view.rerender(<ChatShell />);
+
+    const refreshed = cardProviders.props.at(-1)!;
+    expect(refreshed.inventory?.artifacts).toBe(shellState.artifacts);
+    expect(agents.instances).toHaveLength(1);
+    expect(hostLifecycle).toMatchObject({ mounts: 1, unmounts: 0 });
+    expect(workspaceActions.openPreview).not.toHaveBeenCalled();
+    refreshed.inventory?.onOpenPreview("a-1");
+    expect(workspaceActions.openPreview).toHaveBeenCalledExactlyOnceWith("a-1");
   });
 
   it("waits for the project library before consuming a resolve-draft handoff", async () => {
@@ -459,7 +567,7 @@ it("keeps selected project files through searches and drops files that are no lo
   shellState.projectFiles = shellState.projectFiles.filter((file) => file.fileId !== "file-c");
   view.rerender(<ChatShell />);
   await waitFor(() => expect(getProjectFileIds()).toEqual(["file-a"]));
-  expect(screen.getByRole("status").textContent).toContain("1 selected file is no longer available");
+  expect(screen.getByText("1 selected file is no longer available. It was removed from your selection.").getAttribute("role")).toBe("status");
   expect(screen.queryByRole("checkbox", { name: "Contract.txt (draft)" })).toBeNull();
 });
 
@@ -720,6 +828,72 @@ it("retains persisted failure after switching away, returning, and remounting", 
   expect(status()).toBe("ready");
 });
 
+it("confirms a header-menu delete on a phone while the session drawer is closed", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener() {}, removeEventListener() {} }));
+  try {
+    shellState.pendingDeleteId = "session-1";
+    render(<ChatShell />);
+    const confirm = await screen.findByRole("alertdialog", { name: "Move this session to Trash?" });
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull();
+    expect(confirm.textContent).toContain('"session-1"');
+    fireEvent.click(within(confirm).getByRole("button", { name: "Move to Trash" }));
+    expect(sessionListActions.confirmDelete).toHaveBeenCalledOnce();
+    // The action also closes the dialog; the hook reads the pending id before that.
+    sessionListActions.confirmDelete.mockClear();
+    fireEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
+    expect(sessionListActions.cancelDelete).toHaveBeenCalled();
+    expect(sessionListActions.confirmDelete).not.toHaveBeenCalled();
+  } finally {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+  }
+});
+
+it("opens New session from a text field and starts each opening fresh", async () => {
+  sessionListActions.create.mockRejectedValueOnce(new Error("Session service unavailable"));
+  render(<ChatShell />);
+  const field = document.body.appendChild(document.createElement("input"));
+  try {
+    fireEvent.keyDown(field, { key: "O", ctrlKey: true, shiftKey: true });
+    let dialog = await screen.findByRole("dialog", { name: "New session" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create session" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toContain("Session service unavailable");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New session" })).toBeNull());
+    fireEvent.keyDown(field, { key: "O", ctrlKey: true, shiftKey: true });
+    dialog = await screen.findByRole("dialog", { name: "New session" });
+    expect(within(dialog).queryByRole("alert")).toBeNull();
+  } finally {
+    field.remove();
+  }
+});
+
+it("keeps the session shortcuts on a phone while the session drawer is closed or open", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener() {}, removeEventListener() {} }));
+  const press = (key: string) => fireEvent.keyDown(window, { key, ctrlKey: true, shiftKey: true });
+  try {
+    render(<ChatShell />);
+    await waitFor(() => expect(screen.getByTestId("panes").textContent).toContain("sidebar:false"));
+    press("O");
+    const create = await screen.findByRole("dialog", { name: "New session" });
+    fireEvent.click(within(create).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New session" })).toBeNull());
+
+    press("S");
+    await screen.findByRole("dialog", { name: "Sessions" });
+    press("O");
+    expect(await screen.findByRole("dialog", { name: "New session" })).toBeTruthy();
+    // Over the New session dialog, the drawer shortcut does nothing.
+    press("S");
+    expect(screen.getByTestId("panes").textContent).toContain("sidebar:true");
+    fireEvent.click(within(screen.getByRole("dialog", { name: "New session" })).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "New session" })).toBeNull());
+    press("S");
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Sessions" })).toBeNull());
+  } finally {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+  }
+});
+
 it("wires selected-session busy and approval state into the header menu", async () => {
   shellState.busyId = "session-1";
   const view = render(<ChatShell />);
@@ -786,4 +960,351 @@ it("shows valid runtime notices saved on the assistant rows", async () => {
 
   expect(await screen.findByText("Saved notice", {}, { timeout: 10_000 })).toBeTruthy();
   expect(screen.queryByText("Bad level")).toBeNull();
+});
+
+// The shell measures the frame beside the session sidebar (the grid in main).
+// jsdom has no layout, so these tests give that grid a width and report a
+// change through the ResizeObserver, as a browser does.
+const frame = vi.hoisted(() => ({ width: 1000, callbacks: new Map<ResizeObserverCallback, Element>() }));
+const isFrame = (element: Element) => element.parentElement?.tagName === "MAIN" && element.classList.contains("grid");
+function measureFrame(width: number) {
+  frame.width = width;
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    constructor(private readonly callback: ResizeObserverCallback) {}
+    observe(target: Element) { if (isFrame(target)) frame.callbacks.set(this.callback, target); }
+    unobserve() {}
+    disconnect() { frame.callbacks.delete(this.callback); }
+  };
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+    const width = isFrame(this) ? frame.width : 0;
+    return { x: 0, y: 0, top: 0, left: 0, bottom: 0, right: width, width, height: 0, toJSON: () => ({}) } as DOMRect;
+  });
+}
+function resizeFrame(width: number) {
+  frame.width = width;
+  act(() => {
+    for (const [callback, target] of frame.callbacks) {
+      callback([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver);
+    }
+  });
+}
+const panes = () => screen.getByTestId("panes").textContent;
+const frameGrid = () => document.querySelector("main > div.grid") as HTMLElement;
+const paneWidth = () => frameGrid().style.getPropertyValue("--artifact-pane-width");
+const toggleArtifacts = (target: Element | Window = window) => fireEvent.keyDown(target, { key: ".", ctrlKey: true });
+
+describe("ChatShell workspace frame", () => {
+  afterEach(() => {
+    delete (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+    frame.callbacks.clear();
+  });
+
+  it("opens the artifacts panel at first only where it fits beside a readable chat", () => {
+    // 1280px with the sidebar open leaves a 1000px frame.
+    measureFrame(1000);
+    const view = render(<ChatShell />);
+    expect(panes()).toBe("sidebar:true artifacts:true");
+    expect(paneWidth()).toBe("380px");
+    expect(screen.getByRole("complementary", { name: "Context and artifacts" })).toBeTruthy();
+    view.unmount();
+
+    // 1024px with the sidebar open leaves 744px: the chat would get 360px.
+    measureFrame(744);
+    render(<ChatShell />);
+    expect(panes()).toBe("sidebar:true artifacts:false");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.querySelectorAll("[inert]")).toHaveLength(1);
+  });
+
+  it("clamps a stored 620px width to the space, and keeps the stored preference", () => {
+    window.localStorage.setItem("artifact-pane-width", "620");
+    measureFrame(1000);
+    render(<ChatShell />);
+    // 1000 - 4px handle - 480px chat leaves 516px.
+    expect(paneWidth()).toBe("516px");
+    expect(window.localStorage.getItem("artifact-pane-width")).toBe("620");
+    const handle = screen.getByRole("separator", { name: "Resize artifacts panel" });
+    fireEvent.keyDown(handle, { key: "End" });
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(window.localStorage.getItem("artifact-pane-width")).toBe("620");
+    resizeFrame(1280);
+    expect(paneWidth()).toBe("620px");
+  });
+
+  it("keeps one chat host while the panel moves between beside the chat and over it", async () => {
+    measureFrame(1280);
+    render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    expect(panes()).toBe("sidebar:true artifacts:true");
+
+    // The space shrinks: the panel closes instead of covering the chat.
+    resizeFrame(744);
+    expect(panes()).toBe("sidebar:true artifacts:false");
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    toggleArtifacts();
+    expect(screen.getByRole("dialog", { name: "Context and artifacts" })).toBeTruthy();
+    resizeFrame(1280);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(panes()).toBe("sidebar:true artifacts:true");
+
+    expect(agents.instances).toHaveLength(1);
+    expect(hostLifecycle).toMatchObject({ mounts: 1, unmounts: 0 });
+  });
+
+  it("does not move page focus when a resize closes an unfocused inline panel", () => {
+    measureFrame(1000);
+    render(<ChatShell />);
+    expect(document.activeElement).toBe(document.body);
+    resizeFrame(744);
+    expect(panes()).toBe("sidebar:true artifacts:false");
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("makes the overlay panel a modal: named, focused, Tab inside, background inert, Escape consumed, focus returned", async () => {
+    measureFrame(744);
+    render(<><button type="button">Opener</button><ChatShell /></>);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    const opener = screen.getByRole("button", { name: "Opener" });
+    opener.focus();
+    toggleArtifacts(opener);
+
+    const dialog = screen.getByRole("dialog", { name: "Context and artifacts" });
+    expect(dialog.tagName).toBe("ASIDE");
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    const close = within(dialog).getByRole("button", { name: "Close artifacts panel" });
+    expect(document.activeElement).toBe(close);
+    expect(opener.closest("[inert]")).not.toBeNull();
+    expect(dialog.closest("[inert]")).toBeNull();
+    // The chat column behind the drawer is inert, and stays mounted.
+    expect(frameGrid().firstElementChild!.closest("[inert]")).not.toBeNull();
+    // The shortcut guard sees the open dialog, so Stop stands aside.
+    expect(otherOverlayOpen()).toBe(true);
+
+    // Close is the only control here, so Tab wraps to it in both directions.
+    expect(fireEvent.keyDown(close, { key: "Tab" })).toBe(false);
+    expect(fireEvent.keyDown(close, { key: "Tab", shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(close);
+
+    expect(fireEvent.keyDown(close, { key: "Escape" })).toBe(false);
+    expect(panes()).toBe("sidebar:true artifacts:false");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.querySelectorAll("[inert]")).toHaveLength(1);
+    expect(dialog.hasAttribute("inert")).toBe(true);
+    expect(document.activeElement).toBe(opener);
+    expect(hostLifecycle).toMatchObject({ mounts: 1, unmounts: 0 });
+  });
+
+  it("closes the overlay with its Close button and its backdrop", () => {
+    measureFrame(744);
+    render(<ChatShell />);
+    toggleArtifacts();
+    fireEvent.click(screen.getByRole("button", { name: "Close artifacts panel" }));
+    expect(panes()).toBe("sidebar:true artifacts:false");
+    toggleArtifacts();
+    fireEvent.click(document.querySelector("button[aria-hidden='true'][tabindex='-1']")!);
+    expect(panes()).toBe("sidebar:true artifacts:false");
+  });
+
+  it("toggles the drawer closed with its shortcut and returns a shortcut-only open to the header", () => {
+    measureFrame(744);
+    render(<ChatShell />);
+    toggleArtifacts();
+    const close = screen.getByRole("button", { name: "Close artifacts panel" });
+    toggleArtifacts(close);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Show artifacts panel" }));
+  });
+
+  it("keeps focus in the workspace when the focused modal Close becomes inline", () => {
+    measureFrame(744);
+    render(<ChatShell />);
+    toggleArtifacts();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close artifacts panel" }));
+    resizeFrame(1280);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Hide artifacts panel" }));
+  });
+
+  it("leaves Escape to a nested dialog first, then closes the overlay", async () => {
+    measureFrame(744);
+    const view = render(<ChatShell />);
+    toggleArtifacts();
+    // A preview or menu opens from inside the drawer.
+    shellState.nestedDialog = true;
+    view.rerender(<ChatShell />);
+    const nested = await screen.findByRole("dialog", { name: "Nested preview" });
+    expect(fireEvent.keyDown(nested, { key: "Escape" })).toBe(false);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Nested preview" })).toBeNull());
+    expect(screen.getByRole("dialog", { name: "Context and artifacts" })).toBeTruthy();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Context and artifacts" })).toBeNull();
+  });
+
+  it("keeps an inline panel nonmodal, where Escape is left to Stop", () => {
+    measureFrame(1000);
+    render(<ChatShell />);
+    const pane = screen.getByRole("complementary", { name: "Context and artifacts" });
+    expect(pane.getAttribute("aria-modal")).toBeNull();
+    expect(pane.hasAttribute("data-state")).toBe(false);
+    expect(fireEvent.keyDown(window, { key: "Escape" })).toBe(true);
+    expect(panes()).toBe("sidebar:true artifacts:true");
+  });
+
+  it("resizes the inline panel from the keyboard within the same limits as a drag", () => {
+    measureFrame(1000);
+    render(<ChatShell />);
+    const handle = screen.getByRole("separator", { name: "Resize artifacts panel" });
+    expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+    expect(handle.getAttribute("aria-controls")).toBe(screen.getByRole("complementary", { name: "Context and artifacts" }).id);
+    expect([handle.getAttribute("aria-valuemin"), handle.getAttribute("aria-valuenow"), handle.getAttribute("aria-valuemax")])
+      .toEqual(["320", "380", "516"]);
+    expect(handle.tabIndex).toBe(0);
+
+    expect(fireEvent.keyDown(handle, { key: "ArrowLeft" })).toBe(false);
+    expect(handle.getAttribute("aria-valuenow")).toBe("396");
+    fireEvent.keyDown(handle, { key: "End" });
+    expect(paneWidth()).toBe("516px");
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("516");
+    fireEvent.keyDown(handle, { key: "Home" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("320");
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(handle.getAttribute("aria-valuenow")).toBe("320");
+    expect(window.localStorage.getItem("artifact-pane-width")).toBe("320");
+    expect(fireEvent.keyDown(handle, { key: "Enter" })).toBe(true);
+  });
+
+  it("drags the inline panel no wider than the space allows", () => {
+    measureFrame(1000);
+    render(<ChatShell />);
+    const handle = screen.getByRole("separator", { name: "Resize artifacts panel" });
+    fireEvent.pointerDown(handle, { pointerId: 1 });
+    // The frame's right edge is at 1000. A pointer at x=100 asks for 900px.
+    fireEvent.pointerMove(window, { clientX: 100 });
+    fireEvent.pointerUp(window);
+    expect(paneWidth()).toBe("516px");
+  });
+});
+
+describe("ChatShell chat area without a chat", () => {
+  it("offers New session and the session list when no session is selected", () => {
+    shellState.selectedId = null as unknown as string;
+    render(<ChatShell />);
+    expect(screen.getByRole("heading", { name: "No session selected" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    expect(sessionListActions.create).toHaveBeenCalledOnce();
+    // The sidebar is open, so the list is already there.
+    expect(screen.queryByRole("button", { name: "Open sessions" })).toBeNull();
+    fireEvent.keyDown(window, { key: "S", ctrlKey: true, shiftKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Open sessions" }));
+    expect(panes()).toContain("sidebar:true");
+    expect(hostLifecycle.mounts).toBe(0);
+  });
+
+  it("says that the session list loads before a session is selected", () => {
+    shellState.selectedId = null as unknown as string;
+    shellState.isLoadingSessions = true;
+    render(<ChatShell />);
+    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+  });
+
+  it("says that the session loads, and the artifacts panel does not claim an empty session", () => {
+    shellState.sessionData = "loading";
+    render(<ChatShell />);
+    expect(screen.getByRole("status").textContent).toBe("Loading session…");
+    expect(hostLifecycle.mounts).toBe(0);
+    expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("loading");
+  });
+
+  it("explains a failed first load once, and retries through the session refresh", async () => {
+    shellState.sessionData = "error";
+    let fail!: (error: Error) => void;
+    queryActions.refresh.mockImplementationOnce(() => new Promise<void>((_, reject) => { fail = reject; }));
+    render(<ChatShell />);
+    const alert = screen.getByRole("alert");
+    expect(within(alert).getByRole("heading", { name: "This session did not load" })).toBeTruthy();
+    expect(screen.getAllByText(/HTTP 503/)).toHaveLength(1);
+    expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("unavailable");
+
+    fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+    expect(queryActions.refresh).toHaveBeenCalledWith("session-1");
+    expect(within(alert).getByRole("button", { name: "Retrying…" }).getAttribute("aria-disabled")).toBe("true");
+    // A failed retry is caught. The error stays on the query and the card stays.
+    await act(async () => { fail(new Error("HTTP 503")); });
+    expect(within(alert).getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(hostLifecycle.mounts).toBe(0);
+  });
+
+  it("keeps the cached chat after a failed refetch, with the error in the banner", async () => {
+    shellState.sessionData = "cached-error";
+    render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    expect(screen.getByRole("alert").textContent).toBe("HTTP 503");
+    expect(screen.queryByRole("heading", { name: "This session did not load" })).toBeNull();
+    expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("ready");
+  });
+
+  it("keeps the focused recovery button while a real uncached query clears its error during Retry", async () => {
+    const { QueryClient } = await vi.importActual<typeof import("@tanstack/react-query")>("@tanstack/react-query");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const key = ["retry-focus"];
+    await client.fetchQuery({ queryKey: key, queryFn: () => Promise.reject(new Error("HTTP 503")) }).catch(() => {});
+    shellState.sessionData = "error";
+    const view = render(<ChatShell />);
+    const retry = screen.getByRole("button", { name: "Retry" });
+    retry.focus();
+    let rejectRetry!: (error: Error) => void;
+    queryActions.refresh.mockImplementationOnce(() => {
+      const pending = client.fetchQuery({ queryKey: key, queryFn: () => new Promise<never>((_, reject) => { rejectRetry = reject; }) });
+      expect(client.getQueryState(key)?.error).toBeNull();
+      shellState.sessionData = "loading";
+      return pending;
+    });
+    fireEvent.click(retry);
+    view.rerender(<ChatShell />);
+    expect(screen.getByRole("button", { name: "Retrying…" })).toBe(retry);
+    expect(document.activeElement).toBe(retry);
+    fireEvent.click(retry);
+    expect(queryActions.refresh).toHaveBeenCalledOnce();
+    await act(async () => {
+      rejectRetry(new Error("HTTP 503"));
+      await Promise.resolve();
+      shellState.sessionData = "error";
+    });
+    view.rerender(<ChatShell />);
+    expect(screen.getByRole("button", { name: "Retry" })).toBe(retry);
+    expect(document.activeElement).toBe(retry);
+    client.clear();
+  });
+
+  it("keeps the no-model notice in front of the load states", () => {
+    shellState.hasModels = false;
+    shellState.sessionData = "error";
+    render(<ChatShell />);
+    expect(screen.getByRole("heading", { name: "No models are available" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "This session did not load" })).toBeNull();
+    // The error is not lost: the banner shows it.
+    expect(screen.getByRole("alert").textContent).toBe("HTTP 503");
+  });
+
+  it("keeps panel recovery available through the no-model gate after a failed load", async () => {
+    shellState.hasModels = false;
+    shellState.sessionData = "error";
+    let fail!: (error: Error) => void;
+    queryActions.refresh.mockImplementationOnce(() => new Promise<void>((_, reject) => { fail = reject; }));
+    render(<ChatShell />);
+    expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("unavailable");
+    act(() => artifactPanelProps.values.at(-1)?.inventory.onRetry?.());
+    expect(queryActions.refresh).toHaveBeenCalledWith("session-1");
+    expect(artifactPanelProps.values.at(-1)?.inventory.retrying).toBe(true);
+    act(() => artifactPanelProps.values.at(-1)?.inventory.onRetry?.());
+    expect(queryActions.refresh).toHaveBeenCalledOnce();
+    expect(screen.getByRole("heading", { name: "No models are available" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    await act(async () => { fail(new Error("HTTP 503")); });
+    expect(artifactPanelProps.values.at(-1)?.inventory.retrying).toBe(false);
+    expect(hostLifecycle.mounts).toBe(0);
+  });
 });

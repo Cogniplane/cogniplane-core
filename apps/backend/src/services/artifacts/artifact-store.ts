@@ -37,7 +37,14 @@ export function artifactPiiEligibleSql(alias: string): string {
 
 export type ArtifactPiiDetail = {
   status?: "pending" | "scanning" | "scanned" | "blocked" | "transformed" | "failed";
+  /**
+   * Before a terminal success, or on failure, the value is the planned
+   * (queued) mode. After a terminal success, it is the mode that the scan
+   * applied.
+   */
   modeApplied?: "off" | "detect" | "block" | "transform";
+  /** The PII settings revision that the scan read. Queued, synchronous upload, and chat prompt scans set it. */
+  policyRevision?: number;
   scanRunId?: string;
   summaryText?: string;
   findingsCount?: number;

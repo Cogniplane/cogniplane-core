@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import type { AdminIntegrationView } from "@cogniplane/shared-types";
 import { IntegrationLogo } from "../../integration-logo";
 import { AdminIntegrationPaneNone } from "./admin-integration-pane-none";
@@ -13,31 +14,37 @@ import {
 } from "@/components/ui/dialog";
 
 const CHIP =
-  "inline-flex items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
+  "inline-flex max-w-full break-all items-center rounded bg-surface-container px-1.5 py-0.5 text-xs text-on-surface-variant";
 const PILL_PLANNED =
   "inline-flex items-center rounded-full bg-surface-container px-2 py-0.5 text-xs font-medium text-on-surface-variant";
 
 type Props = {
   integration: AdminIntegrationView;
   busy: boolean;
+  operation?: "toggle" | "save" | "clear";
   /** The failure of this integration's last configuration save or clear. */
   error: string | null;
+  errorOperation?: "toggle" | "save" | "clear";
   onClose: () => void;
-  onSaveConfig: (config: Record<string, string>) => Promise<void>;
-  onClearConfig: () => Promise<void>;
+  onSaveConfig: (config: Record<string, string>) => Promise<boolean | void>;
+  onClearConfig: () => Promise<boolean | void>;
 };
 
 export function AdminIntegrationPane(props: Props) {
-  const { integration, busy, error, onClose, onSaveConfig, onClearConfig } = props;
+  const { integration, busy, operation, error, errorOperation, onClose, onSaveConfig, onClearConfig } = props;
+  const [footer, setFooter] = useState<HTMLDivElement | null>(null);
 
   return (
     <Dialog
       open={true}
       onOpenChange={(open) => {
-        if (!open) onClose();
+        if (!open && !busy) onClose();
       }}
     >
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-[560px]">
+      <DialogContent className="sm:max-w-[560px]" showCloseButton={!busy}
+        onEscapeKeyDown={event => { if (busy) event.preventDefault(); }}
+        onInteractOutside={event => { if (busy) event.preventDefault(); }}
+        footer={<div ref={setFooter} data-integration-decisions className="shrink-0" />}>
         <DialogHeader>
           <div className="flex items-center gap-3">
             <IntegrationLogo
@@ -46,7 +53,7 @@ export function AdminIntegrationPane(props: Props) {
               category={integration.category}
               size={32}
             />
-            <div>
+            <div className="min-w-0 break-words">
               <DialogTitle>{integration.name}</DialogTitle>
               <DialogDescription>{integration.category}</DialogDescription>
             </div>
@@ -59,7 +66,7 @@ export function AdminIntegrationPane(props: Props) {
           </p>
 
           {integration.readToolIds.length > 0 || integration.writeToolIds.length > 0 ? (
-            <div className="flex flex-col gap-3 rounded-lg border border-outline-variant bg-surface-container-low p-3">
+            <div className="flex flex-col gap-3 border-t border-outline-variant pt-3">
               <h4 className="text-xs font-semibold uppercase tracking-wide text-on-surface-variant">
                 What this enables
               </h4>
@@ -91,7 +98,7 @@ export function AdminIntegrationPane(props: Props) {
           ) : null}
 
           {integration.status === "coming_soon" ? (
-            <div className="rounded-lg border border-outline-variant bg-surface-container-low p-3">
+            <div className="border-t border-outline-variant pt-3">
               <p className="text-sm text-on-surface-variant">
                 <span className={PILL_PLANNED}>Coming soon</span>{" "}
                 <span>
@@ -103,7 +110,10 @@ export function AdminIntegrationPane(props: Props) {
             <AdminIntegrationPaneOauthApp
               integration={integration}
               busy={busy}
+              operation={operation}
+              footerTarget={footer}
               error={error}
+              errorOperation={errorOperation}
               onSave={onSaveConfig}
               onClear={onClearConfig}
             />
@@ -112,7 +122,7 @@ export function AdminIntegrationPane(props: Props) {
           )}
 
           {integration.docsUrl ? (
-            <div className="rounded-lg border border-outline-variant bg-surface-container-low p-3">
+            <div className="border-t border-outline-variant pt-3">
               <a
                 href={integration.docsUrl}
                 target="_blank"

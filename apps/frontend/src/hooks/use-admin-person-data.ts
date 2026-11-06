@@ -7,6 +7,8 @@ import { queryKeys } from "../lib/query-keys";
 import { fetchMemberMonthUsage } from "../lib/token-usage-api";
 
 export const RECENT_SESSION_LIMIT = 6;
+/** How often the page reads the list again while this person's link email waits. */
+export const LINK_EMAIL_POLL_MS = 5_000;
 
 /**
  * Data for one person's page. Identity comes from the shared people list, so
@@ -15,7 +17,16 @@ export const RECENT_SESSION_LIMIT = 6;
  * person is never shown.
  */
 export function useAdminPersonData(userId: string) {
-  const people = useQuery({ queryKey: queryKeys.admin.users(), queryFn: listAdminUsers });
+  const people = useQuery({
+    queryKey: queryKeys.admin.users(),
+    queryFn: listAdminUsers,
+    // A link email goes out a few seconds after the action; read again until
+    // it is sent, fails, or expires, so the page shows what happened.
+    refetchInterval: (query) => {
+      const status = query.state.data?.find((user) => user.userId === userId)?.linkEmail?.status;
+      return status === "queued" || status === "sending" ? LINK_EMAIL_POLL_MS : false;
+    }
+  });
   const usage = useQuery({
     queryKey: queryKeys.admin.memberMonthUsage(userId),
     queryFn: () => fetchMemberMonthUsage(userId)

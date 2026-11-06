@@ -9,6 +9,7 @@ import { DisclosureRow } from "./overview-row";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PILL_BLUE, PILL_GRAY, PILL_GREEN } from "../../lib/ui-tokens";
+import { useFeedbackFocus } from "./use-feedback-focus";
 
 type KeySource = AdminProviderStatus["keySource"];
 
@@ -34,16 +35,17 @@ type ApiKeyFormProps = {
   /** Where the provider's effective key comes from (tenant wins). */
   keySource: KeySource;
   /** Whether an org-level key is stored (the only kind this form can remove). */
-  tenantKeyConfigured: boolean;
+  tenantKeyConfigured: boolean | null;
   busyKey: string;
   currentBusyKey: string | null;
+  writesBlocked: boolean;
   successMessage: string | null;
   errorMessage: string | null;
   placeholderConfigured: string;
   placeholderUnconfigured: string;
   target: boolean;
   onSave: (apiKey: string) => Promise<boolean>;
-  onRemove: () => Promise<unknown>;
+  onRemove: () => Promise<boolean>;
 };
 
 function ApiKeyForm(props: ApiKeyFormProps) {
@@ -52,6 +54,13 @@ function ApiKeyForm(props: ApiKeyFormProps) {
   const [open, setOpen] = useState(props.target);
   const [value, setValue] = useState("");
   const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const operationRef = useRef(false);
+  const [operation, setOperation] = useState<"save" | "remove" | null>(null);
+  const resultRef = useRef<HTMLParagraphElement>(null);
+  const [localResult, setLocalResult] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const focusResult = useFeedbackFocus();
+  const errorMessage = props.errorMessage ?? localError;
 
   useEffect(() => {
     if (!props.target) return;
@@ -59,17 +68,41 @@ function ApiKeyForm(props: ApiKeyFormProps) {
     rowRef.current?.scrollIntoView?.({ block: "center", behavior: "smooth" });
   }, [props.target]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (value.trim()) {
-      if (await props.onSave(value.trim())) {
+  const isBusy = operation !== null || props.currentBusyKey === props.busyKey;
+  const disabled = isBusy || props.writesBlocked || props.currentBusyKey !== null || props.tenantKeyConfigured === null;
+  const run = async (kind: "save" | "remove", trigger: HTMLElement | null) => {
+    if (operationRef.current || disabled) return;
+    operationRef.current = true;
+    setOperation(kind);
+    setLocalResult(null);
+    setLocalError(null);
+    let ownsFocus = document.activeElement === trigger;
+    const pendingTarget = ownsFocus ? resultRef.current ?? trigger : trigger;
+    if (ownsFocus) pendingTarget?.focus();
+    const moved = (event: FocusEvent) => { if (event.target !== pendingTarget) ownsFocus = false; };
+    document.addEventListener("focusin", moved);
+    try {
+      const ok = await (kind === "remove" ? props.onRemove() : props.onSave(value.trim()));
+      if (ok) {
         setValue("");
         setConfirmingRemove(false);
+        setLocalResult(`${props.title} organization key ${kind === "remove" ? "removed" : "saved"}.`);
+      } else {
+        setLocalError(`${props.title} key ${kind === "remove" ? "removal" : "save"} was not confirmed. Your input is kept. Try again.`);
+      }
+    } finally {
+      document.removeEventListener("focusin", moved);
+      operationRef.current = false;
+      setOperation(null);
+      if (ownsFocus && (document.activeElement === pendingTarget || document.activeElement === document.body)) {
+        focusResult(() => resultRef.current);
       }
     }
   };
-
-  const isBusy = props.currentBusyKey === props.busyKey;
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (value.trim()) void run("save", document.activeElement as HTMLElement | null);
+  };
 
   return (
     <div ref={rowRef}>
@@ -81,16 +114,14 @@ function ApiKeyForm(props: ApiKeyFormProps) {
       actions={props.actions}
       open={open}
       onOpenChange={setOpen}
+      disabled={isBusy}
       buttonRef={buttonRef}
     >
       <p className="text-sm text-on-surface-variant">{props.description}</p>
 
-      {props.successMessage ? (
-        <p className="rounded border border-outline-variant bg-success-surface px-3 py-2 text-sm text-success">
-          {props.successMessage}
-        </p>
-      ) : null}
-      {props.errorMessage ? <p role="alert" className="text-sm text-danger">{props.errorMessage}</p> : null}
+      {props.tenantKeyConfigured === null ? <p className="text-sm text-warning">Organization key status is unavailable. Load key status before making changes.</p> : null}
+      {!confirmingRemove ? <p ref={resultRef} role="status" tabIndex={-1} className="rounded-sm text-sm text-on-surface-variant outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">{operation ? `Saving ${props.title} organization key...` : localResult ?? (errorMessage ? "Key change was not confirmed. Review the error below." : props.successMessage ?? "Key changes save immediately.")}</p> : null}
+      {errorMessage && !confirmingRemove ? <p role="alert" className="text-sm text-danger">{errorMessage}</p> : null}
 
       <form className="flex flex-col gap-3" onSubmit={handleSubmit}>
         <div className="flex flex-col gap-1.5">
@@ -100,6 +131,8 @@ function ApiKeyForm(props: ApiKeyFormProps) {
             autoComplete="off"
             type="password"
             value={value}
+            disabled={disabled}
+            maxLength={512}
             placeholder={
               props.tenantKeyConfigured
                 ? props.placeholderConfigured
@@ -109,44 +142,18 @@ function ApiKeyForm(props: ApiKeyFormProps) {
           />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button type="submit" disabled={isBusy || !value.trim()}>
-            {isBusy ? "Saving..." : "Save API key"}
+          <Button type="submit" disabled={disabled || !value.trim()}>
+            {operation === "save" ? `Saving ${props.title} key...` : "Save API key"}
           </Button>
-          {props.tenantKeyConfigured ? (
-            confirmingRemove ? (
-              <>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  disabled={isBusy}
-                  onClick={() => {
-                    setConfirmingRemove(false);
-                    void props.onRemove();
-                  }}
-                >
-                  Confirm removal
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  disabled={isBusy}
-                  onClick={() => setConfirmingRemove(false)}
-                >
-                  Cancel
-                </Button>
-              </>
-            ) : (
-              <Button
-                type="button"
-                variant="outline"
-                disabled={isBusy}
-                onClick={() => setConfirmingRemove(true)}
-              >
-                Remove key
-              </Button>
-            )
-          ) : null}
+          {props.tenantKeyConfigured && !confirmingRemove ? <Button type="button" variant="outline" disabled={disabled} onClick={() => setConfirmingRemove(true)}>Remove key</Button> : null}
         </div>
+        {confirmingRemove ? <div className="flex flex-col gap-3 border-t border-outline-variant pt-3">
+          <p className="font-medium">Remove the {props.title} organization key?</p>
+          <p className="text-sm text-on-surface-variant">This saves immediately. A platform key can still provide access after removal. Provider Use choices are saved separately.</p>
+          <p ref={resultRef} role="status" tabIndex={-1} className="rounded-sm text-sm text-on-surface-variant outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">{operation ? `Removing ${props.title} organization key...` : errorMessage ? "Key removal was not confirmed. Review the error below." : "Confirm removal to save this change."}</p>
+          <div className="flex flex-wrap gap-2"><Button type="button" variant="destructive" disabled={disabled} onClick={event => void run("remove", event.currentTarget)}>{operation === "remove" ? `Removing ${props.title} key...` : `Remove ${props.title} organization key`}</Button><Button type="button" variant="outline" disabled={isBusy} onClick={() => setConfirmingRemove(false)}>Keep key</Button></div>
+          {errorMessage ? <p role="alert" className="text-sm text-danger">{errorMessage}</p> : null}
+        </div> : null}
       </form>
     </DisclosureRow>
     </div>
@@ -172,6 +179,7 @@ export function ProviderKeyRows(props: {
   targetProvider?: ModelProvider | null;
   tenant: TenantDetails | null;
   busyKey: string | null;
+  writesBlocked?: boolean;
   /** Success and error messages keyed by provider (only the last-saved one is set). */
   providerSuccessMessage: Partial<Record<ModelProvider, string | null>>;
   providerErrorMessage: Partial<Record<ModelProvider, string | null>>;
@@ -180,6 +188,15 @@ export function ProviderKeyRows(props: {
   status: (provider: ModelProvider) => string;
   actions: (provider: ModelProvider) => ReactNode;
 }) {
+  const lock = useRef(false);
+  const [activeKey, setActiveKey] = useState<string | null>(null);
+  const saveKey = async (provider: ModelProvider, apiKey: string) => {
+    if (lock.current || props.busyKey || props.writesBlocked || !props.tenant) return false;
+    lock.current = true;
+    setActiveKey(providerKeyBusyKey(provider));
+    try { return await props.onSaveProviderKey(provider, apiKey); }
+    finally { lock.current = false; setActiveKey(null); }
+  };
   const statusByProvider = new Map(
     props.providerStatuses.map((status) => [status.id, status])
   );
@@ -187,7 +204,7 @@ export function ProviderKeyRows(props: {
     <div className="divide-y divide-outline-variant border-t border-outline-variant">
         {MODEL_PROVIDERS.map((provider) => {
           const meta = MODEL_PROVIDER_META[provider];
-          const tenantKeyConfigured = Boolean(props.tenant?.settings.providerKeys?.[provider]);
+          const tenantKeyConfigured = props.tenant ? Boolean(props.tenant.settings.providerKeys?.[provider]) : null;
           const keySource: KeySource =
             statusByProvider.get(provider)?.keySource ??
             (tenantKeyConfigured ? "tenant" : "none");
@@ -199,20 +216,21 @@ export function ProviderKeyRows(props: {
               inputId={`${provider}-api-key`}
               title={meta.label}
               label={`${meta.label} API key`}
-              status={props.status(provider)}
+              status={tenantKeyConfigured === null ? `${props.status(provider)} Organization key status is unavailable.` : props.status(provider)}
               actions={props.actions(provider)}
               description={`The key is stored for this organization and cannot be viewed after saving.`}
               keySource={keySource}
               tenantKeyConfigured={tenantKeyConfigured}
               busyKey={providerKeyBusyKey(provider)}
-              currentBusyKey={props.busyKey}
+              currentBusyKey={activeKey ?? props.busyKey}
+              writesBlocked={Boolean(props.writesBlocked)}
               successMessage={props.providerSuccessMessage[provider] ?? null}
               errorMessage={props.providerErrorMessage[provider] ?? null}
               placeholderConfigured={`${placeholder} (leave blank to keep current)`}
               placeholderUnconfigured={placeholder}
               target={props.targetProvider === provider}
-              onSave={(apiKey) => props.onSaveProviderKey(provider, apiKey)}
-              onRemove={() => props.onSaveProviderKey(provider, "")}
+              onSave={(apiKey) => saveKey(provider, apiKey)}
+              onRemove={() => saveKey(provider, "")}
             />
           );
         })}

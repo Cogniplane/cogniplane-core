@@ -11,7 +11,7 @@ const kpi = { current: 0, previous: 0 };
 function metrics(byConfidence: PiiActivityMetrics["byConfidence"]): PiiActivityMetrics {
   return {
     range: { preset: "7d", from: "2026-09-20T00:00:00Z", to: "2026-09-27T00:00:00Z", bucket: "day" },
-    policy: { enabled: true, mode: "detect", rawRetention: "never", scopes: { chatPrompts: true, uploads: true, microsoftImports: false }, entityTypes: [] },
+    policy: { enabled: true, mode: "detect", rawRetention: "never", scopes: { chatPrompts: true, uploads: true }, entityTypes: [] },
     kpis: { scans: kpi, findings: kpi, blocked: kpi, transformed: kpi, failed: kpi },
     timeSeries: [],
     // Entity counts decide whether the breakdown renders at all.

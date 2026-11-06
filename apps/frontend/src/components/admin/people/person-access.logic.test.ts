@@ -88,6 +88,8 @@ describe("display", () => {
   it("maps backend error codes to plain messages", () => {
     const error = new ApiError({ status: 403, code: "cannot_demote_owner", method: "PUT", path: "/x", message: "cannot_demote_owner" });
     expect(memberActionError(error, "fallback")).toBe("An owner cannot be demoted.");
+    const notActive = new ApiError({ status: 409, code: "account_not_active", method: "PUT", path: "/x", message: "account_not_active" });
+    expect(memberActionError(notActive, "fallback")).toBe("Only a person with an active account can become an owner.");
     const unknown = new ApiError({ status: 403, code: "other", method: "PUT", path: "/x", message: "other" });
     expect(memberActionError(unknown, "fallback")).toBe("You do not have permission to do this.");
   });

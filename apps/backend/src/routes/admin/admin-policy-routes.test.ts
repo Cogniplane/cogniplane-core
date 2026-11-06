@@ -1,6 +1,6 @@
 import { test, expect } from "vitest";
 
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 
 import type {
   PolicyDecision,
@@ -14,21 +14,46 @@ import type {
 import { registerAdminPolicyRoutes } from "./admin-policy-routes.js";
 import type { Pool } from "../../lib/db.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
+import { DataRouteControl } from "../../services/data-route-control.js";
 import { PolicyService } from "../../services/policy/policy-service.js";
 import type { PolicyDecisionStore } from "../../services/policy/policy-decision-store.js";
 import {
   PolicyReorderMismatchError,
-  type PolicyRuleStore
+  type PolicyRuleStore,
+  type PolicyRuleWriteOptions
 } from "../../services/policy/policy-rule-store.js";
+import { weakensPolicy } from "../../services/policy/policy-weakening.js";
+import { WeakerChangeError } from "../../services/weaker-change-error.js";
+import { ALLOW_WEAKER, devDataRoutes } from "../../test-helpers/data-routes.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 
 // In-memory rule store keyed by tenant. Mirrors the real store's contract
-// (list ordered by priority, partial update, unique ruleId per tenant).
+// (list ordered by priority, partial update, unique ruleId per tenant; each
+// write classifies the change with the real weakensPolicy, refuses a weaker
+// change unless allowed, and writes its audit event with the change). The
+// SQL and the lock run in the integration suite.
 class InMemoryRuleStore {
   private rules: PolicyRule[] = [];
   private seq = 0;
+
+  constructor(private readonly audit: InMemoryAuditEventStore = new InMemoryAuditEventStore()) {}
+
+  /** Writes `next` when the change is allowed, as the real store's transaction does. */
+  private async commit<T>(tenantId: string, next: PolicyRule[], changed: PolicyRule[], saved: T,
+    options: PolicyRuleWriteOptions<T>): Promise<T> {
+    const before = await this.list(tenantId);
+    const weaker = weakensPolicy(before, next.filter((rule) => rule.tenantId === tenantId), changed);
+    if (weaker && !options.allowWeaker) throw new WeakerChangeError();
+    this.rules = next;
+    const event = options.audit?.(saved, weaker);
+    if (event) {
+      await this.audit.create(event);
+      await event.alsoInTransaction?.({} as never);
+    }
+    return saved;
+  }
 
   async list(tenantId: string): Promise<PolicyRule[]> {
     return this.rules
@@ -45,7 +70,8 @@ class InMemoryRuleStore {
     return priorities.length === 0 ? 0 : Math.max(...priorities) + 10;
   }
 
-  async create(tenantId: string, input: PolicyRuleInput, createdBy: string | null): Promise<PolicyRule> {
+  async create(tenantId: string, input: PolicyRuleInput, createdBy: string | null,
+    options: PolicyRuleWriteOptions<PolicyRule>): Promise<PolicyRule> {
     const rule: PolicyRule = {
       ruleId: `pol_${++this.seq}`,
       tenantId,
@@ -61,11 +87,11 @@ class InMemoryRuleStore {
       createdAt: "2026-05-31T00:00:00.000Z",
       updatedAt: "2026-05-31T00:00:00.000Z"
     };
-    this.rules.push(rule);
-    return rule;
+    return this.commit(tenantId, [...this.rules, rule], [rule], rule, options);
   }
 
-  async update(tenantId: string, ruleId: string, input: PolicyRulePatch): Promise<PolicyRule | null> {
+  async update(tenantId: string, ruleId: string, input: PolicyRulePatch,
+    options: PolicyRuleWriteOptions<PolicyRule>): Promise<PolicyRule | null> {
     const existing = await this.get(tenantId, ruleId);
     if (!existing) return null;
     const updated: PolicyRule = {
@@ -79,14 +105,15 @@ class InMemoryRuleStore {
       reason: input.reason !== undefined ? input.reason : existing.reason,
       updatedAt: "2026-05-31T00:01:00.000Z"
     };
-    this.rules = this.rules.map((r) => (r.ruleId === ruleId && r.tenantId === tenantId ? updated : r));
-    return updated;
+    const next = this.rules.map((r) => (r.ruleId === ruleId && r.tenantId === tenantId ? updated : r));
+    return this.commit(tenantId, next, [existing, updated], updated, options);
   }
 
-  async delete(tenantId: string, ruleId: string): Promise<boolean> {
-    const before = this.rules.length;
-    this.rules = this.rules.filter((r) => !(r.tenantId === tenantId && r.ruleId === ruleId));
-    return this.rules.length < before;
+  async delete(tenantId: string, ruleId: string, options: PolicyRuleWriteOptions<PolicyRule>): Promise<PolicyRule | null> {
+    const existing = await this.get(tenantId, ruleId);
+    if (!existing) return null;
+    const next = this.rules.filter((r) => !(r.tenantId === tenantId && r.ruleId === ruleId));
+    return this.commit(tenantId, next, [existing], existing, options);
   }
 
   // Mirrors the real store: carries the raw stored conditions (the .passthrough()
@@ -101,7 +128,7 @@ class InMemoryRuleStore {
     }));
   }
 
-  async reorder(tenantId: string, ruleIds: readonly string[]): Promise<PolicyRule[]> {
+  async reorder(tenantId: string, ruleIds: readonly string[], options: PolicyRuleWriteOptions<PolicyRule[]>): Promise<PolicyRule[]> {
     if (new Set(ruleIds).size !== ruleIds.length) {
       throw new PolicyReorderMismatchError("ruleIds must not contain duplicates.");
     }
@@ -112,12 +139,12 @@ class InMemoryRuleStore {
         "ruleIds must be exactly the tenant's current set of policy rules."
       );
     }
-    ruleIds.forEach((id, index) => {
-      this.rules = this.rules.map((r) =>
-        r.tenantId === tenantId && r.ruleId === id ? { ...r, priority: index * 10 } : r
-      );
-    });
-    return this.list(tenantId);
+    const next = this.rules.map((r) =>
+      r.tenantId === tenantId && ruleIds.includes(r.ruleId) ? { ...r, priority: ruleIds.indexOf(r.ruleId) * 10 } : r);
+    const moved = existing.filter((r) => r.priority !== ruleIds.indexOf(r.ruleId) * 10);
+    const after = next.filter((r) => r.tenantId === tenantId)
+      .sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.ruleId.localeCompare(b.ruleId)));
+    return this.commit(tenantId, next, moved, after, options);
   }
 }
 
@@ -194,11 +221,13 @@ function fakeDecision(overrides: Partial<SeededDecision> & Pick<SeededDecision, 
   };
 }
 
-async function buildApp(options: { now?: () => Date } = {}) {
+type AuthSession = NonNullable<FastifyRequest["auth"]["session"]>;
+
+async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteControl; session?: AuthSession } = {}) {
   const app = Fastify();
-  const ruleStore = new InMemoryRuleStore();
-  const decisionStore = new InMemoryDecisionStore();
   const audit = new InMemoryAuditEventStore();
+  const ruleStore = new InMemoryRuleStore(audit);
+  const decisionStore = new InMemoryDecisionStore();
   const policyService = new PolicyService({
     rules: ruleStore as unknown as PolicyRuleStore,
     decisions: decisionStore as unknown as PolicyDecisionStore,
@@ -212,7 +241,8 @@ async function buildApp(options: { now?: () => Date } = {}) {
       userId: "admin-user",
       tenantId: "t1",
       isAdmin: true,
-      role: "owner" as const
+      role: "owner" as const,
+      ...(options.session ? { session: options.session } : {})
     };
   });
 
@@ -220,7 +250,7 @@ async function buildApp(options: { now?: () => Date } = {}) {
     policyRules: ruleStore as unknown as PolicyRuleStore,
     policyDecisions: decisionStore as unknown as PolicyDecisionStore,
     policyService,
-    auditEvents: audit as unknown as AuditEventStore,
+    dataRoutes: options.dataRoutes ?? devDataRoutes(),
     now: options.now
   });
   await app.ready();
@@ -907,7 +937,8 @@ test("lint endpoint flags an unknown/typo'd condition key on a PERSISTED rule", 
       effect: "allow",
       conditions: { toolName: ["github_write_file"] } as never
     },
-    "admin-user"
+    "admin-user",
+    ALLOW_WEAKER
   );
   const res = await app.inject({ method: "GET", url: "/admin/policy/lint" });
   const warnings = res.json().warnings;

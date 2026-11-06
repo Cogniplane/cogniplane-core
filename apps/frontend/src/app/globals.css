@@ -32,10 +32,12 @@
   --color-on-secondary-container:  #435368;
 
   --color-on-surface:              #2a3439;
-  --color-on-surface-variant:      #566166;
+  --color-on-surface-variant:      #48575f;
   --color-on-surface-faint:        #52636d;
 
-  --color-outline-variant:         rgba(169, 180, 185, 0.15);
+  /* Layout dividers and static container edges. Deliberately faint: they
+     group content and never identify a control on their own. */
+  --color-outline-variant:         rgba(169, 180, 185, 0.32);
   --color-outline:                 #717c82;
 
   --color-success:                 #1a7a4a;
@@ -45,8 +47,10 @@
   --color-warning:                 #7a5c00;
   --color-warning-surface:         rgba(255, 207, 112, 0.18);
 
+  /* Hover and focus SURFACE for menus, selects, and ghost buttons. Never a
+     text, border, or chart color: it has no contrast against the surfaces
+     it sits on. Use info, brand, or a status token for foregrounds. */
   --color-accent:                  #d6dfe5;
-  --color-accent-soft:             rgba(61, 90, 153, 0.1);
 
   /* Brand teal — pulled from the Cogniplane logo frame gradient (#2c9ba0 →
      #358f91). This is the "pop" accent: active nav, selected controls, focus
@@ -70,7 +74,7 @@
      us hand-editing every CVA variant. Map them to our editorial tokens. */
   --color-foreground:              #2a3439;
   --color-muted:                   #e8eff3;
-  --color-muted-foreground:        #566166;
+  --color-muted-foreground:        #48575f;
   --color-card:                    #ffffff;
   --color-card-foreground:         #2a3439;
   --color-popover:                 #ffffff;
@@ -80,13 +84,24 @@
   --color-accent-foreground:       #2a3439;
   --color-destructive:             #9f403d;
   --color-destructive-foreground:  #ffffff;
-  --color-border:                  rgba(169, 180, 185, 0.15);
-  --color-input:                   rgba(169, 180, 185, 0.15);
+  --color-border:                  rgba(169, 180, 185, 0.32);
+  /* Control boundary for inputs, selects, textareas, and outline buttons.
+     At least 3:1 against every light surface a control sits on, up to
+     surface-container-high. Not a background: use --color-control. */
+  --color-input:                   #7b868c;
+  --color-control:                 #ffffff;
   --color-ring:                    #1f7e86;
 
-  --shadow-sm: 0 2px 8px rgba(42, 52, 57, 0.06);
-  --shadow-md: 0 4px 24px rgba(42, 52, 57, 0.08);
-  --shadow-lg: 0 8px 40px rgba(42, 52, 57, 0.10);
+  --shadow-sm: var(--elevation-low);
+  --shadow-md: var(--elevation-raised);
+  --shadow-lg: var(--elevation-modal);
+
+  /* Type roles beyond Tailwind's default scale. `text-label` is the uppercase
+     group label (rail groups, compact metadata headings). It replaces the
+     earlier 0.62rem size, which was below a readable floor. */
+  --text-label: 0.6875rem;
+  --text-label--line-height: 1rem;
+  --text-label--letter-spacing: 0.08em;
 
   /* Motion. One easing + a small duration scale so every animation in the
      app decelerates the same way ("standard" ease-out curve). */
@@ -109,13 +124,26 @@
 
   /* Categorical chart palette (light). Drawn from the editorial token set so
      dashboard charts read as part of the app theme rather than a bolted-on
-     library palette. Referenced by shadcn <ChartContainer> via each chart's
+     library palette. The color namespace keeps SDK defaults from shadowing
+     the app palette. Referenced by shadcn <ChartContainer> via each chart's
      `chartConfig[series].color = "var(--chart-N)"`. */
-  --chart-1: #3d5a99; /* info blue   */
-  --chart-2: #1a7a4a; /* success     */
-  --chart-3: #7a5c00; /* warning     */
-  --chart-4: #9f403d; /* danger      */
-  --chart-5: #566166; /* neutral ink */
+  --color-chart-1: #3d5a99; /* info blue   */
+  --chart-1: var(--color-chart-1);
+  --color-chart-2: #1a7a4a; /* success     */
+  --chart-2: var(--color-chart-2);
+  --color-chart-3: #7a5c00; /* warning     */
+  --chart-3: var(--color-chart-3);
+  --color-chart-4: #9f403d; /* danger      */
+  --chart-4: var(--color-chart-4);
+  --color-chart-5: #566166; /* neutral ink */
+  --chart-5: var(--color-chart-5);
+}
+
+:root {
+  /* Keep a variable in generated shadow utilities so theme changes reach them. */
+  --elevation-low: 0 2px 8px rgba(42, 52, 57, 0.06);
+  --elevation-raised: 0 4px 24px rgba(42, 52, 57, 0.08);
+  --elevation-modal: 0 8px 40px rgba(42, 52, 57, 0.10);
 }
 
 [data-theme="dark"] {
@@ -152,7 +180,6 @@
   --color-warning-surface:         rgba(241, 200, 106, 0.16);
 
   --color-accent:                  #2d3946;
-  --color-accent-soft:             rgba(140, 184, 255, 0.16);
 
   /* Brand teal (dark) — lifted for contrast on dark surfaces. */
   --color-brand:                   #56c6cd;
@@ -170,7 +197,9 @@
   --color-muted-foreground:        #b1bccb;
   --color-card:                    #1a212b;
   --color-card-foreground:         #e2e9f3;
-  --color-popover:                 #1a212b;
+  /* Raised one step above cards (#1a212b) so menus and dialogs sit over
+     the page, not below it. */
+  --color-popover:                 #202834;
   --color-popover-foreground:      #e2e9f3;
   --color-primary-foreground:      #0f141b;
   --color-secondary-foreground:    #d7e0ea;
@@ -178,20 +207,30 @@
   --color-destructive:             #ff8f87;
   --color-destructive-foreground:  #0f141b;
   --color-border:                  rgba(177, 188, 203, 0.16);
-  --color-input:                   rgba(177, 188, 203, 0.16);
+  /* At least 3:1 on dark surfaces up to surface-bright (#364252). */
+  --color-input:                   #8593a8;
+  --color-control:                 rgba(177, 188, 203, 0.06);
   --color-ring:                    #56c6cd;
 
-  --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.16);
-  --shadow-md: 0 16px 40px rgba(0, 0, 0, 0.2);
-  --shadow-lg: 0 24px 64px rgba(0, 0, 0, 0.24);
+  --elevation-low: 0 8px 24px rgba(0, 0, 0, 0.16);
+  --elevation-raised: 0 16px 40px rgba(0, 0, 0, 0.2);
+  --elevation-modal: 0 24px 64px rgba(0, 0, 0, 0.24);
+  --shadow-sm: var(--elevation-low);
+  --shadow-md: var(--elevation-raised);
+  --shadow-lg: var(--elevation-modal);
 
   /* Categorical chart palette (dark) — brighter variants of the same hues so
      contrast holds on the dark surfaces. */
-  --chart-1: #8cb8ff; /* info blue   */
-  --chart-2: #61d48c; /* success     */
-  --chart-3: #f1c86a; /* warning     */
-  --chart-4: #ff8f87; /* danger      */
-  --chart-5: #b1bccb; /* neutral ink */
+  --color-chart-1: #8cb8ff; /* info blue   */
+  --chart-1: var(--color-chart-1);
+  --color-chart-2: #61d48c; /* success     */
+  --chart-2: var(--color-chart-2);
+  --color-chart-3: #f1c86a; /* warning     */
+  --chart-3: var(--color-chart-3);
+  --color-chart-4: #ff8f87; /* danger      */
+  --chart-4: var(--color-chart-4);
+  --color-chart-5: #b1bccb; /* neutral ink */
+  --chart-5: var(--color-chart-5);
 }
 
 /* ============================================================
@@ -222,20 +261,62 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, h4, h5, h6 {
-  font-family: var(--font-headline), "Manrope", sans-serif;
-  letter-spacing: -0.02em;
-}
-
 @layer base {
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-headline), "Manrope", sans-serif;
+    letter-spacing: -0.02em;
+  }
+
+  textarea, input, select {
+    font: inherit;
+    color: inherit;
+  }
+
   a {
     color: inherit;
   }
+
+  /* Tailwind v4 draws a bare `border` in currentColor. Default every edge to
+     the faint divider; controls opt into the stronger --color-input. */
+  *,
+  ::before,
+  ::after,
+  ::backdrop {
+    border-color: var(--color-border);
+  }
 }
 
-textarea, input, select {
-  font: inherit;
+/* Native controls (select menus, checkboxes, scrollbars, date pickers) follow
+   the app theme, not the operating system default. */
+:root {
+  color-scheme: light;
+  accent-color: var(--color-brand);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+::selection {
+  background-color: color-mix(in srgb, var(--color-brand) 28%, transparent);
   color: inherit;
+}
+
+/* On short phone screens, the full drawer scrolls so its navigation cannot
+   squeeze the session list to less than a readable row. The dialog's close
+   button stays outside this scrolling region. */
+@media (max-width: 767px) and (max-height: 600px) {
+  [data-session-sidebar] {
+    overflow-y: auto;
+    scroll-padding-top: 4.25rem;
+  }
+  [data-session-sidebar] > div {
+    flex-shrink: 0;
+  }
+  [data-session-sidebar-list] {
+    flex: 0 0 auto;
+    max-height: 16rem;
+  }
 }
 
 /* ============================================================
@@ -268,10 +349,167 @@ textarea, input, select {
   --accent-foreground: var(--color-on-surface);
   --destructive: var(--color-danger);
   --border: var(--color-outline-variant);
-  --input: var(--color-outline-variant);
+  --input: var(--color-input);
   --ring: var(--color-ring);
   --radius: var(--radius-lg);
+  --chart-1: var(--color-chart-1);
+  --chart-2: var(--color-chart-2);
+  --chart-3: var(--color-chart-3);
+  --chart-4: var(--color-chart-4);
+  --chart-5: var(--color-chart-5);
   font-family: inherit;
+}
+
+/* ============================================================
+   GENERATED UI THEME BRIDGE
+   CopilotKit 1.83.0 draws generated UI (tables, charts, badges, inputs)
+   with `--a2ui-*` variables and falls back to fixed light colors, such as
+   #0d0d0d text, when a variable is not set. Its built-in dark values apply
+   only under a `.dark` class, which this app never sets. Map every
+   variable that the SDK reads onto our tokens, so a surface follows the
+   `data-theme` switch with the rest of the app.
+   `.a2ui-surface` is the root class of each surface, so this covers the
+   chat transcript and the side panel, which sits outside `.chat-surface`.
+   A Modal draws in a portal outside both, and its wrapper has the same
+   class. The contract test (generative-ui-theme.test.ts) compares this list
+   with the variables of the installed SDK.
+   ============================================================ */
+.a2ui-surface {
+  /* Saved prose and local control labels can contain unbroken identifiers. */
+  overflow-wrap: anywhere;
+  --a2ui-color-text-default: var(--color-on-surface);
+  --a2ui-color-text-prose: var(--color-on-surface);
+  --a2ui-color-text-primary: var(--color-on-surface);
+  --a2ui-color-text-emphasis: var(--color-primary);
+  --a2ui-color-text-secondary: var(--color-on-surface-variant);
+  --a2ui-color-text-tertiary: var(--color-on-surface-faint);
+  --a2ui-color-text-success: var(--color-success);
+  --a2ui-color-text-info: var(--color-info);
+  --a2ui-color-text-warning: var(--color-warning);
+  --a2ui-color-text-caution: var(--color-warning);
+  --a2ui-color-text-danger: var(--color-danger);
+  --a2ui-color-text-discovery: var(--color-brand-strong);
+
+  --a2ui-color-surface: var(--color-surface-container-lowest);
+  --a2ui-color-surface-secondary: var(--color-surface-container-low);
+  --a2ui-color-surface-tertiary: var(--color-surface-container);
+  --a2ui-color-surface-elevated: var(--color-surface-container-lowest);
+  --a2ui-color-surface-elevated-secondary: var(--color-surface-container-low);
+  --a2ui-color-surface-inverted: var(--color-primary);
+  --a2ui-color-surface-soft: var(--color-surface-container-low);
+
+  --a2ui-color-info: var(--color-info-surface);
+  --a2ui-color-warning: var(--color-warning-surface);
+  --a2ui-color-caution: var(--color-warning-surface);
+  --a2ui-color-success: var(--color-success-surface);
+  --a2ui-color-danger: var(--color-danger-surface);
+  --a2ui-color-discovery: var(--color-brand-surface);
+
+  --a2ui-color-info-soft: color-mix(in srgb, var(--color-info-surface) 60%, transparent);
+  --a2ui-color-warning-soft: color-mix(in srgb, var(--color-warning-surface) 60%, transparent);
+  --a2ui-color-caution-soft: color-mix(in srgb, var(--color-warning-surface) 60%, transparent);
+  --a2ui-color-success-soft: color-mix(in srgb, var(--color-success-surface) 60%, transparent);
+  --a2ui-color-danger-soft: color-mix(in srgb, var(--color-danger-surface) 60%, transparent);
+  --a2ui-color-discovery-soft: color-mix(in srgb, var(--color-brand-surface) 60%, transparent);
+
+  --a2ui-color-info-solid: var(--color-info);
+  --a2ui-color-warning-solid: var(--color-warning);
+  --a2ui-color-caution-solid: var(--color-warning);
+  --a2ui-color-success-solid: var(--color-success);
+  --a2ui-color-danger-solid: var(--color-danger);
+  --a2ui-color-discovery-solid: var(--color-brand);
+
+  --a2ui-color-border-default: var(--color-outline-variant);
+  --a2ui-color-border-subtle: color-mix(in srgb, var(--color-outline-variant) 50%, transparent);
+  --a2ui-color-border-strong: var(--color-outline);
+  --a2ui-color-border-info: color-mix(in srgb, var(--color-info) 40%, transparent);
+  --a2ui-color-border-warning: color-mix(in srgb, var(--color-warning) 40%, transparent);
+  --a2ui-color-border-caution: color-mix(in srgb, var(--color-warning) 40%, transparent);
+  --a2ui-color-border-success: color-mix(in srgb, var(--color-success) 40%, transparent);
+  --a2ui-color-border-danger: color-mix(in srgb, var(--color-danger) 40%, transparent);
+  --a2ui-color-border-discovery: var(--color-brand-border);
+  --a2ui-color-border-control: var(--color-input);
+
+  /* Selected and primary states use the brand teal, as the app's own
+     selected controls do. */
+  --a2ui-color-accent: var(--color-brand);
+  --a2ui-color-on-accent: var(--color-on-brand);
+  --a2ui-color-panel: var(--color-surface-container-low);
+  --a2ui-color-control: var(--color-surface-container-lowest);
+  --a2ui-color-focus: var(--color-ring);
+  --a2ui-color-shimmer: color-mix(in srgb, var(--color-on-surface) 12%, transparent);
+  --a2ui-color-chart-cursor: color-mix(in srgb, var(--color-on-surface) 6%, transparent);
+  --a2ui-color-slider-track: color-mix(in srgb, var(--color-on-surface) 10%, transparent);
+  --a2ui-color-badge-secondary: color-mix(in srgb, var(--color-on-surface) 8%, transparent);
+  --a2ui-color-highlight-green: var(--color-success-surface);
+  --a2ui-color-highlight-orange: var(--color-warning-surface);
+  --a2ui-color-highlight-pink: var(--color-danger-surface);
+
+  --a2ui-shadow-sm: var(--shadow-sm);
+  --a2ui-shadow-md: var(--shadow-md);
+
+  --a2ui-chart-1: var(--color-chart-1);
+  --a2ui-chart-2: var(--color-chart-2);
+  --a2ui-chart-3: var(--color-chart-3);
+  --a2ui-chart-4: var(--color-chart-4);
+  --a2ui-chart-5: var(--color-chart-5);
+  --a2ui-chart-6: var(--color-brand);
+}
+
+/* These SDK controls use the static divider token in an inline border.
+   Their schemas expose no border paint. Keep cards and dividers faint. */
+.a2ui-surface [data-a2ui-feedback-button]:not([data-a2ui-popover-trigger]),
+.a2ui-surface [data-a2ui-carousel-arrow] {
+  border-color: var(--a2ui-color-border-control) !important;
+}
+
+.a2ui-surface [data-a2ui-carousel-arrow]:focus-visible {
+  outline: 2px solid var(--a2ui-color-focus);
+  outline-offset: 2px;
+}
+
+/* Choice borders identify controls too. Preserve the selected teal edge. */
+.a2ui-surface button[data-a2ui-input][aria-pressed="false"],
+.a2ui-surface fieldset label:has(> input.a2ui-std-check:not(:checked)),
+.a2ui-surface [role="radiogroup"]:has(> button[data-a2ui-input]) {
+  border-color: var(--a2ui-color-border-control) !important;
+}
+
+.a2ui-surface .a2ui-std-range::-webkit-slider-thumb {
+  border-color: var(--a2ui-color-border-control);
+}
+
+.a2ui-surface .a2ui-std-range::-moz-range-thumb {
+  border-color: var(--a2ui-color-border-control);
+}
+
+/* The SDK has no collision handling. Keep narrow popovers inside the window,
+   above the composer, with their own scroll area. */
+@media (max-width: 40rem) {
+  .a2ui-surface [data-a2ui-std]:has(> [data-a2ui-popover-trigger]) {
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+  }
+
+  .a2ui-surface [data-a2ui-std][role="dialog"]:not([aria-modal]) {
+    position: fixed !important;
+    inset: 50% 1rem auto !important;
+    transform: translateY(-50%) !important;
+    margin: 0 !important;
+    width: auto !important;
+    max-width: calc(100% - 2rem);
+    max-height: min(20rem, calc(100dvh - 2rem));
+    overflow: auto;
+  }
+}
+
+/* Recharts gives its tooltip a white background in an inline style, and the
+   SDK sets no color for it. In dark mode the inherited light text would sit
+   on white. Only !important beats the inline style. */
+.a2ui-surface .recharts-default-tooltip {
+  background-color: var(--a2ui-color-surface-elevated) !important;
+  color: var(--a2ui-color-text-default) !important;
 }
 
 /* Reply typography. The typography plugin sets fixed gray colors on
@@ -320,9 +558,32 @@ textarea, input, select {
   color: var(--color-on-primary-container);
 }
 
+/* The composer is the primary text control. Its edge uses the control
+   boundary, not the divider. It floats over the transcript, so it keeps the
+   low shadow. The SDK draws a 28px pill. The design system gives a singular
+   prominent surface 12px corners. */
 .chat-surface .copilotKitInput {
+  border-radius: var(--radius-lg);
   background-color: var(--color-surface-container-low);
-  box-shadow: 0 0 0 1px var(--color-outline-variant), var(--shadow-sm);
+  box-shadow: 0 0 0 1px var(--color-input), var(--shadow-sm);
+  transition: box-shadow 150ms var(--ease-standard);
+}
+
+/* The SDK sets outline: none on the message box. The whole composer shows
+   the input focus treatment instead: a Signal Teal edge and a 3px
+   translucent ring. The composer leaves 8px below it and 16px at each side
+   (ChatComposer), so the ring stays inside the chat area and its scroll box. */
+.chat-surface .copilotKitInput:has([data-testid="copilot-chat-textarea"]:focus-visible) {
+  box-shadow:
+    0 0 0 1px var(--color-ring),
+    0 0 0 4px color-mix(in srgb, var(--color-ring) 50%, transparent),
+    var(--shadow-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-surface .copilotKitInput {
+    transition: none;
+  }
 }
 
 .chat-surface [data-testid="copilot-chat-textarea"] {
@@ -333,14 +594,28 @@ textarea, input, select {
   color: var(--color-on-surface-faint);
 }
 
+/* Send and Stop are the primary action of the composer: Command Ink, with
+   the 8px corners and the focus ring of the shared button. */
 .chat-surface [data-testid="copilot-send-button"] {
-  background-color: var(--color-primary-container);
-  color: var(--color-on-primary-container);
+  border-radius: var(--radius-md);
+  background-color: var(--color-primary);
+  color: var(--color-on-primary);
+  transition: background-color 150ms var(--ease-standard);
+}
+
+.chat-surface [data-testid="copilot-send-button"]:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--color-primary) 90%, transparent);
+}
+
+.chat-surface [data-testid="copilot-send-button"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-ring) 50%, transparent);
 }
 
 .chat-surface [data-testid="copilot-send-button"]:disabled {
-  background-color: var(--color-surface-container);
-  color: var(--color-on-surface-faint);
+  background-color: var(--color-surface-container-high);
+  color: var(--color-on-surface-variant);
+  opacity: 1;
 }
 
 .chat-surface [data-testid="copilot-assistant-toolbar"] button,
@@ -376,8 +651,100 @@ textarea, input, select {
    scopes the same rules to CopilotChat's built-in renderer, so agent
    tables, quotes, links, and inline code match the rest of the app.
    ============================================================ */
-.md-body table,
-.chat-markdown table {
+/* The assistant scope excludes literal user messages and application tables. */
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) {
+  min-width: 0;
+  max-width: 100%;
+  font-size: 0.875rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) :is(p, h1, h2, h3, h4, h5, h6, ul, ol, blockquote) { max-width: 70ch; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.5rem 0 0.5rem;
+  color: inherit;
+  font-weight: 600;
+  line-height: 1.35;
+}
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h1 { font-size: 1.5rem; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h2 { font-size: 1.25rem; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h3 { font-size: 1.125rem; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h4 { font-size: 1rem; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h5 { font-size: 0.875rem; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) h6 { font-size: 0.875rem; font-weight: 500; color: var(--color-on-surface-variant); }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) p { margin: 0.75rem 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) > :first-child { margin-top: 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) > :last-child { margin-bottom: 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) :is(ul, ol) {
+  margin: 0.75rem 0;
+  padding-inline-start: 1.5rem;
+  list-style-position: outside;
+}
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) ul { list-style-type: disc; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) ol { list-style-type: decimal; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) li { margin: 0.25rem 0; padding: 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) li > p { display: block; margin: 0.5rem 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) li > :is(ul, ol) { margin: 0.375rem 0; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) li:has(> input[type="checkbox"]) { list-style: none; }
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) input[type="checkbox"] {
+  margin-inline: -1.25rem 0.375rem;
+  accent-color: var(--color-brand);
+  opacity: 1;
+}
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) pre {
+  max-width: 100%;
+  margin: 0.75rem 0;
+  padding: 1rem;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-container);
+  color: var(--color-on-surface);
+  font-size: 0.8125rem;
+  line-height: 1.7;
+  tab-size: 4;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+:is(.md-body, .chat-surface .copilotKitAssistantMessage .cpk\:prose) pre code {
+  padding: 0;
+  background: transparent;
+  font-size: inherit;
+  font-weight: 400;
+  white-space: pre;
+}
+.markdown-table-scroll { max-width: 100%; overflow: auto; margin: 0.75rem 0; border-radius: var(--radius-md); }
+.markdown-table-scroll table:not([data-app-table]) { min-width: 32rem; margin: 0; }
+:is(.md-body pre, .markdown-table-scroll, .artifact-code-scroll):focus-visible,
+.chat-surface [data-streamdown="code-block-body"]:focus-visible,
+.chat-surface [data-reading-scroll]:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--color-ring) 60%, transparent);
+  outline-offset: -3px;
+}
+/* Streamdown emits both Shiki palettes, but its dependency dark utilities are
+   not compiled by the app. Map only its generated token variables. */
+[data-theme="dark"] .chat-surface [data-streamdown="code-block-body"] [style*="--shiki-dark:"] {
+  color: var(--shiki-dark) !important;
+}
+.chat-surface [data-streamdown="code-block"] { border-radius: var(--radius-md); }
+.chat-surface [data-streamdown="code-block-body"] { margin: 0; background: var(--color-surface-container) !important; }
+.chat-surface [data-streamdown="code-block-body"] > code > span { min-block-size: 1lh; }
+.chat-surface [data-streamdown="code-block-body"] > code > span::before { color: var(--color-on-surface-faint); }
+/* The SDK emits standalone images directly in its block container. Images
+   inside paragraphs keep their inline layout. */
+.chat-surface .copilotKitAssistantMessage .cpk\:prose > div > [data-markdown-image] {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+}
+.chat-surface .copilotKitAssistantMessage [data-markdown-image] > img { margin: 0; }
+
+/* These table rules sit outside every cascade layer, so they beat any utility
+   class. A table that an application component of generated UI draws itself
+   (ComparisonTable) carries data-app-table and keeps its own styles: its sticky
+   column needs a table without overflow:hidden, and a markdown border and
+   margin would frame it twice. */
+.md-body table:not([data-app-table]),
+.chat-markdown table:not([data-app-table]) {
   width: 100%;
   margin: 0.75rem 0;
   border-collapse: separate;
@@ -387,32 +754,34 @@ textarea, input, select {
   overflow: hidden;
   font-size: 0.875rem;
   line-height: 1.45;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
-.md-body th,
-.chat-markdown th {
+.md-body table:not([data-app-table]) th,
+.chat-markdown table:not([data-app-table]) th {
   background: var(--color-surface-container-low);
   color: var(--color-on-surface);
   font-weight: 600;
   text-align: left;
 }
 
-.md-body th,
-.md-body td,
-.chat-markdown th,
-.chat-markdown td {
+.md-body table:not([data-app-table]) th,
+.md-body table:not([data-app-table]) td,
+.chat-markdown table:not([data-app-table]) th,
+.chat-markdown table:not([data-app-table]) td {
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--color-outline-variant);
   vertical-align: top;
 }
 
-.md-body tbody tr:last-child td,
-.chat-markdown tbody tr:last-child td {
+.md-body table:not([data-app-table]) tbody tr:last-child td,
+.chat-markdown table:not([data-app-table]) tbody tr:last-child td {
   border-bottom: none;
 }
 
-.md-body tbody tr:nth-child(even) td,
-.chat-markdown tbody tr:nth-child(even) td {
+.md-body table:not([data-app-table]) tbody tr:nth-child(even) td,
+.chat-markdown table:not([data-app-table]) tbody tr:nth-child(even) td {
   background: color-mix(in srgb, var(--color-surface-container-low) 45%, transparent);
 }
 
@@ -420,8 +789,9 @@ textarea, input, select {
 .chat-markdown blockquote {
   margin: 0.75rem 0;
   padding: 0.25rem 1rem;
-  border-left: 3px solid var(--color-brand-border);
+  border-left: 1px solid var(--color-brand-border);
   color: var(--color-on-surface-variant);
+  font-style: normal;
 }
 
 .md-body hr,
@@ -499,6 +869,13 @@ textarea, input, select {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* Dialog, menu, popover, and select enter/exit (tw-animate-css). A near-zero
+     duration keeps Radix presence events firing, so overlays still unmount. */
+  .animate-in,
+  .animate-out {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
   .page-enter,
   .card-enter,
   .before\:animate-accent-grow::before {
@@ -511,3 +888,34 @@ textarea, input, select {
     transform: none;
   }
 }
+
+/* Artifact and skill-file fallback code use the same semantic colors in both
+   themes. Source text and the highlighter's language behavior stay unchanged. */
+.artifact-code-scroll {
+  max-width: 100%;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-container-low);
+  color: var(--color-on-surface);
+}
+.artifact-code-scroll pre { margin: 0; padding: 1rem; font-size: 0.8125rem; line-height: 1.7; tab-size: 4; }
+.artifact-code-scroll code { font-family: var(--font-mono, monospace); }
+.artifact-code-scroll :is(.hljs-comment, .hljs-quote) { color: var(--color-on-surface-variant); }
+.artifact-code-scroll :is(.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-link) { color: var(--color-info); }
+.artifact-code-scroll :is(.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attribute, .hljs-meta-string) { color: var(--color-success); }
+.artifact-code-scroll :is(.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-deletion) { color: var(--color-danger); }
+.artifact-code-scroll :is(.hljs-title, .hljs-built_in, .hljs-type, .hljs-attr, .hljs-selector-class) { color: var(--color-warning); }
+.artifact-code-scroll .hljs-emphasis { font-style: italic; }
+.artifact-code-scroll .hljs-strong { font-weight: 600; }
+
+.chat-surface table[data-streamdown]:not([data-app-table]) { min-width: 32rem; }
+
+/* The installed GitHub Shiki palettes have low-contrast comments and warm
+   colors on the mist code surface. Use the app's paired reading colors. */
+:root .chat-surface [data-streamdown="code-block-body"] [style*="--shiki-dark: #6A737D"] { color: var(--color-on-surface-variant) !important; }
+:root .chat-surface [data-streamdown="code-block-body"] [style*="--shiki-dark: #F97583"] { color: var(--color-danger) !important; }
+:root .chat-surface [data-streamdown="code-block-body"] [style*="--shiki-dark: #FFAB70"] { color: var(--color-warning) !important; }
+
+.chat-surface .copilotKitAssistantMessage pre[data-streamdown="code-block-body"] { margin: 0; border-radius: 0; }
+.chat-surface [data-streamdown="code-block-header"] button { color: var(--color-on-surface-variant); }
+.chat-surface [data-streamdown="code-block-header"] button:focus-visible { outline: 3px solid var(--color-ring); outline-offset: 2px; border-radius: var(--radius-sm); }

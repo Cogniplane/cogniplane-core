@@ -2,6 +2,7 @@
 
 import { useEffect, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
+import { LoaderCircleIcon } from "lucide-react";
 
 import { useAuth, type AuthUser } from "./auth-context";
 
@@ -32,8 +33,9 @@ export function AuthGuard({
 
   if (isLoading) {
     return (
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh" }}>
-        Loading...
+      <div role="status" className="flex min-h-dvh items-center justify-center gap-2 bg-background text-sm text-on-surface-variant">
+        <LoaderCircleIcon aria-hidden="true" className="size-4 text-brand motion-safe:animate-spin" />
+        Checking your session…
       </div>
     );
   }

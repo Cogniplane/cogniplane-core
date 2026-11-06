@@ -152,6 +152,12 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     [`reply-${execution.executionId}`, tenantId, sessionId, userId]);
     await superuserPool().query("UPDATE messages SET created_at=NOW()-INTERVAL '2 seconds' WHERE message_id=$1",
       [`reply-${execution.executionId}`]);
+    for (const status of ["in_progress", "completed", "failed"] as const) {
+      await superuserPool().query(`INSERT INTO message_tool_results
+        (tool_result_id, tenant_id, message_id, session_id, user_id, kind, title, status)
+        VALUES ($1,$2,$3,$4,$5,'command','execute',$6)`,
+      [`${status}-${execution.executionId}`, tenantId, `reply-${execution.executionId}`, sessionId, userId, status]);
+    }
     await superuserPool().query(`UPDATE session_executions
       SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1`, [execution.executionId]);
     const sweeper = new SessionExecutionStore(maintenancePool());
@@ -159,12 +165,15 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(await owner.currentOwner(tenantId, sessionId)).toBeNull();
     const reply = await superuserPool().query("SELECT status FROM messages WHERE message_id=$1", [`reply-${execution.executionId}`]);
     expect(reply.rows[0].status).toBe("interrupted");
+    const tools = await superuserPool().query("SELECT status FROM message_tool_results WHERE message_id=$1 ORDER BY status",
+      [`reply-${execution.executionId}`]);
+    expect(tools.rows.map(row => row.status)).toEqual(["completed", "failed", "in_progress"]);
     const approval = await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId]);
     expect(approval.rows[0].status).toBe("expired");
     expect(await owner.heartbeat(execution, 30_000)).toBe(false);
   });
 
-  test("admission cleans an expired reply and tool before replacing its execution", async () => {
+  test("admission interrupts an expired reply and keeps its tool outcome unknown before replacing its execution", async () => {
     const tenantId = await seedTenant(), userId = await seedUser();
     await seedMembership(tenantId, userId);
     const sessionId = await seedSession(tenantId, userId);
@@ -191,7 +200,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect((await superuserPool().query("SELECT status FROM messages WHERE message_id=$1", [messageId])).rows[0].status)
       .toBe("interrupted");
     expect((await superuserPool().query("SELECT status FROM message_tool_results WHERE tool_result_id=$1", [toolResultId])).rows[0].status)
-      .toBe("failed");
+      .toBe("in_progress");
     expect((await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId])).rows[0].status)
       .toBe("expired");
     await new SessionExecutionStore(maintenancePool()).sweepExpired();

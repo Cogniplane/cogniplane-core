@@ -39,7 +39,6 @@ export default function AdminAgentSettingsPage() {
     <section id="capabilities" className="flex flex-col gap-5 pt-5">
       {loadError ? <p className="text-sm text-danger">{loadError}</p> : null}
       {!settings && !loadError ? <p role="status">Loading agent settings...</p> : null}
-      {managedToolsQuery.isError ? <p role="alert" className="text-sm text-danger">Could not load the tool catalog. <Button variant="outline" onClick={() => void managedToolsQuery.refetch()}>Retry tools</Button></p> : null}
       {checking ? <p role="status">Checking model availability...</p> : null}
       {modelCatalogQuery.isError && !checking ? (
         <div className="flex flex-col items-start gap-2">
@@ -57,7 +56,9 @@ export default function AdminAgentSettingsPage() {
           onSave={save}
           saveError={saveError}
           onReload={() => void reload()}
-          managedTools={managedToolsQuery.data ?? []}
+          managedTools={managedToolsQuery.data}
+          toolCatalogState={managedToolsQuery.isFetching || managedToolsQuery.isPending ? "loading" : managedToolsQuery.isError ? "failed" : "ready"}
+          onRetryTools={() => void managedToolsQuery.refetch()}
           modelWarning={modelCatalogQuery.isSuccess
             ? modelAvailabilityWarning(model, modelCatalogQuery.data, settings)
             : null}

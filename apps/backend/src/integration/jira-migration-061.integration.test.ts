@@ -78,6 +78,9 @@ describe.skipIf(!adminDatabaseUrl())("Jira migration 061", () => {
         pipedream_external_user_id: oldId, pipedream_account_id: "apn_old", reason: "member_removed"
       })]);
 
+      // Today's store code needs today's schema.
+      await migrate((file) => Number.parseInt(file, 10) > 61);
+
       // The member comes back and selects a new account. Then the old
       // cleanup runs, as the removal callback and as an administrator retry.
       await db.query("INSERT INTO tenant_memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')", [tenant, user]);
@@ -85,7 +88,7 @@ describe.skipIf(!adminDatabaseUrl())("Jira migration 061", () => {
       const newId = (await store.getIdentity(tenant, user))!.externalUserId;
       expect(newId).toBe(service.externalUserIdFor(tenant, user, 1));
       accounts.push(jira("apn_new", newId));
-      await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE });
+      await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE }, null);
 
       expect(await service.deleteConnection(tenant, user)).toBe(true);
       expect(accounts.map((account) => account.id)).toEqual(["apn_new"]);

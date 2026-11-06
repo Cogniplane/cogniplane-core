@@ -266,6 +266,12 @@ async function open(current = project) {
   );
   await screen.findByText("Brief.txt");
 }
+function secondaryAction(name: string, fileName = "Brief.txt") {
+  const row = screen.getByText(fileName, { selector: "p" }).closest("li")!;
+  const details = row.querySelector("details")!;
+  if (!details.open) fireEvent.click(within(row).getByText("More actions"));
+  return within(row).getByRole("button", { name });
+}
 it("uploads to the project reference session and waits for checks before publishing a participant's file", async () => {
   const pending: Artifact = { ...source, artifactId: "upload", artifactType: "upload",
     artifactName: "Report.txt", userId: "another-participant", status: "pending", detail: { pii: { status: "pending" } } };
@@ -363,7 +369,7 @@ it("leaves Office files download-only and surfaces preview failures", async () =
     ]);
   await open();
   expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
-  expect(screen.getByRole("button", { name: "Download" })).toBeTruthy();
+  expect(secondaryAction("Download")).toBeTruthy();
 });
 it("saves updates as drafts with the version selected when the form was filled", async () => {
   await open();
@@ -413,7 +419,7 @@ it("requires confirmation for Trash and a destination choice for restore", async
   await client.invalidateQueries({ queryKey: ["projects"] });
   fireEvent.click(screen.getByRole("button", { name: "Trash" }));
   fireEvent.click(await screen.findByRole("button", { name: "Restore file" }));
-  const form = screen.getByRole("form", { name: "File location" });
+  const form = screen.getByRole("form", { name: /File location for/ });
   await within(form).findByText("Missing folder. Choose a destination.");
   expect(
     screen
@@ -450,7 +456,7 @@ it.each([
   await client.invalidateQueries({ queryKey: ["projects"] });
   fireEvent.click(screen.getByRole("button", { name: "Trash" }));
   fireEvent.click(await screen.findByRole("button", { name: "Restore file" }));
-  const form = screen.getByRole("form", { name: "File location" });
+  const form = screen.getByRole("form", { name: /File location for/ });
   const choose = await within(form).findByRole("button", {
     name: `Choose nearest folder: ${nearest}`,
   });
@@ -469,14 +475,59 @@ it.each([
     ),
   );
 });
-it("moves focus into the Trash, edit, and history panels when they open", async () => {
+it("owns one named file task and returns focus before a different row task opens", async () => {
+  setLibrary([published, { ...published, fileId: "other", name: "Other.txt" }]);
   await open();
-  fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
-  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Confirm removal" }));
-  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
-  expect(document.activeElement).toBe(within(screen.getByRole("form", { name: "File location" })).getByLabelText("File name"));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(document.activeElement).toBe(screen.getByRole("heading", { name: /History of/ }));
+  const remove = within(screen.getByText("Other.txt").closest("li")!).getByRole("button", { name: "Move to Trash" });
+  remove.focus();
+  fireEvent.click(remove);
+  expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  expect(screen.getByRole("dialog", { name: "Move to Trash Other.txt" })).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(remove));
+  const edit = secondaryAction("Rename or move");
+  edit.focus();
+  fireEvent.click(edit);
+  expect(screen.getByRole("dialog", { name: "Rename or move Brief.txt" })).toBeTruthy();
+  expect(screen.queryByRole("group", { name: "Confirm file removal" })).toBeNull();
+  expect(document.activeElement).toBe(within(screen.getByRole("dialog")).getByLabelText("File name"));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(edit));
+  const history = secondaryAction("History", "Other.txt");
+  history.focus();
+  fireEvent.click(history);
+  expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "History of Other.txt" }));
+  fireEvent.click(screen.getByRole("button", { name: "Close history" }));
+  await waitFor(() => expect(document.activeElement).toBe(history));
+});
+
+it("keeps a pending edit open and retains its name after a failed save", async () => {
+  let fail!: (error: Error) => void;
+  vi.mocked(api.changeProjectFileLocation).mockImplementation(() => new Promise((_, reject) => { fail = reject; }));
+  await open();
+  fireEvent.click(secondaryAction("Rename or move"));
+  fireEvent.change(within(screen.getByRole("dialog")).getByLabelText("File name"), { target: { value: "Revised brief.txt" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save location" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(true));
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  expect(screen.getByRole("dialog", { name: "Rename or move Brief.txt" })).toBeTruthy();
+  await act(async () => fail(new Error("Active work prevents this change. Your draft is kept.")));
+  expect((await within(screen.getByRole("dialog")).findByRole("alert")).textContent).toContain("Active work prevents this change");
+  expect((within(screen.getByRole("dialog")).getByLabelText("File name") as HTMLInputElement).value).toBe("Revised brief.txt");
+  expect(screen.getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(false);
+});
+
+it("returns focus to the file list after the selected row is removed", async () => {
+  vi.mocked(api.trashProjectFile).mockImplementation(async () => { setLibrary([]); });
+  await open();
+  const remove = screen.getByRole("button", { name: "Move to Trash" });
+  remove.focus();
+  fireEvent.click(remove);
+  fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Project files" })));
 });
 
 it("keeps archived project files readable while disabling mutations", async () => {
@@ -506,7 +557,7 @@ it("restores history as a new version using the latest displayed version as a gu
     published.version,
   ]);
   await open();
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(secondaryAction("History"));
   fireEvent.click(
     await screen.findByRole("button", { name: "Restore as new version" }),
   );
@@ -663,17 +714,18 @@ it("moves a file to a folder found by browsing or by searching all folders", asy
   const notes: ProjectFolder = { folderId: "notes", parentId: "folder", name: "Notes", deletedAt: null };
   setLibrary([published], [research, notes]);
   await open();
-  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
-  const form = screen.getByRole("form", { name: "File location" });
+  fireEvent.click(secondaryAction("Rename or move"));
+  const form = screen.getByRole("form", { name: /File location for/ });
   fireEvent.click(await within(form).findByRole("button", { name: "Open Research" }));
   fireEvent.click(await within(form).findByRole("button", { name: "Choose Notes" }));
   await within(form).findByText("Files / Research / Notes");
-  fireEvent.click(within(form).getByRole("button", { name: "Save location" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save location" }));
   await waitFor(() => expect(api.changeProjectFileLocation).toHaveBeenCalledWith(
     "p", "f", { name: "Brief.txt", folderId: "notes" }, "location",
   ));
-  fireEvent.click(screen.getByRole("button", { name: "Rename or move" }));
-  const next = screen.getByRole("form", { name: "File location" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  fireEvent.click(secondaryAction("Rename or move"));
+  const next = screen.getByRole("form", { name: /File location for/ });
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const search = within(next).getByLabelText("Destination folder search");
   fireEvent.change(search, { target: { value: "n" } });
@@ -695,7 +747,7 @@ it("moves a file to a folder found by browsing or by searching all folders", asy
   expect(api.listProjectFolders).toHaveBeenCalledWith("p", { q: "not", cursor: undefined }, expect.anything());
   expect(api.listProjectFolders).not.toHaveBeenCalledWith("p", expect.objectContaining({ q: "n" }), expect.anything());
   fireEvent.change(within(next).getByLabelText("File name"), { target: { value: "Brief notes.txt" } });
-  fireEvent.click(within(next).getByRole("button", { name: "Save location" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save location" }));
   await waitFor(() => expect(api.changeProjectFileLocation).toHaveBeenLastCalledWith(
     "p", "f", { name: "Brief notes.txt", folderId: "notes" }, "location",
   ));

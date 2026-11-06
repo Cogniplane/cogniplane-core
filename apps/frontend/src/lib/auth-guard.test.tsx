@@ -73,7 +73,7 @@ describe("AuthGuard with a forged session hint cookie", () => {
 
     await waitFor(() => expect(router.replace).toHaveBeenCalledWith("/login"));
     expect(protectedContent()).toBeNull();
-    expect(screen.queryByText("Loading...")).toBeNull();
+    expect(screen.queryByText("Checking your session…")).toBeNull();
     // No session, so no token: the guard never asked /auth/me, and nothing sent a bearer token.
     expect(calls.map((call) => call.path)).toEqual(["/auth/refresh"]);
     expect(calls.every((call) => call.authorization === null)).toBe(true);
@@ -86,7 +86,7 @@ describe("AuthGuard with a forged session hint cookie", () => {
     stubAuthApi({ refresh: () => pending });
     mount();
 
-    expect(await screen.findByText("Loading...")).toBeTruthy();
+    expect(await screen.findByText("Checking your session…")).toBeTruthy();
     expect(protectedContent()).toBeNull();
     expect(router.replace).not.toHaveBeenCalled();
     answer();

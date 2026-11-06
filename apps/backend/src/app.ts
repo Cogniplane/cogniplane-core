@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import type { FastifyError, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
@@ -7,9 +7,15 @@ import multipart from "@fastify/multipart";
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
 import { SessionExecutionStore } from "./services/session-execution-store.js";
-import { loadConfig } from "./config.js";
+import { isLoginTypeEnabled, isMailEnabled, loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
-import { workosAuth } from "./lib/auth-workos.js";
+import { jwtAuth } from "./lib/auth-jwt.js";
+import { buildLocalAuth } from "./services/auth/local-auth.js";
+import { stopActiveWork } from "./services/auth/security-change.js";
+import { buildMailWorker } from "./services/mail/build-mail.js";
+import { MailOutbox } from "./services/mail/mail-outbox.js";
+import { DataRouteControl } from "./services/data-route-control.js";
+import { createRefreshTokenRotationService } from "./routes/auth-session.js";
 import { CORS_ALLOWED_METHODS, isCorsOriginAllowed } from "./lib/cors.js";
 import { createDatabase, createMaintenanceDatabase } from "./lib/db.js";
 import { assertApplicationRole, assertMaintenanceRole } from "./lib/maintenance-db.js";
@@ -93,6 +99,11 @@ export function parseTrustProxy(raw: string): boolean | string {
   }
   // Otherwise treat as a comma-separated IP/CIDR allowlist of trusted proxies.
   return value;
+}
+
+function requireRedis(app: FastifyInstance) {
+  if (!app.redis) throw new Error("Redis is required for local login.");
+  return app.redis;
 }
 
 export async function buildApp() {
@@ -188,7 +199,7 @@ export async function buildApp() {
     origin: (requestOrigin, cb) => cb(null, isCorsOriginAllowed(requestOrigin, config.API_ORIGIN)),
     credentials: true,
     methods: CORS_ALLOWED_METHODS,
-    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "X-Tenant-Id", "X-Dev-Auth-Key"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id", "X-Tenant-Id", "X-Dev-Auth-Key", "X-Step-Up"]
   });
   await app.register(cookie);
   // Plugin-level defaults so any route that calls `request.file()` without
@@ -214,32 +225,68 @@ export async function buildApp() {
   // fallback, so boot proceeds either way.
   await deps.policyService.start();
 
-  if (config.AUTH_MODE === "workos") {
-    // Auth callback and membership lookups must bypass RLS because they run before
-    // the tenant context is established. Use a separate privileged connection pool.
-    const authTenantMembers = new TenantMemberStore(privilegedDb);
-    // onRequest, not preHandler: authentication only reads headers/url, so
-    // gating here rejects unauthenticated callers before body parsing/validation.
-    app.addHook("onRequest", workosAuth(config, authTenantMembers, deps.integrationDescriptors.oauthCallbackPaths()));
-    await registerTenantRoutes(app, {
-      db: app.db,
-      tenantOrgSettings: deps.tenantOrgSettings,
-      githubConnections: deps.githubConnectionService,
-      runtimeAdapter: deps.runtimeAdapter,
-      integrationDescriptors: deps.integrationDescriptors,
-      getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
-    });
-  } else {
-    app.addHook("onRequest", localDevAuth(config, deps.integrationDescriptors.oauthCallbackPaths()));
-    await registerTenantRoutes(app, {
-      db: app.db,
-      tenantOrgSettings: deps.tenantOrgSettings,
-      githubConnections: deps.githubConnectionService,
-      runtimeAdapter: deps.runtimeAdapter,
-      integrationDescriptors: deps.integrationDescriptors,
-      getMicrosoftConfigured: deps.overlays.getMicrosoftConfigured
-    });
+  // After the commit of a security change (a new security version of a local
+  // account, or a member removal): stop the account's runtimes in this
+  // process. The tool-context check refuses their tool calls on every replica.
+  const afterSecurityChange = stopActiveWork({ runtimes: deps.runtimeAdapter, logger: app.log });
+
+  // Local login: password sign-in, one-time links, step-up, manager actions.
+  // Lookups before the tenant is known use the privileged pool; everything
+  // else uses the app_user pool under RLS.
+  const localAuth =
+    config.AUTH_MODE === "jwt" && isLoginTypeEnabled(config, "local")
+      ? buildLocalAuth({
+          config,
+          db: app.db,
+          lookupDb: privilegedDb,
+          redis: requireRedis(app),
+          refreshTokens: createRefreshTokenRotationService(app),
+          afterSecurityChange
+        })
+      : undefined;
+
+  // Data routes (tenant settings that change where data goes): step-up for
+  // local sessions, a notice to every owner when email is on, and the admin
+  // rate limit. Startup warns when WorkOS login is on and email is off.
+  const dataRoutes = new DataRouteControl({
+    authMode: config.AUTH_MODE,
+    loginTypes: config.AUTH_LOGIN_TYPES,
+    localAuth,
+    ownerNotices: isMailEnabled(config) ? new MailOutbox({ secret: config.DATA_ENCRYPTION_SECRET }) : null,
+    limits: deps.limits,
+    logger: app.log
+  });
+
+  // Exhaustive on purpose: only dev-headers may trust identity headers, so a
+  // new mode must not fall into that branch by default.
+  // onRequest, not preHandler: authentication only reads headers/url, so
+  // gating here rejects unauthenticated callers before body parsing/validation.
+  switch (config.AUTH_MODE) {
+    case "jwt": {
+      // Auth callback and membership lookups must bypass RLS because they run before
+      // the tenant context is established. Use a separate privileged connection pool.
+      const authTenantMembers = new TenantMemberStore(privilegedDb);
+      app.addHook("onRequest", jwtAuth(config, authTenantMembers, deps.integrationDescriptors.oauthCallbackPaths()));
+      break;
+    }
+    case "dev-headers":
+      app.addHook("onRequest", localDevAuth(config, deps.integrationDescriptors.oauthCallbackPaths()));
+      break;
+    default: {
+      const unknownMode: never = config.AUTH_MODE;
+      throw new Error(`Unknown AUTH_MODE: ${String(unknownMode)}`);
+    }
   }
+  await registerTenantRoutes(app, {
+    db: app.db,
+    tenantOrgSettings: deps.tenantOrgSettings,
+    githubConnections: deps.githubConnectionService,
+    afterSecurityChange,
+    integrationDescriptors: deps.integrationDescriptors,
+    piiImportScopes: deps.piiImportScopes,
+    localAuth,
+    dataRoutes
+  });
 
   // Admin routes run the heaviest aggregate queries in the app and are spread
   // across a dozen registration functions, so throttle them in one place rather
@@ -261,14 +308,16 @@ export async function buildApp() {
   }
 
   await registerAuthRoutes(app, {
-    db: config.AUTH_MODE === "workos" ? privilegedDb : app.db,
+    db: config.AUTH_MODE === "jwt" ? privilegedDb : app.db,
+    appDb: app.db,
+    localAuth,
     config,
     auditEvents: deps.auditEvents,
     limits: deps.limits,
     integrationDescriptors: deps.integrationDescriptors
   });
 
-  await registerAppRoutes(app, deps);
+  await registerAppRoutes(app, deps, { dataRoutes });
 
   const schedulerWorker = buildSchedulerWorker(config, {
     userSettings: deps.userSettings,
@@ -304,6 +353,9 @@ export async function buildApp() {
     messages: deps.messages,
     privilegedDb,
     schedulerWorker,
+    // Cross-tenant mail queue: the maintenance pool sees every tenant's
+    // outbox. Runs in jwt mode even when email is off, to clean up.
+    mailWorker: buildMailWorker(config, privilegedDb, app.log),
     // Cross-tenant stale-approval recovery needs a BYPASSRLS pool; reuse the
     // privileged pool (asserted to bypass RLS above) so the sweep can see every
     // tenant's rows in one statement.

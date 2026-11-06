@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 export function AdminSkillGithubImportTab(props: {
   draft: GithubImportDraft;
   busyKey: string | null;
+  error?: string;
   onDraftChange: (updater: (current: GithubImportDraft) => GithubImportDraft) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -19,6 +20,8 @@ export function AdminSkillGithubImportTab(props: {
         <Label htmlFor="skill-github-url">GitHub repository URL</Label>
         <Input
           id="skill-github-url"
+          type="url"
+          required
           placeholder="https://github.com/org/repo"
           value={props.draft.githubUrl}
           onChange={(event) =>
@@ -50,10 +53,11 @@ export function AdminSkillGithubImportTab(props: {
           />
         </div>
       </div>
+      {props.error ? <p role="alert" className="text-sm text-danger">{props.error}</p> : null}
       <div className="flex justify-end">
         <Button
           type="submit"
-          disabled={!props.draft.githubUrl || props.busyKey === "skill-import-github"}
+          disabled={!props.draft.githubUrl || props.busyKey !== null}
         >
           {props.busyKey === "skill-import-github" ? "Importing..." : "Import GitHub skill"}
         </Button>

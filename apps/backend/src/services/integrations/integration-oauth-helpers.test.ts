@@ -1,12 +1,14 @@
 import cookie from "@fastify/cookie";
 import Fastify from "fastify";
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import { registerGithubOAuthRoutes } from "./github/github-oauth-routes.js";
 import {
   createOAuthBrowserBinding,
   mapOAuthProviderError,
+  oauthBrowserBindingCookieName,
   oauthBrowserBindingMatches,
+  takeOAuthBrowserNonce,
   toIsoFromNow
 } from "./integration-oauth-helpers.js";
 
@@ -65,6 +67,34 @@ test("createOAuthBrowserBinding scopes an httpOnly cookie to the callback path",
 
   const local = createOAuthBrowserBinding("notion", "http://localhost:3001/integrations/notion/callback", 600);
   expect(local.cookie.options).toMatchObject({ secure: false, sameSite: "lax" });
+});
+
+// A browser that started a connect before a deploy must still send the same
+// cookie name to the callback after the deploy. An overlay id gets the same form.
+test.each(["github", "notion", "example_overlay-2"])("browser binding cookie name for %s keeps its form", (provider) => {
+  expect(oauthBrowserBindingCookieName(provider)).toBe(`cogniplane_oauth_bind_${provider}`);
+  expect(createOAuthBrowserBinding(provider, "https://api.example.com/cb", 600).cookie.name).toBe(
+    `cogniplane_oauth_bind_${provider}`
+  );
+});
+
+test.each(["", "Notion", "notion;path=/", "notion=x", "no tion", "a:b", "a".repeat(65)])(
+  "browser binding rejects the provider id %j",
+  (provider) => {
+    expect(() => oauthBrowserBindingCookieName(provider)).toThrow("Invalid OAuth provider id");
+    expect(() => createOAuthBrowserBinding(provider, "https://api.example.com/cb", 600)).toThrow(
+      "Invalid OAuth provider id"
+    );
+  }
+);
+
+test("takeOAuthBrowserNonce rejects a bad provider id before it reads or clears a cookie", () => {
+  const clearCookie = vi.fn();
+  const request = { cookies: { "cogniplane_oauth_bind_x;y": "nonce" }, url: "/cb" } as never;
+  expect(() => takeOAuthBrowserNonce(request, { clearCookie } as never, "x;y")).toThrow(
+    "Invalid OAuth provider id"
+  );
+  expect(clearCookie).not.toHaveBeenCalled();
 });
 
 test("oauthBrowserBindingMatches requires the nonce that produced the hash", () => {

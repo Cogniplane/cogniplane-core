@@ -5,15 +5,20 @@ import { useEffect, useMemo, useState } from "react";
 import { useAdminIntegrations } from "../../../hooks/use-integrations";
 import { AdminIntegrationRow } from "./admin-integration-row";
 import { AdminIntegrationPane } from "./admin-integration-pane";
+import { Button } from "../../ui/button";
 import { HINT } from "../../../lib/ui-tokens";
 
 export function AdminIntegrationsList() {
   const {
     integrations,
     isLoading,
-    activeId,
-    error,
-    configError,
+    hasData,
+    isRefreshing,
+    loadError,
+    pending,
+    errors,
+    isPending,
+    reload,
     flashMessage,
     update,
     clearConfig
@@ -42,22 +47,32 @@ export function AdminIntegrationsList() {
 
   return (
     <section id="integrations" aria-labelledby="integrations-heading" className="flex flex-col gap-2">
-      <h2 id="integrations-heading" className="text-lg font-semibold text-on-surface">Built-in integrations</h2>
-
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
-      {flashMessage ? <p className={HINT}>{flashMessage}</p> : null}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="integrations-heading" className="text-lg font-semibold text-on-surface">Built-in integrations</h2>
+        <Button type="button" variant="outline" size="sm" aria-disabled={isRefreshing || Object.keys(pending).length > 0}
+          onClick={() => { if (!isRefreshing) reload(); }}>{loadError ? "Retry integrations" : "Reload integrations"}</Button>
+      </div>
+      <div role="status" className={HINT}>
+        {isRefreshing && hasData ? "Refreshing integrations. Showing the last loaded list." : flashMessage}
+      </div>
+      {loadError ? <div role="alert" className="text-sm text-danger">
+        <p>{hasData ? "Could not refresh integrations. Showing the last loaded list." : "Could not load integrations."}</p>
+        <p>{loadError} Use Retry integrations to try again.</p>
+      </div> : null}
 
       {isLoading ? (
         <p className={HINT}>Loading integrations...</p>
-      ) : available.length === 0 ? (
-        <p className={HINT}>No integrations available yet.</p>
+      ) : !hasData ? null : available.length === 0 ? (
+        <p className={HINT}>{loadError ? "The last loaded list had no available integrations." : "No integrations available yet."}</p>
       ) : (
         <div className="divide-y divide-outline-variant border-t border-outline-variant">
           {available.map((integration) => (
             <AdminIntegrationRow
               key={integration.id}
               integration={integration}
-              busy={activeId === integration.id}
+              busy={Boolean(pending[integration.id])}
+              operation={pending[integration.id]}
+              error={errors[integration.id]?.operation === "toggle" ? errors[integration.id]?.message : undefined}
               onOpen={() => setOpenId(integration.id)}
               onToggleReads={(next) => void update(integration.id, { readsEnabled: next })}
               onToggleWrites={(next) => void update(integration.id, { writesEnabled: next })}
@@ -73,14 +88,16 @@ export function AdminIntegrationsList() {
       {openIntegration ? (
         <AdminIntegrationPane
           integration={openIntegration}
-          busy={activeId === openIntegration.id}
-          error={configError?.integrationId === openIntegration.id ? configError.message : null}
-          onClose={() => setOpenId(null)}
+          busy={Boolean(pending[openIntegration.id])}
+          operation={pending[openIntegration.id]}
+          errorOperation={errors[openIntegration.id]?.operation}
+          error={errors[openIntegration.id]?.operation !== "toggle" ? errors[openIntegration.id]?.message ?? null : null}
+          onClose={() => { if (!isPending(openIntegration.id)) setOpenId(null); }}
           onSaveConfig={async (config) => {
-            await update(openIntegration.id, { config });
+            return update(openIntegration.id, { config });
           }}
           onClearConfig={async () => {
-            await clearConfig(openIntegration.id);
+            return clearConfig(openIntegration.id);
           }}
         />
       ) : null}

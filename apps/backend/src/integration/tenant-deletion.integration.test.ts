@@ -2,11 +2,15 @@ import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, test, vi } from "vitest";
 import type { Checkpoint, CheckpointMetadata } from "@langchain/langgraph";
 
+import { PasswordHasher } from "../lib/password-hash.js";
+import { bootstrapLocalTenant } from "../scripts/local-auth-commands-lib.js";
+import { LocalAccountService, markLocalIdentityRemoved } from "../services/auth/local-account-service.js";
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
 import { TenantDeletionService } from "../services/tenant-deletion-service.js";
 import {
   adminDatabaseUrl,
   appPool,
+  maintenancePool,
   runAppUserUrl,
   superuserPool
 } from "./support/database.js";
@@ -17,6 +21,8 @@ import {
   seedTenant,
   seedUser
 } from "./support/fixtures.js";
+import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
+import { withSecurityChange } from "../services/auth/security-change.js";
 
 describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
   const checkpointer = adminDatabaseUrl() ? createDeepAgentsCheckpointer(runAppUserUrl()) : null;
@@ -179,5 +185,46 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
     expect(
       (await appPool().query(`SELECT * FROM tenant_deletion_receipts WHERE request_id = $1`, [requestId])).rowCount
     ).toBe(0);
+  });
+
+  // A local tenant's accounts, also one removed earlier (it has no membership
+  // left), leave with the tenant: identities, passwords, links, and user rows.
+  test("deletes a local tenant with its local accounts", async () => {
+    const boot = await bootstrapLocalTenant(superuserPool(), "https://app.test", {
+      tenantName: "Local offboarding", ownerEmail: `${randomUUID()}@example.test`, ownerName: null
+    });
+    const accounts = new LocalAccountService({ afterSecurityChange: IGNORE_SECURITY_CHANGE,
+      db: appPool(), lookupDb: maintenancePool(), hasher: new PasswordHasher(2), frontendOrigin: "https://app.test"
+    });
+    const meta = { ipAddress: null, userAgent: null };
+    await accounts.redeemLink("account_setup", boot.link.url.split("#token=")[1]!, "purple elephants dance quietly", meta);
+    const removed = await accounts.createMember({
+      tenantId: boot.tenantId, email: `${randomUUID()}@example.test`, displayName: null, role: "member", actorUserId: boot.userId, meta
+    });
+    await withSecurityChange(appPool(), boot.tenantId, IGNORE_SECURITY_CHANGE, async (client, change) => {
+      await markLocalIdentityRemoved(change, removed.userId);
+      await client.query(`DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`, [boot.tenantId, removed.userId]);
+    });
+
+    const service = new TenantDeletionService({
+      db: superuserPool(),
+      artifactStorage: { delete: vi.fn(async () => undefined) },
+      skillBundleStorage: { deleteBundle: vi.fn(async () => undefined) },
+      purgeRuntimeThread: (threadId) => checkpointer!.deleteThread(threadId),
+      flushRedis: vi.fn(async () => undefined)
+    });
+    const receipt = await service.execute({
+      requestId: `NONPROD-OFFBOARD-${randomUUID()}`,
+      tenantId: boot.tenantId,
+      redisDisposition: "Integration Redis double flushed.",
+      thirdPartyDisposition: "None.",
+      backupDisposition: "None."
+    });
+
+    expect(receipt.status).toBe("completed");
+    for (const table of ["local_identities", "local_passwords", "auth_action_tokens", "tenant_memberships"]) {
+      expect((await superuserPool().query(`SELECT 1 FROM ${table} WHERE tenant_id = $1`, [boot.tenantId])).rowCount, table).toBe(0);
+    }
+    expect((await superuserPool().query(`SELECT 1 FROM users WHERE user_id = ANY($1)`, [[boot.userId, removed.userId]])).rowCount).toBe(0);
   });
 });

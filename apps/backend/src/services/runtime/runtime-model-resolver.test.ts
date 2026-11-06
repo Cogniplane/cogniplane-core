@@ -46,6 +46,29 @@ test.each(["none", "minimal"])(
   }
 );
 
+test.each(["none", "max"])(
+  "resolveRuntimeModel: GPT-6.1 Terra accepts %s effort",
+  async (requestedEffort) => {
+    const result = await resolveRuntimeModel(makeInput({
+      requestedModel: "openai/gpt-6.1-terra",
+      requestedEffort
+    }));
+    expect(result).toMatchObject({
+      kind: "ok",
+      selectedModel: { id: "openai/gpt-6.1-terra", provider: "openai" },
+      selectedEffort: requestedEffort
+    });
+  }
+);
+
+test("resolveRuntimeModel: Gemini 4 Argon rejects none effort before dispatch", async () => {
+  const result = await resolveRuntimeModel(makeInput({
+    requestedModel: "google/gemini-4-argon",
+    requestedEffort: "none"
+  }));
+  expect(result).toMatchObject({ kind: "error", statusCode: 400 });
+});
+
 test("resolveRuntimeModel: resolves ok with the adapter and default model", async () => {
   const result = await resolveRuntimeModel(makeInput());
   expect(result.kind).toBe("ok");

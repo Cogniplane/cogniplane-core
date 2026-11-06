@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 
 import {
@@ -57,8 +57,16 @@ type Props = {
   rules: PolicyRule[];
   lintWarnings: PolicyLintWarning[];
   busyKey: string | null;
+  rulesState?: "loading" | "unavailable" | "stale" | "current";
+  rulesError?: string | null;
+  refreshing?: boolean;
+  onRetryRules?: () => void;
+  lintState?: "checking" | "unavailable" | "current";
+  lintError?: string | null;
+  onRetryLint?: () => void;
+  actionError?: string | null;
   onSave: (ruleId: string | null, input: ReturnType<typeof draftToInput>) => Promise<boolean>;
-  onDelete: (ruleId: string) => void;
+  onDelete: (ruleId: string) => Promise<boolean> | void;
   onReorder: (ruleIds: string[]) => void;
   /** The last 7 days of Monitor records. Each rule shows its own counts. */
   evidence?: PolicyMonitorSummaryResponse;
@@ -72,7 +80,9 @@ const LINT_KIND_LABELS: Record<PolicyLintWarning["kind"], string> = {
   unknown_condition: "Unknown condition"
 };
 
-export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onDelete, onReorder, evidence, children }: Props) {
+export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onDelete, onReorder, evidence, children, rulesState = "current", rulesError, refreshing = false, onRetryRules, lintState = "current", lintError, onRetryLint, actionError }: Props) {
+  const actionLock = useRef(false);
+  const [localPending, setLocalPending] = useState<"save" | "delete" | null>(null);
   const [draft, setDraft] = useState<PolicyRuleDraft | null>(null);
 
   // Group lint warnings by the rule they're about so each row can show its own.
@@ -85,7 +95,9 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
 
   // Drag-to-reorder is disabled while editing (the draft form changes the
   // layout) and while a reorder is in flight.
-  const reorderable = !draft && busyKey !== "reorder" && rules.length > 1;
+  const busy = busyKey !== null || localPending !== null;
+  const editable = rulesState === "current" && !refreshing;
+  const reorderable = !draft && !busy && editable && rules.length > 1;
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -95,47 +107,105 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     const ruleIds = over ? reorderedRuleIds(rules, active.id, over.id) : null;
-    if (ruleIds) onReorder(ruleIds);
+    if (ruleIds && reorderable) onReorder(ruleIds);
   }
 
   // Closing an editor removes the focused control, so move focus to the button that opened it.
+  // After a save, the rules refresh and that button stays disabled until the refresh ends,
+  // so the request waits for it. Focus that the user moved elsewhere stays where it is.
+  const returnFocus = useRef<string | null>(null);
+  const restoreFocus = useCallback(() => {
+    const target = returnFocus.current ? document.getElementById(returnFocus.current) as HTMLButtonElement | null : null;
+    if (!target || target.disabled) return;
+    returnFocus.current = null;
+    const active = document.activeElement;
+    if (active === null || active === document.body) target.focus();
+  }, []);
+  useEffect(() => {
+    // A failed refresh ends the wait; a later recovery must not move focus.
+    if (rulesState !== "current") returnFocus.current = null;
+    else if (editable && !busy) requestAnimationFrame(restoreFocus);
+  }, [rulesState, editable, busy, restoreFocus]);
   function closeEditor(focusId: string) {
+    returnFocus.current = focusId;
     setDraft(null);
-    requestAnimationFrame(() => document.getElementById(focusId)?.focus());
+    requestAnimationFrame(restoreFocus);
   }
 
   async function handleSave() {
-    if (!draft || !isDraftValid(draft)) return;
-    const ok = await onSave(draft.ruleId, draftToInput(draft));
-    if (ok) closeEditor(draft.ruleId ? editButtonId(draft.ruleId) : NEW_RULE_ID);
+    if (!draft || !isDraftValid(draft) || busy || actionLock.current || !editable) return;
+    actionLock.current = true;
+    setLocalPending("save");
+    try {
+      const ok = await onSave(draft.ruleId, draftToInput(draft));
+      if (ok) closeEditor(draft.ruleId ? editButtonId(draft.ruleId) : NEW_RULE_ID);
+    } finally {
+      actionLock.current = false;
+      setLocalPending(null);
+    }
+  }
+
+  async function handleDelete(ruleId: string) {
+    if (busy || actionLock.current || !editable) return;
+    actionLock.current = true;
+    setLocalPending("delete");
+    try {
+      const ok = await onDelete(ruleId);
+      if (ok) closeEditor(NEW_RULE_ID);
+    } finally {
+      actionLock.current = false;
+      setLocalPending(null);
+    }
   }
 
   const creating = draft !== null && draft.ruleId === null;
-  const saving = busyKey === "submit";
+  const saving = busyKey === "submit" || localPending === "save";
+  const deleting = localPending === "delete" || (busyKey?.startsWith("delete-") ?? false);
 
   return (
     <section aria-labelledby="policy-rules-title">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 id="policy-rules-title" className="text-lg font-semibold text-on-surface">Rules</h2>
         {/* An open editor has unsaved edits, so the button cancels it before it starts a new rule. */}
-        <Button id={NEW_RULE_ID} type="button" variant="outline" size="sm" aria-expanded={creating} onClick={() => setDraft(draft ? null : emptyDraft())}>
+        <Button id={NEW_RULE_ID} type="button" variant="outline" size="sm" aria-expanded={creating} disabled={busy || !editable} onClick={() => setDraft(draft ? null : emptyDraft())}>
           {draft ? "Cancel" : "New rule"}
         </Button>
       </div>
       <p className="mt-1 text-sm text-on-surface-variant">
         The first matching rule decides. Drag the handle to change the order. A tool call that matches no rule is allowed.
       </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+        <p role={rulesError ? "alert" : "status"} className={rulesError ? "text-danger" : "text-on-surface-variant"}>
+          {rulesState === "loading" ? "Loading rules..." : rulesState === "unavailable" ? `Rules unavailable. ${rulesError ?? "Try again."}` : rulesState === "stale" ? `Showing saved rules. The latest read failed. ${rulesError ?? "Try again."}` : refreshing ? "Refreshing rules. Showing saved rules." : "Rules are up to date."}
+        </p>
+        {onRetryRules ? <Button type="button" variant="outline" size="sm" aria-disabled={refreshing || busy} onClick={() => { if (!refreshing && !busy) onRetryRules(); }}>
+          {rulesError ? "Retry rules" : "Refresh rules"}
+        </Button> : null}
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+        <p role={lintError ? "alert" : "status"} className={lintError ? "text-danger" : "text-on-surface-variant"}>
+          {lintState === "checking" ? "Checking rule warnings..." : lintState === "unavailable" ? `Rule warnings unavailable. ${lintError ?? "Try again."}` : lintWarnings.length === 0 ? "No rule warnings found." : `${lintWarnings.length} rule warnings found.`}
+        </p>
+        {onRetryLint ? <Button type="button" variant="outline" size="sm" aria-disabled={lintState === "checking" || busy} onClick={() => { if (lintState !== "checking" && !busy) onRetryLint(); }}>
+          {lintError ? "Retry warnings" : "Check warnings"}
+        </Button> : null}
+      </div>
+      {actionError && !draft ? <p role="alert" className="mt-3 text-sm text-danger">{actionError}</p> : null}
+      {busyKey === "reorder" ? <p role="status" className="mt-3 text-sm text-on-surface-variant">Saving rule order...</p> : null}
       {creating && draft ? <div className="mt-4"><RuleEditor
             draft={draft}
             onChange={setDraft}
             onCancel={() => closeEditor(NEW_RULE_ID)}
             onSave={handleSave}
             saving={saving}
+            deleting={deleting}
+            error={actionError}
+            disabled={busy || !editable}
           /></div> : null}
 
       <div className="mt-3 border-t border-outline-variant">
         {rules.length === 0 ? (
-          <p className="py-4 text-sm text-on-surface-variant">No rules. Every tool call is allowed.</p>
+          rulesState === "current" && !refreshing ? <p className="py-4 text-sm text-on-surface-variant">No rules. Every tool call is allowed.</p> : null
         ) : (
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={rules.map((r) => r.ruleId)} strategy={verticalListSortingStrategy}>
@@ -150,7 +220,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
                     evidence={evidence}
                     editing={draft?.ruleId === rule.ruleId}
                     // One editor at a time, so an open draft is never replaced without a warning.
-                    editDisabled={draft !== null && draft.ruleId !== rule.ruleId}
+                    editDisabled={busy || !editable || draft !== null && draft.ruleId !== rule.ruleId}
                     onEdit={() => draft?.ruleId === rule.ruleId ? closeEditor(editButtonId(rule.ruleId)) : setDraft(draftFromRule(rule))}
                   >
                     {draft?.ruleId === rule.ruleId ? <RuleEditor
@@ -159,7 +229,10 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
             onCancel={() => closeEditor(editButtonId(rule.ruleId))}
             onSave={handleSave}
             saving={saving}
-            onDelete={() => { onDelete(rule.ruleId); closeEditor(NEW_RULE_ID); }}
+            deleting={deleting}
+            error={actionError}
+            disabled={busy || !editable}
+            onDelete={() => { void handleDelete(rule.ruleId); }}
           /> : null}
                   </SortableRuleRow>
                 ))}
@@ -239,7 +312,7 @@ function SortableRuleRow({
           ⠿
         </button>
       ) : null}
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
         <OverviewRow
           title={rule.name}
           status={<>
@@ -269,6 +342,9 @@ function RuleEditor({
   onCancel,
   onSave,
   saving,
+  deleting,
+  disabled,
+  error,
   onDelete
 }: {
   draft: PolicyRuleDraft;
@@ -276,12 +352,22 @@ function RuleEditor({
   onCancel: () => void;
   onSave: () => void;
   saving: boolean;
+  deleting: boolean;
+  disabled: boolean;
+  error?: string | null;
   onDelete?: () => void;
 }) {
+  const errorId = useId();
+  const actions = useRef<HTMLDivElement>(null);
+  const errorElement = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (error && actions.current?.contains(document.activeElement)) errorElement.current?.scrollIntoView({ block: "nearest" });
+  }, [error]);
   const update = (patch: Partial<PolicyRuleDraft>) => onChange({ ...draft, ...patch });
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-outline bg-surface-container-low p-4">
+    <div className="flex min-w-0 flex-col gap-3 rounded-lg border border-outline bg-surface-container-low p-4">
+      <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-3">
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="policy-name">Name</Label>
         <Input
@@ -386,20 +472,22 @@ function RuleEditor({
         Enabled
       </label>
 
-      <div className="flex gap-2">
-        <Button type="button" onClick={onSave} disabled={saving || !isDraftValid(draft)}>
+      </fieldset>
+      <div ref={actions} className="flex flex-wrap gap-2">
+        <Button type="button" onClick={() => { if (!disabled) onSave(); }} disabled={!disabled && !isDraftValid(draft)} aria-disabled={disabled || !isDraftValid(draft)} aria-describedby={error ? errorId : undefined}>
           {saving ? "Saving…" : draft.ruleId ? "Save changes" : "Create rule"}
         </Button>
-        <Button type="button" variant="ghost" onClick={onCancel}>
+        <Button type="button" variant="ghost" disabled={disabled} onClick={onCancel}>
           Cancel
         </Button>
         {onDelete ? (
           // A delete during a save would race it, so wait for the save to finish.
-          <Button type="button" variant="ghost" className="ml-auto text-danger" disabled={saving} onClick={onDelete}>
-            Delete rule
+          <Button type="button" variant="ghost" className="ml-auto text-danger" aria-disabled={disabled} aria-describedby={error ? errorId : undefined} onClick={() => { if (!disabled) onDelete(); }}>
+            {deleting ? "Deleting…" : "Delete rule"}
           </Button>
         ) : null}
       </div>
+      {error ? <p id={errorId} ref={errorElement} role="alert" className="text-sm text-danger">{error}</p> : null}
     </div>
   );
 }

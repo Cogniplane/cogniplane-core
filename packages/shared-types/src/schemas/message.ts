@@ -78,6 +78,18 @@ export type ToolResult = z.infer<typeof ToolResultSchema>;
 export const ReasoningSegmentSchema = z.object({ offset: z.number(), text: z.string() });
 export type ReasoningSegment = z.infer<typeof ReasoningSegmentSchema>;
 
+// Why the backend stopped a turn that the user did not stop. The backend sends
+// the code on the interrupted RUN_FINISHED and saves it on the assistant row;
+// the frontend owns the text that it shows.
+// - security_change: the account's security version changed (a password
+//   change, sign out everywhere, a factor change, and the like). The
+//   replica that made the change stops the turn, and every other replica
+//   stops it at its next model call, native tool or approval round.
+// - tool_context_ended: the turn's tool access ended for another reason
+//   (expired, or its execution ended), found at one of the same points.
+export const TurnStopReasonSchema = z.enum(["security_change", "tool_context_ended"]);
+export type TurnStopReason = z.infer<typeof TurnStopReasonSchema>;
+
 export const MessageSchema = z.object({
   messageId: z.string(),
   sessionId: z.string(),
@@ -100,6 +112,8 @@ export const MessageSchema = z.object({
   feedbackRating: MessageFeedbackRatingSchema.nullable(),
   // Whole-turn elapsed time, including approval waits. Absent on older turns.
   durationMs: z.number().finite().nonnegative().nullable().optional(),
+  // Set on an interrupted turn that the backend stopped. Absent otherwise.
+  stopReason: TurnStopReasonSchema.nullable().optional(),
   projectInstructions: ProjectInstructionsSnapshotSchema.nullable().optional(),
   // Frontend-only field (passthrough): when the user's message was rewritten
   // by the PII detector before the runtime saw it, the SSE stream surfaces a
@@ -117,11 +131,17 @@ export const ApprovalSchema = z.object({
   approvalId: z.string(),
   sessionId: z.string(),
   itemId: z.string(),
+  // The tool call that this approval is for: the ID that the server gave the
+  // proposed call, the same as the toolCallId of its AG-UI tool call and its
+  // saved tool result. Absent when the server could not prove the link (an
+  // approval inside delegated work, a repeated model call ID, an older row).
+  // The decision route still takes only the approval ID.
+  toolCallId: z.string().min(1).optional(),
   kind: z.enum(["command_execution", "file_change", "permissions", "mcp_tool"]),
   title: z.string(),
   summary: z.string(),
   status: z.enum(["pending", "approved", "rejected", "expired"])
-}).passthrough();
+}).strip();
 export type Approval = z.infer<typeof ApprovalSchema>;
 
 export const ApprovalsListResponseSchema = z.object({
@@ -141,13 +161,148 @@ export type ApprovalsListResponse = z.infer<typeof ApprovalsListResponseSchema>;
 // (app.ts) is the coarse outer guard; this is the precise field-level one.
 export const MAX_MESSAGE_TEXT_LENGTH = 100_000;
 
+// The standard UI catalog is larger than a prompt. Bound its schema and current
+// surface state before either reaches the policy provider or model.
+export const MAX_GENERATIVE_UI_CONTEXT_LENGTH = 256_000;
+export const GENERATIVE_UI_CATALOG_ID = "cogniplane/standard@1";
+// The one named place outside the transcript where render_ui can show a
+// surface. The chat host mounts it beside the transcript. The backend accepts
+// only these targets, and a surface keeps the target of its createSurface.
+export const GENERATIVE_UI_PANEL_TARGET = "side-panel";
+export const GENERATIVE_UI_TARGETS = ["chat", GENERATIVE_UI_PANEL_TARGET] as const;
+export type GenerativeUiTarget = (typeof GENERATIVE_UI_TARGETS)[number];
+// The props that the model sets on the ArtifactCard component of that catalog.
+// Only the id: the browser reads the name, status, size, type and PII label of
+// the file from the session's artifact list, never from the model.
+export const ArtifactCardPropsSchema = z.object({ artifactId: z.string().uuid() });
+// The props of the Checklist component of that catalog. The model sets the
+// items, the title, and the start values. `checked` and `notes` are
+// writable: the model binds them to data model paths, and the user's edits
+// go there. A value over a bound, a duplicate item id, or a `checked` key
+// that names no item makes the props invalid, and the component does not render.
+export const CHECKLIST_LIMITS = { items: 30, idChars: 64, titleChars: 120, labelChars: 200, descriptionChars: 300, notesChars: 2_000 } as const;
+// The ids of every application component are keys of its data, so they stay
+// plain, and never a prototype name. A Checklist id is also a segment of the
+// data model and of the stored drafts.
+const GeneratedUiIdSchema = z.string()
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
+  .max(CHECKLIST_LIMITS.idChars)
+  .refine((id) => id !== "constructor" && id !== "prototype", { message: "Reserved item id" });
+const ChecklistItemIdSchema = GeneratedUiIdSchema;
+export const ChecklistPropsSchema = z.object({
+  title: z.string().trim().min(1).max(CHECKLIST_LIMITS.titleChars).optional(),
+  items: z.array(z.object({
+    id: ChecklistItemIdSchema,
+    label: z.string().trim().min(1).max(CHECKLIST_LIMITS.labelChars),
+    description: z.string().trim().max(CHECKLIST_LIMITS.descriptionChars).optional()
+  })).min(1).max(CHECKLIST_LIMITS.items),
+  checked: z.record(z.string(), z.boolean()).optional(),
+  notes: z.string().max(CHECKLIST_LIMITS.notesChars).optional()
+}).superRefine((props, context) => {
+  const ids = new Set<string>();
+  props.items.forEach((item, index) => {
+    if (ids.has(item.id)) context.addIssue({ code: "custom", path: ["items", index, "id"], message: `Duplicate item id "${item.id}"` });
+    ids.add(item.id);
+  });
+  for (const key of Object.keys(props.checked ?? {})) {
+    if (!ids.has(key)) context.addIssue({ code: "custom", path: ["checked", key], message: `No item has the id "${key}"` });
+  }
+});
+export type ChecklistProps = z.infer<typeof ChecklistPropsSchema>;
+// The props of the ComparisonTable component of that catalog: a read-only
+// table. The model names the compared items (columns) and the criteria (rows),
+// and gives each cell a text, a number, a boolean, or null for "no data". A
+// column id that a row leaves out also shows as "no data". The numbers stay
+// within +-1e15, so the browser prints each one as it is.
+export const COMPARISON_TABLE_LIMITS = {
+  minColumns: 2, columns: 8, rows: 30, titleChars: 120, labelChars: 120, cellChars: 300, maxNumber: 1e15
+} as const;
+const ComparisonCellSchema = z.union([
+  z.string().max(COMPARISON_TABLE_LIMITS.cellChars),
+  z.number().min(-COMPARISON_TABLE_LIMITS.maxNumber).max(COMPARISON_TABLE_LIMITS.maxNumber),
+  z.boolean(),
+  z.null()
+]);
+export const ComparisonTablePropsSchema = z.object({
+  title: z.string().trim().min(1).max(COMPARISON_TABLE_LIMITS.titleChars).optional(),
+  columns: z.array(z.object({
+    id: GeneratedUiIdSchema,
+    label: z.string().trim().min(1).max(COMPARISON_TABLE_LIMITS.labelChars)
+  })).min(COMPARISON_TABLE_LIMITS.minColumns).max(COMPARISON_TABLE_LIMITS.columns),
+  rows: z.array(z.object({
+    id: GeneratedUiIdSchema,
+    label: z.string().trim().min(1).max(COMPARISON_TABLE_LIMITS.labelChars),
+    // The key schema rejects "__proto__" and the like before a cell reaches the table.
+    cells: z.record(GeneratedUiIdSchema, ComparisonCellSchema)
+  })).min(1).max(COMPARISON_TABLE_LIMITS.rows)
+}).superRefine((props, context) => {
+  const columnIds = new Set<string>();
+  props.columns.forEach((column, index) => {
+    if (columnIds.has(column.id)) context.addIssue({ code: "custom", path: ["columns", index, "id"], message: `Duplicate column id "${column.id}"` });
+    columnIds.add(column.id);
+  });
+  const rowIds = new Set<string>();
+  props.rows.forEach((row, index) => {
+    if (rowIds.has(row.id)) context.addIssue({ code: "custom", path: ["rows", index, "id"], message: `Duplicate row id "${row.id}"` });
+    rowIds.add(row.id);
+    for (const key of Object.keys(row.cells)) {
+      if (!columnIds.has(key)) context.addIssue({ code: "custom", path: ["rows", index, "cells", key], message: `No column has the id "${key}"` });
+    }
+  });
+});
+export type ComparisonTableProps = z.infer<typeof ComparisonTablePropsSchema>;
+// The props of the StatusSummary component of that catalog: a read-only list of
+// phases or items, each with a status label from a fixed list, and optional
+// counts. The browser colors a status by its name and never reads the other
+// text. A count is a pair from the model's data, and the browser computes no
+// count or percentage.
+export const STATUS_SUMMARY_LIMITS = { items: 30, titleChars: 120, labelChars: 120, detailChars: 300, maxCount: 1_000_000 } as const;
+export const STATUS_SUMMARY_STATUSES = ["not-started", "in-progress", "at-risk", "blocked", "complete"] as const;
+export type StatusSummaryStatus = (typeof STATUS_SUMMARY_STATUSES)[number];
+const StatusCountSchema = z.number().int().min(0).max(STATUS_SUMMARY_LIMITS.maxCount);
+const StatusCountsShape = { completed: StatusCountSchema.optional(), total: StatusCountSchema.optional() };
+function refineStatusCounts(counts: { completed?: number; total?: number }, path: (string | number)[], context: z.RefinementCtx): void {
+  if ((counts.completed === undefined) !== (counts.total === undefined)) {
+    context.addIssue({ code: "custom", path, message: "Set completed and total together, or neither" });
+  } else if (counts.completed !== undefined && counts.total !== undefined && counts.completed > counts.total) {
+    context.addIssue({ code: "custom", path: [...path, "completed"], message: "completed is larger than total" });
+  }
+}
+export const StatusSummaryPropsSchema = z.object({
+  title: z.string().trim().min(1).max(STATUS_SUMMARY_LIMITS.titleChars).optional(),
+  ...StatusCountsShape,
+  items: z.array(z.object({
+    id: GeneratedUiIdSchema,
+    label: z.string().trim().min(1).max(STATUS_SUMMARY_LIMITS.labelChars),
+    status: z.enum(STATUS_SUMMARY_STATUSES).optional(),
+    detail: z.string().trim().max(STATUS_SUMMARY_LIMITS.detailChars).optional(),
+    ...StatusCountsShape
+  })).max(STATUS_SUMMARY_LIMITS.items)
+}).superRefine((props, context) => {
+  refineStatusCounts(props, [], context);
+  const ids = new Set<string>();
+  props.items.forEach((item, index) => {
+    if (ids.has(item.id)) context.addIssue({ code: "custom", path: ["items", index, "id"], message: `Duplicate item id "${item.id}"` });
+    ids.add(item.id);
+    refineStatusCounts(item, ["items", index], context);
+  });
+});
+export type StatusSummaryProps = z.infer<typeof StatusSummaryPropsSchema>;
+// Keep accepted tool arguments below the message-list projection's 32k cap.
+export const MAX_RENDER_UI_ARGS_CHARS = 30_000;
+export const MAX_RENDER_UI_OPERATIONS = 100;
+
 export const MessagePostRequestSchema = z.object({
   sessionId: z.string().uuid(),
   text: z.string().trim().min(1).max(MAX_MESSAGE_TEXT_LENGTH),
   artifactIds: z.array(z.string().uuid()).max(10).optional(),
   projectFileIds: z.array(z.string().uuid()).max(20).optional(),
   model: z.string().optional(),
-  effort: z.enum(EFFORT_LEVELS).optional()
+  effort: z.enum(EFFORT_LEVELS).optional(),
+  generativeUiContext: z.string().trim().min(1).max(MAX_GENERATIVE_UI_CONTEXT_LENGTH).optional(),
+  generativeUiTransport: z.literal("tool").optional()
+}).refine((input) => input.generativeUiTransport === undefined || Boolean(input.generativeUiContext), {
+  message: "Tool UI transport requires browser UI context", path: ["generativeUiTransport"]
 });
 export type MessagePostRequest = z.infer<typeof MessagePostRequestSchema>;
 

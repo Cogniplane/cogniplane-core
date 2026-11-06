@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Artifact } from "@cogniplane/shared-types";
 import { ArtifactBrowser } from "./artifact-browser";
@@ -45,7 +45,7 @@ it("keeps loaded rows when the next page fails and retries the same cursor", asy
   fireEvent.click(screen.getByRole("button", { name: "Load more" }));
   await screen.findByText("Page unavailable");
   expect(screen.getByText("notes.md")).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  fireEvent.click(screen.getByRole("button", { name: "Retry loading more" }));
   await screen.findByText("second.md");
   expect(screen.getByText("notes.md")).toBeTruthy();
   expect(api.browse.mock.calls.slice(1).map(([params]) => params.cursor)).toEqual(["page-2", "page-2"]);
@@ -84,13 +84,13 @@ it("opens and closes a real preview and reports a download failure", async () =>
   api.download.mockRejectedValue(new Error("Download unavailable"));
   mount();
   await screen.findByText("notes.md");
-  fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+  fireEvent.click(screen.getByRole("button", { name: "Preview notes.md" }));
   expect(await screen.findByRole("dialog")).toBeTruthy();
   await screen.findByText("Preview contents");
   expect(api.preview).toHaveBeenCalledWith(artifact);
   fireEvent.click(screen.getByRole("button", { name: "Close" }));
   await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-  fireEvent.click(screen.getByRole("button", { name: "Download" }));
+  fireEvent.click(screen.getByRole("button", { name: "Download notes.md" }));
   await waitFor(() => expect(api.error).toHaveBeenCalledWith("Failed to download artifact."));
   expect(api.download).toHaveBeenCalledWith("artifact-1");
 });
@@ -99,6 +99,72 @@ it("disables preview and download for a generated artifact still processing", as
   api.browse.mockResolvedValue({ items: [{ ...artifact, status: "processing" }], nextCursor: null });
   mount();
   await screen.findByText("notes.md");
-  expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(true);
-  expect((screen.getByRole("button", { name: "Download" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Preview notes.md" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Download notes.md" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+
+it("announces loading and explains an empty library, including a sort-only URL", async () => {
+  api.search = "sort=name_asc";
+  let resolve!: (value: unknown) => void;
+  api.browse.mockReturnValue(new Promise(done => { resolve = done; }));
+  mount();
+  expect(screen.getByRole("status").textContent).toBe("Loading artifacts…");
+  await act(async () => { resolve({ items: [], nextCursor: null }); });
+  await screen.findByText("No artifacts yet.");
+  expect(screen.getByText(/Upload a file in a session/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+});
+
+it("clears a filtered no-match result locally without dropping recovery", async () => {
+  api.search = "q=missing&type=upload";
+  api.browse.mockResolvedValueOnce({ items: [], nextCursor: null });
+  mount();
+  await screen.findByText("No artifacts match these filters.");
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  await screen.findByText("notes.md");
+  expect(api.replace).toHaveBeenLastCalledWith("/artifacts");
+  expect(api.browse).toHaveBeenLastCalledWith({ sort: "created_desc", cursor: undefined });
+});
+
+it("names filter purposes and shows readable source values while preserving multiselect enums", async () => {
+  mount();
+  await screen.findByText("notes.md");
+  expect(screen.getByRole("combobox", { name: "Sort artifacts" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "File format" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "File status" })).toBeTruthy();
+  fireEvent.keyDown(screen.getByRole("button", { name: "Source" }), { key: "Enter" });
+  const upload = await screen.findByRole("menuitemcheckbox", { name: "Uploaded" });
+  fireEvent.click(upload);
+  fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Generated" }));
+  await waitFor(() => expect(api.browse).toHaveBeenLastCalledWith({ sort: "created_desc", type: ["upload", "generated"], cursor: undefined }));
+  expect(screen.getByRole("menuitemcheckbox", { name: "Uploaded" }).getAttribute("aria-checked")).toBe("true");
+});
+
+it("explains unsupported formats separately from processing and keeps full contextual names", async () => {
+  const fullName = "A very long supporting research archive with customer evidence.zip";
+  api.browse.mockResolvedValue({ items: [
+    { ...artifact, artifactName: fullName, mimeType: "application/zip" },
+    { ...artifact, artifactId: "processing", artifactName: "Processing.pdf", status: "processing" }
+  ], nextCursor: null });
+  mount();
+  await screen.findByText(fullName);
+  const row = screen.getByText(fullName).closest('[role="listitem"]') as HTMLElement;
+  expect(within(row).getByText(/Preview is not supported/)).toBeTruthy();
+  expect((within(row).getByRole("button", { name: `Preview ${fullName}` }) as HTMLButtonElement).disabled).toBe(true);
+  expect((within(row).getByRole("button", { name: `Download ${fullName}` }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.getByText("Preview and download will be available when the file is ready.")).toBeTruthy();
+});
+
+it("announces preview failure and retries the same artifact without changing eligibility", async () => {
+  api.preview.mockRejectedValueOnce(new Error("Unavailable")).mockResolvedValueOnce({ kind: "text", text: "Recovered preview" });
+  mount();
+  await screen.findByText("notes.md");
+  fireEvent.click(screen.getByRole("button", { name: "Preview notes.md" }));
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain("Failed to load preview");
+  fireEvent.click(screen.getByRole("button", { name: "Retry preview" }));
+  await screen.findByText("Recovered preview");
+  expect(api.preview.mock.calls.map(([target]) => target)).toEqual([artifact, artifact]);
+  expect(screen.queryByRole("button", { name: "Retry preview" })).toBeNull();
 });

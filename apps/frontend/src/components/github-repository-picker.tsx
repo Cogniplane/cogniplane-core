@@ -8,7 +8,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { HINT, LIST_ITEM, PILL_AMBER, PILL_BLUE, PILL_GRAY, SECTION_LABEL } from "../lib/ui-tokens";
+import { HINT, LIST_ITEM, PILL_AMBER, PILL_BLUE, PILL_GRAY } from "../lib/ui-tokens";
 
 export type GithubRepositoryPickerProps = {
   /** The connected GitHub account. A selection belongs to the account that it started from. */
@@ -76,8 +76,7 @@ export function GithubRepositoryPicker(input: GithubRepositoryPickerProps) {
       <CardHeader>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className={SECTION_LABEL}>Repository access</p>
-            <h2 className="text-lg font-semibold text-on-surface">Repositories the agent can use</h2>
+            <h2 className="text-base font-semibold text-on-surface">Repositories the agent can use</h2>
             <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
               The agent works only in the repositories that you select here. It cannot change this
               list. Your GitHub account must also have access to each repository.
@@ -108,6 +107,7 @@ export function GithubRepositoryPicker(input: GithubRepositoryPickerProps) {
           </Button>
         </div>
 
+        {input.isLoading ? <p role="status" className={HINT}>Loading your repositories...</p> : null}
         {input.loadError ? (
           <p role="alert" className="text-sm text-danger">{input.loadError}</p>
         ) : null}
@@ -124,9 +124,9 @@ export function GithubRepositoryPicker(input: GithubRepositoryPickerProps) {
                       checked={checked}
                       disabled={input.isSaving || (!checked && atLimit)}
                       onChange={(event) => toggle(repository.fullName, event.target.checked)}
-                      className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+                      className="size-4 shrink-0 rounded border-control-boundary accent-primary disabled:cursor-not-allowed disabled:opacity-50"
                     />
-                    <span className="min-w-0 truncate">{repository.fullName}</span>
+                    <span className="min-w-0 break-words [overflow-wrap:anywhere]">{repository.fullName}</span>
                   </label>
                   <span className="flex items-center gap-1.5">
                     {repository.private ? <span className={PILL_GRAY}>private</span> : null}
@@ -156,7 +156,7 @@ export function GithubRepositoryPicker(input: GithubRepositoryPickerProps) {
             addByName();
           }}
         >
-          <div className="flex flex-col gap-1">
+          <div className="flex min-w-0 flex-1 flex-col gap-1 sm:flex-initial">
             <Input
               aria-label="Add a repository by name"
               placeholder="owner/name"
@@ -167,7 +167,7 @@ export function GithubRepositoryPicker(input: GithubRepositoryPickerProps) {
               }}
               disabled={input.isSaving || atLimit}
               aria-invalid={manualError !== null}
-              className="w-64"
+              className="w-full sm:w-64"
             />
             {manualError ? <p role="alert" className="text-sm text-danger">{manualError}</p> : null}
           </div>

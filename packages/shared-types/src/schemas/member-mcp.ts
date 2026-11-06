@@ -5,7 +5,14 @@ export const McpCredentialScopeSchema = z.object({ tenantId: z.string().min(1), 
 export const McpCredentialStatusSchema = z.object({
   status: z.enum(["not_connected", "connected", "reconnect_required", "organization", "no_auth", "unavailable"]),
   credentialVersion: z.number().int().nonnegative(),
-  accountLabel: z.string().nullable()
+  accountLabel: z.string().nullable(),
+  // True with status `reconnect_required`: a security change of the member's
+  // account (password change, sign out everywhere) suspended the saved
+  // credential. Runtime calls do not use it. The member saves a new secret or
+  // removes it; there is no confirm, because the page cannot show which
+  // account the secret belongs to. Optional, so that a client without this
+  // field still reads the status as "reconnect required".
+  suspended: z.boolean().optional()
 });
 export type McpCredentialStatus = z.infer<typeof McpCredentialStatusSchema>;
 export const McpConnectionSchema = McpCredentialStatusSchema.extend({

@@ -133,6 +133,8 @@ export function useSessionData(input: {
     artifacts,
     initialApprovals: sessionData?.approvals ?? EMPTY_SESSION_DATA.approvals,
     refreshSessionData,
-    isSessionDataReady
+    isSessionDataReady,
+    /** The session's data is known, from this visit or from the cache. */
+    hasSessionData: sessionData !== undefined
   };
 }

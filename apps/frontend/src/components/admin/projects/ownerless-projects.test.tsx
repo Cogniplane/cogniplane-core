@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdminUser } from "@cogniplane/shared-types";
 
@@ -191,4 +191,88 @@ describe("ownerless projects", () => {
 
     expect(await screen.findByText("Q3 planning")).toBeTruthy();
   });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function openAssignment() {
+  await waitFor(() => expect(chooser("Q3 planning").disabled).toBe(false));
+  fireEvent.change(chooser("Q3 planning"), { target: { value: "dana" } });
+  assignButton("Q3 planning").focus();
+  fireEvent.click(assignButton("Q3 planning"));
+  return screen.findByRole("alertdialog");
+}
+
+it("keeps the pending confirmation focused and ignores repeat activation", async () => {
+  const held = deferred<void>();
+  vi.mocked(recoverProjectOwner).mockReturnValue(held.promise);
+  renderScreen();
+  const dialog = await openAssignment();
+  const confirm = within(dialog).getByRole("button", { name: "Make owner" }) as HTMLButtonElement;
+  confirm.focus();
+  fireEvent.click(confirm);
+  await waitFor(() => expect(confirm.getAttribute("aria-disabled")).toBe("true"));
+  expect(confirm.disabled).toBe(false);
+  expect(document.activeElement).toBe(confirm);
+  expect(confirm.getAttribute("aria-busy")).toBe("true");
+  fireEvent.click(confirm);
+  expect(recoverProjectOwner).toHaveBeenCalledTimes(1);
+  await act(async () => { held.resolve(); });
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Projects without an owner" })));
+});
+
+it("returns focus to the opener after Cancel", async () => {
+  renderScreen();
+  const dialog = await openAssignment();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(assignButton("Q3 planning")));
+});
+
+it("puts a member failure beside its project and focuses the recovery message", async () => {
+  vi.mocked(recoverProjectOwner).mockRejectedValue(apiError(404, "organization_member_not_found"));
+  renderScreen();
+  const dialog = await openAssignment();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Make owner" }));
+  const notice = await screen.findByRole("alert");
+  expect(notice.closest("li")).toBe(row("Q3 planning"));
+  await waitFor(() => expect(document.activeElement).toBe(notice));
+  expect(chooser("Q3 planning").value).toBe("");
+});
+
+it("keeps a conflict message stable while a removed project refreshes", async () => {
+  const refresh = deferred<typeof PROJECTS>();
+  vi.mocked(listOwnerlessProjects).mockResolvedValueOnce(PROJECTS).mockReturnValue(refresh.promise);
+  vi.mocked(recoverProjectOwner).mockRejectedValue(apiError(409, "project_has_owner"));
+  renderScreen();
+  const dialog = await openAssignment();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Make owner" }));
+  const notice = await screen.findByRole("alert");
+  expect(notice.textContent).toContain("Q3 planning: This project already has an owner.");
+  expect(notice.closest("li")).toBeNull();
+  await waitFor(() => expect(document.activeElement).toBe(notice));
+  await act(async () => { refresh.resolve([PROJECTS[1]!]); });
+  expect(screen.getByRole("alert")).toBe(notice);
+  expect(document.activeElement).toBe(notice);
+});
+
+it("does not take focus back when a person moves during the list refresh", async () => {
+  const refresh = deferred<typeof PROJECTS>();
+  vi.mocked(listOwnerlessProjects).mockResolvedValueOnce(PROJECTS).mockReturnValue(refresh.promise);
+  renderScreen();
+  const dialog = await openAssignment();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Make owner" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Projects without an owner" })));
+  await waitFor(() => expect(chooser("Vendor review").disabled).toBe(true));
+  // A destination outside the pending list stays available while it refreshes.
+  const destination = document.createElement("button");
+  destination.textContent = "Another task";
+  document.body.append(destination);
+  destination.focus();
+  await act(async () => { refresh.resolve([PROJECTS[1]!]); });
+  expect(document.activeElement).toBe(destination);
+  destination.remove();
 });

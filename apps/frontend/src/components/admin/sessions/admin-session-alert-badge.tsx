@@ -5,7 +5,7 @@ import { PILL_BASE } from "../../../lib/ui-tokens";
 
 type BadgeMeta = {
   label: string;
-  color: "red" | "blue" | "gray";
+  color: "red" | "amber" | "green" | "blue" | "gray";
   tooltip: string;
 };
 
@@ -17,12 +17,12 @@ export const ALERT_BADGE_META: Record<AdminSessionAlertKind, BadgeMeta> = {
   },
   "pii-transformed": {
     label: "PII transformed",
-    color: "blue",
+    color: "green",
     tooltip: "PII detection masked or rewrote content before processing."
   },
   "pii-detected": {
     label: "PII detected",
-    color: "gray",
+    color: "amber",
     tooltip: "PII detection completed and surfaced findings without modifying content."
   },
   "approval-rejected": {
@@ -44,7 +44,9 @@ export const ALERT_BADGE_META: Record<AdminSessionAlertKind, BadgeMeta> = {
 
 const PILL_TONE: Record<BadgeMeta["color"], string> = {
   red: `${PILL_BASE} bg-danger-surface text-danger`,
-  blue: `${PILL_BASE} bg-accent-soft text-accent`,
+  amber: `${PILL_BASE} bg-warning-surface text-warning`,
+  green: `${PILL_BASE} bg-success-surface text-success`,
+  blue: `${PILL_BASE} bg-info-surface text-info`,
   gray: `${PILL_BASE} bg-surface-container text-on-surface-variant`
 };
 

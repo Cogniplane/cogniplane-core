@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
 import type { AdminModelCatalogResponse, ModelProvider } from "@cogniplane/shared-types";
 
-import { getAdminModelCatalog } from "../../../lib/admin-api";
+import { getAdminModelCatalog, listAdminManagedTools } from "../../../lib/admin-api";
 import { useTenantSettings } from "../../../hooks/use-tenant-settings";
 import { makeTenantSettings } from "../../../test-helpers/tenant-settings";
 import { queryKeys } from "../../../lib/query-keys";
@@ -15,7 +15,7 @@ vi.mock("../../../lib/auth-context", () => ({ useAuth: () => ({ user: { role: "o
 vi.mock("../../../hooks/use-tenant-settings", () => ({ useTenantSettings: vi.fn() }));
 vi.mock("../../../lib/admin-api", () => ({
   getAdminModelCatalog: vi.fn(),
-  listAdminManagedTools: async () => [],
+  listAdminManagedTools: vi.fn(),
   listAdminMcpServers: async () => []
 }));
 
@@ -48,6 +48,7 @@ vi.mock("../../../lib/admin-history-api", () => ({ listAdminHistory: async () =>
 beforeEach(() => {
   vi.resetAllMocks();
   localStorage.clear();
+  vi.mocked(listAdminManagedTools).mockResolvedValue([]);
   vi.mocked(useTenantSettings).mockReturnValue({
     settings, saving: false, error: null, loadError: null, saveError: null,
     save: async () => true, saveWithResult: async () => ({ ok: true as const }), resetSaveError: () => {}, reload: async () => {}
@@ -184,5 +185,37 @@ describe("Agent settings model warning", () => {
     await waitFor(() => expect(getAdminModelCatalog).toHaveBeenCalledTimes(2));
     await screen.findByRole("button", { name: "Retry model check" });
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+
+describe("Agent settings tool catalog", () => {
+  beforeEach(() => {
+    vi.mocked(getAdminModelCatalog).mockResolvedValue(catalog("openai", "platform"));
+    vi.mocked(useTenantSettings).mockReturnValue({
+      settings: { ...settings, enabledToolIds: ["saved_tool"] }, saving: false, error: null, loadError: null, saveError: null,
+      save: async () => true, saveWithResult: async () => ({ ok: true as const }), resetSaveError: () => {}, reload: async () => {}
+    });
+  });
+
+  it("keeps pending and failed catalog reads distinct from an empty catalog and retries locally", async () => {
+    let fail!: (error: Error) => void;
+    vi.mocked(listAdminManagedTools).mockReturnValue(new Promise((_done, reject) => { fail = reject; }));
+    renderPage();
+    await screen.findByText(/Loading the tool catalog/);
+    expect(screen.queryByText(/No built-in tools/)).toBeNull();
+    expect(screen.queryByText(/no longer in the catalog/)).toBeNull();
+    fail(new Error("offline"));
+    const retry = await screen.findByRole("button", { name: "Retry tools" });
+    expect(screen.queryByText(/No built-in tools/)).toBeNull();
+    expect(screen.queryByText(/no longer in the catalog/)).toBeNull();
+    let finish!: (tools: Awaited<ReturnType<typeof listAdminManagedTools>>) => void;
+    vi.mocked(listAdminManagedTools).mockReturnValue(new Promise(done => { finish = done; }));
+    fireEvent.click(retry);
+    await screen.findByText(/Loading the tool catalog/);
+    expect(screen.queryByRole("button", { name: "Retry tools" })).toBeNull();
+    finish([]);
+    await screen.findByText(/No built-in tools/);
+    expect(screen.getByText(/1 saved tool is no longer in the catalog/)).toBeTruthy();
   });
 });

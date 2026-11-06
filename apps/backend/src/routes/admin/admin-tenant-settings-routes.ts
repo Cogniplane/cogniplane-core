@@ -9,10 +9,12 @@ import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { pruneUnknownModelIds } from "../../domain/model-availability.js";
 import { AVAILABLE_MODELS } from "../../domain/models.js";
+import type { DataRouteControl } from "../../services/data-route-control.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { ManagedToolCatalog } from "../../services/managed-tools/catalog.js";
 import { tenantSettingsBodySchema } from "./admin-route-schemas.js";
+import { classifyTenantSettingsSave, tenantSettingsLabels } from "./data-route-fields.js";
 import {
   respondAdminMutationError,
   withAdmin
@@ -21,6 +23,13 @@ import {
 export type TenantSettingsRouteStores = {
   dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
   managedToolCatalog: Pick<ManagedToolCatalog, "listTenantConfigurable">;
+  /**
+   * Step-up and owner notice of a save that changes a field that routes data
+   * or a control (data-route-fields.ts): the providers and models that get
+   * the prompts, the hosts that the sandbox can reach, the MCP servers and
+   * tools, approval and enforcement, and the agent's instructions.
+   */
+  dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
   /**
    * The tenant's admin-added custom models (id + supported efforts are all
    * this route needs). Merged with AVAILABLE_MODELS when validating
@@ -159,8 +168,25 @@ export async function registerAdminTenantSettingsRoutes(
       updateInput = adminUpdateInput;
     }
 
+    // Step-up and the owner notice only when a field that routes data or a
+    // control changes (data-route-fields.ts). The write leaves out the
+    // protected fields that do not change, so a save without step-up never
+    // writes one, also when another save changes it meanwhile.
+    const { tenantId } = request.auth;
+    const stored = await stores.dynamicConfig.getOrCreateTenantSettings(tenantId);
+    const { expectedVersion, ...fields } = updateInput;
+    const save = classifyTenantSettingsSave(fields, stored);
+    updateInput = { ...save.write, ...(expectedVersion === undefined ? {} : { expectedVersion }) };
+    if (save.changed.length > 0 && !(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/tenant-settings"))) {
+      return reply;
+    }
+    const notice = save.changed.length > 0
+      ? stores.dataRoutes.ownerNotice(request, { setting: "tenant_settings", fields: tenantSettingsLabels(save.changed) })
+      : undefined;
+
     try {
-      // The audit event commits in the same transaction as the change.
+      // The audit event and the owner notice commit in the same transaction
+      // as the change.
       const settings = await stores.dynamicConfig.updateTenantSettings(
         request.auth.tenantId,
         updateInput,
@@ -196,7 +222,8 @@ export async function registerAdminTenantSettingsRoutes(
             configHash: saved.configHash
           },
           ipAddress: request.ip,
-          userAgent: request.headers["user-agent"]
+          userAgent: request.headers["user-agent"],
+          alsoInTransaction: notice
         })
       );
       return serialize(TenantSettingsEnvelopeSchema, { settings });

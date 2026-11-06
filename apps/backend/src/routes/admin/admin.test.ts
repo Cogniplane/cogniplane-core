@@ -18,6 +18,8 @@ import type {
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
+import type { AdminMcpServerRecord } from "../../services/admin-config-records.js";
 
 function createMarketplaceStore(): AdminRouteStores["skillMarketplace"] {
   return {
@@ -87,6 +89,7 @@ async function registerTestAdminRoutes(
   stores: AdminTestRouteStores
 ): Promise<void> {
   await registerAdminRoutes(app, {
+    dataRoutes: devDataRoutes(),
     config: createTestConfig({}),
     managedToolCatalog: {
       listTenantConfigurable() {
@@ -135,7 +138,7 @@ async function registerTestAdminRoutes(
         throw new Error("Unexpected policy rule update");
       },
       async delete() {
-        return false;
+        return null;
       },
       async reorder() {
         return [];
@@ -170,7 +173,7 @@ async function registerTestAdminRoutes(
       async get() {
         return null;
       },
-      async upsert() {
+      async applyChanges() {
         throw new Error("Unexpected integration state update");
       },
       async clearConfig() {
@@ -541,9 +544,27 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
   }
 
-  async listMcpServers(_tenantId: string) {
+  /** Servers that saveMcpServerWithAudience stored, as the real store lists them. */
+  savedMcpServers = new Map<string, AdminMcpServerRecord>();
+
+  /** Shared system servers that the tenant can turn on (setInheritedMcpAudience). */
+  inheritedMcpServerIds = ["built-in"];
+
+  // Like the real store: every record names its owner tenant, and the list
+  // includes the shared system servers.
+  async listMcpServers(tenantId: string) {
     return [
+      ...[...this.savedMcpServers.values()].map((server) => ({ ...server, ownerTenantId: tenantId })),
+      ...this.inheritedMcpServerIds.map((serverId) => ({
+        serverId, ownerTenantId: "system", serverName: serverId, description: null, transportKind: "http" as const,
+        mode: "proxy" as const, routePath: `/mcp/${serverId}`, upstreamUrl: "https://example.com/mcp",
+        upstreamAuthType: "none" as const, upstreamAuthName: null, upstreamAuthConfigured: false,
+        credentialScope: "organization" as const, credentialBindingId: "00000000-0000-0000-0000-000000000002",
+        version: 1, configHash: `hash-${serverId}`, enabled: true, isPublished: true, createdBy: "system",
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+      })),
       {
+        ownerTenantId: tenantId,
         serverId: "trusted-echo",
         serverName: "Trusted echo",
         description: null,
@@ -642,6 +663,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       updatedAt: new Date().toISOString()
     };
     if (audit) await this.transactionAudits?.create(audit(saved));
+    this.savedMcpServers.set(saved.serverId, saved);
     return saved;
   }
 

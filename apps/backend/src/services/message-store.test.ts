@@ -927,6 +927,38 @@ test("MessageStore.updateContent returns mapped record on success", async () => 
   expect(finishTools).toHaveBeenCalledWith(["t", "m-1", "u"]);
 });
 
+test("MessageStore.updateContent saves a stop reason only on an interrupted turn, and reads it back", async () => {
+  const db = new ScriptedDatabase();
+  const saved: unknown[] = [];
+  db.scripts = [
+    { match: (t) => t.includes("UPDATE message_tool_results SET status = 'failed'"), fn: () => ({ rows: [], rowCount: 0 }) },
+    {
+      match: (t) => t.includes("UPDATE messages") && t.includes("content_text = $5"),
+      fn: (vals) => {
+        saved.push(JSON.parse(String(vals[5])));
+        return {
+          rows: [{
+            id: 1, message_id: vals[1], session_id: "s", user_id: vals[2], role: "assistant", status: vals[3],
+            content_text: vals[4], reasoning_content: "", plan_content: "", input_tokens: null, cached_input_tokens: null,
+            output_tokens: null, reasoning_output_tokens: null, total_tokens: null, model_name: null, cost_usd: null,
+            feedback_rating: null, detail_json: JSON.parse(String(vals[5])), created_at: "2026-01-01", updated_at: "2026-01-01"
+          }],
+          rowCount: 1
+        };
+      }
+    }
+  ];
+  const store = new MessageStore(db as unknown as Pool);
+
+  const stopped = await store.updateContent("t", "m-1", "u", "interrupted", "partial", 1200, "security_change");
+  const completed = await store.updateContent("t", "m-2", "u", "completed", "done", 900, "security_change");
+
+  expect(saved).toEqual([{ durationMs: 1200, stopReason: "security_change" }, { durationMs: 900 }]);
+  expect(stopped).toMatchObject({ status: "interrupted", stopReason: "security_change", durationMs: 1200 });
+  expect(stopped!.detail).toEqual({});
+  expect(completed).toMatchObject({ status: "completed", stopReason: null });
+});
+
 test("MessageStore.updateStreamingContent: returns early when both fields are undefined", async () => {
   // ScriptedDatabase has no scripts; if the method tried to query it would throw.
   const db = new ScriptedDatabase();

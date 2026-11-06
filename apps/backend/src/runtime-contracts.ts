@@ -1,7 +1,7 @@
 import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
-import type { EffortLevel, PolicyTurnContext, ProjectApprovalMode } from "@cogniplane/shared-types";
+import type { EffortLevel, PolicyTurnContext, ProjectApprovalMode, TurnStopReason } from "@cogniplane/shared-types";
 import type { ResolvedRuntimePolicy } from "./services/admin-config-records.js";
 import type { SessionExecution } from "./services/session-execution-store.js";
 
@@ -80,6 +80,8 @@ export interface RuntimeAdapter {
     input: {
       prompt: string;
       projectInstructions?: ProjectInstructionsSnapshot | null;
+      generativeUiContext?: string | null;
+      generativeUiTransport?: "tool";
       userInputs?: RuntimeUserInput[];
       toolContextId: string | null;
       /** Project approval mode captured when this turn was admitted. */
@@ -149,11 +151,13 @@ export interface RuntimeAdapter {
     options?: { idleOnly?: boolean; workspaceResetReason?: string }
   ): Promise<string[]>;
   /**
-   * Tear down every active runtime owned by one tenant member. Member removal
-   * uses this to stop both interactive and scheduled turns under that identity.
-   * Returns the invalidated session ids.
+   * Tear down every active runtime owned by one tenant member. A security
+   * change of the member's account (services/auth/security-change.ts) uses
+   * this to stop both interactive and scheduled turns under that identity.
+   * `reason` goes on the interrupted RUN_FINISHED of a running turn, so the
+   * user sees why it stopped. Returns the invalidated session ids.
    */
-  invalidateRuntimesForUser(tenantId: string, userId: string): Promise<string[]>;
+  invalidateRuntimesForUser(tenantId: string, userId: string, options?: { reason?: TurnStopReason }): Promise<string[]>;
   /**
    * Tear down every active runtime for a specific user after they (re)connect
    * or disconnect an integration (the credentials in their live sandbox are now

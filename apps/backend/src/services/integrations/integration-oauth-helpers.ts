@@ -5,7 +5,10 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 
 import type { AppConfig } from "../../config.js";
 import { getJwtSigningKey, resolveJwtVerificationKey } from "../../lib/jwt.js";
-import type { IntegrationOAuthProvider } from "./integration-oauth-state-store.js";
+import {
+  assertIntegrationOAuthProvider,
+  type IntegrationOAuthProvider
+} from "./integration-oauth-state-store.js";
 
 /**
  * OAuth plumbing shared by the integration connection services (GitHub,
@@ -78,6 +81,7 @@ export type OAuthBrowserBindingCookie = {
 };
 
 export function oauthBrowserBindingCookieName(provider: IntegrationOAuthProvider): string {
+  assertIntegrationOAuthProvider(provider);
   return `cogniplane_oauth_bind_${provider}`;
 }
 

@@ -11,6 +11,7 @@ import { TenantSettingsStore } from "../services/tenant-settings-store.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedTenantGraph } from "./support/fixtures.js";
+import { devDataRoutes } from "../test-helpers/data-routes.js";
 
 const ENCRYPTION_SECRET = "integration-mcp-availability-secret-value";
 
@@ -114,7 +115,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       };
     });
     const service = makeService();
-    await registerAdminMcpServerRoutes(app, { dynamicConfig: service });
+    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig: service });
     try {
       const saved = await service.setInheritedMcpAudience(owner.tenantId, serverId, "test_users");
       expect(JSON.stringify(saved)).not.toContain(secret);
@@ -297,7 +298,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     app.addHook("preHandler", async (request) => {
       request.auth = { userId: owner.userId, tenantId: owner.tenantId, isAdmin: true, role: "owner" };
     });
-    await registerAdminMcpServerRoutes(app, { dynamicConfig: service });
+    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig: service });
     const base = {
       serverId,
       serverName: "Setup",

@@ -36,7 +36,7 @@ import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "../services/managed-tools/factory.js";
 import { runtimeTokenSecret } from "../lib/derived-secrets.js";
 import type { ManagedToolDefinition } from "../services/managed-tools/types.js";
-import { registerBuiltinManagedTools } from "../services/managed-tools/register-builtin-managed-tools.js";
+import { registerAllBuiltinManagedTools } from "./builtin-managed-tools.js";
 
 type ScriptedAgentEvent = {
   type: string;
@@ -67,7 +67,7 @@ function makeTestManagedToolRegistries(extraTools: readonly ManagedToolDefinitio
 } {
   const catalog = new ManagedToolCatalog();
   const factoryRegistry = new ManagedToolFactoryRegistry();
-  registerBuiltinManagedTools(catalog, factoryRegistry);
+  registerAllBuiltinManagedTools(catalog, factoryRegistry);
 
   // Test-only tools. A test needs a handler whose OUTPUT it controls — the
   // built-ins all derive theirs from store state — to exercise what the
@@ -559,9 +559,11 @@ class FakeRuntimeManager implements RuntimeAdapter {
 class InMemoryToolContextStore {
   private readonly contexts = new Map<string, ToolExecutionContext>();
   readonly createdContexts: ToolExecutionContext[] = [];
+  /** The ownerSecurityVersion of each create, in order. */
+  readonly ownerSecurityVersions: Array<number | null> = [];
   private nextId = 1;
   async create(input: {
-    tenantId: string; sessionId: string; userId: string; runtimeId: string; runtimePolicyId: string; messageId: string | null; credentialEnvelope?: Record<string, unknown>; metadata?: Record<string, unknown>; ttlMs: number;
+    tenantId: string; sessionId: string; userId: string; runtimeId: string; runtimePolicyId: string; messageId: string | null; credentialEnvelope?: Record<string, unknown>; metadata?: Record<string, unknown>; ownerSecurityVersion: number | null; ttlMs: number;
   }): Promise<ToolExecutionContext> {
     const now = new Date();
     const context: ToolExecutionContext = {
@@ -579,7 +581,13 @@ class InMemoryToolContextStore {
     };
     this.contexts.set(context.toolContextId, context);
     this.createdContexts.push(context);
+    this.ownerSecurityVersions.push(input.ownerSecurityVersion);
     return context;
+  }
+  /** Local accounts of the fake: user id to security version. */
+  readonly securityVersions = new Map<string, number>();
+  async currentOwnerSecurityVersion(_tenantId: string, userId: string): Promise<number | null> {
+    return this.securityVersions.get(userId) ?? null;
   }
   async require(_tenantId: string, toolContextId: string) {
     const context = this.contexts.get(toolContextId);
@@ -777,11 +785,14 @@ export async function createTestApp(
   app.addHook("preHandler", async (request) => {
     const userId = request.headers["x-user-id"]?.toString() || "test-user";
     const isAdmin = config.ADMIN_USER_IDS.includes(userId);
+    // A test can act as a local session that carries this security version.
+    const sessionVersion = request.headers["x-test-session-security-version"]?.toString();
     request.auth = {
       userId,
       tenantId: request.headers["x-tenant-id"]?.toString() || "test-tenant",
       isAdmin,
-      role: isAdmin ? ("owner" as const) : ("member" as const)
+      role: isAdmin ? ("owner" as const) : ("member" as const),
+      ...(sessionVersion ? { session: { authSource: "local" as const, familyId: "test-family", securityVersion: Number(sessionVersion) } } : {})
     };
   });
   await registerHealthRoutes(app);
@@ -894,9 +905,6 @@ export async function createTestApp(
     limits,
     auditEvents,
     toolContexts,
-    githubConnections: { async getRuntimeCredentials() { return null; } },
-    notionConnections: { async getRuntimeCredentials() { return null; } },
-    jiraConnections: { async read() { return { ok: false as const, error: "No Jira connection found." }; } },
     managedToolFactoryRegistry,
     managedToolCatalog,
     // Policy Center with no rules → every action evaluates to default-allow and
@@ -956,6 +964,7 @@ export async function createTestToolContext(
     messageId: overrides.messageId ?? null,
     credentialEnvelope: overrides.credentialEnvelope,
     metadata: { runtimePolicy: testRuntimePolicy, ...(overrides.metadata ?? {}) },
+    ownerSecurityVersion: null,
     ttlMs: overrides.ttlMs ?? 60_000
   });
 }

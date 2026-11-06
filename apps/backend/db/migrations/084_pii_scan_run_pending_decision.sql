@@ -1,0 +1,11 @@
+-- The decision that a queued PII scan made and has not finished applying.
+-- The worker records it before it applies the decision, so before a block
+-- deletes the bytes of a file. When an attempt stops after that point, the
+-- next attempt and the failed-job recovery finish the recorded decision. They
+-- do not evaluate the subject again under a newer policy. The terminal update
+-- of the scan run sets the column back to NULL, so the findings in it are not
+-- kept twice. NULL: no decision is in progress (also every existing row).
+-- See PiiScanJobHandler.
+--
+-- A nullable column with no default changes only the catalog.
+ALTER TABLE pii_scan_runs ADD COLUMN pending_decision jsonb;

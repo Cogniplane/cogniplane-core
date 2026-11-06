@@ -27,6 +27,7 @@ import type {
   DeepAgentsSessionRuntime
 } from "./deep-agents-types.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
+import type { ToolContextLiveness, ToolExecutionContextStore } from "../auth/tool-execution-context-store.js";
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
 import { createPolicyApprovalProof } from "../policy/policy-approval-proof.js";
 import { memoryContentSha256 } from "../memory-store.js";
@@ -269,13 +270,14 @@ const fakeTenantMemberStore = { isUserBetaTester: async () => false };
 type StreamScript = (config: {
   configurable: { thread_id: string };
   signal?: AbortSignal;
+  callbacks?: unknown[];
 }) => AsyncIterable<Record<string, unknown>>;
 
 /** Graph factory whose streamEvents replays a scripted envelope sequence. */
 function makeRuntimeFactory(script: StreamScript) {
   const factoryCalls: Array<Parameters<DeepAgentsRuntimeFactory>[0]> = [];
   const dispose = vi.fn(async () => {});
-  const streamConfigs: Array<{ configurable: { thread_id: string }; signal?: AbortSignal }> = [];
+  const streamConfigs: Array<{ configurable: { thread_id: string }; signal?: AbortSignal; callbacks?: unknown[] }> = [];
   const modelRequests: string[] = [];
   const effortRequests: Array<RuntimeReasoningEffort | null | undefined> = [];
 
@@ -338,7 +340,7 @@ function makeAdapter(input: {
   activationTracker?: Pick<import("../activation-tracker.js").ActivationTracker, "recordMaterialization">;
   tenantMembers?: {
     isUserBetaTester: (tenantId: string, userId: string) => Promise<boolean>;
-    getRole?: (tenantId: string, userId: string) => Promise<"owner" | "admin" | "member" | null>;
+    getActiveRole?: (tenantId: string, userId: string) => Promise<"owner" | "admin" | "member" | null>;
   };
   /**
    * Convenience: a single tenant key applied to every provider. Translated to a
@@ -348,6 +350,8 @@ function makeAdapter(input: {
   /** Full control over the ProviderCredentials (overrides getTenantApiKey). */
   providerCredentials?: ProviderCredentials;
   config?: typeof testConfig;
+  toolContexts?: Pick<ToolExecutionContextStore, "extend" | "liveness">;
+  log?: ReturnType<typeof createSilentLogger>;
 }) {
   const tenantKeyFn = input.getTenantApiKey;
   const credentials: ProviderCredentials | undefined =
@@ -362,7 +366,7 @@ function makeAdapter(input: {
   return new DeepAgentsRuntimeAdapter(
     input.config ?? testConfig,
     input.dynamicConfig ?? makeDynamicConfig(),
-    fakeLog,
+    input.log ?? fakeLog,
     {
       approvals: fakeApprovalStore,
       auditEvents: fakeAuditEventStore,
@@ -376,7 +380,8 @@ function makeAdapter(input: {
       conversationMessages: input.conversationMessages as never,
       sessions: input.sessions ?? fakeSessionAccess,
       tenantMembers: (input.tenantMembers ?? fakeTenantMemberStore) as never,
-      activeTurns: input.activeTurns
+      activeTurns: input.activeTurns,
+      toolContexts: input.toolContexts
     },
     credentials,
     input.factory
@@ -415,6 +420,7 @@ type PendingAction = {
   name: string;
   args: Record<string, unknown>;
   description?: string;
+  modelCallId?: string;
   policyApproval?: PolicyApprovalProof;
 };
 
@@ -424,22 +430,32 @@ type PendingAction = {
  */
 function makeInterruptingFactory(input: {
   rounds: PendingAction[][];
+  /** Calls that the first pass's model message proposes. */
+  proposals?: Array<{ id: string; name: string }>;
   mcpToolNames?: string[];
   mcpToolServers?: Map<string, string>;
+  /** Throw AbortError on a stream pass whose signal is aborted, as the real graph does. */
+  honorAbort?: boolean;
 }) {
   const resumes: unknown[] = [];
+  const uiContexts: Array<string | null | undefined> = [];
   let round = 0;
   const factory: DeepAgentsRuntimeFactory = () => ({
     ...emptyRuntimeCapabilities(),
       async getAgentForModel() {
       return {
-        async *streamEvents(streamInput: unknown) {
+        async *streamEvents(streamInput: unknown, config?: { signal?: AbortSignal; context?: { generativeUiContext?: string | null } }) {
+          uiContexts.push(config?.context?.generativeUiContext);
+          if (input.honorAbort && config?.signal?.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
           const isResume = typeof streamInput === "object" && streamInput !== null && !("messages" in (streamInput as object));
           yield {
             event: "on_chat_model_stream",
             metadata: {},
             data: { chunk: { content: isResume ? "after approval" : "before approval " } }
           };
+          if (!isResume && input.proposals) {
+            yield { event: "on_chat_model_end", metadata: {}, data: { output: { tool_calls: input.proposals } } };
+          }
         }
       };
     },
@@ -459,7 +475,7 @@ function makeInterruptingFactory(input: {
     },
     dispose: async () => {}
   });
-  return { factory, resumes };
+  return { factory, resumes, uiContexts };
 }
 
 function startTurn(
@@ -955,7 +971,289 @@ describe("DeepAgentsRuntimeAdapter", () => {
       type: AGUIEventType.RUN_FINISHED,
       result: { interrupted: true }
     });
+    // No reason given: the user sees a plain stop.
+    expect((events.at(-1) as { result?: unknown }).result).toEqual({ interrupted: true });
     await adapter.close();
+  });
+
+  it("invalidateRuntimesForUser puts its reason on the interrupted RUN_FINISHED", async () => {
+    const { factory } = makeRuntimeFactory(async function* ({ signal }) {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          { once: true }
+        );
+      });
+      yield { event: "on_chat_model_end", metadata: {} };
+    });
+    const adapter = makeAdapter({ factory });
+    const target = await adapter.createSession(sessionInput);
+    const activeTurn = collect(adapter.runMessageAGUI(target, runMessageInput()));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await adapter.invalidateRuntimesForUser("test-tenant", "user-1", { reason: "security_change" });
+
+    const events = await activeTurn;
+    expect((events.at(-1) as { type: string; result?: unknown })).toEqual(expect.objectContaining({
+      type: AGUIEventType.RUN_FINISHED,
+      result: { interrupted: true, reason: "security_change" }
+    }));
+    await adapter.close();
+  });
+
+  it("invalidateRuntimesForUser ends the turn before the runtime is disposed", async () => {
+    // The disposal can wait for provider calls (the MCP client close, the
+    // kill of a sandbox that has no saved binding). stopActiveWork does not
+    // wait for it, so the turn must stop without it.
+    const { factory, dispose } = makeRuntimeFactory(async function* ({ signal }) {
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          { once: true }
+        );
+      });
+      yield { event: "on_chat_model_end", metadata: {} };
+    });
+    const disposal = makeDeferred();
+    dispose.mockImplementation(() => disposal.promise);
+    const adapter = makeAdapter({ factory });
+    const target = await adapter.createSession(sessionInput);
+    const activeTurn = collect(adapter.runMessageAGUI(target, runMessageInput()));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    let invalidated = false;
+    const invalidation = adapter.invalidateRuntimesForUser("test-tenant", "user-1", { reason: "security_change" })
+      .then(() => { invalidated = true; });
+
+    const events = await activeTurn;
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(invalidated).toBe(false);
+    expect(events.at(-1)).toEqual(expect.objectContaining({
+      type: AGUIEventType.RUN_FINISHED,
+      result: { interrupted: true, reason: "security_change" }
+    }));
+    disposal.resolve();
+    await invalidation;
+    await adapter.close();
+  });
+
+  describe("tool context check at each model start", () => {
+    /**
+     * A turn of two model calls. Each call first runs the start handlers of
+     * the turn's callbacks, in parallel, as LangChain does before it sends a
+     * request to the provider.
+     */
+    function twoStepRuntime() {
+      return makeRuntimeFactory(async function* (config) {
+        for (const text of ["first step", "second step"]) {
+          const runId = await startModel(config);
+          yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: text } } };
+          // Match the SDK: end callbacks release metered calls before the next start.
+          const handlers = (config.callbacks ?? []) as Array<{ handleLLMEnd?: (...args: unknown[]) => Promise<void> }>;
+          await Promise.all(handlers.map(handler => handler.handleLLMEnd?.({ generations: [[{
+            message: { usage_metadata: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } }
+          }]] }, runId)));
+          yield { event: "on_chat_model_end", metadata: {} };
+        }
+      });
+    }
+    let runs = 0;
+    async function startModel(config: { callbacks?: unknown[] }) {
+      const handlers = (config.callbacks ?? []) as Array<{ handleChatModelStart?: (...args: unknown[]) => Promise<void> }>;
+      const runId = `model-run-${++runs}`;
+      await Promise.all(handlers.map((handler) => handler.handleChatModelStart?.({}, [[]], runId)));
+      return runId;
+    }
+    const toolContexts = (...states: ToolContextLiveness[]) => ({
+      extend: vi.fn(async () => null),
+      liveness: vi.fn(async (): Promise<ToolContextLiveness> => states.shift() ?? "live")
+    });
+    const text = (events: AGUIBaseEvent[]) => JSON.stringify(events);
+    const spendingStore = () => ({
+      reserve: vi.fn(async () => ({ tenantId: sessionInput.tenantId, reservationId: "reply", reservedMicroUsd: 1_000_000 })),
+      startCall: vi.fn(async () => {}),
+      completeCall: vi.fn(async () => {}),
+      failCall: vi.fn(async () => {}),
+      finish: vi.fn(async () => {})
+    });
+
+    it.each([
+      ["security_change", "security_change"],
+      ["ended", "tool_context_ended"]
+    ] as const)("a context that is %s stops the turn at the next model start, with no stop call", async (state, reason) => {
+      const runtime = twoStepRuntime();
+      const stores = toolContexts("live", state);
+      const log = createSilentLogger();
+      const warn = vi.spyOn(log, "warn");
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores, log });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        expect(stores.liveness.mock.calls).toEqual([[sessionInput.tenantId, "ctx-1"], [sessionInput.tenantId, "ctx-1"]]);
+        expect(text(events)).toContain("first step");
+        expect(text(events)).not.toContain("second step");
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_FINISHED,
+          result: { interrupted: true, reason }
+        }));
+        expect(warn).toHaveBeenCalledWith(
+          { sessionId: sessionInput.sessionId, toolContextId: "ctx-1", reason },
+          "Tool context is no longer live; the turn stops"
+        );
+        // The runtime stays for the next turn; only the turn stopped.
+        expect(adapter.hasSession(sessionInput.sessionId)).toBe(true);
+      } finally { await adapter.close(); }
+    });
+
+    it("a live context costs one read per model start, and no write", async () => {
+      const runtime = twoStepRuntime();
+      const stores = toolContexts();
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        expect(stores.liveness).toHaveBeenCalledTimes(2);
+        expect(stores.extend).not.toHaveBeenCalled();
+        expect(text(events)).toContain("second step");
+        expect(isAGUIInterruptedFinish(events.at(-1)!)).toBe(false);
+      } finally { await adapter.close(); }
+    });
+
+    it("a turn without a tool context reads nothing; an adapter without the store gets no check", async () => {
+      const runtime = twoStepRuntime();
+      const stores = toolContexts("ended");
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, runMessageInput()));
+        expect(stores.liveness).not.toHaveBeenCalled();
+        // Only the tracker of tool-call IDs: no model start check.
+        expect(runtime.streamConfigs[0]).toHaveProperty("callbacks", [expect.objectContaining({ name: "ToolCallIdTracker" })]);
+        expect(text(events)).toContain("second step");
+      } finally { await adapter.close(); }
+
+      const bare = makeRuntimeFactory(() => scriptedChatStream());
+      const withoutStore = makeAdapter({ factory: bare.factory });
+      try {
+        await withoutStore.createSession(sessionInput);
+        expect(bare.factoryCalls[0]!.requireLiveToolContext).toBeUndefined();
+      } finally { await withoutStore.close(); }
+    });
+
+    it("a read that keeps failing stops the call after three tries, as an unverified state, not a stop reason", async () => {
+      const runtime = twoStepRuntime();
+      const failure = new Error("database unavailable");
+      const stores = { extend: vi.fn(async () => null), liveness: vi.fn(async (): Promise<ToolContextLiveness> => { throw failure; }) };
+      const log = createSilentLogger();
+      const error = vi.spyOn(log, "error");
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores, log });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        expect(stores.liveness).toHaveBeenCalledTimes(3);
+        expect(text(events)).not.toContain("first step");
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_ERROR,
+          message: "This turn stopped because its tool access could not be checked. Send the message again."
+        }));
+        expect(error).toHaveBeenCalledWith(
+          { err: failure, sessionId: sessionInput.sessionId, toolContextId: "ctx-1" },
+          "Could not check the tool context; the call does not start and the turn stops"
+        );
+      } finally { await adapter.close(); }
+    });
+
+    it("a read that fails once and then answers lets the call start", async () => {
+      const runtime = twoStepRuntime();
+      const stores = {
+        extend: vi.fn(async () => null),
+        liveness: vi.fn(async (): Promise<ToolContextLiveness> => "live")
+          .mockRejectedValueOnce(new Error("connection reset"))
+      };
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+        expect(stores.liveness).toHaveBeenCalledTimes(3);
+        expect(text(events)).toContain("second step");
+      } finally { await adapter.close(); }
+    });
+
+    it("with a spending reservation, a refused model start writes nothing to the ledger", async () => {
+      const runtime = twoStepRuntime();
+      const modelSpending = spendingStore();
+      const stores = toolContexts("live", "security_change");
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores, modelSpending });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        // The check runs in the spending callback, before its ledger write.
+        expect(runtime.streamConfigs[0]!).toHaveProperty("callbacks", [expect.objectContaining({ name: "TenantModelSpending" }),
+          expect.objectContaining({ name: "ToolCallIdTracker" })]);
+        // Only the completed first call is in the ledger. The refused call is not.
+        expect(modelSpending.startCall).toHaveBeenCalledTimes(1);
+        expect(modelSpending.completeCall).toHaveBeenCalledTimes(1);
+        expect(modelSpending.failCall).not.toHaveBeenCalled();
+        expect(stores.liveness).toHaveBeenCalledTimes(2);
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_FINISHED,
+          result: { interrupted: true, reason: "security_change" }
+        }));
+      } finally { await adapter.close(); }
+    });
+
+    it("a turn whose execution ended keeps its own error", async () => {
+      const runtime = twoStepRuntime();
+      let current = true;
+      const executions = { isCurrent: vi.fn(async () => current), bindRuntime: vi.fn(async () => {}) };
+      const states: ToolContextLiveness[] = ["live", "ended"];
+      const stores = {
+        extend: vi.fn(async () => null),
+        liveness: vi.fn(async (): Promise<ToolContextLiveness> => {
+          // The lease ends after admission, before the second model call.
+          current = false;
+          return states.shift()!;
+        })
+      };
+      const adapter = makeAdapter({ factory: runtime.factory, executions, toolContexts: stores });
+      const execution = { ...sessionInput, executionId: "execution-1", ownerId: "replica-1", projectId: null,
+        expiresAt: new Date(Date.now() + 30_000).toISOString() };
+      try {
+        const session = await adapter.createSession({ ...sessionInput, execution });
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        expect(stores.liveness).toHaveBeenCalledTimes(2);
+        expect(text(events)).not.toContain("second step");
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_ERROR,
+          message: "This turn stopped because its execution permission is no longer valid."
+        }));
+      } finally { await adapter.close(); }
+    });
+
+    it("the runtime hook (native tools, provider retries) runs the same check", async () => {
+      const runtime = makeRuntimeFactory(async function* () {
+        await runtime.factoryCalls.at(-1)!.requireLiveToolContext!();
+        yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: "after the tool check" } } };
+      });
+      const stores = toolContexts("security_change");
+      const adapter = makeAdapter({ factory: runtime.factory, toolContexts: stores });
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+        expect(text(events)).not.toContain("after the tool check");
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_FINISHED,
+          result: { interrupted: true, reason: "security_change" }
+        }));
+      } finally { await adapter.close(); }
+    });
   });
 
   it("rechecks membership before publishing a runtime created during removal", async () => {
@@ -965,7 +1263,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
       factory,
       tenantMembers: {
         isUserBetaTester: async () => false,
-        getRole: async () => (++membershipChecks === 1 ? "member" : null)
+        getActiveRole: async () => (++membershipChecks === 1 ? "member" : null)
       }
     });
 
@@ -1074,6 +1372,27 @@ describe("DeepAgentsRuntimeAdapter", () => {
       decision: "approve"
     });
     expect(outcome).toBe("missing");
+  });
+
+  it("passes fresh browser UI context through a warm runtime and clears omitted context", async () => {
+    const { factory, factoryCalls, streamConfigs } = makeRuntimeFactory(() => scriptedChatStream());
+    const adapter = makeAdapter({ factory });
+    try {
+      const session = await adapter.createSession(sessionInput);
+      const contextOf = (index: number) =>
+        (streamConfigs[index] as unknown as { context?: { generativeUiContext?: string | null } }).context?.generativeUiContext;
+      await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), generativeUiContext: "Catalog A, slider 10", generativeUiTransport: "tool" }));
+      await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), generativeUiContext: "Catalog B, slider 20" }));
+      await collect(adapter.runMessageAGUI(session, runMessageInput()));
+      expect(contextOf(0)).toBe("Catalog A, slider 10");
+      expect((streamConfigs[0] as unknown as { context: { generativeUiTransport?: string } }).context.generativeUiTransport).toBe("tool");
+      expect((streamConfigs[1] as unknown as { context: { generativeUiTransport?: string } }).context.generativeUiTransport).toBeUndefined();
+      expect(contextOf(1)).toBe("Catalog B, slider 20");
+      expect(contextOf(2)).toBeNull();
+      expect(factoryCalls).toHaveLength(1);
+      expect(JSON.stringify(factoryCalls[0]!.systemPrompt)).not.toContain("Catalog A");
+      expect(JSON.stringify(factoryCalls[0]!.systemPrompt)).not.toContain("Catalog B");
+    } finally { await adapter.close(); }
   });
 
   it("keeps memory text out of the system prompt and sends it as a data message on every turn", async () => {
@@ -1510,7 +1829,7 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
   });
 
   it("bridges a native interrupt to an AG-UI approval carrying the real approvalId, then resumes", async () => {
-    const { factory, resumes } = makeInterruptingFactory({
+    const { factory, resumes, uiContexts } = makeInterruptingFactory({
       rounds: [[{ interruptId: "int-1", name: "execute", args: { command: "rm -rf build" } }], []]
     });
     const approvals = createInMemoryApprovalStore();
@@ -1534,6 +1853,7 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     const done = (async () => {
       for await (const event of adapter.runMessageAGUI(session, {
         prompt: "hi",
+        generativeUiContext: "Current catalog for this turn",
         toolContextId: "ctx-1"
       })) {
         events.push(event);
@@ -1559,8 +1879,96 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
 
     await done;
     expect(resumes).toEqual([[{ type: "approve" }]]);
+    expect(uiContexts).toEqual(["Current catalog for this turn", "Current catalog for this turn"]);
     expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
     await adapter.close();
+  });
+
+  it.each(["approve", "reject"] as const)(
+    "links a %sd approval to the card of its proposed call, in the stored row and the event", async (decision) => {
+      const { factory } = makeInterruptingFactory({
+        rounds: [[{ interruptId: "int-1", name: "execute", args: { command: "make" }, modelCallId: "call-1" }], []],
+        proposals: [{ id: "call-1", name: "execute" }]
+      });
+      const approvals = createInMemoryApprovalStore();
+      const adapter = new DeepAgentsRuntimeAdapter(testConfig, makeDynamicConfig(), fakeLog, {
+        sessions: fakeSessionAccess, executions: unusedExecutions, approvals: approvals as never,
+        auditEvents: { create: async () => {} } as never, tenantMembers: fakeTenantMemberStore
+      }, undefined, factory);
+      try {
+        const session = await adapter.createSession(sessionInput);
+        const { events, done } = startTurn(adapter, session);
+        const approval = (await waitForEvent(events, (event) =>
+          event.type === AGUIEventType.CUSTOM && (event as { name?: string }).name === "approval_required"
+        )) as AGUIBaseEvent & { value: { approvalId: string; toolCallId?: string } };
+        const card = events.find((event) => event.type === AGUIEventType.TOOL_CALL_START) as AGUIBaseEvent & { toolCallId: string };
+        // The card shows before the approval, and both name the server's ID, not the model's.
+        expect(events.indexOf(card)).toBeLessThan(events.indexOf(approval));
+        expect(card.toolCallId).not.toBe("call-1");
+        expect(approval.value.toolCallId).toBe(card.toolCallId);
+        expect(approvals.rows.get(approval.value.approvalId)).toMatchObject({ toolCallId: card.toolCallId });
+        expect(JSON.stringify(approvals.rows.get(approval.value.approvalId)!.requestPayload)).not.toContain(card.toolCallId);
+
+        await adapter.resolveApproval({ tenantId: sessionInput.tenantId, approvalId: approval.value.approvalId,
+          userId: sessionInput.userId, decision });
+        await done;
+        const results = events.filter((event) => event.type === AGUIEventType.TOOL_CALL_RESULT) as Array<AGUIBaseEvent & { toolCallId: string; content: string }>;
+        // The fake graph never starts the tool. A declined card gets the model's
+        // message; an approved card that never started did not run.
+        expect(results).toEqual([expect.objectContaining({ toolCallId: card.toolCallId,
+          content: decision === "reject" ? "User denied permission." : "This action did not run." })]);
+        expect(events.at(-1)?.type).toBe(AGUIEventType.RUN_FINISHED);
+      } finally {
+        await adapter.close();
+      }
+    }
+  );
+
+  it.each([
+    ["ended", "tool_context_ended"],
+    ["security_change", "security_change"]
+  ] as const)("stops the turn when its tool context ended at an approval round (%s)", async (liveness, reason) => {
+    const { factory, resumes } = makeInterruptingFactory({
+      rounds: [[{ interruptId: "int-1", name: "execute", args: { command: "ls" } }], []],
+      honorAbort: true
+    });
+    const approvals = createInMemoryApprovalStore();
+    // Not found, expired, or ended by a security change: extend renews nothing.
+    const extend = vi.fn(async () => null);
+    const readLiveness = vi.fn(async (): Promise<ToolContextLiveness> => liveness);
+    const log = createSilentLogger();
+    const warn = vi.spyOn(log, "warn");
+    const adapter = new DeepAgentsRuntimeAdapter(testConfig, makeDynamicConfig(), log, {
+      sessions: fakeSessionAccess, executions: unusedExecutions, approvals: approvals as never,
+      auditEvents: { create: async () => {} } as never, tenantMembers: fakeTenantMemberStore,
+      toolContexts: { extend, liveness: readLiveness }
+    }, undefined, factory);
+    try {
+      const session = await adapter.createSession(sessionInput);
+      const turn = startTurn(adapter, session, { toolContextId: "ctx-1" });
+      const request = (await waitForAGUIEvent(turn.events,
+        event => event.type === AGUIEventType.CUSTOM && (event as { name?: string }).name === "approval_required"
+      )) as AGUIBaseEvent & { value: { approvalId: string } };
+      await adapter.resolveApproval({
+        tenantId: sessionInput.tenantId, approvalId: request.value.approvalId, userId: sessionInput.userId, decision: "approve"
+      });
+      await turn.done;
+
+      expect(extend).toHaveBeenCalledWith(sessionInput.tenantId, "ctx-1", testConfig.TOOL_CONTEXT_TTL_MS);
+      expect(warn).toHaveBeenCalledWith(
+        { sessionId: sessionInput.sessionId, toolContextId: "ctx-1" },
+        "Tool context was not found, expired, or ended by a security change at the approval round; the turn stops"
+      );
+      // The reason is read only after extend failed.
+      expect(readLiveness).toHaveBeenCalledExactlyOnceWith(sessionInput.tenantId, "ctx-1");
+      // The model did not run after the approval.
+      expect(resumes).toHaveLength(1);
+      expect(JSON.stringify(turn.events)).not.toContain("after approval");
+      expect(turn.events.at(-1)).toEqual(expect.objectContaining({
+        type: AGUIEventType.RUN_FINISHED,
+        result: { interrupted: true, reason }
+      }));
+    } finally { await adapter.close(); }
   });
 
   it("keeps a remote approval's remember choice for the next action", async () => {
@@ -3011,7 +3419,7 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
     factory: DeepAgentsRuntimeFactory;
     approvals: unknown;
     auditEvents?: { create: (event: Record<string, unknown>) => Promise<unknown> };
-    getRole?: () => Promise<"member" | null>;
+    getActiveRole?: () => Promise<"member" | null>;
     config?: typeof testConfig;
   }) {
     return new DeepAgentsRuntimeAdapter(input.config ?? testConfig, makeDynamicConfig(), fakeLog, {
@@ -3019,7 +3427,7 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
       executions: unusedExecutions,
       approvals: input.approvals as never,
       auditEvents: (input.auditEvents ?? fakeAuditEventStore) as never,
-      tenantMembers: { ...fakeTenantMemberStore, ...(input.getRole ? { getRole: input.getRole } : {}) } as never
+      tenantMembers: { ...fakeTenantMemberStore, ...(input.getActiveRole ? { getActiveRole: input.getActiveRole } : {}) } as never
     }, undefined, input.factory);
   }
 
@@ -3110,7 +3518,7 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
     const approvals = createInMemoryApprovalStore();
     const resolve = approvals.resolve;
     let member = true;
-    const adapter = makeApprovalAdapter({ factory, approvals, getRole: async () => (member ? "member" : null) });
+    const adapter = makeApprovalAdapter({ factory, approvals, getActiveRole: async () => (member ? "member" : null) });
     try {
       const turn = await promptedTurn(adapter);
       member = false;

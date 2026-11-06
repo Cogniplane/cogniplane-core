@@ -1,7 +1,7 @@
 "use client";
 
 import { useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { AdminChatReplay } from "./admin-chat-replay";
 import { AdminSessionAlertsTab } from "./admin-session-alerts-tab";
@@ -36,6 +36,24 @@ export function AdminSessionDetailSidebar(props: { detail: AdminSessionDetailRes
   const [activeTab, setActiveTab] = useState<SidebarTabId>(
     requested && VALID_TABS.has(requested) ? requested as SidebarTabId : "conversation"
   );
+  const [jumpId, setJumpId] = useState<string | null>(null);
+  const [jumpError, setJumpError] = useState<string | null>(null);
+  const jumpNotice = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (!jumpId || activeTab !== "conversation") return;
+    const frame = requestAnimationFrame(() => {
+      const target = document.getElementById(`message-${jumpId}`);
+      if (target) {
+        target.focus({ preventScroll: true });
+        target.scrollIntoView({ block: "nearest", behavior: "auto" });
+      } else {
+        setJumpError("This message is not in the loaded conversation evidence.");
+        requestAnimationFrame(() => jumpNotice.current?.focus());
+      }
+      setJumpId(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [jumpId, activeTab]);
   const isDiagnostic = DIAGNOSTICS.some((tab) => tab.id === activeTab);
   const { detail } = props;
 
@@ -52,10 +70,11 @@ export function AdminSessionDetailSidebar(props: { detail: AdminSessionDetailRes
             </TabsList>
             <div className="mt-4 min-w-0">
               <TabsContent value="conversation" className="data-[state=inactive]:hidden">
+                {jumpError ? <p ref={jumpNotice} tabIndex={-1} role="status" className="mb-3 scroll-mt-2 rounded-md p-2 text-sm text-on-surface-variant outline-none focus:ring-[3px] focus:ring-ring/50">{jumpError}</p> : null}
                 <AdminChatReplay messages={detail.messages} piiRuns={detail.piiRuns} />
               </TabsContent>
               <TabsContent value="alerts" className="data-[state=inactive]:hidden">
-                <AdminSessionAlertsTab messages={detail.messages} approvals={detail.approvals} piiRuns={detail.piiRuns} />
+                <AdminSessionAlertsTab messages={detail.messages} approvals={detail.approvals} piiRuns={detail.piiRuns} onJumpToMessage={(id) => { setJumpError(null); setActiveTab("conversation"); setJumpId(id); }} />
               </TabsContent>
               <TabsContent value="approvals" className="data-[state=inactive]:hidden">
                 <AdminSessionApprovalsTab approvals={detail.approvals} />
@@ -63,7 +82,7 @@ export function AdminSessionDetailSidebar(props: { detail: AdminSessionDetailRes
               <TabsContent value="diagnostics" className="space-y-4 data-[state=inactive]:hidden">
                 <label className="flex flex-col gap-2 text-sm font-medium sm:flex-row sm:items-center">
                   Diagnostic view
-                  <select className="max-w-full rounded-md border border-outline-variant bg-surface px-3 py-2 text-on-surface" value={isDiagnostic ? activeTab : "overview"} onChange={(event) => setActiveTab(event.target.value as SidebarTabId)}>
+                  <select className="min-h-9 max-w-full rounded-md border border-input bg-control px-3 py-2 text-on-surface outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" value={isDiagnostic ? activeTab : "overview"} onChange={(event) => setActiveTab(event.target.value as SidebarTabId)}>
                     {DIAGNOSTICS.map((tab) => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
                   </select>
                 </label>

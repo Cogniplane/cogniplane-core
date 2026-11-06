@@ -18,10 +18,7 @@ import { AuditEventStore } from "./audit-event-store.js";
 import { PlatformEventStore } from "./platform-event-store.js";
 import { TenantSettingsStore } from "./tenant-settings-store.js";
 import { CustomModelStore } from "./custom-model-store.js";
-import { GithubConnectionStore } from "./integrations/github/github-connection-store.js";
 import { IntegrationStateStore } from "./integrations/integration-state-store.js";
-import { NotionConnectionStore } from "./integrations/notion/notion-connection-store.js";
-import { JiraConnectionStore } from "./integrations/pipedream/jira-connection-store.js";
 import { MemoryStore } from "./memory-store.js";
 import { MessageStore } from "./message-store.js";
 import { MemberMcpCredentialStore } from "./member-mcp-credential-store.js";
@@ -81,9 +78,6 @@ export function buildStores(
   const customModels = new CustomModelStore(db);
   const userSettings = new UserSettingsStore(db, schedulerDb);
   const tenantMembers = new TenantMemberStore(db);
-  const githubConnections = new GithubConnectionStore(db);
-  const notionConnections = new NotionConnectionStore(db);
-  const jiraConnections = new JiraConnectionStore(db);
   const approvals = new ApprovalStore(db);
   const auditEvents = new AuditEventStore(db);
   const platformEvents = new PlatformEventStore(db);
@@ -126,9 +120,6 @@ export function buildStores(
     customModels,
     userSettings,
     tenantMembers,
-    githubConnections,
-    notionConnections,
-    jiraConnections,
     approvals,
     auditEvents,
     platformEvents,

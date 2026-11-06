@@ -32,6 +32,7 @@ import type { ActivationTracker } from "../../services/activation-tracker.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
+import type { DataRouteControl } from "../../services/data-route-control.js";
 import {
   GithubConnectionNotConfiguredError,
   type GithubConnectionService
@@ -108,6 +109,12 @@ export type AdminSkillRouteStores = {
     // counts (last 30 days) per skill. Failures are swallowed — counts are
     // decorative. Tests that don't supply it just get skills with no counts.
     activations?: Pick<ActivationTracker, "countSkillActivations">;
+    /**
+     * Step-up and owner notice of a release (activate a revision, publish):
+     * a released skill gives its instructions to users' agents, and it stays
+     * after the victim of a stolen token signs out.
+     */
+    dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
 };
 
 export async function registerAdminSkillRoutes(
@@ -427,15 +434,23 @@ export async function registerAdminSkillRoutes(
       if (!bodyResult.ok) {
         return bodyResult.response;
       }
+      const { skillId } = paramsResult.value;
+      if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/skills/:skillId/revisions/:skillRevisionId/activate"))) {
+        return reply;
+      }
 
       try {
+        // The owner notice commits with the release.
         const activated = await skillLifecycle.activateSkillRevision(request.auth.tenantId, {
-          skillId: paramsResult.value.skillId,
+          skillId,
           skillRevisionId: paramsResult.value.skillRevisionId,
           actorUserId: request.auth.userId,
           reviewNotes: bodyResult.value.reviewNotes ?? null,
           audience: bodyResult.value.audience,
-          expectedSnapshot: bodyResult.value.expectedSnapshot
+          expectedSnapshot: bodyResult.value.expectedSnapshot,
+          alsoInTransaction: stores.dataRoutes.ownerNotice(request, {
+            setting: "skill_release", skillId, change: "revision_activated", audience: bodyResult.value.audience ?? null
+          })
         });
 
         if (!activated) {
@@ -456,10 +471,15 @@ export async function registerAdminSkillRoutes(
     }
     const bodyResult=parseRequestInput(reply,AdminSkillReleaseSnapshotRequestSchema,request.body ?? {});
     if (!bodyResult.ok) return bodyResult.response;
+    const { skillId } = paramsResult.value;
+    if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/skills/:skillId/publish"))) return reply;
 
     try {
-      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, true,
-        bodyResult.value.expectedSnapshot);
+      // The owner notice commits with the release.
+      const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, skillId, true,
+        bodyResult.value.expectedSnapshot, {
+          alsoInTransaction: stores.dataRoutes.ownerNotice(request, { setting: "skill_release", skillId, change: "published", audience: "members" })
+        });
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }

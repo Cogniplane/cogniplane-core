@@ -1,125 +1,41 @@
 import type { GithubConnectionStatus } from "@cogniplane/shared-types";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import {
-  OAuthConnectionActions,
-  OAuthConnectionSectionHeading
-} from "./oauth-connection-presentation";
+import { OAuthConnectionActions, OAuthConnectionAvailability, OAuthConnectionOverview, OAuthConnectionReadBoundary, OAuthConnectionSectionHeading, type OAuthConnectionReadState } from "./oauth-connection-presentation";
 import { GithubRepositoryPicker, type GithubRepositoryPickerProps } from "./github-repository-picker";
 import { formatMediumDateTime } from "../lib/time-format";
-import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
-type GithubConnectionSectionProps = {
+type GithubConnectionSectionProps = OAuthConnectionReadState & {
   status: GithubConnectionStatus | null;
   error: string | null;
   flashMessage: string | null;
   busyKey: string | null;
   onConnect: () => void;
   onDisconnect: () => void;
-  /** The repository choice. Shown while the member is connected. */
+  onConfirm: () => void;
   repositorySelection: Omit<GithubRepositoryPickerProps, "allowed" | "githubUserId">;
 };
 
-function getConnectionHeadline(status: GithubConnectionStatus | null): string {
-  if (status?.userConnection) {
-    return `Authorized as ${status.userConnection.githubLogin}`;
-  }
-  return "GitHub not connected";
-}
-
 export function GithubConnectionSection(input: GithubConnectionSectionProps) {
-  const { status, error, flashMessage, busyKey, onConnect, onDisconnect, repositorySelection } = input;
-  const userConnection = status?.userConnection ?? null;
-
-  return (
-    <section id="github" className="flex flex-col gap-5">
-      <OAuthConnectionSectionHeading provider="GitHub" />
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className={SECTION_LABEL}>User identity</p>
-                <h2 className="text-lg font-semibold text-on-surface">
-                  Connect your GitHub account
-                </h2>
-                <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-                  Authorize GitHub so the agent can read files, write files, and open pull requests
-                  on your behalf. After you connect, choose the repositories it may use.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className={PILL_GRAY}>oauth</span>
-                <span className={PILL_GRAY}>per-user</span>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <OAuthConnectionActions
-              busyKey={busyKey === "connect" || busyKey === "disconnect" ? busyKey : null}
-              configured={status?.configured === true}
-              connected={userConnection !== null}
-              connectLabel="Connect GitHub"
-              reconnectLabel="Reconnect GitHub"
-              error={error}
-              flashMessage={flashMessage}
-              onConnect={onConnect}
-              onDisconnect={onDisconnect}
-            >
-              {null}
-            </OAuthConnectionActions>
-
-            {!status?.configured ? (
-              <p className={HINT}>GitHub OAuth is not configured on this deployment yet.</p>
-            ) : null}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className={SECTION_LABEL}>Current state</p>
-                <h2 className="text-lg font-semibold text-on-surface">
-                  {getConnectionHeadline(status)}
-                </h2>
-              </div>
-              <span className={userConnection ? PILL_BLUE : PILL_GRAY}>
-                {userConnection ? "user token" : "disconnected"}
-              </span>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {userConnection ? (
-              <>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={CHIP}>login {userConnection.githubLogin}</span>
-                </div>
-                <details className="mt-3 text-sm text-on-surface-variant">
-                  <summary className="cursor-pointer font-medium text-on-surface">Connection diagnostics</summary>
-                  <p className="mt-2">Connected: {formatMediumDateTime(userConnection.connectedAt, "Not available")}</p>
-                  <p>Last used: {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}</p>
-                  <p>Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}</p>
-                  <p>Refresh expiry: {formatMediumDateTime(userConnection.refreshTokenExpiresAt, "Not available")}</p>
-                </details>
-              </>
-            ) : (
-              <p className={HINT}>
-                Once you connect, the agent can act on GitHub as you. Disconnect anytime to revoke
-                access.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {userConnection ? (
-        <GithubRepositoryPicker
-          githubUserId={userConnection.githubUserId}
-          allowed={userConnection.allowedRepositories}
-          {...repositorySelection}
-        />
-      ) : null}
-    </section>
-  );
+  const { status } = input;
+  const account = status?.userConnection ?? null;
+  const suspended = account?.suspended === true;
+  const available = status?.configured === true && status.tenantEnabled !== false;
+  const readBlocked = Boolean(input.isLoading || input.statusError);
+  return <section id="github" className="flex min-w-0 flex-col gap-5">
+    <OAuthConnectionSectionHeading provider="GitHub" />
+    {input.flashMessage ? <p role="status" className="text-sm text-on-surface-variant">{input.flashMessage}</p> : null}
+    <OAuthConnectionReadBoundary {...input} known={status !== null}>
+      <OAuthConnectionOverview headline={account ? `Authorized as ${account.githubLogin}` : "GitHub not connected"} state={suspended ? "suspended" : account ? "connected" : "not connected"} suspended={suspended} connected={account !== null}
+        description="Connect your GitHub account so the agent can read files, write files, and open pull requests on your behalf. Choose the repositories it may use below."
+        identity={account ? <p>GitHub login: {account.githubLogin}</p> : null}
+        diagnostics={account ? <><p>Connected: {formatMediumDateTime(account.connectedAt, "Not available")}</p><p>Last used: {formatMediumDateTime(account.lastUsedAt, "Not available")}</p><p>Token expiry: {formatMediumDateTime(account.accessTokenExpiresAt, "Not available")}</p><p>Refresh expiry: {formatMediumDateTime(account.refreshTokenExpiresAt, "Not available")}</p></> : null}>
+        <OAuthConnectionAvailability provider="GitHub" configured={status?.configured === true} enabled={status?.tenantEnabled !== false} />
+        {account && !available && !suspended ? <p className="break-words text-sm text-on-surface-variant [overflow-wrap:anywhere]">Saved repository access: {account.allowedRepositories.length > 0 ? account.allowedRepositories.join(", ") : "No repositories selected."}</p> : null}
+        <OAuthConnectionActions busyKey={input.busyKey === "connect" || input.busyKey === "disconnect" || input.busyKey === "confirm" ? input.busyKey : null} configured={available && !readBlocked} connected={account !== null} connectLabel="Connect GitHub" reconnectLabel="Reconnect GitHub" error={input.error === input.statusError ? null : input.error} flashMessage={null} onConnect={input.onConnect} onDisconnect={input.onDisconnect}
+          suspended={account && suspended ? { confirm: { account: `the GitHub account ${account.githubLogin}`, onConfirm: input.onConfirm } } : undefined}>
+          {account && suspended ? <p className="break-words text-sm text-on-surface-variant [overflow-wrap:anywhere]">{account.allowedRepositories.length > 0 ? `The agent may use these repositories after you confirm: ${account.allowedRepositories.join(", ")}.` : "The agent may use no repositories."}</p> : null}
+        </OAuthConnectionActions>
+      </OAuthConnectionOverview>
+      {account && !suspended && available ? <GithubRepositoryPicker githubUserId={account.githubUserId} allowed={account.allowedRepositories} {...input.repositorySelection} /> : null}
+    </OAuthConnectionReadBoundary>
+  </section>;
 }

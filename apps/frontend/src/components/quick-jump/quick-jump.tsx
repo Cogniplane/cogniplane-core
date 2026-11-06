@@ -1,5 +1,6 @@
 "use client";
 
+import { cn } from "@/lib/cn";
 import { useQuery } from "@tanstack/react-query";
 import { Compass, CornerDownLeft, FolderIcon, MessageSquare, MessagesSquare, Plug, Puzzle, Search, User, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
@@ -40,11 +41,15 @@ const CATEGORY_ICONS: Record<QuickJumpCategory, typeof Compass> = {
   sessions: MessagesSquare
 };
 
-const KBD = "rounded border border-outline-variant bg-surface-container-low px-1.5 py-px font-mono text-[0.68rem] text-on-surface-variant";
+const KBD = "rounded border border-outline-variant bg-surface-container-low px-1.5 py-px font-mono text-xs text-on-surface-variant";
 
 
 /** Quick jump: a header button and Ctrl+K (Cmd+K on Apple devices). Each page header mounts one. */
-export function QuickJump() {
+/**
+ * `compact` keeps the trigger icon-only at every width, for headers that
+ * have no room for its label (the narrow workspace header).
+ */
+export function QuickJump({ compact = false, className }: { compact?: boolean; className?: string } = {}) {
   const [open, setOpen] = useState(false);
   const apple = useApplePlatform();
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -77,22 +82,27 @@ export function QuickJump() {
         aria-haspopup="dialog"
         aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.quickJump, apple)}
         onClick={() => { returnFocusRef.current = triggerRef.current; setOpen(true); }}
-        className="inline-flex size-8 cursor-pointer items-center justify-center gap-2 rounded-md bg-surface-container-lowest text-sm text-on-surface-variant shadow-[inset_0_0_0_1px_var(--color-outline-variant)] transition-colors hover:bg-surface-container hover:text-on-surface focus-visible:outline-2 focus-visible:outline-primary sm:w-auto sm:px-2.5"
+        className={cn(
+          "inline-flex size-8 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-md border border-transparent text-sm text-on-surface-variant transition-colors hover:bg-accent hover:text-on-surface focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 motion-reduce:transition-none",
+          compact ? "" : "sm:w-auto sm:border-input sm:bg-control sm:px-2.5",
+          className
+        )}
       >
         <Search className="size-4 shrink-0" aria-hidden="true" />
-        <span className="sr-only sm:not-sr-only">Jump to…</span>
-        <kbd className={`${KBD} hidden sm:inline`} aria-hidden="true">{shortcutKeys(SHORTCUTS.quickJump, apple).join(apple ? "" : " ")}</kbd>
+        <span className={compact ? "sr-only" : "sr-only sm:not-sr-only"}>Jump to…</span>
+        <kbd className={`${KBD} hidden ${compact ? "" : "sm:inline"}`} aria-hidden="true">{shortcutKeys(SHORTCUTS.quickJump, apple).join(apple ? "" : " ")}</kbd>
       </button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent
           ref={contentRef}
           showCloseButton={false}
+          scrollBody={false}
           onCloseAutoFocus={(event) => {
             event.preventDefault();
             const target = returnFocusRef.current;
             (target && target.isConnected && target !== document.body ? target : triggerRef.current)?.focus();
           }}
-          className="top-[max(1rem,10vh)] max-h-[min(36rem,calc(100dvh-2rem))] translate-y-0 grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl"
+          className="top-[max(1rem,10vh)] max-h-[min(36rem,calc(100dvh-max(1rem,10vh)-1rem))] translate-y-0 grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-xl"
         >
           <QuickJumpPanel
             onClose={() => setOpen(false)}

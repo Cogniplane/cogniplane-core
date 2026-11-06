@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { sessionDetailHref, sessionListHref } from "../../../lib/admin-session-links";
 import {
@@ -16,6 +16,8 @@ import {
   type SessionsFilterState
 } from "./admin-sessions-filters.logic";
 
+afterEach(() => vi.useRealTimers());
+
 describe("dateRangeLabel", () => {
   test("returns null when no range is set", () => {
     expect(dateRangeLabel("", "")).toBeNull();
@@ -27,6 +29,8 @@ describe("dateRangeLabel", () => {
   });
 
   test("recognizes preset spans within 5 min tolerance", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-09T12:00:00Z"));
     const to = "2026-05-09T12:00:00Z";
     const from24h = "2026-05-08T12:02:00Z"; // ~24h - 2min
     const from7d = "2026-05-02T12:00:00Z";
@@ -34,6 +38,13 @@ describe("dateRangeLabel", () => {
     expect(dateRangeLabel(from24h, to)).toBe("Last 24h");
     expect(dateRangeLabel(from7d, to)).toBe("Last 7d");
     expect(dateRangeLabel(from30d, to)).toBe("Last 30d");
+  });
+
+
+  test("keeps historical seven-day windows explicit", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-04T12:00:00Z"));
+    expect(dateRangeLabel("2026-05-02T12:00:00Z", "2026-05-09T12:00:00Z")).toBe("2026-05-02 → 2026-05-09");
   });
 
   test("falls back to YYYY-MM-DD → YYYY-MM-DD for non-preset spans", () => {

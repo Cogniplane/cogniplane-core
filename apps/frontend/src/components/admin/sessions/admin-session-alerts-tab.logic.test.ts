@@ -86,13 +86,13 @@ describe("buildPiiAlertItem", () => {
     expect(item.summary).toContain("on artifact art-1");
   });
 
-  test("color follows status: blocked=red, transformed=blue, else gray", () => {
+  test("color follows status: blocked=red, transformed=green, else gray", () => {
     expect(
       buildPiiAlertItem(makePiiRun({ scanRunId: "a", status: "blocked" }), new Map()).iconColor
     ).toBe("red");
     expect(
       buildPiiAlertItem(makePiiRun({ scanRunId: "b", status: "transformed" }), new Map()).iconColor
-    ).toBe("blue");
+    ).toBe("green");
     expect(
       buildPiiAlertItem(makePiiRun({ scanRunId: "c", status: "completed" }), new Map()).iconColor
     ).toBe("gray");

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
@@ -53,12 +53,14 @@ export function usePolicyData() {
 
   const rulesQuery = useQuery({
     queryKey: rulesKey,
-    queryFn: listPolicyRules
+    queryFn: listPolicyRules,
+    retry: false
   });
 
   const lintQuery = useQuery({
     queryKey: lintKey,
-    queryFn: listPolicyLintWarnings
+    queryFn: listPolicyLintWarnings,
+    retry: false
   });
 
   const submitMutation = useMutation({
@@ -100,25 +102,37 @@ export function usePolicyData() {
     onSettled: () => invalidateRules()
   });
 
-  const simulateMutation = useMutation<PolicySimulateResponse, unknown, PolicySimulateRequest>({
-    mutationFn: (input) => simulatePolicy(input)
-  });
+  const actionLock = useRef(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const simulationSequence = useRef(0);
+  const simulationLock = useRef(false);
+  const [simulation, setSimulation] = useState<PolicySimulateResponse | null>(null);
+  const [simulationError, setSimulationError] = useState<string | null>(null);
+  const [simulating, setSimulating] = useState(false);
 
-  // The page has one error banner. It shows the result of the action the user
-  // started last: a new action clears the old error, and an older action that
-  // fails later does not replace the newer action's result.
-  const actions = {
-    submit: { mutation: submitMutation, fallback: "Failed to save policy rule." },
-    delete: { mutation: deleteMutation, fallback: "Failed to delete policy rule." },
-    reorder: { mutation: reorderMutation, fallback: "Failed to reorder policy rules." }
-  };
-  const [lastAction, setLastAction] = useState<keyof typeof actions | null>(null);
-  const last = lastAction ? actions[lastAction] : null;
-  // Select by status, not by the error value: a rejection with a falsy value
-  // ("" or 0) is still a failure and shows the fallback.
-  let error: string | null = null;
-  if (last?.mutation.isError) error = toErrorMessage(last.mutation.error, last.fallback);
-  else if (rulesQuery.isError) error = toErrorMessage(rulesQuery.error, "Failed to load Policy Center.");
+  async function actOnRules(action: () => Promise<unknown>, fallback: string) {
+    if (actionLock.current) return false;
+    actionLock.current = true;
+    setActionError(null);
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      setActionError(toErrorMessage(error, fallback));
+      return false;
+    } finally {
+      actionLock.current = false;
+    }
+  }
+
+  const rulesError = rulesQuery.isError
+    ? toErrorMessage(rulesQuery.error, "Failed to load Policy Center.") : null;
+  const hasRules = rulesQuery.data !== undefined;
+  const rulesState: "loading" | "unavailable" | "stale" | "current" = !hasRules ? (rulesQuery.isError ? "unavailable" : "loading")
+    : rulesQuery.isError ? "stale" : "current";
+  const lintError = lintQuery.isError
+    ? toErrorMessage(lintQuery.error, "Could not check policy warnings.") : null;
+  const lintState: "checking" | "unavailable" | "current" = lintQuery.isError ? "unavailable" : lintQuery.isFetching || lintQuery.data === undefined ? "checking" : "current";
 
   let busyKey: string | null = null;
   if (submitMutation.isPending) busyKey = "submit";
@@ -129,30 +143,55 @@ export function usePolicyData() {
 
   return {
     rules: (rulesQuery.data ?? []) as PolicyRule[],
-    lintWarnings: (lintQuery.data ?? []) as PolicyLintWarning[],
+    lintWarnings: (lintQuery.isError ? [] : lintQuery.data ?? []) as PolicyLintWarning[],
     loading: rulesQuery.isLoading,
+    rulesState,
+    rulesError,
+    refreshing: rulesQuery.isFetching,
+    retryRules: () => { if (!rulesQuery.isFetching) void rulesQuery.refetch(); },
+    lintState,
+    lintError,
+    retryLint: () => { if (!lintQuery.isFetching) void lintQuery.refetch(); },
     busyKey,
-    error,
-    simulation: simulateMutation.data ?? null,
-    simulating: simulateMutation.isPending,
-    saveRule: async (ruleId: string | null, input: PolicyRuleInput): Promise<boolean> => {
-      setLastAction("submit");
+    actionError,
+    error: actionError ?? rulesError,
+    simulation,
+    simulationError,
+    simulating,
+    saveRule: (ruleId: string | null, input: PolicyRuleInput) =>
+      actOnRules(() => submitMutation.mutateAsync({ ruleId, input }), "Failed to save policy rule."),
+    deleteRule: (ruleId: string) =>
+      actOnRules(() => deleteMutation.mutateAsync(ruleId), "Failed to delete policy rule."),
+    reorderRules: (ruleIds: string[]) =>
+      actOnRules(() => reorderMutation.mutateAsync(ruleIds), "Failed to reorder policy rules."),
+    clearSimulation: () => {
+      simulationSequence.current += 1;
+      simulationLock.current = false;
+      setSimulation(null);
+      setSimulationError(null);
+      setSimulating(false);
+    },
+    runSimulation: async (input: PolicySimulateRequest) => {
+      if (simulationLock.current) return;
+      simulationLock.current = true;
+      const sequence = ++simulationSequence.current;
+      setSimulation(null);
+      setSimulationError(null);
+      setSimulating(true);
       try {
-        await submitMutation.mutateAsync({ ruleId, input });
-        return true;
-      } catch {
-        return false;
+        const result = await simulatePolicy(input);
+        if (sequence === simulationSequence.current) setSimulation(result);
+      } catch (error) {
+        if (sequence === simulationSequence.current) {
+          setSimulationError(toErrorMessage(error, "Could not test this tool call. Try again."));
+        }
+      } finally {
+        if (sequence === simulationSequence.current) {
+          simulationLock.current = false;
+          setSimulating(false);
+        }
       }
-    },
-    deleteRule: (ruleId: string) => {
-      setLastAction("delete");
-      deleteMutation.mutate(ruleId);
-    },
-    reorderRules: (ruleIds: string[]) => {
-      setLastAction("reorder");
-      reorderMutation.mutate(ruleIds);
-    },
-    runSimulation: (input: PolicySimulateRequest) => simulateMutation.mutate(input)
+    }
   };
 }
 

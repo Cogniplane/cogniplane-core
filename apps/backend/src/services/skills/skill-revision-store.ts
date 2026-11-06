@@ -314,6 +314,8 @@ export class SkillRevisionStore {
     reviewNotes: string | null;
     audience?: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
+    /** Runs in the activation's transaction after the change: the owner notice of the release. */
+    alsoInTransaction?: (client: PoolClient) => Promise<void>;
   }): Promise<ActivatedSkillRevisionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockOrganizationSkillNames(client, tenantId);
@@ -417,6 +419,7 @@ export class SkillRevisionStore {
       if (!skill || !active.rows[0]) {
         throw new Error(`Failed to load activated skill revision ${input.skillRevisionId}.`);
       }
+      if (input.alsoInTransaction) await input.alsoInTransaction(client);
       return {
         skill,
         revision: mapSkillRevision(active.rows[0]),

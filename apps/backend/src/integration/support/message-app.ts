@@ -98,7 +98,10 @@ export async function buildMessageApp(options: MessageAppOptions) {
     return (options.runtimeFactory ?? createDeepAgentsSessionRuntime)(init);
   };
   const quota = vi.fn(async () => null);
-  const evaluateText = vi.fn(async () => ({ action: "allow" as const, reason: "no_findings" as const }));
+  const evaluateTextWithPolicy = vi.fn(async () => ({
+    decision: { action: "allow" as const, reason: "no_findings" as const },
+    appliedPolicy: { mode: "detect" as const, revision: 1 }
+  }));
   // The message route does not reach these stores on the paths under test.
   const unusedStores = {} as Pick<
     MessageRouteStores,
@@ -112,7 +115,7 @@ export async function buildMessageApp(options: MessageAppOptions) {
     limits: { consumeRateLimit: async () => null, consumeTurnQuota: quota, sweepExpired: () => {} },
     customModels: { list: async () => [] },
     artifacts: { listBySession: async () => [] },
-    piiProtection: { evaluateText }
+    piiProtection: { evaluateTextWithPolicy }
   };
   const servers: MessageServer[] = [];
 
@@ -163,7 +166,7 @@ export async function buildMessageApp(options: MessageAppOptions) {
     config,
     created,
     quota,
-    evaluateText,
+    evaluateTextWithPolicy,
     addServer,
     send: (sessionId: string, text: string, server: FastifyInstance = first.app) =>
       server.inject({ method: "POST", url: "/messages", payload: { sessionId, text, model } })

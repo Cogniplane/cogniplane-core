@@ -16,3 +16,17 @@ packages/*/dist
 *.tsbuildinfo
 .worktrees/
 *:Zone.Identifier
+
+# Local configuration and generated files.
+.env.*
+!.env.example
+**/.env.*
+!**/.env.example
+.dev.vars
+.dev.vars.*
+coverage-integration
+apps/backend/bundle
+private/*/node_modules
+private/*/dist
+CLAUDE.local.md
+.beads/

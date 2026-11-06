@@ -8,8 +8,20 @@ import {
 export type LedgerCall = { id?: string; name: string; serverId?: string; args: Record<string, unknown> };
 
 // HITL action requests carry only name, args and description. The backend
-// writes the description, so it carries the tool-call ID that keys the proof.
+// writes the description of every gated call, so it carries the model's
+// tool-call ID: it keys the proof, and it finds the card of the proposed call.
 const PROOF_REF = "policy-proof:";
+
+/** HITL description for a gated call: it carries the model's call ID. */
+export function hitlCallDescription(toolCallId: string | undefined): string {
+  return `${PROOF_REF}${toolCallId ?? ""}`;
+}
+
+/** The model's call ID that {@link hitlCallDescription} wrote, if any. */
+export function modelCallIdOf(description: string | undefined): string | undefined {
+  const id = description?.startsWith(PROOF_REF) ? description.slice(PROOF_REF.length) : undefined;
+  return id || undefined;
+}
 
 /**
  * Backend-held Policy Center proofs for one session runtime, keyed by tool-call
@@ -29,7 +41,7 @@ export class PolicyProofLedger {
 
   /** HITL description for an interrupted call. */
   description(toolCallId: string | undefined): string {
-    return `${PROOF_REF}${toolCallId ?? ""}`;
+    return hitlCallDescription(toolCallId);
   }
 
   /**
@@ -86,7 +98,7 @@ export class PolicyProofLedger {
 
   /** Proof for a pending HITL action request, found through its description. */
   forAction(action: LedgerCall & { description?: string }): PolicyApprovalProof | undefined {
-    const id = action.description?.startsWith(PROOF_REF) ? action.description.slice(PROOF_REF.length) : undefined;
+    const id = modelCallIdOf(action.description);
     return id && this.pending.has(id) && this.owns({ ...action, id }) ? this.proofs.get(id) : undefined;
   }
 

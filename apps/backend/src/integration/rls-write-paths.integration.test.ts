@@ -53,6 +53,7 @@ import { GithubConnectionStore } from "../services/integrations/github/github-co
 import { IntegrationStateStore } from "../services/integrations/integration-state-store.js";
 import { NotionConnectionStore } from "../services/integrations/notion/notion-connection-store.js";
 import { JiraConnectionStore } from "../services/integrations/pipedream/jira-connection-store.js";
+import { MailOutbox } from "../services/mail/mail-outbox.js";
 import { MemberMcpCredentialStore } from "../services/member-mcp-credential-store.js";
 import { McpServerStore } from "../services/mcp-server-store.js";
 import { McpAppCspStore } from "../services/mcp/mcp-app-csp-store.js";
@@ -79,6 +80,13 @@ import { TenantSettingsStore } from "../services/tenant-settings-store.js";
 import { ToolEventStore } from "../services/tool-event-store.js";
 import { UserSettingsStore } from "../services/user-settings-store.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
+import { PasswordHasher } from "../lib/password-hash.js";
+import { hashActionToken, LocalAccountService } from "../services/auth/local-account-service.js";
+import { bootstrapLocalTenant } from "../scripts/local-auth-commands-lib.js";
+import { LocalMfaService } from "../services/auth/local-mfa-service.js";
+import { LocalPasskeyService } from "../services/auth/local-passkey-service.js";
+import { SoftAuthenticator } from "../test-helpers/soft-authenticator.js";
+import { base32Decode, totpCode, totpStep } from "../lib/totp.js";
 
 import {
   adminDatabaseUrl,
@@ -87,6 +95,8 @@ import {
   runRoleName,
   superuserPool
 } from "./support/database.js";
+import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
+import { ALLOW_WEAKER } from "../test-helpers/data-routes.js";
 
 /** Column values that identify one row. tenant_id is added by the harness. */
 type RowKey = Record<string, string | number>;
@@ -101,6 +111,11 @@ type WritePath = {
    * before any policy check runs.
    */
   ownerUpdate?: "append-only" | "immutable";
+  /**
+   * The tenant that owns the row, when it is not the shared WorkOS owner:
+   * local accounts exist only in a tenant whose login type is local.
+   */
+  owner?: () => Promise<Member>;
   /** Writes the row as the owner tenant and returns its key. */
   write: () => Promise<RowKey>;
 } & (
@@ -151,6 +166,48 @@ const people = once(async () => {
   const member = await signIn(organization);
   const peer = await signIn(unique("org-peer"));
   return { owner, member, peer };
+});
+
+// Local accounts live in a local tenant. The operator command creates the
+// tenant (on the migration pool, as in production); the app pool writes the
+// accounts through LocalAccountService.
+const localTenant = once(async () =>
+  bootstrapLocalTenant(superuserPool(), "https://app.test", {
+    tenantName: "Local write paths",
+    ownerEmail: `${randomUUID()}@example.test`,
+    ownerName: null
+  })
+);
+const localOwner = once(async (): Promise<Member> => {
+  const tenant = await localTenant();
+  return { tenantId: tenant.tenantId, userId: tenant.userId };
+});
+const localAccounts = once(async () =>
+  new LocalAccountService({ afterSecurityChange: IGNORE_SECURITY_CHANGE,
+    db: appPool(),
+    lookupDb: maintenancePool(),
+    hasher: new PasswordHasher(2),
+    frontendOrigin: "https://app.test"
+  })
+);
+async function createLocalMember() {
+  const owner = await localOwner();
+  return (await localAccounts()).createMember({
+    tenantId: owner.tenantId,
+    email: `${randomUUID()}@example.test`,
+    displayName: null,
+    role: "member",
+    actorUserId: owner.userId,
+    meta: { ipAddress: null, userAgent: null }
+  });
+}
+const tokenOf = (url: string) => url.split("#token=")[1]!;
+const localMfa = (now: () => number = Date.now) =>
+  new LocalMfaService({ afterSecurityChange: IGNORE_SECURITY_CHANGE, db: appPool(), secret: "rls-write-paths-mfa-secret-at-least-32-chars", issuer: "Cogniplane", now });
+const PASSKEY_SITE = { origin: "https://app.example.test", rpId: "app.example.test" };
+const localPasskeys = () => new LocalPasskeyService({ afterSecurityChange: IGNORE_SECURITY_CHANGE,
+  db: appPool(), lookupDb: maintenancePool(), secret: "rls-write-paths-mfa-secret-at-least-32-chars",
+  rpId: PASSKEY_SITE.rpId, rpName: "Cogniplane", origin: PASSKEY_SITE.origin
 });
 
 /**
@@ -338,7 +395,8 @@ const scheduledJob = once(async () => {
     settingsSnapshot: {},
     enabled: true,
     // Not due during the run, so scheduler sweeps in other files leave it alone.
-    nextRunAt: FAR_FUTURE().toISOString()
+    nextRunAt: FAR_FUTURE().toISOString(),
+    ownerSecurityVersion: null
   }, { maxActive: 0 });
   if (created.status !== "created") throw new Error("createScheduledJob did not create the job");
   return created.job.jobId;
@@ -449,7 +507,8 @@ async function connectJira(user: Member) {
       accountName: "me@example.test",
       cloudId: "11111111-2222-4333-8444-555555555555",
       siteName: "Acme",
-      siteUrl: "https://acme.atlassian.net"
+      siteUrl: "https://acme.atlassian.net",
+      ownerSecurityVersion: null
     },
     identity
   );
@@ -523,6 +582,103 @@ const WRITE_PATHS: Record<string, WritePath> = {
     reason: "Written in the same sign-in transaction as the tenant row.",
     write: async () => ({ user_id: (await people()).member.userId })
   },
+  local_identities: {
+    path: "LocalAccountService.createMember",
+    writer: "app",
+    owner: localOwner,
+    write: async () => ({ user_id: (await createLocalMember()).userId })
+  },
+  auth_action_tokens: {
+    path: "LocalAccountService.createMember (setup link)",
+    writer: "app",
+    owner: localOwner,
+    write: async () => ({ token_hash: hashActionToken(tokenOf((await createLocalMember()).link!.url)) })
+  },
+  user_totp_factors: {
+    path: "LocalMfaService.startTotpEnrollment",
+    writer: "app",
+    owner: localOwner,
+    write: async () => {
+      const created = await createLocalMember();
+      await (await localAccounts()).redeemLink(
+        "account_setup", tokenOf(created.link!.url), "purple elephants dance quietly", { ipAddress: null, userAgent: null }
+      );
+      const owner = await localOwner();
+      const version = (await superuserPool().query(`SELECT security_version FROM local_identities WHERE user_id = $1`, [created.userId])).rows[0].security_version;
+      await localMfa().startTotpEnrollment(owner.tenantId, created.userId, version);
+      return { user_id: created.userId };
+    }
+  },
+  user_recovery_codes: {
+    path: "LocalMfaService.regenerateRecoveryCodes (via confirmTotpEnrollment)",
+    writer: "app",
+    owner: localOwner,
+    write: async () => {
+      const created = await createLocalMember();
+      const accounts = await localAccounts();
+      await accounts.redeemLink("account_setup", tokenOf(created.link!.url), "purple elephants dance quietly", { ipAddress: null, userAgent: null });
+      const owner = await localOwner();
+      const versionOf = async () => (await superuserPool().query(`SELECT security_version FROM local_identities WHERE user_id = $1`, [created.userId])).rows[0].security_version as number;
+      const now = Date.now();
+      const mfa = localMfa(() => now);
+      const started = await mfa.startTotpEnrollment(owner.tenantId, created.userId, await versionOf());
+      await mfa.confirmTotpEnrollment(owner.tenantId, created.userId, totpCode(base32Decode(started.secret), totpStep(now)), await versionOf(), { ipAddress: null, userAgent: null });
+      const hash = (await superuserPool().query(`SELECT code_hash FROM user_recovery_codes WHERE user_id = $1 LIMIT 1`, [created.userId])).rows[0].code_hash as string;
+      return { user_id: created.userId, code_hash: hash };
+    }
+  },
+  user_passkeys: {
+    path: "LocalPasskeyService.register",
+    writer: "app",
+    owner: localOwner,
+    write: async () => {
+      const created = await createLocalMember();
+      await (await localAccounts()).redeemLink(
+        "account_setup", tokenOf(created.link!.url), "purple elephants dance quietly", { ipAddress: null, userAgent: null }
+      );
+      const owner = await localOwner();
+      const version = (await superuserPool().query(`SELECT security_version FROM local_identities WHERE user_id = $1`, [created.userId])).rows[0].security_version as number;
+      const passkeys = localPasskeys();
+      const options = await passkeys.registrationOptions(owner.tenantId, created.userId, version);
+      const authenticator = new SoftAuthenticator(PASSKEY_SITE);
+      await passkeys.register({
+        tenantId: owner.tenantId, userId: created.userId, credential: authenticator.register(options), expectedChallenge: options.challenge,
+        expectedVersion: version, name: undefined, meta: { ipAddress: null, userAgent: null }
+      });
+      return { credential_id: authenticator.id };
+    }
+  },
+  email_outbox: {
+    path: "MailOutbox.queue (LocalAccountService.changeOwnPassword)",
+    writer: "app",
+    owner: localOwner,
+    write: async () => {
+      const created = await createLocalMember();
+      const meta = { ipAddress: null, userAgent: null };
+      const accounts = new LocalAccountService({ afterSecurityChange: IGNORE_SECURITY_CHANGE,
+        db: appPool(), lookupDb: maintenancePool(), hasher: new PasswordHasher(2), frontendOrigin: "https://app.test",
+        notices: new MailOutbox({ secret: "rls-write-paths-mail-secret-at-least-32-chars" })
+      });
+      await accounts.redeemLink("account_setup", tokenOf(created.link!.url), "purple elephants dance quietly", meta);
+      const owner = await localOwner();
+      const version = (await superuserPool().query(`SELECT security_version FROM local_identities WHERE user_id = $1`, [created.userId])).rows[0].security_version as number;
+      await accounts.changeOwnPassword(owner.tenantId, created.userId, "purple elephants dance quietly", "seven orange kites drift slowly", version, meta);
+      const row = (await superuserPool().query(`SELECT email_id FROM email_outbox WHERE user_id = $1`, [created.userId])).rows[0];
+      return { email_id: row.email_id as string };
+    }
+  },
+  local_passwords: {
+    path: "LocalAccountService.redeemLink (account setup)",
+    writer: "app",
+    owner: localOwner,
+    write: async () => {
+      const created = await createLocalMember();
+      await (await localAccounts()).redeemLink(
+        "account_setup", tokenOf(created.link!.url), "purple elephants dance quietly", { ipAddress: null, userAgent: null }
+      );
+      return { user_id: created.userId };
+    }
+  },
 
   // Sessions and the runtime turn.
   sessions: {
@@ -580,6 +736,7 @@ const WRITE_PATHS: Record<string, WritePath> = {
         runtimeId: await runtimeId(),
         runtimePolicyId: "default",
         messageId: await message(),
+        ownerSecurityVersion: null,
         ttlMs: 10 * 60 * 1000
       });
       return { tool_context_id: context.toolContextId };
@@ -946,7 +1103,7 @@ const WRITE_PATHS: Record<string, WritePath> = {
         serverVersion: server.version,
         secret: "personal-secret",
         accountLabel: null
-      });
+      }, null);
       return { user_id: owner.userId, server_id: server.serverId };
     }
   },
@@ -1035,7 +1192,8 @@ const WRITE_PATHS: Record<string, WritePath> = {
       const rule = await new PolicyRuleStore(appPool()).create(
         owner.tenantId,
         { name: "Review exports", effect: "require_approval", conditions: { toolNames: ["export_customers"] } },
-        owner.userId
+        owner.userId,
+        ALLOW_WEAKER
       );
       return { rule_id: rule.ruleId };
     }
@@ -1146,7 +1304,8 @@ const WRITE_PATHS: Record<string, WritePath> = {
         accessTokenExpiresAt: null,
         refreshTokenEncrypted: null,
         refreshTokenExpiresAt: null,
-        tokenLastRefreshedAt: null
+        tokenLastRefreshedAt: null,
+        ownerSecurityVersion: null
       });
       return { user_id: owner.userId };
     }
@@ -1172,7 +1331,8 @@ const WRITE_PATHS: Record<string, WritePath> = {
         accessTokenExpiresAt: null,
         refreshTokenEncrypted: null,
         refreshTokenExpiresAt: null,
-        tokenLastRefreshedAt: null
+        tokenLastRefreshedAt: null,
+        ownerSecurityVersion: null
       });
       return { user_id: owner.userId };
     }
@@ -1233,6 +1393,10 @@ const WRITE_PATHS: Record<string, WritePath> = {
 
 const CASES = Object.entries(WRITE_PATHS).map(([table, entry]) => ({ table, ...entry }));
 
+async function ownerOf(table: string): Promise<Member> {
+  return (await WRITE_PATHS[table]?.owner?.()) ?? (await people()).owner;
+}
+
 /** Each table's row is written once, then shared by every probe. */
 const written = new Map<string, Promise<RowKey>>();
 function rowOf(table: string): Promise<RowKey> {
@@ -1240,7 +1404,7 @@ function rowOf(table: string): Promise<RowKey> {
   if (!row) {
     const entry = WRITE_PATHS[table];
     if (!entry) throw new Error(`No write path for ${table}`);
-    row = (async () => ({ tenant_id: (await people()).owner.tenantId, ...(await entry.write()) }))();
+    row = (async () => ({ tenant_id: (await ownerOf(table)).tenantId, ...(await entry.write()) }))();
     written.set(table, row);
   }
   return row;
@@ -1390,7 +1554,8 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
     // In each test, not in beforeAll: a writer that throws must fail these
     // tests, not mark them skipped. rowOf() writes the row only once.
     beforeEach(async () => {
-      ({ owner, peer } = await people());
+      ({ peer } = await people());
+      owner = await ownerOf(table);
       key = await rowOf(table);
     });
 
@@ -1444,11 +1609,21 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
       // column name (admin_mcp_app_csp_* tables have a `source` column). Every other column is the
       // one the store wrote, so no NOT NULL or check constraint can fail
       // first, and RLS runs before unique and foreign key checks.
+      // Generated columns (tenant_memberships.local_tenant_id) take no
+      // explicit value, so the copy names only the ordinary columns.
+      const columns = (await superuserPool().query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+         ORDER BY ordinal_position`,
+        [table]
+      )).rows.map((row) => `"${row.column_name}"`).join(", ");
       const copy = rolledBack(owner.tenantId, (client) =>
         client.query(
-          `INSERT INTO ${table} OVERRIDING SYSTEM VALUE
-           SELECT (jsonb_populate_record(stored_row, jsonb_build_object('tenant_id', $${peerParam}::text))).*
-           FROM ${table} AS stored_row WHERE ${sql}`,
+          `INSERT INTO ${table} (${columns}) OVERRIDING SYSTEM VALUE
+           SELECT ${columns} FROM (
+             SELECT (jsonb_populate_record(stored_row, jsonb_build_object('tenant_id', $${peerParam}::text))).*
+             FROM ${table} AS stored_row WHERE ${sql}
+           ) AS copied`,
           [...values, peer.tenantId]
         )
       );

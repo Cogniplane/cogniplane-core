@@ -115,6 +115,10 @@ export const ScheduledJobSchema = z.object({
   }).passthrough(),
   settingsSnapshot: z.record(z.string(), z.unknown()),
   enabled: z.boolean(),
+  // Why the scheduler paused the job. `security_change`: the owner's account
+  // security changed (for example a password change) after the job was saved.
+  // The owner turns the job on again with an edit.
+  pausedReason: z.enum(["security_change"]).nullable().optional(),
   lastRunAt: IsoDateSchema.nullable(),
   nextRunAt: IsoDateSchema.nullable(),
   createdAt: IsoDateSchema,

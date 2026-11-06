@@ -6,6 +6,10 @@ import type {
   ToolExecutionContextStore
 } from "../auth/tool-execution-context-store.js";
 
+/** The answer for a context that ended. It has no ID: see the catch below. */
+export const TOOL_CONTEXT_UNAVAILABLE_MESSAGE =
+  "The tool access of this turn was not found, expired, or ended by a security change.";
+
 export async function resolveBoundToolContext(input: {
   rpc: { id?: string | number | undefined };
   tenantId: string;
@@ -45,7 +49,10 @@ export async function resolveBoundToolContext(input: {
       context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
     }
   } catch (error) {
-    return { error: failure(rpc.id, -32000, error instanceof ToolContextUnavailableError ? error.message : "Tool context lookup failed.") };
+    // The model reads this text as the tool result, and the checkpoint keeps it.
+    // The error's own message names the trusted context ID, so it stays out.
+    return { error: failure(rpc.id, -32000, error instanceof ToolContextUnavailableError
+      ? TOOL_CONTEXT_UNAVAILABLE_MESSAGE : "Tool context lookup failed.") };
   }
 
   if (!context) {

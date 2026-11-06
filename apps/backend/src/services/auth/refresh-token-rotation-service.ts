@@ -1,12 +1,17 @@
 import {
+  clearUnauditedReuse,
   completeRefreshRotation,
   consumeRefreshJti,
+  isRefreshFamilyActive,
   issueRefreshJti,
+  keepUnauditedReuse,
+  readUnauditedReuse,
   restoreRefreshJti,
   revokeRefreshFamily,
   waitForRefreshRotation,
   type RefreshRotationResult,
-  type RefreshTokenRedis
+  type RefreshTokenRedis,
+  type UnauditedReuse
 } from "../../lib/refresh-token-store.js";
 
 export type RefreshRotationClaim =
@@ -71,10 +76,30 @@ export class RefreshTokenRotationService {
     await completeRefreshRotation(this.redis, { jti, result });
   }
 
+  async isActive(familyId: string): Promise<boolean> {
+    return isRefreshFamilyActive(this.redis, familyId);
+  }
+
   async revoke(familyId: string): Promise<void> {
     await revokeRefreshFamily(this.redis, {
       familyId,
       ttlSeconds: this.tokenTtlSeconds
     });
+  }
+
+  /**
+   * Keeps a reuse detection whose audit event failed, for as long as the
+   * revoked family state lives, so that a later refusal can write the event.
+   */
+  async keepUnauditedReuse(familyId: string, reuse: UnauditedReuse): Promise<void> {
+    await keepUnauditedReuse(this.redis, { familyId, reuse, ttlSeconds: this.tokenTtlSeconds });
+  }
+
+  async readUnauditedReuse(familyId: string): Promise<UnauditedReuse | null> {
+    return readUnauditedReuse(this.redis, familyId);
+  }
+
+  async clearUnauditedReuse(familyId: string): Promise<void> {
+    await clearUnauditedReuse(this.redis, familyId);
   }
 }

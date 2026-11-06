@@ -376,7 +376,8 @@ describe("UserSettingsStore – scheduled job admission", () => {
     input: { prompt: "Digest." },
     settingsSnapshot: {},
     enabled: overrides.enabled ?? true,
-    nextRunAt: "2026-03-18T09:00:00.000Z"
+    nextRunAt: "2026-03-18T09:00:00.000Z",
+    ownerSecurityVersion: null
   });
 
   // A scripted database: `activeJobs` answers the count, `rowEnabled` answers

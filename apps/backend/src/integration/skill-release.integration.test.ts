@@ -125,4 +125,28 @@ describe.skipIf(!adminDatabaseUrl())("atomic skill release", () => {
     expect(active[0]?.skillRevisionId).toBe(skill?.activeRevisionId);
     expect(skill?.isPublished).toBe(skill?.activeRevisionId === seed.first.revision.skillRevisionId);
   });
+
+  // The owner notice of a release (DataRouteControl.ownerNotice) runs in the
+  // release's transaction: it sees the release, and a failure rolls the
+  // release back, so no release commits without its notice.
+  test("the release's notice runs in its transaction, and its failure rolls the release back", async () => {
+    const release = await seedRelease();
+    const seen: unknown[] = [];
+    await expect(release.revisions.activateSkillRevision(release.tenantId, {
+      skillId: release.skillId, skillRevisionId: release.second.revision.skillRevisionId, reviewedBy: release.userId, reviewNotes: null,
+      alsoInTransaction: async (client) => {
+        seen.push((await client.query("SELECT active_revision_id FROM admin_skills WHERE tenant_id = $1 AND skill_id = $2",
+          [release.tenantId, release.skillId])).rows[0]?.active_revision_id);
+        throw new Error("the notice failed");
+      }
+    })).rejects.toThrow("the notice failed");
+    expect(seen.map(Number)).toEqual([release.second.revision.skillRevisionId]);
+    expect((await release.skills.getSkill(release.tenantId, release.skillId))?.activeRevisionId).toBe(release.first.revision.skillRevisionId);
+
+    await release.skills.setSkillPublished(release.tenantId, release.skillId, false);
+    await expect(release.skills.setSkillPublished(release.tenantId, release.skillId, true, undefined, {
+      alsoInTransaction: async () => { throw new Error("the notice failed"); }
+    })).rejects.toThrow("the notice failed");
+    expect((await release.skills.getSkill(release.tenantId, release.skillId))?.isPublished).toBe(false);
+  });
 });

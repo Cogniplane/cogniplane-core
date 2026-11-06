@@ -179,3 +179,33 @@ it("shows no member controls to a person who cannot manage the project, or when 
   expect(screen.queryByRole("button", { name: "Leave project" })).toBeNull();
   expect(screen.queryByLabelText("Role of Owner")).toBeNull();
 });
+
+
+it("keeps saved audience and retained-access warnings while a members-only draft is unsaved", async () => {
+  vi.mocked(getProjectAccess).mockResolvedValue({ visibility: "organization", organizationRole: "editor",
+    members: [{ userId: "u1", role: "owner", displayName: "Owner", email: "owner@example.com" }] });
+  renderSharing({ currentUserId: "u1" });
+  fireEvent.change(await screen.findByLabelText("Who can access"), { target: { value: "private" } });
+  expect(screen.getByText("Organization shared")).toBeTruthy();
+  expect(screen.getByText(/Current access: everyone in your organization can open/)).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toContain("After you save, only project members");
+  expect(screen.queryByText(/Organization sharing is off/)).toBeNull();
+  expect(updateProjectSharing).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Leave project" }));
+  const dialog = screen.getByRole("alertdialog");
+  expect(dialog.textContent).toContain("still gives everyone in the organization edit access");
+  expect(within(dialog).getByRole("alert").textContent).toContain("no owner");
+  expect(updateProjectMember).not.toHaveBeenCalled();
+});
+
+it("keeps members-only access current until organization sharing is confirmed and saved", async () => {
+  renderSharing();
+  fireEvent.change(await screen.findByLabelText("Who can access"), { target: { value: "organization" } });
+  expect(screen.getByText("Members only")).toBeTruthy();
+  expect(screen.getByText("Current access: only project members can access this project.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Save access" }));
+  expect(screen.getByText("Members only")).toBeTruthy();
+  expect(updateProjectSharing).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("status").textContent).toContain("Unsaved access change");
+});

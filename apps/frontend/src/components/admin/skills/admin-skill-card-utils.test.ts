@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
-import type { SkillRevision } from "@cogniplane/shared-types";
+import type { AdminSkill, SkillRevision } from "@cogniplane/shared-types";
 
-import { getRevisionGithubMetadata } from "./admin-skill-card-utils";
+import { describeRevisionSource, describeSkillUsage, getRevisionGithubMetadata } from "./admin-skill-card-utils";
 
 function revision(metadata: Record<string, unknown>): SkillRevision {
   return {
@@ -30,4 +30,17 @@ it.each([
   ["a non-string subdirectory", { github: { url: "https://github.com/o/r", subdirectory: ["pdf"] } }]
 ])("ignores GitHub metadata with %s", (_case, metadata) => {
   expect(getRevisionGithubMetadata(revision(metadata))).toBeNull();
+});
+
+it("describes actual source types without assuming GitHub visibility", () => {
+  expect(describeRevisionSource({ ...revision({}), sourceType: "github" })).toBe("GitHub import");
+  expect(describeRevisionSource({ ...revision({}), sourceType: "zip" })).toBe("ZIP upload");
+  expect(describeRevisionSource({ ...revision({}), sourceType: "inline" })).toBe("Inline SKILL.md");
+  expect(describeRevisionSource({ ...revision({}), sourceType: "inline", metadata: { organizationSubmissionId: "submission-a" } })).toBe("Inline member submission");
+});
+
+it("keeps unknown usage separate from explicit zero and each 30-day measure", () => {
+  expect(describeSkillUsage({} as AdminSkill)).toBe("Used sessions unavailable; offered sessions unavailable. Period: last 30 days.");
+  expect(describeSkillUsage({ invokedSessions30d: 0, materializedSessions30d: 24 } as AdminSkill)).toBe("Used in 0 sessions; offered in 24 sessions. Period: last 30 days.");
+  expect(describeSkillUsage({ materializedSessions30d: 0 } as AdminSkill)).toBe("Used sessions unavailable; offered in 0 sessions. Period: last 30 days.");
 });

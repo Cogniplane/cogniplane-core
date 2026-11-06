@@ -1,145 +1,38 @@
 import type { NotionConnectionStatus } from "@cogniplane/shared-types";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import {
-  OAuthConnectionActions,
-  OAuthConnectionSectionHeading
-} from "./oauth-connection-presentation";
+import { OAuthConnectionActions, OAuthConnectionAvailability, OAuthConnectionOverview, OAuthConnectionReadBoundary, OAuthConnectionSectionHeading, type OAuthConnectionReadState } from "./oauth-connection-presentation";
 import { formatMediumDateTime } from "../lib/time-format";
-import { CHIP, PILL_GRAY, PILL_BLUE, HINT, SECTION_LABEL } from "../lib/ui-tokens";
 
-type NotionConnectionSectionProps = {
+type NotionConnectionSectionProps = OAuthConnectionReadState & {
   status: NotionConnectionStatus | null;
   error: string | null;
   flashMessage: string | null;
   busyKey: string | null;
   onConnect: () => void;
   onDisconnect: () => void;
+  onConfirm: () => void;
 };
 
-function getConnectionHeadline(status: NotionConnectionStatus | null): string {
-  if (status?.userConnection) {
-    const workspace = status.userConnection.notionWorkspaceName;
-    const owner = status.userConnection.notionOwnerName ?? status.userConnection.notionOwnerEmail;
-    if (workspace && owner) return `Connected as ${owner} in ${workspace}`;
-    if (workspace) return `Connected to ${workspace}`;
-    return `Connected as ${owner ?? "Notion user"}`;
-  }
-  if (status?.configured) return "Notion configured for this platform";
-  return "Notion not configured";
-}
-
 export function NotionConnectionSection(input: NotionConnectionSectionProps) {
-  const { status, error, flashMessage, busyKey, onConnect, onDisconnect } = input;
-  const userConnection = status?.userConnection ?? null;
-
-  return (
-    <section id="notion" className="flex flex-col gap-5">
-      <OAuthConnectionSectionHeading provider="Notion" />
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className={SECTION_LABEL}>User identity</p>
-                <h2 className="text-lg font-semibold text-on-surface">
-                  Connect your Notion account
-                </h2>
-                <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
-                  Authorize your Notion workspace to let the agent search pages, read content,
-                  query databases, and create or update pages on your behalf. The agent only sees
-                  workspaces and pages you grant access to during Notion's consent flow.
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className={PILL_GRAY}>notion</span>
-                <span className={PILL_GRAY}>per-user</span>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <OAuthConnectionActions
-              busyKey={busyKey === "connect" || busyKey === "disconnect" ? busyKey : null}
-              configured={status?.configured === true}
-              connected={userConnection !== null}
-              connectLabel="Connect my Notion account"
-              reconnectLabel="Reconnect my account"
-              error={error}
-              flashMessage={flashMessage}
-              onConnect={onConnect}
-              onDisconnect={onDisconnect}
-            >
-              <div>
-                <h3 className="text-sm font-semibold text-on-surface">Authorization</h3>
-                <p className={`${HINT} mt-1`}>
-                  Your Notion credentials are encrypted at rest and used only when the agent needs
-                  to read or modify Notion content during a session.
-                </p>
-              </div>
-            </OAuthConnectionActions>
-
-            {!status?.configured ? (
-              <p className={HINT}>
-                Notion OAuth is not configured on this deployment yet. Set
-                NOTION_OAUTH_CLIENT_ID, NOTION_OAUTH_CLIENT_SECRET, and NOTION_OAUTH_REDIRECT_URI
-                in the backend environment.
-              </p>
-            ) : null}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className={SECTION_LABEL}>Current state</p>
-                <h2 className="text-lg font-semibold text-on-surface">
-                  {getConnectionHeadline(status)}
-                </h2>
-              </div>
-              <span
-                className={
-                  userConnection ? PILL_BLUE : status?.configured ? PILL_GRAY : PILL_GRAY
-                }
-              >
-                {userConnection
-                  ? "connected"
-                  : status?.configured
-                    ? "not connected"
-                    : "not configured"}
-              </span>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {userConnection ? (
-              <>
-                <div className="flex flex-wrap items-center gap-2">
-                  {userConnection.notionWorkspaceName ? (
-                    <span className={CHIP}>{userConnection.notionWorkspaceName}</span>
-                  ) : null}
-                  {userConnection.notionOwnerName ? (
-                    <span className={CHIP}>{userConnection.notionOwnerName}</span>
-                  ) : null}
-                  {userConnection.notionOwnerEmail ? (
-                    <span className={CHIP}>{userConnection.notionOwnerEmail}</span>
-                  ) : null}
-                </div>
-                <details className="mt-3 text-sm text-on-surface-variant">
-                  <summary className="cursor-pointer font-medium text-on-surface">Connection diagnostics</summary>
-                  <p className="mt-2">Connected: {formatMediumDateTime(userConnection.connectedAt, "Not available")}</p>
-                  <p>Last used: {formatMediumDateTime(userConnection.lastUsedAt, "Not available")}</p>
-                  <p>Token expiry: {formatMediumDateTime(userConnection.accessTokenExpiresAt, "Not available")}</p>
-                </details>
-              </>
-            ) : (
-              <p className={HINT}>
-                Once connected, the agent can search your Notion workspace, fetch pages and
-                database rows, and write back when write tools are enabled in agent settings.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-    </section>
-  );
+  const { status } = input;
+  const account = status?.userConnection ?? null;
+  const suspended = account?.suspended === true;
+  const workspace = account?.notionWorkspaceName;
+  const owner = account?.notionOwnerName ?? account?.notionOwnerEmail;
+  const headline = account ? workspace && owner ? `Connected as ${owner} in ${workspace}` : workspace ? `Connected to ${workspace}` : `Connected as ${owner ?? "Notion user"}` : status?.configured ? "Notion not connected" : "Notion not configured";
+  const available = status?.configured === true && status.tenantEnabled !== false;
+  return <section id="notion" className="flex min-w-0 flex-col gap-5">
+    <OAuthConnectionSectionHeading provider="Notion" />
+    {input.flashMessage ? <p role="status" className="text-sm text-on-surface-variant">{input.flashMessage}</p> : null}
+    <OAuthConnectionReadBoundary {...input} known={status !== null}>
+      <OAuthConnectionOverview headline={headline} state={suspended ? "suspended" : account ? "connected" : "not connected"} suspended={suspended} connected={account !== null}
+        description="Connect your Notion account to search pages, read content, query databases, and create or update pages. The agent only sees the workspaces and pages you grant access to in Notion."
+        identity={account ? <>{account.notionOwnerEmail ? <p>{account.notionOwnerEmail}</p> : null}{workspace ? <p>Workspace: {workspace}</p> : null}</> : null}
+        diagnostics={account ? <><p>Connected: {formatMediumDateTime(account.connectedAt, "Not available")}</p><p>Last used: {formatMediumDateTime(account.lastUsedAt, "Not available")}</p><p>Token expiry: {formatMediumDateTime(account.accessTokenExpiresAt, "Not available")}</p></> : null}>
+        <OAuthConnectionAvailability provider="Notion" configured={status?.configured === true} enabled={status?.tenantEnabled !== false} />
+        <OAuthConnectionActions busyKey={input.busyKey === "connect" || input.busyKey === "disconnect" || input.busyKey === "confirm" ? input.busyKey : null} configured={available && !input.isLoading && !input.statusError} connected={account !== null} connectLabel="Connect my Notion account" reconnectLabel="Reconnect my account" error={input.error === input.statusError ? null : input.error} flashMessage={null} onConnect={input.onConnect} onDisconnect={input.onDisconnect}
+          // Only the email is attested. A display name cannot authorize confirmation.
+          suspended={account && suspended ? { confirm: account.notionOwnerEmail ? { account: `the Notion account ${account.notionOwnerEmail}`, onConfirm: input.onConfirm } : null } : undefined} />
+      </OAuthConnectionOverview>
+    </OAuthConnectionReadBoundary>
+  </section>;
 }

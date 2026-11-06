@@ -101,6 +101,31 @@ it("refreshes a new submission conflict without losing the note", async () => {
   await waitFor(() => expect(submitPersonalSkill).toHaveBeenCalledTimes(2));
 });
 
+it.each([false, true])("recovers a create conflict after a failed list refresh, with open review %s", async (hasOpenReview) => {
+  vi.mocked(submitPersonalSkill).mockRejectedValueOnce(new ApiError({ status: 409, code: "submission_conflict", method: "POST", path: "/me/skill-submissions", message: "Review changed" }));
+  vi.mocked(listMySkillSubmissions).mockResolvedValueOnce({ scope, submissions: [] })
+    .mockRejectedValueOnce(new Error("List unavailable"))
+    .mockResolvedValueOnce({ scope, submissions: hasOpenReview ? [submission("pending")] : [] });
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={vi.fn()} />);
+  await waitFor(() => expect((screen.getByRole("button", { name: "Submit for review" }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.change(screen.getByLabelText("Saved revision to share"), { target: { value: "1" } });
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Keep this review note" } });
+  fireEvent.click(screen.getByRole("button", { name: "Submit for review" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Refresh submission state" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Retry submissions" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Retry submissions" })).toBeNull());
+  expect((screen.getByLabelText("Private skill") as HTMLSelectElement).value).toBe(skillId);
+  expect((screen.getByLabelText("Saved revision to share") as HTMLSelectElement).value).toBe("1");
+  expect((screen.getByLabelText("Note to reviewers") as HTMLTextAreaElement).value).toBe("Keep this review note");
+  expect((screen.getByRole("button", { name: "Submit for review" }) as HTMLButtonElement).disabled).toBe(hasOpenReview);
+  if (hasOpenReview) expect(screen.getByText(/already has an open submission/)).toBeTruthy();
+  else {
+    fireEvent.click(screen.getByRole("button", { name: "Submit for review" }));
+    await waitFor(() => expect(submitPersonalSkill).toHaveBeenCalledTimes(2));
+    expect(submitPersonalSkill).toHaveBeenLastCalledWith({ scope, personalSkillId: skillId, sourceRevision: 1, note: "Keep this review note", targetOrganizationSkillId: null });
+  }
+});
+
 it("clears private data on a mismatched response scope", async () => {
   vi.mocked(listMySkillSubmissions).mockResolvedValue({ scope: { ...scope, userId: "other" }, submissions: [submission("pending")] });
   render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={null} onBack={vi.fn()} />);
@@ -172,4 +197,114 @@ it("keeps the list that loads while a linked submission opens and warns about an
   finishList({ scope, submissions: [accepted, open] });
   expect(await screen.findByText(/already has an open submission/)).toBeTruthy();
   expect((screen.getByRole("button", { name: "Submit update" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("retains the complete draft when Back, Cancel, or a linked row change is declined", async () => {
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  const onBack = vi.fn();
+  const dirty = vi.fn();
+  const view = render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={onBack} onDirtyChange={dirty} />);
+  await waitFor(() => expect(dirty).toHaveBeenLastCalledWith(true));
+  fireEvent.change(screen.getByLabelText("Saved revision to share"), { target: { value: "1" } });
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Keep this note" } });
+  fireEvent.click(screen.getByRole("button", { name: "Back to private skills" }));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  view.rerender(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} requestedSubmissionId={submission("pending").id} onBack={onBack} onDirtyChange={dirty} />);
+  await waitFor(() => expect(confirm).toHaveBeenCalledTimes(3));
+  expect(onBack).not.toHaveBeenCalled();
+  expect(getMySkillSubmission).not.toHaveBeenCalled();
+  expect(screen.getByLabelText("Note to reviewers")).toHaveProperty("value", "Keep this note");
+  expect(screen.getByLabelText("Saved revision to share")).toHaveProperty("value", "1");
+  expect(screen.getByText("Old instructions")).toBeTruthy();
+  confirm.mockReturnValue(true);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(await screen.findByRole("button", { name: "New submission" }));
+  expect(screen.getByLabelText("Note to reviewers")).toHaveProperty("value", "");
+  expect(submitPersonalSkill).not.toHaveBeenCalled();
+  confirm.mockRestore();
+});
+
+it("retains the note while the user changes the source and saved revision", async () => {
+  const other = { ...skill, id: "personal-skill-cccccccc-cccc-4ccc-cccc-cccccccccccc", latest: { ...latest, content: { ...latest.content, name: "other-skill" } } };
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill, other]} initialSkillId={skillId} onBack={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "My context" } });
+  fireEvent.change(screen.getByLabelText("Private skill"), { target: { value: other.id } });
+  fireEvent.change(screen.getByLabelText("Saved revision to share"), { target: { value: "1" } });
+  expect(screen.getByLabelText("Note to reviewers")).toHaveProperty("value", "My context");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit for review" })).toHaveProperty("disabled", false));
+  fireEvent.click(screen.getByRole("button", { name: "Submit for review" }));
+  await waitFor(() => expect(submitPersonalSkill).toHaveBeenCalledWith({ scope, personalSkillId: other.id, sourceRevision: 1, note: "My context", targetOrganizationSkillId: null }));
+});
+
+it("blocks duplicate submits and departure while pending, then retains the draft on failure", async () => {
+  let fail!: (cause: Error) => void;
+  vi.mocked(submitPersonalSkill).mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject; }));
+  const onBack = vi.fn(), pending = vi.fn();
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={onBack} onPendingChange={pending} />);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit for review" })).toHaveProperty("disabled", false));
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Retry this later" } });
+  const submit = screen.getByRole("button", { name: "Submit for review" });
+  fireEvent.click(submit); fireEvent.click(submit);
+  fireEvent.click(screen.getByRole("button", { name: "Back to private skills" }));
+  expect(onBack).not.toHaveBeenCalled();
+  expect(submitPersonalSkill).toHaveBeenCalledOnce();
+  expect(pending).toHaveBeenLastCalledWith(true);
+  fail(new Error("Fictional service unavailable"));
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Fictional service unavailable"));
+  expect(screen.getByLabelText("Note to reviewers")).toHaveProperty("value", "Retry this later");
+  expect(pending).toHaveBeenLastCalledWith(false);
+  expect(document.activeElement).not.toBe(document.body);
+});
+
+it("separates failed list reads from empty history and retries without losing a composing note", async () => {
+  vi.mocked(listMySkillSubmissions).mockRejectedValueOnce(new Error("List offline"));
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={vi.fn()} />);
+  await screen.findByRole("button", { name: "Retry submissions" });
+  expect(screen.queryByText(/No submissions yet/)).toBeNull();
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Local note" } });
+  expect(screen.getByRole("button", { name: "Submit for review" })).toHaveProperty("disabled", true);
+  fireEvent.click(screen.getByRole("button", { name: "Retry submissions" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(screen.getByLabelText("Note to reviewers")).toHaveProperty("value", "Local note");
+  expect(screen.getByRole("button", { name: "Submit for review" })).toHaveProperty("disabled", false);
+});
+
+it("retries the same failed detail and focuses the loaded view", async () => {
+  vi.mocked(getMySkillSubmission).mockRejectedValueOnce(new Error("Detail offline"));
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={null} requestedSubmissionId={submission("pending").id} onBack={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry submission" }));
+  await screen.findByRole("heading", { name: "meeting-notes" });
+  expect(getMySkillSubmission).toHaveBeenLastCalledWith(submission("pending").id);
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "My submissions" }));
+});
+
+it.each([401, 403, 409])("clears private composing text after scope or session refusal %s", async (status) => {
+  vi.mocked(submitPersonalSkill).mockRejectedValueOnce(new ApiError({ status, code: status === 409 ? "submission_scope_changed" : "forbidden", method: "POST", path: "/me/skill-submissions", message: "Access changed" }));
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={vi.fn()} />);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit for review" })).toHaveProperty("disabled", false));
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Private note" } });
+  fireEvent.click(screen.getByRole("button", { name: "Submit for review" }));
+  await screen.findByRole("button", { name: "Reload page" });
+  expect(screen.queryByDisplayValue("Private note")).toBeNull();
+  expect(screen.queryByText("New instructions")).toBeNull();
+});
+
+it("retains last loaded history after a failed refresh and distinguishes it from an empty result", async () => {
+  vi.mocked(listMySkillSubmissions).mockResolvedValueOnce({ scope, submissions: [submission("pending")] }).mockRejectedValueOnce(new Error("Refresh offline"));
+  render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={null} onBack={vi.fn()} />);
+  fireEvent.click(await screen.findByRole("button", { name: /meeting-notes/ }));
+  await screen.findByRole("button", { name: "Withdraw submission" });
+  fireEvent.click(screen.getByRole("button", { name: "Back to submissions" }));
+  expect(await screen.findByText(/history shown is from the last successful load/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: /meeting-notes/ })).toBeTruthy();
+  expect(screen.queryByText(/No submissions yet/)).toBeNull();
+});
+
+it("clears an unsent note and preview when the expected account changes", async () => {
+  const view = render(<OrganizationSkillSubmissions expectedScope={scope} skills={[skill]} initialSkillId={skillId} onBack={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText("Note to reviewers"), { target: { value: "Private scope note" } });
+  view.rerender(<OrganizationSkillSubmissions expectedScope={{ ...scope, tenantId: "other-tenant" }} skills={[skill]} initialSkillId={skillId} onBack={vi.fn()} />);
+  await screen.findByRole("button", { name: "Reload page" });
+  expect(screen.queryByDisplayValue("Private scope note")).toBeNull();
+  expect(screen.queryByText("New instructions")).toBeNull();
 });

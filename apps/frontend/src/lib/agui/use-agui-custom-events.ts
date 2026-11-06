@@ -34,7 +34,9 @@ import {
   mcpAppsFromMessages,
   runtimeNoticeRow,
   runtimeNoticesFromMessages,
-  toolStatusesFromMessages
+  toolStatusesFromMessages,
+  turnStoppedNotice,
+  turnStopReasonOfResult
 } from "../../components/agui-transcript";
 import { listApprovals, resolveApproval } from "../session-api";
 import { isReconnectRun } from "./deep-agents-browser-agent";
@@ -96,7 +98,7 @@ const EMPTY_MCP_APPS: Record<string, McpAppCall> = {};
 const APPROVAL_READ_RETRY_MS = 2_000;
 const APPROVAL_READ_ATTEMPTS = 4;
 
-type ApprovalRequiredValue = Pick<Approval, "approvalId" | "itemId" | "kind" | "title" | "summary">;
+type ApprovalRequiredValue = Pick<Approval, "approvalId" | "itemId" | "kind" | "title" | "summary" | "toolCallId">;
 
 function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
   return {
@@ -104,6 +106,7 @@ function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
     rowId: `approval:${approval.approvalId}`,
     approvalId: approval.approvalId,
     itemId: approval.itemId,
+    ...(approval.toolCallId ? { toolCallId: approval.toolCallId } : {}),
     kind: approval.kind,
     title: approval.title,
     summary: approval.summary,
@@ -212,6 +215,17 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
           const kept = prev.filter((notice) => !notice.noticeId.startsWith(SEND_REFUSED_NOTICE_PREFIX));
           return kept.length === prev.length ? prev : kept;
         });
+      },
+      onRunFinishedEvent({ event }) {
+        if (disposed) return;
+        // A turn that the backend stopped says why (a security change, ended
+        // tool access). The saved row shows the same notice after a reload.
+        const reason = turnStopReasonOfResult((event as { result?: unknown }).result);
+        const runId = (event as { runId?: unknown }).runId;
+        if (!reason || typeof runId !== "string") return;
+        const notice = turnStoppedNotice(runId, reason, new Date().toISOString());
+        if (dismissedNoticeIdsRef.current.has(notice.noticeId)) return;
+        setNotices((prev) => (prev.some((n) => n.noticeId === notice.noticeId) ? prev : [...prev, notice]));
       },
       onCustomEvent({ event, input }) {
         if (disposed) return;

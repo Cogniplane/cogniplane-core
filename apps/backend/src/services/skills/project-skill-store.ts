@@ -297,8 +297,15 @@ export class ProjectSkillStore {
     });
   }
 
+  /**
+   * A release makes the latest revision live for the project's editors (and
+   * for every member when the project gives the organization edit access).
+   * `alsoInTransaction` runs in the release's transaction after the change:
+   * the owner notice. It does not run for "disable".
+   */
   async action(tenantId: string, userId: string, projectId: string, skillId: string,
-    action: "release" | "disable", version: number): Promise<ProjectSkill> {
+    action: "release" | "disable", version: number,
+    options: { alsoInTransaction?: (client: PoolClient) => Promise<void> } = {}): Promise<ProjectSkill> {
     const actor = { tenantId, userId, projectId };
     return withTenantScope(this.db, tenantId, async client => {
       await lockOwner(client, actor);
@@ -316,6 +323,7 @@ export class ProjectSkillStore {
       }
       await audit(client, actor, action === "release" ? "project.skill.released" : "project.skill.disabled",
         { skillId, revision: Number(row.latest_revision), version: version + 1 });
+      if (action === "release" && options.alsoInTransaction) await options.alsoInTransaction(client);
       return readSkill(client, actor, skillId);
     });
   }

@@ -123,6 +123,19 @@ export type TenantMemberRecord = {
   isBetaTester: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Local accounts only: pending_setup, active, disabled. Null for WorkOS members. */
+  accountStatus?: "pending_setup" | "active" | "disabled" | "removed" | null;
+  /** Local accounts only: a second factor (authenticator app or passkey) is set up. */
+  mfaEnabled?: boolean;
+  /** Local accounts only. */
+  passkeyCount?: number;
+  /** Local accounts only: the latest email that carried a link, or null. */
+  linkEmail?: {
+    purpose: "account_setup" | "password_reset";
+    status: "queued" | "sending" | "sent" | "failed" | "expired";
+    updatedAt: string;
+    error: string | null;
+  } | null;
 };
 
 import type { TenantSettingsRecord } from "./tenant-settings-store.js";

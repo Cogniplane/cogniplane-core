@@ -1,11 +1,14 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import { Aes256GcmFindingEncryptor } from "./pii-finding-encryption.js";
+import { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import {
   PiiProtectionService,
   PiiProtectionServiceError,
   buildCsvPreview,
+  piiDecisionScanned,
+  type PiiDecision,
   type PiiPolicyReader,
   type PiiSubject
 } from "./pii-protection-service.js";
@@ -21,8 +24,8 @@ function buildSettings(overrides: Partial<PiiProtectionSettings> = {}): PiiProte
   };
 }
 
-function stubReader(settings: PiiProtectionSettings | null): PiiPolicyReader {
-  return { getPiiProtection: async () => settings };
+function stubReader(settings: unknown, revision = 1): PiiPolicyReader {
+  return { readPiiProtection: async () => ({ stored: settings, revision }) };
 }
 
 function stubProvider(overrides: Partial<PiiProvider> = {}): PiiProvider {
@@ -113,7 +116,7 @@ test("evaluateText allows when scope is excluded", async () => {
       buildSettings({
         enabled: true,
         mode: "block",
-        scopes: { chatPrompts: false, uploads: true, microsoftImports: true }
+        scopes: { chatPrompts: false, uploads: true, partnerImports: true }
       })
     ),
     ruleDetector: new RuleBasedPiiDetector(),
@@ -135,7 +138,7 @@ test("the skill_corpus subject is evaluated even when every tenant scope toggle 
       buildSettings({
         enabled: true,
         mode: "block",
-        scopes: { chatPrompts: false, uploads: false, microsoftImports: false }
+        scopes: { chatPrompts: false, uploads: false, partnerImports: false }
       })
     ),
     ruleDetector: new RuleBasedPiiDetector(),
@@ -792,14 +795,188 @@ test("rawRetention='never' still allows transform redaction of the prompt", asyn
   }
 });
 
-test("getActiveSettings falls back to DEFAULT_PII_PROTECTION when reader returns null", async () => {
+test("getPolicy falls back to DEFAULT_PII_PROTECTION when reader returns null", async () => {
   const service = new PiiProtectionService({
     policyReader: stubReader(null),
     ruleDetector: new RuleBasedPiiDetector(),
     timeoutMs: 5000
   });
-  const settings = await service.getActiveSettings("t1");
-  expect(settings).toEqual(DEFAULT_PII_PROTECTION);
+  const policy = await service.getPolicy("t1");
+  expect(policy.settings).toEqual(DEFAULT_PII_PROTECTION);
+  expect(policy.activation).toBe("off");
+});
+
+function invalidPolicyService(stored: unknown) {
+  const provider = stubProvider({
+    detectText: vi.fn(async () => ({ findings: [], providerType: "stub", providerModel: "m" })),
+    scanArtifact: vi.fn(async () => ({ findings: [], summaryText: null, providerType: "stub", providerModel: "m" }))
+  });
+  const ruleDetector = new RuleBasedPiiDetector();
+  const detect = vi.spyOn(ruleDetector, "detect");
+  const logger = { warn: vi.fn(), error: vi.fn() };
+  const service = new PiiProtectionService({ policyReader: stubReader(stored), ruleDetector, provider, timeoutMs: 5000, logger });
+  return { service, provider, detect, logger };
+}
+
+const ARTIFACT = {
+  artifactId: "a1",
+  contentType: "text/plain",
+  entityTypes: [],
+  readContent: vi.fn(async () => "a@b.co")
+};
+
+test("an invalid policy stops content in scope with pii_policy_invalid before any read or provider call", async () => {
+  const { service, provider, detect, logger } = invalidPolicyService({ ...DEFAULT_PII_PROTECTION, enabled: true, mode: "bogus" });
+  await expect(service.evaluateText({ tenantId: "t1", text: "a@b.co", subject: CHAT }))
+    .rejects.toMatchObject({ code: "pii_policy_invalid" });
+  await expect(service.evaluateArtifact({ tenantId: "t1", artifact: ARTIFACT, subject: { kind: "upload" } }))
+    .rejects.toMatchObject({ code: "pii_policy_invalid" });
+  expect(provider.detectText).not.toHaveBeenCalled();
+  expect(provider.scanArtifact).not.toHaveBeenCalled();
+  expect(detect).not.toHaveBeenCalled();
+  expect(ARTIFACT.readContent).not.toHaveBeenCalled();
+  expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({ tenantId: "t1", state: "error", reasons: ["mode_invalid"] }), expect.any(String));
+});
+
+test("an invalid policy lets content through when its valid scope is off, and an invalid scope counts as on", async () => {
+  const { service } = invalidPolicyService({
+    ...DEFAULT_PII_PROTECTION, enabled: true, mode: "off", scopes: { chatPrompts: false, uploads: "x" }
+  });
+  expect(await service.evaluateText({ tenantId: "t1", text: "a@b.co", subject: CHAT }))
+    .toEqual({ action: "allow", reason: "scope_excluded" });
+  await expect(service.evaluateArtifact({ tenantId: "t1", artifact: ARTIFACT, subject: { kind: "upload" } }))
+    .rejects.toMatchObject({ code: "pii_policy_invalid" });
+});
+
+test("detect uses only the rules when a stored provider field is invalid, and logs a warning", async () => {
+  const { service, provider, logger } = invalidPolicyService({
+    ...DEFAULT_PII_PROTECTION, enabled: true, mode: "detect", provider: { type: "openai-compatible", model: 7 }
+  });
+  const decision = await service.evaluateText({ tenantId: "t1", text: "write to a@b.co", subject: CHAT });
+  expect(decision.action).toBe("report");
+  const artifact = await service.evaluateArtifact({ tenantId: "t1", artifact: ARTIFACT, subject: { kind: "upload" } });
+  expect(artifact.action).toBe("report");
+  expect(provider.detectText).not.toHaveBeenCalled();
+  expect(provider.scanArtifact).not.toHaveBeenCalled();
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ reasons: ["provider_invalid"], fields: ["provider.model"] }), expect.any(String));
+});
+
+test("an invalid policy error carries the settings revision that the evaluation read", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader({ ...DEFAULT_PII_PROTECTION, enabled: true, mode: "bogus" }, 9),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000
+  });
+  await expect(service.evaluateTextWithPolicy({ tenantId: "t1", text: "a@b.co", subject: CHAT }))
+    .rejects.toMatchObject({ code: "pii_policy_invalid", policyRevision: 9 });
+  await expect(service.evaluateArtifact({ tenantId: "t1", artifact: ARTIFACT, subject: { kind: "upload" } }))
+    .rejects.toMatchObject({ code: "pii_policy_invalid", policyRevision: 9 });
+});
+
+test("the applied mode and revision come from the same settings read as the decision", async () => {
+  // Each read returns the next save. A second read for the record would see
+  // the save after the one that made the decision.
+  const saves = [
+    { stored: buildSettings({ enabled: true, mode: "block" }), revision: 4 },
+    { stored: buildSettings({ enabled: true, mode: "detect" }), revision: 5 },
+    { stored: buildSettings({ enabled: true, mode: "transform" }), revision: 6 }
+  ];
+  const readPiiProtection = vi.fn(async () => saves.shift()!);
+  const service = new PiiProtectionService({
+    policyReader: { readPiiProtection },
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000
+  });
+  const artifact = { ...ARTIFACT, readContent: async () => "a@b.co" };
+  const upload = { tenantId: "t1", artifact, subject: { kind: "upload" } as const };
+
+  const blocked = await service.evaluateArtifactWithPolicy(upload);
+  expect(blocked.decision.action).toBe("block");
+  expect(blocked.appliedPolicy).toEqual({ mode: "block", revision: 4 });
+  expect(readPiiProtection).toHaveBeenCalledTimes(1);
+
+  const reported = await service.evaluateTextWithPolicy({ tenantId: "t1", text: "write to a@b.co", subject: CHAT });
+  expect(reported.decision.action).toBe("report");
+  expect(reported.appliedPolicy).toEqual({ mode: "detect", revision: 5 });
+  expect(readPiiProtection).toHaveBeenCalledTimes(2);
+
+  // Artifact transform reports in phase 1, but the policy mode is transform.
+  const transformed = await service.evaluateArtifactWithPolicy(upload);
+  expect(transformed.decision.action).toBe("report");
+  expect(transformed.appliedPolicy).toEqual({ mode: "transform", revision: 6 });
+});
+
+test("the applied mode is off when the policy is off or the subject is out of scope", async () => {
+  const applied = async (settings: PiiProtectionSettings, text: string) => {
+    const service = new PiiProtectionService({ policyReader: stubReader(settings, 3), ruleDetector: new RuleBasedPiiDetector(), timeoutMs: 5000 });
+    return service.evaluateTextWithPolicy({ tenantId: "t1", text, subject: CHAT });
+  };
+  // A stored mode with protection off still scans nothing.
+  expect(await applied(buildSettings({ enabled: false, mode: "block" }), "a@b.co")).toEqual({
+    decision: { action: "allow", reason: "disabled" }, appliedPolicy: { mode: "off", revision: 3 }
+  });
+  expect(await applied(buildSettings({ enabled: true, mode: "detect", scopes: { chatPrompts: false, uploads: true } }), "a@b.co"))
+    .toEqual({ decision: { action: "allow", reason: "scope_excluded" }, appliedPolicy: { mode: "off", revision: 3 } });
+  // A scan with no findings applied its mode.
+  expect(await applied(buildSettings({ enabled: true, mode: "detect" }), "no personal data")).toEqual({
+    decision: { action: "allow", reason: "no_findings" }, appliedPolicy: { mode: "detect", revision: 3 }
+  });
+});
+
+test("an evaluation given an earlier read uses it and does not read the policy again", async () => {
+  const readPiiProtection = vi.fn(async () => ({ stored: buildSettings({ enabled: true, mode: "block" }), revision: 4 }));
+  const service = new PiiProtectionService({
+    policyReader: { readPiiProtection }, ruleDetector: new RuleBasedPiiDetector(), provider: stubProvider(), timeoutMs: 5000
+  });
+  const read = await service.readPolicy("t1");
+  expect(read).toMatchObject({ tenantId: "t1", revision: 4, policy: { activation: "on", settings: { mode: "block" } } });
+
+  const artifact = { ...ARTIFACT, readContent: async () => "a@b.co" };
+  const blocked = await service.evaluateArtifactWithPolicy({ tenantId: "t1", artifact, subject: { kind: "upload" } }, read);
+  const text = await service.evaluateTextWithPolicy({ tenantId: "t1", text: "no personal data", subject: CHAT }, read);
+
+  expect(readPiiProtection).toHaveBeenCalledTimes(1);
+  expect(blocked).toMatchObject({ decision: { action: "block" }, appliedPolicy: { mode: "block", revision: 4 } });
+  expect(text).toEqual({ decision: { action: "allow", reason: "no_findings" }, appliedPolicy: { mode: "block", revision: 4 } });
+});
+
+test("an evaluation refuses an earlier read for a different tenant", async () => {
+  const readPiiProtection = vi.fn(async () => ({ stored: buildSettings({ enabled: true, mode: "block" }), revision: 4 }));
+  const service = new PiiProtectionService({
+    policyReader: { readPiiProtection }, ruleDetector: new RuleBasedPiiDetector(), provider: stubProvider(), timeoutMs: 5000
+  });
+  const otherTenant = await service.readPolicy("t2");
+  const artifact = { ...ARTIFACT, readContent: async () => "a@b.co" };
+
+  await expect(service.evaluateTextWithPolicy({ tenantId: "t1", text: "a@b.co", subject: CHAT }, otherTenant))
+    .rejects.toThrow("PII policy read is for a different tenant");
+  await expect(service.evaluateArtifactWithPolicy({ tenantId: "t1", artifact, subject: { kind: "upload" } }, otherTenant))
+    .rejects.toThrow("PII policy read is for a different tenant");
+});
+
+test("piiDecisionScanned classifies every allow reason and refuses an unknown one", () => {
+  expect(piiDecisionScanned({ action: "allow", reason: "no_findings" })).toBe(true);
+  expect(piiDecisionScanned({ action: "allow", reason: "disabled" })).toBe(false);
+  expect(piiDecisionScanned({ action: "allow", reason: "scope_excluded" })).toBe(false);
+  expect(piiDecisionScanned({ action: "report", findings: [], providerType: null, providerModel: null })).toBe(true);
+  // A reason that the switch does not know must not count as "scanned nothing".
+  expect(() => piiDecisionScanned({ action: "allow", reason: "future_reason" } as unknown as PiiDecision))
+    .toThrow("Unknown PII allow reason: future_reason");
+});
+
+test("a registered import uses its own scope; an unregistered import is in scope", async () => {
+  const importScopes = new PiiImportScopeRegistry();
+  importScopes.register({ subjectKind: "partner_import", scopeKey: "partnerImports", defaultOn: true });
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "detect", scopes: { chatPrompts: true, uploads: true, partnerImports: false } })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000,
+    importScopes
+  });
+  const evaluate = (subjectKind: string) =>
+    service.evaluateText({ tenantId: "t1", text: "a@b.co", subject: { kind: "import", subjectKind } });
+  expect(await evaluate("partner_import")).toEqual({ action: "allow", reason: "scope_excluded" });
+  expect((await evaluate("unknown_import")).action).toBe("report");
 });
 
 test("detect mode degrades to rules-only when provider throws breaker_open", async () => {

@@ -49,8 +49,10 @@ backend image alone no longer applies migrations.
 | Consumer | Required tables and operations |
 |---|---|
 | WorkOS provisioning and membership checks | SELECT, INSERT, UPDATE on tenants, users, tenant_memberships |
+| Local sign-in lookups (account by email, link by token hash, passkey by credential id) | SELECT on local_identities, auth_action_tokens, user_passkeys. Every later read and write of a local account runs as app_user in the tenant's scope. |
+| Mail outbox worker (claims, retries, expiry, purge) | SELECT, UPDATE, DELETE on email_outbox. Messages are written by app_user in the tenant's scope. |
 | Provider credentials and PII policy | SELECT on tenant_org_settings |
-| Scheduler claims and stale-run recovery | SELECT, UPDATE on scheduled_jobs and scheduled_job_runs; membership reads |
+| Scheduler claims, security pauses, and stale-run recovery | SELECT, UPDATE on scheduled_jobs and scheduled_job_runs; membership reads; SELECT on local_identities (the owner's security version) |
 | PII claims and recovery | SELECT, UPDATE on pii_scan_jobs; SELECT on pii_scan_runs |
 | Approval, execution, and message recovery | SELECT, UPDATE on approvals, session_executions, messages, message_tool_results |
 | Download-token lookup and consumption | SELECT, UPDATE on artifact_download_tokens; SELECT on artifacts, sessions, projects, project_memberships, tenant_memberships |

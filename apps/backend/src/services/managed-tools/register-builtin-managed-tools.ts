@@ -1,9 +1,6 @@
 import { type ManagedToolCatalog, type ManagedToolCatalogEntry } from "./catalog.js";
 import { type ManagedToolFactoryRegistry } from "./factory.js";
-import { createGithubTools, GITHUB_TOOL_CATALOG } from "./github-tools.js";
-import { createJiraTools, JIRA_TOOL_CATALOG } from "./jira-tools.js";
 import { createMemoryTools, MEMORY_TOOL_CATALOG } from "./memory-tools.js";
-import { createNotionTools, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 import { createSessionTools, SESSION_TOOL_CATALOG } from "./session-tools.js";
 import { createSkillCorpusTool, SKILL_CORPUS_TOOL_CATALOG } from "./skill-corpus-tool.js";
 import { createWriteArtifactTool, WRITE_ARTIFACT_CATALOG } from "./write-artifact.js";
@@ -11,7 +8,7 @@ import { createProjectTools, PROJECT_TOOL_CATALOG } from "./project-tools.js";
 import { createInteractiveUiTool, INTERACTIVE_UI_CATALOG } from "./interactive-ui.js";
 import type { ManagedToolAppResource } from "./types.js";
 
-type RawCatalogEntry = {
+export type RawCatalogEntry = {
   name: string;
   description: string;
   readOnly: boolean;
@@ -19,7 +16,7 @@ type RawCatalogEntry = {
   requiresUserApproval?: boolean;
 };
 
-function asCatalogEntries(
+export function asCatalogEntries(
   entries: ReadonlyArray<RawCatalogEntry>,
   tenantConfigurable: boolean,
   category: string
@@ -35,12 +32,21 @@ function asCatalogEntries(
   }));
 }
 
-// Register every built-in managed tool catalog and factory on the supplied
-// registry instances. Called once per `buildAppDependencies()`.
+// Register the built-in managed tool catalog and the factories that come
+// before the built-in connector modules. Called once per
+// `buildAppDependencies()`.
 //
-// Optional overlay tools are not registered here. They register themselves via
-// their own bootstrap so they can capture any integration-specific services in
-// a closure.
+// The factory order sets the order of the MCP `tools/list` response. The agent
+// runtime loads its managed tools from that response. Keep this order:
+//   1. `registerBuiltinManagedTools`: session, skill-corpus.
+//   2. The built-in connector modules (`services/connectors/builtin-connectors.ts`):
+//      github, notion, jira.
+//   3. `registerBuiltinManagedToolsAfterConnectors`: write-artifact, project,
+//      memory, interactive-ui.
+//   4. Overlays.
+//
+// Connector and overlay tools are not registered here. Each registers its own
+// catalog entries and a factory closure that captures its own services.
 export function registerBuiltinManagedTools(
   catalog: ManagedToolCatalog,
   factoryRegistry: ManagedToolFactoryRegistry
@@ -54,17 +60,15 @@ export function registerBuiltinManagedTools(
   catalog.register(asCatalogEntries(MEMORY_TOOL_CATALOG, true, "memory"));
   catalog.register(asCatalogEntries(INTERACTIVE_UI_CATALOG, true, "interactive-ui"));
 
-  // tenantConfigurable=false: integration-owned tools, gated by the
-  // integrations system (tenant_integrations toggles + readiness).
-  catalog.register(asCatalogEntries(GITHUB_TOOL_CATALOG, false, "github"));
-  catalog.register(asCatalogEntries(NOTION_TOOL_CATALOG, false, "notion"));
-  catalog.register(asCatalogEntries(JIRA_TOOL_CATALOG, false, "jira"));
-
   factoryRegistry.register("session", createSessionTools);
   factoryRegistry.register("skill-corpus", createSkillCorpusTool);
-  factoryRegistry.register("github", createGithubTools);
-  factoryRegistry.register("notion", createNotionTools);
-  factoryRegistry.register("jira", createJiraTools);
+}
+
+// Register the built-in factories that come after the built-in connector
+// modules. See the order in `registerBuiltinManagedTools`.
+export function registerBuiltinManagedToolsAfterConnectors(
+  factoryRegistry: ManagedToolFactoryRegistry
+): void {
   factoryRegistry.register("write-artifact", createWriteArtifactTool);
   factoryRegistry.register("project", (deps) => deps.projectFiles ? createProjectTools({
     projectFiles: deps.projectFiles,

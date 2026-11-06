@@ -90,6 +90,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   only_owner_can_change_admin_role: "Only owners can change an admin's role.",
   cannot_change_own_role: "You cannot change your own role.",
   cannot_demote_owner: "An owner cannot be demoted.",
+  account_not_active: "Only a person with an active account can become an owner.",
   cannot_remove_self: "You cannot remove yourself.",
   cannot_remove_owner: "Owners cannot be removed.",
   only_owner_can_remove_admin: "Only owners can remove an admin.",

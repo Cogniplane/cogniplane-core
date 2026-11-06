@@ -39,7 +39,6 @@ import {
   type TenantProviderKeyUpdateRequest,
   TenantMarketplaceManifestUrlUpdateResponseSchema,
   TenantDetailsSchema,
-  TenantOkResponseSchema,
   TenantPiiProtectionUpdateResponseSchema,
   TenantSettingsEnvelopeSchema
 } from "@cogniplane/shared-types";
@@ -401,15 +400,21 @@ export async function getAdminPersonAccess(
 // Member role and removal live on the tenant routes. The backend enforces who
 // may change what (apps/backend/src/routes/tenant.ts); callers show only the
 // permitted actions and map the error codes for the rest.
-export async function changeMemberRole(userId: string, role: AdminUser["role"]): Promise<void> {
+/** `stepUpToken`: required to change the role of a local account. */
+export async function changeMemberRole(userId: string, role: AdminUser["role"], stepUpToken?: string): Promise<void> {
   await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}/role`, {
     method: "PUT",
-    body: JSON.stringify({ role })
+    body: JSON.stringify({ role }),
+    ...(stepUpToken ? { headers: { "X-Step-Up": stepUpToken } } : {})
   });
 }
 
-export async function removeMember(userId: string): Promise<void> {
-  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}`, { method: "DELETE" });
+/** `stepUpToken`: required to remove a member of a tenant with local login. */
+export async function removeMember(userId: string, stepUpToken?: string): Promise<void> {
+  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}`, {
+    method: "DELETE",
+    ...(stepUpToken ? { headers: { "X-Step-Up": stepUpToken } } : {})
+  });
 }
 
 export async function getTenantSettings(): Promise<TenantSettings> {
@@ -549,34 +554,19 @@ export async function updateTenantMarketplaceManifestUrl(
   );
 }
 
-export async function updateTenantPiiProtection(input: PiiProtectionSettings) {
+// Send the revision that the form loaded. The server then refuses the save with
+// 409 `pii_settings_conflict` when another session saved first. A server older
+// than the revision sends none, so the save then has no revision.
+export async function updateTenantPiiProtection(input: PiiProtectionSettings, expectedRevision?: number) {
   const raw = await request<unknown>("/tenant/settings/pii", {
     method: "PUT",
-    body: JSON.stringify(input)
+    body: JSON.stringify(expectedRevision === undefined ? input : { ...input, expectedRevision })
   });
   return parseResponse(
     TenantPiiProtectionUpdateResponseSchema,
     raw,
     "PUT /tenant/settings/pii"
   );
-}
-
-export async function saveTenantMicrosoftConfig(input: {
-  clientId?: string;
-  clientSecret?: string;
-  entraTenantId?: string;
-}) {
-  const raw = await request<unknown>("/tenant/settings/microsoft", {
-    method: "PUT",
-    body: JSON.stringify(input)
-  });
-  return parseResponse(TenantOkResponseSchema, raw, "PUT /tenant/settings/microsoft");
-}
-
-export async function deleteTenantMicrosoftConfig(): Promise<void> {
-  await request<void>("/tenant/settings/microsoft", {
-    method: "DELETE"
-  });
 }
 
 // ─── PII admin metrics ──────────────────────────────────────────────────────

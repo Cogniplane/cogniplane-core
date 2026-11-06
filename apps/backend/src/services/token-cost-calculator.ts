@@ -28,6 +28,10 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input:  2.00, cachedInput: 0.10,  output: 10.00 },
     long:  { input:  4.00, cachedInput: 0.20,  output: 15.00 }
   },
+  "gpt-6.1-terra": {
+    short: { input:  1.00, cachedInput: 0.05,  output:  5.00 },
+    long:  { input:  2.00, cachedInput: 0.10,  output:  7.50 }
+  },
   "gpt-6-sol": {
     short: { input:  2.00, cachedInput: 0.20,  output: 10.00 },
     long:  { input:  4.00, cachedInput: 0.40,  output: 15.00 }
@@ -142,6 +146,15 @@ const PRICING: Record<string, ModelPricing> = {
   // Keys are the bare VENDOR model id (catalog id with its first namespace
   // segment stripped — inner slashes and the `:free` suffix preserved), which
   // is exactly what resolveModelConstruction().vendorModel yields.
+  // Gemini 4 Argon is the one Google row taken from Google's own pricing page
+  // (it is newer than the OpenRouter-sourced rows). Google's introductory
+  // rates end on a set date, and this table holds one rate per model: Argon
+  // doubles to $4.00/$0.20/$20.00 on 2026-12-01, and 3.8 Flash doubles to
+  // $1.50/$0.15/$7.50 on 2027-01-01. Update these rows on those dates.
+  "gemini-4-argon": {
+    short: { input: 2.00, cachedInput: 0.10,   output: 10.00 },
+    long:  null
+  },
   "gemini-3.8-flash": {
     short: { input: 0.75, cachedInput: 0.075,  output:  3.75 },
     long:  null
@@ -196,10 +209,6 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0.20,  cachedInput: 0.04,   output: 1.15 },
     long:  null
   },
-  "qwen/qwen3.7-max": {
-    short: { input: 1.475, cachedInput: 0.295,  output: 4.425 },
-    long:  null
-  },
   "qwen/qwen3.8-max-0902": {
     short: { input: 2.00,  cachedInput: 0.25,   output: 6.00 },
     long:  null
@@ -213,11 +222,27 @@ const PRICING: Record<string, ModelPricing> = {
     long:  null
   },
   "mistralai/mistral-large-4-0": {
-    short: { input: 0.68,  cachedInput: 0.07,   output: 2.09 },
+    short: { input: 1.36,  cachedInput: 0.14,   output: 4.18 },
     long:  null
   },
   "meta/muse-spark-1.3": {
     short: { input: 1.25,  cachedInput: 0.15,   output: 4.25 },
+    long:  null
+  },
+  "meta/muse-wonder": {
+    short: { input: 4.00,  cachedInput: 0.20,   output: 20.00 },
+    long:  null
+  },
+  "moonshotai/kimi-k3.1-pro": {
+    short: { input: 2.00,  cachedInput: 0.20,   output: 10.00 },
+    long:  null
+  },
+  "minimax/minimax-m3.1-flash": {
+    short: { input: 0.15,  cachedInput: 0.015,  output: 0.60 },
+    long:  null
+  },
+  "stepfun/step-5-preview": {
+    short: { input: 1.00,  cachedInput: 0.10,   output: 2.70 },
     long:  null
   },
   "z-ai/glm-5.2": {
@@ -232,7 +257,7 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0.30,  cachedInput: 0.006,  output: 1.20 },
     long:  null
   },
-  "nvidia/nemotron-3-super-120b-a12b:free": {
+  "nvidia/nemotron-3.5-super-vl:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
@@ -256,7 +281,17 @@ const PRICING: Record<string, ModelPricing> = {
   // 2026-09-18 gpt-oss-120b:free, tencent/hy3:free and minimax-m3:free 404 on
   // OpenRouter, and glm-5.2:free no longer accepts tools. On 2026-10-08
   // deepseek-v4-flash-0731:free was gone, and V4.1 Flash and MiMo V2.6
-  // replaced their predecessors in the catalog.
+  // replaced their predecessors in the catalog. On 2026-10-27
+  // nemotron-3-super-120b-a12b:free was gone, and Qwen3.8 Max replaced Qwen3.7
+  // Max in the catalog.
+  "nvidia/nemotron-3-super-120b-a12b:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
+  "qwen/qwen3.7-max": {
+    short: { input: 1.475, cachedInput: 0.295,  output: 4.425 },
+    long:  null
+  },
   "deepseek/deepseek-v4-flash-0731:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null

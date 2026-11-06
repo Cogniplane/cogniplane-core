@@ -5,12 +5,13 @@ import { useState } from "react";
 
 import { toErrorMessage } from "../lib/error-utils";
 
-export type OAuthConnectionBusyKey = "connect" | "disconnect";
+export type OAuthConnectionBusyKey = "connect" | "disconnect" | "confirm";
 
 type OAuthConnectionMessages = {
   load: string;
   connect: string;
   disconnect: string;
+  confirm: string;
 };
 
 type OAuthConnectionOptions<TStatus> = {
@@ -18,6 +19,12 @@ type OAuthConnectionOptions<TStatus> = {
   fetchStatus: () => Promise<TStatus>;
   createAuthorizationUrl: () => Promise<string>;
   deleteConnection: () => Promise<void>;
+  /**
+   * Confirms a connection that a security change suspended, for the account
+   * in `status`, the status that the page shows. Absent for a provider whose
+   * account has no attested identity (Jira): there is no confirm.
+   */
+  confirmConnection?: (status: TStatus) => Promise<unknown>;
   messages: OAuthConnectionMessages;
   /**
    * Reload the status after a failed disconnect too. Set it when the server
@@ -46,6 +53,16 @@ export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TSta
     }
   });
 
+  const confirmMutation = useMutation({
+    mutationFn: options.confirmConnection ?? (async () => undefined),
+    onMutate: () => setActiveMutation("confirm"),
+    onSettled: () => {
+      setActiveMutation(null);
+      // Also after an error: the account can have changed meanwhile.
+      void queryClient.invalidateQueries({ queryKey: options.queryKey });
+    }
+  });
+
   const loadError = statusQuery.error
     ? toErrorMessage(statusQuery.error, options.messages.load)
     : null;
@@ -53,12 +70,16 @@ export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TSta
     ? toErrorMessage(disconnectMutation.error, options.messages.disconnect)
     : null;
 
+  const confirmError = confirmMutation.error
+    ? toErrorMessage(confirmMutation.error, options.messages.confirm)
+    : null;
+
   return {
     status: statusQuery.data ?? null,
     isLoading: statusQuery.isFetching,
     statusError: loadError,
     busyKey: activeMutation,
-    error: connectError ?? disconnectError ?? loadError,
+    error: connectError ?? disconnectError ?? confirmError ?? loadError,
     reload: () => queryClient.invalidateQueries({ queryKey: options.queryKey }),
     connect: async () => {
       setActiveMutation("connect");
@@ -73,8 +94,16 @@ export function useOAuthConnection<TStatus>(options: OAuthConnectionOptions<TSta
     },
     disconnect: () => {
       setConnectError(null);
+      confirmMutation.reset();
       disconnectMutation.reset();
       disconnectMutation.mutate();
+    },
+    confirm: () => {
+      if (!statusQuery.data || !options.confirmConnection) return;
+      setConnectError(null);
+      disconnectMutation.reset();
+      confirmMutation.reset();
+      confirmMutation.mutate(statusQuery.data);
     }
   };
 }

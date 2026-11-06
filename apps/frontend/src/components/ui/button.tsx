@@ -10,15 +10,18 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default: "bg-primary text-primary-foreground hover:bg-primary/90",
+        // A solid destructive fill with its paired foreground in both themes:
+        // white on Guardrail Red in light, dark ink on the lifted coral in dark.
         destructive:
-          "bg-destructive text-white hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:bg-destructive/60 dark:focus-visible:ring-destructive/40",
+          "bg-destructive text-destructive-foreground hover:bg-destructive/90 focus-visible:ring-destructive/40",
+        // The edge is the control boundary (3:1), not the faint divider.
         outline:
-          "border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
+          "border border-input bg-control hover:bg-accent hover:text-accent-foreground",
         secondary:
           "bg-brand-surface text-brand-strong ring-1 ring-inset ring-brand-border hover:bg-brand-surface/70",
         ghost:
           "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
-        link: "text-primary underline-offset-4 hover:underline",
+        link: "text-primary underline underline-offset-4 hover:decoration-2",
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",

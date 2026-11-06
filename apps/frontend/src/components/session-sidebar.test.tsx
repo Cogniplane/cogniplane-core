@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
 import type { Project, Session } from "@cogniplane/shared-types";
 
-import { API_URL, setAccessToken } from "../lib/api-client";
+import { setAccessToken } from "../lib/api-client";
 import { SessionSidebar } from "./session-sidebar";
 import { deriveAttentionSessionIds } from "./session-list-derivations";
 
@@ -64,9 +64,9 @@ it("promotes pending sessions above pins, filters them, and restores their group
     { ...session, sessionId: "live", sessionName: "Live work", purpose: "skill_improvement" }
   ];
   const props = {
-    list: { sessions, selectedId: "live", isLoading: false, streamingIds: new Set(["running"]), attentionIds: deriveAttentionSessionIds(sessions, "live", 1, true), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
+    list: { sessions, selectedId: "live", isLoading: false, streamingIds: new Set(["running"]), attentionIds: deriveAttentionSessionIds(sessions, "live", 1, true), errorId: null, onSelect: vi.fn(), onCreate: vi.fn(), onNewSession: vi.fn() },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
-    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    deletion: { busyId: null, onRequest: vi.fn() },
     pinning: { busyId: null, ids: new Set(["pinned", "approval"]), onToggle: vi.fn() }
   };
   const view = render(<SessionSidebar {...props} />);
@@ -93,6 +93,7 @@ it("promotes pending sessions above pins, filters them, and restores their group
 
 it("shows active projects and hides archived projects from the sidebar", async () => {
   const onCreate = vi.fn().mockResolvedValue(undefined);
+  const onNewSession = vi.fn();
   const onAddToProject = vi.fn().mockResolvedValue(undefined);
   const projectSession = { ...session, sessionId: "project-session", sessionName: "Launch research", projectId: project.projectId };
   const archivedSession = { ...session, sessionId: "archived-session", sessionName: "Old notes", projectId: archivedProject.projectId };
@@ -100,9 +101,9 @@ it("shows active projects and hides archived projects from the sidebar", async (
     <SessionSidebar
       projects={[project, archivedProject]}
       onAddToProject={onAddToProject}
-      list={{ sessions: [session, projectSession, archivedSession], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, attentionIds: new Set([projectSession.sessionId]), onSelect: vi.fn(), onCreate }}
+      list={{ sessions: [session, projectSession, archivedSession], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, attentionIds: new Set([projectSession.sessionId]), onSelect: vi.fn(), onCreate, onNewSession }}
       rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
-      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
+      deletion={{ busyId: null, onRequest: vi.fn() }}
       pinning={{ busyId: null, ids: new Set([projectSession.sessionId]), onToggle: vi.fn() }}
     />
   );
@@ -121,54 +122,21 @@ it("shows active projects and hides archived projects from the sidebar", async (
   expect(screen.getByRole("button", { name: /^Launch research/ })).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
-  fireEvent.change(screen.getByLabelText("Project"), { target: { value: project.projectId } });
-  fireEvent.click(screen.getByRole("button", { name: "Create session" }));
-  await waitFor(() => expect(onCreate).toHaveBeenCalledWith(project.projectId));
+  expect(onNewSession).toHaveBeenCalledOnce();
 
   fireEvent.keyDown(screen.getByRole("button", { name: "Session actions for Research notes" }), { key: "Enter" });
   fireEvent.click(await screen.findByRole("menuitem", { name: "Add to project" }));
-  fireEvent.click(screen.getByRole("button", { name: "Add to project" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Add to project" }));
   await waitFor(() => expect(onAddToProject).toHaveBeenCalledWith("session-1", project.projectId));
-});
-
-it("opens the create dialog with Ctrl+Shift+O, also from the search field", async () => {
-  render(
-    <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() }}
-      rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
-      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
-      pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
-    />
-  );
-  fireEvent.keyDown(screen.getByLabelText("Search sessions"), { key: "O", ctrlKey: true, shiftKey: true });
-  expect(await screen.findByRole("dialog", { name: "New session" })).toBeTruthy();
-});
-
-it("keeps the create dialog open and shows a creation error", async () => {
-  const onCreate = vi.fn().mockRejectedValue(new Error("Session service unavailable"));
-  render(
-    <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate }}
-      rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
-      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
-      pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
-    />
-  );
-
-  fireEvent.click(screen.getByRole("button", { name: "New session" }));
-  fireEvent.click(screen.getByRole("button", { name: "Create session" }));
-
-  expect((await screen.findByRole("alert")).textContent).toContain("Session service unavailable");
-  expect(screen.getByRole("dialog")).toBeTruthy();
 });
 
 it("does not offer project assignment for non-normal sessions", async () => {
   render(
     <SessionSidebar
       projects={[project]}
-      list={{ sessions: [{ ...session, purpose: "skill_improvement" }], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn().mockResolvedValue(undefined) }}
+      list={{ sessions: [{ ...session, purpose: "skill_improvement" }], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn().mockResolvedValue(undefined), onNewSession: vi.fn() }}
       rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
-      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
+      deletion={{ busyId: null, onRequest: vi.fn() }}
       pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
     />
   );
@@ -183,10 +151,10 @@ it("routes select, pin, rename, and delete actions through their owners", async 
   const onStartRename = vi.fn();
   const onRequestDelete = vi.fn();
   const rename = { busyId: null, sessionId: null, renameDraft: "", onStartRename, onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() };
-  const deletion = { busyId: null, pendingId: null, onRequest: onRequestDelete, onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() };
+  const deletion = { busyId: null, onRequest: onRequestDelete };
   const view = render(
     <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), attentionIds: new Set(), errorId: null, onSelect, onCreate: vi.fn() }}
+      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), attentionIds: new Set(), errorId: null, onSelect, onCreate: vi.fn(), onNewSession: vi.fn() }}
       rename={rename}
       deletion={deletion}
       pinning={{ busyId: null, ids: new Set(), onToggle: onTogglePin }}
@@ -205,18 +173,7 @@ it("routes select, pin, rename, and delete actions through their owners", async 
 
   view.rerender(
     <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), attentionIds: new Set(), errorId: null, onSelect, onCreate: vi.fn() }}
-      rename={rename}
-      deletion={{ ...deletion, pendingId: "session-1" }}
-      pinning={{ busyId: null, ids: new Set(), onToggle: onTogglePin }}
-    />
-  );
-  fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
-  expect(deletion.onConfirmDelete).toHaveBeenCalledOnce();
-
-  view.rerender(
-    <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), attentionIds: new Set(), errorId: null, onSelect, onCreate: vi.fn() }}
+      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), attentionIds: new Set(), errorId: null, onSelect, onCreate: vi.fn(), onNewSession: vi.fn() }}
       rename={{ ...rename, sessionId: "session-1", renameDraft: "New title" }}
       deletion={deletion}
       pinning={{ busyId: null, ids: new Set(), onToggle: onTogglePin }}
@@ -230,9 +187,9 @@ it("routes select, pin, rename, and delete actions through their owners", async 
 it("archives idle sessions and disables archive for running turns and pending approvals", async () => {
   const onArchive = vi.fn();
   const props = {
-    list: { sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), attentionIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
+    list: { sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), attentionIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn(), onNewSession: vi.fn() },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
-    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    deletion: { busyId: null, onRequest: vi.fn() },
     pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() },
     archive: { busyId: null, onArchive }
   };
@@ -271,9 +228,9 @@ it("archives idle sessions and disables archive for running turns and pending ap
 
 it("shows stored failures for unselected sessions and clears them during retry", () => {
   const props = {
-    list: { sessions: [{ ...session, hasTurnFailed: true }], selectedId: null, isLoading: false, streamingIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() },
+    list: { sessions: [{ ...session, hasTurnFailed: true }], selectedId: null, isLoading: false, streamingIds: new Set<string>(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn(), onNewSession: vi.fn() },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
-    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    deletion: { busyId: null, onRequest: vi.fn() },
     pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() }
   };
   const view = render(<SessionSidebar {...props} />);
@@ -286,13 +243,13 @@ it("shows stored failures for unselected sessions and clears them during retry",
 it("delegates search and paging, disables pending loads and retries without hiding existing rows", () => {
   const list = {
     sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set<string>(), errorId: null,
-    onSelect: vi.fn(), onCreate: vi.fn(), search: "", onSearch: vi.fn(), hasMore: true,
+    onSelect: vi.fn(), onCreate: vi.fn(), onNewSession: vi.fn(), search: "", onSearch: vi.fn(), hasMore: true,
     isLoadingMore: false, onLoadMore: vi.fn(), error: null as string | null, onRetry: vi.fn()
   };
   const props = {
     list,
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
-    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    deletion: { busyId: null, onRequest: vi.fn() },
     pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() }
   };
   const view = render(<SessionSidebar {...props} />);
@@ -317,10 +274,10 @@ it("trusts server search hits when the cached project name is stale and keeps co
     list: {
       sessions: [{ ...session, projectId: project.projectId }], selectedId: null,
       isLoading: false, streamingIds: new Set<string>(), errorId: null,
-      onSelect: vi.fn(), onCreate: vi.fn(), search: "Renamed project", onSearch: vi.fn(), hasMore: true
+      onSelect: vi.fn(), onCreate: vi.fn(), onNewSession: vi.fn(), search: "Renamed project", onSearch: vi.fn(), hasMore: true
     },
     rename: { busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() },
-    deletion: { busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() },
+    deletion: { busyId: null, onRequest: vi.fn() },
     pinning: { busyId: null, ids: new Set<string>(), onToggle: vi.fn() }
   };
   const view = render(<SessionSidebar {...props} />);
@@ -332,88 +289,4 @@ it("trusts server search hits when the cached project name is stale and keeps co
   // Without a server-search callback the component still supports local filtering.
   view.rerender(<SessionSidebar {...props} list={{ ...props.list, onSearch: undefined }} />);
   expect(screen.queryByRole("button", { name: /^Research notes/ })).toBeNull();
-});
-
-describe("backend build in the sidebar footer", () => {
-  const DIAGNOSTICS = {
-    status: "ok",
-    uptimeSeconds: 120,
-    version: { sha: "abcdef0123456789", buildDate: "2026-10-12T08:30:00Z" },
-    runtimes: { activeRuntimeCount: 1, activeTurnCount: 0 }
-  };
-  const json = (status: number, body: unknown) =>
-    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-  const sidebar = () => (
-    <SessionSidebar
-      list={{ sessions: [session], selectedId: null, isLoading: false, streamingIds: new Set(), errorId: null, onSelect: vi.fn(), onCreate: vi.fn() }}
-      rename={{ busyId: null, sessionId: null, renameDraft: "", onStartRename: vi.fn(), onCancelRename: vi.fn(), onConfirmRename: vi.fn(), onRenameDraftChange: vi.fn() }}
-      deletion={{ busyId: null, pendingId: null, onRequest: vi.fn(), onConfirmDelete: vi.fn(), onCancelDelete: vi.fn() }}
-      pinning={{ busyId: null, ids: new Set(), onToggle: vi.fn() }}
-    />
-  );
-  const requested = (fetchMock: ReturnType<typeof vi.fn>) => fetchMock.mock.calls.map((call: unknown[]) => String(call[0]));
-
-  it.each(["admin", "owner"])("shows the backend build to the %s role, from the authenticated diagnostics request", async (role) => {
-    auth.role = role;
-    setAccessToken("admin-token");
-    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => json(200, DIAGNOSTICS));
-    vi.stubGlobal("fetch", fetchMock);
-    render(sidebar());
-
-    expect(await screen.findByText("be · abcdef0 · 2026-10-12")).toBeTruthy();
-    expect(screen.getByText("be · abcdef0 · 2026-10-12").getAttribute("title"))
-      .toBe("Backend: abcdef0123456789 · 2026-10-12T08:30:00Z");
-    expect(requested(fetchMock)).toEqual([`${API_URL}/admin/diagnostics`]);
-    const init = fetchMock.mock.calls[0]![1];
-    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer admin-token");
-  });
-
-  it.each(["member", undefined])("makes no diagnostics or health request for the %s role, and shows only the frontend build", async (role) => {
-    auth.role = role;
-    setAccessToken("member-token");
-    const fetchMock = vi.fn(async () => json(200, DIAGNOSTICS));
-    vi.stubGlobal("fetch", fetchMock);
-    render(sidebar());
-
-    expect(screen.getByText(/^fe · /)).toBeTruthy();
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.queryByText(/^be · /)).toBeNull();
-  });
-
-  it("shows no backend build, and no error, when the diagnostics request fails", async () => {
-    auth.role = "admin";
-    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const unhandled: unknown[] = [];
-    const record = (reason: unknown) => { unhandled.push(reason); };
-    process.on("unhandledRejection", record);
-    const fetchMock = vi.fn(async () => json(403, { error: "forbidden" }));
-    vi.stubGlobal("fetch", fetchMock);
-    render(sidebar());
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
-    process.off("unhandledRejection", record);
-    expect(screen.queryByText(/^be · /)).toBeNull();
-    expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByText(/^fe · /)).toBeTruthy();
-    expect(unhandled).toEqual([]);
-    expect(errors).not.toHaveBeenCalled();
-    errors.mockRestore();
-  });
-
-  it.each([
-    ["a network error", () => { throw new TypeError("Failed to fetch"); }],
-    ["a body with no build", () => json(200, { status: "ok" })],
-    ["a body that is not JSON", () => new Response("<html>Bad gateway</html>", { status: 200 })]
-  ])("shows no backend build after %s", async (_name, reply) => {
-    auth.role = "owner";
-    const fetchMock = vi.fn(async () => reply());
-    vi.stubGlobal("fetch", fetchMock);
-    render(sidebar());
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
-    expect(screen.queryByText(/^be · /)).toBeNull();
-  });
 });

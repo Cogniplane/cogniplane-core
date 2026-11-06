@@ -47,10 +47,10 @@ function ArchivedSessions() {
   return (
     <main className="min-h-screen bg-background">
       <ConsolePageHeader
-        eyebrow="Workspace"
+        className="mx-auto max-w-4xl px-4 pt-4 md:px-8 md:pt-6"
         title="Archived sessions"
         subtitle="Keep past conversations here. Restore a session to read its messages or continue chatting."
-        menuLinks={[{ href: "/", label: "Chat", description: "Return to the active workspace" }]}
+        destinations={["chat", "artifacts", "settings", "admin"]}
       />
       <div className="mx-auto max-w-4xl space-y-6 px-4 py-6 md:px-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -82,7 +82,7 @@ function ArchivedSessions() {
                 </div>
                 <div className="flex gap-2">
                   <Button variant="outline" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate({ session, action: "restore" })}><ArchiveRestoreIcon />Restore</Button>
-                  <Button variant="ghost" size="icon-sm" aria-label={`Move ${session.sessionName} to Trash`} disabled={mutation.isPending} onClick={() => { mutation.reset(); setPendingDelete(session); }}><Trash2Icon className="text-danger" /></Button>
+                  <Button variant="ghost" size="icon-sm" aria-label={(sessions.data?.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS) > 0 ? `Move ${session.sessionName} to Trash` : `Delete ${session.sessionName} permanently`} disabled={mutation.isPending} onClick={() => { mutation.reset(); setPendingDelete(session); }}><Trash2Icon className="text-danger" /></Button>
                 </div>
               </li>
             ))}

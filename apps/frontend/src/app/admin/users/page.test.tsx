@@ -14,6 +14,10 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: nav.replace, push: vi.fn() })
 }));
 vi.mock("../../../lib/admin-api", () => ({ listAdminUsers: vi.fn() }));
+const auth = vi.hoisted(() => ({
+  user: { userId: "walter", tenantId: "tenant-a", role: "owner", loginType: "workos" } as Record<string, unknown> | null
+}));
+vi.mock("../../../lib/auth-context", () => ({ useAuth: () => ({ user: auth.user }) }));
 
 function person(userId: string, overrides: Partial<AdminUser> = {}): AdminUser {
   return {
@@ -33,6 +37,7 @@ function renderPage() {
 beforeEach(() => {
   vi.resetAllMocks();
   nav.query = "";
+  auth.user = { userId: "walter", tenantId: "tenant-a", role: "owner", loginType: "workos" };
   vi.mocked(listAdminUsers).mockResolvedValue([
     person("dana", { displayName: "Dana Scully", isBetaTester: true }),
     person("fox", { displayName: "Fox Mulder", role: "admin" }),
@@ -75,5 +80,34 @@ describe("people directory", () => {
     renderPage();
     expect(nav.replace).toHaveBeenCalledWith("/admin/users/dana");
     expect(screen.getByRole("status").textContent).toBe("Opening person…");
+  });
+
+  // Local tenants: managers add people; a WorkOS tenant gets people from sign-in.
+  it("offers Add person only to a manager of a local tenant", async () => {
+    renderPage();
+    await screen.findByRole("list", { name: "People" });
+    expect(screen.queryByRole("button", { name: "Add person" })).toBeNull();
+    cleanup();
+
+    auth.user = { userId: "walter", tenantId: "tenant-a", role: "owner", loginType: "local" };
+    renderPage();
+    await screen.findByRole("list", { name: "People" });
+    expect(screen.getByRole("button", { name: "Add person" })).toBeTruthy();
+  });
+
+  it("marks local accounts that are not set up or disabled", async () => {
+    vi.mocked(listAdminUsers).mockResolvedValue([
+      person("ann", { accountStatus: "pending_setup" }),
+      person("bob", { accountStatus: "disabled" }),
+      person("cat", { accountStatus: "active" }),
+      person("dan", { accountStatus: null })
+    ]);
+    renderPage();
+    const list = await screen.findByRole("list", { name: "People" });
+    const row = (id: string) => within(list).getByText(`${id}@example.test`).closest("a")!;
+    expect(within(row("ann")).getByText("Not set up")).toBeTruthy();
+    expect(within(row("bob")).getByText("Disabled")).toBeTruthy();
+    expect(within(row("cat")).queryByText("Active")).toBeNull();
+    expect(within(row("dan")).queryByText("Not set up")).toBeNull();
   });
 });

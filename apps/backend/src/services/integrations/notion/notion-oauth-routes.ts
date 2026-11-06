@@ -14,7 +14,7 @@ export const NOTION_OAUTH_CALLBACK_PATHS = ["/integrations/notion/callback"] as 
 export function registerNotionOAuthRoutes(
   app: FastifyInstance,
   connections: Pick<NotionConnectionService, "completeAuthorization">,
-  limits?: RequestLimitsInterface
+  limits?: Pick<RequestLimitsInterface, "consumeRateLimit">
 ): void {
   app.get("/integrations/notion/callback", async (request, reply) => {
     if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;

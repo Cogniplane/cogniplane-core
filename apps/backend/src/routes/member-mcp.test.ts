@@ -13,7 +13,10 @@ const connection = { serverId: "docs", serverName: "Documents", description: nul
 const input = { scope, serverVersion: 3, version: 1, secret: "private-member-secret", accountLabel: "Work" };
 async function setup() {
   const app = Fastify(); apps.push(app);
-  app.addHook("preHandler", async request => { request.auth = { ...scope, role: "member", isAdmin: false }; });
+  // A local session at security version 7.
+  app.addHook("preHandler", async request => {
+    request.auth = { ...scope, role: "member", isAdmin: false, session: { authSource: "local", securityVersion: 7 } };
+  });
   const memberMcpCredentials = {
     list: vi.fn(async () => [{ ...connection, secret: "must-not-leak" }]),
     save: vi.fn(async () => ({ ...connection, secret: "must-not-leak" })),
@@ -38,13 +41,24 @@ test("binds saves and removal to authenticated identity and preserves expected v
   const response = await app.inject({ method: "PUT", url: "/me/mcp-connections/docs/credentials", payload: input });
   expect(response.statusCode).toBe(200);
   expect(response.json()).toEqual({ scope, connection });
+  // The credential keeps the security version of the session that saved it.
   expect(memberMcpCredentials.save).toHaveBeenCalledWith("tenant", "member", "docs", {
     serverVersion: 3, version: 1, secret: "private-member-secret", accountLabel: "Work"
-  });
+  }, 7);
   expect(response.body).not.toContain("secret");
   const removed = await app.inject({ method: "DELETE", url: "/me/mcp-connections/docs/credentials", payload: { scope, version: 2 } });
   expect(removed.json()).toEqual({ scope, removed: true });
   expect(memberMcpCredentials.remove).toHaveBeenCalledWith("tenant", "member", "docs", 2);
+});
+
+// q4w0.8 review: an MCP credential has no confirm. The label is free text that
+// the saver chose and the page cannot show the secret, so a confirm would give
+// a replaced secret back to an attacker. The member saves a new secret instead.
+test("offers no confirm route for a suspended credential", async () => {
+  const { app, memberMcpCredentials } = await setup();
+  const response = await app.inject({ method: "POST", url: "/me/mcp-connections/docs/confirm", payload: { scope, version: 2 } });
+  expect(response.statusCode).toBe(404);
+  expect(memberMcpCredentials.save).not.toHaveBeenCalled();
 });
 
 test("rejects account or organization changes before validating or saving a secret", async () => {

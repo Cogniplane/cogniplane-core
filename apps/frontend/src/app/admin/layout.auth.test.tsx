@@ -80,7 +80,7 @@ it("shows only a loading state, and no admin UI, while the session check runs", 
   vi.stubGlobal("fetch", vi.fn(async () => pending));
   mount();
 
-  expect(await screen.findByText("Loading...")).toBeTruthy();
+  expect(await screen.findByText("Checking your session…")).toBeTruthy();
   expectNoAdminUi();
   answer();
   await waitFor(() => expect(router.replace).toHaveBeenCalledWith("/login"));

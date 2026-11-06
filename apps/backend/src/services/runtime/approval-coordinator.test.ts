@@ -467,6 +467,48 @@ describe("stored artifact approval presentation", () => {
   }
 });
 
+describe("approval of a proposed tool call", () => {
+  it("stores the server ID of the call and names it in the card, from the stored row", async () => {
+    const f = setup();
+    const turn = f.coordinator.openTurn(f.options);
+    const wait = turn.request({ ...action, toolCallId: "card-1" }, f.publish);
+    await flush();
+    const stored = [...f.rows.values()][0]!;
+    expect(stored).toMatchObject({ toolCallId: "card-1", itemId: stored.approvalId, requestPayload: action.args });
+    expect(f.published).toEqual([expect.objectContaining({ name: "approval_required",
+      value: expect.objectContaining({ approvalId: stored.approvalId, toolCallId: "card-1" }) })]);
+    await f.coordinator.decide({ ...identity, approvalId: stored.approvalId, decision: "approve" });
+    await expect(wait).resolves.toBe("approve");
+    f.coordinator.close();
+  });
+
+  it("names no call when the runtime proved none, and a reused row without one stays unlinked", async () => {
+    const f = setup();
+    const turn = f.coordinator.openTurn(f.options);
+    const unlinked = turn.request(action, f.publish);
+    await flush();
+    expect([...f.rows.values()][0]).not.toHaveProperty("toolCallId");
+    expect(f.published[0]!.value).not.toHaveProperty("toolCallId");
+
+    // A Policy Center row saved before the link existed: its event names no call,
+    // even when the current request has one, so the event and a read agree.
+    const proof = createPolicyApprovalProof({ ...identity, toolContextId: "ctx", toolCallId: "call-1",
+      toolName: action.name, serverId: "managed", args: action.args, ruleId: null, explanation: "Review" });
+    const first = turn.request({ ...action, policyApproval: proof }, f.publish);
+    await flush();
+    delete f.rows.get(proof.approvalId)!.toolCallId;
+    turn.cancelLocal();
+    await Promise.all([unlinked, first]);
+    const again = f.coordinator.openTurn({ ...f.options, identity: { ...identity, turnId: "turn-2" } });
+    const reused = again.request({ ...action, policyApproval: proof, toolCallId: "card-2" }, f.publish);
+    await flush();
+    expect(f.published.at(-1)!.value).not.toHaveProperty("toolCallId");
+    again.cancelLocal();
+    await reused;
+    f.coordinator.close();
+  });
+});
+
 describe("approval of a durable write", () => {
   const args = { name: "units", content: "User prefers metric units." };
   const durableWrite = {

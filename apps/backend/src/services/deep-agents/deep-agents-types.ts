@@ -1,5 +1,5 @@
 import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
-import type { ProjectInstructionsSnapshot, ModelProvider, PolicyEnforcementMode, PolicyTurnContext } from "@cogniplane/shared-types";
+import type { ProjectInstructionsSnapshot, ModelProvider, PolicyEnforcementMode, PolicyTurnContext, TurnStopReason } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeConfigBundle } from "../admin-config-records.js";
@@ -26,6 +26,18 @@ export type DeepAgentsPendingAction = {
   name: string;
   args: Record<string, unknown>;
   description?: string;
+  /**
+   * The model's ID of the call, for a call of the main agent's latest model
+   * message. Models repeat these IDs, so it is never identity: the AG-UI driver
+   * uses it only to find the server ID that it gave this call in that message.
+   * Absent for delegated work.
+   */
+  modelCallId?: string;
+  /**
+   * The server ID of the proposed call: its tool card and its saved tool
+   * result use it. The AG-UI driver sets it when the link is proven.
+   */
+  toolCallId?: string;
   /** Present when this HITL action also satisfies a Policy Center rule. */
   policyApproval?: PolicyApprovalProof;
 };
@@ -48,6 +60,8 @@ export type DeepAgentsGraph = {
         projectInstructions: ProjectInstructionsSnapshot | null;
         /** Labelled data message of recalled memories. Model input only, never the system prompt. */
         memoryContext?: string | null;
+        generativeUiContext?: string | null;
+        generativeUiTransport?: "tool";
       };
       signal?: AbortSignal;
     }
@@ -189,6 +203,14 @@ export type DeepAgentsSandboxBinding = {
 export type DeepAgentsRuntimeFactory = (init: {
   /** Backend-owned authorization, checked before model and tool dispatch. */
   requireExecution?: () => Promise<void>;
+  /**
+   * Stops the turn when its tool execution context is no longer live. The
+   * runtime calls it before each native tool dispatch (after
+   * `requireExecution`) and after each failed provider request that the client
+   * would retry. The adapter calls it at each model start through the turn's
+   * callbacks (ModelStartCheck), which also covers the summaries.
+   */
+  requireLiveToolContext?: () => Promise<void>;
   requireSpendingAllowance?: () => void;
   /** True when the current turn holds a spending reservation. */
   hasSpendingReservation?: () => boolean;
@@ -311,8 +333,12 @@ export type DeepAgentsSessionState = {
   /** Idle teardown timer — same RUNTIME_IDLE_TIMEOUT_MS semantics as the
    *  other adapters: armed at creation and turn end, cleared at turn start. */
   idleTimer: NodeJS.Timeout | null;
-  /** Aborts the in-flight turn only (Stop button). Set at turn start. */
-  activeTurnInterrupt: { current: (() => Promise<void>) | null };
+  /**
+   * Aborts the in-flight turn only. Set at turn start. The Stop button gives
+   * no reason; a backend stop gives one, and the interrupted RUN_FINISHED
+   * carries it.
+   */
+  activeTurnInterrupt: { current: ((reason?: TurnStopReason) => Promise<void>) | null };
   /** Push hook for out-of-band framework events (Policy Center approvals). */
   activeTurnPush: { current: ((event: BaseEvent) => void) | null };
   /**

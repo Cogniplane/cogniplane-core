@@ -62,7 +62,7 @@ const ADMIN_PAGES: readonly QuickJumpItem[] = [
   ...ADMIN_LIVE_SECTIONS.map((section) => page(`page:${section.id}`, section.label,
     "group" in section ? `Admin · ${section.group}` : "Admin", `/admin/${section.id}`, PAGE_KEYWORDS[section.id])),
   page("page:privacy-activity", "Privacy activity", "Admin · Governance", "/admin/privacy?tab=activity", "pii scans findings detections"),
-  page("page:integrations", "Built-in integrations", "Admin · Setup", "/admin/connections#integrations", "github microsoft notion"),
+  page("page:integrations", "Built-in integrations", "Admin · Setup", "/admin/connections#integrations", "github notion"),
   page("page:skill-review", "Skill submissions", "Admin · Setup", "/admin/skills?view=review", "review requests")
 ];
 

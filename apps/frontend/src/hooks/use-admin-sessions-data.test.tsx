@@ -93,3 +93,30 @@ it("shows a load error but keeps the feature available", async () => {
   await waitFor(() => expect(result.current.error).toBe("Failed to load sessions."));
   expect(result.current.available).toBe(true);
 });
+
+it("keeps the first-read failure during retry and does not report successful empty data", async () => {
+  let finish!: (value: AdminSessionsListResponse) => void;
+  vi.mocked(listAdminSessions).mockRejectedValueOnce(new Error("sample unavailable"));
+  const { result } = renderSessions();
+  await waitFor(() => expect(result.current.error).toBe("sample unavailable"));
+  expect(result.current.hasData).toBe(false);
+  vi.mocked(listAdminSessions).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  act(() => { result.current.retry(); result.current.retry(); });
+  await waitFor(() => expect(result.current.isRefreshing).toBe(true));
+  expect(result.current.error).toBe("sample unavailable");
+  expect(listAdminSessions).toHaveBeenCalledTimes(2);
+  await act(async () => finish(page([], null)));
+  await waitFor(() => expect(result.current.hasData).toBe(true));
+  expect(result.current.error).toBeNull();
+  expect(result.current.sessions).toEqual([]);
+});
+
+it("keeps already loaded sessions after a refresh fails", async () => {
+  vi.mocked(listAdminSessions).mockResolvedValueOnce(page(["s1"], null));
+  const { result } = renderSessions();
+  await waitFor(() => expect(result.current.hasData).toBe(true));
+  vi.mocked(listAdminSessions).mockRejectedValue(new Error("refresh failed"));
+  act(() => result.current.retry());
+  await waitFor(() => expect(result.current.error).toBe("refresh failed"));
+  expect(ids(result.current.sessions)).toEqual(["s1"]);
+});

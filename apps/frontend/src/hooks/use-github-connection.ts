@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError } from "../lib/api-client";
 import { toErrorMessage } from "../lib/error-utils";
 import {
+  confirmGithubConnection,
   createGithubAuthorizationUrl,
   deleteGithubConnection,
   fetchGithubConnectionStatus,
@@ -20,10 +21,14 @@ export function useGithubConnection() {
     fetchStatus: fetchGithubConnectionStatus,
     createAuthorizationUrl: createGithubAuthorizationUrl,
     deleteConnection: deleteGithubConnection,
+    confirmConnection: async (status) => {
+      if (status.userConnection) await confirmGithubConnection(status.userConnection.githubUserId);
+    },
     messages: {
       load: "Failed to load GitHub connection status.",
       connect: "Failed to start GitHub authorization.",
-      disconnect: "Failed to disconnect GitHub."
+      disconnect: "Failed to disconnect GitHub.",
+      confirm: "Failed to confirm the GitHub connection."
     }
   });
 }

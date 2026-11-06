@@ -95,3 +95,43 @@ license-check:
 clean:
 	rm -rf node_modules apps/*/node_modules packages/*/node_modules
 	rm -rf apps/*/.next apps/*/dist packages/*/dist
+
+# Postgres-backed RLS suite. Needs a database; without INTEGRATION_DATABASE_URL
+# the project skips itself, which is why it is not part of `make test`.
+#
+# The DSN is a SUPERUSER connection to the SERVER, not to the `cogniplane`
+# database. Each run creates its own throwaway database AND its own throwaway
+# role, then drops both, so it never touches your dev data or the `app_user`
+# password a running backend is using. (Roles are cluster-wide, which is why
+# the role is per-run too.)
+#
+# Override the DSN to point at a Postgres you already have, e.g. when 5432 is
+# taken:
+#   make test-integration INTEGRATION_DATABASE_URL=postgres://postgres:postgres@localhost:55432/postgres
+INTEGRATION_DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/postgres
+
+# Seconds to wait for the container health check before giving up.
+INTEGRATION_DB_WAIT_S ?= 60
+
+test-integration:
+ifeq ($(INTEGRATION_DATABASE_URL),postgres://postgres:postgres@localhost:5432/postgres)
+	$(COMPOSE) up -d postgres
+	@echo "Waiting for postgres to be healthy (up to $(INTEGRATION_DB_WAIT_S)s)..."
+	@attempt=0; \
+	until [ "$$(docker inspect --format='{{.State.Health.Status}}' cogniplane-postgres 2>/dev/null)" = "healthy" ]; do \
+	  attempt=$$((attempt + 1)); \
+	  if [ $$attempt -ge $(INTEGRATION_DB_WAIT_S) ]; then \
+	    echo "cogniplane-postgres did not become healthy in $(INTEGRATION_DB_WAIT_S)s." >&2; \
+	    echo "Most often port 5432 is already bound by another container or a local postgres." >&2; \
+	    echo "Point the suite at that server instead:" >&2; \
+	    echo "  make test-integration INTEGRATION_DATABASE_URL=postgres://user:pass@localhost:5432/postgres" >&2; \
+	    echo "--- docker inspect ---" >&2; \
+	    docker inspect --format='{{.State.Status}} {{.State.Health.Status}}' cogniplane-postgres >&2 || true; \
+	    echo "--- last 20 log lines ---" >&2; \
+	    $(COMPOSE) logs --tail=20 postgres >&2 || true; \
+	    exit 1; \
+	  fi; \
+	  sleep 1; \
+	done
+endif
+	INTEGRATION_DATABASE_URL=$(INTEGRATION_DATABASE_URL) $(PNPM) test:integration

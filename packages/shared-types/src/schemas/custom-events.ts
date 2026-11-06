@@ -20,7 +20,8 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
       summary: z.string(),
       availableDecisions: z.array(z.enum(["approve", "reject"])).optional(),
       command: z.string().nullable().optional(),
-      cwd: z.string().nullable().optional()
+      cwd: z.string().nullable().optional(),
+      toolCallId: ApprovalSchema.shape.toolCallId
     })
   }),
   z.object({

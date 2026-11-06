@@ -12,11 +12,14 @@
 // pauses BEFORE tool execution and checkpoints — no held promise, no
 // in-sandbox bridge. The adapter detects the pending interrupt after the
 // stream ends, runs the approval round-trip, and resumes with a Command.
+// Each gated call's HITL description carries the model's call ID, so a
+// pending action of the main agent names its proposed call (`modelCallId`).
 
 import { MemorySaver, Command, type BaseCheckpointSaver } from "@langchain/langgraph";
-import { executionAuthorizationMiddleware } from "./execution-authorization-middleware.js";
+import { executionAuthorizationMiddleware, toolContextLivenessMiddleware } from "./execution-authorization-middleware.js";
 import type { ServerTool, StructuredTool } from "@langchain/core/tools";
 import { initChatModel, createMiddleware } from "langchain";
+import { AsyncCaller } from "@langchain/core/utils/async_caller";
 import { CompositeBackend, StateBackend, createDeepAgent } from "deepagents";
 
 import type { ModelProvider } from "@cogniplane/shared-types";
@@ -32,8 +35,9 @@ import {
 
 import { E2bDeepAgentsSandbox } from "./deep-agents-e2b-backend.js";
 import { GatewayMcpClient } from "./gateway-mcp-client.js";
-import { PolicyProofLedger } from "./policy-proof-ledger.js";
+import { hitlCallDescription, modelCallIdOf, PolicyProofLedger } from "./policy-proof-ledger.js";
 import { memoryContextMiddleware, memoryContextSchema } from "./memory-context-middleware.js";
+import { generativeUiContextMiddleware, generativeUiContextSchema } from "./generative-ui-context-middleware.js";
 import { projectInstructionsContextSchema, projectInstructionsMiddleware } from "./project-instructions-middleware.js";
 import { CurrentSkillsCheckpointer } from "./current-skills-checkpointer.js";
 import { SKILLS_LIBRARY_PREFIX, createSkillsLibraryBackend } from "./deep-agents-skills-library.js";
@@ -117,6 +121,27 @@ export class ProviderKeyMissingError extends Error {
  * `configuration.baseURL` (verified against @langchain/openai). Returns an
  * empty object when no override applies (each client hits its own default).
  */
+/**
+ * The AsyncCaller hook that runs after each failed provider request. It keeps
+ * the default decision (a hook error stops the retries) and then checks the
+ * tool context, so a dead context gets no more requests. The check runs before
+ * the wait between two requests, not after it.
+ */
+export function checkBeforeRetry(check: () => Promise<void>): (error: unknown) => Promise<void> {
+  const caller = new DefaultRetryDecision({});
+  return async (error) => {
+    await caller.decide(error);
+    await check();
+  };
+}
+
+/** The default AsyncCaller decision: it throws for an error that must not be retried. */
+class DefaultRetryDecision extends AsyncCaller {
+  decide(error: unknown): unknown {
+    return this.onFailedAttempt?.(error);
+  }
+}
+
 export function buildProviderBaseUrlOptions(
   provider: ModelProvider,
   baseUrl: string | null
@@ -224,6 +249,15 @@ const MUTATING_BUILTIN_TOOLS = ["execute", "write_file", "edit_file", "delete"];
 const READ_ONLY_BUILTIN_TOOLS = ["ls", "read_file", "glob", "grep"];
 
 /**
+ * The graph task that holds an interrupt of the main agent's HITL middleware
+ * (langchain@1.5 `${middleware.name}.after_model`). An interrupt raised inside
+ * delegated work surfaces under the `tools` task instead: its calls come from
+ * another model message, whose call IDs can equal the main agent's.
+ * deep-agents-graph.test.ts pins both names.
+ */
+export const MAIN_AGENT_APPROVAL_TASK = "HumanInTheLoopMiddleware.after_model";
+
+/**
  * Names we refuse to let an MCP server claim — pinned to deepagents@1.13.3
  * (BUILTIN_TOOL_NAMES in agent.ts = FILESYSTEM_TOOL_NAMES +
  * ASYNC_TASK_TOOL_NAMES + task; the library does not export the constant, so
@@ -243,6 +277,7 @@ export const RESERVED_BUILTIN_TOOL_NAMES: ReadonlySet<string> = new Set([
   ...READ_ONLY_BUILTIN_TOOLS,
   "task",
   "write_todos",
+  "render_ui",
   "start_async_task",
   "check_async_task",
   "update_async_task",
@@ -504,6 +539,11 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // Provider retries cannot supply separate usage records for failed attempts.
         // Turn them off only when a reservation meters this turn.
         ...(metered ? { maxRetries: 0 } : {}),
+        // The model start callback checks the tool context once per call.
+        // The client retries a failed request itself (AsyncCaller), so check
+        // again after each failed attempt, before the next request.
+        ...(!metered && init.requireLiveToolContext
+          ? { onFailedAttempt: checkBeforeRetry(init.requireLiveToolContext) } : {}),
         // The in-process loop calls each provider's API DIRECTLY; usage is
         // accounted from stream usage_metadata.
         ...buildProviderBaseUrlOptions(provider, effectiveBaseUrl),
@@ -540,6 +580,9 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       // the library's tool union (the tools really are DynamicStructuredTools
       // from @langchain/mcp-adapters' loadMcpTools).
       const executionMiddleware = init.requireExecution ? executionAuthorizationMiddleware(init.requireExecution) : null;
+      // After the execution check, so a turn whose project access ended keeps that error.
+      const livenessMiddleware = init.requireLiveToolContext
+        ? toolContextLivenessMiddleware(init.requireLiveToolContext, (toolName) => mcpToolNames.has(toolName)) : null;
       const spendingMiddleware = init.requireSpendingAllowance ? createMiddleware({
         name: "ModelSpendingToolGuard",
         wrapToolCall: async (request, handler) => {
@@ -548,7 +591,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
           return handler(request);
         }
       }) : null;
-      const guards = [executionMiddleware, spendingMiddleware].filter((guard) => guard !== null);
+      const guards = [executionMiddleware, livenessMiddleware, spendingMiddleware].filter((guard) => guard !== null);
       const agent = createDeepAgent({
         model,
         checkpointer,
@@ -559,8 +602,8 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // prompt; the model reads SKILL.md (and companions) on demand through
         // the composite backend's /skills/ route.
         skills: [SKILLS_LIBRARY_PREFIX],
-        contextSchema: projectInstructionsContextSchema.extend(memoryContextSchema.shape),
-        middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware],
+        contextSchema: projectInstructionsContextSchema.extend(memoryContextSchema.shape).extend(generativeUiContextSchema.shape),
+        middleware: [...guards, projectInstructionsMiddleware, memoryContextMiddleware, generativeUiContextMiddleware],
         // deepagents does not append new custom middleware to its default
         // general-purpose agent (it merges with `appendNew: false`). Supply the
         // guards, the project instructions and the memory context explicitly for
@@ -576,10 +619,14 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         ...(systemPrompt ? { systemPrompt } : {})
       }) as unknown as DeepAgentsGraph;
 
+      const graphSandbox = allowCommandExecution ? sandbox : null;
       const streamingAgent: DeepAgentsGraph = {
         streamEvents(input, config) {
           if (!(input instanceof Command)) policyProofs.reset();
-          return agent.streamEvents(input, config);
+          // Middleware can await a tool or a history read before writing to the shared backend.
+          return graphSandbox
+            ? graphSandbox.scopeToCurrentTurn(() => agent.streamEvents(input, config))
+            : agent.streamEvents(input, config);
         }
       };
       compiled = { modelId, effort: normalizedEffort, metered, agent, streamingAgent };
@@ -591,10 +638,11 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         getState: (config: { configurable: { thread_id: string } }) => Promise<unknown>;
       };
       const snapshot = (await agent.getState({ configurable: { thread_id: threadId } })) as {
-        tasks?: Array<{ interrupts?: Array<{ id?: string; value?: unknown }> }>;
+        tasks?: Array<{ name?: string; interrupts?: Array<{ id?: string; value?: unknown }> }>;
       } | null;
       const actions: DeepAgentsPendingAction[] = [];
       for (const task of snapshot?.tasks ?? []) {
+        const mainAgent = task.name === MAIN_AGENT_APPROVAL_TASK;
         for (const interruptEntry of task.interrupts ?? []) {
           const value = interruptEntry.value as
             | { actionRequests?: Array<{ name?: string; args?: Record<string, unknown>; description?: string }> }
@@ -605,11 +653,13 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
             const policyApproval = policyProofs.forAction({
               name: request.name, serverId: mcpToolServers.get(request.name), args, description: request.description
             });
+            const modelCallId = mainAgent ? modelCallIdOf(request.description) : undefined;
             actions.push({
               interruptId: typeof interruptEntry.id === "string" ? interruptEntry.id : null,
               name: request.name,
               args: withoutPolicyApprovalMetadata(args),
               description: request.description,
+              ...(modelCallId ? { modelCallId } : {}),
               ...(policyApproval ? { policyApproval } : {})
             });
           }
@@ -748,6 +798,9 @@ async function evaluatePolicyCenter(policy: PolicyGating, toolName: string, cont
   });
 }
 
+// Native entries write the same description as the proof entries: it carries the call ID.
+const describeCall = (toolCall: { id?: string }) => hitlCallDescription(toolCall.id);
+
 const DURABLE_WRITE_EXPLANATION =
   "This action saves data for later sessions, so it always needs your approval of the exact arguments.";
 
@@ -831,7 +884,8 @@ export function buildInterruptOn(input: {
         when: async ({ toolCall }) => {
           stripPolicyApprovalMetadata(toolCall.args);
           return nativeApproval;
-        }
+        },
+        description: describeCall
       }]);
       continue;
     }
@@ -875,7 +929,7 @@ export function buildInterruptOn(input: {
       ...MUTATING_BUILTIN_TOOLS,
       ...(approvals.autoApproveReadOnly ? [] : READ_ONLY_BUILTIN_TOOLS)
     ]) {
-      entries.push([name, { allowedDecisions: ["approve", "reject"] }]);
+      entries.push([name, { allowedDecisions: ["approve", "reject"], description: describeCall }]);
     }
   }
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;

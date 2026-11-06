@@ -7,6 +7,7 @@ import { ArtifactStore } from "../services/artifacts/artifact-store.js";
 import { McpServerStore } from "../services/mcp-server-store.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedArtifact, seedRuntimeSession, seedTenantGraph } from "./support/fixtures.js";
+import { ALLOW_WEAKER } from "../test-helpers/data-routes.js";
 
 describe.skipIf(!adminDatabaseUrl())("store SQL boundaries", () => {
   test("stale runtime updates preserve the replacement and never revive terminal rows", async () => {
@@ -42,14 +43,14 @@ describe.skipIf(!adminDatabaseUrl())("store SQL boundaries", () => {
     const foreign = await seedTenantGraph();
     const store = new PolicyRuleStore(appPool());
     expect(await store.nextAppendPriority(owner.tenantId)).toBe(0);
-    const first = await store.create(owner.tenantId, { name: "first", effect: "allow" }, owner.userId);
+    const first = await store.create(owner.tenantId, { name: "first", effect: "allow" }, owner.userId, ALLOW_WEAKER);
     expect(first).toMatchObject({ priority: 0, createdBy: owner.userId, enabled: true });
-    const late = await store.create(owner.tenantId, { name: "late", effect: "block", priority: 40 }, owner.userId);
-    const tieB = await store.create(owner.tenantId, { name: "tie B", effect: "allow", priority: 5 }, owner.userId);
-    const tieA = await store.create(owner.tenantId, { name: "tie A", effect: "allow", priority: 5 }, owner.userId);
-    const other = await store.create(foreign.tenantId, { name: "foreign", effect: "allow", priority: 900 }, foreign.userId);
+    const late = await store.create(owner.tenantId, { name: "late", effect: "block", priority: 40 }, owner.userId, ALLOW_WEAKER);
+    const tieB = await store.create(owner.tenantId, { name: "tie B", effect: "allow", priority: 5 }, owner.userId, ALLOW_WEAKER);
+    const tieA = await store.create(owner.tenantId, { name: "tie A", effect: "allow", priority: 5 }, owner.userId, ALLOW_WEAKER);
+    const other = await store.create(foreign.tenantId, { name: "foreign", effect: "allow", priority: 900 }, foreign.userId, ALLOW_WEAKER);
     expect(await store.nextAppendPriority(owner.tenantId)).toBe(50);
-    const appended = await store.create(owner.tenantId, { name: "appended", effect: "allow" }, owner.userId);
+    const appended = await store.create(owner.tenantId, { name: "appended", effect: "allow" }, owner.userId, ALLOW_WEAKER);
     expect(appended.priority).toBe(50);
     const expected = [first.ruleId, ...[tieA.ruleId, tieB.ruleId].sort(), late.ruleId, appended.ruleId];
     expect((await store.list(owner.tenantId)).map(rule => rule.ruleId)).toEqual(expected);

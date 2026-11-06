@@ -10,6 +10,7 @@ import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedMembership, seedTenant, seedUser } from "./support/fixtures.js";
+import { devDataRoutes } from "../test-helpers/data-routes.js";
 
 // PostgreSQL stores created_at in microseconds. A JS Date keeps milliseconds.
 // These tests page real rows whose timestamps differ below one millisecond, and
@@ -50,7 +51,7 @@ async function buildApp(tenantId: string) {
     policyRules: rules,
     policyDecisions: decisions,
     policyService: new PolicyService({ rules, decisions, auditEvents }),
-    auditEvents,
+    dataRoutes: devDataRoutes(),
     now: () => WINDOW_END
   });
   onTestFinished(() => app.close());

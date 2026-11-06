@@ -62,7 +62,7 @@ export default function AdminSessionsPage() {
   }, [state, pathname, router]);
 
   const params = useMemo(() => filterStateToParams(state), [state]);
-  const { sessions, error, available, isLoading, hasMore, isLoadingMore, loadMore } =
+  const { sessions, error, available, isLoading, hasMore, isLoadingMore, loadMore, hasData, isRefreshing, retry } =
     useAdminSessionsData(params);
 
   const handleClear = () => {
@@ -75,19 +75,22 @@ export default function AdminSessionsPage() {
 
   return (
     <section id="sessions" className="flex flex-col gap-5 pt-5">
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
       <AdminSessionsPresets state={state} onApply={setState} />
       <AdminSessionsFilters state={state} onChange={setState} onClear={handleClear} />
-      {available ? (
-        <AdminSessionsSection
+      <AdminSessionsSection
           sessions={sessions as AdminSessionRow[]}
           isLoading={isLoading}
           onRowClick={handleRowClick}
           hasMore={hasMore}
           isLoadingMore={isLoadingMore}
           onLoadMore={loadMore}
+          hasData={hasData}
+          error={error}
+          available={available}
+          isRefreshing={isRefreshing}
+          onRetry={retry}
+          isFiltered={Object.keys(params).length > 0}
         />
-      ) : null}
     </section>
   );
 }

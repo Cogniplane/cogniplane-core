@@ -29,7 +29,7 @@ export type UploadAdmissionResult =
 
 /**
  * The one path that turns user-supplied bytes into a session artifact. Every
- * entry point (direct upload, Microsoft import, import tool) must use it, so
+ * entry point (direct upload, overlay import, import tool) must use it, so
  * access checks, file name validation, pending-until-scanned state, and the PII
  * scan stay the same.
  */

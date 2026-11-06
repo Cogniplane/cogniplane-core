@@ -1,7 +1,6 @@
 "use client";
 
 import SyntaxHighlighter from "react-syntax-highlighter";
-import { atomOneDark } from "react-syntax-highlighter/dist/esm/styles/hljs";
 
 // Isolated so next/dynamic can split react-syntax-highlighter (+ its hljs
 // grammars) out of the main chat bundle. Rendered only by ArtifactPreviewModal's
@@ -14,13 +13,14 @@ export default function ArtifactCodeBlock({
   code: string;
 }) {
   return (
-    <SyntaxHighlighter
-      language={language}
-      style={atomOneDark}
-      customStyle={{ margin: 0, borderRadius: 4, fontSize: "0.85rem", lineHeight: 1.6 }}
-      wrapLongLines
-    >
-      {code}
-    </SyntaxHighlighter>
+    <div className="artifact-code-scroll" tabIndex={0} role="region" aria-label="Code preview">
+      <SyntaxHighlighter
+        language={language}
+        useInlineStyles={false}
+        wrapLongLines
+      >
+        {code}
+      </SyntaxHighlighter>
+    </div>
   );
 }

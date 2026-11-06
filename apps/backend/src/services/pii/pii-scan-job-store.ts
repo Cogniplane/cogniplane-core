@@ -13,7 +13,8 @@ export type PiiScanJobPayload = {
   contentType?: string;
   storageKey?: string;
   entityTypes?: string[];
-  subjectKind?: "chat_prompt" | "upload" | "microsoft_import";
+  // "chat_prompt", "upload", or the subject kind of a registered import source.
+  subjectKind?: "chat_prompt" | "upload" | (string & {});
 };
 
 export type PiiScanJobRecord = {

@@ -1,8 +1,3 @@
-import type { ReactNode } from "react";
-import Link from "next/link";
-
-import { SECTION_LABEL } from "../lib/ui-tokens";
-
 export function buildOAuthFlashMessage(input: {
   provider: string;
   result: string | null;
@@ -10,35 +5,13 @@ export function buildOAuthFlashMessage(input: {
   successMessage: string;
 }): string | null {
   if (input.result === "connected") return input.successMessage;
+  // The account security changed after the authorization started, so the
+  // backend stored nothing (an older session started it).
+  if (input.result === "error" && input.reason === "session_changed") return "Your session changed. Connect again.";
   if (input.result === "error") {
     return input.reason
       ? `${input.provider} authorization failed: ${input.reason.replaceAll("_", " ")}.`
       : `${input.provider} authorization failed.`;
   }
   return null;
-}
-
-export function OAuthSettingsPage(input: {
-  id: string;
-  provider: string;
-  tenantEnabled: boolean | undefined;
-  children: ReactNode;
-}) {
-  if (input.tenantEnabled !== false) return input.children;
-
-  return (
-    <section id={input.id} className="flex flex-col gap-5">
-      <div>
-        <Link href="/settings/connections" className="text-sm text-on-surface-variant underline underline-offset-4 hover:text-on-surface focus-visible:outline-2 focus-visible:outline-primary">
-          Connected accounts
-        </Link>
-        <p className={`${SECTION_LABEL} mt-4`}>Account details</p>
-        <h3 className="text-lg font-semibold text-on-surface">{input.provider}</h3>
-      </div>
-      <p className="text-sm text-on-surface-faint">
-        {input.provider} is not enabled for this tenant. Ask an administrator to enable it from the
-        Integrations page.
-      </p>
-    </section>
-  );
 }

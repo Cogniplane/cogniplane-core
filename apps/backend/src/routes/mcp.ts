@@ -113,9 +113,6 @@ export function buildMcpRouteStores(
     storage: deps.artifactStorage,
     auditEvents: deps.auditEvents,
     toolContexts: deps.toolContexts,
-    githubConnections: deps.githubConnectionService,
-    notionConnections: deps.notionConnectionService,
-    jiraConnections: deps.jiraConnectionService,
     piiProtection: deps.piiProtection,
     managedToolFactoryRegistry: deps.managedToolFactoryRegistry,
     managedToolCatalog: deps.managedToolCatalog,
@@ -158,9 +155,6 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     artifacts: stores.artifacts,
     storage: stores.storage,
     auditEvents: stores.auditEvents,
-    githubConnections: stores.githubConnections,
-    notionConnections: stores.notionConnections,
-    jiraConnections: stores.jiraConnections,
     piiProtection: stores.piiProtection,
     readRuntimeFile: stores.readRuntimeFile,
     statRuntimeFile: stores.statRuntimeFile,
@@ -851,8 +845,9 @@ async function handleManagedToolCall(
 
 /**
  * A refusal that the model reads as the tool result, as the GitHub and Jira tools
- * return theirs. A JSON-RPC error would reach the graph as a thrown tool exception,
- * which ends the turn, so the model could not tell the user that nothing was saved.
+ * return theirs. The runtime's gateway client also gives a JSON-RPC error to the
+ * model, as a failed call (gatewayErrorsAsResults). A refusal is not a failure:
+ * the call was handled, and the result says that nothing was saved.
  */
 function toolRefusal(id: z.infer<typeof rpcRequestSchema>["id"], message: string): RpcResponse {
   return ok(id, {

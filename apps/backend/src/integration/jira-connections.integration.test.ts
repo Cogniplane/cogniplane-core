@@ -35,7 +35,8 @@ function mapping(tenantId: string, userId: string, externalUserId: string, accou
     accountName: "me@example.test",
     cloudId: SITE,
     siteName: "Acme",
-    siteUrl: "https://acme.atlassian.net"
+    siteUrl: "https://acme.atlassian.net",
+    ownerSecurityVersion: null
   };
 }
 
@@ -362,7 +363,7 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
     await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
     const oldId = (await store.getIdentity(tenant, user))!.externalUserId;
     pipedream.accounts = [jira("apn_old", oldId)];
-    await service.selectConnection(tenant, user, { accountId: "apn_old", siteId: SITE });
+    await service.selectConnection(tenant, user, { accountId: "apn_old", siteId: SITE }, null);
 
     await removeMembership(tenant, user);
     await seedMembership(tenant, user);
@@ -370,7 +371,7 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
     const fresh = (await store.getIdentity(tenant, user))!;
     expect(fresh.externalUserId).not.toBe(oldId);
     pipedream.accounts.push(jira("apn_new", fresh.externalUserId));
-    await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE });
+    await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE }, null);
 
     // The callback of the first removal runs only now.
     expect(await service.deleteConnection(tenant, user)).toBe(true);

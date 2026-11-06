@@ -36,7 +36,8 @@ export function useJiraConnection() {
     messages: {
       load: "Failed to load Jira connection status.",
       connect: "Failed to start Jira authorization.",
-      disconnect: "Failed to disconnect Jira. Try again."
+      disconnect: "Failed to disconnect Jira. Try again.",
+      confirm: "Failed to confirm the Jira connection."
     }
   });
 }

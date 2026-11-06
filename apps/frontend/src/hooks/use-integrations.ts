@@ -1,160 +1,88 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
-
-import {
-  deleteIntegrationConfig,
-  fetchAdminIntegrations,
-  updateIntegration,
-  type UpdateIntegrationInput
-} from "../lib/integrations-api";
+import { deleteIntegrationConfig, fetchAdminIntegrations, updateIntegration, type UpdateIntegrationInput } from "../lib/integrations-api";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import type { AdminIntegrationView } from "@cogniplane/shared-types";
 
-const ignore = () => undefined;
+type Operation = "toggle" | "save" | "clear";
+type Failure = { operation: Operation; message: string };
 
 export function useAdminIntegrations() {
   const queryClient = useQueryClient();
-  const [activeId, setActiveId] = useState<string | null>(null);
-  // `config` marks a configuration save or clear. The open dialog shows only
-  // its own integration's configuration error.
-  const [mutationError, setMutationError] = useState<{ integrationId: string; config: boolean; message: string } | null>(null);
+  const pendingRef = useRef<Record<string, Operation>>({});
+  const [pending, setPending] = useState<Record<string, Operation>>({});
+  const [errors, setErrors] = useState<Record<string, Failure | undefined>>({});
   const [flashMessage, setFlashMessage] = useState<string | null>(null);
-  // One handle for the flash timer. Back-to-back saves would otherwise let the
-  // first mutation's timer erase the second one's message, and an unmount
-  // mid-flash would set state on a gone component.
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flash = useCallback((message: string) => {
     if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
     setFlashMessage(message);
     flashTimerRef.current = setTimeout(() => setFlashMessage(null), 1800);
   }, []);
-  useEffect(
-    () => () => {
-      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-    },
-    []
-  );
+  useEffect(() => () => { if (flashTimerRef.current) clearTimeout(flashTimerRef.current); }, []);
 
   const listQuery = useQuery({
     queryKey: queryKeys.admin.integrations(),
-    queryFn: fetchAdminIntegrations
-  });
-
-  const invalidateIntegrationData = () => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.settings.integrationsAvailability() });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
-  };
-
-  const updateMutation = useMutation({
-    mutationFn: async (args: { integrationId: string; input: UpdateIntegrationInput }) => {
-      return updateIntegration(args.integrationId, args.input);
-    },
-    onMutate: async ({ integrationId, input }) => {
-      setActiveId(integrationId);
-      setMutationError(null);
-      // A list fetch already in flight would land after this write and clobber
-      // the optimistic row; cancel it before taking the snapshot.
-      await queryClient.cancelQueries({ queryKey: queryKeys.admin.integrations() });
-      // Optimistic update for toggle flips (skip when config is being saved —
-      // the response carries the authoritative `hasConfig` / `configSummary`).
-      if (input.config) return { previous: null };
-      const previous = queryClient.getQueryData<AdminIntegrationView[]>(
-        queryKeys.admin.integrations()
-      );
-      if (previous) {
-        queryClient.setQueryData<AdminIntegrationView[]>(
-          queryKeys.admin.integrations(),
-          previous.map((entry) =>
-            entry.id === integrationId
-              ? {
-                  ...entry,
-                  readsEnabled: input.readsEnabled ?? entry.readsEnabled,
-                  writesEnabled: input.writesEnabled ?? entry.writesEnabled
-                }
-              : entry
-          )
-        );
-      }
-      return { previous };
-    },
-    onError: (error, { integrationId, input }, context) => {
-      const ctx = context as { previous: AdminIntegrationView[] | null } | undefined;
-      if (ctx?.previous) {
-        queryClient.setQueryData(queryKeys.admin.integrations(), ctx.previous);
-      }
-      setMutationError({
-        integrationId,
-        config: Boolean(input.config),
-        message: toErrorMessage(error, "Failed to update integration.")
-      });
-    },
-    onSuccess: (integration) => {
-      const previous = queryClient.getQueryData<AdminIntegrationView[]>(
-        queryKeys.admin.integrations()
-      );
-      if (previous) {
-        queryClient.setQueryData<AdminIntegrationView[]>(
-          queryKeys.admin.integrations(),
-          previous.map((entry) => (entry.id === integration.id ? integration : entry))
-        );
-      }
-      invalidateIntegrationData();
-      flash("Saved.");
-    },
-    onSettled: () => {
-      setActiveId(null);
+    queryFn: async () => {
+      const fresh = await fetchAdminIntegrations();
+      const cached = queryClient.getQueryData<AdminIntegrationView[]>(queryKeys.admin.integrations());
+      // A background refresh can finish while a row is still being written.
+      return fresh.map(row => pendingRef.current[row.id] ? cached?.find(entry => entry.id === row.id) ?? row : row);
     }
   });
+  const replaceRow = (integration: AdminIntegrationView) => {
+    queryClient.setQueryData<AdminIntegrationView[]>(queryKeys.admin.integrations(), rows =>
+      rows?.map(row => row.id === integration.id ? integration : row));
+  };
 
-  const clearMutation = useMutation({
-    mutationFn: (integrationId: string) => deleteIntegrationConfig(integrationId),
-    onMutate: (integrationId) => {
-      setActiveId(integrationId);
-      setMutationError(null);
-    },
-    onError: (error, integrationId) => {
-      setMutationError({
-        integrationId,
-        config: true,
-        message: toErrorMessage(error, "Failed to clear integration configuration.")
-      });
-    },
-    onSuccess: (integration) => {
-      const previous = queryClient.getQueryData<AdminIntegrationView[]>(
-        queryKeys.admin.integrations()
-      );
-      if (previous) {
-        queryClient.setQueryData<AdminIntegrationView[]>(
-          queryKeys.admin.integrations(),
-          previous.map((entry) => (entry.id === integration.id ? integration : entry))
-        );
-      }
-      invalidateIntegrationData();
-      flash("Configuration cleared.");
-    },
-    onSettled: () => setActiveId(null)
-  });
-
-  const loadError = listQuery.error
-    ? toErrorMessage(listQuery.error, "Failed to load integrations.")
-    : null;
+  const run = async (integrationId: string, operation: Operation, input?: UpdateIntegrationInput): Promise<boolean> => {
+    // Claim synchronously, before React renders or the first await yields.
+    if (pendingRef.current[integrationId]) return false;
+    pendingRef.current = { ...pendingRef.current, [integrationId]: operation };
+    setPending(pendingRef.current);
+    setErrors(previous => ({ ...previous, [integrationId]: undefined }));
+    await queryClient.cancelQueries({ queryKey: queryKeys.admin.integrations() });
+    const previous = queryClient.getQueryData<AdminIntegrationView[]>(queryKeys.admin.integrations())?.find(row => row.id === integrationId);
+    if (operation === "toggle" && previous && input) {
+      replaceRow({ ...previous, readsEnabled: input.readsEnabled ?? previous.readsEnabled, writesEnabled: input.writesEnabled ?? previous.writesEnabled });
+    }
+    try {
+      const saved = operation === "clear" ? await deleteIntegrationConfig(integrationId) : await updateIntegration(integrationId, input!);
+      // A background read must not replace this write with an older response.
+      await queryClient.cancelQueries({ queryKey: queryKeys.admin.integrations() });
+      replaceRow(saved);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.settings.integrationsAvailability() });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.admin.runtimeSessions() });
+      flash(operation === "clear" ? "Configuration cleared." : "Saved.");
+      return true;
+    } catch (error) {
+      await queryClient.cancelQueries({ queryKey: queryKeys.admin.integrations() });
+      if (operation === "toggle" && previous) replaceRow(previous);
+      setErrors(previousErrors => ({ ...previousErrors, [integrationId]: { operation, message: toErrorMessage(error, operation === "clear" ? "Failed to clear integration configuration." : "Failed to update integration.") } }));
+      return false;
+    } finally {
+      const next = { ...pendingRef.current };
+      delete next[integrationId];
+      pendingRef.current = next;
+      setPending(next);
+    }
+  };
 
   return {
     integrations: listQuery.data ?? [],
-    isLoading: listQuery.isLoading,
-    activeId,
-    error: mutationError?.message ?? loadError,
-    configError: mutationError?.config ? mutationError : null,
+    hasData: listQuery.data !== undefined,
+    isLoading: listQuery.isPending,
+    isRefreshing: listQuery.isFetching,
+    loadError: listQuery.error ? toErrorMessage(listQuery.error, "Failed to load integrations.") : null,
+    pending,
+    errors,
     flashMessage,
-    // A failure already shows through `error` or `configError`, so these resolve either way.
-    // Callers fire them from event handlers, where a rejection would go unhandled.
-    update: (integrationId: string, input: UpdateIntegrationInput): Promise<void> =>
-      updateMutation.mutateAsync({ integrationId, input }).then(ignore, ignore),
-    clearConfig: (integrationId: string): Promise<void> =>
-      clearMutation.mutateAsync(integrationId).then(ignore, ignore),
-    dismissError: () => setMutationError(null)
+    isPending: (id: string) => Boolean(pendingRef.current[id]),
+    reload: () => { if (!Object.keys(pendingRef.current).length) void listQuery.refetch(); },
+    update: (id: string, input: UpdateIntegrationInput) => run(id, input.config ? "save" : "toggle", input),
+    clearConfig: (id: string) => run(id, "clear")
   };
 }

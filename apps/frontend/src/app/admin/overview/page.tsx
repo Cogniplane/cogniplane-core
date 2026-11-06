@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
 import { CheckIcon } from "lucide-react";
 import { OverviewRow } from "../../../components/admin/overview-row";
 import { RecentAdminChanges } from "../../../components/admin/history/history-widgets";
@@ -30,14 +31,29 @@ function QueueRow({ item }: { item: WorkItem }) {
   </li>;
 }
 
-function CheckError({ label, retry, retryLabel = `Retry ${label}` }: { label: string; retry: () => void; retryLabel?: string }) {
+function CheckError({ label, retry, retrying, retryLabel = `Retry ${label}` }: { label: string; retry: () => void; retrying: boolean; retryLabel?: string }) {
   return <li className="flex flex-col gap-3 border-b border-outline-variant py-4 last:border-b-0 sm:flex-row sm:items-center sm:justify-between">
-    <p className="text-sm text-danger">Could not check {label}.</p>
-    <Button variant="outline" size="sm" onClick={retry}>{retryLabel}</Button>
+    <p className="text-sm text-danger" role={retrying ? "status" : undefined}>{retrying ? `Checking ${label} again...` : `Could not check ${label}.`}</p>
+    <Button variant="outline" size="sm" aria-disabled={retrying} className="aria-disabled:pointer-events-none aria-disabled:opacity-50" onClick={() => { if (!retrying) retry(); }}>{retrying ? "Retrying..." : retryLabel}</Button>
   </li>;
 }
 
+// A retry clears isError before it returns. Keep the failed check visible during that request.
+function checkFailed(query: { isError: boolean; isFetching: boolean; errorUpdatedAt: number; dataUpdatedAt: number }) {
+  return query.isError || (query.isFetching && query.errorUpdatedAt > query.dataUpdatedAt);
+}
+
 export default function AdminOverviewPage() {
+  const attentionHeading = useRef<HTMLHeadingElement>(null);
+  const [recoveredButton, setRecoveredButton] = useState<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (recoveredButton && document.activeElement === document.body) attentionHeading.current?.focus();
+  }, [recoveredButton]);
+  const retryCheck = async (query: { refetch: () => Promise<{ isSuccess: boolean }> }) => {
+    const focused = document.activeElement;
+    const result = await query.refetch();
+    if (result.isSuccess && focused instanceof HTMLButtonElement) setRecoveredButton(focused);
+  };
   const { user } = useAuth();
   const scopeKey = [user?.tenantId ?? "", user?.userId ?? ""];
   const settings = useQuery({ queryKey: queryKeys.admin.tenantSettings(), queryFn: getTenantSettings });
@@ -61,18 +77,23 @@ export default function AdminOverviewPage() {
   const month = useUtcMonth();
   const budget = useModelSpending(month);
   // Only the summary matters here. A failed "Load more" on the Usage page does not make it stale.
-  const budgetFailed = budget.isError && !budget.isFetchNextPageError;
+  const budgetFailed = checkFailed(budget) && !budget.isFetchNextPageError && !budget.isFetchingNextPage;
   const budgetSummary = budgetFailed ? undefined : budget.data?.pages[0];
   const budgetWork = budgetSummary ? budgetItems(budgetSummary) : [];
   const review = submissions.data ? submissionItems(submissions.data) : [];
   const connectionWork = connections.data ? connectionItems(connections.data, settings.data) : [];
   const modelWork = models.data && settings.data ? modelItems(models.data, settings.data) : [];
-  const pending = submissions.isPending || connections.isPending || models.isPending || settings.isPending || budget.isPending;
-  const failed = submissions.isError || connections.isError || models.isError || settings.isError || budgetFailed;
+  const pending = [submissions, connections, models, settings, budget].some(query => query.isPending && !checkFailed(query));
+  const failed = checkFailed(submissions) || checkFailed(connections) || checkFailed(models) || checkFailed(settings) || budgetFailed;
   const workCount = budgetWork.length + review.length + connectionWork.length + modelWork.length;
   const hasWork = workCount > 0;
-  const readyModelCount = models.data?.models.filter((model) => settings.data && isModelEnabled(model, settings.data)
+  const configuredModelCount = models.data?.models.filter((model) => settings.data && isModelEnabled(model, settings.data)
     && models.data.providers.some((provider) => provider.id === model.provider && provider.keySource !== "none")).length ?? 0;
+  const modelsFailed = checkFailed(models) || checkFailed(settings);
+  const modelsChecking = models.isPending || settings.isPending || models.isFetching || settings.isFetching;
+  const modelStatus = modelsFailed ? "Could not check model configuration."
+    : modelsChecking ? "Checking model configuration..."
+    : `${configuredModelCount === 1 ? "1 enabled model has a provider key" : `${configuredModelCount} enabled models have provider keys`}. Key validity and model access are not verified.`;
   const orgSkillCount = skills.data?.filter((skill) => !skill.isInherited).length ?? 0;
   const drafts = skills.data?.filter((skill) => !skill.isInherited && (!skill.activeRevisionId || (skill.pendingRevisionCount ?? 0) > 0)) ?? [];
 
@@ -81,7 +102,7 @@ export default function AdminOverviewPage() {
   return <div className="space-y-8 pt-7">
     <section aria-labelledby="attention-heading">
       <div className="flex flex-wrap items-baseline gap-3">
-        <h2 id="attention-heading" className="text-xl font-semibold tracking-tight text-on-surface">Needs attention</h2>
+        <h2 ref={attentionHeading} tabIndex={-1} id="attention-heading" className="text-xl font-semibold tracking-tight text-on-surface">Needs attention</h2>
         {!pending && !failed && hasWork ? <span className="rounded bg-warning-surface px-2 py-0.5 text-xs font-semibold text-warning">{workCount}</span> : null}
       </div>
       {budgetWork.length ? <div className="mt-5"><h3 className="text-xs font-semibold uppercase tracking-wide text-on-surface-variant">Model budget</h3><ul>{budgetWork.map((item) => <QueueRow key={item.id} item={item} />)}</ul></div> : null}
@@ -90,11 +111,11 @@ export default function AdminOverviewPage() {
       {modelWork.length ? <div className="mt-5"><h3 className="text-xs font-semibold uppercase tracking-wide text-on-surface-variant">Models</h3><ul>{modelWork.map((item) => <QueueRow key={item.id} item={item} />)}</ul></div> : null}
       {pending ? <div role="status" aria-label="Checking work queue" className="space-y-3 py-6"><Skeleton className="h-4 w-2/5" /><Skeleton className="h-4 w-3/5" /></div> : null}
       {failed ? <ul aria-label="Checks that need a retry" className="mt-4 rounded-lg bg-surface-container-low px-4">
-        {submissions.isError ? <CheckError label="skill submissions" retry={() => void submissions.refetch()} /> : null}
-        {connections.isError ? <CheckError label="connections" retry={() => void connections.refetch()} /> : null}
-        {models.isError ? <CheckError label="models" retry={() => void models.refetch()} /> : null}
-        {settings.isError ? <CheckError label="organization settings" retry={() => void settings.refetch()} /> : null}
-        {budgetFailed ? <CheckError label="the model budget" retryLabel="Retry budget check" retry={() => void budget.refetch()} /> : null}
+        {checkFailed(submissions) ? <CheckError label="skill submissions" retrying={submissions.isFetching} retry={() => void retryCheck(submissions)} /> : null}
+        {checkFailed(connections) ? <CheckError label="connections" retrying={connections.isFetching} retry={() => void retryCheck(connections)} /> : null}
+        {checkFailed(models) ? <CheckError label="models" retrying={models.isFetching} retry={() => void retryCheck(models)} /> : null}
+        {checkFailed(settings) ? <CheckError label="organization settings" retrying={settings.isFetching} retry={() => void retryCheck(settings)} /> : null}
+        {budgetFailed ? <CheckError label="the model budget" retrying={budget.isFetching} retryLabel="Retry budget check" retry={() => void retryCheck(budget)} /> : null}
       </ul> : null}
       {!pending && !failed && !hasWork ? <p className="mt-2 flex items-center gap-2 text-sm text-on-surface-variant"><CheckIcon aria-hidden="true" className="size-4 text-success" />Nothing needs attention.</p> : null}
     </section>
@@ -102,7 +123,7 @@ export default function AdminOverviewPage() {
     <section aria-labelledby="status-heading" className="border-t border-outline-variant">
       <h2 id="status-heading" className="sr-only">Status</h2>
       <div className="divide-y divide-outline-variant">
-        <OverviewRow title="Models" busy={models.isPending || settings.isPending} status={models.isError || settings.isError ? "Could not check model availability." : models.isPending || settings.isPending ? "Checking model availability..." : `${readyModelCount} model${readyModelCount === 1 ? "" : "s"} ready to use.`}>
+        <OverviewRow title="Models" busy={modelsChecking} status={modelStatus}>
           <Button variant="outline" size="sm" asChild><Link href="/admin/models">Manage models</Link></Button>
         </OverviewRow>
         <OverviewRow title="Model budget" busy={budget.isPending} status={budgetFailed ? "Could not check the model budget." : budget.isPending ? "Checking the model budget..." : budgetSummary ? budgetRoutineLine(budgetSummary, month) : null}>

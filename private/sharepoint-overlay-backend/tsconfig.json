@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // The overlay imports from `../../apps/backend/src/...`. To allow
+    // those cross-package imports under tsc, rootDir is set to the repo
+    // root. We also disable emit because the overlay runs through tsx
+    // — there's no separate build step that needs `outDir`.
+    "rootDir": "../..",
+    "outDir": "dist",
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    // Pull in core's Fastify type augmentations so `request.auth` and
+    // `app.db` resolve correctly inside overlay route handlers.
+    "../../apps/backend/src/types.d.ts"
+  ],
+  "exclude": ["src/**/*.test.ts"]
+}

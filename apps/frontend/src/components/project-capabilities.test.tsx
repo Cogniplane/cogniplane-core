@@ -267,7 +267,8 @@ it("does not let Customize replace a draft during a pending save", async () => {
   const customize = screen.getByRole("button", { name: "Customize" }) as HTMLButtonElement;
   expect(customize.disabled).toBe(true);
   fireEvent.click(customize);
-  expect(screen.getByText("Using organization defaults")).toBeTruthy();
+  expect(screen.getByText("Proposed: organization defaults")).toBeTruthy();
+  expect(updateProjectCapabilities).toHaveBeenCalledWith("p1", { selection: null, version: 2 });
   resolveSave(catalog);
   await waitFor(() => expect(customize.disabled).toBe(false));
   expect(screen.getByText("Using organization defaults")).toBeTruthy();

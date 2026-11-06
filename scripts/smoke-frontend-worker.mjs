@@ -63,8 +63,19 @@ try {
   const html = await response.text();
   assert.equal(response.status, 200, `/login returned HTTP ${response.status}: ${html.slice(0, 500)}`);
   assert.match(html, /Sign in to your workspace/, "The login page did not render.");
-  assert.match(html, /Sign in with Email/, "The login form did not render.");
-  console.log("Frontend Worker smoke check passed: /login renders in workerd.");
+  // The sign-in forms depend on GET /auth/config (WorkOS, local, or both), which
+  // the browser reads after the page loads; no backend runs here. The server
+  // renders the loading state in their place.
+  assert.match(html, /Loading sign-in/, "The login page did not render its sign-in area.");
+
+  const forgot = await fetch(`${origin}/auth/forgot-password`, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(30_000)
+  });
+  const forgotHtml = await forgot.text();
+  assert.equal(forgot.status, 200, `/auth/forgot-password returned HTTP ${forgot.status}: ${forgotHtml.slice(0, 500)}`);
+  assert.match(forgotHtml, /Reset your password/, "The forgot-password page did not render.");
+  console.log("Frontend Worker smoke check passed: /login and /auth/forgot-password render in workerd.");
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   console.error(output);

@@ -17,6 +17,7 @@ import { toAvailableModel } from "../services/custom-model-store.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.js";
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
+import { requestSecurityVersion } from "../services/auth/security-change.js";
 import type { TurnEventLog } from "../services/turn-event-log.js";
 import { SessionExecutionError, type SessionExecution } from "../services/session-execution-store.js";
 import { ProjectAccessError } from "../services/project-access.js";
@@ -37,7 +38,7 @@ import { AVAILABLE_MODELS } from "../domain/models.js";
 // here, NOT a static enum: the catalog is tenant-dependent (built-ins plus
 // admin-added custom models), so membership is validated per-tenant by
 // resolveRuntimeModel, which 400s unknown or disabled ids.
-const sendMessageSchema = MessagePostRequestSchema.extend({
+const sendMessageSchema = MessagePostRequestSchema.safeExtend({
   model: z.string().trim().min(1).max(200).optional()
 });
 
@@ -82,13 +83,13 @@ export type MessageRouteStores = {
   limits: AppDependencies["limits"];
   modelSpending?: Pick<AppDependencies["modelSpending"], "hasLimit">;
   messages: Pick<AppDependencies["messages"], "create" | "addTokenUsage" | "setCostUsd" | "updateContent" | "updateStreamingContent" | "upsertToolResult" | "setRuntimeNotices">;
-  toolContexts: Pick<AppDependencies["toolContexts"], "create">;
+  toolContexts: Pick<AppDependencies["toolContexts"], "create" | "currentOwnerSecurityVersion">;
   dynamicConfig: Pick<AppDependencies["dynamicConfig"], "getOrCreateTenantSettings">;
   customModels: Pick<AppDependencies["customModels"], "list">;
   runtimeAdapter: RuntimeAdapter;
   hasProviderKey: (tenantId: string, provider: ModelProvider) => Promise<boolean>;
   getTenantAnthropicApiKey: AppDependencies["getTenantAnthropicApiKey"];
-  piiProtection: Pick<NonNullable<AppDependencies["piiProtection"]>, "evaluateText"> | undefined;
+  piiProtection: Pick<NonNullable<AppDependencies["piiProtection"]>, "evaluateTextWithPolicy"> | undefined;
   piiScanRuns: PiiHandlerStores["piiScanRuns"];
   auditEvents: Pick<AppDependencies["auditEvents"], "create">;
   activeTurns: AppDependencies["activeTurns"];
@@ -352,6 +353,21 @@ export async function registerMessageRoutes(
         projectInstructions = { ...projectInstructions, instructions: outcome.runtimePrompt };
       }
 
+      let generativeUiContext = input.generativeUiContext;
+      if (generativeUiContext) {
+        const outcome = await gateChatPrompt(piiStores, {
+          tenantId, sessionId: input.sessionId, userId, rawText: generativeUiContext
+        });
+        if (outcome.kind === "unavailable") {
+          return failClosed(request, reply, input.sessionId, tenantId, outcome);
+        }
+        if (outcome.kind === "block") {
+          return reply.code(422).send(apiError("generative_ui_context_blocked",
+            "Interactive UI context was blocked by organization policy. Start a new session or remove sensitive values before sending."));
+        }
+        generativeUiContext = outcome.runtimePrompt;
+      }
+
       // Past the PII gate: this turn will actually be dispatched, so it now
       // spends a daily-quota unit.
       const quotaError = await stores.limits.consumeTurnQuota({
@@ -372,6 +388,15 @@ export async function registerMessageRoutes(
         piiOutcome,
         piiDecision
       });
+
+      // The version that admits this turn: its tool context keeps it, so the
+      // gateway refuses the turn's tool calls after a security change of the
+      // account (services/auth/security-change.ts).
+      const ownerSecurityVersion = await requestSecurityVersion(
+        request.auth,
+        app.config.AUTH_MODE,
+        (tenantId, userId) => stores.toolContexts.currentOwnerSecurityVersion(tenantId, userId)
+      );
 
       openSseResponse(app, request, reply);
 
@@ -413,6 +438,8 @@ export async function registerMessageRoutes(
         effort: selectedEffort,
         prompt: runtimePrompt,
         projectInstructions,
+        generativeUiContext,
+        generativeUiTransport: input.generativeUiTransport,
         projectApprovalMode: project?.approvalMode,
         projectId: project?.projectId,
         projectAgentFileMode: project?.agentFileMode,
@@ -423,6 +450,7 @@ export async function registerMessageRoutes(
         selectedArtifactIds,
         userMessageReplacement,
         turnContext: "interactive",
+        ownerSecurityVersion,
         toolContextTtlMs: app.config.TOOL_CONTEXT_TTL_MS
       });
     } catch (error) {
@@ -524,6 +552,7 @@ async function respondWithPiiBlock(args: {
       pii: {
         status: "blocked",
         modeApplied: "block",
+        ...(outcome.policyRevision !== undefined ? { policyRevision: outcome.policyRevision } : {}),
         blockReason: outcome.blockReason,
         ...(outcome.scanRunId ? { scanRunId: outcome.scanRunId } : {})
       }

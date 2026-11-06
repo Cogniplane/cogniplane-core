@@ -10,7 +10,7 @@
 // rls-write-paths.integration.test.ts does, for every tenant table whose writer
 // is in the core backend. It checks the superuser and owner counts first, so a
 // store that wrote nothing cannot pass as isolation. The one exception is
-// user_microsoft_connections: its writer is in the private SharePoint overlay,
+// user_microsoft_connections: its writer is in a private overlay,
 // and a companion test in the private repository runs it.
 //
 // Ids are UUIDs, not a counter. A counter resets every process run and every

@@ -50,6 +50,7 @@ if (!getIntegrationDescriptor("microsoft")) {
       { key: "clientSecret", label: "Client secret", type: "password", required: true },
       { key: "entraTenantId", label: "Directory (tenant) ID", type: "text", required: true }
     ],
+    setupHelp: "Copy the credentials from the app registration.",
     platformStatus: () => ({ configured: true, message: null })
   });
 }
@@ -260,6 +261,16 @@ test("getIntegrationsForAdmin configSummary excludes password fields", async () 
   const ms = (await service.getIntegrationsForAdmin("tenant-1")).find((v) => v.id === "microsoft")!;
   expect(ms.configSummary).toEqual({ clientId: "abc", entraTenantId: "xyz" });
   expect("clientSecret" in ms.configSummary).toBe(false);
+});
+
+test("getIntegrationsForAdmin copies the descriptor setup help, and leaves it out when absent", async () => {
+  const service = new IntegrationRegistryService(buildConfig(), new FakeStateStore([]), probes);
+
+  const views = await service.getIntegrationsForAdmin("tenant-1");
+  expect(views.find((v) => v.id === "microsoft")!.setupHelp).toBe(
+    "Copy the credentials from the app registration."
+  );
+  expect(views.find((v) => v.id === "notion")!.setupHelp).toBeUndefined();
 });
 
 test("getIntegrationsForUser only returns enabled, available integrations", async () => {

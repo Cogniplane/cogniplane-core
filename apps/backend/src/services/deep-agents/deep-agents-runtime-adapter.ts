@@ -1,5 +1,6 @@
 import type { ModelSpendingStore } from "../model-spending-store.js";
 import { ModelSpendingCallback } from "./model-spending-callback.js";
+import { ModelStartCheck } from "./model-start-check.js";
 import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "../session-execution-store.js";
 // Sole runtime provider (bead im5e.1, then quap.4): the agent loop runs IN
@@ -25,7 +26,7 @@ import {
   type RuntimeSessionRef,
   type RuntimeUserInput
 } from "../../runtime-contracts.js";
-import type { ModelProvider, PolicyTurnContext, ProjectApprovalMode } from "@cogniplane/shared-types";
+import type { ModelProvider, PolicyTurnContext, ProjectApprovalMode, TurnStopReason } from "@cogniplane/shared-types";
 import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
 
 import { AVAILABLE_MODELS } from "../../domain/models.js";
@@ -33,7 +34,7 @@ import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type { AppConfig } from "../../config.js";
 import type { ProviderCredentials } from "../runtime/provider-credentials.js";
 import type { ApprovalStore } from "../auth/approval-store.js";
-import type { ToolExecutionContextStore } from "../auth/tool-execution-context-store.js";
+import type { ToolContextLiveness, ToolExecutionContextStore } from "../auth/tool-execution-context-store.js";
 import type { ActiveTurnsRegistry } from "../active-turns-registry.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
@@ -68,9 +69,10 @@ import { EventType, type BaseEvent } from "@ag-ui/client";
 import { DeepAgentsAGUIAgent } from "./deep-agents-agui-agent.js";
 import { createSessionAGUITurnBackend, type AGUITurnBackend } from "./deep-agents-agui-backend.js";
 import {
-  AGUI_INTERRUPTED_RESULT,
   approvalRequiredEvent,
-  runtimeNoticeEvent
+  interruptedResult,
+  runtimeNoticeEvent,
+  turnStopReasonOf
 } from "./agui-events.js";
 import { createDeepAgentsSessionRuntime, resolveModelConstruction } from "./deep-agents-graph.js";
 import { buildSkillsLibraryFiles } from "./deep-agents-skills-library.js";
@@ -189,13 +191,16 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        */
       skillBundles?: Pick<SkillBundleStorage, "materializeBundle">;
       tenantMembers: Pick<TenantMemberStore, "isUserBetaTester"> &
-        Partial<Pick<TenantMemberStore, "getRole">>;
+        Partial<Pick<TenantMemberStore, "getActiveRole">>;
       /**
-       * Pushes a live tool context's expiry out on each approval round (bead
-       * Optional: without it the TTL stays wall-clock and a turn parked on
-       * several approvals loses managed MCP tool access mid-turn.
+       * Pushes a live tool context's expiry out on each approval round, and
+       * checks the context at each model start and before each native tool.
+       * Optional: without it the TTL stays wall-clock, a turn parked on
+       * several approvals loses managed MCP tool access mid-turn, and a turn
+       * whose context ended runs on until its next approval round or its
+       * timeout.
        */
-      toolContexts?: Pick<ToolExecutionContextStore, "extend">;
+      toolContexts?: Pick<ToolExecutionContextStore, "extend" | "liveness">;
       /**
        * Refreshes the active-turn entry's liveness on each approval round
        * Optional: without it a turn parked on several approvals is stale-evicted
@@ -474,6 +479,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (!await this.stores.executions!.isCurrent(current.execution, runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
       } } : {}),
+      ...(this.stores.toolContexts ? {
+        requireLiveToolContext: () => this.requireLiveToolContext(sessionId, runtimeId)
+      } : {}),
       tenantId,
       sessionId,
       userId,
@@ -652,6 +660,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     input: {
       prompt: string;
       projectInstructions?: ProjectInstructionsSnapshot | null;
+      generativeUiContext?: string | null;
+      generativeUiTransport?: "tool";
       userInputs?: RuntimeUserInput[];
       toolContextId: string | null;
       projectApprovalMode?: ProjectApprovalMode;
@@ -693,18 +703,21 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // Install cancellation and the watchdog as soon as the slot is reserved.
     // Sandbox renewal, approval reconfiguration, artifact sync, and the graph
     // all consume the same bounded working-time budget.
+    // The abort reason of the turn is a TurnStopReason when the backend
+    // stopped it (a security change, ended tool access); the interrupted
+    // RUN_FINISHED carries it to the user.
     const turnAbort = new AbortController();
-    const onSessionAbort = () => turnAbort.abort();
+    const onSessionAbort = () => turnAbort.abort(state.abortController.signal.reason);
     const onAdmissionAbort = () => turnAbort.abort();
     if (state.abortController.signal.aborted) {
-      turnAbort.abort();
+      turnAbort.abort(state.abortController.signal.reason);
     } else {
       state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
     }
     if (input.cancelSignal?.aborted) turnAbort.abort();
     else input.cancelSignal?.addEventListener("abort", onAdmissionAbort, { once: true });
-    state.activeTurnInterrupt.current = async () => {
-      turnAbort.abort();
+    state.activeTurnInterrupt.current = async (reason) => {
+      turnAbort.abort(reason);
     };
     const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
       turnAbort
@@ -735,6 +748,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       state.pendingTurnEvents = [];
       await this.finishIntegrationInvalidation(state);
     };
+    // Checked at each model start of the turn, on every path that calls the
+    // model (ModelStartCheck). With a spending reservation the check runs in
+    // the spending callback, before its ledger write.
+    const checkModelStart = this.stores.toolContexts && input.toolContextId
+      ? () => this.requireLiveToolContext(state.sessionId, state.runtimeId) : undefined;
     armWatchdog();
     try {
       const vendorModel = resolveModelConstruction(modelId).vendorModel;
@@ -745,7 +763,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       this.spending.delete(state.runtimeId);
       if (reservation && this.stores.modelSpending) {
         spending = new ModelSpendingCallback(this.stores.modelSpending, reservation,
-          vendorModel, turnAbort.signal);
+          vendorModel, turnAbort.signal, checkModelStart);
         this.spending.set(state.runtimeId, spending);
       }
     } catch (error) {
@@ -953,7 +971,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const usageCost: { usd: number | null } = { usd: 0 };
 
     const rawBackend = createSessionAGUITurnBackend({
-      callbacks: spending ? [spending] : undefined,
+      callbacks: spending ? [spending] : checkModelStart ? [new ModelStartCheck(checkModelStart)] : undefined,
       threadId: state.threadId,
       runtime: state.runtime,
       toolContextRef: state.toolContextRef,
@@ -962,6 +980,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       promptText,
       conversationMessages,
       projectInstructions: input.projectInstructions,
+      generativeUiContext: input.generativeUiContext,
+      generativeUiTransport: input.generativeUiTransport,
       memoryContext,
       signal: turnAbort.signal,
       onGraphReady: async () => {
@@ -1035,6 +1055,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
     const agent = new DeepAgentsAGUIAgent({
       backend,
+      assistantMessageId: responseId,
       toolContextId: input.toolContextId ?? null,
       approvalAbortSignal: turnAbort.signal,
       // The approval round loop is unbounded, but both the
@@ -1055,10 +1076,21 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
             this.config.TOOL_CONTEXT_TTL_MS
           );
           if (!extended) {
+            // The context was not found, expired, or ended by a security
+            // change (tool-execution-context-store.ts). Every tool call of
+            // the turn would fail, so the turn stops at this step, on the
+            // replica that runs it. A turn with an execution whose access
+            // already ended (a project role change, a removal) fails at the
+            // resume with its own error: requireExecution runs before the
+            // next model call. Every other turn stops here, with the reason
+            // `security_change` when the owner's version changed.
             this.log.warn(
               { sessionId: state.sessionId, toolContextId: input.toolContextId },
-              "Tool context was already expired at the approval round; managed MCP tools will fail for the rest of this turn"
+              "Tool context was not found, expired, or ended by a security change at the approval round; the turn stops"
             );
+            const failsAtResume = Boolean(state.execution) &&
+              !(await this.requireCurrentExecution(state).then(() => true, () => false));
+            if (!failsAtResume) turnAbort.abort(await this.endedToolContextReason(state.tenantId, input.toolContextId));
           }
         } catch (err) {
           this.log.error(
@@ -1137,7 +1169,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               type: EventType.RUN_FINISHED,
               threadId: state.threadId,
               runId: responseId,
-              result: AGUI_INTERRUPTED_RESULT
+              result: interruptedResult(turnStopReasonOf(turnAbort.signal.reason))
             } as BaseEvent);
             queue.end();
             return;
@@ -1285,6 +1317,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     sessionId: string;
     userId: string;
     executionId?: string;
+    /** Why the backend stops the session; its running turn reports it. */
+    reason?: TurnStopReason;
   }): Promise<void> {
     const state = this.sessions.get(input.sessionId);
     if (!state) return;
@@ -1293,7 +1327,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     this.pendingIntegrationInvalidations.delete(input.sessionId);
 
     this.clearIdleTimer(state);
-    state.abortController.abort();
+    state.abortController.abort(input.reason);
 
     void this.approvalCoordinator.cancelPending({
       tenantId: state.tenantId, sessionId: state.sessionId, userId: state.userId, runtimeId: state.runtimeId
@@ -1428,7 +1462,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     return targets.map((state) => state.sessionId);
   }
 
-  async invalidateRuntimesForUser(tenantId: string, userId: string): Promise<string[]> {
+  async invalidateRuntimesForUser(
+    tenantId: string,
+    userId: string,
+    options?: { reason?: TurnStopReason }
+  ): Promise<string[]> {
     const targets = [...this.sessions.values()].filter(
       (state) => state.tenantId === tenantId && state.userId === userId
     );
@@ -1437,7 +1475,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         await this.abortSession({
           tenantId: state.tenantId,
           sessionId: state.sessionId,
-          userId: state.userId
+          userId: state.userId,
+          reason: options?.reason
         });
         this.clearPendingWorkspaceResetNotice(state.sessionId);
       })
@@ -1741,13 +1780,74 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }): Promise<string | null> {
     const [session, membershipRole] = await Promise.all([
       this.stores.sessions.getReadable(input.tenantId, input.sessionId, input.userId),
-      this.stores.tenantMembers.getRole?.(input.tenantId, input.userId) ?? Promise.resolve("member")
+      this.stores.tenantMembers.getActiveRole?.(input.tenantId, input.userId) ?? Promise.resolve("member")
     ]);
     if (!membershipRole || !session || session.status !== "active" || session.purpose === "project_reference" ||
         (session.projectId ? input.execution?.projectId !== session.projectId : Boolean(input.execution?.projectId))) {
       throw new SessionExecutionError("session_unavailable", 403);
     }
     return session.projectId;
+  }
+
+  /**
+   * The check before each model call (ModelStartCheck, also before each
+   * provider retry) and before each native tool (toolContextLivenessMiddleware).
+   * It reads the turn's tool execution context once. When the context is no
+   * longer live, the turn stops with the reason, and so do the model, the
+   * sandbox and the stream, also on a replica that the stop call of a security
+   * change did not reach. When the read fails, it is tried again a few times;
+   * if the state stays unknown, the call does not start and the turn fails
+   * with ToolContextUnverifiedError, which is not a stop reason.
+   */
+  private async requireLiveToolContext(sessionId: string, runtimeId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    const toolContextId = state?.runtimeId === runtimeId ? state.toolContextRef.current : null;
+    // No turn context to check. A disposed or replaced runtime has aborted its turn.
+    if (!state || !toolContextId || !this.stores.toolContexts) return;
+    const liveness = await this.readLiveness(state.tenantId, sessionId, toolContextId);
+    if (liveness === "live") return;
+    // A turn with an execution whose access already ended keeps its own
+    // error, as at the approval round.
+    if (state.execution) await this.requireCurrentExecution(state);
+    const reason = turnStopReasonForEndedContext(liveness);
+    this.log.warn({ sessionId, toolContextId, reason }, "Tool context is no longer live; the turn stops");
+    await state.activeTurnInterrupt.current?.(reason);
+    // The abort above ends the turn with an interrupted RUN_FINISHED. This
+    // error stops the model call in all cases.
+    throw Object.assign(new Error("This turn stopped because its tool access ended."), { statusCode: 403 });
+  }
+
+  /**
+   * `liveness`, with LIVENESS_READ_RETRY_DELAYS_MS between the tries. Throws
+   * ToolContextUnverifiedError when no try gives an answer.
+   */
+  private async readLiveness(tenantId: string, sessionId: string, toolContextId: string): Promise<ToolContextLiveness> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= LIVENESS_READ_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, LIVENESS_READ_RETRY_DELAYS_MS[attempt - 1]));
+      try {
+        return await this.stores.toolContexts!.liveness(tenantId, toolContextId);
+      } catch (err) {
+        lastError = err;
+        this.log.warn({ err, sessionId, toolContextId, attempt: attempt + 1 }, "Failed to read the tool context");
+      }
+    }
+    this.log.error(
+      { err: lastError, sessionId, toolContextId },
+      "Could not check the tool context; the call does not start and the turn stops"
+    );
+    throw new ToolContextUnverifiedError();
+  }
+
+  /** The stop reason of a turn whose tool context renews no more. */
+  private async endedToolContextReason(tenantId: string, toolContextId: string): Promise<TurnStopReason> {
+    try {
+      const liveness = await this.stores.toolContexts!.liveness(tenantId, toolContextId);
+      return turnStopReasonForEndedContext(liveness);
+    } catch (err) {
+      this.log.error({ err, toolContextId }, "Failed to read why the tool context ended");
+      return "tool_context_ended";
+    }
   }
 
   private async requireCurrentExecution(state: DeepAgentsSessionState): Promise<void> {
@@ -1790,6 +1890,30 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       logContext: { sessionId: state.sessionId }
     });
   }
+}
+
+/** The waits between the tries to read the tool context. Three tries take about 350 ms. */
+const LIVENESS_READ_RETRY_DELAYS_MS = [100, 250];
+
+/**
+ * The tool context could not be read, so it is not known to be live. The
+ * model call or the tool does not start, and the turn fails. This is not a
+ * confirmed stop: the user can send the message again.
+ */
+class ToolContextUnverifiedError extends Error {
+  readonly statusCode = 503;
+  constructor() {
+    super("This turn stopped because its tool access could not be checked. Send the message again.");
+    this.name = "ToolContextUnverifiedError";
+  }
+}
+
+/**
+ * The stop reason that a turn shows when its tool context is no longer live:
+ * the owner's security change, or else the end of its tool access.
+ */
+function turnStopReasonForEndedContext(liveness: ToolContextLiveness): TurnStopReason {
+  return liveness === "security_change" ? "security_change" : "tool_context_ended";
 }
 
 /**
@@ -1879,6 +2003,10 @@ function buildDeepAgentsRuntimeManifest(
 function clientSafeTurnFailureMessage(err: unknown): string {
   if (err instanceof Error && err.name === "GraphRecursionError") {
     return "The agent hit its step limit before finishing. Try splitting the request into smaller steps.";
+  }
+  // LangChain can wrap a callback or middleware error; the cause keeps it.
+  for (let cause: unknown = err; cause instanceof Error; cause = cause.cause) {
+    if (cause instanceof ToolContextUnverifiedError) return cause.message;
   }
   // Anthropic/OpenAI SDK errors (and LangChain's re-throws) carry `.status`;
   // some app-thrown errors use `.statusCode`. Accept either as the 4xx signal.

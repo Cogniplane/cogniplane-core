@@ -326,11 +326,12 @@ export class OrganizationSkillSubmissionStore {
       throw error;
     }
   }
+  /** `alsoInTransaction` runs in the release's transaction after the change: the owner notice of the release. */
   async release(tenantId: string, userId: string, id: string, input: {
     expectedOrganizationVersion: number; expectedActiveRevisionId: number | null;
     expectedDraftRevisionId: number; audience: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
-  }) {
+  }, options: { alsoInTransaction?: (client: PoolClient, skillId: string) => Promise<void> } = {}) {
     await withTenantScope(this.db, tenantId, async client => {
       const role = await membership(client, tenantId, userId, true);
       if (!reviewer(role)) throw new SubmissionAccessError();
@@ -385,6 +386,7 @@ export class OrganizationSkillSubmissionStore {
       await insertAuthorUpdate(client,{tenantId,recipientUserId:String(sub.author_user_id),submissionId:id,
         attempt:Number(sub.latest_attempt),kind:"released",skillName:String(metadata.skillName),feedback:null,
         organizationSkillId:skillId,organizationRevisionId:input.expectedDraftRevisionId,audience:input.audience});
+      if (options.alsoInTransaction) await options.alsoInTransaction(client, skillId);
     });
   }
 }

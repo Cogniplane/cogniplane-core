@@ -136,13 +136,14 @@ export const TIME_SERIES_ACTIONS = ["allow", "report", "block", "transform", "fa
 
 // Categorical palette for entity types. Order is stable so the same entity
 // always renders in the same slot when re-querying. Picked from existing
-// CSS tokens. Entity types beyond the six palette entries cycle through them.
+// CSS tokens: the shared chart palette, then the outline neutral. Entity types
+// beyond the six palette entries cycle through them.
 const ENTITY_PALETTE = [
-  "var(--color-accent)",
-  "var(--color-success)",
-  "var(--color-danger)",
-  "var(--color-warning)",
-  "var(--color-on-surface-variant)",
+  "var(--chart-1)",
+  "var(--chart-2)",
+  "var(--chart-4)",
+  "var(--chart-3)",
+  "var(--chart-5)",
   "var(--color-outline)"
 ];
 

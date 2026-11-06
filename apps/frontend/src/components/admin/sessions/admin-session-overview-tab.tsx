@@ -1,28 +1,9 @@
 "use client";
 
 import type { AdminSessionDetailOverview } from "@cogniplane/shared-types";
-import { Button } from "@/components/ui/button";
+import { SessionCopyButton } from "./session-copy-button";
 import { formatTimestamp } from "../../../lib/time-format";
 import { LIST_ITEM } from "../../../lib/ui-tokens";
-
-function CopyButton(props: { value: string; ariaLabel?: string }) {
-  const handleClick = () => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(props.value);
-    }
-  };
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="xs"
-      onClick={handleClick}
-      aria-label={props.ariaLabel ?? "Copy to clipboard"}
-    >
-      Copy
-    </Button>
-  );
-}
 
 function Field(props: { label: string; value: string | number | null }) {
   const display = props.value == null || props.value === "" ? "—" : String(props.value);
@@ -31,7 +12,7 @@ function Field(props: { label: string; value: string | number | null }) {
     <div className={LIST_ITEM}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <strong className="text-sm font-semibold text-on-surface">{props.label}</strong>
-        {copyable ? <CopyButton value={display} ariaLabel={`Copy ${props.label}`} /> : null}
+        {copyable ? <SessionCopyButton value={display} label={`Copy ${props.label}`} /> : null}
       </div>
       <p className="mt-1 text-xs break-all text-on-surface-faint">{display}</p>
     </div>

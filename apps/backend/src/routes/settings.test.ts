@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { test, expect } from "vitest";
 
 import cookie from "@fastify/cookie";
@@ -26,6 +27,11 @@ import {
   GithubConnectionNotConfiguredError
 } from "../services/integrations/github/github-connection-service.js";
 import { InvalidGithubRepositoryListError } from "../services/integrations/github/github-repository-allowlist.js";
+import { ConnectionConfirmError } from "../services/auth/security-change.js";
+import { registerGithubSettingsRoutes } from "../services/integrations/github/github-settings-routes.js";
+import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
+import type { IntegrationStateStore } from "../services/integrations/integration-state-store.js";
+import { registerNotionSettingsRoutes } from "../services/integrations/notion/notion-settings-routes.js";
 
 class InMemoryGithubConnectionService {
   userConnection: {
@@ -41,8 +47,10 @@ class InMemoryGithubConnectionService {
     connectedAt: string;
     updatedAt: string;
     lastUsedAt: string | null;
+    suspended: boolean;
   } | null = null;
   authorizeRequested = false;
+  confirmed: Array<{ githubUserId: string; ownerSecurityVersion: number | null }> = [];
   listing = { repositories: [{ fullName: "Acme/App", private: true, archived: false }], truncated: false };
   savedLists: string[][] = [];
   failure: Error | null = null;
@@ -52,6 +60,14 @@ class InMemoryGithubConnectionService {
       configured: true,
       userConnection: this.userConnection
     };
+  }
+
+  async confirm(_tenantId: string, _userId: string, githubUserId: string, ownerSecurityVersion: number | null) {
+    if (!this.userConnection) throw new ConnectionConfirmError("not_connected", "GitHub");
+    if (this.userConnection.githubUserId !== githubUserId) throw new ConnectionConfirmError("account_changed", "GitHub");
+    this.confirmed.push({ githubUserId, ownerSecurityVersion });
+    this.userConnection = { ...this.userConnection, suspended: false };
+    return this.userConnection;
   }
 
   async listAccessibleRepositories() {
@@ -74,8 +90,11 @@ class InMemoryGithubConnectionService {
     return repositories.map((repository) => repository.toLowerCase()).sort();
   }
 
-  async getAuthorizationUrl() {
+  authorizeVersion: number | null | undefined = undefined;
+
+  async getAuthorizationUrl(input: { ownerSecurityVersion: number | null }) {
     this.authorizeRequested = true;
+    this.authorizeVersion = input.ownerSecurityVersion;
     return {
       url: "https://github.com/login/oauth/authorize?client_id=test-client",
       browserBinding: {
@@ -115,7 +134,8 @@ function connectedAs(githubUserId: string) {
     refreshTokenExpiresAt: null,
     connectedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    lastUsedAt: null
+    lastUsedAt: null,
+    suspended: false
   };
 }
 
@@ -131,8 +151,11 @@ class InMemoryNotionConnectionService {
     };
   }
 
-  async getAuthorizationUrl() {
+  authorizeVersion: number | null | undefined = undefined;
+
+  async getAuthorizationUrl(input: { ownerSecurityVersion: number | null }) {
     this.authorizeRequested = true;
+    this.authorizeVersion = input.ownerSecurityVersion;
     return {
       url: "https://api.notion.com/v1/oauth/authorize?client_id=test-client",
       browserBinding: {
@@ -156,11 +179,32 @@ class InMemoryNotionConnectionService {
     this.userConnection = null;
     return true;
   }
+
+  async confirm() {
+    if (!this.userConnection) throw new ConnectionConfirmError("not_connected", "Notion");
+    if (this.userConnection.notionOwnerEmail === null) throw new ConnectionConfirmError("not_attested", "Notion");
+    this.userConnection = { ...this.userConnection, suspended: false };
+    return this.userConnection;
+  }
 }
 
 class InMemoryUserSettingsStore {
   private readonly sections = new Map<string, UserSettingsSectionRecord>();
   private readonly jobs = new Map<string, ScheduledJobRecord>();
+  // The security version that the saving session gave, per job.
+  readonly ownerSecurityVersions = new Map<string, number | null>();
+  // The account's current version, as `getOwnerSecurityVersion` reads it.
+  currentSecurityVersion: number | null = null;
+
+  async getOwnerSecurityVersion(): Promise<number | null> {
+    return this.currentSecurityVersion;
+  }
+
+  /** What the scheduler does after a security change of the owner. */
+  pauseForSecurityChange(jobId: string): void {
+    const job = this.jobs.get(jobId)!;
+    this.jobs.set(jobId, { ...job, enabled: false, nextRunAt: null, pausedReason: "security_change" });
+  }
 
   async listSections(_tenantId: string, userId: string): Promise<UserSettingsSectionRecord[]> {
     return [...this.sections.values()]
@@ -227,6 +271,7 @@ class InMemoryUserSettingsStore {
     settingsSnapshot: Record<string, unknown>;
     enabled: boolean;
     nextRunAt: string | null;
+    ownerSecurityVersion: number | null;
   }, admission: ScheduledJobAdmission): Promise<CreateScheduledJobResult> {
     this.admissions.push(admission);
     if (input.enabled && admission.maxActive > 0 && this.activeCount(input.userId) >= admission.maxActive) {
@@ -247,6 +292,7 @@ class InMemoryUserSettingsStore {
       input: input.input,
       settingsSnapshot: input.settingsSnapshot,
       enabled: input.enabled,
+      pausedReason: null,
       consecutiveFailures: 0,
       lastRunAt: null,
       nextRunAt: input.nextRunAt,
@@ -254,6 +300,7 @@ class InMemoryUserSettingsStore {
       updatedAt: now
     };
     this.jobs.set(job.jobId, job);
+    this.ownerSecurityVersions.set(job.jobId, input.ownerSecurityVersion);
     return { status: "created", job };
   }
 
@@ -271,6 +318,7 @@ class InMemoryUserSettingsStore {
     settingsSnapshot: Record<string, unknown>;
     enabled: boolean;
     nextRunAt: string | null;
+    ownerSecurityVersion: number | null;
   }, admission: ScheduledJobAdmission): Promise<UpdateScheduledJobResult> {
     this.admissions.push(admission);
     const current = this.jobs.get(input.jobId);
@@ -295,10 +343,12 @@ class InMemoryUserSettingsStore {
       input: input.input,
       settingsSnapshot: input.settingsSnapshot,
       enabled: input.enabled,
+      pausedReason: null,
       nextRunAt: input.nextRunAt,
       updatedAt: new Date().toISOString()
     };
     this.jobs.set(input.jobId, next);
+    this.ownerSecurityVersions.set(input.jobId, input.ownerSecurityVersion);
     return { status: "updated", job: next };
   }
 
@@ -316,7 +366,7 @@ class InMemoryUserSettingsStore {
 }
 
 async function createApp(overrides: {
-  integrationStates?: SettingsRouteStores["integrationStates"];
+  integrationStates?: Pick<IntegrationStateStore, "get">;
   integrationRegistry?: SettingsRouteStores["integrationRegistry"];
   config?: SettingsRouteStores["config"];
   limits?: SettingsRouteStores["limits"];
@@ -333,25 +383,38 @@ async function createApp(overrides: {
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "settings-user" }));
   app.decorate("db", overrides.db ?? new FakeDatabase() as unknown as Pool);
   app.addHook("preHandler", async (request) => {
+    // `x-security-version`: a local session with that version. Without it,
+    // the request has no browser session, as in dev mode.
+    const securityVersion = request.headers["x-security-version"]?.toString();
     request.auth = {
       userId: request.headers["x-user-id"]?.toString() || "settings-user",
       tenantId: request.headers["x-tenant-id"]?.toString() || "settings-tenant",
       isAdmin: false,
-      role: "member" as const
+      role: "member" as const,
+      ...(securityVersion === undefined ? {} : {
+        session: securityVersion === "workos"
+          ? { authSource: "workos" as const }
+          : { authSource: "local" as const, securityVersion: Number(securityVersion) }
+      })
     };
   });
 
+  const config = overrides.config ?? createTestConfig({});
+  const integrationStates = overrides.integrationStates ?? {
+    async get() {
+      return null;
+    }
+  };
+  // The GitHub and Notion member routes ship with their connector modules.
+  // `app-bootstrap.ts` attaches them next to these settings routes.
+  const enablement = (tenantId: string, integrationId: string) =>
+    loadIntegrationEnablement(integrationStates, config, tenantId, integrationId);
+  registerGithubSettingsRoutes(app, { githubConnections, loadIntegrationEnablement: enablement });
+  registerNotionSettingsRoutes(app, { notionConnections, loadIntegrationEnablement: enablement });
   await registerSettingsRoutes(app, {
     settings,
     auditEvents,
-    githubConnections,
-    notionConnections,
-    config: overrides.config ?? createTestConfig({}),
-    integrationStates: overrides.integrationStates ?? {
-      async get() {
-        return null;
-      }
-    },
+    config,
     integrationRegistry: overrides.integrationRegistry ?? {
       async getIntegrationsForUser() {
         return [];
@@ -486,6 +549,123 @@ test("scheduled jobs routes create, update, validate, and delete jobs", async ()
   expect(auditEvents.events.length).toBe(3);
 
   await app.close();
+});
+
+test("a job keeps the security version of the session that saved it; an edit confirms a paused job", async () => {
+  const { app, settings, auditEvents } = await createApp();
+  const job = (enabled: boolean) => ({
+    jobName: "Digest", cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt",
+    input: { prompt: "Write the digest." }, enabled
+  });
+
+  const local = await app.inject({
+    method: "POST", url: "/me/scheduled-jobs", headers: { "x-security-version": "4" }, payload: job(true)
+  });
+  expect(local.statusCode).toBe(201);
+  const jobId = local.json().scheduledJob.jobId as string;
+  expect(settings.ownerSecurityVersions.get(jobId)).toBe(4);
+  // The version is account state: the API does not return it.
+  expect(local.json().scheduledJob).not.toHaveProperty("ownerSecurityVersion");
+  expect(local.json().scheduledJob.pausedReason).toBeNull();
+
+  // WorkOS accounts have no security version here.
+  const workos = await app.inject({
+    method: "POST", url: "/me/scheduled-jobs", headers: { "x-security-version": "workos" }, payload: job(true)
+  });
+  expect(settings.ownerSecurityVersions.get(workos.json().scheduledJob.jobId as string)).toBeNull();
+
+  // The scheduler paused the job after a security change. The list shows why.
+  settings.pauseForSecurityChange(jobId);
+  const listed = (await app.inject({ method: "GET", url: "/me/scheduled-jobs" })).json().scheduledJobs as Array<Record<string, unknown>>;
+  expect(listed.find((row) => row.jobId === jobId)).toMatchObject({ enabled: false, pausedReason: "security_change" });
+
+  // The owner's edit from a current session stores that session's version
+  // and turns the job on again.
+  const resumed = await app.inject({
+    method: "PUT", url: `/me/scheduled-jobs/${jobId}`, headers: { "x-security-version": "5" }, payload: job(true)
+  });
+  expect(resumed.statusCode).toBe(200);
+  expect(resumed.json().scheduledJob).toMatchObject({ enabled: true, pausedReason: null });
+  expect(settings.ownerSecurityVersions.get(jobId)).toBe(5);
+  expect(auditEvents.events.at(-1)).toMatchObject({
+    type: "user.scheduled_job.updated",
+    payload: { jobId, enabled: true, previousPausedReason: "security_change" }
+  });
+
+  await app.close();
+});
+
+test("a review that turns on a job paused after a security change does not use the creation rate limit", async () => {
+  const consumed: string[] = [];
+  const { app, settings } = await createApp({
+    // One active job at most, so the cap check is visible.
+    config: createTestConfig({ SCHEDULED_JOB_MAX_ACTIVE_PER_USER: 1 }),
+    limits: {
+      async consumeRateLimit(input) {
+        consumed.push(input.resource);
+        return {
+          error: "limit_exceeded", limitType: "rate_limit", resource: input.resource, scope: "user", limit: 10,
+          retryAfterMs: 30_000, resetAt: new Date(Date.now() + 30_000).toISOString(), message: "Too many new jobs."
+        };
+      },
+      async consumeTurnQuota() {
+        return null;
+      },
+      sweepExpired() {}
+    } satisfies SettingsRouteStores["limits"]
+  });
+  const fields = (jobId: string, enabled: boolean) => ({
+    tenantId: "settings-tenant", jobId, userId: "settings-user", jobName: jobId, description: null,
+    cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt" as const, targetRef: null,
+    input: { prompt: "Write the digest." }, settingsSnapshot: {}, enabled, nextRunAt: null, ownerSecurityVersion: 1
+  });
+  const [pausedA, pausedB, offByChoice] = [randomUUID(), randomUUID(), randomUUID()];
+  await settings.createScheduledJob(fields(pausedA, true), { maxActive: 0 });
+  await settings.createScheduledJob(fields(pausedB, true), { maxActive: 0 });
+  await settings.createScheduledJob(fields(offByChoice, false), { maxActive: 0 });
+  settings.pauseForSecurityChange(pausedA);
+  settings.pauseForSecurityChange(pausedB);
+  const enable = (jobId: string) => app.inject({
+    method: "PUT", url: `/me/scheduled-jobs/${jobId}`, headers: { "x-security-version": "2" },
+    payload: { jobName: jobId, cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt", input: { prompt: "Write the digest." }, enabled: true }
+  });
+
+  // The limiter refuses every request, but the review is not counted.
+  const resumed = await enable(pausedA);
+  expect(resumed.statusCode).toBe(200);
+  expect(resumed.json().scheduledJob).toMatchObject({ enabled: true, pausedReason: null });
+  expect(consumed).toEqual([]);
+
+  // The active-job cap still applies to a review.
+  const capped = await enable(pausedB);
+  expect(capped.statusCode).toBe(409);
+  expect(capped.json()).toMatchObject({ error: "scheduled_job_limit_reached" });
+
+  // A job that the owner turned off still uses the limit.
+  const throttled = await enable(offByChoice);
+  expect(throttled.statusCode).toBe(429);
+  expect(consumed).toEqual(["scheduled_job_create"]);
+
+  await app.close();
+});
+
+test("in dev-headers mode a job keeps the account's current version; in jwt mode a request without a session stores none", async () => {
+  const payload = { jobName: "Digest", cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt", input: { prompt: "Write the digest." }, enabled: true };
+
+  const dev = await createApp({ config: createTestConfig({ AUTH_MODE: "dev-headers" }) });
+  dev.settings.currentSecurityVersion = 7;
+  const devJob = await dev.app.inject({ method: "POST", url: "/me/scheduled-jobs", payload });
+  expect(dev.settings.ownerSecurityVersions.get(devJob.json().scheduledJob.jobId as string)).toBe(7);
+  // A session still decides when one exists.
+  const withSession = await dev.app.inject({ method: "POST", url: "/me/scheduled-jobs", headers: { "x-security-version": "3" }, payload });
+  expect(dev.settings.ownerSecurityVersions.get(withSession.json().scheduledJob.jobId as string)).toBe(3);
+  await dev.app.close();
+
+  const jwt = await createApp({ config: createTestConfig({ AUTH_MODE: "jwt" }) });
+  jwt.settings.currentSecurityVersion = 7;
+  const jwtJob = await jwt.app.inject({ method: "POST", url: "/me/scheduled-jobs", payload });
+  expect(jwt.settings.ownerSecurityVersions.get(jwtJob.json().scheduledJob.jobId as string)).toBeNull();
+  await jwt.app.close();
 });
 
 test("saving an enabled job rejects a prompt the PII policy blocks", async () => {
@@ -944,7 +1124,8 @@ test("github connection routes expose status, authorization URL, and disconnect 
     refreshTokenExpiresAt: null,
     connectedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    lastUsedAt: null
+    lastUsedAt: null,
+    suspended: false
   };
 
   const statusResponse = await app.inject({
@@ -957,11 +1138,14 @@ test("github connection routes expose status, authorization URL, and disconnect 
 
   const authorizeResponse = await app.inject({
     method: "POST",
-    url: "/me/github-connection/authorize"
+    url: "/me/github-connection/authorize",
+    headers: { "x-security-version": "4" }
   });
   expect(authorizeResponse.statusCode).toBe(200);
   expect(authorizeResponse.json().url as string).toMatch(/client_id=test-client/);
   expect(githubConnections.authorizeRequested).toBe(true);
+  // The signed OAuth state carries the version of the session that started it.
+  expect(githubConnections.authorizeVersion).toBe(4);
   const bindingCookie = authorizeResponse.cookies.find((c) => c.name === "cogniplane_oauth_bind_github");
   expect(bindingCookie).toMatchObject({
     value: "github-nonce",
@@ -1092,7 +1276,8 @@ test("notion connection routes expose status, authorization URL, and disconnect 
     refreshTokenExpiresAt: null,
     connectedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    lastUsedAt: null
+    lastUsedAt: null,
+    suspended: false
   };
 
   const statusResponse = await app.inject({
@@ -1105,11 +1290,14 @@ test("notion connection routes expose status, authorization URL, and disconnect 
 
   const authorizeResponse = await app.inject({
     method: "POST",
-    url: "/me/notion-connection/authorize"
+    url: "/me/notion-connection/authorize",
+    headers: { "x-security-version": "workos" }
   });
   expect(authorizeResponse.statusCode).toBe(200);
   expect(authorizeResponse.json().url as string).toMatch(/api\.notion\.com\/v1\/oauth\/authorize/);
   expect(notionConnections.authorizeRequested).toBe(true);
+  // A WorkOS session has no security version.
+  expect(notionConnections.authorizeVersion).toBeNull();
 
   const disconnectResponse = await app.inject({
     method: "DELETE",
@@ -1265,3 +1453,52 @@ test("token usage rejects a repeated days parameter", async () => {
   expect(usageQueryValues(pool)).toEqual([]);
 });
 
+
+// q4w0.8: confirm stores the security version of the requesting session.
+test("github and notion confirm routes pass the session's security version and map refusals", async () => {
+  const { app, githubConnections, notionConnections } = await createApp();
+  githubConnections.userConnection = { ...connectedAs("12345"), suspended: true };
+
+  const confirmed = await app.inject({
+    method: "POST", url: "/me/github-connection/confirm",
+    headers: { "x-security-version": "6" }, payload: { githubUserId: "12345" }
+  });
+  expect(confirmed.statusCode).toBe(200);
+  expect(confirmed.json().userConnection).toMatchObject({ githubUserId: "12345", suspended: false });
+  expect(githubConnections.confirmed).toEqual([{ githubUserId: "12345", ownerSecurityVersion: 6 }]);
+
+  const otherAccount = await app.inject({
+    method: "POST", url: "/me/github-connection/confirm",
+    headers: { "x-security-version": "6" }, payload: { githubUserId: "999" }
+  });
+  expect(otherAccount.statusCode).toBe(409);
+  expect(otherAccount.json().error).toBe("github_account_changed");
+  const extraField = await app.inject({
+    method: "POST", url: "/me/github-connection/confirm",
+    headers: { "x-security-version": "6" }, payload: { githubUserId: "12345", ownerSecurityVersion: 99 }
+  });
+  expect(extraField.statusCode).toBe(400);
+
+  const notConnected = await app.inject({
+    method: "POST", url: "/me/notion-connection/confirm",
+    headers: { "x-security-version": "6" }, payload: { notionUserId: "n-1", notionWorkspaceId: null }
+  });
+  expect(notConnected.statusCode).toBe(404);
+  expect(notConnected.json().error).toBe("notion_not_connected");
+  expect(notionConnections.userConnection).toBeNull();
+
+  // No attested identity (Notion returned no owner email): the route refuses.
+  notionConnections.userConnection = {
+    notionUserId: "n-1", notionWorkspaceId: "ws-1", notionWorkspaceName: "Mine", notionWorkspaceIcon: null,
+    notionOwnerEmail: null, notionOwnerName: "Me", scopes: [], accessTokenExpiresAt: null, refreshTokenExpiresAt: null,
+    connectedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastUsedAt: null, suspended: true
+  };
+  const notAttested = await app.inject({
+    method: "POST", url: "/me/notion-connection/confirm",
+    headers: { "x-security-version": "6" }, payload: { notionUserId: "n-1", notionWorkspaceId: "ws-1" }
+  });
+  expect(notAttested.statusCode).toBe(409);
+  expect(notAttested.json().error).toBe("notion_not_attested");
+  expect(notionConnections.userConnection?.suspended).toBe(true);
+  await app.close();
+});

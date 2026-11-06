@@ -14,6 +14,7 @@ import type { AppConfig } from "./config.js";
 import type { Pool } from "./lib/db.js";
 import type { UploadAdmission } from "./services/artifacts/upload-admission.js";
 import type { AuditEventStore } from "./services/audit-event-store.js";
+import type { DataRouteControl } from "./services/data-route-control.js";
 import type { RuntimeInvalidator, TenantRuntimeInvalidator } from "./services/integrations/contracts.js";
 import type { IntegrationEnablement } from "./services/integrations/integration-enablement.js";
 import type { IntegrationOAuthStateStore } from "./services/integrations/integration-oauth-state-store.js";
@@ -21,6 +22,7 @@ import type { IntegrationRegistry } from "./services/integrations/integration-re
 import type { IntegrationStateStore } from "./services/integrations/integration-state-store.js";
 import type { ManagedToolCatalog } from "./services/managed-tools/catalog.js";
 import type { ManagedToolFactoryRegistry } from "./services/managed-tools/factory.js";
+import type { PiiImportScopeRegistry } from "./services/pii/pii-import-scopes.js";
 import type { RequestLimitsInterface } from "./services/request-limits.js";
 
 /** Settings an overlay needs for OAuth state JWTs, secret encryption, and redirects. */
@@ -55,15 +57,25 @@ export type AttachOverlaysInput = {
   runtimeInvalidator: RuntimeInvalidator & TenantRuntimeInvalidator;
   managedToolCatalog: Pick<ManagedToolCatalog, "register">;
   managedToolFactoryRegistry: Pick<ManagedToolFactoryRegistry, "register">;
+  // An overlay that imports files registers each import source here, with
+  // the `source` it gives `uploadAdmission.admit` and its PII scope toggle.
+  // Register during bootstrap: core freezes the registry after it.
+  piiImportScopes: Pick<PiiImportScopeRegistry, "register">;
   // Shared rate limiter for overlay routes (OAuth callbacks, file imports).
   limits?: Pick<RequestLimitsInterface, "consumeRateLimit">;
 };
 
+/** Core route checks that an overlay's routes use. */
+export type OverlayRouteControls = {
+  // A route that changes where the tenant's data goes calls
+  // `requireStepUpForOverlay` before the change and puts `ownerNotice` on the
+  // change's audit event, which it writes in the change's transaction.
+  dataRoutes: Pick<DataRouteControl, "requireStepUpForOverlay" | "ownerNotice">;
+};
+
 export type OverlayHandles = {
   // `app-bootstrap.ts` calls this once, after every core route group.
-  attachRoutes: (app: FastifyInstance) => void;
-  // Optional probe for the tenant settings response. Absent in the OSS build.
-  getMicrosoftConfigured?: (tenantId: string, userId: string) => Promise<boolean>;
+  attachRoutes: (app: FastifyInstance, controls: OverlayRouteControls) => void;
 };
 
 /** Called once per `buildAppDependencies()`. Each call must return handles for that app only. */

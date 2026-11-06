@@ -85,6 +85,9 @@ export type IntegrationDescriptor = {
   writeToolIds: readonly string[];
   configMode: IntegrationConfigMode;
   configFields?: readonly IntegrationConfigField[];
+  // Admin text above an empty `oauth_app` form, for example where to find
+  // the credentials. When absent, the admin pane shows generic text.
+  setupHelp?: string;
   docsUrl?: string;
   // Hooks. The descriptor stays a plain data record; live wiring is
   // attached lazily by the bootstrap module so descriptors can ship from

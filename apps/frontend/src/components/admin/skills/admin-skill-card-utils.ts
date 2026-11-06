@@ -140,10 +140,25 @@ export function getMarketplaceReviewPillClass(
     case "official":
       return `${PILL_BASE} bg-success-surface text-success`;
     case "reviewed":
-      return `${PILL_BASE} bg-accent-soft text-accent`;
+      return `${PILL_BASE} bg-info-surface text-info`;
     case "community":
       return `${PILL_BASE} bg-surface-container text-on-surface-variant`;
     case "experimental":
       return `${PILL_BASE} bg-danger-surface text-danger`;
   }
+}
+
+export function describeRevisionSource(revision: SkillRevision): string {
+  switch (revision.sourceType) {
+    case "github": return "GitHub import";
+    case "zip": return "ZIP upload";
+    case "inline": return typeof revision.metadata.organizationSubmissionId === "string" ? "Inline member submission" : "Inline SKILL.md";
+    default: return revision.sourceType || "Source unavailable";
+  }
+}
+
+export function describeSkillUsage(skill: AdminSkill): string {
+  const used = typeof skill.invokedSessions30d === "number" ? `Used in ${skill.invokedSessions30d} sessions` : "Used sessions unavailable";
+  const offered = typeof skill.materializedSessions30d === "number" ? `offered in ${skill.materializedSessions30d} sessions` : "offered sessions unavailable";
+  return `${used}; ${offered}. Period: last 30 days.`;
 }

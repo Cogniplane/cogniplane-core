@@ -158,8 +158,8 @@ async function setup(options: { policyService?: NonNullable<Parameters<typeof cr
 const TEXT = { name: "units", content: "User prefers metric units." };
 
 // A refusal is a successful tool result with an `error` text, like the GitHub and Jira tools
-// return theirs. A JSON-RPC error would reach the graph as a thrown tool exception, which
-// ends the turn, so the model could not tell the user that nothing was saved.
+// return theirs: the call was handled, and the result says that nothing was saved. A
+// JSON-RPC error is for a call that failed.
 function refusal(response: { json(): { error?: unknown; result?: { isError?: boolean; structuredContent?: { error?: string }; content?: Array<{ text: string }> } } }) {
   const body = response.json();
   expect(body.error).toBeUndefined();

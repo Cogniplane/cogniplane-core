@@ -37,10 +37,12 @@ export function useApplePlatform(): boolean {
 }
 
 // Shortcuts never act on top of another dialog, alert dialog, or menu.
-export function otherOverlayOpen(): boolean {
-  return document.querySelector(
+// `through` names one overlay that a shortcut still works over, such as the
+// phone session drawer for the session shortcuts.
+export function otherOverlayOpen(through?: string): boolean {
+  return Array.from(document.querySelectorAll(
     '[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"], [role="menu"][data-state="open"], dialog[open]'
-  ) !== null;
+  )).some((overlay) => !(through && overlay.matches(through)));
 }
 
 function isTextField(target: EventTarget | null): boolean {
@@ -78,7 +80,7 @@ export function ariaKeyShortcut(shortcut: Pick<Shortcut, "key" | "mod" | "shift"
  * so typing "/" or "?" stays text. No shortcut acts in a rich text editor or over
  * an open dialog or menu.
  */
-export function useShortcut(shortcut: Shortcut, handler: (event: KeyboardEvent) => void, enabled = true): void {
+export function useShortcut(shortcut: Shortcut, handler: (event: KeyboardEvent) => void, enabled = true, through?: string): void {
   const handlerRef = useRef(handler);
   useEffect(() => {
     handlerRef.current = handler;
@@ -89,11 +91,11 @@ export function useShortcut(shortcut: Shortcut, handler: (event: KeyboardEvent) 
       if (event.defaultPrevented || !matchesShortcut(event, shortcut, isApplePlatform())) return;
       if (event.target instanceof HTMLElement && event.target.isContentEditable) return;
       if (!shortcut.mod && shortcut.key !== "Escape" && isTextField(event.target)) return;
-      if (otherOverlayOpen()) return;
+      if (otherOverlayOpen(through)) return;
       event.preventDefault();
       handlerRef.current(event);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [enabled, shortcut]);
+  }, [enabled, shortcut, through]);
 }

@@ -1,4 +1,4 @@
-import { EventType, type BaseEvent } from "@ag-ui/client";
+import { EventType, type BaseEvent, type MessagesSnapshotEvent } from "@ag-ui/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
@@ -473,6 +473,25 @@ describe("GET /sessions/:id/connect with a remote turn", () => {
     expect(events).toHaveLength(5);
     expect(reader).not.toHaveBeenCalled();
     expect(waitForEvents).not.toHaveBeenCalled();
+  });
+
+  test("keeps a saved current tool running when the remote replay is unavailable", async () => {
+    const reply = {
+      ...savedRow({ messageId: "a2", role: "assistant", status: "streaming" }),
+      toolResults: [{ toolResultId: "remote-call", toolName: "execute", title: "execute",
+        status: "in_progress", input: '{"command":"sleep 60"}', output: "" }]
+    };
+    const { app } = await makeApp({
+      history: async () => ({ messages: [...EARLIER, RUNNING_USER, reply], hasMore: false }),
+      executions: REMOTE_OWNER,
+      turnBus: { replay: async () => [] }
+    });
+    const response = await app.inject({ method: "GET", url: `/sessions/${SESSION_ID}/connect` });
+    const events = parseEvents(response.body);
+    expect(historyOf(events).connection).toEqual({ activeTurn: "unavailable", hasMoreHistory: false });
+    const snapshot = events.find((event) => event.type === EventType.MESSAGES_SNAPSHOT) as MessagesSnapshotEvent;
+    expect(snapshot.messages).toContainEqual(expect.objectContaining({ id: "a2:call:0", role: "assistant" }));
+    expect(snapshot.messages.some((message) => message.role === "tool" && message.toolCallId === "remote-call")).toBe(false);
   });
 
   test.each([

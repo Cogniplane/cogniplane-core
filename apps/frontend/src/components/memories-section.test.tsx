@@ -70,7 +70,7 @@ beforeEach(() => {
   vi.mocked(updateMemory).mockResolvedValue({ scope, memory: { ...units, content: "Edited.", version: 3, provenance: "user_authored" } });
   vi.mocked(deleteMemory).mockResolvedValue(undefined);
 });
-afterEach(() => { cleanup(); client.clear(); });
+afterEach(() => { cleanup(); client.clear(); vi.restoreAllMocks(); });
 
 it("lists each memory with its full text and where it came from, and flags the unverified one", async () => {
   mount();
@@ -123,6 +123,18 @@ it("lets the user retry after a load failure", async () => {
   expect((await screen.findByRole("alert")).textContent).toContain("Could not load your memories.");
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   expect(await screen.findByText("User prefers metric units.")).toBeTruthy();
+});
+
+it("keeps Retry's focus request when the frame runs before the recovered rows render", async () => {
+  vi.mocked(listMemories).mockRejectedValueOnce(new Error("offline"));
+  mount();
+  const retry = await screen.findByRole("button", { name: "Retry" });
+  vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { callback(0); return 0; });
+  retry.focus();
+  fireEvent.click(retry);
+
+  const edit = await screen.findByRole("button", { name: "Edit memory units" });
+  await waitFor(() => expect(document.activeElement).toBe(edit));
 });
 
 it("saves an edit with the account and the version that the page loaded, and shows the result", async () => {
@@ -356,4 +368,165 @@ it("locks the page when a write is refused because the account changed", async (
 
   await waitFor(() => expect(screen.queryByText("User prefers metric units.")).toBeNull());
   expect(screen.getAllByRole("alert").some((alert) => alert.textContent?.includes("account or organization changed"))).toBe(true);
+});
+
+it("keeps a dirty draft on refused cancel, then discards it only on confirmation", async () => {
+  mount();
+  await screen.findByText("User prefers metric units.");
+  startEditing("Keep this draft.");
+  expect(document.activeElement).toBe(editor());
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  let dialog = await screen.findByRole("alertdialog");
+  expect(within(dialog).getByRole("heading").textContent).toContain("units");
+  expect(within(dialog).getByText(/saved memory will stay unchanged/)).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(editor().value).toBe("Keep this draft.");
+  await waitFor(() => expect(document.activeElement).toBe(editor()));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  dialog = await screen.findByRole("alertdialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Discard edit" }));
+  await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit memory units" })));
+  expect(updateMemory).not.toHaveBeenCalled();
+});
+
+it("uses the same discard rule when switching memories and opens the chosen editor after confirmation", async () => {
+  mount();
+  await screen.findByText("User prefers metric units.");
+  startEditing("Keep this draft.");
+  fireEvent.click(screen.getByRole("button", { name: "Edit memory standup-time" }));
+  let dialog = await screen.findByRole("alertdialog");
+  expect(dialog.textContent).toContain('Then the editor will open "standup-time".');
+  fireEvent.click(within(dialog).getByRole("button", { name: "Keep editing" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(editor().value).toBe("Keep this draft.");
+  fireEvent.click(screen.getByRole("button", { name: "Edit memory standup-time" }));
+  dialog = await screen.findByRole("alertdialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Discard edit" }));
+  const next = await screen.findByRole("textbox", { name: "Text of memory standup-time" });
+  expect((next as HTMLTextAreaElement).value).toBe(standup.content);
+  await waitFor(() => expect(document.activeElement).toBe(next));
+  expect(updateMemory).not.toHaveBeenCalled();
+});
+
+it("exits an unchanged editor directly even after a background refresh changes the saved text", async () => {
+  mount();
+  await screen.findByText("User prefers metric units.");
+  startEditing();
+  act(() => { client.setQueryData(memoriesKey(scope), withNewer); });
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.getByText(newer.content)).toBeTruthy();
+});
+
+it("reports a failed refresh with last-known data and keeps the editor through retry", async () => {
+  mount();
+  await screen.findByText("User prefers metric units.");
+  startEditing("My retained draft.");
+  vi.mocked(listMemories).mockRejectedValueOnce(new Error("offline"));
+  await act(async () => { await client.invalidateQueries({ queryKey: memoriesKey(scope) }); });
+  expect(await screen.findByText(/Showing the last loaded list/)).toBeTruthy();
+  expect(screen.getByText(standup.content)).toBeTruthy();
+  expect(editor().value).toBe("My retained draft.");
+  fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(screen.queryByText(/Showing the last loaded list/)).toBeNull());
+  expect(editor().value).toBe("My retained draft.");
+});
+
+it("locks and clears a dirty editor and discard decision on a scope failure during refresh", async () => {
+  mount();
+  await screen.findByText("User prefers metric units.");
+  startEditing("Private draft.");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await screen.findByRole("alertdialog");
+  vi.mocked(listMemories).mockResolvedValueOnce({ scope: { ...scope, userId: "someone-else" }, memories: [units], total: 1 });
+  await act(async () => { await client.invalidateQueries({ queryKey: memoriesKey(scope) }); });
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.queryByText(units.content)).toBeNull();
+  expect(client.getQueryData(memoriesKey(scope))).toBeUndefined();
+  expect(screen.getByRole("alert").textContent).toContain("account or organization changed");
+});
+
+it("prevents duplicate pending saves and returns focus to Edit after success", async () => {
+  let resolve!: (value: { scope: typeof scope; memory: Memory }) => void;
+  vi.mocked(updateMemory).mockImplementation(() => new Promise(done => { resolve = done; }));
+  mount();
+  await screen.findByText(units.content);
+  startEditing("My saved text.");
+  const save = screen.getByRole("button", { name: "Save" });
+  fireEvent.click(save);
+  fireEvent.click(save);
+  await waitFor(() => expect(updateMemory).toHaveBeenCalledTimes(1));
+  expect((screen.getByRole("button", { name: "Saving…" }) as HTMLButtonElement).disabled).toBe(true);
+  // Run focus before React replaces the editor with the saved row's controls.
+  vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => { callback(0); return 0; });
+  await act(async () => { resolve({ scope, memory: memory({ content: "My saved text.", version: 3 }) }); });
+  await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit memory units" })));
+});
+
+it("prevents duplicate pending deletes and returns focus to the next memory", async () => {
+  let resolve!: () => void;
+  vi.mocked(deleteMemory).mockImplementation(() => new Promise<void>(done => { resolve = done; }));
+  mount();
+  await screen.findByText(units.content);
+  fireEvent.click(screen.getByRole("button", { name: "Delete memory units" }));
+  const dialog = await screen.findByRole("alertdialog");
+  const remove = within(dialog).getByRole("button", { name: "Delete memory" });
+  fireEvent.click(remove);
+  fireEvent.click(remove);
+  await waitFor(() => expect(deleteMemory).toHaveBeenCalledTimes(1));
+  expect((within(dialog).getByRole("button", { name: "Deleting…" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => { resolve(); });
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Delete memory standup-time" })));
+});
+
+it("moves focus to the section heading when the last memory is removed", async () => {
+  vi.mocked(listMemories).mockResolvedValue({ scope, memories: [units], total: 1 });
+  mount();
+  await screen.findByText(units.content);
+  fireEvent.click(screen.getByRole("button", { name: "Delete memory units" }));
+  fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "Delete memory" }));
+  await screen.findByText(/No saved memories yet/);
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "What the agent remembers about you" })));
+});
+
+it("returns focus to the retained editor after a failed latest read is retried", async () => {
+  vi.mocked(updateMemory).mockRejectedValueOnce(conflict());
+  mount();
+  await screen.findByText(units.content);
+  startEditing("My retained draft.");
+  vi.mocked(listMemories).mockRejectedValueOnce(new Error("offline"));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText(/latest saved text could not be loaded/);
+  await waitFor(() => expect(document.activeElement).toBe(editor()));
+  vi.mocked(listMemories).mockResolvedValue(withNewer);
+  const reload = screen.getByRole("button", { name: "Reload it" });
+  reload.focus();
+  fireEvent.click(reload);
+  await screen.findByLabelText("Latest saved text");
+  await waitFor(() => expect(document.activeElement).toBe(editor()));
+  expect(editor().value).toBe("My retained draft.");
+});
+
+it("warns on page unload only while the draft differs from its original base", async () => {
+  mount();
+  await screen.findByText(units.content);
+  startEditing();
+  const clean = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(clean);
+  expect(clean.defaultPrevented).toBe(false);
+  fireEvent.change(editor(), { target: { value: "Unsaved text." } });
+  const dirty = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(dirty);
+  expect(dirty.defaultPrevented).toBe(true);
+  fireEvent.change(editor(), { target: { value: units.content } });
+  const reverted = new Event("beforeunload", { cancelable: true });
+  window.dispatchEvent(reverted);
+  expect(reverted.defaultPrevented).toBe(false);
 });

@@ -19,6 +19,8 @@ import type { AdminMcpServerRecord } from "../../services/admin-config-records.j
 import type { ActivationTracker } from "../../services/activation-tracker.js";
 import type { AuditEventInput } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
+import type { DataRouteControl } from "../../services/data-route-control.js";
+import type { DataSettingChange } from "../../services/mail/setting-change-notices.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import type { McpAppCspStore } from "../../services/mcp/mcp-app-csp-store.js";
 import {
@@ -51,6 +53,10 @@ export async function registerAdminMcpServerRoutes(
     mcpConnectionTests?: Pick<McpConnectionTestService, "listLatest" | "test">;
     // The content security policy sources that this server's widgets may use.
     mcpAppCsp?: Pick<McpAppCspStore, "listForAdmin" | "approve" | "revoke">;
+    // Step-up and owner notice of the routes that change where tool calls go:
+    // a server's address and secret, who uses a shared server, and a widget
+    // domain. Disable, unpublish, and revoke send data nowhere new.
+    dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
   }
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
@@ -81,7 +87,8 @@ export async function registerAdminMcpServerRoutes(
   function auditInput(
     request: FastifyRequest,
     type: AuditEventType,
-    payload: Record<string, unknown>
+    payload: Record<string, unknown>,
+    notice?: DataSettingChange
   ): AuditEventInput {
     return {
       tenantId: request.auth.tenantId,
@@ -90,7 +97,9 @@ export async function registerAdminMcpServerRoutes(
       type,
       payload,
       ipAddress: request.ip,
-      userAgent: request.headers["user-agent"]
+      userAgent: request.headers["user-agent"],
+      // A data route's owner notice commits with the change and its event.
+      ...(notice ? { alsoInTransaction: stores.dataRoutes.ownerNotice(request, notice) } : {})
     };
   }
 
@@ -98,9 +107,10 @@ export async function registerAdminMcpServerRoutes(
   function auditBuilder(
     request: FastifyRequest,
     type: AuditEventType,
-    includeEnabled: boolean
+    includeEnabled: boolean,
+    notice?: (server: AdminMcpServerRecord) => DataSettingChange
   ): (server: AdminMcpServerRecord) => AuditEventInput {
-    return (server) => auditInput(request, type, auditPayload(server, includeEnabled));
+    return (server) => auditInput(request, type, auditPayload(server, includeEnabled), notice?.(server));
   }
 
   app.get("/admin/mcp-servers", withAdmin(app, async (request) => {
@@ -185,6 +195,16 @@ export async function registerAdminMcpServerRoutes(
     return servers.find((server) => server.serverId === serverId && server.mode === "proxy") ?? null;
   }
 
+  // Checked before the step-up check of a change, so that a request for a
+  // server that does not exist answers 404 and does not spend the token.
+  // `own`: the tenant's own server, which an edit changes. `inherited`: a
+  // shared system server, whose availability the tenant chooses.
+  async function serverExists(request: FastifyRequest, serverId: string, owner: "own" | "inherited") {
+    const servers = await stores.dynamicConfig.listMcpServers(request.auth.tenantId, true);
+    return servers.some((server) => server.serverId === serverId &&
+      (owner === "own" ? server.ownerTenantId === request.auth.tenantId : server.ownerTenantId === "system"));
+  }
+
   app.get("/admin/mcp-servers/:serverId/widget-domains", withAdmin(app, async (request, reply) => {
     const params = parseRequestInput(reply, serverIdParamsSchema, request.params);
     if (!params.ok) return params.response;
@@ -211,6 +231,10 @@ export async function registerAdminMcpServerRoutes(
     }
     const serverId = params.value.serverId;
     if (!await findProxyServer(request, serverId)) return respondAdminNotFound(reply, "mcp_server_not_found");
+    // A widget can load from and send data to an approved domain.
+    if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/mcp-servers/:serverId/widget-domains/approve"))) {
+      return reply;
+    }
     try {
       await stores.mcpAppCsp.approve(
         request.auth.tenantId,
@@ -219,7 +243,7 @@ export async function registerAdminMcpServerRoutes(
         request.auth.userId,
         () => auditInput(request, "admin.mcp_server.widget_domain_approved", {
           serverId, directive: body.value.directive, source: parsed.source.normalized
-        })
+        }, { setting: "mcp_widget_domain", serverId })
       );
       reply.header("cache-control", "private, no-store");
       return { widgetDomains: await stores.mcpAppCsp.listForAdmin(request.auth.tenantId, serverId) };
@@ -281,8 +305,15 @@ export async function registerAdminMcpServerRoutes(
       serverId = bodyResult.value.serverId;
     }
     const audience = body.audience;
+    if (editingId && !(await serverExists(request, editingId, "own"))) return respondAdminNotFound(reply, "mcpServer_not_found");
+    if (!(await stores.dataRoutes.requireStepUp(
+      request,
+      reply,
+      editingId ? "PUT /admin/mcp-servers/:serverId/setup" : "POST /admin/mcp-servers/setup"
+    ))) return reply;
     try {
-      // The audit event commits in the same transaction as the change.
+      // The audit event and the owner notice commit in the same transaction
+      // as the change.
       const mcpServer = await stores.dynamicConfig.saveMcpServerWithAudience(
         request.auth.tenantId,
         {
@@ -297,7 +328,8 @@ export async function registerAdminMcpServerRoutes(
         (saved) => auditInput(
           request,
           editingId ? "admin.mcp_server.updated" : "admin.mcp_server.created",
-          auditPayload(saved, true, audience)
+          auditPayload(saved, true, audience),
+          { setting: "mcp_server", serverId: saved.serverId, created: !editingId }
         )
       );
       if (!mcpServer) {
@@ -331,8 +363,16 @@ export async function registerAdminMcpServerRoutes(
       request.body
     );
     if (!bodyResult.ok) return bodyResult.response;
+    if (!(await serverExists(request, paramsResult.value.serverId, "inherited"))) {
+      return respondAdminNotFound(reply, "mcpServer_not_found");
+    }
+    // Turns a shared server on or off for the tenant's members.
+    if (!(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/mcp-servers/:serverId/inherited-availability"))) {
+      return reply;
+    }
     try {
-      // The audit event commits in the same transaction as the change.
+      // The audit event and the owner notice commit in the same transaction
+      // as the change.
       const mcpServer = await stores.dynamicConfig.setInheritedMcpAudience(
         request.auth.tenantId,
         paramsResult.value.serverId,
@@ -345,7 +385,7 @@ export async function registerAdminMcpServerRoutes(
           enabled: server.enabled,
           isPublished: server.isPublished,
           isAllowed: bodyResult.value.audience !== "off"
-        })
+        }, { setting: "mcp_server_audience", serverId: server.serverId })
       );
       return {
         mcpServer: {
@@ -383,6 +423,7 @@ export async function registerAdminMcpServerRoutes(
       return bodyResult.response;
     }
     const body = bodyResult.value;
+    if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/mcp-servers"))) return reply;
     try {
       const mcpServer = await stores.dynamicConfig.createMcpServer(request.auth.tenantId, {
         ...body,
@@ -393,7 +434,8 @@ export async function registerAdminMcpServerRoutes(
         upstreamAuthName: body.upstreamAuthName ?? null,
         upstreamAuthSecret: body.upstreamAuthSecret ?? null,
         actorUserId: request.auth.userId
-      }, auditBuilder(request, "admin.mcp_server.created", true));
+      }, auditBuilder(request, "admin.mcp_server.created", true,
+        (server) => ({ setting: "mcp_server", serverId: server.serverId, created: true })));
       reply.code(201);
       return { mcpServer };
     } catch (error) {
@@ -416,6 +458,8 @@ export async function registerAdminMcpServerRoutes(
       reply.code(400);
       return configError("serverId must match the route parameter.");
     }
+    if (!(await serverExists(request, paramsResult.value.serverId, "own"))) return respondAdminNotFound(reply, "mcpServer_not_found");
+    if (!(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/mcp-servers/:serverId"))) return reply;
 
     try {
       const mcpServer = await stores.dynamicConfig.updateMcpServer(request.auth.tenantId, {
@@ -431,7 +475,8 @@ export async function registerAdminMcpServerRoutes(
         upstreamAuthSecret: body.upstreamAuthSecret,
         credentialScope: body.credentialScope,
         enabled: body.enabled
-      }, auditBuilder(request, "admin.mcp_server.updated", true));
+      }, auditBuilder(request, "admin.mcp_server.updated", true,
+        (server) => ({ setting: "mcp_server", serverId: server.serverId, created: false })));
       if (!mcpServer) return respondAdminNotFound(reply, "mcpServer_not_found");
       return { mcpServer };
     } catch (error) {

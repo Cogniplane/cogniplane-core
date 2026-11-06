@@ -37,13 +37,13 @@ function createInput(overrides: Partial<CreateInput> = {}): CreateInput {
 
 function approvalRow(values: unknown[]): Record<string, unknown> {
   const [tenantId, approvalId, sessionId, userId, runtimeId, turnId, itemId, requestMethod, requestId,
-    kind, title, summary, status, decision, payload, expiresAt] = values;
+    kind, title, summary, status, decision, payload, expiresAt, toolCallId] = values;
   return {
     tenant_id: tenantId, approval_id: approvalId, session_id: sessionId, user_id: userId,
     runtime_id: runtimeId, turn_id: turnId, item_id: itemId, request_method: requestMethod,
     request_id: requestId, kind, title, summary, status, decision,
     request_payload: JSON.parse(String(payload)), remember_for_turn: false,
-    created_at: T0, updated_at: T0, resolved_at: null, expires_at: expiresAt
+    created_at: T0, updated_at: T0, resolved_at: null, expires_at: expiresAt, tool_call_id: toolCallId
   };
 }
 
@@ -100,6 +100,19 @@ describe("ApprovalStore.create", () => {
     expect(tenantScopes(pool)).toEqual(["tenant-a"]);
     expect(pool.queries.some(query => query.text.includes("FOR SHARE OF e"))).toBe(false);
     expect(statements(pool).at(-1)).toBe("COMMIT");
+  });
+
+  test("stores the server ID of the proposed call, and reads a row without one as unlinked", async () => {
+    const session = { tenantId: "tenant-a", sessionId: "session-1", projectId: null, hasExecution: false };
+    const linkedPool = creationPool(session);
+    const linked = await new ApprovalStore(linkedPool.asPool()).create(createInput({ toolCallId: "card-1" }));
+    expect(linked.toolCallId).toBe("card-1");
+    expect(linkedPool.queries.find((query) => query.text.includes("INSERT INTO approvals"))!.values.at(-1)).toBe("card-1");
+
+    const unlinkedPool = creationPool(session);
+    const unlinked = await new ApprovalStore(unlinkedPool.asPool()).create(createInput());
+    expect(unlinkedPool.queries.find((query) => query.text.includes("INSERT INTO approvals"))!.values.at(-1)).toBeNull();
+    expect(unlinked).not.toHaveProperty("toolCallId");
   });
 
   test.each([

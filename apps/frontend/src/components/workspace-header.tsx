@@ -1,45 +1,29 @@
 "use client";
 
-import Link from "next/link";
-import type { KeyboardEvent as ReactKeyboardEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode, Ref } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { CheckIcon, ClipboardIcon, PanelLeftIcon, PanelRightIcon } from "lucide-react";
 
-import { useAuth } from "../lib/auth-context";
-import { useOrganizations } from "../hooks/use-organizations";
+import { toast } from "sonner";
+
+import { useElementWidth } from "../hooks/use-element-width";
 import { SHORTCUTS, ariaKeyShortcut, useApplePlatform } from "../lib/keyboard-shortcuts";
 import { SessionActionMenu, type SessionActionMenuProps } from "./session-action-menu";
 import { SessionStatusIndicator } from "./session-status";
 import { ProjectInstructionsIndicator } from "./project-instructions-indicator";
 import { SessionCapabilitiesButton } from "./session-capabilities";
 import type { CompletedTurn, SessionStatus } from "./session-status.logic";
-import { openKeyboardShortcuts } from "./keyboard-shortcuts-dialog";
 import { QuickJump } from "./quick-jump/quick-jump";
 import { ThemeToggle } from "./theme-toggle";
+import { AccountMenu, type AccountMenuDestination } from "./account-menu";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger
-} from "@/components/ui/dropdown-menu";
 
-type MenuLink = {
-  href: string;
-  label: string;
-  description: string;
-};
+/** Below this header width, the header uses two rows and moves low-use controls into menus. */
+const COMPACT_HEADER_WIDTH = 720;
+/** Below this width, Ready is icon-only. Approval, error, and running text remain visible. */
+const TIGHT_HEADER_WIDTH = 360;
 
-function avatarInitials(name: string | undefined, email: string | undefined): string {
-  const source = (name ?? email ?? "").trim();
-  if (!source) return "?";
-  const parts = source.split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-  return source.slice(0, 2).toUpperCase();
-}
-
-export function WorkspaceHeader(props: {
+export function WorkspaceHeader({ artifactToggleRef, ...props }: {
   title: string;
   projectId?: string | null;
   sessionActions?: SessionActionMenuProps;
@@ -47,9 +31,10 @@ export function WorkspaceHeader(props: {
   sessionStatus?: SessionStatus;
   activeTurnStartedAt?: string;
   completedTurn?: CompletedTurn;
-  menuLinks: MenuLink[];
+  destinations: readonly AccountMenuDestination[];
   isArtifactPaneOpen?: boolean;
   onToggleArtifactPane?: () => void;
+  artifactToggleRef?: Ref<HTMLButtonElement>;
   isSidebarOpen?: boolean;
   onToggleSidebar?: () => void;
   onCopySession?: () => string | undefined;
@@ -57,13 +42,29 @@ export function WorkspaceHeader(props: {
   hasPendingApprovals?: boolean;
 }) {
   const { title, onRenameSession, onCopySession } = props;
-  const { user, login, logout } = useAuth();
-  const organizations = useOrganizations(Boolean(user));
-  const currentSlug = user?.tenantSlug?.toLowerCase();
-  const otherOrganizations = organizations.filter((org) => org.id.toLowerCase() !== currentSlug);
+  const headerRef = useRef<HTMLElement | null>(null);
+  const headerWidth = useElementWidth(headerRef);
+  const compact = headerWidth !== null && headerWidth < COMPACT_HEADER_WIDTH;
+  const tight = headerWidth !== null && headerWidth < TIGHT_HEADER_WIDTH;
   const [sessionCopied, setSessionCopied] = useState(false);
   const [titleText, setTitleText] = useState(title);
   const titleRef = useRef<HTMLHeadingElement | null>(null);
+  const titleEdit = useRef<{ text: string; sessionId: string | undefined } | null>(null);
+
+  // The narrow layout moves the title. Keep an active edit when that move
+  // replaces the editable element, such as when the sidebar is opened.
+  useLayoutEffect(() => {
+    const draft = titleEdit.current;
+    const node = titleRef.current;
+    if (!draft || draft.sessionId !== props.sessionActions?.sessionId || !node) return;
+    node.textContent = draft.text;
+    node.focus();
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    range.collapse(false);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+  }, [compact, props.sessionActions?.sessionId]);
 
   useEffect(() => {
     // A poll may rename the session while the user is editing. Keep their text
@@ -75,6 +76,7 @@ export function WorkspaceHeader(props: {
   }, [title, props.sessionActions?.sessionId]);
 
   const commitTitle = useCallback(() => {
+    titleEdit.current = null;
     if (!onRenameSession) return;
     const next = (titleRef.current?.textContent ?? "").trim();
     if (!next || next === title) {
@@ -120,150 +122,172 @@ export function WorkspaceHeader(props: {
     });
   }, [onCopySession]);
 
+  // The copy button is in the session menu on a narrow header, so the result
+  // is a toast instead of the button's check mark.
+  const copySessionFromMenu = useCallback(() => {
+    const text = onCopySession?.();
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(
+      () => toast.success("Session copied"),
+      () => toast.error("Could not copy the session")
+    );
+  }, [onCopySession]);
+
   const isTitleEditable = Boolean(onRenameSession);
-  const initials = avatarInitials(user?.displayName, user?.email);
   const apple = useApplePlatform();
+  // Comfortable touch targets on the narrow header, compact ones on desktop.
+  const iconSize = compact ? "size-10" : undefined;
 
+  const sidebarToggle = props.onToggleSidebar ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      className={iconSize}
+      aria-label={props.isSidebarOpen ? "Hide sidebar" : "Show sidebar"}
+      data-workspace-sidebar-trigger
+      aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleSidebar, apple)}
+      onClick={props.onToggleSidebar}
+    >
+      <PanelLeftIcon />
+    </Button>
+  ) : null;
+
+  const titleBlock = (
+    <div className="min-w-0 flex-1">
+      <h2
+        key={props.sessionActions?.sessionId}
+        ref={titleRef}
+        className={`truncate text-base font-semibold text-on-surface outline-none ${
+          isTitleEditable
+            ? "-mx-1 cursor-text rounded px-1 hover:bg-surface-container-low focus:bg-surface-container-low focus-visible:ring-[3px] focus-visible:ring-ring/50"
+            : ""
+        }`}
+        contentEditable={isTitleEditable}
+        onFocus={isTitleEditable ? (event) => {
+          titleEdit.current = { text: event.currentTarget.textContent ?? "", sessionId: props.sessionActions?.sessionId };
+        } : undefined}
+        onInput={isTitleEditable ? (event) => {
+          titleEdit.current = { text: event.currentTarget.textContent ?? "", sessionId: props.sessionActions?.sessionId };
+        } : undefined}
+        onBlur={isTitleEditable ? commitTitle : undefined}
+        onKeyDown={isTitleEditable ? handleTitleKeyDown : undefined}
+        spellCheck={false}
+        suppressContentEditableWarning
+        role={isTitleEditable ? "textbox" : undefined}
+        aria-label={isTitleEditable ? "Session title" : undefined}
+        title={isTitleEditable ? "Click to rename session" : undefined}
+      >
+        {titleText}
+      </h2>
+      {props.subtitle ? (
+        <p className="truncate text-xs text-on-surface-variant">{props.subtitle}</p>
+      ) : null}
+    </div>
+  );
+
+  const status = props.sessionStatus ? (
+    <SessionStatusIndicator
+      status={props.sessionStatus}
+      startedAt={props.activeTurnStartedAt}
+      completedTurn={props.completedTurn}
+      showLabel
+      labelClassName={tight && props.sessionStatus === "ready" ? "sr-only" : ""}
+    />
+  ) : null;
+
+  const sessionTools: ReactNode[] = [
+    props.projectId ? <ProjectInstructionsIndicator key={`project-${props.projectId}`} projectId={props.projectId} compact={compact} className={iconSize} /> : null,
+    props.sessionActions ? <SessionCapabilitiesButton key={`capabilities-${props.sessionActions.sessionId}`}
+      sessionId={props.sessionActions.sessionId}
+      className={iconSize}
+      busy={Boolean(props.sessionActions.isRunning || props.sessionActions.hasPendingApprovals)} /> : null,
+    props.sessionActions ? <SessionActionMenu
+      key="session-actions"
+      {...props.sessionActions}
+      triggerClassName={iconSize}
+      onCopyConversation={compact && onCopySession ? copySessionFromMenu : undefined}
+      onRename={props.sessionActions.onRename ?? (onRenameSession ? focusTitleForRename : undefined)}
+    /> : null
+  ];
+
+  const copyButton = onCopySession && !compact ? (
+    <Button
+      type="button"
+      variant="ghost"
+      size="icon-sm"
+      aria-label={sessionCopied ? "Session copied" : "Copy session to clipboard"}
+      title={sessionCopied ? "Copied" : "Copy session to clipboard"}
+      onClick={handleCopySession}
+    >
+      {sessionCopied ? <CheckIcon className="text-success" /> : <ClipboardIcon />}
+    </Button>
+  ) : null;
+
+  const artifactToggle = props.onToggleArtifactPane ? (
+    <div className="relative shrink-0">
+      <Button
+        ref={artifactToggleRef}
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        className={iconSize}
+        aria-label={`${props.isArtifactPaneOpen ? "Hide artifacts panel" : "Show artifacts panel"}${props.hasPendingApprovals ? ", approval waiting" : ""}`}
+        aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleArtifacts, apple)}
+        onClick={props.onToggleArtifactPane}
+      >
+        <PanelRightIcon />
+      </Button>
+      {props.hasPendingApprovals ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute right-1 top-1 size-2 rounded-full bg-warning ring-2 ring-surface-container-lowest"
+        />
+      ) : null}
+    </div>
+  ) : null;
+
+  // One header element in both layouts, so the width observer keeps watching it.
   return (
-    <header className="flex min-h-14 items-center gap-2 border-b border-outline-variant bg-surface-container-lowest px-2 py-2 sm:gap-4 sm:px-4">
-      <div className="flex items-center gap-2">
-        {props.onToggleSidebar ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label={props.isSidebarOpen ? "Hide sidebar" : "Show sidebar"}
-            aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleSidebar, apple)}
-            onClick={props.onToggleSidebar}
-          >
-            <PanelLeftIcon />
-          </Button>
-        ) : null}
-        {props.sessionStatus ? (
-          <SessionStatusIndicator status={props.sessionStatus} startedAt={props.activeTurnStartedAt} completedTurn={props.completedTurn} showLabel />
-        ) : null}
-      </div>
-
-      <div className="min-w-0 flex-1">
-        <h2
-          key={props.sessionActions?.sessionId}
-          ref={titleRef}
-          className={`truncate text-base font-semibold text-on-surface outline-none ${
-            isTitleEditable
-              ? "cursor-text rounded px-1 -mx-1 hover:bg-surface-container-low focus:bg-surface-container-low"
-              : ""
-          }`}
-          contentEditable={isTitleEditable}
-          onBlur={isTitleEditable ? commitTitle : undefined}
-          onKeyDown={isTitleEditable ? handleTitleKeyDown : undefined}
-          spellCheck={false}
-          suppressContentEditableWarning
-          role={isTitleEditable ? "textbox" : undefined}
-          aria-label={isTitleEditable ? "Session title" : undefined}
-          title={isTitleEditable ? "Click to rename session" : undefined}
-        >
-          {titleText}
-        </h2>
-        {props.subtitle ? (
-          <p className="truncate text-xs text-on-surface-variant">{props.subtitle}</p>
-        ) : null}
-      </div>
-
-      <div className="flex items-center gap-1">
-        {props.projectId ? <ProjectInstructionsIndicator key={props.projectId} projectId={props.projectId} /> : null}
-        {props.sessionActions ? <SessionCapabilitiesButton key={props.sessionActions.sessionId}
-          sessionId={props.sessionActions.sessionId}
-          busy={Boolean(props.sessionActions.isRunning || props.sessionActions.hasPendingApprovals)} /> : null}
-        {props.sessionActions ? <SessionActionMenu
-          {...props.sessionActions}
-          onRename={props.sessionActions.onRename ?? (onRenameSession ? focusTitleForRename : undefined)}
-        /> : null}
-        <QuickJump />
-        <ThemeToggle />
-
-        {onCopySession ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label={sessionCopied ? "Session copied!" : "Copy session to clipboard"}
-            title={sessionCopied ? "Copied!" : "Copy session to clipboard"}
-            onClick={handleCopySession}
-          >
-            {sessionCopied ? <CheckIcon className="text-success" /> : <ClipboardIcon />}
-          </Button>
-        ) : null}
-
-        {props.onToggleArtifactPane ? (
-          <div className="relative">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label={props.isArtifactPaneOpen ? "Hide artifacts panel" : "Show artifacts panel"}
-              aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.toggleArtifacts, apple)}
-              onClick={props.onToggleArtifactPane}
-            >
-              <PanelRightIcon />
-            </Button>
-            {props.hasPendingApprovals ? (
-              <span
-                aria-hidden="true"
-                className="pointer-events-none absolute right-1 top-1 size-2 rounded-full bg-warning ring-2 ring-surface-container-lowest"
-              />
-            ) : null}
+    <header
+      ref={headerRef}
+      className={`border-b border-outline-variant bg-surface-container-lowest ${
+        compact ? "flex flex-col gap-0.5 px-2 py-1" : "flex min-h-14 items-center gap-3 px-4 py-2"
+      }`}
+    >
+      {compact ? (
+        // Two rows: what the session is (title, account), then what you can do
+        // with it. Every control stays on screen; theme and copy move into menus.
+        <>
+          <div className="flex min-h-11 items-center gap-1">
+            {sidebarToggle}
+            {titleBlock}
+            <AccountMenu destinations={props.destinations} includeTheme triggerClassName="size-10" />
           </div>
-        ) : null}
-
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Open workspace menu"
-              className="rounded-full"
-            >
-              <span className="flex size-7 items-center justify-center rounded-full bg-primary text-xs font-semibold text-primary-foreground">
-                {initials}
-              </span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-64">
-            {props.menuLinks.map((link) => (
-              <DropdownMenuItem key={link.href} asChild>
-                <Link href={link.href} className="flex flex-col items-start gap-0.5">
-                  <span className="font-medium">{link.label}</span>
-                  <span className="text-xs text-muted-foreground">{link.description}</span>
-                </Link>
-              </DropdownMenuItem>
-            ))}
-            {otherOrganizations.length > 0 ? <DropdownMenuSeparator /> : null}
-            {otherOrganizations.map((org) => (
-              <DropdownMenuItem
-                key={org.id}
-                onSelect={() => void login({ organization: org.id })}
-                className="flex flex-col items-start gap-0.5"
-              >
-                <span className="font-medium">Switch to {org.name}</span>
-                <span className="text-xs text-muted-foreground">Sign in to this organization</span>
-              </DropdownMenuItem>
-            ))}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={openKeyboardShortcuts} className="flex flex-col items-start gap-0.5">
-              <span className="font-medium">Keyboard shortcuts</span>
-              <span className="text-xs text-muted-foreground">Press ? on any page</span>
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onSelect={() => void logout()}
-              className="flex flex-col items-start gap-0.5"
-            >
-              <span className="font-medium">Log out</span>
-              <span className="text-xs text-muted-foreground">End this session and return to login</span>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
+          <div className="flex min-h-10 flex-wrap items-center gap-x-2 gap-y-1 pl-2">
+            {status}
+            <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+              {sessionTools}
+              <QuickJump compact className="size-10" />
+              {artifactToggle}
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          {sidebarToggle}
+          {titleBlock}
+          {status}
+          <div className="flex shrink-0 items-center gap-1">
+            {sessionTools}
+            <QuickJump />
+            <ThemeToggle />
+            {copyButton}
+            {artifactToggle}
+            <AccountMenu destinations={props.destinations} />
+          </div>
+        </>
+      )}
     </header>
   );
 }

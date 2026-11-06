@@ -56,6 +56,7 @@ import type {
   ReadResult
 } from "deepagents";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import type { FastifyBaseLogger } from "fastify";
 
@@ -77,6 +78,7 @@ import {
 import { resolveInsideSandbox } from "../runtime/sandbox-path.js";
 import { createStageTimer } from "../runtime/startup-timing.js";
 import type { DeepAgentsSandboxBinding } from "./deep-agents-types.js";
+import { dispatchExecuteResult } from "./execute-result-event.js";
 
 /** Combined-output cap for a single execute() result. Anything past this is
  *  dropped with `truncated: true` — the model does not need megabytes of
@@ -175,6 +177,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   private killed = false;
   /** The turn or job that is current (beginTurn). Null until the first one begins: nothing runs before that. */
   private turn: TurnToken | null = null;
+  private readonly turnScope = new AsyncLocalStorage<TurnToken>();
   /**
    * The sandbox that was confirmed in a turn, and the turn: created under the
    * policy of that turn, or read and found as that policy. No command and no file
@@ -332,9 +335,31 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     return end;
   }
 
+  /**
+   * Bind graph iteration and its asynchronous middleware work to this turn.
+   * Each iterator call enters the scope because generator bodies start at next(),
+   * and return()/throw() can run cleanup that also calls the backend.
+   */
+  scopeToCurrentTurn<T>(events: () => AsyncIterable<T>): AsyncIterable<T> {
+    const turn = this.currentTurn();
+    const run = <R>(operation: () => R): R => this.turnScope.run(turn, operation);
+    const iterable = run(events);
+    return {
+      [Symbol.asyncIterator]() {
+        const iterator = run(() => iterable[Symbol.asyncIterator]());
+        return {
+          next: (...args: [] | [unknown]) => run(() => iterator.next(...args)),
+          ...(iterator.return ? { return: (value?: unknown) => run(() => iterator.return!(value)) } : {}),
+          ...(iterator.throw ? { throw: (error?: unknown) => run(() => iterator.throw!(error)) } : {})
+        };
+      }
+    };
+  }
+
   /** The turn that is current. An operation that has no live turn is refused, and nothing is run for it. */
   private currentTurn(): TurnToken {
-    const turn = this.turn;
+    // A middleware continuation keeps its original turn, even if its first file call is late.
+    const turn = this.turnScope.getStore() ?? this.turn;
     if (!turn) throw new SandboxNetworkPolicyUnconfirmedError("no turn has begun in this runtime");
     this.requireLive(turn);
     return turn;
@@ -831,7 +856,23 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   // to the foreground run — that would abort the wait while leaving the process
   // (and its billing/side effects) alive, which is worse than the current bound.
   async execute(command: string): Promise<ExecuteResponse> {
-    return this.executeIn(this.currentTurn(), command);
+    const response = await this.executeIn(this.currentTurn(), command);
+    await this.reportExitCode(response);
+    return response;
+  }
+
+  /**
+   * The SDK execute tool formats the response as text and returns it as a successful
+   * result. This sends the structured exit code to the tool run before that happens.
+   * The stream mapper uses it, for the `execute` tool only, to show a failed command.
+   * A failed report is logged and never changes the result of the command.
+   */
+  private async reportExitCode(response: ExecuteResponse): Promise<void> {
+    try {
+      await dispatchExecuteResult(response.exitCode);
+    } catch (err) {
+      this.options.logger.warn({ err, sessionId: this.options.sessionId }, "failed to report the exit code of a command");
+    }
   }
 
   private async executeIn(turn: TurnToken, command: string): Promise<ExecuteResponse> {

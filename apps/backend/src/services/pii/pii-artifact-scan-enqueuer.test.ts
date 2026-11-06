@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
 import {
@@ -6,10 +6,24 @@ import {
   type EnqueueArtifactPiiScanInput,
   type PiiArtifactSubjectReader
 } from "./pii-artifact-scan-enqueuer.js";
-import { PiiProtectionServiceError, type PiiDecision } from "./pii-protection-service.js";
+import { isPiiSubjectInScope, PiiImportScopeRegistry } from "./pii-import-scopes.js";
+import { resolvePiiPolicy } from "./pii-policy.js";
+import {
+  PiiProtectionService,
+  PiiProtectionServiceError,
+  type PiiDecision,
+  type PiiPolicyRead
+} from "./pii-protection-service.js";
+import { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
+
+// A registered import source, as an overlay registers one.
+const importScopes = new PiiImportScopeRegistry();
+importScopes.register({ subjectKind: "partner_import", scopeKey: "partnerImports", defaultOn: true });
 
 function buildDeps(overrides: {
   settings?: Partial<PiiProtectionSettings>;
+  // A raw stored policy, used instead of `settings`.
+  stored?: unknown;
   decision?: PiiDecision;
   imagesNotScanned?: boolean;
   evaluateThrows?: Error;
@@ -54,12 +68,17 @@ function buildDeps(overrides: {
 
   const deps = {
     piiProtection: {
-      async getActiveSettings() {
-        return settings;
+      async readPolicy(): Promise<PiiPolicyRead> {
+        return { tenantId: "tenant-1", policy: resolvePiiPolicy("stored" in overrides ? overrides.stored : settings, importScopes), revision: 3 };
       },
-      async evaluateArtifact() {
+      isSubjectInScope: (policy: ReturnType<typeof resolvePiiPolicy>, subject: Parameters<typeof isPiiSubjectInScope>[1]) =>
+        isPiiSubjectInScope(policy.settings, subject, importScopes),
+      async evaluateArtifactWithPolicy(_input: unknown, read?: PiiPolicyRead) {
         if (overrides.evaluateThrows) throw overrides.evaluateThrows;
-        return overrides.decision ?? ({ action: "allow", reason: "no_findings" } as PiiDecision);
+        return {
+          decision: overrides.decision ?? ({ action: "allow", reason: "no_findings" } as PiiDecision),
+          appliedPolicy: { mode: read!.policy.settings.mode, revision: read!.revision }
+        };
       }
     },
     piiScanRuns: {
@@ -96,6 +115,7 @@ function buildDeps(overrides: {
       }
     },
     subjectReader: reader,
+    importScopes,
     logger: {
       warn(payload: unknown, message: string) {
         logWarnCalls.push({ payload, message });
@@ -156,13 +176,38 @@ test("enqueue returns skipped when PII protection is disabled", async () => {
   expect(scanRunCreateCalls.length).toBe(0);
 });
 
-test("enqueue returns skipped when mode is off", async () => {
-  const { deps, scanRunCreateCalls } = buildDeps({
-    settings: { enabled: true, mode: "off" }
+test("an invalid stored policy stops the upload without a scan, a finding, or byte deletion", async () => {
+  const h = buildDeps({
+    stored: { ...DEFAULT_PII_PROTECTION, enabled: true, mode: "bogus" },
+    withAuditEvents: true
   });
-  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
-  expect(result).toEqual({ kind: "skipped" });
-  expect(scanRunCreateCalls.length).toBe(0);
+  const result = await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput());
+  expect(result).toMatchObject({ kind: "failed", errorCode: "pii_policy_invalid" });
+  expect(h.scanRunCreateCalls).toEqual([]);
+  expect(h.deleteCalls).toEqual([]);
+  expect(h.artifactUpdateCalls.at(-1)?.input.status).toBe("failed");
+  expect(h.piiDetailCalls.at(-1)?.pii).toEqual({ status: "failed", summaryText: "pii_policy_invalid" });
+  expect(h.auditCalls).toEqual([expect.objectContaining({
+    type: "pii_policy_invalid",
+    payload: { subjectType: "artifact", subjectId: "art-1", source: "upload", policyRevision: 3 }
+  })]);
+});
+
+test("an invalid stored policy leaves an upload alone when its valid scope is off", async () => {
+  const h = buildDeps({
+    stored: { ...DEFAULT_PII_PROTECTION, enabled: true, mode: "off", scopes: { chatPrompts: true, uploads: false } }
+  });
+  expect(await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput())).toEqual({ kind: "skipped" });
+});
+
+test("an unregistered import source is scanned as in scope and logged", async () => {
+  const h = buildDeps({ settings: { enabled: true, mode: "block", scopes: { chatPrompts: false, uploads: false } } });
+  const result = await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput({ source: "unknown_import" }));
+  expect(result.kind).toBe("allowed");
+  expect(h.logWarnCalls).toEqual([expect.objectContaining({
+    payload: expect.objectContaining({ source: "unknown_import" }),
+    message: "PII scan source is not registered; it is scanned as in scope"
+  })]);
 });
 
 test("enqueue returns skipped when the upload scope is disabled", async () => {
@@ -170,7 +215,7 @@ test("enqueue returns skipped when the upload scope is disabled", async () => {
     settings: {
       enabled: true,
       mode: "detect",
-      scopes: { chatPrompts: true, uploads: false, microsoftImports: true }
+      scopes: { chatPrompts: true, uploads: false, partnerImports: true }
     }
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ source: "upload" }));
@@ -373,32 +418,34 @@ test("async enqueue logs and returns failed when the scan-run insert throws", as
   expect(piiDetailCalls.length).toBe(0);
 });
 
-test("microsoft_import scope is checked, not uploads", async () => {
+test("a registered import checks its own scope, not uploads", async () => {
   const { deps } = buildDeps({
     settings: {
       enabled: true,
       mode: "block",
-      scopes: { chatPrompts: false, uploads: false, microsoftImports: false }
+      scopes: { chatPrompts: false, uploads: true, partnerImports: false }
     }
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(
-    sampleInput({ source: "microsoft_import" })
+    sampleInput({ source: "partner_import" })
   );
   expect(result.kind).toBe("skipped");
 });
 
-test("microsoft_import scope enabled but uploads disabled still allows microsoft", async () => {
-  const { deps } = buildDeps({
+test("a registered import scope that is on scans while uploads are off", async () => {
+  const { deps, jobCalls } = buildDeps({
     settings: {
       enabled: true,
-      mode: "block",
-      scopes: { chatPrompts: false, uploads: false, microsoftImports: true }
+      mode: "detect",
+      scopes: { chatPrompts: false, uploads: false, partnerImports: true }
     }
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(
-    sampleInput({ source: "microsoft_import" })
+    sampleInput({ source: "partner_import" })
   );
-  expect(result.kind).toBe("allowed");
+  expect(result.kind).toBe("queued");
+  // The stored job keeps the registered value as its subject kind.
+  expect(jobCalls[0]?.payload).toMatchObject({ subjectKind: "partner_import" });
 });
 
 test("block mode 'report' decision counts findings and stamps scanned", async () => {
@@ -497,4 +544,69 @@ test("allow decision does not emit pii_blocked audit event", async () => {
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
   expect(result.kind).toBe("allowed");
   expect(auditCalls.length).toBe(0);
+});
+
+// One read routes the upload, makes the decision, and gives the record. An
+// admin save between two reads must not give a record that disagrees with the
+// decision: here the second read would see detect, so the decision would be
+// a report while the record says block.
+test("a synchronous scan routes, evaluates, and records from one policy read", async () => {
+  const h = buildDeps({ withAuditEvents: true });
+  const saves = [
+    { stored: { ...DEFAULT_PII_PROTECTION, enabled: true, mode: "block" }, revision: 4 },
+    { stored: { ...DEFAULT_PII_PROTECTION, enabled: true, mode: "detect" }, revision: 5 }
+  ];
+  const readPiiProtection = vi.fn(async () => saves.shift()!);
+  const piiProtection = new PiiProtectionService({
+    policyReader: { readPiiProtection },
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000,
+    importScopes
+  });
+  const dirty = {
+    async readArtifact({ artifactId }: { artifactId: string }) {
+      return { artifactId, contentType: "text/plain", entityTypes: [], readContent: async () => "Contact a@b.co" };
+    }
+  };
+
+  const result = await new PiiArtifactScanEnqueuer({ ...h.deps, piiProtection, subjectReader: dirty }).enqueue(sampleInput());
+
+  expect(readPiiProtection).toHaveBeenCalledTimes(1);
+  expect(result).toMatchObject({ kind: "blocked", blockReason: "email" });
+  expect(h.scanRunCreateCalls).toEqual([expect.objectContaining({ mode: "block", policyRevision: 4 })]);
+  expect(h.scanRunUpdateCalls.at(-1)?.patch).toMatchObject({ status: "blocked", actionTaken: "block" });
+  expect(h.piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "blocked", modeApplied: "block", policyRevision: 4 });
+  expect(h.auditCalls).toEqual([
+    expect.objectContaining({ type: "pii_blocked", payload: expect.objectContaining({ mode: "block", policyRevision: 4 }) })
+  ]);
+});
+
+test("a synchronous allow and a synchronous failure record the revision of the read", async () => {
+  const clean = buildDeps({ settings: { enabled: true, mode: "block" } });
+  await new PiiArtifactScanEnqueuer(clean.deps).enqueue(sampleInput());
+  expect(clean.piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "scanned", modeApplied: "block", policyRevision: 3 });
+
+  const failed = buildDeps({ settings: { enabled: true, mode: "block" }, evaluateThrows: new Error("provider down") });
+  await new PiiArtifactScanEnqueuer(failed.deps).enqueue(sampleInput());
+  expect(failed.piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "failed", modeApplied: "block", policyRevision: 3 });
+});
+
+test("a synchronous scan records the policy that the evaluation applied", async () => {
+  const { deps, scanRunUpdateCalls, piiDetailCalls, auditCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: { action: "block", findings: [], providerType: "openai-compatible", providerModel: "m", blockReason: "email" },
+    withAuditEvents: true
+  });
+  // The evaluation reports a different applied policy than the routed read.
+  // The record must follow the evaluation, which made the decision.
+  const evaluate = deps.piiProtection.evaluateArtifactWithPolicy;
+  deps.piiProtection.evaluateArtifactWithPolicy = async (input, read) => ({
+    ...(await evaluate(input, read)),
+    appliedPolicy: { mode: "detect", revision: 8 }
+  });
+
+  expect((await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput())).kind).toBe("blocked");
+  expect(scanRunUpdateCalls.at(-1)?.patch).toMatchObject({ status: "blocked", mode: "detect" });
+  expect(piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "blocked", modeApplied: "detect", policyRevision: 8 });
+  expect(auditCalls.find((call) => call.type === "pii_blocked")?.payload).toMatchObject({ mode: "detect", policyRevision: 8 });
 });

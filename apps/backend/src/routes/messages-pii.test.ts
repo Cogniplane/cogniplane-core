@@ -3,6 +3,7 @@ import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { createTestApp } from "../test-helpers/routes-test-support.js";
+import { textEvaluation } from "../test-helpers/pii-evaluation.js";
 
 function parseAguiEvents(payload: string): BaseEvent[] {
   return payload
@@ -32,17 +33,15 @@ test("POST /messages in block mode persists a system message and does not dispat
   const scanCreateInputs: Array<Record<string, unknown>> = [];
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          return {
-            action: "block",
-            findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
-            blockReason: "email",
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        return {
+          action: "block",
+          findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
+          blockReason: "email",
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }, { mode: "block", revision: 9 }),
       piiScanRuns: {
         async create(input: unknown) {
           scanCreateInputs.push(input as Record<string, unknown>);
@@ -70,7 +69,7 @@ test("POST /messages in block mode persists a system message and does not dispat
 
   expect(runtimeManager.runMessageInputs.length).toBe(0);
   expect(scanCreateInputs.length).toBe(1);
-  expect((scanCreateInputs[0] as { mode: string }).mode).toBe("block");
+  expect(scanCreateInputs[0]).toMatchObject({ mode: "block", policyRevision: 9 });
 
   const { messages: persisted } = await messages.listBySession("test-tenant", sessionId, "platform-user");
   expect(persisted.length).toBe(1);
@@ -81,6 +80,7 @@ test("POST /messages in block mode persists a system message and does not dispat
   expect(pii.status).toBe("blocked");
   expect(pii.blockReason).toBe("email");
   expect(pii.scanRunId).toBe("scan-blk-1");
+  expect(pii.policyRevision).toBe(9);
   // The raw user prompt must NOT be persisted as a user message.
   expect(!persisted.some((message) => message.role === "user")).toBeTruthy();
 });
@@ -88,17 +88,15 @@ test("POST /messages in block mode persists a system message and does not dispat
 test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client can parse", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          return {
-            action: "block",
-            findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
-            blockReason: "email",
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        return {
+          action: "block",
+          findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
+          blockReason: "email",
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }),
       piiScanRuns: {
         async create() {
           return { scanRunId: "scan-blk-agui" };
@@ -155,17 +153,15 @@ test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client
 test("POST /messages in transform mode emits user_message_replaced and sends transformed prompt to runtime", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          return {
-            action: "transform",
-            transformedText: "my email is [REDACTED:email]",
-            findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        return {
+          action: "transform",
+          transformedText: "my email is [REDACTED:email]",
+          findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }),
       piiScanRuns: {
         async create() {
           return { scanRunId: "scan-tfx-1" };
@@ -222,16 +218,14 @@ test("POST /messages in transform mode emits user_message_replaced and sends tra
 test("POST /messages in detect mode persists raw user message with report metadata", async () => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          return {
-            action: "report",
-            findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        return {
+          action: "report",
+          findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }),
       piiScanRuns: {
         async create() {
           return { scanRunId: "scan-det-1" };
@@ -279,14 +273,12 @@ test("POST /messages in detect mode persists raw user message with report metada
 test.each(["pii_provider_unavailable", "pii_kek_missing"])("POST /messages returns HTTP 503 %s and persists nothing", async (errorCode) => {
   const { app, messages, runtimeManager } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          throw new PiiProtectionServiceError(
-            errorCode,
-            "provider timed out"
-          );
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        throw new PiiProtectionServiceError(
+          errorCode,
+          "provider timed out"
+        );
+      }),
       piiScanRuns: {
         async create() {
           throw new Error("should not be called when provider fails");
@@ -317,11 +309,9 @@ test.each(["pii_provider_unavailable", "pii_kek_missing"])("POST /messages retur
 test("POST /messages consumes a rate-limit token but never turn quota when PII provider fails", async () => {
   const { app, limits } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          throw new PiiProtectionServiceError("pii_provider_unavailable", "provider timed out");
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        throw new PiiProtectionServiceError("pii_provider_unavailable", "provider timed out");
+      }),
       piiScanRuns: {
         async create() {
           throw new Error("should not be called");
@@ -367,17 +357,15 @@ test("POST /messages consumes a rate-limit token but never turn quota when PII p
 test("POST /messages consumes a rate-limit token but no turn quota for a PII-blocked turn", async () => {
   const { app, limits } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          return {
-            action: "block",
-            findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
-            blockReason: "email",
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        return {
+          action: "block",
+          findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
+          blockReason: "email",
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }),
       piiScanRuns: {
         async create() {
           return { scanRunId: "scan-blk-2" };
@@ -428,18 +416,16 @@ test("POST /messages does not call the PII provider when the rate limit is exhau
   let evaluateCalls = 0;
   const { app, limits } = await createTestApp({
     pii: {
-      piiProtection: {
-        async evaluateText() {
-          evaluateCalls += 1;
-          return {
-            action: "allow",
-            reason: "no_findings",
-            findings: [],
-            providerType: "openai-compatible",
-            providerModel: "google/gemini-2.5-flash"
-          };
-        }
-      },
+      piiProtection: textEvaluation(async () => {
+        evaluateCalls += 1;
+        return {
+          action: "allow",
+          reason: "no_findings",
+          findings: [],
+          providerType: "openai-compatible",
+          providerModel: "google/gemini-2.5-flash"
+        };
+      }),
       piiScanRuns: {
         async create() {
           throw new Error("should not be called");

@@ -28,6 +28,7 @@ export type AdminIntegrationView = {
   writeToolIds: string[];
   configMode: IntegrationDescriptor["configMode"];
   configFields: IntegrationConfigField[] | undefined;
+  setupHelp: string | undefined;
   docsUrl: string | undefined;
 
   readsEnabled: boolean;
@@ -148,6 +149,7 @@ export class IntegrationRegistryService {
         writeToolIds: [...descriptor.writeToolIds],
         configMode: descriptor.configMode,
         configFields: descriptor.configFields ? [...descriptor.configFields] : undefined,
+        setupHelp: descriptor.setupHelp,
         docsUrl: descriptor.docsUrl,
 
         readsEnabled: isAvailable && (state?.readsEnabled ?? false),

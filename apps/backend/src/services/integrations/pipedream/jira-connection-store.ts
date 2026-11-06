@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 
 import { withTenantScope, type Pool } from "../../../lib/db.js";
 import { isoTimestamp } from "../../../lib/db-mappers.js";
+import { ownerSecurityVersionSql } from "../../auth/security-change.js";
 
 export type JiraConnectionRecord = {
   tenantId: string;
@@ -16,7 +17,17 @@ export type JiraConnectionRecord = {
   updatedAt: string;
 };
 
-export type JiraConnectionUpsert = Omit<JiraConnectionRecord, "createdAt" | "updatedAt">;
+export type JiraConnectionUpsert = Omit<JiraConnectionRecord, "createdAt" | "updatedAt"> & {
+  // The security version of the session that selects the account and site.
+  ownerSecurityVersion: number | null;
+};
+
+/** A connection as its owner sees it: also when a security change suspended it. */
+export type JiraOwnerConnectionRecord = JiraConnectionRecord & { suspended: boolean };
+
+// The owner's account still has the stored version (or is a WorkOS account).
+const CURRENT_VERSION_SQL = ownerSecurityVersionSql("user_jira_connections");
+const SUSPENDED_SQL = `NOT (${CURRENT_VERSION_SQL})`;
 
 /** The Pipedream project and environment that hold a member's accounts. */
 export type PipedreamBinding = { projectId: string; environment: "development" | "production" };
@@ -164,13 +175,32 @@ async function retireInTransaction(
 export class JiraConnectionStore {
   constructor(private readonly db: Pool) {}
 
+  /**
+   * The connection for use: tools and session start. A connection that a
+   * security change of the owner suspended is not returned (see
+   * security-change.ts).
+   */
   async get(tenantId: string, userId: string): Promise<JiraConnectionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `SELECT * FROM user_jira_connections WHERE tenant_id = $1 AND user_id = $2`,
+        `SELECT * FROM user_jira_connections
+         WHERE tenant_id = $1 AND user_id = $2 AND ${CURRENT_VERSION_SQL}`,
         [tenantId, userId]
       );
       return result.rows[0] ? mapRow(result.rows[0]) : null;
+    });
+  }
+
+  /** The connection for its owner's settings page, suspended or not. Not for use. */
+  async getForOwner(tenantId: string, userId: string): Promise<JiraOwnerConnectionRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `SELECT *, ${SUSPENDED_SQL} AS suspended FROM user_jira_connections
+         WHERE tenant_id = $1 AND user_id = $2`,
+        [tenantId, userId]
+      );
+      const row = result.rows[0];
+      return row ? { ...mapRow(row), suspended: row.suspended === true } : null;
     });
   }
 
@@ -245,8 +275,8 @@ export class JiraConnectionStore {
       const result = await client.query(
         `INSERT INTO user_jira_connections (
             tenant_id, user_id, pipedream_external_user_id, pipedream_account_id,
-            account_name, jira_cloud_id, jira_site_name, jira_site_url
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            account_name, jira_cloud_id, jira_site_name, jira_site_url, owner_security_version
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
           ON CONFLICT (tenant_id, user_id) DO UPDATE SET
             pipedream_external_user_id = EXCLUDED.pipedream_external_user_id,
             pipedream_account_id = EXCLUDED.pipedream_account_id,
@@ -254,6 +284,7 @@ export class JiraConnectionStore {
             jira_cloud_id = EXCLUDED.jira_cloud_id,
             jira_site_name = EXCLUDED.jira_site_name,
             jira_site_url = EXCLUDED.jira_site_url,
+            owner_security_version = EXCLUDED.owner_security_version,
             updated_at = NOW()
           RETURNING *`,
         [
@@ -264,7 +295,8 @@ export class JiraConnectionStore {
           input.accountName,
           input.cloudId,
           input.siteName,
-          input.siteUrl
+          input.siteUrl,
+          input.ownerSecurityVersion
         ]
       );
       return mapRow(result.rows[0]);

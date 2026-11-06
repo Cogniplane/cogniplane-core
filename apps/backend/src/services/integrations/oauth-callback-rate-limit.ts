@@ -13,23 +13,37 @@ import type { RequestLimitsInterface } from "../request-limits.js";
  * Returns `true` if the request was throttled (a 429 has been written to
  * `reply` and the caller must stop), `false` to proceed. A missing limiter is
  * treated as "allow" so test/dev wiring without a limiter still works.
+ *
+ * `failClosed`: when the limiter itself fails, answer 503 instead of letting
+ * the request through. Credential endpoints (local password sign-in) use it,
+ * because an unthrottled password check is the attack this limit exists for
+ * (docs/ARCHITECTURE.md, "Authentication").
  */
 export async function enforceOAuthCallbackRateLimit(
   request: FastifyRequest,
   reply: FastifyReply,
-  limits: Pick<RequestLimitsInterface, "consumeRateLimit"> | undefined
+  limits: Pick<RequestLimitsInterface, "consumeRateLimit"> | undefined,
+  options: { failClosed?: boolean } = {}
 ): Promise<boolean> {
   if (!limits) return false;
 
   const ip = request.ip || "unknown";
+  let limiterFailed = false;
   const limitError = await limits.consumeRateLimit({
     resource: "oauth_callback",
     userId: ip,
     tenantId: ip
   }).catch((err: unknown) => {
     request.log.warn({ err }, "OAuth callback rate limiter unavailable");
+    limiterFailed = true;
     return null;
   });
+  if (limiterFailed && options.failClosed) {
+    reply.code(503);
+    reply.header("retry-after", "1");
+    reply.send({ error: "rate_limiter_unavailable" });
+    return true;
+  }
   if (!limitError) return false;
 
   reply.code(429);

@@ -90,3 +90,13 @@ it("loads and restores an older archive after a failed next-page request", async
   expect(api.restoreSession).toHaveBeenCalledWith("old");
   expect(screen.getByText("Research notes")).toBeTruthy();
 });
+
+
+it("names the archived row action for permanent deletion when retention is zero", async () => {
+  api.listArchivedSessions.mockResolvedValue({ sessions: rows, trashRetentionDays: 0 });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Delete Research notes permanently" }));
+  expect(api.deleteSession).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Delete permanently" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Move Research notes to Trash" })).toBeNull();
+});

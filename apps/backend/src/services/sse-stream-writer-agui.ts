@@ -38,7 +38,7 @@ import type { ProjectRuntimeFileSnapshot } from "./project-file-store.js";
 import { buildArtifactTurnInputs } from "./turn-input-builder.js";
 import { syncArtifactsToWorkspace } from "./artifacts/artifact-workspace-sync.js";
 import { SseWriter, type RawSseResponse } from "./sse-writer.js";
-import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
+import { interruptedResult } from "./deep-agents/agui-events.js";
 import type { TurnEventLog } from "./turn-event-log.js";
 import { TurnTranscript, classifyTurnFailure, type TurnOutcome } from "./turn-transcript.js";
 
@@ -93,6 +93,8 @@ export type StreamAssistantReplyAGUIInput = {
       input: {
         prompt: string;
         projectInstructions?: ProjectInstructionsSnapshot | null;
+        generativeUiContext?: string | null;
+        generativeUiTransport?: "tool";
         userInputs?: RuntimeUserInput[];
         toolContextId: string | null;
         projectApprovalMode?: ProjectApprovalMode;
@@ -122,6 +124,8 @@ export type StreamAssistantReplyAGUIInput = {
   effort?: RuntimeReasoningEffort;
   prompt: string;
   projectInstructions?: ProjectInstructionsSnapshot | null;
+  generativeUiContext?: string | null;
+  generativeUiTransport?: "tool";
   /** Approval mode captured when the project turn was admitted. */
   projectApprovalMode?: ProjectApprovalMode;
   projectId?: string | null;
@@ -142,6 +146,12 @@ export type StreamAssistantReplyAGUIInput = {
   // already self-heals — toAguiInitialMessages reads the transformed DB text).
   userMessageReplacement?: { messageId: string; text: string; scanRunId?: string };
   turnContext?: PolicyTurnContext;
+  /**
+   * The requester's security version that admitted the turn (the session's).
+   * Null for a WorkOS user. The turn's tool context keeps it, so the gateway
+   * refuses its tool calls after a security change of the account.
+   */
+  ownerSecurityVersion: number | null;
   toolContextTtlMs?: number;
   /** Overrides STREAMING_PERSIST_INTERVAL_MS. Tests only — production omits it. */
   streamingPersistIntervalMs?: number;
@@ -162,7 +172,7 @@ function terminalEventFor(outcome: TurnOutcome, threadId: string, runId: string)
     type: EventType.RUN_FINISHED,
     threadId,
     runId,
-    ...(outcome.status === "interrupted" ? { result: AGUI_INTERRUPTED_RESULT } : {})
+    ...(outcome.status === "interrupted" ? { result: interruptedResult(outcome.reason) } : {})
   } as BaseEvent;
 }
 
@@ -330,6 +340,7 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
         ...(session.integrationAccounts ? { integrationAccounts: session.integrationAccounts } : {}),
         ...(input.turnContext ? { turnContext: input.turnContext } : {})
       },
+      ownerSecurityVersion: input.ownerSecurityVersion,
       ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000
     });
     if (input.cancelSignal?.aborted) throw new Error("Turn stopped during setup");
@@ -428,6 +439,8 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       for await (const event of input.runtimeAdapter.runMessageAGUI(session, {
         prompt: input.prompt,
         projectInstructions: input.projectInstructions,
+        generativeUiContext: input.generativeUiContext,
+        generativeUiTransport: input.generativeUiTransport,
         projectApprovalMode: input.projectApprovalMode,
         toolContextId: toolContext.toolContextId,
         turnContext: input.turnContext ?? "interactive",

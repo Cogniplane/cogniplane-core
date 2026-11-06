@@ -1,5 +1,5 @@
 import { sessionContentReadAccessSql } from "./session-access.js";
-import { McpAppCallSchema, ProjectInstructionsSnapshotSchema, type McpAppCall, type ProjectInstructionsSnapshot, type UiResource } from "@cogniplane/shared-types";
+import { McpAppCallSchema, ProjectInstructionsSnapshotSchema, TurnStopReasonSchema, type McpAppCall, type ProjectInstructionsSnapshot, type TurnStopReason, type UiResource } from "@cogniplane/shared-types";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
@@ -46,7 +46,14 @@ export type MessageFeedbackRating = "thumbs_up" | "thumbs_down";
 
 export type MessagePiiDetail = {
   status?: "blocked" | "transformed" | "detected" | "scanned" | "failed";
+  /**
+   * Before a terminal success, or on failure, the value is the planned
+   * (queued) mode. After a terminal success, it is the mode that the scan
+   * applied.
+   */
   modeApplied?: "off" | "detect" | "block" | "transform";
+  /** The PII settings revision that the scan read. Queued, synchronous upload, and chat prompt scans set it. */
+  policyRevision?: number;
   scanRunId?: string;
   transformed?: boolean;
   blockReason?: string;
@@ -100,6 +107,8 @@ export type MessageRecord = {
   costUsd: number | null;
   feedbackRating: MessageFeedbackRating | null;
   durationMs?: number | null;
+  /** Why the backend stopped an interrupted turn, when it did. */
+  stopReason?: TurnStopReason | null;
   projectInstructions?: ProjectInstructionsSnapshot | null;
   detail: MessageDetail;
   toolResults: ToolResultRecord[];
@@ -163,8 +172,9 @@ function validDuration(value: unknown): number | null {
 }
 
 function mapMessage(row: Record<string, unknown>): Omit<MessageRecord, "toolResults"> {
-  // Expose measured duration only through the validated top-level field.
-  const { durationMs, projectInstructions, ...detail } = mapDetail(row.detail_json);
+  // Expose measured duration and the stop reason only through the validated top-level fields.
+  const { durationMs, stopReason, projectInstructions, ...detail } = mapDetail(row.detail_json);
+  const reason = TurnStopReasonSchema.safeParse(stopReason);
   const snapshot = ProjectInstructionsSnapshotSchema.safeParse(projectInstructions);
   return {
     id: Number(row.id),
@@ -194,6 +204,7 @@ function mapMessage(row: Record<string, unknown>): Omit<MessageRecord, "toolResu
         ? row.feedback_rating
         : null,
     durationMs: validDuration(durationMs),
+    stopReason: row.status === "interrupted" && reason.success ? reason.data : null,
     projectInstructions: snapshot.success ? snapshot.data : null,
     detail,
     createdAt: isoTimestamp(row.created_at),
@@ -626,11 +637,17 @@ export class MessageStore {
     userId: string,
     status: MessageRecord["status"],
     content: string,
-    durationMs?: number
+    durationMs?: number,
+    /** Saved only on an interrupted turn: why the backend stopped it. */
+    stopReason?: TurnStopReason
   ): Promise<MessageRecord | null> {
     const duration = ["completed", "error", "interrupted"].includes(status)
       ? validDuration(durationMs)
       : null;
+    const detail = {
+      ...(duration === null ? {} : { durationMs: duration }),
+      ...(status === "interrupted" && stopReason ? { stopReason } : {})
+    };
     return withTenantScope(this.db, tenantId, async (client) => {
       const updatedMessage = await client.query(
         `
@@ -641,10 +658,13 @@ export class MessageStore {
           RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
         [tenantId, messageId, userId, status, truncateForStorage(redactSecrets(content), MAX_MESSAGE_CONTENT_LENGTH),
-          JSON.stringify(duration === null ? {} : { durationMs: duration })]
+          JSON.stringify(detail)]
       );
 
-      if (updatedMessage.rows[0] && ["completed", "error", "interrupted"].includes(status)) {
+      // A turn that ended normally or with an error has no running call. A stopped
+      // turn keeps its unreturned calls as `in_progress`: history shows them as
+      // interrupted instead of reporting a tool failure.
+      if (updatedMessage.rows[0] && ["completed", "error"].includes(status)) {
         await client.query(
           `UPDATE message_tool_results SET status = 'failed', updated_at = NOW()
            WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND status = 'in_progress'`,
@@ -735,19 +755,12 @@ export class MessageStore {
 
   async markInterruptedIfActive(tenantId: string, messageId: string, userId: string): Promise<void> {
     await withTenantScope(this.db, tenantId, async (client) => {
-      const result = await client.query(
+      await client.query(
         `UPDATE messages SET status = 'interrupted', updated_at = NOW()
          WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
            AND status IN ('pending', 'streaming')`,
         [tenantId, messageId, userId]
       );
-      if (result.rowCount) {
-        await client.query(
-          `UPDATE message_tool_results SET status = 'failed', updated_at = NOW()
-           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3 AND status = 'in_progress'`,
-          [tenantId, messageId, userId]
-        );
-      }
     });
   }
 
@@ -979,13 +992,6 @@ export class MessageStore {
             FOR UPDATE SKIP LOCKED
           )
           RETURNING tenant_id, session_id, message_id
-        ), stopped_tools AS (
-          UPDATE message_tool_results tool
-          SET status = 'failed', updated_at = NOW()
-          FROM interrupted message
-          WHERE tool.tenant_id = message.tenant_id
-            AND tool.message_id = message.message_id
-            AND tool.status = 'in_progress'
         )
         SELECT tenant_id, session_id, message_id FROM interrupted
       `,

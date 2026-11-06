@@ -100,7 +100,11 @@ describe.each([
     fireEvent.click(screen.getByRole("button", { name: "7d" }));
 
     expect(screen.getByText("30")).toBeTruthy();
-    expect(screen.getByText("Loading…")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "7d" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("status").textContent).toBe("Loading the last 7 days. Showing the previous 30-day report until the read succeeds.");
+    if (_name !== "message feedback") {
+      expect(screen.getByText("In the last 30 days")).toBeTruthy();
+    }
     await act(async () => second.resolve(makeResult(7)));
     await waitFor(() => expect(screen.getByText("7")).toBeTruthy());
   });
@@ -115,14 +119,14 @@ describe("token report presentation", () => {
     const adminView = renderWithQuery(<TokenUsageSection />);
     expect(screen.getAllByTestId("token-usage-stat-skeleton")).toHaveLength(4);
     await act(async () => admin.resolve(usage(1_500)));
-    await screen.findAllByText("1.5k");
+    await screen.findByText("1,500");
     expect(screen.getByText("In the last 30 days")).toBeTruthy();
     adminView.unmount();
 
     renderWithQuery(<PersonalTokenUsageSection />);
     expect(screen.getAllByTestId("token-usage-stat-skeleton")).toHaveLength(4);
     await act(async () => personal.resolve(usage(1_500)));
-    await screen.findAllByText("1.5k");
+    await screen.findByText("1,500");
     expect(screen.getByText("In the last 30 days")).toBeTruthy();
   });
 
@@ -158,8 +162,10 @@ describe("token report presentation", () => {
     renderWithQuery(<TokenUsageSection />);
     await screen.findByText("9");
     fireEvent.click(screen.getByRole("button", { name: "By user" }));
-    expect(screen.getByText("User")).toBeTruthy();
-    expect(screen.getAllByText("user-1234567890")).toHaveLength(2);
+    const breakdown = screen.getByRole("list", { name: "User token breakdown" });
+    expect(within(breakdown).getByText("user-1234567890")).toBeTruthy();
+    expect(within(breakdown).getAllByRole("term").map(term => term.textContent)).toEqual(["Input", "Output", "Total", "Est. cost, USD"]);
+    expect(within(breakdown).getAllByRole("definition").map(value => value.textContent)).toEqual(["6", "3", "9", "$0.2500"]);
   });
 
   it("renders admin daily and model breakdowns", async () => {
@@ -169,10 +175,17 @@ describe("token report presentation", () => {
       byModel: [{ modelName: "admin-model", inputTokens: 8, outputTokens: 4, totalTokens: 12, costUsd: 0.25 }]
     });
     renderWithQuery(<TokenUsageSection />);
-    await screen.findByText("2026-09-03");
+    await screen.findByRole("heading", { name: "Daily tokens, UTC" });
+    expect(screen.getByTestId("bar-chart").textContent).toContain("2026-09-03");
+    fireEvent.click(screen.getByText("Daily values and estimated cost"));
+    const daily = screen.getByRole("list", { name: "Date, UTC token breakdown" });
+    expect(within(daily).getByText("2026-09-03")).toBeTruthy();
+    expect(within(daily).getAllByRole("definition").map(value => value.textContent)).toEqual(["8", "4", "12", "$0.2500"]);
     fireEvent.click(screen.getByRole("button", { name: "By model" }));
-    expect(screen.getByText("Model")).toBeTruthy();
-    expect(screen.getAllByText("admin-model")).toHaveLength(2);
+    const models = screen.getByRole("list", { name: "Model token breakdown" });
+    expect(within(models).getByText("admin-model")).toBeTruthy();
+    expect(within(models).getAllByRole("definition").map(value => value.textContent)).toEqual(["8", "4", "12", "$0.2500"]);
+    expect(screen.queryByRole("list", { name: "Date, UTC token breakdown" })).toBeNull();
   });
 
   it("renders the personal model breakdown", async () => {
@@ -183,8 +196,9 @@ describe("token report presentation", () => {
     renderWithQuery(<PersonalTokenUsageSection />);
     await screen.findByText("6");
     fireEvent.click(screen.getByRole("button", { name: "By model" }));
-    expect(screen.getByText("Model")).toBeTruthy();
-    expect(screen.getAllByText("personal-model")).toHaveLength(2);
+    const breakdown = screen.getByRole("list", { name: "Model token breakdown" });
+    expect(within(breakdown).getByText("personal-model")).toBeTruthy();
+    expect(within(breakdown).getAllByRole("definition").map(value => value.textContent)).toEqual(["4", "2", "6", "$0.1000"]);
   });
 });
 
@@ -195,10 +209,10 @@ describe("message feedback states", () => {
       return feedback(0);
     });
     renderWithQuery(<MessageFeedbackSection />);
-    expect(screen.getByText("Loading…")).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe("Loading feedback for the last 30 days.");
     await screen.findByText("feedback failed");
     fireEvent.click(screen.getByRole("button", { name: "7d" }));
-    await screen.findByText("No feedback recorded in this period.");
+    await screen.findByText("No feedback recorded in the displayed 7-day report.");
     expect(screen.queryByText("feedback failed")).toBeNull();
   });
 
@@ -209,7 +223,7 @@ describe("message feedback states", () => {
     await screen.findByText("Message feedback reporting is not available on this deployment yet.");
     first.unmount();
     renderWithQuery(<MessageFeedbackSection />, client);
-    await screen.findByText("1 rated responses");
+    await screen.findByText("1 rated response");
   });
 
   it("switches breakdowns and sorts the daily table", async () => {

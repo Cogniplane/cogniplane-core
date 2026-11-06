@@ -8,12 +8,13 @@
 // stand-ins, because their own tests cover them.
 
 import { CopilotChat, CopilotKitProvider, MCPAppsActivityContentSchema, MCPAppsActivityType } from "@copilotkit/react-core/v2";
+import { standardUI, useGenerativeUIRuntime } from "@copilotkit/react-core/v2/generative-ui";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { McpAppCall } from "@cogniplane/shared-types";
+import { GENERATIVE_UI_PANEL_TARGET, type Artifact, type McpAppCall } from "@cogniplane/shared-types";
 
-type DraftSeam = { place: (request: { text: string; source: string; append: boolean }) => "placed" | "occupied" | "unavailable" };
+type DraftSeam = import("./widget-draft").WidgetDraftSeam;
 const frames = vi.hoisted(() => ({
   rendered: [] as Array<{ toolCallId: string; busy: boolean; canEdit: boolean }>,
   // The seam that the host gives a tool view, as the last stand-in frame got it.
@@ -59,7 +60,9 @@ vi.mock("./context-window-meter", () => ({ ContextWindowMeter: () => null }));
 import { DeepAgentsBrowserAgent } from "../lib/agui/deep-agents-browser-agent";
 import { API_URL } from "../lib/api-client";
 import { ev, FixtureServer, idleHistory, installBrowserLayoutStubs, savedApproval, type FixtureStream, type JsonReply } from "../test-helpers/agui-fixture-server";
-import { CopilotChatHost, type ChatEventHandlers, type ChatSessionModel } from "./copilot-chat-host";
+import type { ArtifactCardInventory } from "./artifact-card";
+import { CopilotChatHost, logCopilotKitError, type ChatEventHandlers, type ChatSessionModel } from "./copilot-chat-host";
+import { GENERATIVE_UI_CONFIG } from "./generative-ui-catalog";
 
 installBrowserLayoutStubs();
 
@@ -99,6 +102,8 @@ type HostOptions = {
   session?: Partial<ChatSessionModel>;
   model?: string;
   events?: ChatEventHandlers;
+  artifactInventory?: ArtifactCardInventory;
+  draftScope?: { userId: string; tenantId: string };
 };
 
 function hostElement(options: HostOptions = {}) {
@@ -117,6 +122,8 @@ function hostElement(options: HostOptions = {}) {
       }}
       usage={{ contextTokens: 0, contextWindow: 1000, sessionCostUsd: 0 }}
       artifactIds={[]}
+      artifactInventory={options.artifactInventory}
+      draftScope={options.draftScope}
       events={options.events ?? {}}
     />
   );
@@ -159,6 +166,12 @@ const textCount = (text: string) =>
   screen.queryAllByText((_, node) => node?.textContent === text && node.children.length === 0).length;
 const pageText = () => document.body.textContent ?? "";
 
+// The browser builds the tool guide from the provider's catalog envelope.
+const GENERATIVE_UI_CONTEXT = expect.stringMatching(/^Generative UI guide: [^\n]*\n[\s\S]*render_ui/);
+const sentBody = (body: Record<string, unknown>) => ({
+  ...body, generativeUiContext: GENERATIVE_UI_CONTEXT, generativeUiTransport: "tool"
+});
+
 async function typeAndSend(text: string) {
   fireEvent.change(composer(), { target: { value: text } });
   await act(async () => {
@@ -182,7 +195,7 @@ async function sendAfterRecovery() {
     fireEvent.keyDown(composer(), { key: "Enter" });
   });
   await screen.findByText("Answer after recovery");
-  expect(server.sent).toEqual([{ sessionId: "s-1", text: "Question after recovery", model: "model-1" }]);
+  expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Question after recovery", model: "model-1" })]);
   expect(pageText()).not.toContain(SAVED_CONVERSATION_FAILURE);
 }
 
@@ -261,12 +274,12 @@ describe("CopilotChatHost restores the session through CopilotChat's connection"
     render(hostElement({ events }));
 
     await screen.findByText("Found two files.");
-    const order = ["Plan the migration", "Thought for", "Let me check.", "list_files", "Found two files.", "inspect"]
+    const order = ["Plan the migration", "Thought for", "Let me check.", "List files", "Found two files.", "inspect"]
       .map((part) => pageText().indexOf(part));
     expect(order.every((position) => position >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(screen.getByText("Plan")).toBeTruthy();
-    expect(screen.getByRole("button", { name: /list_files/ }).textContent).toContain("done");
+    expect(screen.getByRole("button", { name: /List files/ }).textContent).toContain("done");
     // The composer is open once the history is shown.
     await waitFor(() => expect(screen.getByTestId("copilot-send-button")).toBeTruthy());
     expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
@@ -454,7 +467,7 @@ describe("CopilotChatHost with a history that changes between connections", () =
     view.rerender(hostElement({ session: { isRunning: false } }));
 
     await screen.findByText("All done.");
-    const order = ["First I look.", "list_files", "Now I check.", "read_file", "All done."].map((part) => pageText().indexOf(part));
+    const order = ["First I look.", "List files", "Now I check.", "Read file", "All done."].map((part) => pageText().indexOf(part));
     expect(order.every((position) => position >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
@@ -647,7 +660,7 @@ describe("CopilotChatHost sends", () => {
     const { events } = recordEvents();
     server.connect("s-1", idleHistory(EARLIER));
     server.messageReplies = [(stream) => {
-      stream.push(ev.runStarted("a2"), ev.turnStarted("a2"), ev.textStart("r-1"), ev.text("r-1", "Here is the answer"), ev.textEnd("r-1"), ev.runFinished("a2"));
+      stream.push(ev.runStarted("a2"), ev.turnStarted("a2"), ev.userPersisted("u2", "New question"), ev.textStart("r-1"), ev.text("r-1", "Here is the answer"), ev.textEnd("r-1"), ev.runFinished("a2"));
       stream.finish();
     }];
     const view = render(hostElement({ events }));
@@ -657,7 +670,7 @@ describe("CopilotChatHost sends", () => {
     await typeAndSend("New question");
 
     await screen.findByText("Here is the answer");
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "New question", model: "model-2" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "New question", model: "model-2" })]);
     expect(textCount("New question")).toBe(1);
     await waitFor(() => expect(events.onTurnSettled).toHaveBeenCalledTimes(1));
     // The agent stays: no second connection after the model change.
@@ -701,7 +714,7 @@ describe("CopilotChatHost sends", () => {
     });
 
     await waitFor(() => expect(events.onInitialPromptSent).toHaveBeenCalledTimes(1));
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "Resolve the draft", model: "model-2" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Resolve the draft", model: "model-2" })]);
     view.rerender(hostElement({ session: { initialPrompt: "Resolve the draft" }, events, model: "model-2" }));
     await act(async () => { await Promise.resolve(); });
     expect(server.sent).toHaveLength(1);
@@ -722,13 +735,53 @@ describe("CopilotChatHost Stop", () => {
     render(hostElement({ events }));
     await screen.findByText("Long work");
 
-    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    const stop = screen.getByRole("button", { name: "Stop" });
+    stop.focus();
+    fireEvent.click(stop);
 
     await waitFor(() => expect(server.count("POST /sessions/s-1/interrupt")).toBe(1));
     await waitFor(() => expect(connectStreams()[0]!.aborted).toBe(true));
     await screen.findByText("Stopped reply");
     await waitFor(() => expect(events.onTurnSettled).toHaveBeenCalledTimes(1));
     expect(server.count("GET /sessions")).toBeGreaterThanOrEqual(1);
+    await waitFor(() => expect(document.activeElement).toBe(composer()));
+  });
+
+  it.each(["attached", "remote"] as const)("keeps %s Stop focused through a held failure and ignores duplicate activation", async (kind) => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let interruptCalls = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname.endsWith("/interrupt") && init?.method === "POST") {
+        interruptCalls += 1;
+        await gate;
+      }
+      return server.fetch(input, init);
+    });
+    server.interruptReply = { status: 500, body: { error: "internal", message: "down" } };
+    if (kind === "remote") {
+      server.running.set("s-1", true);
+      server.savedRows.set("s-1", []);
+      server.connect("s-1", stream => {
+        stream.push(...ev.history({ messages: EARLIER, activeTurn: "unavailable" }));
+        stream.finish();
+      });
+    } else server.connect("s-1", stream => stream.push(...attachedTurn([RUNNING_USER], "Still working")));
+    render(hostElement({ session: { isRunning: kind === "remote" } }));
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    stop.focus();
+    fireEvent.click(stop);
+    expect(stop.getAttribute("aria-disabled")).toBe("true");
+    expect((stop as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(stop);
+    expect(interruptCalls).toBe(1);
+    expect(document.activeElement).toBe(stop);
+    await act(async () => release());
+    await screen.findByText(/The agent did not stop/);
+    expect(document.activeElement).toBe(stop);
+    expect(stop.getAttribute("aria-disabled")).toBe("false");
+    expect(interruptCalls).toBe(1);
   });
 
   it("sends after Stop closes CopilotChat's attached connection and the final state loads", async () => {
@@ -771,7 +824,7 @@ describe("CopilotChatHost Stop", () => {
     server.connect("s-1",
       idleHistory(EARLIER),
       idleHistory([...EARLIER, { id: "u2", role: "user", content: "Question" }, { id: "a2", role: "assistant", content: "Stopped answer" }]));
-    server.messageReplies = [(stream) => stream.push(ev.runStarted("a2"), ev.textStart("r-1"), ev.text("r-1", "Partial answer"))];
+    server.messageReplies = [(stream) => stream.push(ev.runStarted("a2"), ev.userPersisted("u2", "Question"), ev.textStart("r-1"), ev.text("r-1", "Partial answer"))];
     render(hostElement({ events }));
     await screen.findByText("Earlier answer");
     await typeAndSend("Question");
@@ -785,6 +838,7 @@ describe("CopilotChatHost Stop", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     expect(events.onTurnSettled).toHaveBeenCalledTimes(1);
     expect(textCount("Question")).toBe(1);
+    expect(composer().value).toBe("");
   });
 
   // Stop answers 409 when the server finds no turn that it can stop. The
@@ -873,7 +927,8 @@ describe("CopilotChatHost connection failures", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     expect(server.count("GET /sessions/s-1/connect")).toBe(1);
     expect(server.sent).toEqual([]);
-    expect(sendDisabled()).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    expect(selector.disabled.at(-1)).toBe(true);
   });
 
   it.each([
@@ -908,7 +963,8 @@ describe("CopilotChatHost connection failures", () => {
     expect(screen.getByText("Run ap-1")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     expect(screen.queryByText(/The agent is still working/)).toBeNull();
-    expect(sendDisabled()).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    expect(selector.disabled.at(-1)).toBe(true);
 
     // Neither time nor a change of the list's running state polls or connects.
     const callsAtRefusal = server.calls.length;
@@ -921,7 +977,8 @@ describe("CopilotChatHost connection failures", () => {
     expect(server.calls.slice(callsAtRefusal)).toEqual([]);
     expect(server.count("GET /sessions/s-1/connect")).toBe(2);
     expect(running.at(-1)).toBe(false);
-    expect(sendDisabled()).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    expect(selector.disabled.at(-1)).toBe(true);
   });
 
   it("connects again once after a network failure before the history", async () => {
@@ -1213,9 +1270,9 @@ describe("CopilotChatHost message slots", () => {
     ]));
     render(hostElement());
 
-    const search = await screen.findByRole("button", { name: /search/ });
+    const search = await screen.findByRole("button", { name: /Search/ });
     expect(within(search).getByText("failed")).toBeTruthy();
-    expect(within(screen.getByRole("button", { name: /execute/ })).getByText("interrupted")).toBeTruthy();
+    expect(within(screen.getByRole("button", { name: /Run command/ })).getByText("interrupted")).toBeTruthy();
   });
 });
 
@@ -1263,7 +1320,7 @@ describe("CopilotChatHost readiness across connections", () => {
     });
 
     await screen.findByText("Third answer");
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "Too early", model: "model-1" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Too early", model: "model-1" })]);
     expect(server.count("GET /sessions/s-1/connect")).toBe(2);
     expect(server.openStreams("connect:s-1")).toHaveLength(0);
   });
@@ -1341,10 +1398,88 @@ describe("CopilotChatHost readiness across connections", () => {
 
     await screen.findByText("Final reply");
     await waitFor(() => expect(events.onInitialPromptSent).toHaveBeenCalledTimes(1));
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "Resolve the draft", model: "model-1" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Resolve the draft", model: "model-1" })]);
     // Once for the end of the remote turn, once for the end of the prompt's turn.
     await waitFor(() => expect(events.onTurnSettled).toHaveBeenCalledTimes(2));
     expect(server.count("GET /sessions/s-1/connect")).toBe(2);
+  });
+});
+
+describe("CopilotChatHost message box and connection status", () => {
+  const status = (text: string) => screen.queryAllByRole("status").find((element) => element.textContent === text) ?? null;
+  // Longer than the delay that keeps a short connection from flashing the status.
+  const pastStatusDelay = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)); });
+
+  it("names the message box and says how Enter works, whatever the box holds", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+
+    const box = screen.getByRole("textbox", { name: "Message" });
+    expect(box).toBe(composer());
+    const hint = document.getElementById(box.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toBe("Enter sends the message. Shift+Enter starts a new line.");
+    // The name stays when the placeholder goes away.
+    fireEvent.change(box, { target: { value: "A question" } });
+    expect(screen.getByRole("textbox", { name: "Message" })).toBe(box);
+  });
+
+  it("says the chat is loading until its first history arrives, and keeps Send closed", async () => {
+    let held!: FixtureStream;
+    server.connect("s-1", (stream) => { held = stream; });
+    render(hostElement());
+
+    await waitFor(() => expect(status("Loading chat…")).not.toBeNull());
+    expect(screen.queryByTestId("copilot-loading-cursor")).toBeNull();
+    fireEvent.change(composer(), { target: { value: "Too early" } });
+    expect(sendDisabled()).toBe(true);
+
+    await act(async () => {
+      held.push(...ev.history({ messages: EARLIER }));
+      held.finish();
+    });
+    await screen.findByText("Earlier answer");
+    await waitFor(() => expect(sendDisabled()).toBe(false));
+    expect(status("Loading chat…")).toBeNull();
+    expect(server.sent).toEqual([]);
+  });
+
+  it("says the chat reconnects while a later connection runs, and keeps the shown messages", async () => {
+    let held!: FixtureStream;
+    server.connect("s-1", idleHistory(EARLIER), (stream) => { held = stream; });
+    const view = render(hostElement());
+    await screen.findByText("Earlier answer");
+    await pastStatusDelay();
+    expect(status("Loading chat…")).toBeNull();
+
+    // Another tab starts a turn, and the host connects again.
+    view.rerender(hostElement({ session: { isRunning: true } }));
+    await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
+    await waitFor(() => expect(status("Reconnecting…")).not.toBeNull());
+    expect(screen.queryByTestId("copilot-loading-cursor")).toBeNull();
+    expect(screen.getByText("Earlier answer")).toBeTruthy();
+    fireEvent.change(composer(), { target: { value: "Not yet" } });
+    expect(sendDisabled()).toBe(true);
+
+    await act(async () => {
+      held.push(...ev.history({ messages: [...EARLIER, RUNNING_USER, { id: "a1", role: "assistant", content: "Other tab reply" }] }));
+      held.finish();
+    });
+    await screen.findByText("Other tab reply");
+    await waitFor(() => expect(status("Reconnecting…")).toBeNull());
+    await waitFor(() => expect(sendDisabled()).toBe(false));
+  });
+
+  it("shows only the refusal when the server refuses the connection", async () => {
+    server.connect("s-1", { status: 403, body: { error: "forbidden" } });
+    render(hostElement());
+
+    await screen.findByText("This chat did not load");
+    await pastStatusDelay();
+    expect(status("Loading chat…")).toBeNull();
+    expect(status("Reconnecting…")).toBeNull();
+    expect(screen.queryByRole("textbox", { name: "Message" })).toBeNull();
+    expect(selector.disabled.at(-1)).toBe(true);
   });
 });
 
@@ -1356,7 +1491,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
     { id: "tc-1:result", role: "tool", toolCallId: "tc-1", content: "Quotes" }
   ];
   const SOURCE = "show_quotes (ui://quotes/app.html)";
-  const notice = () => screen.queryByRole("status", { name: "Draft from a tool view" });
+  const notice = () => screen.queryByRole("group", { name: "Draft from a tool view" });
   const place = (text: string, append = false) => {
     let placement!: string;
     act(() => { placement = frames.draft!.place({ text, source: SOURCE, append }); });
@@ -1365,8 +1500,8 @@ describe("CopilotChatHost drafts from a tool view", () => {
 
   async function openChat(options: HostOptions = {}) {
     server.connect("s-1", idleHistory(APP_HISTORY));
-    server.messageReplies = [(stream) => {
-      stream.push(ev.runStarted("a3"), ev.textStart("r-3"), ev.text("r-3", "Reply to the draft"), ev.textEnd("r-3"), ev.runFinished("a3"));
+    server.messageReplies = [(stream, body) => {
+      stream.push(ev.runStarted("a3"), ev.userPersisted("u3", String(body!.text)), ev.textStart("r-3"), ev.text("r-3", "Reply to the draft"), ev.textEnd("r-3"), ev.runFinished("a3"));
       stream.finish();
     }];
     const view = render(hostElement({ session: { initialMcpApps: { "tc-1": app } }, ...options }));
@@ -1386,8 +1521,11 @@ describe("CopilotChatHost drafts from a tool view", () => {
     expect(composer().value).toBe("Compare the two quotes and pick one.");
     const shown = notice()!;
     expect(shown.textContent).toContain(`Draft from a tool view: ${SOURCE}`);
-    expect(shown.textContent).toContain("A tool view wrote this text. You did not. Nothing is sent until you press Send.");
     expect(shown.textContent).toContain("36 characters, 1 line.");
+    // Only the sentence about the writer is live. The counts are not in it.
+    expect(within(shown).getByRole("status").textContent).toBe(
+      "A tool view wrote this text. You did not. Review it before sending."
+    );
     expect(within(shown).queryByRole("alert")).toBeNull();
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     expect(server.sent).toEqual([]);
@@ -1395,6 +1533,21 @@ describe("CopilotChatHost drafts from a tool view", () => {
     expect(server.openStreams("messages:s-1")).toHaveLength(0);
     // The box does not take focus: a key press meant for the tool view cannot send the draft.
     expect(document.activeElement).toBe(document.body);
+  });
+
+  it.each(["tool-view", "generated-view"] as const)("recovers text and the explanation of a %s after remount", async (origin) => {
+    window.sessionStorage.clear();
+    const options = { draftScope: { userId: "u-1", tenantId: "t-1" } };
+    const view = await openChat(options);
+    act(() => { frames.draft!.place({ text: "Draft from a view", source: SOURCE, origin, append: false }); });
+    fireEvent.change(composer(), { target: { value: "Draft from a view, edited by me" } });
+    view.unmount();
+    await openChat(options);
+    expect(composer().value).toBe("Draft from a view, edited by me");
+    const name = origin === "tool-view" ? "Draft from a tool view" : "Draft from a generated view";
+    expect(screen.getByRole("group", { name }).textContent).toContain(SOURCE);
+    expect(server.sent).toEqual([]);
+    window.sessionStorage.clear();
   });
 
   it("sends exactly the text in the box after the user edits it, and removes the notice", async () => {
@@ -1407,7 +1560,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
     await act(async () => { fireEvent.keyDown(composer(), { key: "Enter" }); });
 
     await screen.findByText("Reply to the draft");
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "Compare the two quotes and pick the cheaper one.", model: "model-1" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Compare the two quotes and pick the cheaper one.", model: "model-1" })]);
     expect(composer().value).toBe("");
     expect(notice()).toBeNull();
     // The next text that the user types is theirs. It gets no notice.
@@ -1425,7 +1578,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
     await act(async () => { fireEvent.click(screen.getByTestId("copilot-send-button")); });
 
     await screen.findByText("Reply to the draft");
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: raw.trim(), model: "model-1" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: raw.trim(), model: "model-1" })]);
   });
 
   it("flags control and direction characters, flags nothing silently stripped, and follows edits", async () => {
@@ -1445,6 +1598,21 @@ describe("CopilotChatHost drafts from a tool view", () => {
     // A tool view cannot make the box show something other than what it holds.
     fireEvent.change(composer(), { target: { value: hostile } });
     expect(within(notice()!).getByRole("alert").textContent).toContain("hidden control characters");
+  });
+
+  it("keeps the counts out of the live region, so typing in the draft changes no announcement", async () => {
+    await openChat();
+    place("Compare the two quotes and pick one.");
+    const live = within(notice()!).getByRole("status");
+    const announced = live.textContent;
+
+    fireEvent.change(composer(), { target: { value: "Compare the two quotes and pick the cheaper one.\nThen explain why." } });
+
+    // The same live element keeps the same text. The counts outside it follow the edit.
+    expect(within(notice()!).getByRole("status")).toBe(live);
+    expect(live.textContent).toBe(announced);
+    expect(notice()!.textContent).toContain("66 characters, 2 lines.");
+    expect(live.contains(screen.getByText("66 characters, 2 lines."))).toBe(false);
   });
 
   it("shows the length of a long draft and warns about a run of blank lines that hides text", async () => {
@@ -1472,7 +1640,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
 
     await act(async () => { fireEvent.keyDown(composer(), { key: "Enter" }); });
     await screen.findByText("Reply to the draft");
-    expect(server.sent).toEqual([{ sessionId: "s-1", text: "My own question\n\nFrom the tool view", model: "model-1" }]);
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "My own question\n\nFrom the tool view", model: "model-1" })]);
   });
 
   it("treats a second request as occupied once the first draft is in the box", async () => {
@@ -1493,7 +1661,10 @@ describe("CopilotChatHost drafts from a tool view", () => {
     fireEvent.change(composer(), { target: { value: "" } });
 
     place("From the tool view again");
-    fireEvent.click(within(notice()!).getByRole("button", { name: "Clear draft" }));
+    const clear = within(notice()!).getByRole("button", { name: "Clear draft" });
+    clear.focus();
+    fireEvent.click(clear);
+    expect(document.activeElement).toBe(composer());
     expect(composer().value).toBe("");
     expect(notice()).toBeNull();
     expect(server.sent).toEqual([]);
@@ -1659,5 +1830,1130 @@ describe("CopilotChatHost MCP Apps activity messages", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     expect(document.querySelectorAll("iframe, [srcdoc]")).toHaveLength(0);
     noFallbackTraffic();
+  });
+});
+
+describe("CopilotChatHost generative UI", () => {
+  // A fence as the model writes it: one JSON operation on each line.
+  const fenceOf = (...operations: object[]) => ["```a2ui", ...operations.map((operation) => JSON.stringify(operation)), "```"].join("\n");
+  const createSurface = (surfaceId: string, components: object[], dataModel: object = {}) =>
+    ({ version: "v1.0", createSurface: { surfaceId, dataModel, components } });
+  const updateComponents = (surfaceId: string, components: object[]) =>
+    ({ version: "v1.0", updateComponents: { surfaceId, components } });
+  const PLAN_OPERATIONS = [
+    createSurface("plan", [{ id: "root", component: "Column", children: ["title", "detail"] }]),
+    updateComponents("plan", [
+      { id: "title", component: "Text", text: "Team plan" },
+      { id: "detail", component: "Text", text: "Twelve seats" }
+    ])
+  ];
+  const PLAN_REPLY = `Here is the plan.\n\n${fenceOf(...PLAN_OPERATIONS)}\n\nTell me what to change.`;
+
+  const toolSurface = (surfaceId: string, operations: object[], status = "ready") => ({
+    surfaceId, target: "chat", catalogId: "cogniplane/standard@1", operations, status, rejected: []
+  });
+
+  it("removes a streamed preview that never reached tool execution", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    let reply!: FixtureStream;
+    server.messageReplies = [(stream) => { reply = stream; }];
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Show it");
+    const surfaceId = "turn:a2:preview";
+    const ops = [createSurface(surfaceId, [{ id: "root", component: "Text", text: "Unfinished preview" }])];
+    await act(async () => { reply.push(ev.runStarted("a2"), {
+      type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface",
+      content: toolSurface(surfaceId, ops, "streaming")
+    }); });
+    await screen.findByText("Unfinished preview");
+    await act(async () => { reply.push({
+      type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface",
+      content: toolSurface(surfaceId, [...ops, { version: "v1.0", deleteSurface: { surfaceId } }])
+    }, ev.runFinished("a2")); reply.finish(); });
+    await waitFor(() => expect(document.querySelector(`[data-generative-ui-chat-surface="${surfaceId}"]`)).toBeNull());
+    expect(screen.queryByText("Unfinished preview")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(server.sent).toHaveLength(1);
+  });
+
+  it("shows no empty card for a chat preview that the backend withdraws, renders its retry, and removes an abandoned one at turn end", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    let reply!: FixtureStream;
+    server.messageReplies = [(stream) => { reply = stream; }];
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Show two views");
+    const [retried, abandoned] = ["turn:a2:retried", "turn:a2:abandoned"];
+    const snapshot = (surfaceId: string, operations: object[], status = "ready") => ({
+      type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface",
+      content: toolSurface(surfaceId, operations, status)
+    });
+    const view = (surfaceId: string, text: string) => createSurface(surfaceId, [{ id: "root", component: "Text", text }]);
+    const cards = () => [...document.querySelectorAll("[data-generative-ui-chat-surface]")]
+      .map((card) => [card.getAttribute("data-generative-ui-chat-surface"), card.textContent]);
+
+    await act(async () => { reply.push(ev.runStarted("a2"),
+      snapshot(retried, [view(retried, "First preview")], "streaming"), snapshot(abandoned, [view(abandoned, "Lost preview")], "streaming")); });
+    await waitFor(() => expect(cards()).toEqual([[retried, "First preview"], [abandoned, "Lost preview"]]));
+    // render-ui-stream.ts withdraws a preview mid-turn with no operations, so a retry can use its id.
+    await act(async () => { reply.push(snapshot(retried, [], "error"), snapshot(abandoned, [], "error")); });
+    await waitFor(() => expect(cards()).toEqual([]));
+    await act(async () => { reply.push(snapshot(retried, [view(retried, "Retried view")])); });
+    await waitFor(() => expect(cards()).toEqual([[retried, "Retried view"]]));
+    await act(async () => { reply.push(snapshot(abandoned, [{ version: "v1.0", deleteSurface: { surfaceId: abandoned } }]),
+      ev.runFinished("a2")); reply.finish(); });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
+    expect(cards()).toEqual([[retried, "Retried view"]]);
+    expect(screen.queryByText("Lost preview")).toBeNull();
+  });
+
+  it("shows one error card for a refused streamed call after its preview error is deleted, and shows an error again after its delete", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    let reply!: FixtureStream;
+    server.messageReplies = [(stream) => { reply = stream; }];
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Update the plan");
+    // The activities that render-ui-stream.ts sends for a call that updates a missing surface.
+    const rejected = [{ index: 0, reason: "Create this surface in the current turn first" }];
+    const errorOf = (callId: string, content: object) => ({
+      type: "ACTIVITY_SNAPSHOT", messageId: `genui:error:turn:a2:${callId}`, activityType: "generative-ui-surface",
+      content: { surfaceId: `error:turn:a2:${callId}`, target: "chat", catalogId: "cogniplane/standard@1", ...content }
+    });
+    const shownError = { operations: [], status: "error", rejected };
+    const preview = "model:index:0";
+    const cards = () => [...document.querySelectorAll("[data-generative-ui-chat-surface]")]
+      .map((card) => [card.getAttribute("data-generative-ui-chat-surface"), within(card as HTMLElement).queryByRole("alert") !== null]);
+
+    await act(async () => { reply.push(ev.runStarted("a2"), errorOf(preview, shownError)); });
+    await waitFor(() => expect(cards()).toEqual([[`error:turn:a2:${preview}`, true]]));
+    // At tool start, the error moves to the tool run id and the preview error is deleted.
+    await act(async () => { reply.push(
+      errorOf("call1", shownError),
+      errorOf(preview, { status: "ready", rejected: [],
+        operations: [{ version: "v1.0", deleteSurface: { surfaceId: `error:turn:a2:${preview}` } }] })
+    ); });
+    await waitFor(() => expect(cards()).toEqual([["error:turn:a2:call1", true]]));
+    await act(async () => { reply.push(errorOf(preview, shownError)); });
+    await waitFor(() => expect(cards()).toEqual([[`error:turn:a2:${preview}`, true], ["error:turn:a2:call1", true]]));
+    await act(async () => { reply.push(ev.runFinished("a2")); reply.finish(); });
+  });
+
+  it("streams tool surfaces through the standard renderer, hides raw calls and restores the saved surface", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    let reply!: FixtureStream;
+    server.messageReplies = [(stream) => { reply = stream; }];
+    const view = render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Show the plan");
+    const surfaceId = "turn:a2:plan";
+    const ops = [
+      createSurface(surfaceId, [{ id: "root", component: "Column", children: ["title", "input", "button"] }]),
+      updateComponents(surfaceId, [
+        { id: "title", component: "Text", text: "Tool plan" },
+        { id: "input", component: "TextField", label: "Tool seats", value: { "@path": "/seats" } },
+        { id: "button", component: "Button", label: "Apply tool plan", onClick: { event: { name: "apply_plan" } } }
+      ])
+    ];
+    await act(async () => { reply.push(
+      ev.runStarted("a2"), ev.textStart("r-1"), ev.text("r-1", "A plan for you."), ev.textEnd("r-1"),
+      { type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface",
+        content: toolSurface(surfaceId, ops, "streaming") }
+    ); });
+    await screen.findByText("Tool plan");
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+    fireEvent.change(await screen.findByLabelText("Tool seats"), { target: { value: "7" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply tool plan" }));
+    expect(server.sent).toHaveLength(1);
+    await act(async () => { reply.push(
+      { type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface", content: toolSurface(surfaceId, ops) },
+      { type: "TOOL_CALL_START", toolCallId: "ui-call", toolCallName: "render_ui" },
+      { type: "TOOL_CALL_ARGS", toolCallId: "ui-call", delta: JSON.stringify({ target: "chat", operations: ops }) },
+      { type: "TOOL_CALL_END", toolCallId: "ui-call" },
+      { type: "TOOL_CALL_RESULT", messageId: "result", toolCallId: "ui-call", content: "Rendered" },
+      ev.runFinished("a2")
+    ); reply.finish(); });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
+    expect((screen.getByLabelText("Tool seats") as HTMLInputElement).value).toBe("7");
+    expect(pageText()).not.toMatch(/render_ui|createSurface|Rendered/);
+    view.unmount();
+    server.connect("s-1", idleHistory([
+      ...EARLIER,
+      { id: "text", role: "assistant", content: "A plan for you." },
+      { id: `genui:${surfaceId}`, role: "activity", activityType: "generative-ui-surface", content: toolSurface(surfaceId, ops) },
+      { id: "call", role: "assistant", toolCalls: [{ id: "ui-call", type: "function", function: { name: "render_ui", arguments: JSON.stringify({ target: "chat", operations: ops }) } }] },
+      { id: "result", role: "tool", toolCallId: "ui-call", content: "Rendered" }
+    ]));
+    render(hostElement());
+    await screen.findByText("Tool plan");
+    expect(textCount("Tool plan")).toBe(1);
+    expect((screen.getByLabelText("Tool seats") as HTMLInputElement).value).toBe("");
+    expect(pageText()).not.toMatch(/render_ui|createSurface|Rendered/);
+  });
+
+  it("applies the safe catalog to activity media, paint and automatic events", async () => {
+    const surfaceId = "turn:a1:unsafe";
+    const event = { functionCall: { "@call": "openUrl", args: { url: "https://evil.test/leak" } } };
+    const ops = [
+      createSurface(surfaceId, [{ id: "root", component: "Column", children: ["image", "html", "box"], onVisible: event }]),
+      updateComponents(surfaceId, [
+        { id: "image", component: "Image", url: "https://evil.test/image", description: "External tool image" },
+        { id: "html", component: "HtmlView", html: "<script>activityScriptRan=true</script>" },
+        { id: "box", component: "Box", background: "url(https://evil.test/paint)", onVisible: event, children: ["label"] },
+        { id: "label", component: "Text", text: "Safe tool surface" }
+      ])
+    ];
+    server.connect("s-1", idleHistory([{ id: `genui:${surfaceId}`, role: "activity", activityType: "generative-ui-surface", content: toolSurface(surfaceId, ops) }]));
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    render(hostElement());
+    await screen.findByText("Safe tool surface");
+    expect(document.querySelectorAll("img, iframe, script, video, audio")).toHaveLength(0);
+    expect(document.querySelectorAll('[style*="evil.test"]')).toHaveLength(0);
+    expect(screen.getByText("<script>activityScriptRan=true</script>")).toBeTruthy();
+    expect(server.sent).toEqual([]);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("shows a surface while its fence streams in pieces, and keeps it when the reply ends", async () => {
+    server.connect("s-1", idleHistory(EARLIER));
+    let reply!: FixtureStream;
+    server.messageReplies = [(stream) => { reply = stream; }];
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Plan it");
+    await waitFor(() => expect(reply).toBeDefined());
+    const [create, update] = PLAN_OPERATIONS.map((operation) => JSON.stringify(operation));
+
+    // The first line is whole. The second line is cut in the middle of a word.
+    await act(async () => {
+      reply.push(
+        ev.runStarted("a2"), ev.textStart("r-1"),
+        ev.text("r-1", `Here is the plan.\n\n\`\`\`a2ui\n${create}\n`),
+        ev.text("r-1", update!.slice(0, 80))
+      );
+    });
+    await screen.findByText("Here is the plan.");
+    expect(screen.queryByText("Team plan")).toBeNull();
+    // No raw fence or JSON shows while it streams.
+    expect(pageText()).not.toMatch(/a2ui|createSurface|"component"/);
+
+    await act(async () => { reply.push(ev.text("r-1", update!.slice(80, 150))); });
+    await act(async () => { reply.push(ev.text("r-1", `${update!.slice(150)}\n`)); });
+    await screen.findByText("Team plan");
+    await screen.findByText("Twelve seats");
+    // The turn still runs: the surface came before the end of the reply.
+    expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+    expect(pageText()).not.toMatch(/a2ui|createSurface|"component"/);
+
+    await act(async () => {
+      reply.push(ev.text("r-1", "```\n\nTell me what to change."), ev.textEnd("r-1"), ev.runFinished("a2"));
+      reply.finish();
+    });
+    await screen.findByText("Tell me what to change.");
+    expect(textCount("Team plan")).toBe(1);
+    expect(textCount("Twelve seats")).toBe(1);
+    expect(pageText()).not.toMatch(/a2ui|createSurface|"component"/);
+  });
+
+  it("shows the same surface from a saved reply as from the stream", async () => {
+    server.connect("s-1", idleHistory([...EARLIER, { id: "a1", role: "assistant", content: PLAN_REPLY }]));
+    render(hostElement());
+
+    await screen.findByText("Team plan");
+    await screen.findByText("Twelve seats");
+    expect(textCount("Here is the plan.")).toBe(1);
+    expect(textCount("Tell me what to change.")).toBe(1);
+    expect(pageText()).not.toMatch(/a2ui|createSurface|"component"/);
+    // The prose before the fence comes first, then the surface, then the prose after it.
+    const order = ["Here is the plan.", "Team plan", "Twelve seats", "Tell me what to change."].map((part) => pageText().indexOf(part));
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  const SEATS_SURFACE = (label: string) => [
+    createSurface("seats", [{ id: "root", component: "Column", children: ["input", "total"] }], { seats: "3" }),
+    updateComponents("seats", [
+      { id: "input", component: "TextField", label, value: { "@path": "/seats" } },
+      { id: "total", component: "Text", text: { "@call": "formatString", args: { value: "Seats: ${/seats}" } } }
+    ])
+  ];
+  const quietReply = (id: string) => (stream: FixtureStream) => {
+    stream.push(ev.runStarted(id), ev.textStart(`r-${id}`), ev.text(`r-${id}`, "Noted."), ev.textEnd(`r-${id}`), ev.runFinished(id));
+    stream.finish();
+  };
+
+  it("updates a surface from a later fence of the same reply, and from the user's input, without a request", async () => {
+    server.connect("s-1", idleHistory([...EARLIER, {
+      id: "a1",
+      role: "assistant",
+      content: [
+        fenceOf(createSurface("total", [{ id: "root", component: "Text", text: "Total: 1" }])),
+        "Now the second figure.",
+        fenceOf(updateComponents("total", [{ id: "root", component: "Text", text: "Total: 2" }])),
+        fenceOf(...SEATS_SURFACE("Seats"))
+      ].join("\n\n")
+    }]));
+    render(hostElement());
+
+    // The later fence changes the surface where it already is.
+    await screen.findByText("Total: 2");
+    expect(screen.queryByText("Total: 1")).toBeNull();
+    expect(textCount("Total: 2")).toBe(1);
+    expect(screen.getByText("Now the second figure.")).toBeTruthy();
+    const input = await screen.findByLabelText("Seats") as HTMLInputElement;
+    expect(input.value).toBe("3");
+    await screen.findByText("Seats: 3");
+    const calls = [...server.calls];
+
+    fireEvent.change(input, { target: { value: "7" } });
+
+    await screen.findByText("Seats: 7");
+    expect(screen.queryByText("Seats: 3")).toBeNull();
+    expect(server.calls).toEqual(calls);
+    expect(server.sent).toEqual([]);
+  });
+
+  it("sends the values that the user entered in a surface with the next message", async () => {
+    server.connect("s-1", idleHistory([...EARLIER, { id: "a1", role: "assistant", content: fenceOf(...SEATS_SURFACE("Seats")) }]));
+    server.messageReplies = [quietReply("a2")];
+    render(hostElement());
+    fireEvent.change(await screen.findByLabelText("Seats"), { target: { value: "USER-ENTERED-4242" } });
+    await screen.findByText("Seats: USER-ENTERED-4242");
+
+    await typeAndSend("Use my seats");
+
+    await screen.findByText("Noted.");
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Use my seats", model: "model-1" })]);
+    expect(String(server.sent[0]!.generativeUiContext)).toContain("USER-ENTERED-4242");
+  });
+
+  it("shows and sends nothing of the surfaces of another session", async () => {
+    server.connect("s-a", idleHistory(
+      [{ id: "aa", role: "assistant", content: fenceOf(...SEATS_SURFACE("Seats in A")) }], { threadId: "s-a" }
+    ));
+    server.connect("s-b", idleHistory(
+      [{ id: "ab", role: "assistant", content: fenceOf(...SEATS_SURFACE("Seats in B")) }], { threadId: "s-b" }
+    ));
+    server.messageReplies = [quietReply("a2")];
+    const view = render(hostElement({ session: { id: "s-a" } }));
+    fireEvent.change(await screen.findByLabelText("Seats in A"), { target: { value: "ONLY-IN-A-7" } });
+    await screen.findByText("Seats: ONLY-IN-A-7");
+
+    view.rerender(hostElement({ session: { id: "s-b" } }));
+
+    const inputB = await screen.findByLabelText("Seats in B") as HTMLInputElement;
+    expect(screen.queryByLabelText("Seats in A")).toBeNull();
+    expect(inputB.value).toBe("3");
+    expect(pageText()).not.toContain("ONLY-IN-A-7");
+    fireEvent.change(composer(), { target: { value: "Question in B" } });
+    await waitFor(() => expect(sendDisabled()).toBe(false));
+    await act(async () => { fireEvent.keyDown(composer(), { key: "Enter" }); });
+    await screen.findByText("Noted.");
+    expect(server.sent).toHaveLength(1);
+    expect(server.sent[0]!.sessionId).toBe("s-b");
+    expect(String(server.sent[0]!.generativeUiContext)).not.toContain("ONLY-IN-A-7");
+  });
+
+  const EVIL = "https://evil.test";
+  const MEDIA_SURFACE = [
+    createSurface("media", [{
+      id: "root", component: "Column",
+      children: ["remote", "trusted", "grid", "carousel", "link", "entity", "icon", "cite", "video", "youtube", "audio", "map", "html", "md", "row"]
+    }]),
+    updateComponents("media", [
+      { id: "remote", component: "Image", url: `${EVIL}/leak.png?secret=1`, description: "Remote chart" },
+      { id: "trusted", component: "Image", url: `${API_URL}/artifacts/a-1/download`, description: "Trusted chart" },
+      { id: "grid", component: "ImageGrid", images: [{ url: `${EVIL}/grid.png`, caption: "Grid one", href: `${EVIL}/grid` }] },
+      { id: "carousel", component: "Carousel", children: ["slide"] },
+      { id: "slide", component: "CarouselMediaItem", url: `${EVIL}/slide.png`, description: "Slide one" },
+      { id: "link", component: "LinkCard", href: `${EVIL}/page`, title: "Evil page", description: "About it", image: `${EVIL}/card.png`, favicon: true },
+      {
+        id: "entity", component: "EntityCard", title: "Cafe", image: `${EVIL}/cafe.png`, href: `${EVIL}/cafe`, badge: { label: "Open" },
+        rating: 4.5, ratingCount: 12,
+        actions: [{ label: "Book", href: `${EVIL}/book` }, { label: "Sneaky", href: "javascript:window.sneaky=1" }]
+      },
+      { id: "icon", component: "Favicon", url: `${EVIL}/favicon.ico`, alt: "Evil icon" },
+      { id: "cite", component: "Citation", index: 1, title: "Source doc", url: `${EVIL}/doc`, snippet: "A snippet" },
+      { id: "video", component: "Video", url: `${EVIL}/clip.mp4`, posterUrl: `${EVIL}/poster.png`, title: "Demo video", captions: [{ url: `${EVIL}/c.vtt`, language: "en" }] },
+      { id: "youtube", component: "Video", url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", title: "YouTube clip" },
+      { id: "audio", component: "AudioPlayer", url: `${EVIL}/talk.mp3`, description: "Podcast" },
+      { id: "map", component: "Map", markers: [{ label: "Montreal", lat: 45.5017, lng: -73.5673, category: "city" }, { label: "Quebec", lat: 46.8139, lng: -71.208 }] },
+      { id: "html", component: "HtmlView", html: `<script>window.htmlViewRan=1</script><img src="${EVIL}/html.png">`, title: "Report" },
+      { id: "md", component: "Markdown", text: `![lifted image](${EVIL}/lifted.png) [lifted link](${EVIL}/ll)` },
+      { id: "row", component: "Row", children: ["md-row", "icon-row"] },
+      { id: "md-row", component: "Markdown", text: `![row image](${EVIL}/row.png) <img src="${EVIL}/raw.png"> [row link](${EVIL}/rl)` },
+      { id: "icon-row", component: "Favicon", url: `${EVIL}/row.ico`, alt: "Row icon" }
+    ])
+  ];
+
+  it("renders no remote image, frame, or media from any standard component, and keeps the rest as text and links", async () => {
+    const errors = vi.spyOn(console, "error");
+    server.connect("s-1", idleHistory([...EARLIER, { id: "a1", role: "assistant", content: fenceOf(...MEDIA_SURFACE) }]));
+    render(hostElement());
+    await screen.findByText("Podcast", { exact: false });
+    await screen.findByText(/row link/);
+    // The lazy SafeMarkdown chunk has loaded once its link shows. Streamdown
+    // renders the lifted prose in a React transition, after the surface.
+    await screen.findByRole("link", { name: /row link/ });
+    await screen.findByRole("link", { name: /External image: lifted image / });
+    await settle();
+
+    // The one image in the page is the one that this app serves.
+    const trusted = `${API_URL}/artifacts/a-1/download`;
+    expect([...document.querySelectorAll("img")].map((image) => image.getAttribute("src"))).toEqual([trusted]);
+    expect([...document.querySelectorAll("[src]")].map((node) => node.getAttribute("src"))).toEqual([trusted]);
+    expect(document.querySelectorAll("iframe, video, audio, source, track, object, embed, script, canvas, picture, link[href]")).toHaveLength(0);
+    expect(document.querySelectorAll("[srcset], [poster], [srcdoc]")).toHaveLength(0);
+    expect([...document.querySelectorAll("[style]")].filter((node) => (node.getAttribute("style") ?? "").includes("evil.test"))).toEqual([]);
+    // HTML shows as text. No script ran, and the img inside it is not an element.
+    expect((window as { htmlViewRan?: number }).htmlViewRan).toBeUndefined();
+    expect(screen.getByText("Report (HTML, not shown)")).toBeTruthy();
+    expect(pageText()).toContain("<script>window.htmlViewRan=1</script>");
+    // Raw HTML in a Markdown component that SafeMarkdown renders is text too.
+    expect(pageText()).toContain(`<img src="${EVIL}/raw.png">`);
+
+    // Remote images are click-through links that fetch nothing.
+    const remote = screen.getByRole("link", { name: "[External image: Remote chart (evil.test)]" });
+    expect(remote.getAttribute("href")).toBe(`${EVIL}/leak.png?secret=1`);
+    expect(remote.getAttribute("target")).toBe("_blank");
+    for (const name of ["Grid one", "Slide one", "lifted image", "row image"]) {
+      expect(screen.getByRole("link", { name: new RegExp(`External image: ${name} `) })).toBeTruthy();
+    }
+    // Every link that leaves the app opens in a new tab and names its host.
+    const links = [...document.querySelectorAll("a")];
+    expect(links.length).toBeGreaterThan(8);
+    for (const link of links) {
+      expect(link.getAttribute("href")).toMatch(/^https:\/\/(evil\.test|www\.youtube\.com)\//);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toContain("noopener");
+    }
+    // A javascript: URL is text, not a link.
+    expect(screen.getByText("Sneaky").closest("a")).toBeNull();
+    expect((window as { sneaky?: number }).sneaky).toBeUndefined();
+    // Media are links to the file, never a player. A map is a list of locations.
+    expect(screen.getByRole("link", { name: "Demo video" }).getAttribute("href")).toBe(`${EVIL}/clip.mp4`);
+    expect(screen.getByRole("link", { name: "YouTube clip" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Podcast" })).toBeTruthy();
+    const locations = within(screen.getByRole("list", { name: "Locations" })).getAllByRole("button");
+    expect(locations.map((location) => location.textContent)).toEqual(["Montreal45.5017, -73.5673 · city", "Quebec46.8139, -71.2080"]);
+    fireEvent.click(locations[1]!);
+    expect(locations[1]!.getAttribute("aria-pressed")).toBe("true");
+    expect(locations[0]!.getAttribute("aria-pressed")).toBe("false");
+    // The card text and rating render. No request left the page, and nothing failed.
+    for (const text of ["Evil page", "About it", "Cafe", "4.5 (12)", "Source doc", "A snippet"]) expect(pageText()).toContain(text);
+    expect(screen.getByRole("img", { name: "Evil icon" }).textContent).toBe("E");
+    expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+    expect(pageText()).not.toContain("couldn't be shown");
+    expect(errors.mock.calls.filter(([first]) => String(first).includes("[CopilotKit] Error"))).toEqual([]);
+  });
+
+  it("drops CSS and SVG resource URLs after resolving bindings", async () => {
+    server.connect("s-1", idleHistory([...EARLIER, {
+      id: "paint-reply", role: "assistant", content: fenceOf(createSurface("paint", [
+        { id: "root", component: "Column", background: { "@path": "/paint" }, children: ["label", "svg", "pulse", "press"] },
+        { id: "label", component: "Text", text: "Safe paint example" },
+        { id: "svg", component: "Svg", label: "Diagram", fill: `url(${EVIL}/svg)`, rects: [{ x: 0, y: 0, width: 10, height: 10, fill: `url(${EVIL}/shape)` }] },
+        { id: "pulse", component: "PulseIndicator", color: `url(${EVIL}/pulse)`, pulseColor: `url(${EVIL}/pulse-ring)` },
+        { id: "press", component: "Pressable", hoverBackground: `url(${EVIL}/hover)`, children: ["press-label"] },
+        { id: "press-label", component: "Text", text: "Hover locally" }
+      ], { paint: `url(${EVIL}/background)` }))
+    }]));
+    render(hostElement());
+    await screen.findByText("Safe paint example");
+    fireEvent.mouseEnter(screen.getByText("Hover locally"));
+    const generated = document.querySelector("[data-a2ui-markdown-surface]")!;
+    expect(generated).toBeTruthy();
+    for (const element of generated.querySelectorAll("[style], [fill], [stroke]")) {
+      expect([element.getAttribute("style"), element.getAttribute("fill"), element.getAttribute("stroke")].join(" "))
+        .not.toMatch(/url\s*\(/i);
+    }
+    expect(server.sent).toEqual([]);
+  });
+
+  it("renders a reply's own prose image as a click-through link next to a surface", async () => {
+    server.connect("s-1", idleHistory([...EARLIER, {
+      id: "a1",
+      role: "assistant",
+      content: [
+        `Prose image: ![chart](${EVIL}/prose.png?secret=1)`,
+        fenceOf(...PLAN_OPERATIONS),
+        `Trusted image: ![report](${API_URL}/artifacts/a-1/download)`
+      ].join("\n\n")
+    }]));
+    render(hostElement());
+
+    await screen.findByText("Team plan");
+    const link = await screen.findByRole("link", { name: /External image: chart/ });
+    expect(link.getAttribute("href")).toBe(`${EVIL}/prose.png?secret=1`);
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    const images = await waitFor(() => {
+      const found = [...document.querySelectorAll("img")];
+      expect(found).toHaveLength(1);
+      return found;
+    });
+    expect(images[0]!.getAttribute("src")).toBe(`${API_URL}/artifacts/a-1/download`);
+  });
+
+  it("shows prose and keeps the chat working when fences are cut, malformed, unknown, or hostile", async () => {
+    const errors = vi.spyOn(console, "error");
+    const HOSTILE = "<script>window.textRan=1</script><img src=x onerror=\"window.textRan=2\">";
+    server.connect("s-1", idleHistory([...EARLIER, {
+      id: "a1",
+      role: "assistant",
+      content: [
+        "First prose.",
+        // Not JSON, then an operation with no known kind.
+        ["```a2ui", "{this is not json", JSON.stringify({ version: "v1.0", explode: {} }), "```"].join("\n"),
+        "Second prose.",
+        // A component that the catalog does not have.
+        fenceOf(createSurface("unknown", [{ id: "root", component: "NotAComponent", text: "x" }])),
+        "Third prose.",
+        // Text that carries markup and a script.
+        fenceOf(createSurface("hostile", [{ id: "root", component: "Text", text: HOSTILE }])),
+        "Fourth prose.",
+        // A fence that the reply cuts in the middle of a line, with no closing fence.
+        `\`\`\`a2ui\n${JSON.stringify(createSurface("cut", [{ id: "root", component: "Text", text: "Cut text" }])).slice(0, 60)}`
+      ].join("\n\n")
+    }]));
+    render(hostElement());
+
+    for (const prose of ["First prose.", "Second prose.", "Third prose.", "Fourth prose."]) await screen.findByText(prose);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    expect(screen.queryByText("Cut text")).toBeNull();
+    expect(pageText()).not.toMatch(/createSurface|NotAComponent|this is not json|explode/);
+    // The markup is text or gone. No script or element came from it, and nothing ran.
+    expect(document.querySelectorAll("script, [onerror]")).toHaveLength(0);
+    expect((window as { textRan?: number }).textRan).toBeUndefined();
+    // The chat still works: the composer is open and the earlier turn shows.
+    expect(textCount("Earlier answer")).toBe(1);
+    await waitFor(() => expect(screen.getByTestId("copilot-chat-textarea")).toBeTruthy());
+    expect(errors.mock.calls.filter(([first]) => /\[CopilotKit\] Error|The above error|Uncaught/.test(String(first)))).toEqual([]);
+  });
+
+  // Callbacks that the model wrote: a built-in function when the surface scrolls
+  // into view, the same function on a click, and an event that messages the agent.
+  const openUrl = (url: string) => ({ functionCall: { "@call": "openUrl", args: { url } } });
+  const CALLBACK_SURFACE = [
+    createSurface("callbacks", [{ id: "root", component: "Column", onVisible: openUrl(`${EVIL}/visible`), children: ["go", "pick", "done"] }]),
+    updateComponents("callbacks", [
+      { id: "go", component: "Button", label: "Open it", onClick: openUrl(`${EVIL}/click`) },
+      { id: "pick", component: "Button", label: "Pick Team", onClick: { event: { name: "pick_plan", userMessage: "I pick the Team plan" } } },
+      { id: "done", component: "Text", text: "Callbacks written" }
+    ]),
+    // An agent call of a function with no click. The renderer must not run it.
+    { version: "v1.0", callRendererFunction: { functionCallId: "c1", callFunction: { "@call": "openUrl", args: { url: `${EVIL}/agent-call` } } } }
+  ];
+  const CALLBACK_HISTORY = [...EARLIER, { id: "a1", role: "assistant", content: fenceOf(...CALLBACK_SURFACE) }];
+  const settle = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });
+  const standAloneAgent = () => new DeepAgentsBrowserAgent({
+    sessionId: "s-1", getModel: () => "model-1", getEffort: () => null, getArtifactIds: () => [], getProjectFileIds: () => []
+  });
+
+  // jsdom never scrolls. This observer reports a surface as visible at once,
+  // as a browser does for a surface that is on screen when it renders.
+  function showSurfacesAtOnce() {
+    class VisibleObserver {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element) {
+        if (!target.closest("[data-a2ui-markdown-surface]")) return;
+        queueMicrotask(() => this.callback([{ isIntersecting: true, target } as IntersectionObserverEntry], this as unknown as IntersectionObserver));
+      }
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    }
+    vi.stubGlobal("IntersectionObserver", VisibleObserver);
+  }
+
+  // The browser counts the task of a click on Send as a user gesture for a
+  // while. A browser without the API gives no answer, and CopilotKit then
+  // assumes a gesture.
+  function setUserActivation(state: "active" | "absent") {
+    Object.defineProperty(navigator, "userActivation", {
+      configurable: true,
+      value: state === "active" ? { isActive: true, hasBeenActive: true } : undefined
+    });
+  }
+  afterEach(() => { delete (navigator as { userActivation?: unknown }).userActivation; });
+
+  it.each(["active", "absent"] as const)("control: the unmodified standard UI opens a URL when a surface scrolls into view, with user activation %s", async (activation) => {
+    setUserActivation(activation);
+    showSurfacesAtOnce();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    server.connect("s-1", idleHistory(CALLBACK_HISTORY));
+    const agent = standAloneAgent();
+    render(
+      <CopilotKitProvider agents__unsafe_dev_only={{ deepAgents: agent }} generativeUI={{ ui: standardUI, transport: "markdown" }} enableInspector={false} showDevConsole={false}>
+        <CopilotChat agentId="deepAgents" threadId="s-1" welcomeScreen={false} />
+      </CopilotKitProvider>
+    );
+
+    await screen.findByText("Callbacks written");
+    await waitFor(() => expect(open).toHaveBeenCalledWith(`${EVIL}/visible`, expect.anything(), expect.anything()));
+    agent.abortRun();
+  });
+
+  it.each(["active", "absent"] as const)("runs no callback that the model wrote after the user sends a message, with user activation %s", async (activation) => {
+    setUserActivation(activation);
+    showSurfacesAtOnce();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    server.connect("s-1", idleHistory(EARLIER));
+    server.messageReplies = [(stream) => {
+      stream.push(ev.runStarted("a2"), ev.userPersisted("u2", "Show callbacks"), ev.textStart("r-1"), ev.text("r-1", fenceOf(...CALLBACK_SURFACE)), ev.textEnd("r-1"), ev.runFinished("a2"));
+      stream.finish();
+    }];
+    render(hostElement());
+    await screen.findByText("Earlier answer");
+    await typeAndSend("Show callbacks");
+    await screen.findByText("Callbacks written");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pick Team" }));
+    await settle();
+
+    expect(open).not.toHaveBeenCalled();
+    // The one turn is the one that the user sent.
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "Show callbacks", model: "model-1" })]);
+    expect(server.count("POST /messages")).toBe(1);
+    expect(pageText()).not.toContain("I pick the Team plan");
+    expect(textCount("Show callbacks")).toBe(1);
+  });
+
+  it.each([true, false])("starts no turn and opens no URL from generated UI, for a session that the user can edit: %s", async (canEdit) => {
+    setUserActivation("absent");
+    showSurfacesAtOnce();
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const errors = vi.spyOn(console, "error");
+    server.connect("s-1", idleHistory(CALLBACK_HISTORY));
+    render(hostElement({ session: { canEdit } }));
+    await screen.findByText("Callbacks written");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pick Team" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open it" }));
+    await settle();
+
+    expect(open).not.toHaveBeenCalled();
+    // The page only loaded the session. No turn started, and no message was added.
+    expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+    expect(server.sent).toEqual([]);
+    expect(pageText()).not.toContain("I pick the Team plan");
+    expect(textCount("Earlier question")).toBe(1);
+    expect(textCount("Earlier answer")).toBe(1);
+    expect(errors.mock.calls.filter(([first]) => String(first).includes("[CopilotKit] Error"))).toEqual([]);
+  });
+
+  it("refuses the run that CopilotKit starts for a generated event, removes only its message, and keeps sending", async () => {
+    const errors = vi.spyOn(console, "error");
+    server.connect("s-1", idleHistory(EARLIER));
+    server.messageReplies = [quietReply("a2")];
+    const agent = standAloneAgent();
+    const seen: Error[] = [];
+    let forward!: NonNullable<ReturnType<typeof useGenerativeUIRuntime>>["forwardEvent"];
+    function Probe() {
+      const runtime = useGenerativeUIRuntime();
+      if (runtime) forward = runtime.forwardEvent;
+      return null;
+    }
+    render(
+      <CopilotKitProvider
+        agents__unsafe_dev_only={{ deepAgents: agent }}
+        generativeUI={GENERATIVE_UI_CONFIG}
+        onError={(event) => { seen.push(event.error); logCopilotKitError(event); }}
+        enableInspector={false}
+        showDevConsole={false}
+      >
+        <Probe />
+        <CopilotChat agentId="deepAgents" threadId="s-1" welcomeScreen={false} />
+      </CopilotKitProvider>
+    );
+    await screen.findByText("Earlier answer");
+    await waitFor(() => expect(forward).toBeDefined());
+
+    // What a control of generated UI does: add a user message, then run the agent.
+    await act(async () => {
+      await forward({ name: "pick_plan", surfaceId: "plan", componentId: "pick", userMessage: "I pick the Team plan", context: {} }, "deepAgents");
+    });
+    await settle();
+
+    expect(seen.map((error) => error.name)).toEqual(["GenerativeUiActionBlockedError"]);
+    expect(errors.mock.calls.filter(([first]) => String(first).includes("[CopilotKit] Error"))).toEqual([]);
+    expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+    expect(pageText()).not.toContain("I pick the Team plan");
+    // The earlier messages stay, and the run left no state behind.
+    expect(agent.messages.map((message) => message.id)).toEqual(["u0", "a0"]);
+    expect(agent.isRunning).toBe(false);
+
+    fireEvent.change(composer(), { target: { value: "A real question" } });
+    await act(async () => { fireEvent.keyDown(composer(), { key: "Enter" }); });
+    await screen.findByText("Noted.");
+    expect(server.sent).toEqual([sentBody({ sessionId: "s-1", text: "A real question", model: "model-1" })]);
+    expect(agent.messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual(["Earlier question", "A real question"]);
+  });
+
+  describe("side panel", () => {
+    const PANEL = GENERATIVE_UI_PANEL_TARGET;
+    const FILE_ID = "8f14e45f-ea2c-4f6b-9a3d-8a2e1c7d0b11";
+    const FILE = {
+      artifactId: FILE_ID, sessionId: "s-1", artifactName: "Panel report.csv", mimeType: "text/csv",
+      fileSizeBytes: 2048, status: "ready", storageKey: "tenant/private/report.csv",
+      detail: { pii: { status: "scanned", findingsCount: 0 } }
+    } as Artifact;
+    const panelSurface = (surfaceId: string, operations: object[], status = "ready", rejected: object[] = []) => ({
+      ...toolSurface(surfaceId, operations, status), target: PANEL, rejected
+    });
+    const panelActivity = (surfaceId: string, operations: object[]) =>
+      ({ id: `genui:${surfaceId}`, role: "activity", activityType: "generative-ui-surface", content: panelSurface(surfaceId, operations) });
+    const textView = (surfaceId: string, text: string) => [createSurface(surfaceId, [{ id: "root", component: "Text", text }])];
+    const toggle = () => screen.getByRole("button", { name: /^Side panel/ });
+    // A closed panel is display: none. Its content stays mounted.
+    const panel = () => document.querySelector("aside[id^='side-panel-']") as HTMLElement;
+    const transcript = () => document.querySelector(".chat-surface") as HTMLElement;
+
+    it("opens the panel for the first new view without moving the focus, keeps it out of the transcript, and keeps chat input and panel input across close and reopen", async () => {
+      server.connect("s-1", idleHistory(EARLIER));
+      let reply!: FixtureStream;
+      server.messageReplies = [(stream) => { reply = stream; }];
+      const onOpenPreview = vi.fn();
+      const open = vi.spyOn(window, "open").mockImplementation(() => null);
+      render(hostElement({ artifactInventory: { artifacts: [FILE], onOpenPreview } }));
+      await screen.findByText("Earlier answer");
+      expect(toggle().getAttribute("aria-expanded")).toBe("false");
+      expect(panel().hidden).toBe(true);
+      expect(within(panel()).getByText("Nothing here yet")).toBeTruthy();
+
+      await typeAndSend("Put the board in the panel");
+      // The guide of the message offers the mounted panel.
+      expect(String(server.sent[0]!.generativeUiContext)).toContain(`- "${PANEL}" (a named area of the app): The side panel next to the chat.`);
+      expect(String(server.sent[0]!.generativeUiContext)).toContain(`Render only to "chat" or "${PANEL}".`);
+
+      const surfaceId = "turn:a2:board";
+      const visit = { functionCall: { "@call": "openUrl", args: { url: "https://evil.test/leak" } } };
+      const ops = [
+        createSurface(surfaceId, [{ id: "root", component: "Column", children: ["title", "note", "apply", "image", "file"], onVisible: visit }]),
+        updateComponents(surfaceId, [
+          { id: "title", component: "Text", text: "Panel board" },
+          { id: "note", component: "TextField", label: "Panel note", value: { "@path": "/note" } },
+          { id: "apply", component: "Button", label: "Apply board", onClick: { event: { name: "apply" } } },
+          { id: "image", component: "Image", url: "https://evil.test/panel.png", description: "Remote panel image" },
+          { id: "file", component: "ArtifactCard", artifactId: FILE_ID }
+        ])
+      ];
+      await act(async () => { reply.push(ev.runStarted("a2"), ev.textStart("r-2"), ev.text("r-2", "The board is in the side panel."), ev.textEnd("r-2"),
+        { type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface", content: panelSurface(surfaceId, ops, "streaming") }); });
+      await waitFor(() => expect(within(panel()).queryByText("Panel board")).toBeTruthy());
+      expect(within(panel()).getByText("The agent is writing this view.")).toBeTruthy();
+      // The first new view opens the panel on a wide screen, and the focus stays where it was. The view never shows in the transcript.
+      expect(toggle().getAttribute("aria-expanded")).toBe("true");
+      expect(panel().hidden).toBe(false);
+      expect(panel().contains(document.activeElement)).toBe(false);
+      expect(screen.queryByRole("button", { name: "View side panel" })).toBeNull();
+      expect(transcript().textContent).toContain("The board is in the side panel.");
+      expect(transcript().textContent).not.toContain("Panel board");
+
+      await act(async () => { reply.push(
+        { type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface", content: panelSurface(surfaceId, ops) },
+        ev.runFinished("a2")
+      ); reply.finish(); });
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
+      expect(within(panel()).queryByText("The agent is writing this view.")).toBeNull();
+
+      fireEvent.change(composer(), { target: { value: "My unsent draft" } });
+      // The user closes the panel and opens it again: the open lands on Close.
+      fireEvent.click(toggle());
+      expect(toggle().getAttribute("aria-expanded")).toBe("false");
+      expect(toggle().textContent).toContain("(has a view)");
+      fireEvent.click(toggle());
+      expect(toggle().getAttribute("aria-expanded")).toBe("true");
+      const region = screen.getByRole("complementary", { name: "Side panel" });
+      expect(document.activeElement).toBe(within(region).getByRole("button", { name: "Close side panel" }));
+      fireEvent.change(within(region).getByLabelText("Panel note"), { target: { value: "Kept note" } });
+      // Safe catalog: no remote media, no model callbacks, and the app's own card.
+      expect(region.querySelectorAll("img, iframe, video, audio")).toHaveLength(0);
+      fireEvent.click(within(region).getByRole("button", { name: "Apply board" }));
+      const card = within(region).getByRole("article", { name: "Panel report.csv" });
+      expect(card.textContent).toContain("Ready · 2.0 KB · text/csv");
+      fireEvent.click(within(card).getByRole("button", { name: "Preview" }));
+      expect(onOpenPreview).toHaveBeenCalledExactlyOnceWith(FILE_ID);
+
+      fireEvent.click(within(region).getByRole("button", { name: "Close side panel" }));
+      expect(screen.queryByRole("complementary", { name: "Side panel" })).toBeNull();
+      // The focus goes back to the toggle, not to the page body.
+      expect(document.activeElement).toBe(toggle());
+      fireEvent.click(toggle());
+      expect((within(panel()).getByLabelText("Panel note") as HTMLInputElement).value).toBe("Kept note");
+      expect(composer().value).toBe("My unsent draft");
+      expect(transcript().textContent).toContain("Earlier answer");
+      expect(server.count("GET /sessions/s-1/connect")).toBe(1);
+      expect(server.sent).toHaveLength(1);
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it("restores the newest saved panel view after a reload, and keeps chat views in the chat", async () => {
+      const older = "turn:a1:board";
+      const newer = "turn:a2:board";
+      const chatView = "turn:a2:inline";
+      server.connect("s-1", idleHistory([
+        ...EARLIER,
+        { id: "a1", role: "assistant", content: "First board." },
+        panelActivity(older, textView(older, "Board from reply one")),
+        { id: "u2", role: "user", content: "Again" },
+        { id: "a2", role: "assistant", content: "Second board." },
+        panelActivity(newer, textView(newer, "Board from reply two")),
+        { id: `genui:${chatView}`, role: "activity", activityType: "generative-ui-surface",
+          content: toolSurface(chatView, textView(chatView, "Inline chat view")) }
+      ]));
+      render(hostElement());
+      await screen.findByText("Second board.");
+      await waitFor(() => expect(within(panel()).queryByText("Board from reply two")).toBeTruthy());
+      expect(pageText()).not.toContain("Board from reply one");
+      expect(within(panel()).queryByText("Inline chat view")).toBeNull();
+      expect(within(transcript()).getByText("Inline chat view")).toBeTruthy();
+      expect(transcript().textContent).not.toContain("Board from reply two");
+      expect(toggle().textContent).toContain("(has a view)");
+      expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+    });
+
+    it("shows the empty state after the agent deletes the view, and a note for refused operations", async () => {
+      const deleted = "turn:a1:gone";
+      const refused = "turn:a2:partial";
+      server.connect("s-1", idleHistory([...EARLIER, panelActivity(deleted, [...textView(deleted, "Deleted board"),
+        { version: "v1.0", deleteSurface: { surfaceId: deleted } }])]));
+      const view = render(hostElement());
+      await screen.findByText("Earlier answer");
+      fireEvent.click(toggle());
+      expect(pageText()).not.toContain("Deleted board");
+      expect(within(panel()).getByText("Nothing here yet")).toBeTruthy();
+      expect(toggle().textContent).not.toContain("(has a view)");
+      view.unmount();
+
+      server.connect("s-1", idleHistory([...EARLIER, { ...panelActivity(refused, textView(refused, "Partial board")),
+        content: panelSurface(refused, textView(refused, "Partial board"), "error", [{ index: 1, reason: "Unknown component" }]) }]));
+      render(hostElement());
+      await screen.findByText("Earlier answer");
+      await waitFor(() => expect(within(panel()).queryByText("Partial board")).toBeTruthy());
+      expect(within(panel()).getByText("Some parts of this view could not be shown.")).toBeTruthy();
+    });
+
+    it("feeds the panel from the messages in a virtualized long thread, whichever rows mount", async () => {
+      // A real layout: CopilotChat virtualizes above 50 rows when its scroll
+      // container has a height. jsdom has none, so give every element one.
+      // A row is 100 px high, any other element 600 px.
+      const heightOf = (element: Element) => (element as HTMLElement).dataset?.index === undefined ? 600 : 100;
+      vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(600);
+      vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) { return heightOf(this); });
+      vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+        const height = heightOf(this);
+        return { x: 0, y: 0, top: 0, left: 0, right: 800, bottom: height, width: 800, height, toJSON: () => ({}) } as DOMRect;
+      });
+      const older = "turn:a1:board";
+      const newer = "turn:a2:board";
+      const filler = Array.from({ length: 30 }, (_, index) => [
+        { id: `fu${index}`, role: "user", content: `Filler question ${index}` },
+        { id: `fa${index}`, role: "assistant", content: `Filler answer ${index}` }
+      ]).flat();
+      server.connect("s-1", idleHistory([
+        { id: "a1", role: "assistant", content: "First board." },
+        panelActivity(older, textView(older, "Board from reply one")),
+        ...filler,
+        { id: "a2", role: "assistant", content: "Second board." },
+        panelActivity(newer, textView(newer, "Board from reply two")),
+        { id: "a3", role: "assistant", content: "Last answer." }
+      ]));
+      render(hostElement());
+      await screen.findByText("First board.");
+      // Only the top rows mount. The newest panel activity is far below them.
+      const rows = () => transcript().querySelectorAll("[data-index]");
+      expect(rows().length).toBeGreaterThan(0);
+      expect(rows().length).toBeLessThan(30);
+      expect(transcript().textContent).not.toContain("Last answer.");
+      await waitFor(() => expect(within(panel()).queryByText("Board from reply two")).toBeTruthy());
+      expect(pageText()).not.toContain("Board from reply one");
+
+      // Scroll to the end and back: other rows mount, the panel keeps its view.
+      // The scroll container of CopilotChat (StickToBottom's scroll element).
+      const scroller = rows()[0]!.closest("[style*='overflow: auto']") as HTMLElement;
+      for (const [top, mounted, unmounted] of [[6000, "Last answer.", "First board."], [0, "First board.", "Last answer."]] as const) {
+        Object.defineProperty(scroller, "scrollTop", { configurable: true, writable: true, value: top });
+        await act(async () => { fireEvent.scroll(scroller); await new Promise((resolve) => setTimeout(resolve, 0)); });
+        await waitFor(() => expect(transcript().textContent).toContain(mounted));
+        expect(transcript().textContent).not.toContain(unmounted);
+        expect(within(panel()).queryByText("Board from reply two")).toBeTruthy();
+        expect(pageText()).not.toContain("Board from reply one");
+      }
+      // A panel activity never takes a transcript row.
+      expect(transcript().textContent).not.toMatch(/Board from reply/);
+    });
+
+    it("shows a failure, not an older view, when the browser rejects the newest panel view", async () => {
+      const older = "turn:a1:board";
+      const unknown = "turn:a2:board";
+      const badProp = "turn:a3:card";
+      server.connect("s-1", idleHistory([
+        ...EARLIER,
+        { id: "a1", role: "assistant", content: "First board." },
+        panelActivity(older, textView(older, "Board from reply one")),
+        { id: "a2", role: "assistant", content: "Second board." },
+        panelActivity(unknown, [createSurface(unknown, [{ id: "root", component: "NotInTheCatalog", text: "Lost" }])])
+      ]));
+      let reply!: FixtureStream;
+      server.messageReplies = [(stream) => { reply = stream; }];
+      render(hostElement());
+      await screen.findByText("Second board.");
+      const failure = "The newest view could not be shown. Ask the agent to try again.";
+      await waitFor(() => expect(within(panel()).queryByText(failure)).toBeTruthy());
+      expect(toggle().textContent).toContain("(has a view)");
+      // The older view is not in the panel at all: a refused view leaves no
+      // older content behind it. The surface stays mounted for the target.
+      expect(within(panel()).queryByText("Board from reply one")).toBeNull();
+      expect(panel().querySelector("[data-generative-ui-surface]")).toBeNull();
+
+      // A rejected prop does the same. The target stays in the guide.
+      await typeAndSend("Show the file card");
+      expect(String(server.sent[0]!.generativeUiContext)).toContain(`Render only to "chat" or "${PANEL}".`);
+      await act(async () => { reply.push(ev.runStarted("a3"),
+        { type: "ACTIVITY_SNAPSHOT", messageId: `genui:${badProp}`, activityType: "generative-ui-surface",
+          content: panelSurface(badProp, [createSurface(badProp, [{ id: "root", component: "ArtifactCard", artifactId: 42 }])]) },
+        ev.runFinished("a3")); reply.finish(); });
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
+      expect(within(panel()).getByText(failure)).toBeTruthy();
+      expect(transcript().textContent).not.toContain(failure);
+    });
+
+    it("keeps a model Modal closed in every target, and still opens it from the user's click", async () => {
+      const modal = (surfaceId: string, label: string) => createSurface(surfaceId, [
+        { id: "root", component: "Column", children: ["literal", "bound"] },
+        { id: "literal", component: "Modal", title: `${label} literal`, open: true, trigger: "t1", content: "c1" },
+        { id: "t1", component: "Button", label: `Open ${label} literal` },
+        { id: "c1", component: "Text", text: `${label} literal body` },
+        { id: "bound", component: "Modal", title: `${label} bound`, open: { "@path": "/open" }, trigger: "t2", content: "c2" },
+        { id: "t2", component: "Button", label: `Open ${label} bound` },
+        { id: "c2", component: "Text", text: `${label} bound body` }
+      ], { open: true });
+      const inPanel = "turn:a1:dialog";
+      const inChat = "turn:a1:inline";
+      server.connect("s-1", idleHistory([...EARLIER,
+        { id: "a1", role: "assistant", content: "Dialogs." },
+        panelActivity(inPanel, [modal(inPanel, "Panel")]),
+        { id: `genui:${inChat}`, role: "activity", activityType: "generative-ui-surface", content: toolSurface(inChat, [modal(inChat, "Chat")]) }
+      ]));
+      render(hostElement());
+      await screen.findByText("Dialogs.");
+      await waitFor(() => expect(within(panel()).queryByRole("button", { name: "Open Panel literal", hidden: true })).toBeTruthy());
+      await screen.findByRole("button", { name: "Open Chat bound" });
+      expect(document.querySelector("[data-a2ui-modal-backdrop]")).toBeNull();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      // The focus stays in the message box.
+      expect(document.activeElement).toBe(composer());
+      expect(pageText()).not.toMatch(/literal body|bound body/);
+
+      fireEvent.click(toggle());
+      fireEvent.click(within(panel()).getByRole("button", { name: "Open Panel bound" }));
+      const dialog = await screen.findByRole("dialog");
+      expect(dialog.textContent).toContain("Panel bound body");
+      expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    });
+
+    it("keeps the earlier view while a withdrawn preview leaves the panel, and shows a retry with the same id", async () => {
+      const earlier = "turn:a1:board";
+      const big = "turn:a2:big";
+      server.connect("s-1", idleHistory([...EARLIER,
+        { id: "a1", role: "assistant", content: "First board." },
+        panelActivity(earlier, textView(earlier, "Board from reply one"))]));
+      let reply!: FixtureStream;
+      server.messageReplies = [(stream) => { reply = stream; }];
+      render(hostElement());
+      await waitFor(() => expect(within(panel()).queryByText("Board from reply one")).toBeTruthy());
+      await typeAndSend("A large board");
+      const snapshot = (content: object) => ({ type: "ACTIVITY_SNAPSHOT", messageId: `genui:${big}`, activityType: "generative-ui-surface", content });
+      await act(async () => { reply.push(ev.runStarted("a2"), snapshot(panelSurface(big, textView(big, "Large preview"), "streaming"))); });
+      await waitFor(() => expect(within(panel()).queryByText("Large preview")).toBeTruthy());
+
+      // The backend withdraws the preview with no operations.
+      await act(async () => { reply.push(snapshot(panelSurface(big, [], "error"))); });
+      await waitFor(() => expect(within(panel()).queryByText("Board from reply one")).toBeTruthy());
+      expect(pageText()).not.toContain("Large preview");
+      expect(within(panel()).queryByText("The agent is writing this view.")).toBeNull();
+      // The live preview opened the panel.
+      expect(toggle().getAttribute("aria-expanded")).toBe("true");
+
+      // A retry in the same turn reuses the surface id.
+      await act(async () => { reply.push(snapshot(panelSurface(big, textView(big, "Smaller board"))), ev.runFinished("a2")); reply.finish(); });
+      await waitFor(() => expect(within(panel()).queryByText("Smaller board")).toBeTruthy());
+      expect(within(panel()).queryByText(/could not be shown/)).toBeNull();
+      expect(pageText()).not.toContain("Board from reply one");
+    });
+
+    it("shows nothing of another session's panel after a switch", async () => {
+      const surfaceId = "turn:a1:board";
+      server.connect("s-a", idleHistory([{ id: "aa", role: "assistant", content: "Board for A." },
+        panelActivity(surfaceId, textView(surfaceId, "Board only in A"))], { threadId: "s-a" }));
+      server.connect("s-b", idleHistory([{ id: "ab", role: "assistant", content: "Nothing for B." }], { threadId: "s-b" }));
+      server.messageReplies = [quietReply("a2")];
+      const view = render(hostElement({ session: { id: "s-a" } }));
+      await waitFor(() => expect(within(panel()).queryByText("Board only in A")).toBeTruthy());
+      fireEvent.click(toggle());
+
+      view.rerender(hostElement({ session: { id: "s-b" } }));
+      await screen.findByText("Nothing for B.");
+      expect(pageText()).not.toContain("Board only in A");
+      expect(toggle().getAttribute("aria-expanded")).toBe("false");
+      expect(within(panel()).getByText("Nothing here yet")).toBeTruthy();
+      fireEvent.change(composer(), { target: { value: "Question in B" } });
+      await waitFor(() => expect(sendDisabled()).toBe(false));
+      await act(async () => { fireEvent.keyDown(composer(), { key: "Enter" }); });
+      await screen.findByText("Noted.");
+      expect(server.sent).toHaveLength(1);
+      expect(server.sent[0]!.sessionId).toBe("s-b");
+      expect(String(server.sent[0]!.generativeUiContext)).not.toMatch(/Board only in A|turn:a1:board/);
+    });
+  });
+
+  describe("ArtifactCard", () => {
+    const CSV_ID = "8f14e45f-ea2c-4f6b-9a3d-8a2e1c7d0b11";
+    const PNG_ID = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+    const OTHER_ID = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d";
+    const stored = (overrides: Partial<Artifact>): Artifact => ({
+      artifactId: CSV_ID, sessionId: "s-1", artifactName: "Stored report.csv", mimeType: "text/csv",
+      fileSizeBytes: 2048, status: "ready", storageKey: "tenant/private/report.csv",
+      detail: { pii: { status: "scanned", findingsCount: 0 } }, ...overrides
+    }) as Artifact;
+    const card = (id: string, artifactId: string, extra: object = {}) => ({ id, component: "ArtifactCard", artifactId, ...extra });
+    const article = (name: string) => screen.findByRole("article", { name });
+
+    it("refreshes a file written during a live reply before that reply ends", async () => {
+      server.connect("s-1", idleHistory(EARLIER));
+      let reply!: FixtureStream;
+      server.messageReplies = [(stream) => { reply = stream; }];
+      const onArtifactsChanged = vi.fn();
+      const onOpenPreview = vi.fn();
+      const options = { events: { onArtifactsChanged }, artifactInventory: { artifacts: [] as Artifact[], onOpenPreview } };
+      const view = render(hostElement(options));
+      await screen.findByText("Earlier answer");
+      await typeAndSend("Write a report");
+      await act(async () => { reply.push(
+        ev.runStarted("a2"),
+        { type: "TOOL_CALL_START", toolCallId: "write", toolCallName: "write_artifact" },
+        { type: "TOOL_CALL_ARGS", toolCallId: "write", delta: "{}" },
+        { type: "TOOL_CALL_END", toolCallId: "write" },
+        { type: "TOOL_CALL_RESULT", messageId: "written", toolCallId: "write", content: JSON.stringify({ artifactId: CSV_ID }) },
+        ev.textStart("report"), ev.text("report", fenceOf(createSurface("report-card", [card("root", CSV_ID)])))
+      ); });
+      await waitFor(() => expect(onArtifactsChanged).toHaveBeenCalledOnce());
+      view.rerender(hostElement({ ...options, artifactInventory: { artifacts: [stored({})], onOpenPreview } }));
+      const report = await article("Stored report.csv");
+      expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
+      fireEvent.click(within(report).getByRole("button", { name: "Preview" }));
+      expect(onOpenPreview).toHaveBeenCalledExactlyOnceWith(CSV_ID);
+      expect(server.count("GET /sessions/s-1/connect")).toBe(1);
+      expect(server.count("POST /messages")).toBe(1);
+      await act(async () => { reply.push(ev.textEnd("report"), ev.runFinished("a2")); reply.finish(); });
+    });
+
+    it("renders from a saved fence and a saved tool surface with stored metadata, and opens a preview only on a click", async () => {
+      const toolId = "turn:a2:files";
+      server.connect("s-1", idleHistory([
+        ...EARLIER,
+        { id: "a1", role: "assistant", content: `Your file.\n\n${fenceOf(createSurface("csv", [card("root", CSV_ID)]))}` },
+        { id: `genui:${toolId}`, role: "activity", activityType: "generative-ui-surface",
+          content: toolSurface(toolId, [createSurface(toolId, [card("root", PNG_ID)])]) }
+      ]));
+      const onOpenPreview = vi.fn();
+      render(hostElement({ artifactInventory: {
+        artifacts: [stored({}), stored({ artifactId: PNG_ID, artifactName: "Chart.png", mimeType: "image/png", fileSizeBytes: 3 * 1024 * 1024 })],
+        onOpenPreview
+      } }));
+
+      const csv = await article("Stored report.csv");
+      const png = await article("Chart.png");
+      expect(csv.textContent).toContain("Ready · 2.0 KB · text/csv");
+      expect(csv.textContent).toContain("PII: clean");
+      expect(png.textContent).toContain("Ready · 3.0 MB · image/png");
+      expect(pageText()).not.toMatch(/a2ui|createSurface|tenant\/private/);
+      // To render the cards loads no file and starts no run.
+      expect(onOpenPreview).not.toHaveBeenCalled();
+      expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+
+      fireEvent.click(within(png).getByRole("button", { name: "Preview" }));
+      fireEvent.click(within(csv).getByRole("button", { name: "Preview" }));
+
+      expect(onOpenPreview.mock.calls).toEqual([[PNG_ID], [CSV_ID]]);
+      expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+      expect(server.sent).toEqual([]);
+    });
+
+    it("rejects claimed metadata, URLs and callbacks, and cannot open a pending, unknown or other-session file", async () => {
+      const surfaceId = "turn:a1:hostile";
+      const openUrl = { functionCall: { "@call": "openUrl", args: { url: "https://evil.test/click" } } };
+      const ops = [
+        createSurface(surfaceId, [{ id: "root", component: "Column", children: ["claimed", "pending", "unknown", "foreign"] }]),
+        // The SDK checks the operation against the catalog schema, which
+        // declares only artifactId. It rejects the whole operation.
+        updateComponents(surfaceId, [card("claimed", CSV_ID, {
+          artifactName: "Claimed.exe", status: "ready", mimeType: "text/html", fileSizeBytes: 1,
+          url: "https://evil.test/leak", href: "https://evil.test/leak", onClick: openUrl, onVisible: openUrl
+        })]),
+        updateComponents(surfaceId, [
+          card("pending", CSV_ID),
+          card("unknown", "00000000-0000-4000-8000-000000000000"),
+          card("foreign", OTHER_ID)
+        ])
+      ];
+      server.connect("s-1", idleHistory([{ id: `genui:${surfaceId}`, role: "activity", activityType: "generative-ui-surface", content: toolSurface(surfaceId, ops) }]));
+      const open = vi.spyOn(window, "open").mockImplementation(() => null);
+      const onOpenPreview = vi.fn();
+      // A stale list that still holds a file of another session.
+      render(hostElement({ artifactInventory: {
+        artifacts: [stored({ status: "pending" }), stored({ artifactId: OTHER_ID, sessionId: "s-2", artifactName: "Other session.csv" })],
+        onOpenPreview
+      } }));
+
+      const pending = await article("Stored report.csv");
+      expect(pending.textContent).toContain("Pending · 2.0 KB · text/csv");
+      expect(screen.getAllByRole("article")).toHaveLength(1);
+      expect(screen.getAllByRole("note").map((note) => note.textContent))
+        .toEqual(["This file is not available in this chat.", "This file is not available in this chat."]);
+      expect(screen.getByText("Part of this UI couldn't be shown.")).toBeTruthy();
+      expect(pageText()).not.toMatch(/Claimed\.exe|evil\.test|Other session/);
+      expect(document.querySelectorAll("a, img, iframe")).toHaveLength(0);
+      expect(screen.queryByRole("button", { name: "Preview" })).toBeNull();
+      fireEvent.click(pending);
+      expect(open).not.toHaveBeenCalled();
+      expect(onOpenPreview).not.toHaveBeenCalled();
+      expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+    });
+
+    it("follows a refresh of the list without a new agent, a new connection or the loss of local input, and sends no list", async () => {
+      server.connect("s-1", idleHistory([...EARLIER, { id: "a1", role: "assistant", content: fenceOf(
+        createSurface("mixed", [{ id: "root", component: "Column", children: ["seats", "file"] }], { seats: "3" }),
+        updateComponents("mixed", [
+          { id: "seats", component: "TextField", label: "Seats", value: { "@path": "/seats" } },
+          card("file", CSV_ID)
+        ])
+      ) }]));
+      server.messageReplies = [quietReply("a2")];
+      const onOpenPreview = vi.fn();
+      const view = render(hostElement({ artifactInventory: { artifacts: [stored({ status: "processing" })], onOpenPreview } }));
+      await article("Stored report.csv");
+      expect(screen.getByText("Preview is available when the file is ready.")).toBeTruthy();
+      fireEvent.change(await screen.findByLabelText("Seats"), { target: { value: "7" } });
+
+      view.rerender(hostElement({ artifactInventory: { artifacts: [stored({})], onOpenPreview } }));
+
+      const ready = await article("Stored report.csv");
+      expect(ready.textContent).toContain("Ready · 2.0 KB");
+      expect((screen.getByLabelText("Seats") as HTMLInputElement).value).toBe("7");
+      expect(textCount("Earlier answer")).toBe(1);
+      expect(server.calls).toEqual(["GET /sessions/s-1/connect"]);
+      fireEvent.click(within(ready).getByRole("button", { name: "Preview" }));
+      expect(onOpenPreview).toHaveBeenCalledExactlyOnceWith(CSV_ID);
+
+      await typeAndSend("Thanks");
+      await screen.findByText("Noted.");
+      // The model learns the component and the id it wrote, never the stored metadata.
+      const context = String(server.sent[0]!.generativeUiContext);
+      expect(context).toContain("ArtifactCard");
+      expect(context).not.toMatch(/Stored report|tenant\/private|2048/);
+    });
   });
 });

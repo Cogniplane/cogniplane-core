@@ -141,6 +141,25 @@ describe.skipIf(!adminDatabaseUrl())("organization skill submissions", () => {
     expect((await store.get(x.tenant,x.admin,id,true)).attempts).toHaveLength(2);
   });
 
+  // The owner notice of a release runs in the release's transaction, with
+  // the released skill: a failure rolls the release back.
+  test("the release's notice runs in its transaction, and its failure rolls the release back", async () => {
+    const x=await setup(), store=submissions();
+    const id=await store.create(x.tenant,x.author,x.skill.id,1,"",null);
+    await store.decide(x.tenant,x.admin,id,{version:1,action:"accept",reason:null,organizationSkillId:"notice-notes",
+      organizationSkillName:"Notice notes",expectedOrganizationVersion:null});
+    const draft=(await store.get(x.tenant,x.admin,id,true)).organizationSkill!.currentDraftRevisionId!;
+    const release={expectedOrganizationVersion:0,expectedActiveRevisionId:null,expectedDraftRevisionId:draft,audience:"members" as const};
+    const seen: Array<[string, unknown]>=[];
+    await expect(store.release(x.tenant,x.admin,id,release,{alsoInTransaction:async(client,skillId)=>{
+      seen.push([skillId,(await client.query("SELECT active_revision_id FROM admin_skills WHERE tenant_id=$1 AND skill_id=$2",
+        [x.tenant,skillId])).rows[0]?.active_revision_id]);
+      throw new Error("the notice failed");
+    }})).rejects.toThrow("the notice failed");
+    expect(seen.map(([skillId,active])=>[skillId,Number(active)])).toEqual([["notice-notes",draft]]);
+    expect((await store.get(x.tenant,x.admin,id,true)).organizationSkill?.activeRevisionId).toBeNull();
+  });
+
   test("rejects name collision, rolls back failed audit, and releases the exact draft and audience", async () => {
     const x=await setup(), store=submissions();
     const first=await store.create(x.tenant,x.author,x.skill.id,1,"",null);

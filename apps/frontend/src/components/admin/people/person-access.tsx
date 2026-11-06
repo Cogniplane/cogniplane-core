@@ -8,8 +8,11 @@ import type { AdminUser } from "@cogniplane/shared-types";
 
 import { Button } from "@/components/ui/button";
 import { changeMemberRole, removeMember, setUserBetaTester } from "../../../lib/admin-api";
+import { isStepUpRefusal } from "../../../lib/local-auth-api";
 import { queryKeys } from "../../../lib/query-keys";
 import {
+  REMOVAL_EFFECTS,
+  REMOVAL_LIMITS,
   displayName,
   isMemberGone,
   memberActionError,
@@ -21,6 +24,9 @@ import {
   type Actor,
   type MemberRole
 } from "./person-access.logic";
+import { accountStatusOf } from "./local-account.logic";
+import { PersonSignIn } from "./person-sign-in";
+import { StepUpDialog } from "./step-up-dialog";
 import { RemoveMemberDialog } from "./remove-member-dialog";
 import { RoleChangeDialog } from "./role-change-dialog";
 
@@ -67,15 +73,46 @@ export function PersonAccess({ person, actor }: { person: AdminUser; actor: Acto
   });
 
   const role = useMutation({
-    mutationFn: (next: MemberRole) => changeMemberRole(person.userId, next),
+    mutationFn: ({ next, stepUpToken }: { next: MemberRole; stepUpToken?: string }) =>
+      stepUpToken ? changeMemberRole(person.userId, next, stepUpToken) : changeMemberRole(person.userId, next),
     onMutate: () => setStatus(""),
-    onSuccess: async (_result, next) => {
+    onSuccess: async (_result, { next }) => {
       await refreshPeople();
       setRoleOpen(false);
       setStatus(`Role changed to ${ROLE_INFO[next].label.toLowerCase()}.`);
     },
     onError: (error) => { if (isMemberGone(error)) void refreshPeople(); }
   });
+
+  // A local account needs the manager's proof again before a role change or
+  // removal.
+  const isLocalAccount = accountStatusOf(person) !== null;
+  const [localRemoveOpen, setLocalRemoveOpen] = useState(false);
+  // The role that waits for the manager's proof, after the role dialog.
+  const [localRole, setLocalRole] = useState<MemberRole | null>(null);
+  const [localRoleOpen, setLocalRoleOpen] = useState(false);
+
+  const confirmRole = (next: MemberRole) => {
+    if (!isLocalAccount) {
+      role.mutate({ next });
+      return;
+    }
+    setLocalRole(next);
+    setRoleOpen(false);
+    setLocalRoleOpen(true);
+  };
+
+  const changeLocalRole = async (stepUpToken: string) => {
+    if (!localRole) return;
+    try {
+      await role.mutateAsync({ next: localRole, stepUpToken });
+    } catch (caught) {
+      // A refused proof stays in the step-up dialog, to try again. Other
+      // refusals show in the role dialog, at the step the manager left.
+      if (isStepUpRefusal(caught)) throw caught;
+      setRoleOpen(true);
+    }
+  };
 
   const removal = useMutation({
     mutationFn: () => removeMember(person.userId),
@@ -117,6 +154,8 @@ export function PersonAccess({ person, actor }: { person: AdminUser; actor: Acto
           )}
         </section>
 
+        <PersonSignIn person={person} actor={actor} onStatus={setStatus} />
+
         <section aria-label="Test access" className={ROW}>
           <h4 className={ROW_LABEL}>Test access</h4>
           <p className="text-base font-semibold text-on-surface">{person.isBetaTester ? "On" : "Off"}</p>
@@ -149,7 +188,11 @@ export function PersonAccess({ person, actor }: { person: AdminUser; actor: Acto
               variant="ghost"
               size="sm"
               className="-ml-3 text-danger hover:bg-danger-surface hover:text-danger"
-              onClick={() => { removal.reset(); setRemoveOpen(true); }}
+              onClick={() => {
+                removal.reset();
+                if (isLocalAccount) setLocalRemoveOpen(true);
+                else setRemoveOpen(true);
+              }}
             >
               Remove from organization…
             </Button>
@@ -167,8 +210,30 @@ export function PersonAccess({ person, actor }: { person: AdminUser; actor: Acto
         currentRole={person.role}
         choices={choices}
         pending={role.isPending}
-        error={role.error ? memberActionError(role.error, "Could not change the role.") : null}
-        onConfirm={(next) => role.mutate(next)}
+        error={role.error && !isStepUpRefusal(role.error) ? memberActionError(role.error, "Could not change the role.") : null}
+        onConfirm={confirmRole}
+      />
+      <StepUpDialog
+        open={localRoleOpen}
+        onOpenChange={setLocalRoleOpen}
+        action="member.role_change"
+        title={localRole === "owner" ? `Make ${name} an owner?` : `Change ${name} to ${ROLE_INFO[localRole ?? "member"].label.toLowerCase()}?`}
+        description={`${ROLE_INFO[person.role].label} to ${ROLE_INFO[localRole ?? "member"].label.toLowerCase()}.${localRole === "owner" ? " You cannot undo this." : ""}`}
+        confirmLabel={localRole === "owner" ? "Make owner" : `Change to ${ROLE_INFO[localRole ?? "member"].label.toLowerCase()}`}
+        run={changeLocalRole}
+      />
+      <StepUpDialog
+        open={localRemoveOpen}
+        onOpenChange={setLocalRemoveOpen}
+        action="member.remove"
+        title={`Remove ${name} from the organization?`}
+        description={`${REMOVAL_EFFECTS.join(" ")} Their account ends for good. ${REMOVAL_LIMITS}`}
+        confirmLabel="Remove from organization"
+        destructive
+        run={async (token) => {
+          await removeMember(person.userId, token);
+          finishRemoval(`${name} was removed from the organization.`);
+        }}
       />
       <RemoveMemberDialog
         open={removeOpen}

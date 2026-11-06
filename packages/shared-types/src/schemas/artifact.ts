@@ -5,7 +5,14 @@ import { MIME_CLASSES } from "../mime-class.js";
 
 export const ArtifactPiiDetailSchema = z.object({
   status: z.enum(["pending", "scanning", "scanned", "blocked", "transformed", "failed"]).optional(),
+  /**
+   * Before a terminal success, or on failure, the value is the planned
+   * (queued) mode. After a terminal success, it is the mode that the scan
+   * applied.
+   */
   modeApplied: z.enum(["off", "detect", "block", "transform"]).optional(),
+  /** The PII settings revision that the scan read. Queued, synchronous upload, and chat prompt scans set it. */
+  policyRevision: z.number().int().nonnegative().optional(),
   scanRunId: z.string().optional(),
   summaryText: z.string().optional(),
   findingsCount: z.number().optional(),

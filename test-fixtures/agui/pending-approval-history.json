@@ -1,0 +1,117 @@
+{
+  "pending": {
+    "rows": [
+      {
+        "messageId": "u1",
+        "role": "user",
+        "status": "completed",
+        "content": "Go"
+      },
+      {
+        "messageId": "a1",
+        "role": "assistant",
+        "status": "streaming",
+        "content": "",
+        "toolResults": [
+          {
+            "toolResultId": "card-1",
+            "toolName": "write_file",
+            "title": "write_file",
+            "status": "in_progress",
+            "input": "{\"file_path\":\"/notes.md\",\"content\":\"notes.md\"}",
+            "output": "",
+            "textOffset": 0
+          }
+        ]
+      }
+    ],
+    "approvals": [
+      {
+        "approvalId": "ap-1",
+        "sessionId": "s-1",
+        "itemId": "ap-1",
+        "kind": "file_change",
+        "title": "Approve write_file",
+        "summary": "{\"file_path\":\"/notes.md\",\"content\":\"notes.md\"}",
+        "status": "pending",
+        "toolCallId": "card-1"
+      }
+    ],
+    "unavailable": [
+      {
+        "id": "u1",
+        "role": "user",
+        "content": "Go"
+      },
+      {
+        "id": "a1:call:0",
+        "role": "assistant",
+        "toolCalls": [
+          {
+            "id": "card-1",
+            "type": "function",
+            "function": {
+              "name": "write_file",
+              "arguments": "{\"file_path\":\"/notes.md\",\"content\":\"notes.md\"}"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "declined": {
+    "rows": [
+      {
+        "messageId": "u1",
+        "role": "user",
+        "status": "completed",
+        "content": "Go"
+      },
+      {
+        "messageId": "a1",
+        "role": "assistant",
+        "status": "completed",
+        "content": "",
+        "toolResults": [
+          {
+            "toolResultId": "card-1",
+            "toolName": "write_file",
+            "title": "write_file",
+            "status": "declined",
+            "input": "{\"file_path\":\"/notes.md\",\"content\":\"notes.md\"}",
+            "output": "User denied permission.",
+            "textOffset": 0
+          }
+        ]
+      }
+    ],
+    "none": [
+      {
+        "id": "u1",
+        "role": "user",
+        "content": "Go"
+      },
+      {
+        "id": "a1:call:0",
+        "role": "assistant",
+        "toolCalls": [
+          {
+            "id": "card-1",
+            "type": "function",
+            "function": {
+              "name": "write_file",
+              "arguments": "{\"file_path\":\"/notes.md\",\"content\":\"notes.md\"}"
+            }
+          }
+        ]
+      },
+      {
+        "id": "card-1:result",
+        "role": "tool",
+        "toolCallId": "card-1",
+        "content": "User denied permission.",
+        "error": "declined"
+      }
+    ]
+  }
+}

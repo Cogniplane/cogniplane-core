@@ -1,6 +1,4 @@
 import type { FastifyBaseLogger } from "fastify";
-import type { PiiProtectionSettings } from "@cogniplane/shared-types";
-
 import type { AppConfig } from "../../config.js";
 import type { Pool } from "../../lib/db.js";
 import type { getRedis } from "../../lib/redis.js";
@@ -14,7 +12,8 @@ import {
   type PiiCircuitBreaker
 } from "./pii-circuit-breaker.js";
 import { Aes256GcmFindingEncryptor } from "./pii-finding-encryption.js";
-import { PiiProtectionService } from "./pii-protection-service.js";
+import type { PiiImportScopeRegistry } from "./pii-import-scopes.js";
+import { PiiProtectionService, type PiiPolicyReader } from "./pii-protection-service.js";
 import { PiiArtifactScanEnqueuer } from "./pii-artifact-scan-enqueuer.js";
 import { PiiScanJobHandler } from "./pii-scan-job-handler.js";
 import { DatabasePiiScanSubjectReader } from "./pii-scan-subject-reader.js";
@@ -22,6 +21,16 @@ import { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
 import type { PdfTextExtractor } from "./scannable-text.js";
 
 import type { Stores } from "../build-stores.js";
+
+/** Reads the stored policy and its revision from one row read, so they always match. */
+export function piiPolicyReader(settings: Pick<TenantOrgSettingsStore, "get">): PiiPolicyReader {
+  return {
+    async readPiiProtection(tenantId) {
+      const record = await settings.get(tenantId);
+      return { stored: record.storedPiiProtection, revision: record.piiProtectionRevision };
+    }
+  };
+}
 
 export function buildPiiServices(input: {
   config: AppConfig;
@@ -32,8 +41,10 @@ export function buildPiiServices(input: {
   tenantOrgSettingsPrivileged: TenantOrgSettingsStore;
   redis: ReturnType<typeof getRedis>;
   extractPdfText: PdfTextExtractor;
+  // Read at scan time: overlays register after this call, before requests.
+  importScopes: PiiImportScopeRegistry;
 }) {
-  const { config, logger, db, stores, artifactStorage, tenantOrgSettingsPrivileged, redis, extractPdfText } = input;
+  const { config, logger, db, stores, artifactStorage, tenantOrgSettingsPrivileged, redis, extractPdfText, importScopes } = input;
 
   const piiCircuitBreaker: PiiCircuitBreaker = config.PII_BREAKER_ENABLED
     ? createPiiCircuitBreaker({
@@ -74,17 +85,16 @@ export function buildPiiServices(input: {
     : undefined;
 
   const piiProtection = new PiiProtectionService({
-    policyReader: {
-      getPiiProtection: async (tenantId: string): Promise<PiiProtectionSettings | null> =>
-        (await tenantOrgSettingsPrivileged.get(tenantId)).piiProtection
-    },
+    policyReader: piiPolicyReader(tenantOrgSettingsPrivileged),
     ruleDetector: new RuleBasedPiiDetector(),
     provider: piiProvider,
     timeoutMs: config.PII_PROVIDER_TIMEOUT_MS,
     artifactMaxBytes: config.PII_ARTIFACT_MAX_BYTES,
     csvPreviewRows: config.PII_CSV_PREVIEW_ROWS,
     csvPreviewMaxBytes: config.PII_CSV_PREVIEW_MAX_BYTES,
-    findingEncryptor
+    findingEncryptor,
+    importScopes,
+    logger
   });
 
   const piiScanJobHandler = new PiiScanJobHandler({
@@ -96,7 +106,8 @@ export function buildPiiServices(input: {
     storage: artifactStorage,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
-    logger
+    logger,
+    importScopes
   });
 
   const piiScanEnqueuer = new PiiArtifactScanEnqueuer({
@@ -107,7 +118,8 @@ export function buildPiiServices(input: {
     storage: artifactStorage,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
-    logger
+    logger,
+    importScopes
   });
 
   return { piiProtection, piiCircuitBreaker, piiScanJobHandler, piiScanEnqueuer };

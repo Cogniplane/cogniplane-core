@@ -36,6 +36,9 @@ export type ApprovalRow = {
   rowId: string;
   approvalId: string;
   itemId: string;
+  // The server ID of the tool call that this approval is for. Its card shows
+  // the decision controls. Absent when the server proved no link.
+  toolCallId?: string;
   kind: Approval["kind"];
   title: string;
   summary: string;

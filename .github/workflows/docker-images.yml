@@ -1,16 +1,7 @@
 name: Docker images
 
-# Builds the two container images a self-hoster runs (docker/backend.Dockerfile
-# and docker/frontend.Dockerfile) and fails when either one breaks.
-#
-# These images are how you deploy Cogniplane Core outside a development shell,
-# so a broken Dockerfile is a broken install. The build runs on every pull
-# request and every push to main, and it is a hard failure rather than a
-# warning.
-#
-# It is a separate workflow from ci.yml so that an image build failure is
-# unambiguous: CI covers lint, types, tests and coverage, and this covers the
-# published container path.
+# Check both self-hosting images on pull requests and pushes to main.
+# Build failures block this workflow; no deployment runs from it.
 
 on:
   push:
@@ -31,11 +22,17 @@ jobs:
   docker-build:
     name: Docker images build
     runs-on: ubuntu-24.04
-    # Two image builds with a remote layer cache; slower than the CI gates.
+    # Longer than the ci.yml gating jobs: two image builds with a remote cache.
     timeout-minutes: 40
+    # Build both images to catch workspace or packaging changes.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # Limit builder RAM and allow disk swap for cold builds on VM207.
+          driver-opts: |
+            ${{ runner.environment == 'self-hosted' && 'memory=6g' || '' }}
+            ${{ runner.environment == 'self-hosted' && 'memory-swap=8g' || '' }}
       - name: Build backend image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

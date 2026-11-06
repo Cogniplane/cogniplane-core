@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { SHORTCUTS, shortcutKeys, useApplePlatform, useShortcut } from "../lib/keyboard-shortcuts";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./ui/dialog";
+import { BuildDetails } from "./build-details";
 
 const OPEN_EVENT = "cogniplane:keyboard-shortcuts";
-const KBD = "rounded border border-outline-variant bg-surface-container-low px-1.5 py-px font-mono text-[0.68rem] text-on-surface-variant";
+const KBD = "rounded border border-outline-variant bg-surface-container-low px-1.5 py-px font-mono text-xs text-on-surface-variant";
 
 /** Opens the shortcuts dialog from a menu item. */
 export function openKeyboardShortcuts(): void {
@@ -16,6 +17,7 @@ export function openKeyboardShortcuts(): void {
 /** Lists every shortcut. "?" opens it. The root layout mounts it once. */
 export function KeyboardShortcutsDialog() {
   const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
   const apple = useApplePlatform();
   useShortcut(SHORTCUTS.help, () => setOpen(true));
   useEffect(() => {
@@ -27,7 +29,12 @@ export function KeyboardShortcutsDialog() {
   const shortcuts = Object.values(SHORTCUTS);
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="sm:max-w-md">
+      {/* Start on the dialog itself: Radix would focus the first tabbable
+          element, which is the Build details disclosure at the bottom. */}
+      <DialogContent ref={contentRef} className="sm:max-w-md" onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        contentRef.current?.focus();
+      }}>
         <DialogHeader>
           <DialogTitle>Keyboard shortcuts</DialogTitle>
           <DialogDescription>Shortcuts do not work while another dialog or menu is open.</DialogDescription>
@@ -47,6 +54,7 @@ export function KeyboardShortcutsDialog() {
             </dl>
           </section>
         ))}
+        <BuildDetails />
       </DialogContent>
     </Dialog>
   );

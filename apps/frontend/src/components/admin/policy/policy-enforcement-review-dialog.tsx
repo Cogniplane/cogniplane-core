@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { TriangleAlert } from "lucide-react";
 
 import type { TenantSettings } from "@cogniplane/shared-types";
@@ -72,12 +72,24 @@ export function enableBlocker(props: Pick<Props, "review" | "settings" | "saving
 export function PolicyEnforcementReviewDialog(props: Props) {
   const { review, settings, saving } = props;
   const keepRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const blocker = enableBlocker(props);
   const failure = review.phase === "ready" ? review.failure : null;
   // "Keep Monitor" is true only when the page knows the mode. After a failed
   // read or an unconfirmed save, closing changes nothing, so say only that.
   const uncertain = review.phase === "readFailed" || failure !== null || props.reloadFailed;
   const closeLabel = blocker === "alreadyOn" ? "Close" : uncertain ? "Back to policies" : "Keep Monitor";
+
+  useEffect(() => {
+    if (review.phase === "closed" || saving || props.reloading) return;
+    // A disabled or removed action can leave focus on the page body. Recover
+    // only that lost focus; keep any control the administrator has selected.
+    const active = document.activeElement;
+    const disabledAction = active instanceof HTMLButtonElement && active.disabled && dialogRef.current?.contains(active);
+    if (active === document.body || active === dialogRef.current || disabledAction) {
+      keepRef.current?.focus();
+    }
+  }, [review.phase, blocker, saving, props.reloading]);
 
   return (
     <Dialog
@@ -87,7 +99,9 @@ export function PolicyEnforcementReviewDialog(props: Props) {
       }}
     >
       <DialogContent
+        ref={dialogRef}
         showCloseButton={false}
+        scrollBody={false}
         // Focus the safe action first, as an alert dialog does.
         onOpenAutoFocus={(event) => {
           event.preventDefault();
@@ -104,18 +118,34 @@ export function PolicyEnforcementReviewDialog(props: Props) {
         onInteractOutside={(event) => {
           if (saving) event.preventDefault();
         }}
-        className="flex max-h-[min(90dvh,52rem)] flex-col gap-0 overflow-hidden border-outline-variant bg-surface p-0 text-on-surface sm:max-w-2xl"
+        className="flex max-h-[min(90dvh,52rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
       >
-        <DialogHeader className="gap-1.5 border-b border-outline-variant px-5 py-4 text-left sm:px-6">
+        <DialogHeader className="shrink-0 gap-1.5 border-b border-outline-variant px-5 py-4 text-left sm:px-6">
           <p className={SECTION_LABEL}>Policy enforcement · organization</p>
           <DialogTitle className="text-lg leading-snug text-on-surface">Enable enforcement</DialogTitle>
-          <DialogDescription className="text-sm text-on-surface-variant">
+        </DialogHeader>
+
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-p-1 px-5 py-4 sm:px-6" aria-busy={review.phase === "reading"}>
+          <DialogDescription className="mb-4 text-sm text-on-surface-variant">
             From the next turn of each session, matching rules block tool calls or ask for approval.
             Turns already running keep their current mode. You can switch back to Monitor at any time.
           </DialogDescription>
-        </DialogHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4 sm:px-6" aria-busy={review.phase === "reading"}>
+          {failure && blocker !== "alreadyOn" && blocker !== "changed" ? (
+            <div role="alert" className="mb-4 rounded-lg border border-danger/30 bg-danger-surface p-3 text-sm">
+              <p className="font-semibold text-danger">
+                {failure.kind === "conflict" ? "Settings changed" : "Could not confirm the save."}
+              </p>
+              <p className="mt-0.5 text-on-surface [overflow-wrap:anywhere]">
+                {failure.message}{" "}
+                {props.reloading
+                  ? "Loading the current settings..."
+                  : props.reloadFailed
+                    ? "The current settings could not be loaded. Load them before you try again."
+                    : "The current settings are loaded and still show Monitor. You can try again."}
+              </p>
+            </div>
+          ) : null}
           {review.phase === "reading" ? (
             <div role="status" aria-label="Reading the latest evidence and settings" className="flex flex-col gap-3">
               <p className="text-sm text-on-surface-variant">Reading the latest evidence and settings...</p>
@@ -150,23 +180,7 @@ export function PolicyEnforcementReviewDialog(props: Props) {
           ) : null}
         </div>
 
-        {failure && blocker !== "alreadyOn" && blocker !== "changed" ? (
-          <div role="alert" className="border-t border-danger/30 bg-danger-surface px-5 py-3 text-sm sm:px-6">
-            <p className="font-semibold text-danger">
-              {failure.kind === "conflict" ? "Settings changed" : "Could not confirm the save."}
-            </p>
-            <p className="mt-0.5 text-on-surface [overflow-wrap:anywhere]">
-              {failure.message}{" "}
-              {props.reloading
-                ? "Loading the current settings..."
-                : props.reloadFailed
-                  ? "The current settings could not be loaded. Load them before you try again."
-                  : "The current settings are loaded and still show Monitor. You can try again."}
-            </p>
-          </div>
-        ) : null}
-
-        <DialogFooter className="border-t border-outline-variant px-5 py-3 sm:px-6">
+        <DialogFooter className="shrink-0 border-t border-outline-variant px-5 py-3 sm:px-6">
           <Button ref={keepRef} type="button" variant="outline" disabled={saving} onClick={props.onClose}>
             {closeLabel}
           </Button>

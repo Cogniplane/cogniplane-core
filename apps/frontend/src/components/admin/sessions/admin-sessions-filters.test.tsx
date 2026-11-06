@@ -1,14 +1,17 @@
 // @vitest-environment jsdom
+import { setTimeout as delay } from "node:timers/promises";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AdminSessionsFilters, EMPTY_FILTER_STATE, type SessionsFilterState } from "./admin-sessions-filters";
 
 // Radix Select scrolls the chosen option into view; jsdom has no scrollIntoView.
 const originalScrollIntoView = Element.prototype.scrollIntoView;
 beforeEach(() => { Element.prototype.scrollIntoView = vi.fn(); });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // Radix queues a real 0 ms timer during cleanup; wait behind it before jsdom teardown.
+  await delay(0);
   Element.prototype.scrollIntoView = originalScrollIntoView;
   vi.useRealTimers();
 });
@@ -115,4 +118,20 @@ it("locks the alert picker when the URL selected several alerts", () => {
   expect(alert.disabled).toBe(true);
   expect(alert.textContent).toBe("Multiple (2)");
   expect(screen.getByText("Alerts: 2")).toBeTruthy();
+});
+
+describe("picker teardown", () => {
+  const onUnmountAutoFocus = vi.fn();
+
+  afterAll(() => {
+    expect(onUnmountAutoFocus).toHaveBeenCalledOnce();
+  });
+
+  it("finishes deferred focus cleanup before the test file ends", () => {
+    renderFilters();
+    fireEvent.click(screen.getByRole("combobox", { name: "Status" }));
+    // Radix Select uses the listbox as its focus-scope container.
+    screen.getByRole("listbox").addEventListener("focusScope.autoFocusOnUnmount", onUnmountAutoFocus);
+    // Leave the picker open so afterEach must unmount its focus scope.
+  });
 });

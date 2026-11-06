@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { ApiError } from "@/lib/api-client";
 import type { AdminSkillReleaseImpact } from "@cogniplane/shared-types";
@@ -39,9 +39,21 @@ export function ReleaseImpactStep({ choiceKey, load, confirm, confirmLabel, prev
   const errorMessage = useRef<HTMLParagraphElement>(null);
   const focusAfterPreview = useRef(false);
   const focusAfterError = useRef(false);
+  const focusAfterConfirm = useRef(false);
   const currentScope = useRef(scopeKey);
   const currentChoice = useRef(choiceKey);
-  useEffect(() => { currentScope.current = scopeKey; currentChoice.current = choiceKey; }, [scopeKey, choiceKey]);
+  useLayoutEffect(() => {
+    const changed = currentScope.current !== scopeKey || currentChoice.current !== choiceKey;
+    currentScope.current = scopeKey; currentChoice.current = choiceKey;
+    if (changed) {
+      focusAfterPreview.current = false; focusAfterError.current = false; focusAfterConfirm.current = false;
+      // A different choice or actor must start a new review, even after switching back.
+      setResult(null); setError(null); setLoading(false);
+    }
+    // This counter tracks async work. Cleanup must advance its current value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { requestId.current++; };
+  }, [scopeKey, choiceKey]);
   const shown = result?.choiceKey === choiceKey && result.scopeKey === scopeKey ? result.impact : null;
   useEffect(() => {
     if (shown && focusAfterPreview.current) {
@@ -55,6 +67,12 @@ export function ReleaseImpactStep({ choiceKey, load, confirm, confirmLabel, prev
       if (document.activeElement === document.body || document.activeElement === previewButton.current) errorMessage.current?.focus();
     }
   }, [error]);
+  useEffect(() => {
+    if (!shown && !submitting && !error && focusAfterConfirm.current) {
+      focusAfterConfirm.current = false;
+      if (document.activeElement === document.body) previewButton.current?.focus();
+    }
+  }, [shown, submitting, error]);
 
   const preview = async () => {
     if (loading || submittingRef.current || disabled) return;
@@ -77,24 +95,31 @@ export function ReleaseImpactStep({ choiceKey, load, confirm, confirmLabel, prev
   };
   const act = async () => {
     if (!shown || submittingRef.current || disabled || loading) return;
-    focusAfterError.current = document.activeElement === confirmButton.current;
+    const id = requestId.current;
+    const ownedFocus = document.activeElement === confirmButton.current;
     submittingRef.current = true;
     setSubmitting(true); setError(null);
     try {
       await confirm(shown.snapshot);
-      if (currentChoice.current === choiceKey && currentScope.current === scopeKey) setResult(null);
+      if (id !== requestId.current || currentChoice.current !== choiceKey || currentScope.current !== scopeKey) return;
+      focusAfterConfirm.current = ownedFocus;
+      setResult(null);
     } catch (cause) {
+      if (id !== requestId.current || currentChoice.current !== choiceKey || currentScope.current !== scopeKey) return;
       setResult(null);
       if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) onAccessError?.(cause);
+      focusAfterError.current = ownedFocus;
       setError(cause instanceof ApiError && cause.status === 409
         ? "The skill changed since this preview. Refresh the impact before you try again."
-        : cause instanceof Error ? `${cause.message} Refresh the impact before you try again.` : "The release failed. Refresh the impact before you try again.");
+        : !(cause instanceof ApiError) || cause.status >= 500
+          ? `${cause instanceof Error ? `${cause.message} ` : ""}The release may have completed. Refresh the impact to check the current state before you try again.`
+          : `${cause.message} Refresh the impact before you try again.`);
     } finally { submittingRef.current = false; setSubmitting(false); }
   };
 
   return <div className="space-y-3">
-    {!shown ? <Button ref={previewButton} type="button" size="sm" variant="outline" disabled={loading || disabled} onClick={() => void preview()}>{loading ? "Checking impact…" : error ? "Refresh impact" : previewLabel}</Button> : null}
-    {loading ? <div aria-label="Loading release impact" className="space-y-2"><Skeleton className="h-8" /><Skeleton className="h-12" /></div> : null}
+    {!shown ? <Button ref={previewButton} type="button" size="sm" variant="outline" className="h-auto min-h-8 max-w-full whitespace-normal break-words py-1.5" disabled={loading || submitting || disabled} onClick={() => void preview()}>{submitting ? "Saving…" : loading ? "Checking impact…" : error ? "Refresh impact" : previewLabel}</Button> : null}
+    {loading ? <div role="status" aria-label="Loading release impact" className="space-y-2"><span className="sr-only">Checking release impact.</span><Skeleton className="h-8" /><Skeleton className="h-12" /></div> : null}
     {error ? <p ref={errorMessage} tabIndex={-1} role="alert" className="rounded-md bg-danger-surface p-3 text-sm text-danger">{error}</p> : null}
     {shown ? <div className="space-y-3 rounded-lg border border-outline-variant bg-surface p-4 text-sm">
       <h5 ref={impactHeading} tabIndex={-1} className="font-semibold">Release impact</h5>
@@ -110,7 +135,7 @@ export function ReleaseImpactStep({ choiceKey, load, confirm, confirmLabel, prev
           <li>Chats: {shown.configuredReferences.sessions.inherited} inherit defaults, {shown.configuredReferences.sessions.explicitSelected} select it</li>
         </ul>
       </div>
-      <div className="flex flex-wrap gap-2"><Button ref={confirmButton} type="button" size="sm" disabled={submitting || disabled} onClick={() => void act()}>{submitting ? "Saving…" : confirmLabel}</Button><Button ref={refreshButton} type="button" size="sm" variant="ghost" disabled={submitting} onClick={() => void preview()}>Refresh impact</Button></div>
+      <div className="flex flex-wrap gap-2"><Button ref={confirmButton} type="button" size="sm" className="h-auto min-h-8 max-w-full whitespace-normal break-words py-1.5" disabled={submitting || disabled} onClick={() => void act()}>{submitting ? "Saving…" : confirmLabel}</Button><Button ref={refreshButton} type="button" size="sm" variant="ghost" disabled={submitting || disabled} onClick={() => void preview()}>Refresh impact</Button></div>
     </div> : null}
   </div>;
 }

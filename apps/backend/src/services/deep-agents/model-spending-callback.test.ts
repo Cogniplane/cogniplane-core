@@ -33,11 +33,11 @@ class MeteredModel extends FakeStreamingChatModel {
     return { generations:[{text:"Done.",message}] };
   }
 }
-function setup(reservedMicroUsd = 1_000_000, modelName = "gpt-6-sol") {
+function setup(reservedMicroUsd = 1_000_000, modelName = "gpt-6-sol", admit?: () => Promise<void>) {
   const store = {startCall:vi.fn(async()=>{}),completeCall:vi.fn(async()=>{}),failCall:vi.fn(async()=>{}),
     finish:vi.fn(async(..._args:unknown[])=>{})};
   const abort = new AbortController();
-  const callback = new ModelSpendingCallback(store,{tenantId:"t",reservationId:"r",reservedMicroUsd},modelName,abort.signal);
+  const callback = new ModelSpendingCallback(store,{tenantId:"t",reservationId:"r",reservedMicroUsd},modelName,abort.signal,admit);
   return { store,callback,abort,config:{callbacks:[callback]},model:new MeteredModel({}) };
 }
 
@@ -102,6 +102,32 @@ describe("model spending callbacks with the installed SDK",()=>{
     expect(t.model.calls).toBe(1);
     expect(()=>t.callback.assertAllowance()).toThrow("allowance");
   });
+  it("checks access after a metered call waits, before writing to the ledger or starting the provider", async () => {
+    let live = true;
+    const admit = vi.fn(async () => {
+      if (!live) throw new Error("Tool access ended");
+    });
+    const t = setup(1_000_000, "gpt-6-sol", admit);
+    let releaseFirst!: () => void;
+    t.store.completeCall.mockImplementationOnce(() => new Promise<void>(resolve => { releaseFirst = resolve; }));
+    const starts = vi.spyOn(t.callback, "handleChatModelStart");
+    const first = t.model.invoke("first", t.config);
+    await vi.waitFor(() => expect(t.store.completeCall).toHaveBeenCalledTimes(1));
+    const second = t.model.invoke("queued", t.config);
+    const refused = expect(second).rejects.toThrow("Tool access ended");
+    await vi.waitFor(() => expect(starts).toHaveBeenCalledTimes(2));
+    // The first call holds the queue while another replica revokes access.
+    live = false;
+    releaseFirst();
+    await first;
+    await refused;
+    expect(admit).toHaveBeenCalledTimes(2);
+    expect(t.store.startCall).toHaveBeenCalledTimes(1);
+    expect(t.model.calls).toBe(1);
+    await t.callback.finish();
+    expect(t.store.failCall).not.toHaveBeenCalled();
+    expect(t.store.finish).toHaveBeenCalledExactlyOnceWith(expect.anything());
+  });
   it("missing usage blocks subsequent work and preserves an unresolved call",async()=>{
     const t=setup();
     t.model.missing=true;
@@ -135,6 +161,34 @@ describe("model spending callbacks with the installed SDK",()=>{
     await t.callback.finish();
     expect(t.store.startCall).not.toHaveBeenCalled();
     expect(t.store.finish).toHaveBeenCalledTimes(1);
+  });
+  it("runs the admission check before the ledger write; a refused start writes nothing and settles cleanly", async () => {
+    let allow!: () => void;
+    const admit = vi.fn(() => new Promise<void>((resolve) => { allow = resolve; }));
+    const t=setup(1_000_000,"gpt-6-sol",admit);
+    const pending=t.model.invoke("hello",t.config);
+    await vi.waitFor(()=>expect(admit).toHaveBeenCalledTimes(1));
+    expect(t.store.startCall).not.toHaveBeenCalled();
+    allow();
+    await pending;
+    expect(t.store.startCall).toHaveBeenCalledTimes(1);
+
+    admit.mockRejectedValueOnce(new Error("Tool access ended"));
+    const graph=createDeepAgent({model:t.model});
+    const events:string[]=[];
+    await expect((async()=>{
+      for await (const event of graph.streamEvents({messages:[new HumanMessage("again")]},{...t.config,version:"v2"})) {
+        t.callback.observeEvent(event as unknown as Record<string, unknown>);
+        events.push(event.event);
+      }
+    })()).rejects.toThrow("Tool access ended");
+    expect(events).toContain("on_chat_model_start");
+    expect(t.model.calls).toBe(1);
+    expect(t.store.startCall).toHaveBeenCalledTimes(1);
+    await t.callback.finish();
+    expect(t.store.failCall).not.toHaveBeenCalled();
+    // No untracked call: the refused start was counted.
+    expect(t.store.finish).toHaveBeenCalledExactlyOnceWith(expect.anything());
   });
   it("records an untracked call when the stream saw a model start that the handler did not", async () => {
     const t=setup();

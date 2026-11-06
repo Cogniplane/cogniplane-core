@@ -29,6 +29,7 @@ it("tests the saved version once and reports discovery without running tools", a
   const button = screen.getByRole("button", { name: "Test saved version 2" });
   button.focus();
   fireEvent.click(button); fireEvent.click(button);
+  expect(document.activeElement).toBe(screen.getByText("This checks the saved organization connection."));
   expect(testAdminMcpConnection).toHaveBeenCalledExactlyOnceWith("research", { expectedVersion: 2, expectedConfigHash: hashA });
   expect(screen.getByRole("status").textContent).toContain("tool discovery");
   finish(result);
@@ -112,4 +113,38 @@ it("hides a previous check when access is denied and offers a safe error", async
   expect(screen.queryByRole("heading", { name: "Organization connection check" })).toBeNull();
   expect(screen.queryByText("Internal provider detail")).toBeNull();
   await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("alert")));
+});
+
+it.each([
+  [409, "saved connection changed"], [404, "no longer available"], [401, "session expired"], [403, "no longer have access"]
+])("shows a fixed recovery message for a synthetic %s", async (status, text) => {
+  vi.mocked(testAdminMcpConnection).mockRejectedValue(new ApiError({ status: Number(status), method: "POST", path: "/admin/mcp-servers/research/connection-test", message: "Raw upstream detail must stay hidden" }));
+  render(<AdminMcpConnectionTestCard server={server} unsavedChanges={false} onReload={vi.fn()} />);
+  fireEvent.click(screen.getByRole("button", { name: "Test saved version 2" }));
+  expect((await screen.findByRole("alert")).textContent).toContain(text);
+  expect(screen.queryByText("Raw upstream detail must stay hidden")).toBeNull();
+});
+
+it("rejects a late reply from another identity", async () => {
+  let finish!: (value: AdminMcpConnectionTest) => void;
+  vi.mocked(testAdminMcpConnection).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  const view = render(<AdminMcpConnectionTestCard server={server} unsavedChanges={false} />);
+  fireEvent.click(screen.getByRole("button", { name: "Test saved version 2" }));
+  auth.user = { tenantId: "tenant-b", userId: "admin-b" };
+  view.rerender(<AdminMcpConnectionTestCard server={server} unsavedChanges={false} />);
+  finish(result);
+  await waitFor(() => expect((screen.getByRole("button", { name: "Test saved version 2" }) as HTMLButtonElement).disabled).toBe(false));
+  expect(screen.queryByRole("heading", { name: "Organization connection check" })).toBeNull();
+});
+
+it("does not move focus from a later control when a test finishes", async () => {
+  let finish!: (value: AdminMcpConnectionTest) => void;
+  vi.mocked(testAdminMcpConnection).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  render(<><AdminMcpConnectionTestCard server={server} unsavedChanges={false} /><button>Later control</button></>);
+  const button = screen.getByRole("button", { name: "Test saved version 2" });
+  button.focus(); fireEvent.click(button);
+  const later = screen.getByRole("button", { name: "Later control" }); later.focus();
+  finish(result);
+  await screen.findByRole("heading", { name: "Organization connection check" });
+  expect(document.activeElement).toBe(later);
 });

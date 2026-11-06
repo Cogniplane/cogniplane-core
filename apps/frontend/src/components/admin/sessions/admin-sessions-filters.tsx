@@ -24,7 +24,7 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { PILL_GRAY, HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
+import { PILL_GRAY, HINT } from "../../../lib/ui-tokens";
 
 export {
   activeFilterChips,
@@ -85,7 +85,6 @@ export function AdminSessionsFilters(props: {
           <summary className="cursor-pointer list-revert">
             <div className="inline-flex w-[calc(100%-24px)] flex-wrap items-center justify-between gap-3 align-middle">
               <div>
-                <p className={SECTION_LABEL}>Filters</p>
                 <h2 className="text-lg font-semibold text-on-surface">Refine sessions</h2>
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                   {chips.length === 0 ? (
@@ -124,6 +123,7 @@ export function AdminSessionsFilters(props: {
             </Button>
           </div>
 
+          <p id="session-date-scope" className="mb-4 max-w-prose text-sm text-on-surface-variant">Dates filter when sessions were created, using UTC days. They do not filter alert time or last activity.</p>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="filter-user">User</Label>
@@ -141,6 +141,7 @@ export function AdminSessionsFilters(props: {
               <Input
                 id="filter-from"
                 type="date"
+                aria-describedby="session-date-scope"
                 value={isoToDateInput(state.from)}
                 onChange={(e) => apply({ from: dateInputToIso(e.target.value, false) })}
               />
@@ -151,6 +152,7 @@ export function AdminSessionsFilters(props: {
               <Input
                 id="filter-to"
                 type="date"
+                aria-describedby="session-date-scope"
                 value={isoToDateInput(state.to)}
                 onChange={(e) => apply({ to: dateInputToIso(e.target.value, true) })}
               />

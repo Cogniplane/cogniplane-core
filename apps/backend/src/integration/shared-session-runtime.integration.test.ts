@@ -190,10 +190,13 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     modelControl.afterOutput = async () => { modelControl.writeFile = false; };
     const turn = h.send("Write a file after approval").then(response => response);
     let approvalId = "";
+    let toolCallId = "";
     await vi.waitFor(async () => {
       const pending = await h.approvals.listPending(h.tenantId, h.sessionId, h.editorId);
       expect(pending).toHaveLength(1);
       approvalId = pending[0]!.approvalId;
+      expect(pending[0]!.toolCallId).toBeTruthy();
+      toolCallId = pending[0]!.toolCallId!;
     }, { timeout: 5000 });
     expect(h.toolsStarted).not.toContain("write_file");
     h.authenticate(h.ownerId);
@@ -204,11 +207,18 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     expect((await h.replica.inject({ method: "POST", url, payload: { decision: "approve" } })).statusCode).toBe(404);
     expect((await h.replica.inject(`/sessions/${h.sessionId}/approvals`)).json()).toEqual({ approvals: [] });
     h.authenticate(h.editorId);
+    expect((await h.replica.inject(`/sessions/${h.sessionId}/approvals`)).json()).toMatchObject({
+      approvals: [expect.objectContaining({ approvalId, toolCallId })]
+    });
     expect((await h.replica.inject({ method: "POST", url, payload: { decision: "approve" } })).statusCode).toBe(200);
     const response = await turn;
     expect(response.body).not.toContain('"type":"RUN_ERROR"');
     expect(h.toolsStarted.filter(name => name === "write_file")).toHaveLength(1);
     expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("approved");
+    const history = await h.messages.listBySession(h.tenantId, h.sessionId, h.editorId);
+    expect(history.messages.flatMap((message) => message.toolResults ?? [])).toContainEqual(
+      expect.objectContaining({ toolResultId: toolCallId, status: "completed" })
+    );
   });
 
   test("another owner can cancel an approval wait across replicas without allowing its resume", async () => {
@@ -239,7 +249,7 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
       notionBotId: null, notionOwnerEmail: null, notionOwnerName: null, tokenType: "bearer", grantedScopes: [],
       accessTokenEncrypted: encrypt("test-only-mode-capture-token", h.config.DATA_ENCRYPTION_SECRET),
       accessTokenExpiresAt: null, refreshTokenEncrypted: null, refreshTokenExpiresAt: null,
-      tokenLastRefreshedAt: null });
+      tokenLastRefreshedAt: null, ownerSecurityVersion: null });
     h.authenticate(h.editorId);
     modelControl.notion = true;
     modelControl.afterOutput = async () => {
@@ -303,7 +313,7 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
       notionWorkspaceId: "workspace", notionWorkspaceName: "Test workspace", notionWorkspaceIcon: null,
       notionBotId: null, notionOwnerEmail: null, notionOwnerName: null, tokenType: "bearer", grantedScopes: [],
       accessTokenEncrypted: encrypt(secret, h.config.DATA_ENCRYPTION_SECRET), accessTokenExpiresAt: null,
-      refreshTokenEncrypted: null, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null });
+      refreshTokenEncrypted: null, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null, ownerSecurityVersion: null });
     const realFetch = globalThis.fetch;
     const headers: string[] = [];
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {

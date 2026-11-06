@@ -96,7 +96,7 @@ export function PiiProviderStatusPill() {
 
 const VARIANT_CLASSES: Record<PillVariant, string> = {
   ok: "bg-success-surface text-success",
-  probing: "bg-accent-soft text-accent",
+  probing: "bg-info-surface text-info",
   outage: "bg-danger-surface text-danger",
   neutral: "bg-surface-container text-on-surface-variant"
 };

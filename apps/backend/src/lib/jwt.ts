@@ -2,20 +2,67 @@ import { SignJWT, jwtVerify, errors as joseErrors } from "jose";
 
 import type { AppConfig } from "../config.js";
 
-export type AccessTokenPayload = {
+/**
+ * How the user proved who they are at sign-in: `workos` for a WorkOS login.
+ * Local login adds `pwd`, `otp`, `rec`, and `pkey` (docs/ARCHITECTURE.md, "Authentication").
+ */
+export type AuthMethod = "workos" | "pwd" | "otp" | "rec" | "pkey";
+
+/**
+ * Sign-in facts that every token of one session carries. Refresh copies them
+ * from the old token and never advances `auth_time`, so a refreshed session
+ * cannot look like a fresh sign-in. Tokens issued before these claims existed
+ * have neither.
+ */
+export type SessionAuthClaims = {
+  amr?: AuthMethod[];
+  /** Sign-in time, epoch seconds. */
+  auth_time?: number;
+  /**
+   * Local accounts: the account's security_version at sign-in. A session
+   * stays valid only while it equals the stored value.
+   */
+  sv?: number;
+};
+
+export type AccessTokenPayload = SessionAuthClaims & {
   sub: string;
   tid: string;
   role: string;
   email?: string;
+  /** Refresh family of the session that issued this token. */
+  fid?: string;
 };
 
-export type RefreshTokenPayload = {
+export type RefreshTokenPayload = SessionAuthClaims & {
   sub: string;
   tid: string;
   jti: string;
   /** Family/lineage id used to detect refresh-token reuse. */
   fid: string;
 };
+
+const AUTH_METHODS: ReadonlySet<string> = new Set<AuthMethod>(["workos", "pwd", "otp", "rec", "pkey"]);
+
+// A signed token can only hold what this backend wrote, but a token from an
+// older or newer version could still hold a shape this one does not know.
+// Reject it rather than read a wrong method list as a weaker or stronger proof.
+function assertSessionAuthClaims(p: Record<string, unknown>): void {
+  if (p.amr !== undefined) {
+    if (!Array.isArray(p.amr) || !p.amr.every((method) => typeof method === "string" && AUTH_METHODS.has(method))) {
+      throw new Error("Invalid token payload: amr");
+    }
+  }
+  if (p.auth_time !== undefined && (typeof p.auth_time !== "number" || !Number.isInteger(p.auth_time))) {
+    throw new Error("Invalid token payload: auth_time");
+  }
+  if (p.sv !== undefined && (typeof p.sv !== "number" || !Number.isInteger(p.sv) || p.sv < 0)) {
+    throw new Error("Invalid token payload: sv");
+  }
+  if (p.fid !== undefined && (typeof p.fid !== "string" || p.fid.length === 0)) {
+    throw new Error("Invalid token payload: fid");
+  }
+}
 
 type JwtKeyConfig = Pick<
   AppConfig,
@@ -80,6 +127,7 @@ function assertAccessTokenPayload(p: unknown): AccessTokenPayload {
   if (typeof p !== "object" || p === null || !("sub" in p) || !("tid" in p) || !("role" in p)) {
     throw new Error("Invalid access token payload: missing required fields");
   }
+  assertSessionAuthClaims(p as Record<string, unknown>);
   return p as AccessTokenPayload;
 }
 
@@ -94,6 +142,7 @@ function assertRefreshTokenPayload(p: unknown): RefreshTokenPayload {
   ) {
     throw new Error("Invalid refresh token payload: missing required fields");
   }
+  assertSessionAuthClaims(p as Record<string, unknown>);
   return p as RefreshTokenPayload;
 }
 

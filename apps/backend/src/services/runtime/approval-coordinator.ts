@@ -21,6 +21,11 @@ export type ApprovalRequest = {
   name: string; kind: ApprovalKind; args: Record<string, unknown>; policyApproval?: PolicyApprovalProof;
   server?: { id: string; mode: "managed" | "proxy" };
   /**
+   * The server ID of the proposed tool call, when the runtime proved which call
+   * this is. Stored on the row, so a reload can show the decision in that call's card.
+   */
+  toolCallId?: string;
+  /**
    * For a tool that saves durable data: the card text that shows the exact value, and
    * server facts that the write checks later. They are stored beside the approval row.
    */
@@ -209,6 +214,7 @@ export class ApprovalCoordinator {
           requestMethod: action.policyApproval ? POLICY_APPROVAL_REQUEST_METHOD : `deepagents/${name}`,
           requestId: approvalId, kind, title, summary,
           status: "pending", decision: null,
+          ...(action.toolCallId ? { toolCallId: action.toolCallId } : {}),
           // `bound` is set after the arguments, so a model cannot supply its own.
           requestPayload: action.policyApproval
             ? { ...redactedArgs, policyApproval: action.policyApproval, bound: action.durableWrite?.bound }
@@ -246,7 +252,9 @@ export class ApprovalCoordinator {
         approvalId, itemId: approvalId, kind, title: approval.title, summary: approval.summary,
         availableDecisions: ["approve", "reject"],
         command: name === "execute" && typeof action.args.command === "string" ? action.args.command : name,
-        cwd: null
+        cwd: null,
+        // From the row, so the event and a later read of the approvals agree.
+        ...(approval.toolCallId ? { toolCallId: approval.toolCallId } : {})
       } });
     } catch (err) {
       this.deps.logger.error({ err, approvalId }, "Failed to publish approval request; denying");

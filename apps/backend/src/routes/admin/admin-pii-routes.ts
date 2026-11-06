@@ -25,7 +25,7 @@ export interface AdminPiiRouteStores {
    * skip wiring it. When absent, /admin/pii/metrics, /admin/pii/top,
    * /admin/pii/recent, and /admin/pii/jobs/stats are not registered.
    */
-  piiProtection?: Pick<PiiProtectionService, "getActiveSettings">;
+  piiProtection?: Pick<PiiProtectionService, "getPolicy">;
   /** Read-only aggregates for the dashboard. Required when piiProtection is wired. */
   piiAnalytics?: Pick<
     PiiAnalyticsStore,
@@ -79,8 +79,8 @@ export async function registerAdminPiiRoutes(
       const { tenantId } = request.auth;
 
       // Active policy goes through the protection service so callers get the
-      // same default-fallback behavior as the runtime path.
-      const settings = await piiProtection.getActiveSettings(tenantId);
+      // same resolution as the runtime path.
+      const { settings, health } = await piiProtection.getPolicy(tenantId);
 
       const [kpiCurrent, kpiPrevious, timeSeries, byEntityType, byConfidence, bySubjectType] =
         await Promise.all([
@@ -117,6 +117,8 @@ export async function registerAdminPiiRoutes(
           scopes: settings.scopes,
           entityTypes: settings.detectors.entityTypes
         },
+        // Outside `policy`: a save never writes it.
+        policyHealth: health,
         kpis,
         timeSeries,
         byEntityType,

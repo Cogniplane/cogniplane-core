@@ -55,10 +55,12 @@ if (!getIntegrationDescriptor("microsoft")) {
     platformStatus: () => ({ configured: true, message: null })
   });
 }
+import type { AuditEventInput } from "../../services/audit-event-store.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 
 import { registerAdminIntegrationsRoutes } from "./admin-integrations-routes.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
 
 class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "upsert" | "clearConfig"> {
   records: IntegrationStateRecord[] = [];
@@ -78,10 +80,14 @@ class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "up
     );
   }
 
+  /** Audit events that the real store writes in the change's transaction. */
+  audits: AuditEventInput[] = [];
+
   async upsert(
     tenantId: string,
     integrationId: string,
-    patch: Parameters<IntegrationStateStore["upsert"]>[2]
+    patch: Parameters<IntegrationStateStore["upsert"]>[2],
+    audit?: Parameters<IntegrationStateStore["upsert"]>[3]
   ): Promise<IntegrationStateRecord> {
     this.upsertCalls.push({ tenantId, integrationId, patch });
     const existingIdx = this.records.findIndex(
@@ -100,7 +106,24 @@ class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "up
     };
     if (existingIdx >= 0) this.records[existingIdx] = next;
     else this.records.push(next);
+    if (audit) this.audits.push(audit(next));
     return next;
+  }
+
+  /** Like the real store: only the given toggles and settings keys change, on the current record. */
+  async applyChanges(
+    tenantId: string,
+    integrationId: string,
+    changes: Parameters<IntegrationStateStore["applyChanges"]>[2],
+    audit?: Parameters<IntegrationStateStore["applyChanges"]>[3]
+  ): Promise<IntegrationStateRecord> {
+    const current = await this.get(tenantId, integrationId);
+    return this.upsert(tenantId, integrationId, {
+      readsEnabled: changes.readsEnabled,
+      writesEnabled: changes.writesEnabled,
+      config: { ...(current?.config ?? {}), ...changes.configChanges },
+      updatedBy: changes.updatedBy
+    }, audit);
   }
 
   async clearConfig(
@@ -174,6 +197,7 @@ async function buildApp(opts: {
   const auditEvents = new InMemoryAuditEventStore();
 
   await registerAdminIntegrationsRoutes(app, {
+    dataRoutes: devDataRoutes(),
     config,
     integrationRegistry: registry,
     integrationStates: stateStore,
@@ -242,7 +266,9 @@ test("PUT /admin/integrations/:id flips toggles, audits, and invalidates runtime
     }
   });
 
-  const updateEvents = auditEvents.events.filter((e) => e.type === "tenant.integration.updated");
+  // The update event commits with the change, in the store's transaction.
+  expect(auditEvents.events.filter((e) => e.type === "tenant.integration.updated")).toEqual([]);
+  const updateEvents = stateStore.audits.filter((e) => e.type === "tenant.integration.updated");
   expect(updateEvents.length).toBe(1);
   expect((updateEvents[0].payload as { integrationId: string }).integrationId).toBe("notion");
 });
@@ -438,6 +464,7 @@ test("non-admin requests are rejected with 403", async () => {
   const stateStore = new FakeStateStore();
   const registry = new IntegrationRegistryService(config, stateStore, buildProbes());
   await registerAdminIntegrationsRoutes(app, {
+    dataRoutes: devDataRoutes(),
     config,
     integrationRegistry: registry,
     integrationStates: stateStore,

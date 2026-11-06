@@ -8,6 +8,8 @@ import { OverviewRow } from "../overview-row";
 type AdminIntegrationRowProps = {
   integration: AdminIntegrationView;
   busy: boolean;
+  error?: string;
+  operation?: "toggle" | "save" | "clear";
   onOpen: () => void;
   onToggleReads: (next: boolean) => void;
   onToggleWrites: (next: boolean) => void;
@@ -41,7 +43,7 @@ function statusCaption(integration: AdminIntegrationView): {
 }
 
 export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
-  const { integration, busy, onOpen, onToggleReads, onToggleWrites } = props;
+  const { integration, busy, error, operation, onOpen, onToggleReads, onToggleWrites } = props;
 
   // The list shows no coming-soon rows. The user must always retain the ability to flip a currently-on switch off — even
   // when configuration disappears (e.g. the GitHub App is uninstalled while
@@ -65,9 +67,10 @@ export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
   return (
     <OverviewRow
       title={<><span aria-hidden="true" className="inline-flex"><IntegrationLogo slug={integration.logoSlug} name={integration.name} category={integration.category} size={20} /></span>{integration.name}</>}
-      status={<span className={CAPTION_TONE_CLASS[status.tone]}>{status.text.endsWith(".") ? status.text : `${status.text}.`}</span>}
+      busy={busy}
+      status={<><span className={CAPTION_TONE_CLASS[status.tone]}>{status.text.endsWith(".") ? status.text : `${status.text}.`}</span>{busy ? operation === "clear" ? " Clearing configuration..." : operation === "save" ? " Saving configuration..." : " Saving access..." : null}{error ? <span role="alert" className="block text-danger"><span>{error}</span> Change the switch to try again.</span> : null}</>}
     >
-      <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
+      <label className="inline-flex cursor-pointer min-h-10 items-center gap-1.5 text-sm text-on-surface-variant">
         <input
           type="checkbox"
           role="switch"
@@ -75,11 +78,11 @@ export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
           checked={integration.readsEnabled}
           disabled={readsDisabled}
           onChange={(e) => onToggleReads(e.currentTarget.checked)}
-          className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+          className="size-4 rounded border-input accent-primary disabled:cursor-not-allowed disabled:opacity-50"
         />
         <span>Reads</span>
       </label>
-      {showWrites ? <label className="inline-flex cursor-pointer items-center gap-1.5 text-sm text-on-surface-variant">
+      {showWrites ? <label className="inline-flex cursor-pointer min-h-10 items-center gap-1.5 text-sm text-on-surface-variant">
         <input
           type="checkbox"
           role="switch"
@@ -87,7 +90,7 @@ export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
           checked={integration.writesEnabled}
           disabled={writesDisabled}
           onChange={(e) => onToggleWrites(e.currentTarget.checked)}
-          className="size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+          className="size-4 rounded border-input accent-primary disabled:cursor-not-allowed disabled:opacity-50"
         />
         <span>Writes</span>
       </label> : null}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 
@@ -13,7 +13,9 @@ import {
   ARTIFACT_SORT_LABELS,
   ARTIFACT_SORT_OPTIONS,
   ARTIFACT_STATUS_OPTIONS,
+  ARTIFACT_STATUS_LABELS,
   ARTIFACT_TYPE_OPTIONS,
+  ARTIFACT_TYPE_LABELS,
   EMPTY_ARTIFACT_FILTER_STATE,
   artifactFilterStateToParams,
   artifactFilterStateToSearchString,
@@ -26,11 +28,9 @@ import {
   canDownloadArtifact,
   formatArtifactStatus,
   formatFileSize,
-  formatPiiLabel,
-  getArtifactOrigin,
-  piiTone,
-  type PiiTone
+  getArtifactOrigin
 } from "./artifact-panel.logic";
+import { PiiChip } from "./artifact-pii-chip";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { canPreviewArtifact } from "../lib/artifact-preview";
 import { useArtifactActions } from "../hooks/use-artifact-actions";
@@ -50,15 +50,7 @@ import {
   SelectTrigger,
   SelectValue
 } from "@/components/ui/select";
-import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN } from "../lib/ui-tokens";
-
-const PII_TONE_CLASS: Record<PiiTone, string> = {
-  neutral: PILL_GRAY,
-  pending: PILL_BLUE,
-  blocked: PILL_RED,
-  failed: PILL_RED,
-  transformed: PILL_GREEN
-};
+import { PILL_GRAY } from "../lib/ui-tokens";
 
 function MultiSelectFilter(props: {
   label: string;
@@ -71,7 +63,7 @@ function MultiSelectFilter(props: {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="outline" size="sm">
+        <Button type="button" variant="outline" size="sm" className="h-10 sm:h-8">
           {props.label}
           {count > 0 ? ` (${count})` : ""}
         </Button>
@@ -100,35 +92,45 @@ function ArtifactBrowserRow(props: {
 }) {
   const { artifact } = props;
   const pii = artifact.detail?.pii;
-  const piiLabel = pii ? formatPiiLabel(pii) : null;
+  const availabilityId = useId();
+  const availability = artifact.status !== "ready"
+    ? artifact.status === "pending" || artifact.status === "processing"
+      ? "Preview and download will be available when the file is ready."
+      : `Preview and download are unavailable for this ${artifact.status} file.`
+    : !canPreviewArtifact(artifact)
+      ? "Preview is not supported for this file format. You can download the file."
+      : null;
 
   return (
-    <div className="flex items-center gap-3 border-b border-outline-variant px-3 py-2.5 text-sm transition-colors hover:bg-surface-container-low">
+    <div role="listitem" className="flex flex-col gap-3 border-b border-outline-variant p-4 text-sm last:border-b-0 hover:bg-surface-container-low sm:flex-row sm:items-start sm:gap-4">
       <div className="min-w-0 flex-1">
-        <p className="truncate font-medium text-on-surface" title={artifact.artifactName}>
+        <p className="font-medium leading-6 text-on-surface [overflow-wrap:anywhere]" title={artifact.artifactName}>
           {artifact.artifactName}
         </p>
         <div className="mt-1 flex flex-wrap items-center gap-1.5">
-          <span className={PILL_GRAY}>{getArtifactOrigin(artifact)}</span>
-          <span className="text-xs text-on-surface-faint">{classifyMimeClass(artifact.mimeType)}</span>
+          <span className={PILL_GRAY}>{getArtifactOrigin(artifact).label}</span>
+          <span className="text-xs text-on-surface-faint">{ARTIFACT_MIME_CLASS_LABELS[classifyMimeClass(artifact.mimeType)]}</span>
           <span className="text-xs text-on-surface-faint">·</span>
           <span className="text-xs text-on-surface-faint">{formatFileSize(artifact.fileSizeBytes)}</span>
           {artifact.status !== "ready" ? (
             <span className={PILL_GRAY}>{formatArtifactStatus(artifact.status)}</span>
           ) : null}
-          {piiLabel ? <span className={PII_TONE_CLASS[piiTone(pii!)]}>{piiLabel}</span> : null}
+          {pii ? <span className="inline-flex rounded bg-surface-container-lowest"><PiiChip pii={pii} /></span> : null}
+          <time className="text-xs text-on-surface-faint" dateTime={artifact.createdAt}>
+            {new Date(artifact.createdAt).toLocaleDateString()}
+          </time>
         </div>
+        {availability ? <p id={availabilityId} className="mt-2 max-w-prose text-xs leading-5 text-on-surface-variant">{availability}</p> : null}
       </div>
 
-      <time className="hidden shrink-0 text-xs text-on-surface-faint sm:block" dateTime={artifact.createdAt}>
-        {new Date(artifact.createdAt).toLocaleDateString()}
-      </time>
-
-      <div className="flex shrink-0 items-center gap-1.5">
+      <div className="flex shrink-0 flex-wrap items-center gap-2 sm:pt-0.5">
         <Button
           type="button"
           variant="ghost"
           size="sm"
+          className="h-10 sm:h-8"
+          aria-label={`Preview ${artifact.artifactName}`}
+          aria-describedby={availability ? availabilityId : undefined}
           disabled={!canPreviewArtifact(artifact)}
           onClick={() => props.onPreview(artifact)}
         >
@@ -138,10 +140,13 @@ function ArtifactBrowserRow(props: {
           type="button"
           variant="outline"
           size="sm"
+          className="h-10 sm:h-8"
+          aria-label={`${props.isDownloading ? "Downloading" : "Download"} ${artifact.artifactName}`}
+          aria-describedby={availability ? availabilityId : undefined}
           disabled={!canDownloadArtifact(artifact) || props.isDownloading}
           onClick={() => props.onDownload(artifact.artifactId)}
         >
-          {props.isDownloading ? "…" : "Download"}
+          {props.isDownloading ? "Downloading…" : "Download"}
         </Button>
       </div>
     </div>
@@ -196,17 +201,17 @@ export function ArtifactBrowser() {
   const hasFilters = artifactSearchHasAnyFilter(
     new URLSearchParams(artifactFilterStateToSearchString(state))
   );
-  const hasSettledFilters = artifactSearchHasAnyFilter(
-    new URLSearchParams(artifactFilterStateToSearchString(settledState))
-  );
+  const hasSettledFilters = Boolean(settledState.q.trim() || settledState.type.length || settledState.status.length || settledState.mimeClass.length);
 
   const clearFilters = useCallback(() => {
     setState(EMPTY_ARTIFACT_FILTER_STATE);
     setDebouncedQ(""); // clear the query immediately, don't wait out the debounce
   }, []);
 
+  const previewTarget = artifacts.find(artifact => artifact.artifactId === actions.previewArtifactId);
+
   return (
-    <section className="flex flex-col gap-4">
+    <section aria-label="Artifact library" className="flex min-w-0 flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
         <Input
           type="search"
@@ -214,22 +219,24 @@ export function ArtifactBrowser() {
           placeholder="Search by name…"
           value={state.q}
           onChange={(event) => setState((s) => ({ ...s, q: event.target.value }))}
-          className="w-56"
+          className="w-full sm:w-64"
         />
         <MultiSelectFilter
-          label="Type"
+          label="Source"
           options={ARTIFACT_TYPE_OPTIONS}
+          optionLabel={(value) => ARTIFACT_TYPE_LABELS[value as keyof typeof ARTIFACT_TYPE_LABELS]}
           selected={state.type}
           onToggle={(value) => setState((s) => ({ ...s, type: toggleInArray(s.type, value) }))}
         />
         <MultiSelectFilter
-          label="Status"
+          label="File status"
           options={ARTIFACT_STATUS_OPTIONS}
+          optionLabel={(value) => ARTIFACT_STATUS_LABELS[value as keyof typeof ARTIFACT_STATUS_LABELS]}
           selected={state.status}
           onToggle={(value) => setState((s) => ({ ...s, status: toggleInArray(s.status, value) }))}
         />
         <MultiSelectFilter
-          label="Kind"
+          label="File format"
           options={ARTIFACT_MIME_CLASS_OPTIONS}
           selected={state.mimeClass}
           optionLabel={(value) => ARTIFACT_MIME_CLASS_LABELS[value as keyof typeof ARTIFACT_MIME_CLASS_LABELS]}
@@ -239,7 +246,7 @@ export function ArtifactBrowser() {
           value={state.sort}
           onValueChange={(value) => setState((s) => ({ ...s, sort: value as ArtifactBrowserFilterState["sort"] }))}
         >
-          <SelectTrigger size="sm" className="w-44">
+          <SelectTrigger aria-label="Sort artifacts" size="sm" className="h-10 w-44 sm:h-8">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -265,7 +272,8 @@ export function ArtifactBrowser() {
       {error ? (
         <div role="alert" className="space-y-2 text-sm text-danger">
           <p>{error}</p>
-          {artifacts.length === 0 ? (
+          {artifacts.length > 0 ? <p className="text-on-surface-variant">Your loaded artifacts are still shown.</p> : null}
+          {artifacts.length === 0 || !hasMore ? (
             <Button type="button" variant="outline" size="sm" disabled={isRetrying} onClick={retry}>
               Try again
             </Button>
@@ -274,13 +282,18 @@ export function ArtifactBrowser() {
       ) : null}
 
       {!error || artifacts.length > 0 ? (
-        <div className="rounded-lg border border-outline-variant">
+        <div role={artifacts.length ? "list" : undefined} aria-label={artifacts.length ? "Artifacts" : undefined} className="rounded-lg border border-outline-variant bg-surface">
           {isLoading ? (
-            <p className="px-3 py-8 text-center text-sm text-on-surface-faint">Loading artifacts…</p>
+            <p role="status" className="px-4 py-8 text-center text-sm text-on-surface-variant">Loading artifacts…</p>
           ) : artifacts.length === 0 ? (
-            <p className="px-3 py-8 text-center text-sm text-on-surface-faint">
-              {hasSettledFilters ? "No artifacts match these filters." : "No artifacts yet."}
-            </p>
+            <div className="space-y-3 px-4 py-8 text-center text-sm">
+              <h2 className="font-medium text-on-surface">{hasSettledFilters ? "No artifacts match these filters." : "No artifacts yet."}</h2>
+              {hasSettledFilters ? (
+                <Button type="button" variant="outline" size="sm" onClick={clearFilters}>Clear filters</Button>
+              ) : (
+                <p className="mx-auto max-w-prose text-on-surface-variant">Upload a file in a session or ask the assistant to create one. Files from your sessions appear here when you have access.</p>
+              )}
+            </div>
           ) : (
             artifacts.map((artifact) => (
               <ArtifactBrowserRow
@@ -298,7 +311,7 @@ export function ArtifactBrowser() {
       {hasMore ? (
         <div className="flex justify-center">
           <Button type="button" variant="outline" size="sm" disabled={isLoadingMore} onClick={loadMore}>
-            {isLoadingMore ? "Loading…" : "Load more"}
+            {isLoadingMore ? "Loading more…" : error ? "Retry loading more" : "Load more"}
           </Button>
         </div>
       ) : null}
@@ -310,6 +323,7 @@ export function ArtifactBrowser() {
           content={actions.previewContent}
           imageUrl={actions.previewImageUrl}
           error={actions.previewError}
+          onRetry={previewTarget && canPreviewArtifact(previewTarget) ? () => { void actions.openPreview(previewTarget); } : undefined}
           onClose={actions.closePreview}
         />
       ) : null}

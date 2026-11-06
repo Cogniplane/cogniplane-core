@@ -1,11 +1,16 @@
 import { ModelSpendingCallback } from "./model-spending-callback.js";
-import { beforeEach, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemorySaver } from "@langchain/langgraph";
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import { createDeepAgentsSessionRuntime } from "./deep-agents-graph.js";
+import { toolContextLivenessMiddleware } from "./execution-authorization-middleware.js";
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 
-const control = vi.hoisted(() => ({ allowed: true, modelCalls: 0, revokeAfterModel: false, delegate: false }));
+const control = vi.hoisted(() => ({
+  allowed: true, modelCalls: 0, revokeAfterModel: false, delegate: false, answerAfter: Infinity,
+  /** Model call `call` waits for `release` after it calls `reached`. */
+  hold: undefined as { call: number; reached: () => void; release: Promise<void> } | undefined
+}));
 vi.mock("langchain", async (importOriginal) => {
   const actual = await importOriginal<typeof import("langchain")>();
   const { FakeStreamingChatModel } = await import("@langchain/core/utils/testing");
@@ -15,7 +20,13 @@ vi.mock("langchain", async (importOriginal) => {
     override bindTools() { return this.withConfig({}); }
     override async _generate() {
       control.modelCalls++;
+      if (control.hold?.call === control.modelCalls) {
+        control.hold.reached();
+        await control.hold.release;
+      }
       const delegate = control.delegate && control.modelCalls === 1;
+      // An answer ends the turn, so a test whose guard did not stop it fails at once.
+      if (control.modelCalls > control.answerAfter) return { generations: [{ text: "Done.", message: new AIMessage("Done.") }] };
       const message = new AIMessage({ content: "", usage_metadata: { input_tokens: 1000, output_tokens: 1000, total_tokens: 2000 }, tool_calls: [delegate
         ? { name: "task", id: "delegate-1", args: { subagent_type: "general-purpose", description: "Write a file" } }
         : { name: "write_file", id: "write-1", args: { file_path: "/protected.txt", content: "secret" } }]
@@ -39,9 +50,11 @@ beforeEach(() => {
   control.modelCalls = 0;
   control.revokeAfterModel = false;
   control.delegate = false;
+  control.answerAfter = Infinity;
+  control.hold = undefined;
 });
 
-function setup(spending?: ModelSpendingCallback) {
+function setup(spending?: ModelSpendingCallback, requireLiveToolContext?: () => Promise<void>) {
   const checkpointer = new MemorySaver();
   const requireExecution = vi.fn(async () => {
     if (!control.allowed) throw new Error("Execution revoked");
@@ -49,7 +62,8 @@ function setup(spending?: ModelSpendingCallback) {
   const runtime = createDeepAgentsSessionRuntime({
     tenantId: "tenant", sessionId: "session", userId: "editor", runtimeId: "runtime",
     resolveProviderKey: async () => "test", systemPrompt: "Complete the requested task.", workspacePath: "/workspace", e2b: null,
-    checkpointer, requireExecution, requireSpendingAllowance: spending ? () => spending.assertAllowance() : undefined, logger: createSilentLogger()
+    checkpointer, requireExecution, requireLiveToolContext,
+    requireSpendingAllowance: spending ? () => spending.assertAllowance() : undefined, logger: createSilentLogger()
   });
   const toolsStarted: string[] = [];
   const callback = BaseCallbackHandler.fromMethods({
@@ -117,4 +131,93 @@ it.each([false, true])("stops native tool dispatch after allowance exhaustion, d
     const state = await test.checkpointer.getTuple(test.config);
     expect(JSON.stringify(state?.checkpoint.channel_values.files ?? {})).not.toContain("protected.txt");
   } finally { await spending.finish(); await test.runtime.dispose(); }
+});
+
+describe("tool context check before native tools", () => {
+  /** A check that throws once `live` is false, as the adapter does for a dead context. */
+  function contextCheck() {
+    const state = { live: true };
+    const requireLiveToolContext = vi.fn(async () => {
+      if (!state.live) throw new Error("Tool access ended");
+    });
+    return { state, requireLiveToolContext };
+  }
+  /** Holds model call `call` until the test releases it. */
+  function holdModelCall(call: number) {
+    let reached!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { reached = resolve; });
+    control.hold = { call, reached, release: new Promise<void>((resolve) => { release = resolve; }) };
+    return { waiting, release };
+  }
+
+  it("a tool call that the model returns after a revocation does not start", async () => {
+    const check = contextCheck();
+    const test = setup(undefined, check.requireLiveToolContext);
+    control.answerAfter = 3;
+    const held = holdModelCall(1);
+    try {
+      const turn = test.invoke([{ role: "user", content: "Write a file" }]);
+      await held.waiting;
+      // The security change commits while the model call waits.
+      check.state.live = false;
+      held.release();
+
+      await expect(turn).rejects.toThrow("Tool access ended");
+      expect(control.modelCalls).toBe(1);
+      expect(test.toolsStarted).toEqual([]);
+      expect(check.requireLiveToolContext).toHaveBeenCalledTimes(1);
+      const saved = await test.checkpointer.getTuple(test.config);
+      expect(JSON.stringify(saved?.checkpoint.channel_values.files ?? {})).not.toContain("protected.txt");
+    } finally { await test.runtime.dispose(); }
+  });
+
+  it("a tool call of delegated work that the model returns after a revocation does not start", async () => {
+    const check = contextCheck();
+    const test = setup(undefined, check.requireLiveToolContext);
+    control.delegate = true;
+    control.answerAfter = 3;
+    // Call 1 delegates; call 2 is the first model call of the delegated agent.
+    const held = holdModelCall(2);
+    try {
+      const turn = test.invoke([{ role: "user", content: "Delegate writing a file" }]);
+      await held.waiting;
+      check.state.live = false;
+      held.release();
+
+      await expect(turn).rejects.toThrow("Tool access ended");
+      expect(control.modelCalls).toBe(2);
+      // The delegation was checked and started; the delegated write was checked and did not.
+      expect(test.toolsStarted).toEqual(["task"]);
+      expect(check.requireLiveToolContext).toHaveBeenCalledTimes(2);
+    } finally { await test.runtime.dispose(); }
+  });
+
+  it("runs after the execution check, so an ended execution keeps its own error", async () => {
+    const check = contextCheck();
+    const test = setup(undefined, check.requireLiveToolContext);
+    control.answerAfter = 3;
+    // beforeAgent and the model call pass; the check before the tool does not.
+    test.requireExecution.mockImplementationOnce(async () => {}).mockImplementationOnce(async () => {});
+    control.allowed = false;
+    try {
+      await expect(test.invoke([{ role: "user", content: "Write a file" }])).rejects.toThrow("Execution revoked");
+      expect(control.modelCalls).toBe(1);
+      expect(check.requireLiveToolContext).not.toHaveBeenCalled();
+      expect(test.toolsStarted).toEqual([]);
+    } finally { await test.runtime.dispose(); }
+  });
+
+  it("leaves MCP gateway tools to the gateway, which checks the same context", async () => {
+    const check = vi.fn(async () => {});
+    const middleware = toolContextLivenessMiddleware(check, (name) => name === "github_search");
+    const handler = vi.fn(async () => "result");
+    const call = (name: string) => middleware.wrapToolCall!({ toolCall: { name, args: {}, id: name } } as never, handler as never);
+
+    await call("github_search");
+    expect(check).not.toHaveBeenCalled();
+    await call("execute");
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
 });

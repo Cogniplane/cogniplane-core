@@ -1,14 +1,14 @@
 // Managed-tool catalog registry.
 //
 // Each per-domain module (session-tools, github-tools, notion-tools, ...)
-// owns its catalog entries; bootstrap (register-builtin-managed-tools.ts)
-// registers them via `catalog.register(entries)`. A private overlay package
+// owns its catalog entries; bootstrap (register-builtin-managed-tools.ts, or
+// a built-in connector module) registers them via `catalog.register(entries)`. A private overlay package
 // can register additional entries by calling the same method on the shared
 // instance — without forking core.
 //
 // Tools whose authorization is governed by the per-tenant Agent settings
 // checklist set `tenantConfigurable: true`. Integration-owned tools
-// (GitHub, SharePoint, Notion) are gated by the integrations system and
+// (for example GitHub and Notion) are gated by the integrations system and
 // must NOT appear in the Agent settings picker — checking one there would
 // bypass `tenant_integrations` read/write toggles and readiness checks.
 

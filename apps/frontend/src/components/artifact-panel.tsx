@@ -1,11 +1,12 @@
 "use client";
 
 import { useMemo, useRef, useState } from "react";
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, CircleAlertIcon, LoaderCircleIcon } from "lucide-react";
 
 import type { FileSourceSummary } from "./file-source-picker";
-import type { Artifact, ArtifactPiiDetail } from "@cogniplane/shared-types";
+import type { Artifact } from "@cogniplane/shared-types";
 import { canPreviewArtifact } from "../lib/artifact-preview";
+import { PiiChip } from "./artifact-pii-chip";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
@@ -20,27 +21,13 @@ import {
   canSelectArtifact,
   formatArtifactStatus,
   formatFileSize,
-  formatPiiLabel,
-  getArtifactOrigin,
-  piiTone
+  getArtifactOrigin
 } from "./artifact-panel.logic";
 
-const PII_TONE_CLASS: Record<ReturnType<typeof piiTone>, string> = {
-  pending: "bg-accent-soft text-accent",
-  blocked: "bg-danger-surface text-danger",
-  failed: "bg-warning-surface text-warning",
-  transformed: "bg-warning-surface text-warning",
-  neutral: "bg-success-surface text-success"
+const ORIGIN_TONE_CLASS: Record<ReturnType<typeof getArtifactOrigin>["tone"], string> = {
+  accent: "bg-info-surface text-info",
+  neutral: "bg-[var(--artifact-chip-surface)] text-on-surface-variant"
 };
-
-function PiiChip({ pii }: { pii: ArtifactPiiDetail }) {
-  const label = formatPiiLabel(pii);
-  if (!label) return null;
-  const tone = PII_TONE_CLASS[piiTone(pii)];
-  return (
-    <span className={`rounded px-1.5 py-0.5 text-[0.62rem] font-semibold ${tone}`}>{label}</span>
-  );
-}
 
 function ArtifactRow(props: {
   artifact: Artifact;
@@ -54,10 +41,10 @@ function ArtifactRow(props: {
 }) {
   const { artifact } = props;
   const pii = artifact.detail?.pii;
-  const isMicrosoftSource = artifact.detail?.source === "microsoft";
+  const origin = getArtifactOrigin(artifact);
 
   return (
-    <article className="flex items-start gap-3 rounded-md bg-surface-container-lowest p-3">
+    <article className="flex items-start gap-3 rounded-md bg-[var(--artifact-card-surface)] p-3">
       <label className="flex min-w-0 flex-1 items-start gap-3 cursor-pointer">
         <input
           type="checkbox"
@@ -72,13 +59,11 @@ function ArtifactRow(props: {
               {artifact.artifactName}
             </strong>
             <span
-              className={`shrink-0 rounded px-1.5 py-0.5 text-[0.62rem] font-semibold ${
-                isMicrosoftSource
-                  ? "bg-accent-soft text-accent"
-                  : "bg-surface-container text-on-surface-variant"
+              className={`shrink-0 rounded px-1.5 py-0.5 text-label font-semibold ${
+                ORIGIN_TONE_CLASS[origin.tone]
               }`}
             >
-              {getArtifactOrigin(artifact)}
+              {origin.label}
             </span>
             {pii ? <PiiChip pii={pii} /> : null}
           </div>
@@ -162,7 +147,7 @@ function AddSourceMenu(props: {
                 <span className="flex items-center gap-1.5 font-medium">
                   {source.label}
                   {connected ? null : (
-                    <span className="rounded bg-warning-surface px-1.5 py-0.5 text-[0.6rem] font-semibold text-warning">
+                    <span className="rounded bg-warning-surface px-1.5 py-0.5 text-label font-semibold text-warning">
                       Not connected
                     </span>
                   )}
@@ -194,7 +179,42 @@ function AddSourceMenu(props: {
 
 export type ArtifactInventoryModel = {
   artifacts: Artifact[];
+  /** "loading" while the first load of the session runs, and "unavailable"
+   *  after it failed with nothing cached. The list is empty then because it is
+   *  not known, so the panel does not say that the session has no files. */
+  status?: "ready" | "loading" | "unavailable";
+  onRetry?: () => void;
+  retrying?: boolean;
 };
+
+/** A list that is not known yet, or could not be loaded. */
+function UnknownInventory({ status, onRetry, retrying }: {
+  status: "loading" | "unavailable";
+  onRetry?: () => void;
+  retrying?: boolean;
+}) {
+  return status === "loading" ? (
+    <p role="status" className="flex items-center gap-2 rounded-md bg-[var(--artifact-card-surface)] p-4 text-sm text-on-surface-variant">
+      <LoaderCircleIcon aria-hidden="true" className="size-4 shrink-0 motion-safe:animate-spin" /><span>Loading files…</span>
+    </p>
+  ) : (
+    <div className="rounded-md bg-[var(--artifact-card-surface)] p-4 text-sm">
+      <p className="flex items-center gap-2 font-medium text-on-surface"><CircleAlertIcon aria-hidden="true" className="size-4 shrink-0 text-danger" />Files did not load</p>
+      <p className="mt-1 text-on-surface-variant">The file list is unavailable. Try loading this session again.</p>
+      {onRetry ? <Button type="button" variant="outline" size="sm" className="mt-3 aria-disabled:opacity-50"
+        aria-disabled={retrying || undefined} aria-busy={retrying || undefined}
+        onClick={() => { if (!retrying) onRetry(); }}>{retrying ? "Retrying…" : "Try again"}</Button> : null}
+    </div>
+  );
+}
+
+function CountBadge({ count, known }: { count: number; known: boolean }) {
+  return (
+    <span aria-hidden={!known || undefined} className="min-w-5 rounded bg-surface-container px-1.5 py-0.5 text-label font-semibold tabular-nums text-on-surface-faint">
+      {known ? count : "–"}
+    </span>
+  );
+}
 
 export type ArtifactSelectionModel = {
   visibleSelectedArtifactIds: string[];
@@ -220,14 +240,17 @@ export type ArtifactSourcesModel = {
   onOpen: (sourceId: string) => void;
 };
 
-export function ArtifactPanel({ inventory, selection, transfers, preview, sources }: {
+export function ArtifactPanel({ inventory, selection, transfers, preview, sources, surface = "inline" }: {
   inventory: ArtifactInventoryModel;
   selection: ArtifactSelectionModel;
   transfers: ArtifactTransferModel;
   preview: ArtifactPreviewModel;
   sources: ArtifactSourcesModel;
+  surface?: "inline" | "raised";
 }) {
   const [tab, setTab] = useState<"context" | "artifacts">("context");
+  const status = inventory.status ?? "ready";
+  const known = status === "ready";
 
   const selectedIdSet = useMemo(
     () => new Set(selection.visibleSelectedArtifactIds),
@@ -238,20 +261,18 @@ export function ArtifactPanel({ inventory, selection, transfers, preview, source
   );
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col">
+    <section className={`flex min-h-0 flex-1 flex-col ${surface === "raised"
+      ? "[--artifact-card-surface:var(--color-surface-container)] [--artifact-chip-surface:var(--color-surface-container-high)]"
+      : "[--artifact-card-surface:var(--color-surface-container-lowest)] [--artifact-chip-surface:var(--color-surface-container)]"}`}>
       <Tabs value={tab} onValueChange={(value) => setTab(value as "context" | "artifacts")} className="flex min-h-0 flex-1 flex-col gap-0">
         <TabsList className="mx-4 mt-3 grid grid-cols-2">
           <TabsTrigger value="context" className="gap-2">
             Context
-            <span className="rounded bg-surface-container px-1.5 py-0.5 text-[0.62rem] font-semibold text-on-surface-faint">
-              {selectedArtifacts.length}
-            </span>
+            <CountBadge count={selectedArtifacts.length} known={known} />
           </TabsTrigger>
           <TabsTrigger value="artifacts" className="gap-2">
             Artifacts
-            <span className="rounded bg-surface-container px-1.5 py-0.5 text-[0.62rem] font-semibold text-on-surface-faint">
-              {inventory.artifacts.length}
-            </span>
+            <CountBadge count={inventory.artifacts.length} known={known} />
           </TabsTrigger>
         </TabsList>
 
@@ -275,8 +296,10 @@ export function ArtifactPanel({ inventory, selection, transfers, preview, source
                 />
               ))}
             </div>
+          ) : status !== "ready" ? (
+            <UnknownInventory status={status} onRetry={inventory.onRetry} retrying={inventory.retrying} />
           ) : (
-            <div className="rounded-md bg-surface-container-lowest p-4 text-sm">
+            <div className="rounded-md bg-[var(--artifact-card-surface)] p-4 text-sm">
               <p className="font-medium text-on-surface">No documents in play</p>
               <p className="text-on-surface-variant">
                 Use &ldquo;Add source&rdquo; to upload a file or pull one from a connected provider.
@@ -311,8 +334,10 @@ export function ArtifactPanel({ inventory, selection, transfers, preview, source
                 />
               ))}
             </div>
+          ) : status !== "ready" ? (
+            <UnknownInventory status={status} onRetry={inventory.onRetry} retrying={inventory.retrying} />
           ) : (
-            <div className="rounded-md bg-surface-container-lowest p-4 text-sm">
+            <div className="rounded-md bg-[var(--artifact-card-surface)] p-4 text-sm">
               <p className="font-medium text-on-surface">No artifacts yet</p>
               <p className="text-on-surface-variant">
                 Files generated by the agent during this session appear here.

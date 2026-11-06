@@ -82,7 +82,7 @@ describe.skipIf(!adminDatabaseUrl())("admin MCP connection tests", () => {
     const saved = (await servers.getAdminMcpServer(tenant.tenantId, serverId))!;
     await credentials.save(tenant.tenantId, tenant.userId, serverId, {
       version: 0, serverVersion: saved.version, secret: "first-personal-secret", accountLabel: null
-    });
+    }, null);
     const forward = vi.fn(async (_url, request) => rpcOk(request.id, {
       tools: [{ name: "search", inputSchema: { type: "object" } }]
     }));
@@ -97,7 +97,7 @@ describe.skipIf(!adminDatabaseUrl())("admin MCP connection tests", () => {
     expect((await tester.listLatest(tenant.tenantId, tenant.userId, [saved])).size).toBe(1);
     await credentials.save(tenant.tenantId, tenant.userId, serverId, {
       version: 1, serverVersion: saved.version, secret: "new-personal-secret", accountLabel: null
-    });
+    }, null);
     expect((await tester.listLatest(tenant.tenantId, tenant.userId, [saved])).size).toBe(0);
   });
 });

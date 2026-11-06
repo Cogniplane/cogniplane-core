@@ -1,11 +1,12 @@
 import { describe, expect, test, vi } from "vitest";
 import { ToolContextUnavailableError, type ToolExecutionContext } from "../auth/tool-execution-context-store.js";
-import { resolveBoundToolContext } from "./tool-context-binder.js";
+import { resolveBoundToolContext, TOOL_CONTEXT_UNAVAILABLE_MESSAGE } from "./tool-context-binder.js";
 
-test.each([new Error("database password leaked"), new ToolContextUnavailableError("context")])(
-  "context lookup exposes only known domain errors", async (error) => {
+// The model reads the answer and the checkpoint keeps it, so it names no context ID.
+test.each([new Error("database password leaked"), new ToolContextUnavailableError("ctx_trusted_id")])(
+  "context lookup exposes only known domain errors, without the context ID", async (error) => {
     const result = await resolveBoundToolContext({
-      rpc: { id: 1 }, tenantId: "tenant", args: { toolContextId: "context" },
+      rpc: { id: 1 }, tenantId: "tenant", args: { toolContextId: "ctx_trusted_id" },
       metadataToolContextId: null, urlToolContextId: null, sessionIdFromRuntimeToken: "session",
       runtimeTokenClaims: { jti: "token", sid: "session", tid: "tenant", uid: "user", rid: "runtime" },
       toolContexts: {
@@ -14,9 +15,10 @@ test.each([new Error("database password leaked"), new ToolContextUnavailableErro
       }
     });
     expect(result).toMatchObject({ error: { error: {
-      message: error instanceof ToolContextUnavailableError ? error.message : "Tool context lookup failed."
+      message: error instanceof ToolContextUnavailableError ? TOOL_CONTEXT_UNAVAILABLE_MESSAGE : "Tool context lookup failed."
     } } });
     expect(JSON.stringify(result)).not.toContain("database password");
+    expect(JSON.stringify(result)).not.toContain("ctx_trusted_id");
   }
 );
 

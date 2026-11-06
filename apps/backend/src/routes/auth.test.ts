@@ -1,4 +1,5 @@
 import { test, expect, describe, beforeEach, vi } from "vitest";
+import { decodeJwt } from "jose";
 import Fastify, { type FastifyInstance } from "fastify";
 import cookie from "@fastify/cookie";
 
@@ -19,6 +20,18 @@ import type {
 // ──────────────────────────────────────────────────────────────────────────
 // Pure-helper coverage (kept from the original auth.test.ts).
 // ──────────────────────────────────────────────────────────────────────────
+
+
+/**
+ * The membership upsert as Postgres answers it: an existing row keeps its
+ * role (`inserted` false); a new row takes the role the code sends.
+ */
+function membershipUpsert(existingRole: string | null) {
+  return (_text: string, values: unknown[]) =>
+    existingRole
+      ? { rows: [{ role: existingRole, inserted: false }], rowCount: 1 }
+      : { rows: [{ role: values[2], inserted: true }], rowCount: 1 };
+}
 
 test("resolveTenantMembershipRole preserves an existing owner role", () => {
   expect(resolveTenantMembershipRole({
@@ -109,15 +122,31 @@ describe("timingSafeEqualString", () => {
 // ──────────────────────────────────────────────────────────────────────────
 
 const TEST_CONFIG = createTestConfig({
-  AUTH_MODE: "workos",
+  AUTH_MODE: "jwt",
+  AUTH_LOGIN_TYPES: ["workos"],
   WORKOS_API_KEY: "test-workos-api-key",
   WORKOS_CLIENT_ID: "test-client-id",
   WORKOS_REDIRECT_URI: "https://test.example/auth/callback"
 });
 const TEST_PKCE_VERIFIER = "v".repeat(43);
 
+type AuthStateRow = {
+  role: string;
+  login_type: string;
+  auth_source: string;
+  local_status?: string | null;
+  security_version?: number | null;
+};
+
 type Harness = {
   app: FastifyInstance;
+  /**
+   * `app.inject` without the default frontend Origin, for the CSRF cases.
+   * `app.inject` itself adds `Origin: API_ORIGIN` when a test sends none.
+   */
+  rawInject: FastifyInstance["inject"];
+  /** What the membership lookup of refresh returns. null = not a member. */
+  authState: { current: AuthStateRow | null; fail?: boolean };
   pool: FakePool;
   redis: FakeRefreshTokenRedis;
   workosMocks: FakeWorkOSHandlers;
@@ -127,18 +156,31 @@ type Harness = {
 async function buildHarness(opts: {
   authPreHandler?: (request: { auth?: { userId: string; tenantId: string; isAdmin: boolean; role: "owner" | "admin" | "member" } & { email?: string } }) => void;
   limits?: RequestLimitsInterface;
+  /** Receives every log line at warn level or higher. */
+  logLines?: Array<{ level: number; msg: string } & Record<string, unknown>>;
 } = {}): Promise<Harness> {
   const pool = new FakePool();
   const redis = new FakeRefreshTokenRedis();
   const { workos, mocks } = createFakeWorkOS();
   const auditEvents = new InMemoryAuditEventStore();
+  const authState: Harness["authState"] = {
+    current: { role: "member", login_type: "workos", auth_source: "workos" }
+  };
+  // Registered first, so it wins over any test handler for the same query.
+  pool.onQuery(/SELECT tm\.role, t\.login_type, u\.auth_source/, () => {
+    if (authState.fail) throw new Error("connection terminated unexpectedly");
+    return authState.current ? { rows: [authState.current], rowCount: 1 } : { rows: [], rowCount: 0 };
+  });
 
-  const app = Fastify();
+  const logLines = opts.logLines;
+  const app = logLines
+    ? Fastify({ logger: { level: "warn", stream: { write: (line: string) => { logLines.push(JSON.parse(line)); } } } })
+    : Fastify();
   app.decorate("redis", redis.asAppRedis());
   await app.register(cookie);
 
   // Tests that hit auth-protected routes (/auth/me, /auth/organizations)
-  // need `request.auth` populated. We don't run the real `workosAuth`
+  // need `request.auth` populated. We don't run the real `jwtAuth`
   // middleware here — the auth route file doesn't ship middleware itself,
   // and we want to exercise the handler logic, not re-test JWT decode.
   if (opts.authPreHandler) {
@@ -155,7 +197,15 @@ async function buildHarness(opts: {
     workos
   });
 
-  return { app, pool, redis, workosMocks: mocks, auditEvents };
+  // Browsers send Origin on every POST; most tests are the real frontend.
+  const rawInject = app.inject.bind(app) as FastifyInstance["inject"];
+  (app as { inject: unknown }).inject = (opts: Record<string, unknown>) =>
+    rawInject({
+      ...opts,
+      headers: { origin: TEST_CONFIG.API_ORIGIN, ...(opts.headers as Record<string, string> | undefined) }
+    } as never);
+
+  return { app, rawInject, authState, pool, redis, workosMocks: mocks, auditEvents };
 }
 
 function parseSetCookie(header: string | string[] | undefined, name: string): {
@@ -186,6 +236,23 @@ function parseSetCookie(header: string | string[] | undefined, name: string): {
     return { value, attrs };
   }
   return null;
+}
+
+// A deletion only works cross-site with the attributes the cookie was set
+// with: a browser ignores a cross-site Set-Cookie without SameSite=None; Secure.
+function expectRefreshCookieCleared(header: string | string[] | undefined) {
+  const cleared = parseSetCookie(header, "cogniplane_refresh");
+  expect(cleared).not.toBeNull();
+  expect(cleared!.value).toBe("");
+  expect(cleared!.attrs).toMatchObject({ path: "/auth", httponly: true, secure: true });
+  expect(String(cleared!.attrs.samesite).toLowerCase()).toBe("none");
+  expect(cleared!.attrs["max-age"] === "0" || cleared!.attrs.expires !== undefined).toBe(true);
+}
+
+// A refusal of /auth/refresh keeps the refresh cookie: the browser can hold a
+// newer cookie from another tab when the answer arrives (auth-session.ts).
+function expectRefreshCookieKept(header: string | string[] | undefined) {
+  expect(parseSetCookie(header, "cogniplane_refresh")).toBeNull();
 }
 
 const RATE_LIMIT_PAYLOAD: LimitExceededErrorPayload = {
@@ -396,11 +463,11 @@ describe("POST /auth/callback", () => {
     // DB choreography: every multi-statement upsert returns the expected row.
     harness.pool
       .onQuery(/INSERT INTO tenants/, () => ({
-        rows: [{ tenant_id: "tenant-uuid-1" }],
+        rows: [{ login_type: "workos", tenant_id: "tenant-uuid-1" }],
         rowCount: 1
       }))
       // No row holds this email yet → the INSERT path.
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
         rows: [],
         rowCount: 0
       }))
@@ -413,12 +480,7 @@ describe("POST /auth/callback", () => {
         rows: [{ cnt: "0" }],
         rowCount: 1
       }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        // No existing membership → previousRole undefined → no role_changed audit
-        rows: [],
-        rowCount: 0
-      }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO tenant_memberships/, membershipUpsert(null));
 
     const res = await harness.app.inject({
       method: "POST",
@@ -436,6 +498,10 @@ describe("POST /auth/callback", () => {
     expect(body.user.userId).toBe("user-uuid-1");
     expect(body.user.tenantId).toBe("tenant-uuid-1");
     expect(body.accessToken.length).toBeGreaterThan(0);
+    // The session records how and when the user signed in.
+    const claims = decodeJwt(body.accessToken);
+    expect(claims.amr).toEqual(["workos"]);
+    expect(Math.abs((claims.auth_time as number) - Date.now() / 1000)).toBeLessThan(60);
     expect(harness.workosMocks.authenticateWithCode).toHaveBeenCalledWith({
       code: "valid-code",
       clientId: "test-client-id",
@@ -461,34 +527,27 @@ describe("POST /auth/callback", () => {
     expect(harness.auditEvents.events.filter((e) => e.type === "role_changed")).toHaveLength(0);
   });
 
-  // A WorkOS user deleted and re-created reuses the email under a NEW
-  // workos_user_id. The users upsert can only name one conflict target, so
-  // before this the INSERT hit the email unique constraint and 500'd a
-  // legitimate login.
-  test("a recycled WorkOS identity reusing an existing email logs in instead of 500ing", async () => {
+  // An email row with no WorkOS id (a seed row, or a local user, who never
+  // has one) is not adopted by whoever signs in with that email. Adoption
+  // would hand the row's data over without proof that the email is verified
+  // or that the row belongs to this organization's tenant.
+  test.each([
+    ["a row with no WorkOS id", { auth_source: "workos" }],
+    ["a local user's row", { auth_source: "local" }]
+  ])("an email held by %s is refused with 409, not adopted", async (_case, row) => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
-    let insertAttempted = false;
+    let userWritten = false;
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
-      // The email is already held, by a row that was never bound to a WorkOS id.
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
-        rows: [{ user_id: "existing-user", workos_user_id: null }],
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
+        rows: [{ user_id: "existing-user", workos_user_id: null, ...row }],
         rowCount: 1
       }))
-      .onQuery(/INSERT INTO users/, () => {
-        insertAttempted = true;
-        throw Object.assign(new Error("duplicate key value violates unique constraint"), {
-          code: "23505"
-        });
-      })
-      .onQuery(/UPDATE users/, () => ({ rows: [{ user_id: "existing-user" }], rowCount: 1 }))
-      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({
-        rows: [{ cnt: "5" }],
-        rowCount: 1
-      }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({ rows: [], rowCount: 0 }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO users|UPDATE users|INSERT INTO tenant_memberships/, () => {
+        userWritten = true;
+        return { rows: [{ user_id: "existing-user" }], rowCount: 1 };
+      });
 
     const res = await harness.app.inject({
       method: "POST",
@@ -500,10 +559,65 @@ describe("POST /auth/callback", () => {
       payload: { code: "code-1", state: "the-state" }
     });
 
-    expect(res.statusCode).toBe(200);
-    // The existing row is rebound rather than re-inserted — an INSERT here
-    // would collide on the email constraint the ON CONFLICT target misses.
-    expect(insertAttempted).toBe(false);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: "email_in_use" });
+    expect(userWritten).toBe(false);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+  });
+
+  // A WorkOS organization whose tenant uses
+  // another login type gets no session, and the provisioning transaction
+  // rolls back before any user or membership write.
+  test("refuses an organization whose tenant does not use WorkOS login (403)", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+
+    let laterQuery = false;
+    harness.pool
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "local", tenant_id: "t-local" }], rowCount: 1 }))
+      .onQuery(/FROM users|INSERT INTO users|tenant_memberships/, () => {
+        laterQuery = true;
+        return { rows: [], rowCount: 0 };
+      });
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload: { code: "code-1", state: "the-state" }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "wrong_login_type" });
+    expect(laterQuery).toBe(false);
+    expect(harness.pool.queries.some((q) => q.text.trim() === "ROLLBACK")).toBe(true);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+  });
+
+  // The callback creates a session, so a hostile page must not post a code of
+  // its own (login CSRF).
+  test.each([
+    ["a cross-site Origin", { origin: "https://evil.example" }, { code: "valid-code", state: "the-state" }, 403],
+    ["no Origin", {}, { code: "valid-code", state: "the-state" }, 403],
+    ["a text body type", { origin: "http://localhost:3000", "content-type": "text/plain" }, "code=valid-code&state=the-state", 415],
+    ["no body type", { origin: "http://localhost:3000" }, undefined, 415]
+  ] as const)("rejects %s before exchanging the code", async (_case, headers, payload, status) => {
+    const res = await harness.rawInject({
+      method: "POST",
+      url: "/auth/callback",
+      headers,
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload
+    });
+
+    expect(res.statusCode).toBe(status);
+    expect(res.json()).toEqual({ error: status === 403 ? "csrf_origin_mismatch" : "unsupported_media_type" });
+    expect(harness.workosMocks.authenticateWithCode).not.toHaveBeenCalled();
   });
 
   // The other side of the same lookup: taking over an email that a DIFFERENT
@@ -513,8 +627,8 @@ describe("POST /auth/callback", () => {
 
     let membershipWritten = false;
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
         rows: [{ user_id: "someone-else", workos_user_id: "workos-someone-else" }],
         rowCount: 1
       }))
@@ -549,16 +663,15 @@ describe("POST /auth/callback", () => {
     harness.pool
       .onQuery(/INSERT INTO tenants/, (text) => {
         tenantUpsertSql = text;
-        return { rows: [{ tenant_id: "t1" }], rowCount: 1 };
+        return { rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 };
       })
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({
         rows: [{ cnt: "5" }],
         rowCount: 1
       }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({ rows: [{ role: "member" }], rowCount: 1 }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO tenant_memberships/, membershipUpsert("member"));
 
     const res = await harness.app.inject({
       method: "POST",
@@ -580,15 +693,11 @@ describe("POST /auth/callback", () => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "owner" }],
-        rowCount: 1
-      }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO tenant_memberships/, membershipUpsert("owner"));
 
     const res = await harness.app.inject({
       method: "POST",
@@ -608,15 +717,11 @@ describe("POST /auth/callback", () => {
     seedWorkOSHappyPath({ workosRoleSlug: "admin" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "member" }],
-        rowCount: 1
-      }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO tenant_memberships/, membershipUpsert("member"));
 
     const res = await harness.app.inject({
       method: "POST",
@@ -638,15 +743,11 @@ describe("POST /auth/callback", () => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ tenant_id: "t1" }], rowCount: 1 }))
-      .onQuery(/SELECT user_id, workos_user_id FROM users WHERE email/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "admin" }],
-        rowCount: 1
-      }))
-      .onQuery(/INSERT INTO tenant_memberships/, () => ({ rows: [], rowCount: 1 }));
+      .onQuery(/INSERT INTO tenant_memberships/, membershipUpsert("admin"));
 
     const res = await harness.app.inject({
       method: "POST",
@@ -778,10 +879,6 @@ describe("POST /auth/refresh", () => {
     await issueRefreshJti(harness.redis, { jti: oldJti, familyId, ttlSeconds: 60 });
 
     harness.pool
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "admin" }],
-        rowCount: 1
-      }))
       .onQuery(/SELECT email FROM users/, () => ({
         rows: [{ email: "alice@example.com" }],
         rowCount: 1
@@ -826,10 +923,6 @@ describe("POST /auth/refresh", () => {
     await issueRefreshJti(harness.redis, { jti: oldJti, familyId, ttlSeconds: 60 });
 
     harness.pool
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "member" }],
-        rowCount: 1
-      }))
       .onQuery(/SELECT email FROM users/, () => ({
         rows: [{ email: "concurrent@example.com" }],
         rowCount: 1
@@ -857,7 +950,7 @@ describe("POST /auth/refresh", () => {
     ).toHaveLength(0);
   });
 
-  test("replay of an already-consumed jti revokes the family, emits audit, clears cookie, returns 401", async () => {
+  test("replay of an already-consumed jti revokes the family, emits audit, keeps the cookie, returns 401", async () => {
     const familyId = "fid-replay";
     const jti = "jti-replayed";
     const refreshToken = await signRefreshToken(TEST_CONFIG, {
@@ -892,11 +985,154 @@ describe("POST /auth/refresh", () => {
     expect(reuseAudits[0]!.payload).toEqual({ familyId });
     expect(reuseAudits[0]!.userId).toBe("user-2");
 
-    // Cookie cleared.
-    const cleared = parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh");
-    expect(cleared).not.toBeNull();
-    expect(cleared!.attrs.path).toBe("/auth");
-    expect(cleared!.attrs["max-age"] ?? cleared!.attrs.expires).toBeDefined();
+    // The cookie stays: the browser can hold a newer one from another tab.
+    expectRefreshCookieKept(res.headers["set-cookie"]);
+
+    // The kept cookie is dead: it gets 401 again, with no loop and no second audit.
+    const again = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+    expect(again.statusCode).toBe(401);
+    expect(again.json()).toEqual({ error: "token_revoked" });
+    expect(
+      harness.auditEvents.events.filter((e) => e.type === "auth.refresh_token_reuse_detected")
+    ).toHaveLength(1);
+  });
+
+  // The theft event must not depend on the database at the moment of the
+  // detection (Beads issue q4w0.18). A 503 would
+  // be lost: the client's retry finds the family revoked, and a revoked
+  // family does not detect reuse again.
+  describe("a reuse detection whose audit write fails", () => {
+    type LogLine = { level: number; msg: string } & Record<string, unknown>;
+    const ERROR = 50;
+
+    async function replayHarness(tag: string) {
+      const logLines: LogLine[] = [];
+      const h = await buildHarness({ logLines });
+      const familyId = `fid-${tag}`;
+      const jti = `jti-${tag}`;
+      const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-t", tid: "tenant-t", jti, fid: familyId });
+      // Issue, then consume: the next presentation of this jti is a replay.
+      await issueRefreshJti(h.redis, { jti, familyId, ttlSeconds: 60 });
+      await h.redis.getdel(`refresh_jti:${jti}`);
+      const send = () => h.app.inject({
+        method: "POST",
+        url: "/auth/refresh",
+        headers: { "user-agent": "thief-agent" },
+        cookies: { cogniplane_refresh: refreshToken }
+      });
+      const reuseEvents = () => h.auditEvents.events.filter((e) => e.type === "auth.refresh_token_reuse_detected");
+      const marker = () => h.redis.store.get(`refresh_reuse_unaudited:${familyId}`);
+      return { ...h, logLines, familyId, send, reuseEvents, marker };
+    }
+
+    test("still answers 401 with the family revoked, logs an error, and keeps a marker", async () => {
+      const h = await replayHarness("audit-down");
+      vi.spyOn(h.auditEvents, "create").mockRejectedValueOnce(new Error("connection terminated unexpectedly"));
+
+      const res = await h.send();
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toEqual({ error: "token_revoked" });
+      expect(h.redis.store.get(`refresh_family:${h.familyId}`)).toBe("revoked");
+      expectRefreshCookieKept(res.headers["set-cookie"]);
+      expect(h.reuseEvents()).toEqual([]);
+      const errors = h.logLines.filter((line) => line.level >= ERROR);
+      expect(errors.map((line) => line.msg)).toEqual([
+        "auth refresh: SECURITY: the audit event of a refresh-token reuse failed; the family is revoked"
+      ]);
+      expect(errors[0]).toMatchObject({ userId: "user-t", tenantId: "tenant-t", familyId: h.familyId });
+      expect(JSON.parse(h.marker()!)).toMatchObject({ tenantId: "tenant-t", userId: "user-t", userAgent: "thief-agent" });
+      // The marker lives as long as the revoked family state.
+      expect(h.redis.setCalls.find((call) => call.key === `refresh_reuse_unaudited:${h.familyId}`)?.ttlSeconds)
+        .toBe(h.redis.setCalls.find((call) => call.key === `refresh_family:${h.familyId}` && call.value === "revoked")?.ttlSeconds);
+    });
+
+    test("the next refusal of the family writes the event once, with the time of the detection", async () => {
+      const h = await replayHarness("audit-late");
+      vi.spyOn(h.auditEvents, "create").mockRejectedValueOnce(new Error("connection terminated unexpectedly"));
+      await h.send();
+      const { detectedAt } = JSON.parse(h.marker()!) as { detectedAt: string };
+
+      const retried = await h.send();
+
+      expect(retried.statusCode).toBe(401);
+      expect(retried.json()).toEqual({ error: "token_revoked" });
+      expect(h.reuseEvents()).toHaveLength(1);
+      expect(h.reuseEvents()[0]).toMatchObject({ userId: "user-t", payload: { familyId: h.familyId, detectedAt } });
+      expect(h.marker()).toBeUndefined();
+
+      // A later refusal writes no second event.
+      const again = await h.send();
+      expect(again.statusCode).toBe(401);
+      expect(h.reuseEvents()).toHaveLength(1);
+    });
+
+    test("a late write that fails again keeps the marker for the next refusal", async () => {
+      const h = await replayHarness("audit-down-twice");
+      vi.spyOn(h.auditEvents, "create")
+        .mockRejectedValueOnce(new Error("connection terminated unexpectedly"))
+        .mockRejectedValueOnce(new Error("connection terminated unexpectedly"));
+      await h.send();
+
+      const retried = await h.send();
+
+      expect(retried.statusCode).toBe(401);
+      expect(retried.json()).toEqual({ error: "token_revoked" });
+      expect(h.reuseEvents()).toEqual([]);
+      expect(h.marker()).toBeDefined();
+      expect(h.logLines.filter((line) => line.level >= ERROR).map((line) => line.msg)).toContain(
+        "auth refresh: SECURITY: the late audit event of a refresh-token reuse failed again; the marker stays"
+      );
+
+      await h.send();
+      expect(h.reuseEvents()).toHaveLength(1);
+      expect(h.marker()).toBeUndefined();
+    });
+
+    test("answers 401 and logs the detection when the marker cannot be written either", async () => {
+      const h = await replayHarness("audit-and-marker-down");
+      vi.spyOn(h.auditEvents, "create").mockRejectedValueOnce(new Error("connection terminated unexpectedly"));
+      const set = h.redis.set.bind(h.redis);
+      vi.spyOn(h.redis, "set").mockImplementation(async (key, value, mode, ttl) => {
+        if (key.startsWith("refresh_reuse_unaudited:")) throw new Error("redis unavailable");
+        return set(key, value, mode, ttl);
+      });
+
+      const res = await h.send();
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toEqual({ error: "token_revoked" });
+      expect(h.redis.store.get(`refresh_family:${h.familyId}`)).toBe("revoked");
+      const errors = h.logLines.filter((line) => line.level >= ERROR);
+      expect(errors.map((line) => line.msg)).toEqual([
+        "auth refresh: SECURITY: the audit event of a refresh-token reuse failed; the family is revoked",
+        "auth refresh: SECURITY: a refresh-token reuse has no audit event and no marker; this log is the only record"
+      ]);
+      expect(errors[1]).toMatchObject({ userId: "user-t", tenantId: "tenant-t", familyId: h.familyId });
+    });
+
+    test("a failed revoke answers 503 with the family active, and the retry revokes and audits", async () => {
+      const h = await replayHarness("revoke-down");
+      vi.spyOn(h.redis, "set").mockRejectedValueOnce(new Error("redis unavailable"));
+
+      const failed = await h.send();
+
+      expect(failed.statusCode).toBe(503);
+      expect(failed.json()).toEqual({ error: "refresh_unavailable" });
+      expect(h.redis.store.get(`refresh_family:${h.familyId}`)).toBe("active");
+      expect(h.reuseEvents()).toEqual([]);
+
+      const retried = await h.send();
+
+      expect(retried.statusCode).toBe(401);
+      expect(h.redis.store.get(`refresh_family:${h.familyId}`)).toBe("revoked");
+      expect(h.reuseEvents()).toHaveLength(1);
+      expect(h.reuseEvents()[0]!.payload).toEqual({ familyId: h.familyId });
+    });
   });
 
   test("refresh against a revoked family returns 401 without re-revoking", async () => {
@@ -924,9 +1160,10 @@ describe("POST /auth/refresh", () => {
     expect(
       harness.auditEvents.events.filter((e) => e.type === "auth.refresh_token_reuse_detected")
     ).toHaveLength(0);
+    expectRefreshCookieKept(res.headers["set-cookie"]);
   });
 
-  test("refresh past the absolute session lifetime revokes the family and clears the cookie", async () => {
+  test("refresh past the absolute session lifetime revokes the family and keeps the cookie", async () => {
     const familyId = "fid-absolute-expiry";
     const jti = "jti-absolute-expiry";
     const refreshToken = await signRefreshToken(TEST_CONFIG, {
@@ -951,8 +1188,16 @@ describe("POST /auth/refresh", () => {
     expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({ error: "session_expired" });
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
-    const cleared = parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh");
-    expect(cleared?.attrs.path).toBe("/auth");
+    expectRefreshCookieKept(res.headers["set-cookie"]);
+
+    // The kept cookie is dead: the next refresh gets 401 token_revoked.
+    const again = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+    expect(again.statusCode).toBe(401);
+    expect(again.json()).toEqual({ error: "token_revoked" });
   });
 
   test("returns 403 when the user is no longer a tenant member", async () => {
@@ -966,10 +1211,7 @@ describe("POST /auth/refresh", () => {
     });
     await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
 
-    harness.pool.onQuery(/SELECT role FROM tenant_memberships/, () => ({
-      rows: [],
-      rowCount: 0
-    }));
+    harness.authState.current = null;
 
     const res = await harness.app.inject({
       method: "POST",
@@ -979,6 +1221,36 @@ describe("POST /auth/refresh", () => {
 
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: "not_a_member" });
+    // The session ends for good: the family is revoked, so the token cannot
+    // work again if the membership comes back. The cookie stays.
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
+    expectRefreshCookieKept(res.headers["set-cookie"]);
+  });
+
+  // If the revoke itself fails, the family is still active. A final 403 would
+  // then be false: the same token would work again once the membership came
+  // back. The route answers a retryable 503 and keeps the cookie instead.
+  test("a failed family revoke after a refused membership is retryable, not final", async () => {
+    const familyId = "fid-revoke-fails";
+    const jti = "jti-revoke-fails";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-r", tid: "tenant-r", jti, fid: familyId });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+    harness.authState.current = null;
+    vi.spyOn(harness.redis, "set").mockRejectedValueOnce(new Error("redis unavailable"));
+
+    const failed = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).toEqual({ error: "refresh_unavailable" });
+    expect(failed.headers["retry-after"]).toBe("1");
+    expect(parseSetCookie(failed.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
+
+    const retried = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(retried.statusCode).toBe(403);
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
+    expectRefreshCookieKept(retried.headers["set-cookie"]);
   });
 
   // A transient failure AFTER the jti is claimed is the dangerous case: the
@@ -995,16 +1267,13 @@ describe("POST /auth/refresh", () => {
     });
     await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
 
-    let failMembershipLookup = true;
-    harness.pool
-      .onQuery(/SELECT role FROM tenant_memberships/, () => {
-        if (failMembershipLookup) throw new Error("connection terminated unexpectedly");
-        return { rows: [{ role: "admin" }], rowCount: 1 };
-      })
-      .onQuery(/SELECT email FROM users/, () => ({
-        rows: [{ email: "alice@example.com" }],
-        rowCount: 1
-      }));
+    // The email read is the database call after the claim; the membership
+    // lookup runs before the claim.
+    let failEmailLookup = true;
+    harness.pool.onQuery(/SELECT email FROM users/, () => {
+      if (failEmailLookup) throw new Error("connection terminated unexpectedly");
+      return { rows: [{ email: "alice@example.com" }], rowCount: 1 };
+    });
 
     const failed = await harness.app.inject({
       method: "POST",
@@ -1024,7 +1293,7 @@ describe("POST /auth/refresh", () => {
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
 
     // The retry succeeds rather than tripping replay detection.
-    failMembershipLookup = false;
+    failEmailLookup = false;
     const retried = await harness.app.inject({
       method: "POST",
       url: "/auth/refresh",
@@ -1074,16 +1343,119 @@ describe("POST /auth/refresh", () => {
     expect(consumeRateLimit).not.toHaveBeenCalled();
   });
 
-  test("rejects a cross-site Referer when no Origin is sent (403)", async () => {
-    const res = await harness.app.inject({
+  // Browsers send Origin on every POST, so a request without one is not the
+  // frontend. The earlier guard let a request with neither header through.
+  test.each([
+    ["no Origin and a cross-site Referer", { referer: "https://evil.example/attack" }],
+    ["no Origin and a same-site Referer", { referer: "http://localhost:3000/chat" }],
+    ["neither Origin nor Referer", {}],
+    ["Origin null", { origin: "null" }]
+  ])("rejects a request with %s (403)", async (_case, headers) => {
+    const res = await harness.rawInject({
       method: "POST",
       url: "/auth/refresh",
-      headers: { referer: "https://evil.example/attack" },
+      headers,
       cookies: { cogniplane_refresh: "anything" }
     });
 
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: "csrf_origin_mismatch" });
+  });
+
+  // A form post from a hostile page has a form body type. Bodyless calls and
+  // JSON stay allowed while older frontends still send no body.
+  // text/plain is a body type a hostile page can send without a preflight,
+  // and Fastify parses it, so this is the guard's own refusal. (Fastify itself
+  // refuses a form body type before the route runs.)
+  test("rejects a non-JSON body type, accepts no body and JSON", async () => {
+    const text = await harness.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      headers: { "content-type": "text/plain" },
+      payload: "a=1"
+    });
+    expect(text.statusCode).toBe(415);
+    expect(text.json()).toEqual({ error: "unsupported_media_type" });
+
+    for (const call of [{}, { payload: {} }]) {
+      const res = await harness.app.inject({ method: "POST", url: "/auth/refresh", ...call });
+      expect(res.json()).toEqual({ error: "missing_refresh_token" });
+    }
+  });
+
+  // See docs/ARCHITECTURE.md, "Authentication": the membership decides
+  // before every answer, also the cached successor of a concurrent rotation,
+  // which returns before any other database read.
+  test("does not return a cached rotation result after the membership is gone", async () => {
+    const familyId = "fid-cached";
+    const jti = "jti-cached";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-c", tid: "tenant-c", jti, fid: familyId });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+    harness.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "c@example.com" }], rowCount: 1 }));
+
+    const first = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+    expect(first.statusCode).toBe(200);
+
+    // The same token again, inside the grace window, would get the cached
+    // result. The member was removed in between.
+    harness.authState.current = null;
+    const second = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(second.statusCode).toBe(403);
+    expect(second.json()).toEqual({ error: "not_a_member" });
+    expect(second.json()).not.toHaveProperty("accessToken");
+  });
+
+  test("refuses a member whose login path is not the tenant's (403)", async () => {
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-m", tid: "tenant-m", jti: "jti-m", fid: "fid-m" });
+    await issueRefreshJti(harness.redis, { jti: "jti-m", familyId: "fid-m", ttlSeconds: 60 });
+    harness.authState.current = { role: "member", login_type: "workos", auth_source: "local", local_status: "active", security_version: 0 };
+
+    const res = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "login_type_not_allowed" });
+    expectRefreshCookieKept(res.headers["set-cookie"]);
+  });
+
+  // The token is untouched before the claim, so a database failure there is a
+  // retryable 503 and the same cookie still works afterwards.
+  test("a membership lookup failure answers 503 without consuming the token", async () => {
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-f", tid: "tenant-f", jti: "jti-f", fid: "fid-f" });
+    await issueRefreshJti(harness.redis, { jti: "jti-f", familyId: "fid-f", ttlSeconds: 60 });
+    harness.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "f@example.com" }], rowCount: 1 }));
+    harness.authState.fail = true;
+
+    const failed = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).toEqual({ error: "refresh_unavailable" });
+    expect(failed.headers["retry-after"]).toBe("1");
+    expect(harness.redis.store.get("refresh_jti:jti-f")).toBe("fid-f");
+
+    harness.authState.fail = false;
+    const retried = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+    expect(retried.statusCode).toBe(200);
+  });
+
+  test("keeps the sign-in method and time of the session it renews", async () => {
+    const authTime = Math.floor(Date.now() / 1000) - 3600;
+    const refreshToken = await signRefreshToken(TEST_CONFIG, {
+      sub: "user-s", tid: "tenant-s", jti: "jti-s", fid: "fid-s", amr: ["workos"], auth_time: authTime
+    });
+    await issueRefreshJti(harness.redis, { jti: "jti-s", familyId: "fid-s", ttlSeconds: 60 });
+    harness.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "s@example.com" }], rowCount: 1 }));
+
+    const res = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+
+    expect(res.statusCode).toBe(200);
+    const access = decodeJwt((res.json() as { accessToken: string }).accessToken);
+    const refresh = decodeJwt(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")!.value);
+    for (const claims of [access, refresh]) {
+      expect(claims.amr).toEqual(["workos"]);
+      // A refresh never moves auth_time forward.
+      expect(claims.auth_time).toBe(authTime);
+    }
   });
 
   test("allows a same-origin Origin matching API_ORIGIN", async () => {
@@ -1098,10 +1470,6 @@ describe("POST /auth/refresh", () => {
     await issueRefreshJti(harness.redis, { jti: oldJti, familyId, ttlSeconds: 60 });
 
     harness.pool
-      .onQuery(/SELECT role FROM tenant_memberships/, () => ({
-        rows: [{ role: "admin" }],
-        rowCount: 1
-      }))
       .onQuery(/SELECT email FROM users/, () => ({
         rows: [{ email: "alice@example.com" }],
         rowCount: 1
@@ -1149,9 +1517,7 @@ describe("POST /auth/logout", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true });
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
-    const cleared = parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh");
-    expect(cleared).not.toBeNull();
-    expect(cleared!.attrs.path).toBe("/auth");
+    expectRefreshCookieCleared(res.headers["set-cookie"]);
   });
 
   test("tolerates an absent refresh cookie (no Redis writes, 200)", async () => {
@@ -1295,6 +1661,24 @@ describe("GET /auth/organizations", () => {
     expect(res.statusCode).toBe(401);
   });
 
+  test("refuses a local user without calling WorkOS (403)", async () => {
+    const harness = await buildHarness({
+      authPreHandler: (request) => {
+        request.auth = { userId: "u-local", tenantId: "t", isAdmin: false, role: "member" };
+      }
+    });
+    harness.pool.onQuery(/workos_user_id, auth_source FROM users/, () => ({
+      rows: [{ workos_user_id: null, auth_source: "local" }],
+      rowCount: 1
+    }));
+
+    const res = await harness.app.inject({ method: "GET", url: "/auth/organizations" });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "login_type_not_allowed" });
+    expect(harness.workosMocks.listOrganizationMemberships).not.toHaveBeenCalled();
+  });
+
   test("returns an empty list when the user has no workos_user_id", async () => {
     const harness = await buildHarness({
       authPreHandler: (request) => {
@@ -1306,7 +1690,7 @@ describe("GET /auth/organizations", () => {
         };
       }
     });
-    harness.pool.onQuery(/workos_user_id FROM users/, () => ({
+    harness.pool.onQuery(/workos_user_id, auth_source FROM users/, () => ({
       rows: [{ workos_user_id: null }],
       rowCount: 1
     }));

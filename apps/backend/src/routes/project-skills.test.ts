@@ -7,6 +7,7 @@ import {
   ProjectSkillSelectionFullError, ProjectSkillSourceError
 } from "../services/skills/project-skill-store.js";
 import { SkillSourceValidationError } from "../services/skills/personal-skill-validation.js";
+import { devDataRoutes } from "../test-helpers/data-routes.js";
 
 const apps: ReturnType<typeof Fastify>[] = [];
 afterEach(async () => { await Promise.all(apps.splice(0).map(app => app.close())); });
@@ -29,7 +30,7 @@ async function setup() {
     copyFromPersonal: vi.fn(async () => skill), update: vi.fn(async () => skill),
     updateFromPersonal: vi.fn(async () => skill), action: vi.fn(async () => skill), remove: vi.fn(async () => {})
   };
-  await registerProjectSkillRoutes(app, { projectSkills } as unknown as ProjectSkillStores);
+  await registerProjectSkillRoutes(app, { projectSkills, dataRoutes: devDataRoutes() } as unknown as ProjectSkillStores);
   return { app, projectSkills };
 }
 
@@ -54,7 +55,7 @@ test("uses authenticated identity and the path project for every route", async (
   expect(projectSkills.updateFromPersonal).toHaveBeenCalledWith("tenant", "member", projectId, skillId, 4, 2);
   expect((await app.inject({ method: "POST", url: `${url}/${skillId}/action`,
     payload: { scope, version: 1, action: "disable" } })).statusCode).toBe(200);
-  expect(projectSkills.action).toHaveBeenCalledWith("tenant", "member", projectId, skillId, "disable", 1);
+  expect(projectSkills.action).toHaveBeenCalledWith("tenant", "member", projectId, skillId, "disable", 1, { alsoInTransaction: undefined });
   expect((await app.inject({ method: "DELETE", url: `${url}/${skillId}`, payload: { scope, version: 1 } })).json())
     .toEqual({ scope, deleted: true });
   expect(projectSkills.remove).toHaveBeenCalledWith("tenant", "member", projectId, skillId, 1);

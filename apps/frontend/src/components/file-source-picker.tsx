@@ -56,11 +56,8 @@ export function FileSourcePicker(props: {
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="flex max-h-[85vh] max-w-3xl flex-col gap-0 p-0 sm:max-w-3xl">
-        <DialogHeader className="border-b border-outline-variant px-6 py-4">
-          <p className="text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint">
-            Add source
-          </p>
+      <DialogContent scrollBody={false} className="flex max-h-[85vh] flex-col gap-0 p-0 sm:max-w-[min(48rem,calc(100%-2rem))]">
+        <DialogHeader className="shrink-0 border-b border-outline-variant px-6 py-4 pr-14">
           <DialogTitle>Pick a connected source, then add files to this session</DialogTitle>
           <DialogDescription>
             Files you add here become deterministic context for every turn until you remove them.
@@ -68,7 +65,7 @@ export function FileSourcePicker(props: {
         </DialogHeader>
 
         {sources.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center p-12 text-center">
+          <div className="min-h-0 flex-1 overflow-y-auto p-6 text-center">
             <div>
               <p className="text-sm font-semibold text-on-surface">No sources available</p>
               <p className="text-sm text-on-surface-variant">
@@ -94,7 +91,7 @@ export function FileSourcePicker(props: {
               {sources.map((source) => (
                 <TabsTrigger key={source.id} value={source.id} className="flex-col items-start py-2">
                   <span>{source.label}</span>
-                  <small className="text-[0.62rem] text-muted-foreground">
+                  <small className="text-xs text-muted-foreground">
                     {source.connection.kind === "connected"
                       ? source.connection.label
                       : "Not connected"}

@@ -13,7 +13,8 @@ const connection = {
   accountName: "me@example.test",
   site: { siteId: SITE, name: "Acme", url: "https://acme.atlassian.net" },
   connectedAt: "2026-09-30T12:00:00.000Z",
-  updatedAt: "2026-09-30T12:00:00.000Z"
+  updatedAt: "2026-09-30T12:00:00.000Z",
+  suspended: false
 };
 
 const CLEANUP_ID = "00000000-0000-4000-8000-000000000001";
@@ -44,11 +45,16 @@ async function createApp(options: { readsEnabled?: boolean; isAdmin?: boolean } 
   const app = Fastify();
   app.decorate("db", new FakeDatabase() as unknown as Pool);
   app.addHook("preHandler", async (request) => {
+    // `x-security-version`: a local session with that version.
+    const securityVersion = request.headers["x-security-version"]?.toString();
     request.auth = {
       userId: request.headers["x-user-id"]?.toString() || "user-1",
       tenantId: request.headers["x-tenant-id"]?.toString() || "tenant-a",
       isAdmin: options.isAdmin ?? false,
-      role: options.isAdmin ? "admin" as const : "member" as const
+      role: options.isAdmin ? "admin" as const : "member" as const,
+      ...(securityVersion === undefined ? {} : {
+        session: { authSource: "local" as const, securityVersion: Number(securityVersion) }
+      })
     };
   });
   await registerJiraConnectionRoutes(app, {
@@ -83,7 +89,27 @@ describe("Jira connection routes", () => {
       payload: { accountId: "apn_mine", siteId: SITE }
     });
     expect(response.statusCode).toBe(200);
-    expect(jiraConnections.selectConnection).toHaveBeenCalledWith("tenant-b", "user-9", { accountId: "apn_mine", siteId: SITE });
+    // No session in this test app: the selection stores no security version.
+    expect(jiraConnections.selectConnection).toHaveBeenCalledWith("tenant-b", "user-9", { accountId: "apn_mine", siteId: SITE }, null);
+  });
+
+  // q4w0.8: a selection stores the security version of the requesting session.
+  // There is no Jira confirm: the account ID is opaque and the name is chosen
+  // by whoever authorized the account. A new selection restores a suspended one.
+  test("selection stores the session's security version, and there is no confirm route", async () => {
+    const { app, jiraConnections } = await createApp();
+    const selected = await app.inject({
+      method: "PUT", url: "/me/jira-connection", headers: { "x-security-version": "5" },
+      payload: { accountId: "apn_mine", siteId: SITE }
+    });
+    expect(selected.statusCode).toBe(200);
+    expect(jiraConnections.selectConnection).toHaveBeenCalledWith("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE }, 5);
+
+    const confirm = await app.inject({
+      method: "POST", url: "/me/jira-connection/confirm", headers: { "x-security-version": "5" },
+      payload: { accountId: "apn_mine" }
+    });
+    expect(confirm.statusCode).toBe(404);
   });
 
   test("rejects extra identity fields and malformed IDs", async () => {

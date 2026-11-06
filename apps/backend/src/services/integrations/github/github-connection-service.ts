@@ -17,7 +17,7 @@ import {
   GithubConnectionNotConfiguredError
 } from "./github-connection-errors.js";
 import { normalizeAllowedRepositories } from "./github-repository-allowlist.js";
-import type { GithubConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
+import type { GithubOwnerConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
 import {
   isTokenExpired,
   parseScopes,
@@ -37,6 +37,7 @@ import type { RuntimeInvalidator } from "../contracts.js";
 import { IntegrationOAuthStateStore } from "../integration-oauth-state-store.js";
 import { uuidv7 } from "../../../lib/uuid.js";
 import { assertBoundIntegrationAccount } from "../integration-account-binding.js";
+import { ConnectionConfirmError, OwnerSecurityVersionChangedError } from "../../auth/security-change.js";
 
 export { GithubConnectionError, GithubConnectionNotConfiguredError } from "./github-connection-errors.js";
 
@@ -51,6 +52,10 @@ type GithubUserStatePayload = {
   jti: string;
   // SHA-256 of the browser-binding cookie nonce.
   bnh: string;
+  // Security version of the session that started the authorization. Absent
+  // for a WorkOS session. The callback has no session, so the connection
+  // stores this value (see services/auth/security-change.ts).
+  sv?: number;
 };
 
 export type GithubUserConnectionSummary = {
@@ -66,6 +71,9 @@ export type GithubUserConnectionSummary = {
   connectedAt: string;
   updatedAt: string;
   lastUsedAt: string | null;
+  // A security change of the owner's account suspended the connection. The
+  // agent does not use it until the owner confirms it or connects again.
+  suspended: boolean;
 };
 
 export type GithubConnectionStatus = {
@@ -91,7 +99,7 @@ function isGithubConfigured(config: AppConfig): boolean {
   );
 }
 
-function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSummary {
+function toUserSummary(record: GithubOwnerConnectionRecord): GithubUserConnectionSummary {
   return {
     githubUserId: record.githubUserId,
     githubLogin: record.githubLogin,
@@ -104,7 +112,8 @@ function toUserSummary(record: GithubConnectionRecord): GithubUserConnectionSumm
     refreshTokenExpiresAt: record.refreshTokenExpiresAt,
     connectedAt: record.createdAt,
     updatedAt: record.updatedAt,
-    lastUsedAt: record.tokenLastUsedAt
+    lastUsedAt: record.tokenLastUsedAt,
+    suspended: record.suspended
   };
 }
 
@@ -113,7 +122,14 @@ export class GithubConnectionService {
     private readonly config: AppConfig,
     private readonly store: Pick<
       GithubConnectionStore,
-      "get" | "upsert" | "updateRefreshedToken" | "delete" | "markTokenUsed" | "setAllowedRepositories"
+      | "get"
+      | "getForOwner"
+      | "confirm"
+      | "upsert"
+      | "updateRefreshedToken"
+      | "delete"
+      | "markTokenUsed"
+      | "setAllowedRepositories"
     >,
     private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
@@ -123,7 +139,7 @@ export class GithubConnectionService {
   ) {}
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<GithubConnectionStatus> {
-    const userConnection = await this.store.get(tenantId, userId);
+    const userConnection = await this.store.getForOwner(tenantId, userId);
     return {
       configured: isGithubConfigured(this.config),
       userConnection: userConnection ? toUserSummary(userConnection) : null
@@ -146,6 +162,8 @@ export class GithubConnectionService {
   async getAuthorizationUrl(input: {
     tenantId: string;
     userId: string;
+    // The security version of the requesting session (requestSecurityVersion).
+    ownerSecurityVersion: number | null;
   }): Promise<{ url: string; browserBinding: OAuthBrowserBindingCookie }> {
     this.assertConfigured();
 
@@ -160,7 +178,8 @@ export class GithubConnectionService {
       tid: input.tenantId,
       sub: input.userId,
       jti,
-      bnh: binding.nonceHash
+      bnh: binding.nonceHash,
+      ...(input.ownerSecurityVersion === null ? {} : { sv: input.ownerSecurityVersion })
     } satisfies GithubUserStatePayload)
       .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(GITHUB_STATE_ISSUER)
@@ -222,7 +241,13 @@ export class GithubConnectionService {
       if (!(await this.oauthStates.consume("github", payload.jti))) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti, bnh: payload.bnh };
+      state = {
+        tid: payload.tid,
+        sub: payload.sub,
+        jti: payload.jti,
+        bnh: payload.bnh,
+        ...(typeof payload.sv === "number" && Number.isInteger(payload.sv) ? { sv: payload.sv } : {})
+      };
     } catch {
       return fallbackUrl;
     }
@@ -245,7 +270,8 @@ export class GithubConnectionService {
           ? encrypt(connection.refreshToken, this.config.DATA_ENCRYPTION_SECRET)
           : null,
         refreshTokenExpiresAt: connection.refreshTokenExpiresAt,
-        tokenLastRefreshedAt: connection.tokenLastRefreshedAt
+        tokenLastRefreshedAt: connection.tokenLastRefreshedAt,
+        ownerSecurityVersion: state.sv ?? null
       });
 
       try {
@@ -271,10 +297,12 @@ export class GithubConnectionService {
       return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "connected"
       });
-    } catch {
+    } catch (error) {
       return buildIntegrationRedirectUrl(this.config, "/settings/github", {
         githubAuth: "error",
-        reason: "github_authorization_failed"
+        // A security change after the session that started the authorization:
+        // nothing was written.
+        reason: error instanceof OwnerSecurityVersionChangedError ? "session_changed" : "github_authorization_failed"
       });
     }
   }
@@ -290,7 +318,7 @@ export class GithubConnectionService {
   }
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
-    const existing = await this.store.get(tenantId, userId);
+    const existing = await this.store.getForOwner(tenantId, userId);
     const removed = await this.store.delete(tenantId, userId);
 
     if (removed && existing) {
@@ -308,6 +336,30 @@ export class GithubConnectionService {
     }
 
     return removed;
+  }
+
+  /**
+   * The owner confirms a suspended connection from a current session.
+   * `githubUserId` is the account that the owner saw. `ownerSecurityVersion`
+   * is the version of the requesting session. The result stays suspended when
+   * that version is not current (a security change raced the request).
+   */
+  async confirm(
+    tenantId: string,
+    userId: string,
+    githubUserId: string,
+    ownerSecurityVersion: number | null
+  ): Promise<GithubUserConnectionSummary> {
+    // The store writes the audit event in the confirm's transaction.
+    const confirmed = await this.store.confirm(tenantId, userId, githubUserId, ownerSecurityVersion);
+    if (!confirmed) {
+      const current = await this.store.getForOwner(tenantId, userId);
+      throw new ConnectionConfirmError(current ? "account_changed" : "not_connected", "GitHub");
+    }
+    if (!confirmed.suspended) {
+      await this.runtimeManager?.invalidateRuntimesForIntegration(tenantId, userId, "github");
+    }
+    return toUserSummary(confirmed);
   }
 
   // `expectedAccountId` is the account the turn recorded (see boundIntegrationAccount).

@@ -1,6 +1,19 @@
 import type { Redis } from "ioredis";
 
-export type IntegrationOAuthProvider = "github" | "notion" | "microsoft";
+// Opaque id of the integration that runs an OAuth flow, for example "github".
+// Core does not list the ids, so that an overlay can use its own id. The id
+// goes into the Redis key and into the browser binding cookie name. Thus it
+// must start with a lower-case letter and contain only lower-case letters,
+// digits, "_" and "-". Each use checks the id and throws if it is not valid.
+export type IntegrationOAuthProvider = string;
+
+const OAUTH_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+
+export function assertIntegrationOAuthProvider(provider: IntegrationOAuthProvider): void {
+  if (!OAUTH_PROVIDER_ID_PATTERN.test(provider)) {
+    throw new Error(`Invalid OAuth provider id: ${JSON.stringify(provider)}`);
+  }
+}
 
 type OAuthStateRedis = Pick<Redis, "getdel" | "set">;
 
@@ -34,6 +47,7 @@ export class IntegrationOAuthStateStore {
   }
 
   private key(provider: IntegrationOAuthProvider, jti: string): string {
+    assertIntegrationOAuthProvider(provider);
     return `integration_oauth_state:${provider}:${jti}`;
   }
 
