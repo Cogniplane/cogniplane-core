@@ -8,7 +8,7 @@ import { SessionCopyButton } from "./session-copy-button";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { formatTimestamp } from "../../../lib/time-format";
-import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
+import { PILL_GRAY, PILL_GREEN, HINT } from "../../../lib/ui-tokens";
 
 function statusBadgeClass(status: AdminSessionDetailOverview["status"]): string {
   switch (status) {
@@ -20,22 +20,17 @@ function statusBadgeClass(status: AdminSessionDetailOverview["status"]): string 
   }
 }
 
-function HeaderStrip(props: { overview: AdminSessionDetailOverview; backHref: string }) {
+function HeaderStrip(props: { overview: AdminSessionDetailOverview }) {
   const { overview } = props;
   return (
     <Card>
       <CardHeader>
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <p className={SECTION_LABEL}>
-              <Link href={props.backHref} className="hover:underline">
-                ← Back to sessions
-              </Link>
-            </p>
-            <h3 className="break-words text-lg font-semibold text-on-surface">
+          <div className="min-w-0 w-full sm:flex-1">
+            <h3 className="text-lg font-semibold text-on-surface [overflow-wrap:anywhere]">
               {overview.sessionName || "Session"}
             </h3>
-            <p className="mt-1 text-sm text-on-surface-variant">
+            <p className="mt-1 text-sm text-on-surface-variant [overflow-wrap:anywhere]">
               {overview.userEmail ?? overview.userId} · started{" "}
               {formatTimestamp(overview.createdAt)}
             </p>
@@ -78,6 +73,33 @@ export function AdminSessionDetailView(props: {
         <h2 ref={heading} tabIndex={-1} className="scroll-mt-2 rounded-sm text-lg font-semibold text-on-surface outline-none focus:ring-[3px] focus:ring-ring/50">Session detail</h2>
       </div>
 
+      {error ? <p role="alert" className="text-sm text-danger">{detail ? "Session detail could not be updated. The loaded evidence remains below. " : ""}{error}</p> : null}
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
+        <Button asChild variant="outline" className="min-h-11 w-full sm:w-auto">
+          <Link href={backHref}>
+            <span aria-hidden="true">←</span>
+            Back to sessions
+          </Link>
+        </Button>
+        {error || detail ? (
+          <Button
+            variant="outline"
+            className="min-h-11 min-w-36 w-full sm:w-auto"
+            aria-disabled={isRefreshing}
+            aria-busy={isRefreshing}
+            onClick={event => {
+              if (!isRefreshing) {
+                retryOwner.current = event.currentTarget;
+                retry();
+              }
+            }}
+          >
+            {isRefreshing ? "Reloading…" : "Reload session"}
+          </Button>
+        ) : null}
+      </div>
+
       {isLoading ? (
         <Card>
           <CardContent className="pt-6">
@@ -90,20 +112,13 @@ export function AdminSessionDetailView(props: {
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-danger">Session not found or not in your tenant.</p>
-            <p className="mt-2 text-sm text-on-surface-variant">
-              <Link href={backHref} className="text-info hover:underline">
-                Back to sessions
-              </Link>
-            </p>
           </CardContent>
         </Card>
       ) : null}
 
-      {error || detail ? <div className="space-y-2">{error ? <p role="alert" className="text-sm text-danger">{detail ? "Session detail could not be updated. The loaded evidence remains below. " : ""}{error}</p> : null}<Button variant="outline" className="min-w-36" aria-disabled={isRefreshing} aria-busy={isRefreshing} onClick={event => { if (!isRefreshing) { retryOwner.current = event.currentTarget; retry(); } }}>{isRefreshing ? "Reloading…" : "Reload session"}</Button></div> : null}
-
       {!isLoading && available && detail ? (
         <>
-          <HeaderStrip overview={detail.overview} backHref={backHref} />
+          <HeaderStrip overview={detail.overview} />
 
           <AdminSessionDetailSidebar key={detail.overview.sessionId} detail={detail} />
         </>
