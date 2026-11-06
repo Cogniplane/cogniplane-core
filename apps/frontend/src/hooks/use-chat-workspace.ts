@@ -8,7 +8,7 @@ export function useChatWorkspace(input: {
   onError: (message: string) => void;
 }) {
   const { selectedSessionId, onError } = input;
-  const sessionData = useSessionData({ selectedSessionId, onError });
+  const sessionData = useSessionData({ selectedSessionId });
   const artifactState = useArtifacts({
     selectedSessionId,
     artifacts: sessionData.artifacts,

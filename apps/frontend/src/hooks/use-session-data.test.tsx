@@ -100,17 +100,12 @@ function renderSessionData(initialSessionId: string | null = "s-1") {
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
 
-  const onError = vi.fn();
-
   const rendered = renderHook(
     ({ sessionId }: { sessionId: string | null }) =>
-      useSessionData({
-        selectedSessionId: sessionId,
-        onError
-      }),
+      useSessionData({ selectedSessionId: sessionId }),
     { wrapper, initialProps: { sessionId: initialSessionId } }
   );
-  return { ...rendered, onError, queryClient };
+  return { ...rendered, queryClient };
 }
 
 async function settleInitialLoad(
