@@ -37,7 +37,7 @@ describe("forgot password page", () => {
     expect(status.textContent).toContain("30 minutes");
     expect(status.querySelector("button, a")).toBeNull();
     expect(api.requestPasswordReset).toHaveBeenCalledWith("max@example.test");
-    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 })));
 
     fireEvent.click(screen.getByRole("button", { name: "Use another address" }));
     expect((screen.getByLabelText("Email") as HTMLInputElement).value).toBe("");
