@@ -27,3 +27,16 @@ pull requests do not need deployment credentials or access to a private runner.
 Rebuild `@cogniplane/shared-types` after contract changes before checking consumers.
 Run the Cloudflare build after frontend build changes. A passing unit mock does
 not prove provider behavior or database isolation.
+
+## Demo build outputs
+
+After successful push CI on public `main`, the `Demo build` workflow publishes
+an exact-commit prerelease named `demo-build-<SHA>`. It contains the backend
+image, prebuilt frontend and sandbox Workers, and a manifest with file checksums,
+image identity and source CI/build run IDs. The build uses public demo origins
+and has no deployment credentials. It can also be dispatched manually on `main`
+when that commit already has successful push CI.
+
+Deployment is a separate private promotion step. A build release does not change
+the live demo. Promotion verifies the commit, public checks and downloaded outputs
+before it applies migrations or deploys either Worker.
