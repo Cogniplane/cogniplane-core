@@ -610,10 +610,15 @@ class InMemoryArtifactStore {
   private readonly artifacts = new Map<string, ArtifactRecord>();
   private readonly downloadTokens = new Map<string, ArtifactDownloadTokenRecord>();
   private nextId = 1;
-  constructor(private readonly sessions: InMemorySessionStore) {}
-  async createUpload(input: Parameters<ArtifactStore["createUpload"]>[0]) {
+  constructor(
+    private readonly sessions: InMemorySessionStore,
+    private readonly auditEvents: InMemoryAuditEventStore
+  ) {}
+  async createUpload(...[input, audit]: Parameters<ArtifactStore["createUpload"]>) {
     await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
-    return this.create({ ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending" });
+    const artifact = await this.create({ ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending" });
+    await this.auditEvents.create(audit(artifact));
+    return artifact;
   }
   async listForUser(..._args: Parameters<ArtifactStore["listForUser"]>): ReturnType<ArtifactStore["listForUser"]> {
     throw new Error("Configure listForUser for cross-session artifact tests; this fixture serves session artifacts.");
@@ -767,8 +772,8 @@ export async function createTestApp(
   const activeTurns = new ActiveTurnsRegistry();
   const toolContexts = new InMemoryToolContextStore();
   const approvals = createInMemoryApprovalStore();
-  const artifacts = new InMemoryArtifactStore(sessions);
   const auditEvents = new InMemoryAuditEventStore();
+  const artifacts = new InMemoryArtifactStore(sessions, auditEvents);
   const artifactProcessor = new NoopArtifactProcessor();
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-core-artifact-tests-"));
   const artifactStorage = new LocalArtifactStorage(artifactStorageRoot);

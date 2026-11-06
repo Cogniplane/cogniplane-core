@@ -6,6 +6,7 @@ import { uuidv7 } from "../../lib/uuid.js";
 
 import { escapeLikePattern, type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 
 // Persisted metadata key shared by copy creation and scan completion.
 export const PROJECT_COPY_SOURCE_KEY = "reusedFromArtifactId";
@@ -474,19 +475,28 @@ export class ArtifactStore {
     });
   }
 
+  /**
+   * Create a pending upload and write its audit event in one transaction,
+   * under the session/project lock of the access check. When the event
+   * cannot be written, no row commits, so the caller can delete the stored
+   * bytes and no pending upload stays without a scan.
+   */
   async createUpload(
     input: Omit<Parameters<ArtifactStore["create"]>[0], "artifactType" | "createdByType" | "status"> & {
       expectedProjectId: string | null;
       createdByType?: ArtifactRecord["createdByType"];
     },
+    audit: (artifact: ArtifactRecord) => AuditEventInput,
   ): Promise<ArtifactRecord> {
     return withTenantScope(this.db, input.tenantId, async client => {
       const projectId = await requireSessionUploadAccess(client, input, true);
       if (projectId !== input.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
-      return this.insert(client, {
+      const artifact = await this.insert(client, {
         ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending",
         detail: { ...input.detail, [UPLOAD_SCAN_PENDING_KEY]: true },
       }, true);
+      await AuditEventStore.createInTransaction(client, audit(artifact));
+      return artifact;
     });
   }
 
