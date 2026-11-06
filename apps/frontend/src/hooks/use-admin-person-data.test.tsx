@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AdminUser } from "@cogniplane/shared-types";
 
 const api = vi.hoisted(() => ({ listAdminUsers: vi.fn(), listAdminSessions: vi.fn() }));
@@ -18,30 +18,63 @@ function dana(linkEmail: AdminUser["linkEmail"]): AdminUser {
   };
 }
 
+const clients: QueryClient[] = [];
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  clients.push(client);
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
+beforeEach(() => {
+  vi.useFakeTimers();
+  api.listAdminSessions.mockResolvedValue({ items: [] });
+});
 afterEach(() => {
+  cleanup();
+  clients.splice(0).forEach(client => client.clear());
   vi.useRealTimers();
   vi.resetAllMocks();
 });
 
-it("reads the list again while the person's link email waits, and stops when it is done", async () => {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
-  const at = "2026-10-26T10:00:00.000Z";
-  api.listAdminSessions.mockResolvedValue({ items: [] });
+const at = "2026-10-26T10:00:00.000Z";
+const email = (status: NonNullable<AdminUser["linkEmail"]>["status"]) => ({
+  purpose: "account_setup" as const, status, updatedAt: at, error: status === "failed" ? "EENVELOPE" : null
+});
+
+it.each([
+  ["queued", "sent"],
+  ["queued", "failed"],
+  ["queued", "expired"],
+  ["sending", "sent"],
+  ["sending", "failed"],
+  ["sending", "expired"]
+] as const)("polls a %s email and stops after it becomes %s", async (pending, terminal) => {
   api.listAdminUsers
-    .mockResolvedValueOnce([dana({ purpose: "account_setup", status: "queued", updatedAt: at, error: null })])
-    .mockResolvedValueOnce([dana({ purpose: "account_setup", status: "failed", updatedAt: at, error: "EENVELOPE 550" })]);
+    .mockResolvedValueOnce([dana(email(pending))])
+    .mockResolvedValue([dana(email(terminal))]);
 
   const { result } = renderHook(() => useAdminPersonData("dana"), { wrapper });
-  await waitFor(() => expect(result.current.person?.linkEmail?.status).toBe("queued"));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(result.current.person?.linkEmail?.status).toBe(pending);
 
   await act(async () => { await vi.advanceTimersByTimeAsync(LINK_EMAIL_POLL_MS); });
-  await waitFor(() => expect(result.current.person?.linkEmail?.status).toBe("failed"));
+  expect(result.current.person?.linkEmail?.status).toBe(terminal);
 
   await act(async () => { await vi.advanceTimersByTimeAsync(LINK_EMAIL_POLL_MS * 3); });
   expect(api.listAdminUsers).toHaveBeenCalledTimes(2);
+});
+
+it("does not poll another person's queued email", async () => {
+  api.listAdminUsers.mockResolvedValue([
+    { ...dana(email("queued")), userId: "fox", email: "fox@example.test" },
+    dana(email("sent"))
+  ]);
+
+  const { result } = renderHook(() => useAdminPersonData("dana"), { wrapper });
+  await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+  expect(result.current.person?.userId).toBe("dana");
+  expect(result.current.person?.linkEmail?.status).toBe("sent");
+
+  await act(async () => { await vi.advanceTimersByTimeAsync(LINK_EMAIL_POLL_MS * 3); });
+  expect(api.listAdminUsers).toHaveBeenCalledTimes(1);
 });

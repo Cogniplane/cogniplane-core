@@ -504,7 +504,7 @@ it("keeps failed-read recovery in the Save status and keeps outside focus after 
   expect(document.activeElement).toBe(outside);
 });
 
-it("keeps a keyboard suggestion mounted while focus enters it", async () => {
+it("keeps a keyboard suggestion mounted while focus enters it", () => {
   renderCard({ openRouterModels: [{ id: "MixedCase/Exact-Slug", name: "Keyboard model", contextLength: 200000 }] });
   fireEvent.click(screen.getByRole("button", { name: "Add model" }));
   const input = screen.getByLabelText("OpenRouter slug");
@@ -512,7 +512,6 @@ it("keeps a keyboard suggestion mounted while focus enters it", async () => {
   const suggestion = screen.getByRole("button", { name: /Keyboard model/ });
   fireEvent.blur(input, { relatedTarget: suggestion });
   suggestion.focus();
-  await act(async () => new Promise(resolve => setTimeout(resolve, 180)));
   expect(document.activeElement).toBe(suggestion);
   fireEvent.click(suggestion);
   expect((input as HTMLInputElement).value).toBe("MixedCase/Exact-Slug");

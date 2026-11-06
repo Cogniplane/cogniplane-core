@@ -1,4 +1,5 @@
-import { describe, expect, test } from "vitest";
+import type { PoolClient } from "pg";
+import { describe, expect, test, vi } from "vitest";
 
 import { evaluatePolicy } from "../services/policy/policy-engine.js";
 import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
@@ -7,23 +8,42 @@ import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js"
 import { seedTenantGraph } from "./support/fixtures.js";
 import { ALLOW_WEAKER } from "../test-helpers/data-routes.js";
 
-// Waits until `count` sessions wait for an advisory lock, so a test releases its
-// held lock only after the writers it started are really blocked on it.
-async function waitForAdvisoryWaiters(count: number): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const waiting = await superuserPool().query<{ count: string }>(
-      "SELECT count(*)::text AS count FROM pg_locks WHERE locktype = 'advisory' AND NOT granted");
-    if (Number(waiting.rows[0]!.count) >= count) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+// Match this holder's lock so unrelated work cannot satisfy the waiter count.
+async function waitForAdvisoryWaiters(count: number, holder: PoolClient): Promise<void> {
+  const { rows } = await holder.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+  await vi.waitFor(async () => {
+    const waiting = await superuserPool().query<{ count: string }>(`
+      SELECT count(*)::text AS count FROM pg_locks waiting
+      JOIN pg_locks held USING (locktype, database, classid, objid, objsubid)
+      WHERE waiting.locktype = 'advisory' AND NOT waiting.granted
+        AND held.granted AND held.pid = $1`, [rows[0]!.pid]);
+    expect(Number(waiting.rows[0]!.count)).toBe(count);
+  }, { timeout: 5_000 });
+}
+
+async function releaseRuleLock(holder: PoolClient, settled: Promise<unknown>): Promise<void> {
+  let rollbackError: Error | undefined;
+  try {
+    await holder.query("ROLLBACK");
+  } catch (error) {
+    rollbackError = error as Error;
+    throw error;
+  } finally {
+    holder.release(rollbackError);
+    await settled;
   }
-  throw new Error(`Expected ${count} sessions to wait for the policy rule lock.`);
 }
 
 async function holdRuleLock(tenantId: string) {
   const holder = await superuserPool().connect();
-  await holder.query("BEGIN");
-  await holder.query("SELECT pg_advisory_xact_lock(hashtextextended('policy_rule:' || $1, 0))", [tenantId]);
-  return holder;
+  try {
+    await holder.query("BEGIN");
+    await holder.query("SELECT pg_advisory_xact_lock(hashtextextended('policy_rule:' || $1, 0))", [tenantId]);
+    return holder;
+  } catch (error) {
+    holder.release(error as Error);
+    throw error;
+  }
 }
 
 describe.skipIf(!adminDatabaseUrl())("policy rule write concurrency", () => {
@@ -34,18 +54,20 @@ describe.skipIf(!adminDatabaseUrl())("policy rule write concurrency", () => {
 
     // Another writer holds the tenant's rule lock and turns the rule off.
     const writer = await holdRuleLock(owner.tenantId);
+    let settled: Promise<unknown> = Promise.resolve();
     try {
       await writer.query("UPDATE policy_rule SET enabled = FALSE WHERE tenant_id = $1 AND rule_id = $2",
         [owner.tenantId, rule.ruleId]);
       // A rename starts while the writer is open. It must wait for the lock and
       // read after the writer commits.
       const rename = store.update(owner.tenantId, rule.ruleId, { name: "after" }, ALLOW_WEAKER);
-      await waitForAdvisoryWaiters(1);
+      settled = Promise.allSettled([rename]);
+      await waitForAdvisoryWaiters(1, writer);
       await writer.query("COMMIT");
 
       await expect(rename).resolves.toMatchObject({ name: "after", enabled: false });
     } finally {
-      writer.release();
+      await releaseRuleLock(writer, settled);
     }
     expect(await store.get(owner.tenantId, rule.ruleId)).toMatchObject({ name: "after", enabled: false });
   });
@@ -57,14 +79,16 @@ describe.skipIf(!adminDatabaseUrl())("policy rule write concurrency", () => {
     // Hold the lock until all five creates wait for it, then let them run.
     const holder = await holdRuleLock(owner.tenantId);
     let created;
+    let settled: Promise<unknown> = Promise.resolve();
     try {
-      const pending = Promise.all(Array.from({ length: 5 }, (_, index) =>
-        store.create(owner.tenantId, { name: `rule ${index}`, effect: "allow" }, owner.userId, ALLOW_WEAKER)));
-      await waitForAdvisoryWaiters(5);
+      const pending = Array.from({ length: 5 }, (_, index) =>
+        store.create(owner.tenantId, { name: `rule ${index}`, effect: "allow" }, owner.userId, ALLOW_WEAKER));
+      settled = Promise.allSettled(pending);
+      await waitForAdvisoryWaiters(5, holder);
       await holder.query("COMMIT");
-      created = await pending;
+      created = await Promise.all(pending);
     } finally {
-      holder.release();
+      await releaseRuleLock(holder, settled);
     }
 
     expect(new Set(created.map((rule) => rule.priority)).size).toBe(5);
@@ -82,6 +106,7 @@ describe.skipIf(!adminDatabaseUrl())("policy rule write concurrency", () => {
 
     const holder = await holdRuleLock(owner.tenantId);
     let results: PromiseSettledResult<unknown>[];
+    let settled: Promise<unknown> = Promise.resolve();
     try {
       const pending = Promise.allSettled([
         // After the block rule: never the first match for the export tool.
@@ -90,11 +115,12 @@ describe.skipIf(!adminDatabaseUrl())("policy rule write concurrency", () => {
         // The only rule, moved: the same outcomes.
         store.update(owner.tenantId, block.ruleId, { priority: 30 }, { allowWeaker: false })
       ]);
-      await waitForAdvisoryWaiters(2);
+      settled = pending;
+      await waitForAdvisoryWaiters(2, holder);
       await holder.query("COMMIT");
       results = await pending;
     } finally {
-      holder.release();
+      await releaseRuleLock(holder, settled);
     }
 
     // The second writer reads the first one's committed rule and is refused.

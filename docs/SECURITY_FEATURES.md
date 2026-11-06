@@ -589,7 +589,7 @@ Policy Center rules live in `policy_rule` and are evaluated before and at the MC
 
 ## 25. Test Coverage
 
-- **CI thresholds:** `pnpm test:coverage` and `pnpm test:coverage:frontend` are CI gates. They count every eligible production file, including files that no test imports. `.coverage-thresholds.json` holds the floors and the dated measurements they come from. The imported-module runs use a different denominator and are a nonblocking trend. Backend unit coverage does not include the Postgres integration suite, and unit-test fakes do not prove database policies.
+- **CI thresholds:** `pnpm test:coverage` and `pnpm test:coverage:frontend` are CI gates. They count every eligible production file, including files that no test imports. `.coverage-thresholds.json` holds the floors and the dated measurements they come from. The imported-module runs use a different denominator and are a manual diagnostic that CI does not run. Backend unit coverage does not include the Postgres integration suite, and unit-test fakes do not prove database policies.
 - **Scope:** the backend (`apps/backend`) and the frontend (`apps/frontend`) have separate floors.
 - **Security-critical paths covered:** refresh-token rotation/reuse, `redactSecrets` patterns, RLS scoping helpers, approval coordinator timeouts, MIME-type/magic-byte validation, route-validation rejection paths.
 - **Runner:** `vitest run --coverage` (v8 provider).

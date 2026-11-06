@@ -132,26 +132,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-workspace
-      # `test:all` runs the workspace Vitest projects. Coverage runs per package
-      # because a root Vitest projects run does not inherit package coverage
-      # settings or thresholds.
-      #
-      # The default coverage commands count all production source files and
-      # enforce the floors in .coverage-thresholds.json. The imported-module
-      # runs preserve the old denominator as a diagnostic. They remain
-      # nonblocking because deleting an import can change that measurement
-      # without changing the amount of production code under test.
-      - run: pnpm test:all
+      # Package coverage commands run all backend and frontend unit tests and
+      # enforce their full-source floors. Run the other workspace projects here
+      # so each unit suite runs once. Postgres tests have their own job.
+      - name: Workspace tests without a coverage gate
+        run: pnpm test:all --project='!backend' --project='!frontend' --project='!backend-integration'
       - name: Backend full-source coverage
         run: pnpm test:coverage
       - name: Frontend full-source coverage
         run: pnpm test:coverage:frontend
-      - name: Backend imported-module coverage trend
-        continue-on-error: true
-        run: pnpm test:coverage:imported
-      - name: Frontend imported-module coverage trend
-        continue-on-error: true
-        run: pnpm test:coverage:frontend:imported
+      # Imported-module coverage remains available through the :imported
+      # commands. It adds no test cases and changes when imports change, so it
+      # does not need another run of both suites on every PR.
 
   integration:
     name: Integration (Postgres RLS)

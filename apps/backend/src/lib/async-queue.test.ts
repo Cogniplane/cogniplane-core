@@ -13,17 +13,13 @@ test("push() then iterate yields values in order; end() closes the iterator", as
   expect(out).toEqual([1, 2, 3]);
 });
 
-test("push() returns false after end()", () => {
+test("repeated end() calls keep the queue closed to readers and writers", async () => {
   const q = new AsyncQueue<number>();
-  q.end();
-  expect(q.push(1)).toBe(false);
-});
-
-test("end() is idempotent", () => {
-  const q = new AsyncQueue<number>();
-  q.end();
-  q.end();
-  // Still closed; no throw.
+  for (let call = 0; call < 2; call += 1) {
+    q.end();
+    expect(q.push(1)).toBe(false);
+    await expect(q.next()).resolves.toEqual({ value: undefined, done: true });
+  }
 });
 
 test("a waiter is woken up by a subsequent push without buffering", async () => {
@@ -72,13 +68,6 @@ test("draining buffered values after end() still yields them", async () => {
   expect(r3.done).toBe(true);
 });
 
-test("next() returns done=true on a queue that ends with empty buffer", async () => {
-  const q = new AsyncQueue<number>();
-  q.end();
-  const result = await q.next();
-  expect(result.done).toBe(true);
-});
-
 test("setError() rejects a consumer currently blocked in next()", async () => {
   const q = new AsyncQueue<number>();
   const pending = q.next();
@@ -109,6 +98,7 @@ test("setError() unblocks a for-await consumer instead of hanging", async () => 
   await Promise.resolve();
   q.setError(boom);
   await expect(consumer).rejects.toBe(boom);
+  expect(consumed).toEqual([1]);
 });
 
 test("setError() is terminal: first error wins, end()/push() are no-ops after", async () => {
@@ -119,4 +109,14 @@ test("setError() is terminal: first error wins, end()/push() are no-ops after", 
   q.end();
   expect(q.push(99)).toBe(false);
   await expect(q.next()).rejects.toBe(first);
+});
+
+test("setError() reports the error before any buffered values", async () => {
+  const q = new AsyncQueue<number>();
+  q.push(1);
+  q.push(2);
+  const boom = new Error("producer failed");
+  q.setError(boom);
+  await expect(q.next()).rejects.toBe(boom);
+  await expect(q.next()).rejects.toBe(boom);
 });

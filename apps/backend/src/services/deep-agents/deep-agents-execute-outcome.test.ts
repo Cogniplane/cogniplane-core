@@ -90,7 +90,7 @@ function setup(run: RunCommand) {
 }
 
 /** One turn through the AG-UI driver. The sandbox turn is open for as long as the turn runs, as in the adapter. */
-async function runTurn(runtime: DeepAgentsSessionRuntime, abort = new AbortController()) {
+async function runTurn(runtime: DeepAgentsSessionRuntime, abort = new AbortController(), onEvent?: (event: BaseEvent) => void) {
   const events: BaseEvent[] = [];
   const backend = createSessionAGUITurnBackend({
     threadId: "thread-1", runtime, toolContextRef: { current: null }, modelId: MODEL, promptText: "Go", signal: abort.signal,
@@ -102,7 +102,7 @@ async function runTurn(runtime: DeepAgentsSessionRuntime, abort = new AbortContr
   try {
     await new Promise<void>((resolve) => {
       agent.run({ threadId: "thread-1", runId: "run-1", state: {}, messages: [] } as never).pipe(verifyEvents()).subscribe({
-        next: (event) => events.push(event),
+        next: (event) => { events.push(event); onEvent?.(event); },
         error: (err: unknown) => { error = err; resolve(); },
         complete: resolve
       });
@@ -118,6 +118,23 @@ const starts = (events: BaseEvent[]) => events.filter((event) => event.type === 
 const results = (events: BaseEvent[]) => events.filter((event) => event.type === EventType.TOOL_CALL_RESULT) as unknown as Result[];
 const statuses = (events: BaseEvent[]) => events.flatMap((event) => event.type === EventType.CUSTOM && (event as { name?: string }).name === "tool_status"
   ? [(event as unknown as { value: Status }).value] : []);
+
+async function releaseAfterResult(runtime: DeepAgentsSessionRuntime, firstOutput: string, release: () => void) {
+  const abort = new AbortController();
+  // A missing result must fail the test and release the held command.
+  const deadline = setTimeout(() => { abort.abort(); release(); }, 4_000);
+  try {
+    const result = await runTurn(runtime, abort, (event) => {
+      if (event.type === EventType.TOOL_CALL_RESULT && (event as unknown as Result).content.startsWith(firstOutput)) release();
+    });
+    expect(abort.signal.aborted).toBe(false);
+    expect(result.error).toBeNull();
+    return result;
+  } finally {
+    clearTimeout(deadline);
+    release();
+  }
+}
 /** The command of each card: the arguments that the card shows. */
 const commandsOf = (events: BaseEvent[]) => new Map(events.flatMap((event) => {
   if (event.type !== EventType.TOOL_CALL_ARGS) return [];
@@ -215,14 +232,17 @@ describe("a failed command through the real graph", () => {
     script.steps = [[execute("call-1", "slow-ok"), execute("call-2", "fast-fail")], "Done."];
     let releaseSlow!: () => void;
     const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
-    const { events } = await runTurn(setup(async (command) => {
-      if (command === "fast-fail") { setTimeout(releaseSlow, 20); throw new CommandExitError(3, "failed first"); }
+    const { events } = await releaseAfterResult(setup(async (command) => {
+      if (command === "fast-fail") throw new CommandExitError(3, "failed first");
       await slowGate;
       return { stdout: "finished last", stderr: "", exitCode: 0 };
-    }));
+    }), "failed first", releaseSlow);
 
     const ids = new Map([...commandsOf(events)].map(([id, command]) => [command, id]));
+    expect(starts(events).map((start) => start.toolCallName)).toEqual(["execute", "execute"]);
+    expect(new Set(starts(events).map((start) => start.toolCallId)).size).toBe(2);
     expect(results(events).map((result) => result.toolCallId)).toEqual([ids.get("fast-fail"), ids.get("slow-ok")]);
+    expect(results(events).map((result) => result.content.split("\n")[0])).toEqual(["failed first", "finished last"]);
     expect(statuses(events)).toEqual([expect.objectContaining({ toolCallId: ids.get("fast-fail"), status: "failed" })]);
   });
 
@@ -244,14 +264,20 @@ describe("a failed command through the real graph", () => {
   it("ties each outcome to its own run when two parallel calls repeat both the command and the call ID", async () => {
     script.steps = [[execute("call-1", "make test"), execute("call-1", "make test")], "Done."];
     let run = 0;
-    const { events } = await runTurn(setup(async () => {
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const { events } = await releaseAfterResult(setup(async () => {
       // The run that starts first ends last, and it is the one that exits 0.
       const tag = run++;
-      if (tag === 0) { await new Promise((resolve) => setTimeout(resolve, 30)); return { stdout: "run 0", stderr: "", exitCode: 0 }; }
+      if (tag === 0) { await firstGate; return { stdout: "run 0", stderr: "", exitCode: 0 }; }
       throw new CommandExitError(5, "run 1");
-    }));
+    }), "run 1", releaseFirst);
 
     expect(starts(events)).toHaveLength(2);
+    const [first, second] = starts(events);
+    expect(first!.toolCallId).not.toBe(second!.toolCallId);
+    expect(results(events).map((result) => result.toolCallId)).toEqual([second!.toolCallId, first!.toolCallId]);
+    expect(results(events).map((result) => result.content.split("\n")[0])).toEqual(["run 1", "run 0"]);
     const failed = new Set(statuses(events).map((status) => status.toolCallId));
     expect(failed.size).toBe(1);
     // The text of a card and its status come from one run: the failure belongs to the card whose text says exit code 5.
