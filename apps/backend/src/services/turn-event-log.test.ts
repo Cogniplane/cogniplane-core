@@ -218,14 +218,14 @@ test.each([
   delta("Key: -----BEGIN ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE PRIVATE KEY");
   delta(`-----\n${KEY_LINE}-----END ONE TWO THREE FOUR FIVE SIX SEVEN EIGHT NINE PRIVATE KEY-----\nAfter the key. `);
   log.append({ type: end, messageId: "answer" } as BaseEvent);
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const replay = JSON.stringify(log.subscribe(0, () => undefined)?.replay);
-  for (const output of [replay, mirrored.join("")]) {
+  const replay = log.subscribe(0, () => undefined)!.replay.map((entry) => JSON.stringify(entry.event));
+  await vi.waitFor(() => expect(mirrored).toEqual(replay), { interval: 1 });
+  for (const output of [replay.join(""), mirrored.join("")]) {
     expect(output).not.toContain("MIIEvQIBADANBgkq");
     expect(output).not.toContain("BEGIN ONE TWO");
+    expect(output).toContain("[REDACTED PRIVATE KEY]");
+    expect(output).toContain("After the key.");
   }
-  expect(replay).toContain("[REDACTED PRIVATE KEY]");
-  expect(replay).toContain("After the key.");
 });
 
 test.each([

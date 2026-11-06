@@ -14,6 +14,8 @@ const logger = { info: () => {}, warn: () => {}, error: () => {} };
 test("stop() during the check before a send hands the claim back and sends nothing", async () => {
   let openCheck!: () => void;
   const checkGate = new Promise<void>((resolve) => { openCheck = resolve; });
+  let enterCheck!: () => void;
+  const checkEntered = new Promise<void>((resolve) => { enterCheck = resolve; });
   const queries: string[] = [];
   const db = {
     query: async (sql: string) => {
@@ -24,6 +26,7 @@ test("stop() during the check before a send hands the claim back and sends nothi
         return { rowCount: 1, rows: [{ tenant_id: "t1", email_id: "e1", kind: "password_changed", message_encrypted: message, attempts: 1 }] };
       }
       if (text.startsWith("SELECT (expires_at > now()")) {
+        enterCheck();
         await checkGate;
         return { rowCount: 1, rows: [{ deliverable: true }] };
       }
@@ -35,10 +38,13 @@ test("stop() during the check before a send hands the claim back and sends nothi
   const worker = new MailOutboxWorker({ db, sender, secret: SECRET, logger });
 
   const pass = worker.tick();
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  worker.stop();
-  openCheck();
-  await pass;
+  try {
+    await checkEntered;
+    worker.stop();
+  } finally {
+    openCheck();
+    await pass;
+  }
 
   expect(sent).toEqual([]);
   expect(queries.some((text) => text.startsWith("UPDATE email_outbox SET status = 'queued', attempts = attempts - 1"))).toBe(true);

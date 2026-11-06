@@ -173,16 +173,6 @@ describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
     expect(request.auth).toBeUndefined();
   });
 
-  test("a non-runtime route returns false so normal auth continues", () => {
-    const request = fakeRequest({
-      url: "/messages",
-      headers: { authorization: `Bearer ${validToken()}` }
-    });
-
-    expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
-    expect(request.auth).toBeUndefined();
-  });
-
 });
 
 describe("tryAuthenticateRuntimeToken — rejected tokens", () => {

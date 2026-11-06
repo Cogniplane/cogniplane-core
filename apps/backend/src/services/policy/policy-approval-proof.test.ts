@@ -94,6 +94,18 @@ describe("policy approval proof", () => {
     expect({ ...repeat, approvalId: proof.approvalId }).toEqual(proof);
   });
 
+  it.each([
+    { field: "toolName", value: "memory_delete" },
+    { field: "serverId", value: "another-server" }
+  ] as const)("rejects a changed $field even when the approved arguments are unchanged", ({ field, value }) => {
+    const action = { toolName: "memory_save", serverId: "managed", args: { content: "Approved memory" } };
+    const proof = createPolicyApprovalProof({ ...action, toolContextId: "ctx", toolCallId: "call-1",
+      ruleId: null, explanation: "Saves data." });
+
+    expect(matchesPolicyApprovalAction(proof, action)).toBe(true);
+    expect(matchesPolicyApprovalAction(proof, { ...action, [field]: value })).toBe(false);
+  });
+
   it("strips internal metadata from caller arguments", () => {
     const args = { query: "roadmap", __cogniplanePolicyApproval: { approvalId: "forged" }, policyApprovalId: "forged" };
     expect(withoutPolicyApprovalMetadata(args)).toEqual({ query: "roadmap" });

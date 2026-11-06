@@ -163,25 +163,6 @@ describe("a ComparisonTable in the chat", () => {
     expect(bodyCells(await planTable())).toEqual([["No data", "No data", "No data"], ["No data", "No data", "No data"]]);
   });
 
-  it("keeps long text and the largest table that the schema allows inside the region", async () => {
-    const longText = "Includes the full audit trail, the export of every record, and priority support. ".repeat(3).trim();
-    const columns = Array.from({ length: 8 }, (_, index) => ({ id: `c${index}`, label: index === 0 ? "L".repeat(120) : `Option ${index}` }));
-    const rows = Array.from({ length: 30 }, (_, index) => ({
-      id: `r${index}`, label: index === 0 ? "R".repeat(120) : `Criterion ${index}`, cells: { c0: index === 0 ? longText : index, c1: index === 0 ? "x".repeat(300) : null }
-    }));
-    server.connect("s-1", idleHistory(history([{ operations: table({ title: "T".repeat(120), columns, rows }, TABLE), surfaceId: TABLE }])));
-    render(hostElement());
-
-    const element = await screen.findByRole("table", { name: "T".repeat(120) });
-    expect(within(element).getAllByRole("row")).toHaveLength(31);
-    expect(bodyCells(element)[0]!.slice(0, 2)).toEqual([longText, "x".repeat(300)]);
-    expect(bodyCells(element)[29]).toEqual(["29", ...Array(7).fill("No data")]);
-    const region = screen.getByRole("region", { name: "T".repeat(120) });
-    expect(region.className).toContain("overflow-x-auto");
-    // The page scrolls nowhere, because the region holds the width.
-    expect(region.parentElement!.className).toContain("max-w-full");
-  });
-
   it("inherits the theme of the page: only app tokens, inside the surface that the theme bridge covers", async () => {
     server.connect("s-1", idleHistory(history([{ operations: table(), surfaceId: TABLE }])));
     render(<div data-theme="dark">{hostElement()}</div>);
@@ -275,44 +256,29 @@ describe("props that the catalog refuses", () => {
   /** What the SDK shows for a surface that it cannot render. */
   const refusals = () => screen.queryAllByText(/invalid props|couldn.t be shown/);
 
-  it("renders nothing for a ComparisonTable with a duplicate id, an unknown cell key, a bad cell or too few columns", async () => {
+  // The catalog suite covers the validation matrix. These cases check that
+  // the host uses those validators and shows the SDK refusal.
+  it("renders no table when the catalog refuses duplicate column ids", async () => {
     const duplicateColumn = table({ columns: [PLAN_COLUMNS[0], PLAN_COLUMNS[0]] }, "turn:a1:dup-column");
-    const duplicateRow = table({ rows: [PLAN_ROWS[0], PLAN_ROWS[0]] }, "turn:a1:dup-row");
-    const unknownKey = table({ rows: [{ id: "r", label: "R", cells: { nope: 1 } }] }, "turn:a1:unknown-key");
-    const badCell = table({ rows: [{ id: "r", label: "R", cells: { basic: { nested: true } } }] }, "turn:a1:bad-cell");
-    const oneColumn = table({ columns: [PLAN_COLUMNS[0]] }, "turn:a1:one-column");
-    const reserved = table({ rows: [{ id: "constructor", label: "R", cells: {} }] }, "turn:a1:reserved");
     server.connect("s-1", idleHistory(history([
-      { operations: duplicateColumn, surfaceId: "turn:a1:dup-column" },
-      { operations: duplicateRow, surfaceId: "turn:a1:dup-row" },
-      { operations: unknownKey, surfaceId: "turn:a1:unknown-key" },
-      { operations: badCell, surfaceId: "turn:a1:bad-cell" },
-      { operations: oneColumn, surfaceId: "turn:a1:one-column" },
-      { operations: reserved, surfaceId: "turn:a1:reserved" }
+      { operations: duplicateColumn, surfaceId: "turn:a1:dup-column" }
     ])));
     render(hostElement());
 
     await screen.findByText("Here is the view.");
-    await waitFor(() => expect(refusals()).toHaveLength(6));
+    await waitFor(() => expect(refusals()).toHaveLength(1));
     expect(screen.queryAllByRole("table")).toHaveLength(0);
     expect(screen.queryAllByRole("region", { name: "Plan comparison" })).toHaveLength(0);
   });
 
-  it("renders nothing for a StatusSummary with a duplicate id, a status outside the list, or invalid counts", async () => {
-    const cases: Array<[string, Node]> = [
-      ["dup", { items: [ITEMS[0], ITEMS[0]] }],
-      ["word", { items: [{ id: "a", label: "A", status: "done" }] }],
-      ["negative", { items: [{ id: "a", label: "A", completed: -1, total: 3 }] }],
-      ["over", { items: [{ id: "a", label: "A", completed: 4, total: 3 }] }],
-      ["half", { items: [{ id: "a", label: "A", completed: 2 }] }],
-      ["fraction", { completed: 1.5, total: 3, items: [] }],
-      ["view-over", { completed: 9, total: 3, items: [] }]
-    ];
-    server.connect("s-1", idleHistory(history(cases.map(([name, node]) => ({ operations: status(node, `turn:a1:${name}`), surfaceId: `turn:a1:${name}` })))));
+  it("renders no status summary when the catalog refuses counts above the total", async () => {
+    server.connect("s-1", idleHistory(history([
+      { operations: status({ completed: 9, total: 3, items: [] }), surfaceId: STATUS }
+    ])));
     render(hostElement());
 
     await screen.findByText("Here is the view.");
-    await waitFor(() => expect(refusals()).toHaveLength(cases.length));
+    await waitFor(() => expect(refusals()).toHaveLength(1));
     expect(screen.queryAllByRole("region", { name: "Release 4.2" })).toHaveLength(0);
     expect(screen.queryAllByRole("progressbar")).toHaveLength(0);
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);

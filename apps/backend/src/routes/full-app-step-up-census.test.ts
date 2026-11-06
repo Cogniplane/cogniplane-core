@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { FakePool } from "../test-helpers/fake-pool.js";
@@ -102,41 +102,45 @@ test("real optional overlays extend the complete app; core also works without an
   checkClassification(full, { ...coreClassifications(), ...(capture.overlayPresent ? OVERLAY_CLASSIFICATIONS : {}) });
 });
 
-test.each([
-  ["local only", { AUTH_LOGIN_TYPES: ["local"] }],
-  ["WorkOS only", { AUTH_LOGIN_TYPES: ["workos"] }],
-  ["mail off", { SMTP_URL: undefined, MAIL_FROM: undefined }],
-  ["passkeys off", { WEBAUTHN_RP_ID: undefined }],
-  ["mail and passkeys off", { SMTP_URL: undefined, MAIL_FROM: undefined, WEBAUTHN_RP_ID: undefined }],
-  ["development headers", { AUTH_MODE: "dev-headers", AUTH_LOGIN_TYPES: [] }]
-] satisfies [string, Partial<AppConfig>][])("conditional full-app registration: %s", async (_name, config: Partial<AppConfig>) => {
-  const enabled = await census(false);
-  const routes = await census(false, config);
-  checkClassification(routes, coreClassifications(), false);
-  const local = config.AUTH_MODE !== "dev-headers" && (config.AUTH_LOGIN_TYPES ?? ["local", "workos"]).includes("local");
-  const workos = config.AUTH_MODE !== "dev-headers" && (config.AUTH_LOGIN_TYPES ?? ["local", "workos"]).includes("workos");
-  expect(routes.has("POST /auth/callback")).toBe(workos);
-  expect(routes.has("POST /auth/local/login")).toBe(local);
-  expect(routes.has("POST /tenant/members")).toBe(local);
-  const mail = !("SMTP_URL" in config) || Boolean(config.SMTP_URL);
-  const passkeys = !("WEBAUTHN_RP_ID" in config) || Boolean(config.WEBAUTHN_RP_ID);
-  expect(routes.has("POST /auth/local/password/forgot")).toBe(local && mail);
-  expect(routes.has("POST /auth/passkey/login/options")).toBe(local && passkeys);
-  expect(routes.has("POST /me/security/passkeys/options")).toBe(local && passkeys);
-  const expected = new Set(enabled);
-  for (const route of enabled) {
-    const localRoute = / \/(auth\/(local|passkey|step-up)|me\/security)/.test(route)
-      || /^POST \/tenant\/members(?:$|\/)/.test(route)
-      || route === "PUT /tenant/settings/security";
-    const passkeyRoute = /passkey/.test(route);
-    const mailRoute = route === "POST /auth/local/password/forgot";
-    if ((!local && localRoute) || ((!passkeys && passkeyRoute) || (!mail && mailRoute))
-      || (!workos && route === "POST /auth/callback")
-      || (config.AUTH_MODE === "dev-headers" && ["POST /auth/logout", "POST /auth/refresh"].includes(route))) {
-      expected.delete(route);
+describe("conditional full-app registration", () => {
+  let enabled: ReadonlySet<string>;
+  beforeAll(async () => { enabled = await census(false); });
+
+  test.each([
+    ["local only", { AUTH_LOGIN_TYPES: ["local"] }],
+    ["WorkOS only", { AUTH_LOGIN_TYPES: ["workos"] }],
+    ["mail off", { SMTP_URL: undefined, MAIL_FROM: undefined }],
+    ["passkeys off", { WEBAUTHN_RP_ID: undefined }],
+    ["mail and passkeys off", { SMTP_URL: undefined, MAIL_FROM: undefined, WEBAUTHN_RP_ID: undefined }],
+    ["development headers", { AUTH_MODE: "dev-headers", AUTH_LOGIN_TYPES: [] }]
+  ] satisfies [string, Partial<AppConfig>][])("%s", async (_name, config: Partial<AppConfig>) => {
+    const routes = await census(false, config);
+    checkClassification(routes, coreClassifications(), false);
+    const local = config.AUTH_MODE !== "dev-headers" && (config.AUTH_LOGIN_TYPES ?? ["local", "workos"]).includes("local");
+    const workos = config.AUTH_MODE !== "dev-headers" && (config.AUTH_LOGIN_TYPES ?? ["local", "workos"]).includes("workos");
+    expect(routes.has("POST /auth/callback")).toBe(workos);
+    expect(routes.has("POST /auth/local/login")).toBe(local);
+    expect(routes.has("POST /tenant/members")).toBe(local);
+    const mail = !("SMTP_URL" in config) || Boolean(config.SMTP_URL);
+    const passkeys = !("WEBAUTHN_RP_ID" in config) || Boolean(config.WEBAUTHN_RP_ID);
+    expect(routes.has("POST /auth/local/password/forgot")).toBe(local && mail);
+    expect(routes.has("POST /auth/passkey/login/options")).toBe(local && passkeys);
+    expect(routes.has("POST /me/security/passkeys/options")).toBe(local && passkeys);
+    const expected = new Set(enabled);
+    for (const route of enabled) {
+      const localRoute = / \/(auth\/(local|passkey|step-up)|me\/security)/.test(route)
+        || /^POST \/tenant\/members(?:$|\/)/.test(route)
+        || route === "PUT /tenant/settings/security";
+      const passkeyRoute = /passkey/.test(route);
+      const mailRoute = route === "POST /auth/local/password/forgot";
+      if ((!local && localRoute) || ((!passkeys && passkeyRoute) || (!mail && mailRoute))
+        || (!workos && route === "POST /auth/callback")
+        || (config.AUTH_MODE === "dev-headers" && ["POST /auth/logout", "POST /auth/refresh"].includes(route))) {
+        expected.delete(route);
+      }
     }
-  }
-  expect([...routes].sort(), "exact route registration for this configuration").toEqual([...expected].sort());
+    expect([...routes].sort(), "exact route registration for this configuration").toEqual([...expected].sort());
+  });
 });
 
 test("classification removal and stale entries fail closed", async () => {

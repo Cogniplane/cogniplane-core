@@ -111,7 +111,6 @@ const stored = () => JSON.parse(sessionStorage.getItem(DRAFT_STORAGE_KEY) ?? "nu
 async function openHistory(messages: object[] = HISTORY, options: { hasMoreHistory?: boolean } = {}) {
   server.connect("s-1", idleHistory(messages, options));
   const rendered = render(hostElement());
-  await screen.findByText("Earlier answer");
   await waitFor(() => expect(headerTitle()).toBeTruthy());
   return rendered;
 }

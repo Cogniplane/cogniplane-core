@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { describe, test, expect } from "vitest";
 
 import { SignJWT, decodeProtectedHeader } from "jose";
 
@@ -142,3 +142,47 @@ test("verification rejects unknown and missing key ids", async () => {
   await expect(() => verifyAccessToken(config, unknownKid)).rejects.toThrow(/Unknown JWT kid/);
   await expect(() => verifyAccessToken(config, missingKid)).rejects.toThrow(/missing kid/);
 });
+
+for (const [kind, audience, verify, required] of [
+  ["access", "cogniplane", verifyAccessToken, { sub: "user-1", tid: "tenant-1", role: "owner" }],
+  ["refresh", "cogniplane-refresh", verifyRefreshToken, { sub: "user-1", tid: "tenant-1", jti: "j1", fid: "f1" }]
+] as const) {
+  describe(`${kind} token session claims`, () => {
+    async function signedClaims(claims: Record<string, unknown>) {
+      return new SignJWT({ ...required, ...claims })
+        .setProtectedHeader({ alg: "HS256", kid: config.JWT_KEY_ID })
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .setIssuer("cogniplane")
+        .setAudience(audience)
+        .sign(secretKey);
+    }
+
+    test.each([
+      ["amr", "pwd"],
+      ["amr", ["unknown"]],
+      ["amr", [123]],
+      ["auth_time", "1700000000"],
+      ["auth_time", 1.5],
+      ["sv", "1"],
+      ["sv", -1],
+      ["sv", 1.5],
+      ["fid", ""],
+      ["fid", 123]
+    ])("rejects a correctly signed token with %s=%j", async (claim, value) => {
+      const token = await signedClaims({ [claim]: value });
+      await expect(verify(config, token)).rejects.toThrow(`Invalid token payload: ${claim}`);
+    });
+
+    test("preserves valid session claims, including security version zero", async () => {
+      const claims = {
+        amr: ["workos", "pwd", "otp", "rec", "pkey"],
+        auth_time: 1_700_000_000,
+        sv: 0,
+        fid: "family-1"
+      };
+      const token = await signedClaims(claims);
+      await expect(verify(config, token)).resolves.toMatchObject({ ...required, ...claims });
+    });
+  });
+}

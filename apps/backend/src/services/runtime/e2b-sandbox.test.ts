@@ -33,6 +33,7 @@ let previousApiUrl: string | undefined;
 let mode: "error-500" | "unavailable-503" | "silent" = "error-500";
 // Whether the stub accepts a `connect`, so that a test can get a Sandbox instance.
 let connectable = false;
+let onCreateRequest: (() => void) | undefined;
 
 beforeAll(async () => {
   server = createServer((request, response) => {
@@ -41,6 +42,7 @@ beforeAll(async () => {
     request.on("end", () => {
       const text = Buffer.concat(chunks).toString("utf8");
       requests.push({ method: request.method ?? "", path: request.url ?? "", body: text ? JSON.parse(text) : undefined });
+      if (request.method === "POST" && request.url?.endsWith("/v2/sandboxes")) onCreateRequest?.();
       if (connectable && request.method === "POST" && /\/sandboxes\/[^/]+\/connect$/.test(request.url ?? "")) {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify({
@@ -70,6 +72,7 @@ beforeEach(() => {
   requests.length = 0;
   mode = "error-500";
   connectable = false;
+  onCreateRequest = undefined;
 });
 
 /**
@@ -130,11 +133,22 @@ describe("E2B SDK surface used by the sandbox network policy", () => {
   it("would send it again with the default of the SDK, which is why the options set retries to 0", async () => {
     mode = "unavailable-503";
     const { retries: _retries, ...withoutRetries } = productionCreateOptions();
+    const abort = new AbortController();
+    onCreateRequest = () => {
+      if (createRequests().length === 2) abort.abort();
+    };
+    const deadline = setTimeout(() => abort.abort(), 4_000);
 
-    await expect(Sandbox.create("tpl", withoutRetries)).rejects.toThrow();
+    try {
+      await expect(Sandbox.create("tpl", { ...withoutRetries, signal: abort.signal })).rejects.toThrow();
 
-    // 1 + 3 retries. If the SDK stops doing this, the test above no longer proves anything.
-    expect(createRequests().length).toBeGreaterThan(1);
+      // The second wire request proves the SDK retried. Stop before later backoffs.
+      expect(createRequests()).toHaveLength(2);
+    } finally {
+      clearTimeout(deadline);
+      abort.abort();
+      onCreateRequest = undefined;
+    }
     expect(toE2bCreateOptions({
       apiKey: "k", timeoutMs: 1, metadata: {}, network: toE2bCreateNetwork(resolveSandboxNetworkPolicy([]))
     }).retries).toBe(0);
