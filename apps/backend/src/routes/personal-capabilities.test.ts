@@ -112,3 +112,23 @@ it("shows the caller's connection state without hiding an unconnected approved c
   })]);
   expect(h.memberMcpCredentials.list).toHaveBeenCalledWith("tenant", "member");
 });
+
+it("names a connector without a server record by its ID and flags a suspended credential", async () => {
+  const h = await setup();
+  h.dynamicConfig.compilePersonalCatalog.mockResolvedValue({ skills: [],
+    mcpServers: [{ id: "docs", description: "Read docs" }, { id: "unlisted", description: "No record" }] });
+  h.memberMcpCredentials.list.mockResolvedValue([{
+    serverId: "docs", serverName: "Documents", description: null, upstreamUrl: "https://docs.example.test/mcp",
+    authType: "bearer", authName: null, credentialScope: "personal", serverVersion: 1,
+    credentialVersion: 0, status: "reconnect_required", accountLabel: null, suspended: true, hasCredential: true, canConnect: true
+  }]);
+  const connectors = [
+    { id: "docs", name: "Documents", description: "Read docs",
+      connectionStatus: "reconnect_required", connectionSuspended: true, accountLabel: null },
+    { id: "unlisted", name: "unlisted", description: "No record" }
+  ];
+  expect((await h.get()).json().connectors).toEqual(connectors);
+  const saved = await h.put({ skillIds: [], connectorIds: ["unlisted"] });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.json().connectors).toEqual(connectors);
+});

@@ -37,7 +37,6 @@ const EMPTY_SESSION_DATA: SessionData = {
 
 export function useSessionData(input: {
   selectedSessionId: string | null;
-  onError: (message: string) => void;
 }) {
   const { selectedSessionId } = input;
   const queryClient = useQueryClient();
