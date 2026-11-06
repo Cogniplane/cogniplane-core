@@ -372,7 +372,9 @@ describe("AdminModelAvailabilityCard add custom model", () => {
 it("keeps later edits dirty, adopts the saved version, and ignores a second pending Save", async () => {
   let finish!: (value: ModelAvailabilitySaveResult) => void;
   const held = new Promise<ModelAvailabilitySaveResult>(resolve => { finish = resolve; });
-  const onSave = vi.fn().mockReturnValueOnce(held).mockResolvedValue(false);
+  let finishRetry!: (value: ModelAvailabilitySaveResult) => void;
+  const heldRetry = new Promise<ModelAvailabilitySaveResult>(resolve => { finishRetry = resolve; });
+  const onSave = vi.fn().mockReturnValueOnce(held).mockReturnValueOnce(heldRetry);
   renderCard({ onSave });
   const select = await screen.findByLabelText("Default model");
   fireEvent.change(select, { target: { value: CUSTOM_MODEL_ID } });
@@ -390,7 +392,13 @@ it("keeps later edits dirty, adopts the saved version, and ignores a second pend
   fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
   await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
   expect(onSave).toHaveBeenLastCalledWith(expect.objectContaining({ expectedVersion: 9, defaultModelId: "deepagents/claude-sonnet-5" }));
-  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  const cancel = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+  expect(cancel.disabled).toBe(true);
+  fireEvent.click(cancel);
+  expect(screen.getByText(/Your later edits are still unsaved/)).toBeTruthy();
+  await act(async () => finishRetry(false));
+  expect(cancel.disabled).toBe(false);
+  fireEvent.click(cancel);
   expect(screen.queryByText(/Your later edits are still unsaved/)).toBeNull();
 });
 

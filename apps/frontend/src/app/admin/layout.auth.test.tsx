@@ -61,6 +61,8 @@ afterEach(() => {
 
 function expectNoAdminUi() {
   expect(adminShell()).toBeNull();
+  expect(screen.queryByRole("link", { name: "Skip to content" })).toBeNull();
+  expect(document.getElementById("admin-content")).toBeNull();
   expect(screen.queryByTestId("admin-page")).toBeNull();
   expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
   expect(screen.queryByText(/Admin page content|Overview|Jump to/)).toBeNull();
@@ -109,6 +111,7 @@ it.each(["admin", "owner"] as const)("shows the admin shell once the server says
   mount();
 
   expect(await screen.findByTestId("admin-page")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Skip to content" }).getAttribute("href")).toBe("#admin-content");
   expect(screen.getAllByRole("navigation", { name: "Admin sections" }).length).toBeGreaterThan(0);
   expect(router.replace).not.toHaveBeenCalled();
 });

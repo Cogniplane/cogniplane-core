@@ -55,6 +55,45 @@ it("has one Privacy entry and no Organization entry", () => {
   expect(screen.queryByText(/gateway routes|provider selection/i)).toBeNull();
 });
 
+it("puts Skip to content first and focuses the main content after navigation", () => {
+  mount("/admin/sessions/s1");
+  const skip = screen.getByRole("link", { name: "Skip to content" });
+  const content = screen.getByRole("main");
+  expect(document.querySelector("a, button, input, select, textarea, [tabindex='0']")).toBe(skip);
+  expect(skip.getAttribute("href")).toBe(`#${content.id}`);
+  expect(skip.className).toContain("sr-only");
+  expect(skip.className).toContain("focus:not-sr-only");
+  expect(skip.className).toContain("focus:fixed");
+  expect(skip.className).toContain("focus:px-4");
+  expect(skip.className).toContain("focus:py-2");
+  expect(skip.className).toContain("focus:ring-[3px]");
+  expect(content.tabIndex).toBe(-1);
+  expect(content.className).toContain("focus-visible:ring-[3px]");
+  expect(content.contains(screen.getByRole("heading", { level: 1 }))).toBe(true);
+  expect(content.contains(screen.getByLabelText("Draft name"))).toBe(true);
+  for (const navigation of screen.getAllByRole("navigation", { name: "Admin sections" })) {
+    expect(content.contains(navigation)).toBe(false);
+    expect(navigation.compareDocumentPosition(content) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  }
+
+  skip.focus();
+  expect(document.activeElement).toBe(skip);
+  fireEvent.click(skip);
+  expect(document.activeElement).toBe(content);
+});
+
+it("does not move focus into the content when the layout renders", () => {
+  const field = document.createElement("input");
+  document.body.append(field);
+  field.focus();
+  try {
+    mount("/admin/overview");
+    expect(document.activeElement).toBe(field);
+  } finally {
+    field.remove();
+  }
+});
+
 it("opens quick jump with Ctrl+K from a form field and returns focus to it without resetting the form", async () => {
   mount("/admin/capabilities");
   const field = screen.getByLabelText("Draft name") as HTMLInputElement;
