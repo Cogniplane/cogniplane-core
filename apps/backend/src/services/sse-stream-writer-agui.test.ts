@@ -1,9 +1,12 @@
+import { EventEmitter } from "node:events";
 import { test, expect, vi } from "vitest";
 import { EventType, verifyEvents, type BaseEvent } from "@ag-ui/client";
 import { firstValueFrom, from as rxFrom, toArray } from "rxjs";
 
+import { AsyncQueue } from "../lib/async-queue.js";
 import { streamAssistantReplyAGUI, type StreamAssistantReplyAGUIInput } from "./sse-stream-writer-agui.js";
 import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
+import { SSE_DRAIN_DEADLINE_MS } from "./sse-writer.js";
 import { TurnEventLog } from "./turn-event-log.js";
 
 // ---------------------------------------------------------------------------
@@ -266,6 +269,142 @@ test("a closed stream still completes the turn and saves its tool result", async
     EventType.RUN_FINISHED
   ]);
   expect(eventLog.subscribe(0, () => undefined)).toBeNull();
+});
+
+/** A connected socket that accepts the first frames and then never drains. */
+class StalledResponse extends EventEmitter {
+  readonly writes: string[] = [];
+  writableEnded = false;
+  destroyed = false;
+  destroyCalls = 0;
+  private wrote!: () => void;
+  readonly firstWrite = new Promise<void>((resolve) => { this.wrote = resolve; });
+
+  write(chunk: string): boolean {
+    this.writes.push(chunk);
+    this.wrote();
+    return false;
+  }
+
+  end(): void {
+    this.writableEnded = true;
+  }
+
+  destroy(): void {
+    this.destroyCalls += 1;
+    this.destroyed = true;
+    process.nextTick(() => this.emit("close"));
+  }
+}
+
+test("a client that stops reading cannot hold the turn past the drain deadline", async () => {
+  vi.useFakeTimers();
+  // As in DeepAgentsRuntimeAdapter: the graph pushes into an unbounded queue
+  // without waiting for the consumer. Usage is saved before the terminal event
+  // is yielded, and runtime cleanup runs when the consumer finishes the stream.
+  const queue = new AsyncQueue<BaseEvent>();
+  const usageFlushes = vi.fn();
+  let runtimeCleanedUp = false;
+  let pending: Promise<void> | undefined;
+  try {
+    const raw = new StalledResponse();
+    const eventLog = new TurnEventLog();
+    const replayed: BaseEvent[] = [];
+    eventLog.subscribe(0, (entry) => { if (entry) replayed.push(entry.event); });
+    const cancel = new AbortController();
+    const onTurnSettled = vi.fn(async () => undefined);
+    const interruptTurn = vi.fn();
+    const { input, messages } = runInput([], {
+      eventLog,
+      cancelSignal: cancel.signal,
+      onTurnSettled,
+      runtimeAdapter: {
+        async createSession() {
+          return { sessionId: "session-1", runtimeId: "runtime-1", runtimePolicy: { id: "default" } };
+        },
+        async *runMessageAGUI() {
+          try {
+            for await (const event of queue) {
+              if (event.type === EventType.RUN_FINISHED) usageFlushes();
+              yield event;
+            }
+          } finally {
+            runtimeCleanedUp = true;
+          }
+        },
+        interruptTurn
+      } as unknown as StreamAssistantReplyAGUIInput["runtimeAdapter"]
+    });
+    input.reply = { raw } as unknown as StreamAssistantReplyAGUIInput["reply"];
+
+    queue.push({ type: EventType.RUN_STARTED, threadId: "session-1", runId: "run-1" } as BaseEvent);
+    pending = streamAssistantReplyAGUI(input);
+    // The first frame fills the socket buffer. The consumer now waits for drain.
+    await raw.firstWrite;
+    // The graph keeps producing text, a tool result, and the terminal event.
+    for (const event of [
+      { type: EventType.TEXT_MESSAGE_START, messageId: "m", role: "assistant" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "Hello" },
+      { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: " world" },
+      { type: EventType.TEXT_MESSAGE_END, messageId: "m" },
+      { type: EventType.TOOL_CALL_START, toolCallId: "tool-1", toolCallName: "execute" },
+      { type: EventType.TOOL_CALL_RESULT, toolCallId: "tool-1", content: "ok" },
+      { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "run-1" }
+    ] as BaseEvent[]) {
+      expect(queue.push(event)).toBe(true);
+    }
+    queue.end();
+
+    await vi.advanceTimersByTimeAsync(SSE_DRAIN_DEADLINE_MS - 1);
+    // Still blocked. The heartbeat joined the same drain wait.
+    expect(raw.writes).toEqual([
+      expect.stringContaining('"type":"RUN_STARTED"'),
+      ": keep-alive\n\n"
+    ]);
+    expect(raw.listenerCount("drain")).toBe(1);
+    expect(raw.destroyCalls).toBe(0);
+    expect(messages.contentLog.some((entry) => entry.status === "completed")).toBe(false);
+    expect(usageFlushes).not.toHaveBeenCalled();
+    expect(onTurnSettled).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+
+    // The deadline closed only the wire. No frame reached it afterwards.
+    expect(raw.destroyCalls).toBe(1);
+    expect(raw.listenerCount("drain")).toBe(0);
+    expect(raw.writes).toHaveLength(2);
+    // The consumer read every produced event into the transcript and replay.
+    expect(messages.contentLog.at(-1)).toEqual({ status: "completed", content: "Hello world" });
+    expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "tool-1", status: "completed", output: "ok" });
+    // The replay log groups text deltas by word, so compare the text itself.
+    const replayedText = replayed
+      .filter((event) => event.type === EventType.TEXT_MESSAGE_CONTENT)
+      .map((event) => (event as unknown as { delta: string }).delta)
+      .join("");
+    expect(replayedText).toBe("Hello world");
+    expect(replayed.map((event) => event.type).filter((type) => type !== EventType.TEXT_MESSAGE_CONTENT)).toEqual([
+      EventType.RUN_STARTED,
+      EventType.CUSTOM,
+      EventType.TEXT_MESSAGE_START,
+      EventType.TEXT_MESSAGE_END,
+      EventType.TOOL_CALL_START,
+      EventType.TOOL_CALL_RESULT,
+      EventType.RUN_FINISHED
+    ]);
+    expect(eventLog.subscribe(0, () => undefined)).toBeNull();
+    expect(usageFlushes).toHaveBeenCalledOnce();
+    expect(runtimeCleanedUp).toBe(true);
+    expect(onTurnSettled).toHaveBeenCalledOnce();
+    // The turn was not stopped.
+    expect(cancel.signal.aborted).toBe(false);
+    expect(interruptTurn).not.toHaveBeenCalled();
+  } finally {
+    queue.end();
+    // Settle cleanup without replacing an earlier assertion failure.
+    await Promise.allSettled([pending]);
+    vi.useRealTimers();
+  }
 });
 
 test("replay includes the saved user prompt before the assistant reply", async () => {

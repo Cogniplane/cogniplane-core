@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { toast } from "sonner";
 
-import { __resetSessionGateForTests, API_URL, changeSession, createApiHeaders, getSessionEpoch } from "./api-client";
+import { __resetSessionGateForTests, API_URL, changeSession, createApiHeaders, getAccessToken, getSessionEpoch } from "./api-client";
 import { AuthProvider, useAuth } from "./auth-context";
 import { useAgentBehaviorDraftStore } from "../components/agent-behavior-draft-provider";
 import { COMPOSER_DRAFT_STORAGE_KEY, saveComposerDraft } from "../components/composer-drafts.logic";
@@ -170,6 +170,14 @@ describe.each(["generated UI", "composer"])("%s draft identity boundary", (kind)
     expect(stored()).toContain("Unsent words");
 
     fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    await act(async () => { await getAuth().logout(); });
+    expect(stored()).toContain("Unsent words");
+  });
+
+  it.each([403, 429, 500])("keeps the drafts when sign-out answers %i", async (status) => {
+    const { getAuth, fetchMock } = await renderSignedIn();
+    seed();
+    fetchMock.mockResolvedValue(jsonResponse(status, { error: "sign_out_failed" }));
     await act(async () => { await getAuth().logout(); });
     expect(stored()).toContain("Unsent words");
   });
@@ -613,6 +621,8 @@ describe("AuthProvider — refresh and logout are JSON posts", () => {
 
     expectJsonPost(fetchMock, "/auth/logout");
     expect(window.location.href).toBe("/login");
+    expect(getAccessToken()).toBeNull();
+    expect(screen.getByTestId("user").textContent).toBe("none");
   });
 
   it("keeps the session and shows an error when the sign-out request fails", async () => {
@@ -625,5 +635,40 @@ describe("AuthProvider — refresh and logout are JSON posts", () => {
     expect(vi.mocked(toast.error)).toHaveBeenCalledWith("Sign-out failed. Try again.");
     expect(window.location.href).toBe("http://localhost:3000/");
     expect(screen.getByTestId("user").textContent).toBe(SIGNED_IN_USER.email);
+    expect(getAccessToken()).toBe("tok-boot");
+  });
+
+  // The backend keeps the refresh cookie when it refuses (403), limits (429)
+  // or fails (5xx) the sign-out. A resolved fetch is not a sign-out.
+  it.each([403, 429, 500, 503])("keeps the session and shows an error when the sign-out answers %i", async (status) => {
+    const { getAuth, fetchMock } = await renderSignedIn();
+    const epoch = getSessionEpoch();
+    vi.mocked(toast.error).mockClear();
+    fetchMock.mockResolvedValue(jsonResponse(status, { error: "sign_out_failed" }));
+
+    await act(async () => { await getAuth().logout(); });
+
+    expectJsonPost(fetchMock, "/auth/logout");
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith("Sign-out failed. Try again.");
+    expect(window.location.href).toBe("http://localhost:3000/");
+    expect(screen.getByTestId("user").textContent).toBe(SIGNED_IN_USER.email);
+    expect(getAccessToken()).toBe("tok-boot");
+    expect(getSessionEpoch()).toBe(epoch);
+    expect(document.cookie).toContain("cogniplane_session_hint=1");
+  });
+
+  it("signs out when a retry after a failed sign-out succeeds", async () => {
+    const { getAuth, fetchMock } = await renderSignedIn();
+    fetchMock.mockResolvedValueOnce(jsonResponse(429, { error: "rate_limited" }));
+    await act(async () => { await getAuth().logout(); });
+    expect(getAccessToken()).toBe("tok-boot");
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+    await act(async () => { await getAuth().logout(); });
+
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === `${API_URL}/auth/logout`)).toHaveLength(2);
+    expect(window.location.href).toBe("/login");
+    expect(getAccessToken()).toBeNull();
+    expect(screen.getByTestId("user").textContent).toBe("none");
   });
 });

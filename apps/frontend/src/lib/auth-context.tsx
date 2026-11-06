@@ -430,14 +430,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // shared computer, a hung refresh must not keep the person signed in.
     try {
       await changeSession(
-        (_request, signal) =>
-          fetch(`${API_URL}/auth/logout`, {
+        async (_request, signal) => {
+          const response = await fetch(`${API_URL}/auth/logout`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: "{}",
             credentials: "include",
             signal
-          }),
+          });
+          // A refused or failed sign-out (403, 429, 5xx) keeps the refresh
+          // cookie. Throw, so that changeSession keeps the session in memory.
+          if (!response.ok) throw new Error(`Sign-out failed (${response.status}).`);
+          return response;
+        },
         () => null,
         { stopRefresh: true }
       );

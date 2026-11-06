@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import { expect, test } from "vitest";
 
 import type { ArtifactRecord, ArtifactStore } from "../../../../apps/backend/src/services/artifacts/artifact-store.js";
+import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
 import { SessionUploadAccessError } from "../../../../apps/backend/src/services/session-upload-access.js";
 import { UploadAdmission } from "../../../../apps/backend/src/services/artifacts/upload-admission.js";
 import {
@@ -19,19 +20,32 @@ import { MicrosoftInvalidIdError } from "./graph-id-validation.js";
 type AdmissionDeps = ConstructorParameters<typeof UploadAdmission>[0];
 // Tests pass the stores; makeService wraps them in the real UploadAdmission.
 type MicrosoftFilesDeps = Omit<ConstructorParameters<typeof MicrosoftFilesService>[0], "uploadAdmission"> &
-  AdmissionDeps;
+  AdmissionDeps & { auditEvents: { create(input: AuditEventInput): Promise<void> } };
 
 function makeService(deps: MicrosoftFilesDeps) {
-  const { microsoftConnections, fetchImpl, maxImportBytes, ...admissionDeps } = deps;
+  const { microsoftConnections, fetchImpl, maxImportBytes, auditEvents, artifacts, ...admissionDeps } = deps;
   return new MicrosoftFilesService({
     microsoftConnections,
     fetchImpl,
     maxImportBytes,
-    uploadAdmission: new UploadAdmission(admissionDeps)
+    uploadAdmission: new UploadAdmission({
+      ...admissionDeps,
+      artifacts: {
+        // The store writes the audit event in the transaction of the row, so
+        // a failed event fails the upload.
+        async createUpload(input, audit) {
+          const record = await artifacts.createUpload(input, audit);
+          await auditEvents.create(audit(record));
+          return record;
+        },
+        update: (...args) => artifacts.update(...args),
+        getReadable: (...args) => artifacts.getReadable(...args)
+      }
+    })
   });
 }
 type ArtifactCreateInput = Parameters<ArtifactStore["create"]>[0];
-type AuditCreateInput = Parameters<MicrosoftFilesDeps["auditEvents"]["create"]>[0];
+type AuditCreateInput = AuditEventInput;
 
 function makeArtifactRecord(
   input: ArtifactCreateInput,
@@ -275,7 +289,14 @@ test("MicrosoftFilesService.importFileToSession stores the file as an artifact",
   expect(artifact.artifactId).toBe("artifact-1");
   expect(storedBodies[0]?.toString("utf8")).toBe("artifact body");
   expect(createdArtifacts[0]?.mimeType).toBe("text/plain");
-  expect(auditEvents[0]?.type).toBe("artifact_uploaded");
+  expect(auditEvents).toHaveLength(1);
+  expect(auditEvents[0]).toMatchObject({
+    tenantId: "tenant-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    type: "artifact_uploaded",
+    payload: { artifactId: "artifact-1", source: "microsoft", driveId: "drive-3", itemId: "item-3" }
+  });
 });
 
 test("MicrosoftFilesService.listFiles rejects driveId containing slash before any HTTP call", async () => {
@@ -1022,6 +1043,23 @@ test("importFileToSession: deletes stored bytes when access is lost during the d
   });
   await expect(run()).rejects.toThrow(SessionUploadAccessError);
   expect(calls.deleted).toHaveLength(1);
+});
+
+test("importFileToSession: deletes stored bytes and starts no scan when the upload audit fails", async () => {
+  const failure = new Error("audit insert failed");
+  let enqueued = 0;
+  const { calls, run } = importService({
+    auditEvents: { async create() { throw failure; } },
+    piiScanEnqueuer: {
+      async enqueue() {
+        enqueued += 1;
+        return { kind: "queued", scanRunId: "r", jobId: "j", mode: "detect" };
+      }
+    }
+  });
+  await expect(run()).rejects.toBe(failure);
+  expect(calls.deleted).toHaveLength(1);
+  expect(enqueued).toBe(0);
 });
 
 test("importFileToSession: a queued scan returns the artifact still pending", async () => {

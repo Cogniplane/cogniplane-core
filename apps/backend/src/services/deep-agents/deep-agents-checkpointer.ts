@@ -26,6 +26,8 @@
 import pg from "pg";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 
+import { operationalPoolOptions } from "../../lib/db.js";
+
 export const DEEP_AGENTS_CHECKPOINT_SCHEMA = "deep_agents";
 
 /**
@@ -40,13 +42,17 @@ const CHECKPOINTER_POOL_MAX = 20;
  * Runtime checkpointer (app_user connection). Call `.end()` on shutdown —
  * PostgresSaver.end() closes the injected pool. Assumes
  * `setupDeepAgentsCheckpointer` already ran via migrations.
+ *
+ * The pool stays separate from the app pool, with its own name and size, but
+ * it gets the same operational limits: without them, a stalled connection or
+ * statement could hold a turn's checkpoint write with no bound.
  */
 export function createDeepAgentsCheckpointer(databaseUrl: string): PostgresSaver {
-  const pool = new pg.Pool({
+  const pool = new pg.Pool(operationalPoolOptions({
     connectionString: databaseUrl,
-    max: CHECKPOINTER_POOL_MAX,
-    application_name: "cogniplane-deep-agents-checkpointer"
-  });
+    applicationName: "cogniplane-deep-agents-checkpointer",
+    max: CHECKPOINTER_POOL_MAX
+  }));
   return new PostgresSaver(pool, undefined, {
     schema: DEEP_AGENTS_CHECKPOINT_SCHEMA
   });
@@ -55,7 +61,9 @@ export function createDeepAgentsCheckpointer(databaseUrl: string): PostgresSaver
 /**
  * Migration-time DDL: creates the schema + checkpointer tables and applies
  * the library's internal migrations. Must run on a superuser connection
- * (migrate.ts), mirroring how the SQL migrations run.
+ * (migrate.ts), mirroring how the SQL migrations run. This saver builds its
+ * own short-lived pool without the operational limits; it is not a serving
+ * pool.
  */
 export async function setupDeepAgentsCheckpointer(migrationDatabaseUrl: string): Promise<void> {
   const saver = PostgresSaver.fromConnString(migrationDatabaseUrl, {

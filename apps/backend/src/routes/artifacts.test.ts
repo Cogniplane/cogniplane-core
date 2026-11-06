@@ -666,6 +666,7 @@ describe("POST /artifacts file name validation", () => {
       detail: {}
     });
     let lastName = "";
+    const auditEvents = new InMemoryAuditEventStore();
     const stores = {
       sessions: {
         async requireUploadAccess() {
@@ -675,15 +676,20 @@ describe("POST /artifacts file name validation", () => {
         async getReadable() { return null; }
       },
       artifacts: {
-        async createUpload(input: { artifactName: string }) {
+        async createUpload(
+          input: { artifactName: string },
+          audit: (artifact: ReturnType<typeof record>) => Parameters<InMemoryAuditEventStore["create"]>[0]
+        ) {
           calls.createUpload.push({ artifactName: input.artifactName });
           lastName = input.artifactName;
-          return record(input.artifactName);
+          const created = record(input.artifactName);
+          await auditEvents.create(audit(created));
+          return created;
         },
         async update() { return null; },
         async getReadable() { return record(lastName); }
       },
-      auditEvents: new InMemoryAuditEventStore(),
+      auditEvents,
       storage: {
         async put(input: { storageKey: string; stream: AsyncIterable<Buffer> }) {
           calls.put.push(input.storageKey);

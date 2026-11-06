@@ -2,7 +2,6 @@ import type { Readable } from "node:stream";
 
 import type { FastifyBaseLogger } from "fastify";
 
-import type { AuditEventStore } from "../audit-event-store.js";
 import type { PiiArtifactScanEnqueuer, PiiArtifactScanSource } from "../pii/pii-artifact-scan-enqueuer.js";
 import { SessionUploadAccessError } from "../session-upload-access.js";
 import type { SessionStore } from "../session-store.js";
@@ -39,7 +38,6 @@ export class UploadAdmission {
       sessions: Pick<SessionStore, "requireUploadAccess">;
       artifacts: Pick<ArtifactStore, "createUpload" | "update" | "getReadable">;
       storage: Pick<ArtifactStorage, "put" | "delete">;
-      auditEvents: Pick<AuditEventStore, "create">;
       piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "enqueue">;
       logger?: Pick<FastifyBaseLogger, "error">;
     }
@@ -83,6 +81,7 @@ export class UploadAdmission {
     let artifact: ArtifactRecord;
     try {
       // Access is checked again under lock: it can change while bytes stream.
+      // The audit event commits with the pending row, or neither commits.
       artifact = await this.deps.artifacts.createUpload({
         expectedProjectId: ticket.expectedProjectId,
         tenantId,
@@ -97,9 +96,22 @@ export class UploadAdmission {
         createdByType: input.createdByType,
         createdByRef: input.createdByRef ?? null,
         detail: input.detail
-      });
+      }, (created) => ({
+        tenantId,
+        sessionId,
+        userId,
+        type: "artifact_uploaded",
+        payload: {
+          artifactId: created.artifactId,
+          artifactType: created.artifactType,
+          artifactName: created.artifactName,
+          mimeType: created.mimeType,
+          fileSizeBytes: created.fileSizeBytes,
+          ...input.auditPayload
+        }
+      }));
     } catch (error) {
-      // Keep the access error if cleanup also fails.
+      // Keep the access or audit error if cleanup also fails.
       try {
         await this.deps.storage.delete(stored.storageKey);
       } catch (cleanupError) {
@@ -110,21 +122,6 @@ export class UploadAdmission {
       }
       throw error;
     }
-
-    await this.deps.auditEvents.create({
-      tenantId,
-      sessionId,
-      userId,
-      type: "artifact_uploaded",
-      payload: {
-        artifactId: artifact.artifactId,
-        artifactType: artifact.artifactType,
-        artifactName: artifact.artifactName,
-        mimeType: artifact.mimeType,
-        fileSizeBytes: artifact.fileSizeBytes,
-        ...input.auditPayload
-      }
-    });
 
     const scan = this.deps.piiScanEnqueuer
       ? await this.deps.piiScanEnqueuer.enqueue({

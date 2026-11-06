@@ -14,10 +14,11 @@
 
 import { afterAll, describe, expect, test } from "vitest";
 import type { Checkpoint, CheckpointMetadata } from "@langchain/langgraph";
+import type pg from "pg";
 
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
 
-import { adminDatabaseUrl, runAppUserUrl } from "./support/database.js";
+import { adminDatabaseUrl, runAppUserUrl, runRoleName } from "./support/database.js";
 
 describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
   // The saver owns its own pool (PostgresSaver constructs one), so it is not
@@ -45,6 +46,25 @@ describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
       versions_seen: {}
     };
   }
+
+  test("the saver connects as app_user with the operational limits", async () => {
+    // pg sends these limits when it opens a connection. Read them back from
+    // the server, through the pool that the saver uses for its own queries.
+    const pool = (saver as unknown as { pool: pg.Pool }).pool;
+    const { rows } = await pool.query<Record<string, string>>(`
+      SELECT current_user AS role,
+             current_setting('application_name') AS application_name,
+             current_setting('statement_timeout') AS statement_timeout,
+             current_setting('idle_in_transaction_session_timeout') AS idle_in_transaction_session_timeout
+    `);
+
+    expect(rows[0]).toEqual({
+      role: runRoleName(),
+      application_name: "cogniplane-deep-agents-checkpointer",
+      statement_timeout: "30s",
+      idle_in_transaction_session_timeout: "1min"
+    });
+  });
 
   test("a checkpoint written as app_user reads back", async () => {
     const threadId = `it-thread-${Date.now()}`;

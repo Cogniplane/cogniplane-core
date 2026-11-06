@@ -1,7 +1,16 @@
 import type { Pool, PoolClient } from "pg";
 import { test, expect } from "vitest";
 
-import { withTenantScope, withTransaction } from "./db.js";
+import type { AppConfig } from "../config.js";
+import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
+import {
+  createDatabase,
+  createMaintenanceDatabase,
+  createPrivilegedDatabase,
+  operationalPoolOptions,
+  withTenantScope,
+  withTransaction
+} from "./db.js";
 
 /**
  * The shared `FakePool` (test-helpers/fake-pool.ts) returns a client whose
@@ -205,4 +214,98 @@ test("a successful rollback releases the client back to the pool undamaged", asy
   // needlessly churn the pool on every ordinary query error.
   expect(releaseCount()).toBe(1);
   expect(releaseArgs[0]).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// Serving pool limits
+// ---------------------------------------------------------------------------
+
+const OPERATIONAL_LIMITS = {
+  connectionTimeoutMillis: 10_000,
+  statement_timeout: 30_000,
+  idle_in_transaction_session_timeout: 60_000
+};
+
+type ServingPool = {
+  name: string;
+  url: string;
+  applicationName: string;
+  open(url: string): { pool: Pool; close(): Promise<void> };
+};
+
+function plainPool(pool: Pool) {
+  return { pool, close: () => pool.end() };
+}
+
+// Every pool that serves requests, workers, or agent turns. Add each new
+// serving pool here, so that it cannot ship with pg's unbounded defaults.
+// Constructing a pool opens no connection.
+const SERVING_POOLS: ServingPool[] = [
+  {
+    name: "app",
+    url: "postgres://app_user:app-secret@db.test:5432/cogniplane",
+    applicationName: "cogniplane-backend",
+    open: (url) => plainPool(createDatabase({ DATABASE_URL: url } as AppConfig))
+  },
+  {
+    name: "maintenance",
+    url: "postgres://maintenance_user:maint-secret@db.test:5432/cogniplane",
+    applicationName: "cogniplane-backend-maintenance",
+    open: (url) => plainPool(createMaintenanceDatabase(url))
+  },
+  {
+    name: "operator",
+    url: "postgres://postgres:operator-secret@db.test:5432/cogniplane",
+    applicationName: "cogniplane-operator",
+    open: (url) => plainPool(createPrivilegedDatabase(url))
+  },
+  {
+    name: "Deep Agents checkpointer",
+    url: "postgres://app_user:checkpoint-secret@checkpoints.test:5432/cogniplane",
+    applicationName: "cogniplane-deep-agents-checkpointer",
+    open: (url) => {
+      const saver = createDeepAgentsCheckpointer(url);
+      // PostgresSaver keeps the injected pool in a private field.
+      return { pool: (saver as unknown as { pool: Pool }).pool, close: () => saver.end() };
+    }
+  }
+];
+
+test("operationalPoolOptions adds the operational limits to the pool identity", () => {
+  const identity = { connectionString: "postgres://db.test/cogniplane", applicationName: "cogniplane-test", max: 7 };
+
+  expect(operationalPoolOptions(identity)).toEqual({
+    connectionString: "postgres://db.test/cogniplane",
+    application_name: "cogniplane-test",
+    max: 7,
+    ...OPERATIONAL_LIMITS
+  });
+  expect(identity).toEqual({ connectionString: "postgres://db.test/cogniplane", applicationName: "cogniplane-test", max: 7 });
+});
+
+test.each(SERVING_POOLS)("the $name pool keeps its identity and gets the operational limits", async (serving) => {
+  const { pool, close } = serving.open(serving.url);
+  try {
+    expect(pool.options).toMatchObject({
+      connectionString: serving.url,
+      application_name: serving.applicationName,
+      max: 20,
+      ...OPERATIONAL_LIMITS
+    });
+    for (const limit of Object.keys(OPERATIONAL_LIMITS) as Array<keyof typeof OPERATIONAL_LIMITS>) {
+      expect(pool.options[limit]).toBeGreaterThan(0);
+    }
+  } finally {
+    await close();
+  }
+});
+
+test("each serving pool is a separate pool with its own name", async () => {
+  const opened = SERVING_POOLS.map((serving) => serving.open(serving.url));
+  try {
+    expect(new Set(opened.map(({ pool }) => pool)).size).toBe(SERVING_POOLS.length);
+    expect(new Set(opened.map(({ pool }) => pool.options.application_name)).size).toBe(SERVING_POOLS.length);
+  } finally {
+    await Promise.all(opened.map(({ close }) => close()));
+  }
 });

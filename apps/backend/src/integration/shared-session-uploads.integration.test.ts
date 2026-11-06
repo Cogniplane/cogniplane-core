@@ -300,6 +300,102 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
     expect((await h.upload(personal.sessionId)).statusCode).toBe(201);
   });
 
+  // The pending row and its audit event commit together. Postgres refuses the
+  // audit insert after the row insert in the same transaction, so nothing
+  // commits, the bytes are deleted and no scan starts.
+  test("rolls back the pending row and deletes the bytes when the upload audit insert fails", async () => {
+    const h = await setup("detect");
+    const createAuditEvent = AuditEventStore.createInTransaction.bind(AuditEventStore);
+    let rowsInTransaction: number | undefined;
+    const audit = vi.spyOn(AuditEventStore, "createInTransaction").mockImplementationOnce(async (client, input) => {
+      rowsInTransaction = Number((await client.query(
+        "SELECT count(*) FROM artifacts WHERE tenant_id=$1", [h.tenantId])).rows[0].count);
+      // Not an inet value: the real INSERT INTO audit_events fails.
+      return createAuditEvent(client, { ...input, ipAddress: "not-an-ip-address" });
+    });
+    const enqueue = vi.spyOn(h.enqueuer, "enqueue");
+    const uploadAudits = async () => (await superuserPool().query(
+      "SELECT user_id, session_id, payload FROM audit_events WHERE tenant_id=$1 AND event_type='artifact_uploaded'",
+      [h.tenantId])).rows;
+    const scanRows = async (table: "pii_scan_runs" | "pii_scan_jobs") => Number((await superuserPool().query(
+      `SELECT count(*) FROM ${table} WHERE tenant_id=$1`, [h.tenantId])).rows[0].count);
+    try {
+      expect((await h.upload()).statusCode).toBe(500);
+      expect(audit).toHaveBeenCalledOnce();
+      // The row existed inside the transaction, then rolled back.
+      expect(rowsInTransaction).toBe(1);
+      expect(await h.count()).toBe(0);
+      expect(await uploadAudits()).toEqual([]);
+      const stored = await h.put.mock.results[0]!.value;
+      expect(h.remove).toHaveBeenCalledExactlyOnceWith(stored.storageKey);
+      await expect(h.storage.openReadStream(stored.storageKey)).rejects.toThrow();
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(h.readPolicy).not.toHaveBeenCalled();
+      expect(await scanRows("pii_scan_runs")).toBe(0);
+      expect(await scanRows("pii_scan_jobs")).toBe(0);
+    } finally {
+      audit.mockRestore();
+    }
+
+    // A retry commits one row with one event, then queues one scan.
+    const retry = await h.upload();
+    expect(retry.statusCode).toBe(201);
+    const artifact = retry.json().artifact;
+    expect(await h.count()).toBe(1);
+    expect(await uploadAudits()).toEqual([{
+      user_id: h.editorId,
+      session_id: h.project.referenceSessionId,
+      payload: {
+        artifactId: artifact.artifactId,
+        artifactType: "upload",
+        artifactName: "report.txt",
+        mimeType: "text/plain",
+        fileSizeBytes: "Shared report".length
+      }
+    }]);
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(await scanRows("pii_scan_runs")).toBe(1);
+    expect((await superuserPool().query(
+      "SELECT count(*) FROM pii_scan_jobs WHERE tenant_id=$1 AND subject_id=$2",
+      [h.tenantId, artifact.artifactId])).rows[0].count).toBe("1");
+  });
+
+  // No job exists after a failed enqueue, so no worker can finish the scan.
+  test("closes the pending scan state and keeps the bytes when the scan job insert fails", async () => {
+    const h = await setup("detect");
+    const jobInsert = vi.spyOn(h.piiScanJobs, "create").mockRejectedValueOnce(new Error("job insert failed"));
+
+    const response = await h.upload();
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json().error).toBe("pii_enqueue_failed");
+    expect(response.json().message).toBe("The file scan could not be queued. Try again later.");
+    expect(jobInsert).toHaveBeenCalledOnce();
+    const artifacts = (await superuserPool().query(
+      "SELECT artifact_id, status, storage_key, detail_json FROM artifacts WHERE tenant_id=$1", [h.tenantId])).rows;
+    expect(artifacts).toHaveLength(1);
+    const [artifact] = artifacts;
+    const runs = (await superuserPool().query(
+      "SELECT scan_run_id, status, error_message, completed_at FROM pii_scan_runs WHERE tenant_id=$1 AND subject_id=$2",
+      [h.tenantId, artifact.artifact_id])).rows;
+    expect(runs).toEqual([{
+      scan_run_id: expect.any(String), status: "failed", error_message: "pii_enqueue_failed", completed_at: expect.any(Date)
+    }]);
+    expect(artifact.status).toBe("failed");
+    expect(artifact.detail_json.pii).toEqual({
+      status: "failed", modeApplied: "detect", scanRunId: runs[0].scan_run_id, summaryText: "pii_enqueue_failed"
+    });
+    expect((await superuserPool().query(
+      "SELECT count(*) FROM pii_scan_jobs WHERE tenant_id=$1", [h.tenantId])).rows[0].count).toBe("0");
+    // The content was not scanned: the bytes stay and the file stays unpublished.
+    expect(h.remove).not.toHaveBeenCalled();
+    const handle = await h.storage.openReadStream(artifact.storage_key);
+    const chunks: Buffer[] = [];
+    for await (const chunk of handle.stream) chunks.push(Buffer.from(chunk));
+    expect(Buffer.concat(chunks).toString()).toBe("Shared report");
+    expect((await h.publish(artifact.artifact_id)).statusCode).toBe(404);
+  });
+
   test("keeps the file unpublished before enqueue and completes queued scans under the uploader's identity", async () => {
     const h = await setup("detect");
     const enqueue = h.enqueuer.enqueue.bind(h.enqueuer);

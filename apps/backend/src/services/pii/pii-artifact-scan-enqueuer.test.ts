@@ -30,6 +30,7 @@ function buildDeps(overrides: {
   readerReturnsNull?: boolean;
   readerThrows?: Error;
   scanRunCreateThrows?: Error;
+  jobCreateThrows?: Error;
   storageDeleteThrows?: Error;
   withAuditEvents?: boolean;
 } = {}) {
@@ -46,6 +47,7 @@ function buildDeps(overrides: {
   const piiDetailCalls: Array<{ tenantId: string; artifactId: string; pii: Record<string, unknown> }> = [];
   const artifactUpdateCalls: Array<{ tenantId: string; artifactId: string; input: Record<string, unknown> }> = [];
   const logWarnCalls: Array<{ payload: unknown; message: string }> = [];
+  const logErrorCalls: Array<{ payload: unknown; message: string }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
   let scanRunCounter = 0;
@@ -96,6 +98,7 @@ function buildDeps(overrides: {
     piiScanJobs: {
       async create(input: Record<string, unknown>) {
         jobCalls.push(input);
+        if (overrides.jobCreateThrows) throw overrides.jobCreateThrows;
         return { jobId: "job-1", scanRunId: input.scanRunId as string } as never;
       }
     },
@@ -120,7 +123,9 @@ function buildDeps(overrides: {
       warn(payload: unknown, message: string) {
         logWarnCalls.push({ payload, message });
       },
-      error() {}
+      error(payload: unknown, message: string) {
+        logErrorCalls.push({ payload, message });
+      }
     },
     ...(overrides.withAuditEvents
       ? {
@@ -141,6 +146,7 @@ function buildDeps(overrides: {
     piiDetailCalls,
     artifactUpdateCalls,
     logWarnCalls,
+    logErrorCalls,
     auditCalls,
     deleteCalls
   };
@@ -407,15 +413,90 @@ test("block mode fails closed when the artifact is not found by the reader", asy
   expect(failed).toBeTruthy();
 });
 
-test("async enqueue logs and returns failed when the scan-run insert throws", async () => {
-  const { deps, logWarnCalls, piiDetailCalls } = buildDeps({
+// No job exists after a failed enqueue, so no worker can finish the pending
+// state. The enqueuer closes it and keeps the bytes.
+test("async enqueue marks the artifact failed without a scan run when the scan-run insert throws", async () => {
+  const { deps, logWarnCalls, piiDetailCalls, artifactUpdateCalls, scanRunUpdateCalls, jobCalls, deleteCalls } = buildDeps({
     settings: { enabled: true, mode: "detect" },
     scanRunCreateThrows: new Error("db is down")
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
-  expect(result.kind).toBe("failed");
-  expect(logWarnCalls.length).toBe(1);
-  expect(piiDetailCalls.length).toBe(0);
+  expect(result).toEqual({ kind: "failed", scanRunId: "", errorCode: "pii_enqueue_failed", errorMessage: "The file scan could not be queued. Try again later." });
+  expect(logWarnCalls).toHaveLength(1);
+  expect(logWarnCalls[0]).toMatchObject({ payload: { err: new Error("db is down") } });
+  expect(artifactUpdateCalls).toEqual([{ tenantId: "tenant-1", artifactId: "art-1", input: { status: "failed" } }]);
+  expect(piiDetailCalls).toEqual([{
+    tenantId: "tenant-1",
+    artifactId: "art-1",
+    pii: { status: "failed", modeApplied: "detect", summaryText: "pii_enqueue_failed" }
+  }]);
+  expect(scanRunUpdateCalls).toEqual([]);
+  expect(jobCalls).toEqual([]);
+  expect(deleteCalls).toEqual([]);
+});
+
+test("async enqueue marks the artifact, its PII detail and the scan run failed when the job insert throws", async () => {
+  const { deps, logWarnCalls, logErrorCalls, piiDetailCalls, artifactUpdateCalls, scanRunUpdateCalls, jobCalls, deleteCalls } =
+    buildDeps({ settings: { enabled: true, mode: "detect" }, jobCreateThrows: new Error("job insert failed") });
+
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+
+  expect(result).toEqual({ kind: "failed", scanRunId: "scan-1", errorCode: "pii_enqueue_failed", errorMessage: "The file scan could not be queued. Try again later." });
+  expect(logWarnCalls[0]).toMatchObject({ payload: { err: new Error("job insert failed") } });
+  expect(jobCalls).toHaveLength(1);
+  // The pending stamp comes before the job insert; the failed stamp closes it.
+  expect(piiDetailCalls.map((call) => call.pii)).toEqual([
+    { status: "pending", modeApplied: "detect", scanRunId: "scan-1" },
+    { status: "failed", modeApplied: "detect", scanRunId: "scan-1", summaryText: "pii_enqueue_failed" }
+  ]);
+  expect(artifactUpdateCalls).toEqual([{ tenantId: "tenant-1", artifactId: "art-1", input: { status: "failed" } }]);
+  expect(scanRunUpdateCalls).toEqual([{
+    scanRunId: "scan-1",
+    patch: { status: "failed", errorMessage: "pii_enqueue_failed", completedAt: expect.any(Date) }
+  }]);
+  expect(deleteCalls).toEqual([]);
+  expect(logWarnCalls).toMatchObject([{ payload: { scanRunId: "scan-1", artifactId: "art-1" } }]);
+  expect(logErrorCalls).toEqual([]);
+});
+
+test("async enqueue tries every close write and logs each one that fails", async () => {
+  const { deps, logErrorCalls, scanRunUpdateCalls } =
+    buildDeps({ settings: { enabled: true, mode: "detect" }, jobCreateThrows: new Error("job insert failed") });
+  const attempted: string[] = [];
+  deps.artifacts.update = async () => { attempted.push("artifact_status"); throw new Error("status write failed"); };
+  const setPiiDetail = deps.artifacts.setPiiDetail;
+  deps.artifacts.setPiiDetail = async (tenantId, artifactId, pii) => {
+    if (pii.status !== "failed") return setPiiDetail(tenantId, artifactId, pii);
+    attempted.push("artifact_pii_detail");
+    throw new Error("detail write failed");
+  };
+  deps.piiScanRuns.update = async (_tenantId, scanRunId, patch) => {
+    attempted.push("scan_run");
+    scanRunUpdateCalls.push({ scanRunId, patch });
+    throw new Error("scan run write failed");
+  };
+
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+
+  expect(result).toMatchObject({ kind: "failed", scanRunId: "scan-1", errorCode: "pii_enqueue_failed" });
+  expect(attempted).toEqual(["artifact_status", "artifact_pii_detail", "scan_run"]);
+  expect(logErrorCalls).toEqual(["artifact_status", "artifact_pii_detail", "scan_run"].map((write) => ({
+    payload: expect.objectContaining({ write, scanRunId: "scan-1", artifactId: "art-1", err: expect.any(Error) }),
+    message: "Failed to close PII scan state after a failed enqueue"
+  })));
+});
+
+test("a queued scan keeps the pending state and creates exactly one job", async () => {
+  const { deps, piiDetailCalls, artifactUpdateCalls, scanRunUpdateCalls, jobCalls } =
+    buildDeps({ settings: { enabled: true, mode: "detect" } });
+
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
+
+  expect(result).toEqual({ kind: "queued", scanRunId: "scan-1", jobId: "job-1", mode: "detect" });
+  expect(jobCalls).toMatchObject([{ scanRunId: "scan-1", subjectId: "art-1", mode: "detect" }]);
+  expect(piiDetailCalls.map((call) => call.pii)).toEqual([{ status: "pending", modeApplied: "detect", scanRunId: "scan-1" }]);
+  expect(artifactUpdateCalls).toEqual([]);
+  expect(scanRunUpdateCalls).toEqual([]);
 });
 
 test("a registered import checks its own scope, not uploads", async () => {

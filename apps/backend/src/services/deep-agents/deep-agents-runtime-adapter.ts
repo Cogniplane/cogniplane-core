@@ -735,17 +735,26 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     };
     // Ends the turn in the sandbox. It is set when the turn begins there, and every exit below calls it.
     let endSandboxTurn: () => void = () => {};
+    // Both turn exits call the two steps below: releaseTurnSlot after a setup
+    // failure, and the finally block of the stream. Each exit keeps its own order.
+    const removeAbortListeners = () => {
+      state.abortController.signal.removeEventListener("abort", onSessionAbort);
+      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
+    };
+    // Clears the response id that runtime notices use, and the notices held for it.
+    const clearTurnResponse = () => {
+      state.activeTurnResponseId.current = null;
+      state.pendingTurnEvents = [];
+    };
     const releaseTurnSlot = async () => {
       endSandboxTurn();
       await finishSpending();
       forgetSpending();
       disarmWatchdog();
-      state.abortController.signal.removeEventListener("abort", onSessionAbort);
-      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
+      removeAbortListeners();
       this.activeTurns.delete(session.sessionId);
       state.activeTurnInterrupt.current = null;
-      state.activeTurnResponseId.current = null;
-      state.pendingTurnEvents = [];
+      clearTurnResponse();
       await this.finishIntegrationInvalidation(state);
     };
     // Checked at each model start of the turn, on every path that calls the
@@ -1215,12 +1224,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       turnAbort.abort();
       if (wasAborted) approvalTurn.cancelAndExpire("turn_interrupted");
       else approvalTurn.cancelLocal();
-      state.abortController.signal.removeEventListener("abort", onSessionAbort);
-      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
+      removeAbortListeners();
       state.activeTurnInterrupt.current = null;
       state.activeTurnPush.current = null;
-      state.activeTurnResponseId.current = null;
-      state.pendingTurnEvents = [];
+      clearTurnResponse();
       state.policyContextRef.current = null;
       // Record token usage + cumulative cost onto the assistant row (no-ops when
       // the turn consumed nothing or the writer created no backing row).

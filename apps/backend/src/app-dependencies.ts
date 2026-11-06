@@ -106,7 +106,6 @@ export function buildAppDependencies(input: {
       sessions: stores.sessions,
       artifacts: stores.artifacts,
       storage: bootstrap.artifactStorage,
-      auditEvents: stores.auditEvents,
       piiScanEnqueuer: pii.piiScanEnqueuer,
       logger
     }),
