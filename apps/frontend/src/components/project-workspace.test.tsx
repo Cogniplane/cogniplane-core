@@ -200,20 +200,114 @@ it("keeps the selected approval value visible while saving", async () => {
   await waitFor(() => expect(select.disabled).toBe(false));
 });
 
-it("lets the owner choose automatic approval and explains organization limits", async () => {
-  vi.mocked(api.updateProjectApprovalMode).mockResolvedValue({ ...project, approvalMode: "automatic" });
+it.each(["organization_default", "manual"] as const)("offers no automatic choice for a saved %s project", async (approvalMode) => {
+  vi.mocked(api.getProject).mockResolvedValue({
+    project: { ...project, approvalMode }, sessions: [], files: [], canManage: true
+  });
   await open("settings");
-  vi.mocked(api.getProject).mockResolvedValueOnce({
+  const select = screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement;
+  expect(select.value).toBe(approvalMode);
+  expect(within(select).getAllByRole("option").map(option => (option as HTMLOptionElement).value))
+    .toEqual(["organization_default", "manual"]);
+  expect(api.updateProjectApprovalMode).not.toHaveBeenCalled();
+});
+
+it("shows saved automatic approval as legacy organization behavior without writing on load or refresh", async () => {
+  vi.mocked(api.getProject).mockResolvedValue({
     project: { ...project, approvalMode: "automatic" },
     sessions: [session],
     files: [],
     canManage: true
   });
-  fireEvent.change(screen.getByRole("combobox", { name: "Approval mode" }), {
-    target: { value: "automatic" }
+  await open("settings");
+  const select = screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement;
+  expect(select.value).toBe("automatic");
+  expect(select.disabled).toBe(false);
+  const legacy = within(select).getByRole("option", { name: "Automatic approval, legacy" }) as HTMLOptionElement;
+  expect(legacy.selected).toBe(true);
+  expect(legacy.disabled).toBe(true);
+  expect(screen.getByText(/same approval behavior as Organization default/)).toBeTruthy();
+  expect(screen.getByText(/Denials and mandatory approvals still apply/)).toBeTruthy();
+  expect(screen.getByText(/Changes apply to new turns/)).toBeTruthy();
+  await act(async () => { await client.invalidateQueries({ queryKey: ["projects", "p1"] }); });
+  expect(select.value).toBe("automatic");
+  expect(api.updateProjectApprovalMode).not.toHaveBeenCalled();
+});
+
+it.each(["organization_default", "manual"] as const)("saves an explicit legacy transition to %s and shows pending feedback", async (approvalMode) => {
+  let finish!: (value: Project) => void;
+  const saved = { ...project, approvalMode };
+  vi.mocked(api.getProject).mockResolvedValue({
+    project: { ...project, approvalMode: "automatic" }, sessions: [], files: [], canManage: true
   });
-  await waitFor(() => expect(api.updateProjectApprovalMode).toHaveBeenCalledWith("p1", "automatic"));
-  expect(screen.getByText(/same effective behavior as Organization default/)).toBeTruthy();
+  vi.mocked(api.updateProjectApprovalMode).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  await open("settings");
+  const select = screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement;
+  fireEvent.change(select, { target: { value: approvalMode } });
+  await waitFor(() => expect(api.updateProjectApprovalMode).toHaveBeenCalledExactlyOnceWith("p1", approvalMode));
+  expect(select.value).toBe(approvalMode);
+  expect(select.disabled).toBe(true);
+  expect(select.getAttribute("aria-busy")).toBe("true");
+  expect(screen.getByRole("status").textContent).toContain("Saving approval mode");
+  expect(toast.success).not.toHaveBeenCalled();
+  expect(screen.queryByText(/legacy Automatic approval setting/)).toBeNull();
+  expect(screen.getByText(approvalMode === "manual"
+    ? /Ask for approval before approval-governed actions/
+    : /Uses your organization's approval behavior/)).toBeTruthy();
+  vi.mocked(api.getProject).mockResolvedValue({ project: saved, sessions: [], files: [], canManage: true });
+  await act(async () => { finish(saved); });
+  await waitFor(() => expect(select.disabled).toBe(false));
+  expect(select.value).toBe(approvalMode);
+  expect(within(select).queryByRole("option", { name: /Automatic approval/ })).toBeNull();
+  expect(screen.queryByRole("status")).toBeNull();
+  expect(toast.success).toHaveBeenCalledExactlyOnceWith("Approval mode updated for new turns.");
+});
+
+it.each(["organization_default", "manual"] as const)("restores the saved legacy value after a failed %s save and allows retry", async (approvalMode) => {
+  vi.mocked(api.getProject).mockResolvedValue({
+    project: { ...project, approvalMode: "automatic" }, sessions: [], files: [], canManage: true
+  });
+  vi.mocked(api.updateProjectApprovalMode).mockRejectedValueOnce(new Error("Could not save approval mode. Try again."));
+  await open("settings");
+  const select = screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement;
+  fireEvent.change(select, { target: { value: approvalMode } });
+  await screen.findByRole("alert");
+  await waitFor(() => expect(select.disabled).toBe(false));
+  expect(screen.getByRole("alert").textContent).toBe("Could not save approval mode. Try again.");
+  expect(toast.error).toHaveBeenCalledWith("Could not save approval mode. Try again.");
+  expect(toast.success).not.toHaveBeenCalled();
+  expect(select.value).toBe("automatic");
+  expect(screen.getByText(/legacy Automatic approval setting/)).toBeTruthy();
+  expect(screen.queryByRole("status")).toBeNull();
+  expect(select.getAttribute("aria-busy")).toBe("false");
+
+  const saved = { ...project, approvalMode };
+  vi.mocked(api.updateProjectApprovalMode).mockImplementationOnce(async () => {
+    vi.mocked(api.getProject).mockResolvedValue({ project: saved, sessions: [], files: [], canManage: true });
+    return saved;
+  });
+  fireEvent.change(select, { target: { value: approvalMode } });
+  await waitFor(() => expect(select.disabled).toBe(false));
+  expect(api.updateProjectApprovalMode).toHaveBeenNthCalledWith(2, "p1", approvalMode);
+  expect(select.value).toBe(approvalMode);
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it.each([
+  { access: "viewer", canManage: false, canEdit: false, archivedAt: null, help: "Only project owners can change approval mode." },
+  { access: "editor", canManage: false, canEdit: true, archivedAt: null, help: "Only project owners can change approval mode." },
+  { access: "archived owner", canManage: true, canEdit: true, archivedAt: time, help: "Restore this project before changing approval mode." }
+])("keeps legacy approval read-only for an $access", async ({ canManage, canEdit, archivedAt, help }) => {
+  vi.mocked(api.getProject).mockResolvedValue({
+    project: { ...project, approvalMode: "automatic", archivedAt }, sessions: [], files: [], canManage, canEdit
+  });
+  await open("settings");
+  const select = screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement;
+  expect(select.disabled).toBe(true);
+  expect(select.value).toBe("automatic");
+  expect(screen.getByText(help)).toBeTruthy();
+  expect(screen.getByText(/same approval behavior as Organization default/)).toBeTruthy();
+  expect(api.updateProjectApprovalMode).not.toHaveBeenCalled();
 });
 
 it("lets the owner choose an agent file mode and explains that it affects new turns", async () => {
