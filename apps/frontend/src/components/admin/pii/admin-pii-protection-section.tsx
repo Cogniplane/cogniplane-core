@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 
 import type { PiiEntityType, PiiMode, PiiPolicyHealth, PiiProtectionSettings, PiiRawRetention } from "@cogniplane/shared-types";
 import { Input } from "@/components/ui/input";
@@ -94,6 +94,7 @@ export function AdminPiiProtectionSection(props: {
   // The revision that the draft is based on. A refresh during an edit does not
   // change it, so a save after another session's save is refused.
   const [draftRevision, setDraftRevision] = useState(props.revision);
+  const [snapshot, setSnapshot] = useState({ value: props.value, revision: props.revision });
   const [editing, setEditing] = useState(false);
   // Messages from the shared hook outlive this form's actions, so show them only for the last save here.
   const [lastSave, setLastSave] = useState<"saved" | "failed" | null>(null);
@@ -104,16 +105,20 @@ export function AdminPiiProtectionSection(props: {
   const statusRef = useRef<HTMLDivElement>(null);
   useConfirmLeave(editing && JSON.stringify(draft) !== JSON.stringify(props.value));
 
-  useEffect(() => {
+  // Sync before commit. A deferred effect can overwrite an edit made just after a refresh.
+  if (snapshot.value !== props.value || snapshot.revision !== props.revision) {
+    setSnapshot({ value: props.value, revision: props.revision });
     if (!editing) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setDraft(props.value);
       setDraftRevision(props.revision);
-    } else if (draft && props.value && JSON.stringify(draft) === JSON.stringify(props.value)) {
-      // A successful save is complete when the server snapshot catches up.
-      setEditing(false);
     }
-  }, [props.value, props.revision, editing, draft]);
+  }
+  if (editing && draft && props.value && JSON.stringify(draft) === JSON.stringify(props.value)) {
+    // A successful save is complete when the server snapshot catches up.
+    setEditing(false);
+    setDraft(props.value);
+    setDraftRevision(props.revision);
+  }
 
   if (!draft || !props.value) return null;
 

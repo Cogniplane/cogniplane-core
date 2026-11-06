@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 
@@ -58,6 +59,25 @@ it("asks before the page unloads only while the draft has changes", () => {
   expect(unloadPrevented()).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
   expect(unloadPrevented()).toBe(false);
+});
+
+it("keeps an edit made before the refreshed settings' passive effects run", async () => {
+  const onSave = vi.fn(async (): Promise<PiiSaveResult> => ({ ok: true }));
+  function Refresh({ value, edit }: { value: PiiProtectionSettings; edit: boolean }) {
+    useLayoutEffect(() => {
+      if (edit) (screen.getByRole("checkbox", { name: "Chat prompts" }) as HTMLInputElement).click();
+    }, [edit]);
+    return <AdminPiiProtectionSection value={value} revision={4} busy={false} error={null} savedMessage={null} onSave={onSave} />;
+  }
+  const saved = { ...DEFAULT_PII_PROTECTION, scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: false } };
+  const view = render(<Refresh value={saved} edit={false} />);
+
+  view.rerender(<Refresh value={{ ...saved }} edit />);
+
+  expect((screen.getByRole("checkbox", { name: "Chat prompts" }) as HTMLInputElement).checked).toBe(false);
+  expect(unloadPrevented()).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(onSave).toHaveBeenCalledWith({ ...saved, scopes: { ...saved.scopes, chatPrompts: false } }, 4));
 });
 
 it("Cancel restores the saved values and keeps focus on the form", () => {
