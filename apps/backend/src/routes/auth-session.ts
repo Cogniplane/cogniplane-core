@@ -451,11 +451,22 @@ export async function registerSessionRoutes(
     // Revoke the entire refresh-token family so any rotated jti from the
     // same login chain becomes unusable.
     if (refreshToken) {
+      let familyId: string | null = null;
       try {
-        const payload = await verifyRefreshToken(config, refreshToken);
-        await refreshTokens.revoke(payload.fid);
+        familyId = (await verifyRefreshToken(config, refreshToken)).fid;
       } catch {
-        // If the token is already expired/invalid, nothing to revoke.
+        // An expired or invalid token has no family to revoke.
+      }
+      if (familyId) {
+        try {
+          await refreshTokens.revoke(familyId);
+        } catch (error) {
+          // The family is still active. Keep the cookie, so that the client
+          // can retry. A 200 here would report a sign-out that did not occur.
+          request.log.error({ err: error }, "auth logout: refresh-family revocation failed");
+          reply.header("Retry-After", "1");
+          return reply.code(503).send({ error: "logout_unavailable" });
+        }
       }
     }
 
