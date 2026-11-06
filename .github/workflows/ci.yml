@@ -22,7 +22,7 @@ concurrency:
 jobs:
   ci:
     name: ci
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [frontend-build, dependency-audit, gitleaks, lint, typecheck, test, integration, license-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
