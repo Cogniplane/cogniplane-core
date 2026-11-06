@@ -48,7 +48,7 @@ Files: `apps/backend/src/lib/auth.ts`, `apps/backend/src/lib/auth-jwt.ts`, `apps
 ### 1.6 Refresh cookie hardening
 - **Cookie:** `cogniplane_refresh` — `httpOnly`, `Secure`, `SameSite=None`, scoped to backend domain.
 - Frontend JS cannot read it; route protection is therefore handled by `AuthGuard`.
-- **Deletion:** only an explicit sign-out deletes the cookie (`/auth/logout`, `/me/security/sessions/revoke`). A refused `/auth/refresh` keeps it: all tabs share the cookie, and another tab can have a newer one when the answer arrives. A refused cookie grants nothing, because its family is revoked or it is not valid.
+- **Deletion:** only an explicit sign-out deletes the cookie (`/auth/logout`, `/me/security/sessions/revoke`). If `/auth/logout` cannot revoke the refresh-token family, it answers 503 `logout_unavailable` and keeps the cookie, so the client can try again. A refused `/auth/refresh` keeps it: all tabs share the cookie, and another tab can have a newer one when the answer arrives. A refused cookie grants nothing, because its family is revoked or it is not valid.
 
 ### 1.7 Access token storage
 - **Storage:** held in memory only (the API client module; the auth context shows it as React state) — never written to `localStorage` or `sessionStorage`, so no persistence surface for XSS to read; a page reload re-authenticates via the refresh cookie.

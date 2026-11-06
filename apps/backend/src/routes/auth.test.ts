@@ -1526,6 +1526,73 @@ describe("POST /auth/logout", () => {
     expect(harness.redis.store.size).toBe(0);
   });
 
+  test.each(["invalid", "expired"])("treats an %s refresh token as signed out (no Redis writes, 200)", async (kind) => {
+    let refreshToken = "not-a-real-jwt";
+    if (kind === "expired") {
+      // Sign the token 8 days ago: past its 7-day lifetime.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      try {
+        refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-l", tid: "tenant-l", jti: "jti-old", fid: "fid-old" });
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/logout",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true });
+    expectRefreshCookieCleared(res.headers["set-cookie"]);
+    expect(harness.redis.setCalls).toEqual([]);
+  });
+
+  // A failed revocation leaves the family active. A 200 would tell the person
+  // that the sign-out succeeded while a copy of the token still works.
+  test("answers 503 and keeps the cookie when the revocation fails, and a retry revokes the family", async () => {
+    const logLines: Array<{ level: number; msg: string } & Record<string, unknown>> = [];
+    const h = await buildHarness({ logLines });
+    const familyId = "fid-logout-redis-down";
+    const jti = "jti-logout-redis-down";
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-l", tid: "tenant-l", jti, fid: familyId });
+    await issueRefreshJti(h.redis, { jti, familyId, ttlSeconds: 60 });
+    const logout = () => h.app.inject({ method: "POST", url: "/auth/logout", cookies: { cogniplane_refresh: refreshToken } });
+    vi.spyOn(h.redis, "set").mockRejectedValueOnce(new Error("READONLY You can't write against a read only replica."));
+
+    const failed = await logout();
+
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).toEqual({ error: "logout_unavailable" });
+    expect(failed.headers["retry-after"]).toBe("1");
+    expect(failed.body).not.toContain("READONLY");
+    expectRefreshCookieKept(failed.headers["set-cookie"]);
+    expect(h.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
+    expect(logLines.filter((line) => line.level >= 50).map((line) => line.msg)).toEqual([
+      "auth logout: refresh-family revocation failed"
+    ]);
+
+    const retried = await logout();
+
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toEqual({ ok: true });
+    expectRefreshCookieCleared(retried.headers["set-cookie"]);
+    expect(h.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
+
+    // A copy of the old refresh token cannot continue the session.
+    const copied = await h.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      cookies: { cogniplane_refresh: refreshToken }
+    });
+    expect(copied.statusCode).toBe(401);
+    expect(copied.json()).toEqual({ error: "token_revoked" });
+    expect(parseSetCookie(copied.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+  });
+
   test("rate-limits before revoking the refresh-token family", async () => {
     const { limits } = createThrottledLimits();
     const throttled = await buildHarness({ limits });
