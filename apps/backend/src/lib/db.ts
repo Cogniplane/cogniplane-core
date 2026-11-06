@@ -1,4 +1,4 @@
-import { Pool, type PoolClient } from "pg";
+import { Pool, type PoolClient, type PoolConfig } from "pg";
 
 import type { AppConfig } from "../config.js";
 
@@ -57,11 +57,11 @@ export async function withTransaction<T>(
 }
 
 /**
- * The pool every route shares. pg's defaults are wrong for a multi-tenant API:
+ * Limits for every pool that serves requests, workers, or agent turns. pg's
+ * defaults are wrong for a multi-tenant API:
  *
- * - `max` defaults to 10 for the WHOLE process. The Deep Agents checkpointer got
- *   an explicit 20; this pool serves every request path, so it needs at least as
- *   much headroom.
+ * - `max` defaults to 10 for the WHOLE process. The app pool serves every
+ *   request path, so it needs more headroom.
  * - `connectionTimeoutMillis` defaults to 0 = wait forever. Under pool
  *   exhaustion that turns into unbounded request latency instead of a fast,
  *   visible failure.
@@ -77,15 +77,38 @@ const POOL_CONNECTION_TIMEOUT_MS = 10_000;
 const POOL_STATEMENT_TIMEOUT_MS = 30_000;
 const POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
 
-export function createDatabase(config: AppConfig): Pool {
-  return new Pool({
-    connectionString: config.DATABASE_URL,
-    max: POOL_MAX,
+/** The properties that keep one pool apart from the others. */
+export type PoolIdentity = {
+  connectionString: string;
+  /** Shows the pool's connections in `pg_stat_activity`. */
+  applicationName: string;
+  max: number;
+};
+
+/**
+ * Options for a pool that serves requests, workers, or agent turns: its own
+ * identity, plus the shared connection, statement, and idle-transaction
+ * limits. Use it for every such pool so that no pool gets pg's unbounded
+ * defaults.
+ */
+export function operationalPoolOptions(identity: PoolIdentity): PoolConfig {
+  return {
+    connectionString: identity.connectionString,
+    max: identity.max,
     connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
     statement_timeout: POOL_STATEMENT_TIMEOUT_MS,
     idle_in_transaction_session_timeout: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-    application_name: "cogniplane-backend"
-  });
+    application_name: identity.applicationName
+  };
+}
+
+/** The pool every route shares. */
+export function createDatabase(config: AppConfig): Pool {
+  return new Pool(operationalPoolOptions({
+    connectionString: config.DATABASE_URL,
+    applicationName: "cogniplane-backend",
+    max: POOL_MAX
+  }));
 }
 
 /**
@@ -109,14 +132,7 @@ export function createPrivilegedDatabase(connectionString: string): Pool {
 }
 
 function createOperationalDatabase(connectionString: string, applicationName: string): Pool {
-  return new Pool({
-    connectionString,
-    max: POOL_MAX,
-    connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
-    statement_timeout: POOL_STATEMENT_TIMEOUT_MS,
-    idle_in_transaction_session_timeout: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
-    application_name: applicationName
-  });
+  return new Pool(operationalPoolOptions({ connectionString, applicationName, max: POOL_MAX }));
 }
 
 export async function withTenantScope<T>(
