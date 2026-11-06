@@ -1,6 +1,6 @@
 import { test, expect } from "vitest";
 
-import { loadConfig } from "./config.js";
+import { isMailEnabled, isPasswordRecoveryEnabled, loadConfig } from "./config.js";
 
 // E2B is required at boot (both runtimes run in the sandbox) and the packaged
 // default template id is a placeholder, so any config expected to BOOT must
@@ -36,11 +36,11 @@ function workosConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 
 test("loadConfig requires Redis when WorkOS auth is enabled", () => {
   expect(() =>
-          loadConfig(workosConfig({ REDIS_URL: undefined }))).toThrow(/REDIS_URL is required when AUTH_MODE=workos/);
+          loadConfig(workosConfig({ REDIS_URL: undefined }))).toThrow(/REDIS_URL is required when AUTH_MODE=jwt/);
 });
 
 test("loadConfig requires explicit non-default data encryption secret in WorkOS mode", () => {
-  expect(() => loadConfig(workosConfig({ DATA_ENCRYPTION_SECRET: undefined }))).toThrow(/DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=workos/);
+  expect(() => loadConfig(workosConfig({ DATA_ENCRYPTION_SECRET: undefined }))).toThrow(/DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=jwt/);
 });
 
 test("loadConfig rejects the default data encryption secret in WorkOS mode", () => {
@@ -49,23 +49,23 @@ test("loadConfig rejects the default data encryption secret in WorkOS mode", () 
             workosConfig({
               DATA_ENCRYPTION_SECRET: "local-dev-data-encryption-secret-change-in-production!!"
             })
-          )).toThrow(/DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=workos/);
+          )).toThrow(/DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=jwt/);
 });
 
 test("loadConfig rejects WorkOS mode without WORKOS_API_KEY", () => {
-  expect(() => loadConfig(workosConfig({ WORKOS_API_KEY: undefined }))).toThrow(/WORKOS_API_KEY is required when AUTH_MODE=workos/);
+  expect(() => loadConfig(workosConfig({ WORKOS_API_KEY: undefined }))).toThrow(/WORKOS_API_KEY is required when WorkOS login is enabled/);
 });
 
 test("loadConfig rejects WorkOS mode without WORKOS_CLIENT_ID", () => {
-  expect(() => loadConfig(workosConfig({ WORKOS_CLIENT_ID: undefined }))).toThrow(/WORKOS_CLIENT_ID is required when AUTH_MODE=workos/);
+  expect(() => loadConfig(workosConfig({ WORKOS_CLIENT_ID: undefined }))).toThrow(/WORKOS_CLIENT_ID is required when WorkOS login is enabled/);
 });
 
 test("loadConfig rejects WorkOS mode without WORKOS_REDIRECT_URI", () => {
-  expect(() => loadConfig(workosConfig({ WORKOS_REDIRECT_URI: undefined }))).toThrow(/WORKOS_REDIRECT_URI is required when AUTH_MODE=workos/);
+  expect(() => loadConfig(workosConfig({ WORKOS_REDIRECT_URI: undefined }))).toThrow(/WORKOS_REDIRECT_URI is required when WorkOS login is enabled/);
 });
 
 test("loadConfig rejects WorkOS mode without MAINTENANCE_DATABASE_URL", () => {
-  expect(() => loadConfig(workosConfig({ MAINTENANCE_DATABASE_URL: undefined }))).toThrow(/MAINTENANCE_DATABASE_URL is required when AUTH_MODE=workos/);
+  expect(() => loadConfig(workosConfig({ MAINTENANCE_DATABASE_URL: undefined }))).toThrow(/MAINTENANCE_DATABASE_URL is required when AUTH_MODE=jwt/);
 });
 
 test("loadConfig rejects WorkOS mode when MAINTENANCE_DATABASE_URL equals DATABASE_URL", () => {
@@ -115,13 +115,57 @@ test("loadConfig rejects ARTIFACT_STORAGE_BACKEND=bucket without ARTIFACT_BUCKET
   expect(() => loadConfig({ ARTIFACT_STORAGE_BACKEND: "bucket" })).toThrow(/ARTIFACT_BUCKET_NAME is required when ARTIFACT_STORAGE_BACKEND=bucket/);
 });
 
+test("loadConfig accepts AUTH_MODE=jwt with WorkOS login, the same as the workos alias", () => {
+  const config = loadConfig(workosConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: " WorkOS , workos " }));
+  expect(config.AUTH_MODE).toBe("jwt");
+  expect(config.AUTH_LOGIN_TYPES).toEqual(["workos"]);
+  // WorkOS is the default login type for jwt mode.
+  expect(loadConfig(workosConfig({ AUTH_MODE: "jwt" })).AUTH_LOGIN_TYPES).toEqual(["workos"]);
+  // Production accepts the new name too.
+  expect(loadConfig(workosConfig({ AUTH_MODE: "jwt", NODE_ENV: "production" })).AUTH_MODE).toBe("jwt");
+});
+
+test("loadConfig fails closed on login types it cannot serve", () => {
+  expect(() => loadConfig(workosConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "saml" }))).toThrow(
+    /AUTH_LOGIN_TYPES contains an unknown login type "saml"/
+  );
+  expect(() => loadConfig(workosConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: " , " }))).toThrow(
+    /AUTH_LOGIN_TYPES must list at least one login type/
+  );
+  // The alias means WorkOS only; it cannot be combined with another list.
+  expect(() => loadConfig(workosConfig({ AUTH_LOGIN_TYPES: "workos,local" }))).toThrow(
+    /AUTH_MODE=workos means AUTH_LOGIN_TYPES=workos/
+  );
+  // dev-headers has no login, so a list there is a mistake.
+  expect(() => loadConfig(devConfig({ AUTH_LOGIN_TYPES: "workos" }))).toThrow(
+    /AUTH_LOGIN_TYPES is only valid with AUTH_MODE=jwt/
+  );
+});
+
+test("loadConfig enables local login next to WorkOS, or alone without WorkOS keys", () => {
+  expect(loadConfig(workosConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "workos,local" })).AUTH_LOGIN_TYPES)
+    .toEqual(["workos", "local"]);
+  const localOnly = loadConfig(workosConfig({
+    AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "local",
+    WORKOS_API_KEY: undefined, WORKOS_CLIENT_ID: undefined, WORKOS_REDIRECT_URI: undefined
+  }));
+  expect(localOnly.AUTH_LOGIN_TYPES).toEqual(["local"]);
+  expect(localOnly.LOCAL_AUTH_HASH_CONCURRENCY).toBe(4);
+});
+
+test("loadConfig resolves dev-headers to no login types", () => {
+  expect(loadConfig(devConfig()).AUTH_LOGIN_TYPES).toEqual([]);
+});
+
 test("loadConfig rejects SKILL_BUNDLE_STORAGE_BACKEND=bucket without SKILL_BUNDLE_BUCKET_NAME", () => {
   expect(() => loadConfig({ SKILL_BUNDLE_STORAGE_BACKEND: "bucket" })).toThrow(/SKILL_BUNDLE_BUCKET_NAME is required when SKILL_BUNDLE_STORAGE_BACKEND=bucket/);
 });
 
 test("loadConfig accepts WorkOS mode with explicit non-default data encryption secret", () => {
   const config = loadConfig(workosConfig());
-  expect(config.AUTH_MODE).toBe("workos");
+  // The `workos` alias resolves to jwt mode with WorkOS login.
+  expect(config.AUTH_MODE).toBe("jwt");
+  expect(config.AUTH_LOGIN_TYPES).toEqual(["workos"]);
   expect(config.DATA_ENCRYPTION_SECRET).toBe("test-encryption-secret-must-be-at-least-32chars!");
 });
 
@@ -224,7 +268,7 @@ test("loadConfig accepts versioned/platform pdftotext names, rejects unrelated b
 
 test("loadConfig accepts AUTH_MODE=workos when NODE_ENV=production", () => {
   const config = loadConfig(workosConfig({ NODE_ENV: "production", API_HOST: "0.0.0.0" }));
-  expect(config.AUTH_MODE).toBe("workos");
+  expect(config.AUTH_MODE).toBe("jwt");
   expect(config.API_HOST).toBe("0.0.0.0");
 });
 
@@ -341,7 +385,7 @@ test("loadConfig skipRuntimeChecks still enforces DB-backed (workos) validations
   // posture must still fail closed even on the migration path.
   expect(() =>
     loadConfig(workosConfig({ REDIS_URL: undefined }), undefined, { skipRuntimeChecks: true })
-  ).toThrow(/REDIS_URL is required when AUTH_MODE=workos/);
+  ).toThrow(/REDIS_URL is required when AUTH_MODE=jwt/);
 });
 
 test("loadConfig does not warn on a localhost RUNTIME_GATEWAY_BASE_URL", () => {
@@ -558,4 +602,53 @@ test("the sandbox network check limits default to 20 s and 5 s, can be set, and 
     expect(() => loadConfig(devConfig({ E2B_NETWORK_CONFIRM_TIMEOUT_MS: invalid }))).toThrow();
     expect(() => loadConfig(devConfig({ E2B_NETWORK_REQUEST_TIMEOUT_MS: invalid }))).toThrow();
   }
+});
+
+test("WEBAUTHN_RP_ID needs local login and must match the frontend host", () => {
+  const local = { AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "local", API_ORIGIN: "https://app.example.test" };
+  expect(loadConfig(workosConfig({ ...local, WEBAUTHN_RP_ID: "app.example.test" })).WEBAUTHN_RP_ID).toBe("app.example.test");
+  // A parent domain is valid WebAuthn; the name defaults.
+  const parent = loadConfig(workosConfig({ ...local, WEBAUTHN_RP_ID: "Example.Test" }));
+  expect(parent.WEBAUTHN_RP_ID).toBe("example.test");
+  expect(parent.WEBAUTHN_RP_NAME).toBe("Cogniplane");
+  expect(() => loadConfig(workosConfig({ ...local, WEBAUTHN_RP_ID: "other.test" }))).toThrow(/WEBAUTHN_RP_ID must equal the hostname of API_ORIGIN/);
+  // A suffix that is not a domain boundary is not a parent.
+  expect(() => loadConfig(workosConfig({ ...local, WEBAUTHN_RP_ID: "ample.test" }))).toThrow(/WEBAUTHN_RP_ID must equal/);
+  expect(() => loadConfig(workosConfig({ AUTH_MODE: "jwt", WEBAUTHN_RP_ID: "app.example.test", API_ORIGIN: "https://app.example.test" })))
+    .toThrow(/WEBAUTHN_RP_ID needs local login/);
+});
+
+test("SMTP_URL and MAIL_FROM: both or neither, jwt mode, TLS unless a development opt-in", () => {
+  const local = { AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "local", API_ORIGIN: "https://app.example.test" };
+  const mail = { SMTP_URL: "smtps://user:secret-pass@smtp.example.test", MAIL_FROM: "Cogniplane <no-reply@example.test>" };
+  const on = loadConfig(workosConfig({ ...local, ...mail }));
+  expect(isMailEnabled(on)).toBe(true);
+  expect(on.SMTP_ALLOW_PLAINTEXT).toBe(false);
+  expect(isMailEnabled(loadConfig(workosConfig(local)))).toBe(false);
+
+  expect(() => loadConfig(workosConfig({ ...local, SMTP_URL: mail.SMTP_URL }))).toThrow(/SMTP_URL and MAIL_FROM must be set together/);
+  expect(() => loadConfig(workosConfig({ ...local, MAIL_FROM: mail.MAIL_FROM }))).toThrow(/SMTP_URL and MAIL_FROM must be set together/);
+  // Any login type: WorkOS owners get the notice of a data setting change.
+  // Password recovery still needs local login.
+  const workosOnly = loadConfig(workosConfig({ AUTH_MODE: "jwt", ...mail }));
+  expect(isMailEnabled(workosOnly)).toBe(true);
+  expect(isPasswordRecoveryEnabled(workosOnly)).toBe(false);
+  expect(isPasswordRecoveryEnabled(on)).toBe(true);
+  expect(() => loadConfig(devConfig(mail))).toThrow(/SMTP_URL needs AUTH_MODE=jwt/);
+  expect(() => loadConfig(workosConfig({ ...local, ...mail, SMTP_URL: "http://smtp.example.test" }))).toThrow(/smtps:\/\/ or smtp:\/\//);
+  expect(() => loadConfig(workosConfig({ ...local, ...mail, MAIL_FROM: "not an address" }))).toThrow(/MAIL_FROM must be an email address/);
+  // The error never repeats the URL: it can hold the password.
+  let message = "";
+  try {
+    loadConfig(workosConfig({ ...local, ...mail, SMTP_URL: "smtp://user:secret-pass@smtp.example.test/path" }));
+  } catch (error) {
+    message = (error as Error).message;
+  }
+  expect(message).toMatch(/must not have a path/);
+  expect(message).not.toContain("secret-pass");
+
+  // Plaintext SMTP is a development opt-in, refused in production.
+  const plain = { ...local, SMTP_URL: "smtp://localhost:1025", MAIL_FROM: "dev@example.test", SMTP_ALLOW_PLAINTEXT: "true" };
+  expect(loadConfig(workosConfig(plain)).SMTP_ALLOW_PLAINTEXT).toBe(true);
+  expect(() => loadConfig(workosConfig({ ...plain, NODE_ENV: "production" }))).toThrow(/SMTP_ALLOW_PLAINTEXT is for development only/);
 });

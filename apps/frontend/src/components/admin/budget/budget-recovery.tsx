@@ -55,6 +55,7 @@ export function BudgetRecovery(props: {
   const triggerRef = useRef<HTMLElement | null>(null);
   const headingRef = useRef<HTMLButtonElement | null>(null);
   const revealed = useRef(false);
+  const operationInFlight = useRef(false);
   const reservations = unresolvedReservations(query.data);
 
   // A link from the Overview opens this section. Bring it into view once, not
@@ -84,6 +85,7 @@ export function BudgetRecovery(props: {
       setActionOpen(false);
       props.onStatus("Reservation closed. Its usage is now unknown and it needs reconciliation.");
     },
+    onSettled: () => { operationInFlight.current = false; },
     onError: refreshAfterConflict
   });
   const reconcile = useMutation({
@@ -93,6 +95,7 @@ export function BudgetRecovery(props: {
       setActionOpen(false);
       props.onStatus(`Verified cost of ${formatUsd(input.actualUsd)} recorded. The reservation is settled.`);
     },
+    onSettled: () => { operationInFlight.current = false; },
     onError: refreshAfterConflict
   });
 
@@ -191,7 +194,11 @@ export function BudgetRecovery(props: {
           pending={close.isPending}
           stale={isStale(close.error) ? staleRefresh : null}
           error={actionError(close.error, "Could not close the reservation. Try again.")}
-          onConfirm={() => close.mutate(action.reservation.reservationId)}
+          onConfirm={() => {
+            if (operationInFlight.current || close.isPending || isStale(close.error)) return;
+            operationInFlight.current = true;
+            close.mutate(action.reservation.reservationId);
+          }}
         />
       ) : null}
       {action?.kind === "reconcile" ? (
@@ -204,7 +211,11 @@ export function BudgetRecovery(props: {
           pending={reconcile.isPending}
           stale={isStale(reconcile.error) ? staleRefresh : null}
           error={actionError(reconcile.error, "Could not record the cost. Your entry is kept. Try again.")}
-          onConfirm={(actualUsd) => reconcile.mutate({ reservationId: action.reservation.reservationId, actualUsd })}
+          onConfirm={(actualUsd) => {
+            if (operationInFlight.current || reconcile.isPending || isStale(reconcile.error)) return;
+            operationInFlight.current = true;
+            reconcile.mutate({ reservationId: action.reservation.reservationId, actualUsd });
+          }}
         />
       ) : null}
     </>

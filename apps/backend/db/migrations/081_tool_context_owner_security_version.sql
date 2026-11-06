@@ -1,0 +1,17 @@
+-- A turn calls tools with its owner's tools and credentials. When the owner's
+-- local account gets a new security version (password change or reset,
+-- manager reset, disable, sign out everywhere, removal, a factor change, a
+-- stricter MFA rule), a turn that already started must lose those tools too,
+-- on every replica. Each tool execution context therefore keeps the security
+-- version that admitted its turn: the version of the request's session for an
+-- interactive turn, the version that the job stores for a scheduled turn.
+-- Every lookup of a context compares it with local_identities.security_version
+-- (ToolExecutionContextStore), so the MCP gateway refuses the tool calls of a
+-- turn whose owner changed. See services/auth/security-change.ts.
+--
+-- NULL: for a WorkOS owner, the context is not compared. WorkOS accounts have
+-- no security version in this database. For a local owner, NULL is a
+-- mismatch. Contexts from before this migration have NULL, so a local owner's
+-- turn that crosses the deploy loses its tools. A context expires after
+-- TOOL_CONTEXT_TTL_MS in any case.
+ALTER TABLE tool_execution_contexts ADD COLUMN owner_security_version integer;

@@ -2,11 +2,13 @@ import {
   GithubAllowedRepositoriesResponseSchema,
   GithubConnectionStatusSchema,
   GithubRepositoryListResponseSchema,
+  GithubUserConnectionSchema,
   JiraAccountCandidatesResponseSchema,
   JiraAccountSitesResponseSchema,
   JiraConnectionStatusSchema,
   JiraUserConnectionSchema,
   NotionConnectionStatusSchema,
+  NotionUserConnectionSchema,
   OAuthAuthorizationUrlResponseSchema,
   PersonalTokenUsageResponseSchema,
   ScheduledJobEnvelopeSchema,
@@ -26,12 +28,15 @@ import { parseResponse } from "./validate-response";
 import type {
   GithubConnectionStatus,
   GithubRepositoryListResponse,
+  GithubUserConnection,
   JiraAccountCandidate,
   JiraConnectionSelectRequest,
   JiraConnectionStatus,
   JiraSite,
   JiraUserConnection,
+  NotionConnectionConfirmRequest,
   NotionConnectionStatus,
+  NotionUserConnection,
   ScheduledJob,
   ScheduledJobRun,
   UserSettingsSection
@@ -77,6 +82,15 @@ export async function updateGithubAllowedRepositories(
   ).allowedRepositories;
 }
 
+/** Confirms a suspended connection. `githubUserId` is the account that the page shows. */
+export async function confirmGithubConnection(githubUserId: string): Promise<GithubUserConnection> {
+  const raw = await request<{ userConnection: unknown }>("/me/github-connection/confirm", {
+    method: "POST",
+    body: JSON.stringify({ githubUserId })
+  });
+  return parseResponse(GithubUserConnectionSchema, raw.userConnection, "POST /me/github-connection/confirm");
+}
+
 export async function deleteGithubConnection(): Promise<void> {
   await request<void>("/me/github-connection", {
     method: "DELETE"
@@ -95,6 +109,15 @@ export async function createNotionAuthorizationUrl(): Promise<string> {
     raw,
     "POST /me/notion-connection/authorize"
   ).url;
+}
+
+/** Confirms a suspended connection for the Notion user and workspace that the page shows. */
+export async function confirmNotionConnection(input: NotionConnectionConfirmRequest): Promise<NotionUserConnection> {
+  const raw = await request<{ userConnection: unknown }>("/me/notion-connection/confirm", {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+  return parseResponse(NotionUserConnectionSchema, raw.userConnection, "POST /me/notion-connection/confirm");
 }
 
 export async function deleteNotionConnection(): Promise<void> {

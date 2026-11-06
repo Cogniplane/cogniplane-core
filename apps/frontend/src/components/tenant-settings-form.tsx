@@ -28,6 +28,7 @@ import {
 import { AgentBehaviorReviewDialog } from "./agent-behavior-review-dialog";
 import { useAgentBehaviorDraftStore } from "./agent-behavior-draft-provider";
 import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -50,7 +51,9 @@ type Props = {
   saveError?: string | null;
   /** Fetch the saved settings again, to find a concurrent change. */
   onReload?: () => void;
-  managedTools: AdminManagedTool[];
+  managedTools: AdminManagedTool[] | undefined;
+  toolCatalogState?: "loading" | "failed" | "ready";
+  onRetryTools?: () => void;
   modelWarning: string | null;
   isOwner: boolean;
   /** Shown before the settings version, such as the last recorded save. */
@@ -84,9 +87,9 @@ function CheckboxRow(props: {
         checked={props.checked}
         disabled={props.disabled}
         onChange={(e) => props.onChange(e.target.checked)}
-        className="mt-0.5 size-4 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
+        className="mt-0.5 size-4 shrink-0 rounded border-outline-variant accent-primary disabled:cursor-not-allowed disabled:opacity-50"
       />
-      <span className="flex-1">
+      <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
         <strong className="font-semibold">{props.label}</strong>
         {props.hint ? (
           <span className="mt-0.5 block text-xs text-on-surface-variant">{props.hint}</span>
@@ -103,6 +106,8 @@ export function TenantSettingsForm({
   saveError = null,
   onReload,
   managedTools,
+  toolCatalogState = managedTools === undefined ? "loading" : "ready",
+  onRetryTools,
   modelWarning,
   isOwner,
   meta
@@ -182,13 +187,13 @@ export function TenantSettingsForm({
   }, [settings, newerSaved, applying, appliedDraft, hasChanges, editOverlapsNewer, baselineDraft]);
 
   const sortedTools = useMemo(
-    () => [...managedTools].sort((a, b) => a.id.localeCompare(b.id)),
+    () => [...(managedTools ?? [])].sort((a, b) => a.id.localeCompare(b.id)),
     [managedTools]
   );
   const knownToolIds = useMemo(() => new Set(sortedTools.map((tool) => tool.id)), [sortedTools]);
   const orphanedToolIds = useMemo(
-    () => draft.enabledToolIds.filter((id) => !knownToolIds.has(id)),
-    [draft.enabledToolIds, knownToolIds]
+    () => toolCatalogState === "ready" && managedTools !== undefined ? draft.enabledToolIds.filter((id) => !knownToolIds.has(id)) : [],
+    [draft.enabledToolIds, knownToolIds, toolCatalogState, managedTools]
   );
 
   function openReview(event?: FormEvent<HTMLFormElement>): void {
@@ -266,7 +271,8 @@ export function TenantSettingsForm({
           <CommandExecutionRow draft={draft} updateDraft={updateDraft} isOwner={isOwner} />
           <SandboxNetworkRow draft={draft} updateDraft={updateDraft} egress={egress} open={networkOpen}
             onOpenChange={setNetworkOpen} textareaRef={egressRef} />
-          <ToolsRow draft={draft} updateDraft={updateDraft} sortedTools={sortedTools} orphanedToolIds={orphanedToolIds} />
+          <ToolsRow draft={draft} updateDraft={updateDraft} sortedTools={sortedTools} orphanedToolIds={orphanedToolIds}
+            catalogState={managedTools === undefined && toolCatalogState === "ready" ? "loading" : toolCatalogState} onRetry={onRetryTools} />
           <InstructionsRow draft={draft} updateDraft={updateDraft} />
         </div>
 
@@ -462,22 +468,35 @@ function ToolsRow(props: {
   updateDraft: UpdateDraft;
   sortedTools: AdminManagedTool[];
   orphanedToolIds: string[];
+  catalogState: "loading" | "failed" | "ready";
+  onRetry?: () => void;
 }) {
-  const { draft, updateDraft, sortedTools, orphanedToolIds } = props;
+  const { draft, updateDraft, sortedTools, orphanedToolIds, catalogState, onRetry } = props;
   const on = sortedTools.filter((tool) => draft.enabledToolIds.includes(tool.id)).length;
+  const known = catalogState === "ready";
   return (
     <DisclosureRow
       title="Built-in tools"
       action="Choose tools"
-      status={`${sortedTools.length ? `${on} of ${sortedTools.length} tools on.` : "No built-in tools."}${orphanedToolIds.length ? ` ${orphanedToolIds.length} saved tool${orphanedToolIds.length === 1 ? " is" : "s are"} no longer in the catalog.` : ""}`}
+      status={known
+        ? `${sortedTools.length ? `${on} of ${sortedTools.length} tools on.` : "No built-in tools."}${orphanedToolIds.length ? ` ${orphanedToolIds.length} saved tool${orphanedToolIds.length === 1 ? " is" : "s are"} no longer in the catalog.` : ""}`
+        : <span role={catalogState === "failed" ? "alert" : "status"} className={catalogState === "failed" ? "text-danger" : undefined}>
+          {catalogState === "failed" ? "Could not load the tool catalog." : "Loading the tool catalog..."} Tool choices are kept until the catalog is available.
+        </span>}
+      actions={catalogState === "failed" && onRetry ? <Button type="button" size="sm" variant="outline" onClick={onRetry}>Retry tools</Button> : null}
     >
+      {!known ? <p className="text-sm text-on-surface-variant">{draft.enabledToolIds.length} selected tool{draft.enabledToolIds.length === 1 ? "" : "s"}. Availability has not been confirmed.</p> : null}
       <div className="grid gap-3 sm:grid-cols-2">
         {sortedTools.map((tool) => (
           <CheckboxRow key={tool.id} checked={draft.enabledToolIds.includes(tool.id)}
+            disabled={!known}
             onChange={(checked) => updateDraft((current) => ({ ...current, enabledToolIds: toggleInArray(current.enabledToolIds, tool.id, checked) }))}
             label={toolLabel(tool.id, tool.readOnly)}
             hint={tool.description} />
         ))}
+        {!known ? draft.enabledToolIds.filter(id => !sortedTools.some(tool => tool.id === id)).map(id => (
+          <CheckboxRow key={id} checked disabled onChange={() => {}} label={id} hint="Selected. Catalog availability has not been confirmed." />
+        )) : null}
         {orphanedToolIds.map((id) => (
           <CheckboxRow key={id} checked={true}
             onChange={(checked) => updateDraft((current) => ({ ...current, enabledToolIds: toggleInArray(current.enabledToolIds, id, checked) }))}

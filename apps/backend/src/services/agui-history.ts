@@ -21,6 +21,8 @@
 import { EventType, type BaseEvent, type Message as AguiMessage } from "@ag-ui/client";
 import type { CustomEventValue } from "@cogniplane/shared-types";
 
+import { GENERATIVE_UI_RENDER_TOOL, RenderUiTurn } from "./deep-agents/render-ui.js";
+
 import { customEvent } from "./deep-agents/agui-events.js";
 
 type HistoryToolResult = {
@@ -47,9 +49,14 @@ export type HistoryMessage = {
   toolResults?: HistoryToolResult[];
 };
 
-export function toAguiMessages(messages: HistoryMessage[]): AguiMessage[] {
+export function toAguiMessages(
+  messages: HistoryMessage[],
+  options: { activeTurn?: CustomEventValue<"session_connection">["activeTurn"] } = {}
+): AguiMessage[] {
   const converted: AguiMessage[] = [];
-  for (const message of messages) {
+  let lastPrompt = messages.length - 1;
+  while (lastPrompt >= 0 && messages[lastPrompt]!.role !== "user") lastPrompt -= 1;
+  for (const [index, message] of messages.entries()) {
     // A PII-blocked turn saves only a `system` row (no user or assistant row).
     // The live stream shows the block text as an assistant message
     // (respondWithPiiBlock), so history shows the same assistant message.
@@ -71,7 +78,8 @@ export function toAguiMessages(messages: HistoryMessage[]): AguiMessage[] {
     const toolResults = message.toolResults ?? [];
     if (!message.content && reasoningSegments.length === 0 && toolResults.length === 0) continue;
 
-    converted.push(...interleaveAssistantTurn(message.messageId, message.content, toolResults, reasoningSegments));
+    const running = options.activeTurn === "unavailable" && index > lastPrompt;
+    converted.push(...interleaveAssistantTurn(message.messageId, message.content, toolResults, reasoningSegments, running));
   }
   return converted;
 }
@@ -88,9 +96,8 @@ function toolResultMessage(tr: HistoryToolResult): AguiMessage {
     role: "tool",
     toolCallId: tr.toolResultId,
     content: tr.output,
-    // A tool still "in_progress" in history never returned: the turn stopped
-    // during the call. Mark it interrupted, so it does not look like a
-    // successful call with empty output.
+    // Running calls in the current remote turn have no result message.
+    // Any remaining in_progress row belongs to a stopped turn.
     ...(tr.status === "failed" || tr.status === "declined"
       ? { error: tr.status }
       : tr.status === "in_progress"
@@ -111,7 +118,8 @@ function interleaveAssistantTurn(
   messageId: string,
   content: string,
   toolResults: HistoryToolResult[],
-  segments: HistoryReasoningSegment[]
+  segments: HistoryReasoningSegment[],
+  running = false
 ): AguiMessage[] {
   // A reply with only text: one assistant message with the saved row id.
   if (toolResults.length === 0 && segments.length === 0) {
@@ -132,6 +140,18 @@ function interleaveAssistantTurn(
     ...toolResults.map((tr, index) => ({ kind: "tool" as const, offset: tr.textOffset ?? 0, index, tr }))
   ].sort((a, b) => a.offset - b.offset || rank(a.kind) - rank(b.kind));
 
+  const uiTurn = new RenderUiTurn(messageId);
+  for (const tr of toolResults) {
+    if (tr.title === GENERATIVE_UI_RENDER_TOOL) {
+      uiTurn.set({ id: tr.toolResultId, input: tr.input, output: tr.output,
+        status: tr.status === "completed" ? "ready" : "error" });
+    }
+  }
+  // Place a cumulative surface at the call that first created it. Later calls
+  // update that same activity rather than adding another copy of the surface.
+  const activities = uiTurn.activities();
+  const placed = new Set<string>();
+  const placementTurn = new RenderUiTurn(messageId);
   let cursor = 0;
   for (const insertion of insertions) {
     const offset = Math.max(cursor, Math.min(insertion.offset, content.length));
@@ -141,10 +161,18 @@ function interleaveAssistantTurn(
     if (insertion.kind === "reasoning") {
       out.push(reasoningMessage(messageId, insertion.index, insertion.text));
     } else {
-      out.push(
-        { id: `${messageId}:call:${insertion.index}`, role: "assistant", toolCalls: [toolCall(insertion.tr)] },
-        toolResultMessage(insertion.tr)
-      );
+      const tr = insertion.tr;
+      if (tr.title === GENERATIVE_UI_RENDER_TOOL) {
+        placementTurn.set({ id: tr.toolResultId, input: tr.input, output: tr.output,
+          status: tr.status === "completed" ? "ready" : "error" });
+        for (const activity of placementTurn.activities()) {
+          if (placed.has(activity.id)) continue;
+          placed.add(activity.id);
+          out.push(activities.find((final) => final.id === activity.id)!);
+        }
+      }
+      out.push({ id: `${messageId}:call:${insertion.index}`, role: "assistant", toolCalls: [toolCall(tr)] });
+      if (!running || tr.status !== "in_progress") out.push(toolResultMessage(tr));
     }
   }
   const tail = content.slice(cursor);
@@ -187,7 +215,7 @@ export function historyRunEvents(input: {
   const { threadId, runId } = input;
   return [
     { type: EventType.RUN_STARTED, threadId, runId } as BaseEvent,
-    { type: EventType.MESSAGES_SNAPSHOT, messages: toAguiMessages(input.messages) } as BaseEvent,
+    { type: EventType.MESSAGES_SNAPSHOT, messages: toAguiMessages(input.messages, { activeTurn: input.connection.activeTurn }) } as BaseEvent,
     { type: EventType.STATE_SNAPSHOT, snapshot: planStateFromMessages(input.messages) } as BaseEvent,
     customEvent("session_connection", input.connection),
     { type: EventType.RUN_FINISHED, threadId, runId } as BaseEvent

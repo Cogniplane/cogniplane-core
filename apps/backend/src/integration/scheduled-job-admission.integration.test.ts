@@ -88,7 +88,8 @@ function jobFields(tenantId: string, userId: string, jobId: string, enabled: boo
     input: { prompt: "Write the digest." },
     settingsSnapshot: {},
     enabled,
-    nextRunAt: enabled ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null
+    nextRunAt: enabled ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() : null,
+    ownerSecurityVersion: null
   };
 }
 

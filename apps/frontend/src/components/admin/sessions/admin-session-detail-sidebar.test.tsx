@@ -43,3 +43,21 @@ it("opens existing approval links directly", () => {
   render(<AdminSessionDetailSidebar detail={detail} />);
   expect(screen.getByRole("tab", { name: "Approvals" }).getAttribute("aria-selected")).toBe("true");
 });
+
+it("opens Conversation before focusing an alert's message without smooth motion", async () => {
+  const { waitFor } = await import("@testing-library/react");
+  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+  const scroll = vi.fn();
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scroll });
+  try {
+    location.query = "tab=alerts";
+    render(<AdminSessionDetailSidebar detail={{ ...detail, messages: [{ messageId: "m1", role: "assistant", status: "error", contentText: "Sample failure", reasoningContent: "", planContent: "", modelName: null, inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, detailJson: {}, createdAt: "2026-10-01T00:00:00Z" }] }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Jump to message" }));
+    await waitFor(() => expect(document.activeElement?.id).toBe("message-m1"));
+    expect(screen.getByRole("tab", { name: "Conversation" }).getAttribute("aria-selected")).toBe("true");
+    expect(scroll).toHaveBeenCalledWith({ block: "nearest", behavior: "auto" });
+  } finally {
+    if (original) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", original);
+    else delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+  }
+});

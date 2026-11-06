@@ -7,6 +7,7 @@ import type { ManagedToolCatalogEntry } from "../../services/managed-tools/catal
 import { TenantSettingsConflictError, type TenantSettingsRecord } from "../../services/tenant-settings-store.js";
 import { FakePool } from "../../test-helpers/fake-pool.js";
 import { registerAdminTenantSettingsRoutes } from "./admin-tenant-settings-routes.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
 
 // Built-in catalog entries: Sonnet 5.5 supports low..max, Haiku 4.5 only "none".
 const SONNET = "deepagents/claude-sonnet-5-5";
@@ -54,7 +55,7 @@ async function buildApp(options: {
   app.addHook("preHandler", async (request) => {
     request.auth = { tenantId: "tenant-A", userId: "user-1", role, isAdmin: role !== "member" };
   });
-  await registerAdminTenantSettingsRoutes(app, { dynamicConfig, managedToolCatalog, listCustomModels });
+  await registerAdminTenantSettingsRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig, managedToolCatalog, listCustomModels });
   return { app, dynamicConfig, managedToolCatalog, listCustomModels };
 }
 
@@ -197,7 +198,7 @@ describe("PUT /admin/tenant-settings approved sandbox hosts", () => {
   });
 
   test("saves an empty list: the sandbox then has no network", async () => {
-    const { app, dynamicConfig } = await buildApp();
+    const { app, dynamicConfig } = await buildApp({ current: settingsWith({ approvedSandboxEgressDomains: ["pypi.org"] }) });
 
     const response = await app.inject(put({ approvedSandboxEgressDomains: [] }));
 

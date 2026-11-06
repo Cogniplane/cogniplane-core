@@ -89,3 +89,32 @@ it("disables Load more while the next page loads", () => {
   render(<AdminSessionsSection sessions={[row()]} isLoading={false} hasMore onLoadMore={vi.fn()} isLoadingMore />);
   expect((screen.getByRole("button", { name: "Loading…" }) as HTMLButtonElement).disabled).toBe(true);
 });
+
+it("shows failure recovery without a zero count or empty-result claim", () => {
+  render(<AdminSessionsSection sessions={[]} isLoading={false} hasData={false} error="Sample read failed" onRetry={vi.fn()} />);
+  expect(screen.getByRole("alert").textContent).toBe("Sample read failed");
+  expect(screen.getByRole("button", { name: "Reload sessions" })).toBeTruthy();
+  expect(screen.queryByText(/Showing 0/)).toBeNull();
+  expect(screen.queryByText(/No sessions/)).toBeNull();
+});
+
+it("keeps cached evidence and distinguishes a filter-empty result", () => {
+  const view = render(<AdminSessionsSection sessions={[row()]} isLoading={false} hasData error="Refresh failed" />);
+  expect(screen.getByText("ana@example.com")).toBeTruthy();
+  expect(screen.getByRole("alert").textContent).toContain("loaded results remain");
+  view.rerender(<AdminSessionsSection sessions={[]} isLoading={false} hasData isFiltered />);
+  expect(screen.getByText(/No sessions match these filters/)).toBeTruthy();
+  expect(screen.queryByText(/once users start/)).toBeNull();
+});
+
+
+it("keeps retry mounted until focus reaches the loaded result heading", () => {
+  const retry = vi.fn();
+  const view = render(<AdminSessionsSection sessions={[]} isLoading={false} hasData={false} error="Read failed" onRetry={retry} />);
+  const button = screen.getByRole("button", { name: "Reload sessions" });
+  button.focus();
+  fireEvent.click(button);
+  view.rerender(<AdminSessionsSection sessions={[]} isLoading={false} hasData onRetry={retry} />);
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Sessions" }));
+  expect(button.isConnected).toBe(true);
+});

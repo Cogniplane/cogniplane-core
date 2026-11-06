@@ -9,6 +9,7 @@ import {
   getArtifactOrigin,
   piiTone
 } from "./artifact-panel.logic";
+import { registerArtifactOrigin } from "../lib/artifact-origins";
 
 function makeArtifact(overrides: Partial<Artifact>): Artifact {
   return {
@@ -67,6 +68,14 @@ describe("formatPiiLabel", () => {
     expect(formatPiiLabel(p({ status: "scanned", findingsCount: 3 }))).toBe("PII: 3 findings");
   });
 
+  test("a scan that applied mode off says that it did not scan, not that the file is clean", () => {
+    expect(formatPiiLabel(p({ status: "scanned", modeApplied: "off", findingsCount: 0 }))).toBe("PII: not scanned");
+    expect(formatPiiLabel(p({ status: "scanned", modeApplied: "off", findingsCount: 0, imagesNotScanned: true })))
+      .toBe("PII: not scanned");
+    expect(formatPiiLabel(p({ status: "scanned", modeApplied: "detect", findingsCount: 0 }))).toBe("PII: clean");
+    expect(piiTone(p({ status: "scanned", modeApplied: "off" }))).toBe("neutral");
+  });
+
   test("a verdict on text only says so", () => {
     expect(formatPiiLabel(p({ status: "scanned", findingsCount: 0, imagesNotScanned: true })))
       .toBe("PII: clean (text only)");
@@ -86,7 +95,16 @@ describe("piiTone", () => {
     expect(piiTone({ status: "blocked" } as ArtifactPiiDetail)).toBe("blocked");
     expect(piiTone({ status: "failed" } as ArtifactPiiDetail)).toBe("failed");
     expect(piiTone({ status: "transformed" } as ArtifactPiiDetail)).toBe("transformed");
-    expect(piiTone({ status: "scanned" } as ArtifactPiiDetail)).toBe("neutral");
+    expect(piiTone({ status: "scanned" } as ArtifactPiiDetail)).toBe("clean");
+  });
+
+  test("only a real scan with no findings is clean; findings and skipped scans are not", () => {
+    const p = (overrides: Partial<ArtifactPiiDetail>) => overrides as ArtifactPiiDetail;
+    expect(piiTone(p({ status: "scanned", modeApplied: "detect", findingsCount: 0 }))).toBe("clean");
+    expect(piiTone(p({ status: "scanned", modeApplied: "detect", findingsCount: 0, imagesNotScanned: true }))).toBe("clean");
+    expect(piiTone(p({ status: "scanned", modeApplied: "detect", findingsCount: 7 }))).toBe("findings");
+    expect(piiTone(p({ status: "scanned", findingsCount: 2, imagesNotScanned: true }))).toBe("findings");
+    expect(piiTone(p({ status: "scanned", modeApplied: "off", findingsCount: 0 }))).toBe("neutral");
   });
 });
 
@@ -108,24 +126,40 @@ describe("canDownloadArtifact", () => {
 });
 
 describe("getArtifactOrigin", () => {
-  test("microsoft sources tagged accordingly", () => {
+  // Runs before the registration below: core alone names no import origin.
+  test("an unregistered detail source gets the core labels", () => {
     expect(getArtifactOrigin(makeArtifact({
       detail: { source: "microsoft" },
       createdByType: "user"
-    } as unknown as Partial<Artifact>))).toBe("Microsoft import");
+    } as unknown as Partial<Artifact>))).toEqual({ label: "Uploaded", tone: "neutral" });
+  });
+
+  test("a registered origin gives its label and tone", () => {
+    registerArtifactOrigin({ detailSource: "example-drive", label: "Example import", tone: "accent" });
     expect(getArtifactOrigin(makeArtifact({
-      detail: { source: "microsoft" },
+      detail: { source: "example-drive" },
+      createdByType: "user"
+    } as unknown as Partial<Artifact>))).toEqual({ label: "Example import", tone: "accent" });
+    expect(getArtifactOrigin(makeArtifact({
+      detail: { source: "example-drive" },
       createdByType: "tool"
-    } as unknown as Partial<Artifact>))).toBe("Added by assistant");
+    } as unknown as Partial<Artifact>))).toEqual({ label: "Added by assistant", tone: "accent" });
+  });
+
+  test("the first registration of a detail source wins", () => {
+    registerArtifactOrigin({ detailSource: "example-drive", label: "Other label", tone: "neutral" });
+    expect(getArtifactOrigin(makeArtifact({
+      detail: { source: "example-drive" }
+    } as unknown as Partial<Artifact>))).toEqual({ label: "Example import", tone: "accent" });
   });
 
   test("tool-created artifacts always read 'Added by assistant'", () => {
-    expect(getArtifactOrigin(makeArtifact({ createdByType: "tool" }))).toBe("Added by assistant");
+    expect(getArtifactOrigin(makeArtifact({ createdByType: "tool" }))).toEqual({ label: "Added by assistant", tone: "neutral" });
   });
 
   test("artifact type drives the rest of the labels", () => {
-    expect(getArtifactOrigin(makeArtifact({ artifactType: "generated" }))).toBe("Generated");
-    expect(getArtifactOrigin(makeArtifact({ artifactType: "derived" }))).toBe("Derived");
-    expect(getArtifactOrigin(makeArtifact({ artifactType: "upload" }))).toBe("Uploaded");
+    expect(getArtifactOrigin(makeArtifact({ artifactType: "generated" })).label).toBe("Generated");
+    expect(getArtifactOrigin(makeArtifact({ artifactType: "derived" })).label).toBe("Derived");
+    expect(getArtifactOrigin(makeArtifact({ artifactType: "upload" })).label).toBe("Uploaded");
   });
 });

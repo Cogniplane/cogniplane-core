@@ -90,7 +90,7 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
         </div>
         {access.data ? (
           <span className="rounded-full border border-outline-variant px-2.5 py-1 text-xs font-medium text-on-surface-variant">
-            {visibility === "organization" ? "Organization shared" : "Private"}
+            {savedVisibility === "organization" ? "Organization shared" : "Members only"}
           </span>
         ) : null}
       </div>
@@ -158,14 +158,16 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
             </div>
           </div>
           <p className="max-w-2xl text-sm text-on-surface-variant">
-            {visibility === "organization"
-              ? organizationRole === "editor"
-                ? "Everyone in your organization can open the project and make changes."
-                : "Everyone in your organization can open the project, its sessions, and its files, but cannot make changes."
-              : savedVisibility === "organization"
-                ? `Organization sharing is off. The last organization permission, ${savedRole === "editor" ? "edit" : "view"}, will be kept if you share this project again.`
-                : "Only the project owner and any project members can access it."}
+            {savedVisibility === "organization"
+              ? `Current access: everyone in your organization can ${savedRole === "editor" ? "open the project and make changes" : "view the project, its sessions, and its files"}. Project members keep their explicit roles.`
+              : "Current access: only project members can access this project."}
           </p>
+          {changed ? <p role="status" className="max-w-2xl rounded-md bg-surface-container px-3 py-2 text-sm">
+            <span className="font-medium">Unsaved access change. </span>
+            {visibility === "organization"
+              ? `After you save and confirm, everyone in your organization will have ${organizationRole === "editor" ? "edit" : "view"} access.`
+              : `After you save, only project members will have access. The last organization permission, ${savedRole === "editor" ? "edit" : "view"}, will be kept if you share this project again.`}
+          </p> : null}
           {changedElsewhere && access.data ? (
             <div role="alert" className="space-y-2 rounded-md border border-danger/40 bg-danger-surface px-3 py-2 text-sm text-danger">
               <p>
@@ -187,12 +189,13 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
             access={access.data}
             canManage={canManage && !project.archivedAt}
             currentUserId={currentUserId}
-            organizationNote={visibility === "organization"}
+            organizationNote={savedVisibility === "organization"}
           />
           {save.isError && !changedElsewhere ? <p role="alert" className="text-sm text-danger">{save.error.message}</p> : null}
-          <Button type="submit" disabled={!canManage || !changed || changedElsewhere || Boolean(project.archivedAt) || save.isPending}>
+          <Button type="submit" aria-busy={save.isPending} disabled={!canManage || !changed || changedElsewhere || Boolean(project.archivedAt) || save.isPending}>
             {save.isPending ? "Saving access..." : "Save access"}
           </Button>
+          {!canManage ? <p className="text-sm text-on-surface-variant">Only project owners can change access and membership.</p> : null}
           {project.archivedAt ? <p className="text-xs text-on-surface-variant">Restore the project before changing access.</p> : null}
         </form>
       ) : null}

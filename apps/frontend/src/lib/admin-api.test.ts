@@ -1,8 +1,8 @@
 import { beforeEach, expect, it, vi } from "vitest";
 
-import type { PiiRecentResponse } from "@cogniplane/shared-types";
+import { DEFAULT_PII_PROTECTION, type PiiRecentResponse } from "@cogniplane/shared-types";
 
-import { changeAdminMcpWidgetDomain, getAdminMcpWidgetDomains, getAdminPiiRecent, listAdminSessions, listPolicyDecisions } from "./admin-api";
+import { changeAdminMcpWidgetDomain, changeMemberRole, getAdminMcpWidgetDomains, getAdminPiiRecent, listAdminSessions, listPolicyDecisions, updateTenantPiiProtection } from "./admin-api";
 import { request, requestOptionalOn404 } from "./api-client";
 
 vi.mock("./api-client", () => ({ request: vi.fn(), requestOptionalOn404: vi.fn() }));
@@ -132,4 +132,35 @@ it("rejects a widget domains response that has an unknown source list", async ()
   });
 
   await expect(getAdminMcpWidgetDomains("research")).rejects.toThrow();
+});
+
+it("sends the PII settings with the revision that the form loaded", async () => {
+  vi.mocked(request).mockResolvedValue({ ok: true, piiProtection: DEFAULT_PII_PROTECTION, piiProtectionRevision: 4 });
+
+  expect(await updateTenantPiiProtection(DEFAULT_PII_PROTECTION, 3)).toEqual({ ok: true, piiProtection: DEFAULT_PII_PROTECTION, piiProtectionRevision: 4 });
+  const [path, init] = vi.mocked(request).mock.calls[0]!;
+  expect(path).toBe("/tenant/settings/pii");
+  expect(init?.method).toBe("PUT");
+  expect(JSON.parse(String(init?.body))).toEqual({ ...DEFAULT_PII_PROTECTION, expectedRevision: 3 });
+});
+
+it("sends no revision when the server sent none, so an older server accepts the save", async () => {
+  vi.mocked(request).mockResolvedValue({ ok: true, piiProtection: DEFAULT_PII_PROTECTION });
+
+  await updateTenantPiiProtection(DEFAULT_PII_PROTECTION, undefined);
+  expect(JSON.parse(String(vi.mocked(request).mock.calls[0]![1]?.body))).toEqual(DEFAULT_PII_PROTECTION);
+});
+
+// A local account's role change needs the manager's step-up token; a WorkOS
+// member's role change sends no step-up header.
+it("sends the step-up token with a role change only when there is one", async () => {
+  vi.mocked(request).mockResolvedValue({});
+
+  await changeMemberRole("dana", "owner", "step-up-token");
+  await changeMemberRole("lee", "admin");
+
+  expect(vi.mocked(request).mock.calls[0]).toEqual(["/tenant/members/dana/role", {
+    method: "PUT", body: JSON.stringify({ role: "owner" }), headers: { "X-Step-Up": "step-up-token" }
+  }]);
+  expect(vi.mocked(request).mock.calls[1]).toEqual(["/tenant/members/lee/role", { method: "PUT", body: JSON.stringify({ role: "admin" }) }]);
 });

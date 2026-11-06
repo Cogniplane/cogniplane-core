@@ -8,12 +8,21 @@ export const DEFAULT_MAINTENANCE_ROLE = "maintenance_user";
 // workers use app_user again after claiming a tenant's work.
 export const MAINTENANCE_GRANTS = {
   "SELECT, INSERT, UPDATE": ["tenants", "users", "tenant_memberships"],
-  "SELECT": ["tenant_org_settings", "artifacts", "pii_scan_runs", "projects", "project_memberships"],
+  // local_identities, auth_action_tokens, user_passkeys: sign-in looks an
+  // account up by email, by link, or by passkey credential id before the
+  // tenant is known. Read only; every write goes through app_user in the
+  // tenant's scope.
+  "SELECT": [
+    "tenant_org_settings", "artifacts", "pii_scan_runs", "projects", "project_memberships",
+    "local_identities", "auth_action_tokens", "user_passkeys"
+  ],
   "SELECT, UPDATE": [
     "scheduled_jobs", "scheduled_job_runs", "pii_scan_jobs", "approvals",
     "artifact_download_tokens", "message_tool_results"
   ],
-  "SELECT, UPDATE, DELETE": ["sessions", "session_executions", "messages", "project_files"],
+  // email_outbox: the mail worker claims, finishes, and purges messages of
+  // every tenant. Messages are written by app_user in the tenant's scope.
+  "SELECT, UPDATE, DELETE": ["sessions", "session_executions", "messages", "project_files", "email_outbox"],
   "SELECT, DELETE": ["runtime_sessions", "project_file_versions"],
   "SELECT, INSERT, UPDATE, DELETE": ["project_file_storage_gc", "session_storage_gc", "session_runtime_gc"],
   "INSERT": ["audit_events"]

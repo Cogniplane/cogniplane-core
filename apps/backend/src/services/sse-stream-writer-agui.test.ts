@@ -1155,7 +1155,9 @@ test("Stop that ends the stream with a throw keeps the partial transcript as int
   await streamAssistantReplyAGUI(input);
 
   expect(messages.contentLog.at(-1)).toEqual({ status: "interrupted", content: "partial" });
-  expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "call-1", status: "failed" });
+  // The call never returned and nothing reported a failure: history shows it as interrupted.
+  expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "call-1", status: "in_progress" });
+  expect(messages.toolResultLog.map((row) => row.status)).not.toContain("failed");
   expect(wireEvents(reply.writes).at(-1)).toMatchObject({
     type: EventType.RUN_FINISHED,
     result: AGUI_INTERRUPTED_RESULT

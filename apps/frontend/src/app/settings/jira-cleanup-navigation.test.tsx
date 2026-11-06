@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // Starts at Connected accounts after an administrator turned Jira off, and
 // follows the Details link to the Jira page that removes the authorization.
+// The generic settings route renders that page.
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect, useState, type ReactNode } from "react";
@@ -10,6 +11,7 @@ import type { JiraConnectionStatus, UserIntegrationView } from "@cogniplane/shar
 import { queryKeys } from "../../lib/query-keys";
 
 const state = vi.hoisted(() => ({
+  path: "/settings/connections",
   navigate: (_href: string) => {},
   availability: [] as UserIntegrationView[],
   availabilityError: null as Error | null,
@@ -25,7 +27,14 @@ vi.mock("next/link", () => ({
     <a href={href} {...rest} onClick={(event) => { event.preventDefault(); state.navigate(href); }}>{children}</a>
   )
 }));
-vi.mock("next/navigation", () => ({ useSearchParams: () => new URLSearchParams() }));
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(),
+  useParams: () => ({ integrationId: state.path.split("/")[2] }),
+  notFound: () => {
+    throw new Error(`No settings page for ${state.path}`);
+  }
+}));
+vi.mock("../../overlays", () => ({}));
 vi.mock("../../lib/auth-context", () => ({ useAuth: () => ({ user: null }) }));
 // Jira is off unless a test adds it to the availability list.
 vi.mock("../../lib/integrations-api", () => ({
@@ -42,14 +51,17 @@ vi.mock("../../lib/settings-api", async (importOriginal) => ({
 }));
 
 import ConnectedAccountsPage from "./connections/page";
-import SettingsJiraPage from "./jira/page";
+import SettingsSectionDetailPage from "./[integrationId]/page";
 
 function App() {
-  const [path, setPath] = useState("/settings/connections");
+  const [path, setPath] = useState(state.path);
   useEffect(() => {
-    state.navigate = setPath;
+    state.navigate = (href) => {
+      state.path = href;
+      setPath(href);
+    };
   }, []);
-  return path === "/settings/jira" ? <SettingsJiraPage /> : <ConnectedAccountsPage />;
+  return path === "/settings/connections" ? <ConnectedAccountsPage /> : <SettingsSectionDetailPage />;
 }
 
 function renderApp() {
@@ -79,6 +91,7 @@ const disabled = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  state.path = "/settings/connections";
   state.availability = [];
   state.availabilityError = null;
   state.jiraStatusError = null;
@@ -96,7 +109,9 @@ it("reaches Jira cleanup for an authorization without a site after Jira is turne
   expect(await screen.findByRole("heading", { name: "Jira" })).toBeTruthy();
   fireEvent.click(screen.getByRole("link", { name: "Details for Jira" }));
 
-  expect(await screen.findByText("Jira not enabled")).toBeTruthy();
+  expect(await screen.findByText("Jira is disabled by your organization")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Connect another Jira account" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
   await waitFor(() => expect(state.deleteJiraConnection).toHaveBeenCalledOnce());
   // Reads stay gated: accounts are not listed while Jira is off.
@@ -141,7 +156,9 @@ it("reaches Jira cleanup from a failed status lookup", async () => {
   state.jiraStatus = { ...disabled, authorizationStarted: true };
   fireEvent.click(screen.getByRole("link", { name: "Details for Jira" }));
 
-  expect(await screen.findByText("Jira not enabled")).toBeTruthy();
+  expect(await screen.findByText("Jira is disabled by your organization")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Connect another Jira account" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(false);
   fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
   await waitFor(() => expect(state.deleteJiraConnection).toHaveBeenCalledOnce());
 });

@@ -21,6 +21,21 @@ export class WorkOsEmailConflictError extends Error {
 }
 
 /**
+ * Raised when a WorkOS login resolves to a tenant whose members do not sign
+ * in through WorkOS. The provisioning transaction rolls back, so nothing is
+ * written (docs/ARCHITECTURE.md, "Authentication").
+ */
+export class WrongLoginTypeError extends Error {
+  readonly organizationId: string;
+
+  constructor(organizationId: string) {
+    super(`The tenant of WorkOS organization ${organizationId} does not use WorkOS login`);
+    this.name = "WrongLoginTypeError";
+    this.organizationId = organizationId;
+  }
+}
+
+/**
  * The tenant's own RBAC is authoritative once a membership exists. WorkOS seeds
  * the role at first provisioning only — re-applying the org role slug on every
  * login would undo an in-app demotion (a revoked admin returns at next login)
@@ -129,10 +144,15 @@ export async function provisionTenantIdentity(
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (workos_org_id) DO UPDATE SET
          updated_at = NOW()
-       RETURNING tenant_id`,
+       RETURNING tenant_id, login_type`,
       [uuidv7(), input.organizationName, input.organizationId.toLowerCase(), input.organizationId]
     );
     const tenantId = tenantResult.rows[0].tenant_id as string;
+    // Checked inside the transaction, after the upsert has locked the tenant
+    // row: a throw here rolls back every write of this login.
+    if (tenantResult.rows[0].login_type !== "workos") {
+      throw new WrongLoginTypeError(input.organizationId);
+    }
 
     // `users` is unique on BOTH workos_user_id and email, but the upsert below
     // can only name one conflict target. A WorkOS user that was deleted and
@@ -140,44 +160,50 @@ export async function provisionTenantIdentity(
     // conflicts on the email constraint the ON CONFLICT clause does not cover
     // and raises 23505 — a 500 on a legitimate login.
     //
-    // Serialize on the email before touching the row. An advisory lock, not
+    // Serialize on the email key before touching the row. An advisory lock, not
     // SELECT ... FOR UPDATE: FOR UPDATE locks nothing when it matches no rows,
     // so two concurrent first-logins would both fall through to the INSERT. The
-    // lock is transaction-scoped and releases on commit or rollback.
-    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [
-      `users:email:${input.email}`
+    // lock is transaction-scoped and releases on commit or rollback. The key is
+    // computed by Postgres, the same way as the users.email_key column, so
+    // every login path locks the same value for one person.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('users:email_key:' || lower(btrim($1))))`, [
+      input.email
     ]);
 
-    // Match the email exactly. The UNIQUE constraint is case-sensitive, so a
-    // case-insensitive lookup here would find a row the INSERT could still
-    // collide with.
+    // Match on users.email_key (lowercase, trimmed), which is also the unique
+    // key, so 'Alice@example.com' finds the row of 'alice@example.com'.
     const emailOwner = await client.query(
-      `SELECT user_id, workos_user_id FROM users WHERE email = $1 LIMIT 1`,
+      `SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key = lower(btrim($1)) LIMIT 1`,
       [input.email]
     );
-    const emailOwnerWorkosId = emailOwner.rows[0]?.workos_user_id as string | null | undefined;
+    const emailOwnerRow = emailOwner.rows[0] as
+      | { user_id: string; workos_user_id: string | null; auth_source?: string }
+      | undefined;
 
-    // Rebind the email to the incoming WorkOS identity only when it is unclaimed
-    // or already this identity. An email held by a DIFFERENT non-null
-    // workos_user_id is not ours to take: if WorkOS ever recycles an address
-    // across identities, silently rebinding would hand one person another's
-    // account.
-    if (emailOwner.rows[0] && emailOwnerWorkosId && emailOwnerWorkosId !== input.workosUserId) {
+    // The email row is ours only when it is already bound to this WorkOS
+    // identity. Any other row is refused, also one with workos_user_id NULL:
+    // binding such a row would hand its data to whoever signs in with that
+    // email, without proof that the email is verified or that the row belongs
+    // to this organization's tenant. Local users (auth_source 'local') always
+    // have workos_user_id NULL. See docs/ARCHITECTURE.md, "Authentication".
+    if (
+      emailOwnerRow &&
+      (emailOwnerRow.auth_source === "local" || emailOwnerRow.workos_user_id !== input.workosUserId)
+    ) {
       throw new WorkOsEmailConflictError(input.email);
     }
 
     // An existing email row is updated in place rather than re-inserted: the
     // INSERT below would conflict on the email constraint, which the ON CONFLICT
-    // target does not cover. This is the re-created-WorkOS-user path, and it is
-    // also how an unclaimed (workos_user_id IS NULL) row gets bound.
-    const userId = emailOwner.rows[0]
+    // target does not cover.
+    const userId = emailOwnerRow
       ? ((
           await client.query(
             `UPDATE users
              SET workos_user_id = $2, display_name = $3, updated_at = NOW()
              WHERE user_id = $1
              RETURNING user_id`,
-            [emailOwner.rows[0].user_id, input.workosUserId, input.displayName]
+            [emailOwnerRow.user_id, input.workosUserId, input.displayName]
           )
         ).rows[0].user_id as string)
       : ((
@@ -193,34 +219,39 @@ export async function provisionTenantIdentity(
           )
         ).rows[0].user_id as string);
 
-    // Check member count before upserting membership — inside the same
-    // transaction to prevent concurrent first-login races.
+    // Count members before the membership upsert. Concurrent first logins
+    // to one tenant wait for each other on the tenant row that the upsert
+    // above locked, so only one of them sees zero.
     const memberCount = await client.query(
       `SELECT COUNT(*) AS cnt FROM tenant_memberships WHERE tenant_id = $1`,
       [tenantId]
     );
     const isFirstMember = Number(memberCount.rows[0].cnt) === 0;
 
-    const existingMembership = await client.query(
-      `SELECT role FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2 LIMIT 1`,
-      [tenantId, userId]
-    );
-    const previousRole = existingMembership.rows[0]?.role as string | undefined;
-    const role = resolveTenantMembershipRole({
-      existingRole: previousRole ?? null,
+    // The role of a new membership. An existing membership keeps its role
+    // (resolveTenantMembershipRole), so the upsert never writes `role` on a
+    // conflict: it returns the role as committed now. Reading the role first
+    // and writing it back would undo a role change that commits in between:
+    // ON CONFLICT DO UPDATE waits for the row and acts on its latest version,
+    // a separate read does not. A removal that commits in between leaves no
+    // row, so the login inserts a new membership with this role, as a login
+    // just after the removal would.
+    const newMemberRole = resolveTenantMembershipRole({
+      existingRole: null,
       isFirstMember,
       workosRoleSlug: input.workosRoleSlug
     });
-
-    await client.query(
+    const membership = await client.query<{ role: "owner" | "admin" | "member"; inserted: boolean }>(
       `INSERT INTO tenant_memberships (tenant_id, user_id, role)
        VALUES ($1, $2, $3)
        ON CONFLICT (tenant_id, user_id) DO UPDATE SET
-         role = EXCLUDED.role,
-         updated_at = NOW()`,
-      [tenantId, userId, role]
+         updated_at = NOW()
+       RETURNING role, (xmax = 0) AS inserted`,
+      [tenantId, userId, newMemberRole]
     );
+    const { role, inserted } = membership.rows[0]!;
 
-    return { tenantId, userId, role, previousRole };
+    // An existing membership is unchanged, so its previous role is its role.
+    return { tenantId, userId, role, previousRole: inserted ? undefined : role };
   });
 }

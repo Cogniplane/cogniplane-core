@@ -43,6 +43,18 @@ it("does not overwrite an unsaved draft when a newer revision arrives", () => {
   fireEvent.click(screen.getByRole("button", { name: "Use saved version" }));
   expect((screen.getByLabelText("Project instructions") as HTMLTextAreaElement).value).toBe("Other tab");
 });
+it("shows one recovery alert when a failed save reveals a newer revision", async () => {
+  vi.mocked(updateProjectInstructions).mockRejectedValue(new Error("Settings changed in another tab"));
+  const h = setup();
+  fireEvent.change(screen.getByLabelText("Project instructions"), { target: { value: "My draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save instructions" }));
+  await screen.findByRole("alert");
+  h.changeProject({ ...project, instructions: "Other tab", instructionsRevision: 4 });
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(screen.getByRole("alert").textContent).toContain("Your draft is preserved");
+  expect((screen.getByLabelText("Project instructions") as HTMLTextAreaElement).value).toBe("My draft");
+  expect((screen.getByRole("button", { name: "Save instructions" }) as HTMLButtonElement).disabled).toBe(true);
+});
 it("allows clearing instructions and disables edits while saving", async () => {
   let finish!: (value: Project) => void;
   vi.mocked(updateProjectInstructions).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
@@ -53,4 +65,15 @@ it("allows clearing instructions and disables edits while saving", async () => {
   expect(updateProjectInstructions).toHaveBeenCalledWith("p1", "", 3);
   finish({ ...project, instructions: "", instructionsRevision: 4 });
   await screen.findByRole("status");
+});
+
+
+it("explains the archive lock and sends no instruction update from an archived project", () => {
+  const h = setup();
+  h.changeProject({ ...project, archivedAt: "2026-11-04T12:00:00Z" });
+  expect((screen.getByLabelText("Project instructions") as HTMLTextAreaElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Save instructions" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.submit(screen.getByRole("button", { name: "Save instructions" }).closest("form")!);
+  expect(updateProjectInstructions).not.toHaveBeenCalled();
+  expect(screen.getByText("Restore this project before changing instructions.")).toBeTruthy();
 });

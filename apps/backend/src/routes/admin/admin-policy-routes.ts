@@ -16,10 +16,14 @@ import {
   PolicySimulateResponseSchema,
   z
 } from "@cogniplane/shared-types";
-import type { PolicyDecisionFilters } from "@cogniplane/shared-types";
+import type { PolicyDecisionFilters, PolicyRule } from "@cogniplane/shared-types";
+import type { FastifyRequest } from "fastify";
 
 import { serialize } from "../../lib/serialize-response.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
+import type { AuditEventInput } from "../../services/audit-event-store.js";
+import type { AuditEventType } from "../../services/audit-event-types.js";
+import type { DataRouteControl } from "../../services/data-route-control.js";
+import type { PolicyRuleChange } from "../../services/mail/setting-change-notices.js";
 import type { PolicyDecisionStore } from "../../services/policy/policy-decision-store.js";
 import { lintRules } from "../../services/policy/policy-lint.js";
 import {
@@ -30,7 +34,6 @@ import type { PolicyService } from "../../services/policy/policy-service.js";
 
 import {
   configError,
-  createAdminAuditEvent,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -43,7 +46,13 @@ export type PolicyRouteStores = {
   >;
   policyDecisions: Pick<PolicyDecisionStore, "get" | "list" | "summarizeMonitor">;
   policyService: Pick<PolicyService, "evaluate" | "invalidate">;
-  auditEvents: Pick<AuditEventStore, "create">;
+  /**
+   * Step-up and owner notice of a rule change that makes the policy weaker
+   * (policy-weakening.ts): a stolen admin token must not open a tool that a
+   * rule blocks or routes for approval. The store classifies the change in
+   * its transaction; other changes need neither.
+   */
+  dataRoutes: Pick<DataRouteControl, "writeWithStepUpIfWeaker" | "ownerNotice">;
   /** Clock for the monitor summary window. Tests pin it. */
   now?: () => Date;
 };
@@ -131,6 +140,25 @@ export async function registerAdminPolicyRoutes(
   app: FastifyInstance,
   stores: PolicyRouteStores
 ): Promise<void> {
+  /**
+   * The audit event of a rule change, written in the change's transaction.
+   * A change that makes the policy weaker also queues the owner notice there.
+   */
+  const ruleAudit = <T>(request: FastifyRequest, type: AuditEventType, change: (saved: T) => PolicyRuleChange,
+    payload: (saved: T) => Record<string, unknown>) =>
+    (saved: T, weaker: boolean): AuditEventInput => ({
+      tenantId: request.auth.tenantId,
+      sessionId: null,
+      userId: request.auth.userId,
+      type,
+      payload: { ...payload(saved), weaker },
+      ipAddress: request.ip,
+      userAgent: request.headers["user-agent"] ?? null,
+      alsoInTransaction: weaker ? stores.dataRoutes.ownerNotice(request, change(saved)) : undefined
+    });
+  const ruleChange = (change: PolicyRuleChange["change"]) => (rule: PolicyRule): PolicyRuleChange =>
+    ({ setting: "policy_rules", change, ruleId: rule.ruleId, ruleName: rule.name });
+
   // List rules (evaluation order).
   app.get("/admin/policy/rules", withAdmin(app, async (request) => {
     const rules = await stores.policyRules.list(request.auth.tenantId);
@@ -143,21 +171,14 @@ export async function registerAdminPolicyRoutes(
     if (!parsed.ok) return parsed.response;
 
     try {
-      const rule = await stores.policyRules.create(
-        request.auth.tenantId,
-        parsed.value,
-        request.auth.userId
-      );
+      const audit = ruleAudit(request, "admin.policy_rule.created", ruleChange("rule_added"),
+        (rule: PolicyRule) => ({ ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled }));
+      const written = await stores.dataRoutes.writeWithStepUpIfWeaker(request, reply, "POST /admin/policy/rules",
+        (allowWeaker) => stores.policyRules.create(request.auth.tenantId, parsed.value, request.auth.userId, { allowWeaker, audit }));
+      if (!written) return reply;
+      const rule = written.saved;
       // Drop the hot-path rule cache so the new rule takes effect immediately.
       await stores.policyService.invalidate(request.auth.tenantId);
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.policy_rule.created",
-        payload: { ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
       return serialize(PolicyRuleEnvelopeSchema, { rule });
     } catch (error) {
       return respondAdminMutationError(reply, error, "Failed to create policy rule.");
@@ -173,21 +194,15 @@ export async function registerAdminPolicyRoutes(
     if (!parsed.ok) return parsed.response;
 
     try {
-      const rule = await stores.policyRules.update(
-        request.auth.tenantId,
-        params.data.ruleId,
-        parsed.value
-      );
+      const audit = ruleAudit(request, "admin.policy_rule.updated", ruleChange("rule_changed"),
+        (rule: PolicyRule) => ({ ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled }));
+      // A missing rule answers 404 before any classification: it spends no step-up token.
+      const written = await stores.dataRoutes.writeWithStepUpIfWeaker(request, reply, "PATCH /admin/policy/rules/:ruleId",
+        (allowWeaker) => stores.policyRules.update(request.auth.tenantId, params.data.ruleId, parsed.value, { allowWeaker, audit }));
+      if (!written) return reply;
+      const rule = written.saved;
       if (!rule) return respondAdminNotFound(reply, "policy_rule_not_found");
       await stores.policyService.invalidate(request.auth.tenantId);
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.policy_rule.updated",
-        payload: { ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
       return serialize(PolicyRuleEnvelopeSchema, { rule });
     } catch (error) {
       return respondAdminMutationError(reply, error, "Failed to update policy rule.");
@@ -199,17 +214,13 @@ export async function registerAdminPolicyRoutes(
     const params = ruleIdParamsSchema.safeParse(request.params);
     if (!params.success) return respondAdminNotFound(reply, "policy_rule_not_found");
 
-    const deleted = await stores.policyRules.delete(request.auth.tenantId, params.data.ruleId);
-    if (!deleted) return respondAdminNotFound(reply, "policy_rule_not_found");
+    const audit = ruleAudit(request, "admin.policy_rule.deleted", ruleChange("rule_removed"),
+      (rule: PolicyRule) => ({ ruleId: rule.ruleId }));
+    const written = await stores.dataRoutes.writeWithStepUpIfWeaker(request, reply, "DELETE /admin/policy/rules/:ruleId",
+      (allowWeaker) => stores.policyRules.delete(request.auth.tenantId, params.data.ruleId, { allowWeaker, audit }));
+    if (!written) return reply;
+    if (!written.saved) return respondAdminNotFound(reply, "policy_rule_not_found");
     await stores.policyService.invalidate(request.auth.tenantId);
-    await createAdminAuditEvent(stores.auditEvents, {
-      tenantId: request.auth.tenantId,
-      userId: request.auth.userId,
-      type: "admin.policy_rule.deleted",
-      payload: { ruleId: params.data.ruleId },
-      ipAddress: request.ip,
-      userAgent: request.headers["user-agent"]
-    });
     reply.code(204);
     return null;
   }));
@@ -293,9 +304,16 @@ export async function registerAdminPolicyRoutes(
     const parsed = parseRequestInput(reply, PolicyReorderRequestSchema, request.body);
     if (!parsed.ok) return parsed.response;
 
+    const audit = ruleAudit(request, "admin.policy_rule.reordered",
+      (): PolicyRuleChange => ({ setting: "policy_rules", change: "order_changed", ruleId: null, ruleName: null }),
+      () => ({ ruleIds: parsed.value.ruleIds }));
     let rules;
     try {
-      rules = await stores.policyRules.reorder(request.auth.tenantId, parsed.value.ruleIds);
+      // A drifted view answers 409 before any classification: it spends no step-up token.
+      const written = await stores.dataRoutes.writeWithStepUpIfWeaker(request, reply, "PUT /admin/policy/rules/order",
+        (allowWeaker) => stores.policyRules.reorder(request.auth.tenantId, parsed.value.ruleIds, { allowWeaker, audit }));
+      if (!written) return reply;
+      rules = written.saved;
     } catch (error) {
       if (error instanceof PolicyReorderMismatchError) {
         reply.code(409);
@@ -305,14 +323,6 @@ export async function registerAdminPolicyRoutes(
     }
 
     await stores.policyService.invalidate(request.auth.tenantId);
-    await createAdminAuditEvent(stores.auditEvents, {
-      tenantId: request.auth.tenantId,
-      userId: request.auth.userId,
-      type: "admin.policy_rule.reordered",
-      payload: { ruleIds: parsed.value.ruleIds },
-      ipAddress: request.ip,
-      userAgent: request.headers["user-agent"]
-    });
     return serialize(PolicyRulesListResponseSchema, { rules });
   }));
 }

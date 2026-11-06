@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   bridges: [] as Array<{ onmessage?: (message: { role: string; content: unknown[] }) => Promise<{ isError?: boolean }>;
+    oninitialized?: () => void; onsandboxready?: () => void; onsizechange?: (size: { height: number }) => void;
+    sendToolInput: ReturnType<typeof vi.fn>; sendToolResult: ReturnType<typeof vi.fn>; sendSandboxResourceReady: ReturnType<typeof vi.fn>;
     setHostContext: ReturnType<typeof vi.fn>; connect: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>; options: unknown }>,
   transports: [] as Array<{ peer: unknown; origin: string }>,
   transportError: null as Error | null,
@@ -20,6 +22,9 @@ vi.mock("@modelcontextprotocol/ext-apps/app-bridge", () => ({
       this.options = options;
       state.bridges.push(this);
     }
+    sendToolInput = vi.fn().mockResolvedValue(undefined);
+    sendToolResult = vi.fn().mockResolvedValue(undefined);
+    sendSandboxResourceReady = vi.fn().mockResolvedValue(undefined);
     setHostContext = vi.fn();
     connect = vi.fn(() => state.connectGate ?? Promise.resolve());
     close = vi.fn().mockResolvedValue(undefined);
@@ -355,4 +360,120 @@ it("shows an error and loads nothing when the origin-checked transport cannot st
 
   expect((await screen.findByRole("alert")).textContent).toBe("The tool view could not connect.");
   expect(state.bridges[0]!.connect).not.toHaveBeenCalled();
+});
+
+it("reloads only the saved view resource after a failed read, with a fresh request and no draft or tool action", async () => {
+  vi.stubEnv("NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN", "https://sandbox.example.test");
+  state.fetch.mockResolvedValueOnce({ ok: false, status: 503 }).mockResolvedValueOnce(WIDGET_RESPONSE);
+  const place = vi.fn();
+  render(<McpAppFrame sessionId="s-1" toolCallId="call-1" toolName="show_quotes" app={WIDGET_APP}
+    draft={{ place }} canEdit busy={false} />);
+  await screen.findByRole("alert");
+  const firstSignal = state.fetch.mock.calls[0]![1].signal as AbortSignal;
+  await waitFor(() => expect(firstSignal.aborted).toBe(true));
+  const reload = screen.getByRole("button", { name: "Reload tool view" });
+  reload.focus();
+  fireEvent.click(reload);
+  const frame = await screen.findByTitle("Interactive tool view");
+  await waitFor(() => expect(frame.getAttribute("src")).not.toBeNull());
+  act(() => state.bridges[0]!.oninitialized!());
+  expect(document.activeElement).toBe(frame);
+  expect(state.fetch.mock.calls.map(call => call[0])).toEqual(["/sessions/s-1/mcp-apps/call-1", "/sessions/s-1/mcp-apps/call-1"]);
+  expect(state.fetch.mock.calls[1]![1].signal).not.toBe(firstSignal);
+  expect(place).not.toHaveBeenCalled();
+  expect(state.bridges).toHaveLength(1);
+});
+
+it.each(["loads", "fails"] as const)("does not take focus back when the user moves it while a reloaded view %s", async (outcome) => {
+  vi.stubEnv("NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN", "https://sandbox.example.test");
+  state.fetch.mockResolvedValueOnce({ ok: false, status: 503 });
+  let finish!: (value: unknown) => void;
+  state.fetch.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+  render(<><McpAppFrame sessionId="s-1" toolCallId="call-1" toolName="show_quotes" app={WIDGET_APP}
+    draft={{ place: vi.fn() }} canEdit busy={false} /><textarea aria-label="Message" /></>);
+  const reload = await screen.findByRole("button", { name: "Reload tool view" });
+  reload.focus();
+  fireEvent.click(reload);
+  // The reload owns focus while nothing else has it.
+  await waitFor(() => expect(document.activeElement?.textContent).toBe("Loading tool view…"));
+  const message = screen.getByRole("textbox", { name: "Message" });
+  message.focus();
+  if (outcome === "loads") {
+    await act(async () => finish(WIDGET_RESPONSE));
+    await waitFor(() => expect(screen.getByTitle("Interactive tool view").getAttribute("src")).not.toBeNull());
+    act(() => state.bridges[0]!.oninitialized!());
+  } else {
+    await act(async () => finish({ ok: false, status: 503 }));
+    await screen.findByRole("alert");
+  }
+  expect(document.activeElement).toBe(message);
+});
+
+it("aborts a pending read and ignores its late successful JSON after the frame goes away", async () => {
+  vi.stubEnv("NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN", "https://sandbox.example.test");
+  let finish!: (value: unknown) => void;
+  state.fetch.mockResolvedValue({ ok: true, json: () => new Promise(resolve => { finish = resolve; }) });
+  const view = renderWidget();
+  await waitFor(() => expect(finish).toBeTypeOf("function"));
+  const signal = state.fetch.mock.calls[0]![1].signal as AbortSignal;
+  view.unmount();
+  expect(signal.aborted).toBe(true);
+  await act(async () => { finish(await WIDGET_RESPONSE.json()); });
+  expect(state.bridges).toHaveLength(0);
+  expect(screen.queryByTitle("Interactive tool view")).toBeNull();
+});
+
+it("cleans a failed bridge and pending draft, then ignores its old callbacks and rejected send after reload", async () => {
+  const { place } = await renderQuotes({ placements: ["occupied"] });
+  const old = state.bridges[0]!;
+  const frame = screen.getByTitle("Interactive tool view");
+  let rejectSend!: (cause: Error) => void;
+  old.sendSandboxResourceReady.mockReturnValue(new Promise((_resolve, reject) => { rejectSend = reject; }));
+  old.onsandboxready!();
+  let pending!: Promise<{ isError?: boolean }>;
+  act(() => { pending = old.onmessage!({ role: "user", content: [{ type: "text", text: "Waiting draft" }] }); });
+  expect(screen.getByRole("group", { name: "Tool view message waiting" })).toBeTruthy();
+  old.sendToolInput.mockRejectedValueOnce(new Error("sample initialization failure"));
+  act(() => old.oninitialized!());
+  await screen.findByRole("alert");
+  expect(await pending).toEqual({ isError: true });
+  expect(old.close).toHaveBeenCalledOnce();
+  expect(frame.hasAttribute("src")).toBe(false);
+  expect((state.fetch.mock.calls[0]![1].signal as AbortSignal).aborted).toBe(true);
+  expect(screen.queryByRole("group", { name: "Tool view message waiting" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Reload tool view" }));
+  await waitFor(() => expect(state.bridges).toHaveLength(2));
+  const current = screen.getByTitle("Interactive tool view");
+  await act(async () => {
+    rejectSend(new Error("old send failed late"));
+    old.oninitialized!(); old.onsandboxready!(); old.onsizechange!({ height: 900 });
+    expect(await old.onmessage!({ role: "user", content: [{ type: "text", text: "Old message" }] })).toEqual({ isError: true });
+    document.documentElement.dataset.theme = "dark";
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.getByTitle("Interactive tool view")).toBe(current);
+  expect((current as HTMLIFrameElement).style.height).toBe("560px");
+  expect(old.sendSandboxResourceReady).toHaveBeenCalledOnce();
+  expect(old.sendToolResult).not.toHaveBeenCalled();
+  expect(old.setHostContext).not.toHaveBeenCalled();
+  expect(state.bridges[1]!.setHostContext).toHaveBeenCalledWith({ theme: "dark" });
+  expect(place).toHaveBeenCalledOnce();
+});
+
+it("ignores a closed attempt's late connection rejection after a new tool view is mounted", async () => {
+  vi.stubEnv("NEXT_PUBLIC_MCP_APP_SANDBOX_ORIGIN", "https://sandbox.example.test");
+  state.fetch.mockResolvedValue(WIDGET_RESPONSE);
+  let rejectConnect!: (error: Error) => void;
+  state.connectGate = new Promise((_resolve, reject) => { rejectConnect = reject; });
+  const place = vi.fn();
+  const view = render(<McpAppFrame sessionId="s-1" toolCallId="call-1" toolName="show_quotes" app={WIDGET_APP} draft={{ place }} canEdit busy={false} />);
+  await waitFor(() => expect(state.bridges).toHaveLength(1));
+  const old = state.bridges[0]!;
+  state.connectGate = null;
+  view.rerender(<McpAppFrame sessionId="s-1" toolCallId="call-2" toolName="show_quotes" app={WIDGET_APP} draft={{ place }} canEdit busy={false} />);
+  await waitFor(() => expect(state.bridges).toHaveLength(2));
+  await act(async () => { rejectConnect(new Error("old connection rejected")); });
+  expect(old.close).toHaveBeenCalledOnce();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.getByTitle("Interactive tool view")).toBeTruthy();
 });

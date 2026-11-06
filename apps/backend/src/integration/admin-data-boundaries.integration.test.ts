@@ -8,6 +8,8 @@ import { registerAdminPiiRoutes } from "../routes/admin/admin-pii-routes.js";
 import { registerAdminSessionRoutes } from "../routes/admin/admin-session-routes.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedApproval, seedMessage, seedPiiScanRun, seedSession, seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
+import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
+import { resolvePiiPolicy } from "../services/pii/pii-policy.js";
 
 async function adminApp(owner: TenantFixture) {
   const app = Fastify();
@@ -76,7 +78,7 @@ describe.skipIf(!adminDatabaseUrl())("admin database response boundaries", () =>
     const app = await adminApp(owner);
     await registerAdminPiiRoutes(app, {
       piiAnalytics: new PiiAnalyticsStore(appPool()),
-      piiProtection: { getActiveSettings: async () => DEFAULT_PII_PROTECTION },
+      piiProtection: { getPolicy: async () => resolvePiiPolicy(DEFAULT_PII_PROTECTION, new PiiImportScopeRegistry()) },
       piiCircuitBreaker: { snapshot: async () => ({ state: "closed", failureCount: 0, openedAt: null, willRetryAt: null }) }
     });
     const response = await app.inject({ method: "GET", url: "/admin/pii/metrics?range=custom&from=2026-09-20T00:00:00Z&to=2026-09-21T00:00:00Z" });

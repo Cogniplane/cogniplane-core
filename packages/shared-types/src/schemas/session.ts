@@ -85,6 +85,8 @@ const SessionCapabilityOptionSchema = z.object({
   description: z.string(),
   source: z.enum(["organization", "personal", "project"]).optional(),
   connectionStatus: z.enum(["not_connected", "connected", "reconnect_required", "organization", "no_auth", "unavailable"]).optional(),
+  // With `reconnect_required`: a security change suspended the member's saved credential.
+  connectionSuspended: z.boolean().optional(),
   accountLabel: z.string().nullable().optional()
 });
 export const SessionCapabilitiesSchema = SessionCapabilitiesUpdateSchema.extend({

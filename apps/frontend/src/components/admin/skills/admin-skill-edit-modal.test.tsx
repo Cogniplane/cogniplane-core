@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { AdminSkillEditModal } from "./admin-skill-edit-modal";
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 function renderModal(isBusy = false) {
   const onCancel = vi.fn();
@@ -61,4 +61,35 @@ it("cancels from the button and from Escape", () => {
   fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
 
   expect(onCancel).toHaveBeenCalledTimes(2);
+});
+
+it("holds fields, cancellation, Escape and duplicate submits until a save settles", async () => {
+  let reject!: (error: Error) => void;
+  const onSubmit = vi.fn(() => new Promise<void>((_, no) => { reject = no; }));
+  const onCancel = vi.fn();
+  render(<AdminSkillEditModal skillId="briefing" initialSkillName="Briefing" initialDescription="Purpose" initialInstructions="Text" isBusy={false} onCancel={onCancel} onSubmit={onSubmit} />);
+  const form = screen.getByLabelText("Display name").closest("form")!;
+  fireEvent.submit(form); fireEvent.submit(form);
+  expect(onSubmit).toHaveBeenCalledOnce();
+  expect((screen.getByLabelText("Display name") as HTMLInputElement).matches(":disabled")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  expect(onCancel).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
+  await act(async () => { reject(new Error("Save refused")); });
+  expect(screen.getByRole("alert").textContent).toBe("Save refused");
+  expect((screen.getByLabelText("Display name") as HTMLInputElement).matches(":disabled")).toBe(false);
+});
+
+it("asks before discarding changed text and keeps it when discard is refused", async () => {
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+  const { onCancel } = renderModal();
+  fireEvent.change(screen.getByLabelText("Description"), { target: { value: "New purpose" } });
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(confirm).toHaveBeenCalledOnce();
+  expect(onCancel).not.toHaveBeenCalled();
+  expect((screen.getByLabelText("Description") as HTMLInputElement).value).toBe("New purpose");
+  confirm.mockReturnValue(true);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(onCancel).toHaveBeenCalledOnce());
 });

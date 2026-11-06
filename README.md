@@ -53,7 +53,7 @@ The agent loop runs in the backend (LangChain [deepagentsjs](https://reference.l
 ## What's in the box
 
 - **A production Deep Agents runtime.** Planning, subagents, human-in-the-loop interrupts, and durable LangGraph checkpointing (conversations survive process restarts), wired to sandboxed code execution and a governed tool gateway.
-- **Managed integrations.** GitHub, Notion, artifact upload/download, session context, and a write-artifact tool — credentials brokered server-side, never exposed to the model.
+- **Managed integrations.** GitHub, Notion, SharePoint, artifact upload/download, session context, and a write-artifact tool — credentials brokered server-side, never exposed to the model.
 - **Human-in-the-loop approvals.** Native runtime approvals plus Policy Center rules with tenant-level monitor/enforce mode. Frontend renders approval cards inline in the turn.
 - **Multi-tenant by default.** Every store method takes `tenantId`. Every query runs inside a `withTenantScope` block that activates Postgres RLS. Migrations bypass RLS as superuser; runtime app role does not.
 - **Skills as content.** Authored as structured operating documents (`SKILL.md` bundles), versioned as immutable revisions, and served to the agent as a read-only `/skills/` file library (native progressive disclosure — the model reads each skill on demand rather than having them all inlined into the prompt). Skill bundles can live on local disk or in S3.
@@ -85,3 +85,13 @@ Cogniplane Core is the same backend that powers [Cogniplane Cloud](https://cogni
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request — Cogniplane Core requires a signed Contributor License Agreement (CLA) so we can offer the dual-license terms above.
 
 For security issues, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
+
+## Development repository
+
+This repository contains the complete product, including the SharePoint backend,
+frontend and contracts packages. The `private/` paths and `@cogniplane-private/*`
+workspace names remain for compatibility; those packages use the root AGPL license.
+Development and pull requests belong here. See [development](docs/DEVELOPMENT.md).
+
+Deployment credentials, Cogniplane infrastructure operations, the marketing website
+and internal business documents are maintained separately.

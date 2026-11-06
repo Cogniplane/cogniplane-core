@@ -8,24 +8,20 @@ import type {
 } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { formatTimestamp } from "../../../lib/time-format";
-import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
+import { PILL_GRAY, PILL_BLUE, PILL_RED, PILL_GREEN, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
-const PILL_TONE: Record<"red" | "blue" | "gray", string> = {
+const PILL_TONE: Record<"red" | "green" | "blue" | "gray", string> = {
   red: PILL_RED,
+  green: PILL_GREEN,
   blue: PILL_BLUE,
   gray: PILL_GRAY
 };
-
-function jumpToMessage(messageId: string): void {
-  const target = document.getElementById(`message-${messageId}`);
-  if (!target) return;
-  target.scrollIntoView({ behavior: "smooth", block: "center" });
-}
 
 export function AdminSessionAlertsTab(props: {
   messages: AdminSessionDetailMessage[];
   approvals: AdminSessionDetailApproval[];
   piiRuns: AdminSessionDetailPiiRun[];
+  onJumpToMessage?: (messageId: string) => void;
 }) {
   const items = buildAlertItems(props);
 
@@ -53,7 +49,7 @@ export function AdminSessionAlertsTab(props: {
               variant="ghost"
               size="xs"
               className="mt-2"
-              onClick={() => jumpToMessage(item.jumpToMessageId as string)}
+              onClick={() => props.onJumpToMessage?.(item.jumpToMessageId as string)}
             >
               Jump to message
             </Button>

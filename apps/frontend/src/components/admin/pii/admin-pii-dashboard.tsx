@@ -12,14 +12,17 @@ import {
   type PiiKpiKey
 } from "../../../lib/admin-pii-utils";
 import type { PiiActivityMetrics, PiiRangePreset } from "@cogniplane/shared-types";
+import { piiScopeLabel } from "../../../lib/pii-scope-labels";
 import { queryKeys } from "../../../lib/query-keys";
+import { formatTimestamp } from "../../../lib/time-format";
 import { FindingsBreakdown, TimeSeriesChart } from "./admin-pii-charts";
 import { OpsHealthPanel } from "./admin-pii-ops-panel";
 import { RecentActivityFeed, TopOffenders } from "./admin-pii-tables";
+import { PiiPolicyHealthNotice } from "./pii-policy-health-notice";
 import { PiiProviderStatusPill } from "../../pii-provider-status-pill";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
+import { HINT, SECTION_LABEL } from "../../../lib/ui-tokens";
 
 const MODE_LABELS = { off: "Off", detect: "Detect", block: "Block", transform: "Transform" } as const;
 
@@ -71,10 +74,11 @@ export function AdminPiiDashboard() {
   };
 
   const data = metricsQuery.data ?? null;
-  const isLoading = metricsQuery.isLoading;
+  const isLoading = metricsQuery.isPending || (!data && metricsQuery.isFetching);
 
   const policy = data?.policy;
-  const off = Boolean(policy) && (!policy!.enabled || policy!.mode === "off");
+  const policyInvalid = data?.policyHealth?.state === "error";
+  const off = Boolean(policy) && !policyInvalid && (!policy!.enabled || policy!.mode === "off");
   // With protection off and no scans in the range, every number is zero. Say why instead.
   const nothingToShow = off && (data?.kpis.scans.current ?? 0) === 0;
 
@@ -82,20 +86,38 @@ export function AdminPiiDashboard() {
     <section id="pii" className="flex flex-col gap-5 pt-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm text-on-surface-variant">
-          <p>{policy ? policySentence(policy) : isLoading ? "Loading activity..." : ""}</p>
+          <p>{policyInvalid ? "Content in scope is stopped." : policy ? policySentence(policy) : isLoading ? "Loading activity..." : ""}</p>
           <PiiProviderStatusPill />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <RangeSelector range={range} onChange={setRange} disabled={isLoading} />
-          <Button type="button" variant="ghost" size="sm" onClick={refresh}>
-            Refresh
+          <RangeSelector range={range} onChange={setRange} />
+          <Button type="button" variant="ghost" size="sm" onClick={refresh} disabled={metricsQuery.isFetching}>
+            {metricsQuery.isFetching ? "Refreshing..." : "Refresh"}
           </Button>
         </div>
       </div>
 
+      <PiiPolicyHealthNotice
+        health={data?.policyHealth}
+        action={<><Link href="/admin/privacy" className="underline underline-offset-4">Review and save the policy in Settings</Link>.</>}
+      />
+
       {metricsQuery.error ? (
-        <p role="alert" className="text-sm text-danger">{(metricsQuery.error as Error).message}</p>
+        <div className="flex flex-wrap items-center gap-3">
+          <p role="alert" className="text-sm text-danger">
+            Could not {data ? "refresh" : "load"} activity metrics for {range.preset}.
+            {data ? " Showing the last successful result." : " Counts are not available."}
+          </p>
+          <Button type="button" variant="outline" size="sm" disabled={metricsQuery.isFetching} onClick={() => void metricsQuery.refetch()}>Retry metrics</Button>
+        </div>
       ) : null}
+
+      {data ? <p className="break-words text-sm text-on-surface-variant">
+        Metrics shown for {data.range.preset}. <time dateTime={data.range.from}>{formatTimestamp(data.range.from)}</time> to <time dateTime={data.range.to}>{formatTimestamp(data.range.to)}</time>.
+      </p> : null}
+      {data && metricsQuery.isFetching ? <p role="status" className={HINT}>
+        {metricsQuery.isPlaceholderData ? `Loading metrics for ${range.preset}. Showing ${data.range.preset} until they arrive.` : `Refreshing metrics for ${range.preset}. Showing the last successful result.`}
+      </p> : null}
 
       {nothingToShow ? (
         <p className="border-y border-outline-variant py-4 text-sm text-on-surface-variant">
@@ -104,18 +126,15 @@ export function AdminPiiDashboard() {
         </p>
       ) : (
         <>
-          <KpiRow data={data} loading={isLoading} />
+          {data ? <>
+          <KpiRow data={data} />
 
           <Card>
             <CardHeader>
               <h2 id="pii-time-series-title" className="text-base font-semibold text-on-surface">Activity over time</h2>
             </CardHeader>
             <CardContent>
-              {data ? (
-                <TimeSeriesChart series={data.timeSeries} bucket={data.range.bucket} />
-              ) : (
-                <p className={HINT}>Loading…</p>
-              )}
+              <TimeSeriesChart series={data.timeSeries} bucket={data.range.bucket} />
             </CardContent>
           </Card>
 
@@ -124,9 +143,13 @@ export function AdminPiiDashboard() {
               <h2 id="pii-findings-title" className="text-base font-semibold text-on-surface">Findings breakdown</h2>
             </CardHeader>
             <CardContent>
-              {data ? <FindingsBreakdown data={data} /> : <p className={HINT}>Loading…</p>}
+              <FindingsBreakdown data={data} />
             </CardContent>
           </Card>
+          </> : isLoading ? <p role="status" className={HINT}>Loading activity metrics for {range.preset}...</p> : !metricsQuery.error ? <div className="flex flex-wrap items-center gap-3">
+            <p className={HINT}>Activity metrics are unavailable for {range.preset}. Counts are not available.</p>
+            <Button type="button" variant="outline" size="sm" disabled={metricsQuery.isFetching} onClick={() => void metricsQuery.refetch()}>Retry metrics</Button>
+          </div> : null}
 
           <TopOffenders {...params} />
           <RecentActivityFeed {...params} />
@@ -140,10 +163,11 @@ export function AdminPiiDashboard() {
 /** "Detect mode. Scans chat prompts and uploads." in the words the Settings tab uses. */
 function policySentence(policy: NonNullable<PiiActivityMetrics["policy"]>): string {
   if (!policy.enabled || policy.mode === "off") return "Protection is off.";
+  const imports = Object.keys(policy.scopes).filter((key) => key !== "chatPrompts" && key !== "uploads");
   const sources = [
     policy.scopes.chatPrompts ? "chat prompts" : null,
     policy.scopes.uploads ? "direct uploads" : null,
-    policy.scopes.microsoftImports ? "Microsoft imports" : null
+    ...imports.map((key) => (policy.scopes[key] ? piiScopeLabel(key) : null))
   ].filter((source): source is string => source !== null);
   const scans = sources.length === 0
     ? "No chat prompts, uploads, or imports are scanned."
@@ -154,25 +178,22 @@ function policySentence(policy: NonNullable<PiiActivityMetrics["policy"]>): stri
 function RangeSelector(props: {
   range: RangeState;
   onChange: (next: RangeState) => void;
-  disabled: boolean;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Time range">
       {PRESET_OPTIONS.map((opt) => {
         const active = props.range.preset === opt.value;
-        // Reuses the pill primitives. The active preset shows a green pill;
-        // inactive presets render in gray.
         return (
-          <button
+          <Button
             key={opt.value}
             type="button"
-            disabled={props.disabled}
+            variant={active ? "secondary" : "outline"}
+            size="sm"
             aria-pressed={active}
             onClick={() => props.onChange({ preset: opt.value })}
-            className={`${active ? PILL_GREEN : PILL_GRAY} cursor-pointer border-0 disabled:cursor-not-allowed disabled:opacity-50`}
           >
             {opt.label}
-          </button>
+          </Button>
         );
       })}
     </div>
@@ -180,20 +201,18 @@ function RangeSelector(props: {
 }
 
 function KpiRow({
-  data,
-  loading
+  data
 }: {
-  data: PiiActivityMetrics | null;
-  loading: boolean;
+  data: PiiActivityMetrics;
 }) {
-  const series = data?.timeSeries ?? [];
+  const series = data.timeSeries;
   return (
     <div
       role="list"
       className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5"
     >
       {KPI_DEFINITIONS.map(({ key, label, tone }) => {
-        const kpi = data?.kpis[key];
+        const kpi = data.kpis[key];
         const sparkline =
           key === "findings" ? null : sparklineFromTimeSeries(series, key);
         return (
@@ -201,10 +220,9 @@ function KpiRow({
             key={key}
             label={label}
             tone={tone}
-            current={kpi?.current ?? 0}
-            previous={kpi?.previous ?? 0}
+            current={kpi.current}
+            previous={kpi.previous}
             sparkline={sparkline}
-            loading={loading}
           />
         );
       })}
@@ -218,7 +236,6 @@ function KpiTile(props: {
   current: number;
   previous: number;
   sparkline: number[] | null;
-  loading: boolean;
 }) {
   const delta = computeDelta(props.current, props.previous);
   const deltaLabel =
@@ -241,13 +258,13 @@ function KpiTile(props: {
     <article role="listitem" className={STAT_CARD}>
       <p className={SECTION_LABEL}>{props.label}</p>
       <strong className="mt-2 block text-2xl font-bold tracking-tight text-on-surface tabular-nums">
-        {props.loading ? "—" : props.current.toLocaleString()}
+        {props.current.toLocaleString()}
       </strong>
       <p
         className="m-0 text-xs tabular-nums"
         style={{ color: deltaColor }}
       >
-        {props.loading ? "" : deltaLabel}
+        {deltaLabel}
       </p>
       {props.sparkline && props.sparkline.length >= 2 ? (
         <Sparkline values={props.sparkline} tone={props.tone} />

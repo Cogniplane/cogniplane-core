@@ -11,17 +11,21 @@ import { useSettingsOverviewData } from "../../hooks/use-settings-overview-data"
 import { useSkillUpdates } from "../../hooks/use-skill-updates";
 import { useAuth } from "../../lib/auth-context";
 
-// Frontend overlay attachment. Private build registers the SharePoint
-// settings section here; OSS build's stub is empty. Import is for side
-// effect only — the file's *contents* are what differs between builds.
+// Frontend overlay attachment. The private build registers overlay settings
+// sections here; the OSS build's stub is empty. Import is for side effect
+// only — the file's *contents* are what differs between builds.
 import "../../overlays";
 
 export default function SettingsLayout({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const { liveSections, navigationItems: filteredNavigationItems } =
     useEnabledSettingsSections();
+  // Compare the whole first segment, so that `/settings/jira-x` does not
+  // select `jira`. Nested pages such as `/settings/scheduled-jobs/<id>` keep
+  // their section.
+  const segment = /^\/settings\/([^/?#]+)/.exec(pathname)?.[1];
   const activeSection =
-    liveSections.find((item) => pathname.startsWith(`/settings/${item.id}`)) ??
+    liveSections.find((item) => item.id === segment) ??
     liveSections.find((item) => item.id === "connections");
   const activeSectionId = activeSection?.kind === "integration" ? "connections" : (activeSection?.id ?? "connections");
 
@@ -52,14 +56,9 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
 
         <div className="mx-auto w-full min-w-0 max-w-6xl px-4 pb-10 pt-4 md:px-8 md:pt-6">
           <ConsolePageHeader
-            eyebrow="Settings"
             title={activeSection?.title ?? activeSection?.label ?? "Connected accounts"}
             subtitle={activeSection?.subtitle}
-            menuLinks={[
-              { href: "/", label: "Chat", description: "Return to the active workspace" },
-              { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
-              { href: "/admin", label: "Admin", description: "Open platform control plane" }
-            ]}
+            destinations={["chat", "artifacts", "admin"]}
           />
 
           {children}

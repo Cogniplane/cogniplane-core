@@ -14,19 +14,42 @@ import {
 } from "./github-connection-service.js";
 import type { GithubConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
 import { InvalidGithubRepositoryListError } from "./github-repository-allowlist.js";
+import { OwnerSecurityVersionChangedError } from "../../auth/security-change.js";
 
 class InMemoryGithubConnectionStore {
   record: GithubConnectionRecord | null = null;
   markUsedCount = 0;
+  // The stored owner_security_version, and the owner's current local version
+  // (null: a WorkOS owner). Same rule as ownerSecurityVersionSql.
+  ownerSecurityVersion: number | null = null;
+  currentSecurityVersion: number | null = null;
+
+  private suspended(): boolean {
+    return this.currentSecurityVersion !== null && this.ownerSecurityVersion !== this.currentSecurityVersion;
+  }
 
   async get(): Promise<GithubConnectionRecord | null> {
-    return this.record;
+    return this.suspended() ? null : this.record;
+  }
+
+  async getForOwner() {
+    return this.record ? { ...this.record, suspended: this.suspended() } : null;
+  }
+
+  async confirm(_tenantId: string, _userId: string, expectedGithubUserId: string, ownerSecurityVersion: number | null) {
+    if (!this.record || this.record.githubUserId !== expectedGithubUserId) return null;
+    this.ownerSecurityVersion = ownerSecurityVersion;
+    return { ...this.record, suspended: this.suspended() };
   }
 
   async upsert(input: Omit<GithubConnectionRecord, "createdAt" | "updatedAt" | "tokenLastUsedAt" | "allowedRepositories"> & {
     tokenLastRefreshedAt: string | null;
+    ownerSecurityVersion: number | null;
   }): Promise<GithubConnectionRecord> {
     const now = new Date().toISOString();
+    // Same rule as assertOwnerSecurityVersion: the callback write is bound to the current version.
+    if (this.currentSecurityVersion !== input.ownerSecurityVersion) throw new OwnerSecurityVersionChangedError();
+    this.ownerSecurityVersion = input.ownerSecurityVersion;
     this.record = {
       tenantId: input.tenantId,
       userId: input.userId,
@@ -58,7 +81,8 @@ class InMemoryGithubConnectionStore {
     if (
       !current ||
       current.githubUserId !== input.expectedGithubUserId ||
-      current.refreshTokenEncrypted !== input.expectedRefreshTokenEncrypted
+      current.refreshTokenEncrypted !== input.expectedRefreshTokenEncrypted ||
+      this.suspended()
     ) {
       return null;
     }
@@ -124,7 +148,8 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("authorize
 
   const { url: authorizeUrl, browserBinding } = await service.getAuthorizationUrl({
     tenantId: "tenant-1",
-    userId: "user-1"
+    userId: "user-1",
+    ownerSecurityVersion: null
   });
   const authState = new URL(authorizeUrl).searchParams.get("state");
   expect(authState).toBeTruthy();
@@ -310,7 +335,7 @@ test("getAuthorizationUrl throws when GitHub OAuth is not configured", async () 
   const store = new InMemoryGithubConnectionStore();
   const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
 
-  await expect(() => service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1" })).rejects.toThrow(GithubConnectionNotConfiguredError);
+  await expect(() => service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1", ownerSecurityVersion: null })).rejects.toThrow(GithubConnectionNotConfiguredError);
 });
 
 test("completeAuthorization consumes GitHub OAuth state before token exchange", async () => {
@@ -319,7 +344,8 @@ test("completeAuthorization consumes GitHub OAuth state before token exchange", 
   const service = new GithubConnectionService(config, store);
   const { url, browserBinding } = await service.getAuthorizationUrl({
     tenantId: "tenant-1",
-    userId: "user-1"
+    userId: "user-1",
+    ownerSecurityVersion: null
   });
   const state = new URL(url).searchParams.get("state")!;
   const browserNonce = browserBinding.value;
@@ -351,8 +377,8 @@ test("completeAuthorization rejects a state from another browser without storing
   const store = new InMemoryGithubConnectionStore();
   const service = new GithubConnectionService(config, store);
   // The attacker starts the flow; the victim's browser has no cookie or its own.
-  const attacker = await service.getAuthorizationUrl({ tenantId: "tenant-a", userId: "attacker" });
-  const victim = await service.getAuthorizationUrl({ tenantId: "tenant-v", userId: "victim" });
+  const attacker = await service.getAuthorizationUrl({ tenantId: "tenant-a", userId: "attacker", ownerSecurityVersion: null });
+  const victim = await service.getAuthorizationUrl({ tenantId: "tenant-v", userId: "victim", ownerSecurityVersion: null });
   const state = new URL(attacker.url).searchParams.get("state")!;
   let exchangeCalls = 0;
   const fake = createFakeFetch(() => {
@@ -660,4 +686,111 @@ test("listAccessibleRepositories separates a missing connection, a rejected toke
   await expect(service.listAccessibleRepositories("tenant-1", "user-1")).rejects.toMatchObject({
     code: "credentials_unusable"
   });
+});
+
+// q4w0.8: a connection keeps the security version of the session that started
+// the authorization. After a security change of the owner's account, no use
+// path returns it, the status shows it suspended, and only a confirm from a
+// current session restores it.
+test("a connection that an older session saved is suspended until a current session confirms it", async () => {
+  const config = createOAuthConfig();
+  const store = new InMemoryGithubConnectionStore();
+  const auditEvents = new InMemoryAuditEventStore();
+  const invalidated: string[] = [];
+  const service = new GithubConnectionService(config, store, auditEvents, {
+    async invalidateRuntimesForIntegration(_tenantId: string, userId: string, integrationId: string) {
+      invalidated.push(`${userId}:${integrationId}`);
+      return [];
+    }
+  }, undefined, { warn() {} });
+  store.currentSecurityVersion = 3;
+
+  const { url, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1", userId: "user-1", ownerSecurityVersion: 3
+  });
+  const fake = createFakeFetch((requestUrl) => {
+    if (requestUrl === "https://github.com/login/oauth/access_token") {
+      return Response.json({ access_token: "ghu_attached", token_type: "bearer", expires_in: 3600 });
+    }
+    if (requestUrl === "https://api.github.com/user") {
+      return Response.json({ id: 777, login: "someone", name: null, email: "someone@example.test", avatar_url: null });
+    }
+    throw new Error(`Unexpected fetch URL: ${requestUrl}`);
+  });
+  try {
+    expect(await service.completeAuthorization({
+      code: "oauth-code", state: new URL(url).searchParams.get("state"), browserNonce: browserBinding.value
+    })).toMatch(/githubAuth=connected/);
+  } finally {
+    fake.restore();
+  }
+  // The callback has no session: the version comes from the signed state.
+  expect(store.ownerSecurityVersion).toBe(3);
+  expect((await service.getRuntimeCredentials("tenant-1", "user-1"))?.token).toBe("ghu_attached");
+
+  // Password change or sign out everywhere.
+  store.currentSecurityVersion = 4;
+  expect(await service.getRuntimeCredentials("tenant-1", "user-1")).toBeNull();
+  expect(await service.hasConnection("tenant-1", "user-1")).toBe(false);
+  expect(await service.connectedAccountId("tenant-1", "user-1")).toBeNull();
+  await expect(service.listAccessibleRepositories("tenant-1", "user-1")).rejects.toMatchObject({ code: "not_connected" });
+  expect((await service.getConnectionStatus("tenant-1", "user-1")).userConnection)
+    .toMatchObject({ githubLogin: "someone", suspended: true });
+
+  // A confirm for another account, or from a session older than the change, does not restore it.
+  await expect(service.confirm("tenant-1", "user-1", "999", 4)).rejects.toMatchObject({ code: "account_changed" });
+  expect(await service.confirm("tenant-1", "user-1", "777", 3)).toMatchObject({ suspended: true });
+  expect(invalidated).toEqual(["user-1:github"]);
+
+  expect(await service.confirm("tenant-1", "user-1", "777", 4)).toMatchObject({ suspended: false });
+  expect((await service.getRuntimeCredentials("tenant-1", "user-1"))?.token).toBe("ghu_attached");
+  // The store writes user.github.confirmed in the confirm's transaction (integration test).
+  expect(invalidated).toEqual(["user-1:github", "user-1:github"]);
+
+  // Disconnect still works on a suspended connection and audits the account.
+  store.currentSecurityVersion = 5;
+  expect(await service.disconnect("tenant-1", "user-1")).toBe(true);
+  expect(auditEvents.events.at(-1)).toMatchObject({ type: "user.github.disconnected", payload: { githubUserId: "777" } });
+  await expect(service.confirm("tenant-1", "user-1", "777", 5)).rejects.toMatchObject({ code: "not_connected" });
+});
+
+// q4w0.8 review: the callback has no session. An authorization that a session
+// started before a security change must not overwrite the owner's connection.
+test.each([
+  ["a version older than the owner's current one", 3],
+  ["no version for a local owner", null]
+])("a callback with %s writes nothing and reports session_changed", async (_label, startedAt) => {
+  const config = createOAuthConfig();
+  const store = new InMemoryGithubConnectionStore();
+  const auditEvents = new InMemoryAuditEventStore();
+  const service = new GithubConnectionService(config, store, auditEvents, undefined, undefined, { warn() {} });
+  // The owner's own connection, saved from a current session at version 4.
+  store.currentSecurityVersion = 4;
+  store.record = githubRecord(config, "owner-account");
+  store.ownerSecurityVersion = 4;
+
+  const { url, browserBinding } = await service.getAuthorizationUrl({
+    tenantId: "tenant-1", userId: "user-1", ownerSecurityVersion: startedAt
+  });
+  const fake = createFakeFetch((requestUrl) => {
+    if (requestUrl === "https://github.com/login/oauth/access_token") {
+      return Response.json({ access_token: "ghu_attacker", token_type: "bearer", expires_in: 3600 });
+    }
+    if (requestUrl === "https://api.github.com/user") {
+      return Response.json({ id: 666, login: "attacker", name: null, email: "a@example.test", avatar_url: null });
+    }
+    throw new Error(`Unexpected fetch URL: ${requestUrl}`);
+  });
+  try {
+    const redirect = await service.completeAuthorization({
+      code: "oauth-code", state: new URL(url).searchParams.get("state"), browserNonce: browserBinding.value
+    });
+    expect(new URL(redirect).searchParams.get("githubAuth")).toBe("error");
+    expect(new URL(redirect).searchParams.get("reason")).toBe("session_changed");
+  } finally {
+    fake.restore();
+  }
+  expect(store.record?.githubUserId).toBe("owner-account");
+  expect(store.ownerSecurityVersion).toBe(4);
+  expect(auditEvents.events.map((event) => event.type)).not.toContain("user.github.connected");
 });

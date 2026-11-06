@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -18,6 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { listAdminUsers } from "../../../lib/admin-api";
 import { listOwnerlessProjects, recoverProjectOwner } from "../../../lib/admin-projects-api";
 import { useAuth } from "../../../lib/auth-context";
+import { ApiError } from "../../../lib/api-client";
 import { toErrorMessage } from "../../../lib/error-utils";
 import { PROJECT_SELECT } from "../../../lib/project-ui";
 import { queryKeys } from "../../../lib/query-keys";
@@ -55,11 +56,17 @@ export function OwnerlessProjects() {
   );
   const [picked, setPicked] = useState<Record<string, string>>({});
   const [assignment, setAssignment] = useState<Assignment | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
+  const [failure, setFailure] = useState<{ projectId: string; projectName: string; message: string; projectUnavailable: boolean } | null>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const failureNotice = useRef<HTMLParagraphElement>(null);
+  const dialog = useRef<HTMLDivElement>(null);
+  const opener = useRef<HTMLButtonElement | null>(null);
+  const closeResult = useRef<"success" | "failure" | null>(null);
 
   const assign = useMutation({
     mutationFn: (value: Assignment) => recoverProjectOwner(value.projectId, value.userId),
     onSuccess: async (_result, value) => {
+      closeResult.current = "success";
       setAssignment(null);
       setFailure(null);
       setPicked((current) => withoutChoice(current, value.projectId));
@@ -67,8 +74,12 @@ export function OwnerlessProjects() {
       await queryClient.invalidateQueries({ queryKey: OWNERLESS_KEY });
     },
     onError: async (error, value) => {
+      closeResult.current = "failure";
       setAssignment(null);
-      setFailure(recoveryErrorMessage(error));
+      setFailure({
+        projectId: value.projectId, projectName: value.projectName, message: recoveryErrorMessage(error),
+        projectUnavailable: error instanceof ApiError && ["project_has_owner", "project_not_found"].includes(error.code ?? "")
+      });
       setPicked((current) => withoutChoice(current, value.projectId));
       // The project or the person can have changed. Load both lists again.
       await Promise.all([
@@ -78,6 +89,7 @@ export function OwnerlessProjects() {
     }
   });
 
+  const failureInList = failure && !failure.projectUnavailable && list.some((project) => project.projectId === failure.projectId);
   const refused = projects.isError && isAdminRequiredError(projects.error);
   const confirmation = assignment
     ? ownerConfirmation(assignment.projectName, assignment.personName, assignment.userId === me?.userId)
@@ -86,7 +98,7 @@ export function OwnerlessProjects() {
   return (
     <section aria-labelledby="ownerless-heading" className="flex flex-col gap-4 pt-5">
       <div className="border-b border-outline-variant pb-4">
-        <h2 id="ownerless-heading" className="text-xl font-semibold tracking-tight text-on-surface">Projects without an owner</h2>
+        <h2 ref={heading} tabIndex={-1} id="ownerless-heading" className="outline-none focus-visible:ring-2 focus-visible:ring-brand text-xl font-semibold tracking-tight text-on-surface">Projects without an owner</h2>
         <p className="mt-1 max-w-3xl text-sm text-on-surface-variant">
           A project has no owner when its last owner left or lost the role. Its members keep their access,
           but nobody can change owner-only settings such as sharing. Choose a person to make the owner.
@@ -94,7 +106,11 @@ export function OwnerlessProjects() {
         </p>
       </div>
 
-      {failure ? <p role="alert" className="rounded-md bg-danger-surface px-3 py-2 text-sm text-danger">{failure}</p> : null}
+      {failure && !failureInList ? (
+        <p ref={failureNotice} tabIndex={-1} role="alert" className="wrap-anywhere rounded-md bg-danger-surface px-3 py-2 text-sm text-danger outline-none focus-visible:ring-2 focus-visible:ring-brand">
+          {failure.projectName}: {failure.message}
+        </p>
+      ) : null}
 
       {projects.isPending ? (
         <div role="status" aria-label="Loading projects" className="flex flex-col gap-3">
@@ -132,40 +148,49 @@ export function OwnerlessProjects() {
             const userId = picked[project.projectId] ?? "";
             const person = choices.find((candidate) => candidate.userId === userId);
             return (
-              <li key={project.projectId} className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:gap-4">
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-on-surface" title={project.name}>{project.name}</span>
-                <select
-                  aria-label={`New owner for ${project.name}`}
-                  className={`${PROJECT_SELECT} sm:w-72`}
-                  value={userId}
-                  disabled={!people.data || assign.isPending}
-                  onChange={(event) => setPicked((current) => ({ ...current, [project.projectId]: event.target.value }))}
-                >
-                  <option value="">{people.isPending ? "Loading people…" : "Choose a person"}</option>
-                  {choices.map((candidate) => (
-                    <option key={candidate.userId} value={candidate.userId}>
-                      {ownerChoiceLabel(candidate)}{candidate.userId === me?.userId ? " (you)" : ""}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  type="button"
-                  size="sm"
-                  aria-label={`Assign owner for ${project.name}`}
-                  disabled={!person || assign.isPending}
-                  onClick={() => {
-                    if (!person) return;
-                    setFailure(null);
-                    setAssignment({
-                      projectId: project.projectId,
-                      projectName: project.name,
-                      userId: person.userId,
-                      personName: displayName(person)
-                    });
-                  }}
-                >
-                  Assign owner
-                </Button>
+              <li key={project.projectId} className="py-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+                  <span className="min-w-0 flex-1 wrap-anywhere text-sm font-semibold text-on-surface" title={project.name}>{project.name}</span>
+                  <select
+                    aria-label={`New owner for ${project.name}`}
+                    className={`${PROJECT_SELECT} sm:w-72`}
+                    value={userId}
+                    disabled={!people.data || assign.isPending}
+                    onChange={(event) => setPicked((current) => ({ ...current, [project.projectId]: event.target.value }))}
+                  >
+                    <option value="">{people.isPending ? "Loading people…" : "Choose a person"}</option>
+                    {choices.map((candidate) => (
+                      <option key={candidate.userId} value={candidate.userId}>
+                        {ownerChoiceLabel(candidate)}{candidate.userId === me?.userId ? " (you)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    type="button"
+                    size="sm"
+                    aria-label={`Assign owner for ${project.name}`}
+                    disabled={!person || assign.isPending}
+                    onClick={(event) => {
+                      if (!person) return;
+                      opener.current = event.currentTarget;
+                      closeResult.current = null;
+                      setFailure(null);
+                      setAssignment({
+                        projectId: project.projectId,
+                        projectName: project.name,
+                        userId: person.userId,
+                        personName: displayName(person)
+                      });
+                    }}
+                  >
+                    Assign owner
+                  </Button>
+                </div>
+                {failureInList && failure?.projectId === project.projectId ? (
+                  <p ref={failureNotice} tabIndex={-1} role="alert" className="mt-2 wrap-anywhere rounded-md bg-danger-surface px-3 py-2 text-sm text-danger outline-none focus-visible:ring-2 focus-visible:ring-brand">
+                    {failure.message}
+                  </p>
+                ) : null}
               </li>
             );
           })}
@@ -173,7 +198,19 @@ export function OwnerlessProjects() {
       ) : null}
 
       <AlertDialog open={assignment !== null} onOpenChange={(open) => { if (!open && !assign.isPending) setAssignment(null); }}>
-        <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
+        <AlertDialogContent
+          ref={dialog}
+          className="max-h-[calc(100dvh-2rem)] overflow-y-auto"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const active = document.activeElement;
+            // A person can move focus after the result, before the exit finishes.
+            if (active && active !== document.body && active !== opener.current && !dialog.current?.contains(active)) return;
+            const target = closeResult.current === "failure" ? failureNotice.current
+              : closeResult.current === "success" ? heading.current : opener.current;
+            target?.focus();
+          }}
+        >
           <AlertDialogHeader>
             <AlertDialogTitle className="wrap-anywhere">{confirmation?.title}</AlertDialogTitle>
             <AlertDialogDescription>An owner can manage the project and everything in it. Check the effects before you continue.</AlertDialogDescription>
@@ -188,8 +225,9 @@ export function OwnerlessProjects() {
             <AlertDialogCancel disabled={assign.isPending}>Cancel</AlertDialogCancel>
             <Button
               type="button"
-              onClick={() => { if (assignment) assign.mutate(assignment); }}
-              disabled={assign.isPending}
+              onClick={() => { if (assignment && !assign.isPending) assign.mutate(assignment); }}
+              aria-disabled={assign.isPending}
+              className="aria-disabled:cursor-wait aria-disabled:opacity-50"
               aria-busy={assign.isPending}
             >
               {assign.isPending ? "Assigning…" : "Make owner"}

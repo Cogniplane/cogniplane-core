@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 import { useQuery } from "@tanstack/react-query";
 
 import { getAdminSessionDetail } from "../lib/admin-api";
@@ -32,7 +34,9 @@ export function useAdminSessionDetailData(sessionId: string | null) {
     }
   });
 
-  const error = query.error;
+  const [retryFailure, setRetryFailure] = useState<{ scope: string | null; error: unknown } | null>(null);
+  const scope = sessionId;
+  const error = query.error ?? (query.isFetching && retryFailure?.scope === scope ? retryFailure.error : null);
   const isNotFound = isSessionNotFound(error);
   const featureUnavailable =
     error && isRouteNotFoundError(error, "GET", "/admin/sessions");
@@ -55,6 +59,13 @@ export function useAdminSessionDetailData(sessionId: string | null) {
     error: errorMessage,
     available,
     isNotFound,
-    isLoading: query.isLoading
+    isLoading: query.isLoading,
+    isRefreshing: query.isFetching,
+    retry: () => {
+      if (query.isFetching) return;
+      const failure = { scope, error: query.error };
+      setRetryFailure(failure);
+      void query.refetch({ cancelRefetch: false }).finally(() => setRetryFailure(current => current === failure ? null : current));
+    }
   };
 }

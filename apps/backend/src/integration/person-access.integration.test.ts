@@ -150,7 +150,7 @@ describe.skipIf(!adminDatabaseUrl())("person access explanation", () => {
     expect(missing.items.find(row => row.id === id)?.gates.at(-1)?.reason).toBe("member_not_connected");
     const record = (await f.stores.mcpServers.getAdminMcpServer(f.tenantId, id))!;
     await f.stores.memberMcpCredentials.save(f.tenantId, f.userId, id,
-      { version: 0, serverVersion: record.version, secret: "private-member-secret", accountLabel: "Private account" });
+      { version: 0, serverVersion: record.version, secret: "private-member-secret", accountLabel: "Private account" }, null);
     expect((await parity(f)).items.find(row => row.id === id)?.status).toBe("included");
     await superuserPool().query("UPDATE admin_mcp_servers SET credential_binding_id=$3 WHERE tenant_id=$1 AND server_id=$2", [f.tenantId, id, randomUUID()]);
     expect((await parity(f)).items.find(row => row.id === id)?.gates.at(-1)?.reason).toBe("member_must_reconnect");

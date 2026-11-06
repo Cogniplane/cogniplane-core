@@ -38,8 +38,21 @@ class MemoryStore {
   cleanupBatch = 500;
   private nextCleanup = 0;
 
+  // The stored owner_security_version per row, and the owner's current local
+  // version (absent: a WorkOS owner). Same rule as ownerSecurityVersionSql.
+  ownerVersions = new Map<string, number | null>();
+  currentVersions = new Map<string, number>();
+  private suspended(key: string) {
+    return this.currentVersions.has(key) && this.ownerVersions.get(key) !== this.currentVersions.get(key);
+  }
   async get(tenantId: string, userId: string) {
-    return this.rows.get(`${tenantId}:${userId}`) ?? null;
+    const key = `${tenantId}:${userId}`;
+    return this.suspended(key) ? null : this.rows.get(key) ?? null;
+  }
+  async getForOwner(tenantId: string, userId: string) {
+    const key = `${tenantId}:${userId}`;
+    const row = this.rows.get(key);
+    return row ? { ...row, suspended: this.suspended(key) } : null;
   }
   async getIdentity(tenantId: string, userId: string) {
     const identity = this.identities.get(`${tenantId}:${userId}`);
@@ -68,8 +81,10 @@ class MemoryStore {
       throw new JiraLifecycleConflictError("identity_changed");
     }
     const now = "2026-09-30T12:00:00.000Z";
-    const row = { ...input, createdAt: now, updatedAt: now };
+    const { ownerSecurityVersion, ...fields } = input;
+    const row = { ...fields, createdAt: now, updatedAt: now };
     this.rows.set(key, row);
+    this.ownerVersions.set(key, ownerSecurityVersion);
     return row;
   }
   async retire(tenantId: string, userId: string, reason: JiraCleanupReason, binding: PipedreamBinding | null) {
@@ -281,7 +296,7 @@ describe("selecting an account", () => {
     const externalId = await authorize();
     pipedream.accounts = [account("apn_mine", externalId)];
 
-    const summary = await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    const summary = await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
 
     expect(summary.site).toEqual({ siteId: SITE_A, name: "Acme", url: "https://acme.atlassian.net" });
     expect(await store.get("tenant-a", "user-1")).toMatchObject({ accountId: "apn_mine", cloudId: SITE_A, externalUserId: externalId });
@@ -301,7 +316,7 @@ describe("selecting an account", () => {
     const { service, store, pipedream, account, authorize } = setup();
     await authorize();
     pipedream.accounts = [account("apn_other", service.externalUserIdFor(tenantId, userId), extra)];
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_other", siteId: SITE_A }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_other", siteId: SITE_A }, null))
       .rejects.toMatchObject({ code: "account_not_found" });
     await expect(service.listAccountSites("tenant-a", "user-1", "apn_other")).rejects.toMatchObject({ code: "account_not_found" });
     expect(store.rows.size).toBe(0);
@@ -311,7 +326,7 @@ describe("selecting an account", () => {
   test("rejects an unknown account with the same error as a foreign one", async () => {
     const { service, authorize } = setup();
     await authorize();
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_missing", siteId: SITE_A }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_missing", siteId: SITE_A }, null))
       .rejects.toMatchObject({ code: "account_not_found" });
   });
 
@@ -319,14 +334,14 @@ describe("selecting an account", () => {
     const { service, pipedream, account } = setup();
     pipedream.accounts = [account("apn_mine", service.externalUserIdFor("tenant-a", "user-1"))];
     expect(await service.listCandidates("tenant-a", "user-1")).toEqual([]);
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null))
       .rejects.toMatchObject({ code: "account_not_found" });
   });
 
   test("rejects an unhealthy account", async () => {
     const { service, pipedream, account, authorize } = setup();
     pipedream.accounts = [account("apn_mine", await authorize(), { healthy: false })];
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null))
       .rejects.toMatchObject({ code: "account_unhealthy" });
     await expect(service.listAccountSites("tenant-a", "user-1", "apn_mine")).rejects.toMatchObject({ code: "account_unhealthy" });
   });
@@ -334,7 +349,7 @@ describe("selecting an account", () => {
   test("rejects a site that the account cannot access", async () => {
     const { service, store, pipedream, account, authorize } = setup();
     pipedream.accounts = [account("apn_mine", await authorize())];
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_B }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_B }, null))
       .rejects.toMatchObject({ code: "site_not_accessible" });
     expect(store.rows.size).toBe(0);
   });
@@ -365,7 +380,7 @@ describe("selecting an account", () => {
     const sites = await service.listAccountSites("tenant-a", "user-1", "apn_sixth");
     expect(sites).toEqual([{ siteId: SITE_A, name: "Acme", url: "https://acme.atlassian.net" }]);
     expect(pipedream.proxyCalls).toEqual([expect.objectContaining({ accountId: "apn_sixth" })]);
-    expect(await service.selectConnection("tenant-a", "user-1", { accountId: "apn_sixth", siteId: SITE_A }))
+    expect(await service.selectConnection("tenant-a", "user-1", { accountId: "apn_sixth", siteId: SITE_A }, null))
       .toMatchObject({ accountId: "apn_sixth" });
   });
 
@@ -390,7 +405,7 @@ describe("concurrent lifecycle changes", () => {
       return proxyResponse(url);
     };
 
-    const selection = service.selectConnection("tenant-a", "user-1", { accountId: "apn_A", siteId: SITE_A });
+    const selection = service.selectConnection("tenant-a", "user-1", { accountId: "apn_A", siteId: SITE_A }, null);
     await lookupStarted.promise;
     expect(await service.disconnect("tenant-a", "user-1")).toBe(true);
     expect(pipedream.deleted).toEqual(["apn_A"]);
@@ -405,7 +420,7 @@ describe("concurrent lifecycle changes", () => {
     const { service, store, pipedream, account, authorize } = setup();
     const oldId = await authorize();
     pipedream.accounts = [account("apn_old", oldId)];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A }, null);
 
     const listStarted = deferred();
     const releaseList = deferred();
@@ -423,7 +438,7 @@ describe("concurrent lifecycle changes", () => {
     const newId = await authorize();
     expect(newId).not.toBe(oldId);
     pipedream.accounts.push(account("apn_new", newId));
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A }, null);
 
     releaseList.resolve();
     expect(await disconnect).toBe(true);
@@ -441,7 +456,7 @@ describe("concurrent lifecycle changes", () => {
       store.removeMember("tenant-a", "user-1");
       return proxyResponse(url);
     };
-    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_A", siteId: SITE_A }))
+    await expect(service.selectConnection("tenant-a", "user-1", { accountId: "apn_A", siteId: SITE_A }, null))
       .rejects.toMatchObject({ code: "connection_changed" });
     expect(store.rows.size).toBe(0);
   });
@@ -451,7 +466,7 @@ describe("reads", () => {
   async function connected(options: { readsEnabled?: boolean } = {}) {
     const context = setup(options);
     context.pipedream.accounts = [context.account("apn_mine", await context.authorize())];
-    await context.service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    await context.service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
     context.pipedream.proxyCalls = [];
     return context;
   }
@@ -465,6 +480,41 @@ describe("reads", () => {
       accountId: "apn_mine",
       url: `https://api.atlassian.com/ex/jira/${SITE_A}/rest/api/3/issue/ABC-1`
     }]);
+  });
+
+  // q4w0.8: the selection keeps the security version of the session that made
+  // it. After a security change, no read uses it. There is no confirm (the
+  // Pipedream account ID is opaque and the account name is chosen by whoever
+  // authorized it): a site selection from a current session restores it.
+  test("a selection that an older session made is suspended until a current session selects a site again", async () => {
+    const context = setup();
+    const { service, store, pipedream, runtime } = context;
+    pipedream.accounts = [context.account("apn_mine", await context.authorize())];
+    store.currentVersions.set("tenant-a:user-1", 6);
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, 6);
+    expect(store.ownerVersions.get("tenant-a:user-1")).toBe(6);
+    expect((await service.read("tenant-a", "user-1", { kind: "sites" })).ok).toBe(true);
+
+    store.currentVersions.set("tenant-a:user-1", 7);
+    pipedream.proxyCalls = [];
+    expect((await service.read("tenant-a", "user-1", { kind: "sites" })).ok).toBe(false);
+    expect(await service.hasConnection("tenant-a", "user-1")).toBe(false);
+    expect(await service.connectedAccountId("tenant-a", "user-1")).toBeNull();
+    expect(pipedream.proxyCalls).toHaveLength(0);
+    expect((await service.getConnectionStatus("tenant-a", "user-1")).userConnection)
+      .toMatchObject({ accountId: "apn_mine", suspended: true });
+
+    expect("confirm" in service).toBe(false);
+    runtime.invalidateRuntimesForIntegration.mockClear();
+
+    // A selection from a session older than the change stays suspended.
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, 6);
+    expect((await service.read("tenant-a", "user-1", { kind: "sites" })).ok).toBe(false);
+    // A selection from a current session restores it.
+    expect(await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, 7))
+      .toMatchObject({ suspended: false });
+    expect((await service.read("tenant-a", "user-1", { kind: "sites" })).ok).toBe(true);
+    expect(runtime.invalidateRuntimesForIntegration).toHaveBeenCalledWith("tenant-a", "user-1", "jira");
   });
 
   test("refuses a read when the turn recorded another account, and names the connected one", async () => {
@@ -555,7 +605,7 @@ describe("reads", () => {
     store.identities.set("tenant-a:user-1", { generation: 0, externalUserId: "cp1_old_secret", binding: null });
     await store.upsert({
       tenantId: "tenant-a", userId: "user-1", externalUserId: "cp1_old_secret", accountId: "apn_old",
-      accountName: null, cloudId: SITE_A, siteName: "Acme", siteUrl: "https://acme.atlassian.net"
+      accountName: null, cloudId: SITE_A, siteName: "Acme", siteUrl: "https://acme.atlassian.net", ownerSecurityVersion: null
     }, { generation: 0, externalUserId: "cp1_old_secret" });
     expect(await service.read("tenant-a", "user-1", { kind: "issue", issueIdOrKey: "ABC-1", fields: [] }))
       .toMatchObject({ ok: true });
@@ -579,7 +629,7 @@ describe("disconnect", () => {
       account("apn_spare", externalId),
       account("apn_other", service.externalUserIdFor("tenant-a", "user-2"))
     ];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
 
     expect(await service.disconnect("tenant-a", "user-1")).toBe(true);
     expect(pipedream.deleted.sort()).toEqual(["apn_mine", "apn_spare"]);
@@ -601,7 +651,7 @@ describe("disconnect", () => {
   test("removes the row even when the remote deletion fails, and keeps the cleanup for a retry", async () => {
     const { service, store, pipedream, account, authorize } = setup();
     pipedream.accounts = [account("apn_mine", await authorize())];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
     pipedream.deleteFailure = new PipedreamRequestError("delete_account", 500);
 
     await expect(service.disconnect("tenant-a", "user-1")).rejects.toMatchObject({ code: "cleanup_incomplete" });
@@ -628,7 +678,7 @@ describe("disconnect", () => {
   test("treats an account already deleted in Pipedream as gone", async () => {
     const { service, store, pipedream, account, authorize } = setup();
     pipedream.accounts = [account("apn_mine", await authorize())];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
     pipedream.accounts = [];
 
     expect(await service.disconnect("tenant-a", "user-1")).toBe(true);
@@ -639,7 +689,7 @@ describe("disconnect", () => {
   test("never deletes a stored account that now belongs to someone else", async () => {
     const { service, store, pipedream, account, authorize } = setup();
     pipedream.accounts = [account("apn_mine", await authorize())];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_mine", siteId: SITE_A }, null);
     pipedream.accounts[0].external_id = service.externalUserIdFor("tenant-a", "user-2");
 
     expect(await service.disconnect("tenant-a", "user-1")).toBe(true);
@@ -679,7 +729,7 @@ describe("member removal cleanup", () => {
     const { service, store, pipedream, account, authorize } = setup();
     const oldId = await authorize();
     pipedream.accounts = [account("apn_old", oldId), account("apn_unselected", oldId)];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A }, null);
 
     store.removeMember("tenant-a", "user-1");
     pipedream.listFailure = new PipedreamRequestError("list_accounts", 0, "timeout");
@@ -695,7 +745,7 @@ describe("member removal cleanup", () => {
     const newId = await authorize();
     expect(newId).not.toBe(oldId);
     pipedream.accounts.push(account("apn_new", newId));
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A }, null);
 
     pipedream.listFailure = null;
     expect(await service.retryCleanup("tenant-a", pending.cleanupId)).toEqual({ status: "completed", remoteAccountsDeleted: 2 });
@@ -709,7 +759,7 @@ describe("member removal cleanup", () => {
     const { service, store, pipedream, account, authorize } = setup();
     const oldId = await authorize();
     pipedream.accounts = [account("apn_old", oldId)];
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_old", siteId: SITE_A }, null);
 
     // The trigger retires the identity; the member comes back and selects a
     // new account before the removal callback runs.
@@ -717,7 +767,7 @@ describe("member removal cleanup", () => {
     store.addMember("tenant-a", "user-1");
     const newId = await authorize();
     pipedream.accounts.push(account("apn_new", newId));
-    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A });
+    await service.selectConnection("tenant-a", "user-1", { accountId: "apn_new", siteId: SITE_A }, null);
     const identity = await store.getIdentity("tenant-a", "user-1");
 
     expect(await service.deleteConnection("tenant-a", "user-1")).toBe(true);

@@ -11,13 +11,14 @@ import type { Pool } from "./lib/db.js";
 import type { buildAppDependencies } from "./app-dependencies.js";
 import { ManagedToolCatalog } from "./services/managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "./services/managed-tools/factory.js";
-import { registerBuiltinManagedTools } from "./services/managed-tools/register-builtin-managed-tools.js";
+import { registerAllBuiltinManagedTools } from "./test-helpers/builtin-managed-tools.js";
 import { ActiveTurnsRegistry } from "./services/active-turns-registry.js";
 
 import { DeepAgentsRuntimeAdapter } from "./services/deep-agents/deep-agents-runtime-adapter.js";
 import type { DeepAgentsRuntimeFactory } from "./services/deep-agents/deep-agents-types.js";
 import { testRuntimePolicy } from "./test-helpers/test-runtime-policy.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "./services/auth/runtime-token.js";
+import { devDataRoutes } from "./test-helpers/data-routes.js";
 
 type AppDependencies = ReturnType<typeof buildAppDependencies>;
 
@@ -265,15 +266,20 @@ async function createRouteTestApp() {
         return [];
       }
     },
+    builtinConnectors: {
+      attachRoutes: (routeApp: typeof app) => {
+        routeApp.get("/me/test-connector", async () => ({ attached: true }));
+      }
+    },
     overlays: { attachRoutes: () => {} },
     managedToolCatalog: (() => {
       const catalog = new ManagedToolCatalog();
-      registerBuiltinManagedTools(catalog, new ManagedToolFactoryRegistry());
+      registerAllBuiltinManagedTools(catalog, new ManagedToolFactoryRegistry());
       return catalog;
     })(),
     managedToolFactoryRegistry: (() => {
       const factoryRegistry = new ManagedToolFactoryRegistry();
-      registerBuiltinManagedTools(new ManagedToolCatalog(), factoryRegistry);
+      registerAllBuiltinManagedTools(new ManagedToolCatalog(), factoryRegistry);
       return factoryRegistry;
     })()
   } as unknown as AppDependencies;
@@ -284,7 +290,7 @@ async function createRouteTestApp() {
 
 test("registerAppRoutes wires health, admin, and settings endpoints", async () => {
   const { app, deps } = await createRouteTestApp();
-  await registerAppRoutes(app, deps);
+  await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
   await app.ready();
 
   const healthResponse = await app.inject({ method: "GET", url: "/health" });
@@ -305,6 +311,10 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
   const adminResponse = await app.inject({ method: "GET", url: "/admin/skills" });
   expect(adminResponse.statusCode).toBe(200);
   expect(adminResponse.json()).toEqual({ skills: [] });
+
+  // Built-in connector routes attach with the core route groups.
+  const connectorResponse = await app.inject({ method: "GET", url: "/me/test-connector" });
+  expect(connectorResponse.json()).toEqual({ attached: true });
 
   const settingsResponse = await app.inject({ method: "GET", url: "/me/settings" });
   expect(settingsResponse.statusCode).toBe(200);
@@ -396,7 +406,7 @@ test("app gateway accepts tokens issued by adapter creation and capability refre
   generation += 1;
   await adapter.createSession(actor);
   expect(outgoing).toHaveLength(2);
-  await registerAppRoutes(app, deps);
+  await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
   const payload = { jsonrpc: "2.0", id: 1, method: "initialize", params: {} };
   for (const authorization of outgoing) {
     const response = await app.inject({ method: "POST", url: server.routePath, remoteAddress: "127.0.0.1",

@@ -49,26 +49,80 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  scrollBody = true,
+  footer,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
+  /** False when the caller owns its scrolling layout, as Quick Jump does. */
+  scrollBody?: boolean
+  /** Keeps decisions and their feedback outside the scrolling body. */
+  footer?: React.ReactNode
 }) {
+  const opener = React.useRef<HTMLElement | null>(null)
+  const [body, setBody] = React.useState<HTMLDivElement | null>(null)
+  React.useLayoutEffect(() => {
+    const container = body
+    if (!container || typeof ResizeObserver === "undefined") return
+    const revealFocus = () => {
+      const active = document.activeElement
+      if (!(active instanceof HTMLElement) || !container.contains(active)) return
+      const bounds = container.getBoundingClientRect()
+      const target = active.getBoundingClientRect()
+      if (target.top < bounds.top + 4 || target.bottom > bounds.bottom - 4) {
+        active.scrollIntoView?.({ block: "nearest" })
+      }
+    }
+    // Autofocus can precede the final body height. Keep the owned control
+    // visible when the dialog opens, resizes, or gains feedback.
+    const observer = new ResizeObserver(revealFocus)
+    observer.observe(container)
+    return () => observer.disconnect()
+  }, [body])
   return (
     <DialogPortal data-slot="dialog-portal">
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        onOpenAutoFocus={(event) => {
+          opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+          onOpenAutoFocus?.(event)
+        }}
+        onCloseAutoFocus={(event) => {
+          onCloseAutoFocus?.(event)
+          // Programmatic dialogs may have no DialogTrigger. Keep the stable
+          // opener instead of letting focus fall back to the page body.
+          if (!event.defaultPrevented && opener.current?.isConnected && opener.current !== document.body) {
+            event.preventDefault()
+            opener.current.focus()
+          }
+        }}
         className={cn(
-          "fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border bg-background p-6 shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg",
-          className
+          "fixed top-[50%] left-[50%] z-50 max-h-[calc(100dvh-2rem)] w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 overflow-hidden rounded-lg border bg-popover p-6 text-popover-foreground shadow-lg duration-200 outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 sm:max-w-lg",
+          scrollBody ? "flex flex-col" : "grid",
+          className,
+          // Reserve a fixed band above the scrolling body for Close.
+          scrollBody && "pt-14"
         )}
         {...props}
       >
-        {children}
+        {scrollBody ? (
+          <div
+            ref={setBody}
+            data-slot="dialog-body"
+            className="-m-1 min-h-0 flex-1 overflow-y-auto overscroll-contain scroll-p-1 p-1"
+            style={{ display: "inherit", flexDirection: "inherit", gap: "inherit", gridTemplateColumns: "inherit", gridTemplateRows: "inherit" }}
+          >
+            {children}
+          </div>
+        ) : children}
+        {footer}
         {showCloseButton && (
           <DialogPrimitive.Close
             data-slot="dialog-close"
-            className="absolute top-4 right-4 rounded-xs opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-muted-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+            className="absolute top-3 right-3 z-10 inline-flex size-9 items-center justify-center rounded-md bg-transparent text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none disabled:pointer-events-none motion-reduce:transition-none [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
           >
             <XIcon />
             <span className="sr-only">Close</span>
@@ -83,7 +137,7 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="dialog-header"
-      className={cn("flex flex-col gap-2 text-center sm:text-left", className)}
+      className={cn("flex flex-col gap-2 pr-8 text-left", className)}
       {...props}
     />
   )
@@ -100,8 +154,10 @@ function DialogFooter({
   return (
     <div
       data-slot="dialog-footer"
+      // Sticky, so the decision stays reachable while a long dialog body scrolls.
+      // The shadow paints the padding below it, so scrolled content does not show there.
       className={cn(
-        "flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+        "sticky bottom-0 flex flex-col-reverse gap-2 bg-popover pt-2 shadow-[0_1.5rem_0_0_var(--color-popover)] sm:flex-row sm:justify-end",
         className
       )}
       {...props}
@@ -123,7 +179,7 @@ function DialogTitle({
   return (
     <DialogPrimitive.Title
       data-slot="dialog-title"
-      className={cn("text-lg leading-none font-semibold", className)}
+      className={cn("text-lg leading-snug font-semibold", className)}
       {...props}
     />
   )

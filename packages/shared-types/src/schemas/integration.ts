@@ -71,9 +71,19 @@ export const GithubUserConnectionSchema = z.object({
   refreshTokenExpiresAt: IsoDateSchema.nullable(),
   connectedAt: IsoDateSchema,
   updatedAt: IsoDateSchema,
-  lastUsedAt: IsoDateSchema.nullable()
+  lastUsedAt: IsoDateSchema.nullable(),
+  // A security change of the owner's account (password change, sign out
+  // everywhere) suspended the connection. The agent does not use it until the
+  // owner confirms it or connects again.
+  suspended: z.boolean().default(false)
 }).passthrough();
 export type GithubUserConnection = z.infer<typeof GithubUserConnectionSchema>;
+
+// The owner confirms a suspended connection for the account the page shows.
+export const GithubConnectionConfirmRequestSchema = z.object({
+  githubUserId: z.string().min(1).max(64)
+}).strict();
+export type GithubConnectionConfirmRequest = z.infer<typeof GithubConnectionConfirmRequestSchema>;
 
 export const GithubConnectionStatusSchema = z.object({
   configured: z.boolean(),
@@ -84,72 +94,6 @@ export const GithubConnectionStatusSchema = z.object({
   platformConfigured: z.boolean().optional()
 }).passthrough();
 export type GithubConnectionStatus = z.infer<typeof GithubConnectionStatusSchema>;
-
-// ── Microsoft ─────────────────────────────────────────────────────────────────
-
-export const MicrosoftUserConnectionSchema = z.object({
-  microsoftUserId: z.string(),
-  microsoftEmail: z.string().nullable(),
-  microsoftDisplayName: z.string().nullable(),
-  scopes: z.array(z.string()),
-  accessTokenExpiresAt: IsoDateSchema.nullable(),
-  refreshTokenExpiresAt: IsoDateSchema.nullable(),
-  connectedAt: IsoDateSchema,
-  updatedAt: IsoDateSchema,
-  lastUsedAt: IsoDateSchema.nullable()
-}).passthrough();
-export type MicrosoftUserConnection = z.infer<typeof MicrosoftUserConnectionSchema>;
-
-export const MicrosoftConnectionStatusSchema = z.object({
-  configured: z.boolean(),
-  userConnection: MicrosoftUserConnectionSchema.nullable(),
-  tenantEnabled: z.boolean().optional(),
-  tenantReadsEnabled: z.boolean().optional(),
-  tenantWritesEnabled: z.boolean().optional(),
-  platformConfigured: z.boolean().optional()
-}).passthrough();
-export type MicrosoftConnectionStatus = z.infer<typeof MicrosoftConnectionStatusSchema>;
-
-export const MicrosoftSiteSchema = z.object({
-  siteId: z.string(),
-  name: z.string().nullable(),
-  displayName: z.string().nullable(),
-  webUrl: z.string().nullable()
-}).passthrough();
-export type MicrosoftSite = z.infer<typeof MicrosoftSiteSchema>;
-
-export const MicrosoftSitesListResponseSchema = z.object({
-  sites: z.array(MicrosoftSiteSchema)
-}).passthrough();
-export type MicrosoftSitesListResponse = z.infer<typeof MicrosoftSitesListResponseSchema>;
-
-export const MicrosoftFileSchema = z.object({
-  itemId: z.string(),
-  driveId: z.string(),
-  parentId: z.string().nullable(),
-  siteId: z.string().nullable(),
-  name: z.string(),
-  webUrl: z.string().nullable(),
-  size: z.number().nullable(),
-  mimeType: z.string().nullable(),
-  isFolder: z.boolean(),
-  isFile: z.boolean(),
-  lastModifiedDateTime: z.string().nullable(),
-  path: z.string().nullable(),
-  source: z.enum(["onedrive", "sharepoint"]),
-  summary: z.string().nullable().optional()
-}).passthrough();
-export type MicrosoftFile = z.infer<typeof MicrosoftFileSchema>;
-
-export const MicrosoftFilesListResponseSchema = z.object({
-  items: z.array(MicrosoftFileSchema)
-}).passthrough();
-export type MicrosoftFilesListResponse = z.infer<typeof MicrosoftFilesListResponseSchema>;
-
-export const MicrosoftFilesSearchResponseSchema = z.object({
-  results: z.array(MicrosoftFileSchema)
-}).passthrough();
-export type MicrosoftFilesSearchResponse = z.infer<typeof MicrosoftFilesSearchResponseSchema>;
 
 // ── Notion ────────────────────────────────────────────────────────────────────
 
@@ -165,9 +109,20 @@ export const NotionUserConnectionSchema = z.object({
   refreshTokenExpiresAt: IsoDateSchema.nullable(),
   connectedAt: IsoDateSchema,
   updatedAt: IsoDateSchema,
-  lastUsedAt: IsoDateSchema.nullable()
+  lastUsedAt: IsoDateSchema.nullable(),
+  // A security change of the owner's account (password change, sign out
+  // everywhere) suspended the connection. The agent does not use it until the
+  // owner confirms it or connects again.
+  suspended: z.boolean().default(false)
 }).passthrough();
 export type NotionUserConnection = z.infer<typeof NotionUserConnectionSchema>;
+
+// The owner confirms a suspended connection for the Notion user and workspace the page shows.
+export const NotionConnectionConfirmRequestSchema = z.object({
+  notionUserId: z.string().min(1).max(200),
+  notionWorkspaceId: z.string().min(1).max(200).nullable()
+}).strict();
+export type NotionConnectionConfirmRequest = z.infer<typeof NotionConnectionConfirmRequestSchema>;
 
 export const NotionConnectionStatusSchema = z.object({
   configured: z.boolean(),
@@ -193,7 +148,11 @@ export const JiraUserConnectionSchema = z.object({
   accountName: z.string().nullable(),
   site: JiraSiteSchema,
   connectedAt: IsoDateSchema,
-  updatedAt: IsoDateSchema
+  updatedAt: IsoDateSchema,
+  // A security change of the owner's account (password change, sign out
+  // everywhere) suspended the connection. The agent does not use it until the
+  // owner confirms it or connects again.
+  suspended: z.boolean().default(false)
 }).passthrough();
 export type JiraUserConnection = z.infer<typeof JiraUserConnectionSchema>;
 
@@ -287,6 +246,7 @@ export const AdminIntegrationViewSchema = z.object({
   writeToolIds: z.array(z.string()),
   configMode: IntegrationConfigModeSchema,
   configFields: z.array(IntegrationConfigFieldSchema).optional(),
+  setupHelp: z.string().optional(),
   docsUrl: z.string().optional(),
   readsEnabled: z.boolean(),
   writesEnabled: z.boolean(),

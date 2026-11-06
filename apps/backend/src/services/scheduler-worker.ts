@@ -1,4 +1,5 @@
 import { uuidv7 } from "../lib/uuid.js";
+import type { TurnStopReason } from "@cogniplane/shared-types";
 
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { AuditEventStore } from "./audit-event-store.js";
@@ -19,7 +20,7 @@ import {
   type TurnOutcome,
   type TurnTranscriptMessages
 } from "./turn-transcript.js";
-import type { ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
+import type { ClaimedScheduledJob, ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
 
 /** The text a scheduled job sends to the model. */
 export function scheduledJobPrompt(input: ScheduledJobRecord["input"]): string {
@@ -30,6 +31,20 @@ export function scheduledJobPrompt(input: ScheduledJobRecord["input"]): string {
 function jobOwnerError(message: string): Error {
   return Object.assign(new Error(message), { statusCode: 400 });
 }
+
+/**
+ * The run error of an interrupted scheduled turn. The owner reads it in the
+ * job's run list, so a backend stop says why (TurnStopReason).
+ */
+export function scheduledInterruptionMessage(reason?: TurnStopReason): string {
+  if (reason === "security_change") return "Scheduled job stopped because your account's security settings changed.";
+  if (reason === "tool_context_ended") return "Scheduled job stopped because its tool access ended.";
+  return "Scheduled job was interrupted.";
+}
+
+/** The run error when the owner's account security changed after the claim. */
+export const OWNER_SECURITY_CHANGED_RUN_ERROR =
+  "The run did not start because your account security changed after the job was saved.";
 
 /**
  * Per-job runtime resolution, mirroring the interactive /messages path
@@ -57,6 +72,8 @@ export type SchedulerWorkerDeps = {
     | "completeJobRun"
     | "recordJobRunOutcome"
     | "sweepStaleJobRuns"
+    | "pauseJobForSecurityChange"
+    | "getOwnerSecurityVersion"
   >;
   sessions: Pick<SessionStore, "create">;
   messages: Pick<MessageStore, "create" | "getOwned"> & TurnTranscriptMessages;
@@ -284,7 +301,7 @@ export class SchedulerWorker {
           break;
         }
         this.activeCount += 1;
-        let claimed: ScheduledJobRecord | null = null;
+        let claimed: ClaimedScheduledJob | null = null;
         try {
           claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt);
         } finally {
@@ -293,6 +310,10 @@ export class SchedulerWorker {
           }
         }
         if (!claimed) {
+          // The claim also refuses a job whose owner had a security change
+          // since the job was saved. Pause such a job, so it leaves the due
+          // query. After a claim that another worker won, this changes nothing.
+          await this.pauseForSecurityChange(job);
           continue;
         }
 
@@ -352,6 +373,44 @@ export class SchedulerWorker {
       );
     } finally {
       this.projectCleanupInFlight = false;
+    }
+  }
+
+  /**
+   * Pause a job whose owner had a security change since the job was saved,
+   * and write an audit event. Best-effort: after a failure the job stays
+   * enabled, the claim still refuses it, and the next tick tries again.
+   */
+  private async pauseForSecurityChange(job: ScheduledJobRecord): Promise<void> {
+    let paused: boolean;
+    try {
+      paused = await this.deps.settings.pauseJobForSecurityChange(job.tenantId, job.jobId);
+    } catch (error) {
+      this.deps.logger.error(
+        { error, jobId: job.jobId },
+        "Failed to pause scheduled job after a security change of its owner"
+      );
+      return;
+    }
+    if (!paused) return;
+
+    this.deps.logger.warn(
+      { jobId: job.jobId, tenantId: job.tenantId, userId: job.userId },
+      "Scheduled job paused: its owner's account security changed"
+    );
+    try {
+      await this.deps.auditEvents.create({
+        tenantId: job.tenantId,
+        sessionId: null,
+        userId: job.userId,
+        type: "scheduler.job.disabled",
+        payload: { jobId: job.jobId, reason: "security_change", disabled: true }
+      });
+    } catch (auditError) {
+      this.deps.logger.error(
+        { error: auditError, jobId: job.jobId },
+        "Failed to create audit event for a job paused after a security change"
+      );
     }
   }
 
@@ -557,7 +616,7 @@ export class SchedulerWorker {
     }
   }
 
-  private async executeJobWithTimeout(job: ScheduledJobRecord): Promise<void> {
+  private async executeJobWithTimeout(job: ClaimedScheduledJob): Promise<void> {
     // `executeJob` owns the run-record lifecycle. On timeout we abort the
     // runtime session. That ends the AG-UI turn and unblocks the `for await` loop,
     // so the same promise settles with status="failed" and records the outcome.
@@ -633,7 +692,7 @@ export class SchedulerWorker {
     }
   }
 
-  private async executeJob(job: ScheduledJobRecord, turn: ScheduledTurnHandle): Promise<void> {
+  private async executeJob(job: ClaimedScheduledJob, turn: ScheduledTurnHandle): Promise<void> {
     const runId = uuidv7();
     const startTime = Date.now();
     let sessionId: string | null = null;
@@ -658,6 +717,20 @@ export class SchedulerWorker {
       if (turn.timedOut) throw new Error("Scheduled job timed out before its turn started");
       // The runtimes close at shutdown; a job still preparing must not start a turn.
       if (this.turnsRefused) throw new Error("Scheduler shut down before the job's turn started");
+    };
+    // The claim compared the owner's security version, but the account can
+    // change while the run prepares (for example during the PII check). Check
+    // again before the runtime loads the owner's tools and credentials, and
+    // before the turn starts. On a change, refuse the run and pause the job.
+    const admitTurn = async () => {
+      const current = await this.deps.settings.getOwnerSecurityVersion(job.tenantId, job.userId);
+      if (current !== job.ownerSecurityVersion) {
+        // The job is paused; the run is not the job's fault.
+        countsTowardDisable = false;
+        await this.pauseForSecurityChange(job);
+        throw jobOwnerError(OWNER_SECURITY_CHANGED_RUN_ERROR);
+      }
+      stopIfTimedOut();
     };
 
     try {
@@ -734,6 +807,7 @@ export class SchedulerWorker {
             pii: {
               status: "blocked",
               modeApplied: "block",
+              ...(pii.policyRevision !== undefined ? { policyRevision: pii.policyRevision } : {}),
               blockReason: pii.blockReason,
               ...(pii.scanRunId ? { scanRunId: pii.scanRunId } : {})
             }
@@ -772,7 +846,7 @@ export class SchedulerWorker {
       });
       transcript = scheduledTurn;
 
-      stopIfTimedOut();
+      await admitTurn();
       const runtimeSession = await runtime.createSession({
         tenantId: job.tenantId,
         sessionId,
@@ -794,6 +868,10 @@ export class SchedulerWorker {
           ...(runtimeSession.mcpServerSources ? { mcpServerSources: runtimeSession.mcpServerSources } : {}),
           ...(runtimeSession.integrationAccounts ? { integrationAccounts: runtimeSession.integrationAccounts } : {}),
           turnContext: "scheduled" },
+        // The version that the claim and admitTurn compared. After a security
+        // change of the owner, the gateway refuses the turn's tool calls, also
+        // when this replica's runtime is not stopped (security-change.ts).
+        ownerSecurityVersion: job.ownerSecurityVersion,
         // Outlive the job watchdog by a margin — a context TTL equal to the
         // timeout would let a tool call near the deadline race context expiry
         // and fail with -32000 instead of running to the watchdog.
@@ -805,7 +883,7 @@ export class SchedulerWorker {
       // rejects gated tool calls at once for `turnContext: "scheduled"`. Policy
       // Center still receives the scheduled turn context through the tool
       // execution metadata above.
-      stopIfTimedOut();
+      await admitTurn();
       const stream = runtime.runMessageAGUI(runtimeSession, {
         prompt,
         toolContextId: toolContext.toolContextId,
@@ -861,7 +939,7 @@ export class SchedulerWorker {
         outcome.status === "error"
           ? outcome.message
           : outcome.status === "interrupted"
-            ? "Scheduled job was interrupted."
+            ? scheduledInterruptionMessage(outcome.reason)
             : null,
       summary,
       inputTokens,

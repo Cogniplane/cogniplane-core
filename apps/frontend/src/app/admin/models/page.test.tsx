@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
@@ -19,8 +19,8 @@ type ModelCardProps = ComponentProps<typeof import("../../../components/admin/ad
 
 vi.mock("../../../lib/auth-context", () => ({ useAuth: () => ({ user: { role: "owner" } }) }));
 vi.mock("../../../lib/admin-api", () => ({
-  getTenantDetails: async () => null,
-  getAdminModelCatalog: async () => ({ models: [], providers: [] }),
+  getTenantDetails: async () => ({ settings: { providerKeys: {} } }),
+  getAdminModelCatalog: vi.fn(async () => ({ models: [], providers: [] })),
   getOpenRouterModels: async () => [],
   getTenantSettings: vi.fn(),
   updateTenantModelAvailability: vi.fn(),
@@ -31,8 +31,9 @@ vi.mock("../../../lib/admin-api", () => ({
 }));
 // Test page mutation wiring with real queries; existing card tests cover the forms.
 vi.mock("../../../components/admin/admin-model-availability-card", () => ({
-  AdminModelAvailabilityCard: ({ onSave, onAddModel, onRemoveModel, addError, saveError, providerKeys }: ModelCardProps) => <>
+  AdminModelAvailabilityCard: ({ onSave, onAddModel, onRemoveModel, addError, saveError, providerKeys, writesBlocked, recoveredVersion }: ModelCardProps) => <>
     {saveError ? <p>{saveError}</p> : null}
+    <p>Writes: {writesBlocked ? "paused" : "ready"}. Recovered version: {recoveredVersion ?? "none"}</p>
     <p>Target provider: {providerKeys.targetProvider ?? "none"}</p>
     <button onClick={() => void providerKeys.onSaveProviderKey("openai", "test-key")}>Save key</button>
     <button onClick={() => void providerKeys.onSaveProviderKey("openai", "")}>Remove key</button>
@@ -72,6 +73,7 @@ let rerenderPage: ReturnType<typeof render>["rerender"];
 function renderPage({ showChat = true, initialSettings = settings } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000, gcTime: 0 }, mutations: { retry: false } } });
   clients.push(client);
+  client.setQueryData(queryKeys.admin.tenant(), { settings: { providerKeys: {} } });
   client.setQueryData(queryKeys.models.list(), "Cached model choices");
   client.setQueryData(queryKeys.models.adminCatalog(), { models: [], providers: [] });
   client.setQueryData(queryKeys.admin.tenantSettings(), initialSettings);
@@ -83,6 +85,7 @@ beforeEach(() => {
   providerQuery = "";
   vi.clearAllMocks();
   cardResults.save = [];
+  vi.mocked(api.getAdminModelCatalog).mockResolvedValue({ models: [], providers: [] });
   vi.mocked(api.getTenantSettings).mockResolvedValue(settings);
   vi.mocked(api.updateTenantModelAvailability).mockResolvedValue({ ...settings, enabledModelIds: [] });
   vi.mocked(api.updateTenantAgentSettings).mockResolvedValue({ ...settings, showEffortSelector: true });
@@ -184,4 +187,41 @@ describe("Model data after admin changes", () => {
     expect(await screen.findByText("Updated model choices")).toBeTruthy();
     await waitFor(() => expect(client.getQueryData(queryKeys.admin.tenantSettings())).toEqual({ ...settings, showEffortSelector: true }));
   });
+});
+
+it("rejects retained data after a failed 409 reread and waits for an explicit recovery", async () => {
+  vi.mocked(api.updateTenantModelAvailability).mockRejectedValueOnce(new ApiError({ status: 409, code: "settings_conflict", method: "PUT", path: "/admin/tenant-settings", message: "Settings changed." }));
+  vi.mocked(api.getTenantSettings).mockRejectedValue(new Error("Read unavailable"));
+  renderPage({ initialSettings: makeTenantSettings({ version: 5 }) });
+  fireEvent.click(screen.getByRole("button", { name: "Save availability" }));
+  await waitFor(() => expect(cardResults.save).toEqual([false]));
+  expect(screen.getByText(/latest version could not load/)).toBeTruthy();
+  expect(screen.getByText(/Writes: paused/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Save availability" }));
+  expect(api.updateTenantModelAvailability).toHaveBeenCalledTimes(1);
+  vi.mocked(api.getTenantSettings).mockResolvedValue(makeTenantSettings({ version: 6 }));
+  fireEvent.click(screen.getByRole("button", { name: "Retry model settings" }));
+  await screen.findByText(/Recovered version: 6/);
+  expect(api.updateTenantModelAvailability).toHaveBeenCalledTimes(1);
+});
+
+it("keeps retained catalog state visible with a retry and blocks a write after its refresh fails", async () => {
+  const client = renderPage();
+  vi.mocked(api.getAdminModelCatalog).mockRejectedValue(new Error("Read unavailable"));
+  await act(async () => { await client.invalidateQueries({ queryKey: queryKeys.models.adminCatalog() }); });
+  expect(await screen.findByText(/Earlier models are shown/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry model catalog" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Save availability" }));
+  expect(api.updateTenantModelAvailability).not.toHaveBeenCalled();
+});
+
+it("rejects a duplicate request synchronously while the first write waits", async () => {
+  let finish!: (value: typeof settings) => void;
+  vi.mocked(api.updateTenantModelAvailability).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  renderPage();
+  const button = screen.getByRole("button", { name: "Save availability" });
+  fireEvent.click(button);
+  fireEvent.click(button);
+  await waitFor(() => expect(api.updateTenantModelAvailability).toHaveBeenCalledTimes(1));
+  await act(async () => finish(settings));
 });

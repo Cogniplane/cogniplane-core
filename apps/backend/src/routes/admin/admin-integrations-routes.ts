@@ -19,6 +19,8 @@ import {
 import type { IntegrationRegistryService } from "../../services/integrations/integration-registry-service.js";
 import type { IntegrationStateStore } from "../../services/integrations/integration-state-store.js";
 import type { RuntimeAdapter } from "../../runtime-contracts.js";
+import type { DataRouteControl } from "../../services/data-route-control.js";
+import { classifyIntegrationSave } from "./data-route-fields.js";
 import {
   createAdminAuditEvent,
   respondAdminMutationError,
@@ -32,9 +34,11 @@ export type AdminIntegrationsRouteStores = {
     IntegrationRegistryService,
     "getIntegrationsForAdmin" | "isReadyToEnable"
   >;
-  integrationStates: Pick<IntegrationStateStore, "get" | "upsert" | "clearConfig">;
+  integrationStates: Pick<IntegrationStateStore, "get" | "applyChanges" | "clearConfig">;
   auditEvents: Pick<AuditEventStore, "create">;
   runtimeAdapter: Pick<RuntimeAdapter, "invalidateTenantRuntimes">;
+  /** Step-up and owner notice: an integration's settings decide where its data goes. */
+  dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
 };
 
 const integrationIdParamsSchema = z.object({
@@ -146,20 +150,20 @@ export async function registerAdminIntegrationsRoutes(
         return apiError("integration_writes_unsupported", "This integration has no write tools.");
       }
 
+      // The save is classified against this copy of the row (data-route-
+      // fields.ts): the settings (an OAuth app, a site address) and turning
+      // reads or writes on decide where the integration's data goes, so they
+      // need step-up and the owner notice. Turning them off, or the same
+      // values again, needs neither. Only what differs from the copy is
+      // written, onto the row as it is at the write (applyChanges): a save
+      // without step-up never writes back an older toggle or secret.
       const existing = await stores.integrationStates.get(request.auth.tenantId, integrationId);
-      const existingConfig = existing?.config ?? {};
+      const save = classifyIntegrationSave({ descriptor, existing, body: bodyResult.value });
+      const configChanges = encryptPasswordFields(descriptor, save.write.config, {}, stores.config.DATA_ENCRYPTION_SECRET);
+      const nextConfig = { ...(existing?.config ?? {}), ...configChanges };
 
-      const nextConfig = bodyResult.value.config
-        ? encryptPasswordFields(
-            descriptor,
-            bodyResult.value.config,
-            existingConfig,
-            stores.config.DATA_ENCRYPTION_SECRET
-          )
-        : existingConfig;
-
-      const wantsReads = bodyResult.value.readsEnabled ?? existing?.readsEnabled ?? false;
-      const wantsWrites = bodyResult.value.writesEnabled ?? existing?.writesEnabled ?? false;
+      const wantsReads = save.write.readsEnabled ?? existing?.readsEnabled ?? false;
+      const wantsWrites = save.write.writesEnabled ?? existing?.writesEnabled ?? false;
       const ready =
         !wantsReads && !wantsWrites
           ? true
@@ -176,31 +180,40 @@ export async function registerAdminIntegrationsRoutes(
         );
       }
 
+      const { changes } = save;
+      if (changes.length > 0 && !(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/integrations/:integrationId"))) {
+        return reply;
+      }
+
       try {
-        const updated = await stores.integrationStates.upsert(
+        // The audit event and the owner notice commit with the change.
+        const updated = await stores.integrationStates.applyChanges(
           request.auth.tenantId,
           integrationId,
           {
-            readsEnabled: wantsReads,
-            writesEnabled: wantsWrites,
-            config: nextConfig,
+            readsEnabled: save.write.readsEnabled,
+            writesEnabled: save.write.writesEnabled,
+            configChanges,
             updatedBy: request.auth.userId
-          }
-        );
-
-        await createAdminAuditEvent(stores.auditEvents, {
-          tenantId: request.auth.tenantId,
-          userId: request.auth.userId,
-          type: "tenant.integration.updated",
-          payload: {
-            integrationId,
-            readsEnabled: updated.readsEnabled,
-            writesEnabled: updated.writesEnabled,
-            configChanged: bodyResult.value.config !== undefined
           },
-          ipAddress: request.ip,
-          userAgent: request.headers["user-agent"]
-        });
+          (saved) => ({
+            tenantId: request.auth.tenantId,
+            sessionId: null,
+            userId: request.auth.userId,
+            type: "tenant.integration.updated",
+            payload: {
+              integrationId,
+              readsEnabled: saved.readsEnabled,
+              writesEnabled: saved.writesEnabled,
+              configChanged: Object.keys(configChanges).length > 0
+            },
+            ipAddress: request.ip,
+            userAgent: request.headers["user-agent"] ?? null,
+            alsoInTransaction: changes.length > 0
+              ? stores.dataRoutes.ownerNotice(request, { setting: "integration", integrationName: descriptor.name, fields: changes })
+              : undefined
+          })
+        );
 
         const togglesChanged =
           (existing?.readsEnabled ?? false) !== updated.readsEnabled ||

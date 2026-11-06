@@ -3,6 +3,8 @@ import {
   ArtifactBrowseTypeSchema,
   ArtifactBrowseStatusSchema,
   MIME_CLASSES,
+  type ArtifactBrowseType,
+  type ArtifactBrowseStatus,
   type ArtifactSort
 } from "@cogniplane/shared-types";
 
@@ -28,6 +30,18 @@ export const ARTIFACT_TYPE_OPTIONS = ArtifactBrowseTypeSchema.options;
 export const ARTIFACT_STATUS_OPTIONS = ArtifactBrowseStatusSchema.options;
 export const ARTIFACT_MIME_CLASS_OPTIONS = MIME_CLASSES;
 export const ARTIFACT_SORT_OPTIONS = ArtifactSortSchema.options;
+
+export const ARTIFACT_TYPE_LABELS: Record<ArtifactBrowseType, string> = {
+  upload: "Uploaded",
+  generated: "Generated"
+};
+
+export const ARTIFACT_STATUS_LABELS: Record<ArtifactBrowseStatus, string> = {
+  pending: "Pending",
+  processing: "Processing",
+  ready: "Ready",
+  failed: "Failed"
+};
 
 export const ARTIFACT_SORT_LABELS: Record<ArtifactSort, string> = {
   created_desc: "Newest first",

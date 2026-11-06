@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 import { useInfiniteQuery } from "@tanstack/react-query";
 
 import { listAdminSessions } from "../lib/admin-api";
@@ -23,7 +25,9 @@ export function useAdminSessionsData(params: AdminSessionsListParams = {}) {
     getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined
   });
 
-  const loadError = sessionsQuery.error;
+  const [retryFailure, setRetryFailure] = useState<{ scope: string | null; error: unknown } | null>(null);
+  const scope = JSON.stringify(params);
+  const loadError = sessionsQuery.error ?? (sessionsQuery.isFetching && retryFailure?.scope === scope ? retryFailure.error : null);
   const available = loadError ? !isRouteNotFoundError(loadError, "GET", "/admin/sessions") : true;
   const sessions: AdminSessionRow[] = available
     ? sessionsQuery.data?.pages.flatMap((page) => page.items) ?? []
@@ -42,11 +46,19 @@ export function useAdminSessionsData(params: AdminSessionsListParams = {}) {
     error: errorMessage,
     available,
     isLoading: sessionsQuery.isLoading,
+    hasData: sessionsQuery.data !== undefined,
+    isRefreshing: sessionsQuery.isFetching && !sessionsQuery.isFetchingNextPage,
+    retry: () => {
+      if (sessionsQuery.isFetching) return;
+      const failure = { scope, error: sessionsQuery.error };
+      setRetryFailure(failure);
+      void sessionsQuery.refetch({ cancelRefetch: false }).finally(() => setRetryFailure(current => current === failure ? null : current));
+    },
     hasMore: sessionsQuery.hasNextPage,
     isLoadingMore: sessionsQuery.isFetchingNextPage,
     loadMore: () => {
       if (sessionsQuery.hasNextPage && !sessionsQuery.isFetchingNextPage) {
-        void sessionsQuery.fetchNextPage();
+        void sessionsQuery.fetchNextPage({ cancelRefetch: false });
       }
     }
   };

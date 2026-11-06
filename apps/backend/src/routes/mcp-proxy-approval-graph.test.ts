@@ -155,9 +155,11 @@ async function setup() {
 
   async function run(input: unknown) {
     const graph = await runtime.getAgentForModel("deepagents/claude-sonnet-5");
-    for await (const _event of graph.streamEvents(input, { version: "v2", configurable: { thread_id: sessionId } })) {
-      // The requests on both sides of the gateway are what the tests read.
+    const events: Array<{ event?: unknown; name?: unknown; data?: unknown }> = [];
+    for await (const event of graph.streamEvents(input, { version: "v2", configurable: { thread_id: sessionId } })) {
+      events.push(event as (typeof events)[number]);
     }
+    return events;
   }
 
   // What the approval route leaves in the approvals table once the user decided.
@@ -255,10 +257,15 @@ it("does not forward a call whose approval expired", async () => {
   const pending = await env.runtime.getPendingActions(env.sessionId);
   env.decide(pending[0]!.policyApproval!, "expired");
 
-  // A JSON-RPC error from the gateway reaches the graph as a thrown tool exception and ends the turn.
-  const failure = await env.run(env.runtime.buildResumeInput(pending, [{ type: "approve" }])).then(() => null, (error: unknown) => error);
-  expect(String(failure)).toMatch(/Approval request expired/);
-  expect(String(failure)).not.toMatch(/polapr_|ctx_/);
+  // The gateway refuses with a JSON-RPC error. The model gets it as a failed
+  // tool result, and the turn goes on to the model's answer.
+  const events = await env.run(env.runtime.buildResumeInput(pending, [{ type: "approve" }]));
+  const toolEndAt = events.findIndex((event) => event.event === "on_tool_end" && event.name === "search_docs");
+  const message = (events[toolEndAt]?.data as { output?: { status?: unknown; content?: unknown } } | undefined)?.output;
+  expect(message?.status).toBe("error");
+  expect(JSON.stringify(message?.content)).toMatch(/Approval request expired/);
+  expect(JSON.stringify(message?.content)).not.toMatch(/polapr_|ctx_/);
+  expect(events.slice(toolEndAt + 1).some((event) => event.event === "on_chat_model_end")).toBe(true);
 
   expect(env.gatewayCalls()).toHaveLength(1);
   expect(env.approvals.consumed.size).toBe(0);

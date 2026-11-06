@@ -2,9 +2,11 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { SettingsLiveSection } from "../settings-sections";
+
 const state = vi.hoisted(() => ({
   user: { tenantId: "tenant-a", userId: "user-a" },
-  sections: [] as Array<{ id: string; label: string; kind: "integration"; accountRow?: () => React.JSX.Element }>,
+  sections: [] as SettingsLiveSection[],
   loading: false,
   error: null as string | null,
   retry: vi.fn(),
@@ -52,12 +54,13 @@ vi.mock("../../../lib/auth-context", () => ({ useAuth: () => ({ user: state.user
 vi.mock("../../../components/member-mcp-accounts", () => ({ MemberMcpAccounts: ({ expectedScope }: { expectedScope: { tenantId: string; userId: string } }) => <div data-testid="member-mcp">{expectedScope.tenantId}:{expectedScope.userId}</div> }));
 
 import ConnectedAccountsPage from "./page";
+import { listSettingsLiveSections } from "../settings-sections";
+
+// Core services bring their account row in their registered section.
+const coreSection = (id: string) => listSettingsLiveSections().find((section) => section.id === id)!;
 
 beforeEach(() => {
-  state.sections = [
-    { id: "github", label: "GitHub", kind: "integration" },
-    { id: "notion", label: "Notion", kind: "integration" }
-  ];
+  state.sections = [coreSection("github"), coreSection("notion")];
   state.loading = false;
   state.error = null;
   state.github.status = { configured: true, tenantEnabled: true, userConnection: null };
@@ -101,13 +104,13 @@ describe("Connected accounts landing", () => {
 
   it("keeps an overlay service in the same list without adding a core dependency", () => {
     state.sections = [{
-      id: "microsoft",
-      label: "Microsoft 365",
+      id: "example-connector",
+      label: "Example",
       kind: "integration",
-      accountRow: () => <li>Microsoft personal connection</li>
+      accountRow: () => <li>Example personal connection</li>
     }];
     render(<ConnectedAccountsPage />);
-    expect(screen.getByText("Microsoft personal connection")).toBeTruthy();
+    expect(screen.getByText("Example personal connection")).toBeTruthy();
   });
 
   it("does not show an empty state while availability is loading or has failed", () => {
@@ -131,7 +134,8 @@ describe("Connected accounts landing", () => {
     state.github.statusError = "Could not load GitHub status.";
     render(<ConnectedAccountsPage />);
 
-    expect(screen.getByText("Status unavailable")).toBeTruthy();
+    expect(screen.getByText(/Showing the last known account/)).toBeTruthy();
+    expect(screen.getByRole("alert").textContent).toContain("Could not load GitHub status.");
     expect((screen.getByRole("button", { name: "Connect GitHub" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(state.github.reload).toHaveBeenCalledOnce();
@@ -139,13 +143,13 @@ describe("Connected accounts landing", () => {
   });
 
   it("offers Jira authorization only when the organization enabled Jira reads", () => {
-    state.sections = [{ id: "jira", label: "Jira", kind: "integration" }];
+    state.sections = [coreSection("jira")];
     // Writes alone make Jira available, but authorization requires reads.
     state.jira.status = {
       configured: true, tenantEnabled: true, tenantReadsEnabled: false, tenantWritesEnabled: true, userConnection: null
     };
     const { rerender } = render(<ConnectedAccountsPage />);
-    expect(screen.getByText("Not available")).toBeTruthy();
+    expect(screen.getByText("Disabled by your organization")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Connect Jira" }) as HTMLButtonElement).disabled).toBe(true);
 
     state.jira.status = { ...state.jira.status, tenantReadsEnabled: true, tenantWritesEnabled: false };
@@ -167,4 +171,15 @@ describe("Connected accounts landing", () => {
     expect(screen.getByText("Not available")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Reconnect GitHub" }) as HTMLButtonElement).disabled).toBe(true);
   });
+});
+
+it("keeps a details path for services outside the enabled list without claiming an account exists", () => {
+  state.sections = [];
+  render(<ConnectedAccountsPage />);
+  expect(screen.getByText("Other account details")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "GitHub account details" }).getAttribute("href")).toBe("/settings/github");
+  expect(screen.getByRole("link", { name: "Notion account details" }).getAttribute("href")).toBe("/settings/notion");
+  expect(screen.queryByText("Connected")).toBeNull();
+  expect(state.github.connect).not.toHaveBeenCalled();
+  expect(state.github.reload).not.toHaveBeenCalled();
 });

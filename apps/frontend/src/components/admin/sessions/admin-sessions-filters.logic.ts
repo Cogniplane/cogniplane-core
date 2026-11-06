@@ -46,7 +46,7 @@ export function presetRange(days: number): { from: string; to: string } {
 
 /**
  * Map a from/to ISO range to a human label. Returns one of the named
- * presets when the span is within 5 minutes of a known duration; falls
+ * presets when the span and its end match the current window; falls
  * back to "Custom date" or a YYYY-MM-DD → YYYY-MM-DD literal range.
  * Returns null when no range is set.
  */
@@ -66,7 +66,7 @@ export function dateRangeLabel(from: string, to: string): string | null {
     { label: "Last 30d", days: 30 }
   ];
   for (const c of candidates) {
-    if (Math.abs(span - c.days * dayMs) <= PRESET_TOLERANCE_MS) return c.label;
+    if (Math.abs(Date.now() - toMs) <= PRESET_TOLERANCE_MS && Math.abs(span - c.days * dayMs) <= PRESET_TOLERANCE_MS) return c.label;
   }
   // Format as YYYY-MM-DD → YYYY-MM-DD when not a known preset.
   return `${from.slice(0, 10)} → ${to.slice(0, 10)}`;

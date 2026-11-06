@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 
 import { ContextWindowMeter } from "./context-window-meter";
@@ -59,4 +59,45 @@ it("caps the fill at 100% when usage passes the window", () => {
   expect(element!.getAttribute("aria-label")).toMatch(/^Context window 100% full/);
   expect(ringFill(element!)).toBeCloseTo(1);
   expect(element!.className).toContain("text-danger");
+});
+
+/** Opens the details as a click, a tap, or Enter on the focused button does. */
+function openDetails(element: HTMLElement): HTMLElement {
+  element.focus();
+  fireEvent.click(element);
+  return screen.getByRole("dialog", { name: "Usage details" });
+}
+
+it("is a named button that opens the details, and Escape returns the focus to it", async () => {
+  const element = meter(50_000, 200_000, 1.5)!;
+
+  expect(element.tagName).toBe("BUTTON");
+  expect(element.getAttribute("aria-haspopup")).toBe("dialog");
+  expect(element.getAttribute("aria-expanded")).toBe("false");
+  const details = openDetails(element);
+  expect(element.getAttribute("aria-expanded")).toBe("true");
+  expect(within(details).getByRole("heading", { name: "Context window" })).toBeTruthy();
+  expect(details.textContent).toContain(`Used${formatTokenCount(50_000)} tokens`);
+  expect(details.textContent).toContain(`Limit${formatTokenCount(200_000)} tokens`);
+  expect(details.textContent).toContain("Full25%");
+  expect(details.textContent).toContain(`Session cost${formatCostUsd(1.5)}`);
+
+  await act(async () => { fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" }); });
+  expect(screen.queryByRole("dialog")).toBeNull();
+  // Radix moves the focus back after the details unmount.
+  await waitFor(() => expect(document.activeElement).toBe(element));
+});
+
+it("says session cost and nothing about the context window when only the cost is known", () => {
+  const details = openDetails(meter(0, 200_000, 0.42)!);
+
+  expect(details.textContent).toBe(`Session cost${formatCostUsd(0.42)}`);
+  expect(within(details).queryByRole("heading")).toBeNull();
+});
+
+it("leaves out the cost when the session has none", () => {
+  const details = openDetails(meter(50_000, 200_000, 0)!);
+
+  expect(details.textContent).toContain("Full25%");
+  expect(details.textContent).not.toMatch(/cost|\$/i);
 });

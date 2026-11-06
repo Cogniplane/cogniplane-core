@@ -40,8 +40,8 @@ vi.mock("../../hooks/use-notion-connection", () => ({
   useNotionConnection: () => state.notion
 }));
 
-import SettingsGithubPage from "./github/page";
-import SettingsNotionPage from "./notion/page";
+import { GithubSettingsDetail as SettingsGithubPage } from "../../components/github-settings";
+import { NotionSettingsDetail as SettingsNotionPage } from "../../components/notion-settings";
 
 beforeEach(() => {
   state.params = new URLSearchParams();
@@ -66,7 +66,7 @@ describe.each([
     connectLabel: "Connect GitHub",
     reconnectLabel: "Reconnect GitHub",
     consentText: /read files, write files, and open pull requests/,
-    notConfiguredText: "GitHub OAuth is not configured on this deployment yet.",
+    notConfiguredText: "GitHub is not set up yet",
     connectedStatus: {
       configured: true,
       tenantEnabled: true,
@@ -95,8 +95,8 @@ describe.each([
     success: "Notion account connected successfully.",
     connectLabel: "Connect my Notion account",
     reconnectLabel: "Reconnect my account",
-    consentText: /only sees workspaces and pages you grant access/,
-    notConfiguredText: /Notion OAuth is not configured on this deployment yet/,
+    consentText: /only sees the workspaces and pages you grant access/,
+    notConfiguredText: "Notion is not set up yet",
     connectedStatus: {
       configured: true,
       tenantEnabled: true,
@@ -124,8 +124,9 @@ describe.each([
     render(<Page />);
 
     expect(screen.getByRole("heading", { name: provider })).toBeTruthy();
-    expect(screen.getByText(new RegExp(`${provider} is not enabled for this tenant`))).toBeTruthy();
-    expect(screen.queryByRole("button")).toBeNull();
+    expect(screen.getByText(`${provider} is disabled by your organization`)).toBeTruthy();
+    expect((screen.getByRole("button", { name: testCase.connectLabel }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
   });
 
   it("preserves the provider-specific callback success message", () => {

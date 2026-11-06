@@ -1,8 +1,12 @@
 import { test, expect } from "vitest";
 
-import type { PiiDecision } from "./pii-protection-service.js";
+import type { PiiMode } from "@cogniplane/shared-types";
 
-import { handlePiiDecision, type PiiHandlerStores } from "./chat-prompt-pii.js";
+import { PiiProtectionServiceError, type PiiDecision } from "./pii-protection-service.js";
+import type { PiiFinding } from "./pii-provider.js";
+import { textEvaluation } from "../../test-helpers/pii-evaluation.js";
+
+import { gateChatPrompt, handlePiiDecision, type PiiHandlerStores } from "./chat-prompt-pii.js";
 
 test.each(["sync", "async"])("a %s audit failure preserves the PII decision", async (mode) => {
   const outcome = await handlePiiDecision({
@@ -293,4 +297,51 @@ test("non-allow action with no auditEvents store does not throw", async () => {
   };
   await handlePiiDecision(decision, baseInput, makeStores({ capture: [] }));
   // No assertion needed — just verifying no crash when auditEvents is omitted.
+});
+
+// The gate records the settings revision from the read that made the
+// decision: on the scan run, the user message detail, and the audit event.
+const gateFindings: PiiFinding[] = [{ entityType: "email", value: "", start: 0, end: 7, confidence: "high" }];
+const gateCases: Array<[string, PiiDecision, string, PiiMode]> = [
+  ["report", { action: "report", findings: gateFindings, providerType: null, providerModel: null }, "pii_reported", "detect"],
+  ["transform", { action: "transform", transformedText: "[EMAIL]", findings: gateFindings, providerType: null, providerModel: null },
+    "pii_transformed", "transform"],
+  ["block", { action: "block", blockReason: "email", findings: gateFindings, providerType: null, providerModel: null },
+    "pii_blocked", "block"]
+];
+test.each(gateCases)("a chat prompt %s records the settings revision of its decision", async (_, decision, eventType, mode) => {
+  const runs: unknown[] = [];
+  const audit = makeAuditCapture();
+  const outcome = await gateChatPrompt({
+    ...makeStores({ capture: runs }),
+    auditEvents: audit.auditEvents,
+    piiProtection: textEvaluation(async () => decision, { mode, revision: 8 })
+  }, baseInput);
+
+  expect(runs).toEqual([expect.objectContaining({ mode, policyRevision: 8 })]);
+  expect(audit.events).toEqual([
+    expect.objectContaining({ type: eventType, payload: expect.objectContaining({ mode, policyRevision: 8 }) })
+  ]);
+  if (outcome.kind === "unavailable") throw outcome.error;
+  if (outcome.kind === "block") expect(outcome.policyRevision).toBe(8);
+  else expect(outcome.userDetail?.pii).toMatchObject({ modeApplied: mode, policyRevision: 8 });
+});
+
+test("an invalid chat-prompt policy records the settings revision that it read", async () => {
+  const audit = makeAuditCapture();
+  const outcome = await gateChatPrompt({
+    piiScanRuns: undefined,
+    auditEvents: audit.auditEvents,
+    piiProtection: {
+      async evaluateTextWithPolicy() {
+        throw new PiiProtectionServiceError("pii_policy_invalid", "invalid policy", { policyRevision: 5 });
+      }
+    }
+  }, baseInput);
+
+  expect(outcome.kind).toBe("unavailable");
+  expect(audit.events).toEqual([expect.objectContaining({
+    type: "pii_policy_invalid",
+    payload: { subjectType: "message", policyRevision: 5 }
+  })]);
 });

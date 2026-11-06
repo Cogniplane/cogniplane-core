@@ -25,8 +25,10 @@ it.each(["<img src=x>.md", `${"W".repeat(116)}.txt`])(
     expect(screen.getByText(row.summary)).toBeTruthy();
     expect(view.container.querySelector("img")).toBeNull();
     const summary = screen.getByRole("button", { name: row.summary });
-    fireEvent.click(summary);
     expect(summary.getAttribute("aria-expanded")).toBe("true");
+    expect(summary.querySelector(".truncate")).toBeNull();
+    fireEvent.click(summary);
+    expect(summary.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
     fireEvent.click(screen.getByRole("button", { name: "Allow for this turn" }));
     fireEvent.click(screen.getByRole("button", { name: "Decline" }));

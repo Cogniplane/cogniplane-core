@@ -1,3 +1,5 @@
 packages:
   - apps/*
   - packages/*
+  # SharePoint packages retain their original paths and workspace names.
+  - private/*

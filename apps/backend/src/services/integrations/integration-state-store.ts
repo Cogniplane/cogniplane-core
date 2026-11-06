@@ -1,5 +1,6 @@
 import { withTenantScope, type Pool } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 
 export type IntegrationStateRecord = {
   tenantId: string;
@@ -65,10 +66,15 @@ export class IntegrationStateStore {
     });
   }
 
+  /**
+   * Writes the patch. The audit event, when given, commits in the same
+   * transaction as the change, with its owner notice (AuditEventInput).
+   */
   async upsert(
     tenantId: string,
     integrationId: string,
-    patch: IntegrationStatePatch
+    patch: IntegrationStatePatch,
+    audit?: (saved: IntegrationStateRecord) => AuditEventInput
   ): Promise<IntegrationStateRecord> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const existing = await client.query(
@@ -99,7 +105,63 @@ export class IntegrationStateStore {
           RETURNING *`,
         [tenantId, integrationId, readsEnabled, writesEnabled, JSON.stringify(config), updatedBy]
       );
-      return toRecord(result.rows[0]);
+      const saved = toRecord(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(saved));
+      return saved;
+    });
+  }
+
+  /**
+   * Writes only what the save changes, onto the row as it is now: the row is
+   * locked (`FOR UPDATE`) in the transaction, an omitted toggle keeps its
+   * value, and the settings keys in `configChanges` replace only those keys.
+   * A save read from an older copy can therefore not write back an older
+   * toggle or secret (an admin route classifies the save against that copy,
+   * docs/ARCHITECTURE.md, "Data routes"). The audit event, when given,
+   * commits in the same transaction, with its owner notice.
+   */
+  async applyChanges(
+    tenantId: string,
+    integrationId: string,
+    changes: {
+      readsEnabled?: boolean;
+      writesEnabled?: boolean;
+      /** Settings keys to set; values are already encrypted where the field is a secret. */
+      configChanges: Record<string, unknown>;
+      updatedBy: string;
+    },
+    audit?: (saved: IntegrationStateRecord) => AuditEventInput
+  ): Promise<IntegrationStateRecord> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      // A first save makes the row, so that the lock below always has one.
+      await client.query(
+        `INSERT INTO tenant_integrations (tenant_id, integration_id, reads_enabled, writes_enabled, config_json)
+         VALUES ($1, $2, FALSE, FALSE, '{}'::jsonb)
+         ON CONFLICT (tenant_id, integration_id) DO NOTHING`,
+        [tenantId, integrationId]
+      );
+      const locked = await client.query(
+        `SELECT * FROM tenant_integrations WHERE tenant_id = $1 AND integration_id = $2 FOR UPDATE`,
+        [tenantId, integrationId]
+      );
+      const current = toRecord(locked.rows[0]);
+      const result = await client.query(
+        `UPDATE tenant_integrations
+         SET reads_enabled = $3, writes_enabled = $4, config_json = $5::jsonb, updated_by = $6, updated_at = NOW()
+         WHERE tenant_id = $1 AND integration_id = $2
+         RETURNING *`,
+        [
+          tenantId,
+          integrationId,
+          changes.readsEnabled ?? current.readsEnabled,
+          changes.writesEnabled ?? current.writesEnabled,
+          JSON.stringify({ ...current.config, ...changes.configChanges }),
+          changes.updatedBy
+        ]
+      );
+      const saved = toRecord(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(saved));
+      return saved;
     });
   }
 

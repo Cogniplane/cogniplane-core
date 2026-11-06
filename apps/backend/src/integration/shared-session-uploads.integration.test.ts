@@ -24,6 +24,8 @@ import * as projectAccess from "../services/project-access.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { appPool, superuserPool, adminDatabaseUrl } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
+import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
+import { resolvePiiPolicy } from "../services/pii/pii-policy.js";
 
 async function setup(mode: PiiProtectionSettings["mode"] = "off") {
   const tenantId = await seedTenant(), ownerId = await seedUser(), editorId = await seedUser(), viewerId = await seedUser();
@@ -52,10 +54,15 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
   const piiScanRuns = new PiiScanRunStore(appPool());
   const piiScanJobs = new PiiScanJobStore(appPool(), superuserPool());
   const evaluateArtifact = vi.fn(async (): Promise<PiiDecision> => ({ action: "allow", reason: "no_findings" }));
-  const getActiveSettings = vi.fn(async (): Promise<PiiProtectionSettings> => ({
-    ...DEFAULT_PII_PROTECTION, enabled: true, mode,
-    scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: true },
+  const readPolicy = vi.fn(async (readTenantId: string) => ({
+    tenantId: readTenantId,
+    policy: resolvePiiPolicy({
+      ...DEFAULT_PII_PROTECTION, enabled: mode !== "off", mode,
+      scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: true },
+    }, new PiiImportScopeRegistry()),
+    revision: 1
   }));
+  const isSubjectInScope = () => true;
   const subjectReader = {
     readMessageText: async () => null,
     readArtifact: async ({ artifactId }: { artifactId: string }) => {
@@ -70,7 +77,11 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
     },
   };
   const scanDeps = { artifacts, storage, piiScanRuns, piiScanJobs, subjectReader, auditEvents,
-    piiProtection: { getActiveSettings, evaluateArtifact, evaluateText: async (): Promise<PiiDecision> => ({ action: "allow", reason: "no_findings" }) },
+    piiProtection: { readPolicy, isSubjectInScope,
+      evaluateArtifactWithPolicy: async () => ({ decision: await evaluateArtifact(), appliedPolicy: { mode, revision: 1 } }),
+      evaluateTextWithPolicy: async () => ({
+        decision: { action: "allow", reason: "no_findings" } as PiiDecision, appliedPolicy: { mode, revision: 1 }
+      }) },
     logger: app.log };
   const enqueuer = new PiiArtifactScanEnqueuer(scanDeps);
   const worker = new PiiScanJobHandler({ ...scanDeps, messages: { setPiiDetail: async () => {} } });
@@ -95,7 +106,7 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
   const count = async () => Number((await superuserPool().query(
     "SELECT count(*) FROM artifacts WHERE tenant_id=$1", [tenantId])).rows[0].count);
   return { app, tenantId, ownerId, editorId, viewerId, project, actor, members, projects, sessionId,
-    sessions, artifacts, storage, put, remove, upload, publish, count, getActiveSettings,
+    sessions, artifacts, storage, put, remove, upload, publish, count, readPolicy,
     evaluateArtifact, enqueuer, worker, piiScanJobs,
     authenticate: (userId: string, tenant = tenantId) => { auth = { ...auth, userId, tenantId: tenant }; } };
 }
@@ -182,7 +193,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
       expect(await h.count()).toBe(0);
       expect(h.remove).toHaveBeenCalledOnce();
       await expect(h.storage.openReadStream(h.remove.mock.calls[0]![0])).rejects.toThrow();
-      expect(h.getActiveSettings).not.toHaveBeenCalled();
+      expect(h.readPolicy).not.toHaveBeenCalled();
       expect((await superuserPool().query(
         "SELECT id FROM audit_events WHERE tenant_id=$1 AND event_type='artifact_uploaded'", [h.tenantId])).rows).toEqual([]);
     },

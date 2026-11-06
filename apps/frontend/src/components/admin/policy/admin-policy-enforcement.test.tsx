@@ -254,6 +254,24 @@ describe("policy enforcement in Monitor", () => {
     expect(updateTenantAgentSettings).not.toHaveBeenCalled();
   });
 
+  it("sends one versioned save while a duplicate activation is pending", async () => {
+    vi.mocked(getTenantSettings).mockResolvedValue(makeTenantSettings({ version: 7 }));
+    let finish!: (value: ReturnType<typeof makeTenantSettings>) => void;
+    vi.mocked(updateTenantAgentSettings).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    mount();
+    const dialog = await openReview();
+    const enable = within(dialog).getByRole("button", { name: "Enable enforcement" });
+    await waitFor(() => expect((enable as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(enable);
+    fireEvent.click(enable);
+    await waitFor(() => expect(updateTenantAgentSettings).toHaveBeenCalledTimes(1));
+    expect((within(dialog).getByRole("button", { name: "Enabling..." }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(dialog).getByRole("button", { name: "Keep Monitor" }) as HTMLButtonElement).disabled).toBe(true);
+    finish(makeTenantSettings({ version: 8, policyEnforcementMode: "enforce" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(vi.mocked(updateTenantAgentSettings).mock.calls[0]?.[0]).toEqual({ expectedVersion: 7, policyEnforcementMode: "enforce" });
+  });
+
   it("opens the review from the Overview link and drops the parameter", async () => {
     navigation.search = "review=enforcement&rule=pol_writes";
     vi.mocked(getTenantSettings).mockResolvedValue(makeTenantSettings({ policyEnforcementMode: "monitor" }));
@@ -268,11 +286,14 @@ describe("policy enforcement in Enforce", () => {
     vi.mocked(getTenantSettings).mockResolvedValue(makeTenantSettings({ version: 4, policyEnforcementMode: "enforce" }));
     vi.mocked(updateTenantAgentSettings).mockResolvedValue(makeTenantSettings({ version: 5, policyEnforcementMode: "monitor" }));
     mount();
-    fireEvent.click(await screen.findByRole("button", { name: "Switch to Monitor" }));
+    const switchButton = await screen.findByRole("button", { name: "Switch to Monitor" });
+    switchButton.focus();
+    fireEvent.click(switchButton);
     expect(await screen.findByText(/Monitor is on\. Rules stop blocking/)).toBeTruthy();
     expect(vi.mocked(updateTenantAgentSettings).mock.calls[0]?.[0]).toEqual({ expectedVersion: 4, policyEnforcementMode: "monitor" });
     expect(screen.getByRole("heading", { name: "Monitor is active" })).toBeTruthy();
     expect(getPolicyMonitorSummary).toHaveBeenCalled();
+    await waitFor(() => expect(document.activeElement?.getAttribute("role")).toBe("status"));
   });
 
   it("reports the current mode after an unconfirmed switch", async () => {

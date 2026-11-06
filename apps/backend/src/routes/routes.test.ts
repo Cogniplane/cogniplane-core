@@ -200,6 +200,36 @@ test("rejects concurrent turns on the same session", async () => {
       });
 });
 
+// Bead q4w0.13: the turn's tool context keeps the security version that
+// admitted the turn, so the gateway refuses its tool calls after a security
+// change of the account (services/auth/security-change.ts).
+test("the turn's tool context keeps the requester's security version", async () => {
+  const { app, runtimeManager, toolContexts } = await createTestApp();
+  onTestFinished(async () => {
+    await app.close();
+  });
+  const turn = async (headers: Record<string, string>) => {
+    const created = await app.inject({ method: "POST", url: "/sessions", headers, payload: { name: "Versioned turn" } });
+    const sessionId = created.json().session.sessionId as string;
+    runtimeManager.queueEvents(sessionId, [
+      { type: "response.created", responseId: `resp-${sessionId}` },
+      { type: "response.completed", responseId: `resp-${sessionId}` }
+    ]);
+    const response = await app.inject({ method: "POST", url: "/messages", headers, payload: { sessionId, text: "Hello" } });
+    expect(response.statusCode).toBe(200);
+  };
+
+  // A local session: the version that the session carries, not the account's version now.
+  toolContexts.securityVersions.set("test-user", 8);
+  await turn({ "x-test-session-security-version": "7" });
+  // AUTH_MODE=dev-headers has no session: the account's version now.
+  await turn({});
+  // A user without a local account (WorkOS): none.
+  await turn({ "x-user-id": "workos-user" });
+
+  expect(toolContexts.ownerSecurityVersions).toEqual([7, 8, null]);
+});
+
 test("omitted artifact scope leaves the turn unscoped by default", async () => {
   const { app, sessions, artifacts, runtimeManager, toolContexts } = await createTestApp();
   onTestFinished(async () => {
@@ -685,7 +715,8 @@ test("lists pending approvals and resolves a decision", async () => {
     summary: "pwd",
     status: "pending",
     decision: null,
-    requestPayload: {},
+    toolCallId: "card-1",
+    requestPayload: { policyApproval: { toolContextId: "internal-context", argumentHash: "internal-hash" } },
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     resolvedAt: null,
@@ -700,6 +731,11 @@ test("lists pending approvals and resolves a decision", async () => {
   expect(listResponse.statusCode).toBe(200);
   expect(listResponse.headers["cache-control"]).toBe("private, no-store");
   expect(listResponse.json().approvals.length).toBe(1);
+  // The read names the card of the proposed call; the decision still takes the approval ID.
+  expect(listResponse.json().approvals[0]).toEqual({
+    approvalId: "approval-1", sessionId, itemId: "cmd-1", toolCallId: "card-1",
+    kind: "command_execution", title: "Approve shell command", summary: "pwd", status: "pending"
+  });
 
   // A session the caller cannot read gives no list, even for its own approval rows.
   const hidden = await sessions.create("test-tenant", "another-user", "Hidden");

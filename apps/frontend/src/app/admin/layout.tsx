@@ -61,14 +61,9 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
 
         <div className="mx-auto w-full min-w-0 max-w-6xl px-4 pb-10 pt-4 md:px-8 md:pt-6">
           <ConsolePageHeader
-            eyebrow="Admin"
             title={ADMIN_SECTION_TITLES[activeSectionId].title}
             subtitle={ADMIN_SECTION_TITLES[activeSectionId].subtitle}
-            menuLinks={[
-              { href: "/", label: "Chat", description: "Return to the live workspace" },
-              { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
-              { href: "/settings", label: "Settings", description: "Open user preferences and jobs" }
-            ]}
+            destinations={["chat", "artifacts", "settings"]}
           />
 
           {children}

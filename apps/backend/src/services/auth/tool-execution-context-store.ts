@@ -3,10 +3,12 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 import { interactiveContextExecutionSql } from "../session-execution-store.js";
+import { ownerSecurityVersionSql } from "./security-change.js";
 
 /**
  * Thrown when a `require`/`requireOwned` lookup finds no live tool context
- * (missing row, wrong tenant, wrong owner, or expired TTL). Carries a stable
+ * (missing row, wrong tenant, wrong owner, expired TTL, or a security change
+ * of the owner's local account). Carries a stable
  * machine-readable `code` so callers and tests can branch on the contract
  * instead of matching prose in the message.
  */
@@ -14,10 +16,18 @@ export class ToolContextUnavailableError extends Error {
   readonly code = "TOOL_CONTEXT_UNAVAILABLE" as const;
 
   constructor(public readonly toolContextId: string) {
-    super(`Tool context ${toolContextId} was not found or expired.`);
+    super(`Tool context ${toolContextId} was not found, expired, or ended by a security change.`);
     this.name = "ToolContextUnavailableError";
   }
 }
+
+/**
+ * The state of a tool context for the runtime loop (`liveness`):
+ * - `live`: a lookup returns the context.
+ * - `security_change`: the owner's local account has another security version.
+ * - `ended`: no row, or the TTL expired, or the interactive execution ended.
+ */
+export type ToolContextLiveness = "live" | "security_change" | "ended";
 
 export type ToolExecutionContext = {
   toolContextId: string;
@@ -67,6 +77,12 @@ export class ToolExecutionContextStore {
     messageId: string | null;
     credentialEnvelope?: Record<string, unknown>;
     metadata?: Record<string, unknown>;
+    /**
+     * The owner's security version that admitted the turn: the session's
+     * for an interactive turn, the job's for a scheduled turn. Null for a
+     * WorkOS owner. A different version later refuses every lookup.
+     */
+    ownerSecurityVersion: number | null;
     ttlMs: number;
   }): Promise<ToolExecutionContext> {
     const toolContextId = `ctx_${uuidv7()}`;
@@ -83,9 +99,10 @@ export class ToolExecutionContextStore {
             message_id,
             credential_envelope,
             metadata,
+            owner_security_version,
             expires_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, NOW() + ($10 * INTERVAL '1 millisecond'))
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $11, NOW() + ($10 * INTERVAL '1 millisecond'))
           RETURNING *
         `,
         [
@@ -98,7 +115,8 @@ export class ToolExecutionContextStore {
           input.messageId,
           JSON.stringify(input.credentialEnvelope ?? {}),
           JSON.stringify(input.metadata ?? {}),
-          input.ttlMs
+          input.ttlMs,
+          input.ownerSecurityVersion
         ]
       );
 
@@ -126,6 +144,7 @@ export class ToolExecutionContextStore {
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND session_id = $2 AND expires_at > NOW()
             AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           ORDER BY created_at DESC
           LIMIT 1
         `,
@@ -157,12 +176,53 @@ export class ToolExecutionContextStore {
           SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
             AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           RETURNING expires_at
         `,
         [tenantId, toolContextId, ttlMs]
       );
 
       return result.rows[0] ? isoTimestamp(result.rows[0].expires_at) : null;
+    });
+  }
+
+  /**
+   * Tells the runtime if its turn can continue. The runtime calls this at
+   * each model start and before each native tool, so it must stay cheap:
+   * one read of the context by its unique id, with the same conditions as
+   * `get` (TTL, interactive execution, owner's security version) as columns,
+   * so that a dead context also gives its reason. It reads no JSON column.
+   */
+  async liveness(tenantId: string, toolContextId: string): Promise<ToolContextLiveness> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query<{ owner_current: boolean; usable: boolean }>(
+        `
+          SELECT ${ownerSecurityVersionSql("tool_execution_contexts")} AS owner_current,
+            (expires_at > NOW() AND ${interactiveContextExecutionSql("tool_execution_contexts")}) AS usable
+          FROM tool_execution_contexts
+          WHERE tenant_id = $1 AND tool_context_id = $2
+        `,
+        [tenantId, toolContextId]
+      );
+      const row = result.rows[0];
+      if (!row) return "ended";
+      if (!row.owner_current) return "security_change";
+      return row.usable ? "live" : "ended";
+    });
+  }
+
+  /**
+   * The security version of the user's local account now, or null for a
+   * WorkOS user. Only for AUTH_MODE=dev-headers, which has no session to
+   * take the version from (requestSecurityVersion).
+   */
+  async currentOwnerSecurityVersion(tenantId: string, userId: string): Promise<number | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query<{ security_version: number }>(
+        `SELECT security_version FROM local_identities WHERE tenant_id = $1 AND user_id = $2`,
+        [tenantId, userId]
+      );
+      return result.rows[0] ? Number(result.rows[0].security_version) : null;
     });
   }
 
@@ -174,6 +234,7 @@ export class ToolExecutionContextStore {
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
             AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           LIMIT 1
         `,
         [tenantId, toolContextId]

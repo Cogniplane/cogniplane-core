@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { Artifact } from "@cogniplane/shared-types";
 
 import { ArtifactPanel } from "./artifact-panel";
+import { registerArtifactOrigin } from "../lib/artifact-origins";
 
 afterEach(cleanup);
 
@@ -36,6 +37,7 @@ it("routes selection, preview, download, and source actions through their owners
   const onOpenFileSource = vi.fn();
   const view = render(
     <ArtifactPanel
+      surface="raised"
       inventory={{ artifacts: [artifact] }}
       selection={{ visibleSelectedArtifactIds: ["artifact-1"], onToggle: onToggleSelection }}
       transfers={{ isUploading: false, downloadingId: null, onUpload, onDownload }}
@@ -77,4 +79,72 @@ it("routes selection, preview, download, and source actions through their owners
     />
   );
   expect(screen.getByRole("button", { name: "Uploading..." }).hasAttribute("disabled")).toBe(true);
+});
+
+it("shows the label and tone of a registered artifact origin", () => {
+  const panel = (artifacts: Artifact[]) => (
+    <ArtifactPanel
+      inventory={{ artifacts }}
+      selection={{ visibleSelectedArtifactIds: ["artifact-1"], onToggle: vi.fn() }}
+      transfers={{ isUploading: false, downloadingId: null, onUpload: vi.fn(), onDownload: vi.fn() }}
+      preview={{ artifactId: null, isLoading: false, onOpen: vi.fn() }}
+      sources={{ sessionId: "session-1", items: [], onOpen: vi.fn() }}
+    />
+  );
+  const imported = { ...artifact, detail: { source: "example-drive" } };
+
+  // No overlay registered the source: the core label shows.
+  const view = render(panel([imported]));
+  expect(screen.getByText("Uploaded").className).toContain("bg-[var(--artifact-chip-surface)]");
+
+  registerArtifactOrigin({ detailSource: "example-drive", label: "Example import", tone: "accent" });
+  view.rerender(panel([imported]));
+  expect(screen.getByText("Example import").className).toContain("bg-info-surface");
+});
+
+it("does not report an empty session while the files are unknown", () => {
+  const panel = (status: "ready" | "loading" | "unavailable") => (
+    <ArtifactPanel
+      inventory={{ artifacts: [], status }}
+      selection={{ visibleSelectedArtifactIds: [], onToggle: vi.fn() }}
+      transfers={{ isUploading: false, downloadingId: null, onUpload: vi.fn(), onDownload: vi.fn() }}
+      preview={{ artifactId: null, isLoading: false, onOpen: vi.fn() }}
+      sources={{ sessionId: "session-1", items: [], onOpen: vi.fn() }}
+    />
+  );
+  const tabCounts = () => screen.getAllByRole("tab").map((tab) => tab.textContent);
+
+  const view = render(panel("loading"));
+  expect(screen.getByRole("status").textContent).toBe("Loading files…");
+  expect(screen.queryByText("No documents in play")).toBeNull();
+  expect(tabCounts()).toEqual(["Context–", "Artifacts–"]);
+
+  view.rerender(panel("unavailable"));
+  expect(screen.getByText("Files did not load")).toBeTruthy();
+  expect(screen.queryByText("No documents in play")).toBeNull();
+  expect(tabCounts()).toEqual(["Context–", "Artifacts–"]);
+
+  view.rerender(panel("ready"));
+  expect(screen.getByText("No documents in play")).toBeTruthy();
+  expect(tabCounts()).toEqual(["Context0", "Artifacts0"]);
+});
+
+it("offers file recovery in the panel without a chat-area Retry", () => {
+  const onRetry = vi.fn();
+  const panel = (retrying: boolean) => <ArtifactPanel
+    inventory={{ artifacts: [], status: "unavailable", onRetry, retrying }}
+    selection={{ visibleSelectedArtifactIds: [], onToggle: vi.fn() }}
+    transfers={{ isUploading: false, downloadingId: null, onUpload: vi.fn(), onDownload: vi.fn() }}
+    preview={{ artifactId: null, isLoading: false, onOpen: vi.fn() }}
+    sources={{ sessionId: "session-1", items: [], onOpen: vi.fn() }} />;
+  const view = render(panel(false));
+  const retry = screen.getByRole("button", { name: "Try again" });
+  retry.focus();
+  fireEvent.click(retry);
+  expect(onRetry).toHaveBeenCalledOnce();
+  view.rerender(panel(true));
+  expect(screen.getByRole("button", { name: "Retrying…" })).toBe(retry);
+  expect(document.activeElement).toBe(retry);
+  fireEvent.click(retry);
+  expect(onRetry).toHaveBeenCalledOnce();
 });

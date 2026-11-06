@@ -1,5 +1,6 @@
 import type { Artifact, ArtifactPiiDetail } from "@cogniplane/shared-types";
 import { isArtifactEligibleForChatContext } from "../lib/artifact-eligibility";
+import { findArtifactOrigin, type ArtifactOriginTone } from "../lib/artifact-origins";
 
 export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -20,9 +21,15 @@ export function formatArtifactStatus(status: Artifact["status"]): string {
 export function formatPiiLabel(pii: ArtifactPiiDetail): string | null {
   const label = formatPiiVerdict(pii);
   // A PDF verdict covers only its text; images in it are not scanned.
-  return label && pii.imagesNotScanned && (pii.status === "scanned" || pii.status === "transformed")
+  return label && pii.imagesNotScanned && !isPiiNotScanned(pii) && (pii.status === "scanned" || pii.status === "transformed")
     ? `${label} (text only)`
     : label;
+}
+
+// The scan applied mode off: protection was off, or the file was out of
+// scope, when the scan ran. It read nothing, so the file is not clean.
+function isPiiNotScanned(pii: ArtifactPiiDetail): boolean {
+  return pii.status === "scanned" && pii.modeApplied === "off";
 }
 
 function formatPiiVerdict(pii: ArtifactPiiDetail): string | null {
@@ -35,6 +42,7 @@ function formatPiiVerdict(pii: ArtifactPiiDetail): string | null {
     case "failed":
       return "PII scan failed";
     case "scanned":
+      if (isPiiNotScanned(pii)) return "PII: not scanned";
       return pii.findingsCount && pii.findingsCount > 0
         ? `PII: ${pii.findingsCount} finding${pii.findingsCount === 1 ? "" : "s"}`
         : "PII: clean";
@@ -45,7 +53,9 @@ function formatPiiVerdict(pii: ArtifactPiiDetail): string | null {
   }
 }
 
-export type PiiTone = "neutral" | "pending" | "blocked" | "failed" | "transformed";
+// `clean` and `findings` are the two outcomes of a real scan. A scan that read
+// nothing (mode off) is `neutral`, so it never looks like a clean result.
+export type PiiTone = "neutral" | "clean" | "findings" | "pending" | "blocked" | "failed" | "transformed";
 
 export function piiTone(pii: ArtifactPiiDetail): PiiTone {
   switch (pii.status) {
@@ -58,6 +68,9 @@ export function piiTone(pii: ArtifactPiiDetail): PiiTone {
       return "failed";
     case "transformed":
       return "transformed";
+    case "scanned":
+      if (isPiiNotScanned(pii)) return "neutral";
+      return pii.findingsCount && pii.findingsCount > 0 ? "findings" : "clean";
     default:
       return "neutral";
   }
@@ -73,12 +86,14 @@ export function canSelectArtifact(artifact: Artifact): boolean {
   return isArtifactEligibleForChatContext(artifact);
 }
 
-export function getArtifactOrigin(artifact: Artifact): string {
-  if (artifact.detail?.source === "microsoft") {
-    return artifact.createdByType === "tool" ? "Added by assistant" : "Microsoft import";
-  }
-  if (artifact.createdByType === "tool") return "Added by assistant";
-  if (artifact.artifactType === "generated") return "Generated";
-  if (artifact.artifactType === "derived") return "Derived";
-  return "Uploaded";
+export function getArtifactOrigin(artifact: Artifact): { label: string; tone: ArtifactOriginTone } {
+  // An origin that an overlay registered keeps its tone for every artifact
+  // from it. The tool label still wins, so the user sees who added the file.
+  const origin = findArtifactOrigin(artifact.detail?.source);
+  const tone = origin?.tone ?? "neutral";
+  if (artifact.createdByType === "tool") return { label: "Added by assistant", tone };
+  if (origin) return { label: origin.label, tone };
+  if (artifact.artifactType === "generated") return { label: "Generated", tone };
+  if (artifact.artifactType === "derived") return { label: "Derived", tone };
+  return { label: "Uploaded", tone };
 }

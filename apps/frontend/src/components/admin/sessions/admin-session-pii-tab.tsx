@@ -1,20 +1,10 @@
 "use client";
 
-import { aggregateFindings } from "../../../lib/admin-session-pii-utils";
+import { summarizePiiRun } from "../../../lib/admin-session-pii-utils";
 import { shortId, statusPillClass } from "../../../lib/admin-pii-utils";
 import { formatTimestamp } from "../../../lib/time-format";
 import type { AdminSessionDetailPiiRun } from "@cogniplane/shared-types";
 import { PILL_GRAY } from "../../../lib/ui-tokens";
-
-function findingsLabel(findings: unknown[]): string {
-  const aggregated = aggregateFindings(findings);
-  if (aggregated.length === 0) {
-    return findings.length === 1 ? "1 finding" : `${findings.length} findings`;
-  }
-  return aggregated
-    .map((b) => `${b.count} ${b.label}${b.count === 1 ? "" : "s"}`)
-    .join(", ");
-}
 
 export function AdminSessionPiiTab(props: { piiRuns: AdminSessionDetailPiiRun[] }) {
   if (props.piiRuns.length === 0) {
@@ -41,7 +31,7 @@ export function AdminSessionPiiTab(props: { piiRuns: AdminSessionDetailPiiRun[] 
                 {run.actionTaken ? <span className={PILL_GRAY}>action: {run.actionTaken}</span> : null}
               </div>
               <p className="mt-1 text-xs text-on-surface-faint">
-                {findingsLabel(run.findings)} · created {formatTimestamp(run.createdAt)}
+                {summarizePiiRun(run)} · created {formatTimestamp(run.createdAt)}
               </p>
             </div>
           </summary>

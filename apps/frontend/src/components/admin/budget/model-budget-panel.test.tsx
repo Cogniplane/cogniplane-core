@@ -259,6 +259,55 @@ describe("budget dialog", () => {
     expect(limitInput(dialog).value).toBe("150");
   });
 
+  it("shows a changed version during consequence confirmation and reloads into comparison", async () => {
+    const { dialog } = await openEditor();
+    fireEvent.click(within(dialog).getByRole("radio", { name: /No limit/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save budget" }));
+    expect(within(dialog).getByRole("heading", { name: "Remove the monthly limit?" })).toBe(document.activeElement);
+    vi.mocked(getModelSpending).mockResolvedValue(spending({ limit: 120, version: 4 }));
+    await act(() => client.refetchQueries());
+    expect(await within(dialog).findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Someone else changed the budget"));
+    expect((within(dialog).getByRole("button", { name: "Remove the limit" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Load current budget" }));
+    expect(await within(dialog).findByText("Compare before you save")).toBeTruthy();
+    expect((within(dialog).getByRole("radio", { name: /No limit/ }) as HTMLInputElement).checked).toBe(true);
+    expect(within(dialog).getByText("Limit $120.00, hold per turn $1.00")).toBeTruthy();
+    expect(updateModelSpendingPolicy).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save my draft" }));
+    expect(within(dialog).getByRole("heading", { name: "Remove the monthly limit?" })).toBeTruthy();
+  });
+
+  it("freezes the submitted draft through the save and the real cache refresh", async () => {
+    const request = deferred<ModelSpendingResponse>();
+    const refresh = deferred<ModelSpendingResponse>();
+    vi.mocked(updateModelSpendingPolicy).mockReturnValue(request.promise);
+    const { dialog } = await openEditor();
+    fireEvent.change(limitInput(dialog), { target: { value: "150.000001" } });
+    act(() => {
+      fireEvent.submit(dialog.querySelector("form")!);
+      fireEvent.submit(dialog.querySelector("form")!);
+    });
+    expect(await within(dialog).findByRole("button", { name: "Saving…" })).toBeTruthy();
+    const assertLocked = () => {
+      expect(limitInput(dialog).disabled).toBe(true);
+      expect((within(dialog).getByLabelText("Hold per turn (USD)") as HTMLInputElement).disabled).toBe(true);
+      for (const radio of within(dialog).getAllByRole("radio")) expect((radio as HTMLInputElement).disabled).toBe(true);
+      fireEvent.keyDown(dialog, { key: "Escape" });
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      expect(within(dialog).queryByRole("button", { name: "Close" })).toBeNull();
+    };
+    assertLocked();
+    fireEvent.submit(dialog.querySelector("form")!);
+    expect(updateModelSpendingPolicy).toHaveBeenCalledTimes(1);
+    vi.mocked(getModelSpending).mockReturnValue(refresh.promise);
+    request.resolve(spending({ limit: 150.000001, version: 4 }));
+    await waitFor(() => expect(getModelSpending).toHaveBeenCalledTimes(2));
+    assertLocked();
+    refresh.resolve(spending({ limit: 150.000001, version: 4 }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(updateModelSpendingPolicy).toHaveBeenCalledWith({ monthlyLimitUsd: 150.000001, turnReservationUsd: 1, version: 3 });
+  });
+
   it("keeps a retryable draft after a network failure", async () => {
     vi.mocked(updateModelSpendingPolicy).mockRejectedValueOnce(new TypeError("Failed to fetch")).mockResolvedValueOnce(spending({ limit: 150, version: 4 }));
     const { dialog } = await openEditor();
@@ -344,8 +393,10 @@ describe("recovery", () => {
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain("Requests already sent to a provider keep running. Closing does not cancel them.");
     expect(dialog.textContent).toContain("No new turn can start this month until you reconcile it.");
-    fireEvent.click(within(dialog).getByRole("button", { name: "Close reservation" }));
+    const confirm = within(dialog).getByRole("button", { name: "Close reservation" });
+    act(() => { fireEvent.click(confirm); fireEvent.click(confirm); });
     expect(await within(dialog).findByRole("button", { name: "Closing…" })).toBeTruthy();
+    expect(closeModelSpendingReservation).toHaveBeenCalledTimes(1);
 
     vi.mocked(getModelSpending).mockClear();
     vi.mocked(getModelSpending).mockResolvedValue(spending({ unknownReservations: 1, unresolved: [reservation("r-1", { status: "unknown" })], nextCursor: "c1" }));
@@ -450,9 +501,16 @@ describe("recovery", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Record verified cost" }));
     expect(within(dialog).getByText("Enter the verified total cost.")).toBeTruthy();
     expect(within(dialog).getByText("Confirm both statements before you record the cost.")).toBeTruthy();
+    expect(document.activeElement).toBe(amount);
     fireEvent.change(amount, { target: { value: "0.42" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Record verified cost" }));
+    expect(document.activeElement).toBe(within(dialog).getByRole("checkbox", { name: "No provider request from this turn is still running." }));
     fireEvent.click(within(dialog).getByRole("checkbox", { name: "No provider request from this turn is still running." }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Record verified cost" }));
+    const records = within(dialog).getByRole("checkbox", { name: "This total comes from provider records and recorded call usage." });
+    expect(document.activeElement).toBe(records);
+    expect(records.getAttribute("aria-invalid")).toBe("true");
+    expect(document.getElementById(records.getAttribute("aria-describedby")!)?.textContent).toBe("Confirm both statements before you record the cost.");
     expect(reconcileModelSpendingReservation).not.toHaveBeenCalled();
 
     fireEvent.click(within(dialog).getByRole("checkbox", { name: "This total comes from provider records and recorded call usage." }));
@@ -461,6 +519,65 @@ describe("recovery", () => {
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
     expect(reconcileModelSpendingReservation).toHaveBeenCalledWith("r-u", 0.42);
     expect(screen.getByText("Verified cost of $0.42 recorded. The reservation is settled.")).toBeTruthy();
+  });
+
+  it("freezes verified zero and both acknowledgments until reconciliation and refresh finish", async () => {
+    vi.mocked(getModelSpending).mockResolvedValue(spending({ unknownReservations: 1, unresolved: [reservation("r-u", { status: "unknown" })] }));
+    const request = deferred<void>();
+    const refresh = deferred<ModelSpendingResponse>();
+    vi.mocked(reconcileModelSpendingReservation).mockReturnValue(request.promise);
+    openRecovery();
+    fireEvent.click(await screen.findByRole("button", { name: "Reconcile…" }));
+    const dialog = await screen.findByRole("alertdialog");
+    const amount = within(dialog).getByLabelText("Verified total cost (USD)") as HTMLInputElement;
+    fireEvent.change(amount, { target: { value: "0" } });
+    const boxes = within(dialog).getAllByRole("checkbox") as HTMLInputElement[];
+    for (const box of boxes) fireEvent.click(box);
+    act(() => {
+      fireEvent.submit(dialog.querySelector("form")!);
+      fireEvent.submit(dialog.querySelector("form")!);
+    });
+    expect(await within(dialog).findByRole("button", { name: "Recording…" })).toBeTruthy();
+    const assertLocked = () => {
+      expect(amount.disabled).toBe(true);
+      for (const box of boxes) { expect(box.matches(":disabled")).toBe(true); expect(box.checked).toBe(true); }
+      fireEvent.keyDown(dialog, { key: "Escape" });
+      expect(screen.getByRole("alertdialog")).toBe(dialog);
+    };
+    assertLocked();
+    fireEvent.submit(dialog.querySelector("form")!);
+    expect(reconcileModelSpendingReservation).toHaveBeenCalledTimes(1);
+    vi.mocked(getModelSpending).mockReturnValue(refresh.promise);
+    request.resolve();
+    await waitFor(() => expect(getModelSpending).toHaveBeenCalledTimes(2));
+    assertLocked();
+    refresh.resolve(spending({ unresolved: [] }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(reconcileModelSpendingReservation).toHaveBeenCalledWith("r-u", 0);
+  });
+
+  it("unlocks a failed reconciliation and keeps the verified amount and acknowledgments for retry", async () => {
+    vi.mocked(getModelSpending).mockResolvedValue(spending({ unresolved: [reservation("r-u", { status: "unknown" })] }));
+    vi.mocked(reconcileModelSpendingReservation).mockRejectedValueOnce(new TypeError("Failed to fetch")).mockResolvedValueOnce(undefined);
+    openRecovery();
+    fireEvent.click(await screen.findByRole("button", { name: "Reconcile…" }));
+    const dialog = await screen.findByRole("alertdialog");
+    const amount = within(dialog).getByLabelText("Verified total cost (USD)") as HTMLInputElement;
+    fireEvent.change(amount, { target: { value: "0.420001" } });
+    for (const box of within(dialog).getAllByRole("checkbox")) fireEvent.click(box);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Record verified cost" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toBe("Could not record the cost. Your entry is kept. Try again.");
+    expect(amount.disabled).toBe(false);
+    expect(amount.value).toBe("0.420001");
+    for (const box of within(dialog).getAllByRole("checkbox") as HTMLInputElement[]) {
+      expect(box.checked).toBe(true);
+      expect(box.matches(":disabled")).toBe(false);
+    }
+    vi.mocked(getModelSpending).mockResolvedValue(spending({ unresolved: [] }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(reconcileModelSpendingReservation).toHaveBeenCalledTimes(2);
+    expect(reconcileModelSpendingReservation).toHaveBeenLastCalledWith("r-u", 0.420001);
   });
 
   it("does not repeat a reconciliation after a conflict", async () => {

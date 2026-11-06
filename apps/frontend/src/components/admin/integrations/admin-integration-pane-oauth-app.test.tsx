@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { AdminIntegrationView } from "@cogniplane/shared-types";
 
@@ -46,6 +46,18 @@ it("asks for credentials on a new integration, marks required fields, and saves 
   await waitFor(() => expect(onSave).toHaveBeenCalledWith({ clientId: "app-1", clientSecret: "s3cret", authority: "" }));
 });
 
+it("shows the setup help of the integration, and generic text when it has none", () => {
+  const view = renderPane({ setupHelp: "Copy the values from the example app registration." });
+  expect(screen.getByText("Copy the values from the example app registration.")).toBeTruthy();
+  expect(screen.queryByText(/Provide the credentials/)).toBeNull();
+
+  view.unmount();
+  renderPane();
+  expect(
+    screen.getByText("Provide the credentials to allow users to connect their accounts.")
+  ).toBeTruthy();
+});
+
 it("fills saved values but never the secret, and masks the saved secret", () => {
   const { onClear } = renderPane({
     hasConfig: true,
@@ -61,6 +73,9 @@ it("fills saved values but never the secret, and masks the saved secret", () => 
   expect(screen.getByRole("button", { name: "Update configuration" })).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "Clear configuration" }));
+  expect(onClear).not.toHaveBeenCalled();
+  expect(screen.getByRole("dialog", { name: "Clear SharePoint configuration?" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Clear SharePoint configuration" }));
   expect(onClear).toHaveBeenCalledTimes(1);
 });
 
@@ -72,22 +87,67 @@ it("masks an empty secret field while a configuration exists, and unmasks it onc
   expect(input(/Client secret/).placeholder).toBe("");
 });
 
-it("resyncs the form when the saved integration changes", () => {
+it("keeps dirty values across a background saved-row change until explicit reload", () => {
   const { rerender, onSave, onClear } = renderPane({ hasConfig: true, configSummary: { clientId: "app-1" }, updatedAt: "2026-10-01T00:00:00.000Z" });
   fireEvent.change(input(/Client ID/), { target: { value: "draft" } });
+  fireEvent.change(input(/Client secret/), { target: { value: "fictional-only-secret" } });
 
   rerender(<AdminIntegrationPaneOauthApp
     integration={{ ...base, hasConfig: true, configSummary: { clientId: "app-2" }, updatedAt: "2026-10-02T00:00:00.000Z" }}
     busy={false} error={null} onSave={onSave} onClear={onClear}
   />);
 
+  expect(input(/Client ID/).value).toBe("draft");
+  expect(input(/Client secret/).value).toBe("fictional-only-secret");
+  expect(screen.getByRole("status").textContent).toMatch(/saved configuration changed/i);
+  fireEvent.click(screen.getByRole("button", { name: "Reload saved values and discard my entries" }));
   expect(input(/Client ID/).value).toBe("app-2");
+  expect(input(/Client secret/).value).toBe("");
+  expect(screen.queryByRole("status")).toBeNull();
 });
 
 it("locks the form while saving", () => {
   renderPane({ hasConfig: true }, true);
 
   expect(input(/Client ID/).disabled).toBe(true);
-  expect((screen.getByRole("button", { name: "Saving..." }) as HTMLButtonElement).disabled).toBe(true);
-  expect((screen.getByRole("button", { name: "Clear configuration" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Saving configuration..." }) as HTMLButtonElement).getAttribute("aria-disabled")).toBe("true");
+  expect((screen.getByRole("button", { name: "Clear configuration" }) as HTMLButtonElement).getAttribute("aria-disabled")).toBe("true");
+});
+
+
+it("adopts refreshed saved data when clean and resets when the integration changes", () => {
+  const { rerender, onSave, onClear } = renderPane({ configSummary: { clientId: "app-1" } });
+  rerender(<AdminIntegrationPaneOauthApp integration={{ ...base, configSummary: { clientId: "app-2" } }} busy={false} error={null} onSave={onSave} onClear={onClear} />);
+  expect(input(/Client ID/).value).toBe("app-2");
+  fireEvent.change(input(/Client ID/), { target: { value: "unsent" } });
+  rerender(<AdminIntegrationPaneOauthApp integration={{ ...base, id: "other", configSummary: { clientId: "other-app" } }} busy={false} error={null} onSave={onSave} onClear={onClear} />);
+  expect(input(/Client ID/).value).toBe("other-app");
+});
+
+it.each([true, false])("preserves later focus after a held save returning %s", async (success) => {
+  let finish!: (value: boolean) => void;
+  const onSave = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+  render(<AdminIntegrationPaneOauthApp integration={{ ...base, hasConfig: true }} busy={false} error={null} onSave={onSave} onClear={vi.fn()} />);
+  const save = screen.getByRole("button", { name: "Update configuration" });
+  save.focus();
+  fireEvent.click(save);
+  fireEvent.click(save);
+  expect(onSave).toHaveBeenCalledTimes(1);
+  const clear = screen.getByRole("button", { name: "Clear configuration" });
+  clear.focus();
+  await act(async () => { finish(success); });
+  expect(document.activeElement).toBe(clear);
+});
+
+it("retains failed-save entries and clears a submitted password only after success", async () => {
+  const onSave = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+  render(<AdminIntegrationPaneOauthApp integration={base} busy={false} error={null} onSave={onSave} onClear={vi.fn()} />);
+  fireEvent.change(input(/Client ID/), { target: { value: "sample-draft" } });
+  fireEvent.change(input(/Client secret/), { target: { value: "fictional-only-secret" } });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Save configuration" })); });
+  expect(input(/Client ID/).value).toBe("sample-draft");
+  expect(input(/Client secret/).value).toBe("fictional-only-secret");
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Save configuration" })); });
+  expect(input(/Client ID/).value).toBe("sample-draft");
+  expect(input(/Client secret/).value).toBe("");
 });

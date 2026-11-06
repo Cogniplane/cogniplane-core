@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { PiiRecentResponse, PiiRecentRow, PiiTopResponse, PiiTopSessionRow, PiiTopUserRow } from "@cogniplane/shared-types";
 
@@ -19,7 +19,8 @@ afterEach(() => {
 function renderWithClient(ui: React.ReactElement) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   clients.push(client);
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  const result = render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return { ...result, client, rerenderProduct: (next: React.ReactElement) => result.rerender(<QueryClientProvider client={client}>{next}</QueryClientProvider>) };
 }
 
 function row(overrides: Partial<PiiRecentRow>): PiiRecentRow {
@@ -56,6 +57,12 @@ it("shows a scan without a session as a plain row", async () => {
 
   expect((await screen.findByText(/^Artifact/)).closest("a")).toBeNull();
   expect(screen.getByText(/^1 finding •/)).toBeTruthy();
+});
+
+it("says that a scan with mode off did not scan the subject", async () => {
+  renderFeed([row({ mode: "off", actionTaken: "allow", findingsCount: 0, entityTypes: [] })]);
+
+  expect(await screen.findByText(/^Not scanned •/)).toBeTruthy();
 });
 
 it("names project instructions with their revision and shows a failed scan's error", async () => {
@@ -122,10 +129,10 @@ it("switches to sessions, linking each to its PII tab and naming its user", asyn
   ]);
   await screen.findByText("u1");
 
-  fireEvent.click(screen.getByRole("tab", { name: "Sessions" }));
+  fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
 
   expect(await screen.findByText("session/1")).toBeTruthy();
-  expect(screen.getByRole("tab", { name: "Sessions" }).getAttribute("aria-selected")).toBe("true");
+  expect(screen.getByRole("button", { name: "Sessions" }).getAttribute("aria-pressed")).toBe("true");
   expect(linkOf("session/1")).toBe("/admin/sessions/session%2F1?tab=pii");
   expect(linkOf("s2")).toBe("/admin/sessions/s2?tab=pii");
   expect(screen.getByText("2 blocked")).toBeTruthy();
@@ -146,7 +153,97 @@ it.each([
   renderTop([], []);
   await screen.findByText("No users with findings in this range.");
 
-  fireEvent.click(screen.getByRole("tab", { name: tab }));
+  fireEvent.click(screen.getByRole("button", { name: tab }));
 
   expect(await screen.findByText(message)).toBeTruthy();
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+it.each(["top", "recent"] as const)("separates pending, failed, retry and empty %s reads", async kind => {
+  const pending = deferred<PiiTopResponse | PiiRecentResponse | null>();
+  const top = kind === "top";
+  const api = top ? getAdminPiiTop : getAdminPiiRecent;
+  const label = top ? "most findings" : "recent activity";
+  const empty = top ? { range: RANGE, groupBy: "user" as const, rows: [] } : { range: RANGE, actions: [], rows: [] };
+  vi.mocked(api).mockReturnValueOnce(pending.promise as never).mockResolvedValueOnce(empty as never);
+  renderWithClient(top ? <TopOffenders range="7d" /> : <RecentActivityFeed range="7d" />);
+  expect(screen.getByText(`Loading ${label} for 7d...`)).toBeTruthy();
+  expect(screen.queryByText(/^No (users|blocked)/)).toBeNull();
+  await act(async () => { pending.reject(new Error("sensitive transport text")); });
+  expect((await screen.findByRole("alert")).textContent).toContain(`Could not load ${label} for 7d.`);
+  expect(screen.queryByText(/^No (users|blocked)/)).toBeNull();
+  expect(screen.queryByText(/sensitive transport/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: `Retry ${label}` }));
+  await screen.findByText(top ? "No users with findings in this range." : "No blocked, transformed, or failed scans in this range.");
+  expect(api).toHaveBeenCalledTimes(2);
+});
+
+it.each(["top", "recent"] as const)("keeps optional null %s reads unavailable until a local retry succeeds", async kind => {
+  const top = kind === "top";
+  const api = top ? getAdminPiiTop : getAdminPiiRecent;
+  const empty = top ? { range: RANGE, groupBy: "user" as const, rows: [] } : { range: RANGE, actions: [], rows: [] };
+  vi.mocked(api).mockResolvedValueOnce(null).mockResolvedValueOnce(empty as never);
+  renderWithClient(top ? <TopOffenders range="7d" /> : <RecentActivityFeed range="7d" />);
+  await screen.findByText(top ? "Most findings are unavailable for 7d. Results are not available." : "Recent activity is unavailable for 7d. Results are not available.");
+  expect(screen.queryByText(/^No (users|blocked)/)).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: `Retry ${top ? "most findings" : "recent activity"}` }));
+  await screen.findByText(top ? "No users with findings in this range." : "No blocked, transformed, or failed scans in this range.");
+});
+
+it("uses a named pressed-button group and keeps a late user read out of the sessions result", async () => {
+  const users = deferred<PiiTopResponse | null>();
+  const sessions = deferred<PiiTopResponse | null>();
+  vi.mocked(getAdminPiiTop).mockImplementation(params => params.groupBy === "user" ? users.promise : sessions.promise);
+  renderWithClient(<TopOffenders range="7d" />);
+  expect(screen.getByRole("group", { name: "Group findings by" })).toBeTruthy();
+  expect(screen.queryByRole("tablist")).toBeNull();
+  const sessionButton = screen.getByRole("button", { name: "Sessions" });
+  expect(sessionButton.tabIndex).toBe(0);
+  expect(screen.getByRole("button", { name: "Users" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(sessionButton);
+  await act(async () => { sessions.resolve({ range: RANGE, groupBy: "session", rows: [sessionRow("active-session")] }); });
+  await screen.findByText("active-s…");
+  await act(async () => { users.resolve({ range: RANGE, groupBy: "user", rows: [userRow("late-user")] }); });
+  expect(screen.queryByTitle("late-user")).toBeNull();
+  expect(screen.getByTitle("active-session")).toBeTruthy();
+  expect(sessionButton.getAttribute("aria-pressed")).toBe("true");
+});
+
+it("does not show recent rows for the prior range while a new range is pending or failed", async () => {
+  const pending = deferred<PiiRecentResponse | null>();
+  vi.mocked(getAdminPiiRecent).mockResolvedValueOnce({ range: RANGE, actions: [], rows: [row({})] }).mockReturnValueOnce(pending.promise);
+  const view = renderWithClient(<RecentActivityFeed range="7d" />);
+  await screen.findByText(/^Message/);
+  view.rerenderProduct(<RecentActivityFeed range="24h" />);
+  await screen.findByText("Loading recent activity for 24h...");
+  expect(screen.queryByText(/^Message/)).toBeNull();
+  expect(screen.queryByText(/^Results shown for 7d/)).toBeNull();
+  await act(async () => { pending.reject(new Error("offline")); });
+  await screen.findByText(/Could not load recent activity for 24h/);
+  expect(screen.queryByText(/^No blocked/)).toBeNull();
+});
+
+it.each(["top", "recent"] as const)("identifies retained %s evidence after a failed background read and retries only that panel", async kind => {
+  const top = kind === "top";
+  const api = top ? getAdminPiiTop : getAdminPiiRecent;
+  const pending = deferred<PiiTopResponse | PiiRecentResponse | null>();
+  const response = top ? { range: RANGE, groupBy: "user" as const, rows: [userRow("kept-user")] } : { range: RANGE, actions: [], rows: [row({})] };
+  vi.mocked(api).mockResolvedValueOnce(response as never).mockReturnValueOnce(pending.promise as never).mockResolvedValueOnce(response as never);
+  const view = renderWithClient(top ? <TopOffenders range="7d" /> : <RecentActivityFeed range="7d" />);
+  await screen.findByText(/^Results shown for 7d/);
+  act(() => { void view.client.refetchQueries(); });
+  await screen.findByText(`Refreshing ${top ? "most findings" : "recent activity"} for 7d. Showing the last successful result.`);
+  await act(async () => { pending.reject(new Error("offline")); });
+  await screen.findByText(new RegExp(`Could not refresh ${top ? "most findings" : "recent activity"}`));
+  expect(screen.getByText(/^Results shown for 7d/).querySelector("time")!.dateTime).toBe(RANGE.from);
+  expect(screen.getByTitle(top ? "kept-user" : "msg-1234567890")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: `Retry ${top ? "most findings" : "recent activity"}` }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(api).toHaveBeenCalledTimes(3);
 });

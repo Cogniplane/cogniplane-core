@@ -91,6 +91,17 @@ describe("calculateCostUsd", () => {
     }))).toBeCloseTo(expected, 6);
   });
 
+  it.each([
+    { inputTokens: 272_000, cachedInputTokens: 50_000, expected: 0.222 * 1 + 0.05 * 0.05 + 0.05 * 5 },
+    { inputTokens: 272_001, cachedInputTokens: 50_000, expected: 0.222001 * 2 + 0.05 * 0.1 + 0.05 * 7.5 }
+  ])("prices GPT-6.1 Terra at $inputTokens input tokens", ({ inputTokens, cachedInputTokens, expected }) => {
+    expect(calculateCostUsd("gpt-6.1-terra", usage({
+      inputTokens,
+      cachedInputTokens,
+      outputTokens: 50_000
+    }))).toBeCloseTo(expected, 6);
+  });
+
   it("applies Haiku 5.5's long-context tier above 100K input tokens, cache reads included", () => {
     // 100K prompt tokens (half cached) stays on the short tier.
     expect(calculateCostUsd("claude-haiku-5-5", usage({ inputTokens: 100_000, cachedInputTokens: 50_000, outputTokens: 10_000 })))

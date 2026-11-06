@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -73,6 +73,8 @@ function renderCard(overrides: {
   saveError?: string;
   openRouterModels?: OpenRouterModelOption[];
   onAddModel?: (input: CustomModelCreateRequest) => Promise<boolean>;
+  readError?: string;
+  onRetryRead?: () => Promise<void>;
 } = {}) {
   const onSave = vi.fn(overrides.onSave ?? (async () => true));
   const onRemoveModel = vi.fn(overrides.onRemoveModel ?? (async () => ({ ...settings, version: settings.version + 1 })));
@@ -93,6 +95,8 @@ function renderCard(overrides: {
       onRemoveModel={onRemoveModel}
       providerKeys={{ ...providerKeys, targetProvider: overrides.targetProvider }}
       saveError={overrides.saveError ?? null}
+      readError={overrides.readError}
+      onRetryRead={overrides.onRetryRead}
     />
   );
   return { onSave, onRemoveModel, onAddModel, onNeedOpenRouterModels };
@@ -138,7 +142,8 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
     const { onSave } = renderCard({ settings: { ...settings, defaultModelId: CUSTOM_MODEL_ID } });
     fireEvent.click(screen.getByRole("checkbox", { name: /OpenAI/i }));
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
     await waitFor(() => expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(""));
     fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
     await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ defaultModelId: null })));
@@ -170,7 +175,8 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
     // Remove the custom model (Codex P2: previously the dirty draft kept the
     // deleted id in enabledModelIds and the next Save got a 400).
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
     await waitFor(() => expect(onRemoveModel).toHaveBeenCalledWith(CUSTOM_MODEL_ID));
 
     fireEvent.click(screen.getByRole("button", { name: /Save model availability/i }));
@@ -191,7 +197,8 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
 
     fireEvent.click(screen.getByRole("checkbox", { name: /OpenAI/i }));
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
     await waitFor(() => expect(onRemoveModel).toHaveBeenCalled());
 
     fireEvent.click(screen.getByRole("button", { name: /Save model availability/i }));
@@ -263,11 +270,11 @@ it("summarizes the models and hides the save bar until something changes", async
 
 it("shows each provider's on/off choice and selected model count, and saves the choice with the draft", async () => {
   const { onSave } = renderCard();
-  expect(await screen.findAllByText("On, but it needs a key.")).toHaveLength(3);
-  expect(screen.getAllByText("On. 1 model available.")).toHaveLength(2);
+  expect(await screen.findAllByText(/^On, but it needs a key\./)).toHaveLength(3);
+  expect(screen.getAllByText(/^On\. 1 model available\./)).toHaveLength(2);
   const anthropic = screen.getByRole("checkbox", { name: "Use Anthropic" });
   fireEvent.click(anthropic);
-  expect(screen.getByText("Off. Tick Use and save to show its 1 model.")).toBeTruthy();
+  expect(screen.getByText(/^Off\. Tick Use and save to show its 1 model\./)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
   await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ enabledProviders: ["openai", "google", "openrouter", "zai"] })));
 });
@@ -304,6 +311,7 @@ it("announces a successful save and keeps focus on the page", async () => {
   fireEvent.change(await screen.findByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
   const status = screen.getByRole("status");
   expect(status.textContent).toBe("Unsaved changes");
+  screen.getByRole("button", { name: "Save model availability" }).focus();
   fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
   await waitFor(() => expect(status.textContent).toBe("Model availability saved."));
   expect(document.activeElement).toBe(status);
@@ -359,4 +367,177 @@ describe("AdminModelAvailabilityCard add custom model", () => {
     // The add failed, so the admin keeps the input to correct it.
     expect((screen.getByLabelText("Display name") as HTMLInputElement).value).toBe(" GPT-6 Preview ");
   });
+});
+
+it("keeps later edits dirty, adopts the saved version, and ignores a second pending Save", async () => {
+  let finish!: (value: ModelAvailabilitySaveResult) => void;
+  const held = new Promise<ModelAvailabilitySaveResult>(resolve => { finish = resolve; });
+  const onSave = vi.fn().mockReturnValueOnce(held).mockResolvedValue(false);
+  renderCard({ onSave });
+  const select = await screen.findByLabelText("Default model");
+  fireEvent.change(select, { target: { value: CUSTOM_MODEL_ID } });
+  const submit = screen.getByRole("button", { name: "Save model availability" });
+  submit.focus();
+  fireEvent.click(submit);
+  expect(document.activeElement?.textContent).toContain("Saving submitted availability");
+  fireEvent.click(submit);
+  fireEvent.change(select, { target: { value: "deepagents/claude-sonnet-5" } });
+  await act(async () => finish({ saved: { ...settings, version: 9, defaultModelId: CUSTOM_MODEL_ID } }));
+  expect((select as HTMLSelectElement).value).toBe("deepagents/claude-sonnet-5");
+  expect(screen.getByText("Unsaved changes")).toBeTruthy();
+  expect(screen.getByText(/Your later edits are still unsaved/)).toBeTruthy();
+  expect(onSave).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+  expect(onSave).toHaveBeenLastCalledWith(expect.objectContaining({ expectedVersion: 9, defaultModelId: "deepagents/claude-sonnet-5" }));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByText(/Your later edits are still unsaved/)).toBeNull();
+});
+
+it("keeps focus where the administrator moved it during a Save", async () => {
+  let finish!: (value: ModelAvailabilitySaveResult) => void;
+  renderCard({ onSave: () => new Promise(resolve => { finish = resolve; }) });
+  fireEvent.change(await screen.findByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+  const save = screen.getByRole("button", { name: "Save model availability" });
+  save.focus();
+  fireEvent.click(save);
+  const destination = screen.getByRole("button", { name: "Choose models" });
+  destination.focus();
+  await act(async () => finish(true));
+  expect(document.activeElement).toBe(destination);
+});
+
+it("reveals owned Save feedback after the sticky bar becomes a completed result", async () => {
+  let finish!: (value: ModelAvailabilitySaveResult) => void;
+  renderCard({ onSave: () => new Promise(resolve => { finish = resolve; }) });
+  fireEvent.change(await screen.findByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+  const save = screen.getByRole("button", { name: "Save model availability" });
+  const status = screen.getByRole("status");
+  const reveal = vi.fn();
+  Element.prototype.scrollIntoView = reveal;
+  vi.spyOn(status, "getBoundingClientRect").mockImplementation(() => ({ top: status.textContent === "Model availability saved." ? 1500 : 300, bottom: status.textContent === "Model availability saved." ? 1520 : 320 } as DOMRect));
+  save.focus();
+  fireEvent.click(save);
+  expect(reveal).not.toHaveBeenCalled();
+  await act(async () => finish(true));
+  expect(document.activeElement).toBe(status);
+  await waitFor(() => expect(reveal).toHaveBeenCalledWith({ block: "center", inline: "nearest", behavior: "instant" }));
+});
+
+it("locks an idle Add form during availability Save without claiming an Add is running", async () => {
+  let finish!: (value: ModelAvailabilitySaveResult) => void;
+  const { onAddModel } = renderCard({ onSave: () => new Promise(resolve => { finish = resolve; }) });
+  fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+  fireEvent.change(screen.getByLabelText("OpenRouter slug"), { target: { value: "sample/idle" } });
+  fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+  fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
+  const form = screen.getByLabelText("OpenRouter slug").closest("form")!;
+  expect(form.querySelector("fieldset")?.disabled).toBe(true);
+  expect(within(form).getByRole("button", { name: "Add model" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Adding model..." })).toBeNull();
+  expect(onAddModel).not.toHaveBeenCalled();
+  await act(async () => finish(true));
+});
+
+it("requires a named removal decision, holds it pending, and keeps it after failure", async () => {
+  let finish!: (value: TenantSettings | null) => void;
+  const { onRemoveModel } = renderCard({ settings: { ...settings, defaultModelId: CUSTOM_MODEL_ID, enabledModelIds: [CUSTOM_MODEL_ID] }, onRemoveModel: () => new Promise(resolve => { finish = resolve; }) });
+  fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+  fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
+  expect(onRemoveModel).not.toHaveBeenCalled();
+  expect(screen.getByText(/last saved selected model/)).toBeTruthy();
+  const confirm = screen.getByRole("button", { name: "Confirm model removal" });
+  confirm.focus();
+  fireEvent.click(confirm);
+  expect(document.activeElement?.textContent).toBe("Removing Kimi K3 (OpenRouter)...");
+  fireEvent.click(confirm);
+  expect(screen.getByRole("button", { name: "Removing model..." })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Keep model" }) as HTMLButtonElement).disabled).toBe(true);
+  await act(async () => finish(null));
+  expect(onRemoveModel).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("alert").textContent).toContain("Could not remove Kimi K3");
+  expect(screen.getByRole("button", { name: "Confirm model removal" })).toBeTruthy();
+});
+
+it.each([false, true])("keeps custom-add focus on its named pending and result feedback, moved elsewhere: %s", async (moveAway) => {
+  let finish!: (ok: boolean) => void;
+  const { onAddModel } = renderCard({ onAddModel: () => new Promise(resolve => { finish = resolve; }) });
+  fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+  fireEvent.change(screen.getByLabelText("OpenRouter slug"), { target: { value: "sample/focus-model" } });
+  const submit = within(screen.getByLabelText("OpenRouter slug").closest("form")!).getByRole("button", { name: "Add model" });
+  submit.focus();
+  fireEvent.click(submit);
+  expect(document.activeElement?.textContent).toBe("Adding sample/focus-model...");
+  expect(document.activeElement?.getAttribute("role")).toBe("status");
+  fireEvent.click(submit);
+  const outside = screen.getByRole("button", { name: "Choose models" });
+  if (moveAway) outside.focus();
+  await act(async () => finish(true));
+  expect(onAddModel).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(/sample\/focus-model added/)).toBeTruthy();
+  expect(document.activeElement).toBe(moveAway ? outside : screen.getByText(/sample\/focus-model added/));
+  expect((screen.getByLabelText("OpenRouter slug") as HTMLInputElement).value).toBe("");
+});
+
+it("keeps failed-read recovery in the Save status and keeps outside focus after retry", async () => {
+  let finish!: () => void;
+  const retry = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+  renderCard({ readError: "Changes paused. Your draft is kept.", onRetryRead: retry });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Use OpenAI" }));
+  const recover = screen.getByRole("button", { name: "Retry model data" });
+  recover.focus();
+  fireEvent.click(recover);
+  expect(document.activeElement?.getAttribute("role")).toBe("status");
+  expect(document.activeElement?.textContent).toContain("Changes paused. Your draft is kept.");
+  const outside = screen.getByRole("button", { name: "Choose models" });
+  outside.focus();
+  await act(async () => finish());
+  expect(retry).toHaveBeenCalledTimes(1);
+  expect(document.activeElement).toBe(outside);
+});
+
+it("keeps a keyboard suggestion mounted while focus enters it", async () => {
+  renderCard({ openRouterModels: [{ id: "MixedCase/Exact-Slug", name: "Keyboard model", contextLength: 200000 }] });
+  fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+  const input = screen.getByLabelText("OpenRouter slug");
+  fireEvent.change(input, { target: { value: "key" } });
+  const suggestion = screen.getByRole("button", { name: /Keyboard model/ });
+  fireEvent.blur(input, { relatedTarget: suggestion });
+  suggestion.focus();
+  await act(async () => new Promise(resolve => setTimeout(resolve, 180)));
+  expect(document.activeElement).toBe(suggestion);
+  fireEvent.click(suggestion);
+  expect((input as HTMLInputElement).value).toBe("MixedCase/Exact-Slug");
+});
+
+it("checks the integer context limits and exact slug before submitting manual metadata", async () => {
+  Element.prototype.scrollIntoView = vi.fn();
+  const { onAddModel } = renderCard({ onAddModel: async () => false });
+  fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "Provider" }));
+  fireEvent.click(await screen.findByRole("option", { name: "OpenAI" }));
+  const slug = screen.getByLabelText("Vendor model id");
+  const context = screen.getByLabelText("Context window");
+  const submit = screen.getAllByRole("button", { name: "Add model" }).at(-1) as HTMLButtonElement;
+  fireEvent.change(slug, { target: { value: " MixedCase/Exact-Slug " } });
+  fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Sample model" } });
+  for (const value of ["999", "1000.5", "100000001"]) {
+    fireEvent.change(context, { target: { value } });
+    expect(submit.disabled).toBe(true);
+  }
+  fireEvent.change(context, { target: { value: "1000" } });
+  for (const value of ["x".repeat(151), "model with space", "../model"]) {
+    fireEvent.change(slug, { target: { value } });
+    expect(submit.disabled).toBe(true);
+  }
+  fireEvent.change(slug, { target: { value: " MixedCase/Exact-Slug " } });
+  fireEvent.click(submit);
+  await waitFor(() => expect(onAddModel).toHaveBeenCalledWith({ provider: "openai", vendorModelId: "MixedCase/Exact-Slug", displayName: "Sample model", contextWindow: 1000 }));
+});
+
+it.each([null, []] as const)("keeps the saved all-model versus empty-list distinction: %s", async (enabledModelIds) => {
+  const { onSave } = renderCard({ settings: { ...settings, enabledModelIds: enabledModelIds as string[] | null } });
+  fireEvent.click(screen.getByRole("checkbox", { name: "Use OpenAI" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
+  await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ enabledModelIds })));
 });

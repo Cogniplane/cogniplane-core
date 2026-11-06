@@ -30,7 +30,7 @@ Proxy MCP servers can use HTTP or HTTPS URLs on the backend host, LAN, or a tail
 | **Redis 6+** | Refresh-token `jti` revocation, shared rate limits across multiple backend instances. | Any managed Redis (Upstash, ElastiCache, Memorystore, self-hosted). Without Redis, rate limits and quotas are per-process — fine for a single instance, broken for a horizontal-scaled deployment. |
 | **S3-compatible object storage** | Artifact uploads and (in `bucket` mode) skill bundles. | AWS S3, Cloudflare R2, MinIO, GCS with S3 compat. The skill-bundle backend reuses `ARTIFACT_BUCKET_*` credentials by design. |
 | **E2B account** | Per-session agent sandboxes. | Sign up at [e2b.dev](https://e2b.dev). You'll need an API key and you'll build a custom template (next section). |
-| **WorkOS** | SSO. Optional if you can live with `dev-headers` mode, but **do not run `dev-headers` in production** — it accepts user/tenant ids from request headers with no verification. | [workos.com](https://workos.com) — set up an organization, configure SAML/OIDC, get the API key + client id. |
+| **WorkOS** (optional) | SSO through WorkOS. Not needed when your tenants use local accounts (email and password). **Do not run `dev-headers` in production** — it accepts user/tenant ids from request headers with no verification. | [workos.com](https://workos.com) — set up an organization, configure SAML/OIDC, get the API key + client id. |
 | **Node.js 24 LTS** | Runtime for the backend. The workspace pins `engines.node` to `>=24.0.0`. | The frontend is a Next.js app. This repository's Cloudflare build uses `@opennextjs/cloudflare`; verify the build and deployment path for your target. |
 
 ## Build the E2B sandbox template
@@ -80,15 +80,86 @@ Run `pnpm db:migrate` before starting the new backend. Migrations track applied 
 ### Authentication
 
 ```bash
-AUTH_MODE=workos                      # Production. dev-headers is a security hole in production.
+AUTH_MODE=jwt                         # Production. dev-headers is a security hole in production.
+AUTH_LOGIN_TYPES=local                # workos, local, or both: workos,local
+WEBAUTHN_RP_ID=app.example.com        # optional: turns on passkeys; the frontend's hostname
+SMTP_URL=smtps://user:password@smtp.example.com:465   # optional: email for local accounts
+MAIL_FROM=Cogniplane <no-reply@example.com>           # required with SMTP_URL
 JWT_SECRET=<32+ random bytes>         # Refresh-token signing. Rotate via JWT_KEY_ID infrastructure.
 JWT_KEY_ID=v1                         # Stamp on tokens; lets you rotate JWT_SECRET without invalidating in-flight tokens.
 DATA_ENCRYPTION_SECRET=<32+ random bytes>  # AES-256-GCM key for OAuth-token at-rest encryption.
 
+# Only when AUTH_LOGIN_TYPES includes workos:
 WORKOS_API_KEY=<from WorkOS dashboard>
 WORKOS_CLIENT_ID=<from WorkOS dashboard>
 WORKOS_REDIRECT_URI=https://your-frontend-host/auth/callback
 ```
+
+`AUTH_MODE=workos` still works: it is the earlier name for `AUTH_MODE=jwt` with
+`AUTH_LOGIN_TYPES=workos`.
+
+**Each tenant has one login type, set when the tenant is created. You cannot
+change it later.** WorkOS creates `workos` tenants at the first sign-in of an
+organization. You create `local` tenants with a command (next section). A
+client that starts with local accounts and later wants SSO gets a new tenant.
+
+#### Local accounts
+
+Local accounts sign in with email and password. Passwords are hashed with
+Argon2id (Node 24.7 or later is required). Create a local tenant and its first
+owner:
+
+```bash
+MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend auth:bootstrap \
+  --tenant-name "Acme" --owner-email owner@acme.example
+```
+
+The command prints a one-time setup link (valid 72 hours). Send it to the owner
+in a private message. The owner sets a password, then adds people in
+**Admin › People**; each new person gets their own setup link. Owners and admins
+can reset a password (a one-time link), disable or enable an account, and sign a
+person out of every device. Resetting and disabling ask for the manager's own
+password again. The person who holds a reset link can set the password, so send
+links only to the person they are for.
+
+People can add an authenticator app in **Settings › Sign-in & security** and
+get 10 recovery codes. In **Admin › People**, a manager can make two-step
+verification required for owners and admins, or for everyone; only an owner can
+make the rule weaker. If a person loses their phone and their recovery codes, a
+manager resets their two-step verification, and the person sets it up again at
+the next sign-in. Manager actions ask for a code from the manager's own
+authenticator app when the manager has one.
+
+To turn on passkeys, set `WEBAUTHN_RP_ID` to the hostname of the frontend
+(`API_ORIGIN`). People can then add passkeys in **Settings › Sign-in &
+security**, sign in with a passkey and no password, and use a passkey as their
+second step. Passkeys are bound to `WEBAUTHN_RP_ID`: if you change it later,
+every registered passkey stops working, and people need a recovery code or a
+manager reset.
+
+To send email to local accounts, set `SMTP_URL` and `MAIL_FROM` (both or
+neither). Use your mail provider's SMTP relay with `smtps://` (port 465) or
+`smtp://` (port 587, STARTTLS is required). People then get a security notice
+when their password changes, when a second factor is added or removed, and
+when a manager resets their second factors. Setup and reset links then go
+to the person by email, not to the manager, and the People page shows whether
+the email went out, with "Send the link again". The sign-in page
+also offers "Forgot your password?": a person gets a reset link by email that
+works for 30 minutes (their two-step verification stays). Messages wait in
+the database (encrypted) until a backend process sends them, and are retried
+when the relay is down. Configure SPF, DKIM, and DMARC for the domain of
+`MAIL_FROM`, or receiving servers can mark the messages as spam.
+
+If an owner loses their password and no other owner can help:
+
+```bash
+MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend auth:recover-owner \
+  --tenant-id <tenant id> --email owner@acme.example
+```
+
+This ends all of the owner's sessions, removes the password and the second
+factors, writes an audit event, and prints a new setup link. In the container image the commands are
+`node dist/scripts/auth-bootstrap.js` and `node dist/scripts/auth-recover-owner.js`.
 
 `JWT_SECRET` and `DATA_ENCRYPTION_SECRET` MUST differ from the placeholder values in `.env.example`. The boot-time validator will reject placeholders in production.
 
@@ -100,7 +171,7 @@ The WorkOS redirect URI must match exactly what's registered in your WorkOS dash
 REDIS_URL=rediss://default:<password>@<host>:6379  # TLS-required for production
 ```
 
-Required for `AUTH_MODE=workos`. The refresh-token `jti` is consumed atomically via `GETDEL` on every refresh; without Redis, you have no replay defense. Also used for shared rate limits and quotas across multiple backend instances.
+Required for `AUTH_MODE=jwt`. The refresh-token `jti` is consumed atomically via `GETDEL` on every refresh; without Redis, you have no replay defense. Also used for shared rate limits and quotas across multiple backend instances.
 
 ### Object storage
 
@@ -197,7 +268,7 @@ If your frontend and backend are on different domains (typical), the WorkOS refr
 Before you point real users at it:
 
 - [ ] **RLS is active.** Connect as `app_user` (not superuser), forget to set `app.current_tenant_id`, query a tenant-scoped table — should return zero rows. If it returns rows, stop and fix.
-- [ ] **`AUTH_MODE=workos`**, NOT `dev-headers`.
+- [ ] **`AUTH_MODE=jwt`** (or its alias `workos`), NOT `dev-headers`.
 - [ ] **`JWT_SECRET` and `DATA_ENCRYPTION_SECRET` are not placeholder values.** The boot validator will reject `local-dev-jwt-secret-change-in-production!!`.
 - [ ] **`REDIS_URL` is configured.** Without it, refresh-token reuse detection is broken.
 - [ ] **TLS in front of the backend.** HSTS is sent on every response (2-year preload); serving HTTPS is required for it to make sense.
@@ -205,7 +276,7 @@ Before you point real users at it:
 - [ ] **`E2B_TEMPLATE_ID` matches what `make e2b-build` produced.** The backend fails fast on the placeholder default, but it cannot detect a stale-but-real id — verify after every template rebuild under a new name.
 - [ ] **Database backups configured.** Postgres is the only durable state — sessions, messages, audit events, integrations all live there. Treat it like the production database it is.
 - [ ] **Log retention policy set.** Tool events (`tool_events`) and audit events (`audit_events`) accumulate. Decide your retention before they fill the disk.
-- [ ] **At least one user is `owner` of each tenant.** First-member owner promotion is automatic on the first WorkOS callback, but verify it actually happened.
+- [ ] **At least one user is `owner` of each tenant.** First-member owner promotion is automatic on the first WorkOS callback, but verify it actually happened. For a local tenant, `auth:bootstrap` creates the owner.
 
 ## Operating concerns
 

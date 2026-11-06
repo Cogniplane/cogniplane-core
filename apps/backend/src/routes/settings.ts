@@ -1,13 +1,8 @@
 
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import {
-  GithubAllowedRepositoriesRequestSchema,
-  GithubAllowedRepositoriesResponseSchema,
-  GithubConnectionStatusSchema,
-  GithubRepositoryListResponseSchema,
-  NotionConnectionStatusSchema,
   ScheduledJobEnvelopeSchema,
   ScheduledJobPreviewRequestSchema,
   ScheduledJobPreviewResponseSchema,
@@ -28,24 +23,15 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import {
-  GithubConnectionError,
-  GithubConnectionNotConfiguredError
-} from "../services/integrations/github/github-connection-service.js";
-import { InvalidGithubRepositoryListError } from "../services/integrations/github/github-repository-allowlist.js";
-import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
-import { NotionConnectionNotConfiguredError } from "../services/integrations/notion/notion-connection-service.js";
-import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
-import type { NotionConnectionService } from "../services/integrations/notion/notion-connection-service.js";
-import type { IntegrationStateStore } from "../services/integrations/integration-state-store.js";
 import type { IntegrationRegistryService } from "../services/integrations/integration-registry-service.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
-import type { ChatPromptGateStores } from "../services/pii/chat-prompt-pii.js";
-import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
+import { PiiProtectionServiceError, type PiiProtectionService } from "../services/pii/pii-protection-service.js";
 import { scheduledJobPrompt } from "../services/scheduler-worker.js";
+import { requestSecurityVersion } from "../services/auth/security-change.js";
 import {
   userSettingsSectionKeys,
+  type ScheduledJobOwnerSession,
   type ScheduledJobRecord,
   type UserSettingsStore
 } from "../services/user-settings-store.js";
@@ -126,12 +112,27 @@ async function resolveScheduledJobPersistenceInput(
   }
 }
 
+// The security version of the session that saves the job. The scheduler
+// pauses the job after a later security change of the account (password
+// change or reset, sign out everywhere), so a job that a stolen access token
+// saved stops acting as the owner. requestSecurityVersion has the rule for a
+// WorkOS session (null) and for AUTH_MODE=dev-headers (the version now).
+async function scheduledJobOwnerSession(
+  request: FastifyRequest,
+  stores: Pick<SettingsRouteStores, "settings" | "config">
+): Promise<ScheduledJobOwnerSession> {
+  return {
+    ownerSecurityVersion: await requestSecurityVersion(request.auth, stores.config.AUTH_MODE, (tenantId, userId) =>
+      stores.settings.getOwnerSecurityVersion(tenantId, userId))
+  };
+}
+
 // Tell the owner at save time that the policy blocks the prompt. This is a
 // convenience only: the worker checks again at every run, because the policy
 // can change. An outage does not stop the save for the same reason.
 async function rejectBlockedScheduledPrompt(
   reply: FastifyReply,
-  piiProtection: ChatPromptGateStores["piiProtection"],
+  piiProtection: SettingsRouteStores["piiProtection"],
   tenantId: string,
   job: { enabled: boolean; input: ScheduledJobRecord["input"] }
 ): Promise<unknown | null> {
@@ -156,39 +157,11 @@ async function rejectBlockedScheduledPrompt(
   }
 }
 
-const GITHUB_CONNECTION_ERROR_STATUS: Record<GithubConnectionError["code"], number> = {
-  not_connected: 404,
-  credentials_unusable: 409,
-  upstream_unavailable: 502,
-  account_changed: 409
-};
-
-// Maps the failures of a GitHub repository settings request to a response.
-// Anything else is a bug and rethrows to the global error handler.
-function sendGithubRepositoryError(reply: FastifyReply, error: unknown) {
-  if (error instanceof GithubConnectionNotConfiguredError) {
-    reply.code(503);
-    return notFoundError("github_integration_not_configured");
-  }
-  if (error instanceof GithubConnectionError) {
-    reply.code(GITHUB_CONNECTION_ERROR_STATUS[error.code]);
-    return apiError(`github_${error.code}`, error.message);
-  }
-  if (error instanceof InvalidGithubRepositoryListError) {
-    reply.code(400);
-    return apiError("invalid_request", error.message);
-  }
-  throw error;
-}
-
 export function buildSettingsRouteStores(deps: AppDependencies, extras: { config: AppConfig }) {
   return {
     settings: deps.userSettings,
     auditEvents: deps.auditEvents,
-    githubConnections: deps.githubConnectionService,
-    notionConnections: deps.notionConnectionService,
     config: extras.config,
-    integrationStates: deps.integrationStates,
     integrationRegistry: deps.integrationRegistry,
     limits: deps.limits,
     piiProtection: deps.piiProtection
@@ -206,25 +179,14 @@ export type SettingsRouteStores = {
     | "updateScheduledJob"
     | "deleteScheduledJob"
     | "listJobRuns"
+    | "getOwnerSecurityVersion"
   >;
   auditEvents: Pick<AuditEventStore, "create">;
-  githubConnections: Pick<
-    GithubConnectionService,
-    | "getConnectionStatus"
-    | "getAuthorizationUrl"
-    | "disconnect"
-    | "listAccessibleRepositories"
-    | "setAllowedRepositories"
-  >;
-  notionConnections: Pick<
-    NotionConnectionService,
-    "getConnectionStatus" | "getAuthorizationUrl" | "disconnect"
-  >;
   config: AppConfig;
-  integrationStates: Pick<IntegrationStateStore, "get">;
   integrationRegistry: Pick<IntegrationRegistryService, "getIntegrationsForUser">;
   limits: RequestLimitsInterface;
-  piiProtection?: ChatPromptGateStores["piiProtection"];
+  // The save-time check records nothing, so it needs only the decision.
+  piiProtection?: Pick<PiiProtectionService, "evaluateText">;
 };
 
 export async function registerSettingsRoutes(
@@ -284,94 +246,6 @@ export async function registerSettingsRoutes(
     });
   });
 
-  app.get("/me/github-connection", async (request) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    const [status, enablement] = await Promise.all([
-      stores.githubConnections.getConnectionStatus(tenantId, userId),
-      loadIntegrationEnablement(stores.integrationStates, stores.config, tenantId, "github")
-    ]);
-    return serialize(GithubConnectionStatusSchema, { ...status, ...enablement });
-  });
-
-  app.post("/me/github-connection/authorize", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-
-    try {
-      const { url, browserBinding } = await stores.githubConnections.getAuthorizationUrl({
-        tenantId,
-        userId
-      });
-      reply.setCookie(browserBinding.name, browserBinding.value, browserBinding.options);
-      return { url };
-    } catch (error) {
-      if (error instanceof GithubConnectionNotConfiguredError) {
-        reply.code(503);
-        return notFoundError("github_integration_not_configured");
-      }
-      throw error;
-    }
-  });
-
-  // The choices for the allowed-repository list: what GitHub lets the member
-  // reach. The model has no tool that calls this.
-  app.get("/me/github-connection/repositories", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    try {
-      const listing = await stores.githubConnections.listAccessibleRepositories(tenantId, userId);
-      return serialize(GithubRepositoryListResponseSchema, listing);
-    } catch (error) {
-      return sendGithubRepositoryError(reply, error);
-    }
-  });
-
-  // Tenant and user come from `request.auth`. The browser sends the list and
-  // the GitHub account it chose the list for. The service validates and
-  // normalizes the list, and answers 409 `github_account_changed` when another
-  // account is connected now.
-  app.put("/me/github-connection/repositories", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    const body = parseRequestInput(reply, GithubAllowedRepositoriesRequestSchema, request.body);
-    if (!body.ok) return body.response;
-    try {
-      const allowedRepositories = await stores.githubConnections.setAllowedRepositories(
-        tenantId,
-        userId,
-        body.value.repositories,
-        body.value.githubUserId
-      );
-      return serialize(GithubAllowedRepositoriesResponseSchema, { allowedRepositories });
-    } catch (error) {
-      return sendGithubRepositoryError(reply, error);
-    }
-  });
-
-  app.delete("/me/github-connection", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    const removed = await stores.githubConnections.disconnect(tenantId, userId);
-    if (!removed) {
-      reply.code(404);
-      return notFoundError("github_connection_not_found");
-    }
-
-    reply.code(204);
-    return null;
-  });
-
-  app.get("/me/notion-connection", async (request) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    const [status, enablement] = await Promise.all([
-      stores.notionConnections.getConnectionStatus(tenantId, userId),
-      loadIntegrationEnablement(stores.integrationStates, stores.config, tenantId, "notion")
-    ]);
-    return serialize(NotionConnectionStatusSchema, { ...status, ...enablement });
-  });
-
   app.get("/me/integrations-availability", async (request) => {
     const { userId, tenantId } = request.auth;
     await ensureUser(app.db, userId);
@@ -386,38 +260,6 @@ export async function registerSettingsRoutes(
         writesEnabled: v.writesEnabled
       }))
     };
-  });
-
-  app.post("/me/notion-connection/authorize", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-
-    try {
-      const { url, browserBinding } = await stores.notionConnections.getAuthorizationUrl({
-        tenantId,
-        userId
-      });
-      reply.setCookie(browserBinding.name, browserBinding.value, browserBinding.options);
-      return { url };
-    } catch (error) {
-      if (error instanceof NotionConnectionNotConfiguredError) {
-        reply.code(503);
-        return notFoundError("notion_integration_not_configured");
-      }
-      throw error;
-    }
-  });
-
-  app.delete("/me/notion-connection", async (request, reply) => {
-    const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
-    const removed = await stores.notionConnections.disconnect(tenantId, userId);
-    if (!removed) {
-      reply.code(404);
-      return notFoundError("notion_connection_not_found");
-    }
-    reply.code(204);
-    return null;
   });
 
   app.get("/me/scheduled-jobs", async (request) => {
@@ -483,7 +325,7 @@ export async function registerSettingsRoutes(
     // requests cannot pass the check together.
     const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
     const created = await stores.settings.createScheduledJob(
-      { jobId: uuidv7(), ...persistenceInputResult.value },
+      { jobId: uuidv7(), ...persistenceInputResult.value, ...(await scheduledJobOwnerSession(request, stores)) },
       { maxActive }
     );
     if (created.status === "limit_reached") {
@@ -548,7 +390,14 @@ export async function registerSettingsRoutes(
     // disabled jobs and PUT-enable them all, bypassing both controls. Updates
     // that keep the job enabled (or disable it) are not gated — the active
     // count already includes the job itself.
-    if (persistenceInputResult.value.enabled && !existing.enabled) {
+    //
+    // A job that was paused after a security change does not use the limit
+    // when its owner turns it on again: one password change can pause more
+    // jobs than the window allows. The active-job cap below still applies.
+    if (
+      persistenceInputResult.value.enabled && !existing.enabled &&
+      existing.pausedReason !== "security_change"
+    ) {
       const rateLimitError = await stores.limits.consumeRateLimit({
         resource: "scheduled_job_create",
         userId,
@@ -563,10 +412,12 @@ export async function registerSettingsRoutes(
 
     // The store applies the active-job cap to a disabled to enabled change in
     // one locked transaction. It decides the transition from the job row it
-    // locks, not from the `existing` read above, which can be stale.
+    // locks, not from the `existing` read above, which can be stale. The edit
+    // also confirms the job for this session: a job that the scheduler paused
+    // after a security change can run again.
     const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
     const updated = await stores.settings.updateScheduledJob(
-      { jobId: paramsResult.value.jobId, ...persistenceInputResult.value },
+      { jobId: paramsResult.value.jobId, ...persistenceInputResult.value, ...(await scheduledJobOwnerSession(request, stores)) },
       { maxActive }
     );
 
@@ -589,7 +440,10 @@ export async function registerSettingsRoutes(
       sessionId: null,
       userId,
       type: "user.scheduled_job.updated",
-      payload: buildScheduledJobAuditPayload(job)
+      payload: {
+        ...buildScheduledJobAuditPayload(job),
+        ...(existing.pausedReason ? { previousPausedReason: existing.pausedReason } : {})
+      }
     });
 
     return serialize(ScheduledJobEnvelopeSchema, { scheduledJob: job });

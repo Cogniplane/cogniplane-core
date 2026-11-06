@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import type {
@@ -12,6 +12,7 @@ import type {
 } from "@cogniplane/shared-types";
 import { isTextReadableArtifact, SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -43,7 +44,12 @@ import {
 import { fetchModels } from "../lib/api-client";
 
 const SELECT =
-  "h-9 w-full min-w-0 rounded-md border border-outline-variant bg-surface-container-lowest px-2 text-sm disabled:opacity-50";
+  "h-9 w-full min-w-0 rounded-md border border-input bg-surface-container-lowest px-2 text-sm disabled:opacity-50";
+
+type FileEdit = { file: ProjectFile; name: string; folderId: string; asNew: boolean };
+type FileTask =
+  | { type: "edit"; edit: FileEdit }
+  | { type: "remove" | "history"; file: ProjectFile };
 
 function VersionPreview({
   projectId,
@@ -155,25 +161,17 @@ export function ProjectFiles({
   const [target, setTarget] = useState<ProjectFilePickerEntry | null>(null);
   const [targetSearch, setTargetSearch] = useState("");
   const [addOpen, setAddOpen] = useState(false);
-  const [editing, setEditing] = useState<{
-    file: ProjectFile;
-    name: string;
-    folderId: string;
-    asNew: boolean;
-  } | null>(null);
-  const [removing, setRemoving] = useState<ProjectFile | null>(null);
-  const [historyFile, setHistoryFile] = useState<ProjectFile | null>(null);
-  // Panels open below the list. Move focus into a panel when it opens, so
-  // keyboard and screen reader users reach it.
-  const removeConfirmRef = useRef<HTMLButtonElement>(null);
+  const [task, setTask] = useState<FileTask | null>(null);
+  const editing = task?.type === "edit" ? task.edit : null;
+  const removing = task?.type === "remove" ? task.file : null;
+  const historyFile = task?.type === "history" ? task.file : null;
+  const taskFile = task?.type === "edit" ? task.edit.file : task?.file;
+  const setEditing = (edit: FileEdit) => setTask({ type: "edit", edit });
+  const opener = useRef<HTMLElement | null>(null);
+  const listHeadingRef = useRef<HTMLHeadingElement>(null);
   const editNameRef = useRef<HTMLInputElement>(null);
   const historyHeadingRef = useRef<HTMLHeadingElement>(null);
-  const removingId = removing?.fileId;
-  const editingId = editing?.file.fileId;
-  const historyId = historyFile?.fileId;
-  useLayoutEffect(() => { if (removingId) removeConfirmRef.current?.focus(); }, [removingId]);
-  useLayoutEffect(() => { if (editingId) editNameRef.current?.focus(); }, [editingId]);
-  useLayoutEffect(() => { if (historyId) historyHeadingRef.current?.focus(); }, [historyId]);
+  const cancelRemovalRef = useRef<HTMLButtonElement>(null);
   const [preview, setPreview] = useState<{
     file: ProjectFile;
     version: ProjectFileVersion;
@@ -273,25 +271,25 @@ export function ProjectFiles({
     setFolderId(next);
     setRenamingFolder(false);
   };
-  const fileActions = (file: ProjectFile, version = file.version) => (
+  const fileActions = (file: ProjectFile, version = file.version, show: "all" | "preview" | "download" = "all") => (
     <>
-      {canPreviewArtifact({ mimeType: version.mimeType, status: "ready" }) ? (
+      {show !== "download" && canPreviewArtifact({ mimeType: version.mimeType, status: "ready" }) ? (
         <Button
-          size="xs"
-          variant="ghost"
+          size="sm"
+          variant="outline"
           onClick={() => setPreview({ file, version })}
         >
           Preview
         </Button>
       ) : null}
-      <Button
-        size="xs"
+      {show !== "preview" ? <Button
+        size="sm"
         variant="ghost"
         disabled={download.isPending}
         onClick={() => download.mutate({ file, version })}
       >
         Download
-      </Button>
+      </Button> : null}
     </>
   );
   // The loaded row refreshes after mutations. Fall back to the version shown
@@ -300,19 +298,22 @@ export function ProjectFiles({
     ? (visible.find((file) => file.fileId === historyFile.fileId)?.version
         .versionId ?? historyFile.version.versionId)
     : null;
-  const edit = (file: ProjectFile) => {
+  const openTask = (next: FileTask) => {
+    opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     mutation.reset();
-    setEditing({
-      file,
-      name: file.name,
-      folderId: file.folderId ?? "",
-      asNew: false,
-    });
+    download.reset();
+    setTask(next);
+  };
+  const closeTask = () => setTask(null);
+  const edit = (file: ProjectFile) => {
+    openTask({ type: "edit", edit: {
+      file, name: file.name, folderId: file.folderId ?? "", asNew: false,
+    } });
   };
   return (
     <section aria-label="Project files" className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h3 className="font-semibold">Project files</h3>
+        <h3 ref={listHeadingRef} tabIndex={-1} className="font-semibold outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">Project files</h3>
         <nav aria-label="Project file sections" className="flex gap-1">
           <Button
             size="sm"
@@ -357,7 +358,7 @@ export function ProjectFiles({
           </Button>
         </div>
       ) : null}
-      {mutation.isError || download.isError ? (
+      {!task && (mutation.isError || download.isError) ? (
         <p role="alert" className="text-sm text-danger">
           {mutation.error?.message ?? download.error?.message}
         </p>
@@ -555,11 +556,11 @@ export function ProjectFiles({
                 : "No published files in this folder."}
         </p>
       ) : null}
-      <ul className="divide-y divide-outline-variant">
+      <ul aria-label="Project file list" className="divide-y divide-outline-variant">
         {visible.map((file) => (
           <li
             key={file.fileId}
-            className="flex flex-wrap items-center gap-3 py-3"
+            className="flex flex-wrap items-center gap-3 py-4"
           >
             <div className="min-w-0 flex-1 basis-48">
               <p className="break-words text-sm font-medium">{file.name}</p>
@@ -584,10 +585,10 @@ export function ProjectFiles({
                 </p>
               ) : null}
             </div>
-            <div className="flex flex-wrap gap-1">
+            <div role="group" aria-label={`Actions for ${file.name}`} className="flex flex-wrap items-start gap-2 max-sm:basis-full">
               {file.trashedAt ? (
                 <Button
-                  size="xs"
+                  size="sm"
                   variant="outline"
                   disabled={disabled}
                   onClick={() => edit(file)}
@@ -596,11 +597,11 @@ export function ProjectFiles({
                 </Button>
               ) : (
                 <>
-                  {fileActions(file)}
+                  {fileActions(file, file.version, "preview")}
                   {file.kind === "draft" ? (
                     <>
                       <Button
-                        size="xs"
+                        size="sm"
                         disabled={disabled}
                         onClick={() =>
                           mutation.mutate(() =>
@@ -615,7 +616,7 @@ export function ProjectFiles({
                       </Button>
                       {canResolveConflict(file) ? (
                         <Button
-                          size="xs"
+                          size="sm"
                           variant="outline"
                           disabled={disabled}
                           onClick={() =>
@@ -636,26 +637,19 @@ export function ProjectFiles({
                       ) : null}
                     </>
                   ) : null}
+                  <details className="relative">
+                    <summary aria-label={`More actions for ${file.name}`} className="flex min-h-9 cursor-pointer list-none items-center rounded-md border border-input px-3 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">More actions</summary>
+                    <div className="mt-2 flex flex-col items-stretch gap-1 border-l border-outline-variant pl-2">
+                      {fileActions(file, file.version, "download")}
+                      <Button size="sm" variant="ghost" onClick={() => openTask({ type: "history", file })}>History</Button>
+                      <Button size="sm" variant="ghost" disabled={disabled} onClick={() => edit(file)}>Rename or move</Button>
+                    </div>
+                  </details>
                   <Button
-                    size="xs"
-                    variant="ghost"
-                    onClick={() => setHistoryFile(file)}
-                  >
-                    History
-                  </Button>
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    disabled={disabled}
-                    onClick={() => edit(file)}
-                  >
-                    Rename or move
-                  </Button>
-                  <Button
-                    size="xs"
+                    size="sm"
                     variant="ghost"
                     disabled={disabled}
-                    onClick={() => setRemoving(file)}
+                    onClick={() => openTask({ type: "remove", file })}
                   >
                     Move to Trash
                   </Button>
@@ -684,180 +678,220 @@ export function ProjectFiles({
           {files.query.isFetchingNextPage ? "Loading..." : "More files"}
         </Button>
       ) : null}
-      {removing ? (
-        <div
-          role="group"
-          aria-label="Confirm file removal"
-          className="flex flex-col gap-2"
-        >
-          <p className="text-sm">
-            Move {removing.name} to Trash? It can be recovered for {SESSION_TRASH_RETENTION_DAYS} days.
-          </p>
-          <div className="flex gap-2">
-            <Button
-              ref={removeConfirmRef}
-              variant="destructive"
-              size="sm"
-              disabled={disabled}
-              onClick={() =>
-                mutation.mutate(async () => {
-                  await api.trashProjectFile(
-                    project.projectId,
-                    removing.fileId,
-                  );
-                  setRemoving(null);
-                })
-              }
-            >
-              Confirm removal
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              disabled={mutation.isPending}
-              onClick={() => setRemoving(null)}
-            >
-              Cancel
-            </Button>
-          </div>
-        </div>
-      ) : null}
-      {editing ? (
-        <form
-          aria-label="File location"
-          className="flex flex-col gap-3"
-          onSubmit={(event) => {
+      <Dialog open={Boolean(task)} onOpenChange={(open) => { if (!open && !mutation.isPending) closeTask(); }}>
+        {task && taskFile ? (
+        <DialogContent
+          className="sm:max-w-xl"
+          showCloseButton={!mutation.isPending}
+          onEscapeKeyDown={(event) => { if (mutation.isPending) event.preventDefault(); }}
+          onPointerDownOutside={(event) => event.preventDefault()}
+          onOpenAutoFocus={(event) => {
             event.preventDefault();
-            mutation.mutate(async () => {
-              await api.changeProjectFileLocation(
-                project.projectId,
-                editing.file.fileId,
-                {
-                  name: editing.name.trim(),
-                  folderId: editing.folderId || null,
-                },
-                editing.file.trashedAt
-                  ? "restore"
-                  : editing.asNew
-                    ? "save-as-new"
-                    : "location",
-              );
-              setEditing(null);
-            });
+            if (editing) editNameRef.current?.focus();
+            else if (removing) cancelRemovalRef.current?.focus();
+            else historyHeadingRef.current?.focus();
           }}
-        >
-          <Label htmlFor="project-file-name">File name</Label>
-          <Input
-            ref={editNameRef}
-            id="project-file-name"
-            value={editing.name}
-            maxLength={255}
-            onChange={(event) =>
-              setEditing({ ...editing, name: event.target.value })
-            }
-          />
-          <FolderDestinationPicker
-            projectId={project.projectId}
-            label="Destination folder"
-            value={editing.folderId}
-            onChange={(next) => setEditing({ ...editing, folderId: next })}
-          />
-          {editing.file.kind === "draft" &&
-          editing.file.targetFileId &&
-          !editing.file.trashedAt ? (
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={editing.asNew}
-                onChange={(event) =>
-                  setEditing({ ...editing, asNew: event.target.checked })
-                }
-              />
-              Save as a separate draft instead of updating the original file
-            </label>
-          ) : null}
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              disabled={
-                disabled ||
-                !editing.name.trim() ||
-                editDestination.status !== "live"
-              }
-            >
-              {editing.file.trashedAt ? "Confirm restore" : "Save location"}
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setEditing(null)}
-            >
-              Cancel
-            </Button>
-          </div>
-        </form>
-      ) : null}
-      {historyFile ? (
-        <section
-          aria-label="File version history"
-          className="flex flex-col gap-2"
-        >
-          <div className="flex items-center justify-between">
-            <h4 ref={historyHeadingRef} tabIndex={-1} className="text-sm font-semibold">
-              History of {historyFile.name}
-            </h4>
-            <Button
-              size="xs"
-              variant="ghost"
-              onClick={() => setHistoryFile(null)}
-            >
-              Close history
-            </Button>
-          </div>
-          {history.isPending ? <p>Loading versions...</p> : null}
-          {history.isError ? (
-            <div role="alert">
-              <p>Could not load versions.</p>
-              <Button variant="ghost" onClick={() => void history.refetch()}>
-                Retry history
-              </Button>
-            </div>
-          ) : null}
-          {history.data?.map((version) => (
-            <div
-              key={version.versionId}
-              className="flex flex-wrap items-center gap-2"
-            >
-              <span className="text-sm">
-                Version {version.versionNumber} ·{" "}
-                {new Date(version.createdAt).toLocaleString()}
-              </span>
-              {fileActions(historyFile, version)}
-              {historyFile.kind === "published" &&
-              version.versionId !== historyVersionId ? (
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const target = opener.current?.isConnected ? opener.current : listHeadingRef.current;
+            target?.focus();
+          }}
+          footer={<div className="flex flex-col gap-3 border-t border-outline-variant pt-3">
+            {mutation.isError || download.isError ? <p role="alert" className="break-words text-sm text-danger">{mutation.error?.message ?? download.error?.message}</p> : null}
+            {mutation.isPending ? <p role="status" className="text-sm">Saving changes to {taskFile.name}...</p> : null}
+            {removing ? (
+              <div className="flex flex-wrap gap-2">
                 <Button
-                  size="xs"
-                  variant="outline"
+                  variant="destructive"
+                  size="sm"
                   disabled={disabled}
                   onClick={() =>
-                    mutation.mutate(() =>
-                      api.restoreProjectFileVersion(
+                    mutation.mutate(async () => {
+                      await api.trashProjectFile(
                         project.projectId,
-                        historyFile.fileId,
-                        version.versionId,
-                        historyVersionId!,
-                      ),
-                    )
+                        removing.fileId,
+                      );
+                    }, { onSuccess: closeTask })
                   }
                 >
-                  Restore as new version
+                  {mutation.isPending ? "Moving to Trash..." : "Confirm removal"}
                 </Button>
-              ) : null}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={mutation.isPending}
+                  ref={cancelRemovalRef}
+                  onClick={closeTask}
+                >
+                  Cancel
+                </Button>
+              </div>
+            ) : null}
+            {editing ? (
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="submit"
+                  form="project-file-location"
+                  size="sm"
+                  disabled={
+                    disabled ||
+                    !editing.name.trim() ||
+                    editDestination.status !== "live"
+                  }
+                >
+                  {mutation.isPending ? "Saving..." : editing.file.trashedAt ? "Confirm restore" : "Save location"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={mutation.isPending}
+                  onClick={closeTask}
+                >
+                  Cancel
+                </Button>
+              </div>
+            ) : null}
+          </div>}
+        >
+          <DialogHeader>
+            <DialogTitle ref={historyHeadingRef} tabIndex={-1} className="break-words">{removing ? "Move to Trash" : historyFile ? "History of" : editing?.file.trashedAt ? "Restore file" : "Rename or move"} {taskFile.name}</DialogTitle>
+            <DialogDescription>Version {taskFile.version.versionNumber} · {taskFile.kind === "draft" ? "Draft" : "Published file"}</DialogDescription>
+          </DialogHeader>
+          {removing ? (
+            <div
+              role="group"
+              aria-label="Confirm file removal"
+              className="flex flex-col gap-2"
+            >
+              <p className="text-sm">
+                Move {removing.name} to Trash? It can be recovered for {SESSION_TRASH_RETENTION_DAYS} days.
+              </p>
+
             </div>
-          ))}
-        </section>
-      ) : null}
+          ) : null}
+          {editing ? (
+            <form
+              id="project-file-location"
+              aria-label={`File location for ${editing.file.name}`}
+              className="flex flex-col gap-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                mutation.mutate(async () => {
+                  await api.changeProjectFileLocation(
+                    project.projectId,
+                    editing.file.fileId,
+                    {
+                      name: editing.name.trim(),
+                      folderId: editing.folderId || null,
+                    },
+                    editing.file.trashedAt
+                      ? "restore"
+                      : editing.asNew
+                        ? "save-as-new"
+                        : "location",
+                  );
+                }, { onSuccess: closeTask });
+              }}
+            >
+              <Label htmlFor="project-file-name">File name</Label>
+              <Input
+                ref={editNameRef}
+                id="project-file-name"
+                value={editing.name}
+                maxLength={255}
+                disabled={disabled}
+                onChange={(event) =>
+                  setEditing({ ...editing, name: event.target.value })
+                }
+              />
+              <FolderDestinationPicker
+                projectId={project.projectId}
+                label="Destination folder"
+                disabled={disabled}
+                value={editing.folderId}
+                onChange={(next) => setEditing({ ...editing, folderId: next })}
+              />
+              {editing.file.kind === "draft" &&
+              editing.file.targetFileId &&
+              !editing.file.trashedAt ? (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    disabled={disabled}
+                    checked={editing.asNew}
+                    onChange={(event) =>
+                      setEditing({ ...editing, asNew: event.target.checked })
+                    }
+                  />
+                  Save as a separate draft instead of updating the original file
+                </label>
+              ) : null}
+
+            </form>
+          ) : null}
+          {historyFile ? (
+            <section
+              aria-label="File version history"
+              className="flex flex-col gap-2"
+            >
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-semibold">Versions</h4>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  disabled={mutation.isPending}
+                  onClick={closeTask}
+                >
+                  Close history
+                </Button>
+              </div>
+              {history.isPending ? <p>Loading versions...</p> : null}
+              {history.isError ? (
+                <div role="alert">
+                  <p>Could not load versions.</p>
+                  <Button variant="ghost" onClick={() => void history.refetch()}>
+                    Retry history
+                  </Button>
+                </div>
+              ) : null}
+              {history.data?.map((version) => (
+                <div
+                  key={version.versionId}
+                  className="flex flex-wrap items-center gap-2"
+                >
+                  <span className="text-sm">
+                    Version {version.versionNumber} ·{" "}
+                    {new Date(version.createdAt).toLocaleString()}
+                  </span>
+                  {fileActions(historyFile, version)}
+                  {historyFile.kind === "published" &&
+                  version.versionId !== historyVersionId ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={() =>
+                        mutation.mutate(() =>
+                          api.restoreProjectFileVersion(
+                            project.projectId,
+                            historyFile.fileId,
+                            version.versionId,
+                            historyVersionId!,
+                          ),
+                        )
+                      }
+                    >
+                      Restore as new version
+                    </Button>
+                  ) : null}
+                </div>
+              ))}
+            </section>
+          ) : null}
+        </DialogContent>
+        ) : null}
+      </Dialog>
       <details
         className="border-t border-outline-variant pt-4"
         onToggle={(event) => setAddOpen(event.currentTarget.open)}
@@ -963,7 +997,7 @@ export function ProjectFiles({
               disabled={disabled}
               onChange={(event) => setTargetSearch(event.target.value)}
             />
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <select
                 id="project-save-target"
                 className={SELECT}

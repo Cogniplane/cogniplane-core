@@ -1,91 +1,17 @@
 "use client";
 
-import { ConnectedAccountRow } from "../../../components/connected-account-row";
+import Link from "next/link";
+import { listSettingsLiveSections } from "../settings-sections";
 import { useEnabledSettingsSections } from "../../../hooks/use-enabled-settings-sections";
-import { useGithubConnection } from "../../../hooks/use-github-connection";
-import { useJiraConnection } from "../../../hooks/use-jira-connection";
-import { useNotionConnection } from "../../../hooks/use-notion-connection";
 import { useAuth } from "../../../lib/auth-context";
 import { MemberMcpAccounts } from "../../../components/member-mcp-accounts";
-
-function GithubAccountRow() {
-  const { status, isLoading, busyKey, error, statusError, connect, reload } = useGithubConnection();
-  return (
-    <ConnectedAccountRow
-      service="GitHub"
-      slug="github"
-      description="Repositories and pull requests"
-      identity={status?.userConnection?.githubLogin ?? null}
-      configured={status?.configured === true && status.tenantEnabled !== false}
-      isLoading={isLoading}
-      busyKey={busyKey}
-      error={error}
-      statusError={statusError}
-      detailsHref="/settings/github"
-      onConnect={() => void connect()}
-      onRetry={() => void reload()}
-    />
-  );
-}
-
-function NotionAccountRow() {
-  const { status, isLoading, busyKey, error, statusError, connect, reload } = useNotionConnection();
-  const user = status?.userConnection;
-  const identity = user
-    ? [user.notionOwnerName ?? user.notionOwnerEmail, user.notionWorkspaceName]
-        .filter(Boolean)
-        .join(" · ") || "Notion account"
-    : null;
-  return (
-    <ConnectedAccountRow
-      service="Notion"
-      slug="notion"
-      description="Pages and databases in your workspace"
-      identity={identity}
-      configured={status?.configured === true && status.tenantEnabled !== false}
-      isLoading={isLoading}
-      busyKey={busyKey}
-      error={error}
-      statusError={statusError}
-      detailsHref="/settings/notion"
-      onConnect={() => void connect()}
-      onRetry={() => void reload()}
-    />
-  );
-}
-
-function JiraAccountRow() {
-  const { status, isLoading, busyKey, error, statusError, connect, reload } = useJiraConnection();
-  const user = status?.userConnection;
-  return (
-    <ConnectedAccountRow
-      service="Jira"
-      slug="jira"
-      description="Read-only issue search and history"
-      identity={user ? [user.accountName, user.site.name].filter(Boolean).join(" · ") : null}
-      // Jira has no write tools, and authorization requires reads.
-      configured={status?.configured === true && status.tenantReadsEnabled === true}
-      isLoading={isLoading}
-      busyKey={busyKey}
-      error={error}
-      statusError={statusError}
-      detailsHref="/settings/jira"
-      onConnect={() => void connect()}
-      onRetry={() => void reload()}
-    />
-  );
-}
-
-const coreRows: Record<string, () => React.JSX.Element> = {
-  github: GithubAccountRow,
-  notion: NotionAccountRow,
-  jira: JiraAccountRow
-};
+import { withSectionComponents } from "../settings-section-components";
 
 export default function ConnectedAccountsPage() {
   const { user } = useAuth();
   const { liveSections, isLoading, error, retry } = useEnabledSettingsSections();
-  const accounts = liveSections.filter((section) => section.kind === "integration");
+  const otherAccounts = listSettingsLiveSections().filter((section) => section.kind === "integration" && !liveSections.some((live) => live.id === section.id)).map(withSectionComponents).filter((section) => section.detail);
+  const accounts = liveSections.filter((section) => section.kind === "integration").map(withSectionComponents);
 
   return (
     <section id="connections" className="pt-5">
@@ -104,7 +30,7 @@ export default function ConnectedAccountsPage() {
       ) : accounts.length > 0 ? (
         <ul className="overflow-hidden rounded-xl border border-outline-variant bg-surface-container-lowest">
           {accounts.map((account) => {
-            const Row = account.accountRow ?? coreRows[account.id];
+            const Row = account.accountRow;
             return Row ? <Row key={account.id} /> : null;
           })}
         </ul>
@@ -113,6 +39,11 @@ export default function ConnectedAccountsPage() {
           No built-in account services are enabled for your organization.
         </p>
       ) : null}
+      {otherAccounts.length > 0 ? <details className="mt-5 rounded-lg border border-outline-variant bg-surface-container-lowest p-4 text-sm">
+        <summary className="min-h-9 cursor-pointer rounded-md font-medium text-on-surface focus-visible:outline-2 focus-visible:outline-primary">Other account details</summary>
+        <p className="mt-2 max-w-prose text-on-surface-variant">These services may be turned off for your organization. Open their details to check for an existing account or disconnect it.</p>
+        <ul className="mt-3 flex flex-wrap gap-2">{otherAccounts.map(account => <li key={account.id}><Link href={`/settings/${account.id}`} className="inline-flex min-h-9 items-center rounded-md border border-input px-3 text-sm text-on-surface hover:bg-surface-container focus-visible:outline-2 focus-visible:outline-primary">{account.label} account details</Link></li>)}</ul>
+      </details> : null}
       {user ? <MemberMcpAccounts key={`${user.tenantId}:${user.userId}`}
         expectedScope={{ tenantId: user.tenantId, userId: user.userId }} /> : null}
     </section>

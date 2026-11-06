@@ -2,27 +2,16 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { AlertCircleIcon, ArchiveIcon, ChevronDownIcon, ChevronRightIcon, FolderIcon, PinIcon, PlusIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
 import { useAuth } from "../lib/auth-context";
-import { getBackendBuild, type BackendBuild } from "../lib/admin-api";
-import { SHORTCUTS, ariaKeyShortcut, useApplePlatform, useShortcut } from "../lib/keyboard-shortcuts";
-import { SESSION_TRASH_RETENTION_DAYS, type Project, type Session } from "@cogniplane/shared-types";
+import { SHORTCUTS, ariaKeyShortcut, useApplePlatform } from "../lib/keyboard-shortcuts";
+import type { Project, Session } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle
-} from "@/components/ui/alert-dialog";
 import { SessionActionMenu } from "./session-action-menu";
 import { SessionStatusIndicator } from "./session-status";
 import { resolveSessionStatus } from "./session-status.logic";
@@ -37,6 +26,8 @@ export type SessionSidebarListModel = {
   attentionIds?: Set<string>;
   onSelect: (sessionId: string) => void;
   onCreate: (projectId: string | null) => Promise<void>;
+  /** Opens the New session dialog, which the workspace owns. */
+  onNewSession: () => void;
   isCreating?: boolean;
   search?: string;
   onSearch?: (value: string) => void;
@@ -59,11 +50,7 @@ export type SessionSidebarRenameModel = {
 
 export type SessionSidebarDeletionModel = {
   busyId: string | null;
-  pendingId: string | null;
-  trashRetentionDays?: number;
   onRequest: (sessionId: string) => void;
-  onConfirmDelete: () => void;
-  onCancelDelete: () => void;
 };
 
 export type SessionSidebarPinningModel = {
@@ -85,42 +72,18 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   const [localQuery, setLocalQuery] = useState("");
   const query = list.search ?? localQuery;
   const setQuery = list.onSearch ?? setLocalQuery;
-  const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [createProjectId, setCreateProjectId] = useState("personal");
-  const [createError, setCreateError] = useState<string | null>(null);
-  const openCreateDialog = () => { setCreateError(null); setCreateProjectId("personal"); setCreateDialogOpen(true); };
-  useShortcut(SHORTCUTS.newSession, openCreateDialog);
   const apple = useApplePlatform();
   const [addSessionId, setAddSessionId] = useState<string | null>(null);
   const [addProjectId, setAddProjectId] = useState("");
   const [addError, setAddError] = useState<string | null>(null);
   const [isAddingSession, setIsAddingSession] = useState(false);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(() => new Set());
-  const [fetchedBackendBuild, setFetchedBackendBuild] = useState<BackendBuild | null>(null);
   const normalizedQuery = query.trim().toLowerCase();
   const serverSearch = Boolean(list.onSearch);
   const activeProjects = useMemo(
     () => projects.filter((project) => !project.archivedAt),
     [projects]
   );
-
-  // The public health check no longer reports the build. Admin diagnostics do,
-  // so only an admin or owner asks, and a failed request shows nothing.
-  const canSeeBackendBuild = user?.role === "admin" || user?.role === "owner";
-  useEffect(() => {
-    if (!canSeeBackendBuild) return;
-    let cancelled = false;
-    getBackendBuild()
-      .then((build) => { if (!cancelled) setFetchedBackendBuild(build); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [canSeeBackendBuild]);
-  const backendVersion = canSeeBackendBuild ? fetchedBackendBuild : null;
-
-  const feSha = (process.env.NEXT_PUBLIC_BUILD_SHA ?? "dev").slice(0, 7);
-  const feDate = (process.env.NEXT_PUBLIC_BUILD_DATE ?? "").slice(0, 10);
-  const beSha = backendVersion?.sha.slice(0, 7);
-  const beDate = backendVersion?.buildDate.slice(0, 10);
 
   const groups = useMemo(
     () => groupSessions(
@@ -146,16 +109,9 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   );
   const hasResults = totalGroupedCount(groups) > 0 || projectGroups.length > 0;
   const addSession = addSessionId ? list.sessions.find((session) => session.sessionId === addSessionId) : null;
-  const selectedCreateProjectId = createProjectId === "personal" || activeProjects.some((project) => project.projectId === createProjectId)
-    ? createProjectId
-    : "personal";
   const selectedAddProjectId = activeProjects.some((project) => project.projectId === addProjectId)
     ? addProjectId
     : activeProjects[0]?.projectId ?? "";
-  const pendingDeleteSession = deletion.pendingId
-    ? list.sessions.find((s) => s.sessionId === deletion.pendingId)
-    : null;
-  const trashRetentionDays = deletion.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS;
 
   const renderSessionRow = (session: Session) => {
     const isActive = session.sessionId === list.selectedId;
@@ -187,12 +143,12 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
             disabled={busy}
             onChange={(event) => rename.onRenameDraftChange(event.target.value)}
             value={rename.renameDraft}
-            className="h-7 flex-1 text-sm"
+            className="h-10 min-w-0 flex-1 text-base md:h-7 md:text-sm"
           />
-          <Button type="submit" size="xs" disabled={busy || !rename.renameDraft.trim()}>
+          <Button type="submit" size="xs" className="h-10 md:h-6" disabled={busy || !rename.renameDraft.trim()}>
             Save
           </Button>
-          <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={rename.onCancelRename}>
+          <Button type="button" size="xs" variant="ghost" className="h-10 md:h-6" disabled={busy} onClick={rename.onCancelRename}>
             Cancel
           </Button>
         </form>
@@ -230,6 +186,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
           </span>
         </button>
         <SessionActionMenu
+          triggerClassName="size-10 md:size-8"
           sessionId={session.sessionId}
           sessionName={session.sessionName}
           isPinned={isPinned}
@@ -253,19 +210,18 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
   };
 
   return (
-    <aside className="flex h-full min-h-0 flex-col overflow-hidden bg-surface-container-low">
-      <div className="flex items-center gap-3 px-4 pt-4 pb-3">
+    <aside data-session-sidebar className="flex h-full min-h-0 flex-col overflow-hidden bg-surface-container-low">
+      <div className="sticky top-0 z-10 flex shrink-0 items-center gap-3 bg-surface-container-low px-4 pt-4 pb-2 pr-14">
         <Image src="/brand/cogniplane.svg" alt="Cogniplane logo" width={40} height={40} priority />
         <div className="min-w-0">
-          <p className="text-[0.62rem] font-bold uppercase tracking-[0.12em] text-on-surface-faint">
-            Control Room
-          </p>
-          <h1 className="truncate text-sm font-semibold text-on-surface">Cogniplane</h1>
+          <h1 className="truncate text-base font-semibold text-on-surface">Cogniplane</h1>
         </div>
       </div>
 
-      <div className="relative px-3 pb-2">
-        <SearchIcon className="pointer-events-none absolute left-5 top-1/2 size-4 -translate-y-1/2 text-on-surface-faint" />
+      <div className="px-3 pt-1 pb-2">
+        {/* `relative` wraps the input only, so the icon centres on the input, not on its padding. */}
+        <div className="relative">
+        <SearchIcon aria-hidden="true" className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-on-surface-faint" />
         <Input
           aria-label="Search sessions"
           maxLength={200}
@@ -273,17 +229,18 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
           placeholder="Search sessions"
           type="text"
           value={query}
-          className="h-8 pl-8 text-sm"
+          className="h-10 pl-8 text-base md:h-8 md:text-sm"
         />
+        </div>
       </div>
 
       <div className="px-3 pb-2">
-        <Button type="button" className="w-full" aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.newSession, apple)} onClick={openCreateDialog}>
+        <Button type="button" className="h-10 w-full md:h-9" aria-keyshortcuts={ariaKeyShortcut(SHORTCUTS.newSession, apple)} onClick={list.onNewSession}>
           New session
         </Button>
       </div>
 
-      <div className="flex-1 overflow-y-auto pb-2">
+      <div data-session-sidebar-list className="flex-1 overflow-y-auto pb-2">
         {list.isLoading && list.sessions.length === 0 ? (
           <div className="flex flex-col gap-2 px-4 pt-3">
             {Array.from({ length: 6 }, (_, i) => (
@@ -296,7 +253,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
         ) : null}
         {projectGroups.length > 0 ? (
           <div className="pt-2">
-            <div className="flex items-center justify-between px-4 pb-1 text-[0.62rem] font-bold uppercase tracking-[0.12em] text-on-surface-faint">
+            <div className="flex items-center justify-between px-4 pb-1 text-xs font-semibold text-on-surface-variant">
               <span>Projects</span>
               <span>{activeProjects.length}</span>
             </div>
@@ -318,6 +275,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                       type="button"
                       variant="ghost"
                       size="icon-xs"
+                      className="size-10 md:size-6"
                       aria-expanded={expanded}
                       aria-label={`${expanded ? "Collapse" : "Expand"} ${project.name}`}
                       onClick={toggleExpanded}
@@ -327,7 +285,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                     <Link
                       href={`/projects?project=${encodeURIComponent(project.projectId)}`}
                       aria-label={`Open ${project.name}`}
-                      className="flex min-w-0 flex-1 items-center gap-2 rounded-sm py-1 text-left text-sm font-medium text-on-surface hover:text-brand-strong focus-visible:ring-2 focus-visible:ring-brand/60"
+                      className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-sm py-1 text-left text-sm font-medium text-on-surface hover:text-brand-strong focus-visible:ring-2 focus-visible:ring-brand/60 md:min-h-0"
                     >
                       <FolderIcon className="size-4 shrink-0 text-brand-strong" />
                       <span className="truncate">{project.name}</span>
@@ -353,7 +311,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                         </span>
                       ) : null}
                     </Link>
-                    <Button asChild variant="ghost" size="icon-xs">
+                    <Button asChild variant="ghost" size="icon-xs" className="size-10 md:size-6">
                       <Link
                         href={`/projects?project=${encodeURIComponent(project.projectId)}&view=settings`}
                         aria-label={`Project settings for ${project.name}`}
@@ -366,6 +324,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
                       variant="ghost"
                       size="icon-xs"
                       aria-label={`New session in ${project.name}`}
+                      className="size-10 md:size-6"
                       disabled={list.isCreating}
                       // createSession records failures in session-list state;
                       // ChatShell renders that state in the main error banner.
@@ -418,7 +377,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
           <Button variant="ghost" onClick={list.onRetry}>Try again</Button>
         </div> : null}
         {list.hasMore ? <div className="px-3 py-2">
-          <Button variant="outline" className="w-full" disabled={list.isLoadingMore} onClick={list.onLoadMore}>
+          <Button variant="outline" className="h-10 w-full md:h-9" disabled={list.isLoadingMore} onClick={list.onLoadMore}>
             {list.isLoadingMore ? "Loading..." : "Load more sessions"}
           </Button>
         </div> : null}
@@ -440,23 +399,12 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
       </div>
 
       <div className="px-3 py-2">
-        <Button asChild variant="ghost" className="w-full justify-start">
+        <Button asChild variant="ghost" className="h-10 w-full justify-start md:h-9">
           <Link href="/projects"><FolderIcon />Projects</Link>
         </Button>
-        <Button asChild variant="ghost" className="w-full justify-start">
+        <Button asChild variant="ghost" className="h-10 w-full justify-start md:h-9">
           <Link href="/sessions/archived"><ArchiveIcon />Archived sessions</Link>
         </Button>
-      </div>
-
-      <div className="flex items-center justify-between border-t border-outline-variant px-4 py-1.5 text-[0.65rem] font-mono text-on-surface-faint">
-        <span title={`Frontend: ${process.env.NEXT_PUBLIC_BUILD_SHA ?? "dev"} · ${process.env.NEXT_PUBLIC_BUILD_DATE ?? ""}`}>
-          fe · {feSha}{feDate ? ` · ${feDate}` : ""}
-        </span>
-        {beSha ? (
-          <span title={`Backend: ${backendVersion?.sha} · ${backendVersion?.buildDate}`}>
-            be · {beSha}{beDate ? ` · ${beDate}` : ""}
-          </span>
-        ) : null}
       </div>
 
       <div className="flex items-center gap-2 border-t border-outline-variant px-3 py-2">
@@ -471,90 +419,13 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
             <div className="truncate text-on-surface-faint">{user.email}</div>
           ) : null}
         </div>
-        <Button asChild variant="ghost" size="icon-sm" aria-label="Settings">
+        <Button asChild variant="ghost" size="icon-sm" className="size-10 md:size-8" aria-label="Settings">
           <Link href="/settings">
             <SettingsIcon />
           </Link>
         </Button>
       </div>
 
-      <AlertDialog
-        open={deletion.pendingId != null}
-        onOpenChange={(open) => {
-          if (!open) deletion.onCancelDelete();
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{trashRetentionDays > 0 ? "Move this session to Trash?" : "Delete this session permanently?"}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {trashRetentionDays > 0
-                ? pendingDeleteSession
-                  ? `"${pendingDeleteSession.sessionName}" and its local files will move to Trash for ${trashRetentionDays} days.`
-                  : `The session will move to Trash for ${trashRetentionDays} days.`
-                : "This session and its local files will be permanently deleted."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deletion.busyId === deletion.pendingId}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={deletion.onConfirmDelete}
-              disabled={deletion.busyId === deletion.pendingId}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deletion.busyId === deletion.pendingId ? (trashRetentionDays > 0 ? "Moving…" : "Deleting…") : trashRetentionDays > 0 ? "Move to Trash" : "Delete permanently"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New session</DialogTitle>
-            <DialogDescription>Choose where this conversation should live. Personal sessions stay private.</DialogDescription>
-          </DialogHeader>
-          <form
-            className="space-y-4"
-            onSubmit={async (event) => {
-              event.preventDefault();
-              try {
-                setCreateError(null);
-                await list.onCreate(selectedCreateProjectId === "personal" ? null : selectedCreateProjectId);
-                setCreateDialogOpen(false);
-              } catch (error) {
-                setCreateError(error instanceof Error ? error.message : "Could not create the session.");
-              }
-            }}
-          >
-            <label htmlFor="new-session-project" className="block text-sm font-medium text-on-surface">Project</label>
-            <select
-              id="new-session-project"
-              className="h-10 w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 text-sm text-on-surface focus-visible:outline-2 focus-visible:outline-brand"
-              value={selectedCreateProjectId}
-              onChange={(event) => setCreateProjectId(event.target.value)}
-              disabled={list.isCreating}
-            >
-              <option value="personal">Personal session</option>
-              {activeProjects.map((project) => (
-                <option key={project.projectId} value={project.projectId}>{project.name}</option>
-              ))}
-            </select>
-            {selectedCreateProjectId !== "personal" ? (
-              <p className="text-xs text-on-surface-variant">This session will follow the project&apos;s access and sharing settings.</p>
-            ) : null}
-            {createError ? <p role="alert" className="text-sm text-danger">{createError}</p> : null}
-            <DialogFooter>
-              <Button type="button" variant="ghost" onClick={() => setCreateDialogOpen(false)} disabled={list.isCreating}>Cancel</Button>
-              <Button type="submit" disabled={list.isCreating || (selectedCreateProjectId !== "personal" && !activeProjects.some((project) => project.projectId === selectedCreateProjectId))}>
-                {list.isCreating ? "Creating..." : "Create session"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
 
       <Dialog open={addSessionId !== null} onOpenChange={(open) => { if (!open) setAddSessionId(null); }}>
         <DialogContent>
@@ -588,7 +459,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
             <label htmlFor="add-session-project" className="block text-sm font-medium text-on-surface">Project</label>
             <select
               id="add-session-project"
-              className="h-10 w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 text-sm text-on-surface focus-visible:outline-2 focus-visible:outline-brand"
+              className="h-10 w-full rounded-md border border-input bg-surface-container-lowest px-3 text-sm text-on-surface focus-visible:outline-2 focus-visible:outline-brand"
               value={selectedAddProjectId}
               onChange={(event) => setAddProjectId(event.target.value)}
               disabled={isAddingSession}
@@ -613,7 +484,7 @@ export function SessionSidebar({ list, rename, deletion, pinning, archive, proje
 function SessionGroupSection(props: { title: string; count: number; children: React.ReactNode }) {
   return (
     <div>
-      <div className="flex items-center justify-between px-4 pt-3 pb-1 text-[0.62rem] font-bold uppercase tracking-[0.12em] text-on-surface-faint">
+      <div className="flex items-center justify-between px-4 pt-3 pb-1 text-xs font-semibold text-on-surface-variant">
         <span>{props.title}</span>
         <span>{props.count}</span>
       </div>

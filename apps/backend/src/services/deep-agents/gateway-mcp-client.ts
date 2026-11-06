@@ -11,7 +11,8 @@ import { MCPAdapter, loadMcpTools, type LoadMcpToolsOptions } from "@langchain/m
 import type { DynamicStructuredTool } from "@langchain/core/tools";
 
 import type { McpInvocationMetadata } from "../mcp/invocation-metadata.js";
-import { McpInvocationScope } from "./mcp-invocation-scope.js";
+import { redactSecrets } from "../redact-secrets.js";
+import { McpInvocationScope, type McpToolClient } from "./mcp-invocation-scope.js";
 
 export type GatewayMcpServer = { id: string; url: string; authorization: string };
 
@@ -34,6 +35,55 @@ function toolCallIdOf(config: Parameters<BeforeToolCall>[2]): string | undefined
   const { toolCall, toolCallId } = (config ?? {}) as { toolCall?: { id?: unknown }; toolCallId?: unknown };
   const id = toolCall?.id ?? toolCallId;
   return typeof id === "string" && id ? id : undefined;
+}
+
+/**
+ * The client that the tools use, with a JSON-RPC error of the gateway given
+ * back as an `isError` result instead of a throw.
+ *
+ * The gateway refuses or fails a call with a JSON-RPC error: a Policy Center
+ * block or an expired approval (-32004), a managed tool that failed (-32000).
+ * The SDK throws it and the adapter throws it again as a ToolException.
+ * deepagents always adds wrapToolCall middleware, and with it ToolNode throws a
+ * tool error again, so the whole turn ended. The adapter gives an `isError`
+ * result to the model as a tool message with status "error": the tool card
+ * shows the call as failed, the model reads why, and the turn goes on.
+ *
+ * Only a plain ProtocolError changes: an error answer of the gateway, or the
+ * SDK's own check of the tool's result against its output schema. The gateway
+ * writes its messages for the model (clientSafeToolErrorMessage, the policy
+ * explanation) and redacts them. The SDK's check does not pass the gateway, so
+ * the text is redacted here too. A transport failure, the abort of the turn, an
+ * interrupt and the SDK's special protocol errors (an elicitation request, an
+ * unsupported protocol version) still throw.
+ */
+export function gatewayErrorsAsResults(client: McpToolClient): McpToolClient {
+  const facade: Pick<McpToolClient, "getProtocolEra" | "listTools" | "callTool"> = {
+    getProtocolEra: () => client.getProtocolEra(),
+    listTools: (params, options) => client.listTools(params, options),
+    callTool: async (params, options) => {
+      try {
+        return await client.callTool(params, options);
+      } catch (error) {
+        if (!isPlainProtocolError(error) || options?.signal?.aborted) throw error;
+        return { content: [{ type: "text", text: redactSecrets(error.message) }], isError: true };
+      }
+    }
+  };
+  // loadMcpTools and the invocation scope read only these three members.
+  return facade as McpToolClient;
+}
+
+/**
+ * An instance of the SDK's ProtocolError class itself, not of a subclass. The
+ * subclasses keep the name "ProtocolError", so the name cannot tell them apart.
+ * The SDK brands each error class with its own static `mcpBrand`; the backend
+ * does not depend on the SDK directly, so this reads the brand.
+ */
+function isPlainProtocolError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const errorClass = error.constructor as { mcpBrand?: unknown };
+  return Object.hasOwn(errorClass, "mcpBrand") && errorClass.mcpBrand === "mcp.ProtocolError";
 }
 
 export class GatewayMcpClient {
@@ -109,7 +159,7 @@ export class GatewayMcpClient {
       // Undefined when the connection failed; onConnectionError has logged it.
       const client = await adapter.getClient(server.id);
       if (this.#closed || !client) return null;
-      const tools = await loadMcpTools(server.id, this.#scope.client(client), {
+      const tools = await loadMcpTools(server.id, this.#scope.client(gatewayErrorsAsResults(client)), {
         beforeToolCall: this.#beforeToolCall,
         throwOnLoadError: false,
         // Tool names are the server's own. The graph drops collisions itself.

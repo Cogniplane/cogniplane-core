@@ -110,10 +110,6 @@ export class SessionExecutionStore {
         AND m.role='assistant' AND m.status IN ('pending','streaming')
         AND m.created_at<=e.expires_at
       RETURNING m.tenant_id, m.message_id
-    ), stopped_tools AS (
-      UPDATE message_tool_results t SET status='failed', updated_at=NOW()
-      FROM interrupted i WHERE t.tenant_id=i.tenant_id AND t.message_id=i.message_id
-        AND t.status='in_progress'
     ) SELECT count(*)::integer AS count FROM expired`, [limit]);
     return result.rows[0]?.count ?? 0;
   }
@@ -163,12 +159,7 @@ export class SessionExecutionStore {
           AND m.role='assistant' AND m.status IN ('pending','streaming')
           AND m.created_at<=e.expires_at
         RETURNING m.tenant_id, m.message_id
-      ), stopped_tools AS (
-        UPDATE message_tool_results t SET status='failed', updated_at=NOW()
-        FROM interrupted i WHERE t.tenant_id=i.tenant_id AND t.message_id=i.message_id
-          AND t.status='in_progress'
-        RETURNING t.tool_result_id
-      ) SELECT (SELECT count(*) FROM expired), (SELECT count(*) FROM stopped_tools)`,
+      ) SELECT (SELECT count(*) FROM expired), (SELECT count(*) FROM interrupted)`,
       [actor.tenantId, actor.sessionId]);
       const executionId = uuidv7();
       const inserted = await db.query(`INSERT INTO session_executions

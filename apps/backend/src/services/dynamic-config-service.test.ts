@@ -18,7 +18,7 @@ import {
 import { DynamicConfigService, parseGitHubSkillSource } from "./dynamic-config-service.js";
 import { ManagedToolCatalog } from "./managed-tools/catalog.js";
 import { ManagedToolFactoryRegistry } from "./managed-tools/factory.js";
-import { registerBuiltinManagedTools } from "./managed-tools/register-builtin-managed-tools.js";
+import { registerAllBuiltinManagedTools } from "../test-helpers/builtin-managed-tools.js";
 import { LocalSkillBundleStorage } from "./skills/skill-bundle-storage.js";
 import {
   buildDefaultTenantSettingsInput,
@@ -28,7 +28,7 @@ import {
 
 function makeManagedToolCatalog(): ManagedToolCatalog {
   const catalog = new ManagedToolCatalog();
-  registerBuiltinManagedTools(catalog, new ManagedToolFactoryRegistry());
+  registerAllBuiltinManagedTools(catalog, new ManagedToolFactoryRegistry());
   return catalog;
 }
 
@@ -847,7 +847,7 @@ test("resolves only the acting member's current personal MCP credential", async 
       }
     }),
     tenantMembers: {
-      getRole: async (_tenant, user) => members.has(user) ? "member" : null,
+      getActiveRole: async (_tenant, user) => members.has(user) ? "member" : null,
       isUserBetaTester: async () => false
     },
     memberMcpCredentials: {

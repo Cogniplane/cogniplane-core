@@ -5,11 +5,11 @@ import { Pool } from "../../lib/db.js";
 import { createFakeFetch } from "../../test-helpers/fake-fetch.js";
 import { ManagedToolCatalog } from "./catalog.js";
 import { ManagedToolFactoryRegistry, type ManagedToolFactoryDeps } from "./factory.js";
-import { registerBuiltinManagedTools } from "./register-builtin-managed-tools.js";
+import { registerAllBuiltinManagedTools } from "../../test-helpers/builtin-managed-tools.js";
 
 const sharedCatalog = new ManagedToolCatalog();
 const sharedFactoryRegistry = new ManagedToolFactoryRegistry();
-registerBuiltinManagedTools(sharedCatalog, sharedFactoryRegistry);
+registerAllBuiltinManagedTools(sharedCatalog, sharedFactoryRegistry);
 
 const listManagedToolIds = (): string[] => sharedCatalog.listIds();
 const createManagedToolDefinitions = sharedFactoryRegistry.createDefinitions.bind(sharedFactoryRegistry);
@@ -136,15 +136,9 @@ function makeGithubConnections(creds: GithubRuntimeCredentials | null) {
   };
 }
 
-function makeNotionConnections() {
-  return {
-    getRuntimeCredentials: async (_tenantId: string, _userId: string) => null
-  };
-}
-
 const unusedDb = new Pool();
 
-function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
+function makeDeps() {
   return {
     db: unusedDb,
     dynamicConfig: {
@@ -160,9 +154,6 @@ function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
     artifacts: makeArtifactStore(),
     storage: new InMemoryStorage(),
     auditEvents: makeAuditEventStore(),
-    githubConnections: makeGithubConnections(githubCreds),
-    notionConnections: makeNotionConnections(),
-    jiraConnections: { async read() { return { ok: false as const, error: "No Jira connection found." }; } },
     artifactMaxBytes: 10_000_000,
     limits: {
       async consumeRateLimit() { return null; }
@@ -174,6 +165,16 @@ function makeDeps(githubCreds: GithubRuntimeCredentials | null = null) {
       async readConflictMetadata() { throw new Error("project conflict metadata read should not be called"); }
     }
   } satisfies ManagedToolFactoryDeps;
+}
+
+// The GitHub tools capture their connection service when they register, so a
+// test that sets the credentials builds its own registry.
+function createDefinitionsWithGithub(githubCreds: GithubRuntimeCredentials | null) {
+  const factoryRegistry = new ManagedToolFactoryRegistry();
+  registerAllBuiltinManagedTools(new ManagedToolCatalog(), factoryRegistry, {
+    github: makeGithubConnections(githubCreds)
+  });
+  return factoryRegistry.createDefinitions(makeDeps());
 }
 
 function makeValidCreds(overrides: Partial<GithubRuntimeCredentials> = {}): GithubRuntimeCredentials {
@@ -203,7 +204,7 @@ function requireRecordField(
 test("every built-in catalog entry has the category of its factory definition", () => {
   // The graph evaluates Policy Center with the catalog category before a call,
   // and the gateway evaluates it again with the definition category.
-  const definitions = createManagedToolDefinitions(makeDeps(null));
+  const definitions = createManagedToolDefinitions(makeDeps());
   expect(definitions.map((definition) => definition.name).sort()).toEqual(listManagedToolIds().sort());
   for (const definition of definitions) {
     expect(sharedCatalog.get(definition.name)?.category, definition.name).toBe(definition.category);
@@ -211,7 +212,7 @@ test("every built-in catalog entry has the category of its factory definition", 
 });
 
 test("github_read_file — returns file content when credentials valid", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
   const tool = tools.find((t) => t.name === "github_read_file")!;
 
   const fileData = {
@@ -238,7 +239,7 @@ test("github_read_file — returns file content when credentials valid", async (
 });
 
 test("managed tools expose output schemas for typed structured results", () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
 
   expect(tools.length).toBe(listManagedToolIds().length);
   for (const tool of tools) {
@@ -247,7 +248,7 @@ test("managed tools expose output schemas for typed structured results", () => {
 });
 
 test("github tools built by the factory deny a repository that the user did not allow", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
   const fake = createFakeFetch(() => Response.json({}));
 
   try {
@@ -269,7 +270,7 @@ test("github tools built by the factory deny a repository that the user did not 
 });
 
 test("github_read_file — returns error when no GitHub connection", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(null));
+  const tools = createDefinitionsWithGithub(null);
   const tool = tools.find((t) => t.name === "github_read_file")!;
 
   const result = await tool.handler({
@@ -281,7 +282,7 @@ test("github_read_file — returns error when no GitHub connection", async () =>
 });
 
 test("github_read_file — returns error on GitHub API 404", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
   const tool = tools.find((t) => t.name === "github_read_file")!;
 
   const fake = createFakeFetch(() => Response.json({ message: "Not Found" }, { status: 404 }));
@@ -298,7 +299,7 @@ test("github_read_file — returns error on GitHub API 404", async () => {
 });
 
 test("github_write_file — returns commit info on success; uses creds.name/email for committer", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
   const tool = tools.find((t) => t.name === "github_write_file")!;
 
   let capturedBody: Record<string, unknown> | null = null;
@@ -335,7 +336,7 @@ test("github_write_file — returns commit info on success; uses creds.name/emai
 });
 
 test("github_write_file — falls back to login@users.noreply.github.com when email is null", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds({ email: null })));
+  const tools = createDefinitionsWithGithub(makeValidCreds({ email: null }));
   const tool = tools.find((t) => t.name === "github_write_file")!;
 
   let capturedBody: Record<string, unknown> | null = null;
@@ -369,7 +370,7 @@ test("github_write_file — falls back to login@users.noreply.github.com when em
 });
 
 test("github_create_pr — returns PR number and URL on success", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
   const tool = tools.find((t) => t.name === "github_create_pr")!;
 
   const responseData = {
@@ -405,7 +406,7 @@ test("github_create_pr — returns PR number and URL on success", async () => {
 });
 
 test("github_create_pr — returns error when no GitHub connection", async () => {
-  const tools = createManagedToolDefinitions(makeDeps(null));
+  const tools = createDefinitionsWithGithub(null);
   const tool = tools.find((t) => t.name === "github_create_pr")!;
 
   const result = await tool.handler({
@@ -538,7 +539,7 @@ test("ManagedToolFactoryRegistry rejects duplicate factory keys", () => {
 // regardless of which managed-server URL the call arrived through.
 
 test("createDefinitions stamps the factory domain key as the tool category", () => {
-  const tools = createManagedToolDefinitions(makeDeps(makeValidCreds()));
+  const tools = createDefinitionsWithGithub(makeValidCreds());
 
   const githubReadFile = tools.find((t) => t.name === "github_read_file")!;
   expect(githubReadFile.category).toBe("github");

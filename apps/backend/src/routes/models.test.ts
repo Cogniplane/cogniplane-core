@@ -181,7 +181,7 @@ test("/models exposes the new provider models with valid effort choices", async 
       defaultEffort: "medium",
       contextWindow: 1_050_000
     });
-    for (const id of ["openai/gpt-6-sol", "openai/gpt-6-luna"]) {
+    for (const id of ["openai/gpt-6.1-terra", "openai/gpt-6-sol", "openai/gpt-6-luna"]) {
       expect(models.find((model) => model.id === id)).toMatchObject({
         supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
         defaultEffort: "medium",

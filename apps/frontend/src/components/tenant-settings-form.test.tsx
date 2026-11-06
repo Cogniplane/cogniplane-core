@@ -15,6 +15,8 @@ function formElement(settings: TenantSettings, onSave: SaveFn, extra: {
   isOwner?: boolean;
   saveError?: string | null;
   onReload?: () => void;
+  managedTools?: Parameters<typeof TenantSettingsForm>[0]["managedTools"];
+  toolCatalogState?: "loading" | "failed" | "ready";
 } = {}) {
   return (
     <TenantSettingsForm
@@ -23,7 +25,8 @@ function formElement(settings: TenantSettings, onSave: SaveFn, extra: {
       onSave={onSave}
       saveError={extra.saveError ?? null}
       onReload={extra.onReload}
-      managedTools={[]}
+      managedTools={extra.managedTools ?? []}
+      toolCatalogState={extra.toolCatalogState}
       modelWarning={null}
       isOwner={extra.isOwner ?? true}
     />
@@ -653,5 +656,47 @@ describe("sandbox network access", () => {
 
     expect(screen.getByText(/Organization settings changed to v5 since your draft began/)).toBeTruthy();
     expect(hostsTextarea().value).toBe("mine.example.com");
+  });
+});
+
+
+describe("tool catalog read state and draft preservation", () => {
+  it("keeps configured IDs unclassified during loading and failure, then identifies a known missing tool", () => {
+    const settings = makeSettings({ enabledToolIds: ["saved_tool"] });
+    const { rerender } = renderForm(settings, undefined, { toolCatalogState: "loading" });
+    expect(screen.queryByText(/No built-in tools/)).toBeNull();
+    expect(screen.queryByText(/no longer in the catalog/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Choose tools" }));
+    const saved = screen.getByRole("checkbox", { name: /saved_tool/ }) as HTMLInputElement;
+    expect(saved.checked).toBe(true); expect(saved.disabled).toBe(true);
+    rerender(settings, { toolCatalogState: "failed" });
+    expect(screen.queryByText(/No built-in tools/)).toBeNull();
+    expect(screen.queryByText(/no longer in the catalog/)).toBeNull();
+    expect((screen.getByRole("checkbox", { name: /saved_tool/ }) as HTMLInputElement).checked).toBe(true);
+    rerender(settings, { toolCatalogState: "ready" });
+    expect(screen.getByText(/No built-in tools/)).toBeTruthy();
+    expect(screen.getByText(/1 saved tool is no longer in the catalog/)).toBeTruthy();
+    expect((screen.getByRole("checkbox", { name: /saved_tool/ }) as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("retains changed tool values and text through failed stale reads and retry before explicit apply", async () => {
+    const settings = makeSettings({ enabledToolIds: ["saved_tool"] });
+    const tools = [{ id: "saved_tool", description: "Saved tool", readOnly: true }, { id: "new_tool", description: "New tool", readOnly: false }];
+    const save = vi.fn(async () => true);
+    const { rerender } = renderForm(settings, save, { managedTools: tools, toolCatalogState: "ready" });
+    fireEvent.click(screen.getByRole("button", { name: "Choose tools" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /New Tool/ }));
+    typeInstructions("Keep this draft across catalog reads");
+    rerender(settings, { managedTools: tools, toolCatalogState: "failed" });
+    expect(screen.queryByText(/no longer in the catalog/)).toBeNull();
+    expect((screen.getByRole("checkbox", { name: /New Tool/ }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole("checkbox", { name: /New Tool/ }) as HTMLInputElement).disabled).toBe(true);
+    rerender(settings, { managedTools: tools, toolCatalogState: "loading" });
+    rerender(settings, { managedTools: tools, toolCatalogState: "ready" });
+    expect(instructionsTextarea().value).toBe("Keep this draft across catalog reads");
+    expect((screen.getByRole("checkbox", { name: /New Tool/ }) as HTMLInputElement).checked).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.click(applyButton(openReview()));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ enabledToolIds: ["saved_tool", "new_tool"], developerInstructions: "Keep this draft across catalog reads", expectedVersion: 1 })));
   });
 });

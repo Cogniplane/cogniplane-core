@@ -56,8 +56,8 @@ export function AdminSkillFileModal({ skillId, skillRevisionId, path, onClose }:
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="flex max-h-[85vh] max-w-4xl flex-col gap-0 p-0 sm:max-w-4xl">
-        <DialogHeader className="flex flex-row items-center justify-between border-b border-outline-variant px-6 py-4">
+      <DialogContent scrollBody={false} className="flex max-h-[85vh] flex-col gap-0 p-0 sm:max-w-[min(56rem,calc(100%-2rem))]">
+        <DialogHeader className="flex shrink-0 flex-row items-center justify-between border-b border-outline-variant px-6 py-4 pr-14">
           <DialogTitle className="truncate text-base">{path}</DialogTitle>
           <DialogDescription className="sr-only">Viewing the contents of {path}.</DialogDescription>
           {state.status === "ready" && state.file.contentType === "text/csv" ? (

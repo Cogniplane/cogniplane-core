@@ -13,6 +13,8 @@
 //   refresh_family:<fid>   → "active" | "revoked"  (TTL = refresh max-age)
 //   refresh_family_login_at:<fid> → initial login epoch seconds (30d, never extended)
 //   refresh_rotation:<jti> → pending marker or completed token result (60s)
+//   refresh_reuse_unaudited:<fid> → a reuse detection whose audit event was
+//                            not written yet (refresh max-age)
 
 const FAMILY_ACTIVE = "active";
 const FAMILY_REVOKED = "revoked";
@@ -31,6 +33,10 @@ function familyLoginAtKey(familyId: string): string {
 
 function rotationKey(jti: string): string {
   return `refresh_rotation:${jti}`;
+}
+
+function unauditedReuseKey(familyId: string): string {
+  return `refresh_reuse_unaudited:${familyId}`;
 }
 
 export const REFRESH_ROTATION_GRACE_SECONDS = 60;
@@ -130,6 +136,7 @@ export type RefreshTokenRedis = {
   get(key: string): Promise<string | null>;
   eval(script: string, numberOfKeys: number, ...args: string[]): Promise<unknown>;
   set(key: string, value: string, mode: "EX", ttlSeconds: number): Promise<unknown>;
+  del(key: string): Promise<unknown>;
 };
 
 export type RefreshRotationResult = {
@@ -285,9 +292,70 @@ export async function waitForRefreshRotation(
   return null;
 }
 
+/** Whether a refresh family is still active (not revoked, not expired). */
+export async function isRefreshFamilyActive(redis: RefreshTokenRedis, familyId: string): Promise<boolean> {
+  return (await redis.get(familyKey(familyId))) === FAMILY_ACTIVE;
+}
+
 export async function revokeRefreshFamily(
   redis: RefreshTokenRedis,
   input: { familyId: string; ttlSeconds: number }
 ): Promise<void> {
   await redis.set(familyKey(input.familyId), FAMILY_REVOKED, "EX", input.ttlSeconds);
+}
+
+/** A refresh-token reuse whose audit event is not written yet. */
+export type UnauditedReuse = {
+  tenantId: string;
+  userId: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+  /** ISO time of the detection. A late audit event records it. */
+  detectedAt: string;
+};
+
+function parseUnauditedReuse(value: string): UnauditedReuse | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<Record<keyof UnauditedReuse, unknown>> | null;
+    const optional = (field: unknown) => (typeof field === "string" ? field : null);
+    if (
+      parsed &&
+      typeof parsed.tenantId === "string" &&
+      typeof parsed.userId === "string" &&
+      typeof parsed.detectedAt === "string"
+    ) {
+      return {
+        tenantId: parsed.tenantId,
+        userId: parsed.userId,
+        ipAddress: optional(parsed.ipAddress),
+        userAgent: optional(parsed.userAgent),
+        detectedAt: parsed.detectedAt
+      };
+    }
+  } catch {
+    // A malformed marker is treated as absent.
+  }
+  return null;
+}
+
+// The audit event of a reuse detection can fail after the family is revoked.
+// The marker keeps the detection until a later refusal of the same family
+// writes the event: the claim of a revoked family does not detect reuse
+// again. It lives as long as the revoked family state.
+export async function keepUnauditedReuse(
+  redis: RefreshTokenRedis,
+  input: { familyId: string; reuse: UnauditedReuse; ttlSeconds: number }
+): Promise<void> {
+  await redis.set(unauditedReuseKey(input.familyId), JSON.stringify(input.reuse), "EX", input.ttlSeconds);
+}
+
+/** The reuse of this family whose audit event is not written yet, if any. */
+export async function readUnauditedReuse(redis: RefreshTokenRedis, familyId: string): Promise<UnauditedReuse | null> {
+  const value = await redis.get(unauditedReuseKey(familyId));
+  return value === null ? null : parseUnauditedReuse(value);
+}
+
+/** Removes the marker after its audit event is written. */
+export async function clearUnauditedReuse(redis: RefreshTokenRedis, familyId: string): Promise<void> {
+  await redis.del(unauditedReuseKey(familyId));
 }

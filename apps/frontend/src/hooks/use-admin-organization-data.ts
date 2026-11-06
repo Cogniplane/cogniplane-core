@@ -4,24 +4,24 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import {
-  deleteTenantMicrosoftConfig,
   getTenantDetails,
-  saveTenantMicrosoftConfig,
   updateTenantProviderKey,
   updateTenantPiiProtection
 } from "../lib/admin-api";
+import { ApiError } from "../lib/api-client";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
-import type { ModelProvider, PiiProtectionSettings } from "@cogniplane/shared-types";
+import type { ModelProvider, PiiProtectionSettings, TenantDetails } from "@cogniplane/shared-types";
 import { MODEL_PROVIDER_META } from "@cogniplane/shared-types";
+
+/** The result of a save. `revision` is the revision of the saved settings; a server older than revisions sends none. */
+export type PiiSaveResult = { ok: true; revision?: number } | { ok: false };
 
 // Per-provider save keys are `save-<provider>-key` so they line up with
 // providerKeyBusyKey() in provider-key-rows.tsx.
 type ProviderMutationKey = `save-${ModelProvider}-key`;
 type MutationKey =
   | ProviderMutationKey
-  | "microsoft-save"
-  | "microsoft-remove"
   | "save-pii-protection";
 
 type OrgMutationContext = {
@@ -37,6 +37,8 @@ export function useAdminOrganizationData() {
   const [mutationError, setMutationError] = useState<string | null>(null);
   const [errorKey, setErrorKey] = useState<MutationKey | null>(null);
   const [activeMutation, setActiveMutation] = useState<MutationKey | null>(null);
+  // True when the last PII save failed because another session saved first.
+  const [piiConflict, setPiiConflict] = useState(false);
 
   const tenantQuery = useQuery({
     queryKey: queryKeys.admin.tenant(),
@@ -85,6 +87,7 @@ export function useAdminOrganizationData() {
     error: mutationError ?? tenantLoadError,
     successMessage,
     successKey,
+    piiConflict,
     handleSaveProviderKey: async (provider: ModelProvider, apiKey: string) => {
       const label = MODEL_PROVIDER_META[provider].label;
       // An empty key is the removal path (the backend clears the stored key).
@@ -110,37 +113,8 @@ export function useAdminOrganizationData() {
         }
       )) === true;
     },
-    handleSaveMicrosoftConfig: async (config: {
-      clientId?: string;
-      clientSecret?: string;
-      entraTenantId?: string;
-    }) => {
-      await run(
-        {
-          key: "microsoft-save",
-          successMessage: "Microsoft OAuth configuration saved.",
-          errorFallback: "Failed to save Microsoft configuration."
-        },
-        async () => {
-          await saveTenantMicrosoftConfig(config);
-          await invalidateTenant();
-        }
-      );
-    },
-    handleRemoveMicrosoftConfig: async () => {
-      await run(
-        {
-          key: "microsoft-remove",
-          successMessage: "Microsoft OAuth configuration removed.",
-          errorFallback: "Failed to remove Microsoft configuration."
-        },
-        async () => {
-          await deleteTenantMicrosoftConfig();
-          await invalidateTenant();
-        }
-      );
-    },
-    handleSavePiiProtection: async (settings: PiiProtectionSettings) => {
+    handleSavePiiProtection: async (settings: PiiProtectionSettings, expectedRevision?: number): Promise<PiiSaveResult> => {
+      setPiiConflict(false);
       return (await run(
         {
           key: "save-pii-protection",
@@ -148,11 +122,40 @@ export function useAdminOrganizationData() {
           errorFallback: "Failed to save PII settings."
         },
         async () => {
-          await updateTenantPiiProtection(settings);
+          let saved;
+          try {
+            saved = await updateTenantPiiProtection(settings, expectedRevision);
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 409 && error.code === "pii_settings_conflict") {
+              setPiiConflict(true);
+              // Read the current settings. The form keeps the admin's changes
+              // until the admin reloads them. The other session's save also
+              // changed the policy that the Activity tab shows.
+              void invalidateTenant();
+              void queryClient.invalidateQueries({ queryKey: queryKeys.admin.piiMetricsAll() });
+              throw new Error(
+                "These settings changed in another session. Your changes are not saved. Reload to see the current settings.",
+                { cause: error }
+              );
+            }
+            throw error;
+          }
+          // The write response confirms these settings even if the next read fails.
+          queryClient.setQueryData<TenantDetails>(queryKeys.admin.tenant(), (current) => {
+            if (!current) return current;
+            const currentRevision = current.settings.piiProtectionRevision;
+            if (currentRevision !== undefined && saved.piiProtectionRevision !== undefined && currentRevision > saved.piiProtectionRevision) return current;
+            const settings = { ...current.settings, piiProtection: saved.piiProtection, piiProtectionRevision: saved.piiProtectionRevision };
+            // Health from the previous revision no longer describes the saved policy.
+            delete settings.piiProtectionHealth;
+            return { ...current, settings };
+          });
           await invalidateTenant();
-          return true;
+          // The Activity tab shows the policy and its health from the metrics.
+          void queryClient.invalidateQueries({ queryKey: queryKeys.admin.piiMetricsAll() });
+          return { ok: true, revision: saved.piiProtectionRevision } as const;
         }
-      )) === true;
+      )) ?? { ok: false };
     }
   };
 }

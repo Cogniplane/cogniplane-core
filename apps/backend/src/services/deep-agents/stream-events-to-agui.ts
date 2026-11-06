@@ -1,6 +1,10 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import type { McpAppCall } from "@cogniplane/shared-types";
 
+import { EXECUTE_RESULT_EVENT } from "./execute-result-event.js";
+import { GENERATIVE_UI_RENDER_TOOL } from "./render-ui.js";
+import { RenderUiStream } from "./render-ui-stream.js";
+
 import { uuidv7 } from "../../lib/uuid.js";
 import { customEvent } from "./agui-events.js";
 import { withoutPolicyApprovalMetadata } from "../policy/policy-approval-proof.js";
@@ -9,7 +13,7 @@ import { redactAppData, redactSecrets } from "../redact-secrets.js";
 export type DeepAgentsStreamEvent = Record<string, unknown>;
 
 type ToolKind = "command" | "mcp";
-type ToolStatus = "in_progress" | "completed" | "failed";
+type ToolStatus = "in_progress" | "completed" | "failed" | "declined";
 
 type PendingToolCall = {
   itemId: string;
@@ -26,8 +30,38 @@ type PendingToolCall = {
   startedAt: number;
 };
 
+/**
+ * A tool call that the main agent's latest model message proposes. Models
+ * repeat call IDs, across messages and turns, so the server gives each
+ * proposed call its own ID (`cardId`). The card, the result, the saved tool
+ * result and the approval all use it.
+ */
+type ProposedCall = {
+  cardId: string;
+  name: string;
+  /** Set once the call shows: at its approval, or when it starts. */
+  card: PendingToolCall | null;
+  started: boolean;
+  settled: boolean;
+  /** Why an approved call will not run: another call of its step was not approved. */
+  notRun?: string;
+};
+
 export type StreamEventsToAGUIState = {
+  /** Cards of running tools, by the run ID of the tool. */
   pendingToolCalls: Map<string, PendingToolCall>;
+  /**
+   * The calls of the main agent's latest model message, by the model's call
+   * ID. A call ID that the message repeats is left out: its calls keep a card
+   * per tool run and get no approval link.
+   */
+  proposals: Map<string, ProposedCall>;
+  /**
+   * Exit codes that the sandbox reported for tool runs, by run ID. A run takes
+   * its code when it ends. See `execute-result-event.ts`.
+   */
+  exitCodes: Map<string, number>;
+  renderUi?: RenderUiStream;
   planMarkdown: string;
   emittedTextThisRun: boolean;
   textMessageId: string | null;
@@ -35,13 +69,18 @@ export type StreamEventsToAGUIState = {
 };
 
 export type StreamEventsToAGUIOptions = {
+  assistantMessageId?: string;
   mcpToolNames?: ReadonlySet<string>;
   mcpToolServers?: ReadonlyMap<string, string>;
+  /** The model's call ID of a tool run (from the tool-start callback). */
+  modelCallIdOf?: (runId: string) => string | undefined;
 };
 
 export function createStreamEventsToAGUIState(): StreamEventsToAGUIState {
   return {
     pendingToolCalls: new Map(),
+    proposals: new Map(),
+    exitCodes: new Map(),
     planMarkdown: "",
     emittedTextThisRun: false,
     textMessageId: null,
@@ -57,22 +96,30 @@ export function streamEventsToAGUI(
   const kind = typeof event.event === "string" ? event.event : undefined;
   if (!kind || !isRootNamespace(event)) return [];
 
+  if (options.assistantMessageId && !state.renderUi) state.renderUi = new RenderUiStream(options.assistantMessageId);
   switch (kind) {
+    case "on_chat_model_start":
+      // The step of the previous message is over. A call of it that showed
+      // and never started did not run.
+      return settleUnstartedCalls(state);
     case "on_chat_model_stream":
       return mapModelStreamChunk(state, event);
     case "on_chat_model_end":
+      recordProposals(state, event);
       return mapModelRunEnd(state);
     case "on_tool_start":
       return mapToolStart(state, event, options);
     case "on_tool_end":
       return mapToolEnd(state, event);
+    case "on_custom_event":
+      return recordExitCode(state, event);
     default:
       return [];
   }
 }
 
-export function flushOpenAGUIMessages(state: StreamEventsToAGUIState): BaseEvent[] {
-  return closeText(state).concat(closeReasoning(state));
+export function flushOpenAGUIMessages(state: StreamEventsToAGUIState, finishUi = true): BaseEvent[] {
+  return [...closeText(state), ...closeReasoning(state), ...(finishUi ? state.renderUi?.finish() ?? [] : [])];
 }
 
 function isRootNamespace(event: DeepAgentsStreamEvent): boolean {
@@ -100,6 +147,10 @@ function mapModelStreamChunk(
     if (text) events.push(...openReasoning(state, text));
   };
 
+  if (Array.isArray(chunk.tool_call_chunks) && state.renderUi) {
+    const snapshots = state.renderUi.push(String(event.run_id ?? "model"), chunk.tool_call_chunks);
+    if (snapshots.length > 0) events.push(...closeText(state), ...closeReasoning(state), ...snapshots);
+  }
   if (typeof chunk.content === "string") {
     pushText(chunk.content);
     return events;
@@ -128,6 +179,39 @@ function mapModelRunEnd(state: StreamEventsToAGUIState): BaseEvent[] {
 
 const PLAN_TOOL_NAME = "write_todos";
 
+// The result of a shown call that did not run. The status says why, and the
+// card shows the text.
+const NOT_RUN_SIBLING = "This action did not run: another action in the same step was not approved.";
+const NOT_RUN = "This action did not run.";
+
+function recordProposals(state: StreamEventsToAGUIState, event: DeepAgentsStreamEvent): void {
+  const output = (event.data as { output?: { tool_calls?: unknown } } | undefined)?.output;
+  const calls = (Array.isArray(output?.tool_calls) ? output.tool_calls : [])
+    .filter((call): call is { id: string; name: string } =>
+      typeof call?.id === "string" && call.id !== "" && typeof call.name === "string");
+  const counts = new Map<string, number>();
+  for (const call of calls) counts.set(call.id, (counts.get(call.id) ?? 0) + 1);
+  state.proposals = new Map(calls.filter((call) => counts.get(call.id) === 1).map((call): [string, ProposedCall] => [call.id,
+    { cardId: uuidv7(), name: call.name, card: null, started: false, settled: false }]));
+}
+
+function newCard(id: string, name: string, input: Record<string, unknown> | null, options: StreamEventsToAGUIOptions): PendingToolCall {
+  const isMcp = options.mcpToolNames?.has(name) ?? false;
+  return {
+    itemId: id,
+    kind: isMcp ? "mcp" : "command",
+    title: isMcp ? `Tool: ${name}` : name,
+    status: "in_progress",
+    command: extractShellCommand(name, input),
+    server: isMcp ? (options.mcpToolServers?.get(name) ?? null) : null,
+    toolName: name,
+    input: JSON.stringify(isMcp ? redactAppData(input ?? {}) : input ?? {}),
+    output: "",
+    durationMs: null,
+    startedAt: Date.now()
+  };
+}
+
 function mapToolStart(
   state: StreamEventsToAGUIState,
   event: DeepAgentsStreamEvent,
@@ -141,22 +225,118 @@ function mapToolStart(
 
   if (name === PLAN_TOOL_NAME) return emitPlanDelta(state, input);
 
-  const isMcp = options.mcpToolNames?.has(name) ?? false;
-  const call: PendingToolCall = {
-    itemId: runId,
-    kind: isMcp ? "mcp" : "command",
-    title: isMcp ? `Tool: ${name}` : name,
-    status: "in_progress",
-    command: extractShellCommand(name, input),
-    server: isMcp ? (options.mcpToolServers?.get(name) ?? null) : null,
-    toolName: name,
-    input: JSON.stringify(isMcp ? redactAppData(input ?? {}) : input ?? {}),
-    output: "",
-    durationMs: null,
-    startedAt: Date.now()
-  };
+  // The callback gives the model's call ID of this run. Within the latest
+  // message, it names one proposed call, so the run takes that call's card.
+  const modelCallId = typeof event.run_id === "string" ? options.modelCallIdOf?.(event.run_id) : undefined;
+  const found = modelCallId ? state.proposals.get(modelCallId) : undefined;
+  // A settled card already says that the call did not run, so a run of it gets a card of its own.
+  const proposal = found?.name === name && !found.settled ? found : undefined;
+  if (proposal?.card) {
+    // Shown at its approval, or a delegation that runs again after an approval inside it.
+    if (!proposal.started) proposal.card.startedAt = Date.now();
+    proposal.started = true;
+    state.pendingToolCalls.set(runId, proposal.card);
+    return [];
+  }
+
+  const call = newCard(proposal?.cardId ?? runId, name, input, options);
+  if (proposal) {
+    proposal.card = call;
+    proposal.started = true;
+  }
   state.pendingToolCalls.set(runId, call);
-  return startTool(state, call);
+  const surfaces = name === GENERATIVE_UI_RENDER_TOOL ? state.renderUi?.start(call.itemId, call.input) ?? [] : [];
+  return surfaces.length > 0
+    ? [...closeText(state), ...closeReasoning(state), ...surfaces, ...startTool(state, call)]
+    : startTool(state, call);
+}
+
+/**
+ * Shows the card of each pending approval of the main agent before the
+ * approval is asked, and returns the server ID of each action's call. Only an
+ * action whose model call ID names one call of the latest message gets an ID.
+ * Delegated work and repeated call IDs get none: their approvals stay in the
+ * notification list.
+ */
+export function showApprovalCalls(
+  state: StreamEventsToAGUIState,
+  actions: ReadonlyArray<{ name: string; args: Record<string, unknown>; modelCallId?: string }>,
+  options: StreamEventsToAGUIOptions = {}
+): { events: BaseEvent[]; toolCallIds: Array<string | undefined> } {
+  const counts = new Map<string, number>();
+  for (const { modelCallId } of actions) if (modelCallId) counts.set(modelCallId, (counts.get(modelCallId) ?? 0) + 1);
+  const events: BaseEvent[] = [];
+  const toolCallIds = actions.map((action) => {
+    if (!action.modelCallId || counts.get(action.modelCallId) !== 1) return undefined;
+    const proposal = state.proposals.get(action.modelCallId);
+    if (!proposal || proposal.name !== action.name || proposal.started || proposal.settled) return undefined;
+    if (!proposal.card) {
+      proposal.card = newCard(proposal.cardId, action.name, withoutPolicyApprovalMetadata(action.args), options);
+      events.push(...startTool(state, proposal.card));
+    }
+    return proposal.cardId;
+  });
+  return { events, toolCallIds };
+}
+
+/**
+ * Settles the cards of the approvals that did not approve their call: the
+ * result is the message that the model gets. When the main agent's step has a
+ * call that was not approved, LangChain's HITL middleware runs none of the
+ * step's other calls, so an approved call of that step gets a reason that the
+ * card shows if it does not start.
+ */
+export function settleApprovalCalls(
+  state: StreamEventsToAGUIState,
+  actions: ReadonlyArray<{ modelCallId?: string; toolCallId?: string }>,
+  decisions: ReadonlyArray<{ type: "approve" } | { type: "reject"; message?: string }>
+): BaseEvent[] {
+  const byCard = new Map([...state.proposals.values()].map((proposal) => [proposal.cardId, proposal]));
+  const events: BaseEvent[] = [];
+  let stepNotApproved = false;
+  actions.forEach((action, index) => {
+    const decision = decisions[index];
+    if (decision?.type !== "reject") return;
+    if (action.modelCallId) stepNotApproved = true;
+    const proposal = action.toolCallId ? byCard.get(action.toolCallId) : undefined;
+    if (proposal) events.push(...settleCall(proposal, "declined", decision.message ?? "Declined."));
+  });
+  if (stepNotApproved) {
+    actions.forEach((action, index) => {
+      const proposal = action.toolCallId ? byCard.get(action.toolCallId) : undefined;
+      if (proposal && decisions[index]?.type === "approve") proposal.notRun = NOT_RUN_SIBLING;
+    });
+  }
+  return events;
+}
+
+/** Settles each shown call of the latest message that never started: it did not run. */
+export function settleUnstartedCalls(state: StreamEventsToAGUIState): BaseEvent[] {
+  return [...state.proposals.values()].flatMap((proposal) => proposal.card && !proposal.started && !proposal.settled
+    ? settleCall(proposal, proposal.notRun ? "declined" : "failed", proposal.notRun ?? NOT_RUN)
+    : []);
+}
+
+function settleCall(proposal: ProposedCall, status: "declined" | "failed", output: string): BaseEvent[] {
+  const call = proposal.card;
+  if (!call || proposal.started || proposal.settled) return [];
+  proposal.settled = true;
+  call.status = status;
+  call.output = output;
+  return completeTool(call);
+}
+
+/**
+ * Keeps the exit code that the sandbox reported to a tool run. Only the
+ * sandbox dispatches this event: it comes from the structured response of the
+ * command, not from the text that the tool returns. Any other event name, and
+ * a value that is not an integer, records nothing.
+ */
+function recordExitCode(state: StreamEventsToAGUIState, event: DeepAgentsStreamEvent): BaseEvent[] {
+  if (event.name !== EXECUTE_RESULT_EVENT || typeof event.run_id !== "string") return [];
+  const exitCode = (event.data as { exitCode?: unknown } | undefined)?.exitCode;
+  if (typeof exitCode === "number" && Number.isInteger(exitCode)) state.exitCodes.set(event.run_id, exitCode);
+  return [];
 }
 
 function mapToolEnd(state: StreamEventsToAGUIState, event: DeepAgentsStreamEvent): BaseEvent[] {
@@ -165,20 +345,29 @@ function mapToolEnd(state: StreamEventsToAGUIState, event: DeepAgentsStreamEvent
 
   const runId = typeof event.run_id === "string" ? event.run_id : null;
   if (!runId) return [];
+  const exitCode = state.exitCodes.get(runId);
+  state.exitCodes.delete(runId);
   const call = state.pendingToolCalls.get(runId);
   if (!call) return [];
   state.pendingToolCalls.delete(runId);
 
   const data = event.data as Record<string, unknown> | undefined;
   const { output, isError, mcpApp } = extractToolOutput(data?.output, call.kind === "mcp");
-  call.status = isError ? "failed" : "completed";
+  // The SDK returns the result of a failed command as a successful message, so
+  // the exit code of the sandbox decides. Other tools report through their
+  // message status. A derived file tool (grep with no match) exits non-zero as a normal result.
+  const commandFailed = call.kind === "command" && call.toolName === "execute" && exitCode !== undefined && exitCode !== 0;
+  call.status = isError || commandFailed ? "failed" : "completed";
   call.output = output;
   call.durationMs = Math.max(0, Date.now() - call.startedAt);
   if (mcpApp && call.kind === "mcp" && !isError) {
     call.mcpApp = { ...mcpApp, input: JSON.parse(call.input) as Record<string, unknown>,
       result: redactAppData(mcpApp.result) };
   }
-  return completeTool(call);
+  return [
+    ...(name === GENERATIVE_UI_RENDER_TOOL ? state.renderUi?.end(call.itemId, isError, output) ?? [] : []),
+    ...completeTool(call)
+  ];
 }
 
 function openText(state: StreamEventsToAGUIState, delta: string): BaseEvent[] {
@@ -267,7 +456,7 @@ function completeTool(call: PendingToolCall): BaseEvent[] {
       role: "tool"
     } as BaseEvent
   ];
-  if (call.status === "failed") {
+  if (call.status === "failed" || call.status === "declined") {
     events.push(
       customEvent("tool_status", {
         toolCallId: call.itemId,

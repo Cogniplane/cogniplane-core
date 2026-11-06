@@ -11,7 +11,7 @@ export type AlertItem = {
   id: string;
   timestamp: string;
   kind: "pii" | "approval" | "error";
-  iconColor: "red" | "blue" | "gray";
+  iconColor: "red" | "green" | "blue" | "gray";
   iconLabel: string;
   summary: string;
   jumpToMessageId: string | null;
@@ -34,7 +34,9 @@ export function buildPiiAlertItem(
       ? `on artifact ${shortId(run.subjectId)}`
       : "on session";
   const color: AlertItem["iconColor"] =
-    run.status === "blocked" ? "red" : run.status === "transformed" ? "blue" : "gray";
+    // Same meaning as the session badge and the artifact chip: a redaction is
+    // a completed protection (green). A completed run can be clean, so it stays neutral.
+    run.status === "blocked" ? "red" : run.status === "transformed" ? "green" : "gray";
   return {
     id: `pii-${run.scanRunId}`,
     timestamp: run.createdAt,

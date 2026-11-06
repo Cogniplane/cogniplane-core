@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { ProjectWorkspace } from "./project-workspace";
 import * as api from "../lib/project-api";
 import { listSessions, restoreSession, archiveSession, deleteSession, interruptSession } from "../lib/session-api";
 
 import type { Artifact, Project, Session } from "@cogniplane/shared-types";
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("./project-files", () => ({ ProjectFiles: ({ project }: { project: Project }) => <div data-testid="project-files">{project.archivedAt ? "Archived file library" : "File library"}</div> }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn(), replace: vi.fn() }) }));
 vi.mock("@/lib/auth-context", () => ({ useAuth: () => ({ user: { tenantId: "t1", userId: "u" } }) }));
@@ -125,13 +127,20 @@ async function open(view: "overview" | "settings" = "overview") {
     </QueryClientProvider>
   );
   await screen.findByText(view === "overview" ? "File library" : "Project settings");
+  if (view === "overview") {
+    const addSession = screen.queryByText("Add an existing session");
+    if (addSession) {
+      fireEvent.click(addSession);
+      await waitFor(() => expect(screen.queryByText("Loading personal sessions...")).toBeNull());
+    }
+  }
 }
 
 it("keeps everyday project work in Overview and owner controls in Settings", async () => {
   await open();
   expect(screen.getByRole("link", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
   expect(screen.getByRole("link", { name: "Settings" }).getAttribute("href"))
-    .toBe("/projects?project=p1&view=settings");
+    .toBe("/projects?project=p1&archived=false&view=settings");
   expect(screen.getByRole("heading", { name: "Sessions" })).toBeTruthy();
   expect(screen.queryByText("Project settings")).toBeNull();
   expect(screen.queryByRole("combobox", { name: "Approval mode" })).toBeNull();
@@ -140,7 +149,7 @@ it("keeps everyday project work in Overview and owner controls in Settings", asy
   await open("settings");
   expect(screen.getByRole("link", { name: "Settings" }).getAttribute("aria-current")).toBe("page");
   expect(screen.getByRole("link", { name: "Overview" }).getAttribute("href"))
-    .toBe("/projects?project=p1");
+    .toBe("/projects?project=p1&archived=false");
   expect(screen.getByRole("combobox", { name: "Approval mode" })).toBeTruthy();
   expect(screen.getByTestId("project-skills").textContent).toBe("Project skills in Planning");
   expect(screen.getByRole("button", { name: "Rename" })).toBeTruthy();
@@ -149,7 +158,7 @@ it("keeps everyday project work in Overview and owner controls in Settings", asy
 });
 it("adds an existing session only after disclosure confirmation ", async () => {
   await open();
-  fireEvent.change(screen.getByRole("combobox", { name: "Existing session" }), {
+  fireEvent.change(screen.getByRole("combobox", { name: "Session to add" }), {
     target: { value: "s2" }
   });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
@@ -185,6 +194,8 @@ it("keeps the selected approval value visible while saving", async () => {
   fireEvent.change(select, { target: { value: "manual" } });
   await waitFor(() => expect(select.disabled).toBe(true));
   expect(select.value).toBe("manual");
+  expect(select.getAttribute("aria-busy")).toBe("true");
+  expect(screen.getByRole("status").textContent).toContain("Saving approval mode");
   finish({ ...project, approvalMode: "manual" });
   await waitFor(() => expect(select.disabled).toBe(false));
 });
@@ -219,7 +230,9 @@ it("passes archived state to the overview file library", async () => {
   vi.mocked(api.getProject).mockResolvedValue({ project: { ...project, archivedAt: time }, sessions: [session], files: [], canManage: true });
   render(<QueryClientProvider client={client}><ProjectWorkspace project={{ ...project, archivedAt: time }} view="overview" /></QueryClientProvider>);
   await screen.findByText("Archived file library");
-  expect(screen.getByRole("combobox", { name: "Existing session" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.queryByText("Add an existing session")).toBeNull();
+  expect(screen.getByText("Restore this project in Settings to start or add sessions.")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "New session" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByRole("button", { name: "Restore project" })).toBeNull();
 });
 
@@ -238,7 +251,7 @@ it("does not hide owner controls when the members request fails", async () => {
   expect(screen.getByRole("button", { name: "Archive project" })).toBeTruthy();
 });
 
-it("uses the project detail capability to hide owner controls for non-owners", async () => {
+it("uses the project detail capability to prevent owner actions and explain approval access", async () => {
   vi.mocked(api.getProject).mockResolvedValue({
     project,
     sessions: [session],
@@ -249,7 +262,9 @@ it("uses the project detail capability to hide owner controls for non-owners", a
   expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Archive project" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Delete project" })).toBeNull();
-  expect(screen.queryByRole("combobox", { name: "Approval mode" })).toBeNull();
+  expect((screen.getByRole("combobox", { name: "Approval mode" }) as HTMLSelectElement).disabled).toBe(true);
+  expect(screen.getByText("Only project owners can change approval mode.")).toBeTruthy();
+  expect(api.updateProjectApprovalMode).not.toHaveBeenCalled();
   expect(screen.queryByRole("combobox", { name: "File mode" })).toBeNull();
 });
 
@@ -262,7 +277,7 @@ it("offers only active unassigned conversations and never offers moves or detach
     { ...session, sessionId: "free", projectId: null, sessionName: "Private conversation" }
   ] });
   await open();
-  const options = within(screen.getByRole("combobox", { name: "Existing session" })).getAllByRole("option");
+  const options = within(screen.getByRole("combobox", { name: "Session to add" })).getAllByRole("option");
   expect(options.map((option) => option.textContent)).toEqual(["Add an existing session...", "Private conversation"]);
   expect(screen.queryByRole("button", { name: "Remove from project" })).toBeNull();
 });
@@ -270,7 +285,7 @@ it("offers only active unassigned conversations and never offers moves or detach
 it("preserves the confirmation on failure and lets the user retry", async () => {
   vi.mocked(api.setProjectSession).mockRejectedValueOnce(new Error("The session changed. Reload and try again."));
   await open();
-  fireEvent.change(screen.getByLabelText("Existing session"), { target: { value: "s2" } });
+  fireEvent.change(screen.getByLabelText("Session to add"), { target: { value: "s2" } });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   fireEvent.click(screen.getByRole("button", { name: "Confirm addition" }));
   await screen.findByText("The session changed. Reload and try again.");
@@ -282,7 +297,7 @@ it("preserves the confirmation on failure and lets the user retry", async () => 
 
 it("blocks confirmation when a refreshed session list shows the session was assigned elsewhere", async () => {
   await open();
-  fireEvent.change(screen.getByLabelText("Existing session"), { target: { value: "s2" } });
+  fireEvent.change(screen.getByLabelText("Session to add"), { target: { value: "s2" } });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   vi.mocked(listSessions).mockResolvedValue({ trashRetentionDays: 30, sessions: [session] });
   await client.invalidateQueries({ queryKey: ["sessions"] });
@@ -300,8 +315,8 @@ it("finds an older personal session through paged search and confirms its assign
       nextCursor: cursor || search ? null : "older", trashRetentionDays: 30 };
   });
   await open();
-  fireEvent.click(await screen.findByRole("button", { name: "Load more sessions" }));
-  await screen.findByText("Could not load sessions.");
+  fireEvent.click(await screen.findByRole("button", { name: "Find more personal sessions" }));
+  await screen.findByText("Could not load personal sessions to add.");
   expect(screen.getAllByRole("alert")).toHaveLength(1);
   expect(screen.getAllByRole("button", { name: "Try again" })).toHaveLength(1);
   const callsBeforeRetry = vi.mocked(listSessions).mock.calls.length;
@@ -309,9 +324,9 @@ it("finds an older personal session through paged search and confirms its assign
   fireEvent.click(screen.getByRole("button", { name: "Try again" }));
   await screen.findByRole("option", { name: "Older planning" });
   expect(vi.mocked(listSessions).mock.calls.slice(callsBeforeRetry).map(([options]) => options?.cursor)).toEqual(["older"]);
-  fireEvent.change(screen.getByLabelText("Search existing sessions"), { target: { value: "planning" } });
+  fireEvent.change(screen.getByLabelText("Find a session to add"), { target: { value: "planning" } });
   await screen.findByRole("option", { name: "Older planning" });
-  fireEvent.change(screen.getByLabelText("Existing session"), { target: { value: "old-personal" } });
+  fireEvent.change(screen.getByLabelText("Session to add"), { target: { value: "old-personal" } });
   fireEvent.click(screen.getByRole("button", { name: "Add" }));
   fireEvent.click(screen.getByRole("button", { name: "Confirm addition" }));
   await waitFor(() => expect(api.setProjectSession).toHaveBeenCalledWith(project.projectId, "old-personal"));
@@ -342,7 +357,7 @@ it("paginates each project session list independently and retries only a failed 
   expect(screen.getAllByRole("link", { name: "Research" })).toHaveLength(1);
   expect(screen.queryByRole("alert")).toBeNull();
   expect(screen.queryByRole("button", { name: "Load more active sessions" })).toBeNull();
-  fireEvent.click(screen.getByRole("tab", { name: "Archived" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archived" }));
   fireEvent.click(screen.getByRole("button", { name: "Load more archived sessions" }));
   await screen.findByRole("link", { name: "archived older" });
   fireEvent.click(screen.getByRole("button", { name: "Load more Trash sessions" }));
@@ -351,7 +366,7 @@ it("paginates each project session list independently and retries only a failed 
   expect(vi.mocked(api.listProjectSessions).mock.calls.map(([id, { status, cursor }]) => [id, status, cursor]))
     .toEqual([["p1", "active", "active-next"], ["p1", "active", "active-next"],
       ["p1", "archived", "archived-next"], ["p1", "deleted", "trash-next"]]);
-  fireEvent.click(screen.getByRole("tab", { name: "Active" }));
+  fireEvent.click(screen.getByRole("button", { name: "Active" }));
   expect(screen.getByRole("link", { name: "active older" })).toBeTruthy();
 });
 
@@ -402,9 +417,132 @@ it.each([
     sessions: [{ ...session, isRunning: running }] });
   await open();
   expect(api.listProjectSessions).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole("button", { name: label }));
+  const actionName = label === "Move to Trash" ? "Move to Trash: Research" : label === "Stop turn" ? "Stop turn in Research" : label;
+  fireEvent.click(screen.getByRole("button", { name: actionName }));
+  if (label === "Move to Trash") {
+    expect(deleteSession).not.toHaveBeenCalled();
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: label }));
+  }
   await waitFor(() => expect(action).toHaveBeenCalledWith(session.sessionId));
   await waitFor(() => expect(api.listProjectSessions).toHaveBeenCalledWith(project.projectId,
     expect.objectContaining({ status: "active", cursor: undefined })));
   expect(screen.queryByRole("alert")).toBeNull();
+});
+
+
+it("separates finding a personal session from the project's status filter", async () => {
+  await open();
+  expect(screen.getByRole("group", { name: "Project session status" })).toBeTruthy();
+  expect(screen.queryByRole("tablist")).toBeNull();
+  expect(screen.getByText(/This search does not filter the project sessions above/)).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Find a session to add"), { target: { value: "missing" } });
+  await waitFor(() => expect(listSessions).toHaveBeenCalledWith(expect.objectContaining({ search: "missing", personalOnly: true })));
+  expect(screen.getByRole("link", { name: "Research" })).toBeTruthy();
+  expect(api.listProjectSessions).not.toHaveBeenCalled();
+});
+
+it.each([0, 30])("explains retention %i before any removal and returns focus after cancel", async retentionDays => {
+  vi.mocked(api.getProject).mockResolvedValue({ project, files: [], sessions: [session], canManage: true, trash: { sessions: [], retentionDays } });
+  await open();
+  const opener = screen.getByRole("button", { name: retentionDays ? "Move to Trash: Research" : "Delete permanently: Research" });
+  opener.focus();
+  fireEvent.click(opener);
+  const dialog = screen.getByRole("alertdialog");
+  expect(dialog.textContent).toContain('"Research"');
+  expect(dialog.textContent).toContain("conversation and local files");
+  expect(dialog.textContent).toContain(retentionDays ? "30 days" : "cannot be restored");
+  expect(deleteSession).not.toHaveBeenCalled();
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(document.activeElement).toBe(opener));
+  expect(deleteSession).not.toHaveBeenCalled();
+});
+
+it.each([0, 30])("guards repeated removal at retention %i, reports the outcome, and focuses the list", async retentionDays => {
+  let finish!: () => void;
+  vi.mocked(api.getProject).mockResolvedValue({ project, files: [], sessions: [session], canManage: true, trash: { sessions: [], retentionDays } });
+  vi.mocked(api.listProjectSessions).mockResolvedValue({ sessions: [], nextCursor: null, trashRetentionDays: retentionDays });
+  vi.mocked(deleteSession).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: retentionDays ? "Move to Trash: Research" : "Delete permanently: Research" }));
+  const confirm = within(screen.getByRole("alertdialog")).getByRole("button", { name: retentionDays ? "Move to Trash" : "Delete permanently" });
+  fireEvent.click(confirm);
+  fireEvent.click(confirm);
+  await waitFor(() => expect(deleteSession).toHaveBeenCalledTimes(1));
+  expect(confirm.hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "Cancel" }).hasAttribute("disabled")).toBe(true);
+  await act(async () => finish());
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(toast.success).toHaveBeenCalledWith(retentionDays
+    ? "Session moved to Trash. Its conversation and local files can be restored for 30 days."
+    : "Session deleted. Its conversation and local files cannot be restored.");
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Sessions" })));
+});
+
+it("keeps a refused removal decision open and lets the user retry", async () => {
+  vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Access refused"));
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Move to Trash: Research" }));
+  fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Move to Trash" }));
+  await screen.findByText(/Move to Trash failed.*Access refused/);
+  expect(screen.getByRole("alertdialog")).toBeTruthy();
+  expect(toast.success).not.toHaveBeenCalled();
+  fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Move to Trash" }));
+  await waitFor(() => expect(deleteSession).toHaveBeenCalledTimes(2));
+});
+
+it.each([
+  { role: "viewer", canManage: false, canEdit: false, archivedAt: null, isRunning: false, hasPendingApprovals: false },
+  { role: "archived", canManage: true, canEdit: true, archivedAt: time, isRunning: false, hasPendingApprovals: false },
+  { role: "running", canManage: false, canEdit: true, archivedAt: null, isRunning: true, hasPendingApprovals: false },
+  { role: "approval", canManage: false, canEdit: true, archivedAt: null, isRunning: false, hasPendingApprovals: true }
+])("preserves the $role session removal guard", async fixture => {
+  vi.mocked(api.getProject).mockResolvedValue({ project: { ...project, archivedAt: fixture.archivedAt }, files: [], sessions: [{ ...session, isRunning: fixture.isRunning, hasPendingApprovals: fixture.hasPendingApprovals }], canManage: fixture.canManage, canEdit: fixture.canEdit });
+  render(<QueryClientProvider client={client}><ProjectWorkspace project={project} /></QueryClientProvider>);
+  await screen.findByRole("link", { name: "Research" });
+  const button = screen.queryByRole("button", { name: "Move to Trash: Research" });
+  if (fixture.role === "viewer") expect(button).toBeNull();
+  else { expect(button?.hasAttribute("disabled")).toBe(true); fireEvent.click(button!); }
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(deleteSession).not.toHaveBeenCalled();
+});
+
+it("blocks a removal if refreshed permission changes during the decision", async () => {
+  await open();
+  fireEvent.click(screen.getByRole("button", { name: "Move to Trash: Research" }));
+  vi.mocked(api.getProject).mockResolvedValue({ project, files: [], sessions: [session], canManage: false, canEdit: false });
+  await act(async () => { await client.invalidateQueries({ queryKey: ["projects", "p1"], exact: true }); });
+  await waitFor(() => expect(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Move to Trash" }).hasAttribute("disabled")).toBe(true));
+  expect(deleteSession).not.toHaveBeenCalled();
+});
+
+it.each([
+  { role: "viewer", canManage: false, canEdit: false, archivedAt: null,
+    help: "You have read-only access. A project owner or editor can start or add sessions." },
+  { role: "archived owner", canManage: true, canEdit: true, archivedAt: time,
+    help: "Restore this project in Settings to start or add sessions." },
+  { role: "archived viewer", canManage: false, canEdit: false, archivedAt: time,
+    help: "This project is archived. A project owner must restore it before sessions can be started or added." }
+])("explains unavailable session actions for an empty $role project", async fixture => {
+  vi.mocked(api.getProject).mockResolvedValue({ project: { ...project, archivedAt: fixture.archivedAt },
+    files: [], sessions: [], canManage: fixture.canManage, canEdit: fixture.canEdit });
+  vi.mocked(api.listProjectSessions).mockResolvedValue({ sessions: [], nextCursor: null, trashRetentionDays: 30 });
+  render(<QueryClientProvider client={client}><ProjectWorkspace project={project} /></QueryClientProvider>);
+  await screen.findByText("No active sessions in this project.");
+  expect(screen.getByText(fixture.help)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "New session" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.queryByText("Add an existing session")).toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Find a session to add" })).toBeNull();
+  expect(screen.queryByText("Start a session here or add an existing conversation.")).toBeNull();
+  expect(listSessions).not.toHaveBeenCalled();
+  expect(api.createProjectSession).not.toHaveBeenCalled();
+  expect(api.setProjectSession).not.toHaveBeenCalled();
+});
+
+
+it("shows the current saved project name in Settings when detail is newer than the list", async () => {
+  vi.mocked(api.getProject).mockResolvedValue({ project: { ...project, name: "Updated planning" }, sessions: [], files: [], canManage: true });
+  await open("settings");
+  expect(screen.getByRole("heading", { name: "Updated planning" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+  expect((screen.getByLabelText("Rename project") as HTMLInputElement).value).toBe("Updated planning");
 });

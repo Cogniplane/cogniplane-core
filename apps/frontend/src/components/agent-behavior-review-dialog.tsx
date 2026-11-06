@@ -13,7 +13,7 @@ import {
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
-import { CHIP, PILL_AMBER, PILL_BLUE, PILL_GRAY, SECTION_LABEL } from "../lib/ui-tokens";
+import { CHIP, PILL_AMBER, PILL_BLUE, PILL_GRAY } from "../lib/ui-tokens";
 
 type Props = {
   open: boolean;
@@ -47,7 +47,7 @@ function TonePill({ change }: { change: BehaviorChange }) {
 
 function ValueTerm({ children }: { children: string }) {
   return (
-    <dt className="pt-0.5 text-[0.68rem] font-semibold uppercase tracking-[0.1em] text-on-surface-faint">
+    <dt className="pt-0.5 text-xs font-medium text-on-surface-variant">
       {children}
     </dt>
   );
@@ -56,7 +56,7 @@ function ValueTerm({ children }: { children: string }) {
 function TextValue({ text }: { text: string }) {
   if (!text) return <span className="text-sm italic text-on-surface-variant">None</span>;
   return (
-    <p className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-md border border-outline-variant bg-surface-container-low px-3 py-2 text-xs leading-relaxed text-on-surface [overflow-wrap:anywhere]">
+    <p className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-md bg-surface-container-low px-3 py-2 text-sm leading-relaxed text-on-surface [overflow-wrap:anywhere]">
       {text}
     </p>
   );
@@ -127,6 +127,7 @@ export function AgentBehaviorReviewDialog(props: Props) {
     >
       <DialogContent
         showCloseButton={false}
+        scrollBody={false}
         // Focus the safe action first, as an alert dialog does.
         onOpenAutoFocus={(event) => {
           event.preventDefault();
@@ -143,10 +144,9 @@ export function AgentBehaviorReviewDialog(props: Props) {
         onInteractOutside={(event) => {
           if (applying) event.preventDefault();
         }}
-        className="flex max-h-[min(90dvh,52rem)] flex-col gap-0 overflow-hidden border-outline-variant bg-surface p-0 text-on-surface sm:max-w-2xl"
+        className="flex max-h-[min(90dvh,52rem)] flex-col gap-0 overflow-hidden p-0 [overflow-wrap:anywhere] sm:max-w-2xl"
       >
         <DialogHeader className="gap-1.5 border-b border-outline-variant px-5 py-4 text-left sm:px-6">
-          <p className={SECTION_LABEL}>Agent behavior · organization defaults</p>
           <DialogTitle className="text-lg leading-snug text-on-surface">
             {changes.length === 0 ? "No changes to apply" : `Review ${plural(changes.length, "change")}`}
           </DialogTitle>
@@ -158,7 +158,7 @@ export function AgentBehaviorReviewDialog(props: Props) {
             <p className="text-xs font-medium text-warning">
               {widening === changes.length && changes.length === 1
                 ? "This change widens what agents can do."
-                : `${plural(widening, "change")} widen what agents can do.`}
+                : `${plural(widening, "change")} ${widening === 1 ? "widens" : "widen"} what agents can do.`}
             </p>
           ) : null}
         </DialogHeader>
@@ -208,9 +208,7 @@ export function AgentBehaviorReviewDialog(props: Props) {
               {changes.map((change) => (
                 <li
                   key={change.field}
-                  className={`flex flex-col gap-2.5 py-4 first:pt-0 last:pb-0 ${
-                    change.tone === "widens" ? "border-l-2 border-l-warning pl-3" : ""
-                  }`}
+                  className="flex flex-col gap-2.5 py-4 first:pt-0 last:pb-0"
                 >
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                     <h3 className="text-sm font-semibold text-on-surface">{change.label}</h3>

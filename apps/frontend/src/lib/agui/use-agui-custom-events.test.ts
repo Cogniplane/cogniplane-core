@@ -20,6 +20,7 @@ function makeFakeAgent() {
     | {
         onRunInitialized?: (arg: { input: RunInput }) => void;
         onCustomEvent?: (arg: { event: { name: string; value?: Record<string, unknown> }; input: RunInput }) => void;
+        onRunFinishedEvent?: (arg: { event: { type: string; runId: string; result?: unknown }; input: RunInput }) => void;
       }
     | null = null;
   const unsubscribe = vi.fn();
@@ -42,7 +43,9 @@ function makeFakeAgent() {
   };
   const emit = (name: string, value?: Record<string, unknown>) =>
     act(() => sub?.onCustomEvent?.({ event: { name, value }, input }));
-  return { agent, emit, run, unsubscribe };
+  const finish = (runId: string, result?: unknown) =>
+    act(() => sub?.onRunFinishedEvent?.({ event: { type: "RUN_FINISHED", runId, result }, input }));
+  return { agent, emit, finish, run, unsubscribe };
 }
 
 describe("useAguiCustomEvents — tool_status side-channel (R8)", () => {
@@ -596,6 +599,38 @@ describe("useAguiCustomEvents — saved runtime notices", () => {
     act(() => result.current.syncServerState(snapshot([notice("n-1"), notice("n-2"), notice("n-3")])));
     emit("runtime_notice", liveNotice("n-2"));
     expect(result.current.notices.map((row) => row.noticeId)).toEqual(["n-3"]);
+  });
+});
+
+describe("useAguiCustomEvents — a turn that the backend stopped", () => {
+  it("shows why when the turn ends, once, and not for the user's own Stop", () => {
+    const { agent, finish } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
+
+    finish("turn-1", { interrupted: true });
+    finish("turn-2");
+    expect(result.current.notices).toEqual([]);
+
+    finish("turn-3", { interrupted: true, reason: "security_change" });
+    finish("turn-3", { interrupted: true, reason: "security_change" });
+    expect(result.current.notices).toEqual([expect.objectContaining({
+      noticeId: "turn-stopped:turn-3",
+      title: "Turn stopped",
+      message: "This turn stopped because your account's security settings changed. Send the message again."
+    })]);
+  });
+
+  it("the saved row and the live event show one notice", () => {
+    const { agent, finish } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
+
+    finish("turn-3", { interrupted: true, reason: "security_change" });
+    act(() => result.current.syncServerState({
+      messages: [savedReply({ messageId: "turn-3", status: "interrupted", stopReason: "security_change" })],
+      approvals: []
+    }));
+
+    expect(result.current.notices.map((row) => row.noticeId)).toEqual(["turn-stopped:turn-3"]);
   });
 });
 

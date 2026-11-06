@@ -85,6 +85,14 @@ it("selects the section that the path names, including nested pages", () => {
   expect(state.header).toMatchObject({ title: "Scheduled jobs", subtitle: section("scheduled-jobs").subtitle });
 });
 
+it("matches a whole path segment, not the start of a section id", () => {
+  state.pathname = "/settings/jira-extra";
+  render(<SettingsLayout>{null}</SettingsLayout>);
+
+  expect(state.navigation!.activeSectionId).toBe("connections");
+  expect(state.header).toMatchObject({ title: "Connected accounts", subtitle: section("connections").subtitle });
+});
+
 it("keeps Connected accounts selected in the menu for an integration page, but titles the page after it", () => {
   state.pathname = "/settings/notion";
   render(<SettingsLayout>{null}</SettingsLayout>);

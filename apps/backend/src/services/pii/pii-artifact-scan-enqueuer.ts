@@ -1,10 +1,15 @@
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
+import { piiSubjectForSource, type PiiImportScopeRegistry } from "./pii-import-scopes.js";
+import { PII_POLICY_INVALID_CODE, PII_POLICY_INVALID_MESSAGE } from "./pii-policy.js";
 import type { PiiFinding } from "./pii-provider.js";
 import {
   isScannableContentType,
   PiiProtectionServiceError,
+  type PiiDecision,
+  type PiiAppliedPolicy,
+  type PiiPolicyRead,
   type PiiProtectionService,
   type PiiScanArtifactInput
 } from "./pii-protection-service.js";
@@ -12,7 +17,10 @@ import { PERMANENT_PII_ERROR_CODES } from "./pii-scan-job-handler.js";
 import type { PiiScanJobMode, PiiScanJobStore } from "./pii-scan-job-store.js";
 import type { PiiScanRunStore } from "./pii-scan-run-store.js";
 
-export type PiiArtifactScanSource = "upload" | "microsoft_import";
+// "upload" for a direct upload, or the subject kind of a registered import
+// source (see pii-import-scopes.ts). Stored as the job `subjectKind` and the
+// audit `source`.
+export type PiiArtifactScanSource = "upload" | (string & {});
 
 export interface EnqueueArtifactPiiScanInput {
   tenantId: string;
@@ -25,9 +33,10 @@ export interface EnqueueArtifactPiiScanInput {
 }
 
 // The synchronous path runs in block mode and, in every mode, for a type the
-// scan cannot read. It records the tenant's real mode, as the async handler
-// records `job.mode`.
-type SyncScanInput = EnqueueArtifactPiiScanInput & { mode: PiiScanJobMode };
+// scan cannot read. `mode` and `read` come from the one policy read that
+// routed the upload. The evaluation uses the same read, so the scan run, the
+// detail, and the audit event agree with the decision.
+type SyncScanInput = EnqueueArtifactPiiScanInput & { mode: PiiScanJobMode; read: PiiPolicyRead };
 
 export type PiiArtifactScanResult =
   | { kind: "skipped" }
@@ -55,10 +64,10 @@ type PiiArtifactScanLogger = {
 
 /**
  * Runs after an artifact has been persisted. Enforces the tenant's PII policy
- * for uploads and Microsoft imports:
+ * for uploads and registered imports:
  *
- * - `block` mode is **synchronous**: the helper calls `evaluateArtifact` in the
- *   request path and, on a block decision, marks the artifact `failed` +
+ * - `block` mode is **synchronous**: the helper calls `evaluateArtifactWithPolicy`
+ *   in the request path and, on a block decision, marks the artifact `failed` +
  *   stamps a `blocked` PII detail. Callers should surface an error to the
  *   user. Provider failures fail-closed the same way.
  * - `detect` and `transform` modes are async — the helper stamps a `pending`
@@ -73,7 +82,8 @@ export class PiiArtifactScanEnqueuer {
 
   constructor(
     private readonly deps: {
-      piiProtection: Pick<PiiProtectionService, "getActiveSettings" | "evaluateArtifact">;
+      piiProtection: Pick<PiiProtectionService, "readPolicy" | "isSubjectInScope" | "evaluateArtifactWithPolicy">;
+      importScopes?: Pick<PiiImportScopeRegistry, "findBySubjectKind">;
       piiScanRuns: Pick<PiiScanRunStore, "create" | "update">;
       piiScanJobs: Pick<PiiScanJobStore, "create">;
       artifacts: Pick<ArtifactStore, "setPiiDetail" | "update">;
@@ -85,23 +95,60 @@ export class PiiArtifactScanEnqueuer {
     }
   ) {}
 
+  // One policy read routes the upload. The synchronous scan evaluates and
+  // records with the same read. A queued scan applies the policy in force
+  // when it runs (see PiiScanJobHandler).
   async enqueue(input: EnqueueArtifactPiiScanInput): Promise<PiiArtifactScanResult> {
-    const settings = await this.deps.piiProtection.getActiveSettings(input.tenantId);
-    if (!settings.enabled || settings.mode === "off") return { kind: "skipped" };
+    const read = await this.deps.piiProtection.readPolicy(input.tenantId);
+    const { policy } = read;
+    if (policy.activation === "off") return { kind: "skipped" };
 
-    const scopeEnabled =
-      input.source === "upload" ? settings.scopes.uploads : settings.scopes.microsoftImports;
-    if (!scopeEnabled) return { kind: "skipped" };
+    if (input.source !== "upload" && !this.deps.importScopes?.findBySubjectKind(input.source)) {
+      // No toggle exists for this source, so the gate scans it.
+      this.deps.logger?.warn?.(
+        { tenantId: input.tenantId, artifactId: input.artifactId, source: input.source.slice(0, 64) },
+        "PII scan source is not registered; it is scanned as in scope"
+      );
+    }
+    if (!this.deps.piiProtection.isSubjectInScope(policy, piiSubjectForSource(input.source))) {
+      return { kind: "skipped" };
+    }
+    if (policy.activation === "invalid") return this.stopForInvalidPolicy(input, read.revision);
 
-    const mode = settings.mode as PiiScanJobMode;
+    const mode = policy.settings.mode as PiiScanJobMode;
 
     // A type the scan cannot read is rejected now in every mode, so the
     // uploader gets the reason at once instead of a later background failure.
     if (mode === "block" || !isScannableContentType(input.contentType)) {
-      return this.runSyncBlock({ ...input, mode });
+      return this.runSyncBlock({ ...input, mode, read });
     }
 
-    return this.runAsync(input, mode);
+    return this.runAsync(input, mode, policy.settings.detectors.entityTypes);
+  }
+
+  // Not a finding: the artifact fails and keeps its bytes, so an admin can
+  // repair the policy without data loss. No provider call and no scan run.
+  private async stopForInvalidPolicy(
+    input: EnqueueArtifactPiiScanInput,
+    policyRevision: number
+  ): Promise<PiiArtifactScanResult> {
+    await this.deps.artifacts.update(input.tenantId, input.artifactId, { status: "failed" });
+    await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
+      status: "failed",
+      summaryText: PII_POLICY_INVALID_CODE
+    });
+    await this.emitAudit(input, "pii_policy_invalid", {
+      subjectType: "artifact",
+      subjectId: input.artifactId,
+      source: input.source,
+      policyRevision
+    });
+    return {
+      kind: "failed",
+      scanRunId: "",
+      errorCode: PII_POLICY_INVALID_CODE,
+      errorMessage: PII_POLICY_INVALID_MESSAGE
+    };
   }
 
   private async runSyncBlock(
@@ -114,6 +161,7 @@ export class PiiArtifactScanEnqueuer {
       sourceSessionId: input.sessionId,
       sourceUserId: input.userId,
       mode: input.mode,
+      policyRevision: input.read.revision,
       status: "processing"
     });
 
@@ -127,17 +175,14 @@ export class PiiArtifactScanEnqueuer {
         return this.handleArtifactNotFound(input, scanRun.scanRunId);
       }
 
-      const decision = await this.deps.piiProtection.evaluateArtifact({
-        tenantId: input.tenantId,
-        artifact: subject,
-        subject: {
-          kind: input.source === "upload" ? "upload" : "microsoft_import"
-        }
-      });
+      const { decision, appliedPolicy } = await this.deps.piiProtection.evaluateArtifactWithPolicy(
+        { tenantId: input.tenantId, artifact: subject, subject: piiSubjectForSource(input.source) },
+        input.read
+      );
 
       return decision.action === "block"
-        ? await this.handleBlockDecision(input, scanRun.scanRunId, decision)
-        : await this.handleAllowDecision(input, scanRun.scanRunId, decision, subject.imagesNotScanned?.() ?? false);
+        ? await this.handleBlockDecision(input, scanRun.scanRunId, decision, appliedPolicy)
+        : await this.handleAllowDecision(input, scanRun.scanRunId, decision, appliedPolicy, subject.imagesNotScanned?.() ?? false);
     } catch (error) {
       return this.handleProviderError(input, scanRun.scanRunId, error);
     }
@@ -164,10 +209,8 @@ export class PiiArtifactScanEnqueuer {
   private async handleBlockDecision(
     input: SyncScanInput,
     scanRunId: string,
-    decision: Extract<
-      Awaited<ReturnType<PiiProtectionService["evaluateArtifact"]>>,
-      { action: "block" }
-    >
+    decision: Extract<PiiDecision, { action: "block" }>,
+    applied: PiiAppliedPolicy
   ): Promise<PiiArtifactScanResult> {
     // Purge the stored bytes BEFORE flipping to a terminal `blocked` state, so
     // a terminal status never coexists with a silent orphan: if the delete
@@ -175,8 +218,11 @@ export class PiiArtifactScanEnqueuer {
     // status is the honest signal that cleanup is incomplete.
     const objectDeleted = await this.purgeRejectedObject(input, scanRunId);
 
+    // Record the mode that the evaluation applied. The scan run was created
+    // with the routed mode, from the same read.
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "blocked",
+      mode: applied.mode,
       providerType: decision.providerType,
       providerModel: decision.providerModel,
       findings: decision.findings,
@@ -188,14 +234,16 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "blocked",
-      modeApplied: input.mode,
+      modeApplied: applied.mode,
+      policyRevision: applied.revision,
       scanRunId,
       blockReason: decision.blockReason,
       findingsCount: decision.findings.length
     });
     await this.emitAudit(input, "pii_blocked", {
       scanRunId,
-      mode: input.mode,
+      mode: applied.mode,
+      policyRevision: applied.revision,
       subjectType: "artifact",
       subjectId: input.artifactId,
       source: input.source,
@@ -246,16 +294,15 @@ export class PiiArtifactScanEnqueuer {
   private async handleAllowDecision(
     input: SyncScanInput,
     scanRunId: string,
-    decision: Exclude<
-      Awaited<ReturnType<PiiProtectionService["evaluateArtifact"]>>,
-      { action: "block" }
-    >,
+    decision: Exclude<PiiDecision, { action: "block" }>,
+    applied: PiiAppliedPolicy,
     imagesNotScanned: boolean
   ): Promise<PiiArtifactScanResult> {
     const findingsCount =
       decision.action === "report" ? decision.findings.length : 0;
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "completed",
+      mode: applied.mode,
       providerType: decision.action === "report" ? decision.providerType : null,
       providerModel: decision.action === "report" ? decision.providerModel : null,
       findings: decision.action === "report" ? decision.findings : [],
@@ -264,7 +311,8 @@ export class PiiArtifactScanEnqueuer {
     });
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "scanned",
-      modeApplied: input.mode,
+      modeApplied: applied.mode,
+      policyRevision: applied.revision,
       scanRunId,
       findingsCount,
       ...(imagesNotScanned ? { imagesNotScanned: true } : {})
@@ -295,10 +343,9 @@ export class PiiArtifactScanEnqueuer {
 
   private async runAsync(
     input: EnqueueArtifactPiiScanInput,
-    mode: PiiScanJobMode
+    mode: PiiScanJobMode,
+    entityTypes: string[]
   ): Promise<PiiArtifactScanResult> {
-    const settings = await this.deps.piiProtection.getActiveSettings(input.tenantId);
-
     try {
       const scanRun = await this.deps.piiScanRuns.create({
         tenantId: input.tenantId,
@@ -330,7 +377,7 @@ export class PiiArtifactScanEnqueuer {
           subjectKind: input.source,
           contentType: input.contentType,
           storageKey: input.storageKey,
-          entityTypes: settings.detectors.entityTypes
+          entityTypes
         }
       });
 
@@ -356,7 +403,7 @@ export class PiiArtifactScanEnqueuer {
 
   private async emitAudit(
     input: EnqueueArtifactPiiScanInput,
-    eventType: "pii_blocked" | "pii_transformed" | "pii_reported" | "pii_block_object_orphaned",
+    eventType: "pii_blocked" | "pii_transformed" | "pii_reported" | "pii_block_object_orphaned" | "pii_policy_invalid",
     payload: Record<string, unknown>
   ): Promise<void> {
     if (!this.deps.auditEvents) return;
@@ -388,6 +435,7 @@ export class PiiArtifactScanEnqueuer {
     await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
       status: "failed",
       modeApplied: input.mode,
+      policyRevision: input.read.revision,
       scanRunId,
       summaryText: errorMessage
     });

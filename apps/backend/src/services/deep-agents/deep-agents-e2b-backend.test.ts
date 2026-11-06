@@ -168,6 +168,35 @@ function makeBackend(input: {
 }
 
 describe("E2bDeepAgentsSandbox", () => {
+  it("binds a graph stream before iteration starts without creating a sandbox", async () => {
+    const fake = makeFakeSandbox();
+    const { backend, provider } = makeBackend({ fake });
+    const events = backend.scopeToCurrentTurn(async function* () {
+      await backend.uploadFiles([["/late.txt", new Uint8Array([1])]]);
+      yield "saved";
+    });
+    expect(provider.create).not.toHaveBeenCalled();
+    backend.beginTurn();
+    await expect(events[Symbol.asyncIterator]().next()).rejects.toBeInstanceOf(SandboxTurnEndedError);
+    expect(provider.create).not.toHaveBeenCalled();
+    expect(fake.files.size).toBe(0);
+  });
+
+  it.each(["return", "throw"] as const)("keeps iterator %s cleanup in its original turn", async (method) => {
+    const fake = makeFakeSandbox();
+    const { backend } = makeBackend({ fake });
+    const events = backend.scopeToCurrentTurn(async function* () {
+      try { yield "ready"; }
+      finally { await backend.uploadFiles([["/cleanup.txt", new Uint8Array([1])]]); }
+    });
+    const iterator = events[Symbol.asyncIterator]();
+    expect(await iterator.next()).toEqual({ value: "ready", done: false });
+    backend.beginTurn();
+    await expect(iterator[method]!()).rejects.toBeInstanceOf(SandboxTurnEndedError);
+    expect(fake.files.size).toBe(0);
+    await expect(backend.uploadFiles([["/fresh.txt", new Uint8Array([2])]])).resolves.toMatchObject([{ error: null }]);
+  });
+
   it("reconnects to a prior replica's workspace", async () => {
     const fake = makeFakeSandbox();
     let saved: { sandboxId: string; networkPolicyHash: string | null } | null = null;

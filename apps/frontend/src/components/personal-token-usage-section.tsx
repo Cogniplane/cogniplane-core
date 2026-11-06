@@ -1,19 +1,20 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 
 import { fetchPersonalTokenUsage } from "../lib/settings-api";
+import { isRouteNotFoundError, toRouteUnavailableMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 import {
-  BarChart,
+  DailyTokenUsage,
+  UsageReportStatus,
   DayRangePicker,
-  type Days,
   TokenBreakdown,
   TokenUsageSkeleton,
   TokenUsageSummary,
   ViewToggle
 } from "./token-usage-chart-primitives";
+import { useUsageReport } from "./use-usage-report";
 import { HINT } from "../lib/ui-tokens";
 
 const STAT_CARD =
@@ -27,57 +28,36 @@ const VIEW_OPTIONS: Array<{ id: View; label: string }> = [
 ];
 
 export function PersonalTokenUsageSection() {
-  const [days, setDays] = useState<Days>(30);
   const [view, setView] = useState<View>("day");
-  const query = useQuery({
-    queryKey: queryKeys.settings.tokenUsage(days),
-    queryFn: () => fetchPersonalTokenUsage(days),
-    placeholderData: keepPreviousData
-  });
-  const usage = query.data;
-  const error = query.error instanceof Error ? query.error.message : query.error ? "Failed to load token usage." : null;
-
-  const dailyBars = useMemo(
-    () =>
-      (usage?.daily ?? []).map((d) => ({
-        label: d.date,
-        inputSeries: d.inputTokens,
-        outputSeries: d.outputTokens
-      })),
-    [usage]
-  );
+  const { days, changeDays, query, report } = useUsageReport(queryKeys.settings.tokenUsage, fetchPersonalTokenUsage);
+  const usage = report?.usage;
+  const available = !isRouteNotFoundError(query.error, "GET", "/me/token-usage");
+  const error = query.error ? toRouteUnavailableMessage(query.error, { method: "GET", pathPrefix: "/me/token-usage", featureName: "Personal usage reporting", fallback: "Failed to load token usage." }) : null;
 
   const totals = usage?.totals;
 
   return (
-    <section id="usage" className="flex flex-col gap-5 pt-5">
+    <section aria-label="Personal token usage" id="usage" className="flex flex-col gap-5 pt-5">
       <div className="flex flex-wrap items-center gap-3 pb-1">
-        <DayRangePicker value={days} onChange={setDays} />
+        <DayRangePicker value={days} onChange={changeDays} />
         <ViewToggle options={VIEW_OPTIONS} value={view} onChange={setView} />
-        {query.isFetching ? <span className="text-xs text-on-surface-faint">Loading…</span> : null}
       </div>
 
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
+      <UsageReportStatus days={days} report={report} fetching={query.isFetching} error={error} unavailable={!available} onRetry={() => { void query.refetch(); }} />
 
       {!totals && query.isPending ? <TokenUsageSkeleton /> : null}
 
-      {totals ? (
-        <TokenUsageSummary totals={totals} days={days} />
+      {totals && report ? (
+        <TokenUsageSummary totals={totals} days={report.days} />
       ) : null}
 
-      {usage && !query.isFetching ? (
-        <div className={`${STAT_CARD} overflow-hidden p-5`}>
+      {usage ? (
+        <div className={`${STAT_CARD} min-w-0 p-4 sm:p-5`}>
           {view === "day" ? (
-            dailyBars.length === 0 ? (
+            usage.daily.length === 0 ? (
               <p className={HINT}>No token data recorded in this period.</p>
             ) : (
-              <BarChart
-                data={dailyBars}
-                primaryColor="var(--color-accent)"
-                secondaryColor="var(--color-success)"
-                primaryLabel="Input tokens"
-                secondaryLabel="Output tokens"
-              />
+              <DailyTokenUsage daily={usage.daily} />
             )
           ) : null}
 
@@ -94,9 +74,7 @@ export function PersonalTokenUsageSection() {
                   totalTokens: m.totalTokens,
                   costUsd: m.costUsd
                 }))}
-                barColor="var(--color-warning)"
-                chartPrimaryColor="var(--color-warning)"
-                chartSecondaryColor="var(--color-success)"
+                barColor="var(--chart-3)"
                 firstColumnLabel="Model"
               />
             )

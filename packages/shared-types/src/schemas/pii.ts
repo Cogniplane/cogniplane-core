@@ -14,6 +14,11 @@ export const PII_PROVIDER_TYPES = ["openai-compatible"] as const;
 export const PiiProviderTypeSchema = z.enum(PII_PROVIDER_TYPES);
 export type PiiProviderType = z.infer<typeof PiiProviderTypeSchema>;
 
+// The detection model name that a save accepts. The server reads a stored
+// name with the same schema, so both use one limit.
+export const PII_PROVIDER_MODEL_MAX_LENGTH = 256;
+export const PiiProviderModelSchema = z.string().trim().max(PII_PROVIDER_MODEL_MAX_LENGTH);
+
 export const PII_ENTITY_TYPES = [
   "email",
   "phone",
@@ -25,6 +30,18 @@ export const PII_ENTITY_TYPES = [
 export const PiiEntityTypeSchema = z.enum(PII_ENTITY_TYPES);
 export type PiiEntityType = z.infer<typeof PiiEntityTypeSchema>;
 
+// Core scan scopes. An import source that an overlay adds registers its own
+// scope key on the backend; the stored policy keeps that key next to these two.
+export const PII_CORE_SCOPE_KEYS = ["chatPrompts", "uploads"] as const;
+export type PiiCoreScopeKey = (typeof PII_CORE_SCOPE_KEYS)[number];
+
+// Every other key is a registered import scope, and its value is a boolean.
+export const PiiScopesSchema = z.object({
+  chatPrompts: z.boolean(),
+  uploads: z.boolean()
+}).catchall(z.boolean());
+export type PiiScopes = z.infer<typeof PiiScopesSchema>;
+
 const PiiProtectionSettingsBaseSchema = z.object({
   enabled: z.boolean(),
   mode: PiiModeSchema,
@@ -33,11 +50,7 @@ const PiiProtectionSettingsBaseSchema = z.object({
     type: PiiProviderTypeSchema,
     model: z.string().trim()
   }).passthrough(),
-  scopes: z.object({
-    chatPrompts: z.boolean(),
-    uploads: z.boolean(),
-    microsoftImports: z.boolean()
-  }).passthrough(),
+  scopes: PiiScopesSchema,
   actions: z.object({
     reportToAdmins: z.boolean()
   }).passthrough(),
@@ -50,35 +63,95 @@ const PiiProtectionSettingsBaseSchema = z.object({
 export const PiiProtectionSettingsSchema = PiiProtectionSettingsBaseSchema.passthrough();
 export type PiiProtectionSettings = z.infer<typeof PiiProtectionSettingsSchema>;
 
-export const PiiProtectionSettingsRequestSchema = PiiProtectionSettingsBaseSchema.extend({
-  provider: z.object({
-    type: PiiProviderTypeSchema,
-    model: z.string().trim().max(256)
-  }).strict(),
-  scopes: z.object({
+/**
+ * Strict request schema. It accepts the core scopes and the given import scope
+ * keys, and rejects every other key. An import scope key is optional: when a
+ * request leaves it out, the server keeps the stored value.
+ *
+ * `expectedRevision` is the PII settings revision that the save is based on
+ * (`settings.piiProtectionRevision` in GET /tenant). It is not part of the
+ * stored policy. When the stored revision is different, the server refuses the
+ * save with 409 `pii_settings_conflict`. It is optional for compatibility:
+ * older clients send no revision, and their save replaces the settings with no
+ * check.
+ */
+export function buildPiiProtectionSettingsRequestSchema(importScopeKeys: readonly string[] = []) {
+  const scopeShape: Record<string, z.ZodBoolean | z.ZodOptional<z.ZodBoolean>> = {
     chatPrompts: z.boolean(),
-    uploads: z.boolean(),
-    microsoftImports: z.boolean()
-  }).strict(),
-  actions: z.object({
-    reportToAdmins: z.boolean()
-  }).strict(),
-  detectors: z.object({
-    useRulesFirst: z.boolean(),
-    entityTypes: z.array(PiiEntityTypeSchema).max(PII_ENTITY_TYPES.length)
-  }).strict()
-}).strict();
+    uploads: z.boolean()
+  };
+  for (const key of importScopeKeys) {
+    if (!(PII_CORE_SCOPE_KEYS as readonly string[]).includes(key)) scopeShape[key] = z.boolean().optional();
+  }
+  // The keys are known only at run time, so the static type is the shared
+  // scope shape: two core booleans and optional import booleans.
+  const scopes = z.object(scopeShape).strict() as unknown as z.ZodType<PiiScopes>;
+  return PiiProtectionSettingsBaseSchema.extend({
+    provider: z.object({
+      type: PiiProviderTypeSchema,
+      model: PiiProviderModelSchema
+    }).strict(),
+    scopes,
+    actions: z.object({
+      reportToAdmins: z.boolean()
+    }).strict(),
+    detectors: z.object({
+      useRulesFirst: z.boolean(),
+      entityTypes: z.array(PiiEntityTypeSchema).max(PII_ENTITY_TYPES.length)
+    }).strict(),
+    expectedRevision: z.number().int().nonnegative().optional()
+  }).strict();
+}
+
+// Core scopes only. The backend adds the registered import scope keys.
+export const PiiProtectionSettingsRequestSchema = buildPiiProtectionSettingsRequestSchema();
 export type PiiProtectionSettingsRequest = z.infer<typeof PiiProtectionSettingsRequestSchema>;
 
+// A registered import scope that has no stored value uses its own default.
 export const DEFAULT_PII_PROTECTION: PiiProtectionSettings = {
   enabled: false,
   mode: "off",
   rawRetention: "never",
   provider: { type: "openai-compatible", model: "" },
-  scopes: { chatPrompts: true, uploads: true, microsoftImports: true },
+  scopes: { chatPrompts: true, uploads: true },
   actions: { reportToAdmins: true },
   detectors: { useRulesFirst: true, entityTypes: [...PII_ENTITY_TYPES] }
 };
+
+// ── Stored policy health ─────────────────────────────────────────────────────
+//
+// What the server did with a stored policy that does not match the schema. It
+// is not part of the policy, so a save never writes it. Reason codes and field
+// paths are stable; they never contain stored values.
+// - ok: the stored policy is valid.
+// - warning: safe values replace some fields, or protection is off because
+//   the stored on/off choice is off but another field is invalid.
+// - error: the on/off choice cannot be trusted. Content in scope is stopped,
+//   before any provider call, until an admin saves a valid policy.
+
+export const PII_POLICY_HEALTH_REASONS = [
+  "policy_not_object",
+  "enabled_invalid",
+  "mode_invalid",
+  "mode_off_while_enabled",
+  "scope_invalid",
+  "raw_retention_invalid",
+  "actions_invalid",
+  "detectors_invalid",
+  "entity_types_invalid",
+  "entity_types_unsupported",
+  "provider_invalid"
+] as const;
+export const PiiPolicyHealthReasonSchema = z.enum(PII_POLICY_HEALTH_REASONS);
+export type PiiPolicyHealthReason = z.infer<typeof PiiPolicyHealthReasonSchema>;
+
+export const PiiPolicyHealthSchema = z.object({
+  state: z.enum(["ok", "warning", "error"]),
+  // Unknown codes from a newer server are kept as strings.
+  reasons: z.array(z.string()),
+  fields: z.array(z.string())
+}).passthrough();
+export type PiiPolicyHealth = z.infer<typeof PiiPolicyHealthSchema>;
 
 // ── Provider circuit-breaker status ───────────────────────────────────────────
 
@@ -130,13 +203,11 @@ export const PiiActivityMetricsSchema = z.object({
     enabled: z.boolean(),
     mode: PiiModeSchema,
     rawRetention: PiiRawRetentionSchema,
-    scopes: z.object({
-      chatPrompts: z.boolean(),
-      uploads: z.boolean(),
-      microsoftImports: z.boolean()
-    }).passthrough(),
+    scopes: PiiScopesSchema,
     entityTypes: z.array(PiiEntityTypeSchema)
   }).passthrough(),
+  // Optional: a server older than this field does not send it.
+  policyHealth: PiiPolicyHealthSchema.optional(),
   kpis: z.object({
     scans: PiiActivityKpiSchema,
     findings: PiiActivityKpiSchema,

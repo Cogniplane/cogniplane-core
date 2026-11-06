@@ -9,11 +9,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { listAdminUsers } from "../../../lib/admin-api";
+import { useAuth } from "../../../lib/auth-context";
 import { toErrorMessage } from "../../../lib/error-utils";
 import { queryKeys } from "../../../lib/query-keys";
-import { PILL_BLUE } from "../../../lib/ui-tokens";
+import { PILL_BLUE, PILL_GRAY } from "../../../lib/ui-tokens";
+import { AddPersonButton } from "./add-person-dialog";
+import { ACCOUNT_STATUS_INFO, accountStatusOf } from "./local-account.logic";
 import { displayName } from "./person-access.logic";
 import { PersonMonogram, RolePill } from "./person-header";
+import { TenantMfaPolicy } from "./tenant-mfa-policy";
 
 export function personHref(userId: string): string {
   return `/admin/users/${encodeURIComponent(userId)}`;
@@ -28,6 +32,7 @@ export function matchesPerson(user: AdminUser, search: string): boolean {
 function PersonRow({ user }: { user: AdminUser }) {
   const name = displayName(user);
   const secondary = user.displayName?.trim() ? user.email : null;
+  const status = accountStatusOf(user);
   return (
     <li>
       <Link
@@ -40,6 +45,7 @@ function PersonRow({ user }: { user: AdminUser }) {
           <span className="block truncate text-xs text-on-surface-variant">{secondary ?? user.userId}</span>
         </span>
         <span className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+          {status && status !== "active" ? <span className={PILL_GRAY}>{ACCOUNT_STATUS_INFO[status].label}</span> : null}
           {user.isBetaTester ? <span className={PILL_BLUE}>Test user</span> : null}
           <RolePill role={user.role} />
         </span>
@@ -50,6 +56,9 @@ function PersonRow({ user }: { user: AdminUser }) {
 }
 
 export function PeopleDirectory() {
+  const { user: me } = useAuth();
+  // People join a local tenant only when a manager adds them.
+  const canAdd = me?.loginType === "local" && (me.role === "owner" || me.role === "admin");
   const [search, setSearch] = useState("");
   const searchId = useId();
   const people = useQuery({ queryKey: queryKeys.admin.users(), queryFn: listAdminUsers });
@@ -69,16 +78,19 @@ export function PeopleDirectory() {
             </p>
           ) : null}
         </div>
-        <div className="w-full sm:w-72">
-          <label htmlFor={searchId} className="sr-only">Search people</label>
-          <Input
-            id={searchId}
-            type="search"
-            placeholder="Search by name, email, or ID"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            disabled={!people.data}
-          />
+        <div className="flex w-full items-center gap-2 sm:w-auto">
+          {canAdd && me ? <AddPersonButton actor={{ userId: me.userId, role: me.role }} /> : null}
+          <div className="w-full sm:w-72">
+            <label htmlFor={searchId} className="sr-only">Search people</label>
+            <Input
+              id={searchId}
+              type="search"
+              placeholder="Search by name, email, or ID"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              disabled={!people.data}
+            />
+          </div>
         </div>
       </div>
 
@@ -96,7 +108,9 @@ export function PeopleDirectory() {
       ) : null}
 
       {people.data && users.length === 0 ? (
-        <p className="py-6 text-sm text-on-surface-faint">No one has signed in yet. People appear here after their first sign-in.</p>
+        <p className="py-6 text-sm text-on-surface-faint">
+          {canAdd ? "No one is here yet. Add a person to send them a setup link." : "No one has signed in yet. People appear here after their first sign-in."}
+        </p>
       ) : null}
 
       {people.data && users.length > 0 ? (
@@ -108,6 +122,8 @@ export function PeopleDirectory() {
           </ul>
         )
       ) : null}
+
+      {canAdd && me ? <TenantMfaPolicy actorRole={me.role === "owner" ? "owner" : "admin"} /> : null}
     </section>
   );
 }

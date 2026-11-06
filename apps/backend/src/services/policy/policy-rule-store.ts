@@ -11,7 +11,10 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
 import type { LintableRule } from "./policy-lint.js";
+import { weakensPolicy } from "./policy-weakening.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
+import { WeakerChangeError } from "../weaker-change-error.js";
 
 // Coerce a JSONB dimension to a clean string[] (or undefined when absent).
 // Non-array or non-string entries are dropped rather than trusted — the engine
@@ -54,6 +57,20 @@ function mapRow(row: Record<string, unknown>): PolicyRule {
     updatedAt: isoTimestamp(row.updated_at)
   };
 }
+
+/**
+ * How a rule change is written. Each write classifies the change in its own
+ * transaction, under the tenant's rule lock, against the rules as they are
+ * then (policy-weakening.ts). A change that makes the policy weaker throws
+ * WeakerChangeError and rolls back, unless `allowWeaker` (the caller has
+ * step-up, or needs none). The audit event, when given, commits in the same
+ * transaction, with its owner notice (AuditEventInput.alsoInTransaction);
+ * `weaker` tells the caller whether to attach the notice.
+ */
+export type PolicyRuleWriteOptions<T> = {
+  allowWeaker: boolean;
+  audit?: (saved: T, weaker: boolean) => AuditEventInput;
+};
 
 export class PolicyRuleStore {
   constructor(private readonly db: Pool) {}
@@ -112,11 +129,13 @@ export class PolicyRuleStore {
   async create(
     tenantId: string,
     input: PolicyRuleInput,
-    createdBy: string | null
+    createdBy: string | null,
+    options: PolicyRuleWriteOptions<PolicyRule>
   ): Promise<PolicyRule> {
     const ruleId = `pol_${uuidv7()}`;
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
+      const before = await rulesOf(client, tenantId);
       // No explicit priority → append to the end of the current evaluation order
       // (max+10) rather than a fixed 100, so a new rule never lands mid-list after
       // a drag-reorder rewrote priorities to index*10. Read under the lock, so
@@ -144,7 +163,9 @@ export class PolicyRuleStore {
           createdBy
         ]
       );
-      return mapRow(result.rows[0]);
+      const rule = mapRow(result.rows[0]);
+      const weaker = weakensPolicy(before, [...before, rule], [rule]);
+      return finish(client, rule, weaker, options);
     });
   }
 
@@ -152,18 +173,16 @@ export class PolicyRuleStore {
   async update(
     tenantId: string,
     ruleId: string,
-    input: PolicyRulePatch
+    input: PolicyRulePatch,
+    options: PolicyRuleWriteOptions<PolicyRule>
   ): Promise<PolicyRule | null> {
     // Read and write in one locked transaction, so two partial updates (or an
     // update and a reorder) cannot overwrite each other's fields.
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
-      const current = await client.query(
-        `SELECT * FROM policy_rule WHERE tenant_id = $1 AND rule_id = $2`,
-        [tenantId, ruleId]
-      );
-      if (!current.rows[0]) return null;
-      const existing = mapRow(current.rows[0]);
+      const before = await rulesOf(client, tenantId);
+      const existing = before.find((rule) => rule.ruleId === ruleId);
+      if (!existing) return null;
 
       const next = {
         name: input.name ?? existing.name,
@@ -201,18 +220,33 @@ export class PolicyRuleStore {
           next.reason
         ]
       );
-      return result.rows[0] ? mapRow(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const rule = mapRow(result.rows[0]);
+      const after = before.map((candidate) => (candidate.ruleId === ruleId ? rule : candidate));
+      const weaker = weakensPolicy(before, after, [existing, rule]);
+      return finish(client, rule, weaker, options);
     });
   }
 
-  async delete(tenantId: string, ruleId: string): Promise<boolean> {
+  /** Deletes a rule; returns the deleted rule, or null when there is none. */
+  async delete(
+    tenantId: string,
+    ruleId: string,
+    options: PolicyRuleWriteOptions<PolicyRule>
+  ): Promise<PolicyRule | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
+      const before = await rulesOf(client, tenantId);
+      const existing = before.find((rule) => rule.ruleId === ruleId);
+      if (!existing) return null;
       const result = await client.query(
         `DELETE FROM policy_rule WHERE tenant_id = $1 AND rule_id = $2`,
         [tenantId, ruleId]
       );
-      return (result.rowCount ?? 0) > 0;
+      if ((result.rowCount ?? 0) === 0) return null;
+      const after = before.filter((rule) => rule.ruleId !== ruleId);
+      const weaker = weakensPolicy(before, after, [existing]);
+      return finish(client, existing, weaker, options);
     });
   }
 
@@ -228,17 +262,18 @@ export class PolicyRuleStore {
    * Throws {@link PolicyReorderMismatchError} on a set mismatch — the route maps
    * it to a 409 so the UI can refetch and retry.
    */
-  async reorder(tenantId: string, ruleIds: readonly string[]): Promise<PolicyRule[]> {
+  async reorder(
+    tenantId: string,
+    ruleIds: readonly string[],
+    options: PolicyRuleWriteOptions<PolicyRule[]>
+  ): Promise<PolicyRule[]> {
     if (new Set(ruleIds).size !== ruleIds.length) {
       throw new PolicyReorderMismatchError("ruleIds must not contain duplicates.");
     }
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
-      const existing = await client.query(
-        `SELECT rule_id FROM policy_rule WHERE tenant_id = $1`,
-        [tenantId]
-      );
-      const existingIds = new Set(existing.rows.map((row) => String(row.rule_id)));
+      const before = await rulesOf(client, tenantId);
+      const existingIds = new Set(before.map((rule) => rule.ruleId));
       if (existingIds.size !== ruleIds.length || ruleIds.some((id) => !existingIds.has(id))) {
         throw new PolicyReorderMismatchError(
           "ruleIds must be exactly the tenant's current set of policy rules."
@@ -252,11 +287,11 @@ export class PolicyRuleStore {
         );
       }
 
-      const result = await client.query(
-        `SELECT * FROM policy_rule WHERE tenant_id = $1 ORDER BY priority ASC, rule_id ASC`,
-        [tenantId]
-      );
-      return result.rows.map(mapRow);
+      const after = await rulesOf(client, tenantId);
+      // Only a rule whose priority changed can change its place in the order.
+      const moved = before.filter((rule) => after.find((candidate) => candidate.ruleId === rule.ruleId)?.priority !== rule.priority);
+      const weaker = weakensPolicy(before, after, moved);
+      return finish(client, after, weaker, options);
     });
   }
 
@@ -269,6 +304,22 @@ export class PolicyRuleStore {
   async nextAppendPriority(tenantId: string): Promise<number> {
     return withTenantScope(this.db, tenantId, (client) => appendPriority(client, tenantId));
   }
+}
+
+/** All rules of the tenant, in evaluation order, in the write's transaction. */
+async function rulesOf(client: PoolClient, tenantId: string): Promise<PolicyRule[]> {
+  const result = await client.query(
+    `SELECT * FROM policy_rule WHERE tenant_id = $1 ORDER BY priority ASC, rule_id ASC`,
+    [tenantId]
+  );
+  return result.rows.map(mapRow);
+}
+
+/** Refuses a weaker change that the caller did not allow (rolls back), else writes the audit event. */
+async function finish<T>(client: PoolClient, saved: T, weaker: boolean, options: PolicyRuleWriteOptions<T>): Promise<T> {
+  if (weaker && !options.allowWeaker) throw new WeakerChangeError();
+  if (options.audit) await AuditEventStore.createInTransaction(client, options.audit(saved, weaker));
+  return saved;
 }
 
 // Every policy rule write of a tenant takes this transaction lock first, so a

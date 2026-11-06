@@ -24,7 +24,7 @@ export function defaultJobDraft(defaults?: ScheduledJobDefaults): JobDraft {
     scheduleMode: "daily",
     timeZone: defaults?.defaultTimeZone || "UTC",
     prompt: "Summarize new artifacts, approvals, and next actions.",
-    enabled: defaults?.enableOnCreate ?? true
+    enabled: false
   };
 }
 
@@ -37,6 +37,6 @@ export function readScheduledJobDefaults(
         ? section.config.defaultTimeZone
         : "UTC",
     enableOnCreate:
-      typeof section?.config.enableOnCreate === "boolean" ? section.config.enableOnCreate : true
+      typeof section?.config.enableOnCreate === "boolean" ? section.config.enableOnCreate : false
   };
 }

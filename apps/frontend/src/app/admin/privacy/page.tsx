@@ -12,7 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 type PrivacyTab = "settings" | "activity";
 
 function PrivacySettings() {
-  const { tenant, tenantLoading, tenantLoadError, retryTenantLoad, mutationError, errorKey, busyKey, successMessage, successKey, handleSavePiiProtection } =
+  const { tenant, tenantLoading, tenantLoadError, retryTenantLoad, mutationError, errorKey, busyKey, successMessage, successKey, piiConflict, handleSavePiiProtection } =
     useAdminOrganizationData();
 
   return (
@@ -24,13 +24,22 @@ function PrivacySettings() {
           <Button type="button" variant="outline" onClick={() => void retryTenantLoad()}>Retry</Button>
         </div>
       ) : null}
+      {tenant && tenantLoadError ? (
+        <div className="flex flex-wrap items-center gap-3" role="alert">
+          <p className="text-sm text-danger">Could not refresh privacy settings. Showing the last confirmed settings.</p>
+          <Button type="button" variant="outline" onClick={() => void retryTenantLoad()}>Retry settings</Button>
+        </div>
+      ) : null}
       {tenant ? (
         <AdminPiiProtectionSection
           busy={busyKey === "save-pii-protection"}
           error={errorKey === "save-pii-protection" ? mutationError : null}
+          conflict={errorKey === "save-pii-protection" && piiConflict}
           savedMessage={successKey === "save-pii-protection" ? successMessage : null}
           onSave={handleSavePiiProtection}
           value={tenant.settings.piiProtection}
+          revision={tenant.settings.piiProtectionRevision}
+          health={tenant.settings.piiProtectionHealth}
         />
       ) : null}
     </section>

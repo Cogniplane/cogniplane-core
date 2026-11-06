@@ -48,12 +48,14 @@ export function useScheduledJobsData() {
         ? readScheduledJobDefaults(
             sectionsQuery.data.find((section) => section.sectionKey === "scheduled_jobs")
           )
-        : { defaultTimeZone: "UTC", enableOnCreate: true },
+        : { defaultTimeZone: "UTC", enableOnCreate: false },
     [sectionsQuery.data]
   );
 
   const [defaultsDraft, setDefaultsDraft] = useState<ScheduledJobDefaults>(defaultsFromSections);
   const [jobDraft, setJobDraft] = useState<JobDraft>(defaultJobDraft(defaultsFromSections));
+  const [originalJobDraft, setOriginalJobDraft] = useState<JobDraft | null>(null);
+  const mutationLock = useRef(false);
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const editingJobIdRef = useRef<string | null>(null);
   const [expandedRunsJobId, setExpandedRunsJobId] = useState<string | null>(null);
@@ -63,23 +65,23 @@ export function useScheduledJobsData() {
     editingJobIdRef.current = editingJobId;
   }, [editingJobId]);
 
-  // Sync local defaults + draft when the remote sections load / refresh,
-  // but never clobber an active edit session.
-  const appliedDefaultsSignatureRef = useRef<string>("");
-  const previousDefaultsRef = useRef<ScheduledJobDefaults>({ defaultTimeZone: "UTC", enableOnCreate: true });
+  // Apply loaded defaults only to drafts that the user has not changed.
+  const defaultsSignature = JSON.stringify(defaultsFromSections);
+  const [appliedDefaultsSignature, setAppliedDefaultsSignature] = useState<string | null>(null);
+  const defaultsLoaded = sectionsQuery.data !== undefined && appliedDefaultsSignature === defaultsSignature;
+  const previousDefaultsRef = useRef<ScheduledJobDefaults>({ defaultTimeZone: "UTC", enableOnCreate: false });
   useEffect(() => {
     if (!sectionsQuery.data) return;
-    const signature = JSON.stringify(defaultsFromSections);
-    if (signature === appliedDefaultsSignatureRef.current) return;
-    appliedDefaultsSignatureRef.current = signature;
+    if (defaultsSignature === appliedDefaultsSignature) return;
     const previous = previousDefaultsRef.current;
     previousDefaultsRef.current = defaultsFromSections;
     setDefaultsDraft(current => JSON.stringify(current) === JSON.stringify(previous) ? defaultsFromSections : current);
-    if (!editingJobIdRef.current) {
+    if (!editingJobIdRef.current && originalJobDraft === null) {
       setJobDraft(current => JSON.stringify(current) === JSON.stringify(defaultJobDraft(previous))
         ? defaultJobDraft(defaultsFromSections) : current);
     }
-  }, [sectionsQuery.data, defaultsFromSections]);
+    setAppliedDefaultsSignature(defaultsSignature);
+  }, [sectionsQuery.data, defaultsFromSections, defaultsSignature, appliedDefaultsSignature, originalJobDraft]);
 
   const runsQuery = useQuery({
     queryKey: expandedRunsJobId
@@ -111,17 +113,24 @@ export function useScheduledJobsData() {
         enabled: input.draft.enabled
       };
       if (input.editingId) {
-        await updateScheduledJob(input.editingId, payload);
+        return updateScheduledJob(input.editingId, payload);
       } else {
-        await createScheduledJob(payload);
+        return createScheduledJob(payload);
       }
     },
-    onSuccess: () => invalidateJobs()
+    onSuccess: (saved) => {
+      queryClient.setQueryData<ScheduledJob[]>(queryKeys.settings.scheduledJobs(), current =>
+        current?.some(job => job.jobId === saved.jobId) ? current.map(job => job.jobId === saved.jobId ? saved : job) : [...(current ?? []), saved]);
+      return invalidateJobs();
+    }
   });
 
   const deleteJobMutation = useMutation({
     mutationFn: deleteScheduledJob,
-    onSuccess: () => invalidateJobs()
+    onSuccess: (_result, jobId) => {
+      queryClient.setQueryData<ScheduledJob[]>(queryKeys.settings.scheduledJobs(), current => current?.filter(job => job.jobId !== jobId));
+      return invalidateJobs();
+    }
   });
 
   const toggleJobMutation = useMutation({
@@ -142,29 +151,37 @@ export function useScheduledJobsData() {
   const handleDefaultsSubmit = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
+      if (mutationLock.current || !defaultsLoaded) return;
+      mutationLock.current = true;
       setActionError(null);
       try {
         await saveDefaultsMutation.mutateAsync(defaultsDraft);
       } catch (error) {
         setActionError({ scope: "defaults", message: toErrorMessage(error, "Failed to save defaults.") });
-      }
+      } finally { mutationLock.current = false; }
     },
-    [defaultsDraft, saveDefaultsMutation]
+    [defaultsDraft, saveDefaultsMutation, defaultsLoaded]
   );
 
   const handleJobSubmit = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
+    async (event: FormEvent<HTMLFormElement>, enabled?: boolean) => {
       event.preventDefault();
+      if (mutationLock.current) return false;
+      mutationLock.current = true;
       setActionError(null);
       try {
-        await submitJobMutation.mutateAsync({ editingId: editingJobId, draft: jobDraft });
+        await submitJobMutation.mutateAsync({
+          editingId: editingJobId,
+          draft: { ...jobDraft, enabled: editingJobId ? jobDraft.enabled : enabled === true }
+        });
         setEditingJobId(null);
+        setOriginalJobDraft(null);
         setJobDraft(defaultJobDraft(defaultsDraft));
         return true;
       } catch (error) {
         setActionError({ scope: "job", message: toErrorMessage(error, "Failed to save scheduled job.") });
         return false;
-      }
+      } finally { mutationLock.current = false; }
     },
     [defaultsDraft, editingJobId, jobDraft, submitJobMutation]
   );
@@ -172,40 +189,62 @@ export function useScheduledJobsData() {
   const handleCancelEdit = useCallback(() => {
     setActionError(null);
     setEditingJobId(null);
+    setOriginalJobDraft(null);
     setJobDraft(defaultJobDraft(defaultsDraft));
   }, [defaultsDraft]);
 
-  const handleEditJob = useCallback((job: ScheduledJob) => {
+  const handleNewJob = useCallback(() => {
+    if (!defaultsLoaded || mutationLock.current) return;
+    const draft = defaultJobDraft(defaultsDraft);
+    setActionError(null);
+    setEditingJobId(null);
+    setJobDraft(draft);
+    setOriginalJobDraft(draft);
+  }, [defaultsDraft, defaultsLoaded]);
+
+  // Only an explicit save can resume a job paused after a security change.
+  const handleEditJob = useCallback((job: ScheduledJob, options?: { enable?: boolean }) => {
+    if (mutationLock.current) return;
+    setActionError(null);
     setEditingJobId(job.jobId);
-    setJobDraft({
+    const draft: JobDraft = {
       jobName: job.jobName,
       description: job.description ?? "",
       cronExpression: job.cronExpression,
       scheduleMode: inferScheduleMode(job.cronExpression),
       timeZone: job.timeZone,
       prompt: job.input.prompt,
-      enabled: job.enabled
-    });
+      enabled: options?.enable ?? job.enabled
+    };
+    setJobDraft(draft);
+    setOriginalJobDraft(draft);
   }, []);
 
   const handleDeleteJob = useCallback(
-    (jobId: string) => {
+    async (jobId: string) => {
+      if (mutationLock.current) return false;
+      mutationLock.current = true;
       setActionError(null);
-      deleteJobMutation.mutate(jobId, {
-        onSuccess: () => {
-          if (editingJobId === jobId) handleCancelEdit();
-        },
-        onError: (error) =>
-          setActionError({ scope: "list", jobId, message: toErrorMessage(error, "Failed to delete scheduled job.") })
-      });
+      try {
+        await deleteJobMutation.mutateAsync(jobId);
+        if (editingJobId === jobId) handleCancelEdit();
+        if (expandedRunsJobId === jobId) setExpandedRunsJobId(null);
+        return true;
+      } catch (error) {
+        setActionError({ scope: "list", jobId, message: toErrorMessage(error, "Failed to delete scheduled job.") });
+        return false;
+      } finally { mutationLock.current = false; }
     },
-    [deleteJobMutation, editingJobId, handleCancelEdit]
+    [deleteJobMutation, editingJobId, expandedRunsJobId, handleCancelEdit]
   );
 
   const handleToggleJob = useCallback(
     (job: ScheduledJob) => {
+      if (mutationLock.current || job.pausedReason === "security_change") return;
+      mutationLock.current = true;
       setActionError(null);
       toggleJobMutation.mutate(job, {
+        onSettled: () => { mutationLock.current = false; },
         onError: (error) =>
           setActionError({ scope: "list", jobId: job.jobId, message: toErrorMessage(error, "Failed to update scheduled job.") })
       });
@@ -236,15 +275,22 @@ export function useScheduledJobsData() {
 
   return {
     scheduledJobs,
+    jobDirty: originalJobDraft !== null && JSON.stringify(jobDraft) !== JSON.stringify(originalJobDraft),
+    defaultsLoaded,
+    defaultsLoading: sectionsQuery.isFetching,
+    jobsLoaded: jobsQuery.data !== undefined,
+    runsLoaded: runsQuery.data !== undefined,
+    jobsRefreshing: jobsQuery.isFetching && jobsQuery.data !== undefined,
+    runsRefreshing: runsQuery.isFetching && runsQuery.data !== undefined,
     jobsLoading: jobsQuery.isPending,
     jobsLoadFailed: jobsQuery.isError,
-    retryJobs: () => { void jobsQuery.refetch(); },
+    retryJobs: () => jobsQuery.refetch(),
     defaultsDirty: JSON.stringify(defaultsDraft) !== JSON.stringify(defaultsFromSections),
     resetDefaults: () => { setDefaultsDraft(defaultsFromSections); setActionError(null); },
     defaultsError: actionError?.scope === "defaults" ? actionError.message : sectionsQuery.error
       ? toErrorMessage(sectionsQuery.error, "Failed to load job defaults.") : null,
     defaultsLoadFailed: sectionsQuery.isError,
-    retryDefaults: () => { void sectionsQuery.refetch(); },
+    retryDefaults: () => sectionsQuery.refetch(),
     jobError: actionError?.scope === "job" ? actionError.message : null,
     listActionError: actionError?.scope === "list" ? actionError : null,
     defaultsDraft,
@@ -256,9 +302,10 @@ export function useScheduledJobsData() {
     jobRuns: runsQuery.data ?? [],
     runsLoading: runsQuery.isPending && expandedRunsJobId !== null,
     runsError,
-    retryRuns: () => { void runsQuery.refetch(); },
+    retryRuns: () => runsQuery.refetch(),
     busyKey,
     handleDefaultsSubmit,
+    handleNewJob,
     handleJobSubmit,
     handleEditJob,
     handleCancelEdit,

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ApiError } from "@/lib/api-client";
 import type { PersonalSkill, ProjectSkill } from "@cogniplane/shared-types";
@@ -93,12 +93,12 @@ it("reviews a newer private source before updating the project draft", async () 
   fireEvent.click(screen.getByRole("button", { name: "Check my private source" }));
   expect(await screen.findByText(/Released private revision 2/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Create draft from private source" }).hasAttribute("disabled")).toBe(true);
-  fireEvent.click(screen.getByRole("checkbox", { name: "I reviewed this private revision." }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this private revision 2/ }));
   fireEvent.click(screen.getByRole("button", { name: "Create draft from private source" }));
   await waitFor(() => expect(projectApi.updateProjectSkillFromPersonal).toHaveBeenCalledWith("project", copied.id, {
     scope, version: 1, sourceRevision: 2
   }));
-  expect(screen.getByText(/Project sessions still use revision 1/)).toBeTruthy();
+  expect(screen.getByText("Revision 1, available")).toBeTruthy();
 });
 
 it("requires a second click to delete a project skill", async () => {
@@ -110,7 +110,7 @@ it("requires a second click to delete a project skill", async () => {
   expect(projectApi.deleteProjectSkill).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
   await waitFor(() => expect(projectApi.deleteProjectSkill).toHaveBeenCalledWith("project", draft.id, { scope, version: 1 }));
-  expect(screen.getByText("No project skills yet.")).toBeTruthy();
+  expect(screen.getByText(/No project skills yet/)).toBeTruthy();
 });
 
 it("locks a mismatched scope and keeps unsaved text after a version conflict", async () => {
@@ -156,7 +156,7 @@ it("turns an edit into a new draft when the skill was deleted elsewhere", async 
   expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep this text");
   vi.spyOn(window, "confirm").mockReturnValue(true);
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(screen.getByText("No project skills yet.")).toBeTruthy();
+  expect(screen.getByText(/No project skills yet/)).toBeTruthy();
   vi.restoreAllMocks();
 });
 
@@ -215,4 +215,176 @@ it("switches the draft source, asking first only when typed text would be lost",
   } finally {
     confirm.mockRestore();
   }
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+async function editDraft() {
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit draft" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Keep my new instructions." } });
+}
+const conflictError = () => new ApiError({ status: 409, code: "project_skill_conflict", method: "PUT", path: "/projects/project/skills/id", message: "Changed elsewhere" });
+
+it("keeps the pending save focusable, rejects duplicate input and shows failure beside the save", async () => {
+  const held = deferred<{ scope: typeof scope; skill: ProjectSkill }>();
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [draft] });
+  vi.mocked(projectApi.updateProjectSkill).mockReturnValue(held.promise);
+  show(); await editDraft();
+  const save = screen.getByRole("button", { name: "Save draft" });
+  save.focus();
+  fireEvent.click(save); fireEvent.click(save);
+  expect(projectApi.updateProjectSkill).toHaveBeenCalledTimes(1);
+  expect(save.getAttribute("aria-disabled")).toBe("true");
+  expect((save as HTMLButtonElement).disabled).toBe(false);
+  expect(document.activeElement).toBe(save);
+  held.reject(new Error("Service unavailable"));
+  await screen.findByText("Service unavailable");
+  expect(save.parentElement?.parentElement?.textContent).toContain("Service unavailable");
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep my new instructions.");
+  expect(document.activeElement).toBe(save);
+});
+
+it("does not take focus when a held save completes after the person moved away", async () => {
+  const held = deferred<{ scope: typeof scope; skill: ProjectSkill }>();
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [draft] });
+  vi.mocked(projectApi.updateProjectSkill).mockReturnValue(held.promise);
+  render(<><button>Outside</button><ProjectSkills scope={scope} projectName="Planning" canManage archived={false} /></>);
+  await editDraft();
+  const save = screen.getByRole("button", { name: "Save draft" }); save.focus(); fireEvent.click(save);
+  const outside = screen.getByRole("button", { name: "Outside" }); outside.focus();
+  held.resolve({ scope, skill: { ...draft, version: 2 } });
+  await screen.findByText(/Draft revision 1 saved/);
+  expect(document.activeElement).toBe(outside);
+});
+
+it("blocks edits after a conflict reread fails, including after cancel, until explicit recovery", async () => {
+  const latest = { ...draft, version: 2, latest: { ...revision, revision: 2 } };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValueOnce({ scope, canEdit: true, skills: [draft] })
+    .mockRejectedValueOnce(new Error("Read unavailable"))
+    .mockResolvedValue({ scope, canEdit: true, skills: [latest] });
+  vi.mocked(projectApi.updateProjectSkill).mockRejectedValue(conflictError());
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  try {
+    show(); await editDraft();
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    await screen.findByText("Latest project skills could not be loaded");
+    expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep my new instructions.");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect((screen.getByRole("button", { name: "Edit draft" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Edit draft" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(projectApi.updateProjectSkill).toHaveBeenCalledTimes(1);
+  } finally { confirm.mockRestore(); }
+});
+
+it("keeps text after failed reread and requires a version choice after recovery", async () => {
+  const latest = { ...draft, version: 2, latest: { ...revision, revision: 2, content: { ...content, instructions: "Other owner's text" } } };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValueOnce({ scope, canEdit: true, skills: [draft] })
+    .mockRejectedValueOnce(new Error("Read unavailable"))
+    .mockResolvedValue({ scope, canEdit: true, skills: [latest] });
+  vi.mocked(projectApi.updateProjectSkill).mockRejectedValue(conflictError());
+  show(); await editDraft();
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await screen.findByText("Latest project skills could not be loaded");
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  expect(await screen.findByRole("group", { name: "Latest saved version" })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Keep my text" }));
+  expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(projectApi.updateProjectSkill).toHaveBeenCalledTimes(1);
+});
+
+it("names the shown and released revisions and resets release review after a conflict", async () => {
+  const skill = { ...draft, version: 4, enabled: true, active: revision, latest: { ...revision, revision: 3 } };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValueOnce({ scope, canEdit: true, skills: [skill] })
+    .mockResolvedValue({ scope, canEdit: true, skills: [{ ...skill, version: 5, latest: { ...revision, revision: 4 } }] });
+  vi.mocked(projectApi.actOnProjectSkill).mockRejectedValue(conflictError());
+  show(); fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  expect(screen.getByText("Revision 1, available")).toBeTruthy();
+  expect(screen.getByText("Draft revision 3, not released")).toBeTruthy();
+  fireEvent.click(screen.getByRole("checkbox", { name: /draft revision 3 and its validation/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Release in Planning" }));
+  await screen.findByText("Draft revision 4, not released");
+  expect(projectApi.actOnProjectSkill).toHaveBeenCalledWith("project", draft.id, { scope, version: 4, action: "release" });
+  expect((screen.getByRole("checkbox", { name: /draft revision 4 and its validation/ }) as HTMLInputElement).checked).toBe(false);
+  expect((screen.getByRole("button", { name: "Release in Planning" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("closes history and returns focus to its opener", async () => {
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [draft] });
+  vi.mocked(projectApi.getProjectSkillHistory).mockResolvedValue({ scope, revisions: [revision] });
+  show(); fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  const close = await screen.findByRole("button", { name: "Close history" }); close.focus();
+  fireEvent.keyDown(close, { key: "Escape" });
+  expect(screen.queryByText("Revision history")).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "History" }));
+});
+
+it("clears a scope's draft and ignores its held save result after the scope changes", async () => {
+  const held = deferred<{ scope: typeof scope; skill: ProjectSkill }>();
+  const changed = vi.fn();
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [draft] });
+  vi.mocked(projectApi.updateProjectSkill).mockReturnValue(held.promise);
+  const view = render(<ProjectSkills scope={scope} projectName="Planning" canManage archived={false} onChanged={changed} />);
+  await editDraft(); fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  const nextScope = { ...scope, userId: "next-owner" };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope: nextScope, canEdit: true, skills: [] });
+  view.rerender(<ProjectSkills scope={nextScope} projectName="Planning" canManage archived={false} onChanged={changed} />);
+  await screen.findByText(/No project skills yet/);
+  await act(async () => { held.resolve({ scope, skill: draft }); });
+  fireEvent.click(screen.getByRole("button", { name: "Create project skill" }));
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("");
+  expect(changed).not.toHaveBeenCalled();
+});
+
+it.each([401, 409])("clears draft text on a session or scope lock, status %s", async (status) => {
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [draft] });
+  vi.mocked(projectApi.updateProjectSkill).mockRejectedValue(new ApiError({ status, code: status === 401 ? "unauthorized" : "project_skill_scope_changed", method: "PUT", path: "/projects/project/skills/id", message: "Scope lost" }));
+  show(); await editDraft();
+  const save = screen.getByRole("button", { name: "Save draft" }); save.focus(); fireEvent.click(save);
+  await screen.findByText(/Draft text has been cleared/);
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Project skills" }));
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Save draft" })).toBeNull();
+});
+
+it("ignores a file read that completes after an account change", async () => {
+  const file = deferred<string>();
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [] });
+  const view = show();
+  fireEvent.click(await screen.findByRole("button", { name: "Create project skill" }));
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  fireEvent.change(screen.getByLabelText("Upload SKILL.md"), { target: { files: [{ name: "SKILL.md", size: 20, text: () => file.promise }] } });
+  await screen.findByText("Reading SKILL.md…");
+  const nextScope = { ...scope, userId: "next-owner" };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope: nextScope, canEdit: true, skills: [] });
+  view.rerender(<ProjectSkills scope={nextScope} projectName="Planning" canManage archived={false} />);
+  await screen.findByRole("button", { name: "Create project skill" });
+  await act(async () => { file.resolve("Previous account's private instructions"); });
+  fireEvent.click(screen.getByRole("button", { name: "Create project skill" }));
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  expect((screen.getByRole("textbox", { name: "SKILL.md text" }) as HTMLTextAreaElement).value).toBe("");
+});
+
+it("shows an active-work refusal at release and keeps the existing released revision", async () => {
+  const skill = { ...draft, enabled: true, active: revision, latest: { ...revision, revision: 3 } };
+  vi.mocked(projectApi.getProjectSkills).mockResolvedValue({ scope, canEdit: true, skills: [skill] });
+  vi.mocked(projectApi.actOnProjectSkill).mockRejectedValue(new ApiError({ status: 409, code: "project_busy", method: "POST", path: "/projects/project/skills/id/action", message: "Finish active project turns and resolve pending approvals before changing released skills." }));
+  show(); fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /draft revision 3 and its validation/ }));
+  fireEvent.click(screen.getByRole("button", { name: "Release in Planning" }));
+  await screen.findByText(/Finish active project turns/);
+  const release = screen.getByRole("button", { name: "Release in Planning" });
+  expect(release.parentElement?.textContent).toContain("Finish active project turns");
+  expect(screen.getByText("Revision 1, available")).toBeTruthy();
+  expect(projectApi.getProjectSkills).toHaveBeenCalledTimes(1);
+  expect(projectApi.actOnProjectSkill).toHaveBeenCalledTimes(1);
 });

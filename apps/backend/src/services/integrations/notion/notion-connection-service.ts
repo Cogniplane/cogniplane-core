@@ -3,7 +3,12 @@ import { SignJWT, jwtVerify } from "jose";
 import type { AppConfig } from "../../../config.js";
 import { decrypt, encrypt } from "../../../lib/crypto-utils.js";
 import type { AuditEventStore } from "../../audit-event-store.js";
-import type { NotionConnectionRecord, NotionConnectionStore } from "./notion-connection-store.js";
+import type {
+  NotionConnectionRecord,
+  NotionConnectionStore,
+  NotionOwnerConnectionRecord
+} from "./notion-connection-store.js";
+import { ConnectionConfirmError, OwnerSecurityVersionChangedError } from "../../auth/security-change.js";
 import type { RuntimeInvalidator } from "../contracts.js";
 import {
   buildIntegrationRedirectUrl,
@@ -38,6 +43,10 @@ type NotionStatePayload = {
   jti: string;
   // SHA-256 of the browser-binding cookie nonce.
   bnh: string;
+  // Security version of the session that started the authorization. Absent
+  // for a WorkOS session. The callback has no session, so the connection
+  // stores this value (see services/auth/security-change.ts).
+  sv?: number;
 };
 
 type NotionOwner = {
@@ -80,6 +89,9 @@ export type NotionUserConnectionSummary = {
   connectedAt: string;
   updatedAt: string;
   lastUsedAt: string | null;
+  // A security change of the owner's account suspended the connection. The
+  // agent does not use it until the owner confirms it or connects again.
+  suspended: boolean;
 };
 
 export type NotionConnectionStatus = {
@@ -108,7 +120,7 @@ function isExpired(value: string | null): boolean {
   return Number.isFinite(expiresAt) && expiresAt <= Date.now();
 }
 
-function toUserSummary(record: NotionConnectionRecord): NotionUserConnectionSummary {
+function toUserSummary(record: NotionOwnerConnectionRecord): NotionUserConnectionSummary {
   return {
     notionUserId: record.notionUserId,
     notionWorkspaceId: record.notionWorkspaceId,
@@ -121,7 +133,8 @@ function toUserSummary(record: NotionConnectionRecord): NotionUserConnectionSumm
     refreshTokenExpiresAt: record.refreshTokenExpiresAt,
     connectedAt: record.createdAt,
     updatedAt: record.updatedAt,
-    lastUsedAt: record.tokenLastUsedAt
+    lastUsedAt: record.tokenLastUsedAt,
+    suspended: record.suspended
   };
 }
 
@@ -139,7 +152,10 @@ function readNotionConfig(config: AppConfig): NotionOAuthConfig | null {
 export class NotionConnectionService {
   constructor(
     private readonly config: AppConfig,
-    private readonly store: Pick<NotionConnectionStore, "get" | "upsert" | "delete" | "markTokenUsed">,
+    private readonly store: Pick<
+      NotionConnectionStore,
+      "get" | "getForOwner" | "confirm" | "upsert" | "delete" | "markTokenUsed"
+    >,
     private readonly auditEvents?: Pick<AuditEventStore, "create">,
     private readonly runtimeManager?: RuntimeInvalidator,
     private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
@@ -152,7 +168,7 @@ export class NotionConnectionService {
   }
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<NotionConnectionStatus> {
-    const userConnection = await this.store.get(tenantId, userId);
+    const userConnection = await this.store.getForOwner(tenantId, userId);
     return {
       configured: this.isConfigured(),
       userConnection: userConnection ? toUserSummary(userConnection) : null
@@ -177,6 +193,8 @@ export class NotionConnectionService {
   async getAuthorizationUrl(input: {
     tenantId: string;
     userId: string;
+    // The security version of the requesting session (requestSecurityVersion).
+    ownerSecurityVersion: number | null;
   }): Promise<{ url: string; browserBinding: OAuthBrowserBindingCookie }> {
     const oauth = readNotionConfig(this.config);
     if (!oauth) throw new NotionConnectionNotConfiguredError();
@@ -188,7 +206,8 @@ export class NotionConnectionService {
       tid: input.tenantId,
       sub: input.userId,
       jti,
-      bnh: binding.nonceHash
+      bnh: binding.nonceHash,
+      ...(input.ownerSecurityVersion === null ? {} : { sv: input.ownerSecurityVersion })
     } satisfies NotionStatePayload)
       .setProtectedHeader({ alg: "HS256", kid: this.config.JWT_KEY_ID })
       .setIssuer(NOTION_STATE_ISSUER)
@@ -251,7 +270,13 @@ export class NotionConnectionService {
       if (!(await this.oauthStates.consume("notion", payload.jti))) {
         return fallbackUrl;
       }
-      state = { tid: payload.tid, sub: payload.sub, jti: payload.jti, bnh: payload.bnh };
+      state = {
+        tid: payload.tid,
+        sub: payload.sub,
+        jti: payload.jti,
+        bnh: payload.bnh,
+        ...(typeof payload.sv === "number" && Number.isInteger(payload.sv) ? { sv: payload.sv } : {})
+      };
     } catch {
       return fallbackUrl;
     }
@@ -316,7 +341,8 @@ export class NotionConnectionService {
           ? encrypt(tokenPayload.refresh_token, this.config.DATA_ENCRYPTION_SECRET)
           : null,
         refreshTokenExpiresAt: null,
-        tokenLastRefreshedAt: tokenPayload.refresh_token ? new Date().toISOString() : null
+        tokenLastRefreshedAt: tokenPayload.refresh_token ? new Date().toISOString() : null,
+        ownerSecurityVersion: state.sv ?? null
       });
 
       try {
@@ -343,10 +369,12 @@ export class NotionConnectionService {
       return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "connected"
       });
-    } catch {
+    } catch (error) {
       return buildIntegrationRedirectUrl(this.config, "/settings/notion", {
         notionAuth: "error",
-        reason: "notion_authorization_failed"
+        // A security change after the session that started the authorization:
+        // nothing was written.
+        reason: error instanceof OwnerSecurityVersionChangedError ? "session_changed" : "notion_authorization_failed"
       });
     }
   }
@@ -361,8 +389,34 @@ export class NotionConnectionService {
     return this.disconnect(tenantId, userId);
   }
 
+  /**
+   * The owner confirms a suspended connection from a current session. The
+   * Notion user and workspace are the account that the owner saw.
+   * `ownerSecurityVersion` is the version of the requesting session. The
+   * result stays suspended when that version is not current (a security
+   * change raced the request).
+   */
+  async confirm(
+    tenantId: string,
+    userId: string,
+    expected: { notionUserId: string; notionWorkspaceId: string | null },
+    ownerSecurityVersion: number | null
+  ): Promise<NotionUserConnectionSummary> {
+    const confirmed = await this.store.confirm(tenantId, userId, expected, ownerSecurityVersion);
+    if (!confirmed) {
+      const current = await this.store.getForOwner(tenantId, userId);
+      throw new ConnectionConfirmError(
+        !current ? "not_connected" : current.notionOwnerEmail === null ? "not_attested" : "account_changed", "Notion");
+    }
+    // The store writes the audit event in the confirm's transaction.
+    if (!confirmed.suspended) {
+      await this.runtimeManager?.invalidateRuntimesForIntegration(tenantId, userId, "notion");
+    }
+    return toUserSummary(confirmed);
+  }
+
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
-    const existing = await this.store.get(tenantId, userId);
+    const existing = await this.store.getForOwner(tenantId, userId);
     const removed = await this.store.delete(tenantId, userId);
 
     if (removed && existing) {

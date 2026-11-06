@@ -2,7 +2,7 @@ import Fastify from "fastify";
 import { test, expect } from "vitest";
 
 import { localDevAuth } from "./auth.js";
-import { workosAuth } from "./auth-workos.js";
+import { jwtAuth } from "./auth-jwt.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 
 // The non-loopback opt-in removes the network guard, so this shared-secret check
@@ -15,14 +15,14 @@ async function buildApp(overrides: Parameters<typeof createTestConfig>[0]) {
   return app;
 }
 
-test.each(["dev-headers", "workos"])("%s exposes only exact liveness and readiness paths", async (mode) => {
+test.each(["dev-headers", "jwt"])("%s exposes only exact liveness and readiness paths", async (mode) => {
   const app = Fastify();
   const config = createTestConfig({
     COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: true,
     DEV_HEADERS_AUTH_KEY: "dev-headers-shared-secret"
   });
-  app.addHook("onRequest", mode === "workos"
-    ? workosAuth(config, { async getRole() { throw new Error("probe must not query membership"); } })
+  app.addHook("onRequest", mode === "jwt"
+    ? jwtAuth(config, { async getAuthState() { throw new Error("probe must not query membership"); } })
     : localDevAuth(config));
   for (const path of ["/health", "/ready", "/ready/private", "/readyevil", "/health/private"]) {
     app.get(path, async () => ({ ok: true }));

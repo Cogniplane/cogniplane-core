@@ -1,0 +1,75 @@
+{
+  "rows": [
+    {
+      "messageId": "u1",
+      "role": "user",
+      "status": "completed",
+      "content": "Run it"
+    },
+    {
+      "messageId": "a1",
+      "role": "assistant",
+      "status": "streaming",
+      "content": "",
+      "toolResults": [
+        {
+          "toolResultId": "tc-1",
+          "toolName": "execute",
+          "title": "execute",
+          "status": "in_progress",
+          "input": "{\"command\":\"sleep 60\"}",
+          "output": ""
+        }
+      ]
+    }
+  ],
+  "unavailable": [
+    {
+      "id": "u1",
+      "role": "user",
+      "content": "Run it"
+    },
+    {
+      "id": "a1:call:0",
+      "role": "assistant",
+      "toolCalls": [
+        {
+          "id": "tc-1",
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "arguments": "{\"command\":\"sleep 60\"}"
+          }
+        }
+      ]
+    }
+  ],
+  "none": [
+    {
+      "id": "u1",
+      "role": "user",
+      "content": "Run it"
+    },
+    {
+      "id": "a1:call:0",
+      "role": "assistant",
+      "toolCalls": [
+        {
+          "id": "tc-1",
+          "type": "function",
+          "function": {
+            "name": "execute",
+            "arguments": "{\"command\":\"sleep 60\"}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "tc-1:result",
+      "role": "tool",
+      "toolCallId": "tc-1",
+      "content": "",
+      "error": "interrupted"
+    }
+  ]
+}

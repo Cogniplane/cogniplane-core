@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { MessageFeedbackStats } from "@cogniplane/shared-types";
 import { MessageFeedbackSection } from "./message-feedback-section";
@@ -35,11 +35,11 @@ it("shows totals and keeps the previous report visible while changing the period
   await screen.findByText("4 rated responses");
   expect(api.fetch).toHaveBeenCalledWith(30);
   fireEvent.click(screen.getByRole("button", { name: "7d" }));
-  await screen.findByText("Loading…");
+  await screen.findByText("Loading the last 7 days. Showing the previous 30-day report until the read succeeds.");
   expect(screen.getByText("4 rated responses")).toBeTruthy();
   expect(screen.queryByText("No feedback recorded in this period.")).toBeNull();
   await act(async () => resolve({ totals: empty, daily: [], byModel: [] }));
-  await screen.findByText("No feedback recorded in this period.");
+  await screen.findByText("No feedback recorded in the displayed 7-day report.");
   expect(api.fetch).toHaveBeenLastCalledWith(7);
   expect(screen.queryByRole("table")).toBeNull();
 });
@@ -52,13 +52,16 @@ it("sorts model rates in both directions with unrated models last", async () => 
   await screen.findByText("Unrated");
   expect(screen.queryByText("Daily breakdown")).toBeNull();
   const table = screen.getByRole("table");
-  const rate = within(table).getByRole("button", { name: "Rate" });
+  const rate = within(table).getByRole("button", { name: "Rate, not sorted" });
   const names = () => within(table).getAllByRole("row").slice(1)
     .map(row => within(row).getAllByRole("cell")[0].textContent);
   fireEvent.click(rate);
   expect(names()).toEqual(["Positive", "Mixed", "Negative", "Unrated"]);
+  expect(rate.closest("th")?.getAttribute("aria-sort")).toBe("descending");
+  expect(rate.getAttribute("aria-label")).toBe("Rate, sorted descending");
   fireEvent.click(rate);
   expect(names()).toEqual(["Negative", "Mixed", "Positive", "Unrated"]);
+  expect(rate.closest("th")?.getAttribute("aria-sort")).toBe("ascending");
   expect(within(table).getByText("0%")).toBeTruthy();
   expect(within(table).getByText("—")).toBeTruthy();
 });
@@ -70,13 +73,61 @@ it("sorts model names ignoring case and comparing digit runs as numbers", async 
   await screen.findByText("4 rated responses");
   fireEvent.click(screen.getByRole("button", { name: "By model" }));
   const table = await screen.findByRole("table");
-  const label = within(table).getByRole("button", { name: "Model" });
+  const label = within(table).getByRole("button", { name: "Model, not sorted" });
   const names = () => within(table).getAllByRole("row").slice(1)
     .map(row => within(row).getAllByRole("cell")[0].textContent);
   fireEvent.click(label);
   expect(names()).toEqual(["alpha", "Beta", "model 2", "model 10"]);
   fireEvent.click(label);
   expect(names()).toEqual(["model 10", "model 2", "Beta", "alpha"]);
+});
+
+it("keeps the local reload mounted and focused through a failed-first-read retry and blocks duplicate reads", async () => {
+  let resolve!: (value: MessageFeedbackStats) => void;
+  api.fetch.mockRejectedValueOnce(new Error("Reporting unavailable"))
+    .mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  mount();
+  await screen.findByRole("alert");
+  const reload = screen.getByRole("button", { name: "Reload feedback" });
+  reload.focus();
+  fireEvent.click(reload);
+  fireEvent.click(reload);
+  await waitFor(() => expect(api.fetch).toHaveBeenCalledTimes(2));
+  expect(screen.getByRole("button", { name: "Reload feedback" })).toBe(reload);
+  expect(document.activeElement).toBe(reload);
+  expect(reload.getAttribute("aria-disabled")).toBe("true");
+  expect(screen.queryByText("0 rated responses")).toBeNull();
+  await act(async () => resolve(stats));
+  await screen.findByText("4 rated responses");
+  expect(document.activeElement).toBe(reload);
+  expect(reload.getAttribute("aria-disabled")).toBe("false");
+});
+
+it("names the retained report's period after a different period fails without claiming zero", async () => {
+  api.fetch.mockResolvedValueOnce(stats).mockRejectedValueOnce(new Error("Try later"));
+  mount();
+  await screen.findByText("4 rated responses");
+  fireEvent.click(screen.getByRole("button", { name: "7d" }));
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain("The last 7 days could not be loaded. The 30-day report below has not been updated.");
+  expect(screen.getByText("4 rated responses")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "7d" }).getAttribute("aria-pressed")).toBe("true");
+  expect(screen.queryByText(/No feedback recorded/)).toBeNull();
+  expect(screen.getByRole("button", { name: "Reload feedback" }).getAttribute("aria-describedby")).toBe(alert.id);
+});
+
+it("does not take focus back after a reload finishes", async () => {
+  let resolve!: (value: MessageFeedbackStats) => void;
+  api.fetch.mockRejectedValueOnce(new Error("Retry later"))
+    .mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  mount();
+  await screen.findByRole("alert");
+  fireEvent.click(screen.getByRole("button", { name: "Reload feedback" }));
+  const period = screen.getByRole("button", { name: "30d" });
+  period.focus();
+  await act(async () => resolve(stats));
+  await screen.findByText("4 rated responses");
+  expect(document.activeElement).toBe(period);
 });
 
 it("shows a request failure and can recover by selecting another period", async () => {

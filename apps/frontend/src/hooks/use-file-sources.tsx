@@ -7,7 +7,7 @@ import { fetchIntegrationsAvailability } from "../lib/integrations-api";
 import { queryKeys } from "../lib/query-keys";
 
 // File-source registration. Each registered entry contributes one tile to
-// the file-source picker UI. Private overlays (e.g. SharePoint) register
+// the file-source picker UI. Private overlays register
 // their own file-source factory at module load. The OSS subset has no
 // registered factories and the picker simply shows nothing.
 //
@@ -34,7 +34,7 @@ export type FileSourceFactory = {
    * Hook that returns the rendered file-source definition. Called once
    * per render of `useFileSources` regardless of whether the integration
    * is enabled — implementations should short-circuit network calls
-   * internally (see use-microsoft-file-selector for the pattern).
+   * internally.
    */
   useEntry: (input: FileSourceFactoryInput) => FileSourceDefinition;
 };

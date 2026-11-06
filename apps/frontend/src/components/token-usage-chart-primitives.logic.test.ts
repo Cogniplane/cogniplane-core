@@ -44,8 +44,18 @@ describe("fmtAxisShort", () => {
     expect(fmtAxisShort(0)).toBe("0");
     expect(fmtAxisShort(999)).toBe("999");
     expect(fmtAxisShort(1_000)).toBe("1k");
-    expect(fmtAxisShort(2_500)).toBe("3k");
+    expect(fmtAxisShort(2_500)).toBe("2.5k");
     expect(fmtAxisShort(1_500_000)).toBe("1.5M");
+  });
+
+  test("nearby daily-chart levels keep distinct labels across 1k", () => {
+    expect([0, 350, 700, 1_050, 1_400].map(fmtAxisShort)).toEqual([
+      "0",
+      "350",
+      "700",
+      "1.1k",
+      "1.4k"
+    ]);
   });
 });
 

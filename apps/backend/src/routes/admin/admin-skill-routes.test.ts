@@ -15,6 +15,7 @@ import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-even
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import type { Pool } from "../../lib/db.js";
 import type { SkillBundleStorage } from "../../services/skills/skill-bundle-storage.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
 
 const noopSkillBundleStorage: Pick<SkillBundleStorage, "materializeBundle"> = {
   async materializeBundle(storageUri: string) {
@@ -190,7 +191,7 @@ test("GET /admin/skills/marketplace falls back to platform catalog when org mani
     }
   };
 
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig: createFakeDynamicConfig(),
     skillMarketplace,
     auditEvents: new InMemoryAuditEventStore(),
@@ -222,7 +223,7 @@ test("release-impact route validates the target and returns a private snapshot",
   });
   const snapshot={version:1,activeRevisionId:null,latestRevisionId:2,enabled:false,isPublished:false};
   let called=false;
-  await registerAdminSkillRoutes(app,{dynamicConfig:createFakeDynamicConfig(),skillMarketplace:createFakeMarketplace(),
+  await registerAdminSkillRoutes(app,{ dataRoutes: devDataRoutes(),dynamicConfig:createFakeDynamicConfig(),skillMarketplace:createFakeMarketplace(),
     auditEvents:new InMemoryAuditEventStore(),skillBundleStorage:noopSkillBundleStorage,
     skillReleaseImpact:{async preview(tenantId,skillId,input){
       called=true;
@@ -263,7 +264,7 @@ test("github import route passes installation token to lifecycle service", async
     capturedGithubToken = input.githubToken;
   });
 
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig,
     skillMarketplace: createFakeMarketplace(),
     auditEvents: new InMemoryAuditEventStore(),
@@ -314,7 +315,7 @@ test("github import route proceeds without token when getRuntimeCredentials thro
     capturedGithubToken = input.githubToken;
   });
 
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig,
     skillMarketplace: createFakeMarketplace(),
     auditEvents: new InMemoryAuditEventStore(),
@@ -402,7 +403,7 @@ async function buildAppWithRevisionFixture() {
     }
   };
 
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig,
     skillMarketplace: createFakeMarketplace(),
     auditEvents: new InMemoryAuditEventStore(),
@@ -484,7 +485,7 @@ test("admin skill routes reject non-admin callers with 403", async () => {
     };
   });
 
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig: createFakeDynamicConfig(),
     skillMarketplace: {
       async getCatalog() {
@@ -532,7 +533,7 @@ test("skill activation passes the selected audience to the transaction and audit
     };
   };
   const auditEvents = new InMemoryAuditEventStore();
-  await registerAdminSkillRoutes(app, {
+  await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig, auditEvents, skillMarketplace: createFakeMarketplace(), skillBundleStorage: noopSkillBundleStorage
   });
   const expectedSnapshot = { version: 1, activeRevisionId: null, latestRevisionId: 1, enabled: false, isPublished: false };

@@ -3,9 +3,6 @@ import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
-import type { GithubConnectionService } from "../integrations/github/github-connection-service.js";
-import type { NotionConnectionService } from "../integrations/notion/notion-connection-service.js";
-import type { JiraConnectionService } from "../integrations/pipedream/jira-connection-service.js";
 import type { MemoryStore } from "../memory-store.js";
 import type { MessageStore } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
@@ -15,11 +12,11 @@ import type { ProjectFileStore } from "../project-file-store.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
 
 // Shared deps bag every managed-tool factory may consume. Each factory only
-// reads the slots it needs. Integration-specific dependencies (e.g. the
-// SharePoint factory's Microsoft Graph services) are NOT in this bag —
+// reads the slots it needs. Integration-specific dependencies (the GitHub,
+// Notion, Jira, and SharePoint connection services) are NOT in this bag —
 // integrations register their factories via closures that capture their own
-// typed dependencies, so an integration can ship from a private overlay
-// without leaking its type surface into core.
+// typed dependencies, so an integration can ship from a connector module or a
+// private overlay without leaking its type surface into core.
 export type ManagedToolFactoryDeps = {
   db: Pool;
   dynamicConfig: Pick<DynamicConfigService, "listSkills">;
@@ -29,9 +26,6 @@ export type ManagedToolFactoryDeps = {
   artifacts: Pick<ArtifactStore, "create" | "createGenerated" | "getReadable" | "listBySession" | "findLatestReadableDerived">;
   storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
   auditEvents: Pick<AuditEventStore, "create">;
-  githubConnections: Pick<GithubConnectionService, "getRuntimeCredentials">;
-  notionConnections: Pick<NotionConnectionService, "getRuntimeCredentials">;
-  jiraConnections: Pick<JiraConnectionService, "read">;
   /** Optional — forwarded to tools that aggregate cross-session content. */
   piiProtection?: PiiProtectionService;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;

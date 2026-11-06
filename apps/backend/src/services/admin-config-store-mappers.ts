@@ -197,6 +197,16 @@ export function mapMcpServer(row: Record<string, unknown>): AdminMcpServerRecord
   };
 }
 
+function mapLinkEmail(row: Record<string, unknown>): TenantMemberRecord["linkEmail"] {
+  if (row.link_email_kind == null) return null;
+  return {
+    purpose: row.link_email_kind === "account_setup_link" ? "account_setup" : "password_reset",
+    status: assertEnum(row.link_email_status, ["queued", "sending", "sent", "failed", "expired"], "link email status"),
+    updatedAt: isoTimestamp(row.link_email_updated_at),
+    error: toNullableString(row.link_email_error)
+  };
+}
+
 export function mapTenantMember(row: Record<string, unknown>): TenantMemberRecord {
   return {
     userId: String(row.user_id),
@@ -206,6 +216,19 @@ export function mapTenantMember(row: Record<string, unknown>): TenantMemberRecor
     role: assertEnum(row.role, ["owner", "admin", "member"], "membership role"),
     isBetaTester: Boolean(row.is_beta_tester),
     createdAt: isoTimestamp(row.created_at),
-    updatedAt: isoTimestamp(row.updated_at)
+    updatedAt: isoTimestamp(row.updated_at),
+    ...(typeof row.mfa_enabled === "boolean" && row.account_status != null ? { mfaEnabled: row.mfa_enabled } : {}),
+    ...(typeof row.passkey_count === "number" && row.account_status != null ? { passkeyCount: row.passkey_count } : {}),
+    ...(row.account_status != null && "link_email_kind" in row ? { linkEmail: mapLinkEmail(row) } : {}),
+    // Present only when the query joined local_identities.
+    ...(row.account_status === undefined
+      ? {}
+      : {
+          accountStatus: row.account_status === null
+            ? null
+            : assertEnum<NonNullable<TenantMemberRecord["accountStatus"]>>(
+                row.account_status, ["pending_setup", "active", "disabled", "removed"], "local account status"
+              )
+        })
   };
 }

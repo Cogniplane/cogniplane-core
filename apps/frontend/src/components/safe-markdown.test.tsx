@@ -46,3 +46,37 @@ describe("SafeMarkdown images", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 });
+
+describe("SafeMarkdown reading syntax", () => {
+  it("renders GFM tables, deleted text and read-only task lists", async () => {
+    const { container } = render(<SafeMarkdown>{"## Evidence\n\nFirst paragraph.\n\nSecond paragraph with ~~old text~~.\n\n| Source | Result |\n| --- | --- |\n| File | Ready |\n\n- [x] Read source\n- [ ] Review draft"}</SafeMarkdown>);
+    expect(await screen.findByRole("heading", { name: "Evidence", level: 2 })).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "Ready" })).toBeTruthy();
+    expect(container.querySelector("del")?.textContent).toBe("old text");
+    const tasks = screen.getAllByRole("checkbox") as HTMLInputElement[];
+    expect(tasks.map(task => ({ checked: task.checked, disabled: task.disabled, readOnly: task.readOnly }))).toEqual([
+      { checked: true, disabled: true, readOnly: true }, { checked: false, disabled: true, readOnly: true }
+    ]);
+    expect(screen.getByRole("region", { name: "Markdown table" }).tabIndex).toBe(0);
+  });
+
+  it("keeps nested numbered instructions and exact fenced source", async () => {
+    const source = '  const text = "<value>";\n\n    keepIndentation();\n';
+    const { container } = render(<SafeMarkdown>{`3. Read the source.\n   1. Check the date.\n      - Keep this note.\n4. Confirm the result.\n\n\`\`\`unknown-language\n${source}\`\`\``}</SafeMarkdown>);
+    const region = await screen.findByRole("region", { name: "Code block" });
+    expect(region.textContent).toBe(source);
+    const ordered = container.querySelector("ol")!;
+    expect(ordered.start).toBe(3);
+    expect(ordered.querySelector("li ol li ul li")?.textContent).toBe("Keep this note.");
+    expect(region.tabIndex).toBe(0);
+  });
+
+  it("keeps incomplete streamed content readable without accepting raw controls or active HTML", async () => {
+    const { container, rerender } = render(<SafeMarkdown>{"## Incomplete\n\n- [ ] Review\n\n```ts\n  pending("}</SafeMarkdown>);
+    expect((await screen.findByRole("region", { name: "Code block" })).textContent).toBe("  pending(\n");
+    rerender(<SafeMarkdown>{'## Complete\n\n<script>window.bad=true</script>\n<iframe src="https://evil.example"></iframe>\n<input type="text" value="bad">\n\n[Unsafe](javascript:alert(1))'}</SafeMarkdown>);
+    await screen.findByRole("heading", { name: "Complete" });
+    expect(container.querySelector("script,iframe,input,form,style,object,embed")).toBeNull();
+    expect(screen.getByText("Unsafe").getAttribute("href")).not.toMatch(/^javascript:/i);
+  });
+});

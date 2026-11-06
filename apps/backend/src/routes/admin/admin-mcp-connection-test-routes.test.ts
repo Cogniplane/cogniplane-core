@@ -6,6 +6,7 @@ import type { AdminMcpServerRecord } from "../../services/admin-config-records.j
 import { McpConnectionTestConflictError, McpConnectionTestNotFoundError } from "../../services/mcp/mcp-connection-test-service.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { registerAdminMcpServerRoutes } from "./admin-mcp-server-routes.js";
+import { devDataRoutes } from "../../test-helpers/data-routes.js";
 
 const server: AdminMcpServerRecord = {
   serverId: "research", ownerTenantId: "tenant-a", serverName: "Research", description: null,
@@ -40,6 +41,7 @@ async function setup(isAdmin = true) {
   };
   vi.mocked(dynamicConfig.getOrCreateTenantSettings).mockResolvedValue({ enabledMcpServerIds: [server.serverId] } as Awaited<ReturnType<typeof dynamicConfig.getOrCreateTenantSettings>>);
   await registerAdminMcpServerRoutes(app, {
+    dataRoutes: devDataRoutes(),
     dynamicConfig, mcpConnectionTests: { test: run, listLatest }
   });
   return { app, run, listLatest };

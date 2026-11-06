@@ -1,5 +1,7 @@
 import { withTenantScope, type Pool } from "../../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../../lib/db-mappers.js";
+import { AuditEventStore } from "../../audit-event-store.js";
+import { assertOwnerSecurityVersion, ownerSecurityVersionSql } from "../../auth/security-change.js";
 
 export type GithubConnectionRecord = {
   tenantId: string;
@@ -50,6 +52,13 @@ function mapGithubConnection(row: Record<string, unknown>): GithubConnectionReco
   };
 }
 
+/** A connection as its owner sees it: also when a security change suspended it. */
+export type GithubOwnerConnectionRecord = GithubConnectionRecord & { suspended: boolean };
+
+// The owner's account still has the stored version (or is a WorkOS account).
+const CURRENT_VERSION_SQL = ownerSecurityVersionSql("user_github_connections");
+const SUSPENDED_SQL = `NOT (${CURRENT_VERSION_SQL})`;
+
 export type SetAllowedRepositoriesResult =
   | { status: "not_connected" }
   | { status: "account_changed" }
@@ -58,6 +67,11 @@ export type SetAllowedRepositoriesResult =
 export class GithubConnectionStore {
   constructor(private readonly db: Pool) {}
 
+  /**
+   * The connection for use: tools, session start, and repository listing.
+   * A connection that a security change of the owner suspended is not
+   * returned (see services/auth/security-change.ts).
+   */
   async get(tenantId: string, userId: string): Promise<GithubConnectionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -65,12 +79,66 @@ export class GithubConnectionStore {
           SELECT *
           FROM user_github_connections
           WHERE tenant_id = $1 AND user_id = $2
+            AND ${CURRENT_VERSION_SQL}
           LIMIT 1
         `,
         [tenantId, userId]
       );
 
       return result.rows[0] ? mapGithubConnection(result.rows[0]) : null;
+    });
+  }
+
+  /** The connection for its owner's settings page and disconnect, suspended or not. Not for use. */
+  async getForOwner(tenantId: string, userId: string): Promise<GithubOwnerConnectionRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          SELECT *, ${SUSPENDED_SQL} AS suspended
+          FROM user_github_connections
+          WHERE tenant_id = $1 AND user_id = $2
+        `,
+        [tenantId, userId]
+      );
+      const row = result.rows[0];
+      return row ? { ...mapGithubConnection(row), suspended: row.suspended === true } : null;
+    });
+  }
+
+  /**
+   * The owner confirms the connection from a current session: store that
+   * session's security version. `expectedGithubUserId` is the account that the
+   * owner saw, so a reconnect meanwhile is not confirmed. Returns null when
+   * that account is not connected. The result stays suspended when the
+   * session's version is not current. A confirm that restores the connection
+   * writes `user.github.confirmed` in the same transaction.
+   */
+  async confirm(
+    tenantId: string,
+    userId: string,
+    expectedGithubUserId: string,
+    ownerSecurityVersion: number | null
+  ): Promise<GithubOwnerConnectionRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          UPDATE user_github_connections
+          SET owner_security_version = $4
+          WHERE tenant_id = $1 AND user_id = $2 AND github_user_id = $3
+          RETURNING *, ${SUSPENDED_SQL} AS suspended
+        `,
+        [tenantId, userId, expectedGithubUserId, ownerSecurityVersion]
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      const confirmed = { ...mapGithubConnection(row), suspended: row.suspended === true };
+      if (!confirmed.suspended) {
+        await AuditEventStore.createInTransaction(client, {
+          tenantId, userId, sessionId: null, type: "user.github.confirmed",
+          payload: { githubLogin: confirmed.githubLogin, githubUserId: confirmed.githubUserId, ownerSecurityVersion }
+        });
+      }
+      return confirmed;
     });
   }
 
@@ -89,8 +157,13 @@ export class GithubConnectionStore {
     refreshTokenEncrypted: string | null;
     refreshTokenExpiresAt: string | null;
     tokenLastRefreshedAt: string | null;
+    // The security version of the session that started the authorization.
+    // The callback has no session, so the write is bound to this version:
+    // OwnerSecurityVersionChangedError when it is not the owner's current one.
+    ownerSecurityVersion: number | null;
   }): Promise<GithubConnectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
+      await assertOwnerSecurityVersion(client, input.tenantId, input.userId, input.ownerSecurityVersion);
       const result = await client.query(
         `
           INSERT INTO user_github_connections (
@@ -107,9 +180,10 @@ export class GithubConnectionStore {
             access_token_expires_at,
             refresh_token_encrypted,
             refresh_token_expires_at,
-            github_token_last_refreshed_at
+            github_token_last_refreshed_at,
+            owner_security_version
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15)
           ON CONFLICT (tenant_id, user_id)
           DO UPDATE SET
             github_user_id = EXCLUDED.github_user_id,
@@ -132,6 +206,7 @@ export class GithubConnectionStore {
             refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
             refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
             github_token_last_refreshed_at = EXCLUDED.github_token_last_refreshed_at,
+            owner_security_version = EXCLUDED.owner_security_version,
             updated_at = NOW()
           RETURNING *
         `,
@@ -149,7 +224,8 @@ export class GithubConnectionStore {
           input.accessTokenExpiresAt,
           input.refreshTokenEncrypted,
           input.refreshTokenExpiresAt,
-          input.tokenLastRefreshedAt
+          input.tokenLastRefreshedAt,
+          input.ownerSecurityVersion
         ]
       );
 
@@ -160,7 +236,8 @@ export class GithubConnectionStore {
   /**
    * Store refreshed tokens only on the connection that the refresh started
    * from. Returns null when a disconnect or reconnect happened meanwhile, so
-   * a slow refresh cannot recreate or overwrite that connection.
+   * a slow refresh cannot recreate or overwrite that connection, and when a
+   * security change suspended the connection meanwhile.
    */
   async updateRefreshedToken(input: {
     tenantId: string;
@@ -188,6 +265,8 @@ export class GithubConnectionStore {
               updated_at = NOW()
           WHERE tenant_id = $1 AND user_id = $2
             AND github_user_id = $3 AND refresh_token_encrypted = $4
+            -- A security change during the refresh suspended the connection.
+            AND ${CURRENT_VERSION_SQL}
           RETURNING *
         `,
         [

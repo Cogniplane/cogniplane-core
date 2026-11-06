@@ -50,10 +50,12 @@ export const AVAILABLE_MODELS: readonly {
 
   // OpenAI (initChatModel prefix "openai"). Each model lists its supported
   // reasoning efforts. GPT-6.1 Sol starts at low and does not accept none.
+  // GPT-6.1 Terra accepts none through max (OpenAI model page, 2026-10-27).
   // Vendor model id follows the "/".
   { id: "openai/gpt-6-astra-pro",                displayName: "GPT-6 Astra Pro",                description: "OpenAI's most capable GPT-6 model for the hardest problems.", isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6-astra",                    displayName: "GPT-6 Astra",                    description: "OpenAI's flagship GPT-6 model.",                       isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6.1-sol",                    displayName: "GPT-6.1 Sol",                    description: "OpenAI model for complex coding and agent workflows.",      isDefault: false, provider: "openai",     supportedEfforts: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
+  { id: "openai/gpt-6.1-terra",                  displayName: "GPT-6.1 Terra",                  description: "Mid-tier GPT-6.1 model for everyday agentic, coding, and writing work.", isDefault: false, provider: "openai", supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6-sol",                      displayName: "GPT-6 Sol",                      description: "OpenAI model for complex coding and agent workflows.",      isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-6-luna",                     displayName: "GPT-6 Luna",                     description: "OpenAI model for focused, high-volume tasks.",             isDefault: true,  provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
   { id: "openai/gpt-5.6-sol",                    displayName: "GPT-5.6 Sol",                    description: "Prior-generation GPT-5.6 flagship model.",             isDefault: false, provider: "openai",     supportedEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultEffort: "medium", contextWindow: 1_050_000 },
@@ -64,7 +66,9 @@ export const AVAILABLE_MODELS: readonly {
 
   // Google (initChatModel prefix "google-genai" — the key-based Gemini client,
   // NOT Vertex; see MODEL_PROVIDER_META). Thinking budget maps to
-  // none/low/medium/high.
+  // none/low/medium/high. Gemini 4 Argon documents only low/medium/high
+  // thinking, so it does not advertise none (thinkingBudget 0 is unverified).
+  { id: "google/gemini-4-argon",                 displayName: "Gemini 4 Argon",                description: "Google's flagship reasoning model for complex coding and science.", isDefault: false, provider: "google", supportedEfforts: ["low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_048_576 },
   { id: "google/gemini-3.8-flash",               displayName: "Gemini 3.8 Flash",              description: "Google's most intelligent Flash model for agentic work.", isDefault: false, provider: "google",     supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_048_576 },
   { id: "google/gemini-3.7-flash",               displayName: "Gemini 3.7 Flash",              description: "Prior-generation Gemini Flash model.",                 isDefault: false, provider: "google",     supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_048_576 },
   { id: "google/gemini-3.5-flash",               displayName: "Gemini 3.5 Flash",              description: "Older Gemini Flash model.",                            isDefault: false, provider: "google",     supportedEfforts: ["none", "low", "medium", "high"], defaultEffort: "medium", contextWindow: 1_048_576 },
@@ -77,14 +81,14 @@ export const AVAILABLE_MODELS: readonly {
   // splits on the FIRST slash only, preserving "deepseek/deepseek-v4-pro".
   // Reasoning-effort support varies per open model and is not applied here
   // (supportedEfforts: []), so the Effort dropdown stays hidden for these.
-  // Slugs and context windows verified 2026-10-08 against
+  // Slugs, context windows and tool support verified 2026-10-27 against
   // https://openrouter.ai/api/v1/models.
   { id: "openrouter/z-ai/glm-5.3",                    displayName: "GLM 5.3 (OpenRouter)",        description: "Z.AI GLM 5.3 — top open-weight model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/deepseek/deepseek-v4-pro",        displayName: "DeepSeek V4 Pro (OpenRouter)", description: "DeepSeek V4 Pro reasoning/coding model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/deepseek/deepseek-v4.1-flash",    displayName: "DeepSeek V4.1 Flash (OpenRouter)", description: "Fast, efficient DeepSeek V4.1 model via OpenRouter.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
 
   // Widely-used open models on OpenRouter (slugs + context windows verified
-  // 2026-10-08 via /api/v1/models). OpenRouter's public API exposes no usage
+  // 2026-10-27 via /api/v1/models). OpenRouter's public API exposes no usage
   // ranking today (the ?order= param is accepted but ignored), so this set is
   // curated by capability tier, not by a live token chart.
   { id: "openrouter/tencent/hy3",                     displayName: "Tencent Hy3 (OpenRouter)",       description: "Tencent Hy3 295B MoE reasoning model.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
@@ -93,27 +97,32 @@ export const AVAILABLE_MODELS: readonly {
   { id: "openrouter/minimax/minimax-m3",              displayName: "MiniMax M3 (OpenRouter)",        description: "MiniMax M3 open agentic/coding model.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b", displayName: "Nemotron 3 Ultra (OpenRouter)", description: "NVIDIA Nemotron 3 Ultra 550B MoE — strongest open Nemotron.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
   { id: "openrouter/stepfun/step-3.7-flash",          displayName: "Step 3.7 Flash (OpenRouter)",    description: "StepFun Step 3.7 Flash — fast open model for routine work.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
-  { id: "openrouter/qwen/qwen3.7-max",                displayName: "Qwen3.7 Max (OpenRouter)",       description: "Alibaba Qwen3.7 Max — flagship Qwen reasoning model.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/qwen/qwen3.8-max-0902",           displayName: "Qwen3.8 Max (OpenRouter)",       description: "Alibaba Qwen3.8 Max (0902 snapshot) — newest Qwen flagship.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/z-ai/glm-5.3-flashx",             displayName: "GLM 5.3 FlashX (OpenRouter)",    description: "Z.AI GLM 5.3 FlashX — fast, low-cost GLM tier.",       isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/x-ai/grok-4.7",                   displayName: "Grok 4.7 (OpenRouter)",          description: "xAI Grok 4.7 reasoning model.",                        isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 500_000 },
   { id: "openrouter/mistralai/mistral-large-4-0",     displayName: "Mistral Large 4 (OpenRouter)",   description: "Mistral Large 4 — Mistral's flagship model.",          isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/meta/muse-spark-1.3",             displayName: "Muse Spark 1.3 (OpenRouter)",    description: "Meta Muse Spark 1.3 general model.",                   isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/meta/muse-wonder",                displayName: "Muse Wonder (OpenRouter)",       description: "Meta Muse Wonder — frontier reasoning model for agentic tasks.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/moonshotai/kimi-k3.1-pro",        displayName: "Kimi K3.1 Pro (OpenRouter)",     description: "Moonshot Kimi K3.1 Pro — flagship open-weight reasoning model.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/minimax/minimax-m3.1-flash",      displayName: "MiniMax M3.1 Flash (OpenRouter)", description: "MiniMax M3.1 Flash — fast, low-cost successor tier to M3.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
+  { id: "openrouter/stepfun/step-5-preview",          displayName: "Step 5 Preview (OpenRouter)",    description: "StepFun Step 5 (preview) — flagship model for agentic work.", isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
 
   // OpenRouter free tier (":free" slugs) — for testing without spend. Routes
   // rotate: OpenRouter retires a free variant without notice (the slug then
   // 404s), so every entry here was confirmed live AND tool-calling-capable on
-  // 2026-10-08, and each pairs with a paid slug elsewhere in the catalog or a
+  // 2026-10-27, and each pairs with a paid slug elsewhere in the catalog or a
   // vendor equivalent. Tool support matters: a model with no `tools` parameter
   // cannot drive the agent loop at all.
   // (minimax-m3:free was retired, and glm-5.2:free lost tool support and fell
   // to a 32k window, since the 2026-09-05 check → both dropped.
   // deepseek-v4-flash-0731:free was retired after the 2026-09-18 check, and no
-  // free DeepSeek route is left → dropped.)
+  // free DeepSeek route is left → dropped. nemotron-3-super-120b-a12b:free
+  // was retired after the 2026-10-08 check → replaced by its successor,
+  // nemotron-3.5-super-vl:free.)
   { id: "openrouter/thinkingmachines/inkling:free",         displayName: "Inkling (free)",             description: "Free Thinking Machines Inkling for testing.",         isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", displayName: "Nemotron 3 Ultra (free)",   description: "Free NVIDIA Nemotron 3 Ultra for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/nvidia/nemotron-3.5-lightning:free",    displayName: "Nemotron 3.5 Lightning (free)", description: "Free NVIDIA Nemotron 3.5 Lightning for testing.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
-  { id: "openrouter/nvidia/nemotron-3-super-120b-a12b:free", displayName: "Nemotron 3 Super (free)",   description: "Free NVIDIA Nemotron 3 Super for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
+  { id: "openrouter/nvidia/nemotron-3.5-super-vl:free",   displayName: "Nemotron 3.5 Super VL (free)", description: "Free NVIDIA Nemotron 3.5 Super VL for testing.",     isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/google/gemma-4-31b-it:free",            displayName: "Gemma 4 31B (free)",         description: "Free Google Gemma 4 31B for testing.",                isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 262_144 },
 
   // Z.AI (Zhipu / GLM) DIRECT — rides the OpenAI client + Z.AI base URL (see

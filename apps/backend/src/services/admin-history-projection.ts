@@ -15,6 +15,7 @@ export const HISTORY_EVENTS = {
   "tenant.member.role_changed": entry("people", "Member role changed", ["targetUserId", "previousRole", "role"]),
   "tenant.member.removed": entry("people", "Member removed", ["targetUserId", "previousRole"]),
   "admin.user.beta_tester_updated": entry("people", "Test access changed", ["targetUserId", "isBetaTester"]),
+  "tenant.renamed": entry("settings", "Organization renamed", ["previousName", "tenantName"]),
   "tenant.provider_key.updated": entry("models", "Provider credentials changed", ["provider"]),
   "admin.custom_model.created": entry("models", "Custom model added", ["modelId", "provider", "contextWindow"]),
   "admin.custom_model.deleted": entry("models", "Custom model removed", ["modelId"]),

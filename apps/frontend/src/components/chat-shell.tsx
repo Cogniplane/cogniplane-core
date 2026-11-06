@@ -3,22 +3,29 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
 import { useSearchParams } from "next/navigation";
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { GripVerticalIcon } from "lucide-react";
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { useSessionList } from "../hooks/use-session-list";
 import { useChatWorkspace } from "../hooks/use-chat-workspace";
 import { useEffortPreference } from "../hooks/use-effort-preference";
 import { useFileSources } from "../hooks/use-file-sources";
 import { useModelPreference } from "../hooks/use-model-preference";
+import { useElementWidth } from "../hooks/use-element-width";
 import { useAuth } from "../lib/auth-context";
 import { fetchModels } from "../lib/api-client";
-import { SHORTCUTS, useShortcut } from "../lib/keyboard-shortcuts";
+import { keepTabInside, makeBackgroundInert, tabbableWithin } from "../lib/inert-background";
+import { isApplePlatform, matchesShortcut, SHORTCUTS, useShortcut } from "../lib/keyboard-shortcuts";
 import { queryKeys } from "../lib/query-keys";
 import { listProjects, setProjectSession } from "../lib/project-api";
 
 import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus, type LiveTurnActivity } from "./session-status.logic";
 import { SessionSidebar } from "./session-sidebar";
+import { SESSION_DRAWER, WorkspaceSidebarFrame } from "./workspace-sidebar-frame";
+import { SessionCreateDialog } from "./session-create-dialog";
+import { SessionDeleteDialog } from "./session-delete-dialog";
+import type { ArtifactCardInventory } from "./artifact-card";
 import { ArtifactPanel } from "./artifact-panel";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
 import { FileSourcePicker } from "./file-source-picker";
@@ -26,6 +33,9 @@ import { TranscriptFormatNotice } from "./transcript-format-notice";
 import { WorkspaceHeader } from "./workspace-header";
 import { useProjectFileSelection } from "../hooks/use-project-library";
 import { MAX_PROJECT_FILE_SELECTIONS, ProjectFileSelection } from "./project-file-selection";
+import { Button } from "./ui/button";
+import { WorkspaceLoadError, WorkspaceLoading, WorkspaceNoSession } from "./workspace-main-state";
+import { WORKSPACE_DRAWER_BACKDROP, WORKSPACE_DRAWER_SURFACE, WorkspaceDrawerHeader } from "./workspace-drawer";
 
 // CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
 // live HttpAgent in the browser — it never needs to server-render). Loading it
@@ -34,7 +44,7 @@ import { MAX_PROJECT_FILE_SELECTIONS, ProjectFileSelection } from "./project-fil
 // client chunks (served as CF assets, not counted against the Worker size).
 const CopilotChatHost = dynamic(
   () => import("./copilot-chat-host").then((m) => m.CopilotChatHost),
-  { ssr: false }
+  { ssr: false, loading: () => <WorkspaceLoading label="Loading chat…" /> }
 );
 import {
   mcpAppsFromMessages,
@@ -44,7 +54,10 @@ import {
 import {
   ARTIFACT_PANE_WIDTH,
   clampArtifactPaneWidth,
-  readStoredArtifactPaneWidth
+  keyedArtifactPaneWidth,
+  readStoredArtifactPaneWidth,
+  resolveArtifactPaneLayout,
+  type PanePresentation
 } from "./artifact-pane-geometry";
 import { formatSessionForClipboard } from "./session-clipboard";
 import {
@@ -79,6 +92,7 @@ export function ChatShell() {
   const [isArtifactPaneOpen, setIsArtifactPaneOpen] = useState(true);
   const [activeFileSourceId, setActiveFileSourceId] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
   const [artifactPaneWidth, setArtifactPaneWidth] = useState<number>(ARTIFACT_PANE_WIDTH.default);
   // Grid-column transitions ease the pane open/closed, but the same transition
   // would rubber-band live drag-resizing — suppress it while a drag is active.
@@ -225,8 +239,9 @@ export function ChatShell() {
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 767px)");
-    const applyMobileLayout = (isMobile: boolean) => {
-      if (isMobile) {
+    const applyMobileLayout = (mobile: boolean) => {
+      setIsMobile(mobile);
+      if (mobile) {
         setIsSidebarOpen(false);
         setIsArtifactPaneOpen(false);
       }
@@ -237,19 +252,11 @@ export function ChatShell() {
     return () => media.removeEventListener("change", onChange);
   }, []);
 
-  useEffect(() => {
-    if (!isSidebarOpen && !isArtifactPaneOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (window.matchMedia("(max-width: 767px)").matches) {
-        setIsSidebarOpen(false);
-        setIsArtifactPaneOpen(false);
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isArtifactPaneOpen, isSidebarOpen]);
-  useShortcut(SHORTCUTS.toggleSidebar, () => setIsSidebarOpen((open) => !open));
+  useShortcut(SHORTCUTS.toggleSidebar, () => setIsSidebarOpen((open) => !open), true, SESSION_DRAWER);
+  // The workspace owns New session, so its shortcut works while the phone drawer is closed.
+  const [createDialog, setCreateDialog] = useState({ open: false, key: 0 });
+  const openCreateDialog = useCallback(() => setCreateDialog((current) => ({ open: true, key: current.key + 1 })), []);
+  useShortcut(SHORTCUTS.newSession, openCreateDialog, true, SESSION_DRAWER);
   useShortcut(SHORTCUTS.toggleArtifacts, () => setIsArtifactPaneOpen((open) => !open), Boolean(sessionList.selectedSession));
 
   const { model, setModel } = useModelPreference(allModels);
@@ -268,10 +275,17 @@ export function ChatShell() {
     if (stored != null) setArtifactPaneWidth(stored);
   }, []);
 
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("artifact-pane-width", String(artifactPaneWidth));
-  }, [artifactPaneWidth]);
+  // Only a resize by the user saves the width. An effect that saved every
+  // change also saved the default on mount, and in a double-run of the mount
+  // effects (React's development check) that replaced the stored width.
+  const resizeArtifactPane = useCallback((width: number) => {
+    setArtifactPaneWidth(width);
+    try {
+      window.localStorage.setItem("artifact-pane-width", String(width));
+    } catch {
+      // Blocked storage: the width applies to this page only.
+    }
+  }, []);
 
   const modelError = modelsQuery.error
     ? `Could not load the model list: ${modelsQuery.error instanceof Error ? modelsQuery.error.message : String(modelsQuery.error)}`
@@ -320,13 +334,48 @@ export function ChatShell() {
     onImportedArtifact: chatWorkspace.artifactState.selectArtifact
   });
 
-  const startArtifactPaneResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+  // ArtifactCards in the chat read the session's artifacts and open the same
+  // preview as the artifact panel. The object changes only with the list or
+  // the preview action, so other shell renders keep the cards as they are.
+  const { openPreview } = chatWorkspace.artifactState;
+  const artifactInventory = useMemo<ArtifactCardInventory>(() => ({
+    artifacts: chatWorkspace.artifacts,
+    onOpenPreview: (artifactId) => void openPreview(artifactId)
+  }), [chatWorkspace.artifacts, openPreview]);
+
+  // The artifacts panel goes beside the chat only when both fit in the
+  // measured workspace. Otherwise it is a modal drawer over the chat. The
+  // stored width stays the user's preference; the width in effect is clamped
+  // to the space.
+  const mainWidth = useElementWidth(chatMainRef);
+  const paneLayout = resolveArtifactPaneLayout({
+    // A width of 0 is a frame without a layout box, which tells nothing.
+    mainWidth: mainWidth ? mainWidth : null,
+    preferredWidth: artifactPaneWidth,
+    mobile: isMobile
+  });
+  const isPaneOverlay = paneLayout.presentation === "overlay";
+  // The first measurement opens the panel only where it fits beside the chat.
+  // Later, when the space gets too small for it, the panel closes instead of
+  // covering the chat and taking the focus. This runs during render, so no
+  // frame shows a squeezed chat or an overlay that the user did not open.
+  const knownPresentation: PanePresentation | null = mainWidth || isMobile ? paneLayout.presentation : null;
+  const [settledPresentation, setSettledPresentation] = useState<PanePresentation | null>(null);
+  if (knownPresentation !== settledPresentation) {
+    setSettledPresentation(knownPresentation);
+    if (knownPresentation === "overlay" && settledPresentation !== "overlay" && isArtifactPaneOpen) {
+      setIsArtifactPaneOpen(false);
+    }
+  }
+
+  const startArtifactPaneResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const container = chatMainRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
+    const maxWidth = paneLayout.maxWidth;
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
-      setArtifactPaneWidth(clampArtifactPaneWidth(rect.right, moveEvent.clientX));
+      resizeArtifactPane(clampArtifactPaneWidth(rect.right, moveEvent.clientX, maxWidth));
     };
 
     const handlePointerUp = () => {
@@ -339,7 +388,14 @@ export function ChatShell() {
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp, { once: true });
     event.currentTarget.setPointerCapture?.(event.pointerId);
-  }, []);
+  }, [paneLayout.maxWidth, resizeArtifactPane]);
+
+  const resizeArtifactPaneWithKey = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const next = keyedArtifactPaneWidth(paneLayout.width, event.key, paneLayout.maxWidth);
+    if (next === null) return;
+    event.preventDefault();
+    if (next !== paneLayout.width) resizeArtifactPane(next);
+  }, [paneLayout.maxWidth, paneLayout.width, resizeArtifactPane]);
 
   // Once a newer server turn is observed, forget the old live activity even
   // after that server turn ends and its timestamp disappears from the list.
@@ -403,29 +459,105 @@ export function ChatShell() {
     : "md:grid-cols-[0_minmax(0,1fr)]";
   const hasSession = Boolean(sessionList.selectedSession);
   const showArtifactPane = hasSession && isArtifactPaneOpen;
+  const isPaneModal = showArtifactPane && isPaneOverlay;
   // The resizer + pane stay mounted (at zero-width tracks) while a session is
-  // selected so toggling the pane animates instead of unmounting abruptly.
+  // selected so toggling the pane animates instead of unmounting abruptly. An
+  // overlay pane takes no track: it covers the chat.
   const chatColClass = !hasSession
     ? "md:grid-cols-[minmax(0,1fr)]"
-    : showArtifactPane
+    : showArtifactPane && !isPaneOverlay
       ? "md:grid-cols-[minmax(0,1fr)_4px_var(--artifact-pane-width)]"
       : "md:grid-cols-[minmax(0,1fr)_0px_0px]";
 
+  const [sessionRetry, setSessionRetry] = useState<{ sessionId: string; message: string } | null>(null);
+  const isRetryingSession = sessionRetry?.sessionId === sessionId;
+  const sessionLoadMessage = chatWorkspace.loadError ?? (isRetryingSession ? sessionRetry.message : null);
+  const sessionLoadFailed = sessionList.selectedSessionId !== null
+    && !chatWorkspace.hasSessionData
+    && sessionLoadMessage !== null;
+  const showsFormatNotice = Boolean(selectedRawSession && selectedRawSession.transcriptFormat !== "current");
+  // The chat area explains a failed first load, so the banner does not repeat it.
+  const loadErrorInMain = sessionLoadFailed && !noModelsAvailable && !showsFormatNotice;
+  const bannerError = sessionList.error ?? modelError ?? (loadErrorInMain ? null : chatWorkspace.loadError);
+  const retrySessionLoad = () => {
+    if (!sessionId || isRetryingSession) return;
+    const retry = { sessionId, message: sessionLoadMessage ?? "The session is unavailable." };
+    setSessionRetry(retry);
+    void chatWorkspace.refreshSessionData(sessionId)
+      .catch(() => {
+        // The error stays on the session query, and the chat area shows it again.
+      })
+      .finally(() => setSessionRetry((current) => current === retry ? null : current));
+  };
+
+  // An overlay pane is a modal. Focus moves to its Close button, the page
+  // behind it is inert, Tab stays inside, and the focus goes back to the
+  // control that opened it. The pane stays mounted when it closes, so it
+  // slides out instead of disappearing.
+  const paneTitleId = useId();
+  const paneId = useId();
+  const paneRef = useRef<HTMLElement | null>(null);
+  const paneBackdropRef = useRef<HTMLButtonElement | null>(null);
+  const paneCloseRef = useRef<HTMLButtonElement | null>(null);
+  const paneOpenerRef = useRef<HTMLElement | null>(null);
+  const artifactToggleRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!isPaneModal) return;
+    const pane = paneRef.current;
+    const active = document.activeElement;
+    paneOpenerRef.current = active instanceof HTMLElement && active !== document.body && !pane?.contains(active)
+      ? active : artifactToggleRef.current;
+    const undo = makeBackgroundInert([pane, paneBackdropRef.current]);
+    if (!pane?.contains(document.activeElement)) paneCloseRef.current?.focus();
+    // Escape closes the modal pane. It is marked as handled, and the open
+    // dialog role makes the Stop shortcut stand aside in either listener order.
+    // A nested dialog or menu takes Escape first and marks it, so this
+    // listener leaves that Escape alone.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const toggle = matchesShortcut(event, SHORTCUTS.toggleArtifacts, isApplePlatform());
+      // A nested portal owns its shortcuts, including the panel toggle.
+      if (toggle && !pane?.contains(event.target as Node)) return;
+      if (event.key !== "Escape" && !toggle) return;
+      event.preventDefault();
+      setIsArtifactPaneOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      undo();
+    };
+  }, [isPaneModal]);
+  const wasPaneModal = useRef(isPaneModal);
+  useEffect(() => {
+    if (wasPaneModal.current && !isPaneModal && showArtifactPane && document.activeElement === document.body) {
+      // The modal Close disappears when the drawer becomes an inline panel.
+      const control = paneRef.current ? tabbableWithin(paneRef.current)[0] : null;
+      (control ?? artifactToggleRef.current)?.focus();
+    }
+    wasPaneModal.current = isPaneModal;
+  }, [isPaneModal, showArtifactPane]);
+  const wasPaneShown = useRef(showArtifactPane);
+  useEffect(() => {
+    if (wasPaneShown.current && !showArtifactPane) {
+      const opener = paneOpenerRef.current;
+      paneOpenerRef.current = null;
+      const active = document.activeElement;
+      const focusLost = Boolean(paneRef.current?.contains(active))
+        || Boolean(opener && (active === null || active === document.body));
+      if (focusLost) (opener?.isConnected ? opener : artifactToggleRef.current)?.focus();
+    }
+    wasPaneShown.current = showArtifactPane;
+  }, [showArtifactPane]);
+  const onPaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    // Keys from a portal of a nested menu bubble here through React. They are not the pane's.
+    if (!isPaneModal || event.key !== "Tab" || !event.currentTarget.contains(event.target as Node)) return;
+    keepTabInside(event, event.currentTarget);
+  };
+
   return (
     <div className={`relative grid h-dvh grid-cols-1 overflow-hidden transition-[grid-template-columns] duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none ${sidebarColClass}`}>
-      {isSidebarOpen ? (
-        <button
-          type="button"
-          aria-label="Close session sidebar"
-          className="fixed inset-0 z-[var(--z-modal-backdrop)] bg-primary/25 backdrop-blur-[2px] md:hidden"
-          onClick={() => setIsSidebarOpen(false)}
-        />
-      ) : null}
-      <div
-        className={`fixed inset-y-0 left-0 z-[var(--z-modal)] w-[min(86vw,280px)] overflow-hidden shadow-lg transition-transform duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none md:static md:z-auto md:w-auto md:shadow-none ${
-          isSidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
-        }`}
-      >
+      <WorkspaceSidebarFrame mobile={isMobile} open={isSidebarOpen} onOpenChange={setIsSidebarOpen}>
         <SessionSidebar
           archive={{ onArchive: sessionList.archiveSession, busyId: sessionList.busySessionId }}
           projects={projects}
@@ -448,6 +580,7 @@ export function ChatShell() {
             attentionIds: attentionSessionIds,
             onSelect: selectSession,
             onCreate: sessionList.createSession,
+            onNewSession: openCreateDialog,
             isCreating: sessionList.isCreatingSession
           }}
           rename={{
@@ -461,11 +594,7 @@ export function ChatShell() {
           }}
           deletion={{
             busyId: sessionList.busySessionId,
-            pendingId: sessionList.pendingDeleteSessionId,
-            trashRetentionDays: sessionList.trashRetentionDays,
-            onRequest: sessionList.deleteSession,
-            onConfirmDelete: sessionList.confirmDelete,
-            onCancelDelete: sessionList.cancelDelete
+            onRequest: sessionList.deleteSession
           }}
           pinning={{
             busyId: sessionList.busySessionId,
@@ -473,7 +602,23 @@ export function ChatShell() {
             onToggle: sessionList.togglePinSession
           }}
         />
-      </div>
+      </WorkspaceSidebarFrame>
+      <SessionCreateDialog
+        key={createDialog.key}
+        open={createDialog.open}
+        onOpenChange={(open) => setCreateDialog((current) => ({ ...current, open }))}
+        projects={projects}
+        isCreating={sessionList.isCreatingSession}
+        onCreate={sessionList.createSession}
+      />
+      <SessionDeleteDialog
+        sessions={sessionList.sessions}
+        pendingId={sessionList.pendingDeleteSessionId}
+        busyId={sessionList.busySessionId}
+        trashRetentionDays={sessionList.trashRetentionDays}
+        onConfirm={sessionList.confirmDelete}
+        onCancel={sessionList.cancelDelete}
+      />
 
       <main className="flex min-h-0 min-w-0 flex-col">
         <WorkspaceHeader
@@ -490,11 +635,7 @@ export function ChatShell() {
             onArchive: selectedDisplaySession.canEdit === false ? undefined : () => sessionList.archiveSession(selectedDisplaySession.sessionId),
             onDelete: selectedDisplaySession.canEdit === false ? undefined : () => sessionList.deleteSession(selectedDisplaySession.sessionId)
           } : undefined}
-          menuLinks={[
-            { href: "/artifacts", label: "Artifacts", description: "Browse files across all sessions" },
-            { href: "/settings", label: "Settings", description: "User preferences and jobs" },
-            { href: "/admin", label: "Admin", description: "Platform controls and rollout" }
-          ]}
+          destinations={["artifacts", "settings", "admin"]}
           sessionStatus={selectedDisplaySession ? resolveSessionStatus({
             pendingApproval: attentionSessionIds.has(selectedDisplaySession.sessionId),
             failed: hasTurnFailed,
@@ -504,6 +645,7 @@ export function ChatShell() {
           completedTurn={latestCompletedTurn(messages, selectedDisplaySession, liveResolution?.applied ? turnActivity : null)}
           title={sessionList.selectedSession?.sessionName ?? "Select a session"}
           isArtifactPaneOpen={isArtifactPaneOpen}
+          artifactToggleRef={artifactToggleRef}
           onToggleArtifactPane={sessionList.selectedSession ? () => setIsArtifactPaneOpen((v) => !v) : undefined}
           isSidebarOpen={isSidebarOpen}
           onToggleSidebar={() => setIsSidebarOpen((v) => !v)}
@@ -516,9 +658,9 @@ export function ChatShell() {
           hasPendingApprovals={liveApprovalCount > 0}
         />
 
-        {sessionList.error || modelError || chatWorkspace.loadError ? (
+        {bannerError ? (
           <div role="alert" className="shrink-0 border-b border-outline-variant bg-danger-surface px-4 py-3 text-sm text-danger">
-            {sessionList.error ?? modelError ?? chatWorkspace.loadError}
+            {bannerError}
           </div>
         ) : null}
 
@@ -531,15 +673,15 @@ export function ChatShell() {
           } ${chatColClass}`}
           style={
             hasSession
-              ? ({ ["--artifact-pane-width" as string]: `${artifactPaneWidth}px` } as CSSProperties)
+              ? ({ ["--artifact-pane-width" as string]: `${paneLayout.width}px` } as CSSProperties)
               : undefined
           }
         >
           <div className="flex min-h-0 min-w-0 flex-col">
             {noModelsAvailable ? (
               <section className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-surface px-6 py-4">
-                <div className="mx-auto flex w-[min(640px,100%)] flex-col items-center gap-4 rounded-xl border border-outline-variant bg-surface-container-lowest px-8 py-12 text-center shadow-sm">
-                  <h2 className="text-xl font-semibold text-on-surface">
+                <div className="mx-auto mt-8 flex w-[min(560px,100%)] flex-col items-center gap-4 rounded-xl border border-outline-variant bg-surface-container-lowest px-8 py-10 text-center">
+                  <h2 className="text-base font-semibold text-on-surface">
                     No models are available
                   </h2>
                   {/* AuthGuard sends a member straight back here from
@@ -552,12 +694,7 @@ export function ChatShell() {
                         Set up provider credentials and enable at least one model in Models
                         to start a conversation.
                       </p>
-                      <a
-                        href="/admin/models"
-                        className="inline-flex items-center rounded-md border border-outline-variant bg-surface px-4 py-2 text-sm font-medium text-on-surface transition-colors hover:bg-surface-container"
-                      >
-                        Open Models
-                      </a>
+                      <Button asChild variant="outline"><a href="/admin/models">Open Models</a></Button>
                     </>
                   ) : (
                     <p className="max-w-md text-sm text-on-surface-variant">
@@ -567,7 +704,7 @@ export function ChatShell() {
                   )}
                 </div>
               </section>
-            ) : selectedRawSession && selectedRawSession.transcriptFormat !== "current" ? (
+            ) : selectedRawSession && showsFormatNotice ? (
               // The chat reopens only sessions in the current history format.
               <TranscriptFormatNotice
                 format={selectedRawSession.transcriptFormat}
@@ -604,8 +741,16 @@ export function ChatShell() {
                 usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
                 artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
                 projectFileIds={confirmedProjectFileIds}
+                artifactInventory={artifactInventory}
+                draftScope={user ? { userId: user.userId, tenantId: user.tenantId } : undefined}
                 events={{
                   onInitialPromptSent: () => setResolveDraftIntent(null),
+                  onArtifactsChanged: () => {
+                    if (!sessionId) return;
+                    void chatWorkspace.refreshSessionData(sessionId).catch(() => {
+                      // The session query shows the refresh error in the workspace banner.
+                    });
+                  },
                   onTurnSettled: () => {
                     setIsReloadingAfterTurn(true);
                     void sessionList.reload().finally(() => setIsReloadingAfterTurn(false));
@@ -623,35 +768,97 @@ export function ChatShell() {
                   onPendingApprovalsChange: setLiveApprovalCount
                 }}
               />
-            ) : null}
+            ) : sessionLoadFailed ? (
+              <WorkspaceLoadError
+                message={sessionLoadMessage ?? ""}
+                retrying={isRetryingSession}
+                onRetry={retrySessionLoad}
+              />
+            ) : sessionList.selectedSessionId ? (
+              <WorkspaceLoading label="Loading session…" />
+            ) : sessionList.isLoadingSessions ? (
+              <WorkspaceLoading label="Loading sessions…" />
+            ) : (
+              <WorkspaceNoSession
+                hasSessions={sessionList.sessions.length > 0}
+                isCreating={sessionList.isCreatingSession}
+                onNewSession={() => {
+                  void sessionList.createSession().catch(() => {
+                    // The session list shows a failed create in the workspace banner.
+                  });
+                }}
+                onShowSessions={isSidebarOpen ? undefined : () => setIsSidebarOpen(true)}
+              />
+            )}
           </div>
 
           {hasSession ? (
             <>
-              {showArtifactPane ? (
+              {isPaneModal ? (
+                // A tap outside the drawer closes it. Close in the drawer is
+                // the named control, so this one stays out of Tab and the
+                // accessibility tree.
                 <button
+                  ref={paneBackdropRef}
                   type="button"
-                  aria-label="Close artifacts panel"
-                  className="fixed inset-0 z-[var(--z-modal-backdrop)] bg-primary/25 backdrop-blur-[2px] md:hidden"
+                  aria-hidden="true"
+                  tabIndex={-1}
+                  className={WORKSPACE_DRAWER_BACKDROP}
                   onClick={() => setIsArtifactPaneOpen(false)}
                 />
               ) : null}
-              <button
-                aria-label="Resize context panel"
-                aria-hidden={!showArtifactPane}
-                tabIndex={showArtifactPane ? undefined : -1}
-                className="group relative hidden w-full cursor-col-resize bg-transparent transition-colors hover:bg-outline-variant focus-visible:bg-primary-mid focus-visible:outline-none md:block"
+              {/* The handle is 4px in the grid. Its hit area reaches 6px to
+                  each side, and the line in the middle shows hover, drag
+                  and focus. The arrow keys, Home and End resize it too. */}
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize artifacts panel"
+                aria-controls={paneId}
+                aria-valuemin={ARTIFACT_PANE_WIDTH.min}
+                aria-valuemax={paneLayout.maxWidth}
+                aria-valuenow={paneLayout.width}
+                aria-valuetext={`${paneLayout.width} pixels wide`}
+                aria-hidden={!showArtifactPane || isPaneOverlay || undefined}
+                tabIndex={showArtifactPane && !isPaneOverlay ? 0 : -1}
+                className={`group relative z-10 w-full cursor-col-resize touch-none outline-none before:absolute before:inset-y-0 before:-left-1.5 before:-right-1.5 before:content-[''] ${
+                  isPaneOverlay ? "hidden" : "hidden md:block"
+                }`}
                 onPointerDown={startArtifactPaneResize}
-                type="button"
-              />
+                onKeyDown={resizeArtifactPaneWithKey}
+              >
+                <span
+                  aria-hidden="true"
+                  className={`pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-outline-variant transition-[width,background-color] duration-150 motion-reduce:transition-none group-hover:w-1 group-hover:bg-input group-focus-visible:w-1 group-focus-visible:bg-ring ${
+                    isResizingPane ? "w-1 bg-ring" : ""
+                  }`}
+                />
+                <GripVerticalIcon aria-hidden="true" className="pointer-events-none absolute left-1/2 top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded bg-surface text-on-surface-faint group-hover:text-on-surface group-focus-visible:text-ring" />
+              </div>
               <aside
+                ref={paneRef}
+                id={paneId}
                 // inert removes the collapsed pane from tab order + a11y tree
                 // while it stays mounted for the width animation.
                 inert={!showArtifactPane}
-                className={`fixed inset-y-0 right-0 z-[var(--z-modal)] flex w-[min(92vw,420px)] min-w-0 flex-col overflow-hidden bg-surface-container-low shadow-lg transition-transform duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none md:static md:z-auto md:w-auto md:shadow-none ${
-                  showArtifactPane ? "translate-x-0" : "translate-x-full md:translate-x-0"
+                role={isPaneModal ? "dialog" : undefined}
+                aria-modal={isPaneModal ? true : undefined}
+                aria-labelledby={isPaneOverlay ? paneTitleId : undefined}
+                aria-label={isPaneOverlay ? undefined : "Context and artifacts"}
+                // Shortcuts, Stop included, stand aside while a dialog is open.
+                data-state={isPaneModal ? "open" : undefined}
+                tabIndex={isPaneModal ? -1 : undefined}
+                onKeyDown={onPaneKeyDown}
+                className={`fixed inset-y-0 right-0 z-[var(--z-modal)] flex w-[min(92vw,420px)] min-w-0 flex-col overflow-hidden ${isPaneOverlay ? WORKSPACE_DRAWER_SURFACE : "bg-surface-container-low"} outline-none transition-transform duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none ${
+                  isPaneOverlay
+                    ? showArtifactPane ? "translate-x-0" : "translate-x-full"
+                    : `md:static md:z-auto md:w-auto md:shadow-none ${showArtifactPane ? "translate-x-0" : "translate-x-full md:translate-x-0"}`
                 }`}
               >
+                {isPaneOverlay ? (
+                  <WorkspaceDrawerHeader title="Context and artifacts" titleId={paneTitleId}
+                    closeLabel="Close artifacts panel" closeRef={paneCloseRef} onClose={() => setIsArtifactPaneOpen(false)} />
+                ) : null}
                 {projectId ? (
                   <ProjectFileSelection
                     key={projectId}
@@ -678,8 +885,12 @@ export function ChatShell() {
                   />
                 ) : null}
                 <ArtifactPanel
+                  surface={isPaneOverlay ? "raised" : "inline"}
                   inventory={{
-                    artifacts: chatWorkspace.artifacts
+                    artifacts: chatWorkspace.artifacts,
+                    status: chatWorkspace.hasSessionData ? "ready" : sessionLoadFailed ? "unavailable" : "loading",
+                    onRetry: retrySessionLoad,
+                    retrying: isRetryingSession
                   }}
                   selection={{
                     visibleSelectedArtifactIds: chatWorkspace.artifactState.visibleSelectedArtifactIds,

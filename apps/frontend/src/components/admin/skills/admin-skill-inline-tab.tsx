@@ -23,13 +23,14 @@ export const emptyInlineSkillDraft: InlineSkillDraft = {
 
 export function AdminSkillInlineTab(props: {
   busyKey: string | null;
+  error?: string;
   draft: InlineSkillDraft;
   onDraftChange: (draft: InlineSkillDraft) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   const isBusy = props.busyKey === "skill-import-inline";
   const submitDisabled =
-    isBusy
+    props.busyKey !== null
     || !props.draft.skillId.trim()
     || !props.draft.skillName.trim()
     || !props.draft.description.trim()
@@ -42,6 +43,9 @@ export function AdminSkillInlineTab(props: {
         <Input
           id="skill-inline-id"
           name="skill-inline-id"
+          required
+          pattern={"\\s*[a-z0-9][a-z0-9_\\-]*\\s*"}
+          maxLength={80}
           type="text"
           placeholder="my-skill"
           value={props.draft.skillId}
@@ -50,7 +54,7 @@ export function AdminSkillInlineTab(props: {
           }
         />
         <p className="text-xs text-on-surface-variant">
-          Lowercase letters, numbers, and single hyphens. Used as the directory name.
+          Lowercase letters, numbers, hyphens, and underscores. Start with a letter or number. Used as the directory name.
         </p>
       </div>
 
@@ -59,6 +63,7 @@ export function AdminSkillInlineTab(props: {
         <Input
           id="skill-inline-name"
           name="skill-inline-name"
+          required
           type="text"
           placeholder="My Skill"
           maxLength={64}
@@ -74,6 +79,7 @@ export function AdminSkillInlineTab(props: {
         <Input
           id="skill-inline-description"
           name="skill-inline-description"
+          required
           type="text"
           placeholder="What this skill does, in one sentence."
           value={props.draft.description}
@@ -88,8 +94,9 @@ export function AdminSkillInlineTab(props: {
         <Textarea
           id="skill-inline-instructions"
           name="skill-inline-instructions"
-          rows={20}
-          className="font-mono"
+          required
+          rows={10}
+          className="min-h-40 font-mono"
           placeholder={"# When to use\n\nDescribe triggers and behavior here..."}
           value={props.draft.instructions}
           onChange={(event) =>
@@ -98,6 +105,7 @@ export function AdminSkillInlineTab(props: {
         />
       </div>
 
+      {props.error ? <p role="alert" className="text-sm text-danger">{props.error}</p> : null}
       <div className="flex justify-end">
         <Button type="submit" disabled={submitDisabled}>
           {isBusy ? "Creating..." : "Create skill"}

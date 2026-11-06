@@ -48,11 +48,17 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
         role: value.change.role,
         confirmRetainedRole: value.confirmRetainedRole
       }),
-    onSuccess: async (_result, value) => {
+    onSuccess: async (result, value) => {
       setChange(null);
       setError(null);
       const name = memberName(value.change.member);
-      toast.success(value.change.role === null ? `${name} was removed from the project.` : `${name} is now ${value.change.role}.`);
+      toast.success(value.change.role === null
+        ? result.effectiveRole
+          ? `${name}'s explicit role was removed. Organization sharing still gives ${result.effectiveRole === "editor" ? "edit" : "view"} access.`
+          : `${name} was removed from the project.`
+        : result.effectiveRole !== value.change.role && result.effectiveRole
+          ? `${name}'s explicit role is now ${value.change.role}. Organization sharing still gives ${result.effectiveRole === "editor" ? "edit" : "view"} access.`
+          : `${name} is now ${value.change.role}.`);
       // The role of this person can decide what the page shows, so load it all again.
       await client.invalidateQueries({ queryKey: ["projects"] });
     },
@@ -80,7 +86,7 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
             const self = member.userId === currentUserId;
             return (
               <li key={member.userId} className="flex flex-wrap items-center justify-between gap-2 py-2">
-                <span>
+                <span className="min-w-0 wrap-anywhere">
                   {member.displayName ?? member.email ?? member.userId}
                   {member.displayName && member.email ? (
                     <span className="ml-2 text-on-surface-variant">{member.email}</span>
@@ -120,7 +126,7 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
       )}
       {organizationNote ? (
         <p className="mt-2 text-xs text-on-surface-variant">
-          Organization sharing also gives every current organization member the selected access above.
+          Organization sharing currently gives every organization member {access.organizationRole === "editor" ? "edit" : "view"} access, including members whose explicit role is removed.
         </p>
       ) : null}
 

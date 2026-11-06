@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ApiError } from "@/lib/api-client";
 import {
@@ -39,12 +39,15 @@ it("creates a draft, reviews server content, then releases it explicitly", async
   fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
   await waitFor(() => expect(createPersonalSkill).toHaveBeenCalledWith({ scope, source: { kind: "inline", ...content } }));
-  expect(await screen.findByText("Instructions to review")).toBeTruthy();
-  expect((screen.getByRole("button", { name: "Make available for my chats" }) as HTMLButtonElement).disabled).toBe(true);
-  fireEvent.click(screen.getByRole("checkbox", { name: "I reviewed this revision and its validation messages." }));
-  fireEvent.click(screen.getByRole("button", { name: "Make available for my chats" }));
+  expect(await screen.findByText("Instructions in draft revision 1")).toBeTruthy();
+  expect(screen.getByText("Nothing yet. No revision is released.")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Make revision 1 available" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("checkbox", { name: "I reviewed revision 1 and its validation messages." }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available" }));
   await waitFor(() => expect(actOnPersonalSkill).toHaveBeenCalledWith("skill-1", { scope, version: 1, action: "release" }));
-  expect(await screen.findByText("Available only to me · Revision 1")).toBeTruthy();
+  expect(await screen.findByText("Revision 1 is in use")).toBeTruthy();
+  expect(screen.getByText("Revision 1, in use")).toBeTruthy();
+  expect(screen.getByText("Instructions in revision 1")).toBeTruthy();
   expect(onChanged).toHaveBeenCalledOnce();
 });
 
@@ -56,12 +59,14 @@ it("keeps imported text when validation fails and shows server warnings after a 
   fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
   fireEvent.change(screen.getByRole("textbox", { name: "SKILL.md text" }), { target: { value: "bad markdown" } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
-  expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Invalid SKILL.md");
+  const failed = await screen.findByRole("alert");
+  expect(failed.textContent).toContain("Draft not saved");
+  expect(failed.textContent).toContain("Invalid SKILL.md");
   expect((screen.getByRole("textbox", { name: "SKILL.md text" }) as HTMLTextAreaElement).value).toBe("bad markdown");
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
   expect(await screen.findByText("Companion files are not saved.")).toBeTruthy();
-  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this revision/ }));
-  expect((screen.getByRole("button", { name: "Make available for my chats" }) as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  expect((screen.getByRole("button", { name: "Make revision 1 available" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it("saves a new draft while the active revision remains in use", async () => {
@@ -74,7 +79,12 @@ it("saves a new draft while the active revision remains in use", async () => {
   fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Write actions." } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
   await waitFor(() => expect(updatePersonalSkill).toHaveBeenCalledWith("skill-1", { scope, version: 2, source: { kind: "inline", ...content, instructions: "Write actions." } }));
-  expect(await screen.findByText("Your current chats still use revision 1 while this draft waits for review.")).toBeTruthy();
+  const release = await screen.findByRole("group", { name: "Review draft revision 2" });
+  expect(release.textContent).toContain("Release replaces revision 1 with revision 2 as the revision in use.");
+  expect(screen.getByText("Revision 1")).toBeTruthy();
+  expect(screen.getByText("Draft revision 2, not released")).toBeTruthy();
+  expect(screen.getByRole("checkbox", { name: "I reviewed revision 2 and its validation messages." })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Make revision 2 available" })).toBeTruthy();
 });
 
 it("keeps an edit through a conflict and requires a fresh review before release", async () => {
@@ -82,12 +92,12 @@ it("keeps an edit through a conflict and requires a fresh review before release"
   vi.mocked(actOnPersonalSkill).mockRejectedValueOnce(conflictError);
   render(<PersonalSkills expectedScope={scope} />);
   fireEvent.click(await screen.findByRole("button", { name: "Review" }));
-  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this revision/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Make available for my chats" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available" }));
   expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Conflict Review the current version"));
-  expect((screen.getByRole("button", { name: "Make available for my chats" }) as HTMLButtonElement).disabled).toBe(true);
-  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this revision/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Make available for my chats" }));
+  expect((screen.getByRole("button", { name: "Make revision 1 available" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available" }));
   await waitFor(() => expect(actOnPersonalSkill).toHaveBeenLastCalledWith("skill-1", { scope, version: 2, action: "release" }));
 });
 
@@ -118,8 +128,8 @@ it("locks the page when a response or error has another scope", async () => {
   vi.mocked(actOnPersonalSkill).mockRejectedValueOnce(scopeError);
   render(<PersonalSkills expectedScope={scope} />);
   fireEvent.click(await screen.findByRole("button", { name: "Review" }));
-  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this revision/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Make available for my chats" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available" }));
   expect(await screen.findByRole("button", { name: "Reload page" })).toBeTruthy();
   expect(screen.queryByText(content.name)).toBeNull();
 });
@@ -139,12 +149,13 @@ it("requires deletion confirmation and can show revision history", async () => {
   render(<PersonalSkills expectedScope={scope} />);
   fireEvent.click(await screen.findByRole("button", { name: "Details" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(await screen.findByText(/Revision 1 · meeting-notes/)).toBeTruthy();
+  expect((await screen.findByRole("region", { name: "Revision history" })).textContent).toContain("Revision 1");
   fireEvent.click(screen.getByRole("button", { name: "Delete" }));
   expect(deletePersonalSkill).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
   await waitFor(() => expect(deletePersonalSkill).toHaveBeenCalledWith("skill-1", { scope, version: 2 }));
-  expect(await screen.findByText(/No private skills yet/)).toBeTruthy();
+  expect(await screen.findByText(/No private skills saved/)).toBeTruthy();
+  expect(screen.getByText("Deleted meeting-notes and its revision history").closest("[role=status]")).toBeTruthy();
 });
 
 it("does not show a deleted skill's history while reviewing a new imported skill", async () => {
@@ -155,17 +166,17 @@ it("does not show a deleted skill's history while reviewing a new imported skill
   render(<PersonalSkills expectedScope={scope} />);
   fireEvent.click(await screen.findByRole("button", { name: "Details" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(await screen.findByText(/Revision 1 · meeting-notes/)).toBeTruthy();
+  expect(await screen.findByRole("region", { name: "Revision history" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Delete" }));
   fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
   fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
   fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
   fireEvent.change(screen.getByRole("textbox", { name: "SKILL.md text" }), { target: { value: "---\nname: imported-notes\ndescription: Imported\n---\n\nWrite notes." } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
-  expect(await screen.findByText("Instructions to review")).toBeTruthy();
+  expect(await screen.findByText("Instructions in draft revision 1")).toBeTruthy();
   expect(screen.getByRole("heading", { name: "imported-notes" })).toBeTruthy();
   expect(screen.queryByText("Revision history")).toBeNull();
-  expect(screen.queryByText(/Revision 1 · meeting-notes/)).toBeNull();
+  expect(screen.queryByText("meeting-notes", { exact: false })).toBeNull();
 });
 
 it("keeps the server message for a skill limit conflict", async () => {
@@ -178,20 +189,20 @@ it("keeps the server message for a skill limit conflict", async () => {
   fireEvent.change(screen.getByRole("textbox", { name: "Purpose" }), { target: { value: content.description } });
   fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
-  expect(await screen.findByRole("alert")).toHaveProperty("textContent", "You have reached the private skill limit.");
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("You have reached the private skill limit."));
   expect(getPersonalSkills).toHaveBeenCalledTimes(1);
   expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe(content.instructions);
 });
 
 it("can cancel an unsaved create draft", async () => {
-  vi.spyOn(window, "confirm").mockReturnValue(true);
   const onDirtyChange = vi.fn();
   render(<PersonalSkills expectedScope={scope} onDirtyChange={onDirtyChange} />);
   fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "draft" } });
   await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(await screen.findByText(/No private skills yet/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  expect(await screen.findByText(/No private skills saved/)).toBeTruthy();
   await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
 });
 
@@ -213,17 +224,16 @@ it("moves focus between views and marks the selected source", async () => {
 });
 
 it("keeps an unsaved editor when Cancel is declined", async () => {
-  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   render(<PersonalSkills expectedScope={scope} />);
   fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "unsaved" } });
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(confirm).toHaveBeenCalledWith("Discard your unsaved skill changes?");
+  expect(screen.getByRole("alertdialog", { name: "Discard unsaved skill changes?" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
   expect((screen.getByRole("textbox", { name: "Name" }) as HTMLInputElement).value).toBe("unsaved");
-  confirm.mockReturnValue(true);
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Private skills" }));
-  confirm.mockRestore();
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Private skills" })));
 });
 
 it("rejects an oversized Markdown upload before reading it", async () => {
@@ -257,10 +267,12 @@ it("turns off an active skill and keeps a saved selection limit error", async ()
   fireEvent.click(await screen.findByRole("button", { name: "Details" }));
   fireEvent.click(screen.getByRole("button", { name: "Turn off" }));
   await waitFor(() => expect(actOnPersonalSkill).toHaveBeenCalledWith("skill-1", { scope, version: 2, action: "disable" }));
-  expect(await screen.findByText("Off · Revision 1")).toBeTruthy();
-  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed this revision/ }));
-  fireEvent.click(screen.getByRole("button", { name: "Make available for my chats" }));
-  expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Your saved skill selection is full. Remove a skill from Chat defaults first.");
+  expect(await screen.findByText("meeting-notes is off")).toBeTruthy();
+  expect(screen.getByText("Nothing. Revision 1 is off.")).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Make revision 1 available again" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available again" }));
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Your saved skill selection is full. Remove a skill from Chat defaults first."));
   expect(getPersonalSkills).toHaveBeenCalledTimes(1);
 });
 
@@ -277,4 +289,423 @@ it("recovers a deleted skill after a 404 without losing edited text", async () =
   expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("deleted elsewhere"));
   expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep these notes.");
   expect(screen.getByRole("heading", { name: "Create a draft" })).toBe(document.activeElement);
+});
+
+it("shows a failed list read without claiming there are no skills", async () => {
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("Read failed"));
+  render(<PersonalSkills expectedScope={scope} />);
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("Read failed"));
+  expect(screen.queryByText(/No private skills saved/)).toBeNull();
+  const retry = screen.getByRole("button", { name: "Reload skills" });
+  retry.focus();
+  fireEvent.click(retry);
+  expect(await screen.findByText(/No private skills saved/)).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Private skills" }));
+});
+
+it("blocks writes after a failed conflict reread and retries only the read", async () => {
+  const newer = { ...released, version: 3, latest: { ...revision, revision: 2, content: { ...content, instructions: "Other text." } } };
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] })
+    .mockRejectedValueOnce(new Error("Read unavailable"))
+    .mockResolvedValueOnce({ scope, skills: [newer] });
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Keep my draft." } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  const retry = await screen.findByRole("button", { name: "Reload latest version" });
+  const recovery = screen.getByRole("group", { name: "Reload current skill" });
+  expect(recovery.textContent).toContain("Conflict");
+  expect(recovery.textContent).toContain("Read unavailable");
+  expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep my draft.");
+  fireEvent.click(retry);
+  await screen.findByRole("group", { name: "Latest saved version" });
+  expect(screen.queryByText("Draft not saved")).toBeNull();
+  expect(screen.queryByRole("group", { name: "Reload current skill" })).toBeNull();
+  expect(updatePersonalSkill).toHaveBeenCalledTimes(1);
+  expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Keep my text" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(updatePersonalSkill).toHaveBeenLastCalledWith("skill-1", { scope, version: 3, source: { kind: "inline", ...content, instructions: "Keep my draft." } }));
+});
+
+it("names the pending history read and preserves focus moved away during it", async () => {
+  let resolve!: (value: { scope: typeof scope; revisions: typeof revision[] }) => void;
+  vi.mocked(getPersonalSkillHistory).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [released] });
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  const historyButton = screen.getByRole("button", { name: "History" });
+  historyButton.focus();
+  fireEvent.click(historyButton);
+  expect(await screen.findByRole("status")).toHaveProperty("textContent", expect.stringContaining("Loading revision history"));
+  expect(document.activeElement).not.toBe(document.body);
+  const heading = screen.getByRole("heading", { name: content.name });
+  heading.focus();
+  resolve({ scope, revisions: [revision] });
+  await screen.findByText("Revision history");
+  expect(document.activeElement).toBe(heading);
+});
+
+it("names deletion and keeps its decision focused while pending and after failure", async () => {
+  let reject!: (reason: Error) => void;
+  vi.mocked(deletePersonalSkill).mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [released] });
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  expect(screen.getByRole("group", { name: "Confirm deletion" }).textContent).toContain(content.name);
+  fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
+  expect(await screen.findByRole("status")).toHaveProperty("textContent", expect.stringContaining("Deleting"));
+  expect(document.activeElement).not.toBe(document.body);
+  reject(new Error("Delete failed"));
+  await screen.findByRole("alert");
+  expect(screen.getByRole("group", { name: "Confirm deletion" })).toBeTruthy();
+  expect(document.activeElement).not.toBe(document.body);
+  expect(deletePersonalSkill).toHaveBeenCalledTimes(1);
+});
+
+it("blocks duplicate saves in the same turn and keeps the pending trigger focused", async () => {
+  let resolve!: (value: { scope: typeof scope; skill: typeof draft }) => void;
+  vi.mocked(createPersonalSkill).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: content.name } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Purpose" }), { target: { value: content.description } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
+  const save = screen.getByRole("button", { name: "Save draft" });
+  save.focus();
+  fireEvent.click(save);
+  fireEvent.click(save);
+  expect(createPersonalSkill).toHaveBeenCalledTimes(1);
+  expect(save.getAttribute("aria-disabled")).toBe("true");
+  expect(document.activeElement).toBe(save);
+  resolve({ scope, skill: draft });
+  expect(await screen.findByRole("heading", { name: content.name })).toBe(document.activeElement);
+});
+
+it("keeps a local Markdown read pending without a service write or a duplicate read", async () => {
+  let resolve!: (value: string) => void;
+  const read = vi.fn(() => new Promise<string>(done => { resolve = done; }));
+  const onDirtyChange = vi.fn();
+  render(<PersonalSkills expectedScope={scope} onDirtyChange={onDirtyChange} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  const input = screen.getByLabelText("Upload SKILL.md");
+  input.focus();
+  const event = { target: { files: [{ name: "SKILL.md", size: 100, text: read }] } };
+  fireEvent.change(input, event);
+  fireEvent.change(input, event);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(await screen.findByRole("status")).toHaveProperty("textContent", "Reading SKILL.md…");
+  expect(document.activeElement).toBe(screen.getByRole("status"));
+  expect((screen.getByRole("button", { name: "Save draft" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
+  resolve("sample markdown");
+  await waitFor(() => expect((screen.getByRole("textbox", { name: "SKILL.md text" }) as HTMLTextAreaElement).value).toBe("sample markdown"));
+  expect(document.activeElement).toBe(input);
+  expect(createPersonalSkill).not.toHaveBeenCalled();
+});
+
+it("clears the editor, deletion decision, and history after a scope failure", async () => {
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [released] });
+  vi.mocked(deletePersonalSkill).mockRejectedValueOnce(scopeError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  await screen.findByText("Revision history");
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete skill" }));
+  await screen.findByRole("button", { name: "Reload page" });
+  expect(screen.queryByRole("group", { name: "Confirm deletion" })).toBeNull();
+  expect(screen.queryByText(content.name)).toBeNull();
+  expect(screen.queryByText("Revision history")).toBeNull();
+});
+
+it("keeps the latest-version write block after explicitly cancelling an editor", async () => {
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] }).mockRejectedValueOnce(new Error("Read unavailable"));
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "My draft." } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await screen.findByRole("button", { name: "Reload latest version" });
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  expect(screen.getByRole("button", { name: "Reload latest version" })).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Turn off" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(deletePersonalSkill).not.toHaveBeenCalled();
+});
+
+it("uses one list recovery after leaving a skill whose conflict reread failed", async () => {
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] })
+    .mockRejectedValueOnce(new Error("Read unavailable"));
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "My draft." } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await screen.findByRole("button", { name: "Reload latest version" });
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to skills" }));
+  expect(screen.queryByRole("group", { name: "Reload current skill" })).toBeNull();
+  expect(screen.getAllByText("Read unavailable")).toHaveLength(1);
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Reload latest version" })).toBeNull();
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(getPersonalSkills).toHaveBeenCalledTimes(3);
+  expect(updatePersonalSkill).toHaveBeenCalledTimes(1);
+});
+
+
+it.each(["cancel", "save"] as const)("keeps list read recovery after creating a draft then %s", async (outcome) => {
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("List read failed"));
+  render(<PersonalSkills expectedScope={scope} />);
+  await screen.findByText("List read failed");
+  fireEvent.click(screen.getByRole("button", { name: "Create skill" }));
+  if (outcome === "save") {
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: content.name } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Purpose" }), { target: { value: content.description } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
+    fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Back to skills" }));
+    expect(screen.getByRole("heading", { name: content.name })).toBeTruthy();
+    expect(screen.getByText("Could not load the full skills list")).toBeTruthy();
+  } else fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByText("List read failed")).toBeTruthy();
+  expect(screen.queryByText(/No private skills saved/)).toBeNull();
+  const reads = vi.mocked(getPersonalSkills).mock.calls.length;
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: outcome === "save" ? [draft] : [] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  await waitFor(() => expect(screen.queryByText("List read failed")).toBeNull());
+  expect(getPersonalSkills).toHaveBeenCalledTimes(reads + 1);
+  expect(createPersonalSkill).toHaveBeenCalledTimes(outcome === "save" ? 1 : 0);
+});
+
+it.each(["save", "release", "disable", "delete"] as const)("preserves focus moved outside the skill during pending %s", async (operation) => {
+  let complete!: () => void;
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [operation === "release" ? draft : released] });
+  if (operation === "save") vi.mocked(updatePersonalSkill).mockImplementationOnce(() => new Promise(resolve => { complete = () => resolve({ scope, skill: { ...released, version: 3 } }); }));
+  else if (operation === "delete") vi.mocked(deletePersonalSkill).mockImplementationOnce(() => new Promise(resolve => { complete = () => resolve({ scope, deleted: true }); }));
+  else vi.mocked(actOnPersonalSkill).mockImplementationOnce(() => new Promise(resolve => { complete = () => resolve({ scope, skill: operation === "disable" ? { ...released, version: 3, enabled: false } : released }); }));
+  render(<><button>Outside skills</button><PersonalSkills expectedScope={scope} /></>);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  if (operation === "save") {
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Changed draft" } });
+  } else if (operation === "release") fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  else if (operation === "delete") fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  const name = { save: "Save draft", release: "Make revision 1 available", disable: "Turn off", delete: "Delete skill" }[operation];
+  const trigger = screen.getByRole("button", { name });
+  trigger.focus();
+  fireEvent.click(trigger);
+  expect(screen.getByRole("status")).toBeTruthy();
+  const outside = screen.getByRole("button", { name: "Outside skills" });
+  outside.focus();
+  await act(async () => complete());
+  expect(document.activeElement).toBe(outside);
+  // The pending announcement ends. A success notice can remain.
+  expect(screen.queryAllByRole("status").map((node) => node.textContent)).not.toContainEqual(expect.stringMatching(/…$/));
+});
+
+// Records which element each scrollIntoView call brings into view.
+function trackScrolls() {
+  const scrolled: Element[] = [];
+  Object.defineProperty(Element.prototype, "scrollIntoView", { configurable: true, writable: true,
+    value: function (this: Element) { scrolled.push(this); } });
+  return scrolled;
+}
+afterEach(() => { Reflect.deleteProperty(Element.prototype, "scrollIntoView"); });
+const unavailable = () => new Error("Service unavailable.");
+
+it.each([
+  ["save", "Draft not saved"],
+  ["release", "Could not make revision 1 available"],
+  ["disable", "Could not turn off meeting-notes"],
+  ["delete", "Could not delete meeting-notes"],
+  ["history", "Could not load revision history"]
+] as const)("shows a failed %s at its trigger and brings both into view", async (operation, title) => {
+  const scrolled = trackScrolls();
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [operation === "release" ? draft : released] });
+  if (operation === "save") vi.mocked(updatePersonalSkill).mockRejectedValueOnce(unavailable());
+  else if (operation === "delete") vi.mocked(deletePersonalSkill).mockRejectedValueOnce(unavailable());
+  else if (operation === "history") vi.mocked(getPersonalSkillHistory).mockRejectedValueOnce(unavailable());
+  else vi.mocked(actOnPersonalSkill).mockRejectedValueOnce(unavailable());
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  if (operation === "save") {
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Unsaved words" } });
+  } else if (operation === "release") fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  else if (operation === "delete") fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  const name = { save: "Save draft", release: "Make revision 1 available", disable: "Turn off", delete: "Delete skill", history: "History" }[operation];
+  const trigger = screen.getByRole("button", { name });
+  trigger.focus();
+  fireEvent.click(trigger);
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain(title);
+  expect(alert.textContent).toContain("Service unavailable.");
+  expect(trigger.getAttribute("aria-describedby")).toBe(alert.id);
+  expect(document.activeElement).toBe(trigger);
+  // One scroll brings the block with the trigger and its error into view.
+  expect(scrolled).toHaveLength(1);
+  expect(scrolled[0].contains(trigger) && scrolled[0].contains(alert)).toBe(true);
+  if (operation === "save") expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Unsaved words");
+  if (operation === "delete") expect(within(screen.getByRole("group", { name: "Confirm deletion" })).getByRole("alert")).toBe(alert);
+  if (operation === "release") expect(within(screen.getByRole("group", { name: "Review draft revision 1" })).getByRole("alert")).toBe(alert);
+});
+
+it("does not scroll to a failure after focus moves away during the request", async () => {
+  const scrolled = trackScrolls();
+  let fail!: (reason: Error) => void;
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [released] });
+  vi.mocked(actOnPersonalSkill).mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+  render(<><button>Outside skills</button><PersonalSkills expectedScope={scope} /></>);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  const trigger = screen.getByRole("button", { name: "Turn off" });
+  trigger.focus();
+  fireEvent.click(trigger);
+  const outside = screen.getByRole("button", { name: "Outside skills" });
+  outside.focus();
+  await act(async () => fail(unavailable()));
+  expect((await screen.findByRole("alert")).textContent).toContain("Could not turn off meeting-notes");
+  expect(document.activeElement).toBe(outside);
+  expect(scrolled).toHaveLength(0);
+});
+
+it("keeps list, import and write errors apart", async () => {
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("List read failed"));
+  vi.mocked(createPersonalSkill).mockRejectedValueOnce(unavailable());
+  render(<PersonalSkills expectedScope={scope} />);
+  expect((await screen.findByRole("alert")).textContent).toContain("Could not load private skills");
+  fireEvent.click(screen.getByRole("button", { name: "Create skill" }));
+  expect(screen.queryByText("List read failed")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  fireEvent.change(screen.getByLabelText("Upload SKILL.md"), { target: { files: [{ name: "notes.txt", size: 10, text: vi.fn() }] } });
+  expect((await screen.findByRole("alert")).textContent).toContain("Could not use this file");
+  fireEvent.change(screen.getByRole("textbox", { name: "SKILL.md text" }), { target: { value: "notes" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(screen.getAllByRole("alert")).toHaveLength(2));
+  expect(screen.getAllByRole("alert").map((node) => node.textContent?.slice(0, 15))).toEqual(["Could not use t", "Draft not saved"]);
+  expect(createPersonalSkill).toHaveBeenCalledTimes(1);
+});
+
+it("names the draft and active revisions and marks them in a collapsible history", async () => {
+  const draftTwo = { ...revision, revision: 2, content: { ...content, instructions: "Write actions." } };
+  const skill = { ...released, version: 3, latest: draftTwo };
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [skill] });
+  vi.mocked(getPersonalSkillHistory).mockResolvedValue({ scope, revisions: [draftTwo, revision] });
+  const scrolled = trackScrolls();
+  render(<PersonalSkills expectedScope={scope} />);
+  expect(await screen.findByText("Draft revision 2 to review")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Details" }));
+  expect(screen.getByText("Instructions in draft revision 2")).toBeTruthy();
+  const history = screen.getByRole("button", { name: "History" });
+  expect(history.getAttribute("aria-expanded")).toBe("false");
+  history.focus();
+  fireEvent.click(history);
+  const list = await screen.findByRole("region", { name: "Revision history" });
+  expect(history.getAttribute("aria-expanded")).toBe("true");
+  expect(document.getElementById(history.getAttribute("aria-controls")!)?.contains(list)).toBe(true);
+  expect(list.tabIndex).toBe(0);
+  const rows = within(list).getAllByRole("listitem");
+  expect(rows[0].textContent).toContain("Latest draft");
+  expect(rows[1].textContent).toContain("In use");
+  expect(scrolled.some((node) => node.contains(history) && node.contains(list))).toBe(true);
+  fireEvent.click(history);
+  expect(screen.queryByRole("region", { name: "Revision history" })).toBeNull();
+  expect(history.getAttribute("aria-expanded")).toBe("false");
+  fireEvent.click(history);
+  expect(screen.getByRole("region", { name: "Revision history" })).toBeTruthy();
+  expect(getPersonalSkillHistory).toHaveBeenCalledTimes(1);
+});
+
+it("keeps confirmed skills visible while a reload waits", async () => {
+  let finish!: (value: { scope: typeof scope; skills: typeof draft[] }) => void;
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("List read failed"));
+  render(<PersonalSkills expectedScope={scope} />);
+  await screen.findByText("List read failed");
+  fireEvent.click(screen.getByRole("button", { name: "Create skill" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: content.name } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Purpose" }), { target: { value: content.description } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Back to skills" }));
+  vi.mocked(getPersonalSkills).mockImplementationOnce(() => new Promise(done => { finish = done; }));
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  expect(screen.getByRole("heading", { name: content.name })).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toContain("Reloading skills");
+  await act(async () => finish({ scope, skills: [draft] }));
+  expect(screen.getByRole("heading", { name: content.name })).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("clears a success message when the view changes", async () => {
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [draft] });
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Review" }));
+  fireEvent.click(screen.getByRole("checkbox", { name: /I reviewed revision 1 / }));
+  fireEvent.click(screen.getByRole("button", { name: "Make revision 1 available" }));
+  expect(await screen.findByText("meeting-notes is available for your chats.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Back to skills" }));
+  expect(screen.queryByRole("status")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Details" }));
+  expect(screen.queryByText(/is in use$/)).toBeNull();
+});
+
+it("explains Turn off before it runs and does not name an active revision when creating", async () => {
+  vi.mocked(getPersonalSkills).mockResolvedValue({ scope, skills: [released] });
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  expect(screen.getByText(/Turn off makes this skill unavailable for your chats\. Revision 1 stays saved/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  expect(screen.getByText("Saving creates a new draft. Revision 1 stays in use until you release the draft.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to skills" }));
+  fireEvent.click(screen.getByRole("button", { name: "Create skill" }));
+  expect(screen.getByText(/Saving a draft does not make it available in chats/)).toBeTruthy();
+  expect(screen.queryByText(/stays in use|active revision/)).toBeNull();
+});
+
+it("names the initial read while no confirmed skills are available", () => {
+  vi.mocked(getPersonalSkills).mockReturnValue(new Promise(() => {}));
+  render(<PersonalSkills expectedScope={scope} />);
+  expect(screen.getByRole("status").textContent).toBe("Loading private skills…");
+  expect(screen.queryByText(/No private skills saved/)).toBeNull();
+});
+
+it("keeps text after a cancelled source switch and discards only after confirmation", async () => {
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Private unsaved text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  const decision = screen.getByRole("alertdialog", { name: "Discard unsaved skill changes?" });
+  expect(decision.textContent).toContain("Switching the source removes the text you entered.");
+  fireEvent.click(within(decision).getByRole("button", { name: "Keep editing" }));
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Private unsaved text");
+  fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  expect((screen.getByRole("textbox", { name: "SKILL.md text" }) as HTMLTextAreaElement).value).toBe("");
+  expect(screen.queryByRole("textbox", { name: "Instructions" })).toBeNull();
+  expect(createPersonalSkill).not.toHaveBeenCalled();
+});
+
+it("explains the removal of text after a scope lock", async () => {
+  vi.mocked(createPersonalSkill).mockRejectedValueOnce(scopeError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: content.name } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Purpose" }), { target: { value: content.description } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Private scope text" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain("Unsaved text was cleared to protect your private skills.");
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.queryByText("Private scope text")).toBeNull();
 });

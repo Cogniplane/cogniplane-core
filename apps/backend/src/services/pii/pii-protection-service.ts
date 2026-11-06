@@ -1,5 +1,13 @@
-import { DEFAULT_PII_PROTECTION, type PiiMode, type PiiProtectionSettings } from "@cogniplane/shared-types";
+import type { PiiMode, PiiProtectionSettings } from "@cogniplane/shared-types";
 import type { PiiFindingEncryptor } from "./pii-finding-encryption.js";
+import { isPiiSubjectInScope, PiiImportScopeRegistry } from "./pii-import-scopes.js";
+import {
+  logPiiPolicyHealth,
+  PII_POLICY_INVALID_CODE,
+  PII_POLICY_INVALID_MESSAGE,
+  resolvePiiPolicy,
+  type ResolvedPiiPolicy
+} from "./pii-policy.js";
 import type {
   PiiFinding,
   PiiProvider,
@@ -9,17 +17,23 @@ import type { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
 
 export interface PiiPolicyReader {
   /**
-   * Resolves the active `piiProtection` settings for a tenant. Returns `null`
-   * when the tenant has no stored settings — the service falls back to the
-   * disabled default in that case.
+   * One read of the PII settings of a tenant. `stored` is the stored
+   * `piiProtection` value, not checked, or `null` when the tenant has none.
+   * The service resolves it with `resolvePiiPolicy`. `revision` is the
+   * settings revision of the same row: 0 when the tenant never saved PII
+   * settings.
    */
-  getPiiProtection(tenantId: string): Promise<PiiProtectionSettings | null>;
+  readPiiProtection(tenantId: string): Promise<{ stored: unknown; revision: number }>;
 }
 
 export type PiiSubject =
   | { kind: "chat_prompt" }
   | { kind: "upload" }
-  | { kind: "microsoft_import" }
+  /**
+   * A file from an import source. `subjectKind` is the value the source
+   * registered in `PiiImportScopeRegistry`; its scope toggle decides the scan.
+   */
+  | { kind: "import"; subjectKind: string }
   /**
    * Aggregated skill-improvement corpus (many sessions' prompts AND tool
    * outputs). Not tied to any tenant scope toggle: disabling the chatPrompts
@@ -49,6 +63,23 @@ export type PiiDecision =
       providerType: string | null;
       providerModel: string | null;
     };
+
+/** The mode and the settings revision that one evaluation applied. */
+export type PiiAppliedPolicy = {
+  /**
+   * The mode that the evaluation applied. `off` when it scanned nothing:
+   * protection is off, or the subject is out of scope.
+   */
+  mode: PiiMode;
+  /** The revision of the tenant PII settings that the evaluation read. */
+  revision: number;
+};
+
+/** A decision and the policy that made it, both from one read of the settings. */
+export type PiiEvaluation = {
+  decision: PiiDecision;
+  appliedPolicy: PiiAppliedPolicy;
+};
 
 export interface PiiServiceEvaluateTextInput {
   tenantId: string;
@@ -89,23 +120,65 @@ export interface PiiProtectionServiceOptions {
    * persisting plaintext or stripping to empty string.
    */
   findingEncryptor?: PiiFindingEncryptor;
+  /** Import sources and their scope toggles. Without it, every import is in scope. */
+  importScopes?: Pick<PiiImportScopeRegistry, "list" | "findBySubjectKind">;
+  /** Gets one line for each evaluation of a stored policy that is not valid. */
+  logger?: { warn(payload: unknown, message: string): void; error(payload: unknown, message: string): void };
 }
 
 export class PiiProtectionServiceError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
+  /** The settings revision that the evaluation read, when the error comes from the policy. */
+  readonly policyRevision?: number;
+  constructor(code: string, message: string, options: { policyRevision?: number } = {}) {
     super(message);
     this.name = "PiiProtectionServiceError";
     this.code = code;
+    if (options.policyRevision !== undefined) this.policyRevision = options.policyRevision;
   }
 }
 
-export class PiiProtectionService {
-  constructor(private readonly options: PiiProtectionServiceOptions) {}
+/** One read of the stored policy: the tenant, the resolved policy, and the revision of its row. */
+export type PiiPolicyRead = { tenantId: string; policy: ResolvedPiiPolicy; revision: number };
 
-  async getActiveSettings(tenantId: string): Promise<PiiProtectionSettings> {
-    const record = await this.options.policyReader.getPiiProtection(tenantId);
-    return record ?? DEFAULT_PII_PROTECTION;
+export class PiiProtectionService {
+  private readonly importScopes: Pick<PiiImportScopeRegistry, "list" | "findBySubjectKind">;
+
+  constructor(private readonly options: PiiProtectionServiceOptions) {
+    this.importScopes = options.importScopes ?? new PiiImportScopeRegistry();
+  }
+
+  async getPolicy(tenantId: string): Promise<ResolvedPiiPolicy> {
+    return (await this.readPolicy(tenantId)).policy;
+  }
+
+  /**
+   * One read of the stored policy and its revision. A caller that routes on
+   * the policy before an evaluation passes this read to the evaluation. Then
+   * the routing, the decision, and the record use the same policy: a second
+   * read could see a save that the decision did not apply.
+   */
+  async readPolicy(tenantId: string): Promise<PiiPolicyRead> {
+    const { stored, revision } = await this.options.policyReader.readPiiProtection(tenantId);
+    const policy = resolvePiiPolicy(stored, this.importScopes);
+    logPiiPolicyHealth(this.options.logger, tenantId, policy);
+    return { tenantId, policy, revision };
+  }
+
+  isSubjectInScope(policy: ResolvedPiiPolicy, subject: PiiSubject): boolean {
+    return isPiiSubjectInScope(policy.settings, subject, this.importScopes);
+  }
+
+  // Decides before any provider call. Null means: scan in `settings.mode`.
+  private gate({ policy, revision }: PiiPolicyRead, subject: PiiSubject): PiiDecision | null {
+    if (policy.activation === "off") return { action: "allow", reason: "disabled" };
+    if (!this.isSubjectInScope(policy, subject)) return { action: "allow", reason: "scope_excluded" };
+    if (policy.activation === "invalid") {
+      throw new PiiProtectionServiceError(PII_POLICY_INVALID_CODE, PII_POLICY_INVALID_MESSAGE, {
+        policyRevision: revision
+      });
+    }
+    return null;
   }
 
   /**
@@ -152,27 +225,32 @@ export class PiiProtectionService {
   }
 
   async evaluateText(input: PiiServiceEvaluateTextInput): Promise<PiiDecision> {
-    return this.withTimeout("text evaluation", (signal) => this.evaluateTextUnbounded(input, signal));
+    return (await this.evaluateTextWithPolicy(input)).decision;
   }
 
-  private async evaluateTextUnbounded(
+  /**
+   * Same as `evaluateText`. Also gives the mode and the settings revision that
+   * the decision applied. With `read`, the evaluation uses that read and does
+   * not read the policy again.
+   */
+  async evaluateTextWithPolicy(input: PiiServiceEvaluateTextInput, read?: PiiPolicyRead): Promise<PiiEvaluation> {
+    return this.withTimeout("text evaluation", async (signal) => {
+      const policyRead = read ?? (await this.readPolicy(input.tenantId));
+      assertReadForTenant(policyRead, input.tenantId);
+      return evaluation(policyRead, await this.decideText(policyRead, input, signal));
+    });
+  }
+
+  private async decideText(
+    read: PiiPolicyRead,
     input: PiiServiceEvaluateTextInput,
     signal: AbortSignal | undefined
   ): Promise<PiiDecision> {
-    const settings = await this.getActiveSettings(input.tenantId);
-
-    if (!isEffectivelyEnabled(settings)) {
-      return { action: "allow", reason: "disabled" };
-    }
-
-    if (!isScopeEnabled(settings, input.subject)) {
-      return { action: "allow", reason: "scope_excluded" };
-    }
-
+    const gated = this.gate(read, input.subject);
+    if (gated) return gated;
+    const policy = read.policy;
+    const settings = policy.settings;
     const mode: PiiMode = settings.mode;
-    if (mode === "off") {
-      return { action: "allow", reason: "disabled" };
-    }
 
     const ruleResult = this.options.ruleDetector.detect(input.text, {
       entityTypes: settings.detectors.entityTypes
@@ -183,6 +261,7 @@ export class PiiProtectionService {
         settings,
         text: input.text,
         ruleFindings: ruleResult.findings,
+        providerUsable: policy.providerUsable,
         signal
       });
       return this.decideFromCombined(combined, settings, input.tenantId, (sealed) => ({
@@ -199,6 +278,7 @@ export class PiiProtectionService {
         text: input.text,
         ruleFindings: ruleResult.findings,
         failClosed: true,
+        providerUsable: policy.providerUsable,
         signal
       });
       return this.decideFromCombined(combined, settings, input.tenantId, (sealed) => ({
@@ -264,22 +344,34 @@ export class PiiProtectionService {
   }
 
   async evaluateArtifact(input: PiiServiceEvaluateArtifactInput): Promise<PiiDecision> {
-    return this.withTimeout("artifact evaluation", (signal) => this.evaluateArtifactUnbounded(input, signal));
+    return (await this.evaluateArtifactWithPolicy(input)).decision;
   }
 
-  private async evaluateArtifactUnbounded(
+  /**
+   * Same as `evaluateArtifact`. Also gives the mode and the settings revision
+   * that the decision applied. With `read`, the evaluation uses that read and
+   * does not read the policy again.
+   */
+  async evaluateArtifactWithPolicy(
+    input: PiiServiceEvaluateArtifactInput,
+    read?: PiiPolicyRead
+  ): Promise<PiiEvaluation> {
+    return this.withTimeout("artifact evaluation", async (signal) => {
+      const policyRead = read ?? (await this.readPolicy(input.tenantId));
+      assertReadForTenant(policyRead, input.tenantId);
+      return evaluation(policyRead, await this.decideArtifact(policyRead, input, signal));
+    });
+  }
+
+  private async decideArtifact(
+    read: PiiPolicyRead,
     input: PiiServiceEvaluateArtifactInput,
     signal: AbortSignal | undefined
   ): Promise<PiiDecision> {
-    const settings = await this.getActiveSettings(input.tenantId);
-
-    if (!isEffectivelyEnabled(settings) || !isScopeEnabled(settings, input.subject)) {
-      return { action: "allow", reason: !isEffectivelyEnabled(settings) ? "disabled" : "scope_excluded" };
-    }
-
-    if (settings.mode === "off") {
-      return { action: "allow", reason: "disabled" };
-    }
+    const gated = this.gate(read, input.subject);
+    if (gated) return gated;
+    const policy = read.policy;
+    const settings = policy.settings;
 
     // Reject binary content types up front — the rule detector and the LLM both
     // produce noise on binary bytes decoded as UTF-8, and we'd waste tokens.
@@ -305,7 +397,7 @@ export class PiiProtectionService {
     let providerType: string | null = null;
     let providerModel: string | null = null;
 
-    if (this.options.provider) {
+    if (this.options.provider && policy.providerUsable) {
       try {
         const scan = await this.callProvider(() => this.scanWithProvider(input.artifact, content, settings, signal));
         combinedFindings = mergeFindings(ruleFindings, scan.findings);
@@ -349,13 +441,15 @@ export class PiiProtectionService {
     text: string;
     ruleFindings: PiiFinding[];
     failClosed?: boolean;
+    // False when the stored provider fields are invalid: rules only.
+    providerUsable: boolean;
     signal?: AbortSignal;
   }): Promise<{
     findings: PiiFinding[];
     providerType: string | null;
     providerModel: string | null;
   }> {
-    if (!this.options.provider) {
+    if (!this.options.provider || !args.providerUsable) {
       if (args.failClosed && args.settings.mode === "block") {
         throw new PiiProtectionServiceError(
           "pii_provider_unavailable",
@@ -520,30 +614,44 @@ export class PiiProtectionService {
   }
 }
 
+/**
+ * True when the evaluation scanned the subject. A policy that is off, or a
+ * subject out of scope, scans nothing. A new allow reason gives a type error
+ * here until it is classified.
+ */
+export function piiDecisionScanned(decision: PiiDecision): boolean {
+  if (decision.action !== "allow") return true;
+  switch (decision.reason) {
+    case "no_findings":
+      return true;
+    case "disabled":
+    case "scope_excluded":
+      return false;
+    default: {
+      const reason: never = decision.reason;
+      throw new Error(`Unknown PII allow reason: ${String(reason)}`);
+    }
+  }
+}
+
+// A decision that scanned nothing applied mode `off`.
+// A read that a caller passes in must be for the same tenant. Another
+// tenant's policy must never decide this tenant's content.
+function assertReadForTenant(read: PiiPolicyRead, tenantId: string): void {
+  if (read.tenantId !== tenantId) {
+    throw new Error("PII policy read is for a different tenant");
+  }
+}
+
+function evaluation({ policy, revision }: PiiPolicyRead, decision: PiiDecision): PiiEvaluation {
+  return { decision, appliedPolicy: { mode: piiDecisionScanned(decision) ? policy.settings.mode : "off", revision } };
+}
+
 function isBreakerOpenError(error: unknown): boolean {
   return (
     error instanceof PiiProtectionServiceError &&
     error.code === "pii_provider_breaker_open"
   );
-}
-
-function isEffectivelyEnabled(settings: PiiProtectionSettings): boolean {
-  return settings.enabled && settings.mode !== "off";
-}
-
-function isScopeEnabled(settings: PiiProtectionSettings, subject: PiiSubject): boolean {
-  switch (subject.kind) {
-    case "chat_prompt":
-      return settings.scopes.chatPrompts;
-    case "upload":
-      return settings.scopes.uploads;
-    case "microsoft_import":
-      return settings.scopes.microsoftImports;
-    case "skill_corpus":
-      // Always-on while PII protection itself is enabled — the corpus is an
-      // aggregation boundary, not one of the per-surface tenant toggles.
-      return true;
-  }
 }
 
 /**

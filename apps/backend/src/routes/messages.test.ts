@@ -2,8 +2,11 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { afterEach, expect, test, vi } from "vitest";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
+import { MAX_GENERATIVE_UI_CONTEXT_LENGTH } from "@cogniplane/shared-types";
+import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
 import { generateSessionTitle } from "../services/session-titler.js";
+import { textEvaluation } from "../test-helpers/pii-evaluation.js";
 import { registerMessageRoutes, type MessageRouteStores } from "./messages.js";
 
 vi.mock("../services/session-titler.js", () => ({ generateSessionTitle: vi.fn(async () => null) }));
@@ -333,8 +336,8 @@ test.each([
     sessionId: SESSION_ID, sessionName: "Old chat", status: "active", ...(transcriptFormat ? { transcriptFormat } : {})
   });
   harness.stores.sessions.getReadable = getReadable;
-  const evaluateText = vi.fn();
-  harness.stores.piiProtection = { evaluateText };
+  const evaluateTextWithPolicy = vi.fn();
+  harness.stores.piiProtection = { evaluateTextWithPolicy };
   const getTenantSettings = vi.spyOn(harness.stores.dynamicConfig, "getOrCreateTenantSettings");
   const run = vi.spyOn(harness.stores.runtimeAdapter, "runMessageAGUI");
   activeApp = await buildApp(harness.stores);
@@ -353,7 +356,7 @@ test.each([
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
   expect(harness.stores.executions.acquire).not.toHaveBeenCalled();
   expect(harness.consumedQuota).toEqual([]);
-  expect(evaluateText).not.toHaveBeenCalled();
+  expect(evaluateTextWithPolicy).not.toHaveBeenCalled();
   expect(harness.createdMessages).toEqual([]);
   expect(run).not.toHaveBeenCalled();
 });
@@ -547,8 +550,8 @@ test("blocks project instructions before consuming quota or starting the runtime
   const h = makeStores({ gateRuntime: async () => {} });
   h.stores.sessions.getReadable = vi.fn().mockResolvedValue(readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Sensitive instructions", instructionsRevision: 1 }) };
-  h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
-    .mockResolvedValueOnce({ action: "block", findings: [], blockReason: "Sensitive" }) };
+  h.stores.piiProtection = textEvaluation(vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "block", findings: [], blockReason: "Sensitive" }));
   const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
   activeApp = await buildApp(h.stores);
   const response = await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Draft it" } });
@@ -563,8 +566,8 @@ test("uses PII-transformed instructions in both the saved snapshot and model inp
   const h = makeStores({ gateRuntime: async () => {} });
   h.stores.sessions.getReadable = vi.fn().mockResolvedValue(readableSession({ sessionId: SESSION_ID, sessionName: "Proposal", projectId: "project-1" }));
   h.stores.projects = { getReadable: vi.fn().mockResolvedValue({ projectId: "project-1", instructions: "Private name", instructionsRevision: 1 }) };
-  h.stores.piiProtection = { evaluateText: vi.fn().mockResolvedValueOnce({ action: "allow" })
-    .mockResolvedValueOnce({ action: "transform", findings: [], transformedText: "[PERSON]" }) };
+  h.stores.piiProtection = textEvaluation(vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "transform", findings: [], transformedText: "[PERSON]" }));
   const scan = vi.fn().mockResolvedValue({ scanRunId: "instruction-scan" });
   const audit = vi.fn().mockResolvedValue(undefined);
   h.stores.piiScanRuns = { create: scan };
@@ -750,3 +753,93 @@ test("a failed titler call is contained and leaves no unhandled rejection", asyn
   }
   expect(unhandled).not.toHaveBeenCalled();
 });
+
+
+test("sends browser UI context only to the current turn without saving it in message rows", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  const create = vi.spyOn(h.stores.messages, "create");
+  activeApp = await buildApp(h.stores);
+  const send = (extra: Record<string, unknown> = {}) => activeApp!.inject({ method: "POST", url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "Show an estimate", ...extra } });
+  expect((await send({ generativeUiContext: "Current catalog and surface values", generativeUiTransport: "tool" })).statusCode).toBe(200);
+  expect(run).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+    generativeUiContext: "Current catalog and surface values", generativeUiTransport: "tool", prompt: "Show an estimate"
+  }));
+  expect(JSON.stringify(create.mock.calls)).not.toContain("Current catalog");
+  expect((await send()).statusCode).toBe(200);
+  expect(run).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ generativeUiContext: undefined, generativeUiTransport: undefined }));
+});
+
+test.each(["", { catalog: "unexpected object" }, "a".repeat(MAX_GENERATIVE_UI_CONTEXT_LENGTH + 1)])(
+  "rejects invalid or oversized browser UI context before policy evaluation", async (generativeUiContext) => {
+    const h = makeStores({ gateRuntime: async () => {} });
+    const evaluate = vi.fn().mockResolvedValue({ action: "allow" });
+    h.stores.piiProtection = textEvaluation(evaluate);
+    activeApp = await buildApp(h.stores);
+    const response = await activeApp.inject({ method: "POST", url: "/messages",
+      payload: { sessionId: SESSION_ID, text: "Show an estimate", generativeUiContext } });
+    expect(response.statusCode).toBe(400);
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(h.createdMessages).toEqual([]);
+    expect(h.consumedQuota).toEqual([]);
+  }
+);
+
+test("blocks browser UI values before saving a prompt or consuming quota", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  const evaluate = vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "block", findings: [], blockReason: "Sensitive UI value" });
+  h.stores.piiProtection = textEvaluation(evaluate);
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  const response = await activeApp.inject({ method: "POST", url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "Show an estimate", generativeUiTransport: "tool", generativeUiContext: "Private surface value" } });
+  expect(response.statusCode).toBe(422);
+  expect(response.json().error).toBe("generative_ui_context_blocked");
+  expect(evaluate).toHaveBeenLastCalledWith(expect.objectContaining({ text: "Private surface value" }));
+  expect(h.createdMessages).toEqual([]);
+  expect(h.consumedQuota).toEqual([]);
+  expect(run).not.toHaveBeenCalled();
+  expect(h.activeTurns.isBusy(SESSION_ID)).toBe(false);
+});
+
+test("passes only PII-transformed browser UI values to the runtime", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.piiProtection = textEvaluation(vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockResolvedValueOnce({ action: "transform", findings: [], transformedText: "Safe catalog [PERSON]" }));
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  const response = await activeApp.inject({ method: "POST", url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "Show an estimate", generativeUiTransport: "tool", generativeUiContext: "Private surface value" } });
+  expect(response.statusCode).toBe(200);
+  expect(run).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ generativeUiContext: "Safe catalog [PERSON]", generativeUiTransport: "tool" }));
+});
+
+test("fails closed when policy evaluation of UI context is unavailable", async () => {
+  const h = makeStores({ gateRuntime: async () => {} });
+  h.stores.piiProtection = textEvaluation(vi.fn().mockResolvedValueOnce({ action: "allow" })
+    .mockRejectedValueOnce(new PiiProtectionServiceError("pii_provider_unavailable", "Unavailable")));
+  const run = vi.spyOn(h.stores.runtimeAdapter, "runMessageAGUI");
+  activeApp = await buildApp(h.stores);
+  const response = await activeApp.inject({ method: "POST", url: "/messages",
+    payload: { sessionId: SESSION_ID, text: "Show an estimate", generativeUiContext: "Catalog" } });
+  expect(response.statusCode).toBe(503);
+  expect(h.createdMessages).toEqual([]);
+  expect(h.consumedQuota).toEqual([]);
+  expect(run).not.toHaveBeenCalled();
+});
+
+
+test.each([{ generativeUiTransport: "tool" }, { generativeUiTransport: "other", generativeUiContext: "Catalog" }])(
+  "rejects invalid UI transport capabilities before admitting a turn", async (extra) => {
+    const h = makeStores({ gateRuntime: async () => {} });
+    activeApp = await buildApp(h.stores);
+    const response = await activeApp.inject({ method: "POST", url: "/messages", payload: {
+      sessionId: SESSION_ID, text: "Show an estimate", ...extra
+    } });
+    expect(response.statusCode).toBe(400);
+    expect(h.createdMessages).toEqual([]);
+    expect(h.consumedQuota).toEqual([]);
+  }
+);

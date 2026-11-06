@@ -115,6 +115,24 @@ export const AUDIT_EVENT_TYPES = [
   // App role kept despite a different WorkOS role slug — IdP changes do not
   // propagate after provisioning, so revocations surface here, not as errors.
   "role_sync_divergence",
+  // Local accounts (docs/ARCHITECTURE.md, "Authentication"). `login_failed` is
+  // written only for an existing account: an unknown email has no tenant.
+  // Payloads never hold a password, token, or hash.
+  "auth.login_succeeded",
+  "auth.login_failed",
+  "auth.account_setup_completed",
+  "auth.password_changed",
+  "auth.password_reset_requested",
+  "auth.password_reset_completed",
+  "auth.sessions_revoked",
+  "auth.step_up",
+  "auth.owner_recovered",
+  "auth.mfa_enrolled",
+  "auth.mfa_removed",
+  "auth.passkey_added",
+  "auth.passkey_removed",
+  "auth.recovery_code_used",
+  "auth.recovery_codes_regenerated",
 
   // MCP gateway egress-control refusals (CIDR allowlist / per-runtime IP
   // pin) — a leaked rt_* token replayed from an unexpected peer is refused.
@@ -128,6 +146,9 @@ export const AUDIT_EVENT_TYPES = [
   // failed. Makes the residual orphan queryable — block-mode's data-perimeter
   // guarantee is otherwise silently violated. A future sweep keys off this.
   "pii_block_object_orphaned",
+  // Content in scope was stopped because the stored PII policy is not valid.
+  // Not a finding: no PII was detected and nothing was deleted.
+  "pii_policy_invalid",
 
   // Policy Center decisions. `recorded` is a monitor-mode (or non-gating)
   // evaluation; `enforced` is one that actually gated the action.
@@ -151,11 +172,21 @@ export const AUDIT_EVENT_TYPES = [
 
   // Tenant organization settings and membership (routes/tenant.ts). Written
   // in the same transaction as the change.
+  "tenant.renamed",
   "tenant.provider_key.updated",
   "tenant.marketplace_url.updated",
   "tenant.pii_protection.updated",
   "tenant.member.role_changed",
   "tenant.member.removed",
+  // Manager actions on local accounts.
+  "tenant.member.created",
+  "tenant.member.password_reset",
+  "tenant.member.link_resent",
+  "tenant.member.disabled",
+  "tenant.member.enabled",
+  "tenant.member.sessions_revoked",
+  "tenant.member.mfa_reset",
+  "tenant.security_policy.changed",
 
   // Tenant-level integration toggles (admin-driven).
   "tenant.integration.config_cleared",
@@ -174,17 +205,15 @@ export const AUDIT_EVENT_TYPES = [
   "user.github.connected",
   "user.github.disconnected",
   "user.github.repositories_updated",
+  // The owner confirmed a connection that a security change suspended.
+  "user.github.confirmed",
   "user.notion.connected",
   "user.notion.disconnected",
+  "user.notion.confirmed",
   "user.jira.connected",
   "user.jira.disconnected",
   "user.jira.cleanup_completed",
   "user.jira.cleanup_failed",
-  // Microsoft is wired through the SharePoint overlay (private/) but emits
-  // through the same audit pipeline; central enum includes it so the
-  // overlay's call sites typecheck.
-  "user.microsoft.connected",
-  "user.microsoft.disconnected",
 
   // User-driven scheduled job mutations.
   "user.scheduled_job.created",
@@ -199,4 +228,18 @@ export const AUDIT_EVENT_TYPES = [
   "user.settings.updated"
 ] as const;
 
-export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
+// Event types that an overlay emits through the same audit pipeline. Core does
+// not name them. An overlay adds its names with module augmentation, so that
+// its `auditEvents.create` calls typecheck:
+//
+//   declare module "<path to this file>.js" {
+//     interface OverlayAuditEventTypes {
+//       "user.example.connected": true;
+//     }
+//   }
+//
+// The same stability rule applies: do not rename an event type after release.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- overlays augment this interface.
+export interface OverlayAuditEventTypes {}
+
+export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number] | keyof OverlayAuditEventTypes;

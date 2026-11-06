@@ -1,9 +1,12 @@
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { z } from "zod";
 import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
+
+import { parseMailFrom, parseSmtpUrl } from "./lib/smtp-settings.js";
 
 const envFilePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env");
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -244,7 +247,36 @@ export const envSchema = z.object({
   // share a single budget. The worker's PII drain runs whenever the async PII
   // path is wired, even when SCHEDULER_ENABLED=false.
   PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
-  AUTH_MODE: z.enum(["workos", "dev-headers"]).default("dev-headers"),
+  // `jwt` authenticates every request with a backend-issued token; the login
+  // types it offers are in AUTH_LOGIN_TYPES. `workos` is the earlier name and
+  // means `jwt` with AUTH_LOGIN_TYPES=workos. loadConfig resolves it, so the
+  // rest of the backend sees only `jwt` or `dev-headers`.
+  AUTH_MODE: z.enum(["jwt", "workos", "dev-headers"]).default("dev-headers"),
+  // Comma-separated login types that AUTH_MODE=jwt enables: `workos`, `local`.
+  // Each tenant has one login type, fixed at creation (tenants.login_type).
+  AUTH_LOGIN_TYPES: z.string().trim().optional(),
+  // Password hashes that one backend process computes at the same time. Each
+  // Argon2id hash holds 19 MiB for about 30 ms on a libuv thread; a request
+  // past the limit gets a retryable 503 instead of a queue that grows.
+  LOCAL_AUTH_HASH_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(4),
+  // Passkeys (WebAuthn) for local accounts are on only when this is set. The
+  // relying-party id: the frontend's hostname (API_ORIGIN), or a parent
+  // domain of it. Credentials are bound to it: changing it later makes every
+  // registered passkey stop working.
+  WEBAUTHN_RP_ID: z.string().trim().min(1).optional(),
+  // The name that the browser and the authenticator show for this site.
+  WEBAUTHN_RP_NAME: z.string().trim().min(1).max(64).default("Cogniplane"),
+  // Email: security notices and links for local accounts (password changed,
+  // second factor added or removed, manager reset), and the notice to every
+  // owner of a data setting change (any login type). Set both or neither;
+  // without them no email is sent. Needs AUTH_MODE=jwt. smtps://user:password@host:465 (TLS from the
+  // start) or smtp://user:password@host:587 (STARTTLS is required).
+  SMTP_URL: z.string().trim().min(1).optional(),
+  // The sender: `no-reply@example.com` or `Cogniplane <no-reply@example.com>`.
+  MAIL_FROM: z.string().trim().min(1).max(320).optional(),
+  // Development only: lets smtp:// send without TLS, for a local test mail
+  // server such as Mailpit. Refused when NODE_ENV is a production value.
+  SMTP_ALLOW_PLAINTEXT: booleanFromEnvSchema.default(false),
   // Docker port publishing needs 0.0.0.0 *inside* the container, which the
   // dev-headers loopback guard below rejects; this is the operator opt-in.
   COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: booleanFromEnvSchema.default(false),
@@ -391,9 +423,87 @@ export const envSchema = z.object({
 
 type ParsedAppConfig = z.infer<typeof envSchema>;
 
-export type AppConfig = Omit<ParsedAppConfig, "ADMIN_USER_IDS"> & {
+export const LOGIN_TYPES = ["workos", "local"] as const;
+export type LoginType = (typeof LOGIN_TYPES)[number];
+export type AuthMode = "jwt" | "dev-headers";
+
+export type AppConfig = Omit<ParsedAppConfig, "ADMIN_USER_IDS" | "AUTH_MODE" | "AUTH_LOGIN_TYPES"> & {
   ADMIN_USER_IDS: string[];
+  AUTH_MODE: AuthMode;
+  /** Login types enabled in `jwt` mode. Empty in `dev-headers` mode. */
+  AUTH_LOGIN_TYPES: readonly LoginType[];
 };
+
+export function isLoginTypeEnabled(config: Pick<AppConfig, "AUTH_LOGIN_TYPES">, type: LoginType): boolean {
+  return config.AUTH_LOGIN_TYPES.includes(type);
+}
+
+/** Passkeys need local login and a relying-party id. */
+export function arePasskeysEnabled(config: Pick<AppConfig, "AUTH_LOGIN_TYPES" | "WEBAUTHN_RP_ID">): boolean {
+  return isLoginTypeEnabled(config, "local") && Boolean(config.WEBAUTHN_RP_ID);
+}
+
+/**
+ * Email needs AUTH_MODE=jwt and both SMTP settings (loadConfig checks them).
+ * Any login type: local accounts get security notices and links, and every
+ * owner gets the notice of a data setting change.
+ */
+export function isMailEnabled(config: Pick<AppConfig, "AUTH_MODE" | "SMTP_URL" | "MAIL_FROM">): boolean {
+  return config.AUTH_MODE === "jwt" && Boolean(config.SMTP_URL && config.MAIL_FROM);
+}
+
+/** "Forgot password" by email: local login and email. */
+export function isPasswordRecoveryEnabled(
+  config: Pick<AppConfig, "AUTH_MODE" | "AUTH_LOGIN_TYPES" | "SMTP_URL" | "MAIL_FROM">
+): boolean {
+  return isLoginTypeEnabled(config, "local") && isMailEnabled(config);
+}
+
+/** WebAuthn accepts an RP id that equals the page's host or is a parent domain of it. */
+export function isValidRpIdFor(rpId: string, origin: string): boolean {
+  const host = new URL(origin).hostname.toLowerCase();
+  return host === rpId || host.endsWith(`.${rpId}`);
+}
+
+// Resolves the AUTH_MODE alias and parses AUTH_LOGIN_TYPES. Fails closed: an
+// unknown or empty list, a list in dev-headers mode, or a list that contradicts
+// the `workos` alias stops boot instead of guessing.
+function resolveAuthMode(rawMode: ParsedAppConfig["AUTH_MODE"], rawTypes: string | undefined): {
+  mode: AuthMode;
+  loginTypes: LoginType[];
+} {
+  const listed = rawTypes === undefined || rawTypes === ""
+    ? undefined
+    : [...new Set(rawTypes.split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean))];
+
+  if (rawMode === "dev-headers") {
+    if (listed) throw new Error("AUTH_LOGIN_TYPES is only valid with AUTH_MODE=jwt.");
+    return { mode: "dev-headers", loginTypes: [] };
+  }
+  if (rawMode === "workos") {
+    if (listed && (listed.length !== 1 || listed[0] !== "workos")) {
+      throw new Error(
+        "AUTH_MODE=workos means AUTH_LOGIN_TYPES=workos. To enable other login types, set AUTH_MODE=jwt and list them in AUTH_LOGIN_TYPES."
+      );
+    }
+    return { mode: "jwt", loginTypes: ["workos"] };
+  }
+
+  const loginTypes = listed ?? ["workos"];
+  if (loginTypes.length === 0) throw new Error("AUTH_LOGIN_TYPES must list at least one login type.");
+  for (const type of loginTypes) {
+    if (!(LOGIN_TYPES as readonly string[]).includes(type)) {
+      throw new Error(`AUTH_LOGIN_TYPES contains an unknown login type ${JSON.stringify(type)}. Allowed: ${LOGIN_TYPES.join(", ")}.`);
+    }
+  }
+  // Local passwords use Node's built-in Argon2id, added in Node 24.7. The
+  // pinned runtime has it; an older self-hosted Node must not start with a
+  // login type it cannot serve.
+  if (loginTypes.includes("local") && typeof (crypto as { argon2?: unknown }).argon2 !== "function") {
+    throw new Error("AUTH_LOGIN_TYPES=local needs Node 24.7 or later (crypto.argon2).");
+  }
+  return { mode: "jwt", loginTypes: loginTypes as LoginType[] };
+}
 
 /**
  * Minimal logger shape accepted by `loadConfig`. Compatible with Fastify's
@@ -484,6 +594,8 @@ export function loadConfig(
     // Local dev can rely on schema defaults when no .env file exists yet.
   }
   const parsed = envSchema.parse(source);
+  const { mode: authMode, loginTypes } = resolveAuthMode(parsed.AUTH_MODE, parsed.AUTH_LOGIN_TYPES);
+  const workosEnabled = loginTypes.includes("workos");
   if (parsed.MCP_UPSTREAM_SIGNING_SECRET?.trim())
     throw new Error(
       "MCP_UPSTREAM_SIGNING_SECRET is the v1 upstream signing key, which upstreams held. " +
@@ -493,11 +605,11 @@ export function loadConfig(
     throw new Error("SESSION_EXECUTION_LEASE_MS must exceed twice SESSION_EXECUTION_HEARTBEAT_MS.");
 
   // Resolve the API_HOST default by auth mode: dev-headers must stay on the IPv4
-  // loopback (its trust boundary), while workos binds dual-stack so a load
+  // loopback (its trust boundary), while jwt binds dual-stack so a load
   // balancer / ingress can reach it without extra config. An explicit API_HOST
   // always wins (and is still validated by the dev-headers loopback guard below).
   if (parsed.API_HOST === undefined) {
-    parsed.API_HOST = parsed.AUTH_MODE === "dev-headers" ? "127.0.0.1" : "::";
+    parsed.API_HOST = authMode === "dev-headers" ? "127.0.0.1" : "::";
   }
 
   const resolvedArtifactStorageRoot = resolveStoragePath(
@@ -582,24 +694,36 @@ export function loadConfig(
     );
   }
 
-  if (parsed.AUTH_MODE === "workos") {
-    if (!parsed.WORKOS_API_KEY) throw new Error("WORKOS_API_KEY is required when AUTH_MODE=workos.");
-    if (!parsed.WORKOS_CLIENT_ID) throw new Error("WORKOS_CLIENT_ID is required when AUTH_MODE=workos.");
-    if (!parsed.WORKOS_REDIRECT_URI) throw new Error("WORKOS_REDIRECT_URI is required when AUTH_MODE=workos.");
+  if (workosEnabled) {
+    if (!parsed.WORKOS_API_KEY) throw new Error("WORKOS_API_KEY is required when WorkOS login is enabled.");
+    if (!parsed.WORKOS_CLIENT_ID) throw new Error("WORKOS_CLIENT_ID is required when WorkOS login is enabled.");
+    if (!parsed.WORKOS_REDIRECT_URI) throw new Error("WORKOS_REDIRECT_URI is required when WorkOS login is enabled.");
+  }
+  if (authMode === "jwt") {
     if (!opts.skipRuntimeChecks && !parsed.MAINTENANCE_DATABASE_URL) {
-      throw new Error("MAINTENANCE_DATABASE_URL is required when AUTH_MODE=workos.");
+      throw new Error("MAINTENANCE_DATABASE_URL is required when AUTH_MODE=jwt.");
     }
     if (!opts.skipRuntimeChecks && parsed.MAINTENANCE_DATABASE_URL === parsed.DATABASE_URL) {
       throw new Error("MAINTENANCE_DATABASE_URL must use a separate maintenance role from DATABASE_URL.");
     }
     if (!parsed.REDIS_URL) {
-      throw new Error("REDIS_URL is required when AUTH_MODE=workos.");
+      throw new Error("REDIS_URL is required when AUTH_MODE=jwt.");
     }
     if (parsed.JWT_SECRET === DEFAULT_JWT_SECRET) {
-      throw new Error("JWT_SECRET must be changed from the default value when AUTH_MODE=workos.");
+      throw new Error("JWT_SECRET must be changed from the default value when AUTH_MODE=jwt.");
     }
     if (parsed.DATA_ENCRYPTION_SECRET === DEFAULT_DATA_ENCRYPTION_SECRET) {
-      throw new Error("DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=workos.");
+      throw new Error("DATA_ENCRYPTION_SECRET must be explicitly set to a non-default value when AUTH_MODE=jwt.");
+    }
+  }
+  // Hostnames compare without case; keep one form.
+  const webauthnRpId = parsed.WEBAUTHN_RP_ID?.toLowerCase();
+  if (webauthnRpId) {
+    if (!loginTypes.includes("local")) {
+      throw new Error("WEBAUTHN_RP_ID needs local login: add `local` to AUTH_LOGIN_TYPES, or unset it.");
+    }
+    if (!isValidRpIdFor(webauthnRpId, parsed.API_ORIGIN)) {
+      throw new Error("WEBAUTHN_RP_ID must equal the hostname of API_ORIGIN (the frontend) or be a parent domain of it.");
     }
   }
 
@@ -621,16 +745,30 @@ export function loadConfig(
   // keys on an allowlist of recognized non-production environments. Unset
   // NODE_ENV is treated as development (the Node convention, and what `make dev`
   // / the test runner rely on), but any non-empty value that is NOT a recognized
-  // dev/test value is treated as production and requires workos auth.
+  // dev/test value is treated as production and requires jwt auth.
   const RECOGNIZED_NON_PROD_ENVS = new Set(["development", "dev", "test", ""]);
   const nodeEnv = typeof source.NODE_ENV === "string" ? source.NODE_ENV.trim().toLowerCase() : "";
   const isRecognizedNonProd = RECOGNIZED_NON_PROD_ENVS.has(nodeEnv);
-  if (!isRecognizedNonProd && parsed.AUTH_MODE !== "workos") {
+
+  if (Boolean(parsed.SMTP_URL) !== Boolean(parsed.MAIL_FROM)) {
+    throw new Error("SMTP_URL and MAIL_FROM must be set together, or neither.");
+  }
+  if (parsed.SMTP_URL && parsed.MAIL_FROM) {
+    if (authMode !== "jwt") {
+      throw new Error("SMTP_URL needs AUTH_MODE=jwt, or unset SMTP_URL and MAIL_FROM.");
+    }
+    parseSmtpUrl(parsed.SMTP_URL, parsed.SMTP_ALLOW_PLAINTEXT);
+    parseMailFrom(parsed.MAIL_FROM);
+  }
+  if (parsed.SMTP_ALLOW_PLAINTEXT && !isRecognizedNonProd) {
+    throw new Error("SMTP_ALLOW_PLAINTEXT is for development only. Unset it, and use smtps:// or smtp:// with STARTTLS.");
+  }
+  if (!isRecognizedNonProd && authMode !== "jwt") {
     throw new Error(
       `AUTH_MODE=${parsed.AUTH_MODE} is only permitted when NODE_ENV is unset or one of ` +
         `[development, dev, test] (got NODE_ENV=${JSON.stringify(source.NODE_ENV)}). ` +
         "Any other value — including typos like 'prod' or 'Production' — is treated as production " +
-        "and requires AUTH_MODE=workos."
+        "and requires AUTH_MODE=jwt (or its alias AUTH_MODE=workos)."
     );
   }
 
@@ -640,13 +778,13 @@ export function loadConfig(
   // let any reachable client impersonate any user or tenant.
   const DEV_HEADERS_LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
   if (
-    parsed.AUTH_MODE === "dev-headers" &&
+    authMode === "dev-headers" &&
     !DEV_HEADERS_LOOPBACK_HOSTS.has(parsed.API_HOST.trim().toLowerCase()) &&
     !parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK
   ) {
     throw new Error(
       `API_HOST must be a loopback address [127.0.0.1, ::1, localhost] when AUTH_MODE=dev-headers ` +
-        `(got API_HOST=${JSON.stringify(parsed.API_HOST)}). Use AUTH_MODE=workos before exposing the backend on a network interface, ` +
+        `(got API_HOST=${JSON.stringify(parsed.API_HOST)}). Use AUTH_MODE=jwt before exposing the backend on a network interface, ` +
         `or set COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1 if the backend runs inside a container whose host firewall is the real trust boundary.`
     );
   }
@@ -654,7 +792,7 @@ export function loadConfig(
   // mandatory: without a shared secret, dev-headers on a reachable interface is
   // unauthenticated cross-tenant impersonation.
   if (
-    parsed.AUTH_MODE === "dev-headers" &&
+    authMode === "dev-headers" &&
     parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK &&
     !parsed.DEV_HEADERS_AUTH_KEY
   ) {
@@ -668,15 +806,15 @@ export function loadConfig(
   // repo, so as a secret it is worthless.
   if (parsed.DEV_HEADERS_AUTH_KEY === "local-dev-headers-auth-key") {
     logger.warn(
-      { authMode: parsed.AUTH_MODE },
+      { authMode },
       "DEV_HEADERS_AUTH_KEY is the committed compose default. It is public knowledge and provides " +
         "no protection — anyone who can reach the port can impersonate any user. Keep the port bound " +
         "to 127.0.0.1, or set a unique key before exposing it."
     );
   }
-  if (parsed.AUTH_MODE === "dev-headers" && parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK) {
+  if (authMode === "dev-headers" && parsed.COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK) {
     logger.warn(
-      { authMode: parsed.AUTH_MODE, apiHost: parsed.API_HOST },
+      { authMode, apiHost: parsed.API_HOST },
       "dev-headers mode is bound to a non-loopback interface by explicit operator opt-in " +
         "(COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1). This is only safe when the host " +
         "firewall or network isolation prevents untrusted clients from reaching the backend."
@@ -686,24 +824,24 @@ export function loadConfig(
   // Make the effective auth posture visible at boot so an operator can confirm
   // it at a glance rather than inferring it from request behavior.
   logger.warn(
-    { authMode: parsed.AUTH_MODE, nodeEnv: source.NODE_ENV ?? "(unset)", devHeadersTrusted: parsed.AUTH_MODE !== "workos" },
-    parsed.AUTH_MODE === "workos"
-      ? "Auth mode: workos (JWT). Request headers are NOT trusted for identity."
+    { authMode, loginTypes, nodeEnv: source.NODE_ENV ?? "(unset)", devHeadersTrusted: authMode !== "jwt" },
+    authMode === "jwt"
+      ? `Auth mode: jwt, login types: ${loginTypes.join(", ")}. Request headers are NOT trusted for identity.`
       : "Auth mode: dev-headers. X-User-Id / X-Tenant-Id request headers are TRUSTED for identity — DEV ONLY."
   );
 
-  if (parsed.AUTH_MODE !== "workos" && parsed.JWT_SECRET === DEFAULT_JWT_SECRET) {
+  if (authMode !== "jwt" && parsed.JWT_SECRET === DEFAULT_JWT_SECRET) {
     logger.warn(
-      { authMode: parsed.AUTH_MODE },
+      { authMode },
       "JWT_SECRET is using the well-known default value. " +
         "JWTs and runtime tokens (rt_*) are signed with a publicly known key. " +
         "Do not expose this instance outside localhost."
     );
   }
 
-  if (parsed.AUTH_MODE !== "workos" && parsed.DATA_ENCRYPTION_SECRET === DEFAULT_DATA_ENCRYPTION_SECRET) {
+  if (authMode !== "jwt" && parsed.DATA_ENCRYPTION_SECRET === DEFAULT_DATA_ENCRYPTION_SECRET) {
     logger.warn(
-      { authMode: parsed.AUTH_MODE },
+      { authMode },
       "DATA_ENCRYPTION_SECRET is using the well-known default value. " +
         "Stored OAuth credentials and runtime tokens (rt_*) use this key. " +
         "Do not expose this instance outside localhost."
@@ -791,6 +929,9 @@ export function loadConfig(
 
   return {
     ...parsed,
+    AUTH_MODE: authMode,
+    AUTH_LOGIN_TYPES: loginTypes,
+    WEBAUTHN_RP_ID: webauthnRpId,
     ADMIN_USER_IDS:
       parsed.ADMIN_USER_IDS?.split(",")
         .map((entry) => entry.trim())

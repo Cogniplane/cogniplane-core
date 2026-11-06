@@ -73,7 +73,8 @@ type DynamicConfigStores = {
       Promise<{ auth: McpUpstreamAuth; version: number } | null>;
   };
   tenantMembers?: {
-    getRole(tenantId: string, userId: string): Promise<unknown | null>;
+    /** Role of a member whose account may act now; null otherwise. */
+    getActiveRole(tenantId: string, userId: string): Promise<unknown | null>;
     isUserBetaTester(tenantId: string, userId: string): Promise<boolean>;
   };
   skills: Pick<
@@ -192,7 +193,7 @@ export class DynamicConfigService {
   }
 
   async getMcpServerForUser(tenantId: string, serverId: string, userId: string): Promise<McpServerRegistration> {
-    if (!this.stores.tenantMembers || !await this.stores.tenantMembers.getRole(tenantId, userId)) {
+    if (!this.stores.tenantMembers || !await this.stores.tenantMembers.getActiveRole(tenantId, userId)) {
       throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
     }
     const isBetaTester = await this.stores.tenantMembers.isUserBetaTester(tenantId, userId);
@@ -306,8 +307,9 @@ export class DynamicConfigService {
   }
 
   setSkillPublished(tenantId: string, skillId: string, isPublished: boolean,
-    expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
-    return this.stores.skills.setSkillPublished(tenantId, skillId, isPublished, expectedSnapshot);
+    expectedSnapshot?: AdminSkillReleaseSnapshot,
+    options?: { alsoInTransaction?: (client: PoolClient) => Promise<void> }): Promise<AdminSkillRecord | null> {
+    return this.stores.skills.setSkillPublished(tenantId, skillId, isPublished, expectedSnapshot, options);
   }
 
   listSkillRevisions(tenantId: string, skillId: string): Promise<AdminSkillRevisionRecord[]> {
@@ -329,6 +331,7 @@ export class DynamicConfigService {
     reviewNotes?: string | null;
     audience?: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
+    alsoInTransaction?: (client: PoolClient) => Promise<void>;
   }): Promise<ActivatedSkillRevisionRecord | null> {
     return this.stores.skillRevisions.activateSkillRevision(tenantId, {
       skillId: input.skillId,
@@ -336,7 +339,8 @@ export class DynamicConfigService {
       reviewedBy: input.actorUserId,
       reviewNotes: input.reviewNotes ?? null,
       audience: input.audience,
-      expectedSnapshot: input.expectedSnapshot
+      expectedSnapshot: input.expectedSnapshot,
+      alsoInTransaction: input.alsoInTransaction
     });
   }
 

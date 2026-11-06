@@ -25,7 +25,7 @@ import {
 } from "./lib/frontend-security-headers";
 import { sandboxSecurityHeaders } from "./lib/mcp-app-sandbox-headers";
 
-const PUBLIC_PATHS = ["/login", "/auth/callback"];
+const PUBLIC_PATHS = ["/login", "/auth/callback", "/auth/setup", "/auth/reset-password", "/auth/forgot-password"];
 const SESSION_HINT_COOKIE = "cogniplane_session_hint";
 const DEV_MODE = Boolean(process.env.NEXT_PUBLIC_DEV_USER_ID);
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";

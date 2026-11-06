@@ -7,6 +7,7 @@ import {
   type ProjectSkillScope
 } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
+import type { DataRouteControl } from "../services/data-route-control.js";
 import { apiError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
@@ -17,8 +18,16 @@ import {
 } from "../services/skills/project-skill-store.js";
 import { SkillSourceValidationError } from "../services/skills/personal-skill-validation.js";
 
-export type ProjectSkillStores = { projectSkills: Pick<AppDependencies["projectSkills"],
-  "list" | "get" | "history" | "create" | "copyFromPersonal" | "update" | "updateFromPersonal" | "action" | "remove"> };
+export type ProjectSkillStores = {
+  projectSkills: Pick<AppDependencies["projectSkills"],
+    "list" | "get" | "history" | "create" | "copyFromPersonal" | "update" | "updateFromPersonal" | "action" | "remove">;
+  /**
+   * Step-up and owner notice of a release: a released project skill gives
+   * its instructions to the agents of the project's editors, and it stays
+   * after the victim of a stolen token signs out.
+   */
+  dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
+};
 const ProjectParams = z.object({ projectId: z.string().uuid() });
 const SkillParams = ProjectParams.extend({ skillId: z.string().regex(/^project-skill-[0-9a-f-]{36}$/) });
 const base = "/projects/:projectId/skills";
@@ -135,8 +144,19 @@ export async function registerProjectSkillRoutes(app: FastifyInstance, stores: P
       if (scopeFailure) return scopeFailure;
       const body = parseRequestInput(reply, ProjectSkillActionSchema, request.body);
       if (!body.ok) return body.response;
+      // A release makes instructions live for other people: step-up and the
+      // owner notice, in the release's transaction. Turning it off needs neither.
+      const release = body.value.action === "release";
+      if (release && !(await stores.dataRoutes.requireStepUp(request, reply, "POST /projects/:projectId/skills/:skillId/action"))) {
+        return reply;
+      }
       const skill = await stores.projectSkills.action(scope.tenantId, scope.userId, scope.projectId,
-        params.value.skillId, body.value.action, body.value.version);
+        params.value.skillId, body.value.action, body.value.version, {
+          alsoInTransaction: release ? stores.dataRoutes.ownerNotice(request, {
+            setting: "skill_release", skillId: params.value.skillId, change: "project_released", audience: null,
+            projectId: scope.projectId
+          }) : undefined
+        });
       privateReply(reply);
       return serialize(ProjectSkillResponseSchema, { scope, skill });
     });

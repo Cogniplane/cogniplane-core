@@ -3,6 +3,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { registerOrganizationSkillSubmissionRoutes, type SubmissionStores } from "./organization-skill-submissions.js";
 import { SubmissionAccessError, SubmissionConflictError, SubmissionNotFoundError,
   SubmissionValidationError } from "../services/skills/organization-skill-submission-store.js";
+import { devDataRoutes } from "../test-helpers/data-routes.js";
 
 const apps: ReturnType<typeof Fastify>[]=[];
 afterEach(async()=>{await Promise.all(apps.splice(0).map(app=>app.close()));});
@@ -19,16 +20,16 @@ const submission={id,version:1,status:"pending",authorUserId:"member",authorName
 const update={id:"00000000-0000-4000-8000-000000000002",submissionId:id,attempt:1,kind:"changes_requested",
   skillName:"notes",feedback:"Add a step",organizationSkillId:null,organizationRevisionId:null,audience:null,createdAt:now,readAt:null};
 const detail={...submission,attempts:[attempt],updates:[update],organizationSkill:null};
-async function setup(){
+async function setup(role:"member"|"admin"="member"){
   const app=Fastify(); apps.push(app);
-  app.addHook("preHandler",async request=>{request.auth={...scope,role:"member",isAdmin:false};});
+  app.addHook("preHandler",async request=>{request.auth={...scope,role,isAdmin:role==="admin"};});
   const organizationSkillSubmissions={
     list:vi.fn(async()=>[submission]),get:vi.fn(async()=>detail),create:vi.fn(async()=>id),
     withdraw:vi.fn(async()=>{}),resubmit:vi.fn(async()=>{}),decide:vi.fn(async()=>{}),release:vi.fn(async()=>{}),
     listUpdates:vi.fn(async()=>({updates:[update],unreadCount:1,nextCursor:null})),
     readUpdate:vi.fn(async()=>({id:update.id,readAt:now,unreadCount:0}))
   };
-  await registerOrganizationSkillSubmissionRoutes(app,{organizationSkillSubmissions} as unknown as SubmissionStores);
+  await registerOrganizationSkillSubmissionRoutes(app,{organizationSkillSubmissions,dataRoutes:devDataRoutes()} as unknown as SubmissionStores);
   return {app,store:organizationSkillSubmissions};
 }
 test("routes submissions with authenticated scope and no cache",async()=>{
@@ -43,9 +44,15 @@ test("routes submissions with authenticated scope and no cache",async()=>{
   expect(store.resubmit).toHaveBeenCalledWith("tenant","member",id,2,3,"Changed");
   await app.inject({method:"POST",url:`/admin/skill-submissions/${id}/decision`,payload:{scope,version:1,action:"decline",reason:"No"}});
   expect(store.decide).toHaveBeenCalledWith("tenant","member",id,expect.objectContaining({action:"decline",reason:"No"}));
-  await app.inject({method:"POST",url:`/admin/skill-submissions/${id}/release`,payload:{scope,
-    expectedOrganizationVersion:0,expectedActiveRevisionId:null,expectedDraftRevisionId:4,audience:"members"}});
-  expect(store.release).toHaveBeenCalledWith("tenant","member",id,expect.objectContaining({expectedDraftRevisionId:4,audience:"members"}));
+  // A member cannot release; the step-up check does not ask a member for a proof.
+  const release={scope,expectedOrganizationVersion:0,expectedActiveRevisionId:null,expectedDraftRevisionId:4,audience:"members"};
+  const refused=await app.inject({method:"POST",url:`/admin/skill-submissions/${id}/release`,payload:release});
+  expect(refused.statusCode).toBe(403); expect(refused.json().error).toBe("membership_required");
+  expect(store.release).not.toHaveBeenCalled();
+  const admin=await setup("admin");
+  await admin.app.inject({method:"POST",url:`/admin/skill-submissions/${id}/release`,payload:release});
+  expect(admin.store.release).toHaveBeenCalledWith("tenant","member",id,expect.objectContaining({expectedDraftRevisionId:4,audience:"members"}),
+    {alsoInTransaction:expect.any(Function)});
 });
 test("lists bounded author updates and marks only the addressed event",async()=>{
   const {app,store}=await setup();

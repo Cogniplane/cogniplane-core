@@ -1,12 +1,14 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+
 import { AdminSessionAlertBadge } from "./admin-session-alert-badge";
 import type { AdminSessionRow } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatTimestamp } from "../../../lib/time-format";
-import { PILL_GRAY, PILL_GREEN, HINT, SECTION_LABEL, LIST_ITEM } from "../../../lib/ui-tokens";
+import { PILL_GRAY, PILL_GREEN, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
 const LIST_ITEM_HOVER = `${LIST_ITEM} hover-lift hover:border-outline`;
 
@@ -33,20 +35,19 @@ export function isSessionRowClickable(_row: AdminSessionRow): boolean {
 const SECTION_DESCRIPTION =
   "Inspect chat sessions across the tenant. Filter by user, date, and alert type to investigate incidents.";
 
-function SessionsHeader(props: { count: number; hasMore?: boolean }) {
+function SessionsHeader(props: { count?: number; hasMore?: boolean }) {
   return (
     <div className="flex flex-wrap items-start justify-between gap-3">
       <div>
-        <p className={SECTION_LABEL}>Review</p>
-        <h2 className="text-lg font-semibold text-on-surface">Sessions</h2>
+        <h2 tabIndex={-1} className="scroll-mt-2 rounded-sm text-lg font-semibold text-on-surface outline-none focus:ring-[3px] focus:ring-ring/50">Sessions</h2>
         <p className="mt-1 max-w-prose text-sm text-on-surface-variant">
           {SECTION_DESCRIPTION}
         </p>
       </div>
-      <span className={PILL_GRAY}>
+      {props.count !== undefined ? <span className={PILL_GRAY}>
         Showing {props.count} session{props.count === 1 ? "" : "s"}
         {props.hasMore ? "+" : ""}
-      </span>
+      </span> : null}
     </div>
   );
 }
@@ -58,58 +59,48 @@ export function AdminSessionsSection(props: {
   hasMore?: boolean;
   isLoadingMore?: boolean;
   onLoadMore?: () => void;
+  hasData?: boolean;
+  error?: string | null;
+  available?: boolean;
+  isRefreshing?: boolean;
+  isFiltered?: boolean;
+  onRetry?: () => void;
 }) {
-  if (props.isLoading) {
-    return (
-      <Card>
-        <CardContent className="flex flex-col gap-3 pt-6">
-          {Array.from({ length: 5 }, (_, i) => (
-            <div key={i} className={LIST_ITEM} style={{ opacity: 1 - i * 0.15 }}>
-              <div className="flex items-center justify-between gap-2">
-                <Skeleton className="h-4 w-40" />
-                <div className="flex gap-1.5">
-                  <Skeleton className="h-4 w-14 rounded-full" />
-                  <Skeleton className="h-4 w-14 rounded-full" />
-                </div>
-              </div>
-              <Skeleton className="mt-2 h-3 w-72" />
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-    );
-  }
-
-  if (props.sessions.length === 0) {
-    return (
-      <Card>
-        <CardHeader>
-          <SessionsHeader count={0} />
-        </CardHeader>
-        <CardContent>
-          <p className={HINT}>
-            No sessions found. Sessions appear here once users start conversations.
-          </p>
-        </CardContent>
-      </Card>
-    );
-  }
+  const section = useRef<HTMLDivElement>(null);
+  const retryOwner = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!props.isRefreshing && !props.error && retryOwner.current) {
+      if (document.activeElement === retryOwner.current) section.current?.querySelector<HTMLElement>("h2")?.focus();
+      retryOwner.current = null;
+    }
+  }, [props.isRefreshing, props.error]);
+  const hasData = props.hasData ?? !props.isLoading;
+  const showRows = hasData && props.available !== false;
+  const feedback = props.error || (props.onRetry && !props.isLoading && props.available !== false) ? (
+    <div className="mb-4 space-y-2">
+      {props.error ? <p role="alert" className="text-sm text-danger">{showRows ? "Sessions could not be updated. The loaded results remain below. " : ""}{props.error}</p> : null}
+      {props.onRetry ? <Button type="button" variant="outline" aria-disabled={props.isRefreshing} aria-busy={props.isRefreshing} className="min-w-36" onClick={event => { if (!props.isRefreshing) { retryOwner.current = event.currentTarget; props.onRetry?.(); } }}>{props.isRefreshing ? "Reloading…" : "Reload sessions"}</Button> : null}
+    </div>
+  ) : null;
 
   return (
-    <Card>
+    <Card ref={section}>
       <CardHeader>
-        <SessionsHeader count={props.sessions.length} hasMore={props.hasMore} />
+        <SessionsHeader count={showRows ? props.sessions.length : undefined} hasMore={props.hasMore} />
       </CardHeader>
       <CardContent>
+        {feedback}
+        {props.isLoading && !hasData && !props.error ? <div role="status" aria-label="Loading sessions" className="space-y-3"><p className={HINT}>Loading sessions…</p>{Array.from({ length: 3 }, (_, i) => <Skeleton key={i} className="h-16 w-full" />)}</div> : null}
+        {showRows && props.sessions.length === 0 ? <p className={HINT}>{props.isFiltered ? "No sessions match these filters. Change the filters to search another creation period, user or alert." : "No sessions found. Sessions appear here once users start conversations."}</p> : null}
         <div className="flex flex-col gap-2">
-          {props.sessions.map((row) => {
+          {showRows && props.sessions.map((row) => {
             const interactive = props.onRowClick != null;
             const handleActivate = () => {
               if (interactive) props.onRowClick?.(row.sessionId);
             };
             return (
               <div
-                className={`${LIST_ITEM_HOVER} ${interactive ? "cursor-pointer" : ""}`}
+                className={`${LIST_ITEM_HOVER} break-words [overflow-wrap:anywhere] ${interactive ? "cursor-pointer" : ""}`}
                 key={row.sessionId}
                 role={interactive ? "button" : undefined}
                 tabIndex={interactive ? 0 : undefined}
@@ -163,7 +154,7 @@ export function AdminSessionsSection(props: {
           })}
         </div>
 
-        {props.hasMore && props.onLoadMore ? (
+        {showRows && props.hasMore && props.onLoadMore ? (
           <div className="mt-3 text-center">
             <Button
               type="button"

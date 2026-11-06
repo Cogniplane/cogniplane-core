@@ -9,6 +9,7 @@ import { Label } from "@/components/ui/label";
 export function AdminSkillZipUploadTab(props: {
   zipFileName: string;
   busyKey: string | null;
+  error?: string;
   onZipFileNameChange: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -24,13 +25,14 @@ export function AdminSkillZipUploadTab(props: {
           onChange={(event) => props.onZipFileNameChange(event.target.files?.[0]?.name ?? "")}
         />
       </div>
-      <div className="flex items-center justify-end gap-3">
+      {props.error ? <p role="alert" className="text-sm text-danger">{props.error}</p> : null}
+      <div className="flex flex-wrap items-center justify-end gap-3">
         {props.zipFileName ? (
-          <span className="text-xs text-on-surface-variant">{props.zipFileName}</span>
+          <span className="min-w-0 break-all text-xs text-on-surface-variant">{props.zipFileName}</span>
         ) : null}
         <Button
           type="submit"
-          disabled={!props.zipFileName || props.busyKey === "skill-import-zip"}
+          disabled={!props.zipFileName || props.busyKey !== null}
         >
           {props.busyKey === "skill-import-zip" ? "Importing..." : "Import ZIP"}
         </Button>

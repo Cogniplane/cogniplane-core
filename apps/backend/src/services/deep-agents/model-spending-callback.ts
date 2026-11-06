@@ -28,7 +28,15 @@ export class ModelSpendingCallback extends BaseCallbackHandler {
     private readonly store: Pick<ModelSpendingStore, "startCall" | "completeCall" | "failCall" | "finish">,
     private readonly reservation: SpendingReservation,
     private readonly modelName: string,
-    private readonly signal: AbortSignal
+    private readonly signal: AbortSignal,
+    /**
+     * Backend checks that must pass before a model call starts (the tool
+     * context check). They run here, before the ledger write: LangChain runs
+     * the start handlers in parallel, so a separate handler that refuses the
+     * call could not stop this one from recording it, and a recorded call
+     * that never ran settles as failed.
+     */
+    private readonly admit?: () => Promise<void>
   ) { super(); }
 
   assertAllowance(): void {
@@ -50,6 +58,8 @@ export class ModelSpendingCallback extends BaseCallbackHandler {
     this.tail = new Promise<void>(resolve => { release = resolve; });
     try {
       await previous;
+      // A queued call can outlive its access. Check after the wait.
+      await this.admit?.();
       this.assertAllowance();
       const model = typeof metadata?.ls_model_name === "string" ? metadata.ls_model_name : this.modelName;
       if (calculateCostUsd(model, { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 }) === null) {

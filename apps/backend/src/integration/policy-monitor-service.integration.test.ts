@@ -5,6 +5,7 @@ import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedMembership, seedTenant, seedUser } from "./support/fixtures.js";
+import { ALLOW_WEAKER } from "../test-helpers/data-routes.js";
 
 describe.skipIf(!adminDatabaseUrl())("Monitor summary from recorded policy actions", () => {
   test("counts Monitor gateway matches and excludes resource rechecks in either mode", async () => {
@@ -15,7 +16,7 @@ describe.skipIf(!adminDatabaseUrl())("Monitor summary from recorded policy actio
     const service = new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) });
     const rule = await rules.create(tenantId, {
       name: "Review messages", effect: "require_approval", conditions: { toolNames: ["send_message"] }
-    }, userId);
+    }, userId, ALLOW_WEAKER);
     const input = {
       tenantId, userId, sessionId: null, runtimeId: null, toolName: "send_message",
       category: null, severity: "file_change" as const, serverId: null,

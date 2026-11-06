@@ -16,11 +16,12 @@ export function getMcpAvailability(server: AdminMcpServer): {
   label: string;
   blocker: string | null;
 } {
+  const audience: McpAudience = !server.enabled || !server.isAllowed ? "off" : server.isPublished ? "members" : "test_users";
   if (server.mode === "proxy" && !server.upstreamUrl) {
-    return { audience: "off", label: "Setup incomplete", blocker: "Add an upstream URL." };
+    return { audience, label: "Setup incomplete", blocker: "Add an upstream URL." };
   }
-  if (server.upstreamAuthType !== "none" && !server.upstreamAuthConfigured) {
-    return { audience: "off", label: "Setup incomplete", blocker: "Add an authentication secret." };
+  if (server.mode === "proxy" && server.credentialScope !== "personal" && server.upstreamAuthType !== "none" && !server.upstreamAuthConfigured) {
+    return { audience, label: "Setup incomplete", blocker: "Add an authentication secret." };
   }
   if (!server.enabled || !server.isAllowed) {
     return {

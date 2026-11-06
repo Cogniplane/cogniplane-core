@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
+import { ownerSecurityVersionSql } from "./auth/security-change.js";
 
 export const userSettingsSectionKeys = ["scheduled_jobs", "github", "skills", "mcp", "model"] as const;
 
@@ -55,11 +56,29 @@ export type ScheduledJobRecord = {
   input: Record<string, unknown>;
   settingsSnapshot: Record<string, unknown>;
   enabled: boolean;
+  /** Why the job is paused. Null when the job is on, or off by the owner's choice. */
+  pausedReason: ScheduledJobPausedReason | null;
   consecutiveFailures: number;
   lastRunAt: string | null;
   nextRunAt: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type ScheduledJobPausedReason = "security_change";
+
+/**
+ * A job as the scheduler claimed it. `ownerSecurityVersion` is the security
+ * version of the owner's local account from the session that last saved the
+ * job; null for a WorkOS owner. It stays out of `ScheduledJobRecord`, so API
+ * responses do not carry it.
+ */
+export type ClaimedScheduledJob = ScheduledJobRecord & { ownerSecurityVersion: number | null };
+
+/** What a create or edit stores about the session that saved the job. */
+export type ScheduledJobOwnerSession = {
+  /** The session's local security version; null for a WorkOS session. */
+  ownerSecurityVersion: number | null;
 };
 
 /**
@@ -109,11 +128,23 @@ function mapScheduledJob(row: Record<string, unknown>): ScheduledJobRecord {
     input: toRecord(row.input_json),
     settingsSnapshot: toRecord(row.settings_snapshot_json),
     enabled: Boolean(row.enabled),
+    // The reason applies only while the job is off. Older backend code can
+    // turn a paused job on without clearing it (migration 080).
+    pausedReason: !row.enabled && row.paused_reason === "security_change" ? "security_change" : null,
     consecutiveFailures: Number(row.consecutive_failures ?? 0),
     lastRunAt: isoTimestampOrNull(row.last_run_at),
     nextRunAt: isoTimestampOrNull(row.next_run_at),
     createdAt: isoTimestamp(row.created_at),
     updatedAt: isoTimestamp(row.updated_at)
+  };
+}
+
+function mapClaimedScheduledJob(row: Record<string, unknown>): ClaimedScheduledJob {
+  return {
+    ...mapScheduledJob(row),
+    ownerSecurityVersion: row.owner_security_version === null || row.owner_security_version === undefined
+      ? null
+      : Number(row.owner_security_version)
   };
 }
 
@@ -168,6 +199,12 @@ async function countEnabledScheduledJobs(
 
   return Number(result.rows[0]?.count ?? 0);
 }
+
+// True when the owner's local account had no security change (password change
+// or reset, sign out everywhere, disable, a factor change) after the session
+// that last saved the job, or the owner is a WorkOS account. Use it in a
+// statement on `scheduled_jobs`.
+const OWNER_SECURITY_CURRENT_SQL = ownerSecurityVersionSql("scheduled_jobs");
 
 export class UserSettingsStore {
   constructor(
@@ -273,7 +310,7 @@ export class UserSettingsStore {
       settingsSnapshot: Record<string, unknown>;
       enabled: boolean;
       nextRunAt: string | null;
-    },
+    } & ScheduledJobOwnerSession,
     admission: ScheduledJobAdmission
   ): Promise<CreateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
@@ -301,9 +338,10 @@ export class UserSettingsStore {
             input_json,
             settings_snapshot_json,
             enabled,
-            next_run_at
+            next_run_at,
+            owner_security_version
           )
-          VALUES ($1, $2, $3, $4, $5, 'cron', $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13)
+          VALUES ($1, $2, $3, $4, $5, 'cron', $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)
           RETURNING *
         `,
         [
@@ -319,7 +357,8 @@ export class UserSettingsStore {
           JSON.stringify(input.input),
           JSON.stringify(input.settingsSnapshot),
           input.enabled,
-          input.nextRunAt
+          input.nextRunAt,
+          input.ownerSecurityVersion
         ]
       );
 
@@ -332,6 +371,9 @@ export class UserSettingsStore {
    * transition is decided from the job row read under its row lock, not from
    * a caller's earlier read, so enabling a job that is already enabled never
    * counts it twice. Lock order is always quota lock, then job row.
+   *
+   * The edit is the owner's confirmation of the job: it stores the saving
+   * session's security version and clears a pause reason.
    */
   async updateScheduledJob(
     input: {
@@ -348,7 +390,7 @@ export class UserSettingsStore {
       settingsSnapshot: Record<string, unknown>;
       enabled: boolean;
       nextRunAt: string | null;
-    },
+    } & ScheduledJobOwnerSession,
     admission: ScheduledJobAdmission
   ): Promise<UpdateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
@@ -388,6 +430,8 @@ export class UserSettingsStore {
             settings_snapshot_json = $11::jsonb,
             enabled = $12,
             next_run_at = $13,
+            owner_security_version = $14,
+            paused_reason = NULL,
             updated_at = NOW()
           WHERE tenant_id = $1 AND job_id = $2 AND user_id = $3
           RETURNING *
@@ -405,7 +449,8 @@ export class UserSettingsStore {
           JSON.stringify(input.input),
           JSON.stringify(input.settingsSnapshot),
           input.enabled,
-          input.nextRunAt
+          input.nextRunAt,
+          input.ownerSecurityVersion
         ]
       );
 
@@ -460,12 +505,15 @@ export class UserSettingsStore {
    * is the *only* thing isolating one tenant's jobs from another — it must
    * always be present and must come from the job row the worker already read,
    * never from caller-supplied input.
+   *
+   * A job whose owner had a security change since the job was saved is not
+   * claimed. The worker then pauses it with `pauseJobForSecurityChange`.
    */
   async claimJob(
     tenantId: string,
     jobId: string,
     nextRunAt: string | null
-  ): Promise<ScheduledJobRecord | null> {
+  ): Promise<ClaimedScheduledJob | null> {
     const result = await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
@@ -487,12 +535,57 @@ export class UserSettingsStore {
             WHERE m.tenant_id = scheduled_jobs.tenant_id
               AND m.user_id = scheduled_jobs.user_id
           )
+          AND ${OWNER_SECURITY_CURRENT_SQL}
         RETURNING *
       `,
       [tenantId, jobId, nextRunAt]
     );
 
-    return result.rows[0] ? mapScheduledJob(result.rows[0]) : null;
+    return result.rows[0] ? mapClaimedScheduledJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Pause an enabled job whose owner had a security change since the job was
+   * saved: enabled = FALSE, next_run_at = NULL, paused_reason =
+   * 'security_change'. The job and its run history stay. Returns true when
+   * this call paused the job. Only the owner can turn it on again, with an
+   * edit from a current session (`updateScheduledJob`). Runs on the
+   * RLS-bypassing scheduler pool, so the `tenant_id` predicate is the sole
+   * isolation guarantee and must always be present.
+   */
+  async pauseJobForSecurityChange(tenantId: string, jobId: string): Promise<boolean> {
+    const result = await this.schedulerDb.query(
+      `
+        UPDATE scheduled_jobs
+        SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
+        WHERE tenant_id = $1
+          AND job_id = $2
+          AND enabled = TRUE
+          AND NOT (${OWNER_SECURITY_CURRENT_SQL})
+      `,
+      [tenantId, jobId]
+    );
+
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * The current security version of a job owner's local account, or null
+   * for a WorkOS owner, who has no local identity. The worker compares it
+   * with the claimed job's `ownerSecurityVersion` before the turn starts.
+   * Scheduler pool, read only.
+   */
+  async getOwnerSecurityVersion(tenantId: string, userId: string): Promise<number | null> {
+    const result = await this.schedulerDb.query<{ security_version: number }>(
+      `
+        SELECT security_version
+        FROM local_identities
+        WHERE tenant_id = $1 AND user_id = $2
+      `,
+      [tenantId, userId]
+    );
+
+    return result.rows[0] ? Number(result.rows[0].security_version) : null;
   }
 
   /**
@@ -534,7 +627,7 @@ export class UserSettingsStore {
     await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
-        SET enabled = FALSE, next_run_at = NULL, updated_at = NOW()
+        SET enabled = FALSE, next_run_at = NULL, paused_reason = NULL, updated_at = NOW()
         WHERE tenant_id = $1 AND job_id = $2
       `,
       [tenantId, jobId]

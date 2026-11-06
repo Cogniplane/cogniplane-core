@@ -172,3 +172,19 @@ it("does not mark the list loaded while the first load is retrying, or after it 
   await waitFor(() => expect(client.getQueryState(queryKeys.admin.mcpServers())?.status).toBe("error"));
   expect(result.current).toMatchObject({ loading: false, loaded: false, mcpServers: [] });
 });
+
+it("distinguishes successful empty data from a failed refresh with retained rows", async () => {
+  const { result } = await renderLoaded();
+  const generation = result.current.listGeneration;
+  vi.mocked(listAdminMcpServers).mockRejectedValueOnce(new Error("Synthetic refresh unavailable"));
+  await act(async () => { await result.current.reload(); });
+  await waitFor(() => expect(result.current.loadError).toBe("Synthetic refresh unavailable"));
+  expect(result.current.loaded).toBe(true);
+  expect(result.current.mcpServers.map(server => server.serverId)).toEqual(["docs", "search"]);
+  expect(result.current.listGeneration).toBe(generation);
+  vi.mocked(listAdminMcpServers).mockResolvedValueOnce([]);
+  await act(async () => { await result.current.reload(); });
+  await waitFor(() => expect(result.current.mcpServers).toEqual([]));
+  expect(result.current.loaded).toBe(true);
+  expect(result.current.loadError).toBeNull();
+});

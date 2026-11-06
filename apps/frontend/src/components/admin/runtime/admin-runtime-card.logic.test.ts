@@ -1,91 +1,35 @@
 import { describe, expect, test } from "vitest";
 import { withUtcDateLocale } from "../../../test-helpers/date-locale";
-
-
 import { RuntimeSessionSummarySchema, type RuntimeSessionSummary } from "@cogniplane/shared-types";
-
-import {
-  countActiveSessions,
-  filterRuntimeSessions,
-  formatRuntimeTimestamp
-} from "./admin-runtime-card.logic";
+import { countActiveSessions, filterRuntimeSessions, formatRuntimeTimestamp, runtimeStatusBucket } from "./admin-runtime-card.logic";
 
 withUtcDateLocale();
-
-function makeSession(
-  partial: Partial<RuntimeSessionSummary> & { runtimeId: string; sessionId: string }
-): RuntimeSessionSummary {
-  // Parse through the real schema so this fixture can never drift from the
-  // wire contract: a removed/renamed field (the old `mode`) or a newly-required
-  // one (the configSummary hashes) fails here instead of hiding behind a cast.
+function session(status: string, i: number): RuntimeSessionSummary {
   return RuntimeSessionSummarySchema.parse({
-    runtimeId: partial.runtimeId,
-    sessionId: partial.sessionId,
-    status: partial.status ?? "running",
-    healthStatus: partial.healthStatus ?? "healthy",
-    runtimeProvider: partial.runtimeProvider ?? "deep-agents",
-    startedAt: partial.startedAt ?? "2026-05-09T12:00:00Z",
-    lastActiveAt: partial.lastActiveAt ?? "2026-05-09T12:00:00Z",
-    updatedAt: partial.updatedAt ?? "2026-05-09T12:00:00Z",
-    configSummary: partial.configSummary ?? {
-      manifestHash: "manifest-hash",
-      configBundleHash: "config-bundle-hash",
-      runtimePolicy: { id: "default", version: 1, hash: "policy-hash" },
-      skillVersions: [],
-      mcpServerVersions: []
-    }
+    sessionId: `session-${i}`, runtimeId: `runtime-${i}`, status, healthStatus: "healthy", runtimeProvider: "deep-agents",
+    startedAt: null, lastActiveAt: null, updatedAt: "2026-05-09T12:00:00Z",
+    configSummary: { manifestHash: "m", configBundleHash: "c", runtimePolicy: { id: "default", version: 1, hash: "p" }, skillVersions: [], mcpServerVersions: [] }
   });
 }
-
-describe("filterRuntimeSessions", () => {
-  const sessions = [
-    makeSession({ runtimeId: "rt-aaa", sessionId: "sess-1", status: "running" }),
-    makeSession({ runtimeId: "rt-bbb", sessionId: "sess-2", status: "stopped" }),
-    makeSession({ runtimeId: "rt-ccc", sessionId: "sess-3", status: "starting" })
-  ];
-
-  test("empty search returns all when status is 'all'", () => {
-    expect(filterRuntimeSessions(sessions, "", "all")).toHaveLength(3);
+const sessions = ["active", "terminated", "error", "starting", "stopped", "future-state"].map(session);
+describe("recorded lifecycle", () => {
+  test("only counts current active records, including when a terminated record still reports healthy", () => {
+    expect(countActiveSessions(sessions)).toBe(1);
+    expect(filterRuntimeSessions(sessions, "", "active").map(s => s.status)).toEqual(["active"]);
+    expect(filterRuntimeSessions(sessions, "", "terminated").map(s => s.status)).toEqual(["terminated"]);
   });
-
-  test("search matches sessionId or runtimeId case-insensitively", () => {
-    expect(filterRuntimeSessions(sessions, "AAA", "all")).toHaveLength(1);
-    expect(filterRuntimeSessions(sessions, "sess-2", "all")).toHaveLength(1);
+  test("keeps legacy and unknown lifecycle values under Other states", () => {
+    expect(filterRuntimeSessions(sessions, "", "other").map(s => s.status)).toEqual(["starting", "stopped", "future-state"]);
+    expect(runtimeStatusBucket("")).toBe("other");
+    expect(countActiveSessions([session("future-state", 9)])).toBe(0);
   });
-
-  test("'active' bucket excludes stopped sessions", () => {
-    const result = filterRuntimeSessions(sessions, "", "active");
-    expect(result.map((s) => s.sessionId)).toEqual(["sess-1", "sess-3"]);
-  });
-
-  test("'stopped' bucket only includes stopped sessions", () => {
-    const result = filterRuntimeSessions(sessions, "", "stopped");
-    expect(result.map((s) => s.sessionId)).toEqual(["sess-2"]);
-  });
-
-  test("search and status combine (AND)", () => {
-    const result = filterRuntimeSessions(sessions, "rt-", "stopped");
-    expect(result).toHaveLength(1);
+  test("combines a trimmed case-insensitive ID search with lifecycle", () => {
+    expect(filterRuntimeSessions(sessions, " RUNTIME-1 ", "all")).toEqual([sessions[1]]);
+    expect(filterRuntimeSessions(sessions, "session-1", "active")).toEqual([]);
+    expect(filterRuntimeSessions(sessions, "", "error")).toEqual([sessions[2]]);
   });
 });
-
-describe("countActiveSessions", () => {
-  test("counts non-stopped sessions", () => {
-    const sessions = [
-      makeSession({ runtimeId: "a", sessionId: "1", status: "running" }),
-      makeSession({ runtimeId: "b", sessionId: "2", status: "stopped" }),
-      makeSession({ runtimeId: "c", sessionId: "3", status: "starting" })
-    ];
-    expect(countActiveSessions(sessions)).toBe(2);
-  });
-});
-
-describe("formatRuntimeTimestamp", () => {
-  test("nullish renders as 'n/a'", () => {
-    expect(formatRuntimeTimestamp(null)).toBe("n/a");
-  });
-
-  test("renders the calendar date and time in en-CA", () => {
-    expect(formatRuntimeTimestamp("2026-05-09T12:00:00Z")).toBe("May 9, 2026, 12:00 p.m.");
-  });
+describe("timestamps", () => {
+  test("makes missing timestamps explicit", () => expect(formatRuntimeTimestamp(null)).toBe("Unavailable"));
+  test("uses the local en-CA calendar format", () => expect(formatRuntimeTimestamp("2026-05-09T12:00:00Z")).toBe("May 9, 2026, 12:00 p.m."));
 });

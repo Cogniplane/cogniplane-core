@@ -10,13 +10,22 @@ import {
   PersonalSkillScopeSchema
 } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
+import type { DataRouteControl } from "../services/data-route-control.js";
 import { apiError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
 import { SubmissionAccessError, SubmissionConflictError, SubmissionNotFoundError,
   SubmissionValidationError } from "../services/skills/organization-skill-submission-store.js";
 
-export type SubmissionStores = { organizationSkillSubmissions: AppDependencies["organizationSkillSubmissions"] };
+export type SubmissionStores = {
+  organizationSkillSubmissions: AppDependencies["organizationSkillSubmissions"];
+  /**
+   * Step-up and owner notice of a release: a released skill gives its
+   * instructions to users' agents, and it stays after the victim of a stolen
+   * token signs out.
+   */
+  dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
+};
 const paramsSchema = z.object({ id: z.string().uuid() });
 export async function registerOrganizationSkillSubmissionRoutes(app: FastifyInstance, stores: SubmissionStores) {
   await app.register(async routes => {
@@ -108,7 +117,18 @@ export async function registerOrganizationSkillSubmissionRoutes(app: FastifyInst
       const {tenantId,userId}=request.auth; const failed=checkScope(request.body,reply,tenantId,userId); if(failed) return failed;
       const params=parseRequestInput(reply,paramsSchema,request.params); if(!params.ok) return params.response;
       const body=parseRequestInput(reply,OrganizationSkillSubmissionReleaseSchema,request.body); if(!body.ok) return body.response;
-      await stores.organizationSkillSubmissions.release(tenantId,userId,params.value.id,body.value);
+      // A member cannot release: the store checks the role in its
+      // transaction. This early check only spares a member the step-up prompt.
+      if (!request.auth.isAdmin) throw new SubmissionAccessError();
+      if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/skill-submissions/:id/release"))) return reply;
+      // The owner notice commits with the release.
+      await stores.organizationSkillSubmissions.release(tenantId,userId,params.value.id,body.value,{
+        alsoInTransaction: async (client, skillId) => {
+          const notice = stores.dataRoutes.ownerNotice(request,
+            { setting: "skill_release", skillId, change: "submission_released", audience: body.value.audience });
+          if (notice) await notice(client);
+        }
+      });
       reply.header("cache-control","private, no-store"); return detail(tenantId,userId,params.value.id,true);
     });
   });

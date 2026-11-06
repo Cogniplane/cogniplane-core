@@ -121,7 +121,42 @@ describe.skipIf(!adminDatabaseUrl())("detached turn persistence", () => {
     await messages.markInterruptedIfActive(tenantId, row.messageId, userId);
     expect((await messages.listBySession(tenantId, sessionId, userId)).messages[0]).toMatchObject({
       status: "interrupted", content: "partial",
-      toolResults: [{ status: "failed" }]
+      toolResults: [{ status: "in_progress" }]
     });
+  });
+});
+
+describe.skipIf(!adminDatabaseUrl())("tool calls of a finished turn", () => {
+  // A stopped turn keeps a call that never returned as in_progress, which history
+  // shows as interrupted. A turn that completed or failed has no running call.
+  test.each([
+    ["interrupted", "in_progress"],
+    ["completed", "failed"],
+    ["error", "failed"]
+  ] as const)("a turn that ends %s saves its unreturned call as %s and leaves a returned call alone", async (turnStatus, unreturned) => {
+    const tenantId = await seedTenant();
+    const userId = await seedUser();
+    const otherUser = await seedUser();
+    const sessionId = await seedSession(tenantId, userId);
+    const messages = new MessageStore(appPool());
+    const row = await messages.create({ tenantId, sessionId, userId, role: "assistant", status: "streaming", content: "partial" });
+    const call = (toolResultId: string, status: "in_progress" | "completed") => messages.upsertToolResult({
+      tenantId, messageId: row.messageId, sessionId, userId, toolResultId, kind: "command", title: "execute", status,
+      command: "sleep 20", cwd: null, server: null, toolName: "execute", input: "{}", output: status === "completed" ? "ok" : "",
+      exitCode: null, durationMs: null, textOffset: 0
+    });
+    const open = `open-${row.messageId}`;
+    const returned = `returned-${row.messageId}`;
+    await call(open, "in_progress");
+    await call(returned, "completed");
+
+    // Another user's write finds no row and changes no call.
+    expect(await messages.updateContent(tenantId, row.messageId, otherUser, turnStatus, "x")).toBeNull();
+    await messages.updateContent(tenantId, row.messageId, userId, turnStatus, "partial");
+
+    const { messages: [saved] } = await messages.listBySession(tenantId, sessionId, userId);
+    expect(saved).toMatchObject({ status: turnStatus });
+    expect(Object.fromEntries(saved!.toolResults.map((tool) => [tool.toolResultId, tool.status])))
+      .toEqual({ [open]: unreturned, [returned]: "completed" });
   });
 });

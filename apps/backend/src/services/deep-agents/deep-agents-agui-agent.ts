@@ -1,6 +1,10 @@
 // Drives the session graph through AG-UI events. Tool context is injected before
 // streaming; the backend owns approval persistence and keyed interrupt resumes.
 // The mapper emits tool attribution and native todo state updates.
+//
+// A call of the main agent that waits for approval shows its tool card before
+// the approval is asked, and the approval names that card's server ID. A
+// declined call's card gets the message that the model gets.
 
 import { AbstractAgent, EventType, type BaseEvent, type RunAgentInput } from "@ag-ui/client";
 import { Observable } from "rxjs";
@@ -10,6 +14,9 @@ import type { AGUITurnBackend } from "./deep-agents-agui-backend.js";
 import {
   createStreamEventsToAGUIState,
   flushOpenAGUIMessages,
+  settleApprovalCalls,
+  settleUnstartedCalls,
+  showApprovalCalls,
   streamEventsToAGUI
 } from "./stream-events-to-agui.js";
 
@@ -31,11 +38,13 @@ export interface DeepAgentsAGUIAgentConfig {
   onApprovalRound?: (signal?: AbortSignal) => Promise<void>;
   /** Aborts the current turn when Stop or the watchdog fires. */
   approvalAbortSignal?: AbortSignal;
+  assistantMessageId?: string;
   agentId?: string;
   description?: string;
 }
 
 export class DeepAgentsAGUIAgent extends AbstractAgent {
+  private readonly assistantMessageId: string;
   private readonly backend: AGUITurnBackend;
   private readonly toolContextId: string | null;
   private readonly onApprovalRound?: (signal?: AbortSignal) => Promise<void>;
@@ -48,6 +57,7 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
       description: config.description
     });
     this.backend = config.backend;
+    this.assistantMessageId = config.assistantMessageId ?? uuidv7();
     this.toolContextId = config.toolContextId;
     this.onApprovalRound = config.onApprovalRound;
     this.approvalAbortSignal = config.approvalAbortSignal;
@@ -64,8 +74,10 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
         const runId = input.runId ?? uuidv7();
         const mapperState = createStreamEventsToAGUIState();
         const mapperOptions = {
+          assistantMessageId: this.assistantMessageId,
           mcpToolNames: this.backend.mcpToolNames,
-          mcpToolServers: this.backend.mcpToolServers
+          mcpToolServers: this.backend.mcpToolServers,
+          modelCallIdOf: (runId: string) => this.backend.modelCallIdOf?.(runId)
         };
 
         try {
@@ -82,10 +94,19 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
               if (cancelled) return;
               for (const event of streamEventsToAGUI(mapperState, raw, mapperOptions)) emit(event);
             }
-            for (const event of flushOpenAGUIMessages(mapperState)) emit(event);
+            for (const event of flushOpenAGUIMessages(mapperState, false)) emit(event);
 
-            const actions = await this.backend.getPendingActions();
-            if (actions.length === 0) break;
+            const pending = await this.backend.getPendingActions();
+            if (pending.length === 0) break;
+
+            // The card of each linked call shows first, so the approval can
+            // name it. An unlinked approval names no card.
+            const shown = showApprovalCalls(mapperState, pending, mapperOptions);
+            for (const event of shown.events) emit(event);
+            const actions = pending.map((action, index) => {
+              const toolCallId = shown.toolCallIds[index];
+              return toolCallId ? { ...action, toolCallId } : action;
+            });
 
             // The backend emits the approval prompt(s) (it owns the real
             // decision-route approvalId) and blocks until each interrupt is
@@ -93,6 +114,11 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
             // each get their own decision.
             const decisions = await this.backend.awaitDecisions(actions, emit);
             if (cancelled) return;
+            // A stopped turn rejects its approvals, but nobody declined them:
+            // their cards stay unfinished, and the turn ends interrupted.
+            if (!this.approvalAbortSignal?.aborted) {
+              for (const event of settleApprovalCalls(mapperState, actions, decisions)) emit(event);
+            }
             // Push the tool-context TTL and the active-turn staleness window
             // out before resuming: this round consumed wall-clock time that
             // neither budget accounts for.
@@ -105,6 +131,8 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
             streamInput = this.backend.buildResumeInput(actions, decisions);
           }
 
+          for (const event of settleUnstartedCalls(mapperState)) emit(event);
+          for (const event of flushOpenAGUIMessages(mapperState)) emit(event);
           emit({ type: EventType.RUN_FINISHED, threadId: this.backend.threadId, runId } as BaseEvent);
           if (!cancelled) subscriber.complete();
         } catch (err) {

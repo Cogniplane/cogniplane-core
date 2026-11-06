@@ -174,7 +174,7 @@ export function AdminPolicyDecisionsCard({
           </div>
         ) : null}
         {scoped ? (
-          <DecisionScope ref={scopeRef} filters={filters} rules={rules} total={loading ? null : total} onClear={clearDraft} />
+          <DecisionScope ref={scopeRef} filters={filters} rules={rules} total={loading || fetching || error ? null : total} onClear={clearDraft} />
         ) : null}
         <div id={filtersId} hidden={!filtersOpen} className="flex flex-col gap-3">
         <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -256,11 +256,11 @@ export function AdminPolicyDecisionsCard({
         </div>
         </div>
 
-        {error ? <p className="text-sm text-danger">{error}</p> : null}
+        {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
 
         {/* Table */}
         {urlProblems.length > 0 ? null : loading ? (
-          <p className="text-sm text-on-surface-faint">Loading rule matches…</p>
+          <p role="status" className="text-sm text-on-surface-faint">Loading rule matches…</p>
         ) : decisions.length === 0 ? (
           error ? null : (
             <p className="text-sm text-on-surface-variant">
@@ -276,7 +276,7 @@ export function AdminPolicyDecisionsCard({
                   <th className="py-1.5 pr-3 font-medium">Tool</th>
                   <th className="py-1.5 pr-3 font-medium">Server</th>
                   <th className="py-1.5 pr-3 font-medium">When</th>
-                  <th className="py-1.5 font-medium"><span className="sr-only">Details</span></th>
+                  <th className="relative py-1.5 font-medium"><span className="sr-only">Details</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -310,10 +310,10 @@ export function AdminPolicyDecisionsCard({
         {/* Pagination footer */}
         {total > 0 ? (
           <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-on-surface-faint">
-            <span>
+            {fetching ? <span role="status">Loading rule matches. Previous rows remain visible.</span> : <span>
               Showing {rangeStart}–{rangeEnd} of {total}
               {pageCount > 1 ? ` · Page ${page + 1} of ${pageCount}` : null}
-            </span>
+            </span>}
             <span className="flex items-center gap-2">
               <Button type="button" variant="outline" size="sm" onClick={onPrev} disabled={page === 0 || fetching}>
                 ‹ Prev
@@ -361,7 +361,7 @@ function DecisionScope({
       tabIndex={-1}
       role="group"
       aria-labelledby="dec-scope-title"
-      className="flex flex-col gap-3 rounded-lg border-l-2 border-l-primary bg-surface-container-low px-4 py-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/50 sm:flex-row sm:items-start sm:justify-between"
+      className="flex flex-col gap-3 rounded-lg border-l border-l-primary bg-surface-container-low px-4 py-3 outline-none focus-visible:ring-2 focus-visible:ring-ring/50 sm:flex-row sm:items-start sm:justify-between"
     >
       <div className="min-w-0 text-sm">
         <p id="dec-scope-title" className={SECTION_LABEL}>Scope</p>
@@ -412,7 +412,7 @@ function DecisionDetailDialog({
 
   return (
     <Dialog open={decisionId !== null} onOpenChange={(open) => (!open ? onClose() : undefined)}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Rule match detail</DialogTitle>
           <DialogDescription>
@@ -420,9 +420,9 @@ function DecisionDetailDialog({
           </DialogDescription>
         </DialogHeader>
         {loading ? (
-          <p className="text-sm text-on-surface-faint">Loading…</p>
+          <p role="status" className="text-sm text-on-surface-faint">Loading rule match detail…</p>
         ) : error ? (
-          <p className="text-sm text-danger">{error}</p>
+          <p role="alert" className="text-sm text-danger">{error}</p>
         ) : view ? (
           <div className="flex flex-col gap-3 text-sm">
             <div className="flex flex-wrap items-center gap-1.5">
@@ -430,7 +430,7 @@ function DecisionDetailDialog({
               {view.enforced ? <span className={PILL_RED}>applied</span> : null}
               {view.severity ? <span className={PILL_GRAY}>{SEVERITY_LABELS[view.severity]}</span> : null}
             </div>
-            <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1 text-on-surface-variant">
+            <dl className="grid grid-cols-1 gap-x-3 gap-y-1 text-on-surface-variant sm:grid-cols-[8rem_minmax(0,1fr)]">
               <Field label="Tool">{view.toolName}</Field>
               <Field label="Server">{view.serverId ?? "—"}</Field>
               <Field label="Category">{view.toolCategory ?? "—"}</Field>
@@ -441,7 +441,7 @@ function DecisionDetailDialog({
               <Field label="When">{new Date(view.createdAt).toLocaleString()}</Field>
             </dl>
             {view.explanation ? (
-              <p className="rounded bg-surface-container p-2 text-on-surface-variant">{view.explanation}</p>
+              <p className="rounded bg-surface-container p-2 text-on-surface-variant [overflow-wrap:anywhere]">{view.explanation}</p>
             ) : null}
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-on-surface-faint">
@@ -462,7 +462,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (
     <>
       <dt className="text-on-surface-faint">{label}</dt>
-      <dd className="text-on-surface">{children}</dd>
+      <dd className="min-w-0 pb-2 text-on-surface [overflow-wrap:anywhere] sm:pb-0">{children}</dd>
     </>
   );
 }

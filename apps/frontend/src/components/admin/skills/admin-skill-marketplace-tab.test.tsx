@@ -35,25 +35,25 @@ it("lists ready entries with their details and imports one", () => {
     marketplace: { ...common, status: "ready", sourceUrl: "https://x/m.json", fetchedAt: "2026-10-01T00:00:00.000Z", error: null, skills: [entry] }
   });
 
-  expect(screen.getByText("1 curated")).toBeTruthy();
+  expect(screen.getByText(/^1 curated/)).toBeTruthy();
   expect(screen.getByText("recommended")).toBeTruthy();
   expect(screen.getByText("skill v1.2.0")).toBeTruthy();
-  // The commit ref is cut to 12 characters.
-  expect(screen.getByText("0123456789ab")).toBeTruthy();
+  // Keep the full ref available for source review.
+  expect(screen.getByText(entry.ref)).toBeTruthy();
   expect(screen.getByRole("link", { name: "View source" }).getAttribute("href")).toBe(entry.sourceUrl);
 
   fireEvent.click(screen.getByRole("button", { name: "Import skill" }));
   expect(onImportMarketplace).toHaveBeenCalledWith(entry);
 });
 
-it("disables only the entry being imported", () => {
+it("holds other catalog imports until the pending entry finishes", () => {
   renderTab({
     busyKey: "skill-import-marketplace-pdf",
     marketplace: { ...common, status: "ready", sourceUrl: "https://x/m.json", fetchedAt: "2026-10-01T00:00:00.000Z", error: null, skills: [entry, { ...entry, slug: "csv", name: "CSV tools" }] }
   });
 
   const buttons = screen.getAllByRole("button", { name: /Import/ }) as HTMLButtonElement[];
-  expect(buttons.map((button) => [button.textContent, button.disabled])).toEqual([["Importing...", true], ["Import skill", false]]);
+  expect(buttons.map((button) => [button.textContent, button.disabled])).toEqual([["Importing...", true], ["Import skill", true]]);
 });
 
 it("explains a disabled catalog and shows an error with its source", () => {
@@ -120,4 +120,33 @@ it("enables Save only for a changed URL, and Clear only when a URL is saved", ()
   renderTab({ manifestUrl: "https://x/m.json", manifestUrlDraft: "https://x/new.json", busyKey: "skill-marketplace-manifest-url" });
   expect((screen.getByRole("button", { name: "Saving..." }) as HTMLButtonElement).disabled).toBe(true);
   expect((screen.getByRole("button", { name: "Clear" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("shows a failed catalog read with a local retry instead of a loading claim", () => {
+  const retry = vi.fn();
+  renderTab({ catalogState: { status: "failed", refreshing: false, error: "Catalog offline", retry } });
+  expect(screen.queryByText("Loading curated skills...")).toBeNull();
+  expect(screen.getByRole("alert").textContent).toBe("Catalog offline");
+  fireEvent.click(screen.getByRole("button", { name: "Retry marketplace" }));
+  expect(retry).toHaveBeenCalledOnce();
+});
+
+it("keeps a stale catalog readable but blocks imports until refreshed", () => {
+  renderTab({ catalogState: { status: "stale", refreshing: false, error: "Catalog offline", retry: vi.fn() }, marketplace: { ...common, status: "ready", sourceUrl: "https://x/m.json", fetchedAt: "2026-10-01T00:00:00.000Z", error: null, skills: [entry] } });
+  expect(screen.getByText(entry.name)).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Import skill" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("locks configuration on an unknown or stale saved URL and names the known value separately", () => {
+  renderTab({ manifestUrl: undefined, manifestState: { status: "failed", refreshing: false, error: "Saved URL offline", retry: vi.fn() } });
+  expect((screen.getByLabelText("Marketplace manifest URL") as HTMLInputElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Save manifest URL" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("Saved organization override: not loaded")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Retry saved URL" })).toBeTruthy();
+});
+
+it("shows a successful empty catalog without a loading or disabled claim", () => {
+  renderTab({ marketplace: { ...common, status: "ready", sourceUrl: "https://x/m.json", fetchedAt: "2026-10-01T00:00:00.000Z", error: null } });
+  expect(screen.getByText(/This catalog has no skills/)).toBeTruthy();
+  expect(screen.queryByText("Loading curated skills...")).toBeNull();
 });

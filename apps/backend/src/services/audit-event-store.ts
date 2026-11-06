@@ -12,6 +12,14 @@ export type AuditEventInput = {
   payload: Record<string, unknown>;
   ipAddress?: string | null;
   userAgent?: string | null;
+  /**
+   * More writes that must commit with this event, and so with the change
+   * that it records: they run in the event's transaction, after its row. Not
+   * stored. A data route puts the owner notice here
+   * (DataRouteControl.ownerNotice), so every store that writes the change's
+   * audit event in the change's transaction also queues the notice there.
+   */
+  alsoInTransaction?: (client: PoolClient) => Promise<void>;
 };
 
 export type ProjectActivityEvent = {
@@ -83,6 +91,36 @@ export class AuditEventStore {
       (client) => AuditEventStore.createInTransaction(client, input));
   }
 
+  // A system action with no acting user, such as a background job.
+  async createSystemEvent(input: Omit<AuditEventInput, "userId">): Promise<void> {
+    await withTenantScope(this.db, input.tenantId,
+      (client) => AuditEventStore.createInTransaction(client, { ...input, userId: null }));
+  }
+
+  /**
+   * True when the tenant has an event of this type, written at or after
+   * `since`, whose payload names the PII scan run. A PII scan that finishes
+   * the decision of an earlier attempt uses it so that it does not write the
+   * same event again. `since` keeps the read on the tenant and type index.
+   */
+  async hasPiiScanRunEvent(
+    tenantId: string,
+    type: AuditEventType,
+    scanRunId: string,
+    since: Date
+  ): Promise<boolean> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `SELECT 1 FROM audit_events
+         WHERE tenant_id = $1 AND event_type = $2 AND created_at >= $3
+           AND payload->>'scanRunId' = $4
+         LIMIT 1`,
+        [tenantId, type, since, scanRunId]
+      );
+      return result.rows.length > 0;
+    });
+  }
+
   async listProjectActivity(
     tenantId: string,
     projectId: string,
@@ -141,5 +179,6 @@ export class AuditEventStore {
         input.userAgent ?? null
       ]
     );
+    if (input.alsoInTransaction) await input.alsoInTransaction(client);
   }
 }

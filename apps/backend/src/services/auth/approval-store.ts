@@ -21,6 +21,8 @@ export type ApprovalRecord = {
   status: ApprovalStatus;
   decision: "approve" | "reject" | null;
   rememberForTurn?: boolean;
+  /** The server ID of the proposed tool call, when the runtime proved the link. */
+  toolCallId?: string;
   requestPayload: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -51,6 +53,7 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
         : "pending",
     decision: row.decision === "approve" || row.decision === "reject" ? row.decision : null,
     rememberForTurn: row.remember_for_turn === true,
+    ...(typeof row.tool_call_id === "string" && row.tool_call_id ? { toolCallId: row.tool_call_id } : {}),
     requestPayload:
       row.request_payload && typeof row.request_payload === "object"
         ? (row.request_payload as Record<string, unknown>)
@@ -98,9 +101,10 @@ export class ApprovalStore {
             status,
             decision,
             request_payload,
-            expires_at
+            expires_at,
+            tool_call_id
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17)
           RETURNING *
         `,
         [
@@ -119,7 +123,8 @@ export class ApprovalStore {
           input.status,
           input.decision,
           JSON.stringify(input.requestPayload),
-          input.expiresAt
+          input.expiresAt,
+          input.toolCallId ?? null
         ]
       );
 

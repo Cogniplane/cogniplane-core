@@ -23,9 +23,10 @@
 // actions, and it does not recover a turn after a process stops.
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
+import type { TurnStopReason } from "@cogniplane/shared-types";
 
 import { AguiTurnAccumulator, type AccumulatedToolResult } from "./agui-turn-accumulator.js";
-import { isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
+import { interruptedFinishReason, isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
 import type { MessageStore } from "./message-store.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -35,7 +36,7 @@ const MAX_RUNTIME_NOTICES = 50;
 
 export type TurnOutcome =
   | { status: "completed" }
-  | { status: "interrupted" }
+  | { status: "interrupted"; reason?: TurnStopReason }
   | { status: "error"; message: string };
 
 export type FinalizedTurn = {
@@ -150,7 +151,8 @@ export class TurnTranscript {
     if (isAGUIInterruptedFinish(event)) {
       // Turn-abort marker carried on RUN_FINISHED.result. See
       // AGUI_INTERRUPTED_RESULT for why it is not the AG-UI interrupt outcome.
-      this.eventOutcome = { status: "interrupted" };
+      const reason = interruptedFinishReason(event);
+      this.eventOutcome = reason ? { status: "interrupted", reason } : { status: "interrupted" };
     } else if (event.type === EventType.RUN_ERROR) {
       // Provider and graph failures arrive as an event, not a throw.
       const message = (event as { message?: unknown }).message;
@@ -241,7 +243,7 @@ export class TurnTranscript {
     // Rich parts are best effort: a failure here must not change the saved
     // text/status, which the context meter and job ledger depend on.
     try {
-      await this.writeRichTranscript();
+      await this.writeRichTranscript(outcome);
     } catch (err) {
       this.input.logger?.warn({ err, sessionId: this.input.sessionId, tenantId: this.input.tenantId },
         "failed to persist AG-UI turn transcript (reasoning/plan/tool results)");
@@ -261,8 +263,10 @@ export class TurnTranscript {
   private async writeStatus(outcome: TurnOutcome, text: string, durationMs: number | undefined): Promise<boolean> {
     const { messages, tenantId, messageId, userId, sessionId, logger } = this.input;
     try {
+      // The stop reason goes only with an interrupted turn that the backend stopped.
+      const reason = outcome.status === "interrupted" ? outcome.reason : undefined;
       const row = await messages.updateContent(
-        tenantId, messageId, userId, outcome.status, contentFor(outcome, text), durationMs);
+        tenantId, messageId, userId, outcome.status, contentFor(outcome, text), durationMs, ...(reason ? [reason] as const : []));
       if (row) return true;
       logger?.error({ sessionId, tenantId, messageId }, "the assistant turn outcome updated no message row");
     } catch (err) {
@@ -286,8 +290,10 @@ export class TurnTranscript {
   }
 
   // Writes only what the turn produced and what progress writes did not save.
-  // A chat-only turn touches nothing here.
-  private async writeRichTranscript(): Promise<void> {
+  // A chat-only turn touches nothing here. A call that never returned is
+  // `failed` after a completed turn or an error, and stays `in_progress` after
+  // a stop: nothing reported that it failed, and history shows it as interrupted.
+  private async writeRichTranscript(outcome: TurnOutcome): Promise<void> {
     const { messages, tenantId, messageId, userId } = this.input;
     const remapOffset = makeOffsetRemap(this.turn.assistantText);
 
@@ -311,8 +317,9 @@ export class TurnTranscript {
       this.savedNoticeVersion = this.noticeVersion;
     }
 
+    const stopped = outcome.status === "interrupted";
     for (const result of this.turn.toolResults()) {
-      await this.persistTool(result.status === "in_progress" ? { ...result, status: "failed" } : result);
+      await this.persistTool(result.status === "in_progress" && !stopped ? { ...result, status: "failed" } : result);
     }
   }
 

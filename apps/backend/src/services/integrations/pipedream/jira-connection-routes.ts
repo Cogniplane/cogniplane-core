@@ -18,6 +18,7 @@ import { apiError } from "../../../lib/http-errors.js";
 import { parseRequestInput } from "../../../lib/route-validation.js";
 import { serialize } from "../../../lib/serialize-response.js";
 import { withAdmin } from "../../../routes/admin/admin-route-helpers.js";
+import { connectionSaverVersion } from "../../auth/security-change.js";
 import { loadIntegrationEnablement } from "../integration-enablement.js";
 import type { IntegrationStateStore } from "../integration-state-store.js";
 import { JIRA_INTEGRATION_ID, JiraConnectionError, type JiraConnectionService } from "./jira-connection-service.js";
@@ -122,7 +123,12 @@ export async function registerJiraConnectionRoutes(app: FastifyInstance, deps: J
     const disabled = await requireReadsEnabled(tenantId, reply);
     if (disabled) return disabled;
     try {
-      const connection = await deps.jiraConnections.selectConnection(tenantId, userId, body.value);
+      const connection = await deps.jiraConnections.selectConnection(
+        tenantId,
+        userId,
+        body.value,
+        await connectionSaverVersion(request, app)
+      );
       return { userConnection: serialize(JiraUserConnectionSchema, connection) };
     } catch (error) {
       return sendConnectionError(reply, error);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import type { ModelSpendingReservation } from "@cogniplane/shared-types";
 
 import {
@@ -121,13 +121,31 @@ export function ReconcileReservationDialog(props: DialogProps & { onConfirm: (ac
   const [ended, setEnded] = useState(false);
   const [fromRecords, setFromRecords] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  const [validationAttempt, setValidationAttempt] = useState(0);
+  const amountRef = useRef<HTMLInputElement>(null);
+  const endedRef = useRef<HTMLInputElement>(null);
+  const recordsRef = useRef<HTMLInputElement>(null);
+  const invalidTarget = useRef<HTMLInputElement | null>(null);
   const parsed = parseVerifiedCost(amount);
   const amountError = submitted && "error" in parsed ? parsed.error : null;
   const ackError = submitted && !(ended && fromRecords) ? "Confirm both statements before you record the cost." : null;
 
+  useLayoutEffect(() => {
+    const target = invalidTarget.current;
+    invalidTarget.current = null;
+    if (!target?.isConnected) return;
+    target.focus({ preventScroll: true });
+    (target.closest("fieldset") ?? target).scrollIntoView?.({ block: "center" });
+  }, [validationAttempt]);
+
   function submit() {
+    if (props.pending || props.stale) return;
     setSubmitted(true);
-    if ("error" in parsed || !ended || !fromRecords || props.pending || props.stale) return;
+    if ("error" in parsed || !ended || !fromRecords) {
+      invalidTarget.current = "error" in parsed ? amountRef.current : !ended ? endedRef.current : recordsRef.current;
+      setValidationAttempt((attempt) => attempt + 1);
+      return;
+    }
     props.onConfirm(parsed.value);
   }
 
@@ -139,7 +157,7 @@ export function ReconcileReservationDialog(props: DialogProps & { onConfirm: (ac
         onEscapeKeyDown={(event) => { if (props.pending) event.preventDefault(); }}
       >
         <form noValidate className="flex min-h-0 flex-col gap-4" onSubmit={(event) => { event.preventDefault(); submit(); }}>
-          <div className="flex min-h-0 flex-col gap-4 overflow-y-auto">
+          <div className="-m-1 flex min-h-0 scroll-py-2 flex-col gap-4 overflow-y-auto p-1">
             <AlertDialogHeader>
               <AlertDialogTitle>Record the verified cost</AlertDialogTitle>
               <AlertDialogDescription asChild>
@@ -161,11 +179,12 @@ export function ReconcileReservationDialog(props: DialogProps & { onConfirm: (ac
               <div className="relative max-w-60">
                 <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-sm text-on-surface-variant">$</span>
                 <Input
+                  ref={amountRef}
                   id={`${ids}-amount`}
                   inputMode="decimal"
                   autoComplete="off"
                   spellCheck={false}
-                  disabled={props.stale !== null}
+                  disabled={props.pending || props.stale !== null}
                   value={amount}
                   onChange={(event) => setAmount(event.target.value)}
                   aria-invalid={amountError ? true : undefined}
@@ -180,17 +199,17 @@ export function ReconcileReservationDialog(props: DialogProps & { onConfirm: (ac
                   : "This total replaces the held charge."}
               </p>
             </div>
-            <fieldset className="flex flex-col gap-2" disabled={props.stale !== null}>
+            <fieldset className="flex flex-col gap-2" disabled={props.pending || props.stale !== null} aria-describedby={ackError ? `${ids}-ack-error` : undefined}>
               <legend className="mb-1 text-sm font-semibold text-on-surface">Before you record it</legend>
               <label className="flex gap-3 text-sm text-on-surface">
-                <input type="checkbox" className="mt-0.5 size-4 shrink-0 accent-primary" checked={ended} onChange={(event) => setEnded(event.target.checked)} />
+                <input ref={endedRef} type="checkbox" aria-invalid={ackError && !ended ? true : undefined} aria-describedby={ackError ? `${ids}-ack-error` : undefined} className="mt-0.5 size-4 shrink-0 accent-primary" checked={ended} onChange={(event) => setEnded(event.target.checked)} />
                 <span>No provider request from this turn is still running.</span>
               </label>
               <label className="flex gap-3 text-sm text-on-surface">
-                <input type="checkbox" className="mt-0.5 size-4 shrink-0 accent-primary" checked={fromRecords} onChange={(event) => setFromRecords(event.target.checked)} />
+                <input ref={recordsRef} type="checkbox" aria-invalid={ackError && !fromRecords ? true : undefined} aria-describedby={ackError ? `${ids}-ack-error` : undefined} className="mt-0.5 size-4 shrink-0 accent-primary" checked={fromRecords} onChange={(event) => setFromRecords(event.target.checked)} />
                 <span>This total comes from provider records and recorded call usage.</span>
               </label>
-              {ackError ? <p className="text-sm text-danger">{ackError}</p> : null}
+              {ackError ? <p id={`${ids}-ack-error`} className="text-sm text-danger">{ackError}</p> : null}
             </fieldset>
             <p className="text-sm font-medium text-on-surface">You cannot undo or repeat this. The audit log records the amount under your name.</p>
             {props.stale ? <StaleNotice refresh={props.stale} /> : props.error ? <p role="alert" className="text-sm text-danger">{props.error}</p> : null}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import {
   activateSkillRevision,
@@ -23,11 +23,26 @@ import type {
   SkillImportResponse,
   AdminSkillReleaseSnapshot,
   SkillMarketplaceEntry,
-  SkillRevision
+  SkillRevision,
+  TenantDetails
 } from "@cogniplane/shared-types";
 
-function skillBusyKey(action: string, variables: { skillId: string } | undefined): string | null {
-  return variables ? `${action}-skill-${variables.skillId}` : null;
+export type SkillReadState = {
+  status: "pending" | "failed" | "unavailable" | "empty" | "ready" | "stale";
+  refreshing: boolean;
+  error: string | null;
+  retry: () => void;
+};
+
+function readState<T>(query: { data: T | undefined; isError: boolean; isPending: boolean; isFetching: boolean; fetchStatus: string; error: unknown; refetch: () => Promise<unknown> }, empty: (data: T) => boolean, fallback: string): SkillReadState {
+  const hasData = query.data !== undefined;
+  return {
+    status: hasData ? query.isError ? "stale" : empty(query.data!) ? "empty" : "ready"
+      : query.isError ? "failed" : query.fetchStatus === "paused" ? "unavailable" : "pending",
+    refreshing: query.isFetching,
+    error: query.isError ? toErrorMessage(query.error, fallback) : null,
+    retry: () => { void query.refetch(); }
+  };
 }
 
 export function useAdminSkillsData() {
@@ -35,14 +50,17 @@ export function useAdminSkillsData() {
 
   const skillsQuery = useQuery({
     queryKey: queryKeys.admin.skills(),
+    retry: false,
     queryFn: listAdminSkills
   });
   const marketplaceQuery = useQuery({
     queryKey: queryKeys.admin.marketplace(),
+    retry: false,
     queryFn: getSkillMarketplace
   });
   const tenantQuery = useQuery({
     queryKey: queryKeys.admin.tenant(),
+    retry: false,
     queryFn: getTenantDetails
   });
 
@@ -103,72 +121,70 @@ export function useAdminSkillsData() {
 
   const manifestMutation = useMutation({
     mutationFn: (url: string | null) => updateTenantMarketplaceManifestUrl(url),
-    onSuccess: () => {
-      void invalidateMarketplace();
-      void invalidateTenant();
+    onSuccess: async (saved) => {
+      queryClient.setQueryData<TenantDetails>(queryKeys.admin.tenant(), current => current ? { ...current, settings: { ...current.settings, skillMarketplaceManifestUrl: saved.skillMarketplaceManifestUrl } } : current);
+      await Promise.all([invalidateMarketplace(), invalidateTenant()]);
     }
   });
 
-  // The page has one error banner. It shows the result of the action the user
-  // started last: a new action clears the old error, and an older action that
-  // fails later does not replace the newer action's result.
   const [lastAction, setLastAction] = useState<string | null>(null);
-  const start = <V, R>(action: string, mutation: { mutateAsync: (variables: V) => Promise<R> }, variables: V) => {
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const active = useRef(false);
+  const start = async <V, R>(action: string, key: string, mutation: { mutateAsync: (variables: V) => Promise<R> }, variables: V) => {
+    if (active.current) throw new Error("Another skill operation is still pending. Wait for it to finish.");
+    active.current = true;
+    setBusyKey(key);
     setLastAction(action);
-    return mutation.mutateAsync(variables);
+    try { return await mutation.mutateAsync(variables); }
+    finally { active.current = false; setBusyKey(null); }
   };
 
-  // Order is priority: the first pending mutation names busyKey. A busy key of
-  // null skips that mutation.
   const marketplaceEntry = marketplaceImportMutation.variables;
-  const activation = activateMutation.variables;
-  const mutationStates: { action: string; mutation: { isPending: boolean; isError: boolean; error: unknown }; busyKey: string | null; fallback: string }[] = [
-    { action: "zip", mutation: zipImportMutation, busyKey: "skill-import-zip", fallback: "Failed to import zip skill bundle." },
-    { action: "github", mutation: githubImportMutation, busyKey: "skill-import-github", fallback: "Failed to import GitHub skill bundle." },
-    { action: "inline", mutation: inlineImportMutation, busyKey: "skill-import-inline", fallback: "Failed to save inline skill." },
+  const mutationStates: { action: string; mutation: { isPending: boolean; isError: boolean; error: unknown }; fallback: string }[] = [
+    { action: "zip", mutation: zipImportMutation, fallback: "Failed to import zip skill bundle." },
+    { action: "github", mutation: githubImportMutation, fallback: "Failed to import GitHub skill bundle." },
+    { action: "inline", mutation: inlineImportMutation, fallback: "Failed to save inline skill." },
     {
       action: "marketplace",
       mutation: marketplaceImportMutation,
-      busyKey: marketplaceEntry ? `skill-import-marketplace-${marketplaceEntry.slug}` : null,
       fallback: `Failed to import ${marketplaceEntry?.name ?? "marketplace entry"} from the marketplace.`
     },
     {
       action: "activate",
       mutation: activateMutation,
-      busyKey: activation ? `activate-skill-${activation.skillId}-${activation.skillRevisionId}` : null,
       fallback: "Failed to activate skill revision."
     },
-    { action: "publish", mutation: publishMutation, busyKey: skillBusyKey("publish", publishMutation.variables), fallback: "Failed to publish skill." },
-    { action: "unpublish", mutation: unpublishMutation, busyKey: skillBusyKey("unpublish", unpublishMutation.variables), fallback: "Failed to unpublish skill." },
-    { action: "disable", mutation: disableMutation, busyKey: skillBusyKey("disable", disableMutation.variables), fallback: "Failed to disable skill." },
-    { action: "manifest", mutation: manifestMutation, busyKey: "skill-marketplace-manifest-url", fallback: "Failed to save marketplace manifest URL." }
+    { action: "publish", mutation: publishMutation, fallback: "Failed to publish skill." },
+    { action: "unpublish", mutation: unpublishMutation, fallback: "Failed to unpublish skill." },
+    { action: "disable", mutation: disableMutation, fallback: "Failed to disable skill." },
+    { action: "manifest", mutation: manifestMutation, fallback: "Failed to save marketplace manifest URL." }
   ];
 
-  const busyKey = mutationStates.find((state) => state.mutation.isPending && state.busyKey)?.busyKey ?? null;
   // Select by status, not by the error value: a rejection with a falsy value
   // ("" or 0) is still a failure and shows the fallback.
   const last = mutationStates.find((state) => state.action === lastAction);
-  const failedQuery = [skillsQuery, marketplaceQuery, tenantQuery].find((query) => query.isError);
   let error: string | null = null;
   if (last?.mutation.isError) error = toErrorMessage(last.mutation.error, last.fallback);
-  else if (failedQuery) error = toErrorMessage(failedQuery.error, "Failed to load skills.");
 
   return {
     skills: skillsQuery.data ?? [],
     skillsLoaded: skillsQuery.isSuccess,
+    libraryState: readState(skillsQuery, data => data.length === 0, "Could not load the skill library."),
+    catalogState: readState(marketplaceQuery, data => data.status === "ready" && data.skills.length === 0, "Could not load the marketplace."),
+    manifestState: readState(tenantQuery, () => false, "Could not load the saved manifest URL."),
     marketplace: marketplaceQuery.data ?? null,
-    manifestUrl: tenantQuery.data?.settings.skillMarketplaceManifestUrl ?? null,
+    manifestUrl: tenantQuery.data === undefined ? undefined : tenantQuery.data.settings.skillMarketplaceManifestUrl ?? null,
     busyKey,
     error,
     handleZipImport: async (file: File): Promise<SkillImportResponse> => {
-      return start("zip", zipImportMutation, file);
+      return start("zip", "skill-import-zip", zipImportMutation, file);
     },
     handleGithubImport: async (input: {
       githubUrl: string;
       ref?: string;
       subdirectory?: string;
     }): Promise<SkillImportResponse> => {
-      return start("github", githubImportMutation, input);
+      return start("github", "skill-import-github", githubImportMutation, input);
     },
     handleInlineImport: async (input: {
       skillId: string;
@@ -176,10 +192,10 @@ export function useAdminSkillsData() {
       description: string;
       instructions: string;
     }): Promise<SkillImportResponse> => {
-      return start("inline", inlineImportMutation, input);
+      return start("inline", "skill-import-inline", inlineImportMutation, input);
     },
     handleMarketplaceImport: async (entry: SkillMarketplaceEntry): Promise<SkillImportResponse> => {
-      return start("marketplace", marketplaceImportMutation, entry);
+      return start("marketplace", `skill-import-marketplace-${entry.slug}`, marketplaceImportMutation, entry);
     },
     handleListRevisions: async (skillId: string): Promise<SkillRevision[]> => {
       return listSkillRevisions(skillId);
@@ -191,13 +207,13 @@ export function useAdminSkillsData() {
       audience?: "test-users" | "members";
       expectedSnapshot: AdminSkillReleaseSnapshot;
     }): Promise<void> => {
-      await start("activate", activateMutation, input);
+      await start("activate", `activate-skill-${input.skillId}-${input.skillRevisionId}`, activateMutation, input);
     },
-    handlePublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("publish", publishMutation, { skillId, snapshot }),
-    handleUnpublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("unpublish", unpublishMutation, { skillId, snapshot }),
-    handleDisable: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("disable", disableMutation, { skillId, snapshot }),
+    handlePublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("publish", `publish-skill-${skillId}`, publishMutation, { skillId, snapshot }),
+    handleUnpublish: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("unpublish", `unpublish-skill-${skillId}`, unpublishMutation, { skillId, snapshot }),
+    handleDisable: (skillId: string, snapshot: AdminSkillReleaseSnapshot) => start("disable", `disable-skill-${skillId}`, disableMutation, { skillId, snapshot }),
     handleSaveManifestUrl: async (url: string | null): Promise<void> => {
-      await start("manifest", manifestMutation, url);
+      await start("manifest", "skill-marketplace-manifest-url", manifestMutation, url);
     }
   };
 }

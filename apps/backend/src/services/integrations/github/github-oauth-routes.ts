@@ -14,7 +14,7 @@ export const GITHUB_OAUTH_CALLBACK_PATHS = ["/auth/github/user/callback"] as con
 export function registerGithubOAuthRoutes(
   app: FastifyInstance,
   connections: Pick<GithubConnectionService, "completeAuthorization">,
-  limits?: RequestLimitsInterface
+  limits?: Pick<RequestLimitsInterface, "consumeRateLimit">
 ): void {
   app.get("/auth/github/user/callback", async (request, reply) => {
     if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;

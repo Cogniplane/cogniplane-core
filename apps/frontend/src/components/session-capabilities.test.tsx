@@ -16,6 +16,12 @@ async function open(busy = false) {
   await screen.findByRole("radio", { name: "Choose for this session" });
   return view;
 }
+it("returns keyboard focus to the capabilities button after Escape", async () => {
+  await open();
+  fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Session capabilities" })));
+});
 it("saves a narrowed selection and reloads saved choices when reopened", async () => {
   await open();
   expect(screen.getByRole("checkbox", { name: /PDF/ }).matches(":disabled")).toBe(true);

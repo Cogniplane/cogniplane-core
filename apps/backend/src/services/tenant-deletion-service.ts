@@ -183,8 +183,12 @@ export class TenantDeletionService {
       }
 
       const rowCounts = await countTenantRows(client, input.tenantId);
+      // Local accounts removed earlier have no membership left, but their
+      // user rows belong to this tenant too (local_identities).
       const userIds = await client.query<{ user_id: string }>(
-        `SELECT user_id FROM tenant_memberships WHERE tenant_id = $1`,
+        `SELECT user_id FROM tenant_memberships WHERE tenant_id = $1
+         UNION
+         SELECT user_id FROM local_identities WHERE tenant_id = $1`,
         [input.tenantId]
       );
 

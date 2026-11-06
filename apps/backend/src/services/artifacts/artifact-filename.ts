@@ -44,7 +44,7 @@ export function validateArtifactFilename(name: string): string | null {
  * Thrown by `assertValidArtifactFilename`. `statusCode` and `code` follow the
  * convention of app errors the caller can fix: `handleAppError` answers 400
  * with this code and message, and the tool gateway relays the message. A route
- * that catches errors by class (as the Microsoft import route does) still
+ * that catches errors by class (as an overlay import route does) still
  * lets it reach that handler. The message never echoes the name.
  */
 export class InvalidArtifactFilenameError extends Error {

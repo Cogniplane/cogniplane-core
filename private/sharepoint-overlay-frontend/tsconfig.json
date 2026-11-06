@@ -1,0 +1,36 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "allowJs": false,
+    "incremental": true,
+    "isolatedModules": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "noEmit": true,
+    // Allow imports from `../../apps/frontend/src/...` so this overlay can
+    // re-use core hooks/components/lib utilities. The overlay isn't built
+    // separately — the host frontend includes its sources via @cogniplane/...
+    // workspace resolution + the import paths here.
+    "rootDir": "../..",
+    // Mirror the host frontend's `@/*` alias so transitively-included files
+    // from `apps/frontend/src/...` (pulled in by the overlay's relative
+    // imports up the tree) can resolve their `@/components/...` imports.
+    // Without this, tsc walks into a host file like file-source-picker.tsx
+    // and fails on `@/components/ui/dialog` because the overlay's tsconfig
+    // doesn't know the alias. Path is resolved relative to this tsconfig.
+    "paths": {
+      "@/*": ["../../apps/frontend/src/*"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx"
+  ],
+  "exclude": ["node_modules"]
+}

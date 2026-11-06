@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import type { SkillRevision } from "@cogniplane/shared-types";
 
@@ -8,71 +8,54 @@ export function useSkillRevisions(input: {
   onListRevisions: (skillId: string) => Promise<SkillRevision[]>;
 }) {
   const { onListRevisions } = input;
-
   const [revisionMap, setRevisionMap] = useState<Record<string, SkillRevision[]>>({});
   const [expandedSkillId, setExpandedSkillId] = useState<string | null>(null);
-  const [loadError, setLoadError] = useState<Record<string, string>>({});
+  const selected = useRef<string | null>(null);
+  const generations = useRef<Record<string, number>>({});
+  const [loading, setLoading] = useState<Record<string, boolean>>({});
+  const [loadError, setLoadError] = useState<Record<string, string | undefined>>({});
 
-  const setLoadErrorFor = useCallback((skillId: string, message: string | null) => {
-    setLoadError((current) => {
-      if (message === null) {
-        if (!(skillId in current)) return current;
-        const { [skillId]: _removed, ...rest } = current;
-        return rest;
-      }
-      return { ...current, [skillId]: message };
-    });
-  }, []);
-
-  const refresh = useCallback(
-    async (skillId: string) => {
+  const refresh = useCallback(async (skillId: string) => {
+    const generation = (generations.current[skillId] ?? 0) + 1;
+    generations.current[skillId] = generation;
+    setLoading(current => ({ ...current, [skillId]: true }));
+    setLoadError(current => ({ ...current, [skillId]: undefined }));
+    try {
       const revisions = await onListRevisions(skillId);
-      setRevisionMap((current) => ({ ...current, [skillId]: revisions }));
+      if (generations.current[skillId] === generation) {
+        setRevisionMap(current => ({ ...current, [skillId]: revisions }));
+      }
       return revisions;
-    },
-    [onListRevisions]
-  );
-
-  const toggle = useCallback(
-    async (skillId: string) => {
-      if (expandedSkillId === skillId) {
-        setExpandedSkillId(null);
-        setLoadErrorFor(skillId, null);
-        return;
+    } catch (error) {
+      if (generations.current[skillId] === generation) {
+        setLoadError(current => ({ ...current, [skillId]: error instanceof Error ? error.message : "Could not load history." }));
       }
-      setLoadErrorFor(skillId, null);
-      if (!revisionMap[skillId]) {
-        try {
-          await refresh(skillId);
-        } catch (caughtError) {
-          console.error("Failed to load skill revisions", caughtError);
-          const message =
-            caughtError instanceof Error ? caughtError.message : "Failed to load revisions.";
-          setLoadErrorFor(skillId, message);
-          return;
-        }
+      throw error;
+    } finally {
+      if (generations.current[skillId] === generation) {
+        setLoading(current => ({ ...current, [skillId]: false }));
       }
-      setExpandedSkillId(skillId);
-    },
-    [expandedSkillId, refresh, revisionMap, setLoadErrorFor]
-  );
+    }
+  }, [onListRevisions]);
 
   const open = useCallback(async (skillId: string) => {
-    try {
-      await refresh(skillId);
-      setLoadErrorFor(skillId, null);
-      setExpandedSkillId(skillId);
-    } catch (caughtError) {
-      setLoadErrorFor(skillId, caughtError instanceof Error ? caughtError.message : "Failed to load revisions.");
-    }
-  }, [refresh, setLoadErrorFor]);
+    selected.current = skillId;
+    setExpandedSkillId(skillId);
+    try { await refresh(skillId); } catch { /* The selected history shows the read error. */ }
+  }, [refresh]);
 
-  return {
-    revisionMap,
-    expandedSkillId,
-    loadError,
-    toggle,
-    open,
-    refresh
-  };
+  const toggle = useCallback(async (skillId: string) => {
+    if (selected.current === skillId) {
+      selected.current = null;
+      setExpandedSkillId(null);
+      return;
+    }
+    selected.current = skillId;
+    setExpandedSkillId(skillId);
+    if (!revisionMap[skillId]) {
+      try { await refresh(skillId); } catch { /* Keep the selected history open for retry. */ }
+    }
+  }, [refresh, revisionMap]);
+
+  return { revisionMap, expandedSkillId, loading, loadError, toggle, open, refresh };
 }

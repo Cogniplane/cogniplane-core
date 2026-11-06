@@ -9,6 +9,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { apiError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
+import { connectionSaverVersion } from "../services/auth/security-change.js";
 import {
   MemberMcpAccessError, MemberMcpNotFoundError, MemberMcpConflictError, MemberMcpValidationError
 } from "../services/member-mcp-credential-store.js";
@@ -51,7 +52,8 @@ export async function registerMemberMcpRoutes(app: FastifyInstance, stores: Memb
       const body = parseRequestInput(reply, MemberMcpCredentialSaveSchema, request.body);
       if (!body.ok) return body.response;
       const { scope: _scope, ...input } = body.value;
-      const connection = await stores.memberMcpCredentials.save(tenantId, userId, params.value.serverId, input);
+      const connection = await stores.memberMcpCredentials.save(tenantId, userId, params.value.serverId, input,
+        await connectionSaverVersion(request, app));
       return serialize(MemberMcpConnectionResponseSchema, { scope: { tenantId, userId }, connection });
     });
     routes.delete("/me/mcp-connections/:serverId/credentials", async (request, reply) => {

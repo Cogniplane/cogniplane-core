@@ -65,10 +65,13 @@ pnpm exec vitest run -t "write_artifact" apps/backend/src/services/managed-tools
 make e2b-build
 ```
 
+The SharePoint integration is bundled under `private/sharepoint-overlay-*`.
+These paths and `@cogniplane-private/*` names are historical; the packages
+are open source and covered by the root license.
+
 For `pnpm test:integration`, set `INTEGRATION_DATABASE_URL` to a superuser
 connection URL for the test Postgres server. The suite creates and drops its
-own isolated database. The guard's `make test-integration` suggestion applies
-to the private tree; that target is absent from this public Makefile.
+own isolated database. `make test-integration` starts local Postgres when the default URL is used.
 
 Backend unit tests use Vitest and shared fakes under
 `apps/backend/src/test-helpers/`, including `test-runtime-policy.ts`. Check those

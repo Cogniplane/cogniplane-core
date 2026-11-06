@@ -29,8 +29,14 @@ export function summarizeFindings(findings: unknown[]): string {
   return aggregated.map((b) => `${b.count} ${b.label}${b.count === 1 ? "" : "s"}`).join(", ");
 }
 
+// Mode off: the scan applied no check, because protection was off or the
+// subject was out of scope. "0 findings" would suggest a clean scan.
+export function isPiiRunNotScanned(run: Pick<AdminSessionDetailPiiRun, "mode">): boolean {
+  return run.mode === "off";
+}
+
 export function summarizePiiRun(run: AdminSessionDetailPiiRun): string {
-  return summarizeFindings(run.findings);
+  return isPiiRunNotScanned(run) ? "Not scanned" : summarizeFindings(run.findings);
 }
 
 export function readPiiScanRunId(detailJson: unknown): string | null {

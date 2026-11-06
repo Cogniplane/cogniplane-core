@@ -79,6 +79,10 @@ export class FixtureServer {
    *  records answer. A function reply can wait for the test. */
   approvalReplies: Array<JsonReply | (() => Promise<JsonReply>)> = [];
   interruptReply: JsonReply = { status: 200, body: { ok: true } };
+  /** Bodies of POST /approvals/:id/decision, in order. */
+  readonly decisions: Array<{ approvalId: string; body: unknown }> = [];
+  /** The next replies of POST /approvals/:id/decision, before the default success. */
+  decisionReplies: JsonReply[] = [];
 
   connect(sessionId: string, ...replies: Array<StreamReply | JsonReply>): void {
     this.connects.set(sessionId, replies);
@@ -143,7 +147,12 @@ export class FixtureServer {
     if (/^\/sessions\/[^/]+\/interrupt$/.test(url.pathname) && method === "POST") {
       return json(this.interruptReply.body ?? {}, this.interruptReply.status);
     }
-    if (/^\/approvals\/[^/]+\/decision$/.test(url.pathname) && method === "POST") return json({ ok: true });
+    const decision = /^\/approvals\/([^/]+)\/decision$/.exec(url.pathname);
+    if (decision && method === "POST") {
+      this.decisions.push({ approvalId: decision[1]!, body: JSON.parse(String(init?.body ?? "{}")) });
+      const reply = this.decisionReplies.shift() ?? { status: 200, body: { status: "resolved" } };
+      return json(reply.body ?? {}, reply.status);
+    }
     return json({ error: "unexpected_call", path: url.pathname }, 404);
   };
 
@@ -176,8 +185,9 @@ export const ev = {
   custom,
   turnStarted: (messageId: string) => custom("turn_started", { messageId, sequence: 9 }),
   userPersisted: (messageId: string, text: string) => custom("user_message_persisted", { messageId, text }),
-  approvalRequired: (approvalId: string) => custom("approval_required", {
-    approvalId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "Needs a decision"
+  approvalRequired: (approvalId: string, toolCallId?: string) => custom("approval_required", {
+    approvalId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "Needs a decision",
+    ...(toolCallId ? { toolCallId } : {})
   }),
   expired: (approvalId: string) => custom("runtime_notice", {
     noticeId: `approval-expired:${approvalId}`, level: "warning", title: "Approval expired", message: "The request expired.", createdAt: "2026-10-12T10:00:00.000Z"
@@ -218,8 +228,9 @@ export function idleHistory(
 }
 
 /** A saved approval record. */
-export function savedApproval(approvalId: string, status: "pending" | "approved" | "expired", sessionId = "s-1"): object {
-  return { approvalId, sessionId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "Needs a decision", status };
+export function savedApproval(approvalId: string, status: "pending" | "approved" | "expired", sessionId = "s-1", toolCallId?: string): object {
+  return { approvalId, sessionId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "Needs a decision", status,
+    ...(toolCallId ? { toolCallId } : {}) };
 }
 
 class InertObserver {

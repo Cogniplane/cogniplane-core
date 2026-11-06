@@ -17,8 +17,9 @@ export const CHIP =
 
 export const HINT = "text-sm text-on-surface-faint";
 export const LIST_ITEM = "rounded-lg border border-outline-variant bg-surface-container-lowest p-3";
-export const SECTION_LABEL =
-  "text-[0.62rem] font-bold uppercase tracking-[0.14em] text-on-surface-faint";
+// Uppercase group label at the `text-label` size (11px, 0.08em tracking).
+// Use it to name a group of rows or metrics, not as an eyebrow above a heading.
+export const SECTION_LABEL = "text-label font-semibold uppercase text-on-surface-faint";
 
 // Column template shared by the tenant-wide and personal token-usage tables —
 // the two tables must stay column-aligned.

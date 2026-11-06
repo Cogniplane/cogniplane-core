@@ -15,7 +15,8 @@ describe.skipIf(!adminDatabaseUrl())("GitHub connection store", () => {
       tenantId, userId, githubUserId, githubLogin: `login-${githubUserId}`,
       githubName: null, githubEmail: null, githubAvatarUrl: null, tokenType: "bearer",
       grantedScopes: [], accessTokenEncrypted: "access-old", accessTokenExpiresAt: null,
-      refreshTokenEncrypted: refreshToken, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null
+      refreshTokenEncrypted: refreshToken, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null,
+      ownerSecurityVersion: null
     });
     const refresh = (expectedGithubUserId: string, expectedRefreshTokenEncrypted: string) =>
       store.updateRefreshedToken({
@@ -50,7 +51,8 @@ describe.skipIf(!adminDatabaseUrl())("GitHub connection store", () => {
     tenantId, userId, githubUserId, githubLogin: `login-${githubUserId}`,
     githubName: null, githubEmail: null, githubAvatarUrl: null, tokenType: "bearer",
     grantedScopes: ["repo"], accessTokenEncrypted: "access", accessTokenExpiresAt: null,
-    refreshTokenEncrypted: null, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null
+    refreshTokenEncrypted: null, refreshTokenExpiresAt: null, tokenLastRefreshedAt: null,
+    ownerSecurityVersion: null
   });
 
   async function storedList(tenantId: string, userId: string): Promise<string[]> {

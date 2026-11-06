@@ -6,16 +6,17 @@ import { SlidersHorizontalIcon } from "lucide-react";
 import type { SessionCapabilities, SessionCapabilitySelection } from "@cogniplane/shared-types";
 import { getSessionCapabilities, updateSessionCapabilities } from "../lib/session-api";
 import { Button } from "./ui/button";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "./ui/dialog";
+import { Dialog, DialogTrigger, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "./ui/dialog";
 import { ConnectorAccountStatus } from "./connector-account-status";
 
-export function SessionCapabilitiesButton({ sessionId, busy }: { sessionId: string; busy: boolean }) {
+export function SessionCapabilitiesButton({ sessionId, busy, className }: { sessionId: string; busy: boolean; className?: string }) {
   const [open, setOpen] = useState(false);
-  return <>
-    <Button variant="ghost" size="icon-sm" aria-label="Session capabilities" title="Session capabilities" onClick={() => setOpen(true)}>
-      <SlidersHorizontalIcon />
-    </Button>
-    <Dialog open={open} onOpenChange={setOpen}>
+  return <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="icon-sm" className={className} aria-label="Session capabilities" title="Session capabilities">
+          <SlidersHorizontalIcon />
+        </Button>
+      </DialogTrigger>
       <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>Session capabilities</DialogTitle>
@@ -23,8 +24,7 @@ export function SessionCapabilitiesButton({ sessionId, busy }: { sessionId: stri
         </DialogHeader>
         {open ? <CapabilitiesForm key={sessionId} sessionId={sessionId} busy={busy} onClose={() => setOpen(false)} /> : null}
       </DialogContent>
-    </Dialog>
-  </>;
+    </Dialog>;
 }
 
 function CapabilitiesForm({ sessionId, busy, onClose }: { sessionId: string; busy: boolean; onClose: () => void }) {
@@ -96,7 +96,7 @@ function CapabilitiesForm({ sessionId, busy, onClose }: { sessionId: string; bus
         </div>)}
         {options.length === 0 ? <p className="text-sm text-on-surface-variant">No {title.toLowerCase()} are available in the {defaultsLabel} defaults.</p> : options.map((option) => <label key={option.id} className="flex items-start gap-3 rounded-md border border-outline-variant p-3">
           <input type="checkbox" className="mt-1 size-4 shrink-0 accent-brand" checked={selection === null || selection[key].includes(option.id)} onChange={(event) => toggle(key, option.id, event.target.checked)} />
-          <span className="min-w-0 text-sm"><span className="block font-medium">{option.name} {option.source === "personal" || option.source === "project" ? <span className="ml-1 rounded-full border border-outline-variant px-1.5 py-0.5 text-[10px] font-normal text-on-surface-variant">{option.source === "personal" ? "Private" : "Project"}</span> : null}</span><span className="block break-words text-xs text-on-surface-variant">{option.description}</span>{key === "connectorIds" ? <ConnectorAccountStatus option={option} /> : null}</span>
+          <span className="min-w-0 text-sm"><span className="block font-medium">{option.name} {option.source === "personal" || option.source === "project" ? <span className="ml-1 rounded-full border border-outline-variant px-1.5 py-0.5 text-label font-normal text-on-surface-variant">{option.source === "personal" ? "Private" : "Project"}</span> : null}</span><span className="block break-words text-xs text-on-surface-variant">{option.description}</span>{key === "connectorIds" ? <ConnectorAccountStatus option={option} /> : null}</span>
         </label>)}
       </fieldset>)}
     </div> : null}

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { PolicyMonitorSummaryResponse, PolicyRule, PolicySimulateResponse } from "@cogniplane/shared-types";
 import { AdminPolicyRulesCard } from "./admin-policy-rules-card";
@@ -65,9 +65,14 @@ it("keeps one editor open and never replaces unsaved edits", () => {
 });
 
 it("does not delete while a save is pending", () => {
-  mount([rule], { busyKey: "submit" });
+  const props = { rules: [rule], lintWarnings: [], onSave: async () => true, onDelete: vi.fn(), onReorder: vi.fn() };
+  const { rerender } = render(<AdminPolicyRulesCard {...props} busyKey={null} />);
   fireEvent.click(screen.getByRole("button", { name: "Edit Block GitHub writes" }));
-  expect((screen.getByRole("button", { name: "Delete rule" }) as HTMLButtonElement).disabled).toBe(true);
+  rerender(<AdminPolicyRulesCard {...props} busyKey="submit" />);
+  fireEvent.click(screen.getByRole("button", { name: "Delete rule" }));
+  expect(props.onDelete).not.toHaveBeenCalled();
+  expect(screen.getByLabelText("Name").closest("fieldset")?.disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Saving…" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it("reports a test result in one line without claiming the current mode", () => {
@@ -115,4 +120,113 @@ it("saves an edited rule under its own id", async () => {
 
   await waitFor(() => expect(screen.queryByLabelText("Name")).toBeNull());
   expect(onSave).toHaveBeenCalledWith("pol_reads", expect.objectContaining({ name: "Allow all reads", effect: "allow" }));
+});
+
+it("returns focus to the opener once the refresh after a save enables it again", async () => {
+  let finish!: (ok: boolean) => void;
+  const props = { lintWarnings: [], busyKey: null, onSave: () => new Promise<boolean>(resolve => { finish = resolve; }), onDelete: () => {}, onReorder: () => {} };
+  const view = render(<AdminPolicyRulesCard rules={[rule, second]} {...props} />);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Allow reads" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  // The save invalidates the rules, so the card refreshes while the save settles.
+  view.rerender(<AdminPolicyRulesCard rules={[rule, second]} {...props} refreshing />);
+  await act(async () => finish(true));
+  const opener = screen.getByRole("button", { name: "Edit Allow reads" }) as HTMLButtonElement;
+  expect(opener.disabled).toBe(true);
+  // Let the close frame run while the opener is still disabled.
+  await act(() => new Promise(resolve => requestAnimationFrame(() => resolve(undefined))));
+  expect(document.activeElement).not.toBe(opener);
+  view.rerender(<AdminPolicyRulesCard rules={[rule, second]} {...props} />);
+  await waitFor(() => expect(document.activeElement).toBe(opener));
+});
+
+it.each(["loading", "unavailable", "stale"] as const)("does not claim an empty policy is allowed during %s", (rulesState) => {
+  render(<AdminPolicyRulesCard rules={[]} rulesState={rulesState} rulesError={rulesState === "loading" ? null : "Read failed"} lintWarnings={[]} busyKey={null} onSave={async () => true} onDelete={() => {}} onReorder={() => {}} />);
+  expect(screen.queryByText("No rules. Every tool call is allowed.")).toBeNull();
+  expect((screen.getByRole("button", { name: "New rule" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it("keeps the retry button mounted and focused while a rule read recovers", () => {
+  const props = { rules: [], lintWarnings: [], busyKey: null, onSave: async () => true, onDelete: () => {}, onReorder: () => {}, onRetryRules: vi.fn() };
+  const { rerender } = render(<AdminPolicyRulesCard {...props} rulesState="unavailable" rulesError="Read failed" />);
+  const retry = screen.getByRole("button", { name: "Retry rules" });
+  retry.focus();
+  fireEvent.click(retry);
+  rerender(<AdminPolicyRulesCard {...props} rulesState="unavailable" rulesError="Read failed" refreshing />);
+  expect(screen.getByRole("button", { name: "Retry rules" })).toBe(retry);
+  expect(document.activeElement).toBe(retry);
+  rerender(<AdminPolicyRulesCard {...props} rulesState="current" />);
+  expect(screen.getByRole("button", { name: "Refresh rules" })).toBe(retry);
+  expect(document.activeElement).toBe(retry);
+});
+
+it("keeps a failed delete draft and guards repeated clicks before props update", async () => {
+  let finish!: (ok: boolean) => void;
+  const onDelete = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+  render(<AdminPolicyRulesCard rules={[rule]} lintWarnings={[]} busyKey={null} onSave={async () => true} onDelete={onDelete} onReorder={() => {}} />);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Block GitHub writes" }));
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Retain this draft" } });
+  const button = screen.getByRole("button", { name: "Delete rule" });
+  fireEvent.click(button);
+  fireEvent.click(button);
+  expect(onDelete).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: "Deleting…" })).toBe(button);
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeTruthy();
+  expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Retain this draft");
+  finish(false);
+  await waitFor(() => expect(screen.getByLabelText("Name").closest("fieldset")?.disabled).toBe(false));
+  expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Retain this draft");
+});
+
+it("keeps warning retry focused and preserves the editor while warnings recover", () => {
+  const props = { rules: [rule], lintWarnings: [], busyKey: null, onSave: async () => true, onDelete: vi.fn(), onReorder: vi.fn(), onRetryLint: vi.fn() };
+  const { rerender } = render(<AdminPolicyRulesCard {...props} lintState="unavailable" lintError="Warnings offline" />);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Block GitHub writes" }));
+  fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Keep these edits" } });
+  const retry = screen.getByRole("button", { name: "Retry warnings" });
+  retry.focus();
+  fireEvent.click(retry);
+  rerender(<AdminPolicyRulesCard {...props} lintState="checking" />);
+  expect(document.activeElement).toBe(retry);
+  expect(screen.queryByText("No rule warnings found.")).toBeNull();
+  expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Keep these edits");
+  rerender(<AdminPolicyRulesCard {...props} lintState="current" />);
+  expect(document.activeElement).toBe(retry);
+  expect(screen.getByText("No rule warnings found.")).toBeTruthy();
+});
+
+it.each(["save", "delete"] as const)("keeps the %s owner focusable and places its failure beside the decisions", async operation => {
+  let finish!: (ok: boolean) => void;
+  const request = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+  const props = { rules: [rule], lintWarnings: [], busyKey: null, onSave: request, onDelete: request, onReorder: vi.fn() };
+  const { rerender } = render(<AdminPolicyRulesCard {...props} />);
+  fireEvent.click(screen.getByRole("button", { name: "Edit Block GitHub writes" }));
+  const owner = screen.getByRole("button", { name: operation === "save" ? "Save changes" : "Delete rule" });
+  owner.focus();
+  fireEvent.click(owner);
+  fireEvent.click(owner);
+  expect(request).toHaveBeenCalledTimes(1);
+  expect((owner as HTMLButtonElement).disabled).toBe(false);
+  expect(document.activeElement).toBe(owner);
+  finish(false);
+  await waitFor(() => expect(owner.getAttribute("aria-disabled")).toBe("false"));
+  const scroll = vi.fn();
+  const previous = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = scroll;
+  try {
+    rerender(<AdminPolicyRulesCard {...props} actionError="Rule action failed" />);
+    const alert = screen.getByRole("alert");
+    expect(owner.getAttribute("aria-describedby")).toBe(alert.id);
+    expect(owner.parentElement?.parentElement?.contains(alert)).toBe(true);
+    expect(scroll).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(owner);
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    outside.focus();
+    scroll.mockClear();
+    rerender(<AdminPolicyRulesCard {...props} actionError="Another failure" />);
+    expect(scroll).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+  } finally { Element.prototype.scrollIntoView = previous; }
 });

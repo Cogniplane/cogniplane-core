@@ -1,4 +1,8 @@
 export const queryKeys = {
+  auth: {
+    /** Login types this installation offers (GET /auth/config). */
+    config: () => ["auth", "config"] as const
+  },
   projects: {
     all: ["projects"] as const,
     list: () => [...queryKeys.projects.all, "list"] as const,
@@ -34,6 +38,7 @@ export const queryKeys = {
     managedTools: () => [...queryKeys.admin.all, "managed-tools"] as const,
     tenant: () => [...queryKeys.admin.all, "tenant"] as const,
     tenantSettings: () => [...queryKeys.admin.all, "tenant-settings"] as const,
+    mfaPolicy: () => [...queryKeys.admin.all, "mfa-policy"] as const,
     openRouterModels: () => [...queryKeys.admin.all, "openrouter-models"] as const,
     users: () => [...queryKeys.admin.all, "users"] as const,
     // Keyed by tenant and target so one person's result never shows for another.
@@ -47,8 +52,9 @@ export const queryKeys = {
     sessionDetail: (sessionId: string) =>
       [...queryKeys.admin.all, "sessions", "detail", sessionId] as const,
     integrations: () => [...queryKeys.admin.all, "integrations"] as const,
+    piiMetricsAll: () => [...queryKeys.admin.all, "pii", "metrics"] as const,
     piiMetrics: (params: { range: string; from?: string; to?: string }) =>
-      [...queryKeys.admin.all, "pii", "metrics", params] as const,
+      [...queryKeys.admin.piiMetricsAll(), params] as const,
     piiTop: (params: {
       range: string;
       from?: string;
@@ -89,6 +95,8 @@ export const queryKeys = {
   settings: {
     all: ["settings"] as const,
     overview: () => [...queryKeys.settings.all, "overview"] as const,
+    security: () => [...queryKeys.settings.all, "security"] as const,
+    passkeys: () => [...queryKeys.settings.all, "passkeys"] as const,
     sections: () => [...queryKeys.settings.all, "sections"] as const,
     scheduledJobs: () => [...queryKeys.settings.all, "scheduled-jobs"] as const,
     scheduledJobRuns: (jobId: string) =>
@@ -98,7 +106,6 @@ export const queryKeys = {
     // show for another one after a reconnect.
     githubRepositories: (githubUserId: string) =>
       [...queryKeys.settings.all, "github", "repositories", githubUserId] as const,
-    microsoft: () => [...queryKeys.settings.all, "microsoft"] as const,
     notion: () => [...queryKeys.settings.all, "notion"] as const,
     jira: () => [...queryKeys.settings.all, "jira"] as const,
     jiraAccounts: () => [...queryKeys.settings.all, "jira", "accounts"] as const,
@@ -119,14 +126,6 @@ export const queryKeys = {
       [...queryKeys.sessions.all, "detail", sessionId, "artifacts"] as const,
     approvals: (sessionId: string) =>
       [...queryKeys.sessions.all, "detail", sessionId, "approvals"] as const
-  },
-  microsoft: {
-    all: ["microsoft"] as const,
-    connectionStatus: () => [...queryKeys.microsoft.all, "connection-status"] as const,
-    sites: (search: string) => [...queryKeys.microsoft.all, "sites", search] as const,
-    browse: (location: { siteId: string | null; driveId: string | null; folderId: string | null }) =>
-      [...queryKeys.microsoft.all, "browse", location] as const,
-    search: (query: string) => [...queryKeys.microsoft.all, "search", query] as const
   },
   // Everything derived from the tenant's model availability shares this prefix,
   // so one invalidateQueries({ queryKey: queryKeys.models.all }) refreshes the

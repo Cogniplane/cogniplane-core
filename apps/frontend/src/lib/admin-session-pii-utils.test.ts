@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 
-import { aggregateFindings, readPiiScanRunId, summarizeFindings } from "./admin-session-pii-utils";
+import type { AdminSessionDetailPiiRun } from "@cogniplane/shared-types";
+
+import { aggregateFindings, readPiiScanRunId, summarizeFindings, summarizePiiRun } from "./admin-session-pii-utils";
 
 describe("readPiiScanRunId", () => {
   test("reads detailJson.pii.scanRunId when present", () => {
@@ -56,5 +58,21 @@ describe("summarizeFindings", () => {
     expect(summarizeFindings(["a", "b"])).toBe("2 findings");
     expect(summarizeFindings([null])).toBe("1 finding");
     expect(summarizeFindings([])).toBe("0 findings");
+  });
+});
+
+describe("summarizePiiRun", () => {
+  const run = (mode: string): AdminSessionDetailPiiRun => ({
+    scanRunId: "scan-1", subjectType: "artifact", subjectId: "art-1", sourceUserId: null, mode,
+    providerType: null, providerModel: null, status: "completed", findings: [], summaryText: null,
+    actionTaken: "allow", errorMessage: null, createdAt: "2026-10-28T00:00:00Z", completedAt: null
+  });
+
+  test("a scan that applied mode off did not scan the subject", () => {
+    expect(summarizePiiRun(run("off"))).toBe("Not scanned");
+  });
+
+  test("a scan with no findings says so", () => {
+    expect(summarizePiiRun(run("detect"))).toBe("0 findings");
   });
 });

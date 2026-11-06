@@ -7,6 +7,7 @@ import type { AppConfig } from "./config.js";
 import { runtimeTokenSecret } from "./lib/derived-secrets.js";
 import { closeRedis } from "./lib/redis.js";
 import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
+import type { DataRouteControl } from "./services/data-route-control.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
 import { buildArtifactRouteStores, registerArtifactRoutes } from "./routes/artifacts.js";
 import { registerHealthRoutes } from "./routes/health.js";
@@ -27,12 +28,12 @@ import { registerPersonalSkillRoutes } from "./routes/personal-skills.js";
 import { registerOrganizationSkillSubmissionRoutes } from "./routes/organization-skill-submissions.js";
 import { registerProjectSkillRoutes } from "./routes/project-skills.js";
 import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/settings.js";
-import { registerJiraConnectionRoutes } from "./services/integrations/pipedream/jira-connection-routes.js";
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
 import type { SessionExecutionStore } from "./services/session-execution-store.js";
 import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
+import type { MailOutboxWorker } from "./services/mail/mail-outbox-worker.js";
 import {
   sweepStaleApprovals,
   type StaleApprovalSweeperDeps
@@ -44,7 +45,8 @@ import {
 
 export async function registerAppRoutes(
   app: FastifyInstance,
-  deps: AppDependencies
+  deps: AppDependencies,
+  routeControls: { dataRoutes: DataRouteControl }
 ): Promise<void> {
   if (deps.turnBus) {
     await deps.turnBus.subscribeStop(signal => {
@@ -68,25 +70,26 @@ export async function registerAppRoutes(
       configuredProviders
     })
   );
-  await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config }));
+  await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config, dataRoutes: routeControls.dataRoutes }));
   await registerSessionRoutes(app, buildSessionRouteStores(deps));
   await registerSessionCapabilityRoutes(app, deps);
   await registerProjectCapabilityRoutes(app, deps);
   await registerPersonalCapabilityRoutes(app, deps);
   await registerPersonalSkillRoutes(app, deps);
-  await registerOrganizationSkillSubmissionRoutes(app, deps);
-  await registerProjectSkillRoutes(app, deps);
+  await registerOrganizationSkillSubmissionRoutes(app, {
+    organizationSkillSubmissions: deps.organizationSkillSubmissions,
+    dataRoutes: routeControls.dataRoutes
+  });
+  await registerProjectSkillRoutes(app, { projectSkills: deps.projectSkills, dataRoutes: routeControls.dataRoutes });
   await registerMemberMcpRoutes(app, deps);
   await registerMemoryRoutes(app, deps);
   await registerProjectRoutes(app, deps);
   await registerProjectMemberRoutes(app, deps.projectMembers);
   await registerProjectFileRoutes(app, deps);
   await registerSettingsRoutes(app, buildSettingsRouteStores(deps, { config: app.config }));
-  await registerJiraConnectionRoutes(app, {
-    jiraConnections: deps.jiraConnectionService,
-    integrationStates: deps.integrationStates,
-    config: app.config
-  });
+  // Built-in connector routes (GitHub, Notion, Jira member routes). Their
+  // OAuth callbacks register earlier, from the integration registry.
+  await deps.builtinConnectors.attachRoutes(app);
   await registerArtifactRoutes(app, buildArtifactRouteStores(deps));
   await registerMessageRoutes(
     app,
@@ -125,7 +128,7 @@ export async function registerAppRoutes(
 
   // Optional overlays attach their routes last. The core OSS tree ships this
   // as a no-op so derived distributions can add routes without changing core.
-  deps.overlays.attachRoutes(app);
+  deps.overlays.attachRoutes(app, { dataRoutes: routeControls.dataRoutes });
 }
 
 export function registerAppLifecycle(input: {
@@ -142,6 +145,8 @@ export function registerAppLifecycle(input: {
   schedulerDrainWaitMs?: number;
   privilegedDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
+  /** Sends and cleans email_outbox; null in dev-headers mode. */
+  mailWorker?: MailOutboxWorker | null;
   /**
    * Cross-tenant stale-approval recovery. Backed by the privileged store so the
    * sweep spans all tenants. Optional only so tests can omit it; production
@@ -168,12 +173,14 @@ export function registerAppLifecycle(input: {
     schedulerDrainWaitMs = 15_000,
     privilegedDb,
     schedulerWorker,
+    mailWorker,
     staleApprovalSweeper,
     staleMessageSweeper,
     expiredExecutions
   } = input;
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
+  mailWorker?.start();
 
   const sweepInterval = setInterval(() => limits.sweepExpired(), 60_000);
   sweepInterval.unref();
@@ -220,6 +227,7 @@ export function registerAppLifecycle(input: {
   app.addHook("preClose", async () => {
     activeTurns?.beginDrain();
     schedulerWorker?.stop();
+    mailWorker?.stop();
     clearInterval(sweepInterval);
     clearInterval(executionSweepInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
@@ -259,6 +267,12 @@ export function registerAppLifecycle(input: {
     if (schedulerWorker && !(await schedulerWorker.drain(schedulerDrainWaitMs))) {
       app.log.error("Scheduled jobs did not settle after their runtimes closed; the next start marks their runs orphaned");
     }
+    // A message still sending keeps its claim; the claim expires and another
+    // process sends it again (at least once).
+    if (mailWorker && !(await mailWorker.drain(turnDrainWaitMs))) {
+      app.log.warn("Mail outbox pass still running at shutdown; its claims expire and are sent again later");
+    }
+    mailWorker?.close();
   });
 
   app.addHook("onClose", async () => {

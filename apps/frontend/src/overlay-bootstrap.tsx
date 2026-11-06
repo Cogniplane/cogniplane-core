@@ -5,7 +5,7 @@
 // sources, settings sections, etc.
 //
 // Why this exists: `overlays.ts` is a plain server-context module that
-// chains into the SharePoint overlay's `register.tsx` (a `"use client"`
+// chains into each overlay's `register.tsx` (a `"use client"`
 // module). When a server component side-effect-imports a `"use client"`
 // module, Next.js bundles it but does not guarantee eager evaluation
 // unless something from that boundary is actually rendered. Without an

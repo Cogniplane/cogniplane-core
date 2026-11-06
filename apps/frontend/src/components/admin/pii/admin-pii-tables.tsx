@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 import { formatRelativeTime, shortId, statusPillClass } from "../../../lib/admin-pii-utils";
+import { isPiiRunNotScanned } from "../../../lib/admin-session-pii-utils";
 import { formatTimestamp } from "../../../lib/time-format";
 import { getAdminPiiRecent, getAdminPiiTop } from "../../../lib/admin-api";
 import type {
@@ -16,13 +17,38 @@ import type {
 } from "@cogniplane/shared-types";
 import { queryKeys } from "../../../lib/query-keys";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
 type RangeProps = { range: PiiRangePreset; from?: string; to?: string };
 
-const TAB_ACTIVE = `${PILL_BLUE} cursor-pointer border-0`;
-const TAB_INACTIVE = `${PILL_GRAY} cursor-pointer border-0`;
 const LIST_ITEM_LINK = `block ${LIST_ITEM} no-underline text-inherit transition-colors hover:border-outline`;
+
+function ReadStatus({ pending, fetching, failed, available, label, range, retry }: {
+  pending: boolean;
+  fetching: boolean;
+  failed: boolean;
+  available: boolean;
+  label: string;
+  range: PiiRangePreset;
+  retry: () => void;
+}) {
+  if (pending) return <p role="status" className={HINT}>Loading {label} for {range}...</p>;
+  if (failed || !available) return <div className="mb-3 flex flex-wrap items-center gap-3">
+    <p role={failed ? "alert" : "status"} className={failed ? "text-sm text-danger" : HINT}>
+      {failed ? `Could not ${available ? "refresh" : "load"} ${label} for ${range}.` : `${label === "recent activity" ? "Recent activity is" : "Most findings are"} unavailable for ${range}.`}
+      {available ? " Showing the last successful result." : " Results are not available."}
+    </p>
+    <Button type="button" variant="outline" size="sm" disabled={fetching} onClick={retry}>Retry {label}</Button>
+  </div>;
+  return fetching ? <p role="status" className={`${HINT} mb-3`}>Refreshing {label} for {range}. Showing the last successful result.</p> : null;
+}
+
+function DisplayedRange({ range }: { range: { preset: PiiRangePreset; from: string; to: string } }) {
+  return <p className="mb-3 break-words text-xs text-on-surface-variant">
+    Results shown for {range.preset}. <time dateTime={range.from}>{formatTimestamp(range.from)}</time> to <time dateTime={range.to}>{formatTimestamp(range.to)}</time>.
+  </p>;
+}
 
 // ─── TopOffenders ──────────────────────────────────────────────────────────
 
@@ -43,26 +69,26 @@ export function TopOffenders(props: RangeProps) {
       <CardHeader>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 id="pii-top-title" className="text-base font-semibold text-on-surface">Most findings</h2>
-          <div className="flex flex-wrap items-center gap-2" role="tablist" aria-label="Group by">
+          <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Group findings by">
             {(["user", "session"] as PiiTopGroupBy[]).map((tab) => (
-              <button
+              <Button
                 key={tab}
                 type="button"
-                role="tab"
-                aria-selected={groupBy === tab}
+                variant={groupBy === tab ? "secondary" : "outline"}
+                size="sm"
+                aria-pressed={groupBy === tab}
                 onClick={() => setGroupBy(tab)}
-                className={groupBy === tab ? TAB_ACTIVE : TAB_INACTIVE}
               >
                 {tab === "user" ? "Users" : "Sessions"}
-              </button>
+              </Button>
             ))}
           </div>
         </div>
       </CardHeader>
       <CardContent>
-        {topQuery.isLoading ? (
-          <p className={HINT}>Loading…</p>
-        ) : !data || data.rows.length === 0 ? (
+        <ReadStatus pending={topQuery.isPending} fetching={topQuery.isFetching} failed={topQuery.isError} available={data !== null} label="most findings" range={props.range} retry={() => void topQuery.refetch()} />
+        {data ? <DisplayedRange range={data.range} /> : null}
+        {!data ? null : data.rows.length === 0 ? (
           <p className={HINT}>
             {groupBy === "user"
               ? "No users with findings in this range."
@@ -176,9 +202,9 @@ export function RecentActivityFeed(props: RangeProps) {
         <h2 id="pii-recent-title" className="text-base font-semibold text-on-surface">Recent activity</h2>
       </CardHeader>
       <CardContent>
-        {recentQuery.isLoading ? (
-          <p className={HINT}>Loading…</p>
-        ) : !data || data.rows.length === 0 ? (
+        <ReadStatus pending={recentQuery.isPending} fetching={recentQuery.isFetching} failed={recentQuery.isError} available={data !== null} label="recent activity" range={props.range} retry={() => void recentQuery.refetch()} />
+        {data ? <DisplayedRange range={data.range} /> : null}
+        {!data ? null : data.rows.length === 0 ? (
           <p className={HINT}>No blocked, transformed, or failed scans in this range.</p>
         ) : (
           <div className="flex flex-col gap-2">
@@ -202,7 +228,9 @@ export function RecentActivityFeed(props: RangeProps) {
                     </div>
                   </div>
                   <p className="mt-1 text-xs text-on-surface-faint">
-                    {row.findingsCount} finding{row.findingsCount === 1 ? "" : "s"}
+                    {isPiiRunNotScanned(row)
+                      ? "Not scanned"
+                      : `${row.findingsCount} finding${row.findingsCount === 1 ? "" : "s"}`}
                     {row.entityTypes.length > 0 ? `: ${row.entityTypes.join(", ")}` : ""}
                     {row.errorMessage ? ` — ${row.errorMessage}` : ""}
                     {" • "}

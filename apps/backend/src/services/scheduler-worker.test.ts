@@ -7,10 +7,12 @@ import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord, ToolResultRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
-import type { ScheduledJobRecord } from "./user-settings-store.js";
+import type { ClaimedScheduledJob } from "./user-settings-store.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
 import type { PiiFinding } from "./pii/pii-provider.js";
+import { textEvaluation } from "../test-helpers/pii-evaluation.js";
 import {
+  OWNER_SECURITY_CHANGED_RUN_ERROR,
   SchedulerWorker,
   type SchedulerRuntimeResolution,
   type SchedulerRuntimeAdapter,
@@ -44,7 +46,7 @@ function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
   };
 }
 
-function makeFakeJob(overrides: Partial<ScheduledJobRecord> = {}): ScheduledJobRecord {
+function makeFakeJob(overrides: Partial<ClaimedScheduledJob> = {}): ClaimedScheduledJob {
   return {
     tenantId: "test-tenant",
     jobId: "job-1",
@@ -59,11 +61,13 @@ function makeFakeJob(overrides: Partial<ScheduledJobRecord> = {}): ScheduledJobR
     input: { prompt: "Generate the daily report" },
     settingsSnapshot: {},
     enabled: true,
+    pausedReason: null,
     consecutiveFailures: 0,
     lastRunAt: null,
     nextRunAt: "2026-01-01T09:00:00.000Z",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ownerSecurityVersion: null,
     ...overrides
   };
 }
@@ -103,8 +107,12 @@ function makeFakeMessageRecord(
 }
 
 function createFakeDeps(options?: {
-  dueJobs?: ScheduledJobRecord[];
-  claimReturns?: (ScheduledJobRecord | null)[];
+  dueJobs?: ClaimedScheduledJob[];
+  claimReturns?: (ClaimedScheduledJob | null)[];
+  /** The owner's current security version; called for each read. Default null (WorkOS). */
+  ownerSecurityVersion?: () => number | null;
+  /** What `pauseJobForSecurityChange` answers. Default false (nothing to pause). */
+  pauseReturns?: boolean;
   runtimeEvents?: BaseEvent[][];
   runMessageImpl?: (
     session: RuntimeSessionRef,
@@ -172,12 +180,14 @@ function createFakeDeps(options?: {
     role: string;
     status: string;
     content: string;
+    detail?: unknown;
   }> = [];
   const messagesUpdated: Array<{
     messageId: string;
     userId: string;
     status: string;
     content: string;
+    stopReason?: string;
   }> = [];
   const streamingUpdates: Array<{
     reasoningContent?: string;
@@ -209,6 +219,8 @@ function createFakeDeps(options?: {
   const recordOutcomeCalls: Array<{ tenantId: string; jobId: string; succeeded: boolean }> = [];
   const failureCounts = new Map<string, number>();
   const sweepStaleJobRunsCalls: Array<{ olderThanMs: number; limit: number }> = [];
+  const pauseCalls: Array<{ tenantId: string; jobId: string }> = [];
+  const ownerVersionReads: Array<{ tenantId: string; userId: string }> = [];
 
   // The adapter `resolveRuntime` hands back by default — what the worker
   // dispatches createSession/runMessageAGUI/abortSession to after resolution.
@@ -297,6 +309,14 @@ function createFakeDeps(options?: {
           throw options.sweepStaleJobRunsError;
         }
         return options?.orphanedRuns ?? [];
+      },
+      pauseJobForSecurityChange: async (tenantId: string, jobId: string) => {
+        pauseCalls.push({ tenantId, jobId });
+        return options?.pauseReturns ?? false;
+      },
+      getOwnerSecurityVersion: async (tenantId: string, userId: string) => {
+        ownerVersionReads.push({ tenantId, userId });
+        return options?.ownerSecurityVersion?.() ?? null;
       }
     },
     sessions: {
@@ -331,8 +351,8 @@ function createFakeDeps(options?: {
           input.content
         );
       },
-      updateContent: async (_tenantId, messageId, userId, status, content) => {
-        messagesUpdated.push({ messageId, userId, status, content });
+      updateContent: async (_tenantId, messageId, userId, status, content, _durationMs, stopReason) => {
+        messagesUpdated.push({ messageId, userId, status, content, ...(stopReason ? { stopReason } : {}) });
         if (options?.updateContentError) throw options.updateContentError;
         if (options?.updateContentReturnsNull) return null;
         return makeFakeMessageRecord("session-1", userId, "assistant", status, content, { messageId });
@@ -437,7 +457,9 @@ function createFakeDeps(options?: {
     sweepStaleJobRunsCalls,
     auditEvents,
     recordOutcomeCalls,
-    failureCounts
+    failureCounts,
+    pauseCalls,
+    ownerVersionReads
   };
 }
 
@@ -650,6 +672,27 @@ describe("SchedulerWorker", () => {
     expect(messagesUpdated).toEqual([
       expect.objectContaining({ status: "interrupted", content: "partial" })
     ]);
+  });
+
+  test.each([
+    ["security_change", "Scheduled job stopped because your account's security settings changed."],
+    ["tool_context_ended", "Scheduled job stopped because its tool access ended."]
+  ] as const)("a scheduled turn that the backend stopped (%s) records why", async (reason, errorMessage) => {
+    const job = makeFakeJob();
+    const { deps, jobRunsCompleted, messagesUpdated } = createFakeDeps({
+      dueJobs: [job],
+      runMessageImpl: async function* () {
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        yield { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1", result: { interrupted: true, reason } } as BaseEvent;
+      }
+    });
+    const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage });
+    // The assistant row keeps the reason, so the chat shows the same notice.
+    expect(messagesUpdated).toEqual([expect.objectContaining({ status: "interrupted", stopReason: reason })]);
   });
 
   test("tick resolves the runtime per job tenant and dispatches to the resolved adapter", async () => {
@@ -1890,7 +1933,7 @@ describe("SchedulerWorker", () => {
 describe("SchedulerWorker chat-prompt PII policy", () => {
   function runWithPii(evaluateText: () => Promise<PiiDecision>) {
     const fake = createFakeDeps({ dueJobs: [makeFakeJob({ input: { prompt: "Email jane@example.com" } })] });
-    fake.deps.piiProtection = { evaluateText };
+    fake.deps.piiProtection = textEvaluation(evaluateText, { mode: "block", revision: 6 });
     fake.deps.piiScanRuns = { create: async () => ({ scanRunId: "scan-1" }) };
     const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 5 });
     return { ...fake, run: () => worker.tick() };
@@ -1907,6 +1950,7 @@ describe("SchedulerWorker chat-prompt PII policy", () => {
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed" });
     expect(jobRunsCompleted[0].errorMessage).toContain("blocked by organization policy (email)");
     expect(messagesCreated.map((m) => m.role)).toEqual(["system"]);
+    expect(messagesCreated[0].detail).toMatchObject({ pii: { status: "blocked", modeApplied: "block", policyRevision: 6 } });
     expect(messagesCreated.some((m) => m.content.includes("jane@example.com"))).toBe(false);
     expect(auditEvents.some((e) => e.type === "pii_blocked")).toBe(true);
     // The prompt never changes, so a block counts toward auto-disable.
@@ -1945,6 +1989,101 @@ describe("SchedulerWorker chat-prompt PII policy", () => {
 
     expect(runMessageCalls).toEqual([]);
     expect(recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+});
+
+// A job runs as its owner. After a security change of the owner's local
+// account (password change, sign out everywhere), a job that the old session
+// saved must not run: the claim refuses it, and the worker checks again
+// before the runtime loads the owner's tools and before the turn starts.
+describe("SchedulerWorker owner security changes", () => {
+  beforeEach(() => {
+    messageIdCounter = 0;
+  });
+
+  test("a claim refused after an owner security change pauses the job and audits it, without a run", async () => {
+    const { deps, pauseCalls, auditEvents, sessionsCreated, jobRunsCreated } = createFakeDeps({
+      dueJobs: [makeFakeJob({ ownerSecurityVersion: 1 })],
+      claimReturns: [null],
+      pauseReturns: true
+    });
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 }).tick();
+
+    expect(pauseCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1" }]);
+    expect(auditEvents).toEqual([expect.objectContaining({
+      userId: "user-1",
+      type: "scheduler.job.disabled",
+      payload: { jobId: "job-1", reason: "security_change", disabled: true }
+    })]);
+    expect(sessionsCreated).toEqual([]);
+    expect(jobRunsCreated).toEqual([]);
+  });
+
+  test("a claim lost to another worker pauses nothing and writes no audit event", async () => {
+    const { deps, pauseCalls, auditEvents } = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      claimReturns: [null],
+      pauseReturns: false
+    });
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 }).tick();
+
+    expect(pauseCalls).toHaveLength(1);
+    expect(auditEvents).toEqual([]);
+  });
+
+  test("a security change after the claim refuses the run before the runtime starts", async () => {
+    const { deps, runtimeSessionsCreated, runMessageCalls, jobRunsCompleted, recordOutcomeCalls, pauseCalls, auditEvents } =
+      createFakeDeps({
+        dueJobs: [makeFakeJob({ ownerSecurityVersion: 1 })],
+        ownerSecurityVersion: () => 2,
+        pauseReturns: true
+      });
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 }).tick();
+
+    expect(runtimeSessionsCreated).toEqual([]);
+    expect(runMessageCalls).toEqual([]);
+    expect(jobRunsCompleted).toEqual([expect.objectContaining({
+      status: "failed", errorMessage: OWNER_SECURITY_CHANGED_RUN_ERROR
+    })]);
+    expect(pauseCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1" }]);
+    expect(auditEvents.map((event) => [event.type, event.payload.reason])).toEqual([
+      ["scheduler.job.disabled", "security_change"],
+      ["scheduler.job.run.failed", undefined]
+    ]);
+    // The job is paused, so the refused run does not count toward auto-disable.
+    expect(recordOutcomeCalls).toEqual([]);
+  });
+
+  test("a security change while the runtime session starts refuses the turn", async () => {
+    let reads = 0;
+    const { deps, runtimeSessionsCreated, runMessageCalls, jobRunsCompleted } = createFakeDeps({
+      dueJobs: [makeFakeJob({ ownerSecurityVersion: 1 })],
+      ownerSecurityVersion: () => (reads++ === 0 ? 1 : 2),
+      pauseReturns: true
+    });
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 }).tick();
+
+    expect(runtimeSessionsCreated).toHaveLength(1);
+    expect(runMessageCalls).toEqual([]);
+    expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: OWNER_SECURITY_CHANGED_RUN_ERROR });
+  });
+
+  test("a WorkOS owner and a local owner with an unchanged version run the job", async () => {
+    for (const version of [null, 3]) {
+      const { deps, runMessageCalls, jobRunsCompleted, ownerVersionReads, pauseCalls } = createFakeDeps({
+        dueJobs: [makeFakeJob({ ownerSecurityVersion: version })],
+        ownerSecurityVersion: () => version
+      });
+      await new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 }).tick();
+
+      expect(runMessageCalls).toHaveLength(1);
+      expect(jobRunsCompleted[0]).toMatchObject({ status: "completed" });
+      expect(ownerVersionReads).toEqual([
+        { tenantId: "test-tenant", userId: "user-1" },
+        { tenantId: "test-tenant", userId: "user-1" }
+      ]);
+      expect(pauseCalls).toEqual([]);
+    }
   });
 });
 

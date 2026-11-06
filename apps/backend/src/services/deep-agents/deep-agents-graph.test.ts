@@ -8,6 +8,7 @@ import {
   POLICY_APPROVAL_MARKER_KEY
 } from "../policy/policy-approval-proof.js";
 import { PolicyProofLedger } from "./policy-proof-ledger.js";
+import { ToolCallIdTracker } from "./tool-call-id-tracker.js";
 import { MCP_INVOCATION_META_KEY, type McpInvocationMetadata } from "../mcp/invocation-metadata.js";
 import { resolveSandboxNetworkPolicy } from "../runtime/sandbox-network-policy.js";
 import { E2bDeepAgentsSandbox, type E2bDeepAgentsSandboxOptions } from "./deep-agents-e2b-backend.js";
@@ -40,7 +41,10 @@ type ModelToolCall = { id: string; name: string; args: Record<string, unknown> }
 
 const modelMockState = vi.hoisted(() => ({
   toolCall: null as null | ModelToolCall | ModelToolCall[],
-  emitted: false
+  emitted: false,
+  // When set, each model call answers with its next entry: tool calls, or a
+  // text. The main agent and delegated work share the model.
+  script: null as null | Array<ModelToolCall[] | string>
 }));
 
 vi.mock("langchain", async (importOriginal) => {
@@ -50,18 +54,24 @@ vi.mock("langchain", async (importOriginal) => {
   class ApprovalModel extends FakeStreamingChatModel {
     override bindTools() { return this.withConfig({}); }
     override async *_streamResponseChunks(...args: Parameters<InstanceType<typeof FakeStreamingChatModel>["_streamResponseChunks"]>) {
-      this.chunks = modelMockState.toolCall && !modelMockState.emitted
-        ? [new AIMessageChunk({ content: "", tool_calls: [modelMockState.toolCall].flat() })]
-        : [];
+      if (modelMockState.script) {
+        const step = modelMockState.script.shift() ?? "Done.";
+        this.chunks = [typeof step === "string" ? new AIMessageChunk({ content: step })
+          : new AIMessageChunk({ content: "", tool_calls: step })];
+      } else {
+        this.chunks = modelMockState.toolCall && !modelMockState.emitted
+          ? [new AIMessageChunk({ content: "", tool_calls: [modelMockState.toolCall].flat() })]
+          : [];
+      }
       modelMockState.emitted = true;
       yield* super._streamResponseChunks(...args);
     }
   }
   return {
     ...actual,
-    initChatModel: (...args: Parameters<typeof actual.initChatModel>) => modelMockState.toolCall
+    initChatModel: (...args: Parameters<typeof actual.initChatModel>) => modelMockState.toolCall || modelMockState.script
       ? Promise.resolve(new ApprovalModel({ sleep: 0, responses: [new AIMessage("Done.")],
-          chunks: [new AIMessageChunk({ content: "", tool_calls: [modelMockState.toolCall].flat() })] }))
+          chunks: [] }))
       : actual.initChatModel(...args)
   };
 });
@@ -93,9 +103,10 @@ describe("policy proof handoff through HITL", () => {
   }
 
   async function run(graph: Awaited<ReturnType<ReturnType<typeof makeRuntime>["getAgentForModel"]>>,
-    input: unknown) {
+    input: unknown, onEvent?: (event: Record<string, unknown>) => void, callbacks?: ToolCallIdTracker[]) {
     const events: Record<string, unknown>[] = [];
-    for await (const event of graph.streamEvents(input, { version: "v2", configurable: { thread_id: "sess-1" } })) {
+    for await (const event of graph.streamEvents(input, { version: "v2", callbacks, configurable: { thread_id: "sess-1" } })) {
+      onEvent?.(event);
       events.push(event);
     }
     return events;
@@ -110,6 +121,7 @@ describe("policy proof handoff through HITL", () => {
   function cleanup(...runtimes: Array<ReturnType<typeof makeRuntime> | undefined>) {
     return Promise.all(runtimes.map((runtime) => runtime?.dispose())).finally(() => {
       modelMockState.toolCall = null;
+      modelMockState.script = null;
       mcpMockState.current = null;
     });
   }
@@ -174,6 +186,102 @@ describe("policy proof handoff through HITL", () => {
         args: { ...callerArgs, content: "changed" } });
       expect(wireRequests()[1]).toEqual({ arguments: { ...callerArgs, content: "changed" },
         _meta: trusted({ toolContextId: "current-context" }) });
+    } finally {
+      await cleanup(runtime);
+    }
+  });
+
+  // The facts that the approval link to a tool card rests on (see
+  // stream-events-to-agui.ts). The graph pauses before the tool starts. The
+  // tool's start event carries its run ID and not the model's call ID, but the
+  // tool-start callback gives that ID before the event reaches the consumer.
+  it("starts no tool before approval; the callback names the call of a run before its start event arrives", async () => {
+    fixture();
+    modelMockState.toolCall = { id: "call-1", name: "write_artifact", args: { ...callerArgs } };
+    const runtime = makeRuntime(policyOptions());
+    const tracker = new ToolCallIdTracker();
+    try {
+      const graph = await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+      const asked = await run(graph, { messages: [{ role: "user", content: "Save the report" }] }, undefined, [tracker]);
+      expect(asked.filter((event) => event.event === "on_tool_start")).toEqual([]);
+      // The proposal reaches the stream before the pause.
+      const proposed = asked.filter((event) => event.event === "on_chat_model_end");
+      expect((proposed.at(-1)!.data as { output: { tool_calls: Array<{ id: string }> } }).output.tool_calls
+        .map((call) => call.id)).toEqual(["call-1"]);
+      const pending = await runtime.getPendingActions("sess-1");
+      expect(pending[0]!.policyApproval!.toolCallId).toBe("call-1");
+      const named: Array<string | undefined> = [];
+      const resumed = await run(graph, runtime.buildResumeInput(pending, [{ type: "approve" }]), (event) => {
+        if (event.event === "on_tool_start") named.push(tracker.modelCallIdOf(String(event.run_id)));
+      }, [tracker]);
+      const started = resumed.filter((event) => event.event === "on_tool_start");
+      expect(started).toHaveLength(1);
+      expect(started[0]!.run_id).not.toBe("call-1");
+      expect(JSON.stringify(started[0])).not.toContain("call-1");
+      expect(named).toEqual(["call-1"]);
+    } finally {
+      await cleanup(runtime);
+    }
+  });
+
+  it("starts no tool for a declined call: the decision, not the graph, gives its card a result", async () => {
+    fixture();
+    modelMockState.toolCall = { id: "call-1", name: "write_artifact", args: { ...callerArgs } };
+    const runtime = makeRuntime(policyOptions());
+    try {
+      const graph = await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+      await run(graph, { messages: [{ role: "user", content: "Save the report" }] });
+      const pending = await runtime.getPendingActions("sess-1");
+      const declined = await run(graph, runtime.buildResumeInput(pending, [{ type: "reject", message: "Declined" }]));
+      expect(declined.filter((event) => event.event === "on_tool_start")).toEqual([]);
+      expect(wireRequests()).toEqual([]);
+    } finally {
+      await cleanup(runtime);
+    }
+  });
+
+  it.each(["native", "Policy Center"] as const)(
+    "names the model's call ID of a %s approval of the main agent, from the description that the backend writes", async (flow) => {
+      fixture();
+      modelMockState.toolCall = { id: "call-1", name: "write_artifact", args: { ...callerArgs } };
+      const runtime = makeRuntime(flow === "native"
+        ? { mcpServers: servers, approvals, toolContextRef: { current: "ctx" } } : policyOptions());
+      try {
+        const graph = await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+        await run(graph, { messages: [{ role: "user", content: "Save the report" }] });
+        const [pending] = await runtime.getPendingActions("sess-1");
+        expect(pending).toMatchObject({ name: "write_artifact", args: callerArgs, modelCallId: "call-1" });
+        if (flow === "native") expect(pending).not.toHaveProperty("policyApproval");
+        else expect(pending!.policyApproval!.toolCallId).toBe("call-1");
+        // The graph names only the model's ID. The server ID comes from the AG-UI driver.
+        expect(pending).not.toHaveProperty("toolCallId");
+      } finally {
+        await cleanup(runtime);
+      }
+    }
+  );
+
+  it("names no call for approvals inside parallel delegated work, even when a delegated call repeats the delegation's ID", async () => {
+    fixture();
+    const write = (id: string, name: string) => ({ id, name: "write_artifact", args: { ...callerArgs, name } });
+    modelMockState.script = [
+      [{ id: "t1", name: "task", args: { description: "Save a", subagent_type: "general-purpose" } },
+        { id: "t2", name: "task", args: { description: "Save b", subagent_type: "general-purpose" } }],
+      // Each delegation's model repeats the ID of the delegation that started it.
+      [write("t1", "a.md")], [write("t2", "b.md")],
+      "Saved.", "Saved.", "Done."
+    ];
+    const runtime = makeRuntime({ mcpServers: servers, approvals, toolContextRef: { current: "ctx" } });
+    try {
+      const graph = await runtime.getAgentForModel("deepagents/claude-sonnet-5");
+      await run(graph, { messages: [{ role: "user", content: "Save two reports" }] });
+      const pending = await runtime.getPendingActions("sess-1");
+      expect(pending).toHaveLength(2);
+      expect(new Set(pending.map((action) => action.interruptId)).size).toBe(2);
+      for (const action of pending) expect(action).not.toHaveProperty("modelCallId");
+      await run(graph, runtime.buildResumeInput(pending, [{ type: "approve" }, { type: "approve" }]));
+      expect(wireArguments()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "a.md" }), expect.objectContaining({ name: "b.md" })]));
     } finally {
       await cleanup(runtime);
     }
@@ -597,13 +705,14 @@ describe("RESERVED_BUILTIN_TOOL_NAMES pin (deepagents@1.13.3)", () => {
   // the MUTATING/READ_ONLY gating splits) must be re-verified against the new
   // version's agent.ts.
   //
+  // `render_ui` belongs to our root UI middleware, not to deepagents.
   // `write_todos` is reserved by us but NOT by the library since 1.12.0 — it
   // still ships via langchain's todoListMiddleware and drives the plan pane, so
   // we keep dropping MCP tools that claim the name even though createDeepAgent
   // would accept them. Asserted explicitly below so a future SDK change in
   // either direction is caught.
   const LIBRARY_RESERVED = [...RESERVED_BUILTIN_TOOL_NAMES].filter(
-    (name) => name !== "write_todos"
+    (name) => name !== "write_todos" && name !== "render_ui"
   );
 
   it("createDeepAgent rejects every library-reserved name as a tool-name collision", () => {
@@ -687,6 +796,8 @@ describe("delegated subagent middleware", () => {
     expect(subagentMiddleware()).toEqual([
       { name: "general-purpose", middleware: ["ProjectInstructions", "SavedMemories"] }
     ]);
+    const root = lastDeepAgentConfig()?.middleware as Array<{ name: string; tools?: Array<{ name: string }> }>;
+    expect(root.find((entry) => entry.name === "GenerativeUiContext")?.tools?.map((tool) => tool.name)).toContain("render_ui");
   });
 
   it("puts the guards before the context middleware of the general-purpose subagent", async () => {
@@ -817,9 +928,11 @@ describe("buildInterruptOn (native HITL gating map)", () => {
     });
     expect(map).toBeDefined();
     expect(Object.keys(map!).sort()).toEqual([...MUTATING_BUILTINS].sort());
-    // Every gated entry offers exactly the approve/reject decision pair.
+    // Every gated entry offers exactly the approve/reject decision pair, and
+    // its description carries the model's call ID.
     for (const name of MUTATING_BUILTINS) {
-      expect(map![name]).toEqual({ allowedDecisions: ["approve", "reject"] });
+      expect(map![name]).toEqual({ allowedDecisions: ["approve", "reject"], description: expect.any(Function) });
+      expect(map![name]!.description!({ id: "call-1", args: {} })).toBe("policy-proof:call-1");
     }
   });
 
@@ -1052,7 +1165,7 @@ it("rebuilds the MCP tool list when connectors are removed and enabled again", a
 
   it("drops builtin-colliding and duplicate tool names, records server attribution, and survives a broken server", async () => {
     makeMcpMocks({
-      github: [{ name: "create_issue" }, { name: "read_file" }],
+      github: [{ name: "create_issue" }, { name: "read_file" }, { name: "render_ui" }],
       notion: [{ name: "search_pages" }, { name: "create_issue" }]
       // "sharepoint" missing → its connection fails
     });

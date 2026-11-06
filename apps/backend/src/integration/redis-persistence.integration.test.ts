@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 import { describe, expect, onTestFinished, test } from "vitest";
 import {
-  completeRefreshRotation, consumeRefreshJti, issueRefreshJti, restoreRefreshJti,
-  revokeRefreshFamily, waitForRefreshRotation, REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS
+  clearUnauditedReuse, completeRefreshRotation, consumeRefreshJti, issueRefreshJti, keepUnauditedReuse,
+  readUnauditedReuse, restoreRefreshJti, revokeRefreshFamily, waitForRefreshRotation,
+  REFRESH_FAMILY_ABSOLUTE_LIFETIME_SECONDS
 } from "../lib/refresh-token-store.js";
 import { RedisRequestLimits } from "../services/redis-request-limits.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
@@ -110,6 +111,21 @@ describe.skipIf(!process.env.INTEGRATION_REDIS_URL)("refresh rotation in Redis",
     expect(await consumeRefreshJti(h.redis, { ...h, nowEpochSeconds: deadline })).toEqual({ status: "absolute_expired" });
     expect(await h.redis.get(`refresh_family:${h.familyId}`)).toBe("revoked");
     expect(await restoreRefreshJti(h.redis, h)).toBe(false);
+  });
+
+  test("keeps an unaudited reuse for a bounded time until it is cleared", async () => {
+    const h = setup();
+    const reuse = { tenantId: h.tenantId, userId: h.userId, ipAddress: "203.0.113.9", userAgent: null, detectedAt: "2026-10-29T00:00:00.000Z" };
+    expect(await readUnauditedReuse(h.redis, h.familyId)).toBeNull();
+    await keepUnauditedReuse(h.redis, { familyId: h.familyId, reuse, ttlSeconds: 60 });
+    expect(await readUnauditedReuse(h.redis, h.familyId)).toEqual(reuse);
+    const key = `refresh_reuse_unaudited:${h.familyId}`;
+    expect(await h.redis.pttl(key)).toBeGreaterThan(0);
+    expect(await h.redis.pttl(key)).toBeLessThanOrEqual(60_000);
+    await clearUnauditedReuse(h.redis, h.familyId);
+    expect(await h.redis.exists(key)).toBe(0);
+    await h.redis.set(key, "not json", "EX", 60);
+    expect(await readUnauditedReuse(h.redis, h.familyId)).toBeNull();
   });
 
   test("a mismatched claim identifies the token's actual family", async () => {

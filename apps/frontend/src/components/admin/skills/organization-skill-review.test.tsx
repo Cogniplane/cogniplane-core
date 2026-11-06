@@ -270,3 +270,19 @@ it("says there is nothing to compare when the update has no active organization 
 
   expect(screen.getByText("No current organization version is available for comparison.")).toBeTruthy();
 });
+
+it.each([false, true])("hands off the exact accepted identity through both receipt paths, already accepted %s", async alreadyAccepted => {
+  if (alreadyAccepted) {
+    vi.mocked(listAdminSkillSubmissions).mockResolvedValue({ scope, submissions: [accepted] });
+    vi.mocked(getAdminSkillSubmission).mockResolvedValue({ scope, submission: accepted });
+  }
+  if (!alreadyAccepted) vi.mocked(decideSkillSubmission).mockImplementation(async () => { vi.mocked(getAdminSkillSubmission).mockResolvedValue({ scope, submission: accepted }); return { scope, submission: accepted }; });
+  const onOpenLibrary = vi.fn();
+  render(<OrganizationSkillReview requestedSubmissionId={initial.id} onOpenLibrary={onOpenLibrary} />);
+  if (!alreadyAccepted) fireEvent.click(await screen.findByRole("button", { name: "Accept as draft" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Edit draft in library" }));
+  expect(onOpenLibrary).toHaveBeenCalledWith({ scope, submissionId: initial.id, submissionVersion: 2, attempt: 1,
+    acceptedRevisionId: 7, skillId: "meeting-notes", organizationVersion: 1, activeRevisionId: null,
+    draftRevisionId: 7, content });
+  expect(releaseSkillSubmission).not.toHaveBeenCalled();
+});

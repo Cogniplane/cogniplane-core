@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { OrganizationSkillSubmissionUpdate } from "@cogniplane/shared-types";
@@ -91,4 +91,75 @@ it("keeps every loaded row when a refetch finds a new update at the top", async 
   await client.refetchQueries({ queryKey: ["settings", "skill-updates", scope.tenantId, scope.userId] });
   await screen.findByText("Skill e");
   for (const name of ["Skill a", "Skill c", "Skill d"]) expect(screen.getByText(name)).toBeTruthy();
+});
+
+it("retains unread state after a failed save and retries without closing the update", async () => {
+  vi.mocked(readMySkillSubmissionUpdate).mockRejectedValueOnce(new Error("Read state unavailable"));
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: /Skill a/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Retry marking as read" }));
+  await waitFor(() => expect(readMySkillSubmissionUpdate).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(screen.getAllByText("Unread")).toHaveLength(1));
+  expect(screen.getByRole("button", { name: /Skill a/ }).getAttribute("aria-expanded")).toBe("true");
+  expect(screen.getByText("Reviewer feedback: Add an example")).toBeTruthy();
+});
+
+it.each([false, true])("keeps retry focus through a held read and respects moved focus %s", async (moveFocus) => {
+  let finish!: (value: { scope: typeof scope; id: string; readAt: string; unreadCount: number }) => void;
+  vi.mocked(readMySkillSubmissionUpdate).mockRejectedValueOnce(new Error("Read state unavailable"))
+    .mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: /Skill a/ }));
+  const retry = await screen.findByRole("button", { name: "Retry marking as read" });
+  retry.focus();
+  fireEvent.click(retry);
+  fireEvent.click(retry);
+  await waitFor(() => expect(readMySkillSubmissionUpdate).toHaveBeenCalledTimes(2));
+  expect(document.activeElement).toBe(retry);
+  expect(retry.getAttribute("aria-disabled")).toBe("true");
+  const other = screen.getByRole("button", { name: /Skill c/ });
+  if (moveFocus) other.focus();
+  await act(async () => finish({ scope, id: first.id, readAt: "2026-09-26T13:00:00Z", unreadCount: 1 }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Retry marking as read" })).toBeNull());
+  expect(document.activeElement).toBe(moveFocus ? other : screen.getByRole("button", { name: /Skill a/ }));
+  expect(screen.getByRole("button", { name: /Skill a/ }).getAttribute("aria-expanded")).toBe("true");
+  expect(readMySkillSubmissionUpdate).toHaveBeenCalledTimes(2);
+});
+
+it("shows an initial read failure without an empty claim and recovers with Retry", async () => {
+  vi.mocked(listMySkillSubmissionUpdates).mockRejectedValueOnce(new Error("List unavailable"));
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+  expect(screen.queryByText(/No skill updates yet/)).toBeNull();
+  expect(await screen.findByText("Skill a")).toBeTruthy();
+});
+
+it("labels cached updates as stale after a failed refresh and keeps the rows through retry", async () => {
+  const client = mount();
+  await screen.findByText("Skill a");
+  vi.mocked(listMySkillSubmissionUpdates).mockRejectedValueOnce(new Error("Refresh unavailable"));
+  await client.refetchQueries({ queryKey: ["settings", "skill-updates", scope.tenantId, scope.userId] });
+  expect(await screen.findByText(/Showing the last loaded updates/)).toBeTruthy();
+  expect(screen.getByText("Skill c")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Retry updates" }));
+  await waitFor(() => expect(screen.queryByText(/Showing the last loaded updates/)).toBeNull());
+});
+
+it("clears cached private events when a background refresh loses access", async () => {
+  const client = mount();
+  await screen.findByText("Skill a");
+  vi.mocked(listMySkillSubmissionUpdates).mockRejectedValue(new ApiError({ status: 403, code: "forbidden", method: "GET", path: "/me/skill-submission-updates", message: "Access changed" }));
+  await client.refetchQueries({ queryKey: ["settings", "skill-updates", scope.tenantId, scope.userId] });
+  expect(await screen.findByText(/Reload this page before viewing skill updates/)).toBeTruthy();
+  expect(screen.queryByText("Skill a")).toBeNull();
+});
+
+it("keeps acceptance separate from a dated release to test users", async () => {
+  vi.mocked(listMySkillSubmissionUpdates).mockResolvedValue({ scope, updates: [{ ...first, kind: "accepted", readAt: "2026-09-26T13:00:00Z" }, { ...second, kind: "released", audience: "test-users", readAt: "2026-09-26T13:00:00Z" }], unreadCount: 0, nextCursor: null });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: /Skill a/ }));
+  expect(screen.getByText(/An admin manages release separately/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /Skill c/ }));
+  expect(screen.getByText(/released this revision to test users/)).toHaveProperty("textContent", expect.stringContaining("Later releases may have changed"));
+  expect(readMySkillSubmissionUpdate).not.toHaveBeenCalled();
 });

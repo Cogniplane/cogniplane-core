@@ -2,16 +2,19 @@ import type { FastifyBaseLogger } from "fastify";
 
 import type { AppConfig } from "./config.js";
 import { type Pool } from "./lib/db.js";
-import type { OverlayHandles } from "./overlay-contracts.js";
+import type { AttachOverlaysInput, OverlayHandles } from "./overlay-contracts.js";
 import { attachOverlays } from "./overlays.js";
 import { buildBootstrapServices } from "./services/build-bootstrap-services.js";
 import { buildStores } from "./services/build-stores.js";
+import { attachBuiltinConnectors } from "./services/connectors/builtin-connectors.js";
 import { ProxyToolMetadataCache } from "./services/mcp/proxy-tool-metadata-cache.js";
 import { McpConnectionTestService } from "./services/mcp/mcp-connection-test-service.js";
 import { buildIntegrationServices } from "./services/integrations/build-integration-services.js";
 import { loadIntegrationEnablement } from "./services/integrations/integration-enablement.js";
 import { buildManagedToolRegistries } from "./services/managed-tools/build-managed-tools.js";
+import { registerBuiltinManagedToolsAfterConnectors } from "./services/managed-tools/register-builtin-managed-tools.js";
 import { buildPiiServices } from "./services/pii/build-pii-services.js";
+import { PiiImportScopeRegistry } from "./services/pii/pii-import-scopes.js";
 import { UploadAdmission } from "./services/artifacts/upload-admission.js";
 import { RedisPolicyInvalidationBus } from "./services/policy/policy-cache-invalidation.js";
 import { PolicyService } from "./services/policy/policy-service.js";
@@ -72,15 +75,16 @@ export function buildAppDependencies(input: {
     policyService
   });
 
-  const integrations = buildIntegrationServices(
-    config, stores, deepAgentsAdapter, bootstrap.limits, bootstrap.redis, logger
-  );
+  const integrations = buildIntegrationServices(config, stores, bootstrap.redis);
   bootstrap.dynamicConfig.setIntegrationToolSource(integrations.integrationRegistry);
   const proxyToolMetadataCache = new ProxyToolMetadataCache(logger);
 
   // PII scans read a PDF through its extracted text.
   const extractPdfText = (pdf: Buffer, signal?: AbortSignal) =>
     bootstrap.artifactProcessor.extractPdfText(pdf, signal);
+  // Overlays register their import sources below; the PII services read
+  // this registry at scan time, after it is frozen.
+  const piiImportScopes = new PiiImportScopeRegistry();
   const pii = buildPiiServices({
     config,
     logger,
@@ -89,21 +93,14 @@ export function buildAppDependencies(input: {
     artifactStorage: bootstrap.artifactStorage,
     tenantOrgSettingsPrivileged: bootstrap.tenantOrgSettingsPrivileged,
     redis: bootstrap.redis,
-    extractPdfText
+    extractPdfText,
+    importScopes: piiImportScopes
   });
   stores.projectFiles.setPiiProtection(pii.piiProtection, extractPdfText);
 
-  // Attach optional overlays through the core-owned contract in
-  // `overlay-contracts.ts`. The OSS tree ships a no-op implementation.
-  const overlays: OverlayHandles = attachOverlays({
-    config: {
-      API_ORIGIN: config.API_ORIGIN,
-      DATA_ENCRYPTION_SECRET: config.DATA_ENCRYPTION_SECRET,
-      JWT_SECRET: config.JWT_SECRET,
-      JWT_KEY_ID: config.JWT_KEY_ID,
-      JWT_VERIFICATION_KEYS: config.JWT_VERIFICATION_KEYS,
-      ARTIFACT_MAX_UPLOAD_BYTES: config.ARTIFACT_MAX_UPLOAD_BYTES
-    },
+  // Built-in connector modules and optional overlays get the same input. Only
+  // the config differs: connectors get the full config, overlays a narrow one.
+  const extensionInput: Omit<AttachOverlaysInput, "config"> = {
     db,
     uploadAdmission: new UploadAdmission({
       sessions: stores.sessions,
@@ -124,8 +121,27 @@ export function buildAppDependencies(input: {
     runtimeInvalidator: deepAgentsAdapter,
     managedToolCatalog,
     managedToolFactoryRegistry,
+    piiImportScopes,
     limits: bootstrap.limits
+  };
+  const builtinConnectors = attachBuiltinConnectors({ ...extensionInput, config, logger });
+  // The core tool factories after the connectors keep the `tools/list` order.
+  registerBuiltinManagedToolsAfterConnectors(managedToolFactoryRegistry);
+
+  // Attach optional overlays through the core-owned contract in
+  // `overlay-contracts.ts`. The OSS tree ships a no-op implementation.
+  const overlays: OverlayHandles = attachOverlays({
+    ...extensionInput,
+    config: {
+      API_ORIGIN: config.API_ORIGIN,
+      DATA_ENCRYPTION_SECRET: config.DATA_ENCRYPTION_SECRET,
+      JWT_SECRET: config.JWT_SECRET,
+      JWT_KEY_ID: config.JWT_KEY_ID,
+      JWT_VERIFICATION_KEYS: config.JWT_VERIFICATION_KEYS,
+      ARTIFACT_MAX_UPLOAD_BYTES: config.ARTIFACT_MAX_UPLOAD_BYTES
+    }
   });
+  piiImportScopes.freeze();
 
   return {
     db,
@@ -154,11 +170,7 @@ export function buildAppDependencies(input: {
     customModels: stores.customModels,
     userSettings: stores.userSettings,
     tenantMembers: stores.tenantMembers,
-    githubConnections: stores.githubConnections,
-    githubConnectionService: integrations.githubConnectionService,
-    notionConnections: stores.notionConnections,
-    notionConnectionService: integrations.notionConnectionService,
-    jiraConnectionService: integrations.jiraConnectionService,
+    githubConnectionService: builtinConnectors.githubConnections,
     integrationStates: stores.integrationStates,
     integrationRegistry: integrations.integrationRegistry,
     integrationDescriptors: integrations.integrationDescriptors,
@@ -193,12 +205,14 @@ export function buildAppDependencies(input: {
     piiAnalytics: stores.piiAnalytics,
     piiScanJobHandler: pii.piiScanJobHandler,
     piiScanEnqueuer: pii.piiScanEnqueuer,
+    piiImportScopes,
     activeTurns: stores.activeTurns,
     turnBus,
     proxyToolMetadataCache,
     policyRules: stores.policyRules,
     policyDecisions: stores.policyDecisions,
     policyService,
+    builtinConnectors,
     overlays
   };
 }

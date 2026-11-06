@@ -42,6 +42,7 @@ import { registerAdminUserRoutes } from "./admin/admin-user-routes.js";
 import type { AppConfig } from "../config.js";
 import type { AppDependencies } from "../app-dependencies.js";
 import { buildOpenRouterCatalogFetcher } from "../services/openrouter-catalog.js";
+import type { DataRouteControl } from "../services/data-route-control.js";
 
 // ---------------------------------------------------------------------------
 // Route registration
@@ -51,6 +52,7 @@ export function buildAdminRouteStores(
   deps: AppDependencies,
   extras: {
     config: AppConfig;
+    dataRoutes: DataRouteControl;
   }
 ) {
   const tenantSettings = {
@@ -79,6 +81,7 @@ export function buildAdminRouteStores(
     personAccess: new PersonAccessService(deps),
     modelSpending: deps.modelSpending,
     config: extras.config,
+    dataRoutes: extras.dataRoutes,
     dynamicConfig: deps.dynamicConfig,
     skillMarketplace: deps.skillMarketplace,
     auditEvents: deps.auditEvents,
@@ -127,7 +130,16 @@ export type AdminRouteStores = AdminSkillRouteStores &
   ModelAdminRouteStores &
   PolicyRouteStores &
   AdminIntegrationsRouteStores &
-  OptionalAdminPiiRouteStores & { modelSpending?: ModelSpendingStore; personAccess?: Pick<PersonAccessService, "explain"> };
+  OptionalAdminPiiRouteStores & {
+    modelSpending?: ModelSpendingStore;
+    personAccess?: Pick<PersonAccessService, "explain">;
+    /**
+     * Step-up and owner notice of the data routes (tenant settings, MCP
+     * servers, integrations), of a Policy Center change that makes the policy
+     * weaker, and of a skill release.
+     */
+    dataRoutes: DataRouteControl;
+  };
 
 export async function registerAdminRoutes(
   app: FastifyInstance,
@@ -141,7 +153,8 @@ export async function registerAdminRoutes(
     skillBundleStorage: stores.skillBundleStorage,
     githubConnections: stores.githubConnections,
     tenantSettings: stores.tenantSettings,
-    activations: stores.activations
+    activations: stores.activations,
+    dataRoutes: stores.dataRoutes
   });
   await registerAdminUserRoutes(app, {
     tenantMembers: stores.tenantMembers,
@@ -169,6 +182,7 @@ export async function registerAdminRoutes(
   }
   await registerAdminTenantSettingsRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
+    dataRoutes: stores.dataRoutes,
     managedToolCatalog: stores.managedToolCatalog,
     // Custom models never advertise reasoning efforts (see CustomModelStore).
     // Guarded: test wirings pass partial store literals without customModels.
@@ -192,20 +206,22 @@ export async function registerAdminRoutes(
     policyRules: stores.policyRules,
     policyDecisions: stores.policyDecisions,
     policyService: stores.policyService,
-    auditEvents: stores.auditEvents
+    dataRoutes: stores.dataRoutes
   });
   await registerAdminIntegrationsRoutes(app, {
     config: stores.config,
     integrationRegistry: stores.integrationRegistry,
     integrationStates: stores.integrationStates,
     auditEvents: stores.auditEvents,
-    runtimeAdapter: stores.runtimeAdapter
+    runtimeAdapter: stores.runtimeAdapter,
+    dataRoutes: stores.dataRoutes
   });
 
   await registerAdminMcpServerRoutes(app, {
     dynamicConfig: stores.dynamicConfig,
     activations: stores.activations,
     mcpConnectionTests: stores.mcpConnectionTests,
-    mcpAppCsp: stores.mcpAppCsp
+    mcpAppCsp: stores.mcpAppCsp,
+    dataRoutes: stores.dataRoutes
   });
 }

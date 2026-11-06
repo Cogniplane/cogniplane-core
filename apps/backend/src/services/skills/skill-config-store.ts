@@ -163,8 +163,10 @@ export class SkillConfigStore {
     });
   }
 
+  /** `alsoInTransaction` runs in the change's transaction after the change: the owner notice of a release. */
   async setSkillPublished(tenantId: string, skillId: string, isPublished: boolean,
-    expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
+    expectedSnapshot?: AdminSkillReleaseSnapshot,
+    options: { alsoInTransaction?: (client: PoolClient) => Promise<void> } = {}): Promise<AdminSkillRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await checkReleaseSnapshot(client,tenantId,skillId,expectedSnapshot);
       const result = await client.query(
@@ -177,7 +179,9 @@ export class SkillConfigStore {
         [skillId, tenantId, isPublished]
       );
 
-      return result.rowCount ? this.getSkill(tenantId, skillId, client) : null;
+      if (!result.rowCount) return null;
+      if (options.alsoInTransaction) await options.alsoInTransaction(client);
+      return this.getSkill(tenantId, skillId, client);
     });
   }
 }

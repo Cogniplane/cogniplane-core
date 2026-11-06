@@ -109,6 +109,21 @@ test("PiiScanRunStore.create inserts with defaults and returns mapped record", a
   expect(record.findings).toEqual([]);
 });
 
+test("PiiScanRunStore.create writes the policy revision of a synchronous scan", async () => {
+  const db = new CaptureDatabase();
+  db.insertReturn = sampleRow({ policy_revision: 4 });
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const record = await store.create({ tenantId: "tenant-1", subjectType: "artifact", subjectId: "art-1", mode: "block", policyRevision: 4 });
+
+  const text = db.lastQuery!.text;
+  const columns = /INSERT INTO pii_scan_runs \(([^)]*)\)/.exec(text)![1].split(",").map((column) => column.trim());
+  const binds = /VALUES \(([^)]*)\)/.exec(text)![1].split(",").map((bind) => bind.trim());
+  const bind = binds[columns.indexOf("policy_revision")];
+  expect(db.lastQuery!.values[Number(bind.replace("$", "")) - 1]).toBe(4);
+  expect(record.policyRevision).toBe(4);
+});
+
 test("PiiScanRunStore.create serializes findings_json", async () => {
   const db = new CaptureDatabase();
   db.insertReturn = sampleRow({
@@ -183,6 +198,20 @@ test("PiiScanRunStore.update builds patch SQL with only provided fields", async 
   expect(updated?.status).toBe("completed");
 });
 
+test("PiiScanRunStore.update records the applied mode and the policy revision", async () => {
+  const db = new CaptureDatabase();
+  db.updateReturn = sampleRow({ status: "blocked", mode: "block", policy_revision: 7 });
+  const store = new PiiScanRunStore(db as unknown as Pool);
+
+  const updated = await store.update("tenant-1", "scan-1", { status: "blocked", mode: "block", policyRevision: 7 });
+
+  const text = db.lastQuery!.text;
+  const bound = (column: string) => db.lastQuery!.values[Number(new RegExp(`\\b${column} = \\$(\\d+)`).exec(text)?.[1]) - 1];
+  expect(bound("mode")).toBe("block");
+  expect(bound("policy_revision")).toBe(7);
+  expect(updated).toMatchObject({ mode: "block", policyRevision: 7 });
+});
+
 test("PiiScanRunStore.update returns null when row missing", async () => {
   const db = new CaptureDatabase();
   db.updateReturn = null;
@@ -244,6 +273,7 @@ test("maps a finished run's optional fields and normalizes timestamps", async ()
   const record = await mapped({
     subject_type: "project_instructions",
     instructions_revision: "4",
+    policy_revision: "3",
     status: "blocked",
     summary_text: "1 email",
     action_taken: "block",
@@ -255,6 +285,7 @@ test("maps a finished run's optional fields and normalizes timestamps", async ()
 
   expect(record).toMatchObject({
     instructionsRevision: 4,
+    policyRevision: 3,
     sourceSessionId: "session-1",
     providerType: "openai-compatible",
     providerModel: "google/gemini-2.5-flash",
@@ -275,6 +306,7 @@ test("leaves unset fields null", async () => {
 
   expect(record).toMatchObject({
     instructionsRevision: null,
+    policyRevision: null,
     sourceSessionId: null,
     sourceUserId: null,
     providerType: null,
@@ -285,3 +317,77 @@ test("leaves unset fields null", async () => {
     completedAt: null
   });
 });
+
+// The SQL rules (first decision wins, open runs only) are tested on Postgres
+// in pii-scan-recovery.integration.test.ts. These tests cover the mapping.
+const pendingBlock = {
+  action: "block" as const, mode: "block" as const, policyRevision: 2, findings: [],
+  providerType: "rules", providerModel: null, blockReason: "email"
+};
+
+test("PiiScanRunStore.recordDecision stores the decision as JSON and reports whether it recorded it", async () => {
+  const db = new CaptureDatabase();
+  db.updateReturn = {};
+  const store = new PiiScanRunStore(db as unknown as Pool);
+  expect(await store.recordDecision("tenant-1", "scan-1", pendingBlock)).toBe(true);
+  expect(db.lastQuery!.values).toEqual(["tenant-1", "scan-1", JSON.stringify(pendingBlock)]);
+  db.updateReturn = null;
+  expect(await store.recordDecision("tenant-1", "scan-1", pendingBlock)).toBe(false);
+});
+
+test("PiiScanRunStore.getPendingDecision returns the stored decision, or null when there is none", async () => {
+  const db = new CaptureDatabase();
+  const store = new PiiScanRunStore(db as unknown as Pool);
+  db.selectReturn = [{ pending_decision: pendingBlock }];
+  expect(await store.getPendingDecision("tenant-1", "scan-1")).toEqual(pendingBlock);
+  db.selectReturn = [{ pending_decision: null }];
+  expect(await store.getPendingDecision("tenant-1", "scan-1")).toBeNull();
+  db.selectReturn = [];
+  expect(await store.getPendingDecision("tenant-1", "scan-1")).toBeNull();
+});
+
+test("PiiScanRunStore.getPendingDecision refuses a decision with an unknown action", async () => {
+  // Re-deciding could apply a newer policy to a file whose bytes are gone.
+  const db = new CaptureDatabase();
+  db.selectReturn = [{ pending_decision: { ...pendingBlock, action: "quarantine" } }];
+  await expect(new PiiScanRunStore(db as unknown as Pool).getPendingDecision("tenant-1", "scan-1"))
+    .rejects.toThrow();
+});
+
+test("PiiScanRunStore.update clears the recorded decision when asked", async () => {
+  const db = new CaptureDatabase();
+  db.updateReturn = sampleRow({ status: "blocked" });
+  await new PiiScanRunStore(db as unknown as Pool).update("tenant-1", "scan-1", { status: "blocked", pendingDecision: null });
+  expect(db.lastQuery!.text).toMatch(/pending_decision = \$2/);
+  expect(db.lastQuery!.values[1]).toBeNull();
+});
+
+
+test.each([
+  false, 0, "", [], { action: "allow" },
+  { ...pendingBlock, mode: "unknown" },
+  { ...pendingBlock, policyRevision: -1 },
+  { ...pendingBlock, policyRevision: 1.5 },
+  { ...pendingBlock, findings: null },
+  { ...pendingBlock, findings: [{}] },
+  { ...pendingBlock, findings: [{ entityType: "email", value: "", start: 2, end: 1, confidence: "high" }] },
+  { ...pendingBlock, providerType: false },
+  { ...pendingBlock, providerModel: 7 },
+  { ...pendingBlock, blockReason: [] },
+  { ...pendingBlock, imagesNotScanned: "false" }
+])("refuses malformed non-null persisted decision %j", async (decision) => {
+  const db = new CaptureDatabase();
+  db.selectReturn = [{ pending_decision: decision }];
+  await expect(new PiiScanRunStore(db as unknown as Pool).getPendingDecision("tenant-1", "scan-1"))
+    .rejects.toThrow();
+});
+
+test.each(["allow", "report", "block", "transform"] as const)(
+  "reads a valid persisted %s decision from JSON", async (action) => {
+    const db = new CaptureDatabase();
+    const decision = { ...pendingBlock, action, imagesNotScanned: false };
+    db.selectReturn = [{ pending_decision: JSON.stringify(decision) }];
+    expect(await new PiiScanRunStore(db as unknown as Pool).getPendingDecision("tenant-1", "scan-1"))
+      .toEqual(decision);
+  }
+);

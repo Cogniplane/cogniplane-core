@@ -264,3 +264,15 @@ it("saves nothing in a scheduled turn: no prompt, and the gateway refuses the ca
   expect(memories.rows.size).toBe(0);
   expect(approvals.rows.size).toBe(0);
 });
+
+it("gives a managed tool failure to the model as a failed tool result, and the turn goes on", async () => {
+  const { run } = await setup();
+  // A blank name passes the schema, and the handler refuses it with a JSON-RPC error.
+  modelState.toolCall = { id: "call-1", name: "memory_delete", args: { toolContextId: "x", name: "   " } };
+
+  const outputs = await run(startTurn);
+
+  expect(outputs).toHaveLength(1);
+  expect(JSON.parse(outputs[0]!)).toMatchObject({ kwargs: { status: "error", name: "memory_delete" } });
+  expect(outputs[0]).toMatch(/name is required/);
+});

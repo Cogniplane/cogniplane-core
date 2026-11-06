@@ -17,8 +17,8 @@ const MESSAGE_CARD =
   "rounded-lg border border-outline-variant bg-surface-container-lowest p-4 transition-colors";
 
 const STATUS_BORDER: Record<string, string> = {
-  pending: "border-accent",
-  streaming: "border-accent",
+  pending: "border-info/50",
+  streaming: "border-info/50",
   error: "border-danger",
   completed: ""
 };
@@ -99,12 +99,14 @@ function ReplayMessageCard(props: {
   const { message, piiRuns } = props;
   const role = message.role === "user" ? "user" : "assistant";
   const statusClass = chatReplayStatusClass(message.status);
-  const userBg = role === "user" ? "bg-accent-soft/40" : "";
+  const userBg = role === "user" ? "bg-info-surface/40" : "";
 
   return (
     <article
       id={`message-${message.messageId}`}
-      className={`${MESSAGE_CARD} ${STATUS_BORDER[statusClass] ?? ""} ${userBg}`}
+      tabIndex={-1}
+      aria-label={`${role === "user" ? "User" : "Agent"} message`}
+      className={`${MESSAGE_CARD} scroll-mt-2 outline-none focus:ring-[3px] focus:ring-ring/50 ${STATUS_BORDER[statusClass] ?? ""} ${userBg}`}
     >
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs font-semibold uppercase tracking-wide text-on-surface-variant">

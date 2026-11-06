@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useId, useState } from "react";
+import { useCallback, useId, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { ModelSpendingPolicy, ModelSpendingResponse } from "@cogniplane/shared-types";
 
@@ -78,6 +78,7 @@ export function BudgetDialog(props: {
 }) {
   const queryClient = useQueryClient();
   const ids = useId();
+  const operationInFlight = useRef(false);
   const [base, setBase] = useState<ModelSpendingPolicy>(props.summary.policy);
   const [draft, setDraft] = useState<BudgetDraft>(() => draftFromPolicy(props.summary.policy));
   const [touched, setTouched] = useState<{ limit?: boolean; reservation?: boolean }>({});
@@ -93,6 +94,7 @@ export function BudgetDialog(props: {
       await refreshModelSpending(queryClient, props.month, { firstPage: response });
       props.onSaved(savedMessage(value, response.policy));
     },
+    onSettled: () => { operationInFlight.current = false; },
     onError: (error) => {
       if (isConflict(error)) {
         setConflict("conflict");
@@ -106,9 +108,11 @@ export function BudgetDialog(props: {
     onSuccess: async (fresh) => {
       setBase(fresh.policy);
       setConflict("reloaded");
+      setStep("edit");
       save.reset();
       await refreshModelSpending(queryClient, props.month, { firstPage: fresh });
-    }
+    },
+    onSettled: () => { operationInFlight.current = false; }
   });
 
   const pending = save.isPending || reload.isPending;
@@ -125,27 +129,47 @@ export function BudgetDialog(props: {
   const limitError = (touched.limit || submitted) && draft.mode === "limit" ? errors.limit : undefined;
   const reservationError = touched.reservation || submitted ? errors.reservation : undefined;
 
-  const handleOpenChange = (open: boolean) => { if (!pending) props.onOpenChange(open); };
+  const handleOpenChange = (open: boolean) => { if (!pending && !operationInFlight.current) props.onOpenChange(open); };
   const update = (patch: Partial<BudgetDraft>) => {
+    if (pending || operationInFlight.current) return;
     setDraft((current) => ({ ...current, ...patch }));
     if (save.isError && !isConflict(save.error)) save.reset();
   };
 
   function submit() {
     setSubmitted(true);
-    if (!value || unchanged || changedElsewhere || pending) return;
+    if (!value || unchanged || changedElsewhere || pending || operationInFlight.current) return;
     if (consequences && step === "edit") {
       setStep("confirm");
       return;
     }
+    operationInFlight.current = true;
     save.mutate(value);
   }
+
+  const conflictNotice = changedElsewhere ? (
+    <div role="alert" className="flex flex-col gap-3 rounded-lg border border-warning/40 bg-warning-surface p-3 text-sm text-on-surface">
+      <p>
+        <span className="font-semibold">Someone else changed the budget after you opened this dialog.</span>{" "}
+        Your draft is kept. Load the current budget and review it before you save.
+      </p>
+      {reload.isError ? <p className="text-danger">Could not load the current budget. Try again.</p> : null}
+      <Button type="button" size="sm" variant="outline" className="self-start" disabled={pending} aria-busy={reload.isPending} onClick={() => {
+        if (pending || operationInFlight.current) return;
+        operationInFlight.current = true;
+        reload.mutate();
+      }}>
+        {reload.isPending ? "Loading…" : "Load current budget"}
+      </Button>
+    </div>
+  ) : null;
 
   const confirmLabel = value?.monthlyLimitUsd === 0 ? "Pause new turns" : "Remove the limit";
 
   return (
     <Dialog open={props.open} onOpenChange={handleOpenChange}>
       <DialogContent
+        scrollBody={false}
         showCloseButton={!pending}
         className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 p-0"
         onCloseAutoFocus={props.onCloseAutoFocus}
@@ -158,40 +182,34 @@ export function BudgetDialog(props: {
           className="flex min-h-0 flex-1 flex-col"
           onSubmit={(event) => { event.preventDefault(); submit(); }}
         >
-          {step === "confirm" && consequences && value ? (
-            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-6">
-              <DialogHeader className="pr-6">
+          <DialogHeader className="shrink-0 px-6 pb-4 pt-6 pr-14">
+            {step === "confirm" && consequences && value ? (
+              <>
                 <DialogTitle tabIndex={-1} ref={focusOnMount} className="outline-none">
                   {value.monthlyLimitUsd === 0 ? "Pause new turns?" : "Remove the monthly limit?"}
                 </DialogTitle>
                 <DialogDescription>Read what changes before you confirm.</DialogDescription>
-              </DialogHeader>
+              </>
+            ) : (
+              <>
+                <DialogTitle>{base.monthlyLimitUsd === null ? "Set a monthly budget" : "Change the monthly budget"}</DialogTitle>
+                <DialogDescription>Changes apply to new turns. Turns that are already running keep their holds.</DialogDescription>
+              </>
+            )}
+          </DialogHeader>
+          {step === "confirm" && consequences && value ? (
+            <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 pb-6">
+              {conflictNotice}
               <ul className="flex list-disc flex-col gap-1.5 pl-5 text-sm text-on-surface">
                 {consequences.map((line) => <li key={line}>{line}</li>)}
               </ul>
               {save.isError && !isConflict(save.error) ? <p role="alert" className="text-sm text-danger">{saveError(save.error)}</p> : null}
             </div>
           ) : (
-            <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto p-6">
-              <DialogHeader className="pr-6">
-                <DialogTitle>{base.monthlyLimitUsd === null ? "Set a monthly budget" : "Change the monthly budget"}</DialogTitle>
-                <DialogDescription>Changes apply to new turns. Turns that are already running keep their holds.</DialogDescription>
-              </DialogHeader>
-
-              {changedElsewhere ? (
-                <div role="alert" className="flex flex-col gap-3 rounded-lg border border-warning/40 bg-warning-surface p-3 text-sm text-on-surface">
-                  <p>
-                    <span className="font-semibold">Someone else changed the budget after you opened this dialog.</span>{" "}
-                    Your draft is kept. Load the current budget and review it before you save.
-                  </p>
-                  {reload.isError ? <p className="text-danger">Could not load the current budget. Try again.</p> : null}
-                  <Button type="button" size="sm" variant="outline" className="self-start" disabled={reload.isPending} aria-busy={reload.isPending} onClick={() => reload.mutate()}>
-                    {reload.isPending ? "Loading…" : "Load current budget"}
-                  </Button>
-                </div>
-              ) : null}
+            <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 pb-6">
+              {conflictNotice}
               {conflict === "reloaded" ? (
-                <div role="status" className="flex flex-col gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-3 text-sm">
+                <div role="status" tabIndex={-1} ref={focusOnMount} className="outline-none flex flex-col gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-3 text-sm">
                   <p className="font-semibold text-on-surface">Compare before you save</p>
                   <dl className="grid gap-1 sm:grid-cols-[auto_1fr] sm:gap-x-3">
                     <dt className="text-on-surface-variant">Saved now</dt>
@@ -199,13 +217,13 @@ export function BudgetDialog(props: {
                     <dt className="text-on-surface-variant">Your draft</dt>
                     <dd className="text-on-surface">{value ? draftLine(value) : "Not complete"}</dd>
                   </dl>
-                  <Button type="button" size="sm" variant="ghost" className="-ml-2 self-start" onClick={() => { setDraft(draftFromPolicy(base)); setTouched({}); setSubmitted(false); }}>
+                  <Button type="button" size="sm" variant="ghost" className="-ml-2 self-start" disabled={pending} onClick={() => { setDraft(draftFromPolicy(base)); setTouched({}); setSubmitted(false); }}>
                     Use the saved values
                   </Button>
                 </div>
               ) : null}
 
-              <fieldset className="flex flex-col gap-2">
+              <fieldset className="flex flex-col gap-2" disabled={pending}>
                 <legend className="mb-2 text-sm font-semibold text-on-surface">Monthly limit</legend>
                 {MODES.map((mode) => (
                   <label
@@ -219,6 +237,7 @@ export function BudgetDialog(props: {
                       type="radio"
                       name={`${ids}-mode`}
                       value={mode.id}
+                      disabled={pending}
                       checked={draft.mode === mode.id}
                       onChange={() => update({ mode: mode.id })}
                       className="mt-1 size-4 shrink-0 accent-primary"
@@ -236,6 +255,7 @@ export function BudgetDialog(props: {
                   id={`${ids}-limit`}
                   label="Limit per month (USD)"
                   hint="Estimated model cost for the UTC calendar month."
+                  disabled={pending}
                   value={draft.limit}
                   error={limitError}
                   onChange={(limit) => update({ limit })}
@@ -249,6 +269,7 @@ export function BudgetDialog(props: {
                 hint={draft.mode === "none"
                   ? "Used only while a limit is set."
                   : "Each new turn holds this amount until it ends. Unused money returns then. A turn stops when its model calls use up the hold."}
+                disabled={pending}
                 value={draft.reservation}
                 error={reservationError}
                 onChange={(reservation) => update({ reservation })}
@@ -292,6 +313,7 @@ function AmountField(props: {
   hint: string;
   value: string;
   error: string | undefined;
+  disabled: boolean;
   onChange: (value: string) => void;
   onBlur: () => void;
 }) {
@@ -308,6 +330,7 @@ function AmountField(props: {
           autoComplete="off"
           spellCheck={false}
           className="pl-7 tabular-nums"
+          disabled={props.disabled}
           value={props.value}
           aria-invalid={props.error ? true : undefined}
           aria-describedby={props.error ? `${errorId} ${hintId}` : hintId}

@@ -64,6 +64,11 @@ export type JiraConnectionSummary = {
   site: JiraSiteView;
   connectedAt: string;
   updatedAt: string;
+  // A security change of the owner's account suspended the connection. The
+  // agent does not use it until the owner selects a site again from a current
+  // session. There is no confirm: the Pipedream account ID is opaque and the
+  // account name is chosen by whoever authorized it.
+  suspended: boolean;
 };
 
 export type JiraAccountCandidate = {
@@ -111,13 +116,14 @@ export class JiraConnectionError extends Error {
   }
 }
 
-function toSummary(record: JiraConnectionRecord): JiraConnectionSummary {
+function toSummary(record: JiraConnectionRecord & { suspended?: boolean }): JiraConnectionSummary {
   return {
     accountId: record.accountId,
     accountName: record.accountName,
     site: { siteId: record.cloudId, name: record.siteName, url: record.siteUrl },
     connectedAt: record.createdAt,
-    updatedAt: record.updatedAt
+    updatedAt: record.updatedAt,
+    suspended: record.suspended === true
   };
 }
 
@@ -164,7 +170,7 @@ export class JiraConnectionService {
     private readonly config: AppConfig,
     private readonly store: Pick<
       JiraConnectionStore,
-      | "get" | "getIdentity" | "bindIdentity" | "upsert" | "retire"
+      | "get" | "getForOwner" | "getIdentity" | "bindIdentity" | "upsert" | "retire"
       | "listCleanups" | "getCleanup" | "completeCleanup" | "recordCleanupFailure"
     >,
     private readonly integrationStates: Pick<IntegrationStateStore, "get">,
@@ -212,7 +218,7 @@ export class JiraConnectionService {
     cleanupPending: boolean;
   }> {
     const [record, identity, cleanups] = await Promise.all([
-      this.store.get(tenantId, userId),
+      this.store.getForOwner(tenantId, userId),
       this.store.getIdentity(tenantId, userId),
       this.store.listCleanups(tenantId, userId)
     ]);
@@ -305,7 +311,9 @@ export class JiraConnectionService {
   async selectConnection(
     tenantId: string,
     userId: string,
-    input: { accountId: string; siteId: string }
+    input: { accountId: string; siteId: string },
+    // The security version of the requesting session (requestSecurityVersion).
+    ownerSecurityVersion: number | null
   ): Promise<JiraConnectionSummary> {
     this.requireClient();
     const identity = await this.identity(tenantId, userId, false);
@@ -328,7 +336,8 @@ export class JiraConnectionService {
         accountName: account.name ?? null,
         cloudId: site.siteId,
         siteName: site.name,
-        siteUrl: site.url
+        siteUrl: site.url,
+        ownerSecurityVersion
       }, identity);
     } catch (error) {
       throw this.lifecycleError(error);

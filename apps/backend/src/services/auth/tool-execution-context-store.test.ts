@@ -153,6 +153,7 @@ test("ToolExecutionContextStore resolves a valid owned context before expiry", a
     metadata: {
       source: "test"
     },
+    ownerSecurityVersion: null,
     ttlMs: 1_000
   });
 
@@ -178,6 +179,7 @@ test("ToolExecutionContextStore treats expired contexts as missing", async () =>
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: null,
+    ownerSecurityVersion: null,
     ttlMs: 50
   });
 
@@ -208,6 +210,7 @@ test("findLatestActiveBySession returns the most-recently-created active context
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: null,
+    ownerSecurityVersion: null,
     ttlMs: 10_000
   };
 
@@ -231,6 +234,7 @@ test("findLatestActiveBySession returns null when the only match has expired", a
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: null,
+    ownerSecurityVersion: null,
     ttlMs: 50
   });
 
@@ -250,6 +254,7 @@ test("findLatestActiveBySession never returns another tenant or session's contex
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: null,
+    ownerSecurityVersion: null,
     ttlMs: 10_000
   });
 
@@ -274,6 +279,7 @@ test("extend keeps a context alive across consecutive approval rounds", async ()
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: "message-1",
+    ownerSecurityVersion: null,
     ttlMs
   });
 
@@ -301,6 +307,7 @@ test("extend refuses a context that already expired", async () => {
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: "message-1",
+    ownerSecurityVersion: null,
     ttlMs
   });
 
@@ -322,6 +329,7 @@ test("extend does not cross tenants", async () => {
     runtimeId: "runtime-1",
     runtimePolicyId: "test-tools",
     messageId: "message-1",
+    ownerSecurityVersion: null,
     ttlMs
   });
 

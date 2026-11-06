@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { createAdminArtifactDownload } from "../../../lib/admin-api";
 import { API_URL } from "../../../lib/api-client";
@@ -17,16 +17,19 @@ function formatBytes(bytes: number): string {
 }
 
 export function AdminSessionArtifactsTab(props: { artifacts: AdminSessionDetailArtifact[] }) {
-  const [busyArtifactId, setBusyArtifactId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
+  const active = useRef(new Set<string>());
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
   if (props.artifacts.length === 0) {
     return <p className={HINT}>No artifacts in this session.</p>;
   }
 
   const handleDownload = async (artifactId: string) => {
-    setBusyArtifactId(artifactId);
-    setError(null);
+    if (active.current.has(artifactId)) return;
+    active.current.add(artifactId);
+    setBusyIds(new Set(active.current));
+    setErrors(current => ({ ...current, [artifactId]: "" }));
     try {
       const download = await createAdminArtifactDownload(artifactId);
       // Not an internal Next route. API_URL is the backend origin: a different
@@ -39,15 +42,15 @@ export function AdminSessionArtifactsTab(props: { artifacts: AdminSessionDetailA
       // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- absolute cross-origin download URL, see above
       window.location.assign(`${API_URL}${download.url}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start download.");
+      setErrors(current => ({ ...current, [artifactId]: err instanceof Error ? err.message : "Failed to start download." }));
     } finally {
-      setBusyArtifactId(null);
+      active.current.delete(artifactId);
+      setBusyIds(new Set(active.current));
     }
   };
 
   return (
     <>
-      {error ? <p className="mb-2 text-sm text-danger">{error}</p> : null}
       <div className="flex flex-col gap-2">
         {props.artifacts.map((artifact) => (
           <div className={LIST_ITEM} key={artifact.artifactId}>
@@ -71,11 +74,14 @@ export function AdminSessionArtifactsTab(props: { artifacts: AdminSessionDetailA
               variant="ghost"
               size="xs"
               className="mt-2"
-              disabled={busyArtifactId === artifact.artifactId}
+              aria-disabled={busyIds.has(artifact.artifactId)}
+              aria-busy={busyIds.has(artifact.artifactId)}
+              aria-describedby={errors[artifact.artifactId] ? `download-error-${artifact.artifactId}` : undefined}
               onClick={() => void handleDownload(artifact.artifactId)}
             >
-              {busyArtifactId === artifact.artifactId ? "Preparing…" : "Download"}
+              {busyIds.has(artifact.artifactId) ? "Preparing…" : "Download"}
             </Button>
+            {errors[artifact.artifactId] ? <p id={`download-error-${artifact.artifactId}`} role="alert" className="mt-2 text-sm text-danger">{errors[artifact.artifactId]}</p> : null}
           </div>
         ))}
       </div>

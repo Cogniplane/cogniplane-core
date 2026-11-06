@@ -163,6 +163,33 @@ describe("runtimeNoticesFromMessages", () => {
     ])).toEqual([]);
   });
 
+  test("an interrupted turn that the backend stopped shows why", () => {
+    const stopped = (messageId: string, overrides: Partial<Message>) => makeMessage({
+      messageId, role: "assistant", status: "interrupted", updatedAt: "2026-10-28T10:00:00.000Z", ...overrides
+    } as Partial<Message>);
+    const rows = runtimeNoticesFromMessages([
+      stopped("a-1", { stopReason: "security_change" }),
+      stopped("a-2", { stopReason: "tool_context_ended" }),
+      // The user's own Stop has no reason.
+      stopped("a-3", {}),
+      // A reason only counts on an interrupted turn.
+      stopped("a-4", { status: "completed", stopReason: "security_change" })
+    ]);
+
+    expect(rows).toEqual([
+      {
+        type: "runtime-notice", rowId: "notice:turn-stopped:a-1", noticeId: "turn-stopped:a-1", level: "warning",
+        title: "Turn stopped",
+        message: "This turn stopped because your account's security settings changed. Send the message again.",
+        createdAt: "2026-10-28T10:00:00.000Z"
+      },
+      expect.objectContaining({
+        noticeId: "turn-stopped:a-2",
+        message: "This turn stopped because its tool access ended. Send the message again."
+      })
+    ]);
+  });
+
   test("keeps the first entry for a noticeId", () => {
     const rows = runtimeNoticesFromMessages([
       withNotices("a-1", [saved("n-1", { title: "First" }), saved("n-1", { title: "Again" })]),

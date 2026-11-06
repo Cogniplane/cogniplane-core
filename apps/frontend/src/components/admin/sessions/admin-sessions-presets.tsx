@@ -2,12 +2,12 @@
 
 import {
   EMPTY_FILTER_STATE,
+  dateRangeLabel,
   type SessionsFilterState
 } from "./admin-sessions-filters.logic";
 import type { AdminSessionAlertKind } from "@cogniplane/shared-types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 type PresetId = "pii-incidents" | "approvals-pending" | "errored";
 
@@ -75,14 +75,14 @@ export function AdminSessionsPresets(props: {
   state: SessionsFilterState;
   onApply: (next: SessionsFilterState) => void;
 }) {
-  const activeId = PRESETS.find((p) => p.matches(props.state))?.id ?? null;
+  const activeId = PRESETS.find((p) => p.matches(props.state) && !props.state.userId.trim() &&
+    dateRangeLabel(props.state.from, props.state.to) === (p.id === "pii-incidents" ? "Last 30d" : "Last 7d"))?.id ?? null;
 
   return (
     <Card>
       <CardContent className="pt-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <p className={SECTION_LABEL}>Saved views</p>
             <h2 className="text-lg font-semibold text-on-surface">Quick filters</h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -92,6 +92,7 @@ export function AdminSessionsPresets(props: {
                 type="button"
                 variant={activeId === preset.id ? "default" : "outline"}
                 size="sm"
+                aria-pressed={activeId === preset.id}
                 onClick={() => props.onApply(preset.build())}
               >
                 {preset.label}

@@ -1,5 +1,2 @@
-// OSS stub. The private working tree carries a real `overlays.ts` that
-// side-effect imports private overlay registration (e.g. SharePoint).
-// Empty in OSS — no overlays to attach.
-
-export {};
+// Register the bundled SharePoint settings and file source.
+import "@cogniplane-private/sharepoint-overlay-frontend/register";

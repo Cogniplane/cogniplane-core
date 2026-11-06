@@ -10,7 +10,15 @@ import { classifyMarkdownLink } from "./safe-markdown.logic";
 // own chunk so it's not in the initial client bundle; it loads on first render.
 // The Suspense fallback shows the raw text so streamed content is never blank
 // during the (one-time, then cached) chunk fetch.
-const ReactMarkdown = lazy(() => import("react-markdown"));
+const ReactMarkdown = lazy(async () => {
+  const [{ default: Markdown }, { default: remarkGfm }] = await Promise.all([
+    import("react-markdown"), import("remark-gfm")
+  ]);
+  const plugins = [remarkGfm];
+  return { default: function GfmMarkdown(props: React.ComponentProps<typeof Markdown>) {
+    return <Markdown {...props} remarkPlugins={plugins} />;
+  } };
+});
 
 // Whitelist of HAST element names we render. Anything outside this set is
 // dropped (including `script`/`iframe`/`object`/`embed`/`style`/`form`/etc.).
@@ -67,12 +75,20 @@ const LinkRenderer: NonNullable<Components["a"]> = ({ href, children }) => {
 // Both renderers are static, so the map is built once at module scope.
 const COMPONENTS: Components = {
   a: LinkRenderer,
-  img: MarkdownImage
+  img: MarkdownImage,
+  pre: ({ children }) => <pre tabIndex={0} role="region" aria-label="Code block">{children}</pre>,
+  table: ({ children }) => (
+    <div className="markdown-table-scroll" tabIndex={0} role="region" aria-label="Markdown table">
+      <table>{children}</table>
+    </div>
+  ),
+  // Only the parser can create these inputs. Raw HTML stays disabled.
+  input: ({ checked }) => <input type="checkbox" checked={Boolean(checked)} disabled readOnly />
 };
 
 function SafeMarkdownImpl({ children }: { children: string }) {
   return (
-    <Suspense fallback={<span className="whitespace-pre-wrap">{children}</span>}>
+    <Suspense fallback={<div className="md-body whitespace-pre-wrap">{children}</div>}>
       {/* .md-body picks up the shared rendered-markdown rules in globals.css
           (tables, blockquotes, links) that react-markdown emits unstyled. */}
       <div className="md-body">

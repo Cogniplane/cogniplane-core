@@ -1,4 +1,5 @@
-import { EventType } from "@ag-ui/client";
+import runningToolHistory from "../../../../test-fixtures/agui/running-tool-history.json" with { type: "json" };
+import { EventType, type MessagesSnapshotEvent } from "@ag-ui/client";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -342,6 +343,38 @@ describe("hasReplyAfterLastPrompt", () => {
 });
 
 describe("historyRunEvents", () => {
+  test.each(["none", "unavailable"] as const)("matches the real-host fixture with activeTurn %s", (activeTurn) => {
+    expect(toAguiMessages(runningToolHistory.rows as HistoryMessage[], { activeTurn }))
+      .toEqual(runningToolHistory[activeTurn]);
+  });
+
+  test.each(["unavailable", "none"] as const)("keeps only current remote calls unfinished with activeTurn %s", (activeTurn) => {
+    const tool = (id: string, status: "in_progress" | "failed" | "completed") => ({
+      toolResultId: id, toolName: "execute", title: "execute", status, input: "{}", output: ""
+    });
+    const events = historyRunEvents({
+      threadId: "s-1", runId: "history:1", connection: { activeTurn, hasMoreHistory: false },
+      messages: [
+        makeMessage({ messageId: "u1", content: "Earlier" }),
+        makeMessage({ messageId: "a1", role: "assistant", toolResults: [tool("old", "in_progress")] }),
+        makeMessage({ messageId: "u2", content: "Current" }),
+        makeMessage({ messageId: "a2", role: "assistant", status: "streaming", toolResults: [
+          tool("current", "in_progress"), tool("failed", "failed"), tool("done", "completed")
+        ] })
+      ]
+    });
+    const snapshot = events.find((event) => event.type === EventType.MESSAGES_SNAPSHOT) as MessagesSnapshotEvent;
+    const results = snapshot.messages.filter((message) => message.role === "tool");
+    expect(results).toContainEqual(expect.objectContaining({ toolCallId: "old", error: "interrupted" }));
+    expect(results).toContainEqual(expect.objectContaining({ toolCallId: "failed", error: "failed" }));
+    expect(results).toContainEqual(expect.objectContaining({ toolCallId: "done", content: "" }));
+    if (activeTurn === "unavailable") {
+      expect(results.some((message) => message.role === "tool" && message.toolCallId === "current")).toBe(false);
+    } else {
+      expect(results).toContainEqual(expect.objectContaining({ toolCallId: "current", error: "interrupted" }));
+    }
+  });
+
   test("wraps the snapshots in a finished run without input messages", () => {
     const events = historyRunEvents({
       threadId: "s-1",
@@ -363,4 +396,22 @@ describe("historyRunEvents", () => {
       { type: EventType.RUN_FINISHED, threadId: "s-1", runId: "history:1" }
     ]);
   });
+});
+
+
+test.each(["completed", "interrupted"] as const)("replays %s markdown UI byte for byte beside reasoning and tool results", (status) => {
+  const operation = JSON.stringify({ version: "v1.0", createSurface: {
+    surfaceId: "estimate", components: [{ id: "root", component: "Text", text: "Estimate" }]
+  } });
+  const fence = "```a2ui\n" + operation + (status === "completed" ? "\n```" : "\n{\"version\":");
+  const prefix = "I will check the figures.\n";
+  const messages = toAguiMessages([makeMessage({
+    messageId: "ui-reply", role: "assistant", status, content: prefix + fence,
+    reasoningSegments: [{ offset: 0, text: "Check totals" }],
+    toolResults: [{ toolResultId: "figures", toolName: "lookup", title: "Lookup", status: "completed",
+      input: "{}", output: "20", textOffset: prefix.length }]
+  })]);
+  const text = messages.filter(message => message.role === "assistant" && typeof message.content === "string");
+  expect(text.map(message => message.content).join("")).toBe(prefix + fence);
+  expect(text.at(-1)?.content).toBe(fence);
 });

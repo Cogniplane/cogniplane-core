@@ -1,15 +1,14 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import type { AdminSessionDetailMessage } from "@cogniplane/shared-types";
-import { Button } from "@/components/ui/button";
+import { SessionCopyButton } from "./session-copy-button";
 import { formatTimestamp } from "../../../lib/time-format";
 import { PILL_GRAY, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 import { shortId } from "../../../lib/admin-pii-utils";
 
 export function AdminSessionRawTab(props: { messages: AdminSessionDetailMessage[] }) {
-  const [copied, setCopied] = useState(false);
 
   const allJson = useMemo(
     () =>
@@ -27,15 +26,6 @@ export function AdminSessionRawTab(props: { messages: AdminSessionDetailMessage[
     [props.messages]
   );
 
-  const handleCopyAll = () => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(allJson).then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      });
-    }
-  };
-
   if (props.messages.length === 0) {
     return <p className={HINT}>No messages in this session.</p>;
   }
@@ -43,9 +33,7 @@ export function AdminSessionRawTab(props: { messages: AdminSessionDetailMessage[
   return (
     <>
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <Button type="button" variant="ghost" size="sm" onClick={handleCopyAll}>
-          {copied ? "Copied" : "Copy all"}
-        </Button>
+        <SessionCopyButton value={allJson} label="Copy all raw messages" size="sm">Copy all</SessionCopyButton>
         <span className={PILL_GRAY}>
           {props.messages.length} message{props.messages.length === 1 ? "" : "s"}
         </span>

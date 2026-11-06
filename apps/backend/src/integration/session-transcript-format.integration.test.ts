@@ -142,7 +142,7 @@ describe.skipIf(!adminDatabaseUrl())("session history format", () => {
     await seedMembership(tenantId, userId);
     const checkpointer = createDeepAgentsCheckpointer(runAppUserUrl());
     const auth = { userId, admin: false };
-    const { app, stores: { sessions }, created, quota, evaluateText, send: post } =
+    const { app, stores: { sessions }, created, quota, evaluateTextWithPolicy, send: post } =
       await buildMessageApp({ tenantId, auth, checkpointer });
     await registerAdminSessionDetailRoute(app);
     const send = (sessionId: string) => post(sessionId, "Continue");
@@ -182,7 +182,7 @@ describe.skipIf(!adminDatabaseUrl())("session history format", () => {
     // Nothing started: no runtime, lease, quota, or PII scan.
     expect(created).toEqual([]);
     expect(quota).not.toHaveBeenCalled();
-    expect(evaluateText).not.toHaveBeenCalled();
+    expect(evaluateTextWithPolicy).not.toHaveBeenCalled();
     const leases = await superuserPool().query("SELECT count(*)::int AS count FROM session_executions WHERE session_id = ANY($1)", [[legacy, unsupported]]);
     expect(leases.rows[0].count).toBe(0);
 

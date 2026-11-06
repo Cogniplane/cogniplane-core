@@ -25,7 +25,9 @@ function AdminPolicyPage() {
     rules,
     lintWarnings,
     busyKey,
-    error,
+    rulesState, rulesError, refreshing, retryRules,
+    lintState, lintError, retryLint, actionError,
+    simulationError, clearSimulation,
     simulation,
     simulating,
     saveRule,
@@ -43,9 +45,10 @@ function AdminPolicyPage() {
   return (
     <section id="policy" className="flex flex-col gap-10 pt-5">
       <AdminPolicyEnforcement meta={<LastAdminChange section="policy" />} />
-      {error ? <p className="text-sm text-danger">{error}</p> : null}
 
       <AdminPolicyRulesCard
+        rulesState={rulesState} rulesError={rulesError} refreshing={refreshing} onRetryRules={retryRules}
+        lintState={lintState} lintError={lintError} onRetryLint={retryLint} actionError={actionError}
         rules={rules}
         lintWarnings={lintWarnings}
         busyKey={busyKey}
@@ -55,7 +58,7 @@ function AdminPolicyPage() {
         // After a failed refresh the mode row says the numbers are old; the rows hide theirs.
         evidence={monitoring && !monitorSummary.isError ? monitorSummary.data : undefined}
       >
-        <AdminPolicySimulator result={simulation} simulating={simulating} onSimulate={runSimulation} />
+        <AdminPolicySimulator error={simulationError} onInputChange={clearSimulation} result={simulation} simulating={simulating} onSimulate={runSimulation} />
       </AdminPolicyRulesCard>
 
       <AdminPolicyDecisionsCard

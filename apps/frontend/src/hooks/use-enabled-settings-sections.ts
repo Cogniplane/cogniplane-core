@@ -8,6 +8,7 @@ import {
   listSettingsNavigationItems,
   type SettingsLiveSection
 } from "../app/settings/settings-sections";
+import { useAuth } from "../lib/auth-context";
 import { fetchIntegrationsAvailability } from "../lib/integrations-api";
 import { queryKeys } from "../lib/query-keys";
 import { fetchJiraConnectionStatus } from "../lib/settings-api";
@@ -22,6 +23,8 @@ export function useEnabledSettingsSections(): {
   error: string | null;
   retry: () => void;
 } {
+  const { user } = useAuth();
+  const isLocalAccount = user?.loginType === "local";
   const availabilityQuery = useQuery({
     queryKey: queryKeys.settings.integrationsAvailability(),
     queryFn: fetchIntegrationsAvailability
@@ -60,10 +63,11 @@ export function useEnabledSettingsSections(): {
   const liveSections = useMemo<SettingsLiveSection[]>(() => {
     return listSettingsLiveSections().filter((section) => {
       if (section.kind === "always") return true;
+      if (section.kind === "local-account") return isLocalAccount;
       if (isLoading) return false;
       return enabledIds.has(section.id);
     });
-  }, [enabledIds, isLoading]);
+  }, [enabledIds, isLoading, isLocalAccount]);
 
   const navigationItems = useMemo(() => {
     const integrationIds = new Set(
@@ -71,12 +75,18 @@ export function useEnabledSettingsSections(): {
         .filter((s) => s.kind === "integration")
         .map((s) => s.id)
     );
+    const localAccountIds = new Set(
+      listSettingsLiveSections()
+        .filter((s) => s.kind === "local-account")
+        .map((s) => s.id)
+    );
     return listSettingsNavigationItems().filter((item) => {
+      if (localAccountIds.has(item.id)) return isLocalAccount;
       if (!integrationIds.has(item.id)) return true;
       if (isLoading) return false;
       return enabledIds.has(item.id);
     });
-  }, [enabledIds, isLoading]);
+  }, [enabledIds, isLoading, isLocalAccount]);
 
   return {
     liveSections,

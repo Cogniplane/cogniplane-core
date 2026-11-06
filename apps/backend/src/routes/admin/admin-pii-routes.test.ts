@@ -6,6 +6,8 @@ import { PiiAnalyticsStore } from "../../services/pii/pii-analytics-store.js";
 import type { BreakerSnapshot } from "../../services/pii/pii-circuit-breaker.js";
 import type { PiiProtectionSettings } from "@cogniplane/shared-types";
 import { registerAdminPiiRoutes, resolveRange } from "./admin-pii-routes.js";
+import { PiiImportScopeRegistry } from "../../services/pii/pii-import-scopes.js";
+import { resolvePiiPolicy } from "../../services/pii/pii-policy.js";
 
 type StubRow = Record<string, unknown>;
 
@@ -74,7 +76,7 @@ const defaultSettings: PiiProtectionSettings = {
   mode: "detect",
   rawRetention: "never",
   provider: { type: "openai-compatible", model: "" },
-  scopes: { chatPrompts: true, uploads: true, microsoftImports: false },
+  scopes: { chatPrompts: true, uploads: true, partnerImports: false },
   actions: { reportToAdmins: true },
   detectors: {
     useRulesFirst: true,
@@ -85,7 +87,8 @@ const defaultSettings: PiiProtectionSettings = {
 async function buildApp(opts: {
   isAdmin: boolean;
   snapshot?: BreakerSnapshot;
-  settings?: PiiProtectionSettings | null;
+  // A raw stored policy; it may be invalid.
+  settings?: unknown;
   fakeDb?: ReturnType<typeof buildFakeDb>;
 }) {
   const app = Fastify();
@@ -116,8 +119,8 @@ async function buildApp(opts: {
       opts.settings === null
         ? undefined
         : {
-            async getActiveSettings() {
-              return opts.settings ?? defaultSettings;
+            async getPolicy() {
+              return resolvePiiPolicy(opts.settings ?? defaultSettings, new PiiImportScopeRegistry());
             }
           }
   });
@@ -192,6 +195,29 @@ test("resolveRange: custom range respects from/to", () => {
 });
 
 // ─── metrics endpoint ───────────────────────────────────────────────────────
+
+test("metrics: reports the stored policy health next to the policy, never inside it", async () => {
+  const ok = await buildApp({ isAdmin: true });
+  const okBody = (await ok.app.inject({ method: "GET", url: "/admin/pii/metrics?range=24h" })).json();
+  expect(okBody.policyHealth).toEqual({ state: "ok", reasons: [], fields: [] });
+  expect(okBody.policy).not.toHaveProperty("policyHealth");
+  await ok.app.close();
+
+  const broken = await buildApp({ isAdmin: true, settings: { ...defaultSettings, enabled: true, mode: "bogus" } });
+  const body = (await broken.app.inject({ method: "GET", url: "/admin/pii/metrics?range=24h" })).json();
+  expect(body.policyHealth).toEqual({ state: "error", reasons: ["mode_invalid"], fields: ["mode"] });
+  await broken.app.close();
+});
+
+// The Activity tab shows "Content in scope is stopped." for an error health,
+// and the policy sentence never says Off for this stored policy.
+test("metrics: shows a stored policy that is on with mode Off as Block, with an error health", async () => {
+  const { app } = await buildApp({ isAdmin: true, settings: { ...defaultSettings, enabled: true, mode: "off" } });
+  const body = (await app.inject({ method: "GET", url: "/admin/pii/metrics?range=24h" })).json();
+  expect(body.policy).toMatchObject({ enabled: true, mode: "block" });
+  expect(body.policyHealth).toEqual({ state: "error", reasons: ["mode_off_while_enabled"], fields: ["mode"] });
+  await app.close();
+});
 
 test("metrics: non-admin gets 403", async () => {
   const { app } = await buildApp({ isAdmin: false });
@@ -631,7 +657,7 @@ async function buildAppWithOpsStores(opts: {
   await registerAdminPiiRoutes(app, {
     piiCircuitBreaker: { async snapshot() { return closedSnap; } },
     piiAnalytics: new PiiAnalyticsStore(fakeDb.db as unknown as Pool),
-    piiProtection: { async getActiveSettings() { return defaultSettings; } },
+    piiProtection: { async getPolicy() { return resolvePiiPolicy(defaultSettings, new PiiImportScopeRegistry()); } },
     platformEvents: opts.breakerEvents
       ? {
           async listByType() {

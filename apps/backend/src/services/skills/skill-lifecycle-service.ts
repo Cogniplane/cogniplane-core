@@ -5,6 +5,7 @@ import type {
   SkillRevisionCleanupReport
 } from "../admin-config-records.js";
 import type { DynamicConfigService } from "../dynamic-config-service.js";
+import type { PoolClient } from "pg";
 import type { AdminSkillReleaseSnapshot } from "@cogniplane/shared-types";
 
 type AuditEventStore = {
@@ -120,6 +121,8 @@ export class SkillLifecycleService {
     reviewNotes?: string | null;
     audience?: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
+    /** Runs in the activation's transaction after the change: the owner notice of the release. */
+    alsoInTransaction?: (client: PoolClient) => Promise<void>;
   }): Promise<ActivatedSkillRevisionRecord | null> {
     const activated = await this.dynamicConfig.activateSkillRevision(tenantId, input);
     if (!activated) {

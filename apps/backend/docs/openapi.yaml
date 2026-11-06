@@ -1,0 +1,2226 @@
+openapi: 3.0.3
+
+info:
+  title: Cogniplane API
+  version: 0.1.0
+  description: |
+    REST API for the Cogniplane backend.
+
+    **Authentication**: All endpoints (except `GET /health` and `GET /downloads/{token}`) require
+    a Bearer token in the `Authorization` header. Admin endpoints additionally require the caller
+    to have the `isAdmin` flag on their identity.
+
+    **Error envelope**: All error responses share the same shape:
+    ```json
+    { "error": "<error_code>", "message": "<optional human text>", "details": [...] }
+    ```
+    Validation errors always set `error: "invalid_request"` and populate `details`.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Health
+    description: Server and runtime health
+  - name: Sessions
+    description: Conversation session management
+  - name: Messages
+    description: Sending messages and receiving streamed SSE replies
+  - name: Artifacts
+    description: File upload, generation, and download
+  - name: Approvals
+    description: Human-in-the-loop tool approval flow
+  - name: Settings
+    description: Per-user settings and scheduled jobs
+  - name: MCP
+    description: Model Context Protocol (JSON-RPC 2.0) gateway
+  - name: Admin - Skills
+    description: Skill bundle management — requires admin role
+  - name: Admin - MCP Servers
+    description: MCP server CRUD — requires admin role
+  - name: Admin - Runtime
+    description: Runtime session management — requires admin role
+
+security:
+  - bearerAuth: []
+
+# ---------------------------------------------------------------------------
+# Reusable components
+# ---------------------------------------------------------------------------
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  # ---- Shared response objects -------------------------------------------
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            error: unauthorized
+
+    Forbidden:
+      description: Authenticated but caller is not an admin
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            error: admin_required
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    ValidationError:
+      description: Request body or params failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+    RateLimit:
+      description: Rate limit or turn quota exceeded
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            error: rate_limit_exceeded
+
+  # ---- Schemas ------------------------------------------------------------
+  schemas:
+
+    # --- Error shapes -------------------------------------------------------
+
+    ApiError:
+      description: Standard error envelope returned by all non-MCP error responses.
+      type: object
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          example: session_not_found
+        message:
+          type: string
+          description: Optional human-readable explanation
+        details:
+          type: array
+          description: Field-level validation details (present when error is "invalid_request")
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+                description: Dot-separated field path
+                example: cronExpression
+              message:
+                type: string
+                description: What is wrong with this field
+                example: Invalid cron expression
+            required: [path, message]
+      required: [error]
+
+    ValidationError:
+      description: |
+        Returned when request body or path params fail Zod validation.
+        Always has `error: "invalid_request"` and a populated `details` array.
+      type: object
+      properties:
+        error:
+          type: string
+          enum: [invalid_request]
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+                description: Dot-separated field path
+                example: cronExpression
+              message:
+                type: string
+                description: What is wrong with this field
+                example: Invalid cron expression
+            required: [path, message]
+      required: [error, details]
+      example:
+        error: invalid_request
+        details:
+          - path: name
+            message: String must contain at least 1 character(s)
+
+    # --- Domain objects -----------------------------------------------------
+
+    Session:
+      type: object
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        sessionName:
+          type: string
+        status:
+          type: string
+          enum: [active, deleted]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [sessionId, userId, sessionName, status, createdAt, updatedAt]
+
+    Message:
+      type: object
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        sessionId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant]
+        status:
+          type: string
+          enum: [pending, streaming, completed, error]
+        content:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [messageId, sessionId, userId, role, status, content, createdAt, updatedAt]
+
+    Artifact:
+      type: object
+      properties:
+        artifactId:
+          type: string
+          format: uuid
+        sessionId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        artifactType:
+          type: string
+          enum: [upload, generated, derived]
+        sourceArtifactId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Set when `artifactType` is `derived`.
+        artifactName:
+          type: string
+        mimeType:
+          type: string
+        storageBackend:
+          type: string
+          enum: [local, bucket]
+        storageKey:
+          type: string
+        fileSizeBytes:
+          type: integer
+        checksumSha256:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, ready, failed, deleted]
+        createdByType:
+          type: string
+          enum: [user, tool, job, system]
+        createdByRef:
+          type: string
+          nullable: true
+          description: ID of the tool call or job run that created this artifact, if applicable.
+        detail:
+          type: object
+          additionalProperties: true
+          description: Artifact-type-specific metadata (e.g. upload field name, source message ID).
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - artifactId
+        - sessionId
+        - userId
+        - artifactType
+        - sourceArtifactId
+        - artifactName
+        - mimeType
+        - storageBackend
+        - storageKey
+        - fileSizeBytes
+        - checksumSha256
+        - status
+        - createdByType
+        - createdByRef
+        - detail
+        - createdAt
+        - updatedAt
+
+    DownloadToken:
+      type: object
+      properties:
+        token:
+          type: string
+        url:
+          type: string
+          example: /downloads/abc123
+        expiresAt:
+          type: string
+          format: date-time
+      required: [token, url, expiresAt]
+
+    Approval:
+      type: object
+      properties:
+        approvalId:
+          type: string
+        sessionId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        runtimeId:
+          type: string
+        turnId:
+          type: string
+        itemId:
+          type: string
+        requestMethod:
+          type: string
+        requestId:
+          type: string
+        kind:
+          type: string
+          enum: [command_execution, file_change, permissions]
+        title:
+          type: string
+        summary:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved, rejected, expired]
+        decision:
+          type: string
+          enum: [approve, reject]
+          nullable: true
+        requestPayload:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        resolvedAt:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - approvalId
+        - sessionId
+        - userId
+        - runtimeId
+        - turnId
+        - itemId
+        - requestMethod
+        - requestId
+        - kind
+        - title
+        - summary
+        - status
+        - decision
+        - requestPayload
+        - createdAt
+        - updatedAt
+        - resolvedAt
+
+    SettingsSection:
+      type: object
+      properties:
+        sectionKey:
+          type: string
+          enum: [scheduled_jobs, skills, mcp, model]
+        title:
+          type: string
+        status:
+          type: string
+          enum: [live, planned]
+          description: "`live` means the section is operational; `planned` means it is not yet active."
+        version:
+          type: integer
+        config:
+          type: object
+          additionalProperties: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+      required: [sectionKey, title, status, version, config, updatedAt]
+
+    ScheduledJob:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        jobName:
+          type: string
+        description:
+          type: string
+          nullable: true
+        scheduleKind:
+          type: string
+          enum: [cron]
+        cronExpression:
+          type: string
+        timeZone:
+          type: string
+        targetType:
+          type: string
+          enum: [prompt, skill]
+        targetRef:
+          type: string
+          nullable: true
+        input:
+          type: object
+          properties:
+            prompt:
+              type: string
+          required: [prompt]
+        settingsSnapshot:
+          type: object
+          additionalProperties: true
+          description: Snapshot of user settings captured at the time the job was last saved.
+        enabled:
+          type: boolean
+        lastRunAt:
+          type: string
+          format: date-time
+          nullable: true
+        nextRunAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [jobId, userId, jobName, scheduleKind, cronExpression, timeZone, targetType, input, settingsSnapshot, enabled, lastRunAt, nextRunAt, createdAt, updatedAt]
+
+    ScheduledJobRun:
+      type: object
+      properties:
+        runId:
+          type: string
+          format: uuid
+        jobId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        sessionId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Session created for this run, if the job executed successfully.
+        status:
+          type: string
+          enum: [pending, completed, error]
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        durationMs:
+          type: integer
+          nullable: true
+        inputTokens:
+          type: integer
+        outputTokens:
+          type: integer
+        errorMessage:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - runId
+        - jobId
+        - userId
+        - sessionId
+        - status
+        - startedAt
+        - completedAt
+        - durationMs
+        - inputTokens
+        - outputTokens
+        - errorMessage
+        - summary
+        - createdAt
+
+    McpServer:
+      type: object
+      properties:
+        serverId:
+          type: string
+        serverName:
+          type: string
+        description:
+          type: string
+          nullable: true
+        transportKind:
+          type: string
+          enum: [http]
+        mode:
+          type: string
+          enum: [managed, proxy]
+        routePath:
+          type: string
+        upstreamUrl:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        version:
+          type: integer
+      required: [serverId, serverName, transportKind, mode, routePath, enabled, version]
+
+    AdminSkillRecord:
+      type: object
+      properties:
+        skillId:
+          type: string
+        skillName:
+          type: string
+        description:
+          type: string
+          nullable: true
+          description: Optional description. Present in every response but may be null.
+        instructions:
+          type: string
+        version:
+          type: integer
+        contentHash:
+          type: string
+        enabled:
+          type: boolean
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        activeRevisionId:
+          type: integer
+          nullable: true
+        activeSourceType:
+          type: string
+          nullable: true
+        activeBundleName:
+          type: string
+          nullable: true
+        activeBundleRootPath:
+          type: string
+          nullable: true
+        activeBundleHash:
+          type: string
+          nullable: true
+        activeValidationStatus:
+          type: string
+          nullable: true
+        activeReviewStatus:
+          type: string
+          nullable: true
+      required:
+        - skillId
+        - skillName
+        - description
+        - instructions
+        - version
+        - contentHash
+        - enabled
+        - createdBy
+        - createdAt
+        - updatedAt
+
+    AdminSkillRevisionRecord:
+      type: object
+      properties:
+        skillRevisionId:
+          type: integer
+        skillId:
+          type: string
+        revisionNumber:
+          type: integer
+        sourceType:
+          type: string
+          description: Origin of the bundle, e.g. "zip_upload" or "github"
+        sourceLabel:
+          type: string
+          nullable: true
+        bundleName:
+          type: string
+          nullable: true
+        bundleRootPath:
+          type: string
+          nullable: true
+        bundleHash:
+          type: string
+        validationStatus:
+          type: string
+          enum: [pending, passed, failed]
+        validationMessages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        reviewStatus:
+          type: string
+          enum: [pending, approved, rejected]
+        reviewNotes:
+          type: string
+          nullable: true
+        active:
+          type: boolean
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        reviewedBy:
+          type: string
+          nullable: true
+        reviewedAt:
+          type: string
+          format: date-time
+          nullable: true
+        activatedAt:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - skillRevisionId
+        - skillId
+        - revisionNumber
+        - sourceType
+        - bundleHash
+        - validationStatus
+        - validationMessages
+        - reviewStatus
+        - active
+        - createdBy
+        - createdAt
+
+    SkillImportResult:
+      type: object
+      description: Returned when a skill bundle is successfully imported (zip or GitHub).
+      properties:
+        skill:
+          $ref: '#/components/schemas/AdminSkillRecord'
+        revision:
+          $ref: '#/components/schemas/AdminSkillRevisionRecord'
+      required: [skill, revision]
+
+    SkillActivationResult:
+      type: object
+      description: Returned when a skill revision is activated.
+      properties:
+        skill:
+          $ref: '#/components/schemas/AdminSkillRecord'
+        revision:
+          $ref: '#/components/schemas/AdminSkillRevisionRecord'
+        previousActiveRevisionId:
+          type: integer
+          nullable: true
+          description: The revision that was previously active, if any.
+      required: [skill, revision, previousActiveRevisionId]
+
+    SkillRevisionCleanupReport:
+      type: object
+      properties:
+        dryRun:
+          type: boolean
+        deletedRevisionIds:
+          type: array
+          items:
+            type: integer
+        deletedBundlePaths:
+          type: array
+          items:
+            type: string
+        keptRevisionDecisions:
+          type: array
+          items:
+            type: object
+            properties:
+              skillRevisionId:
+                type: integer
+              reason:
+                type: string
+            required: [skillRevisionId, reason]
+        failures:
+          type: array
+          items:
+            type: object
+            properties:
+              skillRevisionId:
+                type: integer
+              reason:
+                type: string
+            required: [skillRevisionId, reason]
+      required: [dryRun, deletedRevisionIds, deletedBundlePaths, keptRevisionDecisions, failures]
+
+    RuntimeSession:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: Auto-incrementing primary key for this runtime session record.
+        sessionId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        runtimeId:
+          type: string
+        workspacePath:
+          type: string
+        codexVersion:
+          type: string
+        codexSchemaVersion:
+          type: string
+        manifestPath:
+          type: string
+        manifestMetadata:
+          type: object
+          additionalProperties: true
+          description: Raw manifest metadata attached to this runtime session at creation time.
+        healthStatus:
+          type: string
+          enum: [starting, healthy, terminating, terminated, error]
+        status:
+          type: string
+          enum: [starting, active, terminating, inactive, terminated, error]
+        lifecycleMetadata:
+          type: object
+          additionalProperties: true
+        configSummary:
+          type: string
+          nullable: true
+          description: Human-readable summary of the runtime configuration, derived from manifestMetadata. Added by the admin route.
+        lastActiveAt:
+          type: string
+          format: date-time
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        terminatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - sessionId
+        - userId
+        - runtimeId
+        - workspacePath
+        - codexVersion
+        - codexSchemaVersion
+        - manifestPath
+        - manifestMetadata
+        - healthStatus
+        - status
+        - lifecycleMetadata
+        - lastActiveAt
+        - startedAt
+        - terminatedAt
+        - createdAt
+        - updatedAt
+
+    # --- MCP (JSON-RPC 2.0) ------------------------------------------------
+
+    JsonRpcRequest:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          description: Request identifier. Omit for notifications.
+          oneOf:
+            - type: string
+            - type: integer
+        method:
+          type: string
+          description: "RPC method name. Supported: `initialize`, `notifications/initialized`, `tools/list`, `tools/call`"
+        params:
+          type: object
+          additionalProperties: true
+      required: [jsonrpc, method]
+
+    JsonRpcResponse:
+      type: object
+      description: JSON-RPC 2.0 response. Either `result` or `error` is present, never both.
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          description: Mirrors the request `id`. Null for notifications.
+          nullable: true
+          oneOf:
+            - type: string
+            - type: integer
+        result:
+          description: Present on success. Shape depends on the method called.
+          type: object
+          additionalProperties: true
+        error:
+          type: object
+          description: Present on failure.
+          properties:
+            code:
+              type: integer
+              description: JSON-RPC error code
+            message:
+              type: string
+          required: [code, message]
+      required: [jsonrpc, id]
+
+    # --- Request body schemas (shared between create / update) -------------
+
+    McpServerBody:
+      type: object
+      description: |
+        Request body for creating or updating an MCP server.
+        `serverId` is required on create and must match the URL path param on update.
+      properties:
+        serverId:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-_]*$'
+          maxLength: 80
+          description: Stable slug identifier. Required on create.
+        serverName:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+          nullable: true
+        transportKind:
+          type: string
+          enum: [http]
+          default: http
+        mode:
+          type: string
+          enum: [managed, proxy]
+        routePath:
+          type: string
+          minLength: 1
+          maxLength: 200
+        upstreamUrl:
+          type: string
+          format: uri
+          description: Required when `mode` is `proxy`. Must use `https://`.
+          nullable: true
+        enabled:
+          type: boolean
+          default: true
+      required: [serverName, mode, routePath]
+
+    ScheduledJobBody:
+      type: object
+      properties:
+        jobName:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+          nullable: true
+        cronExpression:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Standard 5-field cron expression, e.g. `0 9 * * 1-5`
+        timeZone:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: IANA time zone identifier, e.g. `America/New_York`
+        targetType:
+          type: string
+          enum: [prompt, skill]
+          default: prompt
+        targetRef:
+          type: string
+          maxLength: 120
+          nullable: true
+          description: Skill ID when `targetType` is `skill`
+        input:
+          type: object
+          properties:
+            prompt:
+              type: string
+              minLength: 1
+              maxLength: 4000
+          required: [prompt]
+        enabled:
+          type: boolean
+          default: true
+      required: [jobName, cronExpression, timeZone, input]
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+
+  # -------------------------------------------------------------------------
+  # Health
+  # -------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Health check
+      description: |
+        Process liveness. Returns a bare status and does not query dependencies.
+        No authentication required. `GET /ready` has the same body once Postgres
+        answers, and returns 503 with `{"status":"unavailable"}` when it does not.
+        Build, uptime and runtime detail is in `GET /admin/diagnostics`.
+      security: []
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                required: [status]
+
+  # -------------------------------------------------------------------------
+  # Sessions
+  # -------------------------------------------------------------------------
+  /sessions:
+    get:
+      operationId: listSessions
+      tags: [Sessions]
+      summary: List sessions
+      description: Returns all sessions owned by the authenticated user.
+      responses:
+        "200":
+          description: Sessions list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+                required: [sessions]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: createSession
+      tags: [Sessions]
+      summary: Create session
+      description: Creates a new conversation session for the authenticated user.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                  description: Display name. Defaults to "New session" if omitted.
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+                required: [session]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "429":
+          $ref: '#/components/responses/RateLimit'
+
+  /sessions/{sessionId}:
+    delete:
+      operationId: deleteSession
+      tags: [Sessions]
+      summary: Delete session
+      description: Deletes the session and aborts any active runtime turn.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Session deleted
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /sessions/{sessionId}/name:
+    put:
+      operationId: renameSession
+      tags: [Sessions]
+      summary: Rename session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+              required: [name]
+      responses:
+        "200":
+          description: Session renamed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+                required: [session]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /sessions/{sessionId}/messages:
+    get:
+      operationId: getSessionMessages
+      tags: [Messages]
+      summary: Get messages for a session
+      description: Returns the session and all its messages.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session with messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+                  messages:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Message'
+                required: [session, messages]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /sessions/{sessionId}/artifacts:
+    get:
+      operationId: listSessionArtifacts
+      tags: [Artifacts]
+      summary: List session artifacts
+      description: Returns all non-derived artifacts attached to the session.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session with artifacts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session:
+                    $ref: '#/components/schemas/Session'
+                  artifacts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Artifact'
+                required: [session, artifacts]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /sessions/{sessionId}/approvals:
+    get:
+      operationId: listSessionApprovals
+      tags: [Approvals]
+      summary: List pending approvals
+      description: Returns only the tool-call approvals with `status: pending` for the given session.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Pending approvals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  approvals:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/Approval'
+                        - properties:
+                            status:
+                              enum: [pending]
+                required: [approvals]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
+  # Messages
+  # -------------------------------------------------------------------------
+  /messages:
+    post:
+      operationId: sendMessage
+      tags: [Messages]
+      summary: Send a message
+      description: |
+        Sends a user message to the agent and streams the assistant reply as an
+        [SSE (Server-Sent Events)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
+        stream (`Content-Type: text/event-stream`).
+
+        The connection is closed by the server when the turn completes or fails.
+
+        **429 sub-cases**
+        - `session_busy` — the session already has an active turn in progress. No `Retry-After` header.
+        - `rate_limit_exceeded` / `quota_exceeded` — the caller has hit a rate or quota limit. A `Retry-After` header is set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sessionId:
+                  type: string
+                  format: uuid
+                text:
+                  type: string
+                  minLength: 1
+                  description: The user message text
+                artifactIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  maxItems: 10
+                  description: IDs of ready artifacts in the session to attach as context. All must belong to the session.
+              required: [sessionId, text]
+      responses:
+        "200":
+          description: |
+            SSE stream of assistant reply events. Each line is a standard SSE `data:` field
+            carrying a JSON payload.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                enum: [text/event-stream; charset=utf-8]
+            Cache-Control:
+              schema:
+                type: string
+                enum: [no-cache, no-transform]
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Newline-delimited SSE events with JSON payloads.
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "429":
+          description: |
+            Session is busy (`error: session_busy`) or a rate/quota limit was exceeded.
+            The `Retry-After` header is only present for rate/quota errors, not for `session_busy`.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying (rate/quota errors only)
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              examples:
+                session_busy:
+                  summary: Session already has an active turn
+                  value:
+                    error: session_busy
+                rate_limited:
+                  summary: Rate limit exceeded
+                  value:
+                    error: rate_limit_exceeded
+
+  # -------------------------------------------------------------------------
+  # Artifacts
+  # -------------------------------------------------------------------------
+  /artifacts:
+    post:
+      operationId: uploadArtifact
+      tags: [Artifacts]
+      summary: Upload an artifact
+      description: |
+        Uploads a file as an artifact attached to a session.
+
+        **Supported MIME types:**
+        `text/plain`, `text/markdown`, `text/csv`, `application/json`, `application/pdf`,
+        `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
+        `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload
+                sessionId:
+                  type: string
+                  format: uuid
+                  description: Session to attach the artifact to
+                name:
+                  type: string
+                  maxLength: 255
+                  description: Display name. Defaults to the original filename.
+              required: [file, sessionId]
+            encoding:
+              file:
+                contentType: application/octet-stream
+      responses:
+        "201":
+          description: Artifact uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artifact:
+                    $ref: '#/components/schemas/Artifact'
+                required: [artifact]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "413":
+          description: File exceeds the configured maximum upload size
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: artifact_too_large
+        "415":
+          description: File MIME type is not supported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: unsupported_media_type
+
+  /artifacts/{artifactId}/download-token:
+    post:
+      operationId: createArtifactDownloadToken
+      tags: [Artifacts]
+      summary: Create download token
+      description: |
+        Issues a short-lived token for downloading an artifact without authentication.
+        Use the returned `url` (or construct `GET /downloads/{token}`) to fetch the file.
+      parameters:
+        - name: artifactId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Download token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download:
+                    $ref: '#/components/schemas/DownloadToken'
+                required: [download]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "409":
+          description: Artifact exists but is not yet ready for download
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: artifact_not_ready
+
+  /downloads/{token}:
+    get:
+      operationId: downloadArtifact
+      tags: [Artifacts]
+      summary: Download artifact by token
+      description: |
+        Streams the artifact file. No authentication required — access is gated by the
+        short-lived, single-use download token obtained from `POST /artifacts/{artifactId}/download-token`.
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File stream
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="report.pdf"'
+            Content-Type:
+              schema:
+                type: string
+                description: The MIME type of the artifact
+            Content-Length:
+              schema:
+                type: integer
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "410":
+          description: Download token has expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: download_expired
+
+  # -------------------------------------------------------------------------
+  # Approvals
+  # -------------------------------------------------------------------------
+  /approvals/{approvalId}/decision:
+    post:
+      operationId: submitApprovalDecision
+      tags: [Approvals]
+      summary: Submit approval decision
+      description: Approves or rejects a pending tool-call. The runtime resumes or aborts the turn accordingly.
+      parameters:
+        - name: approvalId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                decision:
+                  type: string
+                  enum: [approve, reject]
+              required: [decision]
+      responses:
+        "200":
+          description: Decision recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [resolved]
+                required: [status]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------------------
+  # Settings
+  # -------------------------------------------------------------------------
+  /me/settings:
+    get:
+      operationId: getUserSettings
+      tags: [Settings]
+      summary: Get user settings
+      description: Returns all settings sections for the authenticated user. Sections with no saved config are still returned with `version: 0` and an empty `config`.
+      responses:
+        "200":
+          description: Settings sections
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sections:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SettingsSection'
+                required: [sections]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /me/settings/{section}:
+    put:
+      operationId: updateUserSettingsSection
+      tags: [Settings]
+      summary: Update a settings section
+      description: Upserts the configuration for the given section. The `version` is incremented on every write.
+      parameters:
+        - name: section
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [scheduled_jobs, skills, mcp, model]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config:
+                  type: object
+                  additionalProperties: true
+              required: [config]
+      responses:
+        "200":
+          description: Section updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  section:
+                    $ref: '#/components/schemas/SettingsSection'
+                required: [section]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /me/scheduled-jobs:
+    get:
+      operationId: listScheduledJobs
+      tags: [Settings]
+      summary: List scheduled jobs
+      responses:
+        "200":
+          description: Scheduled jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scheduledJobs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScheduledJob'
+                required: [scheduledJobs]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: createScheduledJob
+      tags: [Settings]
+      summary: Create scheduled job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduledJobBody'
+      responses:
+        "201":
+          description: Scheduled job created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scheduledJob:
+                    $ref: '#/components/schemas/ScheduledJob'
+                required: [scheduledJob]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  /me/scheduled-jobs/{jobId}:
+    put:
+      operationId: updateScheduledJob
+      tags: [Settings]
+      summary: Update scheduled job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduledJobBody'
+      responses:
+        "200":
+          description: Scheduled job updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scheduledJob:
+                    $ref: '#/components/schemas/ScheduledJob'
+                required: [scheduledJob]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: deleteScheduledJob
+      tags: [Settings]
+      summary: Delete scheduled job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Scheduled job deleted
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /me/scheduled-jobs/{jobId}/runs:
+    get:
+      operationId: listScheduledJobRuns
+      tags: [Settings]
+      summary: List job runs
+      description: Returns the execution history for a scheduled job (most recent first, up to 50 entries). Returns an empty array if the job does not exist or belongs to a different user.
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job run history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ScheduledJobRun'
+                required: [runs]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
+  # MCP gateway
+  # -------------------------------------------------------------------------
+  /mcp/{serverId}:
+    post:
+      operationId: mcpRpc
+      tags: [MCP]
+      summary: MCP JSON-RPC endpoint
+      description: |
+        Implements a subset of the [Model Context Protocol](https://spec.modelcontextprotocol.io) (2025-03-26)
+        over HTTP JSON-RPC 2.0.
+
+        **Supported methods**
+
+        | Method | Description |
+        |---|---|
+        | `initialize` | Handshake — returns server capabilities and version |
+        | `notifications/initialized` | Acknowledge init — returns HTTP 202 with no body |
+        | `tools/list` | Enumerate available tools |
+        | `tools/call` | Invoke a tool |
+
+        For `managed` servers tools are executed in-process.
+        For `proxy` servers the RPC is forwarded to the configured upstream URL.
+
+        All `tools/call` requests must include `params.arguments.toolContextId`.
+      parameters:
+        - name: serverId
+          in: path
+          required: true
+          description: Server ID as registered via `POST /admin/mcp-servers`
+          schema:
+            type: string
+            minLength: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonRpcRequest'
+      responses:
+        "200":
+          description: JSON-RPC response (success or application-level error)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+        "202":
+          description: Notification acknowledged (`notifications/initialized`). No response body.
+        "400":
+          description: Malformed JSON-RPC envelope (not a valid JSON-RPC 2.0 request)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+
+  # -------------------------------------------------------------------------
+  # Admin — Skills
+  # -------------------------------------------------------------------------
+  /admin/skills:
+    get:
+      operationId: adminListSkills
+      tags: [Admin - Skills]
+      summary: List skills
+      description: Returns all skills including disabled ones.
+      responses:
+        "200":
+          description: Skills list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skills:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminSkillRecord'
+                required: [skills]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/skills/{skillId}/disable:
+    post:
+      operationId: adminDisableSkill
+      tags: [Admin - Skills]
+      summary: Disable skill
+      parameters:
+        - name: skillId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Skill disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skill:
+                    $ref: '#/components/schemas/AdminSkillRecord'
+                required: [skill]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /admin/skills/import/zip:
+    post:
+      operationId: adminImportSkillFromZip
+      tags: [Admin - Skills]
+      summary: Import skill bundle from ZIP
+      description: |
+        Uploads a ZIP archive containing a skill bundle. The bundle is validated, stored as
+        a new revision, and immediately activated.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: ZIP file containing the skill bundle
+              required: [file]
+            encoding:
+              file:
+                contentType: application/zip
+      responses:
+        "201":
+          description: Skill bundle imported and activated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillImportResult'
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "413":
+          description: Archive exceeds the configured size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: skill_import_too_large
+
+  /admin/skills/import/github:
+    post:
+      operationId: adminImportSkillFromGithub
+      tags: [Admin - Skills]
+      summary: Import skill bundle from GitHub
+      description: Fetches a skill bundle directly from a GitHub repository and imports it as a new revision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                githubUrl:
+                  type: string
+                  format: uri
+                  description: HTTPS URL of the GitHub repository. Must use `https://`.
+                ref:
+                  type: string
+                  maxLength: 200
+                  description: Branch, tag, or commit SHA. Defaults to the repository's default branch.
+                subdirectory:
+                  type: string
+                  maxLength: 300
+                  description: Path within the repository to the skill bundle root. Defaults to repository root.
+              required: [githubUrl]
+      responses:
+        "201":
+          description: Skill bundle imported and activated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillImportResult'
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/skills/revisions/cleanup:
+    post:
+      operationId: adminCleanupSkillRevisions
+      tags: [Admin - Skills]
+      summary: Clean up inactive skill revisions
+      description: |
+        Deletes inactive revisions and their stored bundles to reclaim storage.
+        Use `dryRun: true` to preview what would be deleted without making any changes.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dryRun:
+                  type: boolean
+                  default: false
+                  description: If true, report what would be deleted without actually deleting anything.
+      responses:
+        "200":
+          description: Cleanup report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report:
+                    $ref: '#/components/schemas/SkillRevisionCleanupReport'
+                required: [report]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/skills/{skillId}/revisions:
+    get:
+      operationId: adminListSkillRevisions
+      tags: [Admin - Skills]
+      summary: List skill revisions
+      parameters:
+        - name: skillId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Skill revisions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revisions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminSkillRevisionRecord'
+                required: [revisions]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/skills/{skillId}/revisions/{skillRevisionId}/activate:
+    post:
+      operationId: adminActivateSkillRevision
+      tags: [Admin - Skills]
+      summary: Activate a skill revision
+      description: Makes the specified revision the active version of the skill.
+      parameters:
+        - name: skillId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: skillRevisionId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reviewNotes:
+                  type: string
+                  maxLength: 1000
+                  nullable: true
+                  description: Optional review notes recorded alongside the activation.
+      responses:
+        "200":
+          description: Revision activated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillActivationResult'
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------------------
+  # Admin — MCP Servers
+  # -------------------------------------------------------------------------
+  /admin/mcp-servers:
+    get:
+      operationId: adminListMcpServers
+      tags: [Admin - MCP Servers]
+      summary: List MCP servers
+      description: Returns all MCP servers including disabled ones.
+      responses:
+        "200":
+          description: MCP servers list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mcpServers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/McpServer'
+                required: [mcpServers]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      operationId: adminCreateMcpServer
+      tags: [Admin - MCP Servers]
+      summary: Create MCP server
+      description: '`serverId` is required in the request body.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpServerBody'
+      responses:
+        "201":
+          description: MCP server created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mcpServer:
+                    $ref: '#/components/schemas/McpServer'
+                required: [mcpServer]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "409":
+          description: A server with this `serverId` already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                error: conflict
+
+  /admin/mcp-servers/{serverId}:
+    put:
+      operationId: adminUpdateMcpServer
+      tags: [Admin - MCP Servers]
+      summary: Update MCP server
+      description: If `serverId` is included in the body it must match the path parameter.
+      parameters:
+        - name: serverId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/McpServerBody'
+      responses:
+        "200":
+          description: MCP server updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mcpServer:
+                    $ref: '#/components/schemas/McpServer'
+                required: [mcpServer]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  /admin/mcp-servers/{serverId}/disable:
+    post:
+      operationId: adminDisableMcpServer
+      tags: [Admin - MCP Servers]
+      summary: Disable MCP server
+      parameters:
+        - name: serverId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: MCP server disabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mcpServer:
+                    $ref: '#/components/schemas/McpServer'
+                required: [mcpServer]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+        "404":
+          $ref: '#/components/responses/NotFound'
+
+  # -------------------------------------------------------------------------
+  # Admin — Runtime
+  # -------------------------------------------------------------------------
+  /admin/runtime-sessions:
+    get:
+      operationId: adminListRuntimeSessions
+      tags: [Admin - Runtime]
+      summary: List recent runtime sessions
+      description: Returns the 100 most recent runtime sessions with a human-readable config summary.
+      responses:
+        "200":
+          description: Runtime sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runtimeSessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RuntimeSession'
+                required: [runtimeSessions]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/diagnostics:
+    get:
+      operationId: adminGetDiagnostics
+      tags: [Admin - Runtime]
+      summary: Backend build, uptime and runtime activity
+      description: |
+        Operator detail that the public health endpoints do not return. Runtime
+        counts cover the caller's organization only.
+      responses:
+        "200":
+          description: Diagnostics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  uptimeSeconds:
+                    type: integer
+                    example: 3600
+                  version:
+                    type: object
+                    properties:
+                      sha:
+                        type: string
+                        description: Build commit, or `dev` when the build is not stamped.
+                      buildDate:
+                        type: string
+                        description: Build timestamp, or an empty string when the build is not stamped.
+                    required: [sha, buildDate]
+                  runtimes:
+                    type: object
+                    properties:
+                      activeRuntimeCount:
+                        type: integer
+                      activeTurnCount:
+                        type: integer
+                    required: [activeRuntimeCount, activeTurnCount]
+                required: [status, uptimeSeconds, version, runtimes]
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/runtime-sessions/rollout:
+    post:
+      operationId: adminRolloutRuntimeSessions
+      tags: [Admin - Runtime]
+      summary: Execute a runtime rollout
+      description: |
+        Triggers a rollout action on idle runtime sessions.
+
+        - `drain_idle` — shut down idle runtimes without replacing them
+        - `refresh_idle` — replace idle runtimes with a fresh instance using the latest config
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [drain_idle, refresh_idle]
+              required: [action]
+      responses:
+        "200":
+          description: Rollout executed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action:
+                    type: string
+                    enum: [drain_idle, refresh_idle]
+                  affectedSessionIds:
+                    type: array
+                    items:
+                      type: string
+                required: [action, affectedSessionIds]
+        "400":
+          $ref: '#/components/responses/ValidationError'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/Forbidden'
