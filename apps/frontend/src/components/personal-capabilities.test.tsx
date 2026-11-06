@@ -315,7 +315,7 @@ it("announces saved defaults and focuses the saved feedback when Save disappears
   const feedback = await screen.findByText("Your chat defaults are saved.");
   expect(document.activeElement).toBe(feedback);
   expect(screen.queryByText("Unsaved changes")).toBeNull();
-  expect(dirtyChange).toHaveBeenLastCalledWith(false);
+  await waitFor(() => expect(dirtyChange).toHaveBeenLastCalledWith(false));
 });
 
 it("does not steal focus from another control when a delayed Save completes", async () => {
