@@ -1,3 +1,4 @@
+import { capabilityOptions } from "./capability-options.js";
 import { memberMcpStatuses, type MemberMcpStatusStore } from "./member-mcp-status.js";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { SessionCapabilitiesSchema, SessionCapabilitiesUpdateSchema, type SessionCapabilitySelection } from "@cogniplane/shared-types";
@@ -8,7 +9,7 @@ import { apiError, notFoundError } from "../lib/http-errors.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { serialize } from "../lib/serialize-response.js";
-import { hasUnavailableAdditions, skillSource } from "../services/capability-selection.js";
+import { hasUnavailableAdditions } from "../services/capability-selection.js";
 
 export type SessionCapabilityStores = {
   memberMcpCredentials?: MemberMcpStatusStore;
@@ -61,14 +62,11 @@ async function registerScopedSessionCapabilityRoutes(app: FastifyInstance, store
       stores.dynamicConfig.listMcpServers(tenantId, false),
       memberMcpStatuses(stores.memberMcpCredentials, tenantId, userId)
     ]);
-    return {
-      skills: bundle.skills.filter((s) => !limit || limit.skillIds.includes(s.id))
-        .map((s) => ({ id: s.id, name: s.name, description: s.description ?? "",
-          source: skillSource(s.sourceType) })),
-      connectors: bundle.mcpServers.filter((s) => !limit || limit.connectorIds.includes(s.id))
-        .map((s) => ({ id: s.id,
-        name: servers.find((server) => server.serverId === s.id)?.serverName ?? s.id, description: s.description, ...connectionStatuses.get(s.id) }))
-    };
+    return capabilityOptions({
+      skills: bundle.skills.filter((s) => !limit || limit.skillIds.includes(s.id)),
+      mcpServers: bundle.mcpServers.filter((s) => !limit || limit.connectorIds.includes(s.id)),
+      servers, connectionStatuses
+    });
   };
 
   app.get("/sessions/:sessionId/capabilities", async (request, reply) => {
