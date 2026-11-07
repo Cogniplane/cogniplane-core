@@ -1,6 +1,8 @@
-import type {
-  AdminSessionDetailMessageToolResult,
-  AdminSessionDetailToolEvent
+import {
+  displayedToolStatus,
+  type AdminSessionDetailMessage,
+  type AdminSessionDetailMessageToolResult,
+  type AdminSessionDetailToolEvent
 } from "@cogniplane/shared-types";
 
 export type UnifiedRow =
@@ -21,6 +23,8 @@ export type UnifiedRow =
       createdAt: string;
       durationMs: number | null;
       data: AdminSessionDetailMessageToolResult;
+      /** From displayedToolStatus. `data.status` keeps what was stored. */
+      displayStatus: string;
     };
 
 /**
@@ -31,8 +35,10 @@ export type UnifiedRow =
  */
 export function buildToolRows(
   toolEvents: AdminSessionDetailToolEvent[],
-  toolResults: AdminSessionDetailMessageToolResult[]
+  toolResults: AdminSessionDetailMessageToolResult[],
+  messages: Pick<AdminSessionDetailMessage, "messageId" | "status">[] = []
 ): UnifiedRow[] {
+  const messageStatus = new Map(messages.map((message) => [message.messageId, message.status]));
   const rows: UnifiedRow[] = [
     ...toolEvents.map(
       (evt, idx): UnifiedRow => ({
@@ -53,7 +59,8 @@ export function buildToolRows(
         kind: tr.kind,
         createdAt: tr.createdAt,
         durationMs: tr.durationMs,
-        data: tr
+        data: tr,
+        displayStatus: displayedToolStatus(tr.status, messageStatus.get(tr.messageId))
       })
     )
   ];

@@ -198,6 +198,12 @@ export type DeepAgentsSandboxBinding = {
   load: () => Promise<{ sandboxId: string; networkPolicyHash: string | null } | null>;
   /** Written under the session lease. It throws when the lease is lost, and the new sandbox is then killed. */
   save: (previousId: string | null, sandboxId: string, networkPolicyHash: string) => Promise<void>;
+  /**
+   * Called before the kill of `sandboxId`, so that no next owner loads and adopts it.
+   * Written under the session lease. It throws when the lease is lost or the record
+   * names another sandbox, and the sandbox is then not killed.
+   */
+  release: (sandboxId: string) => Promise<void>;
 };
 
 export type DeepAgentsRuntimeFactory = (init: {

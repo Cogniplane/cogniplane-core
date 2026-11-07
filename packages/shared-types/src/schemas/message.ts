@@ -140,7 +140,10 @@ export const ApprovalSchema = z.object({
   kind: z.enum(["command_execution", "file_change", "permissions", "mcp_tool"]),
   title: z.string(),
   summary: z.string(),
-  status: z.enum(["pending", "approved", "rejected", "expired"])
+  status: z.enum(["pending", "approved", "rejected", "expired"]),
+  // False when "Allow for this turn" would approve nothing more (memory_save).
+  // Absent on older payloads, where the option stays available.
+  allowForTurn: z.boolean().optional()
 }).strip();
 export type Approval = z.infer<typeof ApprovalSchema>;
 

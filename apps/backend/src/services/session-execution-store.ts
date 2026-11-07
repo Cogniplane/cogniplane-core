@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg";
 import { withTenantScope, type Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
@@ -45,6 +46,17 @@ export function interactiveContextExecutionSql(context: string): string {
       )))`;
 }
 
+/**
+ * Call before an `UPDATE sessions ... FROM session_executions` that checks the lease.
+ * After a wait on the session row lock, that UPDATE checks again only the session row,
+ * not the joined execution row, so it can pass the lease of the old owner. The next
+ * statement after this lock takes a new snapshot (READ COMMITTED) and sees the current lease.
+ */
+async function lockSessionRow(db: Pick<PoolClient, "query">, execution: ExecutionActor): Promise<void> {
+  await db.query("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
+    [execution.tenantId, execution.sessionId]);
+}
+
 export class SessionExecutionStore {
   constructor(private readonly pool: Pool, readonly ownerId = uuidv7()) {}
 
@@ -80,6 +92,7 @@ export class SessionExecutionStore {
     execution: SessionExecution, previousId: string | null, sandboxId: string, networkPolicyHash: string
   ): Promise<void> {
     await withTenantScope(this.pool, execution.tenantId, async db => {
+      await lockSessionRow(db, execution);
       const result = await db.query(`UPDATE sessions s SET sandbox_id=$6, sandbox_network_policy=$8::jsonb
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
           AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
@@ -90,6 +103,24 @@ export class SessionExecutionStore {
         RETURNING s.session_id`,
       [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId,
         execution.userId, sandboxId, previousId, JSON.stringify({ sandboxId, hash: networkPolicyHash })]);
+      if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
+    });
+  }
+
+  /** See DeepAgentsSandboxBinding.release. */
+  async releaseSandboxId(execution: SessionExecution, sandboxId: string): Promise<void> {
+    await withTenantScope(this.pool, execution.tenantId, async db => {
+      await lockSessionRow(db, execution);
+      const result = await db.query(`UPDATE sessions s SET sandbox_id=NULL, sandbox_network_policy=NULL
+        FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
+          AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
+          AND e.owner_id=$4 AND e.user_id=$5 AND e.status='active'
+          AND e.expires_at>clock_timestamp() AND s.project_id IS NULL
+          AND s.status='active' AND s.sandbox_id=$6
+          AND ${sessionExecutionAccessSql("s", "e.user_id")}
+        RETURNING s.session_id`,
+      [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId,
+        execution.userId, sandboxId]);
       if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
     });
   }

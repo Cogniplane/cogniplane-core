@@ -5,6 +5,7 @@ import { formatTimestamp } from "../../../lib/time-format";
 import { useMemo, useState } from "react";
 
 import type {
+  AdminSessionDetailMessage,
   AdminSessionDetailMessageToolResult,
   AdminSessionDetailToolEvent
 } from "@cogniplane/shared-types";
@@ -14,7 +15,7 @@ import {
 } from "./admin-session-tools-tab.logic";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
+import { PILL_AMBER, PILL_GRAY, PILL_BLUE, PILL_RED, HINT, LIST_ITEM } from "../../../lib/ui-tokens";
 
 function phasePillClass(phase: string): string {
   if (phase === "completed") return PILL_BLUE;
@@ -25,18 +26,21 @@ function phasePillClass(phase: string): string {
 function statusPillClass(status: string): string {
   if (status === "completed") return PILL_BLUE;
   if (status === "failed" || status === "declined") return PILL_RED;
+  if (status === "interrupted") return PILL_AMBER;
   return PILL_GRAY;
 }
 
 export function AdminSessionToolsTab(props: {
   toolEvents: AdminSessionDetailToolEvent[];
   messageToolResults: AdminSessionDetailMessageToolResult[];
+  /** Tells whether the turn of each call has ended. */
+  messages?: Pick<AdminSessionDetailMessage, "messageId" | "status">[];
 }) {
   const [filter, setFilter] = useState("");
 
   const allRows = useMemo(
-    () => buildToolRows(props.toolEvents, props.messageToolResults),
-    [props.toolEvents, props.messageToolResults]
+    () => buildToolRows(props.toolEvents, props.messageToolResults, props.messages),
+    [props.toolEvents, props.messageToolResults, props.messages]
   );
 
   const filtered = useMemo(() => {
@@ -81,8 +85,8 @@ export function AdminSessionToolsTab(props: {
                         </>
                       ) : (
                         <>
-                          <span className={statusPillClass(row.data.status)}>
-                            {row.data.status}
+                          <span className={statusPillClass(row.displayStatus)}>
+                            {row.displayStatus}
                           </span>
                           {row.data.serverName ? (
                             <span className={PILL_GRAY}>{row.data.serverName}</span>
@@ -99,7 +103,7 @@ export function AdminSessionToolsTab(props: {
               {row.source === "event" ? (
                 <ToolEventBody event={row.data} />
               ) : (
-                <ToolResultBody result={row.data} />
+                <ToolResultBody result={row.data} displayStatus={row.displayStatus} />
               )}
             </details>
           ))}
@@ -140,10 +144,16 @@ function ToolEventBody(props: { event: AdminSessionDetailToolEvent }) {
   );
 }
 
-function ToolResultBody(props: { result: AdminSessionDetailMessageToolResult }) {
+function ToolResultBody(props: { result: AdminSessionDetailMessageToolResult; displayStatus: string }) {
   const { result: tr } = props;
   return (
     <div className="mt-2 text-xs text-on-surface-variant">
+      {props.displayStatus !== tr.status ? (
+        <p>
+          The turn ended before this tool gave a result. The action can be done, partly done, or not
+          started. Stored status: <code className="text-[11px]">{tr.status}</code>
+        </p>
+      ) : null}
       <p>
         <strong className="font-semibold text-on-surface">Tool result ID:</strong> {tr.toolResultId}
       </p>

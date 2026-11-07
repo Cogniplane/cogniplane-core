@@ -1,8 +1,14 @@
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { BaseSandbox } from "deepagents";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  confinedDeleteCommand,
   E2bDeepAgentsSandbox,
   isSandboxGoneError,
   type E2bDeepAgentsSandboxOptions
@@ -211,7 +217,8 @@ describe("E2bDeepAgentsSandbox", () => {
       save: async (previousId: string | null, id: string, networkPolicyHash: string) => {
         expect(saved?.sandboxId ?? null).toBe(previousId);
         saved = { sandboxId: id, networkPolicyHash };
-      }
+      },
+      release: async () => { throw new Error("unexpected release"); }
     };
     const first = makeBackend({ fake, loader, options: { sandboxBinding } }).backend;
     await first.writeFileBytes("notes.txt", new TextEncoder().encode("kept"));
@@ -237,7 +244,8 @@ describe("E2bDeepAgentsSandbox", () => {
     const backend = makeBackend({ fake: firstSandbox, loader, options: {
       sandboxBinding: {
         load: async () => savedId ? { sandboxId: savedId, networkPolicyHash: policy.hash } : null,
-        save: async () => { throw new Error("unexpected create"); }
+        save: async () => { throw new Error("unexpected create"); },
+        release: async () => { throw new Error("unexpected release"); }
       }
     } }).backend;
     await backend.execute("true");
@@ -267,7 +275,8 @@ describe("E2bDeepAgentsSandbox", () => {
         save: async (previousId, id) => {
           expect(previousId).toBe("expired-sandbox");
           savedId = id;
-        }
+        },
+        release: async () => { throw new Error("unexpected release"); }
       }
     } }).backend;
     await backend.execute("true");
@@ -1006,6 +1015,14 @@ describe("E2bDeepAgentsSandbox network policy", () => {
         requireLease();
         expect(previousId).toBe(state.saved?.sandboxId ?? null);
         state.saved = { sandboxId, networkPolicyHash };
+      }),
+      // Under the lease, and only while the record names the sandbox, as the real store does.
+      release: vi.fn(async (sandboxId: string) => {
+        requireLease();
+        if (state.saved?.sandboxId !== sandboxId) {
+          throw Object.assign(new Error("execution_stopped"), { code: "execution_stopped", statusCode: 403 });
+        }
+        state.saved = null;
       })
     };
     return { state, binding };
@@ -1069,7 +1086,10 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     // The new one is created under the policy as it is now, confirmed, and recorded.
     expect(r.provider.create).toHaveBeenCalledTimes(1);
     expect(r.provider.create.mock.calls[0]![1].network).toEqual(network);
-    expect(r.binding.save).toHaveBeenCalledWith("sbx-old", "sbx-new", policy.hash);
+    // The record of the old sandbox is released before its kill, so the new one is saved over no record.
+    expect(r.binding.release).toHaveBeenCalledWith("sbx-old");
+    expect(r.binding.release.mock.invocationCallOrder[0]).toBeLessThan(r.saved.killed.mock.invocationCallOrder[0]!);
+    expect(r.binding.save).toHaveBeenCalledWith(null, "sbx-new", policy.hash);
     expect(r.state.saved).toEqual({ sandboxId: "sbx-new", networkPolicyHash: policy.hash });
     expect(r.replacement.sandbox.reportedNetwork).toEqual(network);
     expect(r.replacement.runCalls.at(-1)?.command).toBe("echo hi");
@@ -1416,10 +1436,12 @@ describe("E2bDeepAgentsSandbox network policy", () => {
   // was created with, so a kill that still fails is logged as an error with the sandbox id.
 
   describe("killing a sandbox that does not match", () => {
-    it("tries a failed kill again, checks the lease before every try, and replaces the sandbox when a try works", async () => {
+    it("checks the lease, releases the record, then tries a failed kill again and replaces the sandbox when a try works", async () => {
       const order: string[] = [];
       const requireOwnership = vi.fn(async () => { order.push("lease"); });
       const r = reconnect({ live: DENY_ALL_NETWORK, policy: approved, options: { requireOwnership } });
+      const release = r.binding.release.getMockImplementation()!;
+      r.binding.release.mockImplementation(async (id: string) => { order.push("release"); return release(id); });
       let tries = 0;
       r.saved.killed.mockImplementation(async () => {
         order.push("kill");
@@ -1429,8 +1451,9 @@ describe("E2bDeepAgentsSandbox network policy", () => {
 
       await expect(r.backend.execute("echo hi")).resolves.toMatchObject({ exitCode: 0 });
 
-      // Every kill, the two that failed too, is preceded by a lease check.
-      expect(order).toEqual(["lease", "kill", "lease", "kill", "lease", "kill"]);
+      // The record no longer names the sandbox before the first kill, so no owner can adopt it:
+      // the tries after that need no more lease checks.
+      expect(order).toEqual(["lease", "release", "kill", "kill", "kill"]);
       expect(error).not.toHaveBeenCalled();
       expect(r.backend.id).toBe("sbx-new");
       expect(r.onSandboxRecreated).toHaveBeenCalledWith({ previousSandboxId: "sbx-old", reason: "network_policy" });
@@ -1459,21 +1482,19 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       error.mockRestore();
     });
 
-    it("stops the tries and fails closed when the lease is lost between two tries", async () => {
-      let checks = 0;
-      const requireOwnership = vi.fn(async () => {
-        if (++checks > 1) throw Object.assign(new Error("execution_stopped"), { statusCode: 403 });
-      });
-      const r = reconnect({ live: DENY_ALL_NETWORK, policy: approved, options: { requireOwnership } });
-      r.saved.killed.mockRejectedValue(new Error("kill failed"));
+    it("sends no kill and fails closed when the record cannot be released under the lease", async () => {
+      const r = reconnect({ live: DENY_ALL_NETWORK, policy: approved });
+      const release = r.binding.release.getMockImplementation()!;
+      r.binding.release.mockRejectedValueOnce(Object.assign(new Error("execution_stopped"), { statusCode: 403 }));
       const error = vi.spyOn(fakeLog, "error");
 
       const failure = await r.backend.execute("echo hi").catch((reason: unknown) => reason);
 
-      // The second try never happened: the next owner may use this sandbox now.
+      // The next owner may use this sandbox now: it keeps its record, and no kill is sent.
       expect(failure).toBeInstanceOf(SandboxNetworkPolicyUnconfirmedError);
       expect((failure as Error).message).toContain("ownership of the session could not be confirmed");
-      expect(r.saved.killed).toHaveBeenCalledTimes(1);
+      expect(r.saved.killed).not.toHaveBeenCalled();
+      expect(r.state.saved).toMatchObject({ sandboxId: "sbx-old" });
       expect(r.provider.create).not.toHaveBeenCalled();
       expect(r.onSandboxRecreated).not.toHaveBeenCalled();
       expect(r.saved.runCalls).toEqual([]);
@@ -1481,12 +1502,37 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(error).not.toHaveBeenCalled();
 
       // The next call starts the replacement again, and finishes it.
-      checks = -100;
-      r.saved.killed.mockReset();
+      r.binding.release.mockImplementation(release);
       await expect(r.backend.execute("echo hi")).resolves.toMatchObject({ exitCode: 0 });
       expect(r.saved.killed).toHaveBeenCalledTimes(1);
       expect(r.provider.create).toHaveBeenCalledTimes(1);
       error.mockRestore();
+    });
+
+    it("without a saved record, checks the lease and the turn before every try of the kill", async () => {
+      const order: string[] = [];
+      let leaseLost = false;
+      const requireOwnership = vi.fn(async () => {
+        order.push("lease");
+        if (leaseLost) throw Object.assign(new Error("execution_stopped"), { statusCode: 403 });
+      });
+      const settings = makeSettings(denyAll);
+      const fake = makeFakeSandbox();
+      const { backend, provider } = makeBackend({ fake, options: { requireOwnership, resolveNetworkPolicy: settings.resolve } });
+      await backend.execute("echo one");
+      settings.state.current = approved;
+      backend.beginTurn();
+      fake.killed.mockImplementation(async () => {
+        order.push("kill");
+        leaseLost = true;
+        throw new Error("kill failed");
+      });
+
+      const failure = await backend.execute("echo two").catch((reason: unknown) => reason);
+
+      expect(failure).toBeInstanceOf(SandboxNetworkPolicyUnconfirmedError);
+      expect(order).toEqual(["lease", "kill", "lease"]);
+      expect(provider.create).toHaveBeenCalledTimes(1);
     });
 
     it("counts a sandbox that the provider no longer has as killed: no more tries, no error", async () => {
@@ -1502,17 +1548,21 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       error.mockRestore();
     });
 
-    it("does not try again once the turn is over", async () => {
+    it("goes on with the kill of a released sandbox when the turn is over, and creates nothing for that turn", async () => {
       const r = reconnect({ live: DENY_ALL_NETWORK, policy: approved });
       r.saved.killed.mockImplementation(async () => {
         r.endTurn();
         throw new Error("kill failed");
       });
+      const error = vi.spyOn(fakeLog, "error");
 
       await expect(r.backend.execute("echo hi")).rejects.toBeInstanceOf(SandboxTurnEndedError);
 
-      expect(r.saved.killed).toHaveBeenCalledTimes(1);
+      // No record names the sandbox any more, so it is of no use to anyone: the tries go on.
+      expect(r.saved.killed).toHaveBeenCalledTimes(4);
+      expect(r.state.saved).toBeNull();
       expect(r.provider.create).not.toHaveBeenCalled();
+      error.mockRestore();
     });
 
     it("tries the kill of a new sandbox that failed its check again, and logs an error when it cannot kill it", async () => {
@@ -1722,6 +1772,10 @@ describe("E2bDeepAgentsSandbox network policy", () => {
         save: vi.fn(async (previousId: string | null, sandboxId: string, hash: string) => {
           if (owner.current !== name) throw Object.assign(new Error("execution_stopped"), { code: "execution_stopped" });
           return binding.save(previousId, sandboxId, hash);
+        }),
+        release: vi.fn(async (sandboxId: string) => {
+          if (owner.current !== name) throw Object.assign(new Error("execution_stopped"), { code: "execution_stopped" });
+          return binding.release(sandboxId);
         })
       });
       const settings = makeSettings(denyAll);
@@ -1811,6 +1865,42 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(s.created[1]!.sandbox.reportedNetwork).toEqual(APPROVED_NETWORK);
       expect(s.created[1]!.runCalls.map((call) => call.command)).toContain("echo B");
       expect(s.state.saved).toEqual({ sandboxId: "sbx-2", networkPolicyHash: approved.hash });
+    });
+
+    it("does not let the next owner adopt a sandbox whose kill is still in flight (issue #20)", async () => {
+      const s = twoReplicas();
+      const a = s.replica("A");
+      const b = s.replica("B");
+      a.beginTurn();
+      await a.execute("echo A1");
+      const doomed = s.created[0]!;
+      // The admin approves a host: A's next turn finds a mismatch and retires the sandbox. The kill is slow.
+      s.settings.state.current = approved;
+      let answerKill!: () => void;
+      doomed.killed.mockImplementation(() => new Promise<void>((resolve) => { answerKill = resolve; }));
+      a.beginTurn();
+      const retiring = a.execute("echo A2").catch((error: unknown) => error);
+      await vi.waitFor(() => expect(doomed.killed).toHaveBeenCalledTimes(1));
+
+      // While the kill is in flight, the admin reverts the change, and B takes the lease. B must not
+      // adopt the sandbox, which matches the policy again: the late kill would destroy it.
+      s.settings.state.current = denyAll;
+      s.owner.current = "B";
+      b.beginTurn();
+      await b.execute("echo B");
+
+      expect(s.provider.connect).not.toHaveBeenCalledWith(doomed.sandbox.sandboxId, expect.anything());
+      expect(doomed.runCalls.map((call) => call.command)).not.toContain("echo B");
+      const adopted = s.created[1]!;
+      expect(adopted.runCalls.map((call) => call.command)).toContain("echo B");
+      expect(s.state.saved).toEqual({ sandboxId: adopted.sandbox.sandboxId, networkPolicyHash: denyAll.hash });
+
+      // The kill lands on the retired sandbox only. A lost the lease, so it creates nothing more.
+      answerKill();
+      expect(await retiring).toMatchObject({ code: "execution_stopped" });
+      expect(adopted.killed).not.toHaveBeenCalled();
+      expect(s.provider.create).toHaveBeenCalledTimes(2);
+      expect(s.state.saved).toEqual({ sandboxId: adopted.sandbox.sandboxId, networkPolicyHash: denyAll.hash });
     });
 
     it("cannot change the network of a sandbox that the next owner uses: its check finds a mismatch and replaces nothing", async () => {
@@ -2437,7 +2527,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       { name: "glob", steps: ["run"], call: (b) => b.glob("*.txt", "/") },
       { name: "write", steps: ["write"], call: (b) => b.write("/w.txt", "text") },
       { name: "edit", steps: ["read", "write"], call: (b) => b.edit("/a.txt", "one", "uno") },
-      { name: "delete", steps: ["run", "run"], call: (b) => b.delete("/a.txt") }
+      { name: "delete", steps: ["run"], call: (b) => b.delete("/a.txt") }
     ];
 
     it("inherits exactly the methods that were audited", () => {
@@ -2595,67 +2685,24 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(s.provider.create).toHaveBeenCalledTimes(1);
     });
 
-    // ── delete: ask, wait, remove ────────────────────────────────────────────
+    // ── delete: one confined command ─────────────────────────────────────────
 
-    /** The probe of delete (`test -e`) waits until `release()`. */
-    function holdProbe(r: Awaited<ReturnType<typeof started>>) {
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const run = r.saved.sandbox.commands.run;
-      let probed = false;
-      r.saved.sandbox.commands.run = async (command, options) => {
-        const result = await run(command, options);
-        if (command.startsWith("test -e") && !probed) {
-          probed = true;
-          await held;
-        }
-        return result;
-      };
-      return { release, started: () => probed };
-    }
     const commandsRun = (r: Awaited<ReturnType<typeof started>>) => r.saved.runCalls.map((call) => call.command);
+    /** Answers the delete command with `result`, and runs every other command as before. */
+    function answerDelete(r: Awaited<ReturnType<typeof started>>, result: { stdout: string; exitCode: number }) {
+      const run = r.saved.sandbox.commands.run;
+      r.saved.sandbox.commands.run = async (command, options) =>
+        command.includes("rm -rf") ? { ...result, stderr: "" } : run(command, options);
+    }
 
-    it("does not let the rm of a delete run in the turn that began while its probe waited", async () => {
-      const s = await started();
-      const gate = holdProbe(s);
-
-      const removal = outcome(s.backend.delete("/a.txt"));
-      await vi.waitFor(() => expect(gate.started()).toBe(true));
-      s.backend.beginTurn();
-      await s.backend.writeFileBytes("/a.txt", "written by the next turn");
-      const before = commandsRun(s).length;
-      gate.release();
-
-      expect(await removal).toBeInstanceOf(SandboxTurnEndedError);
-      // The probe found the file, and the file is the next turn's now: nothing removes it.
-      expect(commandsRun(s).slice(before)).toEqual([]);
-      expect(commandsRun(s).some((command) => command.startsWith("rm "))).toBe(false);
-      expect(text(s.saved.files.get(WORKSPACE_FILE("a.txt")))).toBe("written by the next turn");
-    });
-
-    it("does not remove what a delete found once its turn has ended", async () => {
-      const s = await started();
-      const gate = holdProbe(s);
-
-      const removal = outcome(s.backend.delete("/a.txt"));
-      await vi.waitFor(() => expect(gate.started()).toBe(true));
-      s.endTurn();
-      gate.release();
-
-      expect(await removal).toBeInstanceOf(SandboxTurnEndedError);
-      expect(commandsRun(s).some((command) => command.startsWith("rm "))).toBe(false);
-    });
-
-    it("deletes inside the workspace, with the path that the model gave in the answer", async () => {
+    it("checks and removes in one command, so no other command runs between the check and the rm", async () => {
       const s = await started();
 
       const result = await s.backend.delete("/a.txt");
 
       // The model names the file as it does for write_file: from the root of the workspace.
-      expect(commandsRun(s).slice(-2)).toEqual([
-        `test -e '${WORKSPACE_FILE("a.txt")}' || test -L '${WORKSPACE_FILE("a.txt")}'`,
-        `rm -rf '${WORKSPACE_FILE("a.txt")}'`
-      ]);
+      expect(commandsRun(s).at(-1)).toBe(confinedDeleteCommand("/home/user/workspace/sess-1", WORKSPACE_FILE("a.txt")));
+      expect(s.steps).toEqual(["run"]);
       expect(result).toEqual({ path: "/a.txt", filesUpdate: null });
     });
 
@@ -2664,35 +2711,37 @@ describe("E2bDeepAgentsSandbox network policy", () => {
 
       const result = await s.backend.delete(WORKSPACE_FILE("a.txt"));
 
-      expect(commandsRun(s).at(-1)).toBe(`rm -rf '${WORKSPACE_FILE("a.txt")}'`);
+      expect(commandsRun(s).at(-1)).toBe(confinedDeleteCommand("/home/user/workspace/sess-1", WORKSPACE_FILE("a.txt")));
       expect(result).toMatchObject({ path: WORKSPACE_FILE("a.txt") });
     });
 
-    it("refuses a path outside the workspace and runs no command for it", async () => {
+    it("refuses a path outside the workspace, and the workspace root, and runs no command for them", async () => {
       const s = await started();
 
       expect(await s.backend.delete("/../../etc/passwd")).toEqual({ error: "Path is outside the session workspace" });
       expect(await s.backend.delete("../x")).toEqual({ error: "Path is outside the session workspace" });
+      expect(await s.backend.delete("/")).toEqual({ error: "The session workspace root cannot be deleted" });
+      expect(await s.backend.delete(WORKSPACE_FILE(""))).toEqual({ error: "The session workspace root cannot be deleted" });
       expect(s.steps).toEqual([]);
     });
 
-    it("answers that a path is not found, and does not run the rm", async () => {
+    it("answers that a path is not found", async () => {
       const s = await started();
-      const run = s.saved.sandbox.commands.run;
-      s.saved.sandbox.commands.run = async (command, options) =>
-        command.startsWith("test -e") ? { stdout: "", stderr: "", exitCode: 1 } : run(command, options);
+      answerDelete(s, { stdout: "", exitCode: 3 });
 
-      const result = await s.backend.delete("/missing.txt");
+      expect(await s.backend.delete("/missing.txt")).toEqual({ error: "Error: '/missing.txt' not found" });
+    });
 
-      expect(result).toEqual({ error: `Error: '${WORKSPACE_FILE("missing.txt")}' not found` });
-      expect(commandsRun(s).some((command) => command.startsWith("rm "))).toBe(false);
+    it("answers that a path is outside the workspace when its physical directory is", async () => {
+      const s = await started();
+      answerDelete(s, { stdout: "", exitCode: 4 });
+
+      expect(await s.backend.delete("/link/secret.txt")).toEqual({ error: "Path is outside the session workspace" });
     });
 
     it("reports a rm that failed", async () => {
       const s = await started();
-      const run = s.saved.sandbox.commands.run;
-      s.saved.sandbox.commands.run = async (command, options) =>
-        command.startsWith("rm ") ? { stdout: "rm: cannot remove: Permission denied", stderr: "", exitCode: 1 } : run(command, options);
+      answerDelete(s, { stdout: "rm: cannot remove: Permission denied", exitCode: 1 });
 
       const result = await s.backend.delete("/a.txt");
 
@@ -2939,7 +2988,8 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       await at(3_000);
 
       expect(r.saved.killed.mock.calls.map((call) => call[0]?.requestTimeoutMs)).toEqual([1_000, 1_000, 250]);
-      expect(requireOwnership).toHaveBeenCalledTimes(3);
+      // One lease check, before the release of the record. The tries of the kill come after it.
+      expect(requireOwnership).toHaveBeenCalledTimes(1);
       expect(error).toHaveBeenCalledWith(expect.objectContaining({ sandboxId: "sbx-old", tries: 3 }), expect.any(String));
       expect(operation.state).toBe("resolved");
       expect(r.backend.id).toBe("sbx-new");
@@ -2969,5 +3019,172 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       // No request timer or backoff timer outlives a check that succeeded.
       expect(vi.getTimerCount()).toBe(0);
     });
+  });
+});
+
+// ── grep: the result limit of the SDK contract ────────────────────
+
+describe("E2bDeepAgentsSandbox grep limit", () => {
+  const FIVE_MATCHES = ["a.txt:1:hit", "a.txt:2:hit", "b.txt:1:hit", "b.txt:4:hit", "c.txt:9:hit"].join("\n");
+
+  function grepBackend() {
+    const fake = makeFakeSandbox({ runResult: () => ({ stdout: FIVE_MATCHES, stderr: "", exitCode: 0 }) });
+    return { fake, ...makeBackend({ fake }) };
+  }
+
+  it("bounds the matches with the limit that the caller gives, and flags the cut", async () => {
+    const { backend } = grepBackend();
+
+    const result = await backend.grep("hit", "/", null, 2);
+
+    expect(result.matches).toHaveLength(2);
+    expect(result.matches?.map((match) => `${match.path}:${match.line}`)).toEqual(["a.txt:1", "a.txt:2"]);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("keeps every match when the limit is omitted or null, as the SDK does", async () => {
+    const { backend } = grepBackend();
+
+    expect((await backend.grep("hit")).matches).toHaveLength(5);
+    expect((await backend.grep("hit", null, null, null)).matches).toHaveLength(5);
+    expect((await backend.grep("hit")).truncated).toBeUndefined();
+  });
+
+  it("keeps the directory, the glob and the workspace confinement with a limit", async () => {
+    const { backend, fake } = grepBackend();
+
+    await backend.grep("hit", "/src", "*.ts", 1);
+
+    const command = fake.runCalls.at(-1)!.command;
+    expect(command).toContain("'/home/user/workspace/sess-1/src'");
+    expect(command).toContain("'*.ts'");
+    expect(await backend.grep("hit", "../../etc", null, 1)).toEqual({ error: "Path is outside the session workspace" });
+  });
+});
+
+// ── delete through symlinks, in a real shell ──────────────────────
+// The fake sandbox runs each command in /bin/sh on a temporary directory, so the
+// command that delete sends is checked against a real file system with real symlinks.
+
+describe("E2bDeepAgentsSandbox delete in a real shell", () => {
+  const execFileAsync = promisify(execFile);
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), "cogniplane-delete-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  /** A workspace and, beside it in the same sandbox, a directory outside the workspace. */
+  async function layout() {
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    await mkdir(path.join(workspace, "dir"), { recursive: true });
+    await mkdir(outside);
+    await writeFile(path.join(outside, "secret.txt"), "keep");
+    await writeFile(path.join(workspace, "dir", "notes.txt"), "notes");
+    const fake = makeFakeSandbox({
+      runResult: async (command) => {
+        try {
+          const { stdout, stderr } = await execFileAsync("/bin/sh", ["-c", command], { cwd: workspace });
+          return { stdout, stderr, exitCode: 0 };
+        } catch (error) {
+          const failed = error as { stdout?: string; stderr?: string; code?: number };
+          return { stdout: failed.stdout ?? "", stderr: failed.stderr ?? "", exitCode: failed.code ?? 1 };
+        }
+      }
+    });
+    const { backend } = makeBackend({ fake, options: { workspacePath: workspace } });
+    return { workspace, outside, backend };
+  }
+
+  const exists = (target: string) => lstat(target).then(() => true, () => false);
+
+  it("refuses a path whose intermediate directory is a symlink to outside the workspace, and deletes nothing", async () => {
+    const { workspace, outside, backend } = await layout();
+    await symlink(outside, path.join(workspace, "link"));
+
+    expect(await backend.delete("/link/secret.txt")).toEqual({ error: "Path is outside the session workspace" });
+    expect(await readFile(path.join(outside, "secret.txt"), "utf8")).toBe("keep");
+    expect(await exists(path.join(workspace, "link"))).toBe(true);
+  });
+
+  it("refuses a symlink chain that leaves the workspace and comes back through another link", async () => {
+    const { workspace, outside, backend } = await layout();
+    await mkdir(path.join(outside, "nested"));
+    await writeFile(path.join(outside, "nested", "file.txt"), "keep");
+    await symlink(path.join(outside, "nested"), path.join(workspace, "dir", "away"));
+
+    expect(await backend.delete("/dir/away/file.txt")).toEqual({ error: "Path is outside the session workspace" });
+    expect(await readFile(path.join(outside, "nested", "file.txt"), "utf8")).toBe("keep");
+  });
+
+  it("refuses a symlink to an outside sibling whose name is the workspace name and a trailing newline", async () => {
+    // Command substitution strips trailing newlines, so `$(pwd -P)` read this sibling as the workspace itself.
+    const { workspace, backend } = await layout();
+    const sibling = `${workspace}\n`;
+    await mkdir(sibling);
+    await writeFile(path.join(sibling, "keep.txt"), "keep");
+    await symlink(sibling, path.join(workspace, "link"));
+
+    expect(await backend.delete("/link/keep.txt")).toEqual({ error: "Path is outside the session workspace" });
+    expect(await readFile(path.join(sibling, "keep.txt"), "utf8")).toBe("keep");
+  });
+
+  it("removes a symlink in the last component, and not its target outside the workspace", async () => {
+    const { workspace, outside, backend } = await layout();
+    await symlink(path.join(outside, "secret.txt"), path.join(workspace, "pointer"));
+
+    expect(await backend.delete("/pointer")).toEqual({ path: "/pointer", filesUpdate: null });
+    expect(await exists(path.join(workspace, "pointer"))).toBe(false);
+    expect(await readFile(path.join(outside, "secret.txt"), "utf8")).toBe("keep");
+  });
+
+  it("removes a directory that holds a symlink to outside, and not what the symlink points at", async () => {
+    const { workspace, outside, backend } = await layout();
+    await symlink(outside, path.join(workspace, "dir", "escape"));
+
+    expect(await backend.delete("/dir")).toEqual({ path: "/dir", filesUpdate: null });
+    expect(await exists(path.join(workspace, "dir"))).toBe(false);
+    expect(await readFile(path.join(outside, "secret.txt"), "utf8")).toBe("keep");
+  });
+
+  it("deletes through a symlink that stays inside the workspace, and deletes plain files and directories", async () => {
+    const { workspace, backend } = await layout();
+    await symlink(path.join(workspace, "dir"), path.join(workspace, "alias"));
+    await writeFile(path.join(workspace, "plain.txt"), "x");
+
+    expect(await backend.delete("/alias/notes.txt")).toEqual({ path: "/alias/notes.txt", filesUpdate: null });
+    expect(await exists(path.join(workspace, "dir", "notes.txt"))).toBe(false);
+    expect(await backend.delete("/plain.txt")).toEqual({ path: "/plain.txt", filesUpdate: null });
+    expect(await exists(path.join(workspace, "plain.txt"))).toBe(false);
+  });
+
+  it("answers not found for a missing file, a missing directory, and a broken path", async () => {
+    const { workspace, backend } = await layout();
+    await writeFile(path.join(workspace, "file.txt"), "x");
+
+    expect(await backend.delete("/missing.txt")).toEqual({ error: "Error: '/missing.txt' not found" });
+    expect(await backend.delete("/nowhere/missing.txt")).toEqual({ error: "Error: '/nowhere/missing.txt' not found" });
+    expect(await backend.delete("/file.txt/inner")).toEqual({ error: "Error: '/file.txt/inner' not found" });
+  });
+
+  it("removes a broken symlink", async () => {
+    const { workspace, backend } = await layout();
+    await symlink(path.join(workspace, "gone"), path.join(workspace, "dangling"));
+
+    expect(await backend.delete("/dangling")).toEqual({ path: "/dangling", filesUpdate: null });
+    expect(await exists(path.join(workspace, "dangling"))).toBe(false);
+  });
+
+  it("quotes names with spaces and quotes", async () => {
+    const { workspace, backend } = await layout();
+    const name = "it's a file.txt";
+    await writeFile(path.join(workspace, name), "x");
+
+    expect(await backend.delete(`/${name}`)).toEqual({ path: `/${name}`, filesUpdate: null });
+    expect(await exists(path.join(workspace, name))).toBe(false);
   });
 });

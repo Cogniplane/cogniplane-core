@@ -335,7 +335,7 @@ function makeAdapter(input: {
   modelSpending?: unknown;
   executions?: Pick<import("../session-execution-store.js").SessionExecutionStore, "isCurrent" | "bindRuntime"> &
     Partial<Pick<import("../session-execution-store.js").SessionExecutionStore,
-      "sandboxBinding" | "bindSandboxId">>;
+      "sandboxBinding" | "bindSandboxId" | "releaseSandboxId">>;
   sessions?: Pick<import("../session-store.js").SessionStore, "getReadable">;
   activationTracker?: Pick<import("../activation-tracker.js").ActivationTracker, "recordMaterialization">;
   tenantMembers?: {
@@ -3245,6 +3245,11 @@ it("keeps a standalone runtime and checkpointer across execution generations", a
       expect(previousId).toBe(savedSandbox?.sandboxId ?? null);
       savedSandbox = { sandboxId: id, networkPolicyHash: hash };
     },
+    releaseSandboxId: async (execution: { executionId: string }, id: string) => {
+      sandboxExecutions.push(execution.executionId);
+      expect(id).toBe(savedSandbox?.sandboxId);
+      savedSandbox = null;
+    },
   } });
   const first = { ...sessionInput, executionId: currentId, ownerId: "replica-a",
     projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() };
@@ -3261,7 +3266,10 @@ it("keeps a standalone runtime and checkpointer across execution generations", a
     const binding = runtime.factoryCalls[0]!.sandboxBinding!;
     await binding.save(null, "sandbox-one", "policy-a");
     expect(await binding.load()).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
-    expect(sandboxExecutions).toEqual(["second", "second"]);
+    // The release before a kill uses the current execution generation too.
+    await binding.release("sandbox-one");
+    expect(await binding.load()).toBeNull();
+    expect(sandboxExecutions).toEqual(["second", "second", "second", "second"]);
   } finally { await adapter.close(); }
 });
 

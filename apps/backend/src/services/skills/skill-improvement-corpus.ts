@@ -3,6 +3,7 @@ import type { MessageRecord, ToolResultRecord } from "../message-store.js";
 import type { PiiProtectionService } from "../pii/pii-protection-service.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { displayedToolStatus } from "@cogniplane/shared-types";
 
 const TOOL_OUTPUT_EXCERPT_BYTES = 800;
 const TOOL_INPUT_EXCERPT_BYTES = 400;
@@ -172,8 +173,10 @@ function renderSession(session: CorpusSessionInput): {
       const { excerpt, truncated } = excerptToolOutput(toolResult);
       if (truncated) sessionTruncatedToolResults += 1;
 
+      const status = displayedToolStatus(toolResult.status, message.status);
       sessionLines.push(
-        `- **tool** \`${toolResult.toolName ?? toolResult.kind}\` — status: ${toolResult.status}`
+        `- **tool** \`${toolResult.toolName ?? toolResult.kind}\` — status: ${status}` +
+          (status === toolResult.status ? "" : ` (no result before the turn ended; stored status: ${toolResult.status})`)
       );
       if (toolResult.input) {
         const safeInput = redactSecrets(toolResult.input.slice(0, TOOL_INPUT_EXCERPT_BYTES));

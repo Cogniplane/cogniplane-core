@@ -161,7 +161,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     private readonly stores: {
       approvals: ApprovalStore;
       executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime"> &
-        Partial<Pick<SessionExecutionStore, "sandboxBinding" | "bindSandboxId">>;
+        Partial<Pick<SessionExecutionStore, "sandboxBinding" | "bindSandboxId" | "releaseSandboxId">>;
       conversationMessages?: Pick<MessageStore, "listBySession">;
       sessions: Pick<import("../session-store.js").SessionStore, "getReadable">;
       auditEvents: AuditEventStore;
@@ -524,7 +524,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
             }
           : null,
       ...(input.execution && !input.execution.projectId &&
-        this.stores.executions.sandboxBinding && this.stores.executions.bindSandboxId
+        this.stores.executions.sandboxBinding && this.stores.executions.bindSandboxId &&
+        this.stores.executions.releaseSandboxId
         ? { sandboxBinding: {
             load: async () => {
               const current = this.sessions.get(sessionId)?.execution;
@@ -535,6 +536,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               const current = this.sessions.get(sessionId)?.execution;
               if (!current) throw new SessionExecutionError("execution_stopped", 403);
               await this.stores.executions.bindSandboxId!(current, previousId, sandboxId, networkPolicyHash);
+            },
+            release: async (sandboxId: string) => {
+              const current = this.sessions.get(sessionId)?.execution;
+              if (!current) throw new SessionExecutionError("execution_stopped", 403);
+              await this.stores.executions.releaseSandboxId!(current, sandboxId);
             }
           } } : {}),
       // Surface a transparently replaced sandbox: at that moment every file

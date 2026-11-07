@@ -557,6 +557,42 @@ describe("approval of a durable write", () => {
     f.coordinator.close();
   });
 
+  it("offers no turn option for a save, and keeps it for a native request and another policy request", async () => {
+    const f = setup();
+    const turn = f.coordinator.openTurn(f.options);
+    const save = memorySave();
+    const waits = [turn.request(save, f.publish), turn.request(action, f.publish), turn.request(policyAction(), f.publish)];
+    await flush();
+
+    const cards = f.published.filter((notice) => notice.name === "approval_required")
+      .map((notice) => notice.value as { approvalId: string; allowForTurn?: boolean });
+    expect(cards).toHaveLength(3);
+    for (const card of cards) {
+      expect(card.allowForTurn).toBe(card.approvalId !== save.policyApproval!.approvalId);
+    }
+    turn.cancelLocal();
+    await Promise.all(waits);
+    f.coordinator.close();
+  });
+
+  it("does not remember a save for the turn even when a client asks for that", async () => {
+    const f = setup();
+    const turn = f.coordinator.openTurn(f.options);
+    const first = memorySave();
+    const wait = turn.request(first, f.publish);
+    await flush();
+    await f.coordinator.decide({ ...identity, approvalId: first.policyApproval!.approvalId, decision: "approve", rememberForTurn: true });
+    await expect(wait).resolves.toBe("approve");
+
+    // A later request of the same kind and name, without a proof, still asks the user.
+    const later = turn.request({ name: "memory_save", kind: "mcp_tool", args }, f.publish);
+    await flush();
+    expect(f.published.filter((notice) => notice.name === "approval_required")).toHaveLength(2);
+    turn.cancelLocal();
+    await expect(later).resolves.toBe("reject");
+    f.coordinator.close();
+  });
+
   it("does not auto-approve a later save because the user allowed an earlier one for the turn", async () => {
     const f = setup();
     const turn = f.coordinator.openTurn(f.options);
@@ -577,5 +613,127 @@ describe("approval of a durable write", () => {
     turn.cancelLocal();
     await expect(secondWait).resolves.toBe("reject");
     f.coordinator.close();
+  });
+});
+
+// Two open turns can wait on the same persisted policy approval. Each wait is its own
+// entry: settling one must not remove the other, and every settled wait clears its timers and listener.
+describe("overlapping waits on one approval", () => {
+  /** Two open turns, each with its own abort signal, that wait on the same policy approval. */
+  async function twoWaits() {
+    vi.useFakeTimers();
+    const f = setup();
+    const proof = policyAction();
+    const signals = [new AbortController(), new AbortController()];
+    const removals = signals.map((controller) => vi.spyOn(controller.signal, "removeEventListener"));
+    const turns = signals.map((controller, index) => f.coordinator.openTurn({
+      ...f.options, signal: controller.signal, identity: { ...identity, turnId: `turn-${index + 1}` }
+    }));
+    const older = turns[0]!.request(proof, f.publish);
+    await flush();
+    const newer = turns[1]!.request(proof, f.publish);
+    await flush();
+    // One row, two cards: the newer turn reuses the persisted request.
+    expect(f.approvals.create).toHaveBeenCalledOnce();
+    expect(f.published.filter((notice) => notice.name === "approval_required")).toHaveLength(2);
+    return { ...f, approvalId: proof.policyApproval.approvalId, signals, removals, turns, older, newer };
+  }
+
+  it("settles both waits with one decision", async () => {
+    const w = await twoWaits();
+
+    await expect(w.coordinator.decide({ ...identity, approvalId: w.approvalId, decision: "approve" })).resolves.toBe("resolved");
+
+    await expect(Promise.all([w.older, w.newer])).resolves.toEqual(["approve", "approve"]);
+    expect(w.rows.get(w.approvalId)?.status).toBe("approved");
+    expect(w.removals.map((removal) => removal.mock.calls.filter(([type]) => type === "abort"))).toEqual([
+      [["abort", expect.any(Function)]], [["abort", expect.any(Function)]]
+    ]);
+    expect(vi.getTimerCount()).toBe(0);
+    w.coordinator.close();
+  });
+
+  it.each(["cancel", "abort"] as const)(
+    "keeps the newer wait when the older one ends by %s, and the decision then reaches it", async (end) => {
+      const w = await twoWaits();
+
+      if (end === "cancel") w.turns[0]!.cancelLocal();
+      else w.signals[0]!.abort();
+      await expect(w.older).resolves.toBe("reject");
+
+      await expect(w.coordinator.decide({ ...identity, approvalId: w.approvalId, decision: "reject" })).resolves.toBe("resolved");
+      await expect(w.newer).resolves.toBe("reject");
+      expect(w.rows.get(w.approvalId)?.status).toBe("rejected");
+      expect(vi.getTimerCount()).toBe(0);
+      w.coordinator.close();
+    });
+
+  it("keeps the older wait when the newer one ends first", async () => {
+    const w = await twoWaits();
+
+    w.turns[1]!.cancelLocal();
+    await expect(w.newer).resolves.toBe("reject");
+
+    await expect(w.coordinator.decide({ ...identity, approvalId: w.approvalId, decision: "approve" })).resolves.toBe("resolved");
+    await expect(w.older).resolves.toBe("approve");
+    expect(vi.getTimerCount()).toBe(0);
+    w.coordinator.close();
+  });
+
+  it("decides only the waits of the actor that is local to each turn", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    const proof = policyAction();
+    const localToFirst = vi.fn(() => true);
+    const localToSecond = vi.fn(() => false);
+    const first = f.coordinator.openTurn({ ...f.options, hasLocalActor: localToFirst });
+    const second = f.coordinator.openTurn({ ...f.options, hasLocalActor: localToSecond,
+      identity: { ...identity, turnId: "turn-2" }, signal: new AbortController().signal });
+    const firstWait = first.request(proof, f.publish);
+    await flush();
+    const secondWait = second.request(proof, f.publish);
+    await flush();
+
+    await expect(f.coordinator.decide({ ...identity, approvalId: proof.policyApproval.approvalId, decision: "approve" }))
+      .resolves.toBe("resolved");
+    await expect(firstWait).resolves.toBe("approve");
+    // The other wait is not settled by this replica. It reads the stored decision at its next poll.
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(secondWait).resolves.toBe("approve");
+    expect(vi.getTimerCount()).toBe(0);
+    f.coordinator.close();
+  });
+
+  it("expires each wait at its own TTL and clears every timer", async () => {
+    const w = await twoWaits();
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    await expect(Promise.all([w.older, w.newer])).resolves.toEqual(["expired", "expired"]);
+    expect(w.rows.get(w.approvalId)?.status).toBe("expired");
+    expect(vi.getTimerCount()).toBe(0);
+    w.coordinator.close();
+  });
+
+  it("releases both waits on coordinator shutdown", async () => {
+    const w = await twoWaits();
+
+    w.coordinator.close();
+
+    await expect(Promise.all([w.older, w.newer])).resolves.toEqual(["reject", "reject"]);
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(w.coordinator.decide({ ...identity, approvalId: w.approvalId, decision: "approve" })).resolves.toBe("resolved");
+  });
+
+  it("keeps the tenant and user checks for every wait", async () => {
+    const w = await twoWaits();
+
+    await expect(w.coordinator.decide({ ...identity, userId: "user-2", approvalId: w.approvalId, decision: "approve" }))
+      .resolves.toBe("missing");
+    await expect(w.coordinator.decide({ ...identity, tenantId: "tenant-2", approvalId: w.approvalId, decision: "approve" }))
+      .resolves.toBe("missing");
+    expect(w.rows.get(w.approvalId)?.status).toBe("pending");
+    w.coordinator.close();
+    await Promise.all([w.older, w.newer]);
   });
 });

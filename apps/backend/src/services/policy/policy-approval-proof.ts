@@ -1,6 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 
 export const POLICY_APPROVAL_REQUEST_METHOD = "policy/toolApproval";
+
+/**
+ * Whether "Allow for this turn" can approve later requests like this one. Not for a
+ * durable write (a policy approval with `bound`, such as memory_save): each call needs
+ * a proof of its exact arguments, so the option would approve nothing more.
+ */
+export function approvalAllowsTurnScope(approval: {
+  requestMethod: string; requestPayload?: Record<string, unknown> | null;
+}): boolean {
+  const bound = approval.requestPayload?.bound;
+  return !(approval.requestMethod === POLICY_APPROVAL_REQUEST_METHOD && typeof bound === "object" && bound !== null);
+}
 export const POLICY_APPROVAL_MARKER_KEY = "__cogniplanePolicyApproval";
 // Approval metadata in tool arguments. Nothing reads either key as a proof.
 // The runtime sends its proof in the request `_meta`. The runtime and the

@@ -22,9 +22,7 @@ COPY patches patches
 RUN pnpm install --frozen-lockfile
 
 COPY apps/backend apps/backend
-# These renderer patches are absent from the backend production dependencies.
 RUN pnpm --filter @cogniplane/backend build:bundle \
-  && node -e 'const fs = require("node:fs"); const pkg = JSON.parse(fs.readFileSync("package.json", "utf8")); for (const name of ["@a2ui/web_core@0.10.4", "@copilotkit/a2ui-renderer@1.83.0"]) delete pkg.pnpm.patchedDependencies[name]; fs.writeFileSync("package.json", JSON.stringify(pkg));' \
   && pnpm --filter @cogniplane/backend deploy --prod --no-optional --legacy /opt/backend
 
 FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runtime

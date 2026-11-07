@@ -154,7 +154,7 @@ describe("tool calls of a live turn", () => {
   ];
   const toolResult = (id: string, content: string) => ({ type: "TOOL_CALL_RESULT", messageId: `${id}:result`, toolCallId: id, content, role: "tool" });
 
-  it("keeps an unfinished earlier call interrupted when another turn starts after RUN_ERROR", async () => {
+  it("keeps an unfinished call interrupted after RUN_ERROR, when another turn starts, and after a reload", async () => {
     server.connect("s-1", idleHistory([]));
     let first!: FixtureStream;
     let second!: FixtureStream;
@@ -183,6 +183,22 @@ describe("tool calls of a live turn", () => {
     await waitFor(() => expect(within(card(/Run command/)).getByText("running…")).toBeTruthy());
     expect(within(card(/Read file/)).getByText("interrupted")).toBeTruthy();
     act(() => { second.push(toolResult("tc-new", "/"), ev.runFinished("r-2")); second.finish(); });
+    await waitFor(() => expect(within(card(/Run command/)).getByText("done")).toBeTruthy());
+    expect(screen.queryByText("failed")).toBeNull();
+
+    // Reload. The transcript of the failed turn keeps the call in_progress, and history gives it
+    // the `interrupted` result (turn-transcript.test.ts covers that side). The label stays the same.
+    cleanup();
+    server.connect("s-1", idleHistory([
+      { id: "u1", role: "user", content: "First" },
+      call("tc-old", "read_file", { file_path: "/old" }), result("tc-old", "", "interrupted"),
+      { id: "u2", role: "user", content: "Second" },
+      call("tc-new", "execute", { command: "pwd" }), result("tc-new", "/")
+    ]));
+    render(hostElement());
+    await waitFor(() => expect(within(card(/Read file/)).getByText("interrupted")).toBeTruthy());
+    expect(within(card(/Read file/)).getByText(INTERRUPTED_NOTE)).toBeTruthy();
+    expect(screen.queryByText("failed")).toBeNull();
   });
 
   it("shows a stopped command as interrupted, never as failed, and keeps it so when the next turn starts", async () => {

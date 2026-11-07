@@ -5,6 +5,7 @@ import { uuidv7 } from "../../lib/uuid.js";
 import type { ApprovalKind, ApprovalRecord, ApprovalStatus, ApprovalStore } from "../auth/approval-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import {
+  approvalAllowsTurnScope,
   POLICY_APPROVAL_REQUEST_METHOD,
   type PolicyApprovalProof
 } from "../policy/policy-approval-proof.js";
@@ -63,7 +64,8 @@ const STORED_OUTCOME: Partial<Record<ApprovalStatus, ApprovalOutcome>> = {
 };
 
 export class ApprovalCoordinator {
-  private readonly pending = new Map<string, PendingApproval>();
+  /** Two open turns can wait on the same persisted policy approval. */
+  private readonly pending = new Map<string, Set<PendingApproval>>();
   private readonly turns = new Set<TurnState>();
   private closed = false;
 
@@ -91,17 +93,26 @@ export class ApprovalCoordinator {
   }): Promise<"resolved" | "missing"> {
     const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
     const actor = { tenantId, userId };
-    const entry = this.pending.get(approvalId);
-    if (entry) {
+    const waits = [...(this.pending.get(approvalId) ?? [])];
+    const eligible: PendingApproval[] = [];
+    for (const entry of waits) {
       const { turn } = entry;
       if (turn.identity.tenantId !== tenantId || turn.identity.userId !== userId ||
-          !turn.hasLocalActor(actor)) return "missing";
-      try { await turn.validateLocalDecision(actor); } catch { return "missing"; }
+          !turn.hasLocalActor(actor)) continue;
+      try { await turn.validateLocalDecision(actor); } catch { continue; }
+      eligible.push(entry);
     }
-    if (entry && !entry.requiresDurableProof) {
-      if (!entry.turn.hasLocalActor(actor)) return "missing";
-      if (rememberForTurn && decision === "approve") entry.rememberApproval();
-      entry.settle(decision);
+    if (waits.length > 0 && eligible.length === 0) return "missing";
+    const settleEligible = () => {
+      for (const entry of eligible) {
+        if (!entry.turn.hasLocalActor(actor)) continue;
+        if (rememberForTurn && decision === "approve") entry.rememberApproval();
+        entry.settle(decision);
+      }
+    };
+    if (eligible.length > 0 && eligible.every((entry) => !entry.requiresDurableProof)) {
+      if (!eligible.some((entry) => entry.turn.hasLocalActor(actor))) return "missing";
+      settleEligible();
       try {
         const approval = await this.deps.approvals.resolve(tenantId, approvalId, userId, decision,
           rememberForTurn === true);
@@ -122,10 +133,7 @@ export class ApprovalCoordinator {
       throw err;
     }
     if (!approval) return "missing";
-    if (entry && entry.turn.hasLocalActor(actor)) {
-      if (rememberForTurn && decision === "approve") entry.rememberApproval();
-      entry.settle(decision);
-    }
+    settleEligible();
     try {
       await this.auditDecision(tenantId, approval, decision);
     } catch (err) {
@@ -158,8 +166,10 @@ export class ApprovalCoordinator {
 
   private cancelTurn(turn: TurnState): void {
     if (!this.turns.delete(turn)) return;
-    for (const entry of [...this.pending.values()]) {
-      if (entry.turn === turn) entry.settle("reject");
+    for (const waits of [...this.pending.values()]) {
+      for (const entry of [...waits]) {
+        if (entry.turn === turn) entry.settle("reject");
+      }
     }
   }
 
@@ -254,7 +264,8 @@ export class ApprovalCoordinator {
         command: name === "execute" && typeof action.args.command === "string" ? action.args.command : name,
         cwd: null,
         // From the row, so the event and a later read of the approvals agree.
-        ...(approval.toolCallId ? { toolCallId: approval.toolCallId } : {})
+        ...(approval.toolCallId ? { toolCallId: approval.toolCallId } : {}),
+        allowForTurn: approvalAllowsTurnScope(approval)
       } });
     } catch (err) {
       this.deps.logger.error({ err, approvalId }, "Failed to publish approval request; denying");
@@ -275,11 +286,19 @@ export class ApprovalCoordinator {
         clearTimeout(ttlTimer);
         if (pollTimer) clearTimeout(pollTimer);
         signal.removeEventListener("abort", onAbort);
-        this.pending.delete(approvalId);
+        const waits = this.pending.get(approvalId);
+        waits?.delete(entry);
+        if (waits?.size === 0) this.pending.delete(approvalId);
         resolve(outcome);
       };
+      // Also when a client asks to remember an approval that does not allow it.
+      const rememberable = approvalAllowsTurnScope(approval);
       const rememberApproval = () => {
-        if (!settled && !this.ended(turn)) turn.remembered.add(rememberKey);
+        if (rememberable && !settled && !this.ended(turn)) turn.remembered.add(rememberKey);
+      };
+      const entry: PendingApproval = {
+        turn,
+        requiresDurableProof: Boolean(action.policyApproval || turn.durableNative), rememberApproval, settle
       };
       const onAbort = () => settle("reject");
       const remainingTtlMs = Math.max(0,
@@ -320,10 +339,9 @@ export class ApprovalCoordinator {
       pollTimer = setTimeout(poll, pollDelayMs);
       pollTimer.unref?.();
       signal.addEventListener("abort", onAbort, { once: true });
-      this.pending.set(approvalId, {
-        turn,
-        requiresDurableProof: Boolean(action.policyApproval || turn.durableNative), rememberApproval, settle
-      });
+      const waits = this.pending.get(approvalId) ?? new Set<PendingApproval>();
+      waits.add(entry);
+      this.pending.set(approvalId, waits);
     });
   }
 }

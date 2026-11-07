@@ -44,6 +44,7 @@ export type ApprovalRow = {
   summary: string;
   status: Approval["status"];
   decisionState: ApprovalDecisionState;
+  allowForTurn: boolean;
 };
 
 export type McpServerStatusRow = {
