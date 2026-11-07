@@ -499,7 +499,7 @@ test("a state delta without a plan does not write an empty plan", async () => {
   expect(messages.streamingLog).toEqual([]);
 });
 
-// Issue #16: no tool reported a failure, so the call keeps in_progress and history shows it as interrupted.
+// No tool reported a failure, so the call keeps in_progress and history shows it as interrupted.
 test("keeps a tool left open by a terminal turn in progress, not failed", async () => {
   const { input, messages } = runInput([
     { type: EventType.TOOL_CALL_START, toolCallId: "tool-1", toolCallName: "execute" } as BaseEvent,
@@ -1280,7 +1280,7 @@ test("a turn that throws mid-stream saves its partial transcript as an error", a
     reasoningContent: "plan it",
     reasoningSegments: [{ offset: 0, text: "plan it" }]
   });
-  // The call never returned, so it is not saved as failed (issue #16). History shows it as interrupted.
+  // The call never returned, so it is not saved as failed History shows it as interrupted.
   expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "call-1", status: "in_progress" });
   const events = wireEvents(reply.writes);
   expect(events.at(-1)).toEqual({ type: EventType.RUN_ERROR, message: "The assistant run failed." });

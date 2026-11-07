@@ -33,7 +33,7 @@ function statusPillClass(status: string): string {
 export function AdminSessionToolsTab(props: {
   toolEvents: AdminSessionDetailToolEvent[];
   messageToolResults: AdminSessionDetailMessageToolResult[];
-  /** The messages of the session. The status of a call's message tells whether its turn has ended. */
+  /** Tells whether the turn of each call has ended. */
   messages?: Pick<AdminSessionDetailMessage, "messageId" | "status">[];
 }) {
   const [filter, setFilter] = useState("");

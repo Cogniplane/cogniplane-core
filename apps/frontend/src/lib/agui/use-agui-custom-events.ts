@@ -112,7 +112,6 @@ function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
     summary: approval.summary,
     status: "pending",
     decisionState: "pending",
-    // The same field from the live event and from the approvals list after a reload.
     allowForTurn: approval.allowForTurn !== false
   };
 }

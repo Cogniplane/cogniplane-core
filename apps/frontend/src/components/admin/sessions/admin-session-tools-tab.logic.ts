@@ -23,10 +23,7 @@ export type UnifiedRow =
       createdAt: string;
       durationMs: number | null;
       data: AdminSessionDetailMessageToolResult;
-      /**
-       * The status to show: `interrupted` for a call that never returned in a turn
-       * that has ended (issue #17). `data.status` keeps what was stored.
-       */
+      /** From displayedToolStatus. `data.status` keeps what was stored. */
       displayStatus: string;
     };
 

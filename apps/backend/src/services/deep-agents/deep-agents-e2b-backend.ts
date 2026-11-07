@@ -734,10 +734,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     }
   }
 
-  /**
-   * Removes the record of a sandbox before its kill, limited in time like the lease
-   * check. A refusal or a timeout fails closed: the sandbox is kept and not killed.
-   */
+  /** A refusal or a timeout fails closed: the sandbox is kept and not killed. */
   private async releaseRecord(binding: DeepAgentsSandboxBinding, sandboxId: string, deadline: Deadline): Promise<void> {
     try {
       await this.bounded(deadline, () => binding.release(sandboxId));
@@ -760,18 +757,11 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
    * as an error, and the sandbox is replaced all the same: the old one then runs
    * until the provider expires it, and its processes keep the network that it had.
    *
-   * With a saved record (sandboxBinding), the order is durable (issue #20): the lease
-   * check, then the release of the record under the lease, then the kill. A lease check
-   * before the kill is not sufficient alone, because the next owner could load the
-   * record and adopt the sandbox while the kill is in flight. After the release, no
-   * owner loads this sandbox, so the tries of the kill need no more lease checks, and
-   * they continue when the turn ends: the sandbox is of no use to anyone. Recovery:
-   * - The release is refused (lease lost, or the record names another sandbox): no
-   *   kill is sent, and the sandbox stays for the owner of the record. That owner
-   *   compares it with the policy at its first use, and replaces it under its own lease.
-   * - The process stops after the release, or every try of the kill fails: the
-   *   sandbox has no record, so nobody adopts it, and the provider ends it at its
-   *   lifetime cap (sandboxTimeoutMs). Only the sandbox of the record is extended.
+   * With a saved record, the record is released before the kill. A lease check alone
+   * is not sufficient: the next owner could load the record and adopt the sandbox
+   * while the kill is in flight. After the release, nobody can adopt the sandbox, so
+   * the kill tries need no more lease checks. If the process stops before the kill,
+   * the provider ends the sandbox at its lifetime cap (sandboxTimeoutMs).
    */
   private async retireSandbox(
     bound: Promise<E2bSandboxLike>,
@@ -788,8 +778,6 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
         await this.releaseRecord(binding, sandbox.sandboxId, deadline);
         await this.killWithRetries(sandbox, deadline, "replaced");
       } else {
-        // No record: no other owner can find this sandbox. The lease and the turn are
-        // checked again before every try, as before.
         await this.killWithRetries(sandbox, deadline, "replaced", async () => {
           await this.fence(deadline);
           this.requireLive(turn);
@@ -1064,9 +1052,6 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     return super.read(remapped, offset, limit);
   }
 
-  // maxCount is the cap of the SDK contract on the matches returned. BaseSandbox
-  // applies it after the search, and flags the result `truncated` when it cuts.
-  // An omitted cap (undefined or null) keeps every match, as in the SDK.
   override async grep(
     pattern: string,
     dirPath?: string | null,
@@ -1100,25 +1085,12 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   }
 
   /**
-   * delete does not use BaseSandbox.delete. That method runs `test -e`, awaits, and then runs
-   * `rm -rf` on the path text. The text check of toSandboxPath does not resolve symlinks, so a
-   * directory in the path that is a symlink to a location outside the workspace sent the `rm`
-   * outside it (issue #18), and the path could change between the two commands.
+   * Not BaseSandbox.delete: it runs `rm -rf` on the path text, and toSandboxPath does not
+   * resolve symlinks, so a symlinked directory in the path sent the `rm` outside the workspace.
    *
-   * This override sends one command (confinedDeleteCommand). The shell enters the parent
-   * directory with `cd -P`, which resolves each symlink, and compares that physical directory
-   * with the physical workspace. Then it removes the last component relative to that directory.
-   * The check and the `rm` run in the same process, and the `rm` does not read the path text
-   * again: a symlink that is changed after the `cd` has no effect on it. `rm` removes a symlink in
-   * the last component, not its target, and does not follow symlinks below a directory.
-   *
-   * Residual limit: a process in the sandbox that renames the parent directory out of the
-   * workspace after the check, and before the `rm`, moves the `rm` with it. The model can run any
-   * shell command in this sandbox, so this guard keeps the delete tool on the workspace. It is not
-   * a boundary against a hostile process in the same sandbox.
-   *
-   * The path is remapped into the workspace as for the other tools, and the result names the
-   * path that the model gave. The call takes its turn when it is called, as for one step.
+   * Limit: a process in the sandbox can rename the parent directory out of the workspace
+   * between the check and the `rm`. The model can run any shell command here, so this keeps
+   * the delete tool on the workspace; it is not a boundary against the sandbox itself.
    */
   override async delete(filePath: string): Promise<DeleteResult> {
     const turn = this.currentTurn();
@@ -1369,24 +1341,21 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-/** Exit code of confinedDeleteCommand when the path, or a directory of it, does not exist. */
+// Not 1, the exit code of a failed `rm`.
 const DELETE_NOT_FOUND_EXIT = 3;
-/** Exit code of confinedDeleteCommand when the physical parent directory is outside the workspace. */
 const DELETE_OUTSIDE_WORKSPACE_EXIT = 4;
 
 /**
- * One POSIX shell command that deletes `target` only when its physical parent directory is the
- * workspace or below it (see E2bDeepAgentsSandbox.delete). `target` is an absolute, normalized
- * path below the workspace root, from toSandboxPath. The exit codes 3 and 4 do not collide
- * with the exit code of `rm` (1 on failure).
+ * Deletes `target` only when its physical parent directory is in the workspace. The check
+ * and the `rm` run in one shell, and the `rm` is relative to the checked directory, so it
+ * does not resolve the path again.
  */
 export function confinedDeleteCommand(workspacePath: string, target: string): string {
   const parent = path.posix.dirname(target);
   const name = path.posix.basename(target);
   return [
-    // After `cd -P`, $PWD is the physical directory, exactly. `$(pwd -P)` is not:
-    // command substitution strips trailing newlines, so a sibling named "workspace\n"
-    // would read as the workspace itself.
+    // Not `$(pwd -P)`: command substitution strips trailing newlines, so a sibling
+    // named "workspace\n" would match the workspace.
     `cd -P -- ${shellQuote(workspacePath)} 2>/dev/null || exit ${DELETE_NOT_FOUND_EXIT}`,
     `root=$PWD`,
     `cd -P -- ${shellQuote(parent)} 2>/dev/null || exit ${DELETE_NOT_FOUND_EXIT}`,

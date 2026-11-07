@@ -186,7 +186,7 @@ describe("tool calls of a live turn", () => {
     await waitFor(() => expect(within(card(/Run command/)).getByText("done")).toBeTruthy());
     expect(screen.queryByText("failed")).toBeNull();
 
-    // Reload (issue #16). The transcript of the failed turn keeps the call in_progress, and history gives it
+    // Reload. The transcript of the failed turn keeps the call in_progress, and history gives it
     // the `interrupted` result (turn-transcript.test.ts covers that side). The label stays the same.
     cleanup();
     server.connect("s-1", idleHistory([

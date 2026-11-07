@@ -320,7 +320,7 @@ test("formatCorpus redacts Bearer tokens in user message content", () => {
   expect(result.markdown).toContain("Bearer [REDACTED]");
 });
 
-// Issue #17: a call that never returned keeps the stored status `in_progress`. Once its turn has
+// A call that never returned keeps the stored status `in_progress`. Once its turn has
 // ended, the corpus must not say that it still runs; it names the stored status as evidence.
 test.each([
   ["interrupted", "interrupted (no result before the turn ended; stored status: in_progress)"],

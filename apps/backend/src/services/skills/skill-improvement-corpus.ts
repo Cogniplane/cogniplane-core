@@ -173,8 +173,6 @@ function renderSession(session: CorpusSessionInput): {
       const { excerpt, truncated } = excerptToolOutput(toolResult);
       if (truncated) sessionTruncatedToolResults += 1;
 
-      // A call that never returned in a turn that ended is not running (issue #17).
-      // The stored status stays beside it as evidence.
       const status = displayedToolStatus(toolResult.status, message.status);
       sessionLines.push(
         `- **tool** \`${toolResult.toolName ?? toolResult.kind}\` — status: ${status}` +

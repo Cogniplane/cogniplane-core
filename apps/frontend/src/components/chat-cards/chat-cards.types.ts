@@ -44,8 +44,6 @@ export type ApprovalRow = {
   summary: string;
   status: Approval["status"];
   decisionState: ApprovalDecisionState;
-  // False when "Allow for this turn" would not approve later requests: the
-  // request needs approval of its exact values each time (memory_save).
   allowForTurn: boolean;
 };
 

@@ -739,7 +739,7 @@ test("lists pending approvals and resolves a decision", async () => {
   });
 
   // A durable write (memory_save) is approved for its exact values only: the read offers no turn option,
-  // as the live event does not (issue #21).
+  // as the live event does not.
   approvals.rows.set("approval-memory", {
     ...approvals.rows.get("approval-1")!,
     approvalId: "approval-memory", itemId: "approval-memory", kind: "mcp_tool", title: 'Replace memory "units"',

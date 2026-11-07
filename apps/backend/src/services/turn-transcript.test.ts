@@ -1,9 +1,6 @@
-// What a finished turn saves for a tool call that never returned. Every turn
-// keeps it `in_progress`, however the turn ended, and history shows it as
-// interrupted, as the live card does once the turn settles (issue #16). Only a
-// failure that the tool reported is saved as `failed`. The interactive writer
-// and the scheduler both finish a turn through `finalize`, with the outcome from
-// the events or an override, so both are covered here.
+// A tool call that never returned stays `in_progress`, however the turn ended.
+// The interactive writer and the scheduler both finish a turn through `finalize`,
+// so both are covered here.
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, it } from "vitest";

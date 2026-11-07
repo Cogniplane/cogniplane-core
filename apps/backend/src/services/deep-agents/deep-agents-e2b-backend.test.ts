@@ -1882,8 +1882,8 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       const retiring = a.execute("echo A2").catch((error: unknown) => error);
       await vi.waitFor(() => expect(doomed.killed).toHaveBeenCalledTimes(1));
 
-      // While the kill is in flight, the admin reverts the change, and B takes the lease. Before the fix, B
-      // loaded the record, found that the sandbox matched the policy, and used it: the late kill then destroyed it.
+      // While the kill is in flight, the admin reverts the change, and B takes the lease. B must not
+      // adopt the sandbox, which matches the policy again: the late kill would destroy it.
       s.settings.state.current = denyAll;
       s.owner.current = "B";
       b.beginTurn();
@@ -3022,7 +3022,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
   });
 });
 
-// ── grep: the result limit of the SDK contract (issue #19) ────────────────────
+// ── grep: the result limit of the SDK contract ────────────────────
 
 describe("E2bDeepAgentsSandbox grep limit", () => {
   const FIVE_MATCHES = ["a.txt:1:hit", "a.txt:2:hit", "b.txt:1:hit", "b.txt:4:hit", "c.txt:9:hit"].join("\n");
@@ -3062,7 +3062,7 @@ describe("E2bDeepAgentsSandbox grep limit", () => {
   });
 });
 
-// ── delete through symlinks, in a real shell (issue #18) ──────────────────────
+// ── delete through symlinks, in a real shell ──────────────────────
 // The fake sandbox runs each command in /bin/sh on a temporary directory, so the
 // command that delete sends is checked against a real file system with real symlinks.
 

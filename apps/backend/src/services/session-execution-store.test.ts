@@ -220,16 +220,15 @@ function leasePool(live: LiveExecution) {
     .onQuery("SELECT s.sandbox_id", (_sql, [, , executionId, ownerId, userId]) =>
       owns(executionId, userId, ownerId)
         ? one({ sandbox_id: live.sandboxId, sandbox_network_policy: live.networkPolicy ?? null }) : none)
-    .onQuery("UPDATE sessions s SET sandbox_id", (_sql, [, , executionId, ownerId, userId, sandboxId, previousId, policy]) => {
+    .onQuery("SET sandbox_id=$6", (_sql, [, , executionId, ownerId, userId, sandboxId, previousId, policy]) => {
       if (!owns(executionId, userId, ownerId) || previousId !== live.sandboxId) return none;
       live.sandboxId = String(sandboxId);
       live.networkPolicy = JSON.parse(String(policy));
       return one({ session_id: actor.sessionId });
     })
-    // The session row lock that every sandbox record write takes before it checks the lease.
     .onQuery("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
       () => one({ session_id: actor.sessionId }))
-    .onQuery("SET sandbox_network_policy=NULL, sandbox_id=NULL", (_sql, [, , executionId, ownerId, userId, sandboxId]) => {
+    .onQuery("SET sandbox_id=NULL", (_sql, [, , executionId, ownerId, userId, sandboxId]) => {
       if (!owns(executionId, userId, ownerId) || sandboxId !== live.sandboxId) return none;
       live.sandboxId = null;
       live.networkPolicy = null;

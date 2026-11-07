@@ -47,12 +47,10 @@ export function interactiveContextExecutionSql(context: string): string {
 }
 
 /**
- * Locks the session row before a write of its sandbox record checks the lease. An
- * `UPDATE sessions ... FROM session_executions` takes its snapshot before it waits for
- * the session row lock, and after the wait it checks again only the session row, not
- * the execution row. An admission holds that lock while the lease changes owner, so a
- * write that waited behind it could pass the lease check of the old owner. After this
- * lock, the next statement takes a new snapshot (READ COMMITTED) and sees the current lease.
+ * Call before an `UPDATE sessions ... FROM session_executions` that checks the lease.
+ * After a wait on the session row lock, that UPDATE checks again only the session row,
+ * not the joined execution row, so it can pass the lease of the old owner. The next
+ * statement after this lock takes a new snapshot (READ COMMITTED) and sees the current lease.
  */
 async function lockSessionRow(db: Pick<PoolClient, "query">, execution: ExecutionActor): Promise<void> {
   await db.query("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
@@ -109,19 +107,11 @@ export class SessionExecutionStore {
     });
   }
 
-  /**
-   * Removes the record of `sandboxId` from the session before the runtime kills that
-   * sandbox (issue #20). The write is under the session lease, and it applies only
-   * while the record still names that sandbox. After it commits, no owner loads the
-   * sandbox, so no owner adopts a sandbox that has a kill in flight. It throws when
-   * the lease is lost or the record names another sandbox: the caller then does not
-   * send the kill.
-   */
+  /** See DeepAgentsSandboxBinding.release. */
   async releaseSandboxId(execution: SessionExecution, sandboxId: string): Promise<void> {
     await withTenantScope(this.pool, execution.tenantId, async db => {
       await lockSessionRow(db, execution);
-      // The SET list starts with sandbox_network_policy, so the text is not a prefix of the bindSandboxId statement.
-      const result = await db.query(`UPDATE sessions s SET sandbox_network_policy=NULL, sandbox_id=NULL
+      const result = await db.query(`UPDATE sessions s SET sandbox_id=NULL, sandbox_network_policy=NULL
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
           AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
           AND e.owner_id=$4 AND e.user_id=$5 AND e.status='active'

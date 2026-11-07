@@ -106,7 +106,7 @@ it("filters calls by title", () => {
   expect(screen.getByText("No tools match this filter.")).toBeTruthy();
 });
 
-// Issue #17: the stored `in_progress` of a call that never returned is evidence. The tab derives the
+// The stored `in_progress` of a call that never returned is evidence. The tab derives the
 // label from the call and its message: a call of an ended turn is interrupted, a call of a running turn runs.
 it.each([
   ["interrupted", "interrupted"], ["error", "interrupted"], ["completed", "interrupted"],

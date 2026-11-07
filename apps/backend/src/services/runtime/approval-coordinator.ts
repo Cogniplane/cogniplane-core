@@ -51,8 +51,7 @@ export type ApprovalTurn = {
   cancelAndExpire: (reason: ApprovalCleanupReason) => void;
 };
 // A turn is open while it is in `ApprovalCoordinator.turns`. Its waits are
-// the `pending` entries whose `turn` is this turn. One approval ID can have
-// several waits: two open turns can wait on the same persisted policy approval.
+// the `pending` entries whose `turn` is this turn.
 type TurnState = ApprovalTurnOptions & { remembered: Set<string>; persisted: Set<string> };
 type PendingApproval = {
   turn: TurnState;
@@ -65,10 +64,7 @@ const STORED_OUTCOME: Partial<Record<ApprovalStatus, ApprovalOutcome>> = {
 };
 
 export class ApprovalCoordinator {
-  /**
-   * The waits of each approval ID. Each wait is its own entry, and its settlement
-   * removes only that entry, so a wait never removes the wait of another turn.
-   */
+  /** Two open turns can wait on the same persisted policy approval. */
   private readonly pending = new Map<string, Set<PendingApproval>>();
   private readonly turns = new Set<TurnState>();
   private closed = false;
@@ -98,7 +94,6 @@ export class ApprovalCoordinator {
     const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
     const actor = { tenantId, userId };
     const waits = [...(this.pending.get(approvalId) ?? [])];
-    // The local waits that this actor may decide. Each wait is checked against its own turn.
     const eligible: PendingApproval[] = [];
     for (const entry of waits) {
       const { turn } = entry;
@@ -291,14 +286,12 @@ export class ApprovalCoordinator {
         clearTimeout(ttlTimer);
         if (pollTimer) clearTimeout(pollTimer);
         signal.removeEventListener("abort", onAbort);
-        // Only this wait. Another turn can wait on the same approval ID.
         const waits = this.pending.get(approvalId);
         waits?.delete(entry);
         if (waits?.size === 0) this.pending.delete(approvalId);
         resolve(outcome);
       };
-      // An approval of exact values (a durable write, such as memory_save) is never
-      // remembered for the turn, even when a client still asks for that.
+      // Also when a client asks to remember an approval that does not allow it.
       const rememberable = approvalAllowsTurnScope(approval);
       const rememberApproval = () => {
         if (rememberable && !settled && !this.ended(turn)) turn.remembered.add(rememberKey);

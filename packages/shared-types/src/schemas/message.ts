@@ -141,9 +141,8 @@ export const ApprovalSchema = z.object({
   title: z.string(),
   summary: z.string(),
   status: z.enum(["pending", "approved", "rejected", "expired"]),
-  // False when "Allow for this turn" does not approve later requests: the request
-  // needs approval of its exact values each time (a durable write, such as
-  // memory_save). Absent on older payloads, where the option stays available.
+  // False when "Allow for this turn" would approve nothing more (memory_save).
+  // Absent on older payloads, where the option stays available.
   allowForTurn: z.boolean().optional()
 }).strip();
 export type Approval = z.infer<typeof ApprovalSchema>;

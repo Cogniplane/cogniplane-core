@@ -63,7 +63,7 @@ it("keeps a long one-line summary collapsed behind its toggle", () => {
   expect(screen.getByRole("button", { name: row.summary }).getAttribute("aria-expanded")).toBe("false");
 });
 
-// Issue #21: a save of exact values (memory_save) is approved one value at a time. The turn option
+// A save of exact values (memory_save) is approved one value at a time. The turn option
 // would approve no later save, so neither the card nor the inline controls offer it or its hint.
 const exactValueRow = (allowForTurn: boolean): ApprovalRow => ({
   type: "approval", rowId: "approval:4", approvalId: "approval-4", itemId: "item-4", kind: "mcp_tool",

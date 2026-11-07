@@ -99,7 +99,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(await record()).toEqual(saved("sandbox-two", "policy-b"));
   });
 
-  // Issue #20: the runtime releases the record of a sandbox under the lease before it kills it. After that,
+  // The runtime releases the record of a sandbox under the lease before it kills it. After that,
   // the next owner loads no sandbox and cannot adopt the one with the kill in flight. A stale owner cannot release.
   test("the sandbox record is released only under a current lease, and the next owner then loads no sandbox", async () => {
     const tenantId = await seedTenant(), userId = await seedUser();
@@ -134,7 +134,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
 
   // A record write that waits behind the session row lock while the lease changes must check the lease
   // after the wait, not with the snapshot from before it (an UPDATE ... FROM checks the joined
-  // execution row only at its first snapshot). Found in review of issue #20.
+  // execution row only at its first snapshot).
   test.each(["release", "bind"] as const)(
     "a %s that waited behind the session lock is refused when the lease ended meanwhile", async (write) => {
       const tenantId = await seedTenant(), userId = await seedUser();
