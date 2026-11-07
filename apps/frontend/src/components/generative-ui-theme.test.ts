@@ -5,10 +5,11 @@
 // #0d0d0d on a dark panel). The test reads the variables out of the installed
 // package, so an SDK upgrade that adds or renames one fails here.
 
-import { readFileSync, readdirSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { CHART_PALETTE, DARK_THEME } from "@copilotkit/shared/generative-ui";
 
 const css = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
 
@@ -29,23 +30,14 @@ function declarationsOf(selector: string): Map<string, string> {
 const reactCore = dirname(realpathSync(createRequire(import.meta.url).resolve("@copilotkit/react-core/package.json")));
 const dist = join(reactCore, "dist");
 const generativeUi = readFileSync(join(dist, "v2", "generative-ui.mjs"), "utf8");
-const chunk = readdirSync(dist).find((name) => /^MarkdownSurfaces-.*\.mjs$/.test(name));
-
-/** The colors and shadows that the SDK themes in dark mode: its own list of
- *  every variable that a host can set. */
-function sdkThemeVariables(): Set<string> {
-  expect(chunk, "the chunk that holds the SDK dark theme").toBeDefined();
-  const source = readFileSync(join(dist, chunk!), "utf8");
-  const start = source.indexOf("const DARK_THEME = {");
-  expect(start).toBeGreaterThanOrEqual(0);
-  const block = source.slice(start, source.indexOf("\n};", start));
-  return new Set([...block.matchAll(/"(--a2ui-[a-z0-9-]+)":/g)].map((match) => match[1]!));
-}
+const sharedDist = dirname(realpathSync(createRequire(import.meta.url).resolve("@copilotkit/shared/package.json")));
+const tokens = readFileSync(join(sharedDist, "dist/generative-ui/standard/tokens.mjs"), "utf8");
+const standardCss = readFileSync(join(sharedDist, "dist/generative-ui/standard/styles.mjs"), "utf8");
 
 /** Variables that the components read by name. A name that ends in a dash is
  *  the start of a template, such as `--a2ui-color-text-${name}`. */
 function sdkReadVariables(): Set<string> {
-  return new Set([...generativeUi.matchAll(/--a2ui-[a-z0-9-]*[a-z0-9]/g)].map((match) => match[0]));
+  return new Set([...`${generativeUi}\n${tokens}\n${standardCss}`.matchAll(/--a2ui-[a-z0-9-]*[a-z0-9]/g)].map((match) => match[0]));
 }
 
 // Left at the SDK value on purpose. Each reads fine in both themes, or is not
@@ -64,12 +56,12 @@ const LEFT_TO_THE_SDK: Record<string, string> = {
 
 describe("the generated UI theme bridge", () => {
   const bridge = new Map([...declarationsOf(".a2ui-surface")].filter(([name]) => name.startsWith("--")));
-  const themed = sdkThemeVariables();
+  const themed = new Set(Object.keys(DARK_THEME));
   const read = sdkReadVariables();
 
   it("maps every color and shadow that the SDK themes, and each chart color", () => {
     expect(themed.size).toBeGreaterThan(50);
-    const chartSeries = [...generativeUi.matchAll(/CHART_PALETTE_FALLBACK = \[([^\]]*)\]/g)][0]![1]!.split(",").length;
+    const chartSeries = CHART_PALETTE.length;
     const wanted = new Set([...themed, ...Array.from({ length: chartSeries }, (_, index) => `--a2ui-chart-${index + 1}`)]);
     const missing = [...wanted].filter((name) => !bridge.has(name) && !(name in LEFT_TO_THE_SDK));
     expect(missing).toEqual([]);

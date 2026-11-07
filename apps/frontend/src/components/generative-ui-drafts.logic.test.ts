@@ -99,6 +99,20 @@ describe("saving and loading drafts", () => {
     expect(storage.getItem(DRAFT_STORAGE_KEY)).toBeNull();
   });
 
+  it("removes old drafts without restoring them into the new format", () => {
+    const storage = new FakeStorage();
+    const legacyKey = "cogniplane:generative-ui-drafts:v1";
+    storage.setItem(legacyKey, JSON.stringify({
+      v: 1, owner: ownerKey(USER),
+      sessions: { "s-1": { at: 1, surfaces: { f: draft({ "/a": "old" }) } } }
+    }));
+    expect(loadSessionDrafts(storage, USER, "s-1")).toEqual({});
+    expect(storage.getItem(legacyKey)).toBeNull();
+    expect(saveSessionDrafts(storage, USER, "s-1", { f: draft({ "/a": "new" }) }, 2)).toBe("ok");
+    expect(loadSessionDrafts(storage, USER, "s-1")).toEqual({ f: draft({ "/a": "new" }) });
+    expect(record(storage).v).toBe(2);
+  });
+
   it("never reads a record of another person, and removes it", () => {
     const storage = new FakeStorage();
     saveSessionDrafts(storage, USER, "s-1", { f: draft({ "/a": "secret" }) }, 1);
@@ -110,7 +124,7 @@ describe("saving and loading drafts", () => {
 
   it.each([
     ["corrupt JSON", "{not json"],
-    ["another format", JSON.stringify({ v: 2, owner: "x", sessions: {} })],
+    ["another format", JSON.stringify({ v: 1, owner: "x", sessions: {} })],
     ["a list", "[]"]
   ])("reads %s as empty and removes it", (_, raw) => {
     const storage = new FakeStorage();
@@ -122,7 +136,7 @@ describe("saving and loading drafts", () => {
   it("drops the parts of a record that are not drafts, and keeps the rest", () => {
     const storage = new FakeStorage();
     storage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({
-      v: 1, owner: ownerKey(USER),
+      v: 2, owner: ownerKey(USER),
       sessions: {
         "s-1": {
           at: 1,
@@ -211,9 +225,12 @@ describe("clearGenerativeUiDrafts", () => {
     const storage = new FakeStorage();
     vi.stubGlobal("window", { sessionStorage: storage });
     saveSessionDrafts(storage, USER, "s-1", { f: draft({ "/a": 1 }) }, 1);
+    const legacyKey = "cogniplane:generative-ui-drafts:v1";
+    storage.setItem(legacyKey, "old draft");
     const before = currentClearEpoch();
     clearGenerativeUiDrafts();
     expect(storage.getItem(DRAFT_STORAGE_KEY)).toBeNull();
+    expect(storage.getItem(legacyKey)).toBeNull();
     expect(currentClearEpoch()).toBe(before + 1);
     vi.unstubAllGlobals();
   });

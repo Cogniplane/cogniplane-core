@@ -2,7 +2,7 @@
 // messages, state, and AG-UI events of the chat agent. See "Development
 // Inspector" in docs/ARCHITECTURE.md.
 //
-// CopilotKit 1.83.0 enables the Inspector by default in development: only an
+// CopilotKit 1.85.0 enables the Inspector by default in development: only an
 // explicit `enableInspector={false}` turns it off. So the chat host always
 // passes this gate as a boolean. The gate opens only when all are true:
 //   - the developer set NEXT_PUBLIC_COPILOTKIT_INSPECTOR to exactly "1";
@@ -16,7 +16,7 @@ import { useSyncExternalStore } from "react";
 
 export const INSPECTOR_OPT_IN_VALUE = "1";
 
-// The hostnames that CopilotKit 1.83.0 also accepts. `window.location.hostname`
+// The hostnames that CopilotKit 1.85.0 also accepts. `window.location.hostname`
 // keeps the brackets of an IPv6 address.
 const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "127.0.0.1", "[::1]"]);
 

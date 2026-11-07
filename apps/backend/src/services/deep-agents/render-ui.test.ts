@@ -1,3 +1,4 @@
+import { A2UI_VERSION } from "@copilotkit/shared";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, it } from "vitest";
 import { GENERATIVE_UI_PANEL_TARGET, MAX_RENDER_UI_ARGS_CHARS, MAX_RENDER_UI_OPERATIONS } from "@cogniplane/shared-types";
@@ -11,10 +12,10 @@ import { createStreamEventsToAGUIState, flushOpenAGUIMessages, streamEventsToAGU
 import { renderUiTool } from "./render-ui-tool.js";
 import { generativeUiContextMiddleware } from "./generative-ui-context-middleware.js";
 
-const create = (surfaceId = "s") => ({ version: "v1.0", createSurface: {
+const create = (surfaceId = "s") => ({ version: A2UI_VERSION, createSurface: {
   surfaceId, components: [{ id: "root", component: "Text", text: "Plan" }]
 } });
-const update = (surfaceId = "s") => ({ version: "v1.0", updateDataModel: { surfaceId, path: "/seats", value: 4 } });
+const update = (surfaceId = "s") => ({ version: A2UI_VERSION, updateDataModel: { surfaceId, path: "/seats", value: 4 } });
 const args = (...operations: unknown[]) => ({ target: "chat", operations });
 
 describe("render_ui protocol and reply scope", () => {
@@ -25,9 +26,9 @@ describe("render_ui protocol and reply scope", () => {
     const activity = turn.activities()[0]!;
     expect(activity.id).toBe("genui:turn:a1:s");
     expect(activity.content.operations).toHaveLength(2);
-    expect(activity.content.operations[1]).toEqual({ version: "v1.0", updateDataModel: { surfaceId: "turn:a1:s", path: "/seats", value: 4 } });
+    expect(activity.content.operations[1]).toEqual({ version: A2UI_VERSION, updateDataModel: { surfaceId: "turn:a1:s", path: "/seats", value: 4 } });
     expect(turn.result("two")).toEqual({ rendered: ["s"], rejected: [] });
-    turn.set({ id: "three", input: args({ version: "v1.0", deleteSurface: { surfaceId: "s" } }), status: "ready" });
+    turn.set({ id: "three", input: args({ version: A2UI_VERSION, deleteSurface: { surfaceId: "s" } }), status: "ready" });
     turn.set({ id: "four", input: args(create()), status: "ready" });
     expect(turn.result("four").rejected[0]!.reason).toContain("already used");
     const next = new RenderUiTurn("a2");
@@ -39,14 +40,15 @@ describe("render_ui protocol and reply scope", () => {
 
   it.each([
     ["version", args({ ...create(), version: "v0.9" })],
+    ["previous wire version", args({ ...create(), version: "v1.0" })],
     ["two kinds", args({ ...create(), deleteSurface: { surfaceId: "s" } })],
-    ["renderer function", args({ version: "v1.0", callRendererFunction: { functionCallId: "x", callFunction: { "@call": "openUrl" } } })],
+    ["renderer function", args({ version: A2UI_VERSION, callRendererFunction: { functionCallId: "x", callFunction: { "@call": "openUrl" } } })],
     ["target", { ...args(create()), target: "sidebar" }],
     ["page element target", { ...args(create()), target: "#main" }],
     ["target list", { ...args(create()), target: ["chat", GENERATIVE_UI_PANEL_TARGET] }],
-    ["catalog", args({ version: "v1.0", createSurface: { surfaceId: "s", catalogId: "other" } })],
+    ["catalog", args({ version: A2UI_VERSION, createSurface: { surfaceId: "s", catalogId: "other" } })],
     ["operations count", args(...Array.from({ length: MAX_RENDER_UI_OPERATIONS + 1 }, () => create()))],
-    ["size", args({ version: "v1.0", createSurface: { surfaceId: "s", dataModel: { value: "x".repeat(MAX_RENDER_UI_ARGS_CHARS) } } })],
+    ["size", args({ version: A2UI_VERSION, createSurface: { surfaceId: "s", dataModel: { value: "x".repeat(MAX_RENDER_UI_ARGS_CHARS) } } })],
     ["truncated input", '{"target":"chat","operations":['],
     ["empty", args()]
   ])("rejects %s without throwing or accepting operations", (_, input) => {
@@ -66,7 +68,7 @@ describe("render_ui protocol and reply scope", () => {
     turn.set({ id: "move", input: { target: "chat", operations: [update("p"), update("c")] }, status: "ready" });
     expect(turn.result("move").rendered).toEqual(["c"]);
     expect(turn.result("move").rejected).toEqual([{ index: 0, reason: expect.stringContaining(`target "${GENERATIVE_UI_PANEL_TARGET}"`) }]);
-    turn.set({ id: "delete", input: { target: "chat", operations: [{ version: "v1.0", deleteSurface: { surfaceId: "p" } }] }, status: "ready" });
+    turn.set({ id: "delete", input: { target: "chat", operations: [{ version: A2UI_VERSION, deleteSurface: { surfaceId: "p" } }] }, status: "ready" });
     expect(turn.result("delete").rejected[0]!.reason).toContain("Keep its target");
     // The panel keeps its view. The refusal goes to the surfaces that the
     // refused call rendered, or to a chat error when it rendered none.

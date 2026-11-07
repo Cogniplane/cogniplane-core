@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // Named views in the side panel, in the chat host with the real CopilotKit
 // provider, surface manager and CopilotChat, the real DeepAgentsBrowserAgent,
@@ -63,8 +65,8 @@ function stubViewport(narrow: boolean) {
 }
 
 const createSurface = (surfaceId: string, components: object[], dataModel: object = {}) =>
-  ({ version: "v1.0", createSurface: { surfaceId, dataModel, components } });
-const deleteSurface = (surfaceId: string) => ({ version: "v1.0", deleteSurface: { surfaceId } });
+  ({ version: A2UI_VERSION, createSurface: { surfaceId, dataModel, components } });
+const deleteSurface = (surfaceId: string) => ({ version: A2UI_VERSION, deleteSurface: { surfaceId } });
 const surfaceContent = (surfaceId: string, operations: object[], status = "ready") =>
   ({ surfaceId, target: PANEL, catalogId: "cogniplane/standard@1", operations, status, rejected: [] });
 const activity = (surfaceId: string, operations: object[]) =>
@@ -520,7 +522,7 @@ describe("states of the views", () => {
   it("notes the refused operations of the shown view only", async () => {
     const PARTIAL = "turn:a1:partial";
     const partial = [...planOps().map((op) => JSON.parse(JSON.stringify(op).replaceAll(PLAN, PARTIAL))),
-      { version: "v1.0", updateComponents: { surfaceId: PARTIAL, components: [{ id: "extra", component: "NoSuchComponent" }] } }];
+      { version: A2UI_VERSION, updateComponents: { surfaceId: PARTIAL, components: [{ id: "extra", component: "NoSuchComponent" }] } }];
     // The SDK reports a refused operation each time it applies one. A switch
     // that rebuilt the surface would apply the operations again and report again.
     const reports = () => warn.mock.calls.filter(([message]) => String(message).includes(`operation error in ${PARTIAL}`)).length;

@@ -275,7 +275,7 @@ describe("when the chat offers no starters", () => {
     });
     render(hostElement({ isRunning: true }));
 
-    expect((await screen.findByRole("status")).textContent).toContain("The agent is still working on this chat");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
     await settle();
     expect(screen.queryByText(HEADING)).toBeNull();
     expect(starterButtons()).toEqual([]);

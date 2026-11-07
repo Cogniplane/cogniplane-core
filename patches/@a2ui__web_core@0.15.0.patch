@@ -1,0 +1,22 @@
+diff --git a/src/catalog/spec_annotations.js b/src/catalog/spec_annotations.js
+index 294e216a0276cc4281ea59a23e417b409b96e1a9..a73d2b43f2ad046efd00f4a153fc819d0e716b1c 100644
+--- a/src/catalog/spec_annotations.js
++++ b/src/catalog/spec_annotations.js
+@@ -16,7 +16,7 @@
+ import { z } from 'zod';
+ const annotations = new WeakMap();
+ function cloneWithDefAnnotation(schema, nextAnnotation, description = schema.description) {
+-    const copy = z.ZodType.prototype.describe.call(schema, description);
++    const copy = z.clone(schema).describe(description);
+     annotations.set(copy, nextAnnotation);
+     copy.describe = (nextDescription) => cloneWithDefAnnotation(copy, annotations.get(copy) ?? nextAnnotation, nextDescription);
+     return copy;
+@@ -34,7 +34,7 @@ function cloneWithDefAnnotation(schema, nextAnnotation, description = schema.des
+  * @returns An annotated copy of `schema`.
+  */
+ export function spec(schema, annotation) {
+-    const copy = z.ZodType.prototype.describe.call(schema, schema.description);
++    const copy = z.clone(schema).describe(schema.description);
+     annotations.set(copy, { ...annotations.get(schema), ...annotation });
+     return copy;
+ }

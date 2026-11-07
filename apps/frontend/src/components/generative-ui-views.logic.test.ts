@@ -1,3 +1,4 @@
+import { A2UI_VERSION } from "@copilotkit/shared";
 import type { Message } from "@ag-ui/client";
 import { GENERATIVE_UI_PANEL_TARGET } from "@cogniplane/shared-types";
 import { describe, expect, it } from "vitest";
@@ -7,7 +8,7 @@ import {
   type ViewEntry
 } from "./generative-ui-views.logic";
 
-const activity = (surfaceId: string, operations: object[] = [{ version: "v1.0" }], target: string = GENERATIVE_UI_PANEL_TARGET): Message =>
+const activity = (surfaceId: string, operations: object[] = [{ version: A2UI_VERSION }], target: string = GENERATIVE_UI_PANEL_TARGET): Message =>
   ({
     id: `genui:${surfaceId}`, role: "activity", activityType: "generative-ui-surface",
     content: { surfaceId, target, catalogId: "cogniplane/standard@1", operations, status: "ready", rejected: [] }
@@ -30,7 +31,7 @@ describe("panelActivities", () => {
     const found = panelActivities([
       { id: "s", role: "system", content: "rules" } as Message,
       assistant("a0"), activity("turn:a0:view"),
-      user("u1"), { id: "s2", role: "developer", content: "x" } as Message, assistant("a1"), activity("turn:a1:chat", [{ version: "v1.0" }], "chat")
+      user("u1"), { id: "s2", role: "developer", content: "x" } as Message, assistant("a1"), activity("turn:a1:chat", [{ version: A2UI_VERSION }], "chat")
     ]);
     expect(found.map((view) => [view.surfaceId, view.reply])).toEqual([["turn:a0:view", 1]]);
   });

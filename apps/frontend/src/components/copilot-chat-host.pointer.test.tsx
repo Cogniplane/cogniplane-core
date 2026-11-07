@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // Blocks that the app puts in the composer slot of CopilotChat. The SDK draws
 // the slot inside an overlay with `pointer-events: none` and lets only its own
@@ -129,7 +131,7 @@ describe("pointer events in the composer slot", () => {
   });
 
   it("lets a click reach the Review summary of the entries that the next message sends", async () => {
-    const operations = [{ version: "v1.0", createSurface: {
+    const operations = [{ version: A2UI_VERSION, createSurface: {
       surfaceId: "turn:a1:list", dataModel: { priority: "low" },
       components: [{ id: "root", component: "SegmentedControl", label: "Priority",
         options: [{ label: "Low", value: "low" }, { label: "High", value: "high" }], value: { "@path": "/priority" } }]
@@ -193,7 +195,7 @@ describe("pointer events while the keyboard lifts the composer", () => {
   const region = () => liftedBox().firstElementChild as HTMLElement;
 
   async function showReviewAndDraft() {
-    const operations = [{ version: "v1.0", createSurface: {
+    const operations = [{ version: A2UI_VERSION, createSurface: {
       surfaceId: "turn:a1:list", dataModel: { release: { checked: { tests: true }, notes: "" } },
       components: [{ id: "root", component: "Checklist", title: "Release 4.2",
         items: [{ id: "tests", label: "Tests pass" }, { id: "docs", label: "Release notes published" }],

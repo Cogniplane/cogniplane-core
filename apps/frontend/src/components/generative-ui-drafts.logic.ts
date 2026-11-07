@@ -16,7 +16,8 @@
 
 import { GENERATIVE_UI_PANEL_TARGET } from "@cogniplane/shared-types";
 
-export const DRAFT_STORAGE_KEY = "cogniplane:generative-ui-drafts:v1";
+const LEGACY_DRAFT_STORAGE_KEY = "cogniplane:generative-ui-drafts:v1";
+export const DRAFT_STORAGE_KEY = "cogniplane:generative-ui-drafts:v2";
 
 export const MAX_SESSIONS = 8;
 export const MAX_SURFACES_PER_SESSION = 24;
@@ -43,7 +44,7 @@ export type SurfaceDraft = {
   values: Record<string, JsonValue>;
 };
 export type SessionDrafts = { at: number; surfaces: Record<string, SurfaceDraft> };
-type DraftRecord = { v: 1; owner: string; sessions: Record<string, SessionDrafts> };
+type DraftRecord = { v: 2; owner: string; sessions: Record<string, SessionDrafts> };
 
 /** How well the tab keeps the edits. */
 export type DraftPersistence = "ok" | "unavailable" | "full";
@@ -165,9 +166,10 @@ function readSession(value: unknown): SessionDrafts | null {
  *  one of another format are removed and read as empty. */
 function readRecord(storage: Storage, scope: DraftScope): DraftRecord {
   const owner = ownerKey(scope);
-  const empty: DraftRecord = { v: 1, owner, sessions: {} };
+  const empty: DraftRecord = { v: 2, owner, sessions: {} };
   let raw: string | null;
   try {
+    storage.removeItem(LEGACY_DRAFT_STORAGE_KEY);
     raw = storage.getItem(DRAFT_STORAGE_KEY);
   } catch {
     return empty;
@@ -175,13 +177,13 @@ function readRecord(storage: Storage, scope: DraftScope): DraftRecord {
   if (raw === null) return empty;
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (isRecordOf(parsed) && parsed.v === 1 && parsed.owner === owner && isRecordOf(parsed.sessions)) {
+    if (isRecordOf(parsed) && parsed.v === 2 && parsed.owner === owner && isRecordOf(parsed.sessions)) {
       const sessions: Record<string, SessionDrafts> = {};
       for (const [sessionId, session] of Object.entries(parsed.sessions)) {
         const read = readSession(session);
         if (read) sessions[sessionId] = read;
       }
-      return { v: 1, owner, sessions };
+      return { v: 2, owner, sessions };
     }
   } catch {
     // Corrupt JSON falls through to the removal below.
@@ -271,7 +273,9 @@ function failClosed(storage: Storage, scope: DraftScope, sessionId: string): Dra
 export function clearGenerativeUiDrafts(): void {
   clearEpoch++;
   try {
-    getDraftStorage()?.removeItem(DRAFT_STORAGE_KEY);
+    const storage = getDraftStorage();
+    storage?.removeItem(LEGACY_DRAFT_STORAGE_KEY);
+    storage?.removeItem(DRAFT_STORAGE_KEY);
   } catch {
     // Blocked storage holds nothing to clear.
   }

@@ -362,7 +362,7 @@ body {
 
 /* ============================================================
    GENERATED UI THEME BRIDGE
-   CopilotKit 1.83.0 draws generated UI (tables, charts, badges, inputs)
+   CopilotKit 1.85.0 draws generated UI (tables, charts, badges, inputs)
    with `--a2ui-*` variables and falls back to fixed light colors, such as
    #0d0d0d text, when a variable is not set. Its built-in dark values apply
    only under a `.dark` class, which this app never sets. Map every

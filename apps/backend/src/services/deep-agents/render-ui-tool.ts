@@ -1,3 +1,4 @@
+import { A2UI_VERSION } from "@copilotkit/shared";
 import { tool, type ToolRuntime } from "langchain";
 import { isAIMessage, isHumanMessage, isToolMessage, ToolMessage, type BaseMessage } from "@langchain/core/messages";
 import { GENERATIVE_UI_RENDER_TOOL, RENDER_UI_TRANSPORT_DISABLED, RenderUiTurn, renderUiArgsSchema } from "./render-ui.js";
@@ -42,7 +43,7 @@ export const renderUiTool = tool((input, runtime: ToolRuntime<{ messages: BaseMe
   name: GENERATIVE_UI_RENDER_TOOL,
   // The browser guide names the targets that its page mounts. An older tab
   // has no side panel, so this text does not name one.
-  description: "Render standard UI components in a target that the browser guide lists. Use A2UI v1.0 operations "
+  description: `Render standard UI components in a target that the browser guide lists. Use A2UI ${A2UI_VERSION} operations `
     + "and a new surface id in this turn. Generated events cannot start agent turns.",
   schema: renderUiArgsSchema
 });

@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // The Checklist of generated UI in the chat host, with the real CopilotKit
 // provider, surface manager and CopilotChat, the real DeepAgentsBrowserAgent,
@@ -62,7 +64,7 @@ const ITEMS = [
 ];
 type ChecklistNode = Record<string, unknown>;
 const checklist = (node: ChecklistNode = {}, dataModel: object = { release: { checked: { tests: true }, notes: "" } }, surfaceId = LIST) => [{
-  version: "v1.0",
+  version: A2UI_VERSION,
   createSurface: { surfaceId, dataModel, components: [{
     id: "root", component: "Checklist", title: "Release 4.2", items: ITEMS,
     checked: { "@path": "/release/checked" }, notes: { "@path": "/release/notes" }, ...node
@@ -106,7 +108,7 @@ const EDITED_TEXT = [
 
 describe("button-based generated input", () => {
   it.each(["click", "keyboard"])("previews and saves a bound segment after a %s without native input events", async (interaction) => {
-    const operations = [{ version: "v1.0", createSurface: {
+    const operations = [{ version: A2UI_VERSION, createSurface: {
       surfaceId: LIST,
       dataModel: { priority: "low" },
       components: [{ id: "root", component: "SegmentedControl", label: "Priority",

@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // The chat host with the real CopilotKit V2 provider and CopilotChat, the real
 // DeepAgentsBrowserAgent and @ag-ui/client pipeline (HTTP, SSE decoder, event
@@ -391,7 +393,7 @@ describe("CopilotChatHost with a turn that runs on the server", () => {
     const view = render(hostElement({ session: { isRunning: true }, events }));
 
     await screen.findByText("SAVED-PARTIAL");
-    expect((await screen.findByRole("status")).textContent).toContain("The agent is still working on this chat");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
     expect(screen.queryByTestId("copilot-chat-textarea")).toBeNull();
     await waitFor(() => expect(server.count("GET /sessions")).toBeGreaterThan(0));
     expect(running.at(-1)).toBe(true);
@@ -689,7 +691,7 @@ describe("CopilotChatHost sends", () => {
 
     await typeAndSend("Refused question");
 
-    expect((await screen.findByRole("status")).textContent).toContain("Your message was not sent");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("Your message was not sent"));
     await waitFor(() => expect(textCount("Refused question")).toBe(0));
     await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
     await screen.findByText("Second question");
@@ -1116,7 +1118,7 @@ describe("CopilotChatHost connection failures", () => {
 
     // The turn still runs on the server: the tab polls it and keeps Stop.
     await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
-    expect((await screen.findByRole("status")).textContent).toContain("The agent is still working on this chat");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     expect(screen.queryByText("This chat did not load")).toBeNull();
     const polls = server.count("GET /sessions");
@@ -1382,7 +1384,7 @@ describe("CopilotChatHost readiness across connections", () => {
     }];
     const session = { initialPrompt: "Resolve the draft", isRunning: true };
     const view = render(hostElement({ session, events }));
-    expect((await screen.findByRole("status")).textContent).toContain("The agent is still working on this chat");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
 
     server.running.set("s-1", false);
     view.rerender(hostElement({ session: { ...session, isRunning: false }, events }));
@@ -1711,7 +1713,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
       stream.finish();
     });
     render(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: true } }));
-    expect((await screen.findByRole("status")).textContent).toContain("The agent is still working on this chat");
+    await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
     await waitFor(() => expect(frames.draft).not.toBeNull());
 
     expect(place("From the tool view")).toBe("unavailable");
@@ -1837,9 +1839,9 @@ describe("CopilotChatHost generative UI", () => {
   // A fence as the model writes it: one JSON operation on each line.
   const fenceOf = (...operations: object[]) => ["```a2ui", ...operations.map((operation) => JSON.stringify(operation)), "```"].join("\n");
   const createSurface = (surfaceId: string, components: object[], dataModel: object = {}) =>
-    ({ version: "v1.0", createSurface: { surfaceId, dataModel, components } });
+    ({ version: A2UI_VERSION, createSurface: { surfaceId, dataModel, components } });
   const updateComponents = (surfaceId: string, components: object[]) =>
-    ({ version: "v1.0", updateComponents: { surfaceId, components } });
+    ({ version: A2UI_VERSION, updateComponents: { surfaceId, components } });
   const PLAN_OPERATIONS = [
     createSurface("plan", [{ id: "root", component: "Column", children: ["title", "detail"] }]),
     updateComponents("plan", [
@@ -1869,7 +1871,7 @@ describe("CopilotChatHost generative UI", () => {
     await screen.findByText("Unfinished preview");
     await act(async () => { reply.push({
       type: "ACTIVITY_SNAPSHOT", messageId: `genui:${surfaceId}`, activityType: "generative-ui-surface",
-      content: toolSurface(surfaceId, [...ops, { version: "v1.0", deleteSurface: { surfaceId } }])
+      content: toolSurface(surfaceId, [...ops, { version: A2UI_VERSION, deleteSurface: { surfaceId } }])
     }, ev.runFinished("a2")); reply.finish(); });
     await waitFor(() => expect(document.querySelector(`[data-generative-ui-chat-surface="${surfaceId}"]`)).toBeNull());
     expect(screen.queryByText("Unfinished preview")).toBeNull();
@@ -1901,7 +1903,7 @@ describe("CopilotChatHost generative UI", () => {
     await waitFor(() => expect(cards()).toEqual([]));
     await act(async () => { reply.push(snapshot(retried, [view(retried, "Retried view")])); });
     await waitFor(() => expect(cards()).toEqual([[retried, "Retried view"]]));
-    await act(async () => { reply.push(snapshot(abandoned, [{ version: "v1.0", deleteSurface: { surfaceId: abandoned } }]),
+    await act(async () => { reply.push(snapshot(abandoned, [{ version: A2UI_VERSION, deleteSurface: { surfaceId: abandoned } }]),
       ev.runFinished("a2")); reply.finish(); });
     await waitFor(() => expect(screen.queryByRole("button", { name: "Stop" })).toBeNull());
     expect(cards()).toEqual([[retried, "Retried view"]]);
@@ -1932,7 +1934,7 @@ describe("CopilotChatHost generative UI", () => {
     await act(async () => { reply.push(
       errorOf("call1", shownError),
       errorOf(preview, { status: "ready", rejected: [],
-        operations: [{ version: "v1.0", deleteSurface: { surfaceId: `error:turn:a2:${preview}` } }] })
+        operations: [{ version: A2UI_VERSION, deleteSurface: { surfaceId: `error:turn:a2:${preview}` } }] })
     ); });
     await waitFor(() => expect(cards()).toEqual([["error:turn:a2:call1", true]]));
     await act(async () => { reply.push(errorOf(preview, shownError)); });
@@ -2304,7 +2306,7 @@ describe("CopilotChatHost generative UI", () => {
       content: [
         "First prose.",
         // Not JSON, then an operation with no known kind.
-        ["```a2ui", "{this is not json", JSON.stringify({ version: "v1.0", explode: {} }), "```"].join("\n"),
+        ["```a2ui", "{this is not json", JSON.stringify({ version: A2UI_VERSION, explode: {} }), "```"].join("\n"),
         "Second prose.",
         // A component that the catalog does not have.
         fenceOf(createSurface("unknown", [{ id: "root", component: "NotAComponent", text: "x" }])),
@@ -2342,7 +2344,7 @@ describe("CopilotChatHost generative UI", () => {
       { id: "done", component: "Text", text: "Callbacks written" }
     ]),
     // An agent call of a function with no click. The renderer must not run it.
-    { version: "v1.0", callRendererFunction: { functionCallId: "c1", callFunction: { "@call": "openUrl", args: { url: `${EVIL}/agent-call` } } } }
+    { version: A2UI_VERSION, callRendererFunction: { functionCallId: "c1", callFunction: { "@call": "openUrl", args: { url: `${EVIL}/agent-call` } } } }
   ];
   const CALLBACK_HISTORY = [...EARLIER, { id: "a1", role: "assistant", content: fenceOf(...CALLBACK_SURFACE) }];
   const settle = () => act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)); });
@@ -2618,7 +2620,7 @@ describe("CopilotChatHost generative UI", () => {
       const deleted = "turn:a1:gone";
       const refused = "turn:a2:partial";
       server.connect("s-1", idleHistory([...EARLIER, panelActivity(deleted, [...textView(deleted, "Deleted board"),
-        { version: "v1.0", deleteSurface: { surfaceId: deleted } }])]));
+        { version: A2UI_VERSION, deleteSurface: { surfaceId: deleted } }])]));
       const view = render(hostElement());
       await screen.findByText("Earlier answer");
       fireEvent.click(toggle());

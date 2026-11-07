@@ -55,7 +55,7 @@ type JsdomInstance = { reconfigure(options: { url: string }): void };
 const jsdom = (globalThis as unknown as { jsdom: JsdomInstance }).jsdom;
 
 const API_ORIGIN = "http://localhost:3001";
-// The origins that CopilotKit 1.83.0 calls from a development Inspector: two
+// The origins that CopilotKit 1.85.0 calls from a development Inspector: two
 // feeds when it mounts, and anonymous usage events when it opens.
 const COPILOTKIT_ORIGINS = ["https://cdn.copilotkit.ai", "https://telemetry.copilotkit.ai"];
 
@@ -122,7 +122,7 @@ async function renderClosedHost() {
   return container;
 }
 
-/** The element that CopilotKit 1.83.0 renders, in the same render, when its
+/** The element that CopilotKit 1.85.0 renders, in the same render, when its
  *  gate opens. The Inspector element goes into it after the package loads. */
 const inspectorMounts = (container: HTMLElement) =>
   [...container.querySelectorAll("span")].filter((span) => span.style.display === "contents");
@@ -174,7 +174,7 @@ describe("the chat host with the Inspector opt-in in local development", () => {
     expect(inspectorMounts(container).map((mount) => mount.firstElementChild)).toEqual([inspector]);
     expect(inspectorPackage.configure).toHaveBeenCalledTimes(1);
     expect(inspectorPackage.configure).toHaveBeenCalledWith(inspector, inspector!.core, {
-      development: true, framework: "react", sdkVersion: "1.83.0"
+      development: true, framework: "react", sdkVersion: "1.85.0"
     });
     const agent = inspector!.core!.getAgent("deepAgents");
     expect(agent).toBeInstanceOf(DeepAgentsBrowserAgent);
@@ -338,6 +338,6 @@ describe("the pinned Inspector package", () => {
   it("is the version that the chat host was checked against", async () => {
     const { readFileSync } = await import("node:fs");
     const { version } = JSON.parse(readFileSync(inspectorPackage.packageJsonPath, "utf-8")) as { version: string };
-    expect(version).toBe("1.83.0");
+    expect(version).toBe("1.85.0");
   });
 });

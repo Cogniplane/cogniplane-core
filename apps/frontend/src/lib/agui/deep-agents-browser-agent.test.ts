@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 import { EventType, type RunAgentInput } from "@ag-ui/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -525,7 +527,7 @@ describe("DeepAgentsBrowserAgent generative-UI context on the wire", () => {
 
   const CHAT_TARGET = { id: "chat", kind: "chat" };
   const envelope = (description = "Text component", targets: object[] = [CHAT_TARGET]) => ({ copilotkit: { ui: {
-    "v1.0": { supportedCatalogIds: [GENERATIVE_UI_CATALOG_ID], inlineCatalogs: [{
+    [A2UI_VERSION]: { supportedCatalogIds: [GENERATIVE_UI_CATALOG_ID], inlineCatalogs: [{
       catalogId: GENERATIVE_UI_CATALOG_ID, protocolVersion: "1.0", functions: {},
       components: { Text: { description, props: { type: "object", properties: { text: { type: "string" } } } } }
     }] },
@@ -731,7 +733,7 @@ describe("DeepAgentsBrowserAgent after a PII refusal of earlier UI records", () 
     { status: 200, headers: { "Content-Type": "text/event-stream" } }
   );
   const envelope = (surfaces: Record<string, object>) => ({ copilotkit: { ui: {
-    "v1.0": { supportedCatalogIds: [GENERATIVE_UI_CATALOG_ID], inlineCatalogs: [{
+    [A2UI_VERSION]: { supportedCatalogIds: [GENERATIVE_UI_CATALOG_ID], inlineCatalogs: [{
       catalogId: GENERATIVE_UI_CATALOG_ID, protocolVersion: "1.0", functions: {}, components: {}
     }] },
     metadata: { extensions: { copilotkit_format: 3, copilotkit_transport: "markdown", copilotkit_contextSent: false,
@@ -908,7 +910,7 @@ describe("DeepAgentsBrowserAgent refuses the runs that generated UI starts", () 
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const agent = new DeepAgentsBrowserAgent({ sessionId: "s-1" });
-    const answer = { id: "dev-1", role: "developer" as const, content: JSON.stringify({ version: "v1.0", rendererFunctionResponse: { functionCallId: "c1", error: { code: "x" } } }) };
+    const answer = { id: "dev-1", role: "developer" as const, content: JSON.stringify({ version: A2UI_VERSION, rendererFunctionResponse: { functionCallId: "c1", error: { code: "x" } } }) };
     agent.setMessages([REAL, REPLY, answer]);
 
     await expect(agent.runAgent()).rejects.toBeInstanceOf(GenerativeUiActionBlockedError);

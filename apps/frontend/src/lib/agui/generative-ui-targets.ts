@@ -1,6 +1,6 @@
 // Side-panel views that the user is not looking at.
 //
-// CopilotKit 1.83.0 shows one surface for a target: the newest one that has
+// CopilotKit 1.85.0 shows one surface for a target: the newest one that has
 // that target (`getSurfaceForTarget`), and no public renderer takes a surface
 // id. The host gives every panel view except the selected one this target,
 // which nothing mounts, as it already does for a withdrawn preview.

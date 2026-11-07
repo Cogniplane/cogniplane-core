@@ -86,7 +86,7 @@ describe("useInspectorOptIn", () => {
 
 // The app gate depends on these facts of the pinned CopilotKit gate. An
 // upgrade that changes them fails here.
-describe("CopilotKit 1.83.0 Inspector gate", () => {
+describe("CopilotKit 1.85.0 Inspector gate", () => {
   it("is on by default in a development browser, so the host must pass false", () => {
     expect(shouldEnableInspector({ enableInspector: undefined, isBrowser: true, isDevelopment: true })).toBe(true);
     expect(shouldEnableInspector({ enableInspector: false, isBrowser: true, isDevelopment: true })).toBe(false);

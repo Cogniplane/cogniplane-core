@@ -85,7 +85,7 @@ import {
 } from "./generative-ui-catalog.logic";
 
 // The props that each override reads, from the standard schemas of CopilotKit
-// 1.83.0. CopilotKit's own prop types do not help here: with the app's Zod
+// 1.85.0. CopilotKit's own prop types do not help here: with the app's Zod
 // they resolve to `any`. The host test renders every component with the real
 // props, so a rename in a later CopilotKit shows there.
 type ImageProps = { url: string; description?: string };
@@ -517,7 +517,7 @@ export const COGNIPLANE_GENERATIVE_UI = createGenerativeUI({
   }
 });
 
-// SDK 1.83 overrides replace only the renderer. Update the new app catalog's
+// SDK 1.85 overrides replace only the renderer. Update the new app catalog's
 // description records too, without changing standardUI or any saved schema.
 for (const [name, description] of Object.entries(SAFE_DESCRIPTIONS)) {
   COGNIPLANE_GENERATIVE_UI.components.get(name)!.description = description;

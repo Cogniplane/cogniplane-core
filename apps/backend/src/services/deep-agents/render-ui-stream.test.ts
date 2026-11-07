@@ -1,3 +1,4 @@
+import { A2UI_VERSION } from "@copilotkit/shared";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { EventSchemas } from "@ag-ui/core/schemas";
 import { GENERATIVE_UI_PANEL_TARGET, MAX_RENDER_UI_ARGS_CHARS } from "@cogniplane/shared-types";
@@ -8,7 +9,7 @@ import { createStreamEventsToAGUIState, flushOpenAGUIMessages, streamEventsToAGU
 import { RenderUiStream } from "./render-ui-stream.js";
 import { RenderUiTurn } from "./render-ui.js";
 
-const create = (surfaceId = "s", text = "Plan") => ({ version: "v1.0", createSurface: {
+const create = (surfaceId = "s", text = "Plan") => ({ version: A2UI_VERSION, createSurface: {
   surfaceId, components: [{ id: "root", component: "Text", text }]
 } });
 const args = (...operations: unknown[]) => ({ target: "chat", operations });
@@ -29,7 +30,7 @@ describe("render_ui streamed operations and history", () => {
     const map = mapper();
     const events: BaseEvent[] = [];
     events.push(...map({ event: "on_chat_model_stream", data: { chunk: { content: "Here is the plan." } } }));
-    const input = args(create(), { version: "v1.0", updateDataModel: { surfaceId: "s", value: { seats: 3 } } });
+    const input = args(create(), { version: A2UI_VERSION, updateDataModel: { surfaceId: "s", value: { seats: 3 } } });
     const text = JSON.stringify(input);
     const boundary = text.indexOf(',{"version":', 50);
     const first = map(chunk(text.slice(0, boundary), 0, "render_ui"));
@@ -37,7 +38,7 @@ describe("render_ui streamed operations and history", () => {
     expect(surfaces(first)[0]!.content).toMatchObject({ status: "streaming", operations: [expect.anything()] });
     events.push(...first, ...map(chunk(text.slice(boundary))));
     events.push(...map(start("call1", input)), ...map(end("call1")));
-    events.push(...map(start("call2", args({ version: "v1.0", updateComponents: {
+    events.push(...map(start("call2", args({ version: A2UI_VERSION, updateComponents: {
       surfaceId: "s", components: [{ id: "root", component: "Text", text: "Updated plan" }]
     } }))), ...map(end("call2")));
     const activityEvents = surfaces(events);
@@ -64,7 +65,7 @@ describe("render_ui streamed operations and history", () => {
     const state = createStreamEventsToAGUIState();
     const map = (event: Record<string, unknown>) => streamEventsToAGUI(state, event, { assistantMessageId: "a1" });
     const panel = (...operations: unknown[]) => ({ target: GENERATIVE_UI_PANEL_TARGET, operations });
-    const updatePanel = { version: "v1.0", updateComponents: { surfaceId: "p", components: [{ id: "root", component: "Text", text: "Panel v2" }] } };
+    const updatePanel = { version: A2UI_VERSION, updateComponents: { surfaceId: "p", components: [{ id: "root", component: "Text", text: "Panel v2" }] } };
     const calls = [
       ["one", panel(create("p", "Panel v1"))],
       ["move", args(updatePanel)],
@@ -96,7 +97,7 @@ describe("render_ui streamed operations and history", () => {
     const events: BaseEvent[] = [];
     const step = (out: BaseEvent[]) => { events.push(...out); return surfaces(out); };
     const map = (event: Record<string, unknown>) => step(streamEventsToAGUI(state, event, { assistantMessageId: "a1" }));
-    const input = args({ version: "v1.0", updateComponents: {
+    const input = args({ version: A2UI_VERSION, updateComponents: {
       surfaceId: "missing", components: [{ id: "root", component: "Text", text: "Updated" }]
     } });
     const refused = { index: 0, reason: "Create this surface in the current turn first" };
@@ -109,7 +110,7 @@ describe("render_ui streamed operations and history", () => {
     const started = new Map(map(start("call1", input)).map((event) => [event.messageId, event.content]));
     expect(started.get("genui:error:turn:a1:call1")).toMatchObject({ status: "error", operations: [], rejected: [refused] });
     expect(started.get(previewId)).toMatchObject({ status: "ready", rejected: [],
-      operations: [{ version: "v1.0", deleteSurface: { surfaceId: expect.stringMatching(/^error:turn:a1:/) } }] });
+      operations: [{ version: A2UI_VERSION, deleteSurface: { surfaceId: expect.stringMatching(/^error:turn:a1:/) } }] });
     map(end("call1", "error"));
     step(flushOpenAGUIMessages(state));
 
@@ -129,7 +130,7 @@ describe("render_ui streamed operations and history", () => {
   it("shows the error of a call again when an earlier parallel call takes the surface that it rendered", () => {
     const stream = new RenderUiStream("a1");
     const errorId = "genui:error:turn:a1:model:index:1";
-    const update = { version: "v1.0", updateComponents: { surfaceId: "a", components: [{ id: "root", component: "Text", text: "x" }] } };
+    const update = { version: A2UI_VERSION, updateComponents: { surfaceId: "a", components: [{ id: "root", component: "Text", text: "x" }] } };
     const text = JSON.stringify(args(update, create("b")));
     const boundary = text.indexOf(',{"version":', 30);
     const byId = (events: BaseEvent[]) => new Map(surfaces(events).map((event) => [event.messageId, event.content]));
@@ -178,7 +179,7 @@ describe("render_ui streamed operations and history", () => {
 
     const abandoned = panelPreview();
     expect(surfaces(flushOpenAGUIMessages(abandoned.state)).find((event) => event.messageId === id)!.content).toMatchObject({
-      target: GENERATIVE_UI_PANEL_TARGET, operations: [{ version: "v1.0", deleteSurface: { surfaceId: "turn:a1:s" } }]
+      target: GENERATIVE_UI_PANEL_TARGET, operations: [{ version: A2UI_VERSION, deleteSurface: { surfaceId: "turn:a1:s" } }]
     });
   });
 
@@ -247,7 +248,7 @@ describe("render_ui streamed operations and history", () => {
     const withdrawn = surfaces(flushOpenAGUIMessages(state));
     expect(withdrawn).toHaveLength(1);
     expect(withdrawn[0]!.content).toMatchObject({ status: "ready", rejected: [], operations: [
-      expect.anything(), { version: "v1.0", deleteSurface: { surfaceId: "turn:a1:s" } }
+      expect.anything(), { version: A2UI_VERSION, deleteSurface: { surfaceId: "turn:a1:s" } }
     ] });
     expect(flushOpenAGUIMessages(state)).toEqual([]);
   });

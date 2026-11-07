@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // The height budget of the composer. The SDK pins the composer to the bottom of
 // the chat area in an overlay with no height limit. In a short chat area, the
@@ -85,7 +87,7 @@ function scrollerOf(element: Element): Element | null {
 }
 
 async function showReviewList() {
-  const operations = [{ version: "v1.0", createSurface: {
+  const operations = [{ version: A2UI_VERSION, createSurface: {
     surfaceId: "turn:a1:list", dataModel: { priority: "low" },
     components: [{ id: "root", component: "SegmentedControl", label: "Priority",
       options: [{ label: "Low", value: "low" }, { label: "High", value: "high" }], value: { "@path": "/priority" } }]
@@ -108,7 +110,7 @@ async function showReviewList() {
 /** A Checklist that the user edited and put in the message box. The composer
  *  then shows the Review summary and the draft notice together. */
 async function showReviewAndDraft() {
-  const operations = [{ version: "v1.0", createSurface: {
+  const operations = [{ version: A2UI_VERSION, createSurface: {
     surfaceId: "turn:a1:list", dataModel: { release: { checked: { tests: true }, notes: "" } },
     components: [{ id: "root", component: "Checklist", title: "Release 4.2",
       items: [{ id: "tests", label: "Tests pass" }, { id: "docs", label: "Release notes published" }],

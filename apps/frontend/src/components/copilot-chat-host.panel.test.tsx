@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // The side panel and the values that a user types into generated UI, in the
 // chat host with the real CopilotKit provider, surface manager and CopilotChat,
@@ -64,8 +66,8 @@ const EARLIER = [
   { id: "a0", role: "assistant", content: "Earlier answer" }
 ];
 const createSurface = (surfaceId: string, components: object[], dataModel: object = {}) =>
-  ({ version: "v1.0", createSurface: { surfaceId, dataModel, components } });
-const deleteSurface = (surfaceId: string) => ({ version: "v1.0", deleteSurface: { surfaceId } });
+  ({ version: A2UI_VERSION, createSurface: { surfaceId, dataModel, components } });
+const deleteSurface = (surfaceId: string) => ({ version: A2UI_VERSION, deleteSurface: { surfaceId } });
 const surfaceContent = (target: string, surfaceId: string, operations: object[], status = "ready") =>
   ({ surfaceId, target, catalogId: "cogniplane/standard@1", operations, status, rejected: [] });
 const activity = (target: string, surfaceId: string, operations: object[]) =>

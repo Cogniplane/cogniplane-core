@@ -571,7 +571,7 @@ function ChatComposer(props: CopilotChatInputProps) {
     if (next.trim() === "") endDraft?.();
     onChange?.(next);
   }, [endDraft, onChange]);
-  // CopilotChatInput 1.83.0 calls onChange("") synchronously after submit.
+  // CopilotChatInput 1.85.0 calls onChange("") synchronously after submit.
   // Keep the draft until the server confirms it, including refused sends.
   const submit = (text: string) => {
     sdkClearing.current = true;

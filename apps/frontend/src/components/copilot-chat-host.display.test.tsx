@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+
+import { A2UI_VERSION } from "@copilotkit/shared";
 //
 // The ComparisonTable and the StatusSummary of generated UI in the chat host,
 // with the real CopilotKit provider, surface manager and CopilotChat, the real
@@ -72,7 +74,7 @@ const ITEMS = [
 
 type Node = Record<string, unknown>;
 const createSurface = (surfaceId: string, components: object[], dataModel: object = {}) =>
-  [{ version: "v1.0", createSurface: { surfaceId, dataModel, components } }];
+  [{ version: A2UI_VERSION, createSurface: { surfaceId, dataModel, components } }];
 const table = (node: Node = {}, surfaceId = TABLE, dataModel: object = {}) => createSurface(surfaceId, [{
   id: "root", component: "ComparisonTable", title: "Plan comparison", columns: PLAN_COLUMNS, rows: PLAN_ROWS, ...node
 }], dataModel);

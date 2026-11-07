@@ -90,8 +90,7 @@
       "rxjs": "7.8.2"
     },
     "patchedDependencies": {
-      "@a2ui/web_core@0.10.4": "patches/@a2ui__web_core@0.10.4.patch",
-      "@copilotkit/a2ui-renderer@1.83.0": "patches/@copilotkit__a2ui-renderer@1.83.0.patch"
+      "@a2ui/web_core@0.15.0": "patches/@a2ui__web_core@0.15.0.patch"
     }
   },
   "license": "AGPL-3.0-only"

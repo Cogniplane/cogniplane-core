@@ -1,3 +1,4 @@
+import { A2UI_VERSION } from "@copilotkit/shared";
 import runningToolHistory from "../../../../test-fixtures/agui/running-tool-history.json" with { type: "json" };
 import { EventType, type MessagesSnapshotEvent } from "@ag-ui/client";
 import { describe, expect, test } from "vitest";
@@ -400,7 +401,7 @@ describe("historyRunEvents", () => {
 
 
 test.each(["completed", "interrupted"] as const)("replays %s markdown UI byte for byte beside reasoning and tool results", (status) => {
-  const operation = JSON.stringify({ version: "v1.0", createSurface: {
+  const operation = JSON.stringify({ version: A2UI_VERSION, createSurface: {
     surfaceId: "estimate", components: [{ id: "root", component: "Text", text: "Estimate" }]
   } });
   const fence = "```a2ui\n" + operation + (status === "completed" ? "\n```" : "\n{\"version\":");

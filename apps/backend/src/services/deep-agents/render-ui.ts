@@ -37,7 +37,7 @@ export const renderUiArgsSchema = z.object({
     "A target that the browser guide lists. Updates keep the target of the createSurface."
   ),
   operations: z.unknown().optional().describe(
-    `An array of A2UI v1.0 operations. Create a surface before updating it. At most ${MAX_RENDER_UI_OPERATIONS} operations.`
+    `An array of A2UI ${A2UI_VERSION} operations. Create a surface before updating it. At most ${MAX_RENDER_UI_OPERATIONS} operations.`
   )
 }).passthrough();
 
@@ -128,7 +128,7 @@ export class RenderUiTurn {
           const kind = getOperationKind(raw);
           const surfaceId = getOperationSurfaceId(raw);
           let reason: string | undefined;
-          if (!parsed.success) reason = "Use one supported v1.0 surface operation with valid fields; renderer functions are disabled";
+          if (!parsed.success) reason = `Use one supported ${A2UI_VERSION} surface operation with valid fields; renderer functions are disabled`;
           else if (kind === "createSurface" && created.has(surfaceId!)) reason = "Surface id already used in this turn";
           else if (kind !== "createSurface" && !known.has(surfaceId!)) reason = "Create this surface in the current turn first";
           else if (kind !== "createSurface" && targets.get(surfaceId!) !== target) {

@@ -19,8 +19,8 @@
   "dependencies": {
     "@ag-ui/client": "1.0.3",
     "@cogniplane/shared-types": "workspace:*",
-    "@copilotkit/react-core": "1.83.0",
-    "@copilotkit/shared": "1.83.0",
+    "@copilotkit/react-core": "1.85.0",
+    "@copilotkit/shared": "1.85.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",

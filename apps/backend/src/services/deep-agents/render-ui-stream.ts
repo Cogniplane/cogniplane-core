@@ -1,5 +1,5 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import { RenderUIArgsStream } from "@copilotkit/shared";
+import { A2UI_VERSION, RenderUIArgsStream } from "@copilotkit/shared";
 import { MAX_RENDER_UI_ARGS_CHARS } from "@cogniplane/shared-types";
 import {
   GENERATIVE_UI_RENDER_TOOL, isCallErrorSurface, isGenerativeUiTarget, RenderUiTurn, type RenderUiActivity, type RenderUiCall
@@ -136,7 +136,7 @@ export class RenderUiStream {
       const remove = final || isCallErrorSurface(old.content.surfaceId);
       activities.push({ ...old, content: { ...old.content,
         operations: remove ? [...old.content.operations.filter((operation) => !("deleteSurface" in operation)),
-          { version: "v1.0", deleteSurface: { surfaceId: old.content.surfaceId } }] : [],
+          { version: A2UI_VERSION, deleteSurface: { surfaceId: old.content.surfaceId } }] : [],
         status: remove ? "ready" : "error", rejected: [] } });
     }
     const events: BaseEvent[] = [];
