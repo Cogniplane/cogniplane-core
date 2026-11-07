@@ -1,8 +1,9 @@
-// What a finished turn saves for a tool call that never returned. A stopped
-// turn keeps it `in_progress`, and history shows it as interrupted. A turn
-// that completed or failed saves it as `failed`. The interactive writer and the
-// scheduler both finish a turn through `finalize`, with the outcome from the
-// events or an override, so both are covered here.
+// What a finished turn saves for a tool call that never returned. Every turn
+// keeps it `in_progress`, however the turn ended, and history shows it as
+// interrupted, as the live card does once the turn settles (issue #16). Only a
+// failure that the tool reported is saved as `failed`. The interactive writer
+// and the scheduler both finish a turn through `finalize`, with the outcome from
+// the events or an override, so both are covered here.
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, it } from "vitest";
@@ -80,10 +81,25 @@ describe("TurnTranscript tool calls that never returned", () => {
     ["a run error event", [...started("c1"), { type: EventType.RUN_ERROR, message: "provider down" } as BaseEvent], undefined],
     ["a thrown turn", started("c1"), { status: "error", message: "The assistant run failed." }],
     ["a completed turn", [...started("c1"), finish()], undefined]
-  ])("fails an unfinished call after %s", async (_name, events, override) => {
+  ])("does not report a failure for an unfinished call after %s: history shows it as interrupted", async (_name, events, override) => {
     const { rows, finalized } = await finalizeTurn(events, override);
 
     expect(finalized.outcome.status).not.toBe("interrupted");
-    expect(rows.get("c1")?.status).toBe("failed");
+    expect(rows.get("c1")?.status).toBe("in_progress");
+    const status = finalized.outcome.status === "completed" ? "completed" : "error";
+    expect(historyOf(rows, status)).toEqual([expect.objectContaining({ toolCallId: "c1", error: "interrupted" })]);
+  });
+
+  it("keeps a failure that the tool reported distinct from a call that never returned, after a run error", async () => {
+    const failedCall: BaseEvent[] = [...started("reported"), returned("reported", "exit 1"),
+      { type: EventType.CUSTOM, name: "tool_status", value: { toolCallId: "reported", toolName: "execute", status: "failed" } } as BaseEvent];
+    const { rows } = await finalizeTurn([...failedCall, ...started("open"), { type: EventType.RUN_ERROR, message: "provider down" } as BaseEvent]);
+
+    expect(rows.get("reported")?.status).toBe("failed");
+    expect(rows.get("open")?.status).toBe("in_progress");
+    expect(historyOf(rows, "error")).toEqual([
+      expect.objectContaining({ toolCallId: "reported", error: "failed" }),
+      expect.objectContaining({ toolCallId: "open", error: "interrupted" })
+    ]);
   });
 });

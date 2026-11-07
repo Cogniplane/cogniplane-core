@@ -7,6 +7,8 @@ export * from "./primitives.js";
 export * from "./mime-class.js";
 export * from "./model-availability.js";
 export * from "./non-printing.js";
+// The tool status that admin replay and the skill corpus show for a saved call.
+export * from "./tool-outcome.js";
 // Names and limits for MCP app widget CSP sources. The parser is a separate
 // entry point (`@cogniplane/shared-types/csp-sources`) because it loads a
 // public suffix list.

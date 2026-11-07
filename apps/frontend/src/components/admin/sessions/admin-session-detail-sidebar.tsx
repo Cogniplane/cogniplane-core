@@ -87,7 +87,7 @@ export function AdminSessionDetailSidebar(props: { detail: AdminSessionDetailRes
                   </select>
                 </label>
                 {activeTab === "overview" ? <AdminSessionOverviewTab overview={detail.overview} /> : null}
-                {activeTab === "tools" ? <AdminSessionToolsTab toolEvents={detail.toolEvents} messageToolResults={detail.messageToolResults} /> : null}
+                {activeTab === "tools" ? <AdminSessionToolsTab toolEvents={detail.toolEvents} messageToolResults={detail.messageToolResults} messages={detail.messages} /> : null}
                 {activeTab === "artifacts" ? <AdminSessionArtifactsTab artifacts={detail.artifacts} /> : null}
                 {activeTab === "pii" ? <AdminSessionPiiTab piiRuns={detail.piiRuns} /> : null}
                 {activeTab === "audit" ? <AdminSessionAuditTab auditEvents={detail.auditEvents} /> : null}

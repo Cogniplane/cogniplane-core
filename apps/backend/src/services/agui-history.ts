@@ -97,7 +97,8 @@ function toolResultMessage(tr: HistoryToolResult): AguiMessage {
     toolCallId: tr.toolResultId,
     content: tr.output,
     // Running calls in the current remote turn have no result message.
-    // Any remaining in_progress row belongs to a stopped turn.
+    // Any remaining in_progress row belongs to a turn that ended (stop, run
+    // error, or completion) before the call returned: its outcome is unknown.
     ...(tr.status === "failed" || tr.status === "declined"
       ? { error: tr.status }
       : tr.status === "in_progress"

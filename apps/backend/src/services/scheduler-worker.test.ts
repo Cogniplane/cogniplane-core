@@ -927,8 +927,8 @@ describe("SchedulerWorker", () => {
     await worker.tick();
 
     expect(messagesUpdated).toEqual([expect.objectContaining({ status: "error", content: "partial" })]);
-    // The unfinished call is saved as failed, not left in progress.
-    expect(toolResultsSaved).toEqual([expect.objectContaining({ toolResultId: "call-1", status: "failed" })]);
+    // The unfinished call keeps in_progress: no tool reported a failure, and history shows it as interrupted (issue #16).
+    expect(toolResultsSaved).toEqual([expect.objectContaining({ toolResultId: "call-1", status: "in_progress" })]);
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
     expect(JSON.stringify(jobRunsCompleted)).not.toContain("10.0.4.17");
     expect(purgeSessionDataCalls).toHaveLength(1);

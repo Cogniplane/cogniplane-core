@@ -319,3 +319,47 @@ test("formatCorpus redacts Bearer tokens in user message content", () => {
   expect(result.markdown).not.toContain("rt_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   expect(result.markdown).toContain("Bearer [REDACTED]");
 });
+
+// Issue #17: a call that never returned keeps the stored status `in_progress`. Once its turn has
+// ended, the corpus must not say that it still runs; it names the stored status as evidence.
+test.each([
+  ["interrupted", "interrupted (no result before the turn ended; stored status: in_progress)"],
+  ["error", "interrupted (no result before the turn ended; stored status: in_progress)"],
+  ["completed", "interrupted (no result before the turn ended; stored status: in_progress)"],
+  ["streaming", "in_progress"],
+  ["pending", "in_progress"]
+] as const)("formatCorpus labels an unfinished call in a %s turn as %s", (messageStatus, label) => {
+  const unfinished = { status: "in_progress", output: "" };
+  const markdown = corpusWithTools(messageStatus, [unfinished]);
+
+  expect(markdown).toContain(`status: ${label}`);
+});
+
+test("formatCorpus keeps the reported outcome of a call that returned, in an ended turn", () => {
+  const markdown = corpusWithTools("interrupted", [
+    { status: "completed", output: "ok" }, { status: "failed", output: "exit 1" }, { status: "declined", output: "" }
+  ]);
+
+  expect(markdown).toMatch(/status: completed\n/);
+  expect(markdown).toMatch(/status: failed\n/);
+  expect(markdown).toMatch(/status: declined\n/);
+  expect(markdown).not.toContain("interrupted");
+});
+
+function corpusWithTools(messageStatus: MessageRecord["status"], tools: Array<{ status: string; output: string }>): string {
+  return formatCorpus({
+    skill, tenantId: "tenant-1", generatedAt: "2026-04-25T12:00:00.000Z", sessionLimit: 50,
+    sessions: [{
+      sessionId: "sess_abc", sessionName: "Task", occurredAt: "2026-04-25T11:00:00.000Z",
+      messages: [makeMessage({
+        messageId: "msg_assistant_1", role: "assistant", status: messageStatus, content: "",
+        toolResults: tools.map((tool, index) => ({
+          id: index, toolResultId: `tr_${index}`, messageId: "msg_assistant_1", sessionId: "sess_abc", userId: "user_1",
+          kind: "command", title: "execute", status: tool.status as never, command: null, cwd: null, server: null,
+          toolName: "execute", input: "", output: tool.output, exitCode: null, durationMs: null, textOffset: null,
+          createdAt: "2026-04-25T10:00:05.000Z", updatedAt: "2026-04-25T10:00:05.000Z"
+        }))
+      })]
+    }]
+  }).markdown;
+}

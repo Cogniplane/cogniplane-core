@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it } from "vitest";
 import type { AdminSessionDetailMessageToolResult, AdminSessionDetailToolEvent } from "@cogniplane/shared-types";
 
-import { PILL_BLUE, PILL_GRAY, PILL_RED } from "../../../lib/ui-tokens";
+import { PILL_AMBER, PILL_BLUE, PILL_GRAY, PILL_RED } from "../../../lib/ui-tokens";
 import { AdminSessionToolsTab } from "./admin-session-tools-tab";
 
 afterEach(cleanup);
@@ -104,4 +104,39 @@ it("filters calls by title", () => {
 
   fireEvent.change(filter, { target: { value: "deploy" } });
   expect(screen.getByText("No tools match this filter.")).toBeTruthy();
+});
+
+// Issue #17: the stored `in_progress` of a call that never returned is evidence. The tab derives the
+// label from the call and its message: a call of an ended turn is interrupted, a call of a running turn runs.
+it.each([
+  ["interrupted", "interrupted"], ["error", "interrupted"], ["completed", "interrupted"],
+  ["streaming", "in_progress"], ["pending", "in_progress"]
+] as const)("labels an unfinished call of a %s message as %s", (messageStatus, label) => {
+  render(<AdminSessionToolsTab toolEvents={[]}
+    messageToolResults={[toolResult({ status: "in_progress", messageId: "msg-1" })]}
+    messages={[{ messageId: "msg-1", status: messageStatus }]} />);
+
+  const pill = screen.getByText(label);
+  expect(pill.className).toBe(label === "interrupted" ? PILL_AMBER : PILL_GRAY);
+  const note = screen.queryByText(/The turn ended before this tool gave a result/);
+  if (label === "interrupted") {
+    expect(note?.textContent).toContain("Stored status: in_progress");
+  } else {
+    expect(note).toBeNull();
+  }
+});
+
+it("keeps the reported outcome of a call that returned in an ended turn", () => {
+  render(<AdminSessionToolsTab toolEvents={[]}
+    messageToolResults={[
+      toolResult({ toolResultId: "r1", status: "completed", title: "One" }),
+      toolResult({ toolResultId: "r2", status: "failed", title: "Two" }),
+      toolResult({ toolResultId: "r3", status: "declined", title: "Three" })
+    ]}
+    messages={[{ messageId: "msg-1", status: "interrupted" }]} />);
+
+  expect(screen.getByText("completed").className).toBe(PILL_BLUE);
+  expect(screen.getByText("failed").className).toBe(PILL_RED);
+  expect(screen.getByText("declined").className).toBe(PILL_RED);
+  expect(screen.queryByText("interrupted")).toBeNull();
 });

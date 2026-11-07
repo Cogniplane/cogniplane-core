@@ -243,7 +243,7 @@ export class TurnTranscript {
     // Rich parts are best effort: a failure here must not change the saved
     // text/status, which the context meter and job ledger depend on.
     try {
-      await this.writeRichTranscript(outcome);
+      await this.writeRichTranscript();
     } catch (err) {
       this.input.logger?.warn({ err, sessionId: this.input.sessionId, tenantId: this.input.tenantId },
         "failed to persist AG-UI turn transcript (reasoning/plan/tool results)");
@@ -290,10 +290,12 @@ export class TurnTranscript {
   }
 
   // Writes only what the turn produced and what progress writes did not save.
-  // A chat-only turn touches nothing here. A call that never returned is
-  // `failed` after a completed turn or an error, and stays `in_progress` after
-  // a stop: nothing reported that it failed, and history shows it as interrupted.
-  private async writeRichTranscript(outcome: TurnOutcome): Promise<void> {
+  // A chat-only turn touches nothing here. A call that never returned stays
+  // `in_progress` however the turn ended (stop, run error, or completion): no
+  // tool reported a failure, and its action can be done, partly done, or not
+  // started. History shows it as interrupted, as the live card does once the
+  // turn settles (issue #16). Only a failure that the tool reported is `failed`.
+  private async writeRichTranscript(): Promise<void> {
     const { messages, tenantId, messageId, userId } = this.input;
     const remapOffset = makeOffsetRemap(this.turn.assistantText);
 
@@ -317,10 +319,7 @@ export class TurnTranscript {
       this.savedNoticeVersion = this.noticeVersion;
     }
 
-    const stopped = outcome.status === "interrupted";
-    for (const result of this.turn.toolResults()) {
-      await this.persistTool(result.status === "in_progress" && !stopped ? { ...result, status: "failed" } : result);
-    }
+    for (const result of this.turn.toolResults()) await this.persistTool(result);
   }
 
   private async persistTool(result: AccumulatedToolResult, assistantText = this.turn.assistantText): Promise<void> {

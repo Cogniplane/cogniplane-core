@@ -328,12 +328,12 @@ describe("a stopped command through the real graph", () => {
     expect(toolMessages(saved)).toEqual([expect.objectContaining({ toolCallId: card!.toolCallId, error: "interrupted" })]);
   });
 
-  it("still fails the unfinished call when the turn ends with an error", async () => {
+  it("shows the unfinished call as interrupted, not failed, when the turn ends with an error (issue #16)", async () => {
     const { events } = await stopDuringCommand();
 
     const saved = await save(events, { type: EventType.RUN_ERROR, message: "The assistant run failed." } as BaseEvent);
     expect(saved.status).toBe("error");
-    expect(saved.rows).toEqual([expect.objectContaining({ status: "failed" })]);
-    expect(toolMessages(saved)).toEqual([expect.objectContaining({ error: "failed" })]);
+    expect(saved.rows).toEqual([expect.objectContaining({ status: "in_progress" })]);
+    expect(toolMessages(saved)).toEqual([expect.objectContaining({ error: "interrupted" })]);
   });
 });
