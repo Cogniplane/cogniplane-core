@@ -3,7 +3,7 @@ import type { OutgoingMail } from "./mail-sender.js";
 // The texts of the security notices. A notice says what changed and when,
 // and what to do if the person did not make the change. It has no link: a
 // message that tells people to click is what a phishing message looks like.
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/email.md.
 
 export type SecondFactorMethod = "totp" | "passkey";
 

@@ -10,7 +10,7 @@
 // events, links, inputs or state of the user.
 //
 // The SDK stylesheet resets the margins of p, table, figcaption and headings
-// with a rule that beats utility classes (see LEARNINGS), so the spacing here
+// with a rule that beats utility classes, so the spacing here
 // comes from padding and gaps, and the font size of the heading is forced.
 
 import type { StatusSummaryProps, StatusSummaryStatus } from "@cogniplane/shared-types";

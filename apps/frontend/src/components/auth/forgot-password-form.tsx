@@ -12,7 +12,7 @@ import { fetchAuthConfig, localAuthMessage } from "../../lib/local-auth-api";
 import { authFlowActions, type AuthFlowActions } from "./auth-flow-actions";
 import { queryKeys } from "../../lib/query-keys";
 
-// "Forgot password" (docs/ARCHITECTURE.md, "Authentication"). The backend
+// "Forgot password" (docs/architecture/local-accounts.md). The backend
 // answers the same for every address, so this page shows the same message
 // after every request: it never says whether an account exists.
 

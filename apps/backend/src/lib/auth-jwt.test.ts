@@ -180,7 +180,7 @@ describe("jwt auth with a Bearer access token", () => {
     await app.close();
   });
 
-  // See docs/ARCHITECTURE.md, "Authentication": a token acts only
+  // See docs/architecture/auth.md: a token acts only
   // when the user's login path is the tenant's login type, and that type is
   // enabled in this installation.
   test.each([

@@ -3,8 +3,8 @@ import type { PiiMode, PiiProtectionSettings, PiiRawRetention } from "@cogniplan
 import type { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import { type PiiPolicyActivation, resolvePiiPolicy } from "./pii-policy.js";
 
-// When a PII save makes the protection weaker (docs/ARCHITECTURE.md, "Data
-// routes"). Only such a save needs step-up and sends the owner notice: with a
+// When a PII save makes the protection weaker (docs/architecture/sensitive-changes.md,
+// "Weaker controls and skill releases"). Only such a save needs step-up and sends the owner notice: with a
 // stolen admin token, a weaker policy sends unmasked personal data to the
 // model provider, and the change stays after the victim signs out.
 //

@@ -22,7 +22,7 @@ export class WorkOsEmailConflictError extends Error {
 /**
  * Raised when a WorkOS login resolves to a tenant whose members do not sign
  * in through WorkOS. The provisioning transaction rolls back, so nothing is
- * written (docs/ARCHITECTURE.md, "Authentication").
+ * written (docs/architecture/auth.md).
  */
 export class WrongLoginTypeError extends Error {
   readonly organizationId: string;
@@ -184,7 +184,7 @@ export async function provisionTenantIdentity(
     // binding such a row would hand its data to whoever signs in with that
     // email, without proof that the email is verified or that the row belongs
     // to this organization's tenant. Local users (auth_source 'local') always
-    // have workos_user_id NULL. See docs/ARCHITECTURE.md, "Authentication".
+    // have workos_user_id NULL. See docs/architecture/auth.md.
     if (
       emailOwnerRow &&
       (emailOwnerRow.auth_source === "local" || emailOwnerRow.workos_user_id !== input.workosUserId)

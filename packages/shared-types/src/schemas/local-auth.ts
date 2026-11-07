@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 // Contracts for local accounts and the shared session routes
-// (docs/ARCHITECTURE.md, "Authentication").
+// (docs/architecture/local-accounts.md).
 
 /** NIST SP 800-63B-4 minimum when the password is the only factor. */
 export const PASSWORD_MIN_LENGTH = 15;

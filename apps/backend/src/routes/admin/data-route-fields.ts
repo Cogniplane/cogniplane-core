@@ -4,7 +4,7 @@ import type { IntegrationDescriptor } from "../../services/integrations/integrat
 import type { tenantSettingsBodySchema } from "./admin-route-schemas.js";
 
 // Which changes of a data route need step-up and an owner notice
-// (docs/ARCHITECTURE.md, "Authentication", "Data routes"). A save that
+// (docs/architecture/sensitive-changes.md, "Data routes"). A save that
 // changes none of them needs neither: a small change (the effort selector,
 // an integration turned off) must not ask for a password or send email.
 
@@ -34,7 +34,7 @@ export const TENANT_SETTINGS_FIELDS: Record<TenantSettingsField, { label: string
   approvalPolicy: { label: "Approval policy", kind: "control" },
   allowCommandExecution: { label: "Command execution", kind: "control" },
   autoApproveReadOnlyTools: { label: "Automatic approval of read-only tools", kind: "control" },
-  // No runtime reads it today (docs/ARCHITECTURE.md, "Policy Center"), but it
+  // No runtime reads it today (docs/architecture/data.md, "Tenant settings"), but it
   // names who approves: a control when a runtime reads it again.
   approvalReviewer: { label: "Approval reviewer", kind: "control" },
   showEffortSelector: { label: "Effort selector", kind: null },

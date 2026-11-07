@@ -117,7 +117,7 @@ export class IntegrationStateStore {
    * value, and the settings keys in `configChanges` replace only those keys.
    * A save read from an older copy can therefore not write back an older
    * toggle or secret (an admin route classifies the save against that copy,
-   * docs/ARCHITECTURE.md, "Data routes"). The audit event, when given,
+   * docs/architecture/sensitive-changes.md, "Data routes"). The audit event, when given,
    * commits in the same transaction, with its owner notice.
    */
   async applyChanges(

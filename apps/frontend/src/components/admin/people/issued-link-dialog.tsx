@@ -15,8 +15,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { formatExpiry } from "./local-account.logic";
 
-// The outcome of a new setup or reset link (docs/ARCHITECTURE.md,
-// "Authentication"). With email on, the link went to the person and the
+// The outcome of a new setup or reset link (docs/architecture/local-accounts.md).
+// With email on, the link went to the person and the
 // manager sees only where it went. With email off, the link shows once: the
 // backend stores only its hash, so the manager copies it now and sends it.
 export function IssuedLinkDialog({ delivery, name, onClose }: { delivery: MemberLinkResponse | null; name: string; onClose: () => void }) {

@@ -29,8 +29,7 @@ import { type AfterSecurityChange, type SecurityChange, withSecurityChange } fro
 // Second factors of local accounts: an authenticator app (TOTP) and one-time
 // recovery codes, plus the tenant's MFA policy. Passkeys are the other second
 // factor (local-passkey-service.ts); "has a second factor" means an
-// authenticator app or at least one passkey. See docs/ARCHITECTURE.md,
-// "Authentication".
+// authenticator app or at least one passkey. See docs/architecture/local-accounts.md.
 //
 // Every change locks the account's identity row first, like every other
 // change of a local account, and every check of a code runs in the same

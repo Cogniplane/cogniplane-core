@@ -23,7 +23,7 @@ export function isWeakerPolicy(next: MfaPolicy, current: MfaPolicy): boolean {
 
 // Two-step verification rule for a local tenant. A stricter rule applies at
 // once; only an owner can make it weaker, after a step-up
-// (docs/ARCHITECTURE.md, "Authentication").
+// (docs/architecture/local-accounts.md).
 export function TenantMfaPolicy({ actorRole }: { actorRole: "owner" | "admin" }) {
   const queryClient = useQueryClient();
   const policy = useQuery({ queryKey: queryKeys.admin.mfaPolicy(), queryFn: fetchTenantMfaPolicy });

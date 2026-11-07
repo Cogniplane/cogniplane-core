@@ -11,7 +11,7 @@ import type { DataSettingChange } from "./mail/setting-change-notices.js";
 import { WeakerChangeError } from "./weaker-change-error.js";
 
 // The checks of a data route: a tenant setting that changes where the
-// tenant's data goes (docs/ARCHITECTURE.md, "Authentication"). With a stolen
+// tenant's data goes (docs/architecture/sensitive-changes.md). With a stolen
 // owner or admin access token, a changed provider key or MCP server address
 // sends every user's prompts and data to another server, and the change
 // stays after the victim's password change or "sign out everywhere". So:

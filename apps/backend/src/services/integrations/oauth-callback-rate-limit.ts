@@ -17,7 +17,7 @@ import type { RequestLimitsInterface } from "../request-limits.js";
  * `failClosed`: when the limiter itself fails, answer 503 instead of letting
  * the request through. Credential endpoints (local password sign-in) use it,
  * because an unthrottled password check is the attack this limit exists for
- * (docs/ARCHITECTURE.md, "Authentication").
+ * (docs/architecture/local-accounts.md).
  */
 export async function enforceOAuthCallbackRateLimit(
   request: FastifyRequest,

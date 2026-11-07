@@ -126,8 +126,8 @@ export async function registerAppRoutes(
     })
   );
 
-  // Optional overlays attach their routes last. The core OSS tree ships this
-  // as a no-op so derived distributions can add routes without changing core.
+  // Overlays attach their routes last (the bundled SharePoint overlay through
+  // overlays.ts), so they can add routes without changing core.
   deps.overlays.attachRoutes(app, { dataRoutes: routeControls.dataRoutes });
 }
 

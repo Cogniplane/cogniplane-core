@@ -4,7 +4,7 @@ import type { AppConfig } from "../config.js";
 
 /**
  * How the user proved who they are at sign-in: `workos` for a WorkOS login.
- * Local login adds `pwd`, `otp`, `rec`, and `pkey` (docs/ARCHITECTURE.md, "Authentication").
+ * Local login adds `pwd`, `otp`, `rec`, and `pkey` (docs/architecture/auth.md).
  */
 export type AuthMethod = "workos" | "pwd" | "otp" | "rec" | "pkey";
 

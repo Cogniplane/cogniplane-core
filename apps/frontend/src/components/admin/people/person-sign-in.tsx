@@ -32,7 +32,7 @@ const ROW = "flex flex-col gap-2 py-4";
 const ROW_LABEL = "text-xs font-semibold uppercase tracking-wide text-on-surface-variant";
 
 // The Sign-in row of a person's Access panel, for local accounts only
-// (docs/ARCHITECTURE.md, "Authentication").
+// (docs/architecture/local-accounts.md).
 export function PersonSignIn({ person, actor, onStatus }: { person: AdminUser; actor: Actor; onStatus: (message: string) => void }) {
   const queryClient = useQueryClient();
   const status = accountStatusOf(person);

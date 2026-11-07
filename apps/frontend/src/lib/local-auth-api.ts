@@ -38,7 +38,7 @@ import {
 import { API_URL, ApiError, changeSession, request } from "./api-client";
 import { assertWithPasskey, createPasskey, PasskeyCeremonyError } from "./passkey-browser";
 
-// Client for local accounts (docs/ARCHITECTURE.md, "Authentication").
+// Client for local accounts (docs/architecture/local-accounts.md).
 // Sign-in, setup, and reset run before a session exists: they use plain fetch
 // with credentials, so the backend can set the refresh cookie. Everything else
 // goes through the authenticated API client.

@@ -45,7 +45,7 @@ import { requireStepUp } from "../services/auth/local-auth.js";
 
 // Local accounts: sign-in (password, then a second factor or a forced
 // enrolment), setup and reset links, step-up, and the signed-in user's own
-// security settings. See docs/ARCHITECTURE.md, "Authentication".
+// security settings. See docs/architecture/local-accounts.md.
 // Registered only when `local` is in AUTH_LOGIN_TYPES. The public paths are
 // listed in lib/auth-jwt.ts.
 

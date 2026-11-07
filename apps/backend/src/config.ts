@@ -366,8 +366,8 @@ export const envSchema = z.object({
   //     served by vLLM on a g6.xlarge (no third-party inference API, no external
   //     query logs). This is what backs the "private PII detection (no
   //     third-party, no logs)" claim. Point this at the in-VPC vLLM service on
-  //     its fixed ENI address, e.g. http://10.x.x.x:8000/v1. See infra/gemma-pii/
-  //     and docs/runbooks/gemma-pii-inference.md.
+  //     its fixed ENI address, e.g. http://10.x.x.x:8000/v1. The infrastructure
+  //     and its runbook are maintained outside this repository.
   //   - OSS / dev convenience: any OpenAI-compatible provider (OpenRouter,
   //     a local Ollama/vLLM, etc.). The operator accepts that provider's
   //     logging posture.

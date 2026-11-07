@@ -12,7 +12,7 @@ import type { AuthMethod } from "../../lib/jwt.js";
 // the flow back only when it fails: two requests never spend on one flow, and
 // a commit is always followed by its answer. A new purpose is a new flow, and
 // wrong codes are counted in a separate key by one script. See
-// docs/ARCHITECTURE.md, "Authentication".
+// docs/architecture/local-accounts.md.
 
 export const LOGIN_FLOW_TTL_SECONDS = 5 * 60;
 /** Wrong codes accepted in one flow before it ends. */

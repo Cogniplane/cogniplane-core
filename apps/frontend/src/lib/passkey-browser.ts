@@ -7,7 +7,7 @@ import {
 } from "@simplewebauthn/browser";
 
 // The browser half of a passkey ceremony. The backend sends the options and
-// checks the answer (docs/ARCHITECTURE.md, "Authentication"); this module
+// checks the answer (docs/architecture/local-accounts.md); this module
 // only calls WebAuthn and names its failures.
 
 /** passkey_cancelled: the person closed the prompt, or it timed out. */

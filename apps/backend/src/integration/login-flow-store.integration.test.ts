@@ -5,7 +5,7 @@ import { describe, expect, onTestFinished, test } from "vitest";
 import { LOGIN_FLOW_MAX_FAILURES, LoginFlowStore } from "../services/auth/login-flow-store.js";
 
 // The failure script of the sign-in flow against a real Redis
-// (docs/ARCHITECTURE.md, "Authentication"): a wrong code never brings back
+// (docs/architecture/auth.md): a wrong code never brings back
 // a consumed flow, and every concurrent failure counts.
 
 if (process.env.INTEGRATION_REQUIRE_REDIS === "1" && !process.env.INTEGRATION_REDIS_URL) {

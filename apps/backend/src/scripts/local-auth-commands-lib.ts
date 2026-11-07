@@ -6,7 +6,7 @@ import { uuidv7 } from "../lib/uuid.js";
 import { type IssuedLink, LocalAccountService } from "../services/auth/local-account-service.js";
 import { NO_RUNTIMES_IN_THIS_PROCESS } from "../services/auth/security-change.js";
 
-// Operator commands for local login (docs/ARCHITECTURE.md, "Authentication").
+// Operator commands for local login (docs/architecture/local-accounts.md).
 // They run on MIGRATION_DATABASE_URL, like tenant:delete, and print a one-time
 // link for the person to open.
 

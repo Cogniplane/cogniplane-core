@@ -383,7 +383,7 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
  * There is no cross-backend routing: each backend validates the persisted
  * `storageUri` scheme (`parseFileUri` / `parseS3Uri`) and throws a clear error
  * if it is handed the other scheme. Switching a tenant from `local` → `bucket`
- * is a deliberate re-upload (see docs/ARCHITECTURE.md, "Skill bundle storage"),
+ * is a deliberate re-upload (see docs/architecture/skills.md, "Bundle storage"),
  * so live URIs always match the configured backend. A stray cross-scheme URI is
  * an operator error. Each backend surfaces it loudly and does not re-route it
  * silently.

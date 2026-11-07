@@ -166,7 +166,7 @@ jobs:
     # store methods it explicitly tests, not in arbitrary new code. Its
     # row-visibility cases cover every tenant table through its production
     # write path, except the one exception that rls-write-paths lists. See the
-    # header of rls-write-paths.integration.test.ts and docs/LEARNINGS.md.
+    # header of rls-write-paths.integration.test.ts.
     #
     services:
       postgres:

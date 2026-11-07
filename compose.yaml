@@ -17,8 +17,8 @@
 #
 # Production caveats:
 #   - dev-headers mode reads X-User-Id from the request — never expose this
-#     stack to the internet without first switching AUTH_MODE=workos.
-#   - See README.md for setup instructions.
+#     stack to the internet without first switching AUTH_MODE=jwt.
+#   - See docs/docker-deploy.md for setup instructions.
 
 services:
   exposure-guard:
@@ -166,7 +166,7 @@ services:
       # bridge networking requires it), which the loopback guard rejects — hence
       # the opt-in. The real exposure control is the host port publish bound to
       # 127.0.0.1 above, so the backend is reachable only from the host. To expose
-      # it on a network, switch AUTH_MODE=workos (and drop this opt-in) first.
+      # it on a network, switch AUTH_MODE=jwt (and drop this opt-in) first.
       COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: "1"
       # Request-level guard the opt-in makes mandatory: identity headers are
       # ignored unless the caller also presents this key. Override for anything

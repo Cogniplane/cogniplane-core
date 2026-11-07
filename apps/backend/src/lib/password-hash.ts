@@ -5,7 +5,7 @@ import crypto, { randomBytes, timingSafeEqual } from "node:crypto";
 // Parameters are the OWASP minimum for Argon2id: 19 MiB, 2 passes, 1 lane.
 // The stored value is a PHC string, so a later change of parameters can be
 // recognised and the hash replaced at the next sign-in.
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/local-accounts.md.
 
 type Argon2Params = { memory: number; passes: number; parallelism: number };
 

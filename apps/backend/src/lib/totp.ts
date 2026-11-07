@@ -3,7 +3,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 // Time-based one-time passwords for authenticator apps (RFC 6238 over the
 // HOTP algorithm of RFC 4226): HMAC-SHA1, 6 digits, 30-second steps, one step
 // of clock drift either way. These are the defaults every common app uses.
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/local-accounts.md.
 
 export const TOTP_DIGITS = 6;
 export const TOTP_PERIOD_SECONDS = 30;

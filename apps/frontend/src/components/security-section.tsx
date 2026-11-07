@@ -42,7 +42,7 @@ import { AUTH_FOCUS_RING, AuthMessage, PendingButton, focusIfOwned, pendingField
 import { passwordFieldError } from "./auth/password-field-error";
 
 // Settings › Sign-in & security, for members of a tenant with local login
-// (docs/ARCHITECTURE.md, "Authentication").
+// (docs/architecture/local-accounts.md).
 
 function formatDate(iso: string): string {
   const date = new Date(iso);

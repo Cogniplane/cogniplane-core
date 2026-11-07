@@ -2,7 +2,7 @@ import { parseEmail } from "./email-address.js";
 
 // Parses the SMTP settings (SMTP_URL, MAIL_FROM). Boot calls these, so a bad
 // value stops the start. Error messages never repeat the URL: it can hold a
-// password. See docs/ARCHITECTURE.md, "Authentication".
+// password. See docs/architecture/email.md.
 
 export type SmtpSettings = {
   host: string;
