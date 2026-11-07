@@ -2,3 +2,7 @@ packages:
   - apps/backend
   - packages/shared-types
   - private/sharepoint-overlay-backend
+# The root package.json patches frontend packages too. The backend image does
+# not install them, so pnpm must not stop on those unused patches. A patch for
+# a backend package still applies.
+allowUnusedPatches: true
