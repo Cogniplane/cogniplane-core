@@ -607,10 +607,11 @@ function ChatComposer(props: CopilotChatInputProps) {
     // This box is the composer for the keyboard: the blocks and the message box
     // sit in it, and its bottom margin holds the keyboard. The overlay around it
     // has no pointer events, so this box has none, and only the blocks and the
-    // message box take them.
+    // message box take them. This box scrolls, so it clips what it holds. The
+    // top padding keeps the 4px focus ring of the message box visible.
     <div
       ref={composerRef}
-      className={`flex flex-col scroll-py-2 overflow-y-auto overscroll-contain bg-surface pb-2 ${COMPOSER_BUDGET}`}
+      className={`flex flex-col scroll-py-2 overflow-y-auto overscroll-contain bg-surface pt-1 pb-2 ${COMPOSER_BUDGET}`}
       style={lift > 0 ? ({ marginBottom: `${lift}px`, [KEYBOARD_OFFSET_PROPERTY]: `${lift}px` } as CSSProperties) : undefined}
     >
       {/* The draft decision comes first. Expanded generated values share this

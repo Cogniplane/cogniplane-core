@@ -571,8 +571,9 @@ body {
 
 /* The SDK sets outline: none on the message box. The whole composer shows
    the input focus treatment instead: a Signal Teal edge and a 3px
-   translucent ring. The composer leaves 8px below it and 16px at each side
-   (ChatComposer), so the ring stays inside the chat area and its scroll box. */
+   translucent ring. The composer leaves 4px above it, 8px below it, and 16px
+   at each side (ChatComposer), so the ring stays inside the chat area and its
+   scroll box. */
 .chat-surface .copilotKitInput:has([data-testid="copilot-chat-textarea"]:focus-visible) {
   box-shadow:
     0 0 0 1px var(--color-ring),
