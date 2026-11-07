@@ -1,328 +1,183 @@
-# Self-Hosting Cogniplane Core
+# Self-hosting
 
-A production-grade deployment guide. For local dev, see [getting-started.md](getting-started.md). For the architecture this guide deploys, see [ARCHITECTURE.md](ARCHITECTURE.md). For the security model you're inheriting, see [SECURITY_FEATURES.md](SECURITY_FEATURES.md).
+Scope: production deployment. Every variable and default is in
+[configuration](configuration.md); this guide names the variables to set and the
+decisions to make.
 
-This guide is opinionated. Where there's a fork in the road, it picks the production-safe option and explains the trade-off.
+## Components
 
-## What you're about to deploy
+| Component | Requirement |
+|---|---|
+| Backend | The [Node.js version](getting-started.md#prerequisites) and Poppler `pdftotext`; the backend image includes both. Keeps only caches and running turns in memory |
+| Frontend | Next.js; any Next.js host. This repository builds for Cloudflare Workers (`pnpm --filter @cogniplane/frontend cf:build`) |
+| PostgreSQL | 17 (the version CI and Compose use), with RLS. All durable state except stored files |
+| Redis | Required with `AUTH_MODE=jwt` ([startup rules](configuration.md#startup-rules)). One dedicated database per environment ([contents](architecture/data.md#redis)) |
+| File storage | Artifacts and skill bundles: an S3-compatible bucket, or local disk on a persistent volume ([storage](#other-backend-settings)) |
+| E2B | Account and template for code execution |
+| WorkOS | Only for SSO tenants |
+| SMTP relay | Optional; email for local accounts and owner notices |
+| Model provider | At least one platform key, or tenant keys |
 
-Three runtime components plus their dependencies:
+The backend makes outbound calls to model providers, E2B, WorkOS, SMTP and proxy
+MCP servers. Proxy MCP URLs must be reachable from the backend; put upstream
+credentials in the server's authentication fields, never in the URL.
 
-```
-[ Frontend (Next.js) ] -- HTTPS --> [ Backend (Fastify) ]
-                                          |
-                                          +--> PostgreSQL (RLS)
-                                          +--> Redis (jti revocation, rate limits)
-                                          +--> Object storage (artifacts, skill bundles)
-                                          +--> E2B (per-session agent sandboxes)
-                                          +--> WorkOS (SSO)
-```
+## E2B template
 
-The agent's shell and file tools execute **inside the E2B sandboxes**, not on the backend host. The agent loop itself runs in the backend, which streams events over SSE and writes to Postgres.
+Build the template once per E2B account as in [getting
+started](getting-started.md#steps), and set `E2B_TEMPLATE_ID` to the template's
+id. The backend cannot detect a wrong real id: check it by running a shell
+command in a new chat. Template details:
+[sandbox](architecture/sandbox.md#e2b-sandbox).
 
-Proxy MCP servers can use HTTP or HTTPS URLs on the backend host, LAN, or a tailnet. The backend makes the connection, so the address must be reachable from its container or process. E2B does not make this connection. The admin form warns when a proxy URL uses HTTP or names a local address; it still lets you save the server. Managed MCP servers do not use upstream URLs. Put proxy credentials in the upstream authentication fields, not in the URL.
+## Database
 
-## Required infrastructure
+The roles and their grants are in [database roles](database-roles.md).
 
-| Component | Why | Notes |
-|---|---|---|
-| **PostgreSQL 14+** | Sole persistence layer. RLS is critical to multi-tenant isolation. | Any managed Postgres works (Neon, RDS, Cloud SQL, self-hosted). Must support `SET LOCAL` and RLS policies (Postgres 9.5+; in practice you want 14+). |
-| **Redis 6+** | Refresh-token `jti` revocation, shared rate limits across multiple backend instances. | Any managed Redis (Upstash, ElastiCache, Memorystore, self-hosted). Without Redis, rate limits and quotas are per-process — fine for a single instance, broken for a horizontal-scaled deployment. |
-| **S3-compatible object storage** | Artifact uploads and (in `bucket` mode) skill bundles. | AWS S3, Cloudflare R2, MinIO, GCS with S3 compat. The skill-bundle backend reuses `ARTIFACT_BUCKET_*` credentials by design. |
-| **E2B account** | Per-session agent sandboxes. | Sign up at [e2b.dev](https://e2b.dev). You'll need an API key and you'll build a custom template (next section). |
-| **WorkOS** (optional) | SSO through WorkOS. Not needed when your tenants use local accounts (email and password). **Do not run `dev-headers` in production** — it accepts user/tenant ids from request headers with no verification. | [workos.com](https://workos.com) — set up an organization, configure SAML/OIDC, get the API key + client id. |
-| **Node.js 24 LTS** | Runtime for the backend. The workspace pins `engines.node` to `>=24.0.0`. | The frontend is a Next.js app. This repository's Cloudflare build uses `@opennextjs/cloudflare`; verify the build and deployment path for your target. |
+1. Run `pnpm db:migrate` (backend image: `node
+   apps/backend/dist/scripts/migrate.js`) with all three URLs before each
+   backend release. It creates and updates both runtime roles and their
+   passwords.
+2. Start the backend with `DATABASE_URL` and `MAINTENANCE_DATABASE_URL` only.
+   `MIGRATION_DATABASE_URL` is for the migration job and operator commands. The
+   backend image entry point (`docker/backend-entrypoint.sh`) also unsets it;
+   `node apps/backend/dist/server.js` started directly does not.
+3. Check RLS on a database that has at least one session (sign in once and start
+   a chat). As `app_user`:
+   ```sql
+   BEGIN;
+   SELECT count(*) FROM sessions;                                   -- 0
+   SELECT set_config('app.current_tenant_id', '<tenant id>', true);
+   SELECT count(*) FROM sessions;                                   -- > 0
+   SELECT set_config('app.current_tenant_id', 'no-such-tenant', true);
+   SELECT count(*) FROM sessions;                                   -- 0
+   ROLLBACK;
+   ```
 
-## Build the E2B sandbox template
-
-The agent's shell and file tools execute inside per-session E2B sandboxes — there is no in-process execution mode, so `E2B_API_KEY` and `E2B_TEMPLATE_ID` are required at boot, unconditionally.
-
-Build the code-execution template in your own E2B account:
-
-```bash
-E2B_API_KEY=e2b_xxx make e2b-build
-```
-
-This runs `docker/build.ts`, which calls the v2 E2B Template SDK to build a `deep-agents-runtime-dev` template — a deliberately slim code-execution box (Python with pandas/openpyxl/matplotlib on the stock e2b base image; the agent loop itself runs in the backend, not in the sandbox).
-
-Building with the existing template name updates it in place, preserving the template id. Note the template id printed at the end — set it as `E2B_TEMPLATE_ID`.
-
-The built-in default for `E2B_TEMPLATE_ID` is the placeholder `replace-with-your-template-id` — the backend refuses to start until you provide a real template id via the env var.
-
-## Backend environment
-
-Full env-var schema with defaults is in `apps/backend/src/config.ts` — boot fails fast on missing required secrets via Zod. Below is the production configuration in dependency order.
-
-### Database
-
-```bash
-# RLS-active runtime pool (non-superuser).
-DATABASE_URL=postgres://app_user:<strong-password>@<host>:5432/<dbname>?sslmode=require
-
-# Runtime maintenance role with BYPASSRLS and explicit DML grants.
-MAINTENANCE_DATABASE_URL=postgres://maintenance_user:<separate-password>@<host>:5432/<dbname>?sslmode=require
-
-# Supply this DSN to the migration job only.
-MIGRATION_DATABASE_URL=postgres://postgres:<superuser-password>@<host>:5432/<dbname>?sslmode=require
-```
-
-The migration runner (`apps/backend/src/scripts/migrate.ts`) uses `MIGRATION_DATABASE_URL` to:
-1. `CREATE ROLE app_user WITH LOGIN` if missing.
-2. `ALTER ROLE app_user WITH PASSWORD '<from DATABASE_URL>'` so the runtime DSN actually works.
-3. Apply migrations idempotently.
-4. Grant application DML privileges to `app_user`, which is subject to RLS.
-5. Provision `maintenance_user` from `MAINTENANCE_DATABASE_URL` with explicit runtime DML grants, BYPASSRLS, and no schema ownership.
-
-Run `pnpm db:migrate` before starting the new backend. Migrations track applied state and checksums in `schema_migrations`. Keep the migration credential out of the backend environment. Compose uses a separate `migrate` service. Every backend instance requires `MAINTENANCE_DATABASE_URL`; the migration URL is never a fallback.
-
-**Verifying RLS is active:** after `db:migrate` succeeds, connect as `app_user` and try `SELECT * FROM sessions` without setting `app.current_tenant_id`. You should get zero rows. If you get rows, RLS is misconfigured.
-
-### Authentication
+## Authentication
 
 ```bash
-AUTH_MODE=jwt                         # Production. dev-headers is a security hole in production.
-AUTH_LOGIN_TYPES=local                # workos, local, or both: workos,local
-WEBAUTHN_RP_ID=app.example.com        # optional: turns on passkeys; the frontend's hostname
-SMTP_URL=smtps://user:password@smtp.example.com:465   # optional: email for local accounts
-MAIL_FROM=Cogniplane <no-reply@example.com>           # required with SMTP_URL
-JWT_SECRET=<32+ random bytes>         # Refresh-token signing. Rotate via JWT_KEY_ID infrastructure.
-JWT_KEY_ID=v1                         # Stamp on tokens; lets you rotate JWT_SECRET without invalidating in-flight tokens.
-DATA_ENCRYPTION_SECRET=<32+ random bytes>  # AES-256-GCM key for OAuth-token at-rest encryption.
-
-# Only when AUTH_LOGIN_TYPES includes workos:
-WORKOS_API_KEY=<from WorkOS dashboard>
-WORKOS_CLIENT_ID=<from WorkOS dashboard>
-WORKOS_REDIRECT_URI=https://your-frontend-host/auth/callback
+NODE_ENV=production                  # turns on the production startup checks
+AUTH_MODE=jwt
+AUTH_LOGIN_TYPES=workos,local        # one or both
+JWT_SECRET=<32+ random bytes>
+JWT_KEY_ID=v1
+DATA_ENCRYPTION_SECRET=<32+ random bytes>
+REDIS_URL=rediss://...
+API_ORIGIN=https://app.example.com   # the frontend origin; exactly one origin
 ```
 
-`AUTH_MODE=workos` still works: it is the earlier name for `AUTH_MODE=jwt` with
-`AUTH_LOGIN_TYPES=workos`.
+- Create `local` tenants with `auth:bootstrap`; WorkOS creates `workos` tenants
+  at first sign-in ([modes](architecture/auth.md#modes-and-sign-in-types)).
+- WorkOS: set `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, and `WORKOS_REDIRECT_URI` to
+  the frontend page `https://<frontend>/auth/callback`, not the backend; that
+  page sends the code to `POST /auth/callback`.
+- Passkeys: set `WEBAUTHN_RP_ID` to the frontend host name or a parent domain.
+  Choose it once ([local
+  accounts](architecture/local-accounts.md#second-factors-and-passkeys)).
+- Email: set `SMTP_URL` (`smtps://` port 465, or `smtp://` port 587 with
+  STARTTLS) and `MAIL_FROM` together. Configure SPF, DKIM and DMARC for the
+  sender domain. Effects of email on and off: [email](architecture/email.md).
+- Connectors (GitHub, Notion, Jira, Microsoft 365): [connectors](connectors.md).
+- Behind a proxy, set `TRUST_PROXY` to the proxy addresses.
 
-**Each tenant has one login type, set when the tenant is created. You cannot
-change it later.** WorkOS creates `workos` tenants at the first sign-in of an
-organization. You create `local` tenants with a command (next section). A
-client that starts with local accounts and later wants SSO gets a new tenant.
+## Other backend settings
 
-#### Local accounts
+- Storage: local disk (the default; mount a persistent volume) or an
+  S3-compatible bucket. Skill bundles use the artifact bucket connection
+  (`services/artifacts/artifact-storage.ts`):
+  ```bash
+  ARTIFACT_STORAGE_BACKEND=bucket
+  ARTIFACT_BUCKET_NAME=cogniplane-files
+  ARTIFACT_BUCKET_REGION=us-east-1
+  # Only for a non-AWS service: its URL, and path-style addressing if it needs it.
+  ARTIFACT_BUCKET_ENDPOINT=https://s3.example.com
+  ARTIFACT_BUCKET_FORCE_PATH_STYLE=true
+  # Static keys. Unset: the AWS SDK default credential chain (for example a task role).
+  ARTIFACT_BUCKET_ACCESS_KEY_ID=...
+  ARTIFACT_BUCKET_SECRET_ACCESS_KEY=...
+  # Optional: temporary credentials, and a key prefix inside the bucket.
+  ARTIFACT_BUCKET_SESSION_TOKEN=...
+  ARTIFACT_BUCKET_PREFIX=cogniplane/
+  SKILL_BUNDLE_STORAGE_BACKEND=bucket
+  SKILL_BUNDLE_BUCKET_NAME=cogniplane-files
+  ```
+  The backend needs `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the
+  bucket. Skill bundles upload with `@aws-sdk/lib-storage`, which can use
+  multipart uploads, so on AWS also allow `s3:AbortMultipartUpload`. Keep it
+  private: downloads stream through the backend. Check: upload a file in a chat,
+  download it, and import a skill in Admin > Skills.
+- Runtime: `E2B_API_KEY`, `E2B_TEMPLATE_ID`.
+- Model providers: set at least one platform key, or let tenants add keys
+  ([model providers](architecture/models.md#model-providers)). Provider terms
+  apply to each key owner.
+- PII: `PII_PROVIDER_ENABLED`, `PII_LLM_*`; `PII_RETENTION_KEK` when a tenant
+  keeps reversible findings. See [PII](architecture/pii.md).
+- Workers: `SCHEDULER_*`. Many replicas can run them.
+- Spending defaults: `MODEL_SPENDING_*` ([model
+  spending](architecture/model-spending.md)).
 
-Local accounts sign in with email and password. Passwords are hashed with
-Argon2id (Node 24.7 or later is required). Create a local tenant and its first
-owner:
+## Frontend
+
+- Build with `NEXT_PUBLIC_API_URL` set to the backend URL ([frontend
+  builds](architecture/frontend.md#builds-and-variables)). Leave
+  `NEXT_PUBLIC_DEV_USER_ID` and the other dev-auth values unset.
+- Serve the frontend and the backend over HTTPS; the refresh cookie needs it
+  ([auth](architecture/auth.md#tokens-and-cookies)).
+- For MCP Apps, serve the sandbox page on a separate origin ([MCP
+  Apps](architecture/mcp-apps.md#enable-render_interactive_ui)).
+
+## Deploy with the images
+
+One supported path, with the Dockerfiles in `docker/`. Set the backend variables
+from the sections above in a `backend.env` file (see Database, step 2).
 
 ```bash
-MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend auth:bootstrap \
-  --tenant-name "Acme" --owner-email owner@acme.example
+docker build -f docker/backend.Dockerfile -t cogniplane-backend .
+docker build -f docker/frontend.Dockerfile \
+  --build-arg NEXT_PUBLIC_API_URL=https://api.example.com -t cogniplane-frontend .
+
+# 1. Migrations: all three database URLs, once per release.
+docker run --rm -e DATABASE_URL=... -e MAINTENANCE_DATABASE_URL=... \
+  -e MIGRATION_DATABASE_URL=... cogniplane-backend node apps/backend/dist/scripts/migrate.js
+
+# 2. Backend (port 3001). --stop-timeout: see the shutdown note in operations.md.
+#    Local storage: keep the volume and the two roots; with a bucket, drop them.
+docker run -d --env-file backend.env -p 3001:3001 --stop-timeout 40 \
+  -v cogniplane-data:/var/lib/cogniplane \
+  -e ARTIFACT_STORAGE_ROOT=/var/lib/cogniplane/artifacts \
+  -e SKILL_BUNDLE_STORAGE_ROOT=/var/lib/cogniplane/skills \
+  cogniplane-backend
+curl -fsS https://api.example.com/ready     # {"status":"ok"}
+
+# 3. Frontend (port 3000).
+docker run -d -p 3000:3000 cogniplane-frontend
 ```
 
-The command prints a one-time setup link (valid 72 hours). Send it to the owner
-in a private message. The owner sets a password, then adds people in
-**Admin › People**; each new person gets their own setup link. Owners and admins
-can reset a password (a one-time link), disable or enable an account, and sign a
-person out of every device. Resetting and disabling ask for the manager's own
-password again. The person who holds a reset link can set the password, so send
-links only to the person they are for.
-
-People can add an authenticator app in **Settings › Sign-in & security** and
-get 10 recovery codes. In **Admin › People**, a manager can make two-step
-verification required for owners and admins, or for everyone; only an owner can
-make the rule weaker. If a person loses their phone and their recovery codes, a
-manager resets their two-step verification, and the person sets it up again at
-the next sign-in. Manager actions ask for a code from the manager's own
-authenticator app when the manager has one.
-
-To turn on passkeys, set `WEBAUTHN_RP_ID` to the hostname of the frontend
-(`API_ORIGIN`). People can then add passkeys in **Settings › Sign-in &
-security**, sign in with a passkey and no password, and use a passkey as their
-second step. Passkeys are bound to `WEBAUTHN_RP_ID`: if you change it later,
-every registered passkey stops working, and people need a recovery code or a
-manager reset.
-
-To send email to local accounts, set `SMTP_URL` and `MAIL_FROM` (both or
-neither). Use your mail provider's SMTP relay with `smtps://` (port 465) or
-`smtp://` (port 587, STARTTLS is required). People then get a security notice
-when their password changes, when a second factor is added or removed, and
-when a manager resets their second factors. Setup and reset links then go
-to the person by email, not to the manager, and the People page shows whether
-the email went out, with "Send the link again". The sign-in page
-also offers "Forgot your password?": a person gets a reset link by email that
-works for 30 minutes (their two-step verification stays). Messages wait in
-the database (encrypted) until a backend process sends them, and are retried
-when the relay is down. Configure SPF, DKIM, and DMARC for the domain of
-`MAIL_FROM`, or receiving servers can mark the messages as spam.
-
-If an owner loses their password and no other owner can help:
-
-```bash
-MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend auth:recover-owner \
-  --tenant-id <tenant id> --email owner@acme.example
-```
-
-This ends all of the owner's sessions, removes the password and the second
-factors, writes an audit event, and prints a new setup link. In the container image the commands are
-`node dist/scripts/auth-bootstrap.js` and `node dist/scripts/auth-recover-owner.js`.
-
-`JWT_SECRET` and `DATA_ENCRYPTION_SECRET` MUST differ from the placeholder values in `.env.example`. The boot-time validator will reject placeholders in production.
-
-The WorkOS redirect URI must match exactly what's registered in your WorkOS dashboard. It points to the **frontend**: WorkOS sends the browser to the frontend page `/auth/callback`, which posts the code and state to the backend `POST /auth/callback` for the exchange. The backend has no `GET /auth/callback`, so a redirect URI on the backend host fails with 404.
-
-### Redis
-
-```bash
-REDIS_URL=rediss://default:<password>@<host>:6379  # TLS-required for production
-```
-
-Required for `AUTH_MODE=jwt`. The refresh-token `jti` is consumed atomically via `GETDEL` on every refresh; without Redis, you have no replay defense. Also used for shared rate limits and quotas across multiple backend instances.
-
-### Object storage
-
-```bash
-ARTIFACT_STORAGE_BACKEND=bucket
-ARTIFACT_BUCKET_NAME=<your-bucket>
-ARTIFACT_BUCKET_REGION=<region>
-ARTIFACT_BUCKET_ENDPOINT=<S3-compatible endpoint>   # Optional; default is AWS S3
-ARTIFACT_BUCKET_ACCESS_KEY_ID=<credential>
-ARTIFACT_BUCKET_SECRET_ACCESS_KEY=<credential>
-
-SKILL_BUNDLE_STORAGE_BACKEND=bucket
-SKILL_BUNDLE_BUCKET_NAME=<usually same as ARTIFACT_BUCKET_NAME>
-SKILL_BUNDLE_BUCKET_PREFIX=skills                   # Optional key prefix
-```
-
-Skill bundles are content-addressed: the same bundle hash always points at the same S3 key, so re-deploys never re-upload identical bundles. The local extraction cache (`SKILL_BUNDLE_CACHE_ROOT`, default `<os.tmpdir()>/cogniplane-skill-cache`) is also content-addressed and idempotent — `/tmp` ephemerality on container restart is fine because S3 is the source of truth.
-
-### Runtime sandboxing
-
-```bash
-E2B_API_KEY=<from e2b.dev>
-E2B_TEMPLATE_ID=<from your template build>
-
-# RUNTIME_GATEWAY_BASE_URL is the URL the runtime's MCP client dials for /mcp.
-# The agent loop (and its MCP client) run in the backend process itself, so
-# this must be reachable from the backend over loopback only.
-RUNTIME_GATEWAY_BASE_URL=http://localhost:3001
-```
-
-Note: `RUNTIME_GATEWAY_BASE_URL` must resolve to a loopback address (`localhost`, `127.0.0.1`, or `[::1]`). The MCP gateway enforces loopback-only peer admission and rejects external hostnames at startup validation.
-
-### Model provider key (Anthropic)
-
-```bash
-# Server-level fallback — used when no per-tenant key is configured.
-ANTHROPIC_API_KEY=<from console.anthropic.com>
-```
-
-The Deep Agents runtime calls the Anthropic API (via LangChain's `@langchain/anthropic`); an Anthropic key is required for any agent turn to run. Two paths are supported and you should pick the right one for your deployment shape:
-
-- **Per-tenant keys** (preferred for multi-tenant production). Saved via the admin UI in org settings, encrypted at rest with `DATA_ENCRYPTION_SECRET`, scoped per tenant. Each tenant uses its own billing account; the key never appears in environment variables or process listings. This is the default path for SaaS-style deployments where you don't want one Anthropic invoice covering every tenant.
-- **Server-level env-var fallback**. Used when no per-tenant key is set. Right for single-tenant or solo-operator self-hosters where one Anthropic account covers everything.
-
-The runtime resolves the key for a turn as: per-tenant key → env-var fallback → null. If both resolve to null, `/models` returns an empty list — the "configure a key" state — and no turn can run for that tenant.
-
-**Anthropic Commercial Terms apply.** Cogniplane Core does not bundle any Anthropic SDK binary — the platform calls the Anthropic API directly through LangChain — but API use is governed by Anthropic's [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms), not by Cogniplane Core's AGPL license. A paid API key from `console.anthropic.com` is required — **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used. Each tenant (or operator, for the env-var path) is responsible for maintaining their own Anthropic account and complying with Anthropic's terms.
-
-### Optional: PII detection
-
-```bash
-PII_PROVIDER_ENABLED=false
-PII_LLM_BASE_URL=https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint
-PII_LLM_API_KEY=<provider key>
-PII_LLM_MODEL=google/gemini-2.5-flash
-PII_PROVIDER_TIMEOUT_MS=5000
-```
-
-PII detection is opt-in. The pipeline targets any OpenAI-compatible `/chat/completions` endpoint — point `PII_LLM_BASE_URL` at OpenRouter, a cloud provider, or a model you self-host (e.g. a local Ollama or vLLM server). Whatever provider you choose, you accept that vendor's logging posture; self-hosting the model keeps inference entirely within your own infrastructure.
-
-### Workers
-
-```bash
-SCHEDULER_ENABLED=true
-SCHEDULER_MAX_CONCURRENT_JOBS=2             # Default 2; raise with instance size
-SCHEDULER_JOB_TIMEOUT_MS=300000             # 5 min hard cap per job (default)
-SCHEDULER_POLL_INTERVAL_MS=30000
-SCHEDULER_MAX_CONSECUTIVE_FAILURES=5        # Poison-job guard: auto-disable after N straight failures
-```
-
-The scheduler claims due jobs atomically (`FOR UPDATE SKIP LOCKED`) so it's safe to run multiple backend instances; only one will pick up any given job.
-
-### CORS
-
-```bash
-API_ORIGIN=https://your-frontend-host       # Exact match, single origin. Comma-separate for multiple.
-```
-
-The backend rejects requests from any origin not on this list. CORS for SSE responses is set explicitly via the same allowlist (the response is hijacked, so Fastify's automatic CORS doesn't fire).
-
-## Frontend deployment
-
-The frontend is a Next.js 16 app. Deploy it however you deploy Next apps. Required env vars at **build time** (not runtime — these get baked into the bundle):
-
-```bash
-NEXT_PUBLIC_API_URL=https://your-backend-host
-# Do NOT set NEXT_PUBLIC_DEV_USER_ID in production builds. Setting it bypasses WorkOS.
-```
-
-If your frontend and backend are on different domains (typical), the WorkOS refresh cookie must use `SameSite=None; Secure=true` — without it, the browser silently rejects the cookie on cross-site requests. The cookie is scoped to the **backend domain**, so the frontend middleware can't read it; route protection on the frontend is handled client-side by `auth-guard.tsx`.
+For MCP Apps, see the image note in [MCP
+Apps](architecture/mcp-apps.md#enable-render_interactive_ui). Put TLS in front
+of both. Chat turns stream as SSE (`text/event-stream`): configure the proxy not
+to buffer them (for nginx, `proxy_buffering off`) and to allow long-lived
+connections. Check: send a chat message; the answer must appear progressively,
+not all at once at the end. For Cloudflare Workers, build the frontend with
+`cf:build` instead ([frontend](architecture/frontend.md#builds-and-variables)).
 
 ## Production checklist
 
-Before you point real users at it:
+- [ ] `AUTH_MODE=jwt`, never `dev-headers`.
+- [ ] Unique `JWT_SECRET` and `DATA_ENCRYPTION_SECRET` (startup refuses the
+  built-in defaults).
+- [ ] `REDIS_URL` set, on a dedicated Redis database.
+- [ ] RLS check (step 3) returns 0, then more than 0, then 0.
+- [ ] Backend has no `MIGRATION_DATABASE_URL`.
+- [ ] TLS in front of the backend and the frontend.
+- [ ] Private bucket.
+- [ ] `E2B_TEMPLATE_ID` matches the current build.
+- [ ] Backups cover PostgreSQL and object storage ([Backups and
+  restore](operations.md#backups-and-restore)).
+- [ ] A scheduled delete for old `audit_events` and `tool_events` ([Audit
+  retention](operations.md#audit-retention)).
+- [ ] Each tenant has an owner.
 
-- [ ] **RLS is active.** Connect as `app_user` (not superuser), forget to set `app.current_tenant_id`, query a tenant-scoped table — should return zero rows. If it returns rows, stop and fix.
-- [ ] **`AUTH_MODE=jwt`** (or its alias `workos`), NOT `dev-headers`.
-- [ ] **`JWT_SECRET` and `DATA_ENCRYPTION_SECRET` are not placeholder values.** The boot validator will reject `local-dev-jwt-secret-change-in-production!!`.
-- [ ] **`REDIS_URL` is configured.** Without it, refresh-token reuse detection is broken.
-- [ ] **TLS in front of the backend.** HSTS is sent on every response (2-year preload); serving HTTPS is required for it to make sense.
-- [ ] **Object storage bucket has restrictive ACLs.** The artifact download flow always issues short-lived presigned URLs — there's no reason for any object in your bucket to be public.
-- [ ] **`E2B_TEMPLATE_ID` matches what `make e2b-build` produced.** The backend fails fast on the placeholder default, but it cannot detect a stale-but-real id — verify after every template rebuild under a new name.
-- [ ] **Database backups configured.** Postgres is the only durable state — sessions, messages, audit events, integrations all live there. Treat it like the production database it is.
-- [ ] **Log retention policy set.** Tool events (`tool_events`) and audit events (`audit_events`) accumulate. Decide your retention before they fill the disk.
-- [ ] **At least one user is `owner` of each tenant.** First-member owner promotion is automatic on the first WorkOS callback, but verify it actually happened. For a local tenant, `auth:bootstrap` creates the owner.
-
-## Operating concerns
-
-### Scaling out the backend
-
-The backend is stateless modulo Redis and Postgres. Run multiple instances behind a load balancer — that's the intended deployment shape. Each instance:
-
-- Holds in-memory rate limits/quotas only when Redis isn't configured (so configure Redis for multi-instance).
-- Runs its own scheduler poll loop, but `FOR UPDATE SKIP LOCKED` makes job claiming safe across instances.
-- Holds its active agent sessions (and their lazy E2B sandboxes) in process memory. There's no shared sandbox pool — sessions are per-instance.
-
-What this means: a session's live runtime state lives on whichever backend instance accepted the first message of that session. Subsequent messages on the same session need to land on the same instance, OR the new instance rebuilds the session — conversation history resumes from the Postgres checkpointer (the LangGraph thread is durable), while workspace files start from a fresh sandbox. Sticky sessions (load-balancer level) is the simplest path; failover works but adds a cold-start hit and loses un-captured sandbox files.
-
-### Rotating secrets
-
-- **`JWT_SECRET`**: stamp `kid` (`JWT_KEY_ID`) on every token already; bump the env-var, deploy, and existing tokens with old `kid` continue to validate against the old secret until they expire (15 min for access tokens, 7d for refresh tokens). Plan one full refresh window before retiring the old key.
-- **`DATA_ENCRYPTION_SECRET`**: this encrypts at-rest OAuth tokens. Rotating means re-encrypting every `user_*_connections` row. There's no automated rotation in the OSS code — script it as a one-off migration if you need to.
-- **`WORKOS_API_KEY`** / **provider keys**: bump the env-var and redeploy. WorkOS-issued JWTs survive the API key rotation; only the server-to-server WorkOS client uses the API key.
-
-### Bumping pinned versions
-
-The sandbox template's package pins (Python data-stack versions) live directly in `docker/template.ts`. Bumping is:
-
-1. Edit the pins in `docker/template.ts`.
-2. Run `make e2b-build` to rebuild the template. Building under the same template name updates it in place, so `E2B_TEMPLATE_ID` does not change.
-3. Deploy (running sandboxes keep their old image; new sessions pick up the rebuilt template).
-
-### Monitoring
-
-The OSS code emits structured logs via Fastify's pino logger. There's no built-in metrics endpoint or dashboard — wire your usual observability stack (Datadog, Grafana, OpenTelemetry, etc.) at the log/metric layer.
-
-What's worth alerting on:
-
-- Backend 5xx rate.
-- `audit_events` rows where `event_type LIKE 'auth.%' AND payload->>'reason' = '%'` — auth failures.
-- `approvals` rows stuck in `pending` past their TTL — approval flow is wedged.
-- `runtime_sessions` rows in unexpected states (long-running, crashed-but-not-cleaned).
-- `scheduled_jobs` failure rate — usually means a tenant's scheduled prompt is broken.
-
-Cost tracking: per-turn usage is persisted on `messages` (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, `model_name`, `cost_usd`). `SELECT SUM(cost_usd) FROM messages WHERE created_at > now() - interval '1 day'` is a starting point for daily spend.
-
-## Where to go from here
-
-- [ARCHITECTURE.md](ARCHITECTURE.md) — the system you just deployed, in detail
-- [SECURITY_FEATURES.md](SECURITY_FEATURES.md) — full inventory of security controls; useful for security review questionnaires
-- [DECISIONS.md](DECISIONS.md) — why the architecture is shaped the way it is
-- [deepagentsjs API reference](https://reference.langchain.com/javascript/deepagents) — the library the agent runtime is built on
-- [guides/skill-bundle-decisions.md](guides/skill-bundle-decisions.md) — skill bundle storage and lifecycle
-- [COMMERCIAL.md](../COMMERCIAL.md) — commercial license terms if AGPL doesn't fit your distribution model
+Operations (upgrade, scaling, secret rotation, backups, audit retention, tenant
+deletion, monitoring): [operations](operations.md).

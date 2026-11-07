@@ -1,83 +1,91 @@
 # Working in Cogniplane Core
 
-Cogniplane Core is a multi-tenant browser workspace built with Fastify, Next.js,
-and shared TypeScript contracts. Deep Agents runs the agent loop in the backend;
-E2B supplies lazy shell and file execution.
+Scope: rules and the documentation map for coding agents in this repository.
 
-## Delivery and contributions
+Cogniplane Core is a multi-tenant browser workspace for governed AI agents:
+Fastify backend, Next.js frontend, shared Zod contracts. Deep Agents runs the
+agent loop in the backend; E2B runs shell and file tools.
 
-Carry the requested change through implementation and verification. Trace the
-HTTP route, runtime, persistence, and frontend paths that participate. Keep a
-small change small. Preserve existing work and security boundaries.
+## Delivery
 
-Do not commit, push, publish, merge, or deploy without explicit user authorization.
-When authorized, use conventional commits, batch related changes, and run the
-required checks. Do not bypass hooks. See [CONTRIBUTING](CONTRIBUTING.md) for the
-contribution process. Do not add AI attribution to commits or PRs.
+- Carry a change through implementation and verification. Trace the route,
+  runtime, persistence and frontend paths it touches. Keep small changes small.
+  Preserve existing work and security boundaries.
+- Do not commit, push, publish, merge or deploy without explicit user
+  authorization. When authorized: Conventional Commits, related changes batched,
+  required checks run, hooks never bypassed. No AI attribution in commits or PRs.
+  Process: [CONTRIBUTING](CONTRIBUTING.md).
+- Report what changed, which checks ran, and what stays unverified. Passing unit
+  mocks do not prove a live provider call or a database policy.
 
-Report what changed, which checks ran, and what remains unverified. Passing unit
-mocks does not prove a live provider call or a database policy.
+## Rules
 
-## Code map and security boundaries
+Short forms of the most-used rules; each links to its owner.
 
-- `apps/backend/src/routes/`: HTTP entrypoints. `services/` contains stores,
-  workers, integrations, and the Deep Agents runtime. `lib/` contains auth and DB access.
-- `apps/frontend/src/app/`, `components/`, `hooks/`, `lib/`: routes, UI, state,
-  and clients. AG-UI chat connects through `lib/agui/deep-agents-browser-agent.ts`
-  and `components/copilot-chat-host.tsx`.
-- `packages/shared-types/src/`: shared Zod contracts. Consumers import built
-  `dist/`; rebuild this package after edits before testing consumers.
-- `apps/backend/db/migrations/`: authoritative SQL. Never edit applied migrations;
-  add a numbered migration. The runner checks each applied file's hash.
-- Tenant queries use `withTenantScope`, a transaction-local tenant setting, and
-  the RLS-constrained `app_user`. Privileged maintenance needs an explicit
-  authorization reason. Checkpointer tables in `deep_agents` have no RLS;
-  validate session ownership before reaching them.
-- MCP identity and credentials come from backend context. Preserve approval
-  proof binding, tenant isolation, expiry, and secret redaction. Classify public
-  error messages; unexpected SDK or DB errors must not expose internal details.
-- Native and Policy Center approvals pause the checkpointed graph. Keep resume
-  values keyed by interrupt id and preserve gateway approval-proof verification.
-- E2B workspaces hold artifacts across turns. Artifact checkboxes select prompt
-  context; they do not revoke access to files already synced to the workspace.
-- Skills use a read-only `/skills/` library. Trace import, revision metadata,
-  activation, runtime config, and library construction when changing that path.
-- Frontend middleware is a redirect hint. Backend authentication is the security
-  boundary. Preserve the chat host's live-stream and reload-seeding behavior.
+- Run tenant queries in `withTenantScope` as `app_user`
+  ([tenant data invariant](docs/security.md#tenant-data)).
+- Never give credentials to the model or the sandbox
+  ([credentials invariant](docs/security.md#credentials)).
+- Build public errors with `apiError`; never expose SDK or database errors
+  ([public errors invariant](docs/security.md#public-errors)).
+- Never edit an applied migration; add the next numbered file
+  ([conventions](docs/development.md#conventions)).
+- Before other backend changes, read all
+  [security invariants](docs/security.md#invariants).
 
-Read [architecture](docs/ARCHITECTURE.md) for the affected subsystem.
-[Configuration](docs/CONFIGURATION.md) is generated from
-`apps/backend/src/config.ts`; do not maintain a second list of defaults here.
-[Self-hosting](docs/self-hosting.md) owns infrastructure and setup requirements.
+## Verify
 
-## Commands and verification
+Run `make test` and `make lint` for every change. Also run:
 
-Use Node 24 and the Corepack pnpm version pinned in `package.json`, from repo root.
+- `make test-integration` after a change to SQL, RLS, a migration or a store;
+- `pnpm --filter @cogniplane/frontend cf:build` after a frontend build or
+  configuration change;
+- `pnpm --filter @cogniplane/shared-types build` before you test consumers of an
+  edited contract;
+- the [configuration](docs/configuration.md) and [routes](docs/routes.md)
+  generators after a change to `apps/backend/src/config.ts` or to a route.
 
-```bash
-make dev                  # configured local stack; see README prerequisites
-make test                 # root Vitest suite and workspace typechecks
-make lint                 # workspace ESLint
-pnpm test:integration     # requires INTEGRATION_DATABASE_URL (see below)
-pnpm --filter @cogniplane/shared-types build
-pnpm exec vitest run apps/backend/src/services/managed-tools/factory.test.ts
-pnpm exec vitest run -t "write_artifact" apps/backend/src/services/managed-tools/factory.test.ts
-make e2b-build
-```
+Other commands, test rules and CI gates: [development](docs/development.md).
 
-The SharePoint integration is bundled under `private/sharepoint-overlay-*`.
-These paths and `@cogniplane-private/*` names are historical; the packages
-are open source and covered by the root license.
+## Documentation map
 
-For `pnpm test:integration`, set `INTEGRATION_DATABASE_URL` to a superuser
-connection URL for the test Postgres server. The suite creates and drops its
-own isolated database. `make test-integration` starts local Postgres when the default URL is used.
+Read the document for your task. Each fact has one owner; update that owner and
+link to it. Look up capitalized names in [configuration](docs/configuration.md)
+(backend), [frontend](docs/architecture/frontend.md#builds-and-variables) or
+[connectors](docs/connectors.md) (overlay); any other is a code constant in the
+cited file.
 
-Backend unit tests use Vitest and shared fakes under
-`apps/backend/src/test-helpers/`, including `test-runtime-policy.ts`. Check those
-helpers before adding a fake. Real Postgres security tests live under
-`apps/backend/src/integration/`; unit fakes cannot validate RLS.
-
-[Contributing](CONTRIBUTING.md) describes contributor checks and CI gates.
-Verify frontend build changes with `pnpm --filter @cogniplane/frontend cf:build`.
-[README](README.md#quickstart) owns local setup.
+| Task | Read |
+|---|---|
+| Find code; system shape; turn flow; terms | [architecture overview](docs/architecture/overview.md) |
+| Agent graph, session types, turns, reconnect and stop, streaming contract, scheduled jobs and workers | [runtime](docs/architecture/runtime.md) |
+| Model providers and keys, custom models, [add a model](docs/architecture/models.md#add-a-model-or-provider), utility model | [models](docs/architecture/models.md) |
+| Model cost limits | [model spending](docs/architecture/model-spending.md) |
+| E2B sandbox, workspace, template, sandbox network | [sandbox](docs/architecture/sandbox.md) |
+| MCP gateway, managed and proxy tools, member credentials, personal connections | [tools](docs/architecture/tools.md) ([add a core managed tool](docs/architecture/tools.md#add-a-core-managed-tool)) |
+| Native approvals, approval cards, Policy Center approval proof | [approvals](docs/architecture/approvals.md) |
+| Tenant tool rules (allow, block, require approval) | [Policy Center](docs/architecture/policy-center.md) |
+| Auth modes, tokens, request authentication, roles, WorkOS sign-in | [auth](docs/architecture/auth.md) |
+| Local accounts, revocation, MFA, passkeys, operator commands | [local accounts](docs/architecture/local-accounts.md) |
+| SMTP, account emails, email outbox | [email](docs/architecture/email.md) |
+| Step-up, data routes, weaker controls, skill releases, owner notices | [sensitive changes](docs/architecture/sensitive-changes.md) |
+| RLS, [add a tenant table](docs/architecture/data.md#add-a-tenant-table), tenant settings, Redis, retention, audit, usage and feedback, rate limits | [data](docs/architecture/data.md) |
+| Projects, artifacts, uploads, downloads, workspace sync | [projects and files](docs/architecture/projects-and-files.md) |
+| PII detection, scan jobs, PII policy | [PII protection](docs/architecture/pii.md) |
+| Skills, skill bundles, capability resolution | [skills](docs/architecture/skills.md) |
+| Long-term memory, memory consent | [memory](docs/architecture/memory.md) |
+| Frontend routes, providers, API clients, builds, [add a page](docs/architecture/frontend.md#add-a-page) | [frontend](docs/architecture/frontend.md) |
+| Chat host, `render_ui`, side panel, tool cards | [chat UI](docs/architecture/chat-ui.md) |
+| Widgets, `render_interactive_ui`, MCP App sandbox | [MCP Apps](docs/architecture/mcp-apps.md) |
+| Commands, tests, CI, [new HTTP route and shared contracts](docs/development.md#conventions), deferred SQL, releases | [development](docs/development.md) |
+| New connector or overlay | [overlays](docs/overlays.md) |
+| Set up GitHub, Notion, Jira, Microsoft 365 or a proxy MCP server; [logos](apps/frontend/public/integrations/README.md) | [connectors](docs/connectors.md) |
+| Upstream MCP server verifying gateway requests | [MCP proxy signature](docs/mcp-proxy-signature.md) |
+| Security invariants, secrets, outbound URL (SSRF) rules, headers; review | [security model](docs/security.md), [threat index](docs/threat-index.md) |
+| Environment variables; HTTP routes (both generated) | [configuration](docs/configuration.md), [routes](docs/routes.md) |
+| Database roles and grants | [database roles](docs/database-roles.md) |
+| Local setup; Compose stack; production | [getting started](docs/getting-started.md), [Docker deploy](docs/docker-deploy.md), [self-hosting](docs/self-hosting.md) |
+| Upgrade, scaling, secrets, backups, audit retention, tenant deletion, monitoring | [operations](docs/operations.md) |
+| Why the design is this way | [decisions](docs/decisions.md) |
+| Contribution process, CLA, licenses; vulnerability reports | [CONTRIBUTING](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) |
+| UI design; Next.js version notes | [PRODUCT](apps/frontend/PRODUCT.md), [DESIGN](apps/frontend/DESIGN.md), [frontend AGENTS](apps/frontend/AGENTS.md) |

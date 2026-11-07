@@ -1,156 +1,100 @@
-# Getting Started
+# Getting started
 
-A 5-minute walkthrough that gets Cogniplane Core running on your machine and walks you through your first agent session.
-
-If you want production-grade deployment instead, see [self-hosting.md](self-hosting.md).
+Scope: run Cogniplane Core on one machine for development. For a container
+stack, see [Docker deploy](docker-deploy.md). For production, see
+[self-hosting](self-hosting.md).
 
 ## Prerequisites
 
-You need:
+- Node.js 24 (`engines.node`); 24.7 or later for local accounts ([startup
+  rules](configuration.md#startup-rules)). pnpm through Corepack (`corepack
+  enable`; `package.json` pins the version).
+- Docker with the Compose plugin. `make dev` runs PostgreSQL in a container.
+- `lsof` (the port check of `make dev` uses it) and Poppler's `pdftotext` (PDF
+  text extraction; `PDFTOTEXT_BINARY_PATH`).
+- An API key for at least one [model
+  provider](architecture/models.md#model-providers). For Anthropic, a paid API
+  key; consumer Claude subscriptions do not work.
+- An E2B account. The backend does not start without `E2B_API_KEY` and a real
+  `E2B_TEMPLATE_ID`. There is no local execution mode.
 
-- **Node.js 24 LTS or later**. Check with `node --version`. The workspace pins `engines.node` to `>=24.0.0` in `package.json`; older versions will fail `pnpm install` with an `EBADENGINE` error.
-- **pnpm** via Corepack — `corepack enable` is enough; pnpm itself is pinned via the workspace.
-- **Docker** with the Compose plugin (`docker compose version` should work). The `make dev` flow runs Postgres in a container.
-- **Git**.
-
-And two service accounts:
-
-- **An `ANTHROPIC_API_KEY`** — the model key for the Deep Agents runtime. Without it (or a per-tenant key), the model selector is empty and no agent turn can run. A paid API key from [console.anthropic.com](https://console.anthropic.com) is required; **consumer Free/Pro/Max subscriptions are not supported**, and OAuth tokens from the consumer apps cannot be used.
-- **An `E2B_API_KEY` + `E2B_TEMPLATE_ID`** — the runtime executes shell and file tools inside per-session [E2B](https://e2b.dev) sandboxes; there is no unsandboxed local-execution mode, and the backend fails fast at boot without them. Run `make e2b-build` once to build the code-execution template in your E2B account, then set `E2B_TEMPLATE_ID` to the printed id. Sandboxes are created lazily — chat-only sessions never start one.
-
-Cogniplane Core does not bundle a free model — agents need a paid model-provider account.
-
-## 1. Clone and install
+## Steps
 
 ```bash
 git clone https://github.com/Cogniplane/cogniplane-core.git
 cd cogniplane-core
-pnpm install
-```
-
-Installation pulls dependencies for both `apps/backend` and `apps/frontend`, plus the shared types package. Expect this to take a minute or two on a cold install.
-
-## 2. Configure environment
-
-```bash
+corepack pnpm install --frozen-lockfile
 cp apps/backend/.env.example apps/backend/.env
 cp apps/frontend/.env.example apps/frontend/.env.local
+E2B_API_KEY=e2b_... make e2b-build    # builds template deep-agents-runtime-dev
 ```
 
-The defaults in `.env.example` are tuned for the make-dev flow: dev-headers auth (no SSO required), local Postgres on the standard port. Open `apps/backend/.env` and confirm:
+In `apps/backend/.env`, set:
 
-- `AUTH_MODE=dev-headers` — bypasses WorkOS for local hacking.
-- `DATABASE_URL`, `MAINTENANCE_DATABASE_URL`, and `MIGRATION_DATABASE_URL` — the make target stands these up automatically.
-- `ANTHROPIC_API_KEY=sk-ant-...` — the model key for agent turns.
-- `E2B_API_KEY` and `E2B_TEMPLATE_ID` — from your E2B account and the `make e2b-build` output.
+- `E2B_API_KEY`, and `E2B_TEMPLATE_ID`: the id of template
+  `deep-agents-runtime-dev` (build log or E2B dashboard).
+- One provider key, for example `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. You can
+  also save a key per tenant later in Admin > Models.
 
-**Where the model key lives (env vs. per-tenant).** `ANTHROPIC_API_KEY` in `.env` is the **server-level fallback**. The runtime resolves a key as: per-tenant key (saved in admin → org settings, encrypted at rest) → env-var fallback → null. For local solo dev, putting the key in `.env` is the fastest path. For production multi-tenant deployments, prefer the per-tenant path so each tenant uses its own billing account and the key never leaves the database.
-
-## 3. Start the stack
+Keep the defaults for the rest: `AUTH_MODE=dev-headers`, local database URLs. Do
+not commit `.env` files.
 
 ```bash
 make dev
 ```
 
-This single command:
+`make dev` starts PostgreSQL, waits until it is healthy, runs migrations, then
+starts the backend (`http://localhost:3001`) and the frontend
+(`http://localhost:3000`).
 
-1. Starts Postgres in a Docker container and waits for it to accept connections.
-2. Runs migrations against the new database (creates the `app_user` role, enables Row-Level Security policies, seeds platform-default tenant settings).
-3. Starts the Fastify backend on `http://localhost:3001`.
-4. Starts the Next.js frontend on `http://localhost:3000`.
+## Check that it works
 
-You should see logs from both servers interleaved. The first run takes the longest because Docker pulls the Postgres image. Subsequent runs reuse the container and migration state.
+1. Open `http://localhost:3000`. In `dev-headers` mode there is no sign-in: the
+   frontend sends `X-User-Id: local-dev-user` and `X-Tenant-Id:
+   local-dev-tenant`. Users in `ADMIN_USER_IDS` (default: `LOCAL_DEV_USER_ID`)
+   are owners; others are members.
+2. Select a model and send "What files are in this workspace?". A tool card
+   appears and the answer streams.
+3. Open `http://localhost:3000/admin` for tenant settings, skills and MCP
+   servers.
+4. To see an approval: in Admin > Policies, add a rule `require_approval` for
+   `write_artifact`, set enforcement to `enforce`, then ask the agent to write a
+   file. The turn pauses at an approval card.
 
-If something goes wrong, the [Troubleshooting](#troubleshooting) section at the bottom covers the common cases.
+## Local accounts and email in development
 
-### Common Make targets
+`dev-headers` skips sign-in. To test local accounts, MFA, passkeys or email:
 
-| Target | What it does |
-|---|---|
-| `make dev` | Start Postgres in Docker, run migrations, start backend + frontend (the quickstart path). |
-| `make test` | Run unit tests across the workspace + typecheck. |
-| `make lint` | ESLint across the workspace. |
-| `make typecheck` | `tsc --noEmit` across the workspace. |
-| `make build` | Production build (`pnpm build`). |
-| `make migrate` | Run DB migrations against the configured `DATABASE_URL`. |
-| `make smoke` | Local end-to-end smoke test — boots the stack and runs one `/messages` turn. Requires API keys. |
+1. Stop `make dev`. Start Redis: `docker compose up -d redis`. For email, also
+   start the mail catcher: `docker compose --profile mail up -d mailpit` (web UI
+   on `http://localhost:8025`).
+2. In `apps/backend/.env`, set `AUTH_MODE=jwt`, `AUTH_LOGIN_TYPES=local`,
+   `REDIS_URL=redis://localhost:6379`, your own `JWT_SECRET` and
+   `DATA_ENCRYPTION_SECRET` (the built-in defaults are refused), and optionally
+   `WEBAUTHN_RP_ID=localhost`. For email: `SMTP_URL=smtp://localhost:1025`,
+   `MAIL_FROM=...`, `SMTP_ALLOW_PLAINTEXT=true`.
+3. In `apps/frontend/.env.local`, remove `NEXT_PUBLIC_DEV_USER_ID` and
+   `NEXT_PUBLIC_DEV_TENANT_ID`.
+4. Start `make dev` again, so that both servers load the new values.
+5. Create a tenant and owner ([operator
+   commands](architecture/local-accounts.md#operator-commands)):
+   ```bash
+   MIGRATION_DATABASE_URL=postgres://postgres:postgres@localhost:5432/cogniplane \
+     pnpm --filter @cogniplane/backend auth:bootstrap --tenant-name Dev --owner-email you@example.test
+   ```
+   Open the printed setup link (or the email in Mailpit).
 
-`make help` lists all targets, including the build helpers under the [self-hosting guide](self-hosting.md) (E2B template builds, Docker images).
-
-## 4. Open the app
-
-Visit **`http://localhost:3000`** in your browser.
-
-In dev-headers mode there is no login screen — the frontend sends `X-User-Id: local-dev-user` and `X-Tenant-Id: local-dev-tenant` headers automatically, and the backend's auth middleware accepts them.
-
-## 5. Send your first message
-
-You'll land on the chat workspace. To send a message:
-
-1. Pick a model in the selector (top right). The selector lists the available models when an Anthropic key is configured (server-level env var or per-tenant). With no key, the selector is empty and the frontend shows a "configure a model provider key" empty state.
-2. Type "What files are in this workspace?" and hit send.
-3. Watch the streaming response. You'll see the agent invoke a tool (`ls`, `session_context`, …), and the tool result streams back inline.
-
-A few things to notice:
-
-- **Tool calls show up as collapsible cards** in the chat. Click into one to see the arguments and the (redacted) result.
-- **The session is warm.** Your second message in the same session reuses the same agent state and sandbox — no cold start, and conversation history survives backend restarts thanks to the Postgres checkpointer.
-- **Open a second session** (left sidebar, "New session") and you get a fresh agent with a fresh workspace. Sessions are fully isolated.
-
-## 6. Visit the admin workbench
-
-`http://localhost:3000/admin` is where tenant settings, skills, and MCP servers are configured. In dev-headers mode the seeded `local-dev-user` is an admin of `local-dev-tenant`, so everything is editable.
-
-Worth poking at:
-
-- **Skills** — the catalog of structured agent operating documents. The seeded `write-artifact` skill teaches the agent to generate downloadable files via the `write_artifact` managed tool.
-- **MCP servers** — gateway for Model Context Protocol tool servers. Add an external MCP server here and its tools become available to the agent at the next session start.
-- **Tenant settings** — native approval policy, Policy Center enforcement mode, enabled tools/MCP servers, command-execution posture, and the system-prompt overlay applied to every turn.
-
-## 7. Try human-in-the-loop approvals
-
-In `Tenant settings`, use native approvals to require review for runtime actions, or use Policy Center to create a `require_approval` rule for a specific MCP tool such as `write_artifact` and then switch `policy_enforcement_mode` to `enforce`. Send a new message that asks the agent to write a file (e.g. "Write hello.md with the contents 'hi'"). The turn pauses before the gated action runs, and you'll see an approval card in the chat. Approve it and the turn resumes; reject it and the agent gets a denied tool result and adapts.
-
-You've now seen the platform's core security primitive in action: the model never holds tool credentials directly, every flagged tool call passes through the approval coordinator, and the audit trail captures the decision.
-
-## What's next
-
-- **Read the architecture overview** — [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit together.
-- **Run in production** — [self-hosting.md](self-hosting.md) walks through the production checklist (RLS verification, WorkOS setup, S3 storage, E2B sandboxes, secrets management).
-- **Understand the security model** — [SECURITY_FEATURES.md](SECURITY_FEATURES.md) is the full inventory of controls.
-- **Learn the runtime** — the agent loop is LangChain's [Deep Agents](https://reference.langchain.com/javascript/deepagents) (planning, subagents, human-in-the-loop interrupts, durable checkpointing).
-- **Add a skill** — [guides/skill-bundle-decisions.md](guides/skill-bundle-decisions.md) covers the skill bundle format and lifecycle.
-
----
+Startup rules for these values: [configuration](configuration.md#startup-rules).
 
 ## Troubleshooting
 
-### "Port 3000 / 3001 already in use"
+| Symptom | Fix |
+|---|---|
+| Port 3000 or 3001 in use | `make dev` needs both ports (`scripts/check-dev-ports.mjs`). Stop the other process. |
+| `make dev` waits forever for PostgreSQL | Run `docker compose ps` and `docker compose logs postgres`. Port 5432 may be in use. |
+| Migration `permission denied` | `MIGRATION_DATABASE_URL` must be a superuser URL. |
+| Empty model list | No provider has a key, or Admin > Models turns the providers or models off. Set a key in `.env` and restart, or save a tenant key in Admin > Models; then check that the provider and models are on there. |
+| Shell or file tools fail | `E2B_TEMPLATE_ID` must exist in the E2B account of `E2B_API_KEY`. |
 
-Something else on your machine is using the dev port. Either stop it, or set `API_PORT` (backend) or use `pnpm --filter @cogniplane/frontend dev -p 3010` (frontend) to pick a different port. If you change the backend port, also update `NEXT_PUBLIC_API_URL` in `apps/frontend/.env.local`.
-
-### "Cannot connect to the Docker daemon"
-
-Docker isn't running. Start Docker Desktop (Mac/Windows) or `sudo systemctl start docker` (Linux), then retry `make dev`.
-
-### Postgres connection refused
-
-`make dev` waits for Postgres to be ready, but on slow machines the wait sometimes times out. Run `docker compose ps` — if the postgres container shows `Up`, just rerun `make dev`. If it shows `Exit`, run `docker compose logs postgres` to see why.
-
-### Migrations fail with "permission denied"
-
-The `MIGRATION_DATABASE_URL` must be a **superuser** DSN (`postgres://postgres:...`), not the `app_user` DSN. The migration runner uses superuser privileges to create the `app_user` role and enable RLS policies. Check `apps/backend/.env`.
-
-### The model selector is empty / turns fail with a key error
-
-The backend lists models only when an Anthropic key is available — either at the server level (`ANTHROPIC_API_KEY` in `apps/backend/.env`, requires a restart) or saved per-tenant in admin → org settings (no restart needed; takes effect on the next session start).
-
-A paid API key from [console.anthropic.com](https://console.anthropic.com) is required. Consumer Free/Pro/Max subscriptions and OAuth tokens from the consumer apps cannot be used.
-
-### Boot fails with "E2B_API_KEY is required" or "E2B_TEMPLATE_ID is not configured"
-
-The runtime executes shell/file tools inside E2B sandboxes, so both are required at boot. Create an account at [e2b.dev](https://e2b.dev), set `E2B_API_KEY`, run `make e2b-build`, and set `E2B_TEMPLATE_ID` to the printed template id.
-
-### Tool calls fail with "MCP server not reachable"
-
-`RUNTIME_GATEWAY_BASE_URL` must be a URL the backend's MCP client can reach. For `make dev`, `http://localhost:3001` works — the agent loop and its MCP client run in the backend process itself. See [self-hosting.md](self-hosting.md) for networked deployments.
+Next: [development](development.md) for tests and checks;
+[architecture](architecture/overview.md) for the code.
