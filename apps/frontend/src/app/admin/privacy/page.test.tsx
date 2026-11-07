@@ -20,7 +20,11 @@ const nav = vi.hoisted(() => {
     reset(url: string) { entries = [url]; index = 0; },
     current: () => entries[index],
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    push(url: string) { entries = [...entries.slice(0, index + 1), url]; index += 1; emit(); },
+    push(url: string) {
+      // Next replaces the current entry when the URL is unchanged.
+      if (url === entries[index]) return;
+      entries = [...entries.slice(0, index + 1), url]; index += 1; emit();
+    },
     back() { index = Math.max(0, index - 1); emit(); },
     forward() { index = Math.min(entries.length - 1, index + 1); emit(); }
   };
