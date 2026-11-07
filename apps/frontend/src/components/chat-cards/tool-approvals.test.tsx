@@ -21,7 +21,7 @@ afterEach(cleanup);
 
 const row = (approvalId: string, toolCallId?: string): ApprovalRow => ({
   type: "approval", rowId: `approval:${approvalId}`, approvalId, itemId: approvalId, kind: "file_change",
-  title: approvalId, summary: "", status: "pending", decisionState: "pending", ...(toolCallId ? { toolCallId } : {})
+  title: approvalId, summary: "", status: "pending", decisionState: "pending", allowForTurn: true, ...(toolCallId ? { toolCallId } : {})
 });
 
 function Card({ toolCallId, label, canDecide = true }: { toolCallId: string; label: string; canDecide?: boolean }) {

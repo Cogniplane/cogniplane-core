@@ -98,7 +98,7 @@ const EMPTY_MCP_APPS: Record<string, McpAppCall> = {};
 const APPROVAL_READ_RETRY_MS = 2_000;
 const APPROVAL_READ_ATTEMPTS = 4;
 
-type ApprovalRequiredValue = Pick<Approval, "approvalId" | "itemId" | "kind" | "title" | "summary" | "toolCallId">;
+type ApprovalRequiredValue = Pick<Approval, "approvalId" | "itemId" | "kind" | "title" | "summary" | "toolCallId" | "allowForTurn">;
 
 function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
   return {
@@ -111,7 +111,9 @@ function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
     title: approval.title,
     summary: approval.summary,
     status: "pending",
-    decisionState: "pending"
+    decisionState: "pending",
+    // The same field from the live event and from the approvals list after a reload.
+    allowForTurn: approval.allowForTurn !== false
   };
 }
 

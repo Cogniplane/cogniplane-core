@@ -1,6 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 
 export const POLICY_APPROVAL_REQUEST_METHOD = "policy/toolApproval";
+
+/**
+ * Whether "Allow for this turn" can approve later requests like this one (issue #21).
+ * Not for a durable write, such as memory_save: every call of it is gated by a proof
+ * of its exact arguments, with the server facts (`bound`) stored beside the approval.
+ * The approval coordinator never auto-approves a proof, and the tool has no native
+ * gate, so the option would approve nothing more. Other Policy Center approvals keep
+ * the option: it approves later native-gated calls of the same tool in the turn.
+ * The stored row decides, so the live card and the card after a reload agree.
+ */
+export function approvalAllowsTurnScope(approval: {
+  requestMethod: string; requestPayload?: Record<string, unknown> | null;
+}): boolean {
+  const bound = approval.requestPayload?.bound;
+  return !(approval.requestMethod === POLICY_APPROVAL_REQUEST_METHOD && typeof bound === "object" && bound !== null);
+}
 export const POLICY_APPROVAL_MARKER_KEY = "__cogniplanePolicyApproval";
 // Approval metadata in tool arguments. Nothing reads either key as a proof.
 // The runtime sends its proof in the request `_meta`. The runtime and the

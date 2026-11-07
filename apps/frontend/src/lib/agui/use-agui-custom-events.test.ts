@@ -174,6 +174,19 @@ describe("useAguiCustomEvents — approvals (R19)", () => {
     summary: "rm -rf build"
   });
 
+  it("keeps the turn option of the event, and offers it when an older event does not say", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent));
+
+    emit("approval_required", { ...approvalEvent("ap-save"), kind: "mcp_tool", allowForTurn: false });
+    emit("approval_required", { ...approvalEvent("ap-run"), allowForTurn: true });
+    emit("approval_required", approvalEvent("ap-old"));
+
+    expect(result.current.approvals.map((a) => [a.approvalId, a.allowForTurn])).toEqual([
+      ["ap-save", false], ["ap-run", true], ["ap-old", true]
+    ]);
+  });
+
   it("drops the approval when a native expiry notice arrives", () => {
     const { agent, emit } = makeFakeAgent();
     const { result } = renderHook(() => useAguiCustomEvents(agent));
@@ -372,6 +385,16 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
     approvalId, sessionId: "s-1", itemId: `item-${approvalId}`, kind: "command_execution",
     title: "Run command", summary: "ls", status: "pending", createdAt: "2026-09-22T00:00:00.000Z"
   }) as unknown as Approval;
+
+  it("shows the same turn option after a reload as the live event did", () => {
+    const { agent } = makeFakeAgent();
+    const seed = [{ ...pending("ap-save"), allowForTurn: false }, { ...pending("ap-run"), allowForTurn: true }, pending("ap-old")];
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: seed }));
+
+    expect(result.current.approvals.map((a) => [a.approvalId, a.allowForTurn])).toEqual([
+      ["ap-save", false], ["ap-run", true], ["ap-old", true]
+    ]);
+  });
 
   it("removes an approval already answered before replay reaches its request event", async () => {
     const list = vi.spyOn(sessionApi, "listApprovals").mockResolvedValue([]);

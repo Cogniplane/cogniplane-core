@@ -164,19 +164,23 @@ function ApprovalActions({
       >
         {row.decisionState === "approving" ? "Working…" : "Approve once"}
       </Button>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={working}
-        title="Auto-approve every matching action for the rest of this turn"
-        aria-describedby={working ? undefined : scopeHintId}
-        onClick={() => onDecision(row.approvalId, { decision: "approve", rememberForTurn: true })}
-      >
-        Allow for this turn
-      </Button>
+      {row.allowForTurn ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={working}
+          title="Auto-approve every matching action for the rest of this turn"
+          aria-describedby={working ? undefined : scopeHintId}
+          onClick={() => onDecision(row.approvalId, { decision: "approve", rememberForTurn: true })}
+        >
+          Allow for this turn
+        </Button>
+      ) : null}
       </div>
-      {working ? null : (
+      {/* A request that needs approval of its exact values each time (memory_save) gets no
+          turn option: approving it for the turn would not approve the next one. */}
+      {working || !row.allowForTurn ? null : (
         <p id={scopeHintId} className="text-xs text-on-surface-variant">
           Allow for this turn also approves matching actions until this turn ends.
         </p>

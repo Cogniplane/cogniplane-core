@@ -734,8 +734,22 @@ test("lists pending approvals and resolves a decision", async () => {
   // The read names the card of the proposed call; the decision still takes the approval ID.
   expect(listResponse.json().approvals[0]).toEqual({
     approvalId: "approval-1", sessionId, itemId: "cmd-1", toolCallId: "card-1",
-    kind: "command_execution", title: "Approve shell command", summary: "pwd", status: "pending"
+    kind: "command_execution", title: "Approve shell command", summary: "pwd", status: "pending",
+    allowForTurn: true
   });
+
+  // A durable write (memory_save) is approved for its exact values only: the read offers no turn option,
+  // as the live event does not (issue #21).
+  approvals.rows.set("approval-memory", {
+    ...approvals.rows.get("approval-1")!,
+    approvalId: "approval-memory", itemId: "approval-memory", kind: "mcp_tool", title: 'Replace memory "units"',
+    requestMethod: "policy/toolApproval",
+    requestPayload: { name: "units", content: "metric", bound: { previousContentSha256: null } }
+  });
+  const withMemory = (await app.inject({ method: "GET", url: `/sessions/${sessionId}/approvals` })).json().approvals;
+  expect(withMemory.find((row: { approvalId: string }) => row.approvalId === "approval-memory"))
+    .toMatchObject({ allowForTurn: false });
+  approvals.rows.delete("approval-memory");
 
   // A session the caller cannot read gives no list, even for its own approval rows.
   const hidden = await sessions.create("test-tenant", "another-user", "Hidden");

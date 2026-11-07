@@ -9,6 +9,7 @@ import { parseRequestInput } from "../lib/route-validation.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { serialize } from "../lib/serialize-response.js";
 import { canBrowseSessionContent } from "../services/session-access.js";
+import { approvalAllowsTurnScope } from "../services/policy/policy-approval-proof.js";
 
 export function buildApprovalRouteStores(deps: AppDependencies) {
   return {
@@ -82,11 +83,11 @@ export async function registerApprovalRoutes(
     }
     reply.header("cache-control", "private, no-store");
     return serialize(ApprovalsListResponseSchema, {
-      approvals: await stores.approvals.listPending(
+      approvals: (await stores.approvals.listPending(
         tenantId,
         paramsResult.value.sessionId,
         userId
-      )
+      )).map((approval) => ({ ...approval, allowForTurn: approvalAllowsTurnScope(approval) }))
     });
   });
 
