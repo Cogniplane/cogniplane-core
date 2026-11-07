@@ -59,12 +59,11 @@ type NotionToolDeps = {
 };
 
 /**
- * Wrap a Notion-backed handler so credential lookup + the missing-connection
- * error live in one place. Every Notion tool needs a valid OAuth token; if
- * the user has no connection (or it's expired with no refresh path), every
- * tool must short-circuit with the same message — centralizing here makes
- * "forget to check auth" structurally impossible (this is exactly how the
- * prior S1 path-segment-injection slipped past one handler).
+ * Wrap a Notion-backed handler so credential lookup and the missing-connection
+ * error live in one place. Every Notion tool needs a valid OAuth token. If the
+ * user has no connection, or the token expired with no refresh path, every tool
+ * must short-circuit with the same message. This wrapper makes "forget to check
+ * auth" structurally impossible.
  *
  * The handler receives `token` directly so it can pass it to `callNotion`
  * without re-reading `creds.token` per call site.
@@ -92,8 +91,6 @@ function withNotionAuth(
     }
   };
 }
-
-// ── Catalog ───────────────────────────────────────────────────────────────────
 
 export const NOTION_TOOL_CATALOG: ReadonlyArray<{
   name: string;
@@ -229,8 +226,6 @@ export const NOTION_TOOL_CATALOG: ReadonlyArray<{
 // notion-markdown-blocks.ts.
 export { markdownToNotionBlocks };
 
-// ── Notion blocks → flat text ────────────────────────────────────────────────
-
 function richTextToPlain(rt: unknown): string {
   if (!Array.isArray(rt)) return "";
   return rt
@@ -276,8 +271,6 @@ function blockToText(block: Record<string, unknown>): string {
       return text;
   }
 }
-
-// ── Tool definitions ─────────────────────────────────────────────────────────
 
 export function createNotionTools(deps: NotionToolDeps): ManagedToolDefinition[] {
   return [
@@ -518,8 +511,6 @@ export function createNotionTools(deps: NotionToolDeps): ManagedToolDefinition[]
     }
   ];
 }
-
-// ── Internal helpers ─────────────────────────────────────────────────────────
 
 type NotionApiResult =
   | { ok: true; status: number; response: Response; data: Record<string, unknown> }

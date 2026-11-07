@@ -67,7 +67,7 @@ export class ModelSpendingCallback extends BaseCallbackHandler {
       }
       await this.track((async () => {
         await this.store.startCall(this.reservation, runId, model);
-        // The ledger now records possible spend, even if cancellation races dispatch.
+        // The ledger records possible spend, even if cancellation races dispatch.
         this.calls.set(runId, { release, model });
       })());
       this.assertAllowance();

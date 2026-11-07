@@ -22,7 +22,7 @@ export type ApprovalRequest = {
   name: string; kind: ApprovalKind; args: Record<string, unknown>; policyApproval?: PolicyApprovalProof;
   server?: { id: string; mode: "managed" | "proxy" };
   /**
-   * The server ID of the proposed tool call, when the runtime proved which call
+   * The ID of the proposed tool call, when the runtime proved which call
    * this is. Stored on the row, so a reload can show the decision in that call's card.
    */
   toolCallId?: string;
@@ -174,8 +174,8 @@ export class ApprovalCoordinator {
   }
 
   private cancelAndExpireTurn(turn: TurnState, reason: ApprovalCleanupReason): void {
-    // Keep persisted IDs after local abort settlement. A later turn can start
-    // before these writes finish, so cleanup must never enumerate its rows.
+    // Capture the IDs that this turn persisted, and expire only those IDs. A later
+    // turn can start before these writes finish, so do not list the session's rows.
     const approvalIds = [...turn.persisted];
     turn.persisted.clear();
     this.cancelTurn(turn);
@@ -291,7 +291,8 @@ export class ApprovalCoordinator {
         if (waits?.size === 0) this.pending.delete(approvalId);
         resolve(outcome);
       };
-      // Also when a client asks to remember an approval that does not allow it.
+      // A remember request takes effect only when this approval allows turn scope,
+      // the wait is not settled, and the turn has not ended.
       const rememberable = approvalAllowsTurnScope(approval);
       const rememberApproval = () => {
         if (rememberable && !settled && !this.ended(turn)) turn.remembered.add(rememberKey);

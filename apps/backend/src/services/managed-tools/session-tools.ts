@@ -14,8 +14,6 @@ type SessionToolDeps = {
   storage: Pick<ArtifactStorage, "openReadStream">;
 };
 
-// ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
-
 export const SESSION_TOOL_CATALOG: ReadonlyArray<{
   name: string;
   description: string;
@@ -66,8 +64,6 @@ export const SESSION_TOOL_CATALOG: ReadonlyArray<{
   }
 ];
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function getScopedArtifactIds(context: ToolExecutionContext): string[] | null {
   const selected = context.metadata.selectedArtifactIds;
   if (!Array.isArray(selected)) return null;
@@ -104,8 +100,6 @@ async function resolveReadableArtifact(input: {
   }
   return derivedArtifact;
 }
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
 
 export function createSessionTools(deps: SessionToolDeps): ManagedToolDefinition[] {
   return [

@@ -68,8 +68,8 @@ class FakeBackend implements AGUITurnBackend {
     actions: DeepAgentsPendingAction[],
     emit: (event: BaseEvent) => void
   ): Promise<AGUIApprovalDecision[]> {
-    // The backend owns approval emission now (it holds the real approvalId); the
-    // driver just delegates. Emit an approval prompt per interrupt, then decide.
+    // The backend emits approval prompts, because it holds the real approvalId.
+    // The AG-UI agent only delegates to it.
     for (const action of actions) {
       emit({
         type: EventType.CUSTOM,
@@ -131,7 +131,6 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
     ]);
   });
 
-  // Invariant 1 — toolContextId survives to tool-dispatch time.
   it("injects toolContextId onto the shared ref before the graph dispatches a tool", async () => {
     const backend = new FakeBackend([[toolStart("search", { q: "x" }), toolEnd("search", "ok")]]);
     const agent = new DeepAgentsAGUIAgent({ backend, toolContextId: "ctx-xyz" });
@@ -139,8 +138,6 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
     expect(backend.toolContextSeenAtDispatch).toBe("ctx-xyz");
   });
 
-  // Invariant 4 — write_todos becomes a STATE_DELTA (native state sync), not a
-  // tool card.
   it("maps write_todos to a STATE_DELTA on /plan and not a tool card", async () => {
     const todos = [
       { content: "step one", status: "completed" },
@@ -159,7 +156,6 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
     expect(types(events)).not.toContain(EventType.TOOL_CALL_START);
   });
 
-  // Invariant 3 — native HITL interrupt surfaced + resumed via buildResumeInput.
   it("surfaces a native HITL interrupt and resumes via buildResumeInput", async () => {
     const backend = new FakeBackend(
       [[modelText("thinking")], [modelText("done"), modelEnd()]],
@@ -306,11 +302,8 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
     });
 
     expect((error as Error).message).toBe("provider aborted mid-text");
-    // The open TEXT message was flushed (END) before the terminal error, and no
-    // RUN_FINISHED was emitted for the failed turn.
     expect(types(seen)).toContain(EventType.TEXT_MESSAGE_END);
     expect(types(seen)).not.toContain(EventType.RUN_FINISHED);
-    // The END for the text message is the last event before the error surfaces.
     expect(types(seen).at(-1)).toBe(EventType.TEXT_MESSAGE_END);
   });
 
@@ -362,9 +355,6 @@ describe("DeepAgentsAGUIAgent (Track B)", () => {
       setTimeout(resolve, 20);
     });
 
-    // Only RUN_STARTED reached the subscriber; the loop returned on `cancelled`
-    // before the pass finished, so pending-action collection and RUN_FINISHED
-    // never happened.
     expect(types(seen)).toEqual([EventType.RUN_STARTED]);
     expect(types(seen)).not.toContain(EventType.RUN_FINISHED);
     expect(pendingActionsChecked).toBe(false);

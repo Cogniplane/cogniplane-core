@@ -54,8 +54,6 @@ export type ManagedToolDefinition = {
   category?: string;
 };
 
-// ── Schema primitives ─────────────────────────────────────────────────────────
-
 export const nullableStringSchema = { type: ["string", "null"] } as const;
 export const nullableNumberSchema = { type: ["number", "null"] } as const;
 export const genericObjectSchema = { type: "object", additionalProperties: true } as const;
@@ -69,8 +67,6 @@ const managedToolErrorOutputSchema = {
   required: ["error"],
   additionalProperties: true
 } as const satisfies Record<string, unknown>;
-
-// ── Schema builders ───────────────────────────────────────────────────────────
 
 export function strictObjectSchema(
   properties: Record<string, unknown>,
@@ -93,8 +89,6 @@ export function withManagedToolErrorSchema(successSchema: Record<string, unknown
   // strict clients may reject the entire tools/list response.
   return { type: "object", oneOf: [successSchema, managedToolErrorOutputSchema] };
 }
-
-// ── Shared HTTP helper ────────────────────────────────────────────────────────
 
 type JsonParseLogger = { warn(meta: object, msg: string): void };
 

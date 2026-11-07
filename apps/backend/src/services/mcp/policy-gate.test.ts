@@ -98,7 +98,7 @@ describe("stored policy approval disposition", () => {
 });
 
 describe("enforcePolicyCenter outcome", () => {
-  // The call is the one `approvedCall` describes. The gate claims the approval once, like ApprovalStore.consume.
+  // The gate claims the approval once, like ApprovalStore.consume.
   function gateFor(input: ReturnType<typeof approvedCall>) {
     let claimed = false;
     const consume = async () => {

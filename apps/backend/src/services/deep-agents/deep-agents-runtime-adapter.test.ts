@@ -413,8 +413,6 @@ function runMessageInput(
   };
 }
 
-// ── HITL approval-flow support ───────────────────────────────────────────────
-
 type PendingAction = {
   interruptId: string | null;
   name: string;
@@ -564,7 +562,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
     const { factory, factoryCalls } = makeRuntimeFactory(() => scriptedChatStream());
     const adapter = makeAdapter({ factory, runtimeSessions: { upsert, setStatus: vi.fn() } });
 
-    // Two callers race before either registers the session state (R26).
+    // Two callers race before either registers the session state.
     const [a, b] = await Promise.all([
       adapter.createSession(sessionInput),
       adapter.createSession(sessionInput)
@@ -672,7 +670,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
       }
     });
     // 400 so the failure surfaces as user-actionable ("configure a key") via
-    // clientSafeTurnFailureMessage rather than the generic message (R27).
+    // clientSafeTurnFailureMessage rather than the generic message.
     await expect(adapter.createSession(sessionInput)).rejects.toMatchObject({
       message: expect.stringMatching(/model-provider API key/),
       statusCode: 400
@@ -721,7 +719,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
     await allowedAdapter.close();
   });
 
-  // VULN-13: the sandbox network policy comes from the tenant's approved hosts.
+  // The sandbox network policy comes from the tenant's approved hosts.
   describe("sandbox network policy", () => {
     const configWithE2b = createTestConfig({ ANTHROPIC_API_KEY: "sk-ant-test-key", E2B_API_KEY: "e2b-test-key" });
 
@@ -802,8 +800,8 @@ describe("DeepAgentsRuntimeAdapter", () => {
     });
 
     it("reads the approved hosts from the tenant settings each time the sandbox asks, so a change needs no refresh", async () => {
-      // VULN-13: the sandbox is created under the policy of that moment, and each
-      // turn compares the live network with the policy of that turn.
+      // Sandbox creation uses the policy of that moment, and each turn compares
+      // the live network with the policy of that turn.
       const runtime = makeRuntimeFactory(() => scriptedChatStream());
       const dynamicConfig = makeDynamicConfig({ allowCommandExecution: true });
       let approved: string[] = [];
@@ -1513,7 +1511,7 @@ describe("DeepAgentsRuntimeAdapter", () => {
     });
     await adapter.createSession(sessionInput);
     const systemPrompt = factoryCalls[0]!.systemPrompt ?? "";
-    // Progressive disclosure (bead kpit): skill instructions live in the
+    // Progressive disclosure: skill instructions live in the
     // /skills/ file library, not the system prompt.
     expect(systemPrompt).not.toContain("## Skill:");
     expect(systemPrompt).not.toContain("Call the write_artifact tool");
@@ -1539,7 +1537,6 @@ describe("DeepAgentsRuntimeAdapter", () => {
   });
 });
 
-// ── runMessageAGUI boundary tests ──────────────────────────────────────────
 describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
   async function collectAGUI(iterable: AsyncIterable<AGUIBaseEvent>): Promise<AGUIBaseEvent[]> {
     const events: AGUIBaseEvent[] = [];
@@ -2192,7 +2189,7 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
       const terminal = events.at(-1) as AGUIBaseEvent & { message?: string };
       expect(terminal.type).toBe(AGUIEventType.RUN_ERROR);
       expect(terminal.message).toBe("The turn exceeded the platform time limit and was stopped.");
-      // The core of R1: the watchdog must release the slot so the session is
+      // The watchdog must release the slot so the session is
       // usable again without a process restart.
       expect(adapter.hasActiveTurn("sess-1")).toBe(false);
       await adapter.close();
@@ -2263,8 +2260,8 @@ describe("turn watchdog budget across approval pauses", () => {
       // Still alive: 10s x3 of PAUSED time is correctly not charged.
       expect(timedOut()).toBe(false);
 
-      // Only ~400ms of budget can remain. Under the refunding bug each resume
-      // restored a full 1000ms and 500ms more work would have been fine.
+      // Only ~400ms of budget can remain. If each resume
+      // restored the full 1000ms, the watchdog would allow 500ms more work.
       await vi.advanceTimersByTimeAsync(500);
       expect(timedOut()).toBe(true);
       expect(turnAbort.signal.aborted).toBe(true);
@@ -2348,10 +2345,10 @@ describe("sandbox lifetime and workspace-loss notice", () => {
   }
 
   it("extends the sandbox lifetime at the start of every turn", async () => {
-    // R12: the E2B cap runs from the session's first tool use and is never
-    // renewed, so an active session eventually crosses it mid-turn and loses
-    // every file the agent wrote plus every synced artifact. Extending at each
-    // turn start makes the cap idle-based.
+    // The E2B cap runs from the session's first tool use, and nothing renews it.
+    // An active session therefore eventually crosses it mid-turn and loses every
+    // file the agent wrote plus every synced artifact. Extending at each turn
+    // start makes the cap idle-based.
     const extendSandboxTimeout = vi.fn(async () => {});
     const adapter = makeAdapter({ factory: makeSandboxFactory({ extendSandboxTimeout }) });
     const session = await adapter.createSession(sessionInput);
@@ -2409,7 +2406,7 @@ describe("sandbox lifetime and workspace-loss notice", () => {
   });
 
   it("starts a turn in the sandbox at the start of every turn, before anything uses the sandbox", async () => {
-    // VULN-13: the network of a sandbox is fixed when it is created, and the
+    // The network of a sandbox is fixed when it is created, and the
     // admin can change the approved hosts between two turns. What was confirmed
     // in an earlier turn must not carry over, so every turn or job starts in the
     // sandbox before artifact sync or a tool can reach it, and its first
@@ -2549,9 +2546,7 @@ describe("sandbox lifetime and workspace-loss notice", () => {
   });
 });
 
-// ── Review batch 3 (bead tnci): turn-loop robustness ─────────────────────────
-// Five defects that shared one signature: the user, or the audit trail, is told
-// nothing while something goes wrong.
+// When something goes wrong, the code must tell the user or write to the audit trail.
 
 describe("interrupting a turn while onBeforeTurn is still running (R9)", () => {
   it("aborts an AG-UI turn interrupted during artifact sync", async () => {

@@ -8,8 +8,6 @@ import {
   readStreamAsText
 } from "./artifact-helpers.js";
 
-// isTextReadableArtifact
-
 test("isTextReadableArtifact: text/* is readable", () => {
   expect(isTextReadableArtifact("text/plain")).toBe(true);
   expect(isTextReadableArtifact("text/markdown")).toBe(true);
@@ -22,8 +20,6 @@ test("isTextReadableArtifact: application/json is readable", () => {
 test("isTextReadableArtifact: image/png is not readable", () => {
   expect(isTextReadableArtifact("image/png")).toBe(false);
 });
-
-// readStreamAsText
 
 test("readStreamAsText: respects maxChars", async () => {
   const stream = Readable.from([Buffer.from("hello world")]);
@@ -87,8 +83,6 @@ test("readStreamAsBoundedText: treats undecoded trailing bytes as overflow", asy
     Buffer.from([0xf0, 0x9f])
   ]), 3)).resolves.toEqual({ text: "abc", truncated: true });
 });
-
-// readArtifactExcerpt
 
 test("readArtifactExcerpt: opens via storage and applies the budget", async () => {
   const storage = {

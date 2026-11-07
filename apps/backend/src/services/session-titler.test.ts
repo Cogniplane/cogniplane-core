@@ -244,8 +244,6 @@ test("generateSessionTitle: very long first message is truncated to 2000 chars i
   }
 });
 
-// --- Local utility LLM (UTILITY_LLM_*) ----------------------------------------
-
 test("generateSessionTitle: utility client wins without touching provider APIs or keys", async () => {
   const utilityFetch = (async () => ({
     ok: true,

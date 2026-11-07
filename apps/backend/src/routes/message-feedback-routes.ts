@@ -57,7 +57,6 @@ export async function registerMessageFeedbackRoutes(
   app: FastifyInstance,
   stores: MessageFeedbackRouteStores
 ): Promise<void> {
-  // PATCH /messages/:messageId/feedback — user submits feedback on an assistant message
   app.patch("/messages/:messageId/feedback", async (request, reply) => {
     const paramsResult = parseRequestInput(reply, messageIdParams, request.params);
     if (!paramsResult.ok) {
@@ -83,7 +82,6 @@ export async function registerMessageFeedbackRoutes(
     return null;
   });
 
-  // GET /admin/message-feedback — admin analytics
   app.get(
     "/admin/message-feedback",
     withAdmin(app, async (request, reply) => {

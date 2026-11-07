@@ -475,8 +475,6 @@ test("MessageStore.setPiiDetail issues a jsonb_set merge under detail_json.pii",
   expect(patch.transformed).toBe(true);
 });
 
-// ── Configurable scripted DB for read paths ─────────────────────────────────
-
 class ScriptedDatabase {
   scripts: Array<{ match: (text: string) => boolean; fn: (values: unknown[]) => { rows: Record<string, unknown>[]; rowCount?: number } }> = [];
   lastValuesByMatch: Map<string, unknown[]> = new Map();

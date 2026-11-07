@@ -7,8 +7,7 @@ import { uuidv7 } from "../../lib/uuid.js";
 /**
  * Raised when the email on an incoming WorkOS login already belongs to a
  * different WorkOS identity. The login cannot proceed without taking over that
- * account, so the route answers 409 instead of the 23505-driven 500 this
- * replaces.
+ * account, so the route answers 409.
  */
 export class WorkOsEmailConflictError extends Error {
   readonly email: string;
@@ -193,9 +192,9 @@ export async function provisionTenantIdentity(
       throw new WorkOsEmailConflictError(input.email);
     }
 
-    // An existing email row is updated in place rather than re-inserted: the
-    // INSERT below would conflict on the email constraint, which the ON CONFLICT
-    // target does not cover.
+    // The code updates an existing email row in place and does not re-insert it.
+    // The INSERT below would conflict on the email constraint, which its ON
+    // CONFLICT target does not cover.
     const userId = emailOwnerRow
       ? ((
           await client.query(

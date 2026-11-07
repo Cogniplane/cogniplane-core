@@ -55,8 +55,8 @@ it("shows the removed connection and a retry after a failed Pipedream cleanup", 
   expect(screen.getByRole("button", { name: "Disconnect" })).toBeTruthy();
 });
 
-// q4w0.8 review: while suspended, the account list does not show the account
-// name, which whoever authorized the account chose.
+// While suspended, the account list does not show the account name, which
+// whoever authorized the account chose.
 it("labels a suspended Jira connection without the account name", async () => {
   state.status = { ...connected, userConnection: { ...connected.userConnection!, accountName: "Someone", suspended: true } };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

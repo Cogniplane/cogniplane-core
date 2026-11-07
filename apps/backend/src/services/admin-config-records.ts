@@ -33,16 +33,13 @@ export type AdminSkillRecord = {
   activeBundleHash: string | null;
   activeValidationStatus: string | null;
   activeReviewStatus: string | null;
-  // Tool IDs declared by the active revision's metadata as the tools this
-  // skill is meant to be invoked through. Used by the activation tracker to
-  // attribute tool calls back to a skill (Tier 1, weak-but-useful signal).
-  // Optional so existing test fixtures and partial AdminSkillRecord
-  // constructions don't have to be exhaustively updated.
+  // Tool IDs that the active revision declares for this skill. The activation
+  // tracker uses them to credit tool calls to the skill (Tier 1, a weak signal).
+  // Optional, so partial records and test fixtures need not set it.
   associatedToolIds?: string[];
-  // True when this skill row is owned by `tenant_id = 'system'` and the
-  // requesting tenant is not `system`. Inherited skills are read-only from
-  // a tenant's perspective: tenants must use the import flows (zip / github /
-  // inline paste) to create their own copy before they can edit it.
+  // True when the row belongs to the `system` tenant and the requesting tenant
+  // is not `system`. Inherited skills are read-only for tenants. A tenant must
+  // import its own copy (zip, GitHub, or inline paste) before it can edit it.
   isInherited: boolean;
   pendingRevisionCount?: number;
 };
@@ -170,26 +167,20 @@ function parseSnapshotApprovalPolicy(value: unknown): ApprovalPolicy {
 }
 
 /**
- * Reverse of `tenantSettingsToRuntimePolicy` for the JSONB blob round-tripped
- * through `tool_execution_contexts.metadata.runtimePolicy`. Used by the MCP
- * gateway to enforce the per-turn snapshot of the tenant's runtime policy.
+ * Reverses `tenantSettingsToRuntimePolicy` for the JSONB snapshot stored in
+ * `tool_execution_contexts.metadata.runtimePolicy`. The MCP gateway uses it to
+ * enforce the per-turn snapshot of the tenant's runtime policy.
  *
- * Field-level coercion mirrors the original DB → object decoders elsewhere
- * (e.g. `mapJudgmentRow`): each field is coerced to its declared type with
- * a safe fallback so a single bad row can't crash an entire turn. Unknown
- * enum values land on the conservative default (`approvalReviewer: "user"`,
- * `approvalPolicy: "never"`).
+ * The parser coerces each field to its declared type with a safe fallback, so
+ * one bad row cannot crash a turn. Unknown enum values use the conservative defaults
+ * (`approvalReviewer: "user"`, `approvalPolicy: "never"`).
  *
- * `sandboxMode` is a single-valued literal type on `ResolvedRuntimePolicy`
- * today (`"workspace-write"`). It's emitted by `tenantSettingsToRuntimePolicy`
- * and never read back differently. When the type is widened to allow more
- * values, both this parser and `tenantSettingsToRuntimePolicy` need to thread
- * the actual setting through. Keep the literal here as the single source of
- * fallback.
+ * `sandboxMode` has one value today, `"workspace-write"`. When the type allows
+ * more values, this parser and `tenantSettingsToRuntimePolicy` must both pass
+ * the real setting through. Keep the literal here as the fallback.
  *
- * `sandboxEgressDomains` falls back to an empty list, which is the strictest
- * policy: a snapshot that predates the field, or one that is malformed, gives
- * the sandbox no network.
+ * An empty `sandboxEgressDomains` is the strictest policy. A snapshot that
+ * predates the field, or one that is malformed, gives the sandbox no network.
  */
 export function parseRuntimePolicySnapshot(
   value: unknown,
@@ -222,8 +213,8 @@ export function parseRuntimePolicySnapshot(
       : [],
     allowCommandExecution: Boolean(profile.allowCommandExecution),
     autoApproveReadOnlyTools: Boolean(profile.autoApproveReadOnlyTools),
-    // Default a missing/stale snapshot to "monitor" — fail-safe (never gate
-    // unexpectedly) if a context predates this field.
+    // A missing or old snapshot defaults to "monitor", so it never gates
+    // actions unexpectedly.
     policyEnforcementMode: profile.policyEnforcementMode === "enforce" ? "enforce" : "monitor",
     developerInstructions: profile.developerInstructions ? String(profile.developerInstructions) : null,
     enabledToolIds,
@@ -274,9 +265,9 @@ export type ResolvedRuntimePolicy = {
   approvalReviewer: ApprovalReviewer;
   sandboxMode: "workspace-write";
   /**
-   * Hosts that the sandbox may reach (VULN-13), from the tenant's approved
-   * list. Empty means no network. The sandbox network policy and the recorded
-   * network mode both come from this list, so they cannot disagree.
+   * Hosts that the sandbox may reach, from the tenant's approved list. Empty
+   * means no network. The sandbox network policy and the recorded network mode
+   * both come from this list, so they cannot disagree.
    */
   sandboxEgressDomains: string[];
   allowCommandExecution: boolean;

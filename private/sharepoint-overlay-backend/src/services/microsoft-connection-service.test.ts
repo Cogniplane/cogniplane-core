@@ -282,8 +282,8 @@ test("getAuthorizationUrl returns valid Entra ID URL", async () => {
   });
 });
 
-// Core no longer lists the "microsoft" provider id. The Redis key must stay the
-// same, so a state issued before a deploy is still valid after it.
+// The Redis key must stay the same, so a state issued before a deploy is
+// still valid after it.
 test("getAuthorizationUrl stores the OAuth state under the persisted Microsoft Redis key", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const integrationStates = new InMemoryIntegrationStateStore();
@@ -907,9 +907,10 @@ test.each([
   }
 });
 
-// q4w0.8: the connection keeps the security version of the session that
-// started the authorization, a token refresh keeps it, and after a security
-// change of the owner's account only a confirm from a current session restores it.
+// The connection keeps the security version of the session that started the
+// authorization. A token refresh keeps that version. After a security change of
+// the owner's account, only a confirm from a current session restores the
+// connection.
 test("a connection that an older session saved is suspended until a current session confirms it", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const store = new InMemoryMicrosoftConnectionStore();
@@ -970,7 +971,7 @@ test("a connection that an older session saved is suspended until a current sess
   }
 });
 
-// q4w0.8 review: the callback has no session. An authorization that a session
+// The callback has no session. An authorization that a session
 // started before a security change must not overwrite the owner's connection.
 test.each([
   ["a version older than the owner's current one", 8],
@@ -1015,7 +1016,7 @@ test.each([
   expect(auditEvents.events.map((event) => event.type)).not.toContain("user.microsoft.connected");
 });
 
-// q4w0.8 review: a token refresh has no session. It updates only the row it
+// A token refresh has no session. It updates only the row it
 // started from and never creates a row that a disconnect removed.
 test.each([
   ["a disconnect", "disconnect"],
@@ -1054,7 +1055,7 @@ test.each([
   else expect(store.record?.microsoftUserId).toBe("ms-other");
 });
 
-// q4w0.8 review: a confirm needs an identity that the provider attests. Graph
+// A confirm needs an identity that the provider attests. Graph
 // returned no email, and a display name proves nothing: no confirm.
 test("a suspended connection without an email cannot be confirmed", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });

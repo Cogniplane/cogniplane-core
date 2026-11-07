@@ -105,9 +105,8 @@ describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
     // thread_id is the only key these tables have, so a bug that ignored it
     // would cross sessions — and, because thread_id IS the session id, tenants.
     //
-    // Both threads get DISTINCT data and both are read back. An earlier version
-    // wrote one thread and only queried a nonexistent second one, which passes
-    // if `put` silently fails or `getTuple` always returns undefined.
+    // The test writes distinct data to both threads and reads both back. Reading
+    // a thread that was never written would pass even if `put` failed silently.
     const first = `it-thread-a-${Date.now()}`;
     const second = `it-thread-b-${Date.now()}`;
 

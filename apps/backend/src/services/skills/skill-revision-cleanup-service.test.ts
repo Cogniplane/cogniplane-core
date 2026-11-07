@@ -240,7 +240,7 @@ test("cleanupInactiveSkillRevisions: catches and reports thrown errors", async (
 test("cleanupInactiveSkillRevisions: deletedBundleStorageUris are deduped and sorted", async () => {
   const stores = captureStores();
   stores.skills.listSkills = async () => [skill({ activeRevisionId: 99 })];
-  // Use distinct skillIds so all four are non-latest candidates.
+  // Two skills. Each keeps its latest revision and loses its older one.
   stores.skillRevisions.listAllSkillRevisions = async () => [
     rev({ skillId: "sk1", skillRevisionId: 1, revisionNumber: 1, bundleStorageUri: "s3://bkt/b" }),
     rev({ skillId: "sk1", skillRevisionId: 11, revisionNumber: 2, bundleStorageUri: "s3://bkt/sk1-latest" }),

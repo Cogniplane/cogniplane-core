@@ -6,8 +6,6 @@ import {
   shouldRefreshToken
 } from "./github-token-lifecycle.js";
 
-// parseScopes
-
 test("parseScopes: undefined → []", () => {
   expect(parseScopes(undefined)).toEqual([]);
 });
@@ -19,8 +17,6 @@ test("parseScopes: empty string → []", () => {
 test("parseScopes: comma-separated values are trimmed and filtered", () => {
   expect(parseScopes("repo, user:email,, write:packages ")).toEqual(["repo", "user:email", "write:packages"]);
 });
-
-// shouldRefreshToken
 
 test("shouldRefreshToken: null → false", () => {
   expect(shouldRefreshToken(null)).toBe(false);
@@ -44,8 +40,6 @@ test("shouldRefreshToken: already expired → true", () => {
   const past = new Date(Date.now() - 1_000).toISOString();
   expect(shouldRefreshToken(past)).toBe(true);
 });
-
-// isTokenExpired
 
 test("isTokenExpired: null → false (no recorded expiry means not expired)", () => {
   expect(isTokenExpired(null)).toBe(false);

@@ -81,8 +81,6 @@ type SharepointToolDeps = {
   ) => Promise<string>;
 };
 
-// ── Shared schemas ────────────────────────────────────────────────────────────
-
 const parentReferenceSchema = allRequiredObjectSchema({
   driveId: nullableStringSchema,
   id: nullableStringSchema,
@@ -238,8 +236,6 @@ export const SHAREPOINT_TOOL_CATALOG: ReadonlyArray<{
   }
 ];
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 const TEXT_MIME_PREFIXES = [
   "text/",
   "application/json",
@@ -249,8 +245,6 @@ const TEXT_MIME_PREFIXES = [
   "application/x-yaml",
   "application/sql"
 ];
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
 
 export function createSharepointTools(deps: SharepointToolDeps): ManagedToolDefinition[] {
   return [

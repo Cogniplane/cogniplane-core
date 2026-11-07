@@ -1,14 +1,13 @@
 /**
  * Row-mapper coercion helpers shared by the store layer. Postgres returns
- * timestamps as driver-dependent values; every store normalizes them to ISO
- * strings at the mapper boundary. Centralized so date-parsing semantics are
- * fixed in one place instead of ~74 hand-rolled call sites.
+ * timestamps as driver-dependent values. The stores convert them to ISO
+ * strings here, so the date parsing stays the same in every store.
  */
 
 /**
- * SQL that formats a timestamp expression as UTC ISO text with six fraction
- * digits. A JS Date keeps milliseconds only, so paging cursors and exact
- * bounds select this text instead of the Date.
+ * SQL that formats the timestamp expression as UTC ISO text with six fraction
+ * digits. A JS Date keeps only milliseconds. Paging cursors and exact bounds
+ * use this text instead of a Date.
  */
 export function utcMicrosText(expression: string): string {
   return `to_char(${expression} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;

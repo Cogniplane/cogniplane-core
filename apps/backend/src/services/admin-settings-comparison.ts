@@ -18,9 +18,9 @@ const list: Reader = (value) => {
   const ids = [...new Set(value as string[])].sort();
   return known(ids.length ? ids.join(", ") : "None", ids);
 };
-// Approved sandbox hosts. `safeIdentifier` refuses the `*` of a wildcard, so
-// entries are read with a plain host pattern. The history page does not need
-// the public suffix list that the admin API uses to accept them.
+// Approved sandbox hosts. `safeIdentifier` rejects the `*` of a wildcard, so
+// this reader uses a plain host pattern. The history page does not need the
+// public suffix list that the admin API uses.
 const sandboxHosts: Reader = (value) => {
   if (!Array.isArray(value) || value.length > 500) return unavailable;
   const hosts: string[] = [];

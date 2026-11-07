@@ -42,7 +42,6 @@ test("push respects maxSize and returns false once buffer is full", () => {
   const q = new AsyncQueue<number>(2);
   expect(q.push(1)).toBe(true);
   expect(q.push(2)).toBe(true);
-  // Buffer full
   expect(q.push(3)).toBe(false);
 });
 
@@ -51,7 +50,7 @@ test("a value pushed when a waiter is parked goes to the waiter, not the buffer"
   const next = q.next();
   q.push("delivered");
   await next;
-  // Buffer still empty so we can push another even with maxSize=1
+  // The waiter took the first value, so the buffer is still empty.
   expect(q.push("buffered")).toBe(true);
 });
 
@@ -94,7 +93,7 @@ test("setError() unblocks a for-await consumer instead of hanging", async () => 
     }
   })();
   q.push(1);
-  // Let the consumer pick up the buffered value and block on the next read.
+  // Let the consumer read the buffered value and wait for the next one.
   await Promise.resolve();
   q.setError(boom);
   await expect(consumer).rejects.toBe(boom);

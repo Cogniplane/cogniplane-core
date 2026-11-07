@@ -93,7 +93,7 @@ describe("Jira connection routes", () => {
     expect(jiraConnections.selectConnection).toHaveBeenCalledWith("tenant-b", "user-9", { accountId: "apn_mine", siteId: SITE }, null);
   });
 
-  // q4w0.8: a selection stores the security version of the requesting session.
+  // A selection stores the security version of the requesting session.
   // There is no Jira confirm: the account ID is opaque and the name is chosen
   // by whoever authorized the account. A new selection restores a suspended one.
   test("selection stores the session's security version, and there is no confirm route", async () => {

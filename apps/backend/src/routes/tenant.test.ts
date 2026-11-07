@@ -108,7 +108,7 @@ function makeFakeOrgSettingsStore(initial: Partial<FakeOrgSettingsState> = {}): 
 
 // ---------------------------------------------------------------------------
 // In-memory DB serving GET /tenant's `SELECT tenant_id ... FROM tenants`.
-// All settings now live in the org-settings store, not in tenants.settings_json.
+// All settings live in the org-settings store, not in tenants.settings_json.
 // ---------------------------------------------------------------------------
 
 function makeTenantsDb() {
@@ -476,10 +476,6 @@ function makeMembersApp(role: Role, userId: string) {
   });
   return app;
 }
-
-// ---------------------------------------------------------------------------
-// DELETE /tenant/members/:userId
-// ---------------------------------------------------------------------------
 
 test("DELETE member: removing yourself returns 400 cannot_remove_self and never issues a DELETE", async () => {
   const { db, tracked } = makeMembersDb("member");
@@ -1106,9 +1102,6 @@ test("tenant responses expose provider presence without compatibility aliases", 
   });
 });
 
-// PUT /tenant/settings/marketplace
-// ---------------------------------------------------------------------------
-
 test("marketplace: valid URL is stored and returned", async () => {
   const { store, state } = makeFakeOrgSettingsStore();
   const db = makeTenantsDb();
@@ -1317,10 +1310,6 @@ test("GET /tenant response includes skillMarketplaceManifestUrl", async () => {
   expect(body.settings.skillMarketplaceManifestUrl).toBe("https://example.com/manifest.json");
 });
 
-// ---------------------------------------------------------------------------
-// piiProtection in GET /tenant
-// ---------------------------------------------------------------------------
-
 test("GET /tenant returns default piiProtection when setting is absent", async () => {
   const { store } = makeFakeOrgSettingsStore();
   const db = makeTenantsDb();
@@ -1370,10 +1359,6 @@ test("GET /tenant returns stored piiProtection when present and valid", async ()
   expect(body.settings.piiProtection.scopes).toEqual({ chatPrompts: true, uploads: false });
   expect(body.settings.piiProtection.detectors.entityTypes).toEqual(["email", "phone"]);
 });
-
-// ---------------------------------------------------------------------------
-// PUT /tenant/settings/pii
-// ---------------------------------------------------------------------------
 
 const VALID_PII_PAYLOAD = {
   enabled: true,

@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
-// Privacy activity is now a tab of Privacy. Keep old links and their query.
+// Privacy activity is a tab of Privacy. Old links and their query strings must keep working.
 export default async function AdminPiiPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(await searchParams)) {

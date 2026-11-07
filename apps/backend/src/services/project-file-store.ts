@@ -345,9 +345,8 @@ export class ProjectFileStore {
           });
         }
       }
-      // Older versions of the sweep could enqueue keys that were still
-      // referenced by a promoted target. Remove those stale rows before the
-      // bounded pending query so they cannot permanently occupy its head.
+      // Remove rows for keys that a promoted target still references. Otherwise
+      // they can occupy the head of the bounded pending query.
       await db.query(
         `DELETE FROM project_file_storage_gc gc
          WHERE EXISTS (SELECT 1 FROM project_file_versions v WHERE v.storage_key=gc.storage_key)

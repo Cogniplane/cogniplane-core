@@ -14,17 +14,16 @@ export const AVAILABLE_MODELS: readonly {
   // Max input context in tokens, used by the composer's context-window meter.
   contextWindow: number;
 }[] = [
-  // Deep Agents (bead quap): the agent loop runs in-process via
+  // Deep Agents: the agent loop runs in-process via
   // deepagentsjs + initChatModel. Ids are namespaced "<catalog>/<vendorModel>";
   // the graph maps each id to its provider via the `provider` field here (NOT
   // the namespace) and builds the initChatModel string from
   // MODEL_PROVIDER_META. See resolveModelConstruction in deep-agents-graph.ts.
   //
   // supportedEfforts drives the composer's Effort dropdown AND is applied to
-  // model construction per-provider (bead i52g): Anthropic extended thinking,
-  // OpenAI reasoning.effort, Gemini thinking budget. See applyReasoningEffort
-  // in deep-agents-graph.ts for how each level maps to the client config.
-  // contextWindow feeds the composer's context meter.
+  // model construction per-provider: Anthropic extended thinking, OpenAI
+  // reasoning.effort, Gemini thinking budget. See applyReasoningEffort in
+  // deep-agents-graph.ts for how each level maps to the client config.
   //
   // isDefault marks at most one default per provider. Callers take the first
   // default whose provider has a key, so catalog order sets the priority:
@@ -113,12 +112,6 @@ export const AVAILABLE_MODELS: readonly {
   // 2026-10-27, and each pairs with a paid slug elsewhere in the catalog or a
   // vendor equivalent. Tool support matters: a model with no `tools` parameter
   // cannot drive the agent loop at all.
-  // (minimax-m3:free was retired, and glm-5.2:free lost tool support and fell
-  // to a 32k window, since the 2026-09-05 check → both dropped.
-  // deepseek-v4-flash-0731:free was retired after the 2026-09-18 check, and no
-  // free DeepSeek route is left → dropped. nemotron-3-super-120b-a12b:free
-  // was retired after the 2026-10-08 check → replaced by its successor,
-  // nemotron-3.5-super-vl:free.)
   { id: "openrouter/thinkingmachines/inkling:free",         displayName: "Inkling (free)",             description: "Free Thinking Machines Inkling for testing.",         isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_048_576 },
   { id: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", displayName: "Nemotron 3 Ultra (free)",   description: "Free NVIDIA Nemotron 3 Ultra for testing.",           isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },
   { id: "openrouter/nvidia/nemotron-3.5-lightning:free",    displayName: "Nemotron 3.5 Lightning (free)", description: "Free NVIDIA Nemotron 3.5 Lightning for testing.",  isDefault: false, provider: "openrouter", supportedEfforts: [], defaultEffort: null, contextWindow: 1_000_000 },

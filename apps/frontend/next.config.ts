@@ -29,7 +29,7 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   turbopack: {
     resolveAlias: {
-      // CopilotKit's standard Map imports it. See the file.
+      // CopilotKit's standard Map imports maplibre-gl. This stub replaces it.
       "maplibre-gl": "./src/lib/maplibre-gl-unavailable.ts"
     }
   },

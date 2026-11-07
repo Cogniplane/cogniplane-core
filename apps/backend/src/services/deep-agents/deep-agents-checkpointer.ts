@@ -1,4 +1,4 @@
-// Postgres persistence for the Deep Agents runtime (bead im5e.3).
+// Postgres persistence for the Deep Agents runtime.
 //
 // ── Tenant-isolation boundary (read before touching) ────────────────────────
 // The LangGraph checkpointer tables are keyed by thread_id ONLY: no tenant

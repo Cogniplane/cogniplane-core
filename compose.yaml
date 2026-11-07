@@ -10,7 +10,6 @@
 #   ANTHROPIC_API_KEY  — optional at boot; required for Anthropic model turns
 #   OPENAI_API_KEY, GOOGLE_API_KEY, OPENROUTER_API_KEY, ZAI_API_KEY — optional;
 #                        each one is a fallback for turns on its provider
-# E2B_API_KEY / E2B_TEMPLATE_ID are required for the backend to boot at all.
 #
 # After bring-up:
 #   Frontend: http://localhost:3000

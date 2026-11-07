@@ -161,7 +161,7 @@ export function parseSandboxEgressText(text: string): ParsedSandboxEgress {
   return { domains, errors, tooMany: domains.length > SANDBOX_EGRESS_DOMAINS_MAX };
 }
 
-/** Toggle a string id in or out of an array. Idempotent. */
+/** Adds the id when `enabled` is true, or removes it when false. A repeat call changes nothing. */
 export function toggleInArray(values: string[], id: string, enabled: boolean): string[] {
   if (enabled) {
     return values.includes(id) ? values : [...values, id];
@@ -169,7 +169,7 @@ export function toggleInArray(values: string[], id: string, enabled: boolean): s
   return values.filter((entry) => entry !== id);
 }
 
-/** Casual relative-time formatter for the "Updated …" pill. */
+/** Relative time for the "Updated …" pill. */
 export function formatRelativeTime(dateString: string, now: Date = new Date()): string {
   const date = new Date(dateString);
   const diffMs = now.getTime() - date.getTime();

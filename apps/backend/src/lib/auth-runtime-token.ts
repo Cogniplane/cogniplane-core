@@ -30,7 +30,7 @@ export function tryAuthenticateRuntimeToken(
   let token: string | undefined;
 
   if (authHeader?.startsWith("Bearer rt_")) {
-    token = authHeader.slice(7); // strip "Bearer "
+    token = authHeader.slice(7);
   }
 
   if (!token) {

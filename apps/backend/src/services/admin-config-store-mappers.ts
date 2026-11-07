@@ -10,9 +10,9 @@ import type {
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 
 /**
- * Read the skills a runtime loaded from its manifest metadata. The metadata is
- * free-form JSON, so a malformed entry is skipped and a malformed field becomes
- * empty rather than failing the whole list.
+ * Reads the skills that a runtime loaded, from its manifest metadata. The
+ * metadata is free-form JSON. The function skips a malformed entry and sets a
+ * malformed field to empty. One bad entry does not fail the whole list.
  */
 export function skillReferencesFromManifest(sessionId: string, manifestMetadata: unknown): ActiveRuntimeSkillReference[] {
   const skills = manifestMetadata && typeof manifestMetadata === "object"
@@ -63,7 +63,7 @@ export function parseApprovalPolicy(value: unknown): ApprovalPolicy {
         return parsed as ApprovalPolicy;
       }
     } catch {
-      // fall through
+      // Invalid JSON is not a granular policy, so use the default below.
     }
   }
   return "never";
@@ -115,11 +115,11 @@ export type SkillActivationMetadata = {
 };
 
 /**
- * Extracts the fields required to activate a skill revision from its metadata
- * JSONB. Returns `{ ok: true, value }` when all required fields are present and
- * typed correctly, or `{ ok: false, missing }` listing the offending fields.
- * Activation is the only consumer that requires the full shape — other
- * consumers (e.g. file preview) read different projections defensively.
+ * Extracts the fields needed to activate a skill revision from its metadata
+ * JSONB. Returns `{ ok: true, value }` when the required fields are present and
+ * typed. Otherwise it returns `{ ok: false, missing }` with the missing fields.
+ * Only activation needs the full shape. Other consumers, such as file preview,
+ * read the metadata defensively.
  */
 export function parseSkillActivationMetadata(
   metadata: Record<string, unknown>

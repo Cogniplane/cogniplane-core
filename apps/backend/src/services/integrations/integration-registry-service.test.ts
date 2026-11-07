@@ -349,8 +349,6 @@ test("resolveSessionToolIds with sharepoint writes enabled includes sharepoint_i
   expect(ids.includes("sharepoint_upload_file")).toBe(true);
 });
 
-// ── Per-call integration checks (H10) ────────────────────────────────────────
-
 function accountProbe(accountId: string | null): IntegrationConnectionProbe {
   return {
     async hasConnection() { return accountId !== null; },

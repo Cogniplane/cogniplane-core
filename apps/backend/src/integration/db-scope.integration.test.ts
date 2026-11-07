@@ -1,6 +1,6 @@
 // `withTenantScope`'s tenant GUC does not survive the transaction that set it.
 //
-// This is the R46 case. `set_config('app.current_tenant_id', $1, true)` passes
+// `set_config('app.current_tenant_id', $1, true)` passes
 // `true` for is_local, so the value is supposed to die with the transaction. If
 // it ever leaked, a pooled connection would serve the NEXT borrower under the
 // previous tenant's RLS context, and every query would still look correct. That
@@ -77,9 +77,7 @@ describe.skipIf(!adminDatabaseUrl())("withTenantScope GUC lifetime", () => {
     // backend, so an empty GUC afterwards cannot be explained by having been
     // handed a fresh connection. Asserted on pid too, belt and braces.
     //
-    // Runs the real `withTenantScope`. An earlier version hand-rolled
-    // BEGIN/set_config/COMMIT, which tested PostgreSQL's SET LOCAL semantics
-    // rather than the helper.
+    // Runs the real `withTenantScope`, not a hand-written copy of its SQL.
     await withOneConnectionPool(async (pool) => {
       const pidInside = await withTenantScope(pool, tenantA.tenantId, async (client) => {
         const { rows } = await client.query<{ pid: number; value: string | null }>(
@@ -135,9 +133,8 @@ describe.skipIf(!adminDatabaseUrl())("withTenantScope GUC lifetime", () => {
     // scope's BEGIN would nest inside the still-open transaction and its
     // queries would run as tenant A.
     //
-    // The read happens BEFORE the second scope's own set_config takes effect,
-    // which is what an earlier version got wrong: reading inside the second
-    // scope always shows tenant B, because B just set it.
+    // The read happens before the second scope's own set_config. Inside that
+    // scope, the value is always tenant B, so the read must come first.
     await withOneConnectionPool(async (pool) => {
       const firstPid = await withTenantScope(pool, tenantA.tenantId, async (client) => {
         const { rows } = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");

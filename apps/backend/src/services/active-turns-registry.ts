@@ -7,29 +7,24 @@ import { TurnEventLog } from "./turn-event-log.js";
 // This registry handles local cancellation and replay. The execution lease in
 // Postgres admits turns and reports running state across replicas.
 
-// Must exceed the longest turn the platform allows. A staleness window shorter
-// than the turn ceiling stale-evicts a *live* turn from snapshot(), letting a
-// concurrent request pass the busy check and start a second turn on the same
-// session.
+// The staleness window must exceed the longest turn the platform allows. A
+// shorter window lets snapshot() evict a live turn, so a second turn can start
+// on the same session.
 //
-// Derive it from config rather than hard-coding: the ceiling moves with
-// E2B_SANDBOX_TIMEOUT_MS and TOOL_CONTEXT_TTL_MS, both env-tunable, and a
-// constant that merely happened to sit above today's defaults goes silently
-// wrong the moment an operator raises either one. Those two are the real
-// wall-clock caps on a turn — the turn watchdog is not, since it pauses for
-// the duration of an approval.
+// Derive the window from config. Do not hard-code it. A constant that fits
+// today's defaults breaks silently when an operator raises either value.
+// E2B_SANDBOX_TIMEOUT_MS and TOOL_CONTEXT_TTL_MS are the real wall-clock caps
+// on a turn. The turn watchdog is not, because it pauses during an approval.
 //
-// This window budgets for ONE approval, and the approval round loop is
-// unbounded, so the window alone cannot cover a turn's real wall-clock length.
-// It does not have to: staleness is measured from `lastSeenAt`, and the resume
-// path calls `keepAlive` on every approval decision. The window is therefore an
-// idle timeout between rounds, not a cap on total turn length, and a turn parked
-// on N consecutive approvals stays live as long as each round completes inside it.
+// The window is long enough for one approval round. The approval round loop has
+// no limit, so the window alone cannot cover a whole turn, and it does not need
+// to. The registry measures staleness from `lastSeenAt`. The resume path calls
+// `keepAlive` on each approval decision. The window is therefore an idle timeout
+// between rounds. A turn with N approvals stays live while each round finishes
+// in time.
 //
-// If a future change stops calling `keepAlive` on the resume path, this reverts
-// to a wall-clock cap that stale-evicts LIVE turns, letting the busy check pass
-// and a second turn start on the same session — the exact failure it exists to
-// prevent. Keep the two together.
+// If the resume path stops calling `keepAlive`, the window becomes a wall-clock
+// cap again. Keep the two together.
 export function deriveStaleAfterMs(config: {
   E2B_SANDBOX_TIMEOUT_MS: number;
   TOOL_CONTEXT_TTL_MS: number;
@@ -37,9 +32,9 @@ export function deriveStaleAfterMs(config: {
   return Math.max(config.E2B_SANDBOX_TIMEOUT_MS, config.TOOL_CONTEXT_TTL_MS) + 5 * 60 * 1000;
 }
 
-// Fallback for constructions with no config in reach (tests, in-memory fakes):
-// the derivation applied to the shipped defaults — max(30 min sandbox, 35 min
-// context TTL) + 5 min margin.
+// Fallback for tests and in-memory fakes, which have no config. It is the
+// derivation with the shipped defaults: max(30 min sandbox, 35 min context
+// TTL) + 5 min margin.
 const DEFAULT_STALE_AFTER_MS = 40 * 60 * 1000;
 
 export type TurnIdentity = { messageId: string; sequence: number };
@@ -148,13 +143,12 @@ export class ActiveTurnsRegistry {
   }
 
   /**
-   * Refresh a live entry's liveness without moving its start time. Called on
-   * each approval decision so a turn stalled on N consecutive approvals is not
-   * stale-evicted while still running — eviction would let the busy check pass
-   * and a second turn start on the same session.
+   * Refreshes the liveness of a live entry. The start time does not change.
+   * The resume path calls this on each approval decision, so the registry does
+   * not evict a turn that waits on many approvals while it runs.
    *
-   * No-op when the entry is already gone: this keeps a turn alive, it does not
-   * resurrect one, so it can never re-reserve a session the turn has released.
+   * No-op when the entry is gone. This keeps a turn alive. It does not revive
+   * a turn, so it cannot re-reserve a session that the turn released.
    */
   keepAlive(sessionId: string): void {
     const entry = this.entries.get(sessionId);
@@ -193,10 +187,9 @@ export class ActiveTurnsRegistry {
   }
 
   /**
-   * Return the set of session ids currently streaming. Entries older than
-   * STALE_AFTER_MS are treated as dead (defensive — the `finally` in the
-   * stream writer should always clear, but a crashed process or an awaited
-   * handler that never resolves would leave a sticky entry).
+   * An entry not seen for `staleAfterMs` counts as dead. The stream
+   * writer's `finally` should clear each entry. A crashed process or a handler
+   * that never resolves can still leave a sticky entry.
    */
   snapshot(): Set<string> {
     const now = Date.now();

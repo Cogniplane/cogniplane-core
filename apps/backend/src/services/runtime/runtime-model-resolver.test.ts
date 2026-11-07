@@ -138,8 +138,8 @@ test("resolveRuntimeModel: no key for the selected model's provider returns prov
 });
 
 test("resolveRuntimeModel: no-model path picks a configured non-Anthropic provider's model", async () => {
-  // Codex P2: a tenant with ONLY an OpenAI key running a scheduled job (no
-  // explicit model) must not be rejected on the Anthropic default.
+  // A tenant with only an OpenAI key runs a scheduled job with no explicit model.
+  // The resolver must not reject the job on the Anthropic default.
   const result = await resolveRuntimeModel(
     makeInput({
       requestedModel: undefined,
@@ -261,8 +261,6 @@ test("resolveRuntimeModel: unsupported effort for the chosen model returns 400",
   expect(result.body.details?.[0]?.message).toMatch(/Effort "max" is not supported/);
 });
 
-// ── Tenant model availability (admin-controlled) ────────────────────────────
-
 const availability = (overrides: Partial<{
   enabledProviders: string[];
   enabledModelIds: string[] | null;
@@ -381,8 +379,6 @@ test("resolveRuntimeModel: no availability wiring leaves selectedEffort as the r
   if (result.kind !== "ok") return;
   expect(result.selectedEffort).toBeUndefined();
 });
-
-// ── Admin-added custom models (listModels) ──────────────────────────────────
 
 const CUSTOM_MODEL = {
   id: "openrouter/moonshotai/kimi-k3",

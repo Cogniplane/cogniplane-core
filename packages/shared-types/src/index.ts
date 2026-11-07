@@ -2,8 +2,6 @@
 // them directly without forcing a circular re-entry through this barrel.
 export * from "./primitives.js";
 
-// MIME classification shared by the artifact-browser filter (backend) and its
-// filter labels (frontend) — one mapping, no drift.
 export * from "./mime-class.js";
 export * from "./model-availability.js";
 export * from "./non-printing.js";

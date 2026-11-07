@@ -1,9 +1,8 @@
-// A turn runs on one replica. A security change of its owner is made on
+// A turn runs on one replica. A security change of its owner happens on
 // another replica, so the stop call (stopActiveWork) does not reach the
-// runtime of the turn. The turn must still stop before its next native tool
-// or model call, with the reason that the user sees, because the runtime
-// reads its tool execution context at those points (bead
-// q4w0.19).
+// runtime of the turn. The runtime reads its tool execution context before
+// each native tool or model call. The turn must therefore still stop before
+// its next such call, and the user must see the reason.
 //
 // Real Postgres, the production message route, Deep Agents adapter and graph,
 // ToolExecutionContextStore and LocalAccountService. Only the model is fake.

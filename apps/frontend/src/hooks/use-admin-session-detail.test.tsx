@@ -59,7 +59,7 @@ it("reports a missing session once, without retries or an error message", async 
 it.each([
   // The current backend answers an unknown route with its own 404 body.
   ["the current backend", { error: "not_found" }],
-  // Backends before 2026-06-13 sent Fastify's default body.
+  // Backends before 2026-06-13 send Fastify's default body.
   ["an older backend", { error: "Not Found", message: "Route GET:/admin/sessions/s1 not found" }]
 ])("says session review is unavailable when %s has no such route", async (_backend, body) => {
   vi.mocked(getAdminSessionDetail).mockRejectedValue(apiError(404, body));

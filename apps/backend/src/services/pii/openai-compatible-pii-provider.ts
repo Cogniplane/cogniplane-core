@@ -22,8 +22,8 @@ import type {
  *   `options.temperature`, and (when `disableThinking`) a top-level
  *   `think:false` — reply at `message.content`. This is the ONLY path that
  *   honors `think:false`; Ollama's `/v1` compat layer silently ignores it.
- *   `disableThinking` on a reasoning-tuned Gemma-4 GGUF cut latency ~40%
- *   (14s → 8.3s) with no loss of detection recall on the homelab GTX 1070.
+ *   `disableThinking` cut latency by about 40% for a reasoning-tuned model,
+ *   with no loss of detection recall.
  */
 export type PiiWireFormat = "openai" | "ollama";
 
@@ -119,12 +119,6 @@ export class OpenAiCompatiblePiiProviderError extends Error {
 const VALID_ENTITY_TYPES = new Set<PiiEntityType>(PII_ENTITY_TYPES);
 
 /**
- * PII provider backed by any OpenAI-compatible `/chat/completions` endpoint.
- * In Cogniplane Cloud this points at an in-VPC, Cogniplane-operated Gemma
- * served by vLLM (no third-party inference, no external query logs); in OSS
- * and dev it can point at OpenRouter or a local Ollama/vLLM.
- */
-/**
  * The machine-readable error code from a failed PII-endpoint response, if the
  * body is JSON that carries one. Returns "" otherwise.
  *
@@ -159,6 +153,12 @@ function formatUpstreamErrorCode(body: string): string {
   return ` (${identifier.slice(0, 64)})`;
 }
 
+/**
+ * PII provider backed by any OpenAI-compatible `/chat/completions` endpoint.
+ * In Cogniplane Cloud this points at an in-VPC, Cogniplane-operated Gemma
+ * served by vLLM. That setup has no third-party inference and no external query
+ * logs. In OSS and dev it can point at OpenRouter or a local Ollama/vLLM.
+ */
 export class OpenAiCompatiblePiiProvider implements PiiProvider {
   readonly type = "openai-compatible";
 
@@ -333,10 +333,9 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
       await this.breaker?.record("success");
       return result;
     } catch (error) {
-      // Every OpenAiCompatiblePiiProviderError represents a real provider problem
-      // (timeout / network / 5xx / malformed response). Count them all.
-      // Non-provider errors (programmer errors, signal aborts from caller
-      // unrelated to provider health) shouldn't count.
+      // A provider error (timeout, network, 5xx, malformed response) is a provider
+      // failure, except `breaker_open`, which the breaker raises before the call.
+      // Other errors (programmer errors, caller aborts) do not count.
       if (error instanceof OpenAiCompatiblePiiProviderError && error.code !== "breaker_open") {
         await this.breaker?.record("failure");
       }

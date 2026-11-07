@@ -229,8 +229,6 @@ function mapDownloadToken(row: Record<string, unknown>): ArtifactDownloadTokenRe
   };
 }
 
-// ── Cross-session browser query helpers ──────────────────────────────────────
-
 export type ArtifactSortKey =
   | "created_desc"
   | "created_asc"
@@ -372,8 +370,6 @@ function decodeArtifactCursor(raw: string): ArtifactCursor | null {
       return null;
     }
     const sort = c.sort as ArtifactSortKey;
-    // The key must match the shape the sort's SQL cast expects, else a tampered
-    // cursor would 500 at the cast rather than 400 here.
     if (!isValidCursorKeyForSort(sort, c.k)) {
       return null;
     }

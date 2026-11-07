@@ -140,7 +140,6 @@ test("bucket storage uploads under bucketName when no key prefix is set", async 
   const storage = new BucketArtifactStorage({
     client,
     bucketName: "bkt"
-    // no keyPrefix
   });
 
   await storage.put({

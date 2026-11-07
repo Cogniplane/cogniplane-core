@@ -156,9 +156,6 @@ describe("checkReportedNetwork", () => {
     ).ok).toBe(false);
   });
 
-  // This code requests only allowOut, denyOut and allowPublicTraffic. The SDK type of the report also has
-  // rules, egressProxy, maskRequestHost and httpsPorts. A report that has a value for one of them, or for a
-  // name that the SDK adds later, is not a sandbox that this code made as it was sent.
   it("accepts exactly what the provider reports for a sandbox that this code created (checked live)", () => {
     expect(checkReportedNetwork(
       { network: { denyOut: ["0.0.0.0/0"], allowPublicTraffic: false } }, denyAll
@@ -203,8 +200,6 @@ describe("checkReportedNetwork", () => {
     )).toEqual({ ok: true });
   });
 
-  // Only undefined stands for "not set". e2b@2.53.1 builds the report with every optional name present and the
-  // value undefined (see the test above). Any other value, an empty one too, is a setting that was not requested.
   it.each([
     ["null", null],
     ["false", false],

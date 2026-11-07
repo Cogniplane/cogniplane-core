@@ -2,7 +2,6 @@ import { useId, useState, type ReactNode, type Ref } from "react";
 
 import { Button } from "@/components/ui/button";
 
-/** One Overview line: a name, one status line, and its actions. */
 export function OverviewRow({ title, status, busy, children }: { title: ReactNode; status: ReactNode; busy?: boolean; children: ReactNode }) {
   return <div className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between">
     <div className="min-w-0">

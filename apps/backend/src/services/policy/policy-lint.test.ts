@@ -4,7 +4,6 @@ import type { PolicyConditions } from "@cogniplane/shared-types";
 
 import { conditionsSubsume, lintRules, type LintableRule } from "./policy-lint.js";
 
-// Build a lintable rule with sane defaults; override what a test cares about.
 let seq = 0;
 function rule(overrides: Partial<LintableRule> = {}): LintableRule {
   seq += 1;

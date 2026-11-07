@@ -2,11 +2,11 @@
  * Report backend line coverage counting the integration suite alongside the
  * unit suite.
  *
- * The blocking gate (`pnpm test:coverage`) measures the unit suite alone, so a
- * module whose only tests need Postgres reports near zero even when those tests
- * cover it completely. `project-store.ts` is the clearest case: the gate calls
- * it 4.1% while the RLS suite covers every line. That understates how much of
- * the backend is tested and pushes the floor down at every rebaseline.
+ * The blocking gate (`pnpm test:coverage`) measures the unit suite alone. A
+ * module whose only tests need Postgres therefore reports near zero, even when
+ * those tests cover it completely. `project-store.ts` is the clearest case. That
+ * understates how much of the backend is tested and lowers the floor at every
+ * rebaseline.
  *
  * This merge is a REPORT, not a gate. It stays advisory on purpose: the
  * integration job owns its Postgres service container, and making the unit

@@ -45,7 +45,6 @@ import { type AfterSecurityChange, type SecurityChange, withSecurityChange } fro
 // Changes that the tenant policy depends on (a new factor, a removed one)
 // take the tenant lock, then the identity, like every other factor change.
 
-/** Passkeys one account may hold. */
 export const MAX_PASSKEYS_PER_ACCOUNT = 10;
 
 export type PasskeySummary = {

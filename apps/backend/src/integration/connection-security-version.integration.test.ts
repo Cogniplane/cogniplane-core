@@ -1,10 +1,10 @@
 // A personal connection acts as its owner. A session that a stolen access
-// token opened can attach the attacker's own account or secret (bead
-// q4w0.8). Each connection keeps the security
-// version of the session that saved it (migration 083). After a security
-// change of the owner's local account, the read for use does not return it
-// (suspended), the owner's read shows it as suspended, and only a confirm
-// from a current session restores it. WorkOS owners are not compared.
+// token opened can attach the attacker's own account or secret. Each
+// connection keeps the security version of the session that saved it
+// (migration 083). After a security change of the owner's local account, the
+// read for use does not return the connection (it is suspended). The owner's
+// read shows it as suspended. Only a confirm from a current session restores
+// it. WorkOS owners are not compared.
 //
 // These tests run the production store SQL and LocalAccountService against
 // real Postgres under RLS. The Microsoft store is in the private overlay; its
@@ -76,8 +76,8 @@ async function auditPayloads(tenantId: string, eventType: string) {
   return rows.map((row) => row.payload);
 }
 
-// The MCP contracts as main had them before this change. A client built from
-// them must still read every response of this change (deploy order is free).
+// The MCP contracts from before this change. A client built from them must
+// still read every response (deploy order is free).
 const STATUS_BEFORE = z.enum(["not_connected", "connected", "reconnect_required", "organization", "no_auth", "unavailable"]);
 const McpConnectionBeforeSchema = z.object({
   status: STATUS_BEFORE, credentialVersion: z.number().int().nonnegative(), accountLabel: z.string().nullable(),
@@ -334,8 +334,7 @@ describe.skipIf(!adminDatabaseUrl())("personal connections after a security chan
 });
 
 describe.skipIf(!adminDatabaseUrl())("migration 083: connection owner security version", () => {
-  // An earlier build of this change shipped the same SQL as migration 081.
-  // A development database that applied it must run 083 without an error and
+  // A database that applied the 081 file must run 083 without an error and
   // keep the versions that the backend stored since.
   test("runs again on a database that applied the earlier 081 file", async () => {
     await withStagedDatabase(async ({ db, migrate }) => {

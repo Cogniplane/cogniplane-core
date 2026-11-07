@@ -280,10 +280,6 @@ function expectRateLimited(res: { statusCode: number; headers: Record<string, un
   expect(res.json()).toEqual(RATE_LIMIT_PAYLOAD);
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// /auth/login
-// ──────────────────────────────────────────────────────────────────────────
-
 describe("GET /auth/login", () => {
   let harness: Harness;
   beforeEach(async () => {
@@ -350,10 +346,6 @@ describe("GET /auth/login", () => {
     expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_oauth_state")).toBeNull();
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// /auth/callback
-// ──────────────────────────────────────────────────────────────────────────
 
 describe("POST /auth/callback", () => {
   let harness: Harness;
@@ -1002,9 +994,8 @@ describe("POST /auth/refresh", () => {
   });
 
   // The theft event must not depend on the database at the moment of the
-  // detection (Beads issue q4w0.18). A 503 would
-  // be lost: the client's retry finds the family revoked, and a revoked
-  // family does not detect reuse again.
+  // detection. A 503 would be lost: the client's retry finds the family revoked,
+  // and a revoked family does not detect reuse again.
   describe("a reuse detection whose audit write fails", () => {
     type LogLine = { level: number; msg: string } & Record<string, unknown>;
     const ERROR = 50;
@@ -1344,7 +1335,7 @@ describe("POST /auth/refresh", () => {
   });
 
   // Browsers send Origin on every POST, so a request without one is not the
-  // frontend. The earlier guard let a request with neither header through.
+  // frontend. A request with neither header must not get through.
   test.each([
     ["no Origin and a cross-site Referer", { referer: "https://evil.example/attack" }],
     ["no Origin and a same-site Referer", { referer: "http://localhost:3000/chat" }],
@@ -1486,10 +1477,6 @@ describe("POST /auth/refresh", () => {
     expect((res.json() as { accessToken: string }).accessToken.length).toBeGreaterThan(0);
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// /auth/logout
-// ──────────────────────────────────────────────────────────────────────────
 
 describe("POST /auth/logout", () => {
   let harness: Harness;
@@ -1647,10 +1634,6 @@ describe("POST /auth/logout", () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
-// /auth/me
-// ──────────────────────────────────────────────────────────────────────────
-
 describe("GET /auth/me", () => {
   test("returns 401 when request.auth is missing", async () => {
     const harness = await buildHarness();
@@ -1716,10 +1699,6 @@ describe("GET /auth/me", () => {
     });
   });
 });
-
-// ──────────────────────────────────────────────────────────────────────────
-// /auth/organizations
-// ──────────────────────────────────────────────────────────────────────────
 
 describe("GET /auth/organizations", () => {
   test("returns 401 when request.auth is missing", async () => {

@@ -46,9 +46,8 @@ const RECOVERY_PUBLIC_AUTH_PATHS: readonly string[] = ["/auth/local/password/for
 const WORKOS_PUBLIC_AUTH_PATHS: readonly string[] = ["/auth/login", "/auth/callback"];
 
 /**
- * Public auth paths for this configuration. OAuth callback paths are pulled
- * from the integration registry so a private overlay's integration descriptor
- * can extend the allowlist without editing this file.
+ * OAuth callback paths come from the integration registry. A private overlay's
+ * integration descriptor can extend the allowlist without editing this file.
  */
 export function jwtPublicAuthPaths(
   config: Pick<AppConfig, "AUTH_MODE" | "AUTH_LOGIN_TYPES" | "WEBAUTHN_RP_ID" | "SMTP_URL" | "MAIL_FROM">,
@@ -103,9 +102,8 @@ export function jwtAuth(
     try {
       const payload = await verifyAccessToken(config, token);
 
-      // Look up the user's role and login type in this tenant. The store is
-      // constructed against `privilegedDb` because tenant context isn't
-      // established yet — admitting non-members is a tenant-spanning question.
+      // Look up the user's role and login type in this tenant. The caller must
+      // build the store on `privilegedDb`, because no tenant context exists yet.
       const admission = checkAuthAdmission(config, await tenantMembers.getAuthState(payload.tid, payload.sub), {
         sv: payload.sv
       });

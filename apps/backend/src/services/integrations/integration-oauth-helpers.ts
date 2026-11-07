@@ -12,8 +12,8 @@ import {
 
 /**
  * OAuth plumbing shared by the integration connection services (GitHub,
- * Notion, …). Each service previously carried private copies of these —
- * security-relevant token handling should be patched in one place.
+ * Notion, …). Security-relevant token handling belongs here, so a fix reaches
+ * every service.
  */
 
 /** Key for signing/verifying the OAuth `state` JWT. */
@@ -27,8 +27,8 @@ export function getSecretKey(config: IntegrationJwtConfig): Uint8Array {
 }
 
 export function getVerificationKey(config: IntegrationJwtConfig, kid: unknown): Uint8Array {
-  // State JWTs issued before key rotation support had no kid and live for only
-  // ten minutes. Accept those under the active key during rolling deployment.
+  // During a rolling deployment, accept a state JWT without a kid under the
+  // active key. Such a state lives only ten minutes.
   return resolveJwtVerificationKey(config, kid, { allowMissingKid: true });
 }
 

@@ -61,7 +61,7 @@ export const MANAGER_LINK_COOLDOWN_MS = 60_000;
 /** What a forgot-password request did. Only tests and logs see it; the caller answers the same in every case. */
 export type PasswordResetRequestOutcome = "sent" | "no_account" | "not_active" | "cooldown" | "no_address" | "mail_off";
 // Bounds the work of one hash on attacker input. The policy limit for a new
-// password is far lower (128 characters).
+// password (PASSWORD_MAX_LENGTH) is far lower.
 export const MAX_PASSWORD_INPUT_LENGTH = 1024;
 
 export type ActionPurpose = "account_setup" | "password_reset";
@@ -428,8 +428,6 @@ export class LocalAccountService {
     return { link: null, email: { to, expiresAt: link.expiresAt, purpose: link.purpose } };
   }
 
-  // ---- Sign-in ----
-
   /**
    * Checks an email and password. Every failure is the same
    * `invalid_credentials`, with the same Argon2 work, whatever the cause: no
@@ -522,8 +520,6 @@ export class LocalAccountService {
     return row ? { tenantId: row.tenant_id, userId: row.user_id } : null;
   }
 
-  // ---- One-time links ----
-
   /**
    * Sets a password with a link. `account_setup` works only for an
    * account in pending_setup and activates it; `password_reset` works only for
@@ -591,8 +587,6 @@ export class LocalAccountService {
       };
     });
   }
-
-  // ---- Self-service ----
 
   /**
    * "Forgot password": emails a 30-minute reset link to an active account.
@@ -716,8 +710,6 @@ export class LocalAccountService {
         actorUserId === targetUserId ? {} : { targetUserId }, meta));
     });
   }
-
-  // ---- Manager actions ----
 
   /**
    * Creates a local member and its setup link. The caller has checked the

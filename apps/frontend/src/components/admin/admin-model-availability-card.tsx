@@ -461,13 +461,11 @@ export function AdminModelAvailabilityCard(props: {
       const modelId = model.id;
       const updated = await props.onRemoveModel(modelId);
       if (!updated) { setRemoveError(`Could not remove ${model.displayName}. Your availability draft is kept. Try again.`); return; }
-      // The backend scrubbed the deleted model from tenant_settings, but the
-      // resync effect deliberately ignores server state while the draft is
-      // dirty. Strip the id locally so a later Save can't submit a reference
-      // to the deleted model (the PUT rejects unknown ids with a 400). Plain
-      // setDraft, rather than updateDraft: removal alone must not mark a clean draft
-      // dirty (server state already matches). The removal saved a new settings
-      // version, so a later Save must expect that version.
+      // The backend removed the model from tenant_settings. The resync effect
+      // ignores server state while the draft is dirty, so strip the id here.
+      // Otherwise the next Save sends an unknown id and gets a 400. Use
+      // setDraft, not updateDraft, so a clean draft stays clean. Expect the new
+      // settings version on the next Save.
       setDraft((current) => {
         if (!current) return current;
         const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;

@@ -14,10 +14,6 @@ export type SyncedArtifact = {
 // text-extraction path in buildArtifactTurnInputs.
 const MAX_SYNC_FILE_BYTES = 10 * 1024 * 1024;
 
-/**
- * Strip directory components and path traversal sequences from an artifact
- * name so it can be used safely as a filename under `./artifacts/`.
- */
 function safeFileName(artifactName: string): string {
   const base = path.basename(artifactName);
   if (!base || base === "." || base === "..") {
@@ -27,9 +23,8 @@ function safeFileName(artifactName: string): string {
 }
 
 /**
- * Build a unique workspace path for an artifact. When multiple artifacts
- * share the same name, subsequent ones get the full artifact-ID suffix. A
- * UUIDv7 prefix is a timestamp, so a short prefix is not unique.
+ * When multiple artifacts share the same name, later ones get the full artifact ID
+ * as a suffix. A UUIDv7 prefix is a timestamp, so a short prefix is not unique.
  */
 function uniqueWorkspacePath(artifact: ArtifactRecord, usedNames: Set<string>): string {
   const safe = safeFileName(artifact.artifactName);
@@ -60,14 +55,12 @@ export async function syncArtifactsToWorkspace(input: {
   const usedNames = new Set<string>();
   const results: SyncedArtifact[] = [];
 
-  // Process artifacts sequentially to avoid buffering all files in memory
-  // at once. With 10 artifacts at up to 25 MB each, concurrent loads could
-  // allocate hundreds of MB.
+  // Process artifacts sequentially to avoid buffering all files in memory at once.
+  // With 10 artifacts at the 10 MB cap each, concurrent loads could allocate about 100 MB.
   for (const artifact of scopedArtifacts) {
     if (signal?.aborted) break;
     const workspacePath = uniqueWorkspacePath(artifact, usedNames);
 
-    // Skip files that exceed the per-file size cap.
     if (artifact.fileSizeBytes > MAX_SYNC_FILE_BYTES) {
       results.push({ artifact, workspacePath, synced: false });
       continue;

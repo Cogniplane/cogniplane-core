@@ -569,8 +569,6 @@ export async function updateTenantPiiProtection(input: PiiProtectionSettings, ex
   );
 }
 
-// ─── PII admin metrics ──────────────────────────────────────────────────────
-
 export async function getPiiProviderStatus(): Promise<PiiProviderStatus | null> {
   // 404 means the breaker isn't wired (PII_BREAKER_ENABLED=false). Treat
   // that as "no status to show" rather than an error so the UI can hide

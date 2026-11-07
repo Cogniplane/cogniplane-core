@@ -28,7 +28,7 @@ vi.mock("../lib/message-api", () => ({
   listMessages: vi.fn(
     () =>
       new Promise<{ messages: unknown[]; hasMore: boolean }>((resolve, reject) => {
-        // listMessages returns a paged envelope now. Tests still settle with a
+        // listMessages returns a paged envelope. Tests still settle with a
         // bare Message[], so wrap it here rather than churning every call site.
         apiState.pendingMessageLoads.push({
           resolve: (messages: unknown[]) => resolve({ messages, hasMore: false }),

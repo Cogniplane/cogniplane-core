@@ -456,8 +456,8 @@ test("callChat surfaces HTTP errors with a bounded message", async () => {
 });
 
 test("callChat never puts a 4xx response body in the error message", async () => {
-  // R45. The message is persisted to pii_scan_jobs.error_message and shown to
-  // admins through the analytics error rollup. OpenAI-compatible gateways
+  // The message goes to pii_scan_jobs.error_message, and the analytics error
+  // rollup shows it to admins. OpenAI-compatible gateways
   // commonly echo the offending request back in a 4xx body — which here is the
   // text under scan — so retaining it defeats rawRetention='never'.
   const scannedText = "Jane Doe, SSN 123-45-6789, jane@example.test";
@@ -705,8 +705,6 @@ test("scanCsvPreview: drops findings with unknown entity types", async () => {
   // passport_number isn't in PII_ENTITY_TYPES, so it's dropped.
   expect(result.findings.length).toBe(0);
 });
-
-// --- Ollama native wire format ------------------------------------------------
 
 test("ollama wire format posts to /api/chat with format:json and parses message.content", async () => {
   const capture: CapturedRequest[] = [];

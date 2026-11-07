@@ -97,8 +97,8 @@
   --shadow-lg: var(--elevation-modal);
 
   /* Type roles beyond Tailwind's default scale. `text-label` is the uppercase
-     group label (rail groups, compact metadata headings). It replaces the
-     earlier 0.62rem size, which was below a readable floor. */
+     group label (rail groups, compact metadata headings). Do not set it below
+     a readable size. */
   --text-label: 0.6875rem;
   --text-label--line-height: 1rem;
   --text-label--letter-spacing: 0.08em;
@@ -232,10 +232,6 @@
   --color-chart-5: #b1bccb; /* neutral ink */
   --chart-5: var(--color-chart-5);
 }
-
-/* ============================================================
-   BASE RESET
-   ============================================================ */
 
 *, *::before, *::after {
   box-sizing: border-box;
@@ -550,8 +546,8 @@ body {
   display: table;
 }
 
-/* The user's message uses the soft container tone, as before. Full ink is
-   too strong against the light surface. */
+/* The user's message uses the soft container tone. Full ink is too strong
+   against the light surface. */
 .chat-surface .copilotKitUserMessage .cpk\:prose {
   --tw-prose-body: var(--color-on-primary-container);
   background-color: var(--color-primary-container);

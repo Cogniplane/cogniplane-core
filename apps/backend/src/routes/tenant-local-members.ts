@@ -20,8 +20,9 @@ import { MFA_POLICIES } from "../services/auth/local-mfa-service.js";
 // email off, the manager gets the new account's setup link, and with email on
 // it goes to the address the manager typed: a stolen access token alone must
 // not create an account that outlives the victim's password change. Every
-// action writes an audit event in its own transaction (LocalAccountService). With email on, setup and reset links go
-// to the person by email and the manager sees only where they went.
+// action writes an audit event in its own transaction (LocalAccountService).
+// With email on, setup and reset links go to the person by email, and the
+// manager sees only where they went.
 
 const memberParamsSchema = z.object({
   userId: z.string().trim().min(1).max(80).regex(/^[a-z0-9][a-z0-9-_]*$/)

@@ -17,9 +17,7 @@ test("request limit outages return a safe 503 with retry guidance", async () => 
 
 describe("parseTrustProxy", () => {
   test("the shipped default trusts nothing", () => {
-    // The default moved from "1" to "false" when Fastify removed hop counts.
-    // Deployments behind a proxy set an IP/CIDR allowlist instead. Kept in
-    // sync with config.ts by the assertion below.
+    // Deployments behind a proxy set an IP/CIDR allowlist instead.
     expect(parseTrustProxy("false")).toBe(false);
   });
 
@@ -49,9 +47,8 @@ describe("parseTrustProxy", () => {
 });
 
 test("trustProxy resolves request.ip from X-Forwarded-For for an allowlisted proxy", async () => {
-  // The CIDR allowlist is what replaced the removed hop count. The proxy is
-  // trusted by ADDRESS, so the entry it appended wins and request.ip is the
-  // real client.
+  // Fastify trusts the proxy by its address. It then uses the client IP that the
+  // proxy appended to X-Forwarded-For, so request.ip is the real client.
   const app = Fastify({ logger: false, trustProxy: parseTrustProxy("10.0.0.0/8") });
   app.get("/whoami", async (request) => ({ ip: request.ip }));
 
@@ -65,9 +62,9 @@ test("trustProxy resolves request.ip from X-Forwarded-For for an allowlisted pro
 });
 
 test("trustProxy ignores X-Forwarded-For from a peer outside the allowlist", async () => {
-  // The property the hop count could NOT provide, and the reason Fastify
-  // removed it: a direct client that forges XFF is not believed, because its
-  // address is not in the allowlist. request.ip stays the socket peer.
+  // Fastify ignores X-Forwarded-For from a direct client that forges it, because
+  // its address is not in the allowlist. request.ip stays the socket peer. A hop
+  // count cannot provide this check.
   const app = Fastify({ logger: false, trustProxy: parseTrustProxy("10.0.0.0/8") });
   app.get("/whoami", async (request) => ({ ip: request.ip }));
 
@@ -101,7 +98,6 @@ test("500-class errors return an opaque envelope (no internal message leaks)", a
     error: "internal_error",
     message: "An unexpected error occurred."
   });
-  // The raw Error message must never reach the client.
   expect(response.body).not.toContain("secret");
   expect(response.body).not.toContain("postgres://");
 });

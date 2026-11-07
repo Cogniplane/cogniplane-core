@@ -111,7 +111,6 @@ describe("safeDownloadFilename", () => {
   });
 });
 
-// Pulls the two parameters out of a Content-Disposition value.
 function parseDisposition(header: string) {
   const match = /^attachment; filename="([^"]*)"; filename\*=UTF-8''([^;\s]*)$/.exec(header);
   if (!match) throw new Error(`Unexpected Content-Disposition shape: ${header}`);

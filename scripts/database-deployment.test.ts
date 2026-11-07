@@ -11,7 +11,7 @@ test.each(["compose.yaml"])("%s separates migration from runtime", async file =>
   expect(services.migrate.command).toEqual(["node", "apps/backend/dist/scripts/migrate.js"]);
   expect(services.migrate.restart).toBe("no");
   expect(services.backend.depends_on.migrate.condition).toBe("service_completed_successfully");
-  // In the homelab stack, explicit empty values override the shared env file.
+  // The backend must not receive the migration URL or the bootstrap passwords.
   expect(services.backend.environment.MIGRATION_DATABASE_URL || "").toBe("");
   expect(services.backend.environment.POSTGRES_PASSWORD || "").toBe("");
   expect(services.backend.environment.APP_USER_PASSWORD || "").toBe("");

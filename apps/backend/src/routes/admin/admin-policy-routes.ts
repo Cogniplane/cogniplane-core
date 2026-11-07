@@ -165,7 +165,6 @@ export async function registerAdminPolicyRoutes(
     return serialize(PolicyRulesListResponseSchema, { rules });
   }));
 
-  // Create a rule.
   app.post("/admin/policy/rules", withAdmin(app, async (request, reply) => {
     const parsed = parseRequestInput(reply, PolicyRuleInputSchema, request.body);
     if (!parsed.ok) return parsed.response;
@@ -209,7 +208,6 @@ export async function registerAdminPolicyRoutes(
     }
   }));
 
-  // Delete a rule.
   app.delete("/admin/policy/rules/:ruleId", withAdmin(app, async (request, reply) => {
     const params = ruleIdParamsSchema.safeParse(request.params);
     if (!params.success) return respondAdminNotFound(reply, "policy_rule_not_found");

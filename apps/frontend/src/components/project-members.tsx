@@ -28,7 +28,7 @@ import {
 /** The members of a project. An owner can change a role, remove a member, or
  *  leave. Every change asks first. When the change takes the role of the only
  *  owner, the question says that the project will have no owner. The backend
- *  allows that (decision D13j), and an organization admin can assign an owner. */
+ *  allows that, and an organization admin can assign an owner. */
 export function ProjectMembers({ projectId, access, canManage, currentUserId, organizationNote }: {
   projectId: string;
   access: ProjectAccess;

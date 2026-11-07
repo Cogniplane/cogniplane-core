@@ -43,8 +43,7 @@ describe("policy approval proof", () => {
   });
 
   it("keeps the hash of arguments with no nested transport key, so an approval made earlier still matches", () => {
-    // These values come from the earlier algorithm, which dropped the transport keys at every level.
-    // They must not change: an approval that was made but not yet used holds one of them.
+    // These hashes must not change. A pending approval can hold one of them.
     expect(policyArgsHash({
       name: "units",
       content: "Prefère le système métrique ✓",

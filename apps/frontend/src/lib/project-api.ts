@@ -140,8 +140,8 @@ export async function updateProjectSharing(id: string, input: {
 }
 
 /** Sets the explicit role of a member, or removes it with a null role. A member
- *  can remove their own role. The backend allows the last owner to leave or lose
- *  the role (decision D13j), so the caller warns first. `confirmRetainedRole`
+ *  can remove their own role. The backend lets the last owner leave or lose
+ *  the role, so the caller warns first. `confirmRetainedRole`
  *  confirms the access that organization sharing still gives afterwards. */
 export async function updateProjectMember(id: string, userId: string, input: {
   role: "owner" | "editor" | "viewer" | null;

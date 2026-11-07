@@ -45,8 +45,7 @@ describe("encrypt produces a well-formed envelope", () => {
 describe("tamper detection (GCM authentication)", () => {
   test("flipping a byte in the ciphertext region makes decrypt throw", () => {
     const buf = Buffer.from(encrypt("sensitive-value", SECRET), "base64");
-    // Pick a byte strictly inside the ciphertext region: [IV_LENGTH, len - TAG_LENGTH).
-    const target = IV_LENGTH; // first ciphertext byte
+    const target = IV_LENGTH;
     expect(target).toBeLessThan(buf.length - TAG_LENGTH);
     buf[target] ^= 0xff;
     const tampered = buf.toString("base64");
@@ -55,8 +54,7 @@ describe("tamper detection (GCM authentication)", () => {
 
   test("flipping a byte in the auth-tag region makes decrypt throw", () => {
     const buf = Buffer.from(encrypt("sensitive-value", SECRET), "base64");
-    // Pick a byte inside the tag region: [len - TAG_LENGTH, len).
-    const target = buf.length - TAG_LENGTH; // first tag byte
+    const target = buf.length - TAG_LENGTH;
     buf[target] ^= 0xff;
     const tampered = buf.toString("base64");
     expect(() => decrypt(tampered, SECRET)).toThrow();
@@ -64,7 +62,7 @@ describe("tamper detection (GCM authentication)", () => {
 
   test("flipping a byte in the IV region makes decrypt throw", () => {
     const buf = Buffer.from(encrypt("sensitive-value", SECRET), "base64");
-    buf[0] ^= 0xff; // first IV byte
+    buf[0] ^= 0xff;
     const tampered = buf.toString("base64");
     expect(() => decrypt(tampered, SECRET)).toThrow();
   });
@@ -86,7 +84,6 @@ describe("IV uniqueness", () => {
     // A random IV per call guarantees distinct envelopes; a static IV would
     // leak that the two values are identical.
     expect(a).not.toBe(b);
-    // Both still decrypt back to the same plaintext.
     expect(decrypt(a, SECRET)).toBe(plaintext);
     expect(decrypt(b, SECRET)).toBe(plaintext);
   });
@@ -106,7 +103,6 @@ describe("truncated envelope", () => {
   });
 
   test("an envelope shorter than iv + tag makes decrypt throw", () => {
-    // Fewer than IV_LENGTH + TAG_LENGTH bytes cannot carry a valid frame.
     const tooShort = Buffer.alloc(IV_LENGTH + TAG_LENGTH - 1).toString("base64");
     expect(() => decrypt(tooShort, SECRET)).toThrow();
   });

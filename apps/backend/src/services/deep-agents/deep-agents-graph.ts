@@ -2,15 +2,15 @@
 // initChatModel, the shared Postgres checkpointer, the lazy E2B sandbox
 // backend, MCP gateway tools, and interrupt-based HITL approvals.
 //
-// MCP (bead im5e.4): GatewayMcpClient speaks streamable HTTP to the platform
+// MCP: GatewayMcpClient speaks streamable HTTP to the platform
 // gateway (/mcp/:serverId) with the session's Bearer rt_* token, in a header
 // only, never in `?token=`. The client reads the per-turn toolContextId and any
 // approval proof from backend refs at CALL time and sends them in the
 // request's `_meta`, so it never needs rebuilding between turns.
 //
-// Approvals (bead im5e.4): `interruptOn` (langchain humanInTheLoopMiddleware)
-// pauses BEFORE tool execution and checkpoints — no held promise, no
-// in-sandbox bridge. The adapter detects the pending interrupt after the
+// Approvals: `interruptOn` (langchain humanInTheLoopMiddleware)
+// pauses BEFORE tool execution and checkpoints. It holds no promise and needs
+// no in-sandbox bridge. The adapter detects the pending interrupt after the
 // stream ends, runs the approval round-trip, and resumes with a Command.
 // Each gated call's HITL description carries the model's call ID, so a
 // pending action of the main agent names its proposed call (`modelCallId`).
@@ -115,13 +115,6 @@ export class ProviderKeyMissingError extends Error {
 }
 
 /**
- * initChatModel base-URL option shaped per provider client. Each LangChain
- * chat client names this differently, and — critically for OpenAI/OpenRouter —
- * a top-level `baseUrl`/`baseURL` is IGNORED; the OpenAI client only reads
- * `configuration.baseURL` (verified against @langchain/openai). Returns an
- * empty object when no override applies (each client hits its own default).
- */
-/**
  * The AsyncCaller hook that runs after each failed provider request. It keeps
  * the default decision (a hook error stops the retries) and then checks the
  * tool context, so a dead context gets no more requests. The check runs before
@@ -142,6 +135,13 @@ class DefaultRetryDecision extends AsyncCaller {
   }
 }
 
+/**
+ * initChatModel base-URL option shaped per provider client. Each LangChain
+ * chat client names this option differently. Critically for OpenAI/OpenRouter,
+ * the OpenAI client IGNORES a top-level `baseUrl`/`baseURL`. It only reads
+ * `configuration.baseURL` (verified against @langchain/openai). Returns an
+ * empty object when no override applies (each client hits its own default).
+ */
 export function buildProviderBaseUrlOptions(
   provider: ModelProvider,
   baseUrl: string | null
@@ -164,14 +164,13 @@ export function buildProviderBaseUrlOptions(
 /**
  * initChatModel options that pin native OpenAI models to the Responses API.
  *
- * ChatOpenAI picks Chat Completions vs Responses per model via a hardcoded
- * allowlist (`_modelPrefersResponsesAPI`) that lags new releases — the GPT-5.6
- * family isn't in it as of @langchain/openai 1.5.3, and OpenAI rejects
- * function tools + `reasoning_effort` on /v1/chat/completions for those models
- * ("use /v1/responses or set reasoning_effort to 'none'"), which bricked every
- * tool-bearing turn. The Responses API is OpenAI's recommended path for all
- * GPT-5.x, so force it for the whole native-OpenAI catalog rather than
- * chasing the family list.
+ * ChatOpenAI picks Chat Completions or Responses per model through a hardcoded
+ * allowlist (`_modelPrefersResponsesAPI`). The allowlist lags new releases. The
+ * GPT-5.6 family is not in it as of @langchain/openai 1.5.3. For those models,
+ * OpenAI rejects function tools with `reasoning_effort` on /v1/chat/completions
+ * ("use /v1/responses or set reasoning_effort to 'none'"). The Responses API is
+ * OpenAI's recommended path for all GPT-5.x. So this function forces it for the
+ * whole native-OpenAI catalog and does not chase the family list.
  *
  * Keyed on the provider, NOT the initPrefix: OpenRouter and Z.AI ride the
  * OpenAI client but their gateways speak Chat Completions.
@@ -184,7 +183,7 @@ export function buildOpenAiResponsesApiOptions(
 
 /**
  * initChatModel options that bake reasoning effort into the chat model, shaped
- * per provider client (bead i52g). Each SDK names its knob differently and
+ * per provider client. Each SDK names its knob differently and
  * accepts a different value set:
  *
  * - Anthropic (`@langchain/anthropic`): `outputConfig.effort` takes
@@ -238,10 +237,9 @@ export function applyReasoningEffort(
 /** Built-in Deep Agents tools that mutate state — gated whenever approvals are on. */
 const MUTATING_BUILTIN_TOOLS = ["execute", "write_file", "edit_file", "delete"];
 /**
- * Read-only built-ins. Gated only when the tenant turned OFF
- * autoApproveReadOnlyTools — that flag is the explicit "prompt me even for
- * reads" posture: every tool is gated and the read-only bypass is opt-in
- * (semantics carried over from the retired Claude runtime's canUseTool).
+ * Read-only built-ins. They are gated only when the tenant turned OFF
+ * autoApproveReadOnlyTools. That flag is the explicit "prompt me even for
+ * reads" posture: every tool is gated, and the read-only bypass is opt-in.
  * `write_todos` (plan state) and `task`
  * (subagent dispatch; its inner tool calls are gated individually) stay
  * ungated.
@@ -294,10 +292,10 @@ type LangchainToolLike = {
 };
 
 export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) => {
-  // Durable PostgresSaver shared across all sessions when wired (im5e.3) —
-  // conversations then resume across process restarts. Per-session MemorySaver
-  // fallback otherwise. Either way the same instance is reused across model
-  // rebuilds so a per-turn model switch keeps the thread history.
+  // When wired, all sessions share one durable PostgresSaver. Conversations then
+  // resume across process restarts. Otherwise a per-session MemorySaver is the
+  // fallback. Either way the runtime reuses the same instance across model
+  // rebuilds, so a per-turn model switch keeps the thread history.
   const saver = (init.checkpointer as BaseCheckpointSaver | undefined) ?? new MemorySaver();
   const checkpointer = new CurrentSkillsCheckpointer(saver);
   // Construct a lazy sandbox handle when shell is enabled, including after a
@@ -315,16 +313,15 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   });
   let sandbox = init.e2b ? createSandbox(init.e2b) : null;
 
-  // Skills library (bead kpit): enabled skills are served read-only at
-  // /skills/ through a CompositeBackend route, and surfaced to the model by
-  // the native deepagents skills middleware (`skills` param below) with
-  // progressive disclosure. Routing — instead of staging files into the
-  // sandbox — keeps the sandbox lazy (chat-only sessions with skills still
-  // never create one) and the library immutable. When the default backend is
-  // the sandbox, CompositeBackend still delegates `execute` to it and exposes
-  // its non-empty `id`, so the execute tool stays available; without a
-  // sandbox the composite wraps the same per-run StateBackend the library
-  // would default to, and its empty `id` keeps execute hidden.
+  // Skills library: a CompositeBackend route serves enabled skills read-only at
+  // /skills/. The native deepagents skills middleware (`skills` param below)
+  // surfaces them to the model with progressive disclosure. Routing, instead of
+  // staging files into the sandbox, keeps the sandbox lazy (chat-only sessions
+  // with skills still never create one) and the library immutable. When the
+  // default backend is the sandbox, CompositeBackend still delegates `execute`
+  // to it and exposes its non-empty `id`, so the execute tool stays available.
+  // Without a sandbox the composite wraps the same per-run StateBackend that
+  // the library would default to, and its empty `id` keeps execute hidden.
   let skillsFiles = init.skillsLibraryFiles ?? {};
   let allowCommandExecution = Boolean(sandbox);
   const buildBackend = () => {
@@ -550,7 +547,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         // Native OpenAI models must use the Responses API — Chat Completions
         // rejects tools + reasoning_effort for newer families (GPT-5.6).
         ...buildOpenAiResponsesApiOptions(provider),
-        // Reasoning effort baked in per provider (bead i52g). Empty object when
+        // Reasoning effort baked in per provider. Empty object when
         // the model has no effort selected, so the client keeps its default.
         ...applyReasoningEffort(provider, normalizedEffort)
       });

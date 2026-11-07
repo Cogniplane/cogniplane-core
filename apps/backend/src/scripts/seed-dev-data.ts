@@ -1,15 +1,13 @@
 /**
- * seed-dev-data.ts
- *
  * Inserts realistic dummy token-usage data for local dashboard development.
- * Safe to re-run: every insert is idempotent (ON CONFLICT DO NOTHING or
- * WHERE NOT EXISTS).
+ * Safe to re-run: every insert uses ON CONFLICT DO NOTHING.
  *
  * Creates:
  *   - 3 dummy users in local-dev-tenant
  *   - 1–2 sessions per user
  *   - ~90 days of assistant messages with token usage + cost spread across
- *     3 models, with plausible weekly / daily rhythms
+ *     3 models, with plausible weekly / daily rhythms, some with feedback ratings
+ *   - 30 days of PII scan runs for the PII dashboard
  */
 
 import { loadConfig } from "../config.js";
@@ -39,7 +37,7 @@ const MODELS = [
   { name: "claude-haiku-4-5",    inputRate: 0.8,  outputRate: 4.0,  minIn: 400,  maxIn: 2000, minOut: 100, maxOut: 600  }
 ];
 
-// --- deterministic-ish pseudo-random (no external deps) ---
+// Seeded pseudo-random generator. Each run draws the same sequence.
 
 let seed = 0xdeadbeef;
 function rand(): number {
@@ -69,7 +67,6 @@ const seedConfig = process.env.MIGRATION_DATABASE_URL
 const db = createDatabase(seedConfig);
 
 async function run() {
-  // 1. Ensure users exist
   for (const user of USERS) {
     await db.query(
       `INSERT INTO users (user_id, email, display_name)
@@ -86,7 +83,6 @@ async function run() {
   }
   console.log(`Ensured ${USERS.length} users.`);
 
-  // 2. Create 1–2 sessions per user
   const sessions: Array<{ sessionId: string; userId: string }> = [];
   for (const user of USERS) {
     const count = user.userId === "dev-user-alice" ? 2 : 1;
@@ -103,7 +99,6 @@ async function run() {
   }
   console.log(`Ensured ${sessions.length} sessions.`);
 
-  // 3. Generate messages spanning 90 days
   const now = new Date();
   const DAYS = 90;
 
@@ -133,7 +128,6 @@ async function run() {
     for (const session of sessions) {
       const { userId, sessionId } = session;
       const baseWeight = activityWeight[userId] ?? 0.5;
-      // Weekends are quieter
       const weight = isWeekend ? baseWeight * 0.3 : baseWeight;
 
       // Number of turns this day (0 if inactive)
@@ -143,7 +137,6 @@ async function run() {
       const prefs = modelPref[userId] ?? [0.33, 0.33, 0.34];
 
       for (let t = 0; t < turns; t++) {
-        // Pick model via weighted random
         const r = rand();
         let modelIdx = 0;
         let cumulative = 0;
@@ -167,7 +160,6 @@ async function run() {
 
         const messageId = `dev-msg-${day}-${userId.slice(-4)}-${t}-${modelIdx}`;
 
-        // Insert user turn (no tokens)
         const userMsgId = `dev-usr-${day}-${userId.slice(-4)}-${t}-${modelIdx}`;
         await db.query(
           `INSERT INTO messages
@@ -177,9 +169,9 @@ async function run() {
           [userMsgId, TENANT_ID, sessionId, userId, msgDate.toISOString()]
         );
 
-        // Insert assistant turn with token data. ~30% of turns carry a
-        // feedback rating (mostly positive) so the message-feedback dashboard
-        // renders populated. feedback_given_at is set whenever a rating is.
+        // About 30% of turns get a feedback rating, mostly positive, so the
+        // feedback dashboard has data. The script sets feedback_given_at whenever it
+        // sets a rating.
         const ratingRoll = rand();
         const feedbackRating =
           ratingRoll < 0.22 ? "thumbs_up" : ratingRoll < 0.3 ? "thumbs_down" : null;
@@ -215,11 +207,11 @@ async function run() {
 
   console.log(`Inserted up to ${inserted} assistant messages (skipped existing).`);
 
-  // 4. PII scan runs — populate the PII activity dashboard (donut breakdowns,
-  //    stacked time-series, top offenders, recent activity). Concentrated in
-  //    the last 30 days so the default 7d/30d ranges render data. Each run
-  //    carries findings_json with entityType + confidence so the "by entity"
-  //    and "by confidence" charts populate.
+  // PII scan runs populate the PII activity dashboard: donut breakdowns,
+  // stacked time series, top offenders, and recent activity. They fall in the
+  // last 30 days, so the default 7d and 30d ranges show data. Each run carries
+  // findings_json with entityType and confidence, which the "by entity" and
+  // "by confidence" charts read.
   const PII_ENTITIES = ["email", "phone", "ssn", "credit_card", "ip_address", "person_name"];
   const PII_CONFIDENCES = ["high", "medium", "low"] as const;
   // action_taken drives the time-series + action breakdown. Weighted toward
@@ -239,14 +231,12 @@ async function run() {
     dayDate.setDate(dayDate.getDate() - day);
     const dayOfWeek = dayDate.getDay();
     const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-    // A few scans per active day; quieter on weekends.
     const scans = isWeekend ? randInt(0, 2) : randInt(1, 5);
 
     for (let s = 0; s < scans; s++) {
       const session = sessions[randInt(0, sessions.length - 1)];
       const { userId, sessionId } = session;
 
-      // Weighted action pick.
       const r = rand();
       let cumulative = 0;
       let picked = PII_ACTIONS[0];
@@ -257,7 +247,6 @@ async function run() {
       const isFailed = picked.action === "failed";
       const subjectType = rand() < 0.8 ? "message" : "artifact";
 
-      // Build 0–3 findings (failed scans have none).
       const findingCount = isFailed ? 0 : randInt(picked.action === "allow" ? 0 : 1, 3);
       const findings = Array.from({ length: findingCount }, () => ({
         entityType: PII_ENTITIES[randInt(0, PII_ENTITIES.length - 1)],

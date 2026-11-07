@@ -26,7 +26,7 @@ describe("checkAppUserMessage", () => {
     expect(checkAppUserMessage("user", text("x".repeat(MCP_APP_MESSAGE_MAX_CHARS)), true, false).ok).toBe(true);
     expect(checkAppUserMessage("user", text("x".repeat(MCP_APP_MESSAGE_MAX_CHARS + 1)), true, false))
       .toEqual({ ok: false, reason: "too-long", length: MCP_APP_MESSAGE_MAX_CHARS + 1 });
-    // The old limit was 100,000. A message in between is refused now.
+    // `checkAppUserMessage` refuses a message of 50,000 characters.
     expect(checkAppUserMessage("user", text("x".repeat(50_000)), true, false).ok).toBe(false);
   });
 

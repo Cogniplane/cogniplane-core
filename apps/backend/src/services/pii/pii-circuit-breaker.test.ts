@@ -283,10 +283,8 @@ test("InMemory: failures while open are not counted (shouldAllow gates them)", a
 });
 
 test("Redis: shouldAllow open→half_open routes through transitionTo (clears openedAt + emits event)", async () => {
-  // Regression: an earlier version used a bare `redis.set('half_open')`
-  // which left the openedAt key behind and skipped the event sink. This
-  // test pins the contract by checking both observables: the openedAt key
-  // is gone AND a transition event was emitted.
+  // open -> half_open goes through transitionTo: it clears the openedAt key
+  // and emits a transition event. This test checks both.
   const { redis, store } = makeFakeRedis();
   const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
   const nowMs = 1_000_000;
@@ -312,7 +310,6 @@ test("Redis: shouldAllow open→half_open routes through transitionTo (clears op
   expect(store.get("pii:breaker:pii-llm:state")).toBe("half_open");
   // openedAt key is cleared because half_open is not "open".
   expect(store.has("pii:breaker:pii-llm:openedAt")).toBe(false);
-  // Transition event was emitted.
   expect(events.length).toBe(1);
   expect(events[0]?.payload.from).toBe("open");
   expect(events[0]?.payload.to).toBe("half_open");
@@ -378,7 +375,6 @@ test("Redis: success transitions from half_open to closed and clears failures", 
   await breaker.record("success"); // -> closed
   expect(store.get("pii:breaker:pii-llm:state")).toBe("closed");
   expect(zsets.get("pii:breaker:pii-llm:failures")?.size ?? 0).toBe(0);
-  // closed transition is logged as an event
   expect(events.some((e) => e.payload.to === "closed")).toBe(true);
 });
 
@@ -612,8 +608,3 @@ test("InMemory: a failing event sink does not break the breaker", async () => {
   expect((await breaker.snapshot()).state).toBe("open");
   expect(warnings.length).toBe(1);
 });
-
-// (Removed "emits a structured log on each transition": it pinned the exact
-// logger.info {from,to} meta sequence — a side-channel duplicating the
-// event-sink test above, which already pins the same closed→open→half_open→
-// closed transition sequence as the observable contract.)

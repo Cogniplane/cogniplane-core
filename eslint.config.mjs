@@ -76,26 +76,21 @@ export default tseslint.config(
       ]
     }
   },
-  // React-hooks + Next.js rules apply only to the frontend tree. They are
-  // here (not in apps/frontend/) because we run a single workspace-wide
-  // lint config; scoping by `files` keeps backend lint untouched.
+  // React-hooks and Next.js rules apply only to the frontend tree. They sit
+  // here, not in apps/frontend/, because one workspace-wide lint config runs
+  // everything. Scoping by `files` keeps backend lint untouched.
   //
-  // Plugins are loaded so existing `eslint-disable-next-line
-  // react-hooks/exhaustive-deps` and `@next/next/no-sync-scripts`
-  // comments resolve instead of erroring with "Definition for rule not
-  // found".
+  // The plugins must load. Existing `eslint-disable-next-line
+  // react-hooks/exhaustive-deps` and `@next/next/no-sync-scripts` comments
+  // would otherwise fail with "Definition for rule not found".
   //
-  // The react-hooks set no longer downgrades in bulk. A 2026-09-03 audit
-  // (bead yegr, clean-code C4) linted the frontend with inline suppressions
-  // disabled and found violations in only 4 of the 16 recommended rules. The
-  // other 12, including rules-of-hooks, purity, set-state-in-render and
-  // immutability, are clean, so they run as errors and now gate. Only the four
-  // below stay at "warn", each with the reason it is not an error yet.
+  // Four react-hooks rules run as warnings, set below, each with its reason.
+  // The other react-hooks rules run as errors.
   //
-  // One trap: the plugin's `recommended` set is not uniformly "error". Three
-  // rules ship as "warn" (exhaustive-deps, incompatible-library,
-  // unsupported-syntax), so spreading it gates 11, not 12. unsupported-syntax
-  // is re-raised to "error" below to close that gap.
+  // The plugin's `recommended` set is not uniformly "error". Three rules ship
+  // as "warn" (exhaustive-deps, incompatible-library, unsupported-syntax), so
+  // spreading the set alone leaves them as warnings. unsupported-syntax is
+  // re-raised to "error" below.
   {
     files: ["apps/frontend/**/*.{ts,tsx}"],
     plugins: {
@@ -104,38 +99,30 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      // 23 sites, all deliberate: writes to localStorage or another external
-      // system, async fetch-on-mount loading flags, and prop-change resets.
-      // Each carries an inline suppression stating which; the 10 that batch 10
-      // (bead 1q6n) rewrote were re-triaged afterwards and land in the same
-      // three categories. Kept at "warn" so a NEW violation is visible without
-      // a reviewer having to know that every existing one was already triaged.
+      // The existing sites are deliberate. They write to localStorage or
+      // another external system, set loading flags for a fetch on mount, or
+      // reset state when a prop changes. Keep the rule at "warn". As errors,
+      // these sites would fail lint.
       "react-hooks/set-state-in-effect": "warn",
-      // 2 sites, both deliberate single-run effects whose omitted deps must
-      // NOT retrigger them: the admin sessions page seeds the URL on first
-      // paint, and copilot-chat-host keys its agent on sessionId alone so a
-      // model/effort change cannot rebuild the agent and drop a live turn.
-      // Re-checked after batch 10 (bead 1q6n) landed; the third site went with
-      // use-auto-scroll.ts, but these two are load-bearing and stay.
+      // Two sites use deliberate single-run effects. Their omitted deps must
+      // NOT retrigger them. The admin sessions page seeds the URL on first
+      // paint. copilot-chat-host keys its agent on sessionId alone, so a
+      // model or effort change cannot rebuild the agent and drop a live turn.
       "react-hooks/exhaustive-deps": "warn",
-      // 1 site: copilot-chat-host.tsx's agent memo reads its refs lazily at
-      // send time, not during render, so the rule's heuristic misfires. Also
-      // re-checked after batch 10; the pattern survived that rewrite.
+      // copilot-chat-host.tsx reads its refs at send time, not during render.
+      // The rule's heuristic misfires on this pattern.
       "react-hooks/refs": "warn",
-      // 1 site: TanStack Table returns functions React Compiler cannot
-      // memoize, so it skips the component. Upstream constraint, not ours.
+      // TanStack Table returns functions that React Compiler cannot memoize,
+      // so the compiler skips the component. This limit comes from upstream.
       "react-hooks/incompatible-library": "warn",
-      // No violations, but the plugin ships this one as "warn" in its own
-      // recommended set (alongside exhaustive-deps and incompatible-library),
-      // so spreading `recommended.rules` alone would leave it ungated. Named
-      // explicitly so it errors like the other clean rules.
+      // The plugin ships this rule as "warn". Set it to "error" here, so the
+      // spread of `recommended.rules` does not leave it ungated.
       "react-hooks/unsupported-syntax": "error",
       ...downgradeToWarn(nextPlugin.configs.recommended.rules),
       // App Router only — no pages/ dir for this rule to validate against.
       "@next/next/no-html-link-for-pages": "off",
-      // Boundary guard: the frontend may only consume backend functionality
-      // through @cogniplane/shared-types contracts, never by importing
-      // backend code directly. Held by convention until now; enforced here.
+      // Boundary guard: the frontend uses backend functionality only through
+      // @cogniplane/shared-types contracts. It must not import backend code.
       "no-restricted-imports": [
         "error",
         {
@@ -156,9 +143,9 @@ export default tseslint.config(
   }
 );
 
-// Helper: rewrite a recommended-rules object so every entry runs as a warning
-// instead of an error, preserving the original options tuple shape. Used for
-// the Next.js set only; the react-hooks set is enabled per rule above.
+// Sets each rule in a recommended-rules object to "warn". Keeps each rule's
+// options. Used for the Next.js set only. The config sets the react-hooks rules
+// one by one above.
 function downgradeToWarn(rules) {
   const result = {};
   for (const [name, value] of Object.entries(rules)) {

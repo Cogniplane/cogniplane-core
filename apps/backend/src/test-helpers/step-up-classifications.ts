@@ -1,6 +1,6 @@
 // Reviewed exceptions for the full-app census. Enforcement stays in services/auth/step-up-routes.ts.
 // Canonical data routes require proof for local sessions. WorkOS changes use
-// owner notices until q4w0.20 supplies fresh proof.
+// owner notices until WorkOS can supply fresh proof.
 /** Project skill routes that need no step-up, and why. */
 const PROJECT_SKILL_NO_STEP_UP: Record<string, string> = {
   "POST /projects/:projectId/skills": "makes a draft; nothing runs for anyone until a release",

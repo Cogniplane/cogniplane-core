@@ -232,10 +232,10 @@ test("rejects a same-origin redirect that reintroduces credentials", async () =>
   expect(redirectingFetch).toHaveBeenCalledTimes(1);
 });
 
-// NEW-2 from the second review: classification reads name/cause/cause.code,
-// any of which can be a getter on a non-undici transport. A getter that throws
-// must not escape into the caller's catch, where a default handler would log
-// the error in full and reinstate the leak.
+// Classification reads name, cause, and cause.code. On a non-undici transport,
+// any of them can be a getter. A getter that throws must not escape into the
+// caller's catch. A default handler there would log the error in full and leak
+// the URL.
 
 test("survives an error whose getters throw, without leaking", async () => {
   const { logger, warn } = loggerSpy();
@@ -304,8 +304,8 @@ test("classifies a non-Error rejection without throwing", async () => {
 });
 
 test("logs the undici codes a real deployment actually hits", async () => {
-  // NEW-3: these are defined by undici 8.x and were missing from the first
-  // allowlist, so genuine failures logged as the useless string "other".
+  // These codes come from undici 8.x. Each one must log as its own code, not as
+  // "other".
   for (const code of [
     "UND_ERR_HEADERS_OVERFLOW",
     "UND_ERR_RES_CONTENT_LENGTH_MISMATCH",

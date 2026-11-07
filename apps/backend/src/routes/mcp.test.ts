@@ -351,7 +351,7 @@ test("enforces an MCP-specific request body limit even when the global limit is 
 });
 
 // ---------------------------------------------------------------------------
-// authz-1: arg/URL-supplied toolContextId must be bound to the runtime token's
+// Arg/URL-supplied toolContextId must be bound to the runtime token's
 // sid + uid, preventing same-tenant cross-user/session context substitution.
 // ---------------------------------------------------------------------------
 
@@ -987,7 +987,6 @@ test("upstream tools/list response with JSON-RPC error does NOT mutate cache and
   });
   expect(listResp1.statusCode).toBe(200);
 
-  // Call cached_tool -> severity is read_only
   await app.inject({
     method: "POST",
     url: "/mcp/test-proxy",
@@ -1013,7 +1012,7 @@ test("upstream tools/list response with JSON-RPC error does NOT mutate cache and
   });
   expect(listResp2.json().error).toBeDefined();
 
-  // Call cached_tool again -> prior state is preserved, severity remains read_only!
+  // A second call keeps the prior state. The severity stays read_only.
   await app.inject({
     method: "POST",
     url: "/mcp/test-proxy",
@@ -1610,14 +1609,13 @@ test("removes the trusted entry from the proxied request and keeps other request
 });
 
 test("redacts a managed tool result in content[0].text, not only structuredContent", async () => {
-  // R15. handleManagedToolCall used to build content[0].text by
-  // JSON.stringify-ing the RAW handler output, and only the finished envelope
-  // was redacted afterwards. Walking a string applies the PATTERN rules, so a
-  // recognisable `sk-ant-…` was caught either way — but key-based redaction
-  // matches object KEYS, and once a value is inside a JSON string there are no
-  // keys left to match. So a `{"password": "..."}` with no recognisable prefix
-  // was blanked in structuredContent and left live in the text channel: the one
-  // the model reads and the LangGraph checkpointer persists.
+  // handleManagedToolCall must redact the handler output before it builds
+  // content[0].text. Walking a string applies the PATTERN rules, so a
+  // recognisable `sk-ant-…` is caught either way. Key-based redaction matches
+  // object KEYS, and once a value is inside a JSON string there are no keys left
+  // to match. A `{"password": "..."}` with no recognisable prefix would then be
+  // blanked in structuredContent but stay live in the text channel. The model
+  // reads that channel, and the LangGraph checkpointer persists it.
   const leaked = "hunter2-not-a-recognisable-prefix";
   const { app, toolContexts } = await createTestApp({
     extraManagedTools: [
@@ -1672,9 +1670,9 @@ test("redacts a managed tool result in content[0].text, not only structuredConte
 });
 
 test("a managed tool handler's internal error never reaches the model", async () => {
-  // R60. getErrorMessage relayed error.message unconditionally, so an E2B
-  // sandbox id, an S3 bucket name or a pg relation name went into the JSON-RPC
-  // error the model reads and the transcript stores.
+  // getErrorMessage must not relay error.message unconditionally. Otherwise the
+  // JSON-RPC error could contain an E2B sandbox id, an S3 bucket name or a pg
+  // relation name. The model reads that error, and the transcript stores it.
   const { app, toolContexts } = await createTestApp({
     extraManagedTools: [
       {
@@ -1788,11 +1786,11 @@ test("forwardRpc rejects redirect loops after the maximum hop count", async () =
 });
 
 // ---------------------------------------------------------------------------
-// Proxy upstream transport limits (R14). A proxy upstream is a third party on
-// the critical path of a turn: without a timeout it can hold the turn open
-// until the watchdog fires, without a byte cap it can OOM the shared backend,
-// and without shape validation whatever it returns is handed to the model as a
-// tool result.
+// Proxy upstream transport limits. A proxy upstream is a third party on the
+// critical path of a turn. Without a timeout, it can hold the turn open until
+// the watchdog fires. Without a byte cap, it can run the shared backend out of
+// memory. Without shape validation, the model receives whatever the upstream
+// returns as a tool result.
 // ---------------------------------------------------------------------------
 
 test("forwardRpc gives up on an upstream that never responds", async () => {
@@ -1845,14 +1843,12 @@ test("forwardRpc arms a fresh timeout signal on every hop, not one for the chain
 
 test("forwardRpc leaves a diagnostic trail for the transport error it refuses to return", async () => {
   // The RPC error is a fixed string so an internal host never reaches the
-  // model — which would be a blind spot rather than a fix if the failure went
-  // unrecorded anywhere. Before the timeout existed, a fetch rejection escaped
-  // as a Fastify 500 and Fastify logged it; that trail has to be replaced.
+  // model. A failure that nothing records would be a blind spot, so the route
+  // records a trail for it.
   //
-  // The trail is an allowlisted classification, NOT the error object. This
-  // test used to assert the log carried "10.0.4.17" — an internal address is
-  // exactly the thing that should not be written to log retention, and the
-  // same error message can quote the request URL with its credentials. See
+  // The trail is an allowlisted classification, NOT the error object. An
+  // internal address must not reach log retention. The same error message can
+  // also quote the request URL with its credentials. See
   // mcp-upstream-client.test.ts for the leak cases.
   const warnings: Array<Record<string, unknown>> = [];
   const result = await forwardRpc(

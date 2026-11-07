@@ -1,5 +1,3 @@
-// ── Markdown → Notion blocks (minimal, intentional) ──────────────────────────
-
 type RichText = { type: "text"; text: { content: string; link?: { url: string } | null } };
 
 export function richText(content: string): RichText[] {

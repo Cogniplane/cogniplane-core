@@ -406,7 +406,7 @@ describe.skipIf(!adminDatabaseUrl())("email outbox (migration 074)", () => {
 
   test("a stored address with list syntax is not sent anywhere", async () => {
     const t = await tenant();
-    // Written before the stricter parseEmail, or by hand: the sender refuses it.
+    // Old or hand-edited rows can hold such an address. The sender refuses it.
     await superuserPool().query(`UPDATE users SET email = 'alice<attacker@example.test>' WHERE user_id = $1`, [t.memberId]);
     await withTenantScope(appPool(), t.tenantId, (client) => new MailOutbox({ secret: SECRET }).queue(client, t.tenantId, t.memberId, { kind: "password_changed" }));
     const transport = { sendMail: vi.fn(), close: () => {} };

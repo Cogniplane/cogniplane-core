@@ -19,7 +19,6 @@ test("isPublicAuthPath strips the query string before matching", () => {
 });
 
 test("isPublicAuthPath rejects prefix-smuggling attempts", () => {
-  // These all "startsWith" an allowlisted prefix but are not the allowlisted path.
   for (const url of [
     "/auth/login.attack",
     "/auth/loginextra",

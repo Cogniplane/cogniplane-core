@@ -95,8 +95,7 @@ test("GET /downloads/:token skips header auth: the token is the credential", asy
   app.get("/downloads/:token", async (request) => ({ auth: request.auth ?? null }));
   app.post("/downloads/:token", async () => ({ ok: true }));
 
-  // <img> tags cannot send custom headers. No identity is set, so identity
-  // headers without the key cannot reach the route either.
+  // Spoofed identity headers without the key must not set auth on this route.
   const spoofed = await app.inject({
     method: "GET",
     url: "/downloads/tok123",

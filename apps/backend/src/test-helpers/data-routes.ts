@@ -11,8 +11,8 @@ export function devDataRoutes(): DataRouteControl {
 
 /**
  * Options of a store write in tests that do not test the step-up
- * classification (services/policy/policy-weakening.ts, services/pii/pii-
- * weakening.ts): every change is allowed, as after step-up.
+ * classification (services/policy/policy-weakening.ts and
+ * services/pii/pii-weakening.ts). They allow every change, as after step-up.
  */
 export const ALLOW_WEAKER = { allowWeaker: true } as const;
 

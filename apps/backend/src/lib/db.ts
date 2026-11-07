@@ -11,9 +11,9 @@ export { Pool } from "pg";
  * Two things are going on:
  *
  * 1. A bare `await client.query("ROLLBACK")` inside a catch throws when the
- *    connection itself is what broke — a common cause of the original failure —
- *    replacing the real error with an unhelpful "Connection terminated". So the
- *    rollback error is captured, never thrown.
+ *    connection itself is what broke. That replaces the real error with an
+ *    unhelpful "Connection terminated". So this helper captures the rollback
+ *    error and never throws it.
  *
  * 2. The returned error MUST be handed to `client.release(err)`. `pg-pool` only
  *    destroys a client when release is given an error (or the client is already
@@ -86,10 +86,8 @@ export type PoolIdentity = {
 };
 
 /**
- * Options for a pool that serves requests, workers, or agent turns: its own
- * identity, plus the shared connection, statement, and idle-transaction
- * limits. Use it for every such pool so that no pool gets pg's unbounded
- * defaults.
+ * Pool options for a request, worker, or agent-turn pool. Use this for every
+ * such pool, so that none gets pg's unbounded defaults.
  */
 export function operationalPoolOptions(identity: PoolIdentity): PoolConfig {
   return {
@@ -118,9 +116,7 @@ export function createDatabase(config: AppConfig): Pool {
  * put an unbounded wait on the hottest path in the process. It is built here
  * rather than inline so the two pools cannot drift apart.
  *
- * `application_name` differs so the two are distinguishable in
- * `pg_stat_activity` — which is the first thing anyone looks at when
- * connections pile up.
+ * `application_name` differs, so `pg_stat_activity` shows the two pools apart.
  */
 export function createMaintenanceDatabase(connectionString: string): Pool {
   return createOperationalDatabase(connectionString, "cogniplane-backend-maintenance");

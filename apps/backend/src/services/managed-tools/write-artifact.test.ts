@@ -107,8 +107,6 @@ const tool = (deps: ReturnType<typeof makeDeps>["deps"]) =>
     (x) => x.name === "write_artifact"
   )!;
 
-// inferMimeType
-
 test("inferMimeType: returns text/plain for filenames without extension", () => {
   expect(inferMimeType("README")).toBe("text/plain");
 });
@@ -122,8 +120,6 @@ test("inferMimeType: returns mapped mime for known extensions and is case-insens
 test("inferMimeType: unknown extensions fall back to text/plain", () => {
   expect(inferMimeType("a.unknownext")).toBe("text/plain");
 });
-
-// write_artifact handler
 
 test("write_artifact: requires name", async () => {
   const { deps } = makeDeps();

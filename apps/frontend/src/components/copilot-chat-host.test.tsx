@@ -19,7 +19,7 @@ import { GENERATIVE_UI_PANEL_TARGET, type Artifact, type McpAppCall } from "@cog
 type DraftSeam = import("./widget-draft").WidgetDraftSeam;
 const frames = vi.hoisted(() => ({
   rendered: [] as Array<{ toolCallId: string; busy: boolean; canEdit: boolean }>,
-  // The seam that the host gives a tool view, as the last stand-in frame got it.
+  // The seam that the host gives a tool view.
   draft: null as DraftSeam | null
 }));
 const selector = vi.hoisted(() => ({ disabled: [] as boolean[] }));

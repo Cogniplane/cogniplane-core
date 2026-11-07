@@ -619,7 +619,6 @@ describe("approval of a durable write", () => {
 // Two open turns can wait on the same persisted policy approval. Each wait is its own
 // entry: settling one must not remove the other, and every settled wait clears its timers and listener.
 describe("overlapping waits on one approval", () => {
-  /** Two open turns, each with its own abort signal, that wait on the same policy approval. */
   async function twoWaits() {
     vi.useFakeTimers();
     const f = setup();

@@ -91,10 +91,9 @@ export type PolicyConditions = z.infer<typeof PolicyConditionsSchema>;
 export const PolicyConditionsInputSchema = z.object(policyConditionDimensions).strict();
 export type PolicyConditionsInput = z.infer<typeof PolicyConditionsInputSchema>;
 
-// The dimension keys the engine actually evaluates. `PolicyConditionsSchema` is
-// `.passthrough()` so a future dimension can be stored before the engine learns
-// it — but that same openness means a typo'd key (e.g. `toolName` instead of
-// `toolNames`) is silently dropped by `toConditions` and the rule becomes a
+// The dimension keys that the engine evaluates. `PolicyConditionsSchema` is
+// `.passthrough()`, so a rule can store a typo'd key (`toolName` for
+// `toolNames`). `toConditions` then drops the key, and the rule becomes a
 // catch-all. The conflict lint warns on any key outside this set.
 export const POLICY_CONDITION_KEYS = [
   "toolNames",
@@ -173,8 +172,6 @@ export const PolicyRuleEnvelopeSchema = z
   })
   .passthrough();
 export type PolicyRuleEnvelope = z.infer<typeof PolicyRuleEnvelopeSchema>;
-
-// ── Decisions (evidence) ─────────────────────────────────────────────────────
 
 export const PolicyDecisionSchema = z
   .object({

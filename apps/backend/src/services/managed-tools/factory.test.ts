@@ -18,8 +18,6 @@ import type { GithubRuntimeCredentials } from "../integrations/github/github-con
 import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 import type { ManagedToolDefinition } from "./types.js";
 
-// ── In-memory fakes ──────────────────────────────────────────────────────────
-
 function makeContext(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
   return {
     toolContextId: "ctx-1",
@@ -198,8 +196,6 @@ function requireRecordField(
   }
   return Object.fromEntries(Object.entries(value));
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 test("every built-in catalog entry has the category of its factory definition", () => {
   // The graph evaluates Policy Center with the catalog category before a call,
@@ -442,12 +438,10 @@ test("write_artifact creates artifact and stores content", async () => {
   expect(result["status"]).toBe("ready");
   expect(result["artifactId"]).toBeTruthy();
 
-  // Verify content was stored
   expect(d.storage.stored.size).toBe(1);
   const storedContent = [...d.storage.stored.values()][0]!.toString("utf-8");
   expect(storedContent).toBe("print('hello')");
 
-  // Verify audit event was created
   expect(d.auditEvents.created.length).toBe(1);
 });
 
@@ -531,7 +525,6 @@ test("ManagedToolFactoryRegistry rejects duplicate factory keys", () => {
   );
 });
 
-// ── Policy Center category stamping ───────────────────────────────────────────
 // createDefinitions stamps each produced tool's `category` to its factory domain
 // key so the MCP gateway binds it to the right Policy Center category (consumed
 // at routes/mcp.ts as `tool.category ?? serverId`). This is a security-relevant

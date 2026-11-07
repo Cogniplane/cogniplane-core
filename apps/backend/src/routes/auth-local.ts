@@ -721,8 +721,7 @@ export async function registerLocalAuthRoutes(
     clearRefreshCookie(reply);
     return reply.send({ ok: true });
   });
-  // ---- Passkeys (only when WEBAUTHN_RP_ID is set) ----
-
+  // Passkey routes exist only when passkeys are on (WEBAUTHN_RP_ID is set).
   if (!passkeys) return;
   const passkeyService = passkeys;
 

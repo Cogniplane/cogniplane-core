@@ -16,13 +16,14 @@ export function executionAuthorizationMiddleware(requireExecution: () => Promise
 }
 
 /**
- * Before the dispatch of each native tool (shell, files, delegation), of the
- * turn and of delegated work, the turn's tool execution context must still be
- * live. A model response that arrives after a security change can then start
- * no native tool, on every replica. MCP gateway tools are left out: the
- * gateway checks the same context for each call. The model calls are checked
- * at the model start callback (model-start-check.ts), which also covers the
- * summaries. A command that already runs is not stopped here.
+ * Before a native tool runs (shell, files, delegation), the turn's tool
+ * execution context must still be live. This applies to the turn and to
+ * delegated work. A model response that arrives after a security change can
+ * then start no native tool, on every replica. This middleware leaves out MCP
+ * gateway tools, because the gateway checks the same context for each call. The
+ * model start callback (model-start-check.ts) checks the model calls and also
+ * covers the summaries. This middleware does not stop a command that already
+ * runs.
  */
 export function toolContextLivenessMiddleware(
   requireLiveToolContext: () => Promise<void>,

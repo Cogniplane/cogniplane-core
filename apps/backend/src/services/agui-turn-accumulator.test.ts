@@ -71,8 +71,8 @@ describe("AguiTurnAccumulator", () => {
   });
 
   test("a call started but never resulted (turn aborted mid-call) stays in_progress, not completed", () => {
-    // R2: the abort path emits neither TOOL_CALL_RESULT nor tool_status, so the
-    // call must NOT be persisted as a clean success.
+    // The abort path emits neither TOOL_CALL_RESULT nor tool_status. The call
+    // must not persist as a clean success.
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.TOOL_CALL_ARGS, toolCallId: "c1", delta: '{"cmd":"rm -rf build"}' })
@@ -92,9 +92,9 @@ describe("AguiTurnAccumulator", () => {
   });
 
   test("tool_status declined is a first-class terminal status (approval reject)", () => {
-    // A rejected approval emits tool_status status='declined'. It is terminal
-    // alongside 'failed' and must persist as 'declined' — not be swallowed into
-    // the completed/in_progress promotion — so reload renders the rejection.
+    // A rejected approval emits tool_status 'declined'. It is terminal, like
+    // 'failed'. It must persist as 'declined', not as completed, so reload shows
+    // the rejection.
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.CUSTOM, name: "tool_status", value: { toolCallId: "c1", status: "declined" } })
@@ -103,10 +103,8 @@ describe("AguiTurnAccumulator", () => {
   });
 
   test("tool_status carries durationMs on a successful call without forcing failure", () => {
-    // durationMs is applied unconditionally, independent of the failed/declined
-    // arm. A completed call reporting only a duration keeps status 'completed'
-    // AND captures the timing — a regression writing duration only on the
-    // failure branch would drop timing on every successful card at reload.
+    // durationMs must apply even when the status is not failed or declined.
+    // Otherwise a successful card loses its timing on reload.
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" }),
@@ -118,8 +116,6 @@ describe("AguiTurnAccumulator", () => {
   });
 
   test("a later tool_status without durationMs does not null a previously-captured duration", () => {
-    // The `?? call.durationMs` preserve-fallback: a second status update that
-    // omits durationMs must keep the earlier value, not clobber it with null.
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" }),
@@ -132,9 +128,9 @@ describe("AguiTurnAccumulator", () => {
   });
 
   test("a duplicate TOOL_CALL_START for the same id keeps the first (idempotent re-emission)", () => {
-    // A stream re-emission of TOOL_CALL_START must NOT reset a call's accumulated
-    // input/output/status/textOffset. The `if (!this.calls.has(id))` guard keeps
-    // the first; a dropped guard would corrupt a completed card on re-emit.
+    // A re-emitted TOOL_CALL_START must not reset the call's accumulated input,
+    // output, status, or textOffset. The `!this.calls.has(id)` guard keeps the
+    // first START. Without it, a re-emitted START would corrupt a completed card.
     const turn = feed([
       e({ type: EventType.TEXT_MESSAGE_CONTENT, delta: "abc" }), // offset 3 at first START
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
@@ -228,7 +224,6 @@ describe("AguiTurnAccumulator", () => {
         { offset: 0, text: "first" },
         { offset: 5, text: "second" }
       ]);
-      // The flat copy concatenates every burst.
       expect(turn.reasoningText).toBe("firstsecond");
     });
 

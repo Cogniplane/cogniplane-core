@@ -18,7 +18,7 @@ export function isRouteNotFoundError(
   if (error instanceof ApiError && error.status === 404 && error.code === "not_found") {
     return error.method === method && error.path.startsWith(pathPrefix);
   }
-  // Backends before 2026-06-13 sent Fastify's default "Route GET:/path not found".
+  // Backends before 2026-06-13 send Fastify's default "Route GET:/path not found".
   const message = getErrorMessage(error);
   if (!message) {
     return false;

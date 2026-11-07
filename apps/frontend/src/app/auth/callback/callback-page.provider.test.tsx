@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 //
-// The callback page inside the real AuthProvider (Beads issue
-// q4w0.14). completeLogin sets the person, which
-// changes the key of the provider's QueryProvider, so the page mounts again
+// The callback page inside the real AuthProvider. completeLogin sets the
+// person, which changes the key of the provider's QueryProvider, so the page mounts again
 // while the sign-in completes. The backend model refuses every exchange after
 // the first, as the real one does: the first exchange clears the state cookie.
 

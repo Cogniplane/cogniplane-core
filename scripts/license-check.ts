@@ -1,4 +1,4 @@
-// License gate — fails CI / `make sync` if any production dependency carries
+// License gate — fails CI (`pnpm license:check`) if any production dependency carries
 // strong-copyleft (GPL/AGPL) or source-available (SSPL/BUSL/Elastic-2.0/
 // Commons-Clause) terms. The dual-license model (AGPL-3.0 + commercial)
 // only holds when every transitive prod dep is AGPL-compatible.
@@ -143,9 +143,8 @@ function main(): void {
 
   for (const [licenseHeader, entries] of Object.entries(data)) {
     for (const entry of entries) {
-      // Defense-in-depth: pnpm groups by header but each entry also carries
-      // a `license` field. Use the entry's field — it's authoritative even
-      // if pnpm's grouping ever changes shape.
+      // Use the entry's own `license` field. pnpm groups entries by header,
+      // and the field stays correct if that grouping changes.
       const declared = entry.license ?? licenseHeader;
 
       const issue = classifyPackageLicense(entry.name, declared);

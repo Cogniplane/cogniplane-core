@@ -212,12 +212,12 @@ describe("E2B SDK time limits and retries used by the network check", () => {
   });
 });
 
-// VULN-13: the network of a sandbox is fixed when it is created. The SDK has a
-// call that changes the egress rules of a running sandbox, and the backend must
-// not be able to call it: two replicas that each hold an old request can undo
-// each other's change, and a request that was sent cannot be recalled. A
-// sandbox that does not match its policy is replaced. These cases keep that
-// call out of the interface that the backend uses, and out of the source.
+// The network of a sandbox is fixed when it is created. The SDK has a call that
+// changes the egress rules of a running sandbox. The backend must not be able to
+// call it. Two replicas that each hold an old request can undo each other's
+// change, and the backend cannot recall a request after it sends it. The backend
+// replaces a sandbox that does not match its policy. These cases keep that call
+// out of the interface that the backend uses, and out of the source.
 describe("no way to change the network of a running sandbox", () => {
   const srcRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 

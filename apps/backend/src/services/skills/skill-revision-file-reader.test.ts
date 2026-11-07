@@ -37,8 +37,6 @@ const stubBundleStorage = {
   }
 };
 
-// ── Inline skill paths (no bundle) ──────────────────────────────────────────
-
 test("inline skill: returns the SKILL.md content from metadata.instructions", async () => {
   const result = await readSkillRevisionFile({
     revision: revision({
@@ -87,8 +85,6 @@ test("inline skill: returns too_large when instructions exceed the byte limit", 
     expect(result.limitBytes).toBe(10);
   }
 });
-
-// ── Bundle-backed skill paths ───────────────────────────────────────────────
 
 let tmpRoot: string;
 

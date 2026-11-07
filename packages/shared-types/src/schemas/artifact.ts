@@ -77,8 +77,6 @@ export const ArtifactPreviewTextResponseSchema = z.object({
 }).passthrough();
 export type ArtifactPreviewTextResponse = z.infer<typeof ArtifactPreviewTextResponseSchema>;
 
-// ── Cross-session artifact browser (GET /artifacts) ──────────────────────────
-
 export const ArtifactSortSchema = z.enum([
   "created_desc",
   "created_asc",
@@ -89,8 +87,8 @@ export const ArtifactSortSchema = z.enum([
 ]);
 export type ArtifactSort = z.infer<typeof ArtifactSortSchema>;
 
-// Browser-facing artifact types: `derived` is excluded by design (internal,
-// non-user-facing derivatives — see the browser plan / route).
+// Browser-facing artifact types. The schema excludes `derived` by design,
+// because it holds internal derivatives that users do not see.
 export const ArtifactBrowseTypeSchema = z.enum(["upload", "generated"]);
 export type ArtifactBrowseType = z.infer<typeof ArtifactBrowseTypeSchema>;
 

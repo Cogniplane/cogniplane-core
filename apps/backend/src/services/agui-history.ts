@@ -15,8 +15,8 @@
 // started. The converter splits `content` at those offsets and puts the
 // segments, reasoning blocks, and cards in that order, as they appeared live.
 //
-// The converter reads only the current history format (sessions.
-// transcript_format). The routes do not send an older session here.
+// The converter reads only the current history format
+// (`sessions.transcript_format`). The routes never send an older session here.
 
 import { EventType, type BaseEvent, type Message as AguiMessage } from "@ag-ui/client";
 import type { CustomEventValue } from "@cogniplane/shared-types";
@@ -84,12 +84,10 @@ export function toAguiMessages(
   return converted;
 }
 
-// A reasoning burst as an AG-UI `reasoning`-role message (the thinking block).
 function reasoningMessage(messageId: string, index: number, text: string): AguiMessage {
   return { id: `${messageId}:reasoning:${index}`, role: "reasoning", content: text };
 }
 
-// The `tool`-role result message for one tool call.
 function toolResultMessage(tr: HistoryToolResult): AguiMessage {
   return {
     id: `${tr.toolResultId}:result`,
@@ -121,15 +119,13 @@ function interleaveAssistantTurn(
   segments: HistoryReasoningSegment[],
   running = false
 ): AguiMessage[] {
-  // A reply with only text: one assistant message with the saved row id.
   if (toolResults.length === 0 && segments.length === 0) {
     return [{ id: messageId, role: "assistant", content }];
   }
 
-  // Merge reasoning bursts and tool calls into one list ordered by their
-  // offset into the assistant text. Then walk the content and put the text
-  // segment before each insertion. At an equal offset, reasoning comes before
-  // the tool: live, the burst closed before the tool call started.
+  // Sort reasoning bursts and tool calls by their offset into the assistant
+  // text. At an equal offset, reasoning comes first, because the live burst
+  // closed before the tool call started.
   const out: AguiMessage[] = [];
   type Insertion =
     | { kind: "reasoning"; offset: number; index: number; text: string }
@@ -147,8 +143,8 @@ function interleaveAssistantTurn(
         status: tr.status === "completed" ? "ready" : "error" });
     }
   }
-  // Place a cumulative surface at the call that first created it. Later calls
-  // update that same activity rather than adding another copy of the surface.
+  // Place a generative UI surface at the call that first creates it. Later
+  // calls update that surface and do not add a copy.
   const activities = uiTurn.activities();
   const placed = new Set<string>();
   const placementTurn = new RenderUiTurn(messageId);

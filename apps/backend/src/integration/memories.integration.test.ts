@@ -1,4 +1,4 @@
-// Long-term memories against real Postgres (VULN-05).
+// Long-term memories against real Postgres.
 //
 // What the unit tests cannot show:
 //   - migration 068: the provenance columns, their defaults and the CHECK that
@@ -60,7 +60,7 @@ describe.skipIf(!adminDatabaseUrl())("memory provenance (migration 068)", () => 
   test("a row from before the migration reads as unverified and unversioned by an agent", async () => {
     const tenantId = await seedTenant();
     const userId = await seedPerson(tenantId);
-    const name = await seedAgentMemory(tenantId, userId); // inserts with no provenance columns, like the old code
+    const name = await seedAgentMemory(tenantId, userId); // inserts with no provenance columns, as a pre-migration row has
 
     const memory = await new MemoryStore(appPool()).get(tenantId, userId, name);
 

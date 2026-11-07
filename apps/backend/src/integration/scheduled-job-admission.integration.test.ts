@@ -1,7 +1,7 @@
 // The active-job cap is checked and applied inside UserSettingsStore, in one
-// transaction under a per-(tenant, user) advisory lock. Before that, the route
-// counted in one transaction and wrote in another, so two requests could both
-// see one free slot and each take it.
+// transaction under a per-(tenant, user) advisory lock. Counting in one
+// transaction and writing in another would let two requests both see one free
+// slot and each take it.
 //
 // Every test here calls the PRODUCTION store methods. The race tests use the
 // pattern of policy-rule-concurrency.integration.test.ts: a superuser session

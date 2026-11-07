@@ -82,7 +82,7 @@ export function AdminPolicyEnforcement({ meta }: { meta?: ReactNode } = {}) {
 
   const evidence = summary.data;
   const evidenceFailed = summary.isError && !evidence;
-  // Keep the retry button while it fetches, so focus stays on it.
+  // The retry button stays visible during a refetch, so focus stays on it.
   const evidenceStale = summary.isError && Boolean(evidence);
   let evidenceLine = "";
   if (!enforcing) {

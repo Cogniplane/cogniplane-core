@@ -1345,7 +1345,6 @@ it("rebuilds the MCP tool list when connectors are removed and enabled again", a
   });
 });
 
-// ── resolveModelConstruction: custom-model namespace fallback ────────────────
 // Admin-added custom models (tenant_custom_models) are not in AVAILABLE_MODELS;
 // their id namespace IS the provider (see custom-model-store.ts).
 describe("resolveModelConstruction custom-model namespace fallback", () => {
@@ -1400,9 +1399,9 @@ it("enables shell after an initially disabled policy and retains the handle acro
 });
 
 it("hands the start of a turn to the sandbox, for as long as command execution is on", async () => {
-  // VULN-13: the adapter starts a turn at every turn or job, so that the first
-  // operation of the turn reads the live network of the sandbox once and
-  // replaces the sandbox if it does not match the policy as it is then.
+  // The adapter calls `beginTurn` on the sandbox at every turn or job. The first
+  // operation of the turn then reads the live network of the sandbox once. It
+  // replaces the sandbox if the network does not match the current policy.
   const beginTurn = vi.spyOn(E2bDeepAgentsSandbox.prototype, "beginTurn");
   const runtime = makeRuntime();
   const next = { skillsLibraryFiles: {}, mcpServers: [] };
@@ -1469,7 +1468,6 @@ it("turns provider retries off only for a turn with a spending reservation", asy
   await runtime.dispose();
 });
 
-// ── Durable writes: memory_save always asks for the user's approval ──────────
 // The prompt does not read the tenant approval policy or Policy Center. The
 // approval is bound to the exact arguments by the same proof that Policy Center
 // uses, so a replay or a changed value finds no proof at dispatch.

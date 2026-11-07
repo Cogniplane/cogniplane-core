@@ -2,11 +2,11 @@ import { test, expect } from "vitest";
 
 import { isMailEnabled, isPasswordRecoveryEnabled, loadConfig } from "./config.js";
 
-// E2B is required at boot (both runtimes run in the sandbox) and the packaged
-// default template id is a placeholder, so any config expected to BOOT must
-// carry a real E2B_API_KEY + E2B_TEMPLATE_ID. `devConfig` is the dev-headers
-// equivalent of `workosConfig` for bare-call tests that assert on a successful
-// load rather than an early validation throw.
+// E2B is required at boot, and the packaged default template id is a
+// placeholder. Any config that is expected to BOOT must carry a real
+// E2B_API_KEY and E2B_TEMPLATE_ID. `devConfig` is the dev-headers equivalent of
+// `workosConfig` for bare-call tests that assert on a successful load rather
+// than an early validation throw.
 function devConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     E2B_API_KEY: "e2b-test-key",
@@ -26,8 +26,6 @@ function workosConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     JWT_SECRET: "test-jwt-secret-must-be-at-least-32chars!",
     DATA_ENCRYPTION_SECRET: "test-encryption-secret-must-be-at-least-32chars!",
     REDIS_URL: "redis://localhost:6379",
-    // Both runtimes run inside E2B, which is required at boot. The packaged
-    // default E2B_TEMPLATE_ID is a placeholder, so tests set a real one.
     E2B_API_KEY: "e2b-test-key",
     E2B_TEMPLATE_ID: "tpl-test",
     ...overrides
@@ -121,7 +119,7 @@ test("loadConfig accepts AUTH_MODE=jwt with WorkOS login, the same as the workos
   expect(config.AUTH_LOGIN_TYPES).toEqual(["workos"]);
   // WorkOS is the default login type for jwt mode.
   expect(loadConfig(workosConfig({ AUTH_MODE: "jwt" })).AUTH_LOGIN_TYPES).toEqual(["workos"]);
-  // Production accepts the new name too.
+  // Production accepts jwt mode too.
   expect(loadConfig(workosConfig({ AUTH_MODE: "jwt", NODE_ENV: "production" })).AUTH_MODE).toBe("jwt");
 });
 
@@ -163,7 +161,6 @@ test("loadConfig rejects SKILL_BUNDLE_STORAGE_BACKEND=bucket without SKILL_BUNDL
 
 test("loadConfig accepts WorkOS mode with explicit non-default data encryption secret", () => {
   const config = loadConfig(workosConfig());
-  // The `workos` alias resolves to jwt mode with WorkOS login.
   expect(config.AUTH_MODE).toBe("jwt");
   expect(config.AUTH_LOGIN_TYPES).toEqual(["workos"]);
   expect(config.DATA_ENCRYPTION_SECRET).toBe("test-encryption-secret-must-be-at-least-32chars!");
@@ -179,8 +176,8 @@ test("loadConfig rejects defaulted AUTH_MODE when NODE_ENV=production", () => {
 });
 
 test("loadConfig fail-closes dev-headers on an unrecognized NODE_ENV (typo guard)", () => {
-  // The previous guard did an exact `=== "production"` match, so a typo like
-  // "prod" or "Production" silently left dev-headers active. These must now throw.
+  // A typo such as "prod" or "Production" must not leave dev-headers active.
+  // Each of these values must throw.
   expect(() => loadConfig({ NODE_ENV: "prod" })).toThrow(/treated as production/);
   expect(() => loadConfig({ NODE_ENV: "Production" })).toThrow(/treated as production/);
   expect(() => loadConfig({ NODE_ENV: "staging" })).toThrow(/treated as production/);
@@ -390,9 +387,7 @@ test("loadConfig skipRuntimeChecks still enforces DB-backed (workos) validations
 
 test("loadConfig does not warn on a localhost RUNTIME_GATEWAY_BASE_URL", () => {
   // The MCP client runs in the backend process (deep-agents-graph.ts), so
-  // localhost IS reachable — the correct default for local dev. Verified live
-  // (bead 5qpj): a session_context tools/call succeeds against
-  // http://localhost:3001 from the in-process MultiServerMCPClient.
+  // localhost is reachable. That is the right default for local dev.
   const warnings: Array<{ meta: object; msg: string }> = [];
   loadConfig(
     {
@@ -424,14 +419,12 @@ test("loadConfig requires both ARTIFACT_BUCKET access keys when one is set", () 
   expect(() =>
     loadConfig(devConfig({
       ARTIFACT_BUCKET_ACCESS_KEY_ID: "akid"
-      // missing ARTIFACT_BUCKET_SECRET_ACCESS_KEY
     }))
   ).toThrow(/ARTIFACT_BUCKET_ACCESS_KEY_ID and ARTIFACT_BUCKET_SECRET_ACCESS_KEY must be provided together/);
 
   expect(() =>
     loadConfig(devConfig({
       ARTIFACT_BUCKET_SECRET_ACCESS_KEY: "sk"
-      // missing ARTIFACT_BUCKET_ACCESS_KEY_ID
     }))
   ).toThrow(/ARTIFACT_BUCKET_ACCESS_KEY_ID and ARTIFACT_BUCKET_SECRET_ACCESS_KEY must be provided together/);
 });
@@ -504,11 +497,10 @@ test("loadConfig rejects a turn timeout at or above the sandbox lifetime", () =>
 });
 
 test("loadConfig rejects a tool-context TTL that cannot absorb one paused approval", () => {
-  // The turn watchdog PAUSES while a human decides an approval, so a turn's
-  // wall-clock ceiling is RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS.
+  // The turn watchdog pauses while a human decides an approval. A turn's
+  // wall-clock ceiling is therefore RUNTIME_TURN_TIMEOUT_MS + APPROVAL_REQUEST_TTL_MS.
   // The tool-context TTL does not pause. 25 min of context against a 20-min
-  // watchdog + 10-min approval expires the context mid-turn — and it is the
-  // combination the old watchdog-only check accepted.
+  // watchdog and a 10-min approval expires the context mid-turn.
   expect(() =>
     loadConfig(
       devConfig({
@@ -586,9 +578,9 @@ test("model spending defaults are optional and reject negative or zero reservati
 });
 
 test("the sandbox network check limits default to 20 s and 5 s, can be set, and must be positive integers", () => {
-  // VULN-13: one deadline for the check of the network of a sandbox, and
-  // one timeout for each E2B request inside it. The SDK default of 60 s per
-  // request would let four reads in a row block a call for minutes.
+  // One deadline covers the network check of a sandbox. One timeout covers each
+  // E2B request inside it. The SDK default of 60 s per request would let four
+  // reads in a row block a call for minutes.
   const defaults = loadConfig(devConfig());
   expect(defaults.E2B_NETWORK_CONFIRM_TIMEOUT_MS).toBe(20_000);
   expect(defaults.E2B_NETWORK_REQUEST_TIMEOUT_MS).toBe(5_000);

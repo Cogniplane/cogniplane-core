@@ -62,10 +62,6 @@ function makeRecordingPool(options: { failOnSql?: string } = {}): {
 
 const SENTINEL = "SELECT 'callback-sentinel'";
 
-// ---------------------------------------------------------------------------
-// withTenantScope
-// ---------------------------------------------------------------------------
-
 test("withTenantScope wraps the callback in BEGIN/set_config/COMMIT and commits on success", async () => {
   const { pool, queries, releaseCount } = makeRecordingPool();
 
@@ -120,10 +116,6 @@ test("withTenantScope rejects with the same error, issues ROLLBACK (not COMMIT),
   expect(releaseCount()).toBe(1);
 });
 
-// ---------------------------------------------------------------------------
-// withTransaction
-// ---------------------------------------------------------------------------
-
 test("withTransaction wraps the callback in BEGIN/COMMIT and commits on success", async () => {
   const { pool, queries, releaseCount } = makeRecordingPool();
 
@@ -161,9 +153,7 @@ test("withTransaction rejects with the same error, issues ROLLBACK (not COMMIT),
   expect(releaseCount()).toBe(1);
 });
 
-// ---------------------------------------------------------------------------
-// Failed ROLLBACK — the client must be destroyed, not pooled
-// ---------------------------------------------------------------------------
+// A failed ROLLBACK must destroy the client. It must not return it to the pool.
 //
 // pg-pool returns a still-queryable client to the pool unless release() is given
 // an error; it does NOT notice an open transaction. If a failed ROLLBACK left a
@@ -215,10 +205,6 @@ test("a successful rollback releases the client back to the pool undamaged", asy
   expect(releaseCount()).toBe(1);
   expect(releaseArgs[0]).toBeUndefined();
 });
-
-// ---------------------------------------------------------------------------
-// Serving pool limits
-// ---------------------------------------------------------------------------
 
 const OPERATIONAL_LIMITS = {
   connectionTimeoutMillis: 10_000,

@@ -59,7 +59,6 @@ export function handleAppError(
     });
     return;
   }
-  // Server errors: log the real cause, return an opaque body.
   request.log.error({ err: error }, "unhandled request error");
   reply.code(statusCode >= 500 ? statusCode : 500).send({
     error: "internal_error",
@@ -68,28 +67,23 @@ export function handleAppError(
 }
 
 /**
- * Parse the TRUST_PROXY config string into the shape Fastify's `trustProxy`
- * option expects. This governs `request.ip` resolution for general request
- * handling and logging ONLY. It does not participate in `/mcp` admission: the
- * gateway reads the raw socket peer (`request.raw.socket.remoteAddress`) and
- * deliberately ignores every forwarded header. See the TRUST_PROXY docs in
- * config.ts for the value semantics.
+ * Returns the value for Fastify's `trustProxy` option. Fastify uses it to set
+ * `request.ip` for general request handling and logging only. It does not
+ * affect `/mcp` admission. The gateway reads the raw socket peer
+ * (`request.raw.socket.remoteAddress`) and ignores every forwarded header. See
+ * the TRUST_PROXY docs in config.ts for the value semantics.
  */
 export function parseTrustProxy(raw: string): boolean | string {
   const value = raw.trim();
   if (value === "" || value.toLowerCase() === "false") return false;
   if (value.toLowerCase() === "true") return true;
   if (/^\d+$/.test(value)) {
-    // Hop-count trust is GONE, deliberately. Fastify 5.12.1 removed it for
-    // GHSA-3m5p-2c4r-xxw2 and now fails closed on a numeric value at runtime
-    // ("Hop-count-only trust cannot validate the immediate peer"): counting
-    // hops never checks WHO the immediate peer is, so a direct client can
-    // spoof X-Forwarded-For by supplying enough hops itself.
-    //
-    // Reproducing it as a hop-comparing TrustProxyFunction would reintroduce
-    // exactly the vulnerability, so this refuses instead. Operators set an
-    // IP/CIDR allowlist of their actual proxies (e.g. the ALB subnets), which
-    // validates the peer rather than trusting a count.
+    // This function refuses numeric hop counts on purpose. Fastify 5.12.1 removed
+    // hop-count trust (GHSA-3m5p-2c4r-xxw2) and fails closed on it at runtime. A
+    // hop count never checks who the immediate peer is, so a direct client can
+    // spoof X-Forwarded-For by sending enough hops. A hop-comparing
+    // TrustProxyFunction would bring back the same flaw. An IP/CIDR allowlist of
+    // the real proxies (for example, the ALB subnets) validates the peer instead.
     throw new Error(
       `TRUST_PROXY="${value}": numeric hop counts are no longer supported. ` +
         "Fastify removed them as spoofable (GHSA-3m5p-2c4r-xxw2). Set TRUST_PROXY to a " +
@@ -97,7 +91,6 @@ export function parseTrustProxy(raw: string): boolean | string {
         "subnets), or \"true\" only if every path to this server is already trusted."
     );
   }
-  // Otherwise treat as a comma-separated IP/CIDR allowlist of trusted proxies.
   return value;
 }
 
@@ -114,10 +107,9 @@ export async function buildApp() {
     throw new Error("MAINTENANCE_DATABASE_URL is required for runtime maintenance.");
   }
   const app = Fastify({
-    // Resolve `request.ip` from X-Forwarded-For per the deployment's proxy
-    // topology, so logs and rate limits see the real client rather than the
-    // load balancer. This does NOT affect /mcp admission, which checks the raw
-    // socket peer for loopback and ignores forwarded headers entirely.
+    // Sets `request.ip` from X-Forwarded-For, per the proxy topology, so logs and
+    // rate limits see the client and not the load balancer. This does not affect
+    // /mcp admission, which checks the raw socket peer for loopback.
     trustProxy: parseTrustProxy(config.TRUST_PROXY),
     // Defense-in-depth HTTP-layer cap on JSON/raw request bodies. Field-level
     // schemas (e.g. MessagePostRequestSchema.text) enforce tighter per-field
@@ -126,8 +118,6 @@ export async function buildApp() {
     // the multipart plugin's own `fileSize` limit and are unaffected by this.
     bodyLimit: config.MAX_REQUEST_BODY_BYTES,
     logger: {
-      // Operators can raise/lower verbosity per environment without a code
-      // change (e.g. `debug` to diagnose a prod incident).
       level: config.LOG_LEVEL,
       // Logging-layer safety net. The `req` serializer below already omits the
       // headers object, but redact common secret-bearing paths so any future
@@ -364,22 +354,21 @@ export async function buildApp() {
       auditEvents: deps.auditEvents,
       logger: app.log
     },
-    // Same pool, same reason: assistant rows a killed process left `pending`/
-    // `streaming` span every tenant. Disabled when the turn watchdog is off —
-    // RUNTIME_TURN_TIMEOUT_MS=0 means a turn has no ceiling, so no staleness
-    // deadline can distinguish an abandoned row from a live one.
+    // Assistant rows that a killed process left `pending` or `streaming` can
+    // belong to any tenant, so the sweep uses the privileged pool. The sweep is
+    // off when the turn watchdog is off (RUNTIME_TURN_TIMEOUT_MS=0). With no
+    // ceiling, no deadline can tell an abandoned row from a live one.
     //
-    // The deadline is the turn's wall-clock ceiling: the watchdog caps WORKING
-    // time at RUNTIME_TURN_TIMEOUT_MS but pauses while a human decides an
-    // approval, so real elapsed time is working time plus approval time. The
-    // approval loop is unbounded, so no finite deadline covers every
-    // turn. The x3 factor budgets for a few approval rounds, and the AG-UI writer
-    // refreshes `updated_at` on a timer so an approval wait keeps its row alive.
+    // The deadline is a wall-clock ceiling. The watchdog pauses during approvals,
+    // so the deadline budgets for a few approval rounds (APPROVAL_ROUND_BUDGET).
+    // The approval loop has no fixed bound, so no finite deadline covers every
+    // turn. The AG-UI writer refreshes `updated_at` on a timer, so a live approval
+    // wait keeps its row fresh.
     //
-    // That false positive is self-healing and not worth a heavier mechanism: the
-    // live writer's terminal updateContent overwrites the row with the true
-    // status at turn end. Leaving abandoned rows `pending` forever is the worse
-    // failure, and it is the one that actually happens.
+    // A false positive heals itself, so a heavier mechanism is not worth it. The
+    // live writer's terminal update overwrites the row with the true status at
+    // turn end. A row left `pending` forever is the worse failure, and it happens
+    // in practice.
     staleMessageSweeper: staleMessageDeadlineMs
       ? {
           messages: new MessageStore(privilegedDb),

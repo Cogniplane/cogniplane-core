@@ -39,7 +39,7 @@ const SENDGRID_KEY_PATTERN = /\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}\b/g;
 // string body (e.g. a tool result echoing a URL) is redacted before
 // persistence. Stops at whitespace, `&`, quote, `;`, or `#` to preserve
 // surrounding text. The name check is shared with sanitize-url.ts and
-// url-validation.ts — the copies used to drift.
+// url-validation.ts.
 const URL_QUERY_PARAMETER_PATTERN = /([?&])([^=&\s"';#?]+)=(?!\$\{)([^\s&"';#]+)/g;
 
 // A non-credential value can hold a nested URL (`?next=https://x/?token=…`),

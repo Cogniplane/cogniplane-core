@@ -7,7 +7,7 @@
 // - isSensitiveQueryParameterName: log sanitization (sanitize-url.ts) and
 //   persistence redaction (services/redact-secrets.ts). It covers every name
 //   that validation refuses, plus older whole names, and it decodes the name
-//   first. The lists used to drift apart.
+//   first.
 //
 // Both checks are case-insensitive: a caller controls the casing (`?API_KEY=`),
 // and a case-sensitive match would pass it straight through.

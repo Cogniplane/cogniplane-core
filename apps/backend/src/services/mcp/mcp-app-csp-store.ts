@@ -4,10 +4,9 @@ import { type Pool, withTenantScope } from "../../lib/db.js";
 import { AdminConfigError } from "../admin-config-error.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 
-/** The most approved sources for one server. */
 export const MAX_APPROVED_SOURCES_PER_SERVER = 200;
 // A server can declare any source, so the list of what it asked for has a limit.
-// The limit is checked once for each statement, so one batch can pass it.
+// The check runs once per statement, so one batch can go past the limit.
 const MAX_REQUESTED_SOURCES_PER_SERVER = 200;
 // A widget that opens often does not write on every open.
 const REQUEST_TOUCH_INTERVAL = "1 hour";
@@ -99,8 +98,8 @@ export class McpAppCspStore {
   }
 
   /**
-   * Approves one source. Returns false when it was already approved. The audit
-   * event commits in the same transaction as the change.
+   * Returns false when the source already has approval. The audit event
+   * commits in the same transaction as the change.
    */
   async approve(
     tenantId: string,
@@ -133,8 +132,8 @@ export class McpAppCspStore {
   }
 
   /**
-   * Removes one approval. Returns false when there was none. A caller can pass
-   * more than one spelling of the same source.
+   * Returns false when no approval existed. A caller can pass more than one
+   * spelling of the same source.
    */
   async revoke(
     tenantId: string,

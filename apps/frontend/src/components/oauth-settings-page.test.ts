@@ -4,7 +4,7 @@ import { buildOAuthFlashMessage } from "./oauth-settings-page";
 
 const input = { provider: "GitHub", successMessage: "GitHub connected." };
 
-// q4w0.8 review: the backend refuses a callback whose authorization started
+// The backend refuses a callback whose authorization started
 // before a security change (reason `session_changed`) and stores nothing.
 it("tells the member to connect again after a session change", () => {
   expect(buildOAuthFlashMessage({ ...input, result: "error", reason: "session_changed" }))

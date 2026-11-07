@@ -20,7 +20,7 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
       db: Pool;
       artifacts: Pick<ArtifactStore, "get">;
       storage: Pick<ArtifactStorage, "openReadStream">;
-      /** Overrides the default 5 MiB read cap. */
+      /** Overrides the default read cap. */
       maxBytes?: number;
       /** Without it, PDF uploads are rejected as unscannable. */
       extractPdfText?: PdfTextExtractor;

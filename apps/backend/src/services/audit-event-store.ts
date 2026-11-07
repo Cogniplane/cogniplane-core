@@ -13,11 +13,12 @@ export type AuditEventInput = {
   ipAddress?: string | null;
   userAgent?: string | null;
   /**
-   * More writes that must commit with this event, and so with the change
-   * that it records: they run in the event's transaction, after its row. Not
-   * stored. A data route puts the owner notice here
-   * (DataRouteControl.ownerNotice), so every store that writes the change's
-   * audit event in the change's transaction also queues the notice there.
+   * More writes that must commit with this event, and so with the change that
+   * it records. They run in the event's transaction, after its row. The audit
+   * event does not store them. A data route puts its owner notice here
+   * (`DataRouteControl.ownerNotice`).
+   * So each store that writes this event in the change's transaction must also
+   * queue the notice here.
    */
   alsoInTransaction?: (client: PoolClient) => Promise<void>;
 };
@@ -99,9 +100,9 @@ export class AuditEventStore {
 
   /**
    * True when the tenant has an event of this type, written at or after
-   * `since`, whose payload names the PII scan run. A PII scan that finishes
-   * the decision of an earlier attempt uses it so that it does not write the
-   * same event again. `since` keeps the read on the tenant and type index.
+   * `since`, whose payload names the PII scan run. A PII scan that finishes an
+   * earlier attempt's decision uses it, so it does not write the same event
+   * twice. `since` keeps the read on the tenant and type index.
    */
   async hasPiiScanRunEvent(
     tenantId: string,

@@ -290,8 +290,7 @@ test("formatCorpus tool input is excerpted to TOOL_INPUT_EXCERPT_BYTES (400)", (
       }
     ]
   });
-  // 400 i's quoted via lines beginning "> " — the body must NOT contain 800 i's.
-  // We assert that the markdown contains a 400-char run of 'i's but not an 800-char run.
+  // The input is cut to 400 characters. The markdown has a run of 400 i's, and no run of 500.
   expect(result.markdown).toMatch(/i{400}/);
   expect(result.markdown).not.toMatch(/i{500}/);
 });

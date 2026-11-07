@@ -432,10 +432,9 @@ function RemoteRunningNote({ controls }: { controls: ComposerControls }) {
 // height. CopilotChat reads the height of the overlay and adds it to the space
 // at the end of the transcript, so the last messages scroll above the
 // composer, and not behind the keyboard. Both budgets use the part of the chat
-// area that the keyboard leaves, so the composer never goes above the area. With
-// no keyboard the offset is 0px, and the budgets are the ones above. Tailwind
-// reads class names as plain text, so each class is written in full. `_` is a
-// space.
+// area that the keyboard leaves. With no keyboard the offset is 0px, and the
+// budgets are the ones above. Tailwind reads class names as plain text, so
+// write each class in full. `_` is a space.
 const COMPOSER_BUDGET =
   "[--composer-budget:min(calc(100cqh_-_var(--composer-keyboard-offset,0px)),max(calc((100cqh_-_var(--composer-keyboard-offset,0px))_*_0.6),17.25rem),max(9.25rem,calc(100cqh_-_var(--composer-keyboard-offset,0px)_-_var(--transcript-focus-room,0px))))] max-h-(--composer-budget)";
 // The message box scrolls after a share of the chat area, so a long draft

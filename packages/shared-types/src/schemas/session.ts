@@ -58,9 +58,8 @@ export const SessionEnvelopeSchema = z.object({
 export type SessionEnvelope = z.infer<typeof SessionEnvelopeSchema>;
 
 // The same payload MessagesListResponseSchema describes, plus the session
-// envelope. Extended rather than redeclared so `messages`/`hasMore` cannot drift
-// between the schema the backend serializes with and the one the frontend parses
-// with — that drift is what let `hasMore` reach the client untyped.
+// envelope. It extends that schema, and does not redeclare it, so `messages`
+// and `hasMore` cannot drift between the backend and the frontend.
 export const SessionMessagesResponseSchema = MessagesListResponseSchema.extend({
   session: SessionSchema
 });

@@ -21,8 +21,8 @@ export function artifactApiBase(): string {
  * - pdf    → server-extracted text                          → { kind: "text", text }
  * - other  → mint a signed URL, fetch the raw text body     → { kind: "text", text }
  *
- * Mirrors the original `useArtifacts.openPreview` branch logic exactly; the
- * deps are injectable so tests don't hit the network.
+ * Keeps the branch logic of the preview flow. The deps are injectable, so tests
+ * do not hit the network.
  */
 export type ArtifactPreviewResult =
   | { kind: "image"; imageUrl: string }

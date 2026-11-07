@@ -68,7 +68,6 @@ export function dateRangeLabel(from: string, to: string): string | null {
   for (const c of candidates) {
     if (Math.abs(Date.now() - toMs) <= PRESET_TOLERANCE_MS && Math.abs(span - c.days * dayMs) <= PRESET_TOLERANCE_MS) return c.label;
   }
-  // Format as YYYY-MM-DD → YYYY-MM-DD when not a known preset.
   return `${from.slice(0, 10)} → ${to.slice(0, 10)}`;
 }
 

@@ -17,7 +17,7 @@ const noImports = new PiiImportScopeRegistry();
 const partner = new PiiImportScopeRegistry();
 partner.register({ subjectKind: "partner_import", scopeKey: "partnerImports", defaultOn: true });
 
-// A policy as the admin form saved it before import scopes moved to overlays.
+// A policy as an older admin form saved it: core scopes and one import scope.
 const legacyRow = {
   enabled: true,
   mode: "transform",

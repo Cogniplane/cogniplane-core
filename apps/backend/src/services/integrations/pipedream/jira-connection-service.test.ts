@@ -482,7 +482,7 @@ describe("reads", () => {
     }]);
   });
 
-  // q4w0.8: the selection keeps the security version of the session that made
+  // The selection keeps the security version of the session that made
   // it. After a security change, no read uses it. There is no confirm (the
   // Pipedream account ID is opaque and the account name is chosen by whoever
   // authorized it): a site selection from a current session restores it.

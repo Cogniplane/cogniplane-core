@@ -3,11 +3,9 @@ import type { Approval } from "@cogniplane/shared-types";
 // ---------------------------------------------------------------------------
 // Chat-card row types.
 //
-// These are the row shapes the CopilotKit chat host still renders as cards
-// (approvals, MCP-server status, runtime notices, plan). They outlived the
-// activity-timeline UI removed in the AG-UI cutover — the timeline's row
-// taxonomy, buildTimeline, and grouping went with it. Fed from custom AG-UI
-// events (`use-agui-custom-events.ts`).
+// The CopilotKit chat host renders these row shapes as cards: approvals,
+// MCP-server status, runtime notices, and plan. The custom AG-UI events in
+// `use-agui-custom-events.ts` feed them.
 // ---------------------------------------------------------------------------
 
 export type RuntimeNoticeLevel = "info" | "warning" | "error";

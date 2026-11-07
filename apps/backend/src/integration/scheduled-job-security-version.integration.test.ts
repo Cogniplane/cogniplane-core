@@ -1,6 +1,6 @@
 // A scheduled job runs as its owner, with the owner's tools and credentials.
 // A job that a stolen access token saved must stop when the owner changes the
-// password or signs out everywhere (bead q4w0.9).
+// password or signs out everywhere.
 // The job keeps the security version of the session that saved it (migration
 // 080). The claim refuses a job whose owner's version changed, the worker
 // pauses it with a stored reason and an audit event, and the worker checks
@@ -272,7 +272,7 @@ describe.skipIf(!adminDatabaseUrl())("scheduled jobs after a security change of 
       "SELECT consecutive_failures FROM scheduled_jobs WHERE job_id = $1", [jobId])).rows[0]).toEqual({ consecutive_failures: 0 });
   });
 
-  // Bead q4w0.13: a turn that already runs stops at the change. The production
+  // A turn that already runs stops at the change. The production
   // adapter's invalidateRuntimesForUser aborts the turn, and its stream ends
   // with an interrupted RUN_FINISHED (deep-agents-runtime-adapter.test.ts);
   // this runtime does the same. The gateway refuses the turn's tool calls on

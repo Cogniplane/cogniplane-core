@@ -278,7 +278,7 @@ describe("SecuritySection, passkeys", () => {
 
 });
 
-// Bead q4w0.13: each change that ends the account's sessions also stops its
+// Each change that ends the account's sessions also stops its
 // running agent turns. The confirmation says so before the user confirms.
 describe("SecuritySection, running agent work", () => {
   const STOPS = "Running agent work stops.";

@@ -167,7 +167,6 @@ export async function handlePiiDecision(
     };
   }
 
-  // decision.action === "report"
   const scanRun = await createScanRun(stores, input, decision, {
     mode: "detect",
     status: "completed",

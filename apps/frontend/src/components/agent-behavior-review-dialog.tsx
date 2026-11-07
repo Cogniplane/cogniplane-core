@@ -30,7 +30,6 @@ type Props = {
   onApply: () => void;
   onRebase: () => void;
   onDiscard: () => void;
-  /** Move focus back to the page after the dialog closes. */
   onRestoreFocus: () => void;
 };
 

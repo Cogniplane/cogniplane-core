@@ -2,8 +2,6 @@ import { z } from "zod";
 
 import { IsoDateSchema } from "./_helpers.js";
 
-// ── GitHub ────────────────────────────────────────────────────────────────────
-
 /** Most repositories one GitHub connection can allow. */
 export const GITHUB_ALLOWED_REPOSITORY_LIMIT = 200;
 
@@ -94,8 +92,6 @@ export const GithubConnectionStatusSchema = z.object({
   platformConfigured: z.boolean().optional()
 }).passthrough();
 export type GithubConnectionStatus = z.infer<typeof GithubConnectionStatusSchema>;
-
-// ── Notion ────────────────────────────────────────────────────────────────────
 
 export const NotionUserConnectionSchema = z.object({
   notionUserId: z.string(),

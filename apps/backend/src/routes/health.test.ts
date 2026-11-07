@@ -73,7 +73,7 @@ test.each(["/health", "/ready"])("%s returns a bare status without build, uptime
   try {
     const response = await app.inject(url);
     expect(response.statusCode).toBe(200);
-    // Monitors match this exact text (deploy/homelab/monitor.sh).
+    // External monitors match this exact text.
     expect(response.body).toBe('{"status":"ok"}');
     expect(response.body).not.toContain("0123456789abcdef");
     expect(response.body).not.toContain("2026-10-13");

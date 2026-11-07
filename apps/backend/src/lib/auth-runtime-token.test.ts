@@ -13,11 +13,10 @@ import {
 import { tryAuthenticateRuntimeToken } from "./auth-runtime-token.js";
 import { runtimeTokenSecret } from "./derived-secrets.js";
 
-// Tokens are minted under the HKDF-derived runtime-token subkey, NOT the raw
-// DATA_ENCRYPTION_SECRET (see lib/derived-secrets.ts — the root secret is no
-// longer handed to any HMAC consumer directly). tryAuthenticateRuntimeToken
-// derives the same subkey from the config it is given, so a token minted here
-// verifies there.
+// This file mints tokens with the HKDF-derived runtime-token subkey, not the raw
+// DATA_ENCRYPTION_SECRET. See lib/derived-secrets.ts. No HMAC consumer gets the
+// root secret directly. tryAuthenticateRuntimeToken derives the same subkey from
+// the config it is given, so it accepts a token minted here.
 const config = createTestConfig();
 const SECRET = runtimeTokenSecret(config.DATA_ENCRYPTION_SECRET);
 
@@ -28,7 +27,6 @@ const CLAIMS: RuntimeTokenMintClaims = {
   rid: "runtime-1"
 };
 
-/** Mint a real, currently-valid runtime token (1h in the future). */
 function validToken(claims: RuntimeTokenMintClaims = CLAIMS): string {
   const token = generateRuntimeToken(
     { ...claims, exp: runtimeTokenExpiry(60 * 60 * 1000) },
@@ -50,9 +48,9 @@ type FakeRequest = FastifyRequest & {
 };
 
 /**
- * Build a minimal FastifyRequest stand-in. `auth` is intentionally left
- * undefined so we can assert the function only populates it on success.
- * `log` is the silent logger so we can spy on `.warn`.
+ * The helper leaves `auth` undefined on purpose, so a test can assert that the
+ * function sets it only on success. `log` is the silent logger, so a test can
+ * spy on `.warn`.
  */
 function fakeRequest(opts: {
   url: string;
@@ -138,7 +136,6 @@ describe("tryAuthenticateRuntimeToken — credential precedence", () => {
     });
 
     expect(tryAuthenticateRuntimeToken(request, config)).toBe(true);
-    // The header token's tenant must be the one that lands in auth.
     expect(request.auth?.tenantId).toBe("tenant-HEADER");
   });
 
@@ -177,7 +174,6 @@ describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
 
 describe("tryAuthenticateRuntimeToken — rejected tokens", () => {
   test("expired token returns false, logs a warn, and leaves request.auth untouched", () => {
-    // Mint a token whose exp is already in the past.
     const expired = generateRuntimeToken(
       { ...CLAIMS, exp: runtimeTokenExpiry(-60 * 1000) },
       SECRET
@@ -197,10 +193,9 @@ describe("tryAuthenticateRuntimeToken — rejected tokens", () => {
 
   test("tampered token (valid prefix, bad signature) returns false and does not warn-as-expired", () => {
     const token = validToken();
-    // Flip a bit in the DECODED signature bytes (not a base64url char): the
-    // trailing base64url char only carries 2-4 significant bits, so flipping it
-    // can decode to the same byte sequence and leave the signature valid. The
-    // dotIndex split mirrors verifyRuntimeToken (signature = after the last dot).
+    // Change the first decoded signature byte. Flipping the last base64url character
+    // can decode to the same bytes, because that character holds only 2 to 4 bits.
+    // Split at the last dot, as verifyRuntimeToken does.
     const dot = token.lastIndexOf(".");
     const sigBytes = Buffer.from(token.slice(dot + 1), "base64url");
     sigBytes[0] ^= 0xff; // guaranteed-different signature
@@ -235,7 +230,6 @@ describe("tryAuthenticateRuntimeToken — rejected tokens", () => {
 
     expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
     expect(request.auth).toBeUndefined();
-    // Rejected at the verification step (invalid signature), which warns.
     expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 });

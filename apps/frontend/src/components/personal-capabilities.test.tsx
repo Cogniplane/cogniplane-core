@@ -38,7 +38,7 @@ it("shows a personal connector's saved label and reconnect route", async () => {
   expect(screen.getByText(/Account label: Work/)).toBeTruthy();
   expect(screen.getByRole("link", { name: "Reconnect" }).getAttribute("href")).toBe("/settings/connections");
   expect(screen.getAllByText(/Your account needs a new credential/)).toHaveLength(1);
-  // q4w0.8: a credential that a security change suspended links to its review.
+  // A credential that a security change suspended links to its review.
   expect(screen.getByText(/Suspended because your account security changed/)).toBeTruthy();
   expect(screen.getByRole("link", { name: "Review" }).getAttribute("href")).toBe("/settings/connections");
 });

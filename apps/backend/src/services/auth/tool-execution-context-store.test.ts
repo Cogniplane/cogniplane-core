@@ -61,10 +61,9 @@ class FakeToolContextDatabase {
     }
 
     if (text.includes("UPDATE tool_execution_contexts")) {
-      // extend: push expires_at out, but only for a row that is still live and
-      // in the caller's tenant. Same discipline as the SELECT branch — each
-      // predicate is honored ONLY IF the emitted SQL carries it, so dropping
-      // one from the store changes this fake's result and a test catches it.
+      // extend: push expires_at out, but only for a live row in the caller's
+      // tenant. Each predicate counts only if the emitted SQL carries it, so
+      // dropping one from the store changes this result and a test catches it.
       const scopesTenant = text.includes("tenant_id = $1");
       const scopesContext = text.includes("tool_context_id = $2");
       const filtersExpiry = text.includes("expires_at > NOW()");
@@ -88,11 +87,8 @@ class FakeToolContextDatabase {
       const tenantId = String(values[0]);
       const isUnexpired = (row: StoredContextRow) => Date.parse(row.expires_at) > this.nowMs;
 
-      // findLatestActiveBySession: scope by tenant + session, drop expired, take
-      // the most-recently-created. Each clause is honored ONLY IF the emitted SQL
-      // actually contains it — so dropping a predicate/ordering from the store's
-      // query changes this fake's result and the test catches it (no-DB analog of
-      // running the real WHERE/ORDER BY).
+      // findLatestActiveBySession: the newest active row of the session (a no-DB
+      // analog of the real WHERE and ORDER BY).
       if (text.includes("FROM tool_execution_contexts") && text.includes("ORDER BY created_at")) {
         const scopesSession = text.includes("session_id = $2");
         const filtersExpiry = text.includes("expires_at > NOW()");
@@ -113,7 +109,6 @@ class FakeToolContextDatabase {
         return { rows: latest ? [latest] : [], rowCount: latest ? 1 : 0 };
       }
 
-      // get / requireOwned: scope by tenant + tool_context_id, drop expired.
       const row = this.rows.get(String(values[1]));
       const isActive = row && row.tenant_id === tenantId && isUnexpired(row);
       return {
@@ -265,9 +260,9 @@ test("findLatestActiveBySession never returns another tenant or session's contex
 });
 
 test("extend keeps a context alive across consecutive approval rounds", async () => {
-  // The defect: the TTL was wall-clock from creation, while the approval round
-  // loop is unbounded. Two approvals that each fit inside the TTL still pushed
-  // the turn past it, and the turn lost every managed MCP tool mid-flight.
+  // The TTL must slide. The approval round loop is unbounded, so two approvals
+  // that each fit inside the TTL can still push the turn past it. The turn would
+  // then lose its managed MCP tools.
   const db = new FakeToolContextDatabase();
   const store = new ToolExecutionContextStore(db as unknown as Pool);
   const ttlMs = 35 * 60_000;

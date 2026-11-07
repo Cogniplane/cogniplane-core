@@ -274,9 +274,8 @@ function KpiTile(props: {
 }
 
 /**
- * Inline-SVG sparkline. No charting library — keeps the bundle the same
- * size it is today. The line is normalized to a 100×24 viewBox; CSS sizes
- * the rendered SVG by giving it 100% width and a fixed pixel height.
+ * Inline SVG sparkline. It uses no chart library, so the bundle stays small.
+ * CSS sets the rendered size of the SVG.
  */
 function Sparkline({ values, tone }: { values: number[]; tone: "neutral" | "warn" }) {
   if (values.length < 2) return null;

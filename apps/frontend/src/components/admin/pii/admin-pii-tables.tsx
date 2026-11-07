@@ -50,8 +50,6 @@ function DisplayedRange({ range }: { range: { preset: PiiRangePreset; from: stri
   </p>;
 }
 
-// ─── TopOffenders ──────────────────────────────────────────────────────────
-
 export function TopOffenders(props: RangeProps) {
   const [groupBy, setGroupBy] = useState<PiiTopGroupBy>("user");
   const params = { ...props, groupBy };
@@ -181,12 +179,9 @@ function TopSessionTable({ rows }: { rows: PiiTopSessionRow[] }) {
   );
 }
 
-// ─── RecentActivityFeed ────────────────────────────────────────────────────
-
 export function RecentActivityFeed(props: RangeProps) {
-  // Default actions match the backend's default (block/transform/failed) so
-  // the cache key shape stays stable and we don't request a redundant
-  // permutation. Custom action filtering is a follow-up.
+  // Default actions match the backend default (block, transform, failed), so the
+  // cache key stays stable and the query requests no extra permutation.
   const params = { ...props };
   const recentQuery = useQuery({
     queryKey: queryKeys.admin.piiRecent(params),

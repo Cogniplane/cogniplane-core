@@ -18,8 +18,6 @@ type MemoryToolDeps = {
   memories: Pick<MemoryStore, "search" | "save" | "remove">;
 };
 
-// ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
-
 export const MEMORY_TOOL_CATALOG: ReadonlyArray<{
   name: string;
   description: string;
@@ -82,8 +80,6 @@ export const MEMORY_TOOL_CATALOG: ReadonlyArray<{
   }
 ];
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 const memoryOutputSchema = allRequiredObjectSchema({
   name: { type: "string" },
   content: { type: "string" },
@@ -100,8 +96,6 @@ function toMemoryOutput(memory: MemoryRecord): Record<string, unknown> {
     updatedAt: memory.updatedAt
   };
 }
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
 
 export function createMemoryTools(deps: MemoryToolDeps): ManagedToolDefinition[] {
   return [

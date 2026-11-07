@@ -28,9 +28,9 @@
 // the server ID in the HKDF info. The upstream signing secret is
 // `proxySignatureSecret` in lib/derived-secrets.ts (HKDF of
 // DATA_ENCRYPTION_SECRET under a v2 label), or MCP_UPSTREAM_SIGNING_ROOT_SECRET
-// when the operator sets it. It is never a value a v1 upstream held: anyone
-// with the upstream signing secret can derive every per-server key. The HMAC key is the base64url text of the derived key (use its
-// UTF-8 bytes).
+// when the operator sets it. It is never a value that a v1 upstream held.
+// Anyone with the upstream signing secret can derive every per-server key.
+// The HMAC key is the base64url text of the derived key. Use its UTF-8 bytes.
 //
 // Give an upstream only its own per-server key. Never give it the upstream
 // signing secret or the root secret. A per-server key cannot make a valid
@@ -43,9 +43,6 @@
 // If you rotate MCP_UPSTREAM_SIGNING_ROOT_SECRET, all per-server keys change.
 // Boot refuses the v1 override MCP_UPSTREAM_SIGNING_SECRET (config.ts).
 //
-// v1 (no tenant, server, nonce or body hash, one key for all upstreams) is
-// removed. An upstream that verifies v1 must change to v2.
-//
 // Replay: the upstream accepts a timestamp in [now - maxAgeMs,
 // now + maxFutureSkewMs] and keeps each nonce until timestamp + maxAgeMs.
 // See `verifyProxyHeaders` for the full contract.
@@ -56,7 +53,6 @@ const ALGORITHM = "sha256";
 const SIGNATURE_VERSION = "v2";
 const NONCE_BYTES = 16;
 const SERVER_KEY_BYTES = 32;
-/** Default for how far a timestamp can be ahead of the verifier's clock. */
 export const DEFAULT_MAX_FUTURE_SKEW_MS = 30_000;
 const TIMESTAMP_PATTERN = /^\d{1,16}$/;
 
@@ -226,9 +222,9 @@ export type VerifyProxyHeadersOptions = {
    * difference between the framework and the upstream. A non-negative safe integer.
    * Default DEFAULT_MAX_FUTURE_SKEW_MS (30 s).
    *
-   * Before 2026-10-27 the limit was `maxAgeMs`. To keep that window during a
-   * rollout, set `maxFutureSkewMs: maxAgeMs`. This is safe only with the nonce
-   * store rule on `verifyProxyHeaders`.
+   * To accept the same window as `maxAgeMs` during a rollout, set this to
+   * `maxAgeMs`. This is safe only with the nonce store rule on
+   * `verifyProxyHeaders`.
    */
   maxFutureSkewMs?: number;
   /** Unix ms. See the clock rules on `verifyProxyHeaders`. Default Date.now. */

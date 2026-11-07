@@ -57,7 +57,7 @@ export type TenantSettingsRecord = {
   /** Per-model default reasoning effort overriding the catalog default. */
   modelDefaultEfforts: Record<string, EffortLevel>;
   /**
-   * Hosts that agent-run code in the sandbox may reach (VULN-13), sorted and
+   * Hosts that agent-run code in the sandbox may reach, sorted and
    * without duplicates. Empty means no network. The admin route checks each
    * entry before it reaches the store; resolveSandboxNetworkPolicy checks it
    * again before it reaches the provider.
@@ -173,8 +173,8 @@ export function buildDefaultTenantSettingsInput(): Required<Omit<TenantSettingsI
     developerInstructions: null,
     enabledToolIds: [...DEFAULT_TENANT_TOOL_IDS],
     enabledMcpServerIds: [...DEFAULT_TENANT_MCP_SERVER_IDS],
-    // All providers enabled by default so availability stays key-driven (the
-    // pre-existing behavior) until an admin deliberately disables a provider.
+    // All providers are on by default. Availability depends on keys until
+    // an admin disables a provider.
     enabledProviders: [...MODEL_PROVIDERS],
     // null = every catalog model, so newly shipped models appear automatically.
     enabledModelIds: null,

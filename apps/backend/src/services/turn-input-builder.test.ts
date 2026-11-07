@@ -87,7 +87,6 @@ test("inlines text from a readable text artifact via the storage stream", async 
   const text = (result.userInputs![0] as { text: string }).text;
   expect(text).toMatch(/hello world/);
   expect(text).toMatch(/Readable artifact: notes.txt/);
-  // Tail prompt is preserved
   expect(text).toMatch(/\nsummarize$/);
 });
 

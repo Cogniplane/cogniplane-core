@@ -143,8 +143,8 @@ export async function registerAdminIntegrationsRoutes(
         return apiError("integration_unavailable", "Integration is not yet available.");
       }
 
-      // Only an explicit request is rejected, so an admin can still turn off,
-      // or leave unchanged, a writes flag that an earlier version accepted.
+      // The route rejects only an explicit request. An admin can still turn off, or
+      // leave unchanged, a writes flag that an older client sent.
       if (bodyResult.value.writesEnabled === true && descriptor.writeToolIds.length === 0) {
         reply.code(400);
         return apiError("integration_writes_unsupported", "This integration has no write tools.");

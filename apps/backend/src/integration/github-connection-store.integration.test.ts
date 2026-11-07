@@ -45,8 +45,6 @@ describe.skipIf(!adminDatabaseUrl())("GitHub connection store", () => {
     expect((await store.get(tenantId, userId))?.githubUserId).toBe("2");
   });
 
-  // ── Allowed repositories (migration 067) ──────────────────────────────────
-
   const connectionFor = (tenantId: string, userId: string, githubUserId: string) => ({
     tenantId, userId, githubUserId, githubLogin: `login-${githubUserId}`,
     githubName: null, githubEmail: null, githubAvatarUrl: null, tokenType: "bearer",

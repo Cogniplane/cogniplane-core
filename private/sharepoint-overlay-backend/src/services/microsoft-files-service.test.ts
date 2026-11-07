@@ -563,11 +563,8 @@ test("listFiles: skips items missing required ids/name/driveId in the response",
         json: {
           value: [
             { id: "i1", name: "good", parentReference: { driveId: "d", siteId: "s" }, folder: {} },
-            // missing id
             { name: "noid", parentReference: { driveId: "d" } },
-            // missing parentReference.driveId
             { id: "i2", name: "nodrive", parentReference: {} },
-            // null
             null
           ]
         }
@@ -576,9 +573,7 @@ test("listFiles: skips items missing required ids/name/driveId in the response",
   const items = await service.listFiles({ tenantId: "t", userId: "u" });
   expect(items.length).toBe(1);
   expect(items[0].itemId).toBe("i1");
-  // siteId comes from parentReference; source is sharepoint
   expect(items[0].source).toBe("sharepoint");
-  // folder=true sets isFolder
   expect(items[0].isFolder).toBe(true);
   expect(items[0].isFile).toBe(false);
 });
@@ -657,7 +652,6 @@ test("searchFiles: skips hits with no resource and hits with missing required fi
               hitsContainers: [
                 {
                   hits: [
-                    // good
                     {
                       summary: "a",
                       resource: {
@@ -781,8 +775,6 @@ test("importFileToSession: PII enqueuer 'allowed' result lets import succeed", a
     storage: {
       async delete() {},
       async put(input) {
-        // Drain
-        // Drain
         for await (const _ of input.stream as Readable) {
           /* drained */
         }
@@ -836,7 +828,6 @@ test("importFileToSession: PII enqueuer 'blocked' raises MicrosoftImportBlockedE
     storage: {
       async delete() {},
       async put(input) {
-        // Drain
         for await (const _ of input.stream as Readable) {
           /* drained */
         }
@@ -891,7 +882,6 @@ test("importFileToSession: PII enqueuer 'failed' raises MicrosoftImportPiiScanEr
     storage: {
       async delete() {},
       async put(input) {
-        // Drain
         for await (const _ of input.stream as Readable) {
           /* drained */
         }
@@ -945,7 +935,6 @@ test("importFileToSession: falls back to default name when meta name and overrid
     storage: {
       async delete() {},
       async put(input) {
-        // Drain
         for await (const _ of input.stream as Readable) {
           /* drained */
         }

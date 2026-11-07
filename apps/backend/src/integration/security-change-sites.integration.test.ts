@@ -1,6 +1,5 @@
 // Every place that changes a security version must stop the account's active
-// work after the commit (bead q4w0.13,
-// services/auth/security-change.ts). SECURITY_CHANGE_SITES lists the places,
+// work after the commit (services/auth/security-change.ts). SECURITY_CHANGE_SITES lists the places,
 // and security-change-sites.test.ts checks that list against the source. The
 // table below is typed by the list, so a new site does not compile until it
 // has a case here.

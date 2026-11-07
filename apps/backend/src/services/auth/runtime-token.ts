@@ -12,12 +12,9 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
  * `Authorization: Bearer rt_...` header on every MCP gateway request.
  *
  * Production callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`
- * to bound the leak window if backend process memory or internal request
- * diagnostics are captured. Default TTL is 24 hours (see RUNTIME_TOKEN_TTL_MS
- * in config.ts for the rationale: the token is minted once and must outlive the
- * longest realistic session); operators can shorten via the env var.
- * Verification still tolerates absence of `exp` so older in-flight tokens keep
- * working through a deploy.
+ * to limit the leak window if someone captures backend process memory or
+ * internal request diagnostics. Verification still tolerates absence of `exp` so
+ * older in-flight tokens keep working through a deploy.
  *
  * The token is a bearer credential valid until `exp` — there is no revocation
  * deny-list. The leak window is bounded by two controls instead: the TTL, and
@@ -43,11 +40,10 @@ const MAX_PAYLOAD_LENGTH = 1024;
 
 /**
  * Compute the `exp` claim for a runtime token. Callers pass `ttlMs` from
- * `config.RUNTIME_TOKEN_TTL_MS` (default 24 hours). The token is minted
- * once at workspace bootstrap and not refreshed for the lifetime of the
- * runtime, so the TTL must outlive the longest realistic session — see
- * the docstring on `RUNTIME_TOKEN_TTL_MS` in config.ts for the full
- * trade-off.
+ * `config.RUNTIME_TOKEN_TTL_MS`. The token is minted once at workspace
+ * bootstrap. Nothing refreshes it for the lifetime of the runtime, so the TTL
+ * must outlive the longest realistic session. See the docstring on
+ * `RUNTIME_TOKEN_TTL_MS` in config.ts for the trade-off.
  */
 export function runtimeTokenExpiry(ttlMs: number, now: Date = new Date()): string {
   return new Date(now.getTime() + ttlMs).toISOString();
@@ -85,10 +81,9 @@ export function generateRuntimeToken(
   return `${TOKEN_PREFIX}${payload}.${signature}`;
 }
 
-// Verification result. `expired` is distinguished from `invalid` so callers
-// can log/respond differently — an expired token is operationally normal at
-// the end of a long session, while `invalid` means malformed, tampered, or
-// signed under a rotated secret.
+// This type separates `expired` from `invalid`, so callers can log or respond
+// differently. An expired token is normal at the end of a long session, while
+// `invalid` means malformed, tampered, or signed under a rotated secret.
 export type RuntimeTokenVerification =
   | { kind: "valid"; claims: RuntimeTokenClaims }
   | { kind: "expired" }

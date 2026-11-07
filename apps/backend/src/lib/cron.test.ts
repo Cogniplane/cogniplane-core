@@ -6,7 +6,6 @@ describe("computeNextCronRunAt", () => {
   const NOW = new Date("2026-05-09T12:34:56.000Z");
 
   test("returns the next ISO timestamp at minute precision in UTC", () => {
-    // every minute, UTC — should be 12:35:00
     const next = computeNextCronRunAt("* * * * *", "UTC", NOW);
     expect(next).toBe("2026-05-09T12:35:00.000Z");
   });
@@ -24,7 +23,6 @@ describe("computeNextCronRunAt", () => {
   });
 
   test("does not re-fire at the current minute when expression matches now", () => {
-    // every minute, NOW is 12:34:56 — next match must be 12:35, not 12:34.
     const next = computeNextCronRunAt("* * * * *", "UTC", NOW);
     expect(next).toBe("2026-05-09T12:35:00.000Z");
   });

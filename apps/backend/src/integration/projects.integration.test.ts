@@ -113,7 +113,6 @@ test.skipIf(!adminDatabaseUrl())("legacy project artifact routes are no longer m
   })).statusCode).toBe(404);
 });
 
-/* Legacy artifact-reference coverage moved to project-file integration tests. */
 describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
   test("returns management capability with readable project details", async () => {
     const h = await setup();
@@ -184,7 +183,7 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
   test("activity respects project access and never returns event payloads", async () => {
     const h = await setup();
     const audits = new AuditEventStore(appPool());
-    // A payload carrying exactly what D11c says the feed must not expose.
+    // A payload that carries the fields the feed must not expose.
     const secret = "test-only-upstream-token";
     await audits.create({
       tenantId: h.tenantId,

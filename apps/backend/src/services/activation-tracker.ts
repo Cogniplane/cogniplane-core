@@ -19,16 +19,14 @@ type ActivationContext = {
 
 /**
  * Records `resource_activations` rows for skills, MCP servers, and
- * integrations. Three event types:
- *   - `materialized`: the resource was made available to the agent this turn
- *     (e.g. skill instructions injected into the system prompt, MCP server
- *     wired into the agent loop's tool set).
- *   - `invoked`: the agent actually used it (tool call routed to that
- *     resource, MCP server received a JSON-RPC call, etc.).
- *   - `failed`: tool/MCP call attempted and errored.
+ * integrations. There are three event types:
+ *   - `materialized`: the resource is available to the agent in this turn.
+ *     For example, skill instructions are in the system prompt.
+ *   - `invoked`: the agent used the resource. For example, a tool call went to
+ *     it.
+ *   - `failed`: a tool or MCP call to the resource returned an error.
  *
- * Writes are best-effort: a failure here must not break the turn. Callers
- * pass an optional logger; if absent we fall back to console.warn.
+ * Writes are best-effort. A failure must not break the turn.
  */
 export class ActivationTracker {
   constructor(
@@ -77,20 +75,16 @@ export class ActivationTracker {
   }
 
   /**
-   * Per-skill adoption counts in a recent window. Returns one entry per
-   * skill that has at least one row in the window — skills with no activity
-   * are absent from the map (callers default to zero).
+   * Per-skill adoption counts in a recent window. Skills with no activity in
+   * the window are not in the map. Callers must treat a missing skill as zero.
    *
-   * Both numbers are *distinct sessions*, not raw event counts. Telemetry
-   * writes one `materialized` row per turn the skill is offered; counting raw
-   * rows would inflate a skill that just sat through a long conversation.
-   * Distinct sessions matches the question the admin is actually asking ("in
-   * how many sessions was this skill used").
+   * Both counts are distinct sessions, not event counts. Telemetry writes one
+   * `materialized` row for each turn that offers the skill, so raw rows would
+   * overcount long conversations.
    *
-   * An `invoked` row is written when a tool call routed through the MCP gateway
-   * matches a skill's `metadata.associatedToolIds`. It's a weak signal (the
-   * agent may have called the tool without following the skill's instructions),
-   * but it's the evidence we have that the skill was actually used.
+   * An `invoked` row means a tool call through the MCP gateway matched a
+   * skill's `metadata.associatedToolIds`. This is a weak signal. The agent can
+   * call the tool without following the skill's instructions.
    */
   async countSkillActivations(
     tenantId: string,
@@ -143,15 +137,15 @@ export class ActivationTracker {
   }
 
   /**
-   * Records `invoked` skill rows for every skill materialized in this
-   * turn whose `metadata.associatedToolIds` contains `toolName`. Callers without
-   * a message id match only materializations that also have no message id. Looks
-   * up the candidate skills directly from `resource_activations` so the
-   * MCP gateway doesn't need to thread the runtime config through every
-   * request — the materialization rows already carry everything we need.
+   * Records `invoked` skill rows for each skill materialized in this turn
+   * whose `metadata.associatedToolIds` contains `toolName`. Without a message
+   * id, the query matches only materializations that also have no message id.
+   * The skill lookup reads `resource_activations` directly, so the MCP gateway
+   * does not need the runtime config. The materialization rows already hold
+   * the data it needs.
    *
-   * Best-effort: failures are swallowed so a tracker bug never breaks a
-   * tool call. Returns the credited skill ids for diagnostics/tests.
+   * Best-effort: the method logs failures and does not throw them, so a tracker
+   * bug never breaks a tool call.
    */
   async recordSkillInvocationsForTool(
     context: ActivationContext,
@@ -204,8 +198,8 @@ export class ActivationTracker {
 
     try {
       await withTenantScope(this.db, context.tenantId, async (client) => {
-        // Single multi-row insert via unnest: keeps hot-path overhead low
-        // even when a turn materializes a dozen resources.
+        // One multi-row insert with unnest keeps overhead low when a turn
+        // materializes many resources.
         const resourceTypes: string[] = [];
         const resourceIds: string[] = [];
         const eventTypes: string[] = [];

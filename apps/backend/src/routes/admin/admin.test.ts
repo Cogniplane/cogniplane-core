@@ -950,10 +950,9 @@ test("admin routes reject non-admin callers", async () => {
 });
 
 test("GET /admin/tenant-settings prunes model ids the catalog dropped, so the form can still save", async () => {
-  // The regression this guards: PUT rejects unknown model ids, and the admin
-  // form resubmits whatever GET handed it. Retiring a catalog model therefore
-  // used to wedge the page — the dead id no longer renders as a checkbox, yet
-  // it rode along on every save and came back as a 400.
+  // PUT rejects unknown model ids, and the admin form resubmits whatever GET
+  // handed it. A retired catalog model must not wedge the page. GET prunes the
+  // dead id, so it neither renders as a checkbox nor comes back as a 400 on save.
   const app = Fastify();
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -1443,7 +1442,6 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     transportKind: "http",
     enabled: true
   }), expect.any(Function));
-  // The legacy create audits through the in-transaction builder.
   expect(auditEvents.events.at(-1)?.type).toBe("admin.mcp_server.created");
 
   const setupResponse = await app.inject({

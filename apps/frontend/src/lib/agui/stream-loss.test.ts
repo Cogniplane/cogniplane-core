@@ -252,7 +252,7 @@ describe("the end of a stream through @ag-ui/client", () => {
     expect(onTurnSettled).not.toHaveBeenCalled();
   });
 
-  // cr1 R5: sends wait while a planned connection waits. A connection that
+  // Sends wait while a planned connection waits. A connection that
   // ends without a run releases only its own plan, not a newer one.
   it("keeps sends blocked for a newer planned connection when an older connection ends without a run", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

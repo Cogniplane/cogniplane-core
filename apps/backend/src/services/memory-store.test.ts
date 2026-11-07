@@ -79,8 +79,6 @@ function makeStore() {
   return { db, store: new MemoryStore(db as unknown as Pool) };
 }
 
-// save
-
 test("save upserts by (tenant, user, slug) and maps the returned row", async () => {
   const { db, store } = makeStore();
   db.nextRows = [memoryRow()];
@@ -176,8 +174,6 @@ test("save rejects empty and oversized content", async () => {
   ).rejects.toThrow(/exceeds/i);
 });
 
-// list / updateByUser
-
 test("list returns the most recent memories with the full count", async () => {
   const { db, store } = makeStore();
   db.script = [{ rows: [memoryRow(), memoryRow({ slug: "units" })] }, { rows: [{ total: 7 }] }];
@@ -219,8 +215,6 @@ test("an edit rejects empty and oversized text before it writes", async () => {
   expect(db.statements).toHaveLength(0);
 });
 
-// search
-
 test("search escapes ILIKE wildcards and passes the pattern once", async () => {
   const { db, store } = makeStore();
   db.nextRows = [memoryRow()];
@@ -253,8 +247,6 @@ test("search floors fractional limits and defaults NaN — LIMIT binds must be i
   await store.search("t1", "u1", { limit: Number.NaN });
   expect(db.lastValues?.[2]).toBe(10);
 });
-
-// remove
 
 test("a user's delete by id returns the name of the removed memory, or null", async () => {
   const { db, store } = makeStore();

@@ -41,20 +41,16 @@ export type PolicyEvaluation = {
   explanation: string | null;
 };
 
-// The default when no rule matches: allow. Policy Center is additive — absent
-// an explicit rule, behavior is unchanged from the pre-Policy-Center baseline
-// (the runtime's own approval policy still applies independently).
+// No rule matches: allow. The runtime's own approval policy still applies on its own.
 const DEFAULT_OUTCOME: PolicyEffect = "allow";
 
 function arrayMatches(
   values: readonly string[] | undefined,
   candidate: string | null
 ): boolean {
-  // An omitted/empty dimension matches anything. Defensive: conditions arrive
-  // from JSONB (see toConditions) and could be malformed — a non-array here
-  // would otherwise crash `.includes()` on the hot path and block every tool
-  // call for the tenant. Treat anything that isn't a non-empty array as "no
-  // constraint" so a bad row degrades to a catch-all match, never a throw.
+  // An omitted or empty dimension matches anything. Conditions come from JSONB
+  // (see toConditions) and can be malformed. A throw here would block every tool
+  // call for the tenant, so a bad value counts as "no constraint" and never throws.
   if (!Array.isArray(values) || values.length === 0) return true;
   if (candidate === null) return false;
   return values.includes(candidate);
@@ -104,13 +100,11 @@ export function compareRuleEvaluationOrder(
 }
 
 /**
- * Evaluate an action against an ordered set of rules. The first enabled rule
- * (by ascending priority, then ruleId for stable ties) whose conditions all
- * match decides the outcome. No match → default allow.
+ * The first enabled rule (ascending priority, then ruleId for ties) whose
+ * conditions all match decides the outcome. No match means default allow.
  *
- * Pure: callers' sort/filter is not assumed — the engine sorts defensively so a
- * mis-ordered input list can't change the decision. Whether a gating outcome is
- * actually enforced is the caller's call (tenant enforcement mode).
+ * Pure. The engine sorts its input, so a mis-ordered list cannot change the decision.
+ * The caller uses tenant enforcement mode to decide whether to enforce a gating outcome.
  */
 export function evaluatePolicy(
   rules: readonly EvaluableRule[],

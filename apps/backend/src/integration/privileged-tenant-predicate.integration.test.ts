@@ -71,8 +71,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     tenantB = await seedTenantGraph();
   });
 
-  // ── Shape 1a: stores that call withTenantScope but run on the privileged
-  // pool, where the wrapper is inert and the predicate is everything. ────────
+  // Shape 1a: stores that call withTenantScope on the privileged pool. There
+  // the wrapper is inert, and the predicate is the only tenant boundary.
 
   describe("TenantMemberStore.getRole (the auth middleware's admission check)", () => {
     // app.ts constructs this against privilegedDb: the lookup runs BEFORE any
@@ -363,7 +363,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
   });
 
-  // ── Shape 1b: privileged methods carrying tenant_id = $n. ─────────────────
+  // Shape 1b: privileged methods that carry tenant_id = $n.
 
   describe("UserSettingsStore scheduled-job methods", () => {
     function store(): UserSettingsStore {
@@ -473,7 +473,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
 
     test("peek and consume refuse a token whose user left the tenant", async () => {
-      // The route is public, so the auth hook no longer checks membership. The
+      // The route is public, so the auth hook does not check membership. The
       // gate must, or a removed member keeps access until the token expires.
       const graph = await seedTenantGraph();
       const token = await seedDownloadToken({
@@ -632,7 +632,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
     });
   });
 
-  // ── Shape 2: sweeps and claims with no tenant predicate. ──────────────────
+  // Shape 2: sweeps and claims with no tenant predicate.
 
   // read_text_artifact falls back to derived text for non-text files. That
   // derived row needs the same PII eligibility as a download.
@@ -852,12 +852,10 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
   });
 });
 
-// ── Relationship integrity across tenants. ─────────────────────────────────
-//
-// Separate from the two shapes above because neither RLS nor a tenant predicate
-// checks that a child row's parent belongs to the same tenant. Composite foreign
-// keys provide that database-level guarantee even if a route or store trusts a
-// caller-supplied session id.
+// Relationship integrity across tenants. The shapes above do not cover it.
+// Neither RLS nor a tenant predicate checks that a child row's parent belongs
+// to the same tenant. Composite foreign keys give that guarantee, even when a
+// route or store trusts a caller-supplied session id.
 describe.skipIf(!adminDatabaseUrl())("cross-tenant parent references", () => {
   let tenantA: TenantFixture;
   let tenantB: TenantFixture;

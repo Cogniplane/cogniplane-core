@@ -34,7 +34,6 @@ function resolvePill(status: PiiProviderStatus | null, now: number): ResolvedPil
       detail: "Testing recovery — next call decides whether the breaker closes"
     };
   }
-  // open
   const willRetry = status.willRetryAt;
   const remainingMs = willRetry !== null ? Math.max(0, willRetry - now) : null;
   return {
@@ -64,7 +63,7 @@ export function PiiProviderStatusPill() {
       }
     };
     void fetchStatus();
-    // Refresh every 10s. Cheap call, mostly cache hits in Redis.
+    // Cheap call, mostly cache hits in Redis.
     const refresh = setInterval(fetchStatus, 10_000);
     // Tick the clock once a second so the "retry in Xs" countdown updates.
     const tick = setInterval(() => setNow(Date.now()), 1_000);

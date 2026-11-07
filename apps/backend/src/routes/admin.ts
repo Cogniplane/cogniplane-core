@@ -44,10 +44,6 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { buildOpenRouterCatalogFetcher } from "../services/openrouter-catalog.js";
 import type { DataRouteControl } from "../services/data-route-control.js";
 
-// ---------------------------------------------------------------------------
-// Route registration
-// ---------------------------------------------------------------------------
-
 export function buildAdminRouteStores(
   deps: AppDependencies,
   extras: {

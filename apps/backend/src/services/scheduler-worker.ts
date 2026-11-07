@@ -980,12 +980,12 @@ export class SchedulerWorker {
    * Release the per-run runtime and its checkpointer thread.
    *
    * Each firing creates a fresh session (see executeJob), and nothing else ever
-   * reclaims it: `abortSession` was previously only reached on the timeout path,
-   * so a completed run left a warm runtime — and a live E2B sandbox, if the job
-   * touched files — parked until RUNTIME_IDLE_TIMEOUT_MS, and left a LangGraph
-   * thread in the `deep_agents` schema forever. A scheduled session is never
-   * resumed (a new one is created next tick), so that thread is pure garbage;
-   * `purgeSessionData` is normally called from session or project deletion.
+   * reclaims it. Without this call, a completed run leaves a warm runtime, and a
+   * live E2B sandbox if the job touched files, parked until RUNTIME_IDLE_TIMEOUT_MS.
+   * It also leaves a LangGraph thread in the `deep_agents` schema forever.
+   * Nothing resumes a scheduled session, because each tick creates a new one. So
+   * that thread is pure garbage. Session or project deletion normally calls
+   * `purgeSessionData`.
    *
    * The `sessions` / `messages` rows are deliberately KEPT: `scheduled_job_runs`
    * references the session id and the run-detail UI reads the transcript. Their

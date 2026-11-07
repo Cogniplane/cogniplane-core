@@ -51,9 +51,9 @@ test("binds saves and removal to authenticated identity and preserves expected v
   expect(memberMcpCredentials.remove).toHaveBeenCalledWith("tenant", "member", "docs", 2);
 });
 
-// q4w0.8 review: an MCP credential has no confirm. The label is free text that
-// the saver chose and the page cannot show the secret, so a confirm would give
-// a replaced secret back to an attacker. The member saves a new secret instead.
+// An MCP credential has no confirm. The saver chooses the label, which is free
+// text, and the page cannot show the secret. A confirm would therefore give a
+// replaced secret back to an attacker. The member saves a new secret instead.
 test("offers no confirm route for a suspended credential", async () => {
   const { app, memberMcpCredentials } = await setup();
   const response = await app.inject({ method: "POST", url: "/me/mcp-connections/docs/confirm", payload: { scope, version: 2 } });

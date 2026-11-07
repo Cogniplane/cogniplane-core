@@ -1,7 +1,5 @@
-// Thin structural interface over the E2B SDK's Sandbox, shared by every
-// consumer that talks to an E2B sandbox (today: the Deep Agents execution
-// backend). Extracted from the retired Codex e2b-runtime-process (bead
-// quap.2) so the sandbox surface survives the runtime it was written for.
+// Thin structural interface over the E2B SDK's Sandbox. Every consumer that talks to
+// an E2B sandbox uses it (today: the Deep Agents execution backend).
 
 /** Session workspaces are rooted here inside every sandbox template. */
 export const E2B_WORKSPACE_BASE = "/home/user/workspace";

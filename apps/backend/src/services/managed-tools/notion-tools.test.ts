@@ -6,7 +6,7 @@ import { createFakeFetch } from "../../test-helpers/fake-fetch.js";
 import { createNotionTools, markdownToNotionBlocks, NOTION_TOOL_CATALOG } from "./notion-tools.js";
 
 // Valid Notion IDs used as test fixtures (32 hex chars or dashed UUID).
-// Notion IDs are now validated before URL interpolation, so test inputs must
+// The tools validate Notion IDs before URL interpolation, so test inputs must
 // match the canonical shape.
 const PAGE_ID = "11111111111111111111111111111111";
 const PAGE_ID_2 = "22222222-2222-2222-2222-222222222222";
@@ -884,8 +884,6 @@ test("notion_append_blocks surfaces API errors", async () => {
     restore();
   }
 });
-
-// ── Notion ID validation: reject prompt-injectable URL path segments ───────
 
 test("notion_fetch_page rejects path-traversal in pageId", async () => {
   const fetchPage = findTool("notion_fetch_page");

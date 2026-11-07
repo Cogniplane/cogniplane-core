@@ -64,7 +64,6 @@ export interface SessionAGUITurnBackendParams {
   toolContextRef: { current: string | null };
   modelId: string;
   effort?: RuntimeReasoningEffort | null;
-  /** Prompt text for the initial turn input. */
   promptText: string;
   conversationMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   projectInstructions?: ProjectInstructionsSnapshot | null;

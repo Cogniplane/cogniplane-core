@@ -21,7 +21,7 @@ export type AdminSectionId = (typeof ADMIN_LIVE_SECTIONS)[number]["id"];
 
 export const ADMIN_NAVIGATION_ITEMS: readonly (NavigationItem & { group?: string })[] = ADMIN_LIVE_SECTIONS;
 
-// Older URLs that still open a page. Each one belongs to the section that now owns it.
+// Older URLs that still open a page. Each one maps to its current section.
 const ADMIN_SECTION_ALIASES: Record<string, AdminSectionId> = {
   mcp: "connections",
   integrations: "connections",

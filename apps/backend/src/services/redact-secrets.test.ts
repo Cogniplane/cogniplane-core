@@ -216,7 +216,6 @@ test("redactSecrets preserves the URL fragment and surrounding quotes when redac
   );
 });
 
-// ── Non-plain object handling ────────────────────────────────────────────────
 // redactSecrets walks arbitrary MCP tool results, so it meets values that are
 // not plain objects. Two competing failure modes: walking an opaque built-in
 // destroys it, and NOT walking a class instance leaks whatever it holds. The

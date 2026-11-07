@@ -280,7 +280,7 @@ test("importSkillBundleFromZip rejects a zip bomb before inflating it", async ()
         await rm(root, { recursive: true, force: true });
       });
 
-  // A zip bomb: 20 MB of a single repeated byte, which DEFLATE crushes to a
+  // A zip bomb: 5 MB of a single repeated byte, which DEFLATE crushes to a
   // few KB. Every declared-size check passes if the header is then rewritten
   // to a small lie — so the only thing that can stop this is a bound on how
   // much the entry is allowed to expand relative to the compressed bytes
@@ -315,16 +315,14 @@ test("importSkillBundleFromZip rejects many entries that individually pass every
         await rm(root, { recursive: true, force: true });
       });
 
-  // The subtlest construction: each entry is padded with incompressible random
-  // bytes so its true ratio sits well under the per-entry cap (~60:1), AND
-  // every declared size is then rewritten to 64 bytes. Declared total ~2.6 KB,
-  // declared worst ratio ~1.7:1 — every size and every ratio check passes —
-  // while the archive really inflates to about 32 MB.
+  // The test pads each entry with incompressible random bytes, so its real ratio
+  // stays far below the ratio cap. It then rewrites every declared size to 64
+  // bytes, so every declared check passes. The archive really inflates to about
+  // 32 MB, which is more than the 25 MB total budget.
   //
-  // What refuses it is the per-entry length comparison after inflation, which
-  // fires on the first entry. Worth pinning explicitly: it is the check that
-  // makes the declared sizes safe to reason about at all, and the one that
-  // makes the archive-wide total counter unfoolable downstream of it.
+  // The importer caps the inflate of each entry at the bytes left in that budget,
+  // so a later entry is refused. Pin this: the cap must hold while inflating,
+  // because the declared sizes cannot be trusted.
   const archive = new JSZip();
   archive.file(
     "test-skill/SKILL.md",
@@ -377,8 +375,7 @@ test("importSkillBundleFromZip rejects a bomb whose header also lies about its s
 
   // Rewrite every 4-byte uncompressed-size field (local header offset 22,
   // central-directory offset 24) to a harmless-looking value, so the declared
-  // size caps see a 64-byte file. This is the case the old code let through:
-  // it inflated the whole entry and only compared lengths afterwards.
+  // size caps see a 64-byte file. The bounded inflate must still refuse it.
   const LOCAL_SIG = 0x04034b50;
   const CENTRAL_SIG = 0x02014b50;
   const lie = 64;
@@ -391,10 +388,10 @@ test("importSkillBundleFromZip rejects a bomb whose header also lies about its s
     }
   }
 
-  // The lie makes the ratio look SMALL (64 bytes from a few KB compressed), so
-  // it slips past the ratio check — and is then caught by the post-inflate
-  // length comparison. That inflation is bounded: the ratio check already
-  // capped this entry at compressedSize x 100, which is why running it is safe.
+  // The declared size says 64 bytes, so the declared checks pass. The inflate is
+  // still bounded by two limits: the compressed size (times the ratio cap) and the
+  // per-file byte cap. Here it stops at the 10 MB per-file cap. That bound is why
+  // running it is safe.
   await expect(importSkillBundleFromZip({
         tenantId: "test-tenant",
         config: createTestConfig({
@@ -416,7 +413,7 @@ test("importSkillBundleFromZip accepts a bundle with ordinary text compression",
         await rm(root, { recursive: true, force: true });
       });
 
-  // Real prose compresses maybe 3-5x, nowhere near the 100:1 bound. The ratio
+  // Real prose compresses maybe 3-5x, nowhere near the 1000:1 bound. The ratio
   // check must not become a limit on legitimate bundles.
   const prose = Array.from(
     { length: 400 },
@@ -452,8 +449,8 @@ test("importSkillBundleFromZip handles STORE-compressed (uncompressed) entries",
 
   // Method 0 has no compressed stream to inflate, so `inflateEntryBounded`
   // returns the raw bytes on a separate branch. Archives written by some tools
-  // (and any already-compressed file) take it, so it needs its own coverage —
-  // driving zlib directly means the two methods no longer share a code path.
+  // (and any already-compressed file) take it, so it needs its own coverage.
+  // The two methods take different code paths.
   const archive = new JSZip();
   archive.file(
     "test-skill/SKILL.md",
@@ -597,8 +594,7 @@ test("importSkillBundleFromInline rejects invalid skillId", async () => {
 test("importSkillBundleFromInline accepts descriptions containing colons and special characters", async () => {
   const recorder = { calls: [] as RecordedImportInput[], storageUris: [] as Array<string | null> };
 
-  // Description with ": " previously broke validation when the synthesized
-  // SKILL.md frontmatter used unquoted YAML.
+  // A description with ": " must stay valid in the synthesized SKILL.md frontmatter.
   const trickyDescription = "Python: data tools | analytics";
 
   await importSkillBundleFromInline({
@@ -626,8 +622,6 @@ test("importSkillBundleFromInline rejects empty instructions", async () => {
         actorUserId: "admin-user"
       })).rejects.toThrow(/instructions is required/);
 });
-
-// --- SSRF redirect-loop coverage -------------------------------------------
 
 type FakeHop = { url: string; headers: Record<string, string> };
 
@@ -765,8 +759,6 @@ test("ssrfSafeGithubFetch returns a 3xx with no Location header as-is", async ()
   expect(response.status).toBe(304);
   expect(hops.length).toBe(1);
 });
-
-// --- Archive (zip-slip + file-count) defenses ------------------------------
 
 test("importSkillBundleFromZip rejects path-traversal (zip-slip) entries", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-zipslip-"));

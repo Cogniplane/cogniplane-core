@@ -16,10 +16,10 @@ import { isoTimestamp } from "../../lib/db-mappers.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 import { WeakerChangeError } from "../weaker-change-error.js";
 
-// Coerce a JSONB dimension to a clean string[] (or undefined when absent).
-// Non-array or non-string entries are dropped rather than trusted — the engine
-// must never receive a non-array here (it would crash `.includes()` on the
-// hot path). An empty result is normalized to undefined ("no constraint").
+// Coerce a JSONB dimension to a clean string[]. A value that is not an array,
+// or an empty result, becomes undefined ("no constraint"). Non-string entries are
+// dropped. The engine must never get a non-array, because `.includes()` would
+// crash on the hot path.
 function toStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const entries = value.filter((entry): entry is string => typeof entry === "string");
@@ -136,10 +136,10 @@ export class PolicyRuleStore {
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
       const before = await rulesOf(client, tenantId);
-      // No explicit priority → append to the end of the current evaluation order
-      // (max+10) rather than a fixed 100, so a new rule never lands mid-list after
-      // a drag-reorder rewrote priorities to index*10. Read under the lock, so
-      // two concurrent creates do not take the same priority.
+      // No explicit priority: append to the end of the current evaluation order
+      // (max + 10). A fixed value could land mid-list after a reorder set the
+      // priorities to index * 10. Read under the lock, so two concurrent creates
+      // do not take the same priority.
       const priority = input.priority ?? (await appendPriority(client, tenantId));
       const result = await client.query(
         `
@@ -228,7 +228,6 @@ export class PolicyRuleStore {
     });
   }
 
-  /** Deletes a rule; returns the deleted rule, or null when there is none. */
   async delete(
     tenantId: string,
     ruleId: string,
@@ -255,9 +254,8 @@ export class PolicyRuleStore {
    * must be EXACTLY the tenant's current rule set (same members, no duplicates);
    * a mismatch means the caller's view drifted (a rule was created/deleted since
    * they fetched the list), so we reject the whole reorder rather than apply it
-   * to a stale set. Priorities are rewritten to index*10 (gaps for future single
-   * inserts) and the new ordering is returned. One transaction via the shared
-   * tenant-scoped client.
+   * to a stale set. It rewrites priorities to index*10 (gaps for future single
+   * inserts) and returns the new ordering.
    *
    * Throws {@link PolicyReorderMismatchError} on a set mismatch — the route maps
    * it to a 409 so the UI can refetch and retry.
@@ -296,10 +294,9 @@ export class PolicyRuleStore {
   }
 
   /**
-   * The priority a newly-created rule should take to land at the END of the
-   * tenant's current evaluation order: max(priority)+10, or 0 for the first
-   * rule. Without this a new rule defaults to a fixed priority and can land in
-   * the middle of a reordered list (which uses index*10 priorities).
+   * The priority for a new rule that lands at the END of the current evaluation
+   * order: max(priority) + 10, or 0 for the first rule. A reorder sets priorities
+   * to index * 10, so a fixed priority could land in the middle of the list.
    */
   async nextAppendPriority(tenantId: string): Promise<number> {
     return withTenantScope(this.db, tenantId, (client) => appendPriority(client, tenantId));

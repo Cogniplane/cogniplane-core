@@ -128,7 +128,6 @@ export class RedisRequestLimits implements RequestLimitsInterface {
       incremented.push(key);
 
       if (newCount > limit) {
-        // Rollback all incremented keys
         for (const k of incremented) {
           await this.redis.eval(DECR_IF_EXISTS, 1, k);
         }

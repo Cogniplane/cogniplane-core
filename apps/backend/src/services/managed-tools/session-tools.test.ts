@@ -108,8 +108,6 @@ const baseDeps: Parameters<typeof createSessionTools>[0] = {
   }
 };
 
-// session_context
-
 test("session_context throws when session is not found or not active", async () => {
   const deps = {
     ...baseDeps,
@@ -136,9 +134,8 @@ test("session_context: clamps recentMessageCount and returns the trailing N mess
   const allMessages = Array.from({ length: 13 }, (_, i) => makeMessage(i));
   const deps = {
     ...baseDeps,
-    // session_context now pushes the tail-slice down into the store as `limit`
-    // instead of loading the whole transcript, so the fake has to honor it —
-    // otherwise the clamp assertions below would pass regardless.
+    // The store gets the tail-slice as `limit`, not the whole transcript. The fake
+    // must honor it, or the clamp assertions below would pass regardless.
     messages: { async listBySession(_t: string, _s: string, _u: string, opts: { limit?: number } = {}) {
       return { messages: allMessages.slice(-(opts.limit ?? allMessages.length)), hasMore: false };
     } }
@@ -177,8 +174,6 @@ test("session_context: echoes the context's runtimePolicyId in the result", asyn
   const result = await tool.handler({ context: ctx({ runtimePolicyId: "policy-xyz" }), arguments: {} });
   expect((result as { runtimePolicyId: string }).runtimePolicyId).toBe("policy-xyz");
 });
-
-// list_artifacts
 
 test("list_artifacts throws when session not active", async () => {
   const deps = {
@@ -235,8 +230,6 @@ test("list_artifacts: non-string entries in scope are dropped", async () => {
   const names = (result as { artifacts: { artifactId: string }[] }).artifacts.map((a) => a.artifactId);
   expect(names).toEqual(["a"]);
 });
-
-// read_text_artifact
 
 test("read_text_artifact requires artifactId", async () => {
   const tool = findTool(baseDeps, "read_text_artifact");
@@ -408,7 +401,7 @@ test("read_text_artifact: caps maxChars at 20000 when given an absurd value", as
   expect(r.truncated).toBe(true);
 });
 
-// read_text_artifact follows the same PII eligibility as downloads (VULN-08).
+// read_text_artifact follows the same PII eligibility as downloads.
 
 for (const piiStatus of ["blocked", "pending", "scanning"] as const) {
   test(`read_text_artifact: a ready artifact with a ${piiStatus} PII verdict is not read`, async () => {

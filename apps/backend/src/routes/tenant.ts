@@ -142,7 +142,6 @@ export async function registerTenantRoutes(
     return (await requireStepUp(request, reply, localAuth, route)) !== null;
   }
 
-  // Get tenant details
   app.get("/tenant", async (request, reply) => {
     const { tenantId } = request.auth;
 
@@ -280,7 +279,6 @@ export async function registerTenantRoutes(
       }
     }
 
-    // Normalize: empty string → null
     const value = (url === null || url === undefined || url.trim() === "") ? null : url.trim();
 
     // An address decides where admins import skills from: step-up and the
