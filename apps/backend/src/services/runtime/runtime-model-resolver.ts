@@ -22,8 +22,7 @@ export type RuntimeResolutionInput = {
     /**
      * Presence check for the SELECTED model's provider. Absent means "don't
      * gate on key presence" (some callers wire it later). Gating on the model's
-     * own provider — not Anthropic specifically — lets a tenant with only e.g.
-     * an OpenAI key use OpenAI models.
+     * own provider lets a tenant with only an OpenAI key use OpenAI models.
      */
     hasProviderKey?: (tenantId: string, provider: ModelProvider) => Promise<boolean>;
     /**
@@ -191,9 +190,8 @@ export async function resolveRuntimeModel(
     selectedModel = catalogDefault;
   }
 
-  // Gate on the SELECTED model's provider (known only after resolving the
-  // model above), so a tenant with only a non-Anthropic key can still use that
-  // provider's models.
+  // Gate on the selected model's provider. The provider is available only after
+  // the code above resolves the model.
   if (selectedModel && stores.hasProviderKey) {
     const provider = selectedModel.provider;
     try {

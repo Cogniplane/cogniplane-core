@@ -84,7 +84,7 @@ describe("parseSkillActivationMetadata", () => {
     const result = parseSkillActivationMetadata({
       skillName: "my-skill",
       instructions: "Step 1",
-      description: 42 // wrong type
+      description: 42
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;

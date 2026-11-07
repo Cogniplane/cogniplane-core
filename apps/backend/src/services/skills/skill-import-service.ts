@@ -421,16 +421,6 @@ function normalizeRelativeSubdirectory(value: string | null | undefined): string
 
 export const MAX_GITHUB_REDIRECTS = 5;
 
-/**
- * SSRF-safe fetch for admin-triggered GitHub imports. The default dispatcher
- * (`ssrfSafeAgent`) pins every outbound connection to a DNS-validated public IP,
- * closing the rebinding TOCTOU window. On top of that, redirects are followed
- * manually so each `Location` target is re-validated (scheme + private/reserved
- * host) before we connect — GitHub's zipball endpoint 302s to a presigned
- * codeload/S3 URL, and a compromised/malicious upstream could redirect into the
- * internal network. Must use undici's fetch directly: Node's global fetch
- * ignores the `dispatcher` option as of undici v8.
- */
 function assertFetchableHttpsUrl(rawUrl: string): URL {
   let parsed: URL;
   try {
@@ -447,6 +437,17 @@ function assertFetchableHttpsUrl(rawUrl: string): URL {
   return parsed;
 }
 
+/**
+ * SSRF-safe fetch for admin-triggered GitHub imports. The default dispatcher
+ * (`ssrfSafeAgent`) pins every outbound connection to a DNS-validated public IP,
+ * closing the rebinding TOCTOU window. On top of that, this function follows
+ * redirects manually. It re-validates each `Location` target (scheme and
+ * private/reserved host) before it connects. GitHub's zipball endpoint 302s to
+ * a presigned codeload/S3 URL, and a compromised or malicious upstream could
+ * redirect into the internal network. The function must use undici's fetch
+ * directly, because Node's global fetch ignores the `dispatcher` option as of
+ * undici v8.
+ */
 export async function ssrfSafeGithubFetch(
   url: string,
   init: RequestInit,

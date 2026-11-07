@@ -1,7 +1,6 @@
-// WorkOS provisioning against a real Postgres: a login never writes the role
-// of an existing membership, so an in-app role change that commits while the
-// login runs is kept (Beads f93g). Before the fix, provisioning read the role
-// and wrote it back, and the change was lost.
+// WorkOS provisioning against a real Postgres. A login never writes the role
+// of an existing membership. So provisioning keeps an in-app role change that
+// commits while the login runs.
 
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "vitest";

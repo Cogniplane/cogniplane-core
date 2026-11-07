@@ -67,8 +67,6 @@ afterEach(() => {
   fake = null;
 });
 
-// ── github_read_file ─────────────────────────────────────────────────────────
-
 test("github_read_file rejects malformed repo with extra path segments", async () => {
   installFakeFetch();
   const result = await readTool!.handler({
@@ -80,9 +78,9 @@ test("github_read_file rejects malformed repo with extra path segments", async (
 });
 
 test("github_read_file rejects a repo with a dot-dot segment that survives the regex", async () => {
-  // "../user" has a single slash, so REPO_PATTERN matches (the character
-  // class allows all-dot segments). Without the explicit dot-segment guard
-  // the URL parser would resolve ".." and pivot to /user under the PAT.
+  // "../user" has a single slash, so the name pattern matches it. The dot-segment
+  // check in parseGithubRepositoryName rejects it. Without that check the URL
+  // parser would resolve ".." and pivot to /user under the PAT.
   installFakeFetch();
   for (const repo of ["../user", "owner/..", "..", "owner/."]) {
     const result = await readTool!.handler({
@@ -157,8 +155,6 @@ test("github_read_file reports a non-file entry as an error", async () => {
   expect(result).toEqual({ error: "The path is a submodule, not a file." });
 });
 
-// ── github_write_file ────────────────────────────────────────────────────────
-
 test("github_write_file rejects malformed repo", async () => {
   installFakeFetch();
   const result = await writeTool!.handler({
@@ -191,8 +187,6 @@ test("github_write_file rejects path with '..' segments", async () => {
   expect(capturedUrl()).toBe(null);
 });
 
-// ── github_create_pr ─────────────────────────────────────────────────────────
-
 test("github_create_pr rejects malformed repo", async () => {
   installFakeFetch();
   const result = await prTool!.handler({
@@ -216,8 +210,6 @@ test("github_create_pr constructs canonical URL on valid input", async () => {
   });
   expect(capturedUrl()).toBe("https://api.github.com/repos/octocat/Hello-World/pulls");
 });
-
-// ── catalog sanity ───────────────────────────────────────────────────────────
 
 test("GITHUB_TOOL_CATALOG entries match created tool names", () => {
   const catalogNames = GITHUB_TOOL_CATALOG.map((c) => c.name).sort();
@@ -244,8 +236,6 @@ test("github tools pass the account the turn recorded to the credential lookup",
   expect(expected).toEqual(["gh-1", null, undefined]);
 });
 
-// ── repository allowlist ─────────────────────────────────────────────────────
-//
 // The user's allowed-repository list narrows what the agent can reach. Every
 // tool must apply it before the GitHub API call. The cases below run each tool
 // so a new tool that skips the gate fails here.

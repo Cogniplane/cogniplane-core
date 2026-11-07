@@ -18,7 +18,6 @@ import { HINT } from "../../../lib/ui-tokens";
 
 type ActionState = {
   pending: boolean;
-  /** Shown in the dialog. Null when there is no error. */
   error: string | null;
   /**
    * Set when the server said that the reservation changed. This action must

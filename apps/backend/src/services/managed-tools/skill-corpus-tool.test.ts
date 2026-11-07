@@ -135,9 +135,8 @@ test("read_skill_corpus honors an explicit sessionCount: 0 (no activation query)
   })) as Record<string, unknown>;
 
   expect(result.includedSessionCount).toBe(0);
-  // With sessionCount: 0 the corpus builder short-circuits and runs NO query
-  // (the old `|| 50` bug coerced 0 → 50 and pulled in history). Asserting the
-  // query count is refactor-proof vs. pinning a specific table name.
+  // With sessionCount: 0 the corpus builder short-circuits and runs NO query.
+  // Asserting the query count is refactor-proof vs. pinning a specific table name.
   expect(queries.length).toBe(0);
 });
 

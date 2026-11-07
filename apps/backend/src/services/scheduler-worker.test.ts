@@ -696,9 +696,9 @@ describe("SchedulerWorker", () => {
   });
 
   test("tick resolves the runtime per job tenant and dispatches to the resolved adapter", async () => {
-    // The worker must NOT be hard-wired to Codex — each job runs on
-    // the adapter `resolveRuntime` picks for its tenant (the same resolution
-    // the interactive /messages path performs).
+    // The worker must not depend on one runtime. Each job runs on the adapter
+    // that `resolveRuntime` picks for its tenant, as the interactive /messages
+    // path does.
     const jobs = [
       makeFakeJob({ jobId: "job-a", tenantId: "tenant-a" }),
       makeFakeJob({ jobId: "job-b", tenantId: "tenant-b" })
@@ -757,11 +757,10 @@ describe("SchedulerWorker", () => {
   });
 
   test("an internal exception never reaches the job owner's run row or audit event", async () => {
-    // R8. errorMessage is written to scheduled_job_runs, put in the
-    // scheduler.job.run.failed audit payload, and returned to the job owner by
-    // GET /me/scheduled-jobs/:jobId/runs. It used to be `error.message` raw, so
-    // a pg or E2B failure put connection strings and sandbox ids in front of a
-    // user. The interactive path already classified; this one did not.
+    // The error message goes to scheduled_job_runs, to the scheduler.job.run.failed
+    // audit payload, and to the job owner (GET /me/scheduled-jobs/:jobId/runs). A
+    // raw pg or E2B error would expose connection strings and sandbox ids. The
+    // interactive path classifies errors first, and this path must too.
     const job = makeFakeJob();
     const { deps, jobRunsCompleted, auditEvents, messagesUpdated } = createFakeDeps({
       dueJobs: [job],
@@ -1240,10 +1239,10 @@ describe("SchedulerWorker", () => {
     await worker.tick();
 
     // The watchdog aborts, and reclamation aborts again unconditionally (the
-    // second is a no-op on the real adapter). Asserting an exact count here
-    // would push the code back toward skipping reclamation's abort on
-    // `timedOut`, which is exactly the bug the two tests below cover — so assert
-    // the abort HAPPENED and targeted the right session instead.
+    // second is a no-op on the real adapter). An exact count would push the code
+    // back toward skipping reclamation's abort on `timedOut`. The tests below
+    // guard against that. So assert that the abort happened and targeted the
+    // right session.
     expect(abortSessionCalls.length).toBeGreaterThanOrEqual(1);
     expect(abortSessionCalls.every((c) => c.sessionId === "session-1")).toBe(true);
     expect(abortSessionCalls.every((c) => c.userId === "user-1")).toBe(true);
@@ -1378,9 +1377,9 @@ describe("SchedulerWorker", () => {
     expect(purgeSessionDataCalls).toHaveLength(1);
   });
 
-  // R2: `timedOut` must never be treated as proof the runtime was aborted.
+  // The worker must never treat `timedOut` as proof of a runtime abort.
   // executeJobWithTimeout only aborts `if (turn.sessionId && turn.adapter)`, and
-  // its abortSession can throw — in both cases reclamation holds the only
+  // its abortSession can throw. In both cases, reclamation holds the only
   // remaining chance to release the runtime and its E2B sandbox.
 
   test("reclamation still aborts when the watchdog's own abort threw", async () => {

@@ -370,9 +370,8 @@ export class PiiScanJobHandler {
       return;
     }
 
-    // transform path — phase 1 records the finding set; the derived
-    // transformed-artifact pipeline (Epic 7) handles persisting the
-    // transformed content.
+    // transform path: this records the finding set only, and it does not store
+    // the transformed content.
     await this.writeSubjectDetail(job, {
       status: "transformed",
       ...policy,

@@ -84,9 +84,8 @@ function isPrivateOrReservedIpv4(host: string): boolean {
  * is malformed in a way `isIP` would not have rejected — callers fail closed.
  */
 function expandIpv6(host: string): number[] | null {
-  // A zone index (`fe80::1%eth0`) is never routable off-host; strip it but the
-  // presence of one already implies link-local — treat as blocked by returning
-  // null at the call site is unnecessary because the prefix check covers it.
+  // Strip a zone index such as `%eth0`. It is local to the host, so it is not
+  // part of the address. The prefix checks below classify the address.
   const withoutZone = host.split("%")[0]!;
 
   const halves = withoutZone.split("::");
@@ -174,7 +173,7 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
 
     // IPv4-translatable ::ffff:0:a.b.c.d (the /96 at ::ffff:0:0:0). Distinct
     // from the IPv4-mapped form above: group 5 is 0xffff there, group 4 here.
-    // `::ffff:0:a9fe:a9fe` reached IMDS before this check existed.
+    // `::ffff:0:a9fe:a9fe` is the metadata address, so this branch blocks it.
     if (groups.slice(0, 4).every((g) => g === 0) && groups[4] === 0xffff && groups[5] === 0) {
       const a = (groups[6]! >> 8) & 0xff;
       const b = groups[6]! & 0xff;
@@ -226,9 +225,8 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
 
     // ISATAP: the interface identifier is `<prefix>:0:5efe:w.x.y.z`, i.e.
     // group 4 is 0 or 0x0200 and group 5 is 0x5efe, with the IPv4 in the low
-    // 32 bits. The prefix is arbitrary, so this is not covered by any range
-    // check above — only the link-local case happened to be caught by fe80::/10.
-    // Classify the embedded quad wherever the marker appears.
+    // 32 bits. The prefix can be any value, so the range checks above do not
+    // cover every case. Classify the embedded quad wherever the marker appears.
     if (groups[5] === 0x5efe && (groups[4] === 0x0000 || groups[4] === 0x0200)) {
       const a = (groups[6]! >> 8) & 0xff;
       const b = groups[6]! & 0xff;
@@ -243,17 +241,6 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
   return false;
 }
 
-/**
- * Custom DNS lookup hook for the SSRF-safe undici agent. Resolves all A/AAAA
- * records for the host, refuses the whole lookup if ANY of them is
- * private/reserved (defends against multi-record `(public, private)` rebinding
- * tricks), and otherwise hands back that validated snapshot for Node to
- * connect from.
- *
- * The error message intentionally does not include the resolved IP — surfacing
- * an internal IP in error responses would itself be a small information leak
- * to the attacker who provoked the failure.
- */
 export type LookupAddress = { address: string; family: number };
 
 /**
@@ -273,6 +260,17 @@ type LookupCallback = (
   addresses?: LookupAddress[]
 ) => void;
 
+/**
+ * Custom DNS lookup hook for the SSRF-safe undici agent. It resolves all A/AAAA
+ * records for the host. It refuses the whole lookup if ANY record is
+ * private/reserved, which defends against multi-record `(public, private)`
+ * rebinding tricks. Otherwise it hands back that validated snapshot for Node to
+ * connect from.
+ *
+ * The error message intentionally omits the resolved IP. An internal IP in an
+ * error response would itself be a small information leak to the attacker who
+ * provoked the failure.
+ */
 export async function ssrfSafeLookup(
   hostname: string,
   _options: unknown,
@@ -294,19 +292,11 @@ export async function ssrfSafeLookup(
         return;
       }
     }
-    // Hand back the WHOLE validated snapshot, not just the first record.
-    //
-    // What closes the rebinding window is the loop above: the lookup is
-    // refused outright if ANY resolved record is private or reserved, and the
-    // addresses returned here are exactly the ones that passed. Node connects
-    // from this array without resolving again — verified: with two records it
-    // failed over from an unreachable address to a live one after a SINGLE
-    // lookup call — so no unvalidated address can enter at connect time.
-    //
-    // Returning only records[0] was therefore not a security measure, just a
-    // needless loss of failover: a dual-stack or multi-homed upstream whose
-    // first record happens to be down would fail even though a validated,
-    // reachable address was available.
+    // Return the whole validated snapshot, not only the first record. The loop
+    // above refuses the lookup if ANY record is private or reserved, so every
+    // returned address passed that check. Node connects from this array without
+    // resolving again, and its failover uses the other records. Verified: with
+    // two records, Node failed over to a live address after one lookup call.
     callback(
       null,
       records.map((record) => ({ address: record.address, family: record.family }))
@@ -338,11 +328,10 @@ export const ssrfSafeAgent = new Agent({
 });
 
 /**
- * `ssrfSafeAgent` only takes effect on a fetch that honours the `dispatcher`
- * option — Node's global fetch silently ignores it as of undici v8, which would
- * disable DNS pinning without any visible failure. Call sites accept an
- * injectable fetch (for tests), so enforce the invariant instead of documenting
- * it: passing the global fetch is a wiring bug, not a fallback.
+ * `ssrfSafeAgent` takes effect only on a fetch that honors the `dispatcher`
+ * option. Node's global fetch ignores it as of undici v8. That disables DNS
+ * pinning without a visible failure. Call sites accept an injectable fetch for
+ * tests. Passing the global fetch is a wiring bug, so this function throws.
  */
 export function assertDispatcherAwareFetch(fetchImpl: typeof undiciFetch): void {
   if (Object.is(fetchImpl, globalThis.fetch)) {
@@ -369,12 +358,12 @@ export const httpsUrlSchema = z
     },
     { message: "URL must not point to a private or reserved IP address" }
   )
-  // Reject `https://user:pass@host/...` at write time. A credential embedded
-  // here is stored in plaintext (mcp_servers.upstream_url is not an encrypted
-  // column), returned to the admin UI on every read, and travels into any log
-  // record naming the URL. Refusing it at the boundary is the only place the
-  // fix holds for every downstream consumer at once — `logSafeUrl` covers the
-  // log path, but nothing can un-store a credential already persisted.
+  // Reject `https://user:pass@host/...` at write time. A credential in the URL
+  // is stored in plaintext, because mcp_servers.upstream_url is not an encrypted
+  // column. Every read returns it to the admin UI, and any log record that names
+  // the URL includes it. Only this write boundary covers every consumer at once.
+  // `logSafeUrl` covers the log path, but nothing can remove a credential that
+  // is already stored.
   .refine(
     (url) => {
       try {
@@ -432,16 +421,15 @@ export const mcpUpstreamUrlSchema = z
 
 
 /**
- * Reduce an outbound URL to origin + pathname for logging.
+ * Reduce an outbound URL to its origin for logging.
  *
  * Distinct from `sanitize-url.ts`, and the two are not interchangeable.
  * `sanitizeUrl` redacts a known list of parameter NAMES, which works for our
  * own inbound request paths because we own the names. This function is for
- * third-party URLs an admin configured — an MCP proxy upstream, a marketplace
- * manifest — where the query-parameter name is the vendor's choice and no
- * allowlist can anticipate it. So drop the query entirely rather than trying
- * to classify it, and drop userinfo as belt-and-braces for any URL stored
- * before the schema above started rejecting it.
+ * third-party URLs an admin configured, such as an MCP proxy upstream or a
+ * marketplace manifest. There the query-parameter name is the vendor's choice,
+ * and no allowlist can anticipate it. So this function drops the query entirely,
+ * and userinfo too, as a second line of defense.
  *
  * Returns the fixed string `"[unparseable url]"` rather than falling back to
  * the raw input: a value that failed `new URL()` is exactly the value least
@@ -450,18 +438,15 @@ export const mcpUpstreamUrlSchema = z
  * otherwise concatenate into a misleading (and potentially secret-bearing)
  * line rather than failing cleanly.
  *
- * The pathname is dropped too. It was kept at first, on the argument that the
- * path is routing information and no MCP vendor authenticates with a path
- * segment — but nothing in the write path enforces that: `httpsUrlSchema`
- * constrains the scheme, host and userinfo and says nothing about the path, so
- * `https://vendor.example/keys/<API_KEY>/rpc` is an accepted upstream whose key
- * would be copied verbatim into the log on the first transport failure. A
- * convention no code enforces is not a control.
+ * This function also drops the pathname. A path can carry a secret. The write
+ * path does not limit paths: `httpsUrlSchema` checks the scheme, host, and
+ * userinfo only. It therefore accepts `https://vendor.example/keys/<API_KEY>/rpc`.
+ * Logging that path would expose the key on the first transport failure. A
+ * convention that no code enforces is not a control.
  *
- * Route identity does not depend on the path: callers that need to tell two
- * upstreams on one origin apart log the stable MCP `serverId` alongside this
- * value, which identifies the route better than a path ever did and carries no
- * secret.
+ * Route identity does not depend on the path. Callers that must tell two
+ * upstreams on one origin apart log the stable MCP `serverId` with this value.
+ * The `serverId` identifies the route and carries no secret.
  */
 export function logSafeUrl(url: string): string {
   try {

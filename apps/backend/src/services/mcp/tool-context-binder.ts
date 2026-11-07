@@ -6,7 +6,10 @@ import type {
   ToolExecutionContextStore
 } from "../auth/tool-execution-context-store.js";
 
-/** The answer for a context that ended. It has no ID: see the catch below. */
+/**
+ * Generic message for a tool context that is missing, expired, or ended. It
+ * must not name the context ID (see the catch below).
+ */
 export const TOOL_CONTEXT_UNAVAILABLE_MESSAGE =
   "The tool access of this turn was not found, expired, or ended by a security change.";
 
@@ -16,8 +19,8 @@ export async function resolveBoundToolContext(input: {
   args: Record<string, unknown>;
   /**
    * From the request's trusted `_meta`. When it is present, it is the only
-   * source. A `toolContextId` in the arguments is what the model wrote, and
-   * this function ignores it.
+   * source used. The model writes `args.toolContextId`. The binder uses that
+   * value only when `_meta` is absent.
    */
   metadataToolContextId: string | null;
   urlToolContextId: string | null;

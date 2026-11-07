@@ -33,10 +33,10 @@ export function buildRuntimeAdapter(input: {
     skillBundleStorage
   } = input;
 
-  // Deep Agents (bead quap): the sole runtime provider — an in-process
-  // deepagentsjs loop across the configured model providers. The durable
-  // checkpointer connects as app_user; its DDL ran from migrate.ts (see
-  // deep-agents-checkpointer.ts for the tenant-isolation boundary).
+  // Deep Agents is the only runtime provider: an in-process deepagentsjs loop
+  // across the configured model providers. The durable checkpointer connects as
+  // app_user. Its DDL runs from migrate.ts (see deep-agents-checkpointer.ts for the
+  // tenant-isolation boundary).
   const deepAgentsAdapter = new DeepAgentsRuntimeAdapter(
     config,
     dynamicConfig,

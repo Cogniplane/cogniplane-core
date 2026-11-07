@@ -27,8 +27,6 @@ function record(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
   };
 }
 
-// buildMemorySectionLines (the system prompt part)
-
 test("section is omitted entirely when memory tools are not enabled", () => {
   expect(buildMemorySectionLines(["session_context"])).toEqual([]);
 });
@@ -63,8 +61,6 @@ test("the system section carries no memory text, whatever is stored", () => {
   expect(text).not.toContain("Recently saved memories");
   expect(text).not.toContain("prefers-pnpm");
 });
-
-// buildMemoryDataContext (the labelled data message)
 
 test("the data message is omitted without memories or without memory_search", () => {
   expect(buildMemoryDataContext([], ["memory_search"])).toBeNull();
@@ -123,8 +119,6 @@ test("hidden characters in a memory are shown, not passed to the model", () => {
   expect(text).toContain("⟦U+200B⟧");
   expect(text).toContain("⟦U+E0049⟧");
 });
-
-// loadWorkspaceMemories
 
 test("loadWorkspaceMemories skips the store unless memory_search is enabled", async () => {
   let called = false;

@@ -97,7 +97,6 @@ test("applyMigrations runs the real migration files on a single held client, eac
   expect(pool.queries[1]?.sql).toBe("SELECT pg_advisory_lock(1129270862, 1)");
   expect(pool.queries.every((q) => q.clientId === 1)).toBe(true);
 
-  // Each migration's SQL and its schema_migrations record share a transaction.
   const firstFileSql = await readFile(path.join(realMigrationsDir, realFiles[0]!), "utf8");
   const sqls = pool.queries.map((q) => q.sql);
   const beginIndex = sqls.indexOf("BEGIN");

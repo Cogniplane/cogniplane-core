@@ -1,12 +1,12 @@
 // Connection plumbing for the Postgres-backed integration suite.
 //
 // Why this suite exists: Row-Level Security is the tenant-isolation boundary
-// for every request path, and until this suite no test executed a single
-// policy. Store tests assert SQL strings against `test-helpers/fake-pool.ts`,
-// which understands BEGIN/COMMIT/set_config well enough that `withTenantScope`
-// works unmodified — so a policy with the wrong GUC name, a table with no
-// ENABLE ROW LEVEL SECURITY, or a store method that skips `withTenantScope`
-// all pass the unit suite silently.
+// for every request path. Unit tests never run a policy. Store tests assert
+// SQL strings against `test-helpers/fake-pool.ts`. That fake understands
+// BEGIN/COMMIT/set_config well enough that `withTenantScope` works unmodified.
+// So the unit suite passes silently when a policy has the wrong GUC name, a
+// table has no ENABLE ROW LEVEL SECURITY, or a store method skips
+// `withTenantScope`.
 //
 // appPool() runs tenant queries under RLS. maintenancePool() uses the same
 // explicit grants as production for cross-tenant work. superuserPool() seeds
@@ -151,12 +151,6 @@ export async function closePools(): Promise<void> {
 }
 
 /**
- * Create the throwaway database, migrate it, and set up `app_user`.
- *
- * Returns the database name, or undefined when no database is configured.
- * Called from globalSetup only.
- */
-/**
  * Both names are interpolated (CREATE/DROP DATABASE and DROP ROLE take no bind
  * parameters), so every value that reaches those statements is checked against
  * the exact shape this harness generates. `createRunDatabase` only ever builds
@@ -172,6 +166,12 @@ function assertHarnessIdentifier(name: string): void {
   }
 }
 
+/**
+ * Create the throwaway database, migrate it, and set up `app_user`.
+ *
+ * Returns the database name, or undefined when no database is configured.
+ * Called from globalSetup only.
+ */
 export async function createRunDatabase(): Promise<
   { database: string; role: string } | undefined
 > {

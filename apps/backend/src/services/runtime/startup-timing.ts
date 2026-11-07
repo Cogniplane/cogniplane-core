@@ -1,11 +1,7 @@
 /**
- * Wall-clock stage timer for session-startup latency instrumentation
- * (Phase 0 of the runtime-architecture evaluation). Collects named stage
- * durations so callers can emit ONE structured summary log line per session
- * start — see the `session_startup_timing` line in
- * deep-agents-runtime-adapter.ts, and the
- * `turn_latency_timing` line in sse-stream-writer-agui.ts. Extraction/aggregation:
- * scripts/analyze-startup-latency.mjs.
+ * Wall-clock stage timer for session-startup latency instrumentation. It collects
+ * named stage durations, so the caller can log them in one structured line per
+ * session start (the `session_startup_timing` line in deep-agents-runtime-adapter.ts).
  */
 export type StartupStageTimings = Record<string, number>;
 

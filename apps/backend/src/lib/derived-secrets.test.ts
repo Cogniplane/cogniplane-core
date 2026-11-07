@@ -17,8 +17,8 @@ test("a derived key is never the root secret", () => {
 });
 
 test("the two purposes derive different keys", () => {
-  // The whole point of R13: a partner holding the upstream-signature key must
-  // not be able to mint rt_* gateway tokens.
+  // A partner that holds the upstream-signature key must not be able to mint
+  // rt_* gateway tokens.
   expect(runtimeTokenSecret(ROOT)).not.toBe(proxySignatureSecret(ROOT));
 });
 
@@ -40,8 +40,8 @@ test("the label is what separates the domains", () => {
 });
 
 test("the v2 signing root is not the key v1 upstreams held", () => {
-  // v1 upstreams verified with this key. Every v2 per-server key is derived
-  // from the signing root, so the root must differ from it.
+  // Every v2 per-server key derives from the signing root, so the root must
+  // differ from the v1 key.
   const v1Key = Buffer.from(
     hkdfSync("sha256", ROOT, "cogniplane-derived-secrets-v1", "cogniplane/v1/proxy-upstream-signature", 32)
   ).toString("base64url");

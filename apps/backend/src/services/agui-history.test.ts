@@ -200,8 +200,8 @@ describe("toAguiMessages", () => {
   });
 
   test("marks an in_progress tool result (turn aborted mid-call) as interrupted", () => {
-    // R2: a tool that started but never returned persists as "in_progress";
-    // on reload it must render as interrupted, not a clean blank success.
+    // A tool that started but never returned persists as "in_progress". On
+    // reload it must render as interrupted, not as a clean blank success.
     const seeded = toAguiMessages([
       makeMessage({
         messageId: "a1",

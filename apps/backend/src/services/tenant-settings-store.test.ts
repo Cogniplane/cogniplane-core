@@ -3,10 +3,10 @@ import { describe, expect, test } from "vitest";
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { buildDefaultTenantSettingsInput, TenantSettingsStore } from "./tenant-settings-store.js";
 
-// Unit tests for the approved sandbox hosts (VULN-13). The fake answers the
-// statements of the upsert from the values it binds, and reads the INSERT back
-// by column name, so a value in the wrong column fails here. Row-level security
-// and the real column are proven against Postgres by the integration suite.
+// Unit tests for the approved sandbox hosts. The fake answers the statements of
+// the upsert from the values it binds. It reads the INSERT back by column name,
+// so a value in the wrong column fails here. The integration suite proves
+// row-level security and the real column against Postgres.
 
 type Row = Record<string, unknown>;
 

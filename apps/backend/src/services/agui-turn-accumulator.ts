@@ -2,12 +2,13 @@
 // AG-UI turn accumulator — the persistence counterpart to the live stream
 //
 // The AG-UI SSE writer streams `BaseEvent`s straight to CopilotKit, which renders
-// the live turn from the wire. But a reload has only the DB to read, so the rich
-// parts of the turn (reasoning, tool calls/results, the plan pane) must be
-// captured off the SAME event stream and persisted — otherwise reload shows
-// text-only. This is a PURE reducer over the events the writer already iterates:
-// feed each event to `apply`, then read `assistantText`, `reasoningText`,
-// `planMarkdown`, and `toolResults()` at the end to persist.
+// the live turn from the wire. A reload reads only the DB. So this accumulator
+// captures the rich parts of the turn (reasoning, tool calls and results, the
+// plan pane) from the same event stream for persistence. Otherwise a reload
+// shows text only.
+// This is a pure reducer over the events the writer already iterates. Feed each
+// event to `apply`, then read `assistantText`, `reasoningText`, `planMarkdown`,
+// and `toolResults()` at the end to persist.
 //
 // The event shapes mirror what the direct AG-UI producers emit:
 //   TEXT_MESSAGE_CONTENT      → assistant text (delta)
@@ -19,7 +20,7 @@
 //   CUSTOM tool_meta          → kind / server / command for a call
 //   CUSTOM tool_status        → failed|declined + durationMs for a call
 //   CUSTOM tool_mcp_app       → the linked MCP App call for a tool
-// Any other CUSTOM name, including the retired tool_ui_resources, is ignored.
+// The accumulator ignores other CUSTOM names.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
@@ -94,7 +95,6 @@ export class AguiTurnAccumulator {
         return;
 
       case EventType.REASONING_MESSAGE_START: {
-        // Open a fresh burst positioned at the current assistant-text length.
         this.openReasoning = { offset: this.assistantText.length, text: "" };
         this.reasoningSegmentList.push(this.openReasoning);
         return;
@@ -102,8 +102,8 @@ export class AguiTurnAccumulator {
 
       case EventType.REASONING_MESSAGE_CONTENT: {
         const delta = (event as { delta?: string }).delta ?? "";
-        // Guard: content without a preceding START (defensive) opens a segment
-        // at the current offset so the delta is still captured positionally.
+        // Content without a START opens a burst at the current offset, so the
+        // delta keeps its position.
         if (!this.openReasoning) {
           this.openReasoning = { offset: this.assistantText.length, text: "" };
           this.reasoningSegmentList.push(this.openReasoning);
@@ -130,14 +130,12 @@ export class AguiTurnAccumulator {
             kind: "command",
             server: null,
             command: null,
-            // Starts pending: promoted to "completed" only when a real
-            // TOOL_CALL_RESULT arrives (or "failed"/"declined" via tool_status).
-            // A call still "in_progress" at persist time is one the turn aborted
-            // before it returned — reload renders it as unfinished rather than a
-            // clean success with empty output.
+            // A call starts as in_progress. It becomes completed only on
+            // TOOL_CALL_RESULT, or failed or declined on tool_status. An abort cuts
+            // off a call that stays in_progress before it returns. Reload shows it
+            // as unfinished, not as a clean success with empty output.
             status: "in_progress",
             durationMs: null,
-            // The call sits after whatever assistant text has streamed so far.
             textOffset: this.assistantText.length
           });
         }
@@ -156,16 +154,16 @@ export class AguiTurnAccumulator {
         const call = e.toolCallId ? this.calls.get(e.toolCallId) : undefined;
         if (call) {
           call.output = e.content ?? "";
-          // A result arrived → the call finished. tool_status (failed/declined)
-          // is emitted AFTER TOOL_CALL_RESULT, so a failure still overrides this.
+          // A result means the call finished. tool_status (failed or declined)
+          // arrives after TOOL_CALL_RESULT, so a failure still overrides this.
           if (call.status === "in_progress") call.status = "completed";
         }
         return;
       }
 
       case EventType.STATE_DELTA: {
-        // The translator emits a single add/replace at "/plan" carrying the full
-        // accumulated markdown each time, so take the last value we see.
+        // The translator emits one add or replace at "/plan" per update. Each
+        // value holds the full markdown, so keep the last one.
         const delta = (event as { delta?: Array<{ path?: string; value?: unknown }> }).delta;
         if (!Array.isArray(delta)) return;
         for (const patch of delta) {

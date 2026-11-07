@@ -23,25 +23,20 @@ import { ssrfSafeAgent, ssrfSafeLookup } from "./url-validation.js";
 
 // Why this file exists, separately from url-validation.test.ts:
 //
-// Those tests call `ssrfSafeLookup` directly. They prove the private/reserved
-// BLOCKING logic is right — and it always was. What they could not see is
-// whether the function satisfies the contract UNDICI expects of a connect-time
-// lookup hook. It did not: undici passes `{all: true}`, whose callback takes an
-// array of {address, family}, while the hook called back with the
-// single-address triple. Every request through the agent died with "Invalid IP
-// address: undefined", so the DNS-rebinding guard had never run in production.
+// Those tests call `ssrfSafeLookup` directly. They prove the blocking logic.
+// They do not prove the callback shape that undici expects. undici passes
+// `{all: true}`, so the hook must call back with an array of {address, family}.
 //
-// The failure mode is nasty because it LOOKS like the guard working: requests
-// fail. So the load-bearing test here is the POSITIVE one — a request must get
-// PAST the lookup hook and reach the transport. A suite that only asserts
-// blocking passes with the guard completely broken.
+// The positive test is the load-bearing one. A failed request looks like a
+// working guard, so a suite that only checks blocking can pass with the guard
+// broken. A request must get past the lookup hook and reach the transport.
 //
 // Hermetic by construction: no external network. Real DNS is used only for
-// `localhost`, which resolves everywhere; the one case needing a PUBLIC
-// address stubs the resolver instead. (`example.com` would need real DNS and
-// `ip6-localhost` is a Debian-ism absent on many machines — both flaky in CI.)
-// Note that undici skips the lookup hook entirely for IP-literal hosts, so a
-// literal-IP test would exercise nothing at all.
+// `localhost`, which resolves everywhere. The one case that needs a PUBLIC
+// address stubs the resolver instead. (`example.com` needs real DNS, and
+// `ip6-localhost` is a Debian-ism that many machines lack. Both are flaky in
+// CI.) undici skips the lookup hook for IP-literal hosts, so a literal-IP test
+// would exercise nothing.
 
 const servers: Server[] = [];
 
@@ -71,18 +66,12 @@ afterAll(async () => {
 
 describe("ssrfSafeAgent through undici", () => {
   it("hands undici a success result it can actually consume", async () => {
-    // THE REGRESSION TEST, and the one the original bug slipped past.
+    // Capture the arguments that the real hook passes on success, then replay
+    // exactly those into undici. Do not wrap the hook or substitute a valid
+    // result on error. That would hide the callback bug this test catches.
     //
-    // Capture the arguments the REAL hook passes on its success path, then
-    // replay exactly those into undici. Nothing is normalised or substituted
-    // in between — that is deliberate. An earlier draft of this test wrapped
-    // the hook and supplied a known-good array whenever it errored, which
-    // silently repaired the malformed callback and passed against the very
-    // bug it was written to catch.
-    //
-    // A public hostname is not available in CI, so resolution is driven with
-    // a stubbed DNS answer; only the CALLBACK SHAPE is under test here, and
-    // the policy is covered by the blocking tests below.
+    // A public hostname is not available in CI. The test stubs the DNS answer, so
+    // it covers only the callback shape. The blocking tests cover policy.
     const port = await startLoopbackServer();
 
     const captured = await new Promise<unknown[]>((resolve) => {

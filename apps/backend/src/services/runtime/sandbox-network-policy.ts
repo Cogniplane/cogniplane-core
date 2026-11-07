@@ -1,10 +1,9 @@
-// The network policy of a sandbox (VULN-13). One tenant setting, the approved
-// hosts, becomes one value that decides every call to the sandbox provider:
-// the options at creation, the check of what the provider reports, and the hash
-// that is saved next to the sandbox id. The policy of a sandbox is fixed when
-// it is created. A sandbox that does not match the policy as it is later is
-// replaced, never changed: nothing in the backend can change the network of a
-// running sandbox.
+// The network policy of a sandbox. One tenant setting, the approved hosts,
+// becomes one policy value. This value decides every call to the sandbox
+// provider: the options at creation, the check of what the provider reports,
+// and the hash that is stored next to the sandbox id. The policy of a sandbox
+// is fixed when it is created. The backend replaces a sandbox that later does
+// not match its policy, and never changes it.
 //
 // What E2B enforces, from the SDK types and checked live on 2026-10-14:
 // - Default deny. `denyOut: ["0.0.0.0/0"]` blocks all IPv4 egress, DNS
@@ -39,17 +38,10 @@
 //   never does: a request that is sent cannot be recalled, and two replicas
 //   that each hold an old request can undo each other's change. A fixed network
 //   leaves nothing to race. The only way to a different network is a new sandbox.
-// - `Sandbox.getInfo` reports the network as it is now. A record that an
-//   earlier call saved is not proof of it, so each turn reads it again. For a
-//   sandbox that this code created, the report has `allowOut`, `denyOut` and
-//   `allowPublicTraffic`, and nothing else (checked live on 2026-10-14). The SDK
-//   type can also carry `rules`, `egressProxy`, `maskRequestHost` and
-//   `httpsPorts`, and the object that the SDK builds has those names with the
-//   value `undefined`. That is the only value that means "not set". This code
-//   never asks for them, so a report that has any other value for one of them
-//   (null, false, an empty text, list or object included) does not match the
-//   policy. The check reads values and not key names, or it would refuse every
-//   sandbox.
+// - `Sandbox.getInfo` reports the network as it is now, so each turn reads it again.
+//   For a sandbox that this code created, the report has `allowOut`, `denyOut` and
+//   `allowPublicTraffic`, and nothing else (checked live on 2026-10-14). See
+//   `checkReportedNetwork` for how the check reads the other names.
 
 import { createHash } from "node:crypto";
 
@@ -132,13 +124,14 @@ const REQUESTED_NETWORK_SETTINGS: ReadonlySet<string> = new Set(["allowOut", "de
  *
  * Extra entries in `denyOut` do not fail it: with the deny-all entry present they
  * add nothing. An approved host that is missing or extra does. So does any other
- * setting that the provider reports, whatever its value, except `undefined`: this
- * code requests only `allowOut`, `denyOut` and `allowPublicTraffic`, and e2b@2.53.1
- * builds the report with every optional name present and the value `undefined`
- * (checked live). Nothing else stands for "not set": `null`, `false`, an empty
- * text, an empty list and an empty object are settings that were not requested. A `rules` entry can add headers
- * to requests, and an `egressProxy` sends the egress through a server of another
- * party. A provider that reports such a setting did not apply the policy as it was sent.
+ * setting that the provider reports, unless its value is `undefined`. This code
+ * requests only `allowOut`, `denyOut` and `allowPublicTraffic`. e2b@2.53.1 builds the
+ * report with every optional name present, each with the value `undefined` (checked
+ * live). So the check reads values, not key names, or it would refuse every sandbox.
+ * `null`, `false`, an empty text, an empty list and an empty object are not
+ * `undefined`, so they fail. A `rules` entry can add headers to requests, and an
+ * `egressProxy` sends the egress through a server of another party. A provider that
+ * reports such a setting did not apply the policy that the backend sent.
  */
 export function checkReportedNetwork(info: E2bSandboxInfoLike, policy: SandboxNetworkPolicy): NetworkCheck {
   const network = info.network;

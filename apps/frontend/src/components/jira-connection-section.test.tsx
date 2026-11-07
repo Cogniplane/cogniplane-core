@@ -126,7 +126,7 @@ it("does not offer disconnect when nothing was authorized", () => {
   expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
 });
 
-// q4w0.8: a security change of the owner's account suspended the connection.
+// A security change of the owner's account suspended the connection.
 // There is no confirm for Jira: the Pipedream account ID is opaque and the
 // account name is chosen by whoever authorized the account. Choosing a site
 // again restores it; Disconnect removes all accounts.

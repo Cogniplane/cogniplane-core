@@ -73,10 +73,10 @@ const PRICING: Record<string, ModelPricing> = {
     long:  { input: 60.00, cachedInput: 0,     output: 270.00 }
   },
 
-  // Claude models. Cache-read rates vary by model. Cache-creation
-  // tokens (1.25x input in reality) are folded into `inputTokens` at the
-  // mapper and billed at the regular input rate — small under-bill on that
-  // bucket, not worth a dedicated pricing tier.
+  // Claude models. Cache-read rates vary by model. The mapper folds
+  // cache-creation tokens (1.25x input) into `inputTokens`. The calculator then
+  // bills them at the regular input rate. This under-bills that bucket a little.
+  // A separate pricing tier is not worth it.
   "claude-fable-5-1": {
     short: { input: 10.00, cachedInput: 0.25,  output: 50.00 },
     long:  null
@@ -277,13 +277,7 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  // Retired routes kept for billing history on past messages. As of
-  // 2026-09-18 gpt-oss-120b:free, tencent/hy3:free and minimax-m3:free 404 on
-  // OpenRouter, and glm-5.2:free no longer accepts tools. On 2026-10-08
-  // deepseek-v4-flash-0731:free was gone, and V4.1 Flash and MiMo V2.6
-  // replaced their predecessors in the catalog. On 2026-10-27
-  // nemotron-3-super-120b-a12b:free was gone, and Qwen3.8 Max replaced Qwen3.7
-  // Max in the catalog.
+  // Retired routes, kept for billing history on past messages.
   "nvidia/nemotron-3-super-120b-a12b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null

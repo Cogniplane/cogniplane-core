@@ -19,10 +19,10 @@ export interface PiiCircuitBreaker {
    * Side-effect free for callers — the breaker only changes state inside
    * `record()`.
    *
-   * Note: the half-open transition is opportunistic. The first caller that
-   * arrives after the cool-down expires is allowed through as the probe;
-   * concurrent callers in the same window are also allowed (we don't
-   * single-flight). Phase-1 simplicity over strict probe semantics.
+   * Note: the half-open transition is opportunistic. The breaker lets the first
+   * caller that arrives after the cool-down expires through as the probe. It
+   * also lets concurrent callers in the same window through (no single-flight).
+   * This favors simple code over strict probe semantics.
    */
   shouldAllow(): Promise<boolean>;
 
@@ -76,7 +76,6 @@ export class InMemoryPiiCircuitBreaker implements PiiCircuitBreaker {
     const now = this.now();
     if (this.state === "closed") return true;
     if (this.state === "half_open") return true;
-    // open
     if (this.openedAt !== null && now - this.openedAt >= this.options.cooldownMs) {
       this.transition("half_open", now);
       return true;
@@ -105,7 +104,6 @@ export class InMemoryPiiCircuitBreaker implements PiiCircuitBreaker {
       return;
     }
 
-    // closed
     const cutoff = now - this.options.windowMs;
     this.failureTimestamps = this.failureTimestamps.filter((t) => t >= cutoff);
     this.failureTimestamps.push(now);
@@ -225,7 +223,6 @@ export class RedisPiiCircuitBreaker implements PiiCircuitBreaker {
       return;
     }
 
-    // failure
     if (state === "half_open") {
       await this.transitionTo("open", now, state);
       return;

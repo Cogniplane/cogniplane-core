@@ -28,9 +28,8 @@ const RESERVED_NAMES = ["chatPrompts", "uploads", "chat_prompt", "upload", "skil
 const SUBJECT_KIND_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const SCOPE_KEY_PATTERN = /^[a-z][A-Za-z0-9]{0,63}$/;
 
-// Legacy compatibility. Core declared this scope key before import sources
-// moved to overlays, and a frontend from that time sends it on every save. A
-// save accepts it even when no overlay registers it, and stores it as an
+// Legacy compatibility. An older frontend sends this scope key on every save.
+// A save accepts it even when no overlay registers it, and stores it as an
 // unregistered key. Remove it when no deployed frontend sends it.
 export const LEGACY_PII_SCOPE_KEYS: readonly string[] = ["microsoftImports"];
 

@@ -123,7 +123,6 @@ test("PiiScanJobStore.claimDueJobs returns mapped rows and uses SKIP LOCKED quer
   // claim across competing workers), and the claim flips status to 'claimed'.
   expect(db.lastQuery!.text).toMatch(/FOR UPDATE SKIP LOCKED/);
   expect(db.lastQuery!.text).toMatch(/status\s*=\s*'claimed'/);
-  // The limit reaches the query as a bound value.
   expect(db.lastQuery!.values).toContain(5);
   expect(claimed.length).toBe(1);
   expect(claimed[0].status).toBe("claimed");
@@ -139,9 +138,7 @@ test("PiiScanJobStore.markCompleted updates the job status", async () => {
 
   expect(db.lastQuery).toBeTruthy();
   expect(db.lastQuery!.text).toMatch(/UPDATE pii_scan_jobs/);
-  // The completion contract: the row's status is set to 'completed'.
   expect(db.lastQuery!.text).toMatch(/status\s*=\s*'completed'/);
-  // Tenant + job scope reach the query as bound values.
   expect(db.lastQuery!.values).toContain("tenant-1");
   expect(db.lastQuery!.values).toContain("job-1");
 });

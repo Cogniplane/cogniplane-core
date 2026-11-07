@@ -33,8 +33,8 @@ export interface SkillBundleStorage {
   readonly backend: "local" | "bucket";
   storeBundle(input: StoreBundleInput): Promise<StoreBundleResult>;
   // Bundles are read in place from the content-addressed cache
-  // (materializeBundle). There is deliberately no "install to a caller-supplied
-  // destination" method: it had no callers and no containment check.
+  // (materializeBundle). Do not add a method that installs a bundle to a
+  // caller-supplied destination: it needs a containment check.
   materializeBundle(storageUri: string): Promise<{ localPath: string }>;
   deleteBundle(storageUri: string): Promise<void>;
 }
@@ -186,7 +186,7 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
   }
 
   async materializeBundle(storageUri: string): Promise<{ localPath: string }> {
-    // A relative stored path was always read from the working directory.
+    // A relative stored path resolves against the working directory.
     const localPath = containedPath(this.rootPath, path.resolve(parseFileUri(storageUri)));
     await assertRealContainment(this.rootPath, localPath, true);
     if (!(await pathExists(localPath))) {
@@ -383,9 +383,10 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
  * There is no cross-backend routing: each backend validates the persisted
  * `storageUri` scheme (`parseFileUri` / `parseS3Uri`) and throws a clear error
  * if it is handed the other scheme. Switching a tenant from `local` → `bucket`
- * is a deliberate re-upload (see CLAUDE.md "skill bundle storage"), so live
- * URIs always match the configured backend — a stray cross-scheme URI is an
- * operator error that should surface loudly, not be silently re-routed.
+ * is a deliberate re-upload (see docs/ARCHITECTURE.md, "Skill bundle storage"),
+ * so live URIs always match the configured backend. A stray cross-scheme URI is
+ * an operator error. Each backend surfaces it loudly and does not re-route it
+ * silently.
  */
 export function createSkillBundleStorage(config: AppConfig): SkillBundleStorage {
   if (config.SKILL_BUNDLE_STORAGE_BACKEND === "local") {

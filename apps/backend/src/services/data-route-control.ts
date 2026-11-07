@@ -47,7 +47,6 @@ export class DataRouteControl {
   constructor(
     private readonly deps: {
       authMode: AuthMode;
-      /** The login types of this installation. */
       loginTypes?: readonly LoginType[];
       /** Set when local login is on. */
       localAuth?: Pick<LocalAuth, "stepUp" | "refreshTokens" | "mfa">;

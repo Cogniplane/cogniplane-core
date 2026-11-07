@@ -1,4 +1,4 @@
-// E2B implementation of deepagents' SandboxBackendProtocolV2 (bead im5e.2).
+// E2B implementation of deepagents' SandboxBackendProtocolV2.
 //
 // There is no official E2B backend in deepagentsjs (only LangSmith/Deno/
 // Daytona/Modal), so this subclasses `BaseSandbox`, which derives every file
@@ -8,7 +8,7 @@
 // upload/downloadFiles() — read() is the one hybrid. We implement those three
 // primitives over the same E2B JS SDK the other runtimes already use.
 //
-// Design decisions locked in the bead:
+// Design decisions:
 // - LAZY creation: the sandbox spins up on the first execute()/file call, not
 //   at session start — chat-only turns pay zero sandbox cost. The instance is
 //   memoized for the session lifetime, so files persist across turns.
@@ -16,7 +16,7 @@
 //   timeout is a lifetime cap, not a per-command one).
 // - Slim template (Python + data libs, no agent CLIs) — see
 //   docker/template.ts; template id from E2B_TEMPLATE_ID.
-// - Network (VULN-13): the network policy of a sandbox is fixed when the sandbox
+// - Network: the network policy of a sandbox is fixed when the sandbox
 //   is created, and nothing in this file changes it afterwards. The call that
 //   changes the network of a running sandbox is not in the interface that this
 //   file uses (../runtime/e2b-sandbox.ts), so there is no update to race. A
@@ -123,7 +123,7 @@ export type E2bDeepAgentsSandboxOptions = {
   logger: FastifyBaseLogger;
   /**
    * Reads the network policy of the tenant as it is now, from the tenant
-   * settings (VULN-13). A sandbox is created under it, and each turn compares the
+   * settings. A sandbox is created under it, and each turn compares the
    * live network of the sandbox with it. It is called every time and its result
    * is not kept, so a change of the approved hosts applies at the next creation
    * or turn without a refresh of the runtime. A policy that cannot be read fails
@@ -869,15 +869,16 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     return resolveInsideSandbox(this.options.workspacePath, filePath);
   }
 
-  // F10 — turn-abort does NOT cancel the server-side command. deepagents'
-  // BaseSandbox.execute(command: string) exposes no AbortSignal, so on Stop the
-  // graph tears down but this command keeps running server-side until it finishes
-  // or hits `executeTimeoutMs` (the orphan is billable but bounded by that cap).
+  // Turn-abort does NOT cancel the server-side command. deepagents'
+  // BaseSandbox.execute(command: string) exposes no AbortSignal. On Stop the
+  // graph tears down, but this command keeps running server-side until it
+  // finishes or hits `executeTimeoutMs`. The orphan is billable but bounded by
+  // that cap.
   // E2B's foreground `commands.run(signal)` only aborts the CLIENT wait, not the
   // remote process — real cancellation needs `background:true` + tracking the pid
   // + `commands.kill(pid)` on abort, which in turn needs the turn's abort signal
   // threaded down through the deepagents sandbox interface. That is a framework-
-  // boundary change scoped as a follow-up (bead); keep `executeTimeoutMs` tight to
+  // boundary change, planned as a follow-up. Keep `executeTimeoutMs` tight to
   // bound the orphan window in the meantime. Do NOT "fix" this by passing a signal
   // to the foreground run — that would abort the wait while leaving the process
   // (and its billing/side effects) alive, which is worse than the current bound.
@@ -1129,8 +1130,6 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
       return null;
     }
   }
-
-  // ── Adapter-facing helpers (write_artifact, artifact sync) ────────────────
 
   /** Read raw bytes at a workspace-relative path (adapter readRuntimeFile). */
   async readFileBytes(filePath: string): Promise<Uint8Array> {

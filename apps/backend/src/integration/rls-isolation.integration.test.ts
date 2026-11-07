@@ -83,13 +83,13 @@ describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
   });
 });
 
-// ── System-tenant rows: readable by all, writable by none. ─────────────────
+// System-tenant rows are readable by all and writable by none.
 //
 // Three admin tables carry a read policy shaped
 // `tenant_id = current_setting(...) OR tenant_id = 'system'`, plus
 // tenant-only INSERT/UPDATE/DELETE policies. That is how platform defaults
-// reach every tenant. It is materially different from the single-clause policy
-// on most other tenant tables, and nothing tested it.
+// reach every tenant. It differs from the single-clause policy on most other
+// tenant tables, so it needs its own tests.
 describe.skipIf(!adminDatabaseUrl())("system-tenant defaults", () => {
   const SYSTEM_TABLES = ["admin_skills", "admin_skill_revisions", "admin_mcp_servers"] as const;
 
@@ -134,11 +134,10 @@ describe.skipIf(!adminDatabaseUrl())("system-tenant defaults", () => {
   /**
    * Fully valid INSERTs, one per table, differing ONLY in `tenant_id`.
    *
-   * Every NOT NULL column is supplied deliberately. An INSERT missing columns
-   * fails with 23502 (not-null violation) whether or not a policy would have
-   * rejected it, so a test that accepted 23502 would pass with the INSERT
-   * policy deleted. Verified: dropping `admin_skills_tenant_insert` left an
-   * earlier version of this test green. Only 42501 proves the policy acted.
+   * Every NOT NULL column is supplied deliberately. An INSERT with missing
+   * columns fails with 23502 (not-null violation) whether or not a policy would
+   * have rejected it. A test that accepted 23502 would therefore pass with the
+   * INSERT policy deleted. Only 42501 proves the policy acted.
    */
   const SYSTEM_INSERTS: Record<
     (typeof SYSTEM_TABLES)[number],

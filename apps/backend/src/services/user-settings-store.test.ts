@@ -1,10 +1,6 @@
 import { describe, it, beforeEach, expect } from "vitest";
 import { UserSettingsStore } from "./user-settings-store.js";
 
-// ---------------------------------------------------------------------------
-// In-memory fake Pool that captures queries and returns scripted rows
-// ---------------------------------------------------------------------------
-
 type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 type QueryHandler = (sql: string, params: unknown[]) => QueryResult;
 
@@ -36,10 +32,6 @@ class FakeDatabase {
     };
   }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers to build fake DB rows
-// ---------------------------------------------------------------------------
 
 function fakeJobRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -82,10 +74,6 @@ function fakeRunRow(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe("UserSettingsStore – scheduler methods", () => {
   let db: FakeDatabase;
   let store: UserSettingsStore;
@@ -94,8 +82,6 @@ describe("UserSettingsStore – scheduler methods", () => {
     db = new FakeDatabase();
     store = new UserSettingsStore(db as never);
   });
-
-  // ---- listDueJobs -------------------------------------------------------
 
   describe("listDueJobs", () => {
     it("maps returned job rows and forwards the requested limit", async () => {
@@ -112,7 +98,6 @@ describe("UserSettingsStore – scheduler methods", () => {
       expect(result.length).toBe(1);
       expect(result[0].jobId).toBe("job-due");
       expect(result[0].enabled).toBe(true);
-      // Verify the query was parameterized with the limit
       const call = db.calls.find((c) => c.sql.includes("LIMIT"));
       expect(call).toBeTruthy();
       expect(call!.params[0]).toBe(10);
@@ -126,8 +111,6 @@ describe("UserSettingsStore – scheduler methods", () => {
       expect(result.length).toBe(0);
     });
   });
-
-  // ---- claimJob -----------------------------------------------------------
 
   describe("claimJob", () => {
     it("returns the job when successfully claimed", async () => {
@@ -173,8 +156,6 @@ describe("UserSettingsStore – scheduler methods", () => {
       expect(call.params[2]).toBe("2026-03-20T00:00:00.000Z");
     });
   });
-
-  // ---- createJobRun + completeJobRun --------------------------------------
 
   describe("createJobRun + completeJobRun", () => {
     it("maps returned pending and completed run rows", async () => {
@@ -271,8 +252,6 @@ describe("UserSettingsStore – scheduler methods", () => {
     });
   });
 
-  // ---- sweepStaleJobRuns ---------------------------------------------------
-
   describe("sweepStaleJobRuns", () => {
     it("marks stale pending runs failed and returns identifying fields", async () => {
       db.onQuery((sql) => {
@@ -322,8 +301,6 @@ describe("UserSettingsStore – scheduler methods", () => {
       expect(result).toEqual([]);
     });
   });
-
-  // ---- listJobRuns --------------------------------------------------------
 
   describe("listJobRuns", () => {
     it("returns runs for a specific job and user, ordered by created_at DESC", async () => {

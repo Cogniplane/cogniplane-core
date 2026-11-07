@@ -206,8 +206,8 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
   }, [enabled, syncUrl, scope]);
 
   // Surface query errors through the hook's `error` derived during render (no
-  // effect/extra state). Polling errors stay hidden — only non-refetch failures
-  // surface, matching the original UX. A mutation error takes precedence.
+  // effect/extra state). Polling errors stay hidden. Only non-refetch failures
+  // surface. A mutation error takes precedence.
   const queryError =
     sessionsQuery.status === "error" && !sessionsQuery.isRefetching
       ? sessionsQuery.error instanceof Error

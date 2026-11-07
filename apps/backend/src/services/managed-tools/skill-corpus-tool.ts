@@ -19,8 +19,6 @@ type SkillCorpusToolDeps = {
   piiProtection?: PiiProtectionService;
 };
 
-// ── Catalog entry (static metadata consumed by ./catalog) ────────────────────
-
 export const SKILL_CORPUS_TOOL_CATALOG: ReadonlyArray<{
   name: string;
   description: string;
@@ -44,8 +42,6 @@ export const SKILL_CORPUS_TOOL_CATALOG: ReadonlyArray<{
     }
   }
 ];
-
-// ── Tool definition ──────────────────────────────────────────────────────────
 
 export function createSkillCorpusTool(deps: SkillCorpusToolDeps): ManagedToolDefinition[] {
   return [

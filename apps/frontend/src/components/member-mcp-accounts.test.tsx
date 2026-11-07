@@ -147,7 +147,7 @@ it("clears secret consent on manual reload after a save failure", async () => {
   expect((screen.getByLabelText("Secret") as HTMLInputElement).value).toBe("");
 });
 
-// q4w0.8: a security change of the member's account suspended the saved
+// A security change of the member's account suspended the saved
 // credential. The backend sends `reconnect_required` with `suspended: true`.
 // There is no confirm: the label is free text that the saver chose, and the
 // page cannot show which account the secret belongs to.

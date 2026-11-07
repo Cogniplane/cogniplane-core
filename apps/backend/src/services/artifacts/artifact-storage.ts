@@ -32,8 +32,8 @@ export interface ArtifactStorage {
    * decision the bytes are deleted to honor the "content never lands" promise.
    *
    * NOTE: on a versioning-enabled bucket this deletes the current version (adds
-   * a delete marker); noncurrent versions are handled out-of-band by a bucket
-   * lifecycle rule — see the follow-up bead on artifact-bucket versioning.
+   * a delete marker). A bucket lifecycle rule handles noncurrent versions
+   * out-of-band.
    */
   delete(storageKey: string): Promise<void>;
 }

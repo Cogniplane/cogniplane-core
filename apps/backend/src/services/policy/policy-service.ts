@@ -60,7 +60,6 @@ export type PolicyGateInput = PolicyEvaluationInput & {
   approvalDisposition?: PolicyApprovalDisposition;
 };
 
-// The result of gating an action that may proceed.
 export type PolicyGateResult = {
   evaluation: PolicyEvaluation;
   // True when the matched gating effect is actually being enforced (tenant in
@@ -69,11 +68,10 @@ export type PolicyGateResult = {
 };
 
 export class PolicyService {
-  // Short-TTL per-tenant cache of the compiled rule set. gateAction runs on
-  // the tool-call hot path (once per action); without this every action issues
-  // a fresh `SELECT * FROM policy_rule`. The TTL bounds staleness so admin edits
-  // take effect within a few seconds without any cross-layer invalidation
-  // wiring — acceptable for a config surface.
+  // Short-TTL per-tenant cache of the compiled rule set. gateAction runs on the
+  // tool-call hot path, so without a cache every action would query `policy_rule`.
+  // The TTL bounds staleness. invalidate() clears an entry on this replica. The
+  // invalidation bus, when set, clears it on the other replicas.
   private readonly ruleCache = new Map<string, { rules: EvaluableRule[]; expiresAt: number }>();
 
   private readonly rules: PolicyRuleStore;
@@ -190,7 +188,6 @@ export class PolicyService {
       return { evaluation, enforced };
     }
 
-    // Enforce-mode block → refuse immediately.
     if (evaluation.outcome === "block") {
       await this.recordEvidence(input, evaluation, enforced, null);
       throw new PolicyBlockedError(

@@ -2,13 +2,12 @@ import type { ZodType } from "zod";
 
 /**
  * Validates an outgoing API response against its shared schema before sending.
- * The schemas in `@cogniplane/shared-types` are the single source of truth for API
- * contracts; passing every reply through this helper guarantees the handler
- * cannot drift from what the frontend expects.
+ * The schemas in `@cogniplane/shared-types` are the source of truth for API
+ * contracts.
  *
- * On schema mismatch this throws — Fastify converts it to a 500 — so any
- * drift surfaces in tests immediately rather than silently shipping a wrong
- * shape. The error includes the issue paths so the offending field is obvious.
+ * On a mismatch this throws, and Fastify turns the throw into a 500. Drift then
+ * shows up in tests, not as a wrong response shape. The error lists the issue
+ * paths, so the offending field is easy to find.
  */
 export function serialize<T>(schema: ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);

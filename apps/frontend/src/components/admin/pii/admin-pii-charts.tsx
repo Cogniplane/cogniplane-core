@@ -47,11 +47,9 @@ const CHART_KEYS = {
 } as const;
 
 /**
- * Stacked-bar time-series of PII actions per bucket. The API already returns
- * chart-ready points ({ bucket, allow, report, block, transform, failed }),
- * so this maps them straight onto a Recharts stacked BarChart — no geometry
- * pre-computation. Recharts owns axes, gridlines, hover tooltip, and the
- * responsive container.
+ * Stacked bars of PII actions per bucket. The API already returns chart-ready
+ * points, so this component computes no geometry. Recharts owns the axes, grid,
+ * tooltip, and responsive container.
  */
 export function TimeSeriesChart({
   series,
@@ -103,8 +101,6 @@ export function TimeSeriesChart({
     </ChartContainer>
   );
 }
-
-// ─── Findings breakdown ────────────────────────────────────────────────────
 
 export function FindingsBreakdown({ data }: { data: PiiActivityMetrics }) {
   const allEntities = Array.from(

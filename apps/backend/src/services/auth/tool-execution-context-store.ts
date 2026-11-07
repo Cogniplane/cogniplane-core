@@ -127,11 +127,11 @@ export class ToolExecutionContextStore {
   /**
    * Returns the most recent non-expired tool context for a session, if any.
    *
-   * Used by the MCP gateway as a fallback when an MCP tool call arrives
-   * without `toolContextId` in its arguments. The active turn's context is
-   * always the most recent row for the session, so this preserves full
-   * fidelity (selectedArtifactIds, runtimePolicy snapshot, messageId
-   * attribution) without synthesizing partial context from the runtime token.
+   * Used by the MCP gateway as a fallback when a tool call names no tool
+   * context (no `_meta`, argument, or URL value). The active turn's context is
+   * always the most recent row for the session. This keeps full fidelity
+   * (selectedArtifactIds, runtimePolicy snapshot, messageId attribution). It
+   * does not synthesize partial context from the runtime token.
    */
   async findLatestActiveBySession(
     tenantId: string,
@@ -162,11 +162,10 @@ export class ToolExecutionContextStore {
    * No finite TTL validated at config time can bound that, and a turn that
    * outlives its context loses all managed MCP tool access mid-turn.
    *
-   * The resume path calls this after each approval decision, which is the same
-   * shape as the E2B sandbox idle-timeout fix. Only extends: a context already
-   * expired stays expired (the WHERE clause requires a live row), so this
-   * cannot resurrect a context the gateway has already rejected. Returns the
-   * new expiry, or null when there was no live row to extend.
+   * The resume path calls this after each approval decision. It only extends.
+   * The WHERE clause requires a live row, so an expired context stays expired.
+   * This cannot resurrect a context that the gateway has already rejected.
+   * Returns the new expiry, or null when there was no live row to extend.
    */
   async extend(tenantId: string, toolContextId: string, ttlMs: number): Promise<string | null> {
     return withTenantScope(this.db, tenantId, async (client) => {

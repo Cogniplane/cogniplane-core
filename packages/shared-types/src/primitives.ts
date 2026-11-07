@@ -1,8 +1,6 @@
-// Primitive type definitions shared across the API surface. Lives in its own
-// file (not in index.ts) so the schema modules can import these without
-// re-entering the index barrel — that re-entry caused a circular-init crash
-// at runtime when the schemas tried to read `EFFORT_LEVELS` from a half-loaded
-// index.
+// Primitive type definitions shared across the API surface. They live outside
+// index.ts. Schema modules import them directly, because a re-entry through the
+// index barrel causes a circular-init crash when schemas read `EFFORT_LEVELS`.
 
 export type GranularApprovalPolicy = {
   granular: {
@@ -18,18 +16,14 @@ export type ApprovalPolicy = "never" | "on-request" | GranularApprovalPolicy;
 
 export type ApprovalReviewer = "user" | "guardian_subagent";
 
-// Deep Agents is the sole runtime provider since the Codex/claude-code
-// retirements.
+// Deep Agents is the only runtime provider.
 export type RuntimeProvider = "deep-agents";
 
-// The LLM provider a model id resolves through inside the Deep Agents
-// runtime. Distinct from RuntimeProvider: one runtime, potentially many model
-// providers. This is the PUBLIC provider identity (what a tenant configures a
-// key for and what the model catalog tags); it is NOT necessarily the
-// LangChain initChatModel prefix — see MODEL_PROVIDER_META for that mapping
-// ("openrouter" resolves through the "openai" init prefix + a base URL,
-// "google" resolves through the "google-genai" prefix). Widen this union when
-// a new provider ships.
+// The LLM provider that a model id resolves through in the Deep Agents
+// runtime. It differs from RuntimeProvider: one runtime can use many model
+// providers. This is the public provider identity, used for tenant keys and
+// the model catalog. It is NOT necessarily the LangChain initChatModel prefix.
+// See MODEL_PROVIDER_META. Widen this union when a new provider ships.
 export const MODEL_PROVIDERS = ["anthropic", "openai", "google", "openrouter", "zai"] as const;
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 

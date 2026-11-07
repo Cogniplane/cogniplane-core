@@ -45,7 +45,6 @@ describe("removal", () => {
   it.each([
     [owner, "member", null],
     [owner, "admin", null],
-    // Only an owner can remove an admin, as the backend enforces.
     [admin, "admin", "Only owners can remove an admin."],
     [admin, "member", null],
     [owner, "owner", "Owners cannot be removed."],

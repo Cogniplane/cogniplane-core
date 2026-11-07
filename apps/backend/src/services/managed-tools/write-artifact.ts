@@ -22,8 +22,6 @@ type WriteArtifactDeps = {
   artifactMaxBytes: number;
 };
 
-// ── MIME type inference ───────────────────────────────────────────────────────
-
 const MIME_BY_EXTENSION: Record<string, string> = {
   ".py":   "text/x-python",
   ".js":   "text/javascript",
@@ -55,8 +53,6 @@ export function inferMimeType(filename: string): string {
   if (dot < 0) return "text/plain";
   return MIME_BY_EXTENSION[filename.slice(dot).toLowerCase()] ?? "text/plain";
 }
-
-// ── Catalog entry (static metadata consumed by ./catalog) ────────────────────
 
 export const WRITE_ARTIFACT_CATALOG: ReadonlyArray<{
   name: string;
@@ -90,8 +86,6 @@ export const WRITE_ARTIFACT_CATALOG: ReadonlyArray<{
     }
   }
 ];
-
-// ── Tool definition ───────────────────────────────────────────────────────────
 
 export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDefinition[] {
   return [

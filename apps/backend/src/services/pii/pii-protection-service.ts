@@ -105,12 +105,12 @@ export interface PiiProtectionServiceOptions {
   timeoutMs: number;
   /**
    * Hard cap on artifact bytes read into memory for a scan. Reading beyond
-   * this throws `file_too_large` (permanent failure). Defaults to 5 MiB.
+   * this throws `file_too_large` (permanent failure).
    */
   artifactMaxBytes?: number;
   /**
    * CSV preview budget — header + first N data rows or this many bytes,
-   * whichever is smaller. Defaults to 10 rows / 4 KB.
+   * whichever is smaller.
    */
   csvPreviewRows?: number;
   csvPreviewMaxBytes?: number;
@@ -290,7 +290,6 @@ export class PiiProtectionService {
       }));
     }
 
-    // mode === "transform"
     if (!this.options.provider) {
       throw new PiiProtectionServiceError(
         "pii_provider_unavailable",
@@ -427,7 +426,7 @@ export class PiiProtectionService {
       };
     }
 
-    // detect and transform (artifact transform deferred to phase 2) both surface as report in phase 1.
+    // detect and transform both surface as report. The service does not transform artifacts.
     return {
       action: "report",
       findings: this.applyRetentionPolicy(combinedFindings, settings.rawRetention, input.tenantId),
@@ -752,5 +751,4 @@ function mergeFindings(a: PiiFinding[], b: PiiFinding[]): PiiFinding[] {
   return merged;
 }
 
-// Re-export for consumer convenience — a type declared in pii-provider.ts is used here.
 export type { PiiScanArtifactInput } from "./pii-provider.js";

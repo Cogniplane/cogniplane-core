@@ -2,10 +2,6 @@ import { describe, expect, test } from "vitest";
 
 import { resolveInsideSandbox } from "./sandbox-path.js";
 
-// Merged behavior spec for the shared sandbox path resolver. Previously the
-// Codex and Claude adapters each had their own copy of this guard with their
-// own test subset; this union pins the contract both must satisfy.
-
 describe("resolveInsideSandbox", () => {
   test("resolves relative paths joined to the workspace root", () => {
     expect(resolveInsideSandbox("/home/user/workspace", "out.txt")).toBe(
@@ -50,9 +46,9 @@ describe("resolveInsideSandbox", () => {
   });
 
   test("allows the workspace root ('.') even when workspacePath has a trailing slash", () => {
-    // Regression guard: `resolved` is always normalized (no trailing slash), so
-    // the root comparison must also use a normalized workspace, else this
-    // benign case was spuriously rejected.
+    // `resolved` never has a trailing slash, so the root comparison must use a
+    // normalized workspace too. Otherwise `resolveInsideSandbox` rejects this
+    // benign case.
     expect(resolveInsideSandbox("/home/user/ws/", ".")).toBe("/home/user/ws");
   });
 

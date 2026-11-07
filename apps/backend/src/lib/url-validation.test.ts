@@ -60,10 +60,8 @@ describe("ssrfSafeLookup", () => {
     vi.restoreAllMocks();
   });
 
-  // Mirrors undici's real contract: it passes `{all: true}`, so the callback
-  // receives an ARRAY of {address, family}. The previous version of this
-  // helper assumed the (err, address, family) triple, which is why the
-  // shape mismatch that broke every outbound request went unnoticed here.
+  // Mirror undici's contract. It passes `{all: true}`, so the callback receives
+  // an array of {address, family}, not the (err, address, family) triple.
   function callLookup(hostname: string): Promise<{
     err: NodeJS.ErrnoException | null;
     addresses: Array<{ address: string; family: number }>;
@@ -180,11 +178,11 @@ describe("ssrfSafeLookup", () => {
 });
 
 describe("isPrivateOrReservedHost — hex-encoded IPv4", () => {
-  // A real bypass, not a hypothetical: `NUMERIC_SHAPED` allows the `x` but not
-  // the digits a-f, so `0xA9FEA9FE` was classified public and resolves to
-  // 169.254.169.254 — cloud instance metadata. Every value below was checked
-  // against the actual resolver: the first group resolves to an IP, the second
-  // does not resolve at all and must stay usable as a hostname.
+  // `NUMERIC_SHAPED` alone treats `0xA9FEA9FE` as public, because it allows `x`
+  // but not the digits a-f. That value resolves to 169.254.169.254, cloud
+  // instance metadata. `HEX_IP_SHAPED` blocks this form. The author checked each
+  // value below against the resolver. The first group resolves to an IP. The
+  // second group does not resolve, and it must stay a usable hostname.
   const resolverTreatsAsIp: Array<[string, string]> = [
     ["hex IMDS", "0xA9FEA9FE"],
     ["hex loopback", "0x7f000001"],
@@ -230,10 +228,9 @@ describe("isPrivateOrReservedHost — hex-encoded IPv4", () => {
 });
 
 describe("isPrivateOrReservedHost — IANA special-purpose IPv4 ranges", () => {
-  // Every one of these returned false before this suite existed. Two are
-  // reachable rather than merely reserved: 192.88.99.0/24 is the deprecated
-  // 6to4 relay anycast address, and 198.18.0.0/15 is routed inside some
-  // provider networks.
+  // Two of these ranges are reachable, not only reserved. 192.88.99.0/24 is the
+  // deprecated 6to4 relay anycast address. Some provider networks route
+  // 198.18.0.0/15 internally.
   const blocked: Array<[string, string]> = [
     ["IETF protocol assignments 192.0.0.0/24", "192.0.0.1"],
     ["TEST-NET-1 192.0.2.0/24", "192.0.2.5"],
@@ -255,7 +252,7 @@ describe("isPrivateOrReservedHost — IANA special-purpose IPv4 ranges", () => {
     });
   }
 
-  // The neighbours of each new range must stay reachable, or this fix silently
+  // The neighbors of each range must stay reachable. Otherwise the block list
   // breaks legitimate upstreams.
   const stillAllowed = [
     "192.0.1.1",
@@ -281,8 +278,7 @@ describe("isPrivateOrReservedHost — IANA special-purpose IPv4 ranges", () => {
 
 describe("isPrivateOrReservedHost — IPv6 transition forms embedding IPv4", () => {
   // Each of these routes to an embedded IPv4, so a reserved quad inside one is
-  // as dangerous as the bare address. All three IMDS cases below returned
-  // false before this fix.
+  // as dangerous as the bare address.
   const blocked: Array<[string, string]> = [
     ["6to4 2002::/16 embedding IMDS", "2002:a9fe:a9fe::1"],
     ["6to4 2002::/16 embedding loopback", "2002:7f00:1::1"],
@@ -365,9 +361,8 @@ describe("logSafeUrl", () => {
   });
 
   it("refuses non-http(s) schemes instead of emitting a null origin", () => {
-    // `new URL("mailto:...").origin` is the STRING "null", so concatenating
-    // origin + pathname would produce a misleading line that can still carry
-    // whatever the scheme put in its path.
+    // `new URL("mailto:...").origin` is the string "null". Logging it would give
+    // a misleading line that can still hold whatever the scheme put in its path.
     const otherSchemes: string[] = [
       "mailto:user:pw@example.com?subject=SEKRET",
       "data:text/plain,SEKRET",

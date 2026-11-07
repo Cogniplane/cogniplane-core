@@ -45,10 +45,9 @@ export async function registerAdminRuntimeRoutes(
   }));
 
   // Build, uptime and runtime activity for operators. The public /health and
-  // /ready answer with a bare status; this is the admin-only detail they used
-  // to carry. The counts cover the caller's tenant only: the in-memory maps
-  // also hold other tenants' sessions, which a tenant admin must not see even
-  // as totals.
+  // /ready answer with a bare status. This route holds the admin-only detail.
+  // The counts cover the caller's tenant only: the in-memory maps also hold
+  // other tenants' sessions, which a tenant admin must not see even as totals.
   app.get("/admin/diagnostics", withAdmin(app, async (request) => {
     const runtimes = stores.deepAgentsAdapter.getRuntimeHealthDetail(request.auth.tenantId);
     return {
@@ -66,8 +65,8 @@ export async function registerAdminRuntimeRoutes(
   }));
 
   // Live in-memory session-runtime detail (active turn, last activity),
-  // scoped to the caller's tenant. This is the relocated detail that the
-  // unauthenticated /health endpoint used to expose for every tenant.
+  // scoped to the caller's tenant. The unauthenticated /health endpoint does
+  // not expose it.
   app.get("/admin/runtime-health", withAdmin(app, async (request) => {
     return serialize(AdminRuntimeHealthResponseSchema, {
       runtimes: stores.deepAgentsAdapter.getRuntimeHealthDetail(request.auth.tenantId)
@@ -97,13 +96,11 @@ export async function registerAdminRuntimeRoutes(
       return parsed.response;
     }
 
-    // Both rollout actions collapse to the same deep-agents operation:
-    // tear down the tenant's IDLE session runtimes so the next turn rebuilds
-    // them against fresh config. Sessions with an active turn are skipped —
-    // the actions are labeled "idle" and must not interrupt running
-    // conversations. (The Codex-era distinction between draining and
-    // refreshing separate processes no longer applies — turns hold no
-    // long-lived process.)
+    // Both rollout actions run the same deep-agents operation: tear down the
+    // tenant's IDLE session runtimes, so the next turn rebuilds them against
+    // fresh config. The operation skips sessions with an active turn. The actions
+    // are labeled "idle" and must not interrupt running conversations. Turns hold
+    // no long-lived process, so there is no separate drain step.
     const affectedSessionIds = await stores.deepAgentsAdapter.invalidateTenantRuntimes(
       request.auth.tenantId,
       {

@@ -1,4 +1,4 @@
-// Session deletion → durable runtime-data purge (bead im5e.3).
+// Session deletion → durable runtime-data purge.
 //
 // The Deep Agents checkpointer tables have no tenant column and no RLS —
 // tenant→thread isolation is enforced at the app layer because thread_id is

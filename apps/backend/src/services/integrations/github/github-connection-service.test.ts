@@ -498,14 +498,12 @@ test("getRuntimeCredentials refuses the token of another account than the turn r
   await expect(service.getRuntimeCredentials("tenant-1", "user-1", null)).rejects.toThrow("GitHub account changed");
   expect(store.markUsedCount).toBe(0);
   await expect(service.getRuntimeCredentials("tenant-1", "user-1", "B")).resolves.toMatchObject({ token: "token-B" });
-  // A context without a record keeps the old behaviour.
+  // Without a recorded account, the service skips the check.
   await expect(service.getRuntimeCredentials("tenant-1", "user-1")).resolves.toMatchObject({ token: "token-B" });
   // Without a connection no token is used, so the usual "no connection" answer is safe.
   store.record = null;
   await expect(service.getRuntimeCredentials("tenant-1", "user-1", "B")).resolves.toBeNull();
 });
-
-// ── Allowed repositories ─────────────────────────────────────────────────────
 
 test("getRuntimeCredentials passes the allowed repositories with the token, empty by default", async () => {
   const config = createOAuthConfig();
@@ -688,7 +686,7 @@ test("listAccessibleRepositories separates a missing connection, a rejected toke
   });
 });
 
-// q4w0.8: a connection keeps the security version of the session that started
+// A connection keeps the security version of the session that started
 // the authorization. After a security change of the owner's account, no use
 // path returns it, the status shows it suspended, and only a confirm from a
 // current session restores it.
@@ -754,7 +752,7 @@ test("a connection that an older session saved is suspended until a current sess
   await expect(service.confirm("tenant-1", "user-1", "777", 5)).rejects.toMatchObject({ code: "not_connected" });
 });
 
-// q4w0.8 review: the callback has no session. An authorization that a session
+// The callback has no session. An authorization that a session
 // started before a security change must not overwrite the owner's connection.
 test.each([
   ["a version older than the owner's current one", 3],

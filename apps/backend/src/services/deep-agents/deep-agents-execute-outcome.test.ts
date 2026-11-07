@@ -1,6 +1,6 @@
 // Outcome of the `execute` tool, from the real compiled graph. The SDK `execute`
 // tool turns the structured result of the sandbox into text and returns it as a
-// successful message, so a failed command used to show as done. The E2B
+// successful message. A failed command must still show as failed. The E2B
 // SDK is faked at its boundary (`commands.run`) and the model is scripted. The
 // graph, the SDK tools, the E2B backend, the event tracer, the AG-UI driver, the
 // turn transcript and the history converter are real.

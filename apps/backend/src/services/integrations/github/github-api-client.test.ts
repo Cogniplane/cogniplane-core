@@ -38,16 +38,12 @@ const cfg = {
   GITHUB_OAUTH_REDIRECT_URI: "https://x/cb"
 } as never;
 
-// buildGithubApiHeaders
-
 test("buildGithubApiHeaders: includes auth + accept + version", () => {
   const headers = buildGithubApiHeaders("tok") as Record<string, string>;
   expect(headers.Authorization).toBe("Bearer tok");
   expect(headers["X-GitHub-Api-Version"]).toBe("2022-11-28");
   expect(headers.Accept).toMatch(/github\+json/);
 });
-
-// exchangeUserAuthorizationCode
 
 test("exchangeUserAuthorizationCode: returns payload with access_token on success", async () => {
   const stub = stubFetch(() => jsonResponse({ access_token: "u-tok", token_type: "bearer", scope: "repo" }));
@@ -100,8 +96,6 @@ test("exchangeUserAuthorizationCode: 200 but no access_token still throws", asyn
   }
 });
 
-// refreshUserAccessToken
-
 test("refreshUserAccessToken: returns payload on success", async () => {
   const stub = stubFetch(() => jsonResponse({ access_token: "new-tok", token_type: "bearer" }));
   try {
@@ -133,8 +127,6 @@ test("refreshUserAccessToken: returns null when access_token absent", async () =
     stub.restore();
   }
 });
-
-// selectGithubEmail
 
 test("selectGithubEmail: returns null when API errors", async () => {
   const stub = stubFetch(() => new Response("err", { status: 500 }));
@@ -196,8 +188,6 @@ test("selectGithubEmail: empty list → null", async () => {
   }
 });
 
-// fetchUserProfile
-
 test("fetchUserProfile: returns parsed user", async () => {
   const stub = stubFetch(() =>
     jsonResponse({ id: 1, login: "lo", name: "n", email: "e", avatar_url: "a" })
@@ -218,8 +208,6 @@ test("fetchUserProfile: throws on non-2xx", async () => {
     stub.restore();
   }
 });
-
-// Gateway failures, timeouts
 
 test("refreshUserAccessToken: returns null for a non-JSON gateway error", async () => {
   const stub = stubFetch(() => new Response("<html>502 Bad Gateway</html>", { status: 502 }));

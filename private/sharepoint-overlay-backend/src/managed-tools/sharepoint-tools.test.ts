@@ -73,8 +73,6 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-// ── sharepoint_read_file ─────────────────────────────────────────────────────
-
 test("sharepoint_read_file rejects driveId containing slashes", async () => {
   installFakeFetch();
   const result = await readTool.handler({
@@ -117,8 +115,6 @@ test("sharepoint_read_file constructs canonical URL on valid IDs", async () => {
   ]);
 });
 
-// ── sharepoint_upload_file ───────────────────────────────────────────────────
-
 test("sharepoint_upload_file rejects malformed parentId", async () => {
   installFakeFetch();
   const result = await uploadTool.handler({
@@ -139,8 +135,6 @@ test("sharepoint_upload_file accepts 'root' parentId and encodes filename", asyn
     "https://graph.microsoft.com/v1.0/drives/b!AbCd/items/root:/my%20file.txt:/content"
   ]);
 });
-
-// ── sharepoint_create_folder ─────────────────────────────────────────────────
 
 test("sharepoint_create_folder rejects driveId with embedded slash", async () => {
   installFakeFetch();
@@ -361,7 +355,6 @@ test("sharepoint_search defaults summary to null when missing", async () => {
           name: "doc",
           webUrl: null,
           lastModifiedDateTime: null,
-          // summary omitted
           driveId: "d",
           parentId: null,
           siteId: null

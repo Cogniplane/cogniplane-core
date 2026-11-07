@@ -50,14 +50,12 @@ export class FakePool {
         return pool.dispatch(text, values);
       },
       release() {
-        // no-op
       }
     };
     return client as unknown as PoolClient;
   }
 
   async end(): Promise<void> {
-    // no-op
   }
 
   private dispatch(text: string, values: unknown[]): QueryResult {

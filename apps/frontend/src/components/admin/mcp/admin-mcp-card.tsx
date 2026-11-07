@@ -117,7 +117,7 @@ function AdminMcpEditor({ headingRef, ...props }: {
   listReady?: boolean;
   listNotice?: ReactNode;
   headingRef?: Ref<HTMLHeadingElement>;
-  /** More content for the open row of a connection. `open` is true while its row is open. */
+  /** Extra content for a connection row. `open` tells whether the row is expanded. */
   renderServerExtras?: (server: AdminMcpServer, open: boolean) => ReactNode;
 }) {
   const targetServer = props.mcpServers.find((server) => server.serverId === props.targetServerId);

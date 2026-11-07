@@ -144,7 +144,6 @@ export class ProxyToolMetadataCache {
 
     const nextCursor = page.nextCursor ?? null;
     if (nextCursor === null) {
-      // Listing complete — this is now the authoritative map for the server.
       entry.published = staged;
       entry.staged.delete(listingId);
       return;

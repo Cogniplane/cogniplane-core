@@ -11,15 +11,13 @@ import { isCorsOriginAllowed } from "./cors.js";
  *
  * `Origin` must be present and equal the frontend origin. A missing or `null`
  * Origin is refused: browsers send Origin on every POST, so its absence means
- * the caller is not the frontend. This is stricter than the earlier check,
- * which let a request with neither Origin nor Referer through
- * (docs/ARCHITECTURE.md, "Authentication").
+ * the caller is not the frontend.
  *
  * `requireJson` also refuses any body type other than JSON, so a hostile page
  * cannot use a form post. It is off for refresh and logout until every
  * deployed frontend sends a JSON body on them.
  *
- * Returns false after it has written a 403.
+ * Returns false after it writes a 403 or a 415.
  */
 export function requireBrowserAuthOrigin(
   request: FastifyRequest,

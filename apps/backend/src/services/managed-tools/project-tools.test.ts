@@ -467,8 +467,6 @@ test("project tools require a project runtime context", async () => {
   await expect(tool(tools, "project_list_files").handler({ context: context(), arguments: {} })).rejects.toThrow(/not connected to a project/);
 });
 
-// ─── project_write_file input checks ──────────────────────────────────────
-
 function writeTools(options: {
   maxProjectFileBytes?: number;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;

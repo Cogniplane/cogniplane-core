@@ -108,7 +108,7 @@ it("navigates to the returned authorization URL and keeps actions disabled", asy
   expect((redirect as HTMLButtonElement).disabled).toBe(true);
 });
 
-// q4w0.8: a security change of the owner's account suspended the connection.
+// A security change of the owner's account suspended the connection.
 it("shows a suspended connection and confirms it for the account on the page", async () => {
   const suspended = { ...connected, userConnection: { ...connected.userConnection!, suspended: true } };
   api.status.mockResolvedValue(suspended);
@@ -128,7 +128,7 @@ it("shows a suspended connection and confirms it for the account on the page", a
   expect(screen.queryByText("Suspended because your account security changed")).toBeNull();
 });
 
-// q4w0.8 review: Notion returned no owner email. The user ID and the workspace
+// Notion returned no owner email. The user ID and the workspace
 // name prove nothing (the workspace owner chooses the name), so there is no confirm.
 it("offers no confirm for a suspended connection without an owner email", async () => {
   api.status.mockResolvedValue({ ...connected,

@@ -20,7 +20,7 @@ describe("checkPasswordPolicy", () => {
   });
 
   test("counts characters, not bytes, after NFKC normalisation", () => {
-    // 15 accented characters are 30 bytes but 15 code points.
+    // 15 code points, but 29 UTF-8 bytes. The length rule counts code points.
     expect(checkPasswordPolicy("é".repeat(14) + "x", { email: null })).toBeNull();
     // A full-width form normalises to its ASCII form.
     expect(normalizePassword("ｐａｓｓｗｏｒｄ")).toBe("password");

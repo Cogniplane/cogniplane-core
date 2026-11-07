@@ -321,9 +321,10 @@ describe("E2bDeepAgentsSandbox", () => {
   });
 
   it("kills the created sandbox when the workspace mkdir fails, then retries clean", async () => {
-    // R3: Sandbox.create() succeeds but the post-create mkdir throws. The
-    // created (billable) sandbox must be killed before the memo clears — else
-    // it leaks until E2B's sandboxTimeoutMs — and the next call retries fresh.
+    // Sandbox.create() succeeds but the post-create mkdir throws. The
+    // created (billable) sandbox must be killed before the memo clears.
+    // Otherwise the sandbox leaks until E2B's sandboxTimeoutMs. The next call
+    // then retries fresh.
     let firstMkdir = true;
     const failingMkdir = makeFakeSandbox({
       runResult: (command) => {
@@ -343,7 +344,7 @@ describe("E2bDeepAgentsSandbox", () => {
     const { backend } = makeBackend({ fake: failingMkdir, createSpy: create });
 
     await expect(backend.execute("echo x")).rejects.toThrow("mkdir timed out");
-    // The leaked-sandbox fix: the created sandbox was torn down.
+    // The created sandbox is torn down, so it does not leak.
     expect(failingMkdir.killed).toHaveBeenCalledTimes(1);
 
     // Memo cleared → the next call creates a fresh sandbox and succeeds.
@@ -724,8 +725,7 @@ describe("E2bDeepAgentsSandbox", () => {
     const { backend } = makeBackend({ fake });
 
     // A tool echoing a real sandbox path (e.g. write_artifact.filePath from a
-    // shell command's output) must hit that exact path — parity with the
-    // Codex/Claude adapters — not a doubled "<ws>/home/user/workspace/…".
+    // shell command's output) must hit that exact path, not a doubled "<ws>/home/user/workspace/…".
     const absolute = "/home/user/workspace/sess-1/artifacts/revenue.png";
     const sandboxPath = await backend.writeFileBytes(absolute, new Uint8Array([1]));
     expect(sandboxPath).toBe(absolute);
@@ -769,7 +769,7 @@ describe("E2bDeepAgentsSandbox", () => {
   });
 
   it("extendTimeout() pushes the lifetime cap back to the full window", async () => {
-    // R12: the E2B cap runs from FIRST tool use and is never renewed, so an
+    // The E2B cap runs from FIRST tool use and is never renewed, so an
     // active session crosses it mid-turn and loses its whole workspace. Called
     // at each turn start, this converts the cap from an absolute deadline into
     // an idle timeout.
@@ -974,7 +974,7 @@ describe("E2bDeepAgentsSandbox", () => {
 });
 
 
-// VULN-13: the network policy of a sandbox is fixed when the sandbox is created.
+// The network policy of a sandbox is fixed when the sandbox is created.
 // Nothing here can change the network of a running sandbox: the fake sandbox has
 // a method for it that fails the test that calls it (see the guard at the top of
 // the file). A sandbox that does not match the policy is replaced. Every case
@@ -1094,8 +1094,6 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(r.replacement.sandbox.reportedNetwork).toEqual(network);
     expect(r.replacement.runCalls.at(-1)?.command).toBe("echo hi");
   }
-
-  // ── A new sandbox ──────────────────────────────────────────────────────────
 
   it("creates the sandbox with default deny and closed public URLs, and checks it with the provider", async () => {
     const fake = makeFakeSandbox();
@@ -1283,7 +1281,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(fake.killed).toHaveBeenCalledTimes(1);
   });
 
-  // ── The first use of each turn: one live read ──────────────────────────────
+  // The first use of each turn: one live read.
 
   it("reads the live network once at a reconnect, and the whole turn uses the result", async () => {
     const r = reconnect({ live: DENY_ALL_NETWORK });
@@ -1430,7 +1428,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(r.saved.killed).toHaveBeenCalledTimes(1);
   });
 
-  // ── Killing a sandbox that does not match ──────────────────────────────────
+  // Killing a sandbox that does not match.
   // The kill is tried again after a failure, and the lease is checked before every try. A
   // sandbox that cannot be killed runs until the provider expires it, with the network that it
   // was created with, so a kill that still fails is logged as an error with the sandbox id.
@@ -1623,7 +1621,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(r.replacement.files.size).toBe(1);
   });
 
-  // ── The sandbox cannot be read: fail closed, keep it ───────────────────────
+  // The sandbox cannot be read: fail closed, keep it.
 
   it("keeps the sandbox and fails the call when its network cannot be read at the turn start", async () => {
     const r = reconnect({ live: DENY_ALL_NETWORK, policy: approved });
@@ -1713,7 +1711,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(fake.runCalls.map((call) => call.command)).toContain("echo three");
   });
 
-  // ── The lease: a runtime that lost the session replaces nothing ────────────
+  // The lease: a runtime that lost the session replaces nothing.
 
   it("checks the session lease before it kills a sandbox, and kills it only when the lease is current", async () => {
     const requireOwnership = vi.fn(async () => {});
@@ -1752,7 +1750,6 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     expect(requireOwnership).not.toHaveBeenCalled();
   });
 
-  // ── A former owner ─────────────────────────────────────────────────────────
   // The only thing that a runtime that lost the session can still do to the network
   // is to create a new sandbox under the policy as it read it. It cannot change a
   // running sandbox, because there is no call for that. The next owner reads the
@@ -1929,8 +1926,6 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(s.created[0]!.runCalls.map((call) => call.command)).toContain("echo B2");
     });
   });
-
-  // ── What a check cannot adopt from an earlier turn ─────────────────────────
 
   describe("turns", () => {
     afterEach(() => { vi.useRealTimers(); });
@@ -2490,7 +2485,6 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     });
   });
 
-  // ── Methods that deepagents' BaseSandbox gives to this class ───────────────
   // BaseSandbox builds every file method from three primitives, and each primitive takes the
   // turn that is current when it is called. A method of one step takes its turn when it is
   // called. A method of several steps would take one per step, so edit and delete run on a
@@ -2594,7 +2588,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(Object.prototype.hasOwnProperty.call(s.backend, "execute")).toBe(false);
     });
 
-    // ── edit: download, wait, upload ─────────────────────────────────────────
+    // edit: download, wait, upload.
 
     /** The first read of a file waits until `release()`, and returns what the file held when it was read. */
     function holdFirstDownload(r: Awaited<ReturnType<typeof started>>) {
@@ -2685,7 +2679,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
       expect(s.provider.create).toHaveBeenCalledTimes(1);
     });
 
-    // ── delete: one confined command ─────────────────────────────────────────
+    // delete: one confined command.
 
     const commandsRun = (r: Awaited<ReturnType<typeof started>>) => r.saved.runCalls.map((call) => call.command);
     /** Answers the delete command with `result`, and runs every other command as before. */
@@ -2750,7 +2744,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
     });
   });
 
-  // ── Time limits: one deadline per check, one check per wait ────────────────
+  // Time limits: one deadline per check, one check per wait.
   // These cases run on fake timers, so that a provider that never answers costs
   // no real time, and the exact moments of each request can be checked.
 
@@ -3022,7 +3016,7 @@ describe("E2bDeepAgentsSandbox network policy", () => {
   });
 });
 
-// ── grep: the result limit of the SDK contract ────────────────────
+// grep: the result limit of the SDK contract.
 
 describe("E2bDeepAgentsSandbox grep limit", () => {
   const FIVE_MATCHES = ["a.txt:1:hit", "a.txt:2:hit", "b.txt:1:hit", "b.txt:4:hit", "c.txt:9:hit"].join("\n");
@@ -3062,7 +3056,7 @@ describe("E2bDeepAgentsSandbox grep limit", () => {
   });
 });
 
-// ── delete through symlinks, in a real shell ──────────────────────
+// delete through symlinks, in a real shell.
 // The fake sandbox runs each command in /bin/sh on a temporary directory, so the
 // command that delete sends is checked against a real file system with real symlinks.
 

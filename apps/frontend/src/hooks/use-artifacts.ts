@@ -58,9 +58,9 @@ export function useArtifacts(input: {
 
   const visibleSelectedArtifactIds = useMemo(() => {
     const candidateIds = manualSelectedIds ?? getAutoScopedArtifactIds(artifacts);
-    // Always gate the final list on eligibility so that a freshly flagged
-    // (pending/blocked) artifact cannot leak into the message request even if
-    // the user had previously selected it in manual mode.
+    // Always gate the final list on eligibility. A freshly flagged
+    // (pending/blocked) artifact then cannot leak into the message request, even
+    // if the user selected it in manual mode.
     const eligibleById = new Set(
       artifacts
         .filter(isArtifactEligibleForChatContext)

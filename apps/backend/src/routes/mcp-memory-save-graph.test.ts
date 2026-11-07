@@ -202,8 +202,9 @@ it("saves nothing when the approved row was made for the same call with a differ
 
   await run(startTurn);
   const pending = await runtime.getPendingActions(sessionId);
-  // The row binds the call with another nested value. Under the earlier hash, which dropped nested keys of this
-  // name, both calls had one hash, and this row would have approved a value that the user never saw.
+  // The row binds the call with another nested value. A hash that dropped nested
+  // keys would give both calls one hash, so this row would approve a value that
+  // the user never saw.
   const other = { ...nested, metadata: { toolContextId: "something the user never saw", note: "approved" } };
   approveRow({ ...pending[0]!.policyApproval!, argsHash: policyArgsHash(other) });
   const outputs = await run(runtime.buildResumeInput(pending, [{ type: "approve" }]));

@@ -1,5 +1,5 @@
-// One policy for the hosts that agent-run code in a tenant's sandbox may reach
-// (VULN-13). The backend uses it to check what an administrator approves and,
+// One policy for the hosts that agent-run code in a tenant's sandbox may reach.
+// The backend uses it to check what an administrator approves and,
 // again, before it sends the list to the sandbox provider. The admin page uses
 // it to check input before it sends it.
 //

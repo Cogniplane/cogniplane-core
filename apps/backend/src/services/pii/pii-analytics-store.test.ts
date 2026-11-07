@@ -1,8 +1,8 @@
 // Smoke tests for PiiAnalyticsStore. The full route-level coverage in
-// admin-pii-routes.test.ts already exercises the SQL bodies through
-// substring matchers; these tests assert that the store wraps every method
-// in `withTenantScope` (BEGIN / set_config / COMMIT) and keeps the
-// expected SQL fragments visible to the route-test fakes after the move.
+// routes/admin/admin-pii-routes.test.ts already exercises the SQL bodies through
+// substring matchers. These tests assert two things. The store wraps every
+// method in `withTenantScope` (BEGIN / set_config / COMMIT). The store also
+// keeps the expected SQL fragments visible to the route-test fakes.
 
 import { test, expect } from "vitest";
 

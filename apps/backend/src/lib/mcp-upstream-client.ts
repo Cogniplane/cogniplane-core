@@ -94,13 +94,11 @@ export type ForwardRpcLimits = {
   /**
    * Where the real transport error goes.
    *
-   * The JSON-RPC error this function returns is deliberately a fixed string —
-   * an upstream `ECONNREFUSED` naming an internal host must not reach the
-   * model. But before this had a timeout the same failure escaped as a Fastify
-   * 500 and Fastify's handler logged it, so collapsing it without a logger
-   * would have traded a leak for a blind spot: an operator with a
-   * misconfigured upstream URL would see a generic tool failure and find
-   * nothing anywhere.
+   * The JSON-RPC error that this function returns is a fixed string. An
+   * upstream `ECONNREFUSED` that names an internal host must not reach the
+   * model. The logger keeps the detail for operators. Without it, a
+   * misconfigured upstream URL would show only a generic tool failure, with no
+   * log entry anywhere.
    */
   logger?: Pick<FastifyBaseLogger, "warn">;
   /**
@@ -314,6 +312,15 @@ function classifyTransportError(error: unknown): { errorName: string; errorCode:
 }
 
 /**
+ * Outbound headers, or a function that builds them from the serialized body.
+ * Use the function form when a header must cover the exact bytes sent (the v2
+ * proxy signature signs a hash of the body).
+ */
+export type ForwardRpcHeaders =
+  | Record<string, string>
+  | ((body: string) => Record<string, string>);
+
+/**
  * POST a JSON-RPC request to a proxy MCP upstream.
  *
  * Every failure mode returns a JSON-RPC error rather than throwing. The caller
@@ -323,15 +330,6 @@ function classifyTransportError(error: unknown): { errorName: string; errorCode:
  * fixed strings: an upstream `ECONNREFUSED` naming an internal host belongs in
  * the log, not in a model-visible tool result.
  */
-/**
- * Outbound headers, or a function that builds them from the serialized body.
- * Use the function form when a header must cover the exact bytes sent (the v2
- * proxy signature signs a hash of the body).
- */
-export type ForwardRpcHeaders =
-  | Record<string, string>
-  | ((body: string) => Record<string, string>);
-
 export async function forwardRpc(
   upstreamUrl: string | null,
   payload: McpRpcRequest,

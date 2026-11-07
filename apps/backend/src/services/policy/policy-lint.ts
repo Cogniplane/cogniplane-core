@@ -5,9 +5,8 @@ import {
 } from "@cogniplane/shared-types";
 import { compareRuleEvaluationOrder, normalizeToolName } from "./policy-engine.js";
 
-// A rule as the lint sees it — the subset of fields that affect reachability.
-// Mirrors the engine's EvaluableRule but the lint only needs identity, order,
-// enablement, and the condition set (not the effect — see below).
+// A rule as the lint sees it: only the fields that affect reachability. It mirrors
+// the engine's EvaluableRule. It has no effect, because shadowing ignores the effect.
 export type LintableRule = {
   ruleId: string;
   name: string;
@@ -95,12 +94,12 @@ function unknownConditionKeys(conditions: PolicyConditions): string[] {
  * What it reports (only the provable):
  *   - shadowed: a higher-precedence ENABLED rule whose conditions subsume this
  *     rule's, so the engine returns the earlier rule first and this one never
-   *     fires. EFFECT-AGNOSTIC: the engine stops at the first match regardless
-   *     of effect. Exact-condition duplicates are reported as `duplicate`
-   *     instead.
+ *     fires. EFFECT-AGNOSTIC: the engine stops at the first match regardless
+ *     of effect. The lint reports exact-condition duplicates as `duplicate`
+ *     instead.
  *   - duplicate: a higher-precedence enabled rule with an EQUIVALENT condition
  *     set — a clearer special case of shadowing (identical match space). The
-   *     message notes the lower rule's effect can never apply.
+ *     message notes the lower rule's effect can never apply.
  *   - unknown_condition: a condition key outside the known dimensions (a typo
  *     like `toolName` for `toolNames`), which `toConditions` silently drops —
  *     turning the rule into an unintended catch-all.

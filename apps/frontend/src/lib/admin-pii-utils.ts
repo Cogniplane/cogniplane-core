@@ -128,11 +128,7 @@ export function sparklineFromTimeSeries(
   return series.map((p) => Number(p[field] ?? 0));
 }
 
-// ─── Charts: stacked time series ────────────────────────────────────────────
-
 export const TIME_SERIES_ACTIONS = ["allow", "report", "block", "transform", "failed"] as const;
-
-// ─── Charts: entity-type colors ──────────────────────────────────────────────
 
 // Categorical palette for entity types. Order is stable so the same entity
 // always renders in the same slot when re-querying. Picked from existing
@@ -216,8 +212,6 @@ export function formatRelativeTime(iso: string | null, now: number = Date.now())
     return iso;
   }
 }
-
-// ─── Ops panel helpers ──────────────────────────────────────────────────────
 
 /**
  * Format a millisecond duration for the latency table. Picks a unit that

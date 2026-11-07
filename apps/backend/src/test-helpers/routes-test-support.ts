@@ -912,9 +912,6 @@ export async function createTestApp(
     toolContexts,
     managedToolFactoryRegistry,
     managedToolCatalog,
-    // Policy Center with no rules → every action evaluates to default-allow and
-    // nothing is recorded. Tests that exercise rules pass a real PolicyService
-    // via the `policyService` override.
     policyService: policyServiceOverride ?? {
       async gateAction() {
         return {

@@ -158,8 +158,8 @@ describe("ApprovalStore.create", () => {
 });
 
 describe("ApprovalStore decisions", () => {
-  // Stateless: each write answers with the values it binds. The WHERE
-  // predicates run against Postgres in approval-resolve and approval-consume.
+  // The WHERE predicates run against Postgres in approval-resolve and
+  // approval-consume.
   function decisionPool() {
     return new FakePool()
       .onQuery("SET status = $4", (_sql, [, , , status, decision, remember]) => ({

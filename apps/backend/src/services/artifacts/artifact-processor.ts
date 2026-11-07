@@ -70,7 +70,7 @@ export class ArtifactProcessor {
     }
   }
 
-  /** Extract the text of a PDF. Throws when extraction fails. */
+  /** Throws when extraction fails. */
   async extractPdfText(pdfBuffer: Buffer, signal?: AbortSignal): Promise<string> {
     if (this.deps.extractPdfText) {
       return this.deps.extractPdfText(pdfBuffer);

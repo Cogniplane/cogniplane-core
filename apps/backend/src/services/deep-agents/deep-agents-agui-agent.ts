@@ -86,8 +86,8 @@ export class DeepAgentsAGUIAgent extends AbstractAgent {
           this.backend.setToolContext(this.toolContextId);
           emit({ type: EventType.RUN_STARTED, threadId: this.backend.threadId, runId } as BaseEvent);
 
-          // The native-HITL interrupt/resume loop, reused verbatim; only the
-          // emitted vocabulary is AG-UI now.
+          // The native HITL interrupt and resume loop. Only the emitted events
+          // are AG-UI events.
           let streamInput: unknown = this.backend.buildInitialInput();
           for (;;) {
             for await (const raw of this.backend.streamTurn(streamInput)) {

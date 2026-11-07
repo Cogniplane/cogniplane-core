@@ -1,4 +1,4 @@
-// Skill-improvement corpus isolation against real Postgres (VULN-04).
+// Skill-improvement corpus isolation against real Postgres.
 //
 // The corpus tool renders session ids, titles, timestamps and message content
 // for every session it discovers. Discovery in skill-improvement-corpus.ts is

@@ -29,15 +29,13 @@ import {
 // is exact, not an estimate.
 //
 // Only an action that a changed rule matches (its version before or after the
-// change) can get a different outcome: for any other action the same enabled
-// rules match, in the same order. So the samples are only the actions that a
-// changed rule matches.
+// change) can get a different outcome. For any other action, the same enabled
+// rules match, in the same order.
 //
-// The check runs in the request, so its work has a limit (MAX_WORK): the
-// sample actions times the enabled rules that the engine checks for each,
-// before and after. Above it the change counts as weaker (fail closed): a
-// change of a broad rule in a large rule set needs step-up. A rule that names
-// a few tools stays well under the limit.
+// The check runs in the request, so its work has a limit (MAX_WORK). Above the
+// limit, the change counts as weaker (fail closed). So a change of a broad rule
+// in a large rule set needs step-up. A rule that names a few tools stays well
+// under the limit.
 
 /** The most work for one check: sample actions times enabled rules, before and after. Above it, the change counts as weaker. */
 export const MAX_WORK = 200_000;

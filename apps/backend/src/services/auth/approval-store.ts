@@ -21,7 +21,7 @@ export type ApprovalRecord = {
   status: ApprovalStatus;
   decision: "approve" | "reject" | null;
   rememberForTurn?: boolean;
-  /** The server ID of the proposed tool call, when the runtime proved the link. */
+  /** The ID of the proposed tool call, when the runtime proved the link. */
   toolCallId?: string;
   requestPayload: Record<string, unknown>;
   createdAt: string;

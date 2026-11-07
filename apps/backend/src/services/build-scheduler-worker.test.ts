@@ -6,11 +6,9 @@ import { buildSchedulerWorker } from "./build-scheduler-worker.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 
-// The decoupling under test (review finding #8): the worker must be created
-// when EITHER the cron scheduler or the async PII scan drain is active, and the
-// cron half must be gated independently so PII scans still drain when
-// SCHEDULER_ENABLED=false. The original `if (!SCHEDULER_ENABLED) return null`
-// silently starved the PII queue — these tests lock that fix in.
+// The worker must exist when either the cron scheduler or the async PII scan
+// drain is active. The cron half has its own gate, so PII scans still drain
+// when SCHEDULER_ENABLED=false.
 
 type SchedulerWorkerInput = Parameters<typeof buildSchedulerWorker>[1];
 
@@ -18,13 +16,9 @@ function makeInput(overrides?: {
   piiScanJobs?: PiiScanJobStore;
   piiScanJobHandler?: PiiScanJobHandler;
 }) {
-  // Only `userSettings.listDueJobs` is exercised by tick(); everything else is
-  // a never-called stub. We type the whole `input` as the worker's actual
-  // parameter so a signature change (e.g. a dropped/renamed dependency) fails
-  // this build instead of compiling behind an `as any` cast — the stale
-  // `defaultAdapter`/`runtimeAdapters`-map/per-provider-getter shape that this
-  // fixture used to carry (retired with the deep-agents provider collapse) can
-  // no longer sneak through.
+  // Only `userSettings.listDueJobs` runs in tick(). The other members are stubs
+  // that tick() never calls. The input has the worker's real parameter type, so a
+  // signature change, such as a renamed dependency, fails the build.
   const listDueJobs = vi.fn(async () => []);
   const stub = <T>() => ({}) as T;
   const input: SchedulerWorkerInput = {

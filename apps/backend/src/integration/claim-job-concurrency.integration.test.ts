@@ -1,11 +1,8 @@
 // `claimJob` is the scheduler's atomic gate: two workers polling the same tick
 // must not both run one job.
 //
-// Every test here calls the PRODUCTION `UserSettingsStore.claimJob`. That is
-// deliberate: an earlier version inlined a copy of its UPDATE and raced the
-// copy, which would have stayed green if claimJob were rewritten as a
-// non-atomic SELECT then UPDATE. A concurrency test that races its own SQL
-// tests nothing.
+// Every test here calls the production `UserSettingsStore.claimJob`, on
+// purpose. A concurrency test that races its own copy of the SQL tests nothing.
 //
 // Two shapes, because neither alone is enough. `Promise.all` on two
 // single-connection pools exercises the real race but cannot guarantee the
@@ -30,10 +27,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
   test("two overlapping claims through claimJob produce exactly one winner", async () => {
     // Calls the PRODUCTION method on two separate single-connection pools, so
     // the two claims really do run on different backends and both go through
-    // `UserSettingsStore.claimJob`. An earlier version of this test inlined a
-    // copy of claimJob's UPDATE and raced that instead, which would have stayed
-    // green if claimJob were rewritten tomorrow as a non-atomic SELECT then
-    // UPDATE. Racing the real method is the whole point.
+    // `UserSettingsStore.claimJob`. Racing the real method is the whole point.
     //
     // `max: 1` per pool is what forces distinct backends: a single shared pool
     // could hand both calls the same connection and serialize them inside one

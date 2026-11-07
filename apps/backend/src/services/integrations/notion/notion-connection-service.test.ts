@@ -162,7 +162,6 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeA
   if (failure === "runtime_sync") runtimeManager.invalidateRuntimesForIntegration = () => { throw new Error("runtime unavailable"); };
   const service = new NotionConnectionService(config, store, auditEvents, runtimeManager, undefined, { warn() {} });
 
-  // Get a valid state JWT by calling getAuthorizationUrl
   const { url: authUrl, browserBinding } = await service.getAuthorizationUrl({
     tenantId: "tenant-1",
     userId: "user-1",
@@ -172,7 +171,6 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeA
 
   const fake = createFakeFetch((url, init) => {
     if (url === "https://api.notion.com/v1/oauth/token") {
-      // Verify Basic auth header is present
       const headers = new Headers(init?.headers as HeadersInit | undefined);
       const authHeader = requireValue(headers.get("Authorization"), "Authorization header");
       expect(authHeader.startsWith("Basic ")).toBeTruthy();
@@ -619,7 +617,7 @@ test("hasConnection returns false when the access token has expired", async () =
   expect(await service.hasConnection("tenant-1", "user-1")).toBe(false);
 });
 
-// q4w0.8: see the GitHub test of the same name.
+// Same scenario as the GitHub test of the same name.
 test("a connection that an older session saved is suspended until a current session confirms it", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
   const store = new InMemoryNotionConnectionStore();
@@ -668,7 +666,7 @@ test("a connection that an older session saved is suspended until a current sess
   expect(runtimeManager.invalidations.at(-1)).toEqual({ tenantId: "tenant-1", userId: "user-1", integrationId: "notion" });
 });
 
-// q4w0.8 review: the callback has no session. An authorization that a session
+// The callback has no session. An authorization that a session
 // started before a security change must not overwrite the owner's connection.
 test.each([
   ["a version older than the owner's current one", 2],
@@ -708,7 +706,7 @@ test.each([
   expect(auditEvents.events.map((event) => event.type)).not.toContain("user.notion.connected");
 });
 
-// q4w0.8 review: a confirm needs an identity that the provider attests. Notion
+// A confirm needs an identity that the provider attests. Notion
 // returned no owner email, so the user ID and the workspace name are all the
 // page could show: no confirm. The owner connects again or disconnects.
 test("a suspended connection without an owner email cannot be confirmed", async () => {

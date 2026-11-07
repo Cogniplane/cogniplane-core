@@ -12,10 +12,8 @@ import { PolicyDecisionStore, type PolicyDecisionInput } from "./policy-decision
 
 type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 
-// In-memory fake of `policy_decision`. The store builds dynamic WHERE clauses
-// and pagination, so the fake captures the last page-query params and lets each
-// test assert against the seeded rows it filters itself — we only need to model
-// enough SQL shape for record/list/get to round-trip.
+// In-memory fake of `policy_decision`. It models only the SQL that record, list,
+// and get need. It keeps the last page query so that tests can assert on it.
 class InMemoryDecisionDatabase {
   rows: Record<string, unknown>[] = [];
   lastPageSql = "";
@@ -153,7 +151,6 @@ test("list short-circuits an inverted date range without querying", async () => 
   const result = await store.list("t1", { from: "2026-06-01", to: "2026-05-01" });
   expect(result.total).toBe(0);
   expect(result.decisions).toEqual([]);
-  // No page query ran.
   expect(db.lastPageSql).toBe("");
 });
 
@@ -210,7 +207,7 @@ test("list keeps the microseconds of ISO from and before bounds in UTC", async (
   ]);
   expect(await bounds({ from: "2026-09-20T11:59:59.999999Z" })).toEqual(["2026-09-20T11:59:59.999999Z"]);
   expect(await bounds({ from: "2026-09-20" })).toEqual(["2026-09-20T00:00:00.000Z"]);
-  // An unparseable bound adds no condition, as before.
+  // An unparseable bound adds no condition.
   expect(await bounds({ before: "not-a-date" })).toEqual([]);
   expect(db.lastPageSql).not.toContain("created_at <=");
 });

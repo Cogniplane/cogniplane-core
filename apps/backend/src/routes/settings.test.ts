@@ -950,7 +950,7 @@ test("scheduled job writes pass the configured cap to the store and keep the 409
   expect(enable.json()).toMatchObject({ error: "scheduled_job_limit_reached" });
   expect(enable.json().message).toContain("before enabling this one");
 
-  // Every write hands the store the cap; the route no longer counts itself.
+  // Every write hands the store the cap. The route does not count itself.
   expect(settings.admissions).toEqual(Array(4).fill({ maxActive: 1 }));
 
   await app.close();
@@ -1454,7 +1454,7 @@ test("token usage rejects a repeated days parameter", async () => {
 });
 
 
-// q4w0.8: confirm stores the security version of the requesting session.
+// Confirm stores the security version of the requesting session.
 test("github and notion confirm routes pass the session's security version and map refusals", async () => {
   const { app, githubConnections, notionConnections } = await createApp();
   githubConnections.userConnection = { ...connectedAs("12345"), suspended: true };

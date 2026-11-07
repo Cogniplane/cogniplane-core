@@ -140,8 +140,6 @@ function once<T>(make: () => Promise<T>): () => Promise<T> {
   return () => (made ??= make());
 }
 
-// ── Fixture graph ──────────────────────────────────────────────────────────
-//
 // Tenants and memberships come from the WorkOS sign-in path on the maintenance
 // pool, as in production. Everything else is written by stores on the app pool.
 
@@ -561,8 +559,6 @@ const projectFileCleanup = once(async () => {
   return expired;
 });
 
-// ── The inventory ──────────────────────────────────────────────────────────
-//
 // One entry per tenant table, grouped by area. Several tables share one store
 // call when production writes them in the same transaction.
 
@@ -680,7 +676,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Sessions and the runtime turn.
   sessions: {
     path: "SessionStore.create",
     writer: "app",
@@ -862,7 +857,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Files.
   artifacts: {
     path: "ArtifactStore.createGenerated",
     writer: "app",
@@ -906,7 +900,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     write: async () => ({ session_id: (await sessionCleanup()).sessionId })
   },
 
-  // Projects.
   projects: {
     path: "ProjectStore.create",
     writer: "app",
@@ -985,7 +978,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Skills.
   personal_skills: {
     path: "PersonalSkillStore.create",
     writer: "app",
@@ -1042,7 +1034,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // MCP servers.
   admin_mcp_servers: {
     path: "McpServerStore.createMcpServer",
     writer: "app",
@@ -1108,7 +1099,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Organization settings and models.
   tenant_settings: {
     path: "TenantSettingsStore.upsert",
     writer: "app",
@@ -1183,7 +1173,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Policy Center.
   policy_rule: {
     path: "PolicyRuleStore.create",
     writer: "app",
@@ -1221,7 +1210,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // PII scanning.
   pii_scan_runs: {
     path: "PiiScanRunStore.create",
     writer: "app",
@@ -1247,7 +1235,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Member settings and scheduled work.
   user_settings_sections: {
     path: "UserSettingsStore.upsertSection",
     writer: "app",
@@ -1284,7 +1271,6 @@ const WRITE_PATHS: Record<string, WritePath> = {
     }
   },
 
-  // Per-member integrations.
   user_github_connections: {
     path: "GithubConnectionStore.upsert",
     writer: "app",
@@ -1409,8 +1395,6 @@ function rowOf(table: string): Promise<RowKey> {
   }
   return row;
 }
-
-// ── Probes ─────────────────────────────────────────────────────────────────
 
 type Queryable = { query: (text: string, values?: unknown[]) => Promise<pg.QueryResult> };
 

@@ -214,7 +214,6 @@ export class RequestLimits implements RequestLimitsInterface {
       incremented.push({ key, entry });
 
       if (next.count > limit) {
-        // Roll back all incremented keys.
         for (const { key: k, entry: prev } of incremented) {
           this.rateWindows.set(k, prev);
         }
@@ -285,7 +284,6 @@ export class RequestLimits implements RequestLimitsInterface {
       incremented.push({ key, entry });
 
       if (next.count > limit) {
-        // Roll back all incremented keys.
         for (const { key: k, entry: prev } of incremented) {
           this.quotaWindows.set(k, prev);
         }

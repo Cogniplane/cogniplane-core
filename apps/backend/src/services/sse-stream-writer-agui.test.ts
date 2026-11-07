@@ -679,8 +679,8 @@ test("remaps tool + reasoning offsets to redacted positions when the narration h
   // be remapped to the redacted positions or reload slices the shortened content
   // at stale offsets.
   const token = "ghp_" + "A".repeat(36); // 40 chars
-  // First text chunk ends just past the token: "token is <40> " = 24 raw chars
-  // (9 + 40 + 1 space... "token is " is 9, token 40, trailing space 1 = 50).
+  // The first text chunk ends just past the token: "token is " (9) + token (40)
+  // + space (1) = 50 raw chars.
   const firstChunk = "token is " + token + " "; // raw offset 50 after this
   const secondChunk = "then run"; // streamed after the reasoning burst opens
 
@@ -838,8 +838,6 @@ test.each([
   expect(runInputs[0]?.turnContext).toBe(expected);
 });
 
-// ── Review batch 3 (bead tnci), R11: incremental persistence ─────────────────
-
 /** An adapter whose stream pauses between events, so the checkpoint timer runs. */
 function makeSlowAdapter(events: BaseEvent[], gapMs: number) {
   return {
@@ -968,11 +966,11 @@ test("a failing checkpoint does not end a turn the client is still reading", asy
 test("a slow in-flight checkpoint cannot land after the terminal write", async () => {
   vi.useFakeTimers();
   try {
-    // The failure this guards: the timer fires, its "streaming" write is still
-    // awaiting the DB when the stream ends, the terminal "completed" write lands
-    // first, and then the checkpoint resolves and flips the row BACK to
-    // "streaming" — permanently, since nothing runs after it. That is exactly the
-    // stuck-row state R11 exists to eliminate, reintroduced by its own fix.
+    // This test guards against one failure. The timer fires, and its "streaming"
+    // write is still waiting for the DB when the stream ends. The terminal
+    // "completed" write then lands first. Next the checkpoint resolves and flips
+    // the row back to "streaming" permanently, because nothing runs after it. This
+    // is the stuck-row state that checkpointing exists to prevent.
     const { input, messages } = runInput([], {
       runtimeAdapter: makeSlowAdapter(
         [
@@ -1280,7 +1278,8 @@ test("a turn that throws mid-stream saves its partial transcript as an error", a
     reasoningContent: "plan it",
     reasoningSegments: [{ offset: 0, text: "plan it" }]
   });
-  // The call never returned, so it is not saved as failed History shows it as interrupted.
+  // The call never returned, so the writer does not save it as failed. History
+  // shows it as interrupted.
   expect(messages.toolResultLog.at(-1)).toMatchObject({ toolResultId: "call-1", status: "in_progress" });
   const events = wireEvents(reply.writes);
   expect(events.at(-1)).toEqual({ type: EventType.RUN_ERROR, message: "The assistant run failed." });

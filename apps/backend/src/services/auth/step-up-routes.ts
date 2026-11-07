@@ -10,7 +10,8 @@ import type { StepUpAction } from "./step-up-store.js";
 // creates (an account, a factor, a role, a new data destination, a weaker
 // control, a released skill) stays after the victim changes the password or
 // signs out everywhere. Other things that a session creates (scheduled jobs,
-// external connections) are tracked in bead q4w0.8.
+// external connections) do not need step-up. They keep the security version of
+// the session that saved them instead (services/auth/security-change.ts).
 //
 // Each route gives its own key to requireStepUp (a data route: to
 // DataRouteControl.requireStepUp), which consumes a step-up token for the

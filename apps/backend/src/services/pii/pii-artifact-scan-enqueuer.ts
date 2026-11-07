@@ -74,8 +74,8 @@ type PiiArtifactScanLogger = {
  *   user. Provider failures fail-closed the same way.
  * - `detect` and `transform` modes are async — the helper stamps a `pending`
  *   PII detail and enqueues a job so the scheduler worker can evaluate later.
- *   (Artifact transform is deferred to Epic 7; in phase 1 transform mode on
- *   artifacts behaves like detect per `PiiProtectionService.evaluateArtifact`.)
+ *   Transform mode on artifacts behaves like detect (see
+ *   `PiiProtectionService.evaluateArtifact`).
  *
  * The async pending stamp is written **before** the job is enqueued so the
  * scheduler worker cannot overwrite a completed status with our later update.

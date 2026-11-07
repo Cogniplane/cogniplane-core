@@ -4,8 +4,6 @@ import { ActiveTurnsRegistry, deriveStaleAfterMs } from "./active-turns-registry
 
 describe("deriveStaleAfterMs", () => {
   it("follows whichever wall-clock cap is larger, plus a margin", () => {
-    // The stale window must sit above the longest a turn can still be live, or
-    // snapshot() evicts a running turn and a second turn starts on the session.
     expect(
       deriveStaleAfterMs({ E2B_SANDBOX_TIMEOUT_MS: 30 * 60_000, TOOL_CONTEXT_TTL_MS: 35 * 60_000 })
     ).toBe(40 * 60_000);
@@ -15,8 +13,7 @@ describe("deriveStaleAfterMs", () => {
   });
 
   it("tracks an operator raising either timer past the old hard-coded 35 min", () => {
-    // The regression this replaces: a constant that happened to clear the
-    // defaults, then silently under-shot once a timer was raised by env.
+    // A constant that fits the defaults would under-shoot after an env override.
     const staleAfterMs = deriveStaleAfterMs({
       E2B_SANDBOX_TIMEOUT_MS: 90 * 60_000,
       TOOL_CONTEXT_TTL_MS: 35 * 60_000
@@ -46,10 +43,8 @@ describe("ActiveTurnsRegistry", () => {
   });
 
   it("survives consecutive approval rounds that each land inside the window", () => {
-    // The defect: staleness measured from the turn's START, while the approval
-    // round loop is unbounded. Two approvals that each fit inside the window
-    // still push the turn past it, so a LIVE turn was evicted and the busy
-    // check then let a second turn start on the same session.
+    // Staleness counts from the last keepalive, not from the start. Approval
+    // rounds are unbounded, so a turn can outlast the window.
     const staleAfterMs = 40 * 60_000;
     const registry = new ActiveTurnsRegistry(staleAfterMs);
     const start = Date.now();
@@ -82,9 +77,8 @@ describe("ActiveTurnsRegistry", () => {
   });
 
   it("still evicts a turn whose round overruns the window", () => {
-    // The keepalive turns the window into an idle timeout between rounds. It
-    // must not become an unbounded lease: one round that runs past the whole
-    // window is still a dead turn.
+    // The keepalive makes the window an idle timeout between rounds, not a
+    // lease. A single round that runs past the window is still dead.
     const staleAfterMs = 40 * 60_000;
     const registry = new ActiveTurnsRegistry(staleAfterMs);
     const start = Date.now();
@@ -95,8 +89,7 @@ describe("ActiveTurnsRegistry", () => {
   });
 
   it("does not resurrect a cleared turn", () => {
-    // keepAlive must keep a live turn alive, never re-reserve a session the
-    // turn already released — that would block every later turn on it.
+    // Reserving a cleared session again would block every later turn on it.
     const registry = new ActiveTurnsRegistry();
     registry.mark("s1");
     registry.clear("s1");

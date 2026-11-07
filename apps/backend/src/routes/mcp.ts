@@ -323,10 +323,6 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
   );
 }
 
-// ---------------------------------------------------------------------------
-// MCP method handlers
-// ---------------------------------------------------------------------------
-
 function handleInitialize(
   rpc: z.infer<typeof rpcRequestSchema>,
   server: McpServerRegistration
@@ -815,9 +811,9 @@ async function handleManagedToolCall(
     // `Bearer …`, `rt_…`. The key-based rules (`{"password": "hunter2"}`,
     // `{"api_key": "abc123"}` with no recognisable prefix) match object keys,
     // and once the value is inside content[0].text there are no keys left to
-    // match. That left the text channel — the one the model reads and the
-    // checkpointer persists — holding a live credential while
-    // structuredContent showed [REDACTED]. Redacting the object first means
+    // match. If redaction ran after serialising, the text channel (which the
+    // model reads and the checkpointer persists) could hold a live credential
+    // while structuredContent showed [REDACTED]. Redacting the object first means
     // both channels are built from the same cleaned value.
     const result = redactSecrets(rawResult);
 

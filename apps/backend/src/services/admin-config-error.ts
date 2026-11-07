@@ -1,10 +1,9 @@
 /**
- * A validation failure whose message is written for the admin API client and
- * safe to return verbatim. The admin route helpers
- * (`respondAdminMutationError`, `respondSkillConfigError`) surface `.message`
- * for this class only; any other thrown error is rethrown so the global
- * error handler logs it and returns an opaque 500 — raw Postgres / SDK /
- * filesystem error strings must never reach the client.
+ * A validation failure. Its message is for the admin API client and is safe to
+ * return as is. The admin route helpers (`respondAdminMutationError`,
+ * `respondSkillConfigError`) return `.message` for this class only. The helpers
+ * rethrow other errors, so the global handler logs them and returns an opaque
+ * 500. Raw Postgres, SDK, or filesystem error text must never reach the client.
  */
 export class AdminConfigError extends Error {
   constructor(message: string) {

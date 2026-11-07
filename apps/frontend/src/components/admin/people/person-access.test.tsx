@@ -66,7 +66,6 @@ describe("PersonAccess removal", () => {
 });
 
 describe("PersonAccess role change", () => {
-  /** Picks the role in the role dialog and confirms it there. */
   async function pickRole(label: string, confirmName: string) {
     fireEvent.click(screen.getByRole("button", { name: "Change role" }));
     const roleDialog = await screen.findByRole("alertdialog");

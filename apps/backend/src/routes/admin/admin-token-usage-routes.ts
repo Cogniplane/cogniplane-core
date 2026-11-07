@@ -108,7 +108,6 @@ export async function registerAdminTokenUsageRoutes(
 
       const usage = await withTenantScope(app.db, tenantId, async (client) => {
         const [dailyResult, userResult, modelResult, totalsResult] = await Promise.all([
-          // Daily aggregation
           client.query(
             `
               SELECT
@@ -128,7 +127,6 @@ export async function registerAdminTokenUsageRoutes(
             values
           ),
 
-          // Per-user aggregation
           client.query(
             `
               SELECT
@@ -147,7 +145,6 @@ export async function registerAdminTokenUsageRoutes(
             values
           ),
 
-          // Per-model aggregation
           client.query(
             `
               SELECT
@@ -165,7 +162,6 @@ export async function registerAdminTokenUsageRoutes(
             values
           ),
 
-          // Overall totals
           client.query(
             `
               SELECT

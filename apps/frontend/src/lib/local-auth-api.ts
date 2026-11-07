@@ -292,8 +292,6 @@ export async function signOutEverywhere(): Promise<void> {
   );
 }
 
-// ---- Manager actions ----
-
 /** Needs the manager's step-up token (`member.create`). */
 export async function createLocalMember(input: CreateLocalMemberRequest, stepUpToken: string): Promise<CreateLocalMemberResponse> {
   const raw = await request<unknown>("/tenant/members", { method: "POST", body: JSON.stringify(input), ...withStepUp(stepUpToken) });

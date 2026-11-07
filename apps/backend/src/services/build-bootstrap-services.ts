@@ -18,11 +18,9 @@ import { TenantOrgSettingsStore } from "./tenant-org-settings-store.js";
 
 import type { Stores } from "./build-stores.js";
 
-// Bootstrap-layer services that depend only on `config`, `db`, `logger`, and
-// already-built stores: storage backends, dynamic config compiler, redis +
-// rate limits, tenant-org-settings stores (RLS + privileged), per-tenant key
-// getters. These are constructed once before the integration/runtime/PII
-// builders run because everything downstream needs them.
+// Bootstrap services need only `config`, `db`, `logger`, and stores that already
+// exist. Build them before the integration, runtime, and PII builders run,
+// because everything downstream needs them.
 export function buildBootstrapServices(input: {
   config: AppConfig;
   db: Pool;

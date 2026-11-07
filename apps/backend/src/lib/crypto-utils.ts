@@ -8,9 +8,6 @@ export function computeConfigHash(config: unknown): string {
   return createHash("sha256").update(JSON.stringify(config)).digest("hex");
 }
 
-/**
- * Return a new array with duplicate string values removed.
- */
 export function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -18,8 +15,8 @@ export function unique(values: string[]): string[] {
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
-// Fixed salt — scrypt provides work factor; the salt just ensures the derived key
-// is domain-separated from any other use of the same secret.
+// Fixed salt. scrypt provides the work factor. The salt separates this derived key
+// from other uses of the same secret.
 const KDF_SALT = Buffer.from("cogniplane-encryption-v1");
 
 // Cache derived keys to avoid blocking the event loop on every encrypt/decrypt call.
@@ -27,8 +24,8 @@ const KDF_SALT = Buffer.from("cogniplane-encryption-v1");
 const derivedKeyCache = new Map<string, Buffer>();
 
 /**
- * Derive a 32-byte AES key from a passphrase using scrypt (N=16384, r=8, p=1).
- * Result is cached for the lifetime of the process.
+ * Derive the AES key from the secret. The function caches the result for the
+ * process lifetime.
  */
 function deriveKey(secret: string): Buffer {
   const cached = derivedKeyCache.get(secret);
@@ -39,7 +36,6 @@ function deriveKey(secret: string): Buffer {
 }
 
 /**
- * Encrypt a plaintext string using AES-256-GCM.
  * Returns a base64-encoded string: iv + ciphertext + authTag.
  */
 export function encrypt(plaintext: string, secret: string): string {
@@ -51,9 +47,6 @@ export function encrypt(plaintext: string, secret: string): string {
   return Buffer.concat([iv, encrypted, tag]).toString("base64");
 }
 
-/**
- * Decrypt a base64-encoded AES-256-GCM ciphertext.
- */
 export function decrypt(encoded: string, secret: string): string {
   const key = deriveKey(secret);
   const buf = Buffer.from(encoded, "base64");

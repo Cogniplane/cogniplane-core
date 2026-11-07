@@ -153,8 +153,6 @@ export const PiiPolicyHealthSchema = z.object({
 }).passthrough();
 export type PiiPolicyHealth = z.infer<typeof PiiPolicyHealthSchema>;
 
-// ── Provider circuit-breaker status ───────────────────────────────────────────
-
 export const PiiBreakerStateSchema = z.enum(["closed", "open", "half_open"]);
 export type PiiBreakerState = z.infer<typeof PiiBreakerStateSchema>;
 
@@ -167,8 +165,6 @@ export const PiiProviderStatusSchema = z.object({
   willRetryAt: z.number().nullable()
 }).passthrough();
 export type PiiProviderStatus = z.infer<typeof PiiProviderStatusSchema>;
-
-// ── PII admin dashboard ──────────────────────────────────────────────────────
 
 export const PiiRangePresetSchema = z.enum(["24h", "7d", "30d", "custom"]);
 export type PiiRangePreset = z.infer<typeof PiiRangePresetSchema>;

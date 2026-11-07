@@ -50,8 +50,6 @@ export type CorpusFormatterOutput = {
   truncatedToolResultCount: number;
 };
 
-// ── Pure formatter ──────────────────────────────────────────────────────────
-
 /**
  * Builds the markdown corpus the improver agent reads. Pure function so it
  * can be unit-tested with fake rows.
@@ -227,8 +225,6 @@ function indent(value: string, spaces: number): string {
     .join("\n");
 }
 
-// ── Orchestrator ────────────────────────────────────────────────────────────
-
 export type GatherCorpusDeps = {
   db: Pool;
   loadMessagesForSession: (
@@ -270,7 +266,6 @@ export type GatherCorpusInput = {
   };
   /** Defaults to DEFAULT_SESSIONS, hard-capped at ABSOLUTE_MAX_SESSIONS. */
   sessionLimit?: number;
-  /** Defaults to DEFAULT_CORPUS_BYTE_BUDGET. */
   byteBudget?: number;
 };
 

@@ -159,11 +159,8 @@ function assertSafeRoleName(role: string): void {
  * Create or update the unprivileged `app_user` role and (re-)apply its grants.
  *
  * Lives here rather than inline in `migrate.ts` so the integration harness
- * runs the SAME role and grant setup production migrations do. That sharing is
- * the point: a harness with its own copy of the grants can pass while
- * production migration is broken. Drop the `deep_agents` grant from one copy
- * and the checkpointer test still succeeds against the other, which is exactly
- * the class of failure the harness exists to catch.
+ * runs the same role and grant setup as production. A harness with its own copy
+ * of the grants could pass while production migration is broken.
  *
  * Idempotent, and safe to re-run: the role may be absent if migrations were
  * previously applied without it. Each call reapplies grants because a later

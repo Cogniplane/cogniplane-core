@@ -167,7 +167,7 @@ export class SkillMarketplaceService {
       return this.loadCatalog(overrideUrl, opts?.githubToken);
     }
 
-    // Platform-wide URL: existing caching logic
+    // Platform-wide URL: the service caches the catalog for SKILL_MARKETPLACE_CACHE_TTL_MS.
     if (!this.config.SKILL_MARKETPLACE_MANIFEST_URL) {
       return buildDisabledCatalog(undefined);
     }

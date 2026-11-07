@@ -361,8 +361,8 @@ test("/models ignores a defaultEffort override the model does not support", asyn
 });
 
 test("/models fails closed when the tenant settings lookup throws", async () => {
-  // Availability is an admin policy control now — degrading to "all models"
-  // on a settings failure would silently ignore admin restrictions.
+  // Availability is an admin policy control. Degrading to "all models" on a
+  // settings failure would silently ignore admin restrictions.
   const app = await makeModelsApp(
     makeStores({
       dynamicConfig: {

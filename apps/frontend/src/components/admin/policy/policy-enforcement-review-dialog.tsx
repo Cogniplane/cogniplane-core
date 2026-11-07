@@ -31,7 +31,6 @@ import { SECTION_LABEL } from "../../../lib/ui-tokens";
 
 type Props = {
   review: EnforcementReview;
-  /** Settings as the page has them now. */
   settings: TenantSettings | null;
   saving: boolean;
   reloading: boolean;
@@ -41,7 +40,6 @@ type Props = {
   /** Read the evidence and settings again and restart the review. */
   onReread: () => void;
   onReloadSettings: () => void;
-  /** Move focus back to the page after the dialog closes. */
   onRestoreFocus: () => void;
 };
 

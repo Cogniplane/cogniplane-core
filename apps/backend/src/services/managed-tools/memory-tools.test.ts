@@ -81,8 +81,6 @@ function findTool(memories: FakeMemories, name: string) {
   )!;
 }
 
-// catalog metadata
-
 test("catalog marks memory_search read-only and the write tools not", () => {
   const byName = new Map(MEMORY_TOOL_CATALOG.map((entry) => [entry.name, entry]));
   expect(byName.get("memory_search")?.readOnly).toBe(true);
@@ -105,8 +103,6 @@ test("only memory_save needs the user's approval of its exact arguments", () => 
   const definitions = createMemoryTools({ memories: makeFakeMemories() });
   expect(definitions.find((tool) => tool.name === "memory_save")?.requiresUserApproval).toBe(true);
 });
-
-// memory_search
 
 test("memory_search scopes to the context tenant/user and maps records", async () => {
   const memories = makeFakeMemories();
@@ -153,8 +149,6 @@ test("memory_search works without a query (recent listing)", async () => {
 
   expect(memories.calls[0].args[2]).toEqual({ query: undefined, limit: undefined });
 });
-
-// memory_save
 
 test("memory_save persists the approved text with provenance that the server sets", async () => {
   const memories = makeFakeMemories();
@@ -333,8 +327,6 @@ test("memory_save ignores non-object metadata", async () => {
 
   expect((memories.calls[0].args[2] as { metadata?: unknown }).metadata).toBeUndefined();
 });
-
-// memory_delete
 
 test("memory_delete removes by name and reports the outcome", async () => {
   const memories = makeFakeMemories({

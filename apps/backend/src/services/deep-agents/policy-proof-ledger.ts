@@ -39,7 +39,6 @@ export class PolicyProofLedger {
     this.pending.clear();
   }
 
-  /** HITL description for an interrupted call. */
   description(toolCallId: string | undefined): string {
     return hitlCallDescription(toolCallId);
   }

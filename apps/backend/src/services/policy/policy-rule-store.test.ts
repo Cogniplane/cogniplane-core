@@ -170,7 +170,6 @@ test("update preserves unspecified fields and changes provided ones", async () =
   const updated = await store.update("t1", created.ruleId, { name: "renamed" }, ALLOW_WEAKER);
   expect(updated).not.toBeNull();
   expect(updated!.name).toBe("renamed");
-  // untouched fields preserved
   expect(updated!.effect).toBe("block");
   expect(updated!.description).toBe("d");
   expect(updated!.reason).toBe("r");

@@ -76,8 +76,6 @@ it("names project instructions with their revision and shows a failed scan's err
   expect(screen.getByText("openai")).toBeTruthy();
 });
 
-// ─── TopOffenders ──────────────────────────────────────────────────────────
-
 const RANGE = { preset: "7d", from: "2026-09-24", to: "2026-10-01" } as const;
 
 function userRow(userId: string, overrides: Partial<PiiTopUserRow> = {}): PiiTopUserRow {

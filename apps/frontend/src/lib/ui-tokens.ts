@@ -1,7 +1,6 @@
 /**
  * Shared Tailwind class tokens for the recurring pill/badge/label/list shapes.
- * These were previously copy-pasted as local consts across ~24 components —
- * edit here, not at the call site, so the admin surfaces stay visually
+ * Edit these here, not at the call site, so the admin surfaces stay visually
  * consistent.
  */
 

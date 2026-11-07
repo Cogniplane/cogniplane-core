@@ -150,11 +150,8 @@ test("detect rejects credit card patterns that fail Luhn", () => {
 });
 
 test("detect skips matches when validate fails (luhn check on non-digit characters embedded)", () => {
-  // Luhn check returns false if a non-digit slips through after stripping spaces/dashes.
-  // This exercises the `if (ch < 0 || ch > 9) return false;` path.
   const detector = new RuleBasedPiiDetector();
-  // Construct a 16-digit string: this is the Luhn-valid 4111-1111-1111-1111
-  // but with a cell offset that should match.
+  // A Luhn-valid card number with dashes is a match.
   const result = detector.detect("4111-1111-1111-1111", { entityTypes: ["financial"] });
   expect(result.findings.length).toBe(1);
   expect(result.findings[0]?.entityType).toBe("financial");

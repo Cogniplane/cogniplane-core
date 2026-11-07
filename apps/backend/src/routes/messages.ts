@@ -147,7 +147,6 @@ export async function registerMessageRoutes(
         // API calls that bypass the /models-filtered picker.
         getModelAvailability: tenantId =>
           stores.dynamicConfig.getOrCreateTenantSettings(tenantId),
-        // Built-ins + this tenant's admin-added custom models.
         listModels: async (tenantId) => [
           ...AVAILABLE_MODELS,
           ...(stores.customModels
@@ -637,12 +636,12 @@ async function titleSessionAsync(input: {
       : null;
     const anthropicApiKey = limited ? null : tenantKey || app.config.ANTHROPIC_API_KEY || null;
 
-    // Local-first titling: when UTILITY_LLM_* is configured (the homelab demo
-    // points it at the local Gemma on Ollama), the raw first message goes to
-    // the operator-run endpoint instead of a third-party API. Only if that path
-    // is absent/fails does generateSessionTitle fall back to the Anthropic API
-    // (best-effort — a non-Anthropic-only tenant simply skips titling, since
-    // titles are non-critical and the Gemma path covers the demo).
+    // Local-first titling. When UTILITY_LLM_* is configured, the raw first
+    // message goes to the operator-run endpoint instead of a third-party API.
+    // The endpoint can be, for example, a local Gemma on Ollama. Only if that
+    // path is absent or fails does generateSessionTitle fall back to the
+    // Anthropic API. This is best-effort: a tenant with no Anthropic key skips
+    // titling, because titles are not critical.
     const utilityClient =
       app.config.UTILITY_LLM_ENABLED && app.config.UTILITY_LLM_BASE_URL && app.config.UTILITY_LLM_MODEL
         ? new UtilityLlmClient({

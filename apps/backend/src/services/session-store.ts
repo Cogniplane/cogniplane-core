@@ -645,8 +645,8 @@ export class SessionStore {
           [candidate.tenant_id, candidate.session_id, candidate.user_id],
         );
 
-        // These legacy foreign keys predate the session cascade rules. Remove
-        // their rows explicitly before deleting the session itself.
+        // These legacy foreign keys do not follow the session cascade rules.
+        // Remove their rows explicitly before deleting the session.
         await db.query(
           `DELETE FROM messages WHERE tenant_id=$1 AND session_id=$2`,
           [candidate.tenant_id, candidate.session_id],

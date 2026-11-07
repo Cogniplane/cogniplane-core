@@ -40,7 +40,7 @@ function withoutChoice(choices: Record<string, string>, projectId: string): Reco
 
 type Assignment = { projectId: string; projectName: string; userId: string; personName: string };
 
-/** The recovery screen for projects that have no owner (decision D13j). It
+/** The recovery screen for projects that have no owner. It
  *  shows project names only. It does not open a project, and it reads no
  *  project content. An admin picks a current member of the organization, and
  *  the existing audited route makes that person the owner. */

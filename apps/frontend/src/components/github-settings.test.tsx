@@ -44,7 +44,7 @@ afterEach(() => {
   clients.splice(0).forEach((client) => client.clear());
 });
 
-// q4w0.8: a security change of the owner's account suspended the connection.
+// A security change of the owner's account suspended the connection.
 it("shows a suspended connection, lists no repositories, and confirms the account on the page", async () => {
   api.status.mockResolvedValue(suspended);
   api.confirm.mockImplementationOnce(async () => {

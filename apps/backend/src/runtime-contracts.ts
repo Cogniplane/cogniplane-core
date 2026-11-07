@@ -52,10 +52,7 @@ export function resolveTurnApprovalSettings(
 }
 export type RuntimeUserInput = { type: "text"; text: string };
 
-// Deep Agents is the sole runtime adapter (the Codex/Claude-Code adapters and
-// their registry were retired in 2026-06/07). The methods below are therefore
-// all required — the optional `?.`-guarded surface that once let the framework
-// fan actions across multiple providers is gone.
+// Deep Agents is the only runtime adapter. Every method below is therefore required.
 export interface RuntimeAdapter {
   readonly id: string;
   hasActiveTurn(sessionId: string): boolean;

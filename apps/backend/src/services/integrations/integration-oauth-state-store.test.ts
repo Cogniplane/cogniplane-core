@@ -24,9 +24,8 @@ test("expired local OAuth state is rejected and removed", async () => {
   await expect(store.consume("notion", "expired")).resolves.toBe(false);
 });
 
-// Redis keys from before the provider id became opaque must stay valid, so a
-// state issued by the old release can still be consumed after a deploy. An
-// overlay id gets the same form.
+// Redis keys keep their persisted form, so a new release can still consume a
+// state that an earlier release issued. An overlay id gets the same form.
 test.each(["github", "notion", "example_overlay-2"])("Redis key for %s keeps its persisted form", async (provider) => {
   const set = vi.fn(async () => "OK" as const);
   const getdel = vi.fn(async () => "issued");

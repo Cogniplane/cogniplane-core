@@ -155,10 +155,6 @@ function createFakeMarketplace() {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 test("GET /admin/skills/marketplace falls back to platform catalog when org manifest URL lookup fails", async () => {
   const app = Fastify();
   onTestFinished(() => app.close());
@@ -339,10 +335,6 @@ test("github import route proceeds without token when getRuntimeCredentials thro
   expect(response.statusCode).toBe(201);
   expect(capturedGithubToken).toBe(undefined);
 });
-
-// ---------------------------------------------------------------------------
-// File preview route
-// ---------------------------------------------------------------------------
 
 async function buildAppWithRevisionFixture() {
   const bundleRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-file-"));

@@ -174,7 +174,7 @@ export type DeepAgentsE2bOptions = {
   /** Per-execute() wall-clock budget enforced at our layer. */
   executeTimeoutMs: number;
   /**
-   * What the sandbox may reach (VULN-13): nothing, or the hosts the tenant
+   * What the sandbox may reach: nothing, or the hosts the tenant
    * approved. The provider enforces it, and it is fixed when the sandbox is
    * created. This reads the policy from the tenant settings as it is now: a new
    * sandbox is created under it, and each turn compares the live network of the
@@ -238,18 +238,18 @@ export type DeepAgentsRuntimeFactory = (init: {
    */
   resolveProviderKey: (provider: ModelProvider) => Promise<string | null>;
   /**
-   * Optional per-provider base URL override (tests / a future backend-allowed
-   * proxy). Keyed by public provider id. Absent → each provider's default
-   * endpoint (plus MODEL_PROVIDER_META.baseUrl for OpenRouter).
+   * Optional per-provider base URL override. Keyed by public provider id.
+   * Absent → each provider's default endpoint (plus MODEL_PROVIDER_META.baseUrl
+   * for OpenRouter).
    */
   providerBaseUrls?: Partial<Record<ModelProvider, string>> | null;
   /** System prompt compiled from developerInstructions + memory section. */
   systemPrompt: string | null;
   /**
-   * Enabled skills as a prebuilt read-only file map (path → FileData), served
-   * to the agent at /skills/ via a CompositeBackend route and surfaced by the
-   * native deepagents skills middleware (progressive disclosure — skills are
-   * NOT inlined into the system prompt). Built by buildSkillsLibraryFiles;
+   * Enabled skills as a prebuilt read-only file map (path → FileData). A
+   * CompositeBackend route serves it to the agent at /skills/. The native
+   * deepagents skills middleware surfaces it with progressive disclosure, so the
+   * system prompt does NOT inline the skills. buildSkillsLibraryFiles builds it.
    * An empty library exposes no skills and shadows any old /skills/ files.
    */
   skillsLibraryFiles?: SkillsLibraryFiles | null;
@@ -331,9 +331,9 @@ export type DeepAgentsSessionState = {
   lastActiveAt: string;
   configBundle: RuntimeConfigBundle;
   abortController: AbortController;
-  /** LangGraph thread id — derived from the session id (see im5e.3 for the
-   *  tenant-ownership rationale: every entry point resolves the session
-   *  through tenant-scoped auth before touching the checkpointer). */
+  /** LangGraph thread id, derived from the session id. Every entry point
+   *  resolves the session through tenant-scoped auth before it touches the
+   *  checkpointer. */
   threadId: string;
   runtime: DeepAgentsSessionRuntime;
   /** Idle teardown timer — same RUNTIME_IDLE_TIMEOUT_MS semantics as the

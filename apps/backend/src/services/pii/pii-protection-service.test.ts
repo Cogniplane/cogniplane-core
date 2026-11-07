@@ -900,7 +900,7 @@ test("the applied mode and revision come from the same settings read as the deci
   expect(reported.appliedPolicy).toEqual({ mode: "detect", revision: 5 });
   expect(readPiiProtection).toHaveBeenCalledTimes(2);
 
-  // Artifact transform reports in phase 1, but the policy mode is transform.
+  // Artifact transform reports, but the policy mode is transform.
   const transformed = await service.evaluateArtifactWithPolicy(upload);
   expect(transformed.decision.action).toBe("report");
   expect(transformed.appliedPolicy).toEqual({ mode: "transform", revision: 6 });

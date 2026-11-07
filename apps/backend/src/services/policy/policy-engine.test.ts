@@ -77,9 +77,7 @@ test("values within a dimension are OR-ed", () => {
 });
 
 test("malformed conditions (non-array dimension) degrade to a catch-all, never throw", () => {
-  // conditions arrive from JSONB and could be corrupt (object/string instead of
-  // an array). The engine must not crash the hot path — a bad dimension is
-  // treated as "no constraint" so the rule still matches rather than throwing.
+  // A corrupt JSONB dimension (an object or a string) must not crash the engine.
   const badObject = evaluatePolicy(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [rule({ conditions: { toolNames: { x: 1 } } as any })],
@@ -126,7 +124,6 @@ test("categories dimension matches the MCP server id", () => {
 });
 
 test("dimensions AND together", () => {
-  // Block file_change on scheduled turns via github.
   const r = rule({
     effect: "block",
     conditions: {
@@ -161,7 +158,6 @@ test("lowest priority number wins; ruleId breaks ties deterministically", () => 
     ],
     action
   );
-  // priority 5 wins outright.
   expect(result.matchedRuleId).toBe("pol_c");
   expect(result.outcome).toBe("require_approval");
 });
@@ -179,7 +175,6 @@ test("priority tie falls back to ruleId ascending", () => {
 });
 
 test("engine sorts defensively even if input is mis-ordered", () => {
-  // Same rules, reversed input order — decision must be identical.
   const rules = [
     rule({ ruleId: "pol_low", priority: 200, effect: "block" }),
     rule({ ruleId: "pol_high", priority: 1, effect: "allow" })
@@ -192,7 +187,6 @@ test("gating is the rule's intent: block / require_approval gate, allow does not
   expect(evaluatePolicy([rule({ effect: "block" })], action).gating).toBe(true);
   expect(evaluatePolicy([rule({ effect: "require_approval" })], action).gating).toBe(true);
   expect(evaluatePolicy([rule({ effect: "allow" })], action).gating).toBe(false);
-  // No match → allow → not gating.
   expect(evaluatePolicy([], action).gating).toBe(false);
 });
 

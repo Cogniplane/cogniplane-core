@@ -17,9 +17,8 @@ export const AdminIdSchema = z
  * serialization, AFTER our `serialize(...)` helper has already validated.
  *
  * If we typed every timestamp as `z.string()`, every such handler would 500
- * for real database-backed requests (and pass tests that fake the row with
- * pre-stringified values — exactly the contract drift R4 was meant to catch
- * but in the opposite direction).
+ * for real database-backed requests. Tests that fake the row with
+ * pre-stringified values would still pass.
  *
  * `IsoDateSchema` accepts either an already-stringified ISO timestamp OR a
  * native `Date`, and emits the ISO string. Use this for any field documented

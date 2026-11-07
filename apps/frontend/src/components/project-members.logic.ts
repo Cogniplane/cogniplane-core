@@ -13,7 +13,7 @@ const ROLE_PHRASE: Record<ProjectRole, string> = {
 };
 
 /** The warning before the last owner leaves or loses the role. The backend
- *  allows it (decision D13j), and an organization admin can assign an owner. */
+ *  allows it, and an organization admin can assign an owner. */
 export const NO_OWNER_WARNING =
   "The project will have no owner. An organization admin can assign one later. " +
   "Until then, nobody can change owner-only settings, such as access and sharing. " +

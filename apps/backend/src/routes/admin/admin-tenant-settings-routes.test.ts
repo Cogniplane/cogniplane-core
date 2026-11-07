@@ -179,7 +179,7 @@ describe("PUT /admin/tenant-settings", () => {
   });
 });
 
-// VULN-13: the hosts that agent-run code in the sandbox may reach. The provider
+// The hosts that agent-run code in the sandbox may reach. The provider
 // accepts any text in this list, so the route is the only check.
 describe("PUT /admin/tenant-settings approved sandbox hosts", () => {
   test("saves a valid list for an admin, who does not hold the owner-only command switch", async () => {

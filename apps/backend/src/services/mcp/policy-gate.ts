@@ -31,8 +31,6 @@ export type PolicyGate = {
 };
 
 /**
- * Derive the policy severity for a tool action.
- *
  * The only signal is one boolean: `ManagedToolDefinition.readOnly` for managed
  * tools, the upstream `annotations.readOnlyHint` learned from `tools/list` for
  * proxy tools. Literal `true` gives `read_only`; false, missing, and unknown
@@ -51,27 +49,14 @@ export function deriveActionSeverity(
   return readOnly === true ? "read_only" : "file_change";
 }
 
-// Read a policy turn-context off the tool-execution context metadata, validating
-// against the enum. Anything unexpected (missing, stale, malformed) degrades to
-// null so the dimension acts as "no constraint" instead of throwing.
+// Anything unexpected (missing, stale, malformed) degrades to null, so the
+// dimension acts as "no constraint" instead of throwing.
 function parsePolicyTurnContext(value: unknown): PolicyTurnContext | null {
   return typeof value === "string" && (POLICY_TURN_CONTEXTS as readonly string[]).includes(value)
     ? (value as PolicyTurnContext)
     : null;
 }
 
-/**
- * Policy Center gate at the runtime choke point. Evaluates the proposed action
- * against the tenant's rules, records a decision as evidence (audit +
- * policy_decision), and either:
- *   - proceeds (returns) — for allow / monitor mode / no-match; or
- *   - verifies the checkpointed approval proof for an enforce-mode
- *     `require_approval` (approved → proceed, missing/mismatched → throw); or
- *   - throws {@link PolicyBlockedError} for an enforce-mode `block`.
- *
- * Whether a gating rule actually gates is the tenant's `policyEnforcementMode`,
- * read from the runtime-policy snapshot already on the tool-execution context.
- */
 // The signal that varies per managed/forwarded path and isn't on the
 // ToolExecutionContext: the tool's read/write flag (drives severity).
 // For managed tools, read from the catalog. For forwarded/proxy tools,
@@ -131,6 +116,18 @@ export type PolicyGateOutcome = {
   approval: ApprovalRecord | null;
 };
 
+/**
+ * Policy Center gate at the runtime choke point. Evaluates the proposed action
+ * against the tenant's rules, records a decision as evidence (audit +
+ * policy_decision), and either:
+ *   - proceeds (returns) — for allow / monitor mode / no-match; or
+ *   - verifies the checkpointed approval proof for an enforce-mode
+ *     `require_approval` (approved → proceed, missing/mismatched → throw); or
+ *   - throws {@link PolicyBlockedError} for an enforce-mode `block`.
+ *
+ * Whether a gating rule actually gates is the tenant's `policyEnforcementMode`,
+ * read from the runtime-policy snapshot already on the tool-execution context.
+ */
 export async function enforcePolicyCenter(
   gate: PolicyGate,
   context: ToolExecutionContext,
@@ -178,8 +175,6 @@ export async function enforcePolicyCenter(
     userId: context.userId,
     runtimeId: context.runtimeId,
     toolName,
-    // For managed tools this is the tool's bound domain; for proxy tools it
-    // defaults to the serverId. Recorded as the policy `category`.
     category,
     severity,
     serverId,

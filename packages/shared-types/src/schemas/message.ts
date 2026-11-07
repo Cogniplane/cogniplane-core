@@ -327,8 +327,6 @@ export const MessagesListResponseSchema = z.object({
 }).passthrough();
 export type MessagesListResponse = z.infer<typeof MessagesListResponseSchema>;
 
-// ── Feedback analytics ───────────────────────────────────────────────────────
-
 const FeedbackSummaryShape = {
   thumbsUp: z.number(),
   thumbsDown: z.number(),
@@ -361,8 +359,6 @@ export const MessageFeedbackResponseSchema = z.object({
   days: z.number()
 }).passthrough();
 export type MessageFeedbackResponse = z.infer<typeof MessageFeedbackResponseSchema>;
-
-// ── Token usage analytics ────────────────────────────────────────────────────
 
 const TokenUsageMetricsShape = {
   inputTokens: z.number(),

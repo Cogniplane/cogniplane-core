@@ -156,7 +156,6 @@ describe("buildSkillsLibraryFiles", () => {
         logger: fakeLog
       });
 
-      // The oversized companion is absent; SKILL.md and the small companion remain.
       expect(files["/write-artifact/huge.bin"]).toBeUndefined();
       expect(files["/write-artifact/SKILL.md"]).toBeDefined();
       expect(files["/write-artifact/small.txt"]!.content).toBe("ok\n");

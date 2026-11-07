@@ -82,7 +82,7 @@ describe("auth callback page", () => {
   });
 
   // The AuthProvider mounts the page again when completeLogin sets the
-  // person (Beads issue q4w0.14).
+  // person.
   it("shares the exchange with a page that mounts again during the sign-in, with no error shown", async () => {
     const fetchMock = vi.fn(async (): Promise<Response> => (exchangesOf(fetchMock).length > 1 ? usedCode() : signedIn()));
     vi.stubGlobal("fetch", fetchMock);

@@ -315,11 +315,10 @@ test("metrics: rolls KPI rows + entity aggregations into the response", async ()
         { subjectType: "message", count: 7 },
         { subjectType: "artifact", count: 5 }
       ]);
-  // The byConfidence aggregation is computed by a dedicated `confidence_counts`
-  // CTE. We assert the CTE is present (the real contract) but deliberately do
-  // The response-shape assertions above (byConfidence rows + high/medium/low
-  // values) already cover the observable behavior; pinning the CTE name here only
-  // added rename-fragility, so it's dropped.
+  // The byConfidence aggregation uses a dedicated `confidence_counts` CTE. This
+  // test does not pin the CTE name. The response-shape assertions above
+  // (byConfidence rows and high/medium/low values) already cover the observable
+  // behavior, and a pinned name would break on a rename.
   await app.close();
 });
 

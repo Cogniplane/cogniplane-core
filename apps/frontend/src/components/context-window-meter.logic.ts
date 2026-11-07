@@ -1,5 +1,4 @@
-// Formatters lifted from the retired message-list.logic when its timeline UI
-// was deleted; the context meter is their only remaining consumer.
+// Formatters used only by the context meter.
 export function formatTokenCount(n: number): string {
   if (n < 1_000) return `${Math.round(n)}`;
   if (n < 10_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, "")}k`;

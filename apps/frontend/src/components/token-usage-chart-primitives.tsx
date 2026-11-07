@@ -18,10 +18,8 @@ import {
 export { fmtCost, fmtTokens, type Days } from "./token-usage-chart-primitives.logic";
 
 // ---------------------------------------------------------------------------
-// Grouped bar chart (Recharts via the shadcn chart wrapper). The public prop
-// shape is unchanged from the prior hand-rolled SVG version so every call
-// site keeps working; `primaryColor`/`secondaryColor` accept a CSS color or
-// `var(--chart-N)` token.
+// Grouped bar chart (Recharts via the shadcn chart wrapper). `primaryColor`
+// and `secondaryColor` accept a CSS color or a `var(--chart-N)` token.
 // ---------------------------------------------------------------------------
 
 export type BarChartProps = {
@@ -80,10 +78,6 @@ export function BarChart({
     </ChartContainer>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Horizontal proportion bar
-// ---------------------------------------------------------------------------
 
 export function HBar({ value, max, color }: { value: number; max: number; color: string }) {
   const pct = max > 0 ? (value / max) * 100 : 0;
@@ -238,10 +232,6 @@ export function UsageReportStatus({ days, report, fetching, error, unavailable, 
     </div> : null}
   </div>;
 }
-
-// ---------------------------------------------------------------------------
-// Day range + view toggle controls (shared UI)
-// ---------------------------------------------------------------------------
 
 export function DayRangePicker({
   value,

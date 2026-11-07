@@ -20,7 +20,6 @@ export const MCP_APP_CSP_DIRECTIVE_LABELS: Record<McpAppCspDirective, string> = 
   baseUriDomains: "Base URL"
 };
 
-/** A longer source is never valid. */
 export const CSP_SOURCE_MAX_LENGTH = 300;
 /** The most sources that one source list can contribute. Later ones are ignored. */
 export const CSP_MAX_SOURCES_PER_DIRECTIVE = 25;

@@ -285,8 +285,8 @@ test("DynamicConfigService imports a public GitHub skill bundle", async () => {
     "example-org-skills-main/skills/pdf-processing/SKILL.md",
     "---\nname: pdf-processing\ndescription: Process PDFs from GitHub\n---\nUse the bundle.\n"
   );
-  // Multi-file bundle (companion script) so the import is NOT auto-promoted to
-  // inline storage — this test verifies bundle persistence.
+  // The service does not promote a multi-file bundle, with a companion script,
+  // to inline storage. This test checks bundle persistence.
   archive.file(
     "example-org-skills-main/skills/pdf-processing/scripts/extract.py",
     "print('extract')\n"
@@ -383,8 +383,8 @@ test("DynamicConfigService imports zip bundles from nested archive wrappers", as
     "downloads/export/pdf-processing/SKILL.md",
     "---\nname: pdf-processing\ndescription: Wrapped zip import\n---\nUse the bundle.\n"
   );
-  // Multi-file bundle so the import is NOT auto-promoted to inline storage —
-  // this test verifies bundle persistence under nested archive wrappers.
+  // The service does not promote a multi-file bundle to inline storage. This
+  // test checks bundle persistence through nested archive wrappers.
   archive.file(
     "downloads/export/pdf-processing/scripts/extract.py",
     "print('extract')\n"
@@ -419,7 +419,7 @@ test("DynamicConfigService imports zip bundles from nested archive wrappers", as
 
   expect(imported.skill.skillId).toBe("pdf-processing");
   expect(capturedImports.length).toBe(1);
-  // Bundle paths are now tenant-scoped: <root>/cache/<tenantId>/<bundleName>/...
+  // Bundle paths are tenant-scoped: <root>/cache/<tenantId>/<bundleName>/...
   expect(capturedImports[0]!.bundleStorageUri).toMatch(/^file:\/\/.*\/cache\/[^/]+\/pdf-processing\//);
 });
 

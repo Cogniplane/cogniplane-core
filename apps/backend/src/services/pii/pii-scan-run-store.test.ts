@@ -185,10 +185,8 @@ test("PiiScanRunStore.update builds patch SQL with only provided fields", async 
   expect(db.lastQuery!.text).toMatch(/\baction_taken\s*=/);
   expect(db.lastQuery!.text).toMatch(/\bcompleted_at\s*=/);
   expect(db.lastQuery!.text).toMatch(/updated_at\s*=\s*NOW\(\)/);
-  // Fields NOT in the patch must not appear in the SET clause.
   expect(db.lastQuery!.text).not.toMatch(/\bprovider_type\s*=/);
   expect(db.lastQuery!.text).not.toMatch(/\bfindings_json\s*=/);
-  // Patch values + the WHERE scope all reach the query as bound values.
   expect(db.lastQuery!.values).toContain("completed");
   expect(db.lastQuery!.values).toContain("ok");
   expect(db.lastQuery!.values).toContain("report");

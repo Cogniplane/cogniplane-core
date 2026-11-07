@@ -61,11 +61,7 @@ export function avatarInitials(name: string | undefined, email: string | undefin
   return source.slice(0, 2).toUpperCase();
 }
 
-/**
- * The account and workspace menu shared by the workspace and console headers:
- * the signed-in person, destinations, organization switching, theme (when the
- * header has no room for its own toggle), keyboard shortcuts, and log out.
- */
+/** The account and workspace menu, shared by the workspace and console headers. */
 export function AccountMenu(props: {
   destinations: readonly AccountMenuDestination[];
   /** Show a theme item. Headers that hide their theme toggle set this. */

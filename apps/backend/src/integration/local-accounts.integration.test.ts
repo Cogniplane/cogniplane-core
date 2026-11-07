@@ -312,9 +312,9 @@ describe.skipIf(!adminDatabaseUrl())("local accounts (migration 071)", () => {
       return result.rows[0].n as number;
     }
 
-    // Bead q4w0.2: an owner that is not set up cannot be reset, resent a
-    // link, enabled, demoted, or removed by anyone in the tenant. When its
-    // setup link expires, only the operator can recover it.
+    // Nobody in the tenant can reset an owner that is not set up, resend a link
+    // to it, enable it, demote it, or remove it. When its setup link expires,
+    // only the operator can recover it.
     test("the service refuses to create an owner for a manager, and writes nothing", async () => {
       const { service, boot, adminId } = await ownerAndAdmin();
       const address = email();
@@ -347,7 +347,7 @@ describe.skipIf(!adminDatabaseUrl())("local accounts (migration 071)", () => {
       expect(await userCount(address)).toBe(0);
     });
 
-    // Bead q4w0.6: with only an access token, an owner's session must not
+    // With only an access token, an owner's session must not
     // create an account (its setup link would be the token holder's).
     test("POST /tenant/members without a step-up token creates no account", async () => {
       const { service, boot } = await ownerAndAdmin();
@@ -408,7 +408,7 @@ describe.skipIf(!adminDatabaseUrl())("local accounts (migration 071)", () => {
       expect(await members.getActiveRole(boot.tenantId, created.userId)).toBe("owner");
     });
 
-    // The review finding: an admin's reset link for a member must not
+    // An admin's reset link for a member must not
     // become a way into an owner account after a promotion.
     test("a reset link issued before a promotion to owner is dead after it", async () => {
       const { service, boot, adminId, memberId } = await ownerAndAdmin();
@@ -470,7 +470,7 @@ describe.skipIf(!adminDatabaseUrl())("local accounts (migration 071)", () => {
       expect((await service.redeemLink("account_setup", tokenOf(pending.link!.url), PASSWORD, META)).role).toBe("member");
     });
 
-    // The round-3 review schedule: a change reads the caller's role, then a
+    // A change reads the caller's role, then a
     // demotion commits, then the change finishes with the old role. The tenant
     // membership lock, taken first by every manager change, forbids it. The
     // test holds that lock in a demotion that has not committed, starts the
@@ -525,7 +525,7 @@ describe.skipIf(!adminDatabaseUrl())("local accounts (migration 071)", () => {
         await holder.query(
           "SELECT pg_advisory_xact_lock(($1::bigint << 32) | ($2::bigint & 4294967295))", [keys.ns, keys.h]
         );
-        // The single key an earlier version of the tenant lock used.
+        // The single key that a one-integer tenant lock would use.
         await holder.query("SELECT pg_advisory_xact_lock(hashtext('tenant_membership_changes:' || $1))", [tenantId]);
         const other = await superuserPool().connect();
         try {

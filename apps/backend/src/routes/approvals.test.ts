@@ -12,7 +12,7 @@ test("recently-resolved cache does not leak across tenants on the same approval 
   const cache = createRecentlyResolvedCache(60_000);
   cache.remember("tenant-a", "user-a", "approval-1");
   // Tenant B probing the exact same approvalId must NOT get a positive
-  // "resolved" signal — that's the cross-tenant leak the fix closes.
+  // "resolved" signal. A positive signal would be a cross-tenant leak.
   expect(cache.wasRecentlyResolved("tenant-b", "user-a", "approval-1")).toBe(false);
 });
 

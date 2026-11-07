@@ -71,7 +71,7 @@ it("records requested sources once per statement and writes nothing for an empty
     "tenant-a", "research", ["connectDomains", "resourceDomains"],
     ["https://api.example.com", "https://cdn.example.com"], 200
   ]);
-  // A source that is already known stays a write of its time, and at most once an hour.
+  // A known source updates its last-seen time at most once an hour.
   expect(write?.text).toContain("ON CONFLICT (tenant_id, server_id, directive, source)");
   expect(write?.text).toContain("interval '1 hour'");
   // A new source is refused once the server has too many.

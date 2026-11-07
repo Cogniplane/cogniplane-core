@@ -38,16 +38,12 @@ type Props = {
 };
 
 /**
- * Ops panel collapses by default — the data is operator-flavored and
- * the privacy officer view doesn't need it. Persisted across sessions
- * via localStorage so an SRE who keeps it open between visits doesn't
- * have to re-expand each time.
+ * Collapsed by default: the privacy officer view does not need this data.
+ * The panel keeps the open state in localStorage across sessions.
  *
- * Hydration safety: the initial state is always `false` on both server
- * and client. We read localStorage in a useEffect after mount and
- * promote to `true` if the user previously expanded — same pattern as
- * chat-shell's artifact-pane width persistence. The trade-off is a
- * one-frame flash of "collapsed" before the saved state kicks in.
+ * Hydration: the first render is always `false` on the server and the client.
+ * A useEffect reads localStorage after mount. An expanded panel therefore
+ * flashes collapsed for one frame.
  */
 export function OpsHealthPanel(props: Props) {
   const [expanded, setExpanded] = useState(false);

@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 
 import { MAX_PROXY_TOOL_METADATA_SCOPES, ProxyToolMetadataCache, type ProxyToolMetadata } from "./proxy-tool-metadata-cache.js";
 
-/** A complete single-page listing (no request cursor, no nextCursor). */
 function recordCompleteListing(
   cache: ProxyToolMetadataCache,
   tenantId: string,
@@ -162,7 +161,6 @@ describe("ProxyToolMetadataCache", () => {
       nextCursor: "c1",
       tools: [{ name: "tool_page_1", annotations: { readOnlyHint: true } }]
     });
-    // Nothing is readable until the listing completes.
     expect(cache.isReadOnly("tenant-1", "srv-1", "tool_page_1")).toBeUndefined();
 
     cache.recordToolsPage("tenant-1", "srv-1", "listing-1", {
@@ -216,7 +214,6 @@ describe("ProxyToolMetadataCache", () => {
       nextCursor: "c1",
       tools: [{ name: "new_tool_a", annotations: { readOnlyHint: true } }]
     });
-    // Mid-sequence: the previous complete listing is still authoritative.
     expect(cache.isReadOnly("tenant-1", "srv-1", "old_tool")).toBe(true);
     expect(cache.isReadOnly("tenant-1", "srv-1", "new_tool_a")).toBeUndefined();
 
@@ -254,7 +251,6 @@ describe("ProxyToolMetadataCache", () => {
       tools: [{ name: "abandoned_page", annotations: { readOnlyHint: true } }]
     });
 
-    // The same runtime starts from scratch (no request cursor) and completes.
     cache.recordToolsPage("tenant-1", "srv-1", "listing-1", {
       tools: [{ name: "fresh_tool", annotations: { readOnlyHint: false } }]
     });

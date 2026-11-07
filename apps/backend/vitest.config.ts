@@ -30,11 +30,8 @@ const thresholds =
     ? thresholdFile.importedThresholds
     : thresholdFile.thresholds;
 
-// Backend tests run in the Node environment. Globals are off — we'll keep
-// explicit `import { test, expect, vi } from "vitest"` so a reader doesn't
-// have to know which globals come from where.
-//
-// Discovery matches the existing `tsx --test "src/**/*.test.ts"` glob.
+// Tests import test, expect, and vi from vitest. Globals stay off, so each file
+// shows where its helpers come from.
 export default defineConfig({
   test: {
     execArgv: process.env.VITEST_DISABLE_CONCURRENT_RECOMPILATION === "1"

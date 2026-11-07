@@ -45,10 +45,9 @@ function statusCaption(integration: AdminIntegrationView): {
 export function AdminIntegrationRow(props: AdminIntegrationRowProps) {
   const { integration, busy, error, operation, onOpen, onToggleReads, onToggleWrites } = props;
 
-  // The list shows no coming-soon rows. The user must always retain the ability to flip a currently-on switch off — even
-  // when configuration disappears (e.g. the GitHub App is uninstalled while
-  // toggles are still true). Otherwise availability and session tools stay
-  // enabled with no UI path to disable them.
+  // Always keep the off switch for an enabled integration, even when its
+  // configuration is gone (for example, the GitHub App was uninstalled). Otherwise
+  // availability and session tools stay on with no way to turn them off.
   const cannotEnable =
     !integration.platformConfigured ||
     (integration.configMode !== "none" && !integration.hasConfig);

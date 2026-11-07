@@ -18,7 +18,6 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   constructor(private readonly maxSize?: number) {}
 
   /**
-   * Pushes a value into the queue.
    * Returns `true` if the value was accepted, `false` if the queue is closed
    * or the buffer has reached `maxSize`.
    */
@@ -54,15 +53,13 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   }
 
   /**
-   * Signal that the producer failed. Any consumer currently blocked in `next()`
-   * (i.e. `for await`-ing an empty queue) is rejected immediately, and all
-   * subsequent `next()` calls throw the same error. Without this, a producer
-   * that throws — e.g. a runtime request handler hitting a DB error — leaves the
-   * consumer waiting forever, hanging the turn and pinning its active-turn slot.
+   * Signal that the producer failed. The queue rejects a consumer that waits in
+   * `next()` at once, and later `next()` calls throw the same error. Without
+   * this, a consumer waits forever after a producer error, such as a DB error in
+   * a runtime request handler. The turn then hangs and keeps its active-turn slot.
    *
-   * Idempotent and terminal: the first error wins, and the queue is closed so no
-   * further values can be pushed. Any values already buffered are discarded in
-   * favor of surfacing the failure (the turn is already broken).
+   * The first error wins. The queue closes, so it accepts no later value. The
+   * queue drops buffered values, because `next()` throws before it returns them.
    */
   setError(error: Error): void {
     if (this.closed || this.error) {

@@ -172,8 +172,8 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: /OpenAI/i }));
     expect(screen.getByText("Unsaved changes")).toBeTruthy();
 
-    // Remove the custom model (Codex P2: previously the dirty draft kept the
-    // deleted id in enabledModelIds and the next Save got a 400).
+    // Remove the custom model while the draft is dirty. The deleted id must not
+    // stay in enabledModelIds. Otherwise the next Save gets a 400.
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));

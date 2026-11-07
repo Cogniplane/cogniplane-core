@@ -3,7 +3,8 @@ import { isTextReadableArtifact as isSharedTextReadableArtifact } from "@cognipl
 import type { ArtifactStorage } from "./artifact-storage.js";
 
 /**
- * Read text content from a Node.js readable stream, up to `maxChars` characters.
+ * Returns at most `maxChars` characters. Use `readStreamAsBoundedText` to learn
+ * whether the text was cut.
  */
 export async function readStreamAsText(
   stream: NodeJS.ReadableStream,
@@ -74,7 +75,6 @@ export type BoundedTextRead = {
   truncated: boolean;
 };
 
-/** Read text while reporting overflow separately from the bounded content. */
 export async function readStreamAsBoundedText(
   stream: NodeJS.ReadableStream,
   maxChars: number
@@ -82,16 +82,10 @@ export async function readStreamAsBoundedText(
   return readDecodedText(stream, maxChars);
 }
 
-/**
- * Check whether an artifact's MIME type indicates text-readable content.
- */
 export function isTextReadableArtifact(mimeType: string): boolean {
   return isSharedTextReadableArtifact(mimeType);
 }
 
-/**
- * Open a stored artifact and read a text excerpt up to `maxChars` characters.
- */
 export async function readArtifactExcerpt(
   storage: Pick<ArtifactStorage, "openReadStream">,
   storageKey: string,

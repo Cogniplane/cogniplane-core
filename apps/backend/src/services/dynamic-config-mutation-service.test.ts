@@ -280,7 +280,6 @@ describe("validateMcpServerInput", () => {
     expect(() => validateMcpServerInput(input, options)).toThrow(new AdminConfigError(message));
   });
 
-  // An update keeps the stored URL and secret when the form leaves them empty.
   it("lets an update omit the upstream URL and the secret", () => {
     const keepStored: Input = { ...proxy, upstreamUrl: null, upstreamAuthSecret: null };
 

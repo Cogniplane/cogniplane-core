@@ -9,7 +9,7 @@ interface RuleDefinition {
 }
 
 const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
-// North American + international phone numbers. Accepts optional country code, separators, and extensions.
+// Phone numbers. Accepts an optional country code and common separators.
 const PHONE_PATTERN =
   /(?:(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4})\b/g;
 // US SSN: 3-2-4 digits. Excludes 000, 666, 9xx area numbers per SSA.
@@ -70,8 +70,8 @@ export class RuleBasedPiiDetector {
   }
 
   /**
-   * Detect column-level PII hints for a CSV. Only a small header+sample heuristic —
-   * per plan phase 1, CSV is rules-only and we avoid provider fallback for tabular files.
+   * Detect column-level PII hints for a CSV. This is a small header and sample
+   * heuristic. CSV is rules-only, so tabular files do not fall back to the provider.
    */
   detectCsv(csvText: string, options: RuleBasedDetectOptions): RuleBasedDetectionResult {
     const allowed = new Set<PiiEntityType>(options.entityTypes);

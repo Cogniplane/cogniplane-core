@@ -95,8 +95,9 @@ function mapDetailRow(row: Record<string, unknown>): PolicyDecisionDetail {
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Normalize a `YYYY-MM-DD` (or full ISO) string to an exclusive upper bound at
- * the start of the *next* UTC day. Returns null for an unparseable value.
+ * Turns a `YYYY-MM-DD` (or full ISO) string into an exclusive upper bound, 24 hours
+ * after the parsed time. For a date-only value, this is the start of the next UTC day.
+ * Returns null for an unparseable value.
  */
 function toExclusiveUpperBound(value: string): string | null {
   const ts = Date.parse(value);
@@ -126,7 +127,6 @@ function toExactBound(value: string): string | null {
   return micros ? `${iso.slice(0, -1)}${micros.padEnd(3, "0")}Z` : iso;
 }
 
-/** Dedupe + trim a string array; drop empties. Returns undefined when nothing remains. */
 function cleanList(values: string[] | undefined): string[] | undefined {
   if (!values || values.length === 0) {
     return undefined;

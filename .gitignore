@@ -17,7 +17,6 @@ packages/*/dist
 .worktrees/
 *:Zone.Identifier
 
-# Local configuration and generated files.
 .env.*
 !.env.example
 **/.env.*

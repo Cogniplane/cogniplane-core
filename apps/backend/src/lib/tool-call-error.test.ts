@@ -46,11 +46,9 @@ test("a Postgres relation name never reaches the model", () => {
 });
 
 test("GithubConnectionNotConfiguredError reaches the model", () => {
-  // Caught in review: this is thrown by getRuntimeCredentials, which every
-  // GitHub managed tool calls, and "the integration is not configured" is
-  // exactly what a user needs to hear. It carries no name in the passthrough
-  // list, so it needs the 4xx statusCode to survive — and the first version of
-  // this classifier silently collapsed it.
+  // This error comes from getRuntimeCredentials, which every GitHub managed
+  // tool calls. The user needs its message. It has no name in the passthrough
+  // list, so it must keep its 4xx statusCode to survive.
   const error = new GithubConnectionNotConfiguredError();
   expect(clientSafeToolErrorMessage(error, FALLBACK)).toBe(
     "GitHub App integration is not configured."

@@ -195,8 +195,7 @@ export class MicrosoftConnectionService {
   // and the loser's response would clobber the fresh token row with a now-invalid
   // refresh token. Collapsing concurrent refreshes for the same (tenant, user) onto
   // one in-flight promise guarantees the refresh token is redeemed exactly once.
-  // Note: this is per-process. It does not coordinate across backend instances —
-  // see getRuntimeCredentials for the cross-instance hardening note.
+  // Note: this is per-process. It does not coordinate across backend instances.
   private readonly inFlightRefreshes = new Map<string, Promise<MicrosoftConnectionRecord | null>>();
 
   constructor(

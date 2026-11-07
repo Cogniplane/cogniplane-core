@@ -9,7 +9,6 @@
 
 import { z } from "zod";
 
-/** The `params._meta` key for backend invocation values. */
 export const MCP_INVOCATION_META_KEY = "cogniplane.ai/invocation";
 
 export type McpInvocationMetadata = {

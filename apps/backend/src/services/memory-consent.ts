@@ -51,7 +51,6 @@ export function parseMemorySaveArguments(args: Record<string, unknown>): MemoryS
   if (content.length > MAX_MEMORY_CONTENT_LENGTH) {
     return { ok: false, reason: `content must be at most ${MAX_MEMORY_CONTENT_LENGTH} characters.` };
   }
-  // A value that is not an object is ignored, as before.
   const metadata = isPlainObject(args.metadata) ? args.metadata : undefined;
   if (metadata && JSON.stringify(metadata).length > MAX_MEMORY_METADATA_LENGTH) {
     return { ok: false, reason: `metadata must be at most ${MAX_MEMORY_METADATA_LENGTH} characters as JSON.` };

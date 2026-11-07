@@ -58,7 +58,7 @@ export const TenantSettingsSchema = z.object({
   // server-side when a turn omits an explicit effort, and echoed through
   // /models as each model's defaultEffort.
   modelDefaultEfforts: z.record(z.string(), z.enum(EFFORT_LEVELS)),
-  // Hosts that agent-run code in the sandbox may reach (VULN-13). Empty means
+  // Hosts that agent-run code in the sandbox may reach. Empty means
   // the sandbox has no network. Entries follow the rules in
   // `@cogniplane/shared-types/sandbox-egress`, which the main entry point does
   // not load. The default keeps a newer client working against a server that

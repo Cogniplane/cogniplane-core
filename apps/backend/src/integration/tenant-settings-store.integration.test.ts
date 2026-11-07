@@ -136,7 +136,7 @@ test("TenantSettingsStore.upsert persists webSearchMode and preserves it across 
     expect(await store.get(tenantId)).toMatchObject({ defaultModelId: null, modelDefaultEfforts: {} });
   });
 
-  // VULN-13: the hosts that agent-run code in the sandbox may reach. These run
+  // The hosts that agent-run code in the sandbox may reach. These run
   // the real INSERT ... ON CONFLICT, which the unit test's fake cannot prove.
   test("approves no sandbox host until a tenant does, and saves the list sorted without duplicates", async () => {
     const tenantId = await seedTenant();

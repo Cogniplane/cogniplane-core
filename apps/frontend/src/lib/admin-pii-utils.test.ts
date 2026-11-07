@@ -22,8 +22,6 @@ import type { PiiActivityTimeSeriesPoint } from "@cogniplane/shared-types";
 
 withUtcDateLocale();
 
-// ─── buildMetricsQuery ──────────────────────────────────────────────────────
-
 test("buildMetricsQuery: 24h preset omits from/to", () => {
   const params = buildMetricsQuery("24h");
   expect(params.get("range")).toBe("24h");
@@ -49,8 +47,6 @@ test("buildMetricsQuery: custom range without from/to throws", () => {
   expect(() => buildMetricsQuery("custom")).toThrow(/custom range/);
   expect(() => buildMetricsQuery("custom", "2026-04-01T00:00:00Z")).toThrow(/custom range/);
 });
-
-// ─── computeDelta ───────────────────────────────────────────────────────────
 
 test("computeDelta: positive change → up direction", () => {
   const delta = computeDelta(120, 100);
@@ -98,8 +94,6 @@ test("computeDelta: rounds to one decimal", () => {
   expect(c.pct).toBe(1.5);
 });
 
-// ─── formatBucketLabel ──────────────────────────────────────────────────────
-
 test("formatBucketLabel: hour bucket shows its UTC hour", () => {
   expect(formatBucketLabel("2026-04-30T14:00:00Z", "hour")).toBe("14");
 });
@@ -113,8 +107,6 @@ test("formatBucketLabel: invalid input returns the input verbatim", () => {
   const label = formatBucketLabel("not-a-date", "hour");
   expect(label).toBe("not-a-date");
 });
-
-// ─── sparklineFromTimeSeries ────────────────────────────────────────────────
 
 const sampleSeries: PiiActivityTimeSeriesPoint[] = [
   { bucket: "2026-04-29T00:00:00Z", allow: 5, report: 2, block: 1, transform: 0, failed: 0 },
@@ -146,8 +138,6 @@ test("sparklineFromTimeSeries: empty series returns empty array", () => {
   expect(sparklineFromTimeSeries([], "scans")).toEqual([]);
 });
 
-// ─── entityColor ────────────────────────────────────────────────────────────
-
 test("entityColor: same entity in different orderings gets the same color", () => {
   // Color assignment is stable: the helper sorts the universe of entities
   // before indexing, so API response order doesn't perturb the palette.
@@ -161,8 +151,6 @@ test("entityColor: unknown entity falls back to a default token", () => {
   const out = entityColor("unknown_xx", ["email", "phone"]);
   expect(out).toBe("var(--color-on-surface)");
 });
-
-// ─── buildSegmentTooltip ────────────────────────────────────────────────────
 
 test("buildSegmentTooltip: zero total returns 0% (no NaN)", () => {
   expect(buildSegmentTooltip(0, 0)).toBe("0 (0%)");
@@ -193,8 +181,6 @@ test("statusPillClass: anything else gets the muted tone", () => {
   expect(statusPillClass("completed")).toMatch(/text-on-surface-variant/);
   expect(statusPillClass("pending")).toMatch(/text-on-surface-variant/);
 });
-
-// ─── formatRelativeTime ─────────────────────────────────────────────────────
 
 test("formatRelativeTime: <30s shows 'just now'", () => {
   const now = Date.parse("2026-04-30T12:00:00Z");
@@ -235,8 +221,6 @@ test("formatRelativeTime: invalid input returns input verbatim", () => {
   expect(formatRelativeTime("not-a-date")).toBe("not-a-date");
 });
 
-// ─── formatLatency ──────────────────────────────────────────────────────────
-
 test("formatLatency: nullish returns em dash", () => {
   expect(formatLatency(null)).toBe("—");
   expect(formatLatency(undefined)).toBe("—");
@@ -267,8 +251,6 @@ test("formatLatency: negative or non-finite values return em dash", () => {
   expect(formatLatency(Number.POSITIVE_INFINITY)).toBe("—");
 });
 
-// ─── breakerStatePillClass ──────────────────────────────────────────────────
-
 test("breakerStatePillClass: closed → success, open → danger, half_open → muted", () => {
   expect(breakerStatePillClass("closed")).toMatch(/text-success/);
   expect(breakerStatePillClass("open")).toMatch(/text-danger/);
@@ -280,8 +262,6 @@ test("breakerStatePillClass: unknown state falls back to muted (no crash)", () =
   expect(breakerStatePillClass("disabled")).toMatch(/text-on-surface-variant/);
   expect(breakerStatePillClass("")).toMatch(/text-on-surface-variant/);
 });
-
-// ─── readPersistedBoolean / writePersistedBoolean ───────────────────────────
 
 function createMemoryStorage(): Storage & { snapshot(): Record<string, string> } {
   const store = new Map<string, string>();

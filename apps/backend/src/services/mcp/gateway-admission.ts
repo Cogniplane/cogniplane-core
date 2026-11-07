@@ -83,13 +83,11 @@ export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise
 
   // The MCP gateway exists for the sandboxed runtime alone — every request,
   // including initialize, must carry a valid session-scoped rt_* token as
-  // `Authorization: Bearer` (both runtimes send it on every request). User
-  // JWTs and dev headers are deliberately rejected: resolveBoundToolContext
-  // binds caller-supplied toolContextIds to these claims, so admitting
-  // non-runtime callers would let a same-tenant user substitute another
-  // user's context id and execute tools under that identity. We re-verify
-  // the token here rather than threading claims through request.auth so the
-  // rest of the API surface stays unchanged.
+  // `Authorization: Bearer` (both runtimes send it on every request). Admission
+  // deliberately rejects user JWTs and dev headers. resolveBoundToolContext binds
+  // caller-supplied toolContextIds to these claims, so admitting non-runtime
+  // callers would let a same-tenant user substitute another user's context id
+  // and execute tools under that identity.
   const claims = resolveRuntimeTokenClaims(authorizationHeader, stores.runtimeTokenSecret);
   if (!claims) {
     logger.warn(
@@ -99,8 +97,8 @@ export async function runGatewayAdmission(input: GatewayAdmissionInput): Promise
     return { ok: false, statusCode: 401, body: failure(rpcId, -32000, "The MCP gateway requires a valid runtime token (rt_*).") };
   }
 
-  // Loopback-only egress check: the gateway must only accept connections originating
-  // from the local host (127.0.0.1, ::1, or IPv4-mapped IPv6 loopback).
+  // Loopback-only peer check: the gateway accepts connections only from the
+  // local host (127.0.0.1, ::1, or IPv4-mapped IPv6 loopback).
   if (!remoteAddress || !LOOPBACK_IPS.has(remoteAddress)) {
     await recordGatewayRejection(
       stores.auditEvents,

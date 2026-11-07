@@ -64,8 +64,8 @@ test("deriveSessionAlerts — surfaces pii-detected badge", async () => {
 });
 
 test("deriveSessionAlerts — ignores rows where kind is null", async () => {
-  // The CASE expression returns NULL when no branch matches; SQL would already
-  // exclude those via the WHERE, but we belt-and-suspenders the mapping.
+  // The CASE expression returns NULL when no branch matches. The WHERE clause
+  // already excludes those rows, so this test checks the mapping as a second guard.
   const { client } = makeClient({
     pii: [{ source_session_id: "s1", kind: null, count: 5 }]
   });

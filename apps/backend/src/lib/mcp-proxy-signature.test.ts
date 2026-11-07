@@ -168,7 +168,6 @@ test("verifyProxyHeaders rejects stale timestamps", () => {
   const headers = signProxyHeaders({ ...baseInput, now });
   const result = verifyProxyHeaders(asLowerCase(headers), BODY, KEY_A, {
     ...verifyOptions,
-    // 10 minutes later
     now: () => NOW + 10 * 60 * 1000
   });
   expect(result).toEqual({ ok: false, reason: "stale_timestamp" });
@@ -197,7 +196,7 @@ test("verifyProxyHeaders limits a future timestamp to the skew, not to maxAgeMs"
   expect(DEFAULT_MAX_FUTURE_SKEW_MS).toBe(30_000);
   expect(verifyAt(NOW + 30_000, NOW).ok).toBe(true);
   expect(verifyAt(NOW + 30_001, NOW)).toEqual({ ok: false, reason: "future_timestamp" });
-  // The old rule (|now - ts| <= maxAgeMs) accepted this.
+  // A future limit equal to maxAgeMs would accept this. The skew limit refuses it.
   expect(verifyAt(NOW + 60_000, NOW)).toEqual({ ok: false, reason: "future_timestamp" });
   expect(verifyAt(NOW + 5_000, NOW, { maxFutureSkewMs: 5_000 }).ok).toBe(true);
   expect(verifyAt(NOW + 5_001, NOW, { maxFutureSkewMs: 5_000 })).toEqual({
@@ -403,7 +402,6 @@ test("verifyProxyHeaders rejects non-numeric timestamp", () => {
 
 test("verifyProxyHeaders accepts canonical-cased header names too", () => {
   const headers = signProxyHeaders({ ...baseInput, now });
-  // Pass headers as-is (canonical case) without lower-casing.
   const result = verifyProxyHeaders(
     headers as unknown as Record<string, string>,
     BODY,

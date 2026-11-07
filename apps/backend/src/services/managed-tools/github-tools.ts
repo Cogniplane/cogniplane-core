@@ -39,8 +39,6 @@ function encodeRepoPath(input: string): string | null {
   return segments.map(encodeURIComponent).join("/");
 }
 
-// ── Repository gate ──────────────────────────────────────────────────────────
-//
 // The OAuth token reaches every repository that the user can reach, so the
 // user's allowed-repository list narrows what the agent can use. This is the
 // one place that applies the list. Every GitHub API call that names a
@@ -108,8 +106,6 @@ async function githubApiError(res: Response): Promise<{ error: string; detail?: 
   return { error: `GitHub API error ${res.status}`, detail: await safeJsonBody(res) };
 }
 
-// ── Catalog entries (static metadata consumed by ./catalog) ──────────────────
-
 export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
   name: string;
   description: string;
@@ -174,8 +170,6 @@ export const GITHUB_TOOL_CATALOG: ReadonlyArray<{
     }
   }
 ];
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
 
 export function createGithubTools(deps: GithubToolDeps): ManagedToolDefinition[] {
   const tools: ManagedToolDefinition[] = [

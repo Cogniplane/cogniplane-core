@@ -107,7 +107,7 @@ describe("keyedArtifactPaneWidth", () => {
 
 describe("generatedViewFitsBeside", () => {
   test("needs room for the panel and the minimum chat width", () => {
-    // 768px with both shell panels open left a 104px host row before this change.
+    // At 768px with both shell panels open, the host row is 104px. The panel must not fit beside it.
     expect(generatedViewFitsBeside(104)).toBe(false);
     expect(generatedViewFitsBeside(744)).toBe(false);
     expect(generatedViewFitsBeside(1000)).toBe(true);

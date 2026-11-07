@@ -8,10 +8,9 @@ import { artifactApiBase, loadArtifactPreview } from "../lib/artifact-preview-lo
 
 /**
  * Preview + download actions for a single artifact, shared by the chat artifact
- * panel and the cross-session artifact browser. This is the half of the old
- * `useArtifacts` that has nothing to do with chat-context selection/upload — it
- * was extracted so the two surfaces share ONE 3-way preview loader (image / PDF
- * / other), one signed-URL/download flow, and one request-race guard.
+ * panel and the cross-session artifact browser. Both surfaces use one 3-way
+ * preview loader (image / PDF / other), one signed-URL/download flow, and one
+ * request-race guard.
  *
  * `openPreview` accepts either the full `Artifact` (the browser already holds
  * the row) or an `artifactId` string (the chat message list only has the id).
@@ -19,10 +18,10 @@ import { artifactApiBase, loadArtifactPreview } from "../lib/artifact-preview-lo
  * caller passes in — a paginated browser, which may not have the artifact in
  * any array, passes the object directly instead.
  *
- * The `previewRequestRef` symbol guard is carried here verbatim: each
- * `openPreview` tags its in-flight request, and every state write checks it is
- * still the current request before applying, so a fast click-through doesn't
- * render a stale artifact's content.
+ * The `previewRequestRef` guard works like this. Each `openPreview` tags its
+ * in-flight request. Every state write checks that the request is still the
+ * current one before it applies. A fast click-through therefore does not render
+ * a stale artifact's content.
  */
 export function useArtifactActions(input: {
   onError: (message: string) => void;

@@ -361,9 +361,9 @@ test("create round-trips the kept condition dimensions (categories/severities/tu
 });
 
 test("create rejects a typo'd condition key with 400 instead of storing a catch-all", async () => {
-  // `toolName` (singular) would previously pass the .passthrough() schema,
-  // be dropped by the store's condition reader, and leave a rule matching
-  // EVERYTHING — a typo'd block is a tenant-wide outage in enforce mode.
+  // The .passthrough() schema would accept `toolName` (singular). The store's
+  // condition reader would drop it, and the rule would match EVERYTHING. A
+  // typo'd block is a tenant-wide outage in enforce mode.
   const { app } = await buildApp();
   const res = await app.inject({
     method: "POST",
@@ -925,11 +925,11 @@ test("lint endpoint returns no warnings for a clean rule set", async () => {
 
 test("lint endpoint flags an unknown/typo'd condition key on a PERSISTED rule", async () => {
   const { app, ruleStore } = await buildApp();
-  // `toolName` (singular) is not a known dimension. The create/patch routes now
-  // reject it (strict input schema), but a row written before that
-  // fix — or by a newer writer with a dimension this build doesn't know — can
-  // still carry one. The lint reads the raw stored conditions (listForLint),
-  // so seed the bad row directly through the store.
+  // `toolName` (singular) is not a known dimension. The create and patch routes
+  // reject it (strict input schema). A row written before that schema, or by a
+  // newer writer with a dimension this build does not know, can still carry one.
+  // The lint reads the raw stored conditions (listForLint), so seed the bad row
+  // directly through the store.
   await ruleStore.create(
     "t1",
     {

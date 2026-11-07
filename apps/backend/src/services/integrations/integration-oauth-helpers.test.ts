@@ -20,8 +20,6 @@ test("mapOAuthProviderError returns only fixed public reason codes", () => {
   expect(mapOAuthProviderError(undefined)).toBe("provider_error");
 });
 
-// toIsoFromNow
-
 test("toIsoFromNow: undefined → null", () => {
   expect(toIsoFromNow(undefined)).toBe(null);
 });
@@ -44,8 +42,6 @@ test("toIsoFromNow: positive seconds → ISO string in the future", () => {
   expect(t >= before + 60_000 - 100).toBe(true);
   expect(t <= before + 60_000 + 1_000).toBe(true);
 });
-
-// Browser binding
 
 test("createOAuthBrowserBinding scopes an httpOnly cookie to the callback path", () => {
   const https = createOAuthBrowserBinding(

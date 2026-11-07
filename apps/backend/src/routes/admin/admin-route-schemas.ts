@@ -58,7 +58,7 @@ export const tenantSettingsBodySchema = z.object({
   enabledModelIds: z.array(z.string().trim().min(1).max(200)).nullable().optional(),
   defaultModelId: z.string().trim().min(1).max(200).nullable().optional(),
   modelDefaultEfforts: z.record(z.string().trim().min(1).max(200), z.enum(EFFORT_LEVELS)).optional(),
-  // Hosts that agent-run code in the sandbox may reach (VULN-13). The provider
+  // Hosts that agent-run code in the sandbox may reach. The provider
   // checks nothing, so this is the check: exact host names, with `*.` only over
   // a name that one party registers. An empty list means no network.
   approvedSandboxEgressDomains: SandboxEgressDomainsSchema.optional()

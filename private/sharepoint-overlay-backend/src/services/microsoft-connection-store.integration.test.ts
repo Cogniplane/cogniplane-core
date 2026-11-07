@@ -189,7 +189,7 @@ describe.skipIf(!adminDatabaseUrl())("MicrosoftConnectionStore.upsert under RLS"
     expect(await countInScope(tenantB, microsoftUserId)).toBe(0);
   });
 
-  // q4w0.8: the connection keeps the security version of the session that
+  // The connection keeps the security version of the session that
   // started the authorization (migration 083). After a security change of the
   // owner's local account, the read for use does not return it; a token
   // refresh keeps the stored version; only a current session's confirm restores it.
@@ -256,7 +256,7 @@ describe.skipIf(!adminDatabaseUrl())("MicrosoftConnectionStore.upsert under RLS"
     expect(await store.get(owner.tenantId, owner.userId)).not.toBeNull();
   });
 
-  // q4w0.8 review: a confirm needs an identity that the provider attests. With
+  // A confirm needs an identity that the provider attests. With
   // no email from Graph, a display name is all the page could show: no confirm.
   test("a suspended connection without an email cannot be confirmed", async () => {
     const { owner, versionNow, securityChange, input } = await localOwner();

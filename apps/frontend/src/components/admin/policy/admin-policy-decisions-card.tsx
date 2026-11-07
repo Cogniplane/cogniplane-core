@@ -258,7 +258,6 @@ export function AdminPolicyDecisionsCard({
 
         {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
 
-        {/* Table */}
         {urlProblems.length > 0 ? null : loading ? (
           <p role="status" className="text-sm text-on-surface-faint">Loading rule matches…</p>
         ) : decisions.length === 0 ? (
@@ -307,7 +306,6 @@ export function AdminPolicyDecisionsCard({
           </div>
         )}
 
-        {/* Pagination footer */}
         {total > 0 ? (
           <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-on-surface-faint">
             {fetching ? <span role="status">Loading rule matches. Previous rows remain visible.</span> : <span>

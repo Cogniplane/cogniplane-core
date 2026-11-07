@@ -1,11 +1,11 @@
 import { hasSkillInstructions } from "../capability-selection.js";
-// Read-only skills library for the Deep Agents runtime (bead kpit).
+// Read-only skills library for the Deep Agents runtime.
 //
-// Enabled skills are served to the agent as files under /skills/ via the
-// native deepagents skills middleware (progressive disclosure: only
-// name/description/path reach the system prompt; the model reads the full
-// SKILL.md on demand with read_file). This replaces the retired "## Skill:"
-// system-prompt inlining and finally materializes bundle companion files.
+// The library serves enabled skills to the agent as files under /skills/. The
+// native deepagents skills middleware surfaces them with progressive
+// disclosure: only name/description/path reach the system prompt. The model
+// reads the full SKILL.md on demand with read_file. The library also serves the
+// bundle companion files with each skill.
 //
 // The library is deliberately NOT staged into the E2B sandbox: it is an
 // in-memory backend routed at /skills/ by a CompositeBackend in

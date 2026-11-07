@@ -168,7 +168,6 @@ describe("PolicyService.gateAction — non-gating outcomes", () => {
       makeRule({ ruleId: "pol_1", effect: "block", conditions: { categories: ["github"] } })
     ]);
     const result = await service.gateAction(gateInput({ enforcementMode: "monitor" }));
-    // Even though the rule is `block`, monitor mode proceeds.
     expect(result.enforced).toBe(false);
     expect(result.evaluation.outcome).toBe("block");
     expect(records).toHaveLength(1);
@@ -186,7 +185,6 @@ describe("PolicyService.gateAction — non-gating outcomes", () => {
 
     expect(result.enforced).toBe(false);
     expect(result.evaluation.outcome).toBe("require_approval");
-    // Evidence recorded as a would-have decision.
     expect(records).toHaveLength(1);
     expect(records[0].outcome).toBe("require_approval");
     expect(records[0].enforced).toBe(false);

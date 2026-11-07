@@ -3,7 +3,7 @@
 // gateway must refuse the tool calls of a turn that already started, with the
 // runtime token that the turn already holds, on every replica. Nothing stops
 // the runtime in this test: the database check alone must refuse the call
-// (bead q4w0.13, services/auth/security-change.ts).
+// (services/auth/security-change.ts).
 //
 // Real Postgres, the production MCP route, ToolExecutionContextStore and
 // LocalAccountService. Only the managed tool is a test tool.

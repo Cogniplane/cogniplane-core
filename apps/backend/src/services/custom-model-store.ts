@@ -7,11 +7,10 @@ import { isoTimestamp } from "../lib/db-mappers.js";
 import type { AvailableModel } from "../domain/models.js";
 
 /**
- * Admin-added models extending the built-in catalog per tenant
- * (tenant_custom_models). The catalog id is "<provider>/<vendorModelId>" —
- * the namespace IS the provider, which lets the Deep Agents graph resolve the
- * construction facts for a custom id without a DB lookup (see
- * resolveModelConstruction).
+ * Admin-added models that extend the built-in catalog for each tenant
+ * (tenant_custom_models). The catalog id is "<provider>/<vendorModelId>". The
+ * provider is the namespace, so the Deep Agents graph can resolve construction
+ * facts for a custom id without a DB lookup (see resolveModelConstruction).
  */
 export type CustomModelRecord = {
   modelId: string;

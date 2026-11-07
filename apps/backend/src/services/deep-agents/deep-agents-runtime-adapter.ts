@@ -3,10 +3,9 @@ import { ModelSpendingCallback } from "./model-spending-callback.js";
 import { ModelStartCheck } from "./model-start-check.js";
 import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "../session-execution-store.js";
-// Sole runtime provider (bead im5e.1, then quap.4): the agent loop runs IN
-// the Fastify backend via deepagentsjs instead of inside an E2B sandbox
-// harness. This adapter drives the loop and emits the AG-UI stream consumed by
-// both interactive requests and scheduled jobs.
+// The agent loop runs in the Fastify backend through deepagentsjs, not in an
+// E2B sandbox. This adapter drives the loop and emits the AG-UI stream that
+// both interactive requests and scheduled jobs consume.
 
 import type { ActivationTracker } from "../activation-tracker.js";
 import path from "node:path";
@@ -202,7 +201,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        */
       toolContexts?: Pick<ToolExecutionContextStore, "extend" | "liveness">;
       /**
-       * Refreshes the active-turn entry's liveness on each approval round
+       * Refreshes the active-turn entry's liveness on each approval round.
        * Optional: without it a turn parked on several approvals is stale-evicted
        * while still live, letting a second turn start on the same session.
        */
@@ -349,10 +348,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
 
   /**
    * The network policy that a sandbox of this session must have, read from the
-   * tenant settings now. The sandbox asks every time it creates a sandbox and
-   * at the start of every turn, so a change of the approved hosts applies at the
-   * next turn without a refresh of the runtime. Hosts that fail the host check
-   * are dropped, which approves less; the drop is logged.
+   * tenant settings now. The sandbox calls this every time it creates a sandbox
+   * and at the start of every turn, so a change of the approved hosts applies at
+   * the next turn without a refresh of the runtime.
    */
   private async resolveSandboxPolicy(tenantId: string, sessionId: string) {
     const policy = await this.dynamicConfig.getRuntimePolicy(tenantId);
@@ -378,8 +376,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // Provider credentials are resolved LAZILY per turn (the model — hence the
     // provider — is only known at getAgentForModel time). Build a tenant-scoped
     // resolver the factory calls then. Guard here that AT LEAST ONE provider is
-    // configured so a zero-key tenant fails fast at session creation with the
-    // same UX as before (rather than only failing on the first turn).
+    // configured. A zero-key tenant then fails at session creation, not on its
+    // first turn.
     const credentials = this.providerCredentials;
     const configuredProviders = credentials
       ? await Promise.all(
@@ -418,9 +416,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // is user data. The memories themselves are read at the start of each turn
     // and sent as a data message (see loadMemoryContext).
     const memoryLines = buildMemorySectionLines(runtimePolicy.enabledToolIds);
-    // Enabled skills (bead kpit): served as a read-only /skills/ file library
+    // Enabled skills: served as a read-only /skills/ file library
     // through the native deepagents skills middleware (progressive
-    // disclosure) instead of the retired "## Skill:" system-prompt inlining.
+    // disclosure).
     // Bundle companion files are materialized into the library; a bundle
     // failure degrades that skill to SKILL.md-only. Each new turn replaces
     // the checkpointed listing with the currently selected skills.
@@ -437,7 +435,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     ].filter((part): part is string => Boolean(part));
     const systemPrompt = systemPromptParts.length > 0 ? systemPromptParts.join("\n\n") : null;
 
-    // Per-session workspace layout (unchanged from the retired runtimes).
+    // Per-session workspace layout.
     // Files only materialize when the lazy sandbox is first touched.
     const workspacePath = path.posix.join(E2B_WORKSPACE_BASE, sessionId);
     // MCP gateway servers (compiled to the enabled set) with the session's
@@ -1073,12 +1071,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       assistantMessageId: responseId,
       toolContextId: input.toolContextId ?? null,
       approvalAbortSignal: turnAbort.signal,
-      // The approval round loop is unbounded, but both the
-      // tool-context TTL and the active-turn staleness window budget for a
-      // single approval. Extend both after each decision so a turn parked on
-      // several approvals keeps its MCP tool access and is not stale-evicted
-      // while still running. Failures are logged, never thrown: a missed
-      // keepalive degrades the turn, an exception here would kill it.
+      // The keepalive runs after each approval decision. See `onApprovalRound`
+      // in deep-agents-agui-agent.ts. The callback logs failures and never throws
+      // them. A missed keepalive degrades the turn, but an exception here would
+      // kill it.
       onApprovalRound: async (signal) => {
         if (signal?.aborted) return;
         this.stores.activeTurns?.keepAlive(state.sessionId);
@@ -1446,9 +1442,9 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   /**
    * Tears down the tenant's in-memory session runtimes so the next turn
    * rebuilds them against fresh config. `idleOnly` skips sessions with an
-   * active turn — the admin rollout actions are labeled "idle" and must
-   * never interrupt a running conversation. Explicit integration/security
-   * security invalidation keeps the abort-everything default. Tenant-setting changes use
+   * active turn. The admin rollout actions are labeled "idle" and must never
+   * interrupt a running conversation. Explicit integration or security
+   * invalidation keeps the abort-everything default. Tenant-setting changes use
    * the in-place next-turn capability refresh instead.
    */
   async invalidateTenantRuntimes(

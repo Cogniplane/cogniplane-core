@@ -200,9 +200,9 @@ test("rejects concurrent turns on the same session", async () => {
       });
 });
 
-// Bead q4w0.13: the turn's tool context keeps the security version that
-// admitted the turn, so the gateway refuses its tool calls after a security
-// change of the account (services/auth/security-change.ts).
+// The turn's tool context keeps the security version that admitted the turn.
+// After a security change of the account, the gateway refuses that turn's tool
+// calls (services/auth/security-change.ts).
 test("the turn's tool context keeps the requester's security version", async () => {
   const { app, runtimeManager, toolContexts } = await createTestApp();
   onTestFinished(async () => {
@@ -1546,8 +1546,8 @@ test("GET /models returns the hardcoded model list", async () => {
     throw new Error("Expected the model catalog to include a default model");
   }
   expect(defaultModel.id).toBe("deepagents/claude-haiku-5-5");
-  // Reasoning-capable models now advertise effort levels (bead i52g); the
-  // Anthropic default supports the low/medium/high/xhigh/max scale.
+  // Reasoning-capable models advertise effort levels. The Anthropic default
+  // supports the low/medium/high/xhigh/max scale.
   expect(defaultModel.supportedEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
 });
 

@@ -111,12 +111,11 @@ type DynamicConfigSkillBundleStorage = Pick<SkillBundleStorage, "storeBundle" | 
 /**
  * Facade that provides a single entry point for all admin-config operations.
  *
- * Design decision (2026-03-21): this class intentionally delegates every
- * method to a focused collaborator module. The facade exists so that
- * consumers (routes, runtime manager, scheduler) import one service
- * instead of wiring individual stores and modules themselves. The cost is
- * duplicated method signatures; the benefit is a stable, narrow API
- * surface that decouples consumers from internal module boundaries.
+ * Every method delegates to a focused collaborator module. Consumers (routes,
+ * the runtime manager, the scheduler) import this one service instead of
+ * wiring the stores and modules themselves. The cost is duplicated method
+ * signatures. The benefit is a stable, narrow API that hides the internal
+ * module boundaries.
  */
 export class DynamicConfigService {
   constructor(
@@ -147,8 +146,6 @@ export class DynamicConfigService {
   listMcpServers(tenantId: string, includeDisabled = true): Promise<AdminMcpServerRecord[]> {
     return this.stores.mcpServers.listMcpServers(tenantId, includeDisabled);
   }
-
-  // --- Tenant Settings ---
 
   // The audit event, when given, commits in the same transaction as the change.
   async updateTenantSettings(

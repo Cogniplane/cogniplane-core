@@ -43,11 +43,11 @@ export const envSchema = z.object({
   API_HOST: z.string().optional(),
   API_PORT: z.coerce.number().int().positive().default(3001),
   API_ORIGIN: z.string().url().default("http://localhost:3000"),
-  // Defaults to the RESTRICTED runtime role, not the superuser. The previous
-  // `postgres:postgres` default meant a missing env silently ran the whole app
-  // with RLS bypassed — the one guarantee multi-tenancy rests on. Migrations
-  // need superuser and get it from MIGRATION_DATABASE_URL (scripts/migrate.ts
-  // falls back to the local superuser DSN when that is unset).
+  // Defaults to the restricted runtime role, so RLS applies by default.
+  // Do not default to a superuser. A superuser bypasses RLS, and tenant
+  // isolation depends on RLS.
+  // Migrations need a superuser. Set MIGRATION_DATABASE_URL to one.
+  // scripts/migrate.ts reads that variable.
   DATABASE_URL: z
     .string()
     .min(1)
@@ -86,10 +86,10 @@ export const envSchema = z.object({
   // Sonnet 5.5 do not).
   SESSION_TITLER_CLAUDE_MODEL: z.string().trim().min(1).default("claude-haiku-5-5"),
   SESSION_TITLER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
-  // Optional operator-run endpoint for small background LLM jobs (session
-  // titling today). When enabled, these jobs try the local endpoint FIRST and
-  // fall back to the provider APIs, so raw user prompts stay in-perimeter and
-  // titles work even for tenants without provider keys. Wire-format semantics
+  // Optional operator-run endpoint for small background LLM jobs (for example,
+  // session titling). When enabled, these jobs try the local endpoint first, then
+  // fall back to the provider APIs. Raw user prompts stay in-perimeter, and titles
+  // still work for tenants without provider keys. Wire-format semantics
   // match PII_LLM_WIRE_FORMAT: "ollama" hits <base>/api/chat (host root, no
   // /v1) and honors UTILITY_LLM_DISABLE_THINKING; "openai" hits
   // <base>/chat/completions (base ends in /v1).
@@ -113,24 +113,24 @@ export const envSchema = z.object({
   RUNTIME_TURN_TIMEOUT_MS: z.coerce.number().int().nonnegative().default(20 * 60 * 1000),
   // Lifetime of the HMAC-signed runtime token the runtime's MCP client
   // presents when calling back to /mcp/:serverId.
-  // Default: 24 hours. The token is the only thing tying a runtime to its
-  // tenant/user/session; if it leaks (workspace tarball, log line, snapshot)
-  // an attacker can call MCP tools for the bound session until expiry.
+  // The token is the only link between a runtime and its tenant, user, and
+  // session. If it leaks (workspace tarball, log line, snapshot), an attacker
+  // can call MCP tools for the bound session until it expires.
   //
   // The TTL must outlive the longest realistic session because the token is
   // minted once at session bootstrap and not refreshed for the lifetime of
   // the runtime — the MCP client pins its Authorization header at session
   // start, so an in-place refresh would require tearing down and rebuilding
   // the runtime mid-session.
-  // Idle timeout (RUNTIME_IDLE_TIMEOUT_MS, default 5 min) tears the runtime
-  // down on inactivity, but a session with a turn every few minutes can stay
-  // alive indefinitely. The sandbox lifetime is bounded by
-  // E2B_SANDBOX_TIMEOUT_MS (default 30 min).
+  // The idle timeout (RUNTIME_IDLE_TIMEOUT_MS) tears the runtime down when it
+  // is inactive. A session with a turn every few minutes can still stay alive
+  // indefinitely.
+  // E2B_SANDBOX_TIMEOUT_MS limits the sandbox lifetime.
   //
-  // 24 hours is the floor that comfortably exceeds long debugging sessions
-  // while still being 7x tighter than the previous 7-day default. Tighten to
-  // 1 hour (3600000) only if you accept that any session running continuously
-  // past that will fail with `runtime_token_expired` until it's restarted.
+  // 24 hours is the floor that comfortably exceeds long debugging sessions.
+  // Reduce this value to 1 hour (3600000) only if you accept this limit. A
+  // session that runs continuously for longer fails with `runtime_token_expired`
+  // until it restarts.
   RUNTIME_TOKEN_TTL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
   // Lifetime of the per-turn tool-execution context that the MCP gateway
   // resolves on every managed/proxy tool call. The gateway filters out expired
@@ -218,9 +218,9 @@ export const envSchema = z.object({
   // and tenant subject) to throttle probing of forged state values.
   OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
-  // Admin routes run the heaviest aggregate queries in the app and were
-  // previously unlimited — a compromised admin account could hammer them.
-  // Generous enough for normal dashboard use (many panels load in parallel).
+  // Admin routes run the heaviest aggregate queries in the app. A compromised
+  // admin account could hammer them without this limit. The limit is generous
+  // enough for normal dashboard use (many panels load in parallel).
   ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(300),
   ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(1000),
   // GET /auth/organizations makes one WorkOS API call per membership. Left
@@ -248,7 +248,7 @@ export const envSchema = z.object({
   // path is wired, even when SCHEDULER_ENABLED=false.
   PII_SCAN_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),
   // `jwt` authenticates every request with a backend-issued token; the login
-  // types it offers are in AUTH_LOGIN_TYPES. `workos` is the earlier name and
+  // types it offers are in AUTH_LOGIN_TYPES. `workos` is an alias and
   // means `jwt` with AUTH_LOGIN_TYPES=workos. loadConfig resolves it, so the
   // rest of the backend sees only `jwt` or `dev-headers`.
   AUTH_MODE: z.enum(["jwt", "workos", "dev-headers"]).default("dev-headers"),
@@ -293,8 +293,8 @@ export const envSchema = z.object({
   // touching the root secret that protects stored credentials. Unset falls back
   // to the derived value. It must be a value no upstream ever held.
   MCP_UPSTREAM_SIGNING_ROOT_SECRET: z.string().trim().min(32).optional(),
-  // v1 name of the override above. v1 upstreams held this value, and every
-  // v2 per-server key could be derived from it, so boot refuses it.
+  // Boot refuses this variable. Upstreams once held this value and could
+  // derive every per-server key from it. Use MCP_UPSTREAM_SIGNING_ROOT_SECRET.
   MCP_UPSTREAM_SIGNING_SECRET: z.string().optional(),
   // Per-hop wall-clock budget for a proxy MCP upstream call. An upstream with
   // no timeout can hold a turn open until the turn watchdog fires; 30s is well
@@ -338,18 +338,18 @@ export const envSchema = z.object({
   // clear error instead of an opaque Sandbox.create() failure.
   E2B_TEMPLATE_ID: z.string().trim().min(1).default("replace-with-your-template-id"),
   E2B_SANDBOX_TIMEOUT_MS: z.coerce.number().int().positive().default(30 * 60 * 1000),
-  // Per-execute() wall-clock budget for Deep Agents sandbox commands. The
-  // agent loop runs in the backend, so a runaway command (infinite loop,
-  // fork bomb) must be bounded at OUR layer — the sandbox-level
-  // E2B_SANDBOX_TIMEOUT_MS is a lifetime cap, not a per-command one.
+  // Per-execute() wall-clock budget for Deep Agents sandbox commands. The agent
+  // loop runs in the backend, so the backend must stop a runaway command (for
+  // example, an infinite loop or a fork bomb). E2B_SANDBOX_TIMEOUT_MS is a
+  // lifetime cap, not a per-command cap.
   DEEP_AGENTS_EXECUTE_TIMEOUT_MS: z.coerce.number().int().positive().default(2 * 60 * 1000),
-  // Network policy of a sandbox (VULN-13). The network of a sandbox is fixed when it
+  // Network policy of a sandbox. The network of a sandbox is fixed when it
   // is created. A new sandbox is read back from E2B before any command runs in it,
   // and at the first use of each turn the backend reads the live network of a sandbox
   // that it did not create in that turn and compares it with the policy as it is then.
   // This is the ONE deadline for the reads of that check, with their retries, and for
-  // the read of the policy. When it passes, the call fails and the sandbox is kept, so
-  // no command and no file operation runs on an unchecked network. Calls that arrive
+  // the read of the policy. When the deadline passes, the call fails and the sandbox is kept.
+  // No command or file operation then runs on an unchecked network. Calls that arrive
   // meanwhile share the same check, so the wait does not multiply with the number of calls.
   // The kill of a sandbox that does not match has a deadline of the same length: its tries
   // (the lease is checked before each) stop there, a kill that still fails is logged as an
@@ -389,7 +389,7 @@ export const envSchema = z.object({
   PII_LLM_WIRE_FORMAT: z.enum(["openai", "ollama"]).default("openai"),
   // Ollama-only: send `think:false` so reasoning-tuned models (e.g. the unsloth
   // Gemma-4 GGUFs) skip the thought channel. Measured ~40% faster on the
-  // homelab GTX 1070 with no loss of detection recall. Ignored for wire
+  // local GPU with no loss of detection recall. Ignored for wire
   // format "openai".
   PII_LLM_DISABLE_THINKING: booleanFromEnvSchema.default(false),
   PII_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
@@ -652,26 +652,20 @@ export function loadConfig(
         "RUNTIME_TURN_TIMEOUT_MS must be less than E2B_SANDBOX_TIMEOUT_MS — at or above it the sandbox dies before the watchdog can recover the turn."
       );
     }
-    // The per-turn tool-execution context must outlive the whole turn in WALL
-    // CLOCK, or a long turn loses managed MCP tool access mid-flight when the
-    // context expires at the gateway.
+    // The tool-execution context must outlive the whole turn in wall-clock time.
+    // Otherwise, a long turn loses managed MCP tool access mid-flight.
     //
-    // The bound is the watchdog budget PLUS one approval TTL, not the watchdog
-    // alone: the watchdog is paused while a human decides an approval (native
-    // HITL disarms it around awaitDecisions), so a turn can burn its full watchdog budget and
-    // still sit through an entire APPROVAL_REQUEST_TTL_MS on top. This TTL is
-    // wall-clock and does not pause, so comparing it to the watchdog alone
-    // accepts configurations that expire the context mid-turn.
+    // The bound is the watchdog budget plus one approval TTL. The watchdog pauses
+    // while a person decides an approval (the native HITL loop disarms it around
+    // awaitDecisions). A turn can therefore use its full watchdog budget and then
+    // wait through one more approval TTL. The context TTL does not pause, so the
+    // watchdog alone is not a safe bound.
     //
-    // This covers ONE approval, not N, and that is now sufficient. The approval
-    // round loop in DeepAgentsAGUIAgent is unbounded, so a turn's wall-clock
-    // length is really `working budget + N x APPROVAL_REQUEST_TTL_MS`, which no
-    // finite value here could ever bound. Rather than out-size it, the resume
-    // path extends the context on every approval round
-    // (ToolExecutionContextStore.extend), making the TTL an idle timeout
-    // between rounds. This check is the floor that idle timeout needs: each
-    // individual round must fit inside the TTL, which is exactly what the sum
-    // below guarantees.
+    // The approval round loop in DeepAgentsAGUIAgent has no fixed limit, so no
+    // fixed value can cover N approvals. The resume path extends the context on
+    // each approval round (ToolExecutionContextStore.extend). The TTL then acts as
+    // an idle timeout between rounds. The sum below ensures that each round fits
+    // inside the TTL.
     const maxTurnWallClockMs = parsed.RUNTIME_TURN_TIMEOUT_MS + parsed.APPROVAL_REQUEST_TTL_MS;
     if (parsed.TOOL_CONTEXT_TTL_MS <= maxTurnWallClockMs) {
       throw new Error(
@@ -679,13 +673,12 @@ export function loadConfig(
       );
     }
   } else {
-    // RUNTIME_TURN_TIMEOUT_MS=0 disables the watchdog, so a turn has NO ceiling
-    // and no finite TOOL_CONTEXT_TTL_MS can be validated against it — there is
-    // no correct number to require here. A turn that outlives the context TTL
-    // still loses managed MCP tool access mid-flight; that is the accepted
-    // consequence of turning the watchdog off, not an oversight. The schema
-    // field documents 0 as a deliberate escape hatch (wedged-turn recovery is
-    // then manual), so warn rather than reject.
+    // RUNTIME_TURN_TIMEOUT_MS=0 disables the watchdog, so a turn has no ceiling.
+    // No finite TOOL_CONTEXT_TTL_MS can outlast such a turn. A turn that
+    // outlives the context TTL still loses managed MCP tool access mid-flight.
+    // This is the accepted cost of turning the watchdog off. The schema field
+    // documents 0 as an escape hatch (wedged-turn recovery is then manual), so
+    // warn rather than reject.
     logger.warn(
       { toolContextTtlMs: parsed.TOOL_CONTEXT_TTL_MS },
       "RUNTIME_TURN_TIMEOUT_MS=0 disables the turn watchdog: turns have no ceiling, so a turn " +
@@ -734,18 +727,13 @@ export function loadConfig(
     );
   }
 
-  // dev-headers mode trusts X-User-Id / X-Tenant-Id from request headers, which
-  // lets any caller impersonate any user or tenant. It is intended for local
-  // development only and must never be active in production.
+  // dev-headers mode trusts X-User-Id / X-Tenant-Id request headers. Any caller
+  // can then impersonate any user or tenant. Use it for local development only.
   //
-  // FAIL-CLOSED on unrecognized environments: the previous guard did an exact
-  // `=== "production"` match, so any *other* value — "prod", "Production",
-  // "staging", a typo — silently left dev-headers active, a fail-open
-  // misconfiguration exposing full cross-tenant impersonation. The guard now
-  // keys on an allowlist of recognized non-production environments. Unset
-  // NODE_ENV is treated as development (the Node convention, and what `make dev`
-  // / the test runner rely on), but any non-empty value that is NOT a recognized
-  // dev/test value is treated as production and requires jwt auth.
+  // Fail closed on unrecognized environments. The guard allows only a fixed list
+  // of non-production values, so a typo such as "prod" cannot leave dev-headers
+  // on. An unset NODE_ENV counts as development, as `make dev` and the test
+  // runner expect. Any other non-empty value counts as production and needs jwt.
   const RECOGNIZED_NON_PROD_ENVS = new Set(["development", "dev", "test", ""]);
   const nodeEnv = typeof source.NODE_ENV === "string" ? source.NODE_ENV.trim().toLowerCase() : "";
   const isRecognizedNonProd = RECOGNIZED_NON_PROD_ENVS.has(nodeEnv);
@@ -821,8 +809,6 @@ export function loadConfig(
     );
   }
 
-  // Make the effective auth posture visible at boot so an operator can confirm
-  // it at a glance rather than inferring it from request behavior.
   logger.warn(
     { authMode, loginTypes, nodeEnv: source.NODE_ENV ?? "(unset)", devHeadersTrusted: authMode !== "jwt" },
     authMode === "jwt"
@@ -873,19 +859,14 @@ export function loadConfig(
     }
   }
 
-  // Set E2B_TEMPLATE_ID via env after running `make e2b-build` — booting
-  // against E2B with the placeholder default would fail opaquely in
-  // `Sandbox.create()`, so we surface a clearer error here. The Deep Agents
-  // runtime executes shell/file tools exclusively inside E2B sandboxes —
-  // there is no in-process local execution mode — so E2B is required at
-  // boot, unconditionally.
+  // The placeholder E2B_TEMPLATE_ID would fail opaquely in `Sandbox.create()`, so
+  // this check gives a clearer error at boot. The Deep Agents runtime runs shell
+  // and file tools only inside E2B sandboxes, and it has no local execution mode.
+  // E2B is therefore required at boot unless skipRuntimeChecks is set.
   const e2bTemplateIdLooksUnset =
     !parsed.E2B_TEMPLATE_ID || parsed.E2B_TEMPLATE_ID === "replace-with-your-template-id";
 
-  // Runtime-only validations: these only matter when the backend actually
-  // serves agent traffic. The migration runner passes skipRuntimeChecks so it
-  // can run with nothing but a DATABASE_URL — migrations never touch E2B, the
-  // MCP gateway, or PII detection.
+  // Runtime-only checks. skipRuntimeChecks turns them off for the migration runner.
   if (!opts.skipRuntimeChecks) {
     if (!parsed.E2B_API_KEY) {
       throw new Error(

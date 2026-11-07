@@ -1,6 +1,5 @@
-// Shared schemas, range resolution, and types used by the admin-pii routes
-// and their SQL query helpers. Extracted from admin-pii-routes.ts so the
-// route file stays focused on registration + handlers.
+// Shared schemas, range resolution, and types used by the admin PII routes
+// and their SQL query helpers.
 
 import { z } from "zod";
 
@@ -115,8 +114,6 @@ export function resolveRange(query: RangeQuery, now: Date = new Date()): Resolve
     prevTo: from
   };
 }
-
-// ── Query result row types ──────────────────────────────────────────────────
 
 export type Kpi = { current: number; previous: number };
 export type KpiDeltas = {

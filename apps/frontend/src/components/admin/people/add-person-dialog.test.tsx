@@ -29,7 +29,6 @@ async function submitForm(dialog: HTMLElement, email: string, role?: string) {
   return screen.findByRole("dialog", { name: /^Add .*\?$/ });
 }
 
-/** Types the manager's password in the step-up dialog and confirms. */
 async function confirmWithPassword(stepUpDialog: HTMLElement) {
   fireEvent.change(await within(stepUpDialog).findByLabelText("Your password"), { target: { value: "manager password" } });
   const confirm = within(stepUpDialog).getByRole("button", { name: "Add person" }) as HTMLButtonElement;
