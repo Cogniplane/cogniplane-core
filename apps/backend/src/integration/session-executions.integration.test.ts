@@ -99,6 +99,80 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(await record()).toEqual(saved("sandbox-two", "policy-b"));
   });
 
+  // Issue #20: the runtime releases the record of a sandbox under the lease before it kills it. After that,
+  // the next owner loads no sandbox and cannot adopt the one with the kill in flight. A stale owner cannot release.
+  test("the sandbox record is released only under a current lease, and the next owner then loads no sandbox", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser();
+    await seedMembership(tenantId, userId);
+    const sessionId = await seedSession(tenantId, userId);
+    const actor = { tenantId, sessionId, userId };
+    const first = new SessionExecutionStore(appPool(), "replica-a");
+    const second = new SessionExecutionStore(appPool(), "replica-b");
+    const firstTurn = await first.acquire(actor, 30_000);
+    await first.bindSandboxId(firstTurn, null, "sandbox-one", "policy-a");
+
+    // Another replica, and the owner with a sandbox that the record does not name, release nothing.
+    await expect(first.releaseSandboxId({ ...firstTurn, ownerId: "replica-b" }, "sandbox-one"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    await expect(first.releaseSandboxId(firstTurn, "sandbox-zero"))
+      .rejects.toMatchObject({ code: "execution_stopped", statusCode: 403 });
+    expect(await first.sandboxBinding(firstTurn)).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+
+    await first.releaseSandboxId(firstTurn, "sandbox-one");
+    expect(await first.sandboxBinding(firstTurn)).toBeNull();
+
+    // The lease passes to the next owner, which finds no sandbox to adopt and saves its own over no record.
+    await first.release(firstTurn);
+    const secondTurn = await second.acquire(actor, 30_000);
+    expect(await second.sandboxBinding(secondTurn)).toBeNull();
+    await second.bindSandboxId(secondTurn, null, "sandbox-two", "policy-a");
+    // The former owner cannot release the sandbox of the next owner.
+    await expect(first.releaseSandboxId(firstTurn, "sandbox-two"))
+      .rejects.toMatchObject({ code: "execution_stopped" });
+    expect(await second.sandboxBinding(secondTurn)).toEqual({ sandboxId: "sandbox-two", networkPolicyHash: "policy-a" });
+  });
+
+  // A record write that waits behind the session row lock while the lease changes must check the lease
+  // after the wait, not with the snapshot from before it (an UPDATE ... FROM checks the joined
+  // execution row only at its first snapshot). Found in review of issue #20.
+  test.each(["release", "bind"] as const)(
+    "a %s that waited behind the session lock is refused when the lease ended meanwhile", async (write) => {
+      const tenantId = await seedTenant(), userId = await seedUser();
+      await seedMembership(tenantId, userId);
+      const sessionId = await seedSession(tenantId, userId);
+      const owner = new SessionExecutionStore(appPool(), "replica-a");
+      const execution = await owner.acquire({ tenantId, sessionId, userId }, 30_000);
+      await owner.bindSandboxId(execution, null, "sandbox-one", "policy-a");
+
+      // Another transaction holds the session row, as an admission does while the lease changes owner.
+      const holder = await superuserPool().connect();
+      try {
+        await holder.query("BEGIN");
+        await holder.query("SELECT 1 FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
+        const pending = (write === "release"
+          ? owner.releaseSandboxId(execution, "sandbox-one")
+          : owner.bindSandboxId(execution, "sandbox-one", "stale-sandbox", "policy-b")
+        ).then(() => "written", (error: unknown) => error);
+        // The write is blocked on the session row.
+        await vi.waitFor(async () => {
+          const waiting = await superuserPool().query(
+            "SELECT count(*)::int AS n FROM pg_stat_activity WHERE wait_event_type='Lock' AND query ILIKE '%sessions%'");
+          expect(waiting.rows[0].n).toBeGreaterThan(0);
+        }, { timeout: 5_000 });
+        // While it waits, the lease of the writer ends.
+        await holder.query("UPDATE session_executions SET status='stopped', stop_reason='lease_expired' WHERE execution_id=$1",
+          [execution.executionId]);
+        await holder.query("COMMIT");
+
+        expect(await pending).toMatchObject({ code: "execution_stopped", statusCode: 403 });
+      } finally {
+        holder.release();
+      }
+      const record = await superuserPool().query("SELECT sandbox_id FROM sessions WHERE tenant_id=$1 AND session_id=$2",
+        [tenantId, sessionId]);
+      expect(record.rows[0].sandbox_id).toBe("sandbox-one");
+    });
+
   test("standalone admission, owner lookup, and limits work across replicas", async () => {
     const tenantId = await seedTenant(), userId = await seedUser();
     await seedMembership(tenantId, userId);

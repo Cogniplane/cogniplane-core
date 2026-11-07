@@ -226,6 +226,15 @@ function leasePool(live: LiveExecution) {
       live.networkPolicy = JSON.parse(String(policy));
       return one({ session_id: actor.sessionId });
     })
+    // The session row lock that every sandbox record write takes before it checks the lease.
+    .onQuery("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
+      () => one({ session_id: actor.sessionId }))
+    .onQuery("SET sandbox_network_policy=NULL, sandbox_id=NULL", (_sql, [, , executionId, ownerId, userId, sandboxId]) => {
+      if (!owns(executionId, userId, ownerId) || sandboxId !== live.sandboxId) return none;
+      live.sandboxId = null;
+      live.networkPolicy = null;
+      return one({ session_id: actor.sessionId });
+    })
     .onQuery("SET runtime_id=$4", (_sql, [, executionId, userId, runtimeId]) => {
       if (!owns(executionId, userId) || (live.runtimeId !== null && live.runtimeId !== runtimeId)) return none;
       live.runtimeId = String(runtimeId);
@@ -262,6 +271,22 @@ describe("SessionExecutionStore fencing", () => {
     await expect(store.bindSandboxId(execution, null, "sandbox-2", "hash-a")).rejects.toMatchObject({ code: "execution_stopped" });
     await expect(store.sandboxBinding({ ...execution, ownerId: "owner-b" })).rejects.toMatchObject({ code: "execution_stopped" });
     expect(live.sandboxId).toBe("sandbox-1");
+  });
+
+  test("releases the sandbox record only for the owning replica and the sandbox that it names", async () => {
+    const live: LiveExecution = { executionId: "execution-1", userId: "user-1", ownerId: "owner-a", runtimeId: null, sandboxId: null };
+    const store = new SessionExecutionStore(leasePool(live).asPool(), "owner-a");
+    await store.bindSandboxId(execution, null, "sandbox-1", "hash-a");
+
+    await expect(store.releaseSandboxId({ ...execution, ownerId: "owner-b" }, "sandbox-1")).rejects.toMatchObject({ code: "execution_stopped" });
+    await expect(store.releaseSandboxId(execution, "sandbox-0")).rejects.toMatchObject({ code: "execution_stopped" });
+    expect(live.sandboxId).toBe("sandbox-1");
+
+    await store.releaseSandboxId(execution, "sandbox-1");
+    expect(await store.sandboxBinding(execution)).toBeNull();
+    // The next sandbox is saved over no record.
+    await store.bindSandboxId(execution, null, "sandbox-2", "hash-b");
+    expect(live.sandboxId).toBe("sandbox-2");
   });
 
   test("reads the policy hash as unknown when the record names another sandbox or is missing", async () => {

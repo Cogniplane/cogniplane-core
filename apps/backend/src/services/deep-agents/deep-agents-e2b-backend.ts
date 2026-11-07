@@ -735,6 +735,23 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   }
 
   /**
+   * Removes the record of a sandbox before its kill, limited in time like the lease
+   * check. A refusal or a timeout fails closed: the sandbox is kept and not killed.
+   */
+  private async releaseRecord(binding: DeepAgentsSandboxBinding, sandboxId: string, deadline: Deadline): Promise<void> {
+    try {
+      await this.bounded(deadline, () => binding.release(sandboxId));
+    } catch (error) {
+      if (error instanceof SandboxNetworkPolicyUnconfirmedError) throw error;
+      this.options.logger.warn(
+        { err: error, sessionId: this.options.sessionId, sandboxId },
+        "Deep Agents E2B sandbox not replaced: its record could not be released under the session lease"
+      );
+      throw new SandboxNetworkPolicyUnconfirmedError("ownership of the session could not be confirmed", { cause: error });
+    }
+  }
+
+  /**
    * Drops a sandbox that does not match the policy, or that is gone. The next
    * round of acquireSandbox creates its replacement. A sandbox that exists is
    * killed first (with retries), and only while the session lease is current: if
@@ -742,6 +759,19 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
    * owns the session now. If the kill still fails after the retries, it is logged
    * as an error, and the sandbox is replaced all the same: the old one then runs
    * until the provider expires it, and its processes keep the network that it had.
+   *
+   * With a saved record (sandboxBinding), the order is durable (issue #20): the lease
+   * check, then the release of the record under the lease, then the kill. A lease check
+   * before the kill is not sufficient alone, because the next owner could load the
+   * record and adopt the sandbox while the kill is in flight. After the release, no
+   * owner loads this sandbox, so the tries of the kill need no more lease checks, and
+   * they continue when the turn ends: the sandbox is of no use to anyone. Recovery:
+   * - The release is refused (lease lost, or the record names another sandbox): no
+   *   kill is sent, and the sandbox stays for the owner of the record. That owner
+   *   compares it with the policy at its first use, and replaces it under its own lease.
+   * - The process stops after the release, or every try of the kill fails: the
+   *   sandbox has no record, so nobody adopts it, and the provider ends it at its
+   *   lifetime cap (sandboxTimeoutMs). Only the sandbox of the record is extended.
    */
   private async retireSandbox(
     bound: Promise<E2bSandboxLike>,
@@ -751,12 +781,20 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   ): Promise<void> {
     if (reason === "network_policy") {
       const deadline = this.confirmationDeadline();
-      // The lease and the turn are checked again before every try, so that a try that
-      // comes after a delay does not kill the sandbox of the runtime that owns the session now.
-      await this.killWithRetries(sandbox, deadline, "replaced", async () => {
+      const binding = this.options.sandboxBinding;
+      if (binding) {
         await this.fence(deadline);
         this.requireLive(turn);
-      });
+        await this.releaseRecord(binding, sandbox.sandboxId, deadline);
+        await this.killWithRetries(sandbox, deadline, "replaced");
+      } else {
+        // No record: no other owner can find this sandbox. The lease and the turn are
+        // checked again before every try, as before.
+        await this.killWithRetries(sandbox, deadline, "replaced", async () => {
+          await this.fence(deadline);
+          this.requireLive(turn);
+        });
+      }
     }
     // Another caller may have replaced the memo already. Only its own sandbox is dropped.
     if (this.sandboxPromise === bound) {
@@ -997,7 +1035,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   //   glob     1 execute (find)                          read only        one step
   //   write    1 uploadFiles                             writes           one step
   //   edit     downloadFiles, then uploadFiles           read, then write several steps: bound to one turn
-  //   delete   execute (test -e), then execute (rm -rf)  check, then rm  several steps: bound to one turn
+  //   delete   overridden: 1 execute (confined cd + rm)  check and rm    one step (see delete below)
   //
   // The test "methods inherited from BaseSandbox" repeats this table against the installed
   // package: a method that was added, or a method that gained a step, fails it.
@@ -1026,14 +1064,18 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
     return super.read(remapped, offset, limit);
   }
 
+  // maxCount is the cap of the SDK contract on the matches returned. BaseSandbox
+  // applies it after the search, and flags the result `truncated` when it cuts.
+  // An omitted cap (undefined or null) keeps every match, as in the SDK.
   override async grep(
     pattern: string,
     dirPath?: string | null,
-    glob?: string | null
+    glob?: string | null,
+    maxCount?: number | null
   ): Promise<GrepResult> {
     const base = dirPath == null ? this.options.workspacePath : this.tryRemap(dirPath);
     if (base === null) return { error: OUTSIDE_WORKSPACE_ERROR };
-    return super.grep(pattern, base, glob);
+    return super.grep(pattern, base, glob, maxCount);
   }
 
   override async glob(pattern: string, dirPath?: string): Promise<GlobResult> {
@@ -1058,19 +1100,38 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   }
 
   /**
-   * delete asks whether the path exists, awaits, and then removes it with `rm -rf`: two commands,
-   * and the second one deletes. Like edit, it runs on a view bound to the turn taken now, so the
-   * `rm` of a turn that is over does not delete what the next turn wrote. The path is remapped into
-   * the workspace as for the other tools: BaseSandbox puts it into the command as it is, so
-   * "/notes.txt" named the root of the sandbox here and not the file that write_file made, and
-   * a path outside the workspace was removed. The result names the path that the model gave.
+   * delete does not use BaseSandbox.delete. That method runs `test -e`, awaits, and then runs
+   * `rm -rf` on the path text. The text check of toSandboxPath does not resolve symlinks, so a
+   * directory in the path that is a symlink to a location outside the workspace sent the `rm`
+   * outside it (issue #18), and the path could change between the two commands.
+   *
+   * This override sends one command (confinedDeleteCommand). The shell enters the parent
+   * directory with `cd -P`, which resolves each symlink, and compares that physical directory
+   * with the physical workspace. Then it removes the last component relative to that directory.
+   * The check and the `rm` run in the same process, and the `rm` does not read the path text
+   * again: a symlink that is changed after the `cd` has no effect on it. `rm` removes a symlink in
+   * the last component, not its target, and does not follow symlinks below a directory.
+   *
+   * Residual limit: a process in the sandbox that renames the parent directory out of the
+   * workspace after the check, and before the `rm`, moves the `rm` with it. The model can run any
+   * shell command in this sandbox, so this guard keeps the delete tool on the workspace. It is not
+   * a boundary against a hostile process in the same sandbox.
+   *
+   * The path is remapped into the workspace as for the other tools, and the result names the
+   * path that the model gave. The call takes its turn when it is called, as for one step.
    */
   override async delete(filePath: string): Promise<DeleteResult> {
-    const scoped = this.scopedToCurrentTurn();
+    const turn = this.currentTurn();
     const remapped = this.tryRemap(filePath);
     if (remapped === null) return { error: OUTSIDE_WORKSPACE_ERROR };
-    const result = await super.delete.call(scoped, remapped);
-    return result.path === undefined ? result : { ...result, path: filePath };
+    if (remapped === path.posix.resolve(this.options.workspacePath)) {
+      return { error: "The session workspace root cannot be deleted" };
+    }
+    const result = await this.executeIn(turn, confinedDeleteCommand(this.options.workspacePath, remapped));
+    if (result.exitCode === 0) return { path: filePath, filesUpdate: null };
+    if (result.exitCode === DELETE_NOT_FOUND_EXIT) return { error: `Error: '${filePath}' not found` };
+    if (result.exitCode === DELETE_OUTSIDE_WORKSPACE_EXIT) return { error: OUTSIDE_WORKSPACE_ERROR };
+    return { error: `Error deleting file '${filePath}': ${result.output.trim() || "unknown error"}` };
   }
 
   /**
@@ -1306,4 +1367,32 @@ function isPermissionError(err: unknown): boolean {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Exit code of confinedDeleteCommand when the path, or a directory of it, does not exist. */
+const DELETE_NOT_FOUND_EXIT = 3;
+/** Exit code of confinedDeleteCommand when the physical parent directory is outside the workspace. */
+const DELETE_OUTSIDE_WORKSPACE_EXIT = 4;
+
+/**
+ * One POSIX shell command that deletes `target` only when its physical parent directory is the
+ * workspace or below it (see E2bDeepAgentsSandbox.delete). `target` is an absolute, normalized
+ * path below the workspace root, from toSandboxPath. The exit codes 3 and 4 do not collide
+ * with the exit code of `rm` (1 on failure).
+ */
+export function confinedDeleteCommand(workspacePath: string, target: string): string {
+  const parent = path.posix.dirname(target);
+  const name = path.posix.basename(target);
+  return [
+    // After `cd -P`, $PWD is the physical directory, exactly. `$(pwd -P)` is not:
+    // command substitution strips trailing newlines, so a sibling named "workspace\n"
+    // would read as the workspace itself.
+    `cd -P -- ${shellQuote(workspacePath)} 2>/dev/null || exit ${DELETE_NOT_FOUND_EXIT}`,
+    `root=$PWD`,
+    `cd -P -- ${shellQuote(parent)} 2>/dev/null || exit ${DELETE_NOT_FOUND_EXIT}`,
+    `here=$PWD`,
+    `case "$here/" in "$root/"*) ;; *) exit ${DELETE_OUTSIDE_WORKSPACE_EXIT} ;; esac`,
+    `[ -e ${shellQuote(name)} ] || [ -L ${shellQuote(name)} ] || exit ${DELETE_NOT_FOUND_EXIT}`,
+    `rm -rf -- ${shellQuote(name)}`
+  ].join("\n");
 }

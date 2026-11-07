@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg";
 import { withTenantScope, type Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
@@ -45,6 +46,19 @@ export function interactiveContextExecutionSql(context: string): string {
       )))`;
 }
 
+/**
+ * Locks the session row before a write of its sandbox record checks the lease. An
+ * `UPDATE sessions ... FROM session_executions` takes its snapshot before it waits for
+ * the session row lock, and after the wait it checks again only the session row, not
+ * the execution row. An admission holds that lock while the lease changes owner, so a
+ * write that waited behind it could pass the lease check of the old owner. After this
+ * lock, the next statement takes a new snapshot (READ COMMITTED) and sees the current lease.
+ */
+async function lockSessionRow(db: Pick<PoolClient, "query">, execution: ExecutionActor): Promise<void> {
+  await db.query("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
+    [execution.tenantId, execution.sessionId]);
+}
+
 export class SessionExecutionStore {
   constructor(private readonly pool: Pool, readonly ownerId = uuidv7()) {}
 
@@ -80,6 +94,7 @@ export class SessionExecutionStore {
     execution: SessionExecution, previousId: string | null, sandboxId: string, networkPolicyHash: string
   ): Promise<void> {
     await withTenantScope(this.pool, execution.tenantId, async db => {
+      await lockSessionRow(db, execution);
       const result = await db.query(`UPDATE sessions s SET sandbox_id=$6, sandbox_network_policy=$8::jsonb
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
           AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
@@ -90,6 +105,32 @@ export class SessionExecutionStore {
         RETURNING s.session_id`,
       [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId,
         execution.userId, sandboxId, previousId, JSON.stringify({ sandboxId, hash: networkPolicyHash })]);
+      if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
+    });
+  }
+
+  /**
+   * Removes the record of `sandboxId` from the session before the runtime kills that
+   * sandbox (issue #20). The write is under the session lease, and it applies only
+   * while the record still names that sandbox. After it commits, no owner loads the
+   * sandbox, so no owner adopts a sandbox that has a kill in flight. It throws when
+   * the lease is lost or the record names another sandbox: the caller then does not
+   * send the kill.
+   */
+  async releaseSandboxId(execution: SessionExecution, sandboxId: string): Promise<void> {
+    await withTenantScope(this.pool, execution.tenantId, async db => {
+      await lockSessionRow(db, execution);
+      // The SET list starts with sandbox_network_policy, so the text is not a prefix of the bindSandboxId statement.
+      const result = await db.query(`UPDATE sessions s SET sandbox_network_policy=NULL, sandbox_id=NULL
+        FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
+          AND s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
+          AND e.owner_id=$4 AND e.user_id=$5 AND e.status='active'
+          AND e.expires_at>clock_timestamp() AND s.project_id IS NULL
+          AND s.status='active' AND s.sandbox_id=$6
+          AND ${sessionExecutionAccessSql("s", "e.user_id")}
+        RETURNING s.session_id`,
+      [execution.tenantId, execution.sessionId, execution.executionId, execution.ownerId,
+        execution.userId, sandboxId]);
       if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
     });
   }
