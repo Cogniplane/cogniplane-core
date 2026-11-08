@@ -16,6 +16,7 @@ import {
 import { PERMANENT_PII_ERROR_CODES } from "./pii-scan-job-handler.js";
 import type { PiiScanJobMode, PiiScanJobStore } from "./pii-scan-job-store.js";
 import type { PiiScanRunStore } from "./pii-scan-run-store.js";
+import { imageCoverageDetail, type ImageCoverageDetail } from "./scannable-text.js";
 
 const PII_ENQUEUE_FAILED = "pii_enqueue_failed";
 
@@ -184,9 +185,11 @@ export class PiiArtifactScanEnqueuer {
         input.read
       );
 
+      // A scan that applied mode off read nothing, so no coverage applies.
+      const coverage = appliedPolicy.mode === "off" ? {} : imageCoverageDetail(subject.imageCoverage?.());
       return decision.action === "block"
-        ? await this.handleBlockDecision(input, scanRun.scanRunId, decision, appliedPolicy)
-        : await this.handleAllowDecision(input, scanRun.scanRunId, decision, appliedPolicy, subject.imagesNotScanned?.() ?? false);
+        ? await this.handleBlockDecision(input, scanRun.scanRunId, decision, appliedPolicy, coverage)
+        : await this.handleAllowDecision(input, scanRun.scanRunId, decision, appliedPolicy, coverage);
     } catch (error) {
       return this.handleProviderError(input, scanRun.scanRunId, error);
     }
@@ -214,7 +217,8 @@ export class PiiArtifactScanEnqueuer {
     input: SyncScanInput,
     scanRunId: string,
     decision: Extract<PiiDecision, { action: "block" }>,
-    applied: PiiAppliedPolicy
+    applied: PiiAppliedPolicy,
+    coverage: ImageCoverageDetail
   ): Promise<PiiArtifactScanResult> {
     // Purge the stored bytes BEFORE flipping to a terminal `blocked` state, so
     // a terminal status never coexists with a silent orphan: if the delete
@@ -242,7 +246,8 @@ export class PiiArtifactScanEnqueuer {
       policyRevision: applied.revision,
       scanRunId,
       blockReason: decision.blockReason,
-      findingsCount: decision.findings.length
+      findingsCount: decision.findings.length,
+      ...coverage
     });
     await this.emitAudit(input, "pii_blocked", {
       scanRunId,
@@ -300,7 +305,7 @@ export class PiiArtifactScanEnqueuer {
     scanRunId: string,
     decision: Exclude<PiiDecision, { action: "block" }>,
     applied: PiiAppliedPolicy,
-    imagesNotScanned: boolean
+    coverage: ImageCoverageDetail
   ): Promise<PiiArtifactScanResult> {
     const findingsCount =
       decision.action === "report" ? decision.findings.length : 0;
@@ -319,7 +324,7 @@ export class PiiArtifactScanEnqueuer {
       policyRevision: applied.revision,
       scanRunId,
       findingsCount,
-      ...(imagesNotScanned ? { imagesNotScanned: true } : {})
+      ...coverage
     });
     return { kind: "allowed", scanRunId };
   }

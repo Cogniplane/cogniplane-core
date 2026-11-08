@@ -8,7 +8,7 @@ decisions to make.
 
 | Component | Requirement |
 |---|---|
-| Backend | The [Node.js version](getting-started.md#prerequisites) and Poppler `pdftotext`; the backend image includes both. Keeps only caches and running turns in memory |
+| Backend | The [Node.js version](getting-started.md#prerequisites) and Poppler `pdftotext`; the backend image includes both. For PDF OCR, also Poppler `pdfinfo` and `pdftoppm`, and Tesseract with its language data; the image includes English. Keeps only caches and running turns in memory |
 | Frontend | Next.js; any Next.js host. This repository builds for Cloudflare Workers (`pnpm --filter @cogniplane/frontend cf:build`) |
 | PostgreSQL | 17 (the version CI and Compose use), with RLS. All durable state except stored files |
 | Redis | Required with `AUTH_MODE=jwt` ([startup rules](configuration.md#startup-rules)). One dedicated database per environment ([contents](architecture/data.md#redis)) |
@@ -112,7 +112,11 @@ API_ORIGIN=https://app.example.com   # the frontend origin; exactly one origin
   ([model providers](architecture/models.md#model-providers)). Provider terms
   apply to each key owner.
 - PII: `PII_PROVIDER_ENABLED`, `PII_LLM_*`; `PII_RETENTION_KEK` when a tenant
-  keeps reversible findings. See [PII](architecture/pii.md).
+  keeps reversible findings; `PII_PDF_OCR_*` to scan the page images of PDFs.
+  OCR uses CPU on the backend and can make a block-mode PDF upload wait up to
+  `PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS`. Another OCR language
+  needs its `tesseract-ocr-<lang>` package in the image. See
+  [PII](architecture/pii.md#pdf-ocr).
 - Workers: `SCHEDULER_*`. Many replicas can run them.
 - Spending defaults: `MODEL_SPENDING_*` ([model
   spending](architecture/model-spending.md)).

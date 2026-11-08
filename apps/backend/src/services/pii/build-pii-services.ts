@@ -6,6 +6,7 @@ import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { TenantOrgSettingsStore } from "../tenant-org-settings-store.js";
 
 import { OpenAiCompatiblePiiProvider } from "./openai-compatible-pii-provider.js";
+import { createPdfOcr } from "./pdf-ocr.js";
 import {
   DisabledPiiCircuitBreaker,
   createPiiCircuitBreaker,
@@ -70,6 +71,21 @@ export function buildPiiServices(input: {
       })
     : undefined;
 
+  // Local OCR of PDF pages. Off by default: the scan reads only PDF text.
+  const pdfOcr = config.PII_PDF_OCR_ENABLED
+    ? createPdfOcr({
+        pdfinfoPath: config.PDFINFO_BINARY_PATH,
+        pdftoppmPath: config.PDFTOPPM_BINARY_PATH,
+        tesseractPath: config.TESSERACT_BINARY_PATH,
+        languages: config.PII_PDF_OCR_LANGUAGES,
+        maxPages: config.PII_PDF_OCR_MAX_PAGES,
+        timeoutMs: config.PII_PDF_OCR_TIMEOUT_MS,
+        maxConcurrent: config.PII_PDF_OCR_MAX_CONCURRENT,
+        maxTextBytes: config.PII_ARTIFACT_MAX_BYTES,
+        logger
+      })
+    : undefined;
+
   const piiSubjectReader = new DatabasePiiScanSubjectReader({
     db,
     artifacts: stores.artifacts,
@@ -77,7 +93,8 @@ export function buildPiiServices(input: {
     // Same source as the service-level cap, so the stream-time guard never
     // rejects an artifact the configured policy would otherwise allow.
     maxBytes: config.PII_ARTIFACT_MAX_BYTES,
-    extractPdfText
+    extractPdfText,
+    ocrPdf: pdfOcr
   });
 
   const findingEncryptor = config.PII_RETENTION_KEK
@@ -90,6 +107,7 @@ export function buildPiiServices(input: {
     provider: piiProvider,
     timeoutMs: config.PII_PROVIDER_TIMEOUT_MS,
     artifactMaxBytes: config.PII_ARTIFACT_MAX_BYTES,
+    ...(pdfOcr ? { pdfOcrBudgetMs: config.PII_PDF_OCR_TIMEOUT_MS } : {}),
     csvPreviewRows: config.PII_CSV_PREVIEW_ROWS,
     csvPreviewMaxBytes: config.PII_CSV_PREVIEW_MAX_BYTES,
     findingEncryptor,
@@ -122,5 +140,5 @@ export function buildPiiServices(input: {
     importScopes
   });
 
-  return { piiProtection, piiCircuitBreaker, piiScanJobHandler, piiScanEnqueuer };
+  return { piiProtection, piiCircuitBreaker, piiScanJobHandler, piiScanEnqueuer, pdfOcr };
 }

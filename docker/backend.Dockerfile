@@ -36,9 +36,10 @@ WORKDIR /app
 ENV BUILD_SHA=$BUILD_SHA
 ENV BUILD_DATE=$BUILD_DATE
 
-# Project PDF previews invoke pdftotext at request time.
+# Project PDF previews invoke pdftotext at request time. PDF OCR for the PII
+# scan (PII_PDF_OCR_ENABLED) uses pdfinfo, pdftoppm and tesseract.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends poppler-utils \
+  && apt-get install -y --no-install-recommends poppler-utils tesseract-ocr tesseract-ocr-eng \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/backend/node_modules apps/backend/node_modules

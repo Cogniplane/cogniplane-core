@@ -1,7 +1,8 @@
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
-import type { PiiScanArtifactInput } from "./pii-provider.js";
+import type { PdfOcr } from "./pdf-ocr.js";
+import type { PdfImageCoverage, PiiScanArtifactInput } from "./pii-provider.js";
 import type { PiiScanSubjectReader } from "./pii-scan-job-handler.js";
 import { toScannableText, type PdfTextExtractor } from "./scannable-text.js";
 import { withTenantScope, type Pool } from "../../lib/db.js";
@@ -24,6 +25,8 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
       maxBytes?: number;
       /** Without it, PDF uploads are rejected as unscannable. */
       extractPdfText?: PdfTextExtractor;
+      /** Without it, the scan reads only the text of a PDF. */
+      ocrPdf?: PdfOcr;
     }
   ) {}
 
@@ -50,7 +53,8 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
     const artifact = await this.deps.artifacts.get(input.tenantId, input.artifactId);
     if (!artifact) return null;
 
-    const { storage, extractPdfText } = this.deps;
+    const { storage, extractPdfText, ocrPdf } = this.deps;
+    let imageCoverage: PdfImageCoverage | undefined;
     const maxBytes = this.deps.maxBytes ?? ARTIFACT_READ_MAX_BYTES;
     // `entityTypes` on the input is part of the provider contract but the
     // protection service resolves the effective list from tenant settings —
@@ -59,10 +63,10 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
       artifactId: artifact.artifactId,
       contentType: artifact.mimeType,
       entityTypes: [],
-      // A PDF is scanned through its extracted text only. Image detection
-      // in PDFs is not reliable (an undrawn or broken image is not listed),
-      // so every PDF verdict is marked as text-only.
-      imagesNotScanned: () => isPdf(artifact.mimeType),
+      // Set by `readContent`. Without OCR, every PDF verdict is text-only:
+      // image detection in PDFs is not reliable (an undrawn or broken image
+      // is not listed). With OCR, the OCR pass reads every page it can.
+      imageCoverage: () => imageCoverage,
       async readContent(signal?: AbortSignal) {
         const handle = await storage.openReadStream(artifact.storageKey);
         const chunks: Buffer[] = [];
@@ -84,12 +88,10 @@ export class DatabasePiiScanSubjectReader implements PiiScanSubjectReader {
           }
           chunks.push(buf);
         }
-        return toScannableText(artifact.mimeType, Buffer.concat(chunks), extractPdfText, signal);
+        const scannable = await toScannableText(artifact.mimeType, Buffer.concat(chunks), { extractPdfText, ocrPdf }, signal);
+        imageCoverage = scannable.imageCoverage;
+        return scannable.text;
       }
     };
   }
-}
-
-function isPdf(contentType: string): boolean {
-  return (contentType.toLowerCase().split(";")[0]?.trim() ?? "") === "application/pdf";
 }

@@ -57,13 +57,66 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   `PII_SCAN_MAX_CONCURRENT_JOBS` per worker tick. A file larger than
   `PII_ARTIFACT_MAX_BYTES` fails with `file_too_large` and is not retried.
   Scannable text: plain and structured text, shell scripts, and PDF text through
-  `pdftotext` (`scannable-text.ts`). A PDF without text is rejected; PDF images
-  are not scanned (`imagesNotScanned: true`). With the uploads scope on, images
-  and Office files are rejected (`unsupported_mime`).
+  `pdftotext` (`scannable-text.ts`). With the uploads scope on, images and
+  Office files are rejected (`unsupported_mime`). For PDF images, see [PDF
+  OCR](#pdf-ocr).
 - A queued scan applies the policy current when it runs and records the mode and
   settings revision it read. It records its decision on the scan run
   (`pending_decision`, migration `084`) before it acts; a retry finishes that
   decision and does not evaluate again.
+
+## PDF OCR
+
+`PII_PDF_OCR_ENABLED` is off by default. When it is off, the scan reads only the
+PDF text, a PDF without text is rejected (`pdf_extraction_failed`), and each PDF
+verdict stores `imagesNotScanned: true` (UI: "(text only)").
+
+When it is on, the PII scan of an uploaded or imported PDF also runs OCR
+(`services/pii/pdf-ocr.ts`). Project drafts do not get OCR yet, because their
+image coverage is not stored.
+
+- Location: the backend host. `pdfinfo` reads the page count, `pdftoppm` renders
+  one page at a time (300 DPI, grayscale, longest side 3508 px), and `tesseract`
+  reads it (`PII_PDF_OCR_LANGUAGES`). No content goes to an additional service.
+  The OCR text goes to the same rules and PII provider as the PDF text.
+- Processes: fixed argv, no shell, an environment with only `PATH`, `HOME` and
+  `TESSDATA_PREFIX`, stdin and stderr ignored, 1 MiB stdout cap, SIGKILL on a
+  timeout or abort. A slot frees only after the process exits. Errors keep only
+  the step name: logs and stored errors never hold tool output or OCR text.
+- Data: page images are in a private temporary directory, removed after each
+  PDF. The OCR text stays in memory. Findings follow the retention policy.
+- Limits: `PII_PDF_OCR_MAX_PAGES` pages; `PII_PDF_OCR_TIMEOUT_MS` per PDF,
+  including the wait for one of `PII_PDF_OCR_MAX_CONCURRENT` slots per process;
+  eight waiters per slot, then `busy`; OCR text up to `PII_ARTIFACT_MAX_BYTES`.
+  A PDF evaluation gets `PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS`, which
+  must stay below `SCHEDULER_JOB_TIMEOUT_MS`. A sync block-mode upload can wait
+  that long. There is no memory limit per process: the container limit applies.
+- OCR reads every page, also pages that have text, so a value can count twice.
+  The OCR text removes spaces next to an `@`, because Tesseract often reads
+  `jane@ example.com`. OCR can still misread a value: `complete` means that OCR
+  read every page, not that it found every value.
+
+Coverage (`detail.pii`, and the scan run's `pending_decision`):
+
+| OCR result | `imageScan` | `imagesNotScanned` | UI suffix |
+|---|---|---|---|
+| Every page read | `complete` | absent | none |
+| Stopped at the page, text, or time limit after one page or more | `partial` | `true` | "(images partly scanned)" |
+| A tool failed, no page was read, or no slot was free | `failed` | `true` | "(image scan failed)" |
+| OCR off | absent | `true` | "(text only)" |
+
+`imagePagesScanned` and `imagePageCount` go with `imageScan`. Each PII detail
+write replaces the coverage fields of an earlier scan (`setPiiDetail`).
+
+Verdicts:
+
+- Block mode accepts a PDF only when OCR is `complete`. Otherwise it rejects
+  the upload: `pdf_ocr_incomplete` (422, bytes deleted), or `pdf_ocr_busy` (503,
+  the client can try again).
+- Detect and transform modes keep the text of the pages that OCR read and record
+  `partial` or `failed`.
+- A PDF with no text and no OCR text is rejected (`pdf_extraction_failed`).
+- An evaluation timeout during OCR is `pii_timeout`, not a coverage result.
 
 ## Policy
 

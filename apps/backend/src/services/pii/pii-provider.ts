@@ -1,5 +1,7 @@
 import type { PiiEntityType } from "@cogniplane/shared-types";
 
+import type { PdfOcrIncompleteReason, PdfOcrStatus } from "./pdf-ocr.js";
+
 export type PiiFindingConfidence = "low" | "medium" | "high";
 
 export interface PiiFinding {
@@ -44,13 +46,28 @@ export interface PiiTransformTextInput {
   model?: string;
 }
 
+/**
+ * The image coverage of a PDF scan. `not_scanned`: OCR is off, so the scan
+ * read only the text. Otherwise the status of the OCR pass over the pages.
+ */
+export interface PdfImageCoverage {
+  imageScan: "not_scanned" | PdfOcrStatus;
+  pagesScanned?: number;
+  pageCount?: number;
+  /** Internal. Not stored. */
+  reason?: PdfOcrIncompleteReason;
+}
+
 export interface PiiScanArtifactInput {
   artifactId: string;
   contentType: string;
   /** The signal aborts when the PII evaluation times out. */
   readContent: (signal?: AbortSignal) => Promise<string>;
-  /** True when the scan reads only the text of the file, so any images in it (a PDF) are not scanned. */
-  imagesNotScanned?: () => boolean;
+  /**
+   * What the scan read of a PDF's pages beyond its text. Read it after
+   * `readContent`. Undefined for a file that is not a PDF.
+   */
+  imageCoverage?: () => PdfImageCoverage | undefined;
   entityTypes: PiiEntityType[];
   /** Optional per-call model override; falls back to the provider's default. */
   model?: string;

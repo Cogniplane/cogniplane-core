@@ -7,6 +7,7 @@ import {
   type PiiArtifactSubjectReader
 } from "./pii-artifact-scan-enqueuer.js";
 import { isPiiSubjectInScope, PiiImportScopeRegistry } from "./pii-import-scopes.js";
+import type { PdfImageCoverage } from "./pii-provider.js";
 import { resolvePiiPolicy } from "./pii-policy.js";
 import {
   PiiProtectionService,
@@ -25,7 +26,7 @@ function buildDeps(overrides: {
   // A raw stored policy, used instead of `settings`.
   stored?: unknown;
   decision?: PiiDecision;
-  imagesNotScanned?: boolean;
+  imageCoverage?: PdfImageCoverage;
   evaluateThrows?: Error;
   readerReturnsNull?: boolean;
   readerThrows?: Error;
@@ -63,7 +64,7 @@ function buildDeps(overrides: {
         async readContent() {
           return `content for ${tenantId}/${artifactId}`;
         },
-        imagesNotScanned: () => overrides.imagesNotScanned ?? false
+        imageCoverage: () => overrides.imageCoverage
       };
     }
   };
@@ -339,10 +340,36 @@ test("block still returns blocked and audits an orphan when object delete fails"
 });
 
 test("block mode records that a clean PDF's images were not scanned", async () => {
-  const { deps, piiDetailCalls } = buildDeps({ settings: { enabled: true, mode: "block" }, imagesNotScanned: true });
+  const { deps, piiDetailCalls } = buildDeps({ settings: { enabled: true, mode: "block" }, imageCoverage: { imageScan: "not_scanned" } });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ contentType: "application/pdf" }));
   expect(result.kind).toBe("allowed");
   expect(piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "scanned", imagesNotScanned: true });
+});
+
+test("block mode records complete OCR coverage without the text-only flag", async () => {
+  const { deps, piiDetailCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    imageCoverage: { imageScan: "complete", pagesScanned: 2, pageCount: 2 }
+  });
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ contentType: "application/pdf" }));
+  expect(result.kind).toBe("allowed");
+  const pii = piiDetailCalls.at(-1)?.pii;
+  expect(pii).toMatchObject({ status: "scanned", imageScan: "complete", imagePagesScanned: 2, imagePageCount: 2 });
+  expect(pii).not.toHaveProperty("imagesNotScanned");
+});
+
+test("a block verdict records the OCR coverage of the PDF", async () => {
+  const { deps, piiDetailCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: {
+      action: "block", blockReason: "email", providerType: "rules", providerModel: null,
+      findings: [{ entityType: "email", value: "a@b.co", start: 0, end: 6, confidence: "high" }]
+    },
+    imageCoverage: { imageScan: "complete", pagesScanned: 1, pageCount: 1 }
+  });
+  const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ contentType: "application/pdf" }));
+  expect(result.kind).toBe("blocked");
+  expect(piiDetailCalls.at(-1)?.pii).toMatchObject({ status: "blocked", imageScan: "complete", imagePageCount: 1 });
 });
 
 test("block mode fails closed when the provider throws", async () => {

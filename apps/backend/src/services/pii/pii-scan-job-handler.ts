@@ -20,6 +20,7 @@ import type {
 } from "./pii-provider.js";
 import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanMode, PiiScanRunDecision, PiiScanRunStore } from "./pii-scan-run-store.js";
+import { imageCoverageDetail, type ImageCoverageDetail } from "./scannable-text.js";
 
 /**
  * Reads the raw content of a scan subject so the handler can pass text/binary
@@ -228,7 +229,7 @@ export class PiiScanJobHandler {
 
   // The decision and the policy that it applied, as the scan run records them.
   private async decide(job: PiiScanJobRecord, subject: PiiSubject): Promise<PiiScanRunDecision> {
-    const { decision, appliedPolicy, imagesNotScanned } = await this.evaluate(job, subject);
+    const { decision, appliedPolicy, coverage } = await this.evaluate(job, subject);
     const scanned = decision.action === "allow"
       ? { findings: [], providerType: null, providerModel: null }
       : { findings: decision.findings, providerType: decision.providerType, providerModel: decision.providerModel };
@@ -239,7 +240,7 @@ export class PiiScanJobHandler {
       ...scanned,
       ...(decision.action === "block" ? { blockReason: decision.blockReason } : {}),
       // A scan that applied mode off read nothing, so no coverage applies.
-      ...(imagesNotScanned && appliedPolicy.mode !== "off" ? { imagesNotScanned: true } : {})
+      ...(appliedPolicy.mode !== "off" ? coverage : {})
     };
   }
 
@@ -248,7 +249,7 @@ export class PiiScanJobHandler {
   private async evaluate(
     job: PiiScanJobRecord,
     subject: PiiSubject
-  ): Promise<{ decision: PiiDecision; appliedPolicy: PiiAppliedPolicy; imagesNotScanned: boolean }> {
+  ): Promise<{ decision: PiiDecision; appliedPolicy: PiiAppliedPolicy; coverage: ImageCoverageDetail }> {
     if (job.subjectType === "message") {
       const text = await this.deps.subjectReader.readMessageText({
         tenantId: job.tenantId,
@@ -262,7 +263,7 @@ export class PiiScanJobHandler {
         text,
         subject
       });
-      return { ...evaluation, imagesNotScanned: false };
+      return { ...evaluation, coverage: {} };
     }
 
     const artifact = await this.deps.subjectReader.readArtifact({
@@ -277,7 +278,7 @@ export class PiiScanJobHandler {
       artifact,
       subject
     });
-    return { ...evaluation, imagesNotScanned: artifact.imagesNotScanned?.() ?? false };
+    return { ...evaluation, coverage: imageCoverageDetail(artifact.imageCoverage?.()) };
   }
 
   /**
@@ -298,8 +299,8 @@ export class PiiScanJobHandler {
     // audit payload name it `mode`.
     const policy = { modeApplied: mode, policyRevision };
     const recorded = { mode, policyRevision };
-    // A clean or redacted verdict on a PDF covers only its text.
-    const coverage = decision.imagesNotScanned ? { imagesNotScanned: true } : {};
+    // What the scan read of a PDF's page images, also on a block.
+    const coverage = coverageOf(decision);
     const auditOptions = { once: resumed };
 
     if (action === "allow") {
@@ -349,7 +350,8 @@ export class PiiScanJobHandler {
         status: "blocked",
         ...policy,
         blockReason: decision.blockReason,
-        findingsCount: findings.length
+        findingsCount: findings.length,
+        ...coverage
       });
       await this.emitAudit(job, "pii_blocked", {
         scanRunId: job.scanRunId,
@@ -479,8 +481,7 @@ export class PiiScanJobHandler {
       policyRevision?: number;
       blockReason?: string;
       findingsCount?: number;
-      imagesNotScanned?: boolean;
-    }
+    } & ImageCoverageDetail
   ): Promise<void> {
     if (job.subjectType === "message") {
       const pii: MessagePiiDetail = {
@@ -505,8 +506,21 @@ export class PiiScanJobHandler {
       artifactPii.findingsCount = detail.findingsCount;
     }
     if (detail.imagesNotScanned) artifactPii.imagesNotScanned = true;
+    if (detail.imageScan !== undefined) artifactPii.imageScan = detail.imageScan;
+    if (detail.imagePagesScanned !== undefined) artifactPii.imagePagesScanned = detail.imagePagesScanned;
+    if (detail.imagePageCount !== undefined) artifactPii.imagePageCount = detail.imagePageCount;
     await this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, artifactPii);
   }
+}
+
+// A decision recorded before OCR coverage existed holds only `imagesNotScanned`.
+function coverageOf(decision: PiiScanRunDecision): ImageCoverageDetail {
+  return {
+    ...(decision.imagesNotScanned ? { imagesNotScanned: true } : {}),
+    ...(decision.imageScan !== undefined ? { imageScan: decision.imageScan } : {}),
+    ...(decision.imagePagesScanned !== undefined ? { imagePagesScanned: decision.imagePagesScanned } : {}),
+    ...(decision.imagePageCount !== undefined ? { imagePageCount: decision.imagePageCount } : {})
+  };
 }
 
 // Errors that won't recover with a retry should terminate the job immediately
@@ -520,6 +534,7 @@ export const PERMANENT_PII_ERROR_CODES = new Set([
   "pii_decode_failed",
   "unsupported_mime",
   "pdf_extraction_failed",
+  "pdf_ocr_incomplete",
   "file_too_large"
 ]);
 

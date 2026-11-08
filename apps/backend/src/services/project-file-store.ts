@@ -930,7 +930,9 @@ export class ProjectFileStore {
           artifactId: `project-draft:${uuidv7()}`,
           contentType: mimeType,
           entityTypes: [],
-          readContent: (signal) => toScannableText(mimeType, Buffer.from(input.content), this.extractPdfText, signal)
+          // Project drafts get no OCR: their image coverage is not stored yet.
+          readContent: async (signal) =>
+            (await toScannableText(mimeType, Buffer.from(input.content), { extractPdfText: this.extractPdfText }, signal)).text
         },
         // Project drafts are new bytes entering the shared library, so they
         // follow the tenant's existing upload PII scope and blocking policy.

@@ -17,8 +17,21 @@ export const ArtifactPiiDetailSchema = z.object({
   summaryText: z.string().optional(),
   findingsCount: z.number().optional(),
   blockReason: z.string().optional(),
-  /** The scan read only the text; any images in the file (a PDF) were not scanned. */
-  imagesNotScanned: z.boolean().optional()
+  /**
+   * The scan did not read all of the file's page images (a PDF): OCR was
+   * off, stopped at a limit, or failed. Absent when OCR read every page.
+   */
+  imagesNotScanned: z.boolean().optional(),
+  /**
+   * Set when OCR ran on a PDF. `complete`: every page was read. `partial`:
+   * OCR stopped at a page, size, or time limit. `failed`: OCR did not run
+   * to the end. Only `complete` covers the page images.
+   */
+  imageScan: z.enum(["complete", "partial", "failed"]).optional(),
+  /** Pages that OCR read. Set with `imageScan`. */
+  imagePagesScanned: z.number().int().nonnegative().optional(),
+  /** Pages in the PDF. Absent when OCR could not read the page count. */
+  imagePageCount: z.number().int().positive().optional()
 }).passthrough();
 export type ArtifactPiiDetail = z.infer<typeof ArtifactPiiDetailSchema>;
 

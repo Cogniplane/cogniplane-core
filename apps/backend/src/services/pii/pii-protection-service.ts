@@ -14,6 +14,7 @@ import type {
   PiiScanArtifactInput
 } from "./pii-provider.js";
 import type { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
+import { isPdfContentType } from "./pdf-ocr.js";
 
 export interface PiiPolicyReader {
   /**
@@ -109,6 +110,11 @@ export interface PiiProtectionServiceOptions {
    */
   artifactMaxBytes?: number;
   /**
+   * Set when PDF OCR is on: the OCR budget. A PDF evaluation gets
+   * `timeoutMs` plus this budget. Other evaluations keep `timeoutMs`.
+   */
+  pdfOcrBudgetMs?: number;
+  /**
    * CSV preview budget — header + first N data rows or this many bytes,
    * whichever is smaller.
    */
@@ -198,9 +204,10 @@ export class PiiProtectionService {
    */
   private async withTimeout<T>(
     op: string,
-    run: (signal: AbortSignal | undefined) => Promise<T>
+    run: (signal: AbortSignal | undefined) => Promise<T>,
+    extraMs = 0
   ): Promise<T> {
-    const budget = this.options.timeoutMs;
+    const budget = this.options.timeoutMs > 0 ? this.options.timeoutMs + extraMs : this.options.timeoutMs;
     if (!budget || budget <= 0) {
       return run(undefined);
     }
@@ -355,11 +362,12 @@ export class PiiProtectionService {
     input: PiiServiceEvaluateArtifactInput,
     read?: PiiPolicyRead
   ): Promise<PiiEvaluation> {
+    const ocrBudgetMs = isPdfContentType(input.artifact.contentType) ? this.options.pdfOcrBudgetMs ?? 0 : 0;
     return this.withTimeout("artifact evaluation", async (signal) => {
       const policyRead = read ?? (await this.readPolicy(input.tenantId));
       assertReadForTenant(policyRead, input.tenantId);
       return evaluation(policyRead, await this.decideArtifact(policyRead, input, signal));
-    });
+    }, ocrBudgetMs);
   }
 
   private async decideArtifact(
@@ -381,6 +389,9 @@ export class PiiProtectionService {
     // Always run rule-based detection first — it catches obvious PII deterministically
     // and keeps the detect/block policies working even when the provider is disabled.
     const content = await input.artifact.readContent(signal);
+    // Block mode allows a file only when the scan read all of it. With OCR
+    // on, a PDF whose pages OCR did not all read could hide PII in an image.
+    assertCompleteImageScanForBlock(settings.mode, input.artifact);
     const maxBytes = this.options.artifactMaxBytes ?? 5 * 1024 * 1024;
     if (Buffer.byteLength(content, "utf8") > maxBytes) {
       throw new PiiProtectionServiceError(
@@ -701,6 +712,22 @@ function truncateUtf8(text: string, maxBytes: number): string {
     end += character.length;
   }
   return text.slice(0, end);
+}
+
+function assertCompleteImageScanForBlock(mode: PiiMode, artifact: PiiScanArtifactInput): void {
+  if (mode !== "block") return;
+  const coverage = artifact.imageCoverage?.();
+  if (coverage?.imageScan !== "partial" && coverage?.imageScan !== "failed") return;
+  if (coverage.reason === "busy") {
+    throw new PiiProtectionServiceError(
+      "pdf_ocr_busy",
+      "PII protection is busy reading other PDFs. Try again later."
+    );
+  }
+  throw new PiiProtectionServiceError(
+    "pdf_ocr_incomplete",
+    "PII protection could not read every page of this PDF, so the file was not accepted."
+  );
 }
 
 function isCsvContentType(contentType: string): boolean {

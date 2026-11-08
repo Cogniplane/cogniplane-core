@@ -368,7 +368,7 @@ test.each([
       readArtifact: async ({ artifactId }) => ({
         artifactId, contentType: "application/pdf", entityTypes: [],
         readContent: async () => "Quarterly report",
-        imagesNotScanned: () => true
+        imageCoverage: () => ({ imageScan: "not_scanned" as const })
       })
     }
   });
@@ -844,6 +844,63 @@ test("an attempt whose scan run closed while it evaluated applies nothing and le
   expect(h.failureCalls).toEqual([]);
 });
 
+test.each([
+  [{ action: "report", findings: [{ entityType: "email", value: "a@b.co", start: 0, end: 6, confidence: "high" }],
+    providerType: "rules", providerModel: null }, "scanned"],
+  [{ action: "block", findings: [{ entityType: "email", value: "a@b.co", start: 0, end: 6, confidence: "high" }],
+    blockReason: "email", providerType: "rules", providerModel: null }, "blocked"]
+] as const)("PiiScanJobHandler records the OCR coverage of a %j verdict", async (decision, status) => {
+  const { deps, artifactPiiCalls, recordDecisionCalls } = buildDeps({
+    decision: decision as unknown as PiiDecision,
+    reader: {
+      readArtifact: async ({ artifactId }) => ({
+        artifactId, contentType: "application/pdf", entityTypes: [],
+        readContent: async () => "Quarterly report",
+        imageCoverage: () => ({ imageScan: "partial" as const, pagesScanned: 20, pageCount: 45, reason: "page_limit" as const })
+      })
+    }
+  });
+
+  await new PiiScanJobHandler(deps).execute(sampleJob());
+
+  expect(artifactPiiCalls.at(-1)?.pii).toMatchObject({
+    status, imagesNotScanned: true, imageScan: "partial", imagePagesScanned: 20, imagePageCount: 45
+  });
+  // The recorded decision holds the coverage, so a resumed attempt applies it too.
+  expect(recordDecisionCalls.at(-1)).toMatchObject({
+    imagesNotScanned: true, imageScan: "partial", imagePagesScanned: 20, imagePageCount: 45
+  });
+  expect(JSON.stringify(artifactPiiCalls.at(-1)?.pii)).not.toContain("page_limit");
+});
+
+test("PiiScanJobHandler does not mark a PDF that OCR read completely", async () => {
+  const { deps, artifactPiiCalls } = buildDeps({
+    decision: { action: "allow", reason: "no_findings" },
+    reader: {
+      readArtifact: async ({ artifactId }) => ({
+        artifactId, contentType: "application/pdf", entityTypes: [],
+        readContent: async () => "Quarterly report",
+        imageCoverage: () => ({ imageScan: "complete" as const, pagesScanned: 3, pageCount: 3 })
+      })
+    }
+  });
+  await new PiiScanJobHandler(deps).execute(sampleJob());
+  const pii = artifactPiiCalls.at(-1)?.pii;
+  expect(pii).toMatchObject({ status: "scanned", imageScan: "complete", imagePagesScanned: 3, imagePageCount: 3 });
+  expect(pii).not.toHaveProperty("imagesNotScanned");
+});
+
+test("a resumed decision keeps the OCR coverage that it recorded", async () => {
+  const h = buildDeps();
+  h.run().pendingDecision = {
+    action: "allow", mode: "detect", policyRevision: 5, findings: [], providerType: null, providerModel: null,
+    imagesNotScanned: true, imageScan: "failed", imagePagesScanned: 0
+  };
+  await new PiiScanJobHandler(h.deps).execute(sampleJob({ attempts: 2 }));
+  expect(h.evaluateCalls).toEqual([]);
+  expect(h.artifactPiiCalls.at(-1)?.pii).toMatchObject({ status: "scanned", imagesNotScanned: true, imageScan: "failed", imagePagesScanned: 0 });
+});
+
 test("a PDF that a scan with mode off did not read is not marked as text only", async () => {
   const { deps, artifactPiiCalls } = buildDeps({
     decision: { action: "allow", reason: "disabled" },
@@ -852,7 +909,7 @@ test("a PDF that a scan with mode off did not read is not marked as text only", 
       readArtifact: async ({ artifactId }) => ({
         artifactId, contentType: "application/pdf", entityTypes: [],
         readContent: async () => "Quarterly report",
-        imagesNotScanned: () => true
+        imageCoverage: () => ({ imageScan: "not_scanned" as const })
       })
     }
   });

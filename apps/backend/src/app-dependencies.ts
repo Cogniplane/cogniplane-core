@@ -204,6 +204,7 @@ export function buildAppDependencies(input: {
     piiAnalytics: stores.piiAnalytics,
     piiScanJobHandler: pii.piiScanJobHandler,
     piiScanEnqueuer: pii.piiScanEnqueuer,
+    pdfOcr: pii.pdfOcr,
     piiImportScopes,
     activeTurns: stores.activeTurns,
     turnBus,
