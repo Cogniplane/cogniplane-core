@@ -1,4 +1,4 @@
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS builder
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072 AS builder
 
 # OpenNext starts workerd during builds, which reads the system CA store.
 RUN apt-get update \
@@ -22,7 +22,8 @@ ENV NEXT_TELEMETRY_DISABLED=1
 
 WORKDIR /app
 
-RUN corepack enable
+# Node 25 and later do not include Corepack.
+RUN npm install -g corepack@0.36.0 && corepack enable
 
 # Copy the entire workspace before install so the shared-types `prepare`
 # script (which runs `tsc -p tsconfig.json`) can find its source files.
@@ -42,7 +43,7 @@ RUN pnpm install --frozen-lockfile
 
 RUN pnpm --filter @cogniplane/frontend build
 
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runner
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072 AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
@@ -62,7 +63,7 @@ USER node
 
 EXPOSE 3000
 
-# No wget install: Node 24 has fetch. 302→/login counts as healthy, hence <500.
+# No wget install: Node 26 has fetch. 302→/login counts as healthy, hence <500.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
 

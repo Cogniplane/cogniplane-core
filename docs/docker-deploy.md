@@ -119,4 +119,4 @@ store them as you store the database.
 | "Could not load the model list" | The backend is not up: `docker compose logs backend`. |
 | Empty model list | See [getting started](getting-started.md#troubleshooting). |
 | Shell or file tools fail | The template id must exist in the E2B account of the key, and outbound access to E2B must work. |
-| `EBADENGINE` during build | The Dockerfiles pin a Node 24 image. Update it together with `engines.node`. |
+| `EBADENGINE` during build | The Dockerfiles pin a Node 26 image. Update it together with `engines.node`. |
