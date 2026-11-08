@@ -98,6 +98,8 @@ const SAVED = [
 const composer = () => screen.getByTestId("copilot-chat-textarea") as HTMLTextAreaElement;
 const toggle = () => screen.getByRole("button", { name: /^Side panel/ });
 const panel = () => document.querySelector("aside[id^='side-panel-']") as HTMLElement;
+/** Inert elements other than the panel, which is inert while it is closed. */
+const inertBackground = () => [...document.querySelectorAll("[inert]")].filter((element) => element !== panel());
 const liveRegion = () => document.querySelector("[aria-live='polite']") as HTMLElement;
 const field = <T extends HTMLElement>(label: string) => screen.getByLabelText(label) as T;
 const stored = () => JSON.parse(sessionStorage.getItem(DRAFT_STORAGE_KEY) ?? "null");
@@ -195,7 +197,7 @@ describe("how the panel tells the user about a view", () => {
     await act(async () => { reply.push(ev.runStarted("a2"), snapshotEvent(PANEL, "turn:a2:board", textView("turn:a2:board", "Live board"), "streaming")); });
     await waitFor(() => expect(within(panel()).queryByText("Live board")).toBeTruthy());
     expect(toggle().getAttribute("aria-expanded")).toBe("true");
-    expect(panel().hidden).toBe(false);
+    expect(panel().hasAttribute("inert")).toBe(false);
     expect(document.activeElement).toBe(composer());
     expect(liveRegion().textContent).toBe("The agent opened a view in the side panel.");
     expect(screen.queryByRole("button", { name: "View side panel" })).toBeNull();
@@ -243,7 +245,7 @@ describe("how the panel tells the user about a view", () => {
     await act(async () => { reply.push(ev.runStarted("a2"), snapshotEvent(PANEL, "turn:a2:board", textView("turn:a2:board", "Live board")), ev.runFinished("a2")); reply.finish(); });
     await waitFor(() => expect(within(panel()).queryByText("Live board")).toBeTruthy());
     expect(toggle().getAttribute("aria-expanded")).toBe("false");
-    expect(panel().hidden).toBe(true);
+    expect(panel().hasAttribute("inert")).toBe(true);
     expect(screen.getByRole("button", { name: "View side panel" })).toBeTruthy();
     expect(liveRegion().textContent).toBe("The agent added a view to the side panel.");
 
@@ -251,17 +253,17 @@ describe("how the panel tells the user about a view", () => {
     expect(screen.getByRole("dialog", { name: "Side panel" })).toBeTruthy();
   });
 
-  it("moves entrance motion behind prefers-reduced-motion", async () => {
+  it("animates open and close, and turns the motion off for prefers-reduced-motion", async () => {
+    stubHostWidth(WIDE_HOST);
     server.connect("s-1", idleHistory(EARLIER));
     render(hostElement());
     await screen.findByText("Earlier answer");
-    const classes = [panel().className, document.querySelector("button[aria-hidden='true']")?.className ?? panel().className];
-    for (const name of classes) {
-      for (const utility of name.split(" ").filter((part) => /animate-in|slide-in|fade-in/.test(part))) {
-        expect(utility).toMatch(/^motion-safe:/);
-      }
-    }
-    expect(panel().className).toContain("motion-safe:animate-in");
+    const classes = () => panel().className.split(" ");
+    // Closed, the panel stays laid out at zero width, so the close can animate.
+    expect(classes()).toEqual(expect.arrayContaining(["w-0", "invisible", "transition-[width,border-width,visibility]", "motion-reduce:transition-none"]));
+    expect(classes()).not.toContain("hidden");
+    fireEvent.click(toggle());
+    expect(classes()).toEqual(expect.arrayContaining(["w-[min(45%,420px)]", "visible", "motion-reduce:transition-none"]));
   });
 });
 
@@ -278,7 +280,7 @@ describe("the panel on a narrow host row is a modal", () => {
     server.interruptReply = { status: 200, body: {} };
     render(hostElement());
     await screen.findByText("Working");
-    // The closed panel is hidden, so a role query has to include hidden elements.
+    // The closed panel is inert and invisible, so a role query has to include hidden elements.
     await waitFor(() => expect(within(panel()).queryByText(shown) ?? within(panel()).queryByRole("button", { name: shown, hidden: true })).toBeTruthy());
     fireEvent.click(toggle());
     return screen.getByRole("dialog", { name: "Side panel" });
@@ -296,9 +298,9 @@ describe("the panel on a narrow host row is a modal", () => {
     expect(document.querySelector("button[aria-hidden='true'][tabindex='-1']")!.closest("[inert]")).toBeNull();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Close side panel" }));
-    expect(document.querySelectorAll("[inert]")).toHaveLength(0);
+    expect(inertBackground()).toHaveLength(0);
     expect(document.activeElement).toBe(toggle());
-    expect(panel().hidden).toBe(true);
+    expect(panel().hasAttribute("inert")).toBe(true);
     expect(otherOverlayOpen()).toBe(false);
     // The mounted values stay while it is closed.
     expect(field<HTMLTextAreaElement>("Notes").value).toBe("Default note");
@@ -341,7 +343,7 @@ describe("the panel on a narrow host row is a modal", () => {
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
     fireEvent.keyDown(field("Notes"), { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "Side panel" })).toBeNull();
-    expect(dialog.hidden).toBe(true);
+    expect(dialog.hasAttribute("inert")).toBe(true);
     expect(document.activeElement).toBe(toggle());
     expect(server.count("POST /sessions/s-1/interrupt")).toBe(0);
     // Outside the panel, Escape is still Stop.
@@ -372,7 +374,7 @@ describe("the panel on a narrow host row is a modal", () => {
   it("closes on a tap outside, and a wide host row stays nonmodal", async () => {
     const dialog = await openedPanel();
     fireEvent.click(document.querySelector("button[aria-hidden='true'][tabindex='-1']")!);
-    expect(dialog.hidden).toBe(true);
+    expect(dialog.hasAttribute("inert")).toBe(true);
     expect(document.activeElement).toBe(toggle());
     cleanup();
 
@@ -387,7 +389,7 @@ describe("the panel on a narrow host row is a modal", () => {
     expect(fireEvent.keyDown(field("Tests pass"), { key: "Tab" })).toBe(true);
     // Escape in a nonmodal panel is not the panel's.
     expect(fireEvent.keyDown(field("Notes"), { key: "Escape" })).toBe(true);
-    expect(region.hidden).toBe(false);
+    expect(region.hasAttribute("inert")).toBe(false);
   });
 
   it("closes instead of covering the chat when its host row gets narrow, and opens as a modal on request", async () => {
@@ -402,8 +404,8 @@ describe("the panel on a narrow host row is a modal", () => {
     // A shell panel opens and leaves the host too little room for both.
     resizeHost(NARROW_HOST);
     expect(toggle().getAttribute("aria-expanded")).toBe("false");
-    expect(panel().hidden).toBe(true);
-    expect(document.querySelectorAll("[inert]")).toHaveLength(0);
+    expect(panel().hasAttribute("inert")).toBe(true);
+    expect(inertBackground()).toHaveLength(0);
     expect(document.activeElement).toBe(composer());
     // The values stay mounted.
     expect(field<HTMLTextAreaElement>("Notes").value).toBe("Default note");
