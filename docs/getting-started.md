@@ -91,7 +91,7 @@ Startup rules for these values: [configuration](configuration.md#startup-rules).
 | Symptom | Fix |
 |---|---|
 | Port 3000 or 3001 in use | `make dev` needs both ports (`scripts/check-dev-ports.mjs`). Stop the other process. |
-| `make dev` waits forever for PostgreSQL | Run `docker compose ps` and `docker compose logs postgres`. Port 5432 may be in use. |
+| `make dev` waits forever for PostgreSQL | Run `docker compose ps` and `docker compose logs postgres`. Port 5432 may be in use. If the log says `Error: in 18+`, the volume has PostgreSQL 17 data: see [upgrade from PostgreSQL 17](docker-deploy.md#upgrade-from-postgresql-17). |
 | Migration `permission denied` | `MIGRATION_DATABASE_URL` must be a superuser URL. |
 | Empty model list | No provider has a key, or Admin > Models turns the providers or models off. Set a key in `.env` and restart, or save a tenant key in Admin > Models; then check that the provider and models are on there. |
 | Shell or file tools fail | `E2B_TEMPLATE_ID` must exist in the E2B account of `E2B_API_KEY`. |
