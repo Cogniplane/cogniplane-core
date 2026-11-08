@@ -86,8 +86,12 @@ export type PiiScanRunDecision = {
   providerModel: string | null;
   /** Set for a block. */
   blockReason?: string;
-  /** The scan read only the text of the file; images in it were not scanned. */
+  /** The scan did not read all page images of the file (a PDF). */
   imagesNotScanned?: boolean;
+  /** Set when OCR ran on a PDF. */
+  imageScan?: "complete" | "partial" | "failed";
+  imagePagesScanned?: number;
+  imagePageCount?: number;
 };
 
 const PendingDecisionSchema = z.object({
@@ -104,7 +108,10 @@ const PendingDecisionSchema = z.object({
   providerType: z.string().nullable(),
   providerModel: z.string().nullable(),
   blockReason: z.string().optional(),
-  imagesNotScanned: z.boolean().optional()
+  imagesNotScanned: z.boolean().optional(),
+  imageScan: z.enum(["complete", "partial", "failed"]).optional(),
+  imagePagesScanned: z.number().int().nonnegative().optional(),
+  imagePageCount: z.number().int().positive().optional()
 });
 
 function parseDecision(raw: unknown): PiiScanRunDecision | null {

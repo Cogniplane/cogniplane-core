@@ -84,6 +84,17 @@ describe("formatPiiLabel", () => {
     expect(formatPiiLabel(p({ status: "failed", imagesNotScanned: true }))).toBe("PII scan failed");
   });
 
+  test("a verdict on a PDF says how much of its page images OCR read", () => {
+    expect(formatPiiLabel(p({ status: "scanned", findingsCount: 0, imageScan: "complete", imagePagesScanned: 3, imagePageCount: 3 })))
+      .toBe("PII: clean");
+    expect(formatPiiLabel(p({ status: "scanned", findingsCount: 2, imagesNotScanned: true, imageScan: "partial", imagePagesScanned: 20, imagePageCount: 40 })))
+      .toBe("PII: 2 findings (images partly scanned)");
+    expect(formatPiiLabel(p({ status: "transformed", imagesNotScanned: true, imageScan: "failed", imagePagesScanned: 0 })))
+      .toBe("PII redacted (image scan failed)");
+    expect(formatPiiLabel(p({ status: "blocked", blockReason: "email", imageScan: "partial" }))).toBe("Blocked: email");
+    expect(formatPiiLabel(p({ status: "scanned", modeApplied: "off", findingsCount: 0, imageScan: "failed" }))).toBe("PII: not scanned");
+  });
+
   test("transformed has its own label", () => {
     expect(formatPiiLabel(p({ status: "transformed" }))).toBe("PII redacted");
   });

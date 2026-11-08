@@ -372,7 +372,10 @@ test.each([
   { ...pendingBlock, providerType: false },
   { ...pendingBlock, providerModel: 7 },
   { ...pendingBlock, blockReason: [] },
-  { ...pendingBlock, imagesNotScanned: "false" }
+  { ...pendingBlock, imagesNotScanned: "false" },
+  { ...pendingBlock, imageScan: "not_scanned" },
+  { ...pendingBlock, imagePagesScanned: -1 },
+  { ...pendingBlock, imagePageCount: 0 }
 ])("refuses malformed non-null persisted decision %j", async (decision) => {
   const db = new CaptureDatabase();
   db.selectReturn = [{ pending_decision: decision }];
@@ -389,3 +392,10 @@ test.each(["allow", "report", "block", "transform"] as const)(
       .toEqual(decision);
   }
 );
+
+test("reads a persisted decision with OCR coverage", async () => {
+  const db = new CaptureDatabase();
+  const decision = { ...pendingBlock, action: "allow", imagesNotScanned: true, imageScan: "partial", imagePagesScanned: 20, imagePageCount: 31 };
+  db.selectReturn = [{ pending_decision: decision }];
+  expect(await new PiiScanRunStore(db as unknown as Pool).getPendingDecision("tenant-1", "scan-1")).toEqual(decision);
+});

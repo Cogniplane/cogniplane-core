@@ -50,9 +50,17 @@ export type ArtifactPiiDetail = {
   summaryText?: string;
   findingsCount?: number;
   blockReason?: string;
-  /** The scan read only the text; any images in the file (a PDF) were not scanned. */
+  /** The scan did not read all of the file's page images (a PDF). See the shared `ArtifactPiiDetailSchema`. */
   imagesNotScanned?: boolean;
+  /** Set when OCR ran on a PDF. Only `complete` covers the page images. */
+  imageScan?: "complete" | "partial" | "failed";
+  imagePagesScanned?: number;
+  imagePageCount?: number;
 };
+
+// Each PII detail write states the coverage of its own scan, so a write
+// removes the coverage of an earlier scan before it merges.
+const PII_COVERAGE_KEYS = ["imagesNotScanned", "imageScan", "imagePagesScanned", "imagePageCount"] as const;
 
 export type ArtifactDetail = {
   pii?: ArtifactPiiDetail;
@@ -771,7 +779,7 @@ export class ArtifactStore {
           SET detail_json = jsonb_set(
                 COALESCE(detail_json, '{}'::jsonb),
                 '{pii}',
-                COALESCE(detail_json->'pii', '{}'::jsonb) || $3::jsonb,
+                (COALESCE(detail_json->'pii', '{}'::jsonb) - $4::text[]) || $3::jsonb,
                 true
               ),
               -- Uploads and project copies opt into pending-until-scanned status.
@@ -786,7 +794,7 @@ export class ArtifactStore {
               updated_at = NOW()
           WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
         `,
-        [tenantId, artifactId, JSON.stringify(pii)]
+        [tenantId, artifactId, JSON.stringify(pii), PII_COVERAGE_KEYS]
       );
     });
   }

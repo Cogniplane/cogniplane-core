@@ -210,6 +210,10 @@ export async function buildApp() {
     logger: app.log
   });
 
+  // With PDF OCR on, a missing tool or language stops the boot: PDF scans
+  // would otherwise all fail, and block mode would reject every PDF.
+  await deps.pdfOcr?.verify();
+
   // Subscribe to cross-replica policy cache invalidations before serving
   // traffic. Failure is logged inside start(); the rule-cache TTL is the
   // fallback, so boot proceeds either way.

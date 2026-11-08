@@ -73,6 +73,12 @@ link here instead of repeating these rules.
 - `UTILITY_LLM_ENABLED` requires its base URL and model. `PII_PROVIDER_ENABLED`
   requires `PII_LLM_API_KEY`. `PII_RETENTION_KEK` is 64 hex characters.
 - `PDFTOTEXT_BINARY_PATH` must name `pdftotext`, `pdftotext.*` or `pdftotext-*`.
+  `PDFINFO_BINARY_PATH`, `PDFTOPPM_BINARY_PATH` and `TESSERACT_BINARY_PATH`
+  follow the same rule with their own tool names.
+- With `PII_PDF_OCR_ENABLED`, `PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS`
+  must be less than `SCHEDULER_JOB_TIMEOUT_MS`, and the boot stops when the OCR
+  tools do not run or tesseract does not have each language in
+  `PII_PDF_OCR_LANGUAGES` ([PDF OCR](architecture/pii.md#pdf-ocr)).
 - `TRUST_PROXY` is `false`, `true`, or a list of IPs and CIDRs; hop counts are
   refused.
 
@@ -146,6 +152,9 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `SKILL_MARKETPLACE_MANIFEST_URL` | string, URL | `unset` | [skills](architecture/skills.md) |
 | `SKILL_MARKETPLACE_CACHE_TTL_MS` | number, integer, > 0 | `300000` | [skills](architecture/skills.md) |
 | `PDFTOTEXT_BINARY_PATH` | string, minimum 1, additional validation in source | `"pdftotext"` | [startup rules](#startup-rules), [getting-started](getting-started.md) |
+| `PDFINFO_BINARY_PATH` | string, minimum 1, additional validation in source | `"pdfinfo"` | [startup rules](#startup-rules) |
+| `PDFTOPPM_BINARY_PATH` | string, minimum 1, additional validation in source | `"pdftoppm"` | [startup rules](#startup-rules) |
+| `TESSERACT_BINARY_PATH` | string, minimum 1, additional validation in source | `"tesseract"` | [startup rules](#startup-rules) |
 | `RATE_LIMIT_WINDOW_MS` | number, integer, > 0 | `60000` | [data](architecture/data.md) |
 | `SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `10` | [data](architecture/data.md) |
 | `SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `50` | [data](architecture/data.md) |
@@ -172,7 +181,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `SCHEDULER_ENABLED` | boolean | `true` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
 | `SCHEDULER_POLL_INTERVAL_MS` | number, integer, > 0 | `30000` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
 | `SCHEDULER_MAX_CONCURRENT_JOBS` | number, integer, > 0 | `2` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
-| `SCHEDULER_JOB_TIMEOUT_MS` | number, integer, > 0 | `300000` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
+| `SCHEDULER_JOB_TIMEOUT_MS` | number, integer, > 0 | `300000` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
 | `SCHEDULER_MAX_CONSECUTIVE_FAILURES` | number, integer, > 0 | `5` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
 | `PII_SCAN_MAX_CONCURRENT_JOBS` | number, integer, > 0 | `2` | [pii](architecture/pii.md) |
 | `AUTH_MODE` | one of ["jwt", "workos", "dev-headers"] | `"dev-headers"` | [startup rules](#startup-rules), [auth](architecture/auth.md) |
@@ -223,6 +232,11 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `PII_LLM_WIRE_FORMAT` | one of ["openai", "ollama"] | `"openai"` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_LLM_DISABLE_THINKING` | boolean | `false` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_PROVIDER_TIMEOUT_MS` | number, integer, > 0 | `5000` | [pii](architecture/pii.md) |
+| `PII_PDF_OCR_ENABLED` | boolean | `false` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
+| `PII_PDF_OCR_MAX_PAGES` | number, integer, > 0, maximum 1000 | `20` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
+| `PII_PDF_OCR_TIMEOUT_MS` | number, integer, > 0 | `30000` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
+| `PII_PDF_OCR_MAX_CONCURRENT` | number, integer, > 0, maximum 64 | `2` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
+| `PII_PDF_OCR_LANGUAGES` | string, matches /^[a-z][a-z0-9_]*(\+[a-z][a-z0-9_]*)*$/ | `"eng"` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
 | `PII_ARTIFACT_MAX_BYTES` | number, integer, > 0 | `5242880` | [pii](architecture/pii.md) |
 | `PII_CSV_PREVIEW_ROWS` | number, integer, > 0 | `10` | [pii](architecture/pii.md) |
 | `PII_CSV_PREVIEW_MAX_BYTES` | number, integer, > 0 | `4096` | [pii](architecture/pii.md) |

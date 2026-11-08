@@ -12,7 +12,7 @@ import {
   type PiiPolicyReader,
   type PiiSubject
 } from "./pii-protection-service.js";
-import type { PiiProvider } from "./pii-provider.js";
+import type { PdfImageCoverage, PiiProvider } from "./pii-provider.js";
 import { RuleBasedPiiDetector } from "./rule-based-pii-detector.js";
 
 function buildSettings(overrides: Partial<PiiProtectionSettings> = {}): PiiProtectionSettings {
@@ -1318,4 +1318,98 @@ test("CSV preview findings merge with rule-based CSV findings", async () => {
     expect(types.includes("email")).toBeTruthy();
     expect(types.includes("person_name")).toBeTruthy();
   }
+});
+
+function ocrPdfArtifact(coverage: PdfImageCoverage, text = "no PII here") {
+  return {
+    artifactId: "art_1",
+    contentType: "application/pdf",
+    readContent: async () => text,
+    imageCoverage: () => coverage,
+    entityTypes: []
+  };
+}
+
+test.each([
+  [{ imageScan: "partial", pagesScanned: 20, pageCount: 40, reason: "page_limit" }, "pdf_ocr_incomplete"],
+  [{ imageScan: "partial", pagesScanned: 3, pageCount: 5, reason: "budget" }, "pdf_ocr_incomplete"],
+  [{ imageScan: "failed", pagesScanned: 0, reason: "error" }, "pdf_ocr_incomplete"],
+  [{ imageScan: "failed", pagesScanned: 0, reason: "busy" }, "pdf_ocr_busy"]
+] as const)("block mode rejects a PDF with OCR coverage %j", async (coverage, code) => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "block" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: stubProvider(),
+    timeoutMs: 5000
+  });
+  const err = await service
+    .evaluateArtifact({ tenantId: "t1", artifact: ocrPdfArtifact(coverage), subject: { kind: "upload" } })
+    .catch((e: unknown) => e);
+  expect((err as PiiProtectionServiceError).code).toBe(code);
+  expect((err as Error).message).not.toContain("no PII here");
+});
+
+test.each([
+  { imageScan: "complete", pagesScanned: 2, pageCount: 2 },
+  // OCR off: the existing text-only verdict.
+  { imageScan: "not_scanned" }
+] as const)("block mode allows a clean PDF with coverage %j", async (coverage) => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "block" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: stubProvider(),
+    timeoutMs: 5000
+  });
+  const decision = await service.evaluateArtifact({ tenantId: "t1", artifact: ocrPdfArtifact(coverage), subject: { kind: "upload" } });
+  expect(decision.action).toBe("allow");
+});
+
+test("block mode blocks on PII that only the OCR text holds", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "block" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    provider: stubProvider(),
+    timeoutMs: 5000
+  });
+  const decision = await service.evaluateArtifact({
+    tenantId: "t1",
+    artifact: ocrPdfArtifact({ imageScan: "complete", pagesScanned: 1, pageCount: 1 }, "Report\n\nScanned: jane.doe@example.com"),
+    subject: { kind: "upload" }
+  });
+  expect(decision.action).toBe("block");
+});
+
+test("detect mode reports a PDF with partial OCR coverage", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "detect" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000
+  });
+  const decision = await service.evaluateArtifact({
+    tenantId: "t1",
+    artifact: ocrPdfArtifact({ imageScan: "partial", pagesScanned: 1, pageCount: 9, reason: "page_limit" }, "jane.doe@example.com"),
+    subject: { kind: "upload" }
+  });
+  expect(decision.action).toBe("report");
+});
+
+test("the OCR budget extends the evaluation timeout of a PDF only", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "detect" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 20,
+    pdfOcrBudgetMs: 200
+  });
+  const slowRead = (contentType: string) => ({
+    artifactId: "art_1",
+    contentType,
+    readContent: () => new Promise<string>((resolve) => setTimeout(() => resolve("no PII here"), 60)),
+    entityTypes: []
+  });
+  const pdf = await service.evaluateArtifact({ tenantId: "t1", artifact: slowRead("application/pdf"), subject: { kind: "upload" } });
+  expect(pdf.action).toBe("allow");
+  const text = await service
+    .evaluateArtifact({ tenantId: "t1", artifact: slowRead("text/plain"), subject: { kind: "upload" } })
+    .catch((e: unknown) => e);
+  expect((text as PiiProtectionServiceError).code).toBe("pii_timeout");
 });

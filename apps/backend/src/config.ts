@@ -191,6 +191,29 @@ export const envSchema = z.object({
       message:
         "PDFTOTEXT_BINARY_PATH must point at a pdftotext binary (e.g. pdftotext, pdftotext.exe, pdftotext-24.02)"
     }),
+  // PDF OCR for the PII scan runs these tools (execFile, fixed argv) against
+  // uploaded PDFs, so their basenames are pinned the same way.
+  PDFINFO_BINARY_PATH: z
+    .string()
+    .min(1)
+    .default("pdfinfo")
+    .refine((value) => /^pdfinfo([.-]|$)/.test(path.basename(value)), {
+      message: "PDFINFO_BINARY_PATH must point at a pdfinfo binary (e.g. pdfinfo, pdfinfo.exe)"
+    }),
+  PDFTOPPM_BINARY_PATH: z
+    .string()
+    .min(1)
+    .default("pdftoppm")
+    .refine((value) => /^pdftoppm([.-]|$)/.test(path.basename(value)), {
+      message: "PDFTOPPM_BINARY_PATH must point at a pdftoppm binary (e.g. pdftoppm, pdftoppm.exe)"
+    }),
+  TESSERACT_BINARY_PATH: z
+    .string()
+    .min(1)
+    .default("tesseract")
+    .refine((value) => /^tesseract([.-]|$)/.test(path.basename(value)), {
+      message: "TESSERACT_BINARY_PATH must point at a tesseract binary (e.g. tesseract, tesseract.exe)"
+    }),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   SESSION_CREATE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(10),
   SESSION_CREATE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(50),
@@ -393,6 +416,21 @@ export const envSchema = z.object({
   // format "openai".
   PII_LLM_DISABLE_THINKING: booleanFromEnvSchema.default(false),
   PII_PROVIDER_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+  // Local OCR of the pages of an uploaded PDF for the PII scan (pdfinfo,
+  // pdftoppm and tesseract on the backend host; no external service). Off:
+  // the scan reads only the PDF text. On: a PDF evaluation can take
+  // PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS, and block mode rejects
+  // a PDF whose pages OCR did not all read.
+  PII_PDF_OCR_ENABLED: booleanFromEnvSchema.default(false),
+  PII_PDF_OCR_MAX_PAGES: z.coerce.number().int().positive().max(1000).default(20),
+  // Wall-clock budget of the OCR pass of one PDF, with the wait for a slot.
+  PII_PDF_OCR_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  // OCR passes that run at the same time in one backend process.
+  PII_PDF_OCR_MAX_CONCURRENT: z.coerce.number().int().positive().max(64).default(2),
+  // Tesseract languages, joined with "+". Each one needs its traineddata.
+  PII_PDF_OCR_LANGUAGES: z.string().regex(/^[a-z][a-z0-9_]*(\+[a-z][a-z0-9_]*)*$/, {
+    message: "PII_PDF_OCR_LANGUAGES must be tesseract language codes joined with + (e.g. eng or eng+fra)"
+  }).default("eng"),
   // Hard cap on artifact bytes the PII service will read into memory before
   // a scan. Anything larger throws file_too_large (a permanent failure) and
   // the artifact is marked failed without burning retries.
@@ -422,6 +460,7 @@ export const envSchema = z.object({
 });
 
 type ParsedAppConfig = z.infer<typeof envSchema>;
+
 
 export const LOGIN_TYPES = ["workos", "local"] as const;
 export type LoginType = (typeof LOGIN_TYPES)[number];
@@ -603,6 +642,13 @@ export function loadConfig(
     );
   if (parsed.SESSION_EXECUTION_HEARTBEAT_MS * 2 >= parsed.SESSION_EXECUTION_LEASE_MS)
     throw new Error("SESSION_EXECUTION_LEASE_MS must exceed twice SESSION_EXECUTION_HEARTBEAT_MS.");
+  // The worker must not treat a PII job that still reads a PDF as stale.
+  if (
+    parsed.PII_PDF_OCR_ENABLED &&
+    parsed.PII_PROVIDER_TIMEOUT_MS + parsed.PII_PDF_OCR_TIMEOUT_MS >= parsed.SCHEDULER_JOB_TIMEOUT_MS
+  ) {
+    throw new Error("PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS must be less than SCHEDULER_JOB_TIMEOUT_MS.");
+  }
 
   // Resolve the API_HOST default by auth mode: dev-headers must stay on the IPv4
   // loopback (its trust boundary), while jwt binds dual-stack so a load

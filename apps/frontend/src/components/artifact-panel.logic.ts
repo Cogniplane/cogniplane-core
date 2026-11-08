@@ -20,10 +20,20 @@ export function formatArtifactStatus(status: Artifact["status"]): string {
 
 export function formatPiiLabel(pii: ArtifactPiiDetail): string | null {
   const label = formatPiiVerdict(pii);
-  // A PDF verdict covers only its text; images in it are not scanned.
-  return label && pii.imagesNotScanned && !isPiiNotScanned(pii) && (pii.status === "scanned" || pii.status === "transformed")
-    ? `${label} (text only)`
-    : label;
+  // A verdict on a PDF says when it did not cover all page images.
+  const coverage = label && !isPiiNotScanned(pii) && (pii.status === "scanned" || pii.status === "transformed")
+    ? imageCoverageSuffix(pii)
+    : null;
+  return coverage ? `${label} (${coverage})` : label;
+}
+
+// Only OCR that read every page covers the images. `imagesNotScanned`
+// without `imageScan` is a text-only scan: OCR was off.
+function imageCoverageSuffix(pii: ArtifactPiiDetail): string | null {
+  if (pii.imageScan === "partial") return "images partly scanned";
+  if (pii.imageScan === "failed") return "image scan failed";
+  if (pii.imageScan === "complete") return null;
+  return pii.imagesNotScanned ? "text only" : null;
 }
 
 // The scan applied mode off: protection was off, or the file was out of

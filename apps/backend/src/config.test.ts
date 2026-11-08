@@ -263,6 +263,37 @@ test("loadConfig accepts versioned/platform pdftotext names, rejects unrelated b
   );
 });
 
+test("loadConfig pins the basenames of the PDF OCR tools", () => {
+  const config = loadConfig(devConfig({
+    PDFINFO_BINARY_PATH: "/usr/bin/pdfinfo",
+    PDFTOPPM_BINARY_PATH: "/opt/poppler/pdftoppm-24.02",
+    TESSERACT_BINARY_PATH: "/usr/local/bin/tesseract"
+  }));
+  expect([config.PDFINFO_BINARY_PATH, config.PDFTOPPM_BINARY_PATH, config.TESSERACT_BINARY_PATH])
+    .toEqual(["/usr/bin/pdfinfo", "/opt/poppler/pdftoppm-24.02", "/usr/local/bin/tesseract"]);
+  expect(() => loadConfig(devConfig({ TESSERACT_BINARY_PATH: "/usr/bin/sh" }))).toThrow(/must point at a tesseract binary/);
+  expect(() => loadConfig(devConfig({ PDFTOPPM_BINARY_PATH: "/tmp/pdfinfo" }))).toThrow(/must point at a pdftoppm binary/);
+});
+
+test("loadConfig keeps PDF OCR off by default and checks its settings", () => {
+  const config = loadConfig(devConfig());
+  expect(config).toMatchObject({
+    PII_PDF_OCR_ENABLED: false, PII_PDF_OCR_MAX_PAGES: 20, PII_PDF_OCR_TIMEOUT_MS: 30_000,
+    PII_PDF_OCR_MAX_CONCURRENT: 2, PII_PDF_OCR_LANGUAGES: "eng"
+  });
+  expect(loadConfig(devConfig({ PII_PDF_OCR_LANGUAGES: "eng+fra+chi_sim" })).PII_PDF_OCR_LANGUAGES).toBe("eng+fra+chi_sim");
+  for (const languages of ["", "eng fra", "eng;rm", "-l", "eng+"]) {
+    expect(() => loadConfig(devConfig({ PII_PDF_OCR_LANGUAGES: languages }))).toThrow();
+  }
+});
+
+test("loadConfig requires the PDF OCR budget to fit inside the PII job timeout", () => {
+  expect(() => loadConfig(devConfig({
+    PII_PDF_OCR_ENABLED: "true", PII_PDF_OCR_TIMEOUT_MS: "296000", SCHEDULER_JOB_TIMEOUT_MS: "300000"
+  }))).toThrow(/PII_PDF_OCR_TIMEOUT_MS/);
+  expect(loadConfig(devConfig({ PII_PDF_OCR_ENABLED: "true" })).PII_PDF_OCR_ENABLED).toBe(true);
+});
+
 test("loadConfig accepts AUTH_MODE=workos when NODE_ENV=production", () => {
   const config = loadConfig(workosConfig({ NODE_ENV: "production", API_HOST: "0.0.0.0" }));
   expect(config.AUTH_MODE).toBe("jwt");

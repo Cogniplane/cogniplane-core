@@ -663,7 +663,9 @@ class InMemoryArtifactStore {
   }
   async setPiiDetail(_tenantId: string, artifactId: string, pii: ArtifactPiiDetail) {
     const artifact = this.artifacts.get(artifactId); if (!artifact) return;
-    const current = (artifact.detail.pii as ArtifactPiiDetail | undefined) ?? {};
+    // Like the store: each write replaces the coverage of an earlier scan.
+    const { imagesNotScanned: _n, imageScan: _s, imagePagesScanned: _p, imagePageCount: _c, ...current } =
+      (artifact.detail.pii as ArtifactPiiDetail | undefined) ?? {};
     const updated: ArtifactRecord = {
       ...artifact,
       detail: { ...artifact.detail, pii: { ...current, ...pii } },

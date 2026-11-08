@@ -5,6 +5,7 @@ import { test, expect } from "vitest";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { Pool } from "../../lib/db.js";
+import type { PdfOcr } from "./pdf-ocr.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import { DatabasePiiScanSubjectReader } from "./pii-scan-subject-reader.js";
 
@@ -13,6 +14,7 @@ function buildReader(opts: {
   body: Buffer | Buffer[];
   maxBytes?: number;
   onDestroy?: () => void;
+  ocrPdf?: PdfOcr;
 }): DatabasePiiScanSubjectReader {
   const artifacts: Pick<ArtifactStore, "get"> = {
     get: async () =>
@@ -44,7 +46,8 @@ function buildReader(opts: {
     artifacts,
     storage,
     maxBytes: opts.maxBytes,
-    extractPdfText: async () => "Quarterly report"
+    extractPdfText: async () => "Quarterly report",
+    ocrPdf: opts.ocrPdf
   });
 }
 
@@ -92,12 +95,22 @@ test("readContent marks a PDF verdict as text-only", async () => {
   const reader = buildReader({ artifact: { mimeType: "application/pdf" }, body: Buffer.from("%PDF") });
   const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
   expect(await input!.readContent()).toBe("Quarterly report");
-  expect(input!.imagesNotScanned?.()).toBe(true);
+  expect(input!.imageCoverage?.()).toEqual({ imageScan: "not_scanned" });
+});
+
+test("readContent adds OCR text and records the OCR coverage of a PDF", async () => {
+  const ocrPdf = async () => ({ text: "Signed by jane@example.com", status: "partial" as const, pagesScanned: 20,
+    pageCount: 30, reason: "page_limit" as const });
+  const reader = buildReader({ artifact: { mimeType: "application/pdf" }, body: Buffer.from("%PDF"), ocrPdf });
+  const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
+  expect(input!.imageCoverage?.()).toBeUndefined();
+  expect(await input!.readContent()).toBe("Quarterly report\n\nSigned by jane@example.com");
+  expect(input!.imageCoverage?.()).toMatchObject({ imageScan: "partial", pagesScanned: 20, pageCount: 30 });
 });
 
 test("readContent does not mark a text file", async () => {
   const reader = buildReader({ artifact: {}, body: Buffer.from("hello") });
   const input = await reader.readArtifact({ tenantId: "t1", artifactId: "art_1" });
   await input!.readContent();
-  expect(input!.imagesNotScanned?.()).toBe(false);
+  expect(input!.imageCoverage?.()).toBeUndefined();
 });
