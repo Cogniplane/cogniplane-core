@@ -32,11 +32,9 @@ spending](model-spending.md).
 - A turn without a requested model picks from the enabled models, in order: the
   tenant default model (`defaultModelId`, Admin > Models) if its provider has a
   key, the first built-in provider default with a key, then any enabled model
-  with a key, then the catalog default (the key check then refuses it).
-- Known limit: when no model is enabled, that pick is empty, and `POST
-  /messages` falls back to `DEFAULT_MODEL_ID` without the enablement and key
-  checks (`routes/messages.ts`). Do not rely on an empty enablement list to
-  block turns.
+  with a key, then the catalog default (the key check then refuses it). When no
+  model is enabled, the turn gets 400 `no_model_enabled`; interactive and
+  scheduled turns use the same resolver.
 - `resolveModelConstruction` maps a catalog id to `initChatModel` arguments.
   OpenRouter and Z.AI use the OpenAI client with a custom base URL.
   `applyReasoningEffort` sets reasoning effort per provider. Token usage comes

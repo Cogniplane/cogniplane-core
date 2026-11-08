@@ -68,7 +68,7 @@ export function schedulerRuntimeResolver(input: {
     return {
       kind: "ok",
       adapter: resolution.runtimeAdapter,
-      modelId: resolution.selectedModel?.id ?? null,
+      modelId: resolution.selectedModel.id,
       effort: resolution.selectedEffort
     };
   };

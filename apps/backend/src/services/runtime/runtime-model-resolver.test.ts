@@ -305,6 +305,24 @@ test("resolveRuntimeModel: an explicitly requested model of a disabled provider 
   expect(result.statusCode).toBe(400);
 });
 
+test.each([
+  ["no enabled provider", { enabledProviders: [] }],
+  ["an empty model allowlist", { enabledModelIds: [] }]
+])("resolveRuntimeModel: without a requested model and with %s, refuses with 400 no_model_enabled", async (_name, overrides) => {
+  const result = await resolveRuntimeModel(
+    makeInput({
+      stores: {
+        hasProviderKey: async () => true,
+        getModelAvailability: availability(overrides)
+      }
+    })
+  );
+  expect(result.kind).toBe("error");
+  if (result.kind !== "error") return;
+  expect(result.statusCode).toBe(400);
+  expect(result.body.error).toBe("no_model_enabled");
+});
+
 test("resolveRuntimeModel: the no-model default skips disabled providers/models", async () => {
   // Anthropic is disabled → the OpenAI default (GPT-6 Luna) wins.
   const result = await resolveRuntimeModel(

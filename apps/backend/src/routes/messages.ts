@@ -97,9 +97,6 @@ export type MessageRouteStores = {
   projectFiles?: Pick<AppDependencies["projectFiles"], "captureRuntimeSnapshot">;
 };
 
-const DEFAULT_MODEL_ID =
-  AVAILABLE_MODELS.find((m) => m.isDefault)?.id ?? AVAILABLE_MODELS[0]!.id;
-
 const DEFAULT_SESSION_NAME = "New session";
 const AUTO_NAMED_SESSION_PATTERN = /^Session \d+$/;
 
@@ -433,7 +430,7 @@ export async function registerMessageRoutes(
         tenantId: request.auth.tenantId,
         sessionId: input.sessionId,
         userId: request.auth.userId,
-        modelName: selectedModel?.id ?? input.model ?? DEFAULT_MODEL_ID,
+        modelName: selectedModel.id,
         effort: selectedEffort,
         prompt: runtimePrompt,
         projectInstructions,

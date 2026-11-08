@@ -43,7 +43,7 @@ export type RuntimeResolutionResult =
   | {
       kind: "ok";
       runtimeAdapter: RuntimeAdapter;
-      selectedModel: ResolverModel | null;
+      selectedModel: ResolverModel;
       /**
        * The effort the turn should run with: the validated requested effort,
        * else the tenant's per-model default-effort override, else undefined
@@ -188,6 +188,19 @@ export async function resolveRuntimeModel(
     }
   } else {
     selectedModel = catalogDefault;
+  }
+
+  // No model to run: the tenant turned off every model or provider. Refuse here
+  // so no caller falls back to a built-in default that the tenant turned off.
+  if (!selectedModel) {
+    return {
+      kind: "error",
+      statusCode: 400,
+      body: apiError(
+        "no_model_enabled",
+        "No model is enabled for this organization. An admin can enable one in Admin > Models."
+      )
+    };
   }
 
   // Gate on the selected model's provider. The provider is available only after
