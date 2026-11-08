@@ -2521,7 +2521,7 @@ describe("CopilotChatHost generative UI", () => {
       render(hostElement({ artifactInventory: { artifacts: [FILE], onOpenPreview } }));
       await screen.findByText("Earlier answer");
       expect(toggle().getAttribute("aria-expanded")).toBe("false");
-      expect(panel().hidden).toBe(true);
+      expect(panel().hasAttribute("inert")).toBe(true);
       expect(within(panel()).getByText("Nothing here yet")).toBeTruthy();
 
       await typeAndSend("Put the board in the panel");
@@ -2547,7 +2547,7 @@ describe("CopilotChatHost generative UI", () => {
       expect(within(panel()).getByText("The agent is writing this view.")).toBeTruthy();
       // The first new view opens the panel on a wide screen, and the focus stays where it was. The view never shows in the transcript.
       expect(toggle().getAttribute("aria-expanded")).toBe("true");
-      expect(panel().hidden).toBe(false);
+      expect(panel().hasAttribute("inert")).toBe(false);
       expect(panel().contains(document.activeElement)).toBe(false);
       expect(screen.queryByRole("button", { name: "View side panel" })).toBeNull();
       expect(transcript().textContent).toContain("The board is in the side panel.");
@@ -2579,7 +2579,8 @@ describe("CopilotChatHost generative UI", () => {
       expect(onOpenPreview).toHaveBeenCalledExactlyOnceWith(FILE_ID);
 
       fireEvent.click(within(region).getByRole("button", { name: "Close side panel" }));
-      expect(screen.queryByRole("complementary", { name: "Side panel" })).toBeNull();
+      // The closed panel is inert: the browser takes it out of the accessibility tree.
+      expect(region.hasAttribute("inert")).toBe(true);
       // The focus goes back to the toggle, not to the page body.
       expect(document.activeElement).toBe(toggle());
       fireEvent.click(toggle());

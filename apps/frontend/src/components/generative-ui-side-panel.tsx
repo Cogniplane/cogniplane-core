@@ -631,11 +631,15 @@ export function GenerativeUiSidePanel({
         data-state={modal ? "open" : undefined}
         aria-labelledby={`${panelId}-title`}
         tabIndex={modal ? -1 : undefined}
-        hidden={!open}
+        // The closed panel stays laid out so that open and close animate, as
+        // the shell's panels do. inert and visibility remove it from the tab
+        // order and the accessibility tree. The visibility change waits for
+        // the end of the close transition.
+        inert={!open}
         onKeyDown={onKeyDown}
-        className={`${open ? "flex" : "hidden"} min-w-0 flex-col ${narrow ? WORKSPACE_DRAWER_SURFACE : "bg-surface-container-low"} outline-none ${narrow
-          ? "fixed inset-y-0 right-0 z-[var(--z-modal)] w-[min(92vw,420px)] shadow-lg"
-          : "w-[min(45%,420px)] shrink-0 border-l border-outline-variant"} motion-safe:animate-in motion-safe:fade-in motion-safe:slide-in-from-right-4 motion-safe:duration-200`}
+        className={`flex min-w-0 flex-col overflow-hidden ${narrow ? WORKSPACE_DRAWER_SURFACE : "bg-surface-container-low"} outline-none duration-200 ease-[var(--ease-standard)] motion-reduce:transition-none ${open ? "visible" : "invisible"} ${narrow
+          ? `fixed inset-y-0 right-0 z-[var(--z-modal)] w-[min(92vw,420px)] shadow-lg transition-[transform,visibility] ${open ? "translate-x-0" : "translate-x-full"}`
+          : `shrink-0 border-outline-variant transition-[width,border-width,visibility] ${open ? "w-[min(45%,420px)] border-l" : "w-0 border-l-0"}`}`}
       >
         <WorkspaceDrawerHeader title="Side panel" titleId={`${panelId}-title`} closeLabel="Close side panel"
           closeRef={closeRef} onClose={onClose} modal={narrow} />
