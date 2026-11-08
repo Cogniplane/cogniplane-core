@@ -35,9 +35,7 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   change](sensitive-changes.md#weaker-controls-and-skill-releases).
 - CSV files: rules scan the whole file; the provider gets only a preview (the
   header and the first rows, bounded by `PII_CSV_PREVIEW_ROWS` and
-  `PII_CSV_PREVIEW_MAX_BYTES`). Known limit: that cap counts JavaScript string
-  length (UTF-16 code units), not bytes, so non-ASCII text can exceed it in
-  bytes (`pii-protection-service.ts`).
+  `PII_CSV_PREVIEW_MAX_BYTES`, in UTF-8 bytes; `buildCsvPreview`).
 - Scopes: chat prompts, uploads, and import sources that overlays register. The
   skill-improvement corpus (`skill_corpus`) is always in scope while protection
   is on, whatever the chat scope says; a transform replaces the corpus text and

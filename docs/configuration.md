@@ -17,10 +17,10 @@ example](../apps/backend/.env.example). Overlay variables
 Values are environment strings. Boolean values `1`, `true`, `yes` and `on` are
 true, ignoring case and surrounding whitespace. Other strings are false. Numeric
 bounds apply to values; string bounds apply to character counts. `_MS` values
-are milliseconds, `_BYTES` values are bytes (except `PII_CSV_PREVIEW_MAX_BYTES`:
-see [PII](architecture/pii.md)), and `_DAYS` values are days. `unset` means the
-schema has no default, though startup or a consumer may derive a value as
-described below. `<system-temp>` is Node's operating-system temporary directory.
+are milliseconds, `_BYTES` values are bytes, and `_DAYS` values are days.
+`unset` means the schema has no default, though startup or a consumer may derive
+a value as described below. `<system-temp>` is Node's operating-system temporary
+directory.
 
 ## Startup rules
 
@@ -225,7 +225,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `PII_PROVIDER_TIMEOUT_MS` | number, integer, > 0 | `5000` | [pii](architecture/pii.md) |
 | `PII_ARTIFACT_MAX_BYTES` | number, integer, > 0 | `5242880` | [pii](architecture/pii.md) |
 | `PII_CSV_PREVIEW_ROWS` | number, integer, > 0 | `10` | [pii](architecture/pii.md) |
-| `PII_CSV_PREVIEW_MAX_BYTES` | number, integer, > 0 | `4096` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
+| `PII_CSV_PREVIEW_MAX_BYTES` | number, integer, > 0 | `4096` | [pii](architecture/pii.md) |
 | `PII_BREAKER_ENABLED` | boolean | `true` | [pii](architecture/pii.md) |
 | `PII_BREAKER_FAILURE_THRESHOLD` | number, integer, > 0 | `5` | [pii](architecture/pii.md) |
 | `PII_BREAKER_WINDOW_MS` | number, integer, > 0 | `60000` | [pii](architecture/pii.md) |

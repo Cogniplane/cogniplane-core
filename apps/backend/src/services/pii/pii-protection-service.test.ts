@@ -1101,6 +1101,14 @@ test("buildCsvPreview: returns header + first N rows under the byte cap", () => 
   expect(out).toBe("name,email\nAlice,a@b.co\nBob,b@b.co");
 });
 
+test("buildCsvPreview: counts UTF-8 bytes, not characters", () => {
+  const out = buildCsvPreview("é".repeat(4096), { maxRows: 5, maxBytes: 4096 });
+  expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(4096);
+  expect(out).toBe("é".repeat(2048));
+  const rows = buildCsvPreview(["h", "éé", "éé", "éé"].join("\n"), { maxRows: 5, maxBytes: 12 });
+  expect(rows).toBe(["h", "éé", "éé"].join("\n"));
+});
+
 test("buildCsvPreview: stops at byte cap mid-rows", () => {
   // 3 data rows of 20+ bytes each, 50-byte cap should fit only header+1.
   const csv = "header\n" + Array.from({ length: 5 }, (_, i) => `row-${i}-padding`).join("\n");
