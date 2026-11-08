@@ -10,6 +10,12 @@ it("keeps every schema key, constraint and default current in the operator refer
   await expect(generateConfigReference(true)).resolves.toBeUndefined();
 });
 
+it("names every variable in at least one document", async () => {
+  const table = await readFile(path.resolve(__dirname, "../docs/configuration.md"), "utf8");
+  const unnamed = [...table.matchAll(/^\| `([A-Z0-9_]+)` \|.*\| *\|$/gm)].map((match) => match[1]);
+  expect(unnamed).toEqual([]);
+});
+
 it("documents schema defaults without reading deployment values", async () => {
   vi.stubEnv("DATABASE_URL", "postgres://do-not-copy-this-secret@private-host/db");
   vi.stubEnv("PII_RETENTION_KEK", "do-not-copy-this-key");

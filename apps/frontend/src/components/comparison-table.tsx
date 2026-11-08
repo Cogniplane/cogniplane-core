@@ -14,7 +14,7 @@
 // table.
 //
 // Two stylesheets beat utility classes here, because neither sits in a cascade
-// layer (see LEARNINGS). The SDK resets the margins of p, table, figcaption and
+// layer. The SDK resets the margins of p, table, figcaption and
 // headings, so the spacing here comes from padding and gaps. The markdown rules
 // of globals.css style every table in the chat and the panel, so the table
 // carries data-app-table, which those rules skip.

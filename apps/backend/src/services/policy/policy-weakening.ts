@@ -8,7 +8,7 @@ import {
 } from "./policy-engine.js";
 
 // When a change of the Policy Center rules makes the policy weaker
-// (docs/ARCHITECTURE.md, "Data routes"). Only such a change needs step-up and
+// (docs/architecture/sensitive-changes.md, "Weaker controls and skill releases"). Only such a change needs step-up and
 // sends the owner notice: a stolen admin token must not open a tool that a
 // rule blocks or routes for approval.
 //

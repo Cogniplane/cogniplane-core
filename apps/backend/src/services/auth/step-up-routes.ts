@@ -1,6 +1,6 @@
 import type { StepUpAction } from "./step-up-store.js";
 
-// The routes that need step-up (docs/ARCHITECTURE.md, "Authentication"):
+// The routes that need step-up (docs/architecture/sensitive-changes.md):
 // every route that grants a sign-in credential, a Cogniplane account, or a
 // tenant role, or ends an account or a factor, every tenant setting that
 // changes where the tenant's data goes (data routes, below), every change

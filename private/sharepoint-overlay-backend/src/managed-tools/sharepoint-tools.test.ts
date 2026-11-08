@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import type { ToolExecutionContext } from "../../../../apps/backend/src/services/auth/tool-execution-context-store.js";
 import { createSharepointTools } from "./sharepoint-tools.js";
@@ -22,7 +22,8 @@ const fakeCreds = {
   microsoftUserId: "user-1",
   email: "user@example.com",
   displayName: "Test User",
-  token: "ms_faketoken"
+  token: "ms_faketoken",
+  scopes: ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All", "offline_access"]
 };
 
 type SharepointToolDeps = Parameters<typeof createSharepointTools>[0];
@@ -488,6 +489,29 @@ test("sharepoint_upload_file returns error when there is no Microsoft connection
   });
   expect(String(result.error ?? "")).toMatch(/No Microsoft connection/);
 });
+
+test.each(["sharepoint_upload_file", "sharepoint_create_folder"])(
+  "%s refuses a connection with read scopes only, before any Graph call",
+  async (name) => {
+    const readOnlyDeps: SharepointToolDeps = {
+      ...noCredsDeps,
+      microsoftConnections: {
+        async getRuntimeCredentials() {
+          return { ...fakeCreds, scopes: ["User.Read", "Files.Read.All", "Sites.Read.All"] };
+        }
+      }
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const t = createSharepointTools(readOnlyDeps).find((x) => x.name === name)!;
+    const result = await t.handler({
+      context: fakeContext,
+      arguments: { driveId: "b!d", parentId: "root", filename: "x", content: "y", folderName: "x" }
+    });
+    expect(String(result.error ?? "")).toMatch(/can only read/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  }
+);
 
 test("sharepoint_create_folder returns error when there is no Microsoft connection", async () => {
   const t = createSharepointTools(noCredsDeps).find((x) => x.name === "sharepoint_create_folder")!;

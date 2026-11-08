@@ -1,4 +1,4 @@
-// Password rules for local accounts (docs/ARCHITECTURE.md, "Authentication").
+// Password rules for local accounts (docs/architecture/local-accounts.md).
 // NIST SP 800-63B-4: at least 15 characters when the password is the only
 // factor, no composition rules, a block list. One rule for all accounts keeps
 // it simple. Length counts Unicode code points after NFKC normalisation, which

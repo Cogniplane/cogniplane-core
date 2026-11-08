@@ -13,7 +13,7 @@ import { AuthDisclosure, AuthLink, AuthMessage, PendingButton, focusIfOwned, pen
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-// One page for both login types (docs/ARCHITECTURE.md, "Authentication"). It
+// One page for both login types (docs/architecture/auth.md). It
 // shows the forms the installation enables, side by side. It never asks for the
 // email first to choose a form, so it does not reveal which login type an email
 // uses.

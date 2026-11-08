@@ -16,7 +16,7 @@ import { AuthLink, AuthMessage, NewPasswordInput, PendingButton, focusIfOwned, p
 import { SignInSteps } from "./sign-in-steps";
 import { passwordFieldError } from "./password-field-error";
 
-// The page behind a one-time link (docs/ARCHITECTURE.md, "Authentication"). The
+// The page behind a one-time link (docs/architecture/local-accounts.md). The
 // token is in the URL fragment, so it reaches neither server logs nor the
 // Referer header; the page removes it from the address bar at once, so it does
 // not stay in the browser history either.

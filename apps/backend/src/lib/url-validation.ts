@@ -328,10 +328,12 @@ export const ssrfSafeAgent = new Agent({
 });
 
 /**
- * `ssrfSafeAgent` takes effect only on a fetch that honors the `dispatcher`
- * option. Node's global fetch ignores it as of undici v8. That disables DNS
- * pinning without a visible failure. Call sites accept an injectable fetch for
- * tests. Passing the global fetch is a wiring bug, so this function throws.
+ * `ssrfSafeAgent` is an Agent of the `undici` package, so only that package's
+ * fetch is known to apply it. Node's global fetch bundles another undici
+ * version: depending on the two versions it can reject the agent or not apply
+ * it (Node 24.11 with undici 8.12 rejects it). Call sites accept an injectable
+ * fetch for tests. Passing the global fetch is a wiring bug, so this function
+ * throws.
  */
 export function assertDispatcherAwareFetch(fetchImpl: typeof undiciFetch): void {
   if (Object.is(fetchImpl, globalThis.fetch)) {

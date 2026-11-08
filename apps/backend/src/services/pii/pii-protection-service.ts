@@ -672,18 +672,35 @@ export function buildCsvPreview(
   const lines = content.split("\n");
   if (lines.length === 0) return "";
   const out: string[] = [];
+  // The budget is UTF-8 bytes, so non-ASCII text cannot exceed it.
   let bytes = 0;
   // Always include the header. If even the header is over budget, truncate it.
-  const header = (lines[0] ?? "").replace(/\r$/, "");
-  out.push(header.length > options.maxBytes ? header.slice(0, options.maxBytes) : header);
-  bytes += out[0]!.length + 1; // +1 for the newline join
+  const header = truncateUtf8((lines[0] ?? "").replace(/\r$/, ""), options.maxBytes);
+  out.push(header);
+  bytes += Buffer.byteLength(header, "utf8") + 1; // +1 for the newline join
   for (let i = 1; i < lines.length && out.length <= options.maxRows; i += 1) {
     const row = (lines[i] ?? "").replace(/\r$/, "");
-    if (bytes + row.length + 1 > options.maxBytes) break;
+    const rowBytes = Buffer.byteLength(row, "utf8");
+    if (bytes + rowBytes + 1 > options.maxBytes) break;
     out.push(row);
-    bytes += row.length + 1;
+    bytes += rowBytes + 1;
   }
   return out.join("\n");
+}
+
+// The longest prefix of `text` that fits in `maxBytes` UTF-8 bytes, cut at a
+// character boundary.
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let used = 0;
+  let end = 0;
+  for (const character of text) {
+    const size = Buffer.byteLength(character, "utf8");
+    if (used + size > maxBytes) break;
+    used += size;
+    end += character.length;
+  }
+  return text.slice(0, end);
 }
 
 function isCsvContentType(contentType: string): boolean {

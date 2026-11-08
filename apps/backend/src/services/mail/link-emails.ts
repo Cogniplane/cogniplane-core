@@ -4,7 +4,7 @@ import { escapeHtml, FOOTER, formatWhen, headerSafe } from "./security-notices.j
 // The texts of the emails that carry a one-time link. The link is the only
 // way to act on the account from the email; the text says who asked for it,
 // how long it works, and what to do when the person did not expect it. See
-// docs/ARCHITECTURE.md, "Authentication".
+// docs/architecture/email.md.
 
 /**
  * self_reset: the person asked on the sign-in page ("Forgot password").

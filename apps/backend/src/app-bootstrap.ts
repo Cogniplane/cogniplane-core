@@ -43,6 +43,9 @@ import {
   type StaleMessageSweeperDeps
 } from "./services/runtime/stale-message-sweeper.js";
 
+// How often expired in-memory rate-limit windows are removed.
+const RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
+
 export async function registerAppRoutes(
   app: FastifyInstance,
   deps: AppDependencies,
@@ -126,8 +129,8 @@ export async function registerAppRoutes(
     })
   );
 
-  // Optional overlays attach their routes last. The core OSS tree ships this
-  // as a no-op so derived distributions can add routes without changing core.
+  // Overlays attach their routes last (the bundled SharePoint overlay through
+  // overlays.ts), so they can add routes without changing core.
   deps.overlays.attachRoutes(app, { dataRoutes: routeControls.dataRoutes });
 }
 
@@ -182,7 +185,7 @@ export function registerAppLifecycle(input: {
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
   mailWorker?.start();
 
-  const sweepInterval = setInterval(() => limits.sweepExpired(), 60_000);
+  const sweepInterval = setInterval(() => limits.sweepExpired(), RATE_LIMIT_SWEEP_INTERVAL_MS);
   sweepInterval.unref();
   const sweepExecutions = () => {
     void expiredExecutions?.sweepExpired().catch(err => app.log.error({ err }, "Expired execution sweep failed"));

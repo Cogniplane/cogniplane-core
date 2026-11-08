@@ -122,7 +122,7 @@ test("MicrosoftFilesService.listFiles lists OneDrive root by default", async () 
           microsoftUserId: "ms-user-1",
           displayName: "Test User",
           email: "test@example.com",
-          token: "token"
+          token: "token", scopes: []
         };
       }
     },
@@ -167,7 +167,7 @@ test("MicrosoftFilesService.searchFiles flattens search hits", async () => {
           microsoftUserId: "ms-user-1",
           displayName: "Test User",
           email: "test@example.com",
-          token: "token"
+          token: "token", scopes: []
         };
       }
     },
@@ -231,7 +231,7 @@ test("MicrosoftFilesService.importFileToSession stores the file as an artifact",
           microsoftUserId: "ms-user-1",
           displayName: "Test User",
           email: "test@example.com",
-          token: "token"
+          token: "token", scopes: []
         };
       }
     },
@@ -305,7 +305,7 @@ test("MicrosoftFilesService.listFiles rejects driveId containing slash before an
     ...baseDeps,
     microsoftConnections: {
       async getRuntimeCredentials() {
-        return { microsoftUserId: "u", displayName: null, email: null, token: "t" };
+        return { microsoftUserId: "u", displayName: null, email: null, token: "t", scopes: [] };
       }
     },
     artifacts: stubArtifacts,
@@ -333,7 +333,7 @@ test("MicrosoftFilesService.importFileToSession rejects malformed itemId before 
     ...baseDeps,
     microsoftConnections: {
       async getRuntimeCredentials() {
-        return { microsoftUserId: "u", displayName: null, email: null, token: "t" };
+        return { microsoftUserId: "u", displayName: null, email: null, token: "t", scopes: [] };
       }
     },
     artifacts: stubArtifacts,
@@ -380,7 +380,7 @@ const fakeCreds = {
   microsoftUserId: "ms-user-1",
   displayName: "Test User",
   email: "test@example.com",
-  token: "tk"
+  token: "tk", scopes: []
 };
 
 const credsDeps = {

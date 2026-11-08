@@ -20,7 +20,7 @@ import {
 // worker (mail-outbox-worker.ts) sends it after that. The message is
 // encrypted until it is sent. A row belongs to a member of the tenant
 // (migration 082): a local account, or a WorkOS owner for the notice of a
-// data setting change. See docs/ARCHITECTURE.md, "Authentication".
+// data setting change. See docs/architecture/email.md.
 
 /** A notice that is still not sent after this is dropped: it is no longer news. */
 export const NOTICE_TTL_MS = 72 * 60 * 60_000;

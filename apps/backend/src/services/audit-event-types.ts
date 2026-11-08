@@ -112,7 +112,7 @@ export const AUDIT_EVENT_TYPES = [
   // not propagate after provisioning, so this event shows revocations. They are
   // not errors.
   "role_sync_divergence",
-  // Local accounts (docs/ARCHITECTURE.md, "Authentication"). `login_failed` is
+  // Local accounts (docs/architecture/local-accounts.md). `login_failed` is
   // written only for an existing account: an unknown email has no tenant.
   // Payloads never hold a password, token, or hash.
   "auth.login_succeeded",

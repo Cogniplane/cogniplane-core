@@ -1,5 +1,5 @@
 // Local accounts against a real Postgres with the production roles
-// (docs/ARCHITECTURE.md, "Authentication"): the one-home-tenant
+// (docs/architecture/auth.md): the one-home-tenant
 // foreign keys, the account lifecycle through LocalAccountService, the
 // serialisation of concurrent changes, the maintenance role's read-only
 // access, owner recovery, and tenant deletion.

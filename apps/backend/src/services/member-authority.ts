@@ -4,8 +4,7 @@ import type { LocalAccountStatus, TenantMembershipRole } from "./tenant-member-s
 
 // One place for the rules on who may change whose membership or account, used
 // by the role and removal routes (routes/tenant.ts) and by every manager
-// action on local accounts (LocalAccountService). See docs/ARCHITECTURE.md,
-// "Authentication".
+// action on local accounts (LocalAccountService). See docs/architecture/local-accounts.md.
 //
 // The middleware reads the caller's role when the request starts. So every
 // membership or account change by a manager runs in one transaction that:

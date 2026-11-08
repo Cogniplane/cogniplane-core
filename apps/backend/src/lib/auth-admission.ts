@@ -10,7 +10,7 @@ export type AuthAdmission =
 /**
  * Decides whether a token for this membership may act. Shared by the request
  * middleware and `/auth/refresh`, so a session that one refuses the other
- * cannot renew. See docs/ARCHITECTURE.md, "Authentication":
+ * cannot renew. See docs/architecture/auth.md:
  *
  * - The tenant's login type must be enabled in this installation.
  * - The user's login path must be the tenant's login type. The type is fixed

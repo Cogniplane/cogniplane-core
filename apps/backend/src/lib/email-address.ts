@@ -2,7 +2,7 @@
 // surrounding spaces, lowercase. users.email_key applies lower(btrim()) in
 // Postgres; the NFC step happens here, before the address is stored, so both
 // agree. No provider-specific rules (no Gmail dot removal).
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/local-accounts.md.
 
 const MAX_EMAIL_LENGTH = 254;
 // Deliberately loose: one @, something on each side, a dot in the domain, no

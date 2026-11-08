@@ -1,6 +1,6 @@
 // The app gate of the CopilotKit Inspector, a development tool that shows the
 // messages, state, and AG-UI events of the chat agent. See "Development
-// Inspector" in docs/ARCHITECTURE.md.
+// Inspector" in docs/architecture/chat-ui.md.
 //
 // CopilotKit 1.85.0 enables the Inspector by default in development: only an
 // explicit `enableInspector={false}` turns it off. So the chat host always

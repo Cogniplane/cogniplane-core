@@ -92,8 +92,7 @@ export function buildLocalAuth(input: {
  * password and session must not change credentials. Returns the proof's
  * methods. Writes a 403 `step_up_required` or `strong_step_up_required`,
  * with the action, and returns null otherwise. A session that is not local
- * (WorkOS) always gets `step_up_required`. See docs/ARCHITECTURE.md,
- * "Authentication".
+ * (WorkOS) always gets `step_up_required`. See docs/architecture/local-accounts.md.
  */
 export async function requireStepUp(
   request: FastifyRequest,

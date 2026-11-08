@@ -4,8 +4,8 @@ import { StepUpActionSchema, type StepUpAction as StepUpActionType } from "@cogn
 
 import type { AuthMethod } from "../../lib/jwt.js";
 
-// Fresh proof for one sensitive action (docs/ARCHITECTURE.md,
-// "Authentication"). POST /auth/step-up checks a proof and returns a token; the
+// Fresh proof for one sensitive action (docs/architecture/sensitive-changes.md).
+// POST /auth/step-up checks a proof and returns a token; the
 // sensitive route takes it in the X-Step-Up header and consumes it.
 //
 // The token is single use, lives STEP_UP_TTL_SECONDS, and is bound to the

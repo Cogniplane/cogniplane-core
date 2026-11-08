@@ -1374,7 +1374,7 @@ describe("POST /auth/refresh", () => {
     }
   });
 
-  // See docs/ARCHITECTURE.md, "Authentication": the membership decides
+  // See docs/architecture/auth.md: the membership decides
   // before every answer, also the cached successor of a concurrent rotation,
   // which returns before any other database read.
   test("does not return a cached rotation result after the membership is gone", async () => {

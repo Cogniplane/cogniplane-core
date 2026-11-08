@@ -6,7 +6,7 @@ import { escapeHtml, FOOTER, formatWhen, headerSafe } from "./security-notices.j
 // The text of the owner notice for a change of a data setting: a tenant
 // setting that changes where the tenant's data goes, a change that makes a
 // control weaker (Policy Center rules, PII protection), or a skill release
-// (docs/ARCHITECTURE.md, "Authentication"). Every owner of the tenant gets
+// (docs/architecture/sensitive-changes.md). Every owner of the tenant gets
 // it, also for a change that an owner made. For a WorkOS tenant it is the
 // only check, so its text is fixed:
 // - The subject and the first sentence never change.

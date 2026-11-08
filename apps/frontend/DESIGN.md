@@ -1,10 +1,12 @@
 ---
 name: Cogniplane
-description: The calm control room for governed enterprise AI work.
+description: Visual rules for the Cogniplane workspace and admin console.
 colors:
   command-ink: "#0f172a"
+  on-command-ink: "#f7f7ff"
   signal-teal: "#1f7e86"
   signal-teal-strong: "#17646b"
+  signal-teal-surface: "rgba(44, 155, 160, 0.12)"
   operational-mist: "#f0f4f7"
   operational-layer: "#e8eff3"
   operational-layer-high: "#e1e9ee"
@@ -42,6 +44,11 @@ typography:
     fontSize: "0.875rem"
     fontWeight: 400
     lineHeight: 1.6
+  caption:
+    fontFamily: "Inter, sans-serif"
+    fontSize: "0.75rem"
+    fontWeight: 400
+    lineHeight: "1rem"
   label:
     fontFamily: "Inter, sans-serif"
     fontSize: "0.6875rem"
@@ -64,13 +71,13 @@ spacing:
 components:
   button-primary:
     backgroundColor: "{colors.command-ink}"
-    textColor: "{colors.clear-surface}"
+    textColor: "{colors.on-command-ink}"
     typography: "{typography.body}"
     rounded: "{rounded.md}"
     padding: "8px 16px"
     height: "36px"
   button-secondary:
-    backgroundColor: "{colors.operational-mist}"
+    backgroundColor: "{colors.signal-teal-surface}"
     textColor: "{colors.signal-teal-strong}"
     typography: "{typography.body}"
     rounded: "{rounded.md}"
@@ -93,43 +100,67 @@ components:
   chip:
     backgroundColor: "{colors.operational-layer}"
     textColor: "{colors.slate-voice}"
-    typography: "{typography.label}"
+    typography: "{typography.caption}"
     rounded: "{rounded.sm}"
     padding: "2px 6px"
 ---
 
 # Design System: Cogniplane
 
+Scope: visual rules for the frontend. Read it with `PRODUCT.md` before UI work.
+
 ## 1. Overview
 
-**Creative North Star: "The Calm Control Room"**
+Product intent and anti-references are in `PRODUCT.md`. This file sets the
+visual rules. Code uses the tokens in `apps/frontend/src/app/globals.css`; the
+frontmatter mirrors them for design tools. Change both together.
+`scripts/doc-links.test.ts` checks that each frontmatter color exists in
+`globals.css` and that each component names a defined color; it does not check
+which role a color has in code.
 
-Cogniplane is a focused operational environment where knowledge work remains central and governance becomes visible exactly when it matters. Its cool, layered surfaces reduce visual noise; compact, familiar controls support sustained work; and Signal Teal marks the few elements that need orientation or action. The system feels assured, precise, and approachable without becoming sterile.
-
-The interface is information-dense where administrators need evidence and deliberately quiet where employees converse, draft, and handle artifacts. Workspace, settings, and administration share one visual language. Responsive layouts change structure rather than shrinking type: rails become drawers, multi-column groups stack, and consequential actions retain full clarity.
-
-This system explicitly rejects the generic consumer chatbot and complex enterprise software. It must never reduce Cogniplane to a transcript and prompt box, nor expose platform architecture before a person needs it.
-
-**Key Characteristics:**
-
-- Cool tonal layers with a restrained teal orientation signal
-- Compact, familiar controls with strong keyboard and state feedback
-- Information density organized by hierarchy, not decoration
-- Governance states that are specific, legible, and impossible to miss
-- Light and dark themes with equivalent semantic roles
+Responsive layouts change structure (rails become drawers, columns stack); they
+do not shrink type.
 
 ## 2. Colors
 
-The palette combines Command Ink, cool Operational Mist layers, and a rare Signal Teal accent; semantic colors communicate evidence and consequence rather than decorate surfaces. The frontmatter is the normative token source.
+Code names: each color is a CSS variable in `globals.css` (`dark-*` in the dark
+theme block). `scripts/doc-links.test.ts` checks this table.
+
+| Color | CSS variable |
+|---|---|
+| `command-ink` | `--color-primary` |
+| `on-command-ink` | `--color-on-primary` |
+| `signal-teal` | `--color-brand` |
+| `signal-teal-strong` | `--color-brand-strong` |
+| `signal-teal-surface` | `--color-brand-surface` |
+| `operational-mist` | `--color-surface-container-low` |
+| `operational-layer` | `--color-surface-container` |
+| `operational-layer-high` | `--color-surface-container-high` |
+| `clear-surface` | `--color-surface-container-lowest` |
+| `slate-voice` | `--color-on-surface-variant` |
+| `faint-slate` | `--color-on-surface-faint` |
+| `evidence-blue` | `--color-info` |
+| `verified-green` | `--color-success` |
+| `attention-amber` | `--color-warning` |
+| `guardrail-red` | `--color-danger` |
+| `control-boundary` | `--color-input` |
+| `divider` | `--color-border` |
+| `dark-canvas` | `--color-background` |
+| `dark-surface` | `--color-surface` |
+| `dark-raised` | `--color-popover` |
+| `dark-layer` | `--color-surface-container` |
+| `dark-control-boundary` | `--color-input` |
+| `dark-text` | `--color-on-surface` |
+| `dark-signal-teal` | `--color-brand` |
 
 ### Primary
 
-- **Command Ink:** The workhorse for primary actions and highest-emphasis text in the light theme. It provides authority without making every action look branded.
-- **Signal Teal:** Active navigation, selected controls, focus rings, links, and small moments that orient the user. Signal Teal Strong carries readable teal text on pale surfaces.
+- **Command Ink:** Primary actions and highest-emphasis text in the light theme.
+- **Signal Teal:** Active navigation, selected controls, focus rings and links. Signal Teal Strong carries readable teal text on pale surfaces.
 
 ### Secondary
 
-- **Evidence Blue:** Informational status, non-interactive evidence, and data-series distinction. It never competes with Signal Teal for primary action.
+- **Evidence Blue:** Informational status, non-interactive evidence, and data-series distinction. It is never used for a primary action.
 - **Verified Green:** Successful completion and confirmed healthy states.
 - **Attention Amber:** Pending approval, caution, and situations requiring attention.
 - **Guardrail Red:** Errors, blocked actions, destructive intent, and policy violations.
@@ -140,130 +171,116 @@ The palette combines Command Ink, cool Operational Mist layers, and a rare Signa
 - **Operational Layer / Layer High:** Nested tonal separation and hover or selected surfaces without unnecessary borders.
 - **Clear Surface:** Content containers, popovers, and focused work surfaces in the light theme.
 - **Slate Voice / Faint Slate:** Secondary and tertiary text. Faint Slate is limited to metadata and nonessential labels; body copy uses Slate Voice or stronger.
-- **Dark Canvas / Dark Surface / Dark Layer / Dark Text:** Equivalent dark-theme roles. Dark Signal Teal is lifted for contrast rather than mechanically reusing the light accent.
-- **Dark Raised:** Menus, popovers, dialogs, and drawers in dark mode. It sits one step above cards, so an overlay never looks lower than the page it covers.
+- **Dark Canvas / Dark Surface / Dark Layer / Dark Text:** Equivalent dark-theme roles. Dark Signal Teal is lighter than the light accent, for contrast.
+- **Dark Raised:** Menus, popovers, dialogs, and drawers in dark mode. It is one step lighter than cards.
 
 ### Boundaries
 
 - **Divider:** Faint edges of static containers, rows, and layout regions. A divider groups content; it never identifies a control on its own. A bare `border` class resolves to this color.
-- **Control Boundary:** The edge of every input, select, textarea, outline button, and native form control. It keeps at least 3:1 against every surface a control sits on (light surfaces up to Operational Layer High; dark surfaces up to the brightest dark layer). It is an edge color only; controls fill with the separate control surface token.
+- **Control Boundary:** The edge of every input, select, textarea, outline button and native form control.
+  - Contrast: at least 3:1 against every surface a control sits on, up to Operational Layer High (light) and the brightest dark layer (dark).
+  - Edge only: controls fill with the control surface token.
 - **Hover surface (`accent`):** The background of a hovered or focused menu item, select option, or ghost button. It is never a text, border, or chart color. Foregrounds use Evidence Blue (`info`), Signal Teal (`brand`), or a status color with its paired surface. Charts use the shared `chart-1` to `chart-5` palette.
 
-### Named Rules
-
-**The Signal Rarity Rule.** Signal Teal marks action, focus, or location and occupies no more than a small fraction of a screen. Its rarity is what makes it useful.
-
-**The Semantic Integrity Rule.** Green, amber, red, and blue always communicate state or evidence. They are forbidden as arbitrary decoration.
-
-**The Theme Equivalence Rule.** Dark mode preserves hierarchy and meaning; it is not a neon restyle of the light interface.
+Green, amber, red and blue always show state or evidence, never decoration.
 
 ## 3. Typography
 
-**Display Font:** Manrope (with sans-serif fallback)
-**Body Font:** Inter (with sans-serif fallback)
-**Label/Mono Font:** Inter for labels; the system monospace stack only for code, versions, and machine identifiers.
-
-**Character:** Manrope gives headings compact authority while Inter keeps dense controls and data readable. The pairing is practical and contemporary, with a tight scale suited to a product people use for extended periods.
+Fonts and sizes are the `typography` tokens in the frontmatter. Use the system monospace stack only for code, versions and machine identifiers.
 
 ### Hierarchy
 
-- **Headline** (600, 1.5rem, 1.25): Page titles and the strongest heading on administrative or settings surfaces.
-- **Title** (600, 1rem, 1.4): Panel headings, session titles, dialog titles, and compact section hierarchy.
-- **Body** (400, 0.875rem, 1.6): Product copy, controls, and explanatory text. Prose is capped near 70 characters; tables and operational data may run wider.
-- **Label** (600, 0.6875rem / 11px, 0.08em letter spacing, `text-label`): Sparse group labels for rows or metrics and compact metadata. Never smaller; 10px uppercase text is below the readable floor. Uppercase labels are never repeated as decorative eyebrows across every section, and a page title has no eyebrow above it.
-- **Caption** (400, 0.75rem): Supporting metadata, timestamps, and menu item descriptions. Status chips use the caption size with medium weight.
+- **Headline**: Page titles and the strongest heading on administrative or settings surfaces.
+- **Title**: Panel headings, session titles, dialog titles, and compact section hierarchy.
+- **Body**: Product copy, controls, and explanatory text. Prose is capped near 70 characters; tables and operational data may run wider.
+- **Label**: Sparse group labels for rows or metrics and compact metadata. Do not go smaller: 10px uppercase text is not readable. Do not repeat uppercase labels as decoration above each section or above a page title.
+- **Caption**: Supporting metadata, timestamps, menu item descriptions, chips and status pills.
 
-### Named Rules
-
-**The Working Scale Rule.** Product typography uses fixed sizes and a restrained ratio. Fluid display type and oversized marketing hierarchy are prohibited inside the application.
-
-**The Plain-Language Label Rule.** Labels name the object or action directly. Typography never compensates for unclear wording.
+Use fixed type sizes with a small ratio. No fluid display type or marketing-size headings in the application.
 
 ## 4. Elevation
 
-Cogniplane is layered and restrained. Depth comes first from adjacent cool surface tones, then from borders where boundaries require precision. Shadows are reserved for elements that genuinely rise above the workspace: menus, dialogs, drawers, and interactive surfaces during lift. Dark mode uses stronger ambient shadows because tonal boundaries need more support.
+Shadows are only for elements above the workspace: menus, dialogs, drawers, and interactive surfaces during lift. Dark mode uses stronger shadows.
 
 ### Shadow Vocabulary
 
-- **Low ambient** (`0 2px 8px rgba(42, 52, 57, 0.06)`): Compact floating controls and subtle interactive lift in light mode.
-- **Raised ambient** (`0 4px 24px rgba(42, 52, 57, 0.08)`): Menus, transient panels, and deliberate hover lift.
-- **Modal ambient** (`0 8px 40px rgba(42, 52, 57, 0.10)`): Dialogs and drawers only.
-- **Dark low / raised / modal** (`0 8px 24px rgba(0, 0, 0, 0.16)`, `0 16px 40px rgba(0, 0, 0, 0.20)`, `0 24px 64px rgba(0, 0, 0, 0.24)`): Theme-equivalent floating elevation on dark surfaces.
+Values are the `--elevation-*` tokens in `globals.css` (light and dark).
 
-Dialogs and alert dialogs never exceed the viewport (`100dvh` minus 2rem). Their body scrolls and the footer with the decision stays pinned at the bottom. A dialog that scrolls its whole body reserves a band for Close. Callers with their own scrolling layout use `scrollBody={false}` and keep a fixed or sticky header with room for Close. Hiding that button during a save must preserve the form and its focus. Escape and the close button dismiss unless a pending save requires the dialog to stay open. Under reduced motion, overlay enter and exit animations finish at once.
+- **Low** (`--elevation-low`, `shadow-sm`): compact floating controls and small hover lift.
+- **Raised** (`--elevation-raised`, `shadow-md`): menus, transient panels, deliberate hover lift.
+- **Modal** (`--elevation-modal`, `shadow-lg`): dialogs and drawers only.
 
-### Named Rules
+Dialogs:
 
-**The Layer-Before-Shadow Rule.** Use tonal separation before adding elevation. A static container does not earn a shadow merely because it has content.
-
-**The One Boundary Rule.** Do not combine a decorative border with a broad shadow on the same static card. Pick the boundary the hierarchy actually requires.
+- Never exceed the viewport (`100dvh` minus 2rem). The body scrolls; the footer with the decision stays pinned.
+- A dialog that scrolls its whole body reserves a band for Close. With `scrollBody={false}`, the caller keeps a fixed or sticky header with room for Close.
+- Hiding Close during a save keeps the form and its focus.
+- Escape and Close dismiss, unless a pending save keeps the dialog open.
+- Under reduced motion, enter and exit animations finish at once.
 
 ## 5. Components
 
-**Component philosophy: quiet controls, decisive states.** Controls remain familiar and restrained at rest; focus, selection, approval, warning, and error states become unmistakable.
+Controls are plain at rest; focus, selection, approval, warning and error states are always visible.
 
 ### Buttons
 
-- **Shape:** Gently compact corners (8px) with heights from 24px for dense inline actions to 40px for prominent actions; 36px is the default.
-- **Primary:** Command Ink with clear high-contrast text and 16px horizontal padding. Use for the single strongest action in a local decision set.
-- **Hover / Focus:** A 150ms standard ease, slight color shift, and a 3px translucent Signal Teal focus ring. Active press scales to 0.985; reduced motion removes the transform.
-- **Header toolbars:** Icon-only actions use the ghost style. The desktop Jump control keeps its outline when its label and shortcut are visible. On phones it becomes a ghost icon like its neighbors.
+- **Shape:** frontmatter `button-*` tokens; smaller heights for dense inline actions, larger for prominent ones.
+- **Primary:** the single strongest action in a local decision set.
+- **Hover / Focus:** A 150ms standard ease and a slight color shift; the shared focus ring (see Do's). Active press scales to 0.985; reduced motion removes the transform.
+- **Header toolbars:** icon-only actions use the ghost style.
 - **Secondary / Outline / Ghost:** Pale Signal Teal surfaces identify selected or secondary emphasis. Outline buttons mark neutral alternatives. Ghost buttons are reserved for icon and low-emphasis actions.
-- **Destructive:** A solid Guardrail Red fill with its paired foreground in both themes: white text in light, dark ink on the lifted coral in dark. Never a translucent red under white text.
+- **Destructive:** A solid Guardrail Red fill with its paired foreground in both themes: white text in light, dark ink on the lighter dark-theme red in dark. Never a translucent red under white text.
 - **Disabled / Loading:** Disabled controls remain visible at 50% opacity and cannot receive pointer events. Loading text states the ongoing action.
 
 ### Chips
 
-- **Style:** Compact 4px corners, 2px vertical and 6px horizontal padding, and semantic tonal backgrounds.
-- **State:** Neutral chips carry metadata; semantic chips carry evidence or status. Full pills are reserved for badges whose compact capsule shape improves scanning.
+Classes are in `apps/frontend/src/lib/ui-tokens.ts`.
+
+- **Chip** (`CHIP`, frontmatter `chip`): metadata on a neutral surface.
+- **Status pill** (`PILL_*`): status or evidence. Full rounding, caption size with medium weight, the status color on its paired surface.
 
 ### Cards / Containers
 
 - **Corner Style:** 8px for dense list containers, 12px for standard cards, and 16px only for singular prominent surfaces.
-- **Background:** Clear Surface over Operational Mist or Operational Layer. Nested cards are prohibited; use spacing, dividers, or tonal sections inside a container.
-- **Shadow Strategy:** Flat. The shared Card has no shadow. Refer to the Layer-Before-Shadow Rule.
+- **Background:** Clear Surface over Operational Mist or Operational Layer. Inside a container, use spacing, dividers or tonal sections.
+- **Shadow:** none on the shared Card.
 - **Border:** A faint full perimeter only when adjacent tones do not provide enough structure. Colored side stripes are prohibited.
 - **Internal Padding:** 12–16px for dense operational items and 24px for standard cards.
 
 ### Inputs / Fields
 
-- **Style:** 36px default height, 8px corners, a Control Boundary edge (3:1), a theme-aware control surface, and 12px horizontal padding. Native selects, textareas, and checkboxes follow the same boundary, and the page declares `color-scheme` so native menus and checkboxes match the theme.
-- **Focus:** Border shifts to Signal Teal with a 3px translucent ring. Placeholder text must remain readable, not ornamental gray.
+- **Style:** frontmatter `input` token: a Control Boundary edge on the control surface.
+- **Native controls:** selects, textareas and checkboxes use the same edge. The page declares `color-scheme`, so native menus match the theme.
+- **Focus:** the border turns Signal Teal, with the shared focus ring. Placeholder text must remain readable, not ornamental gray.
 - **Error / Disabled:** Guardrail Red border and ring communicate invalid state. Disabled fields remain legible and show unavailable interaction through opacity and cursor.
 
 ### Navigation
 
-- **Style:** Cool tonal rails and headers frame content without competing with it. Default items use Slate Voice; hover uses a slightly stronger tonal layer; active items use a complete Signal Teal surface and readable teal text, never a decorative side stripe.
-- **Typography:** Compact body text. Group labels are short sentence-case captions that name a `role="group"` of links.
-- **Responsive treatment:** Desktop rails collapse into fixed drawers below 768px. Drawers use an explicit backdrop, Escape dismissal, internal scrolling on short screens, and 40px touch targets rather than squeezing the content column.
-- **Session drawer on short screens:** Below 600px in height, the full sidebar scrolls and the session list keeps a useful height. Its close control remains outside that scrolling area. A closed rail is inert; an open phone drawer contains focus and returns it to the header on dismissal.
-- **Tabs:** Inactive tabs use Slate Voice. The line variant marks the selected tab with a Signal Teal indicator; the default variant raises the selected tab onto a lighter surface.
-- **Workspace header:** When the header is narrower than 720px, it uses two rows: session identity (sidebar, title, account) above session tools (status, capabilities, actions, jump, artifacts). Copy moves into the session menu and the theme into the account menu. Touch targets are 40px there and 32px on desktop. Approval status never leaves the screen.
-- **Account menu:** One shared menu for every header: the person, destinations, organization switching, shortcuts, and log out. Admin appears only for owners and admins. This is presentation only; AuthGuard and the backend decide access.
-- **Console headers:** A transparent title and toolbar align with the content column below. The layout supplies the same column width and horizontal inset for the header and content. A header adds no second inset or filled band.
-- **Theme:** Light or dark, chosen by the person and saved in the browser. The app does not follow the system setting. If the browser blocks saving, the theme still changes for the page and a notice says it will not be kept.
+- **Style:** Default items use Slate Voice; hover uses a stronger tonal layer; active items use a complete Signal Teal surface with readable teal text, never a side stripe.
+- **Group labels:** short sentence-case captions that name a `role="group"` of links.
+- **Responsive:** rails become drawers on narrow screens, with a backdrop, Escape to close, internal scrolling and 40px touch targets. A closed rail is inert; an open drawer contains focus and returns it on close. Breakpoints are in the layout components.
+- **Tabs:** inactive tabs use Slate Voice; the selected tab has a Signal Teal indicator (line variant) or a lighter surface (default variant).
+- **Headers:** console headers align with the content column and add no inset or filled band. Approval status always stays visible in the workspace header.
+- **Theme:** light or dark, chosen by the person and saved in the browser; the app does not follow the system setting.
 
 ### Approval State
 
-Approval is a signature governance component. It pairs a complete Attention Amber tonal surface (one faint amber perimeter, no side stripe, no shadow) and icon with a direct title, exact action summary, and a clear hierarchy between decline, approve once, and turn-scoped approval. The component must explain consequence before requesting a decision and must not rely on amber alone to communicate urgency.
+- Surface: full Attention Amber tonal fill, one faint amber perimeter, an icon; no side stripe, no shadow.
+- Content: a direct title and the exact action, then the consequence, then the decision.
+- Actions: decline and approve once; approve for the turn only when the request allows it (`allowForTurn`). Keep a clear order of emphasis.
+- Do not use amber as the only sign of urgency.
 
 ## 6. Do's and Don'ts
 
 ### Do:
 
-- **Do** keep research, writing, analysis, conversation, and artifacts visually primary.
-- **Do** use Signal Teal only for action, focus, selection, or orientation.
-- **Do** reveal governance and runtime detail progressively, at the moment it helps a decision.
-- **Do** preserve equivalent semantic meaning, contrast, and hierarchy in light and dark themes.
-- **Do** maintain complete keyboard operation, visible focus, reduced-motion behavior, and color-independent status cues to meet WCAG 2.2 AA.
-- **Do** use familiar control shapes and wording consistently across workspace, settings, and administration.
+- **Do** meet WCAG 2.2 AA (the target in `PRODUCT.md`): text contrast 4.5:1 (3:1 for large text); control edges and focus indicators 3:1.
+- **Do** keep full keyboard operation and the shared focus ring: 3px, translucent Signal Teal.
+- **Do** keep layouts usable at 200% browser zoom.
+- **Do** pair every status color with an icon or text.
 
 ### Don't:
 
-- **Don't** make Cogniplane look like a **generic consumer chatbot** whose identity stops at a transcript and prompt box.
-- **Don't** make Cogniplane feel like **complex enterprise software** that exposes architecture or configuration before it becomes relevant.
-- **Don't** use colored side stripes on cards, navigation items, approvals, alerts, or list rows; use complete surfaces, icons, and text hierarchy.
+- **Don't** match the anti-references in `PRODUCT.md`.
 - **Don't** nest cards or repeat identical icon-heading-description card grids where a list, table, or continuous section communicates structure better.
-- **Don't** pair a faint border with a broad decorative shadow on a static element.
 - **Don't** use gradients, glass effects, oversized rounding, or decorative motion as substitutes for hierarchy.
-- **Don't** communicate success, attention, danger, or informational state through color alone.

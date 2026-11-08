@@ -22,7 +22,7 @@ import { TenantMemberStore } from "../services/tenant-member-store.js";
 // The session layer that every login type shares: token issue, refresh with
 // rotation and reuse detection, logout, and /auth/me. A login route proves who
 // the user is, then calls `issueSession`; nothing here knows how that proof
-// was made. See docs/ARCHITECTURE.md, "Authentication".
+// was made. See docs/architecture/auth.md.
 
 export const REFRESH_COOKIE_NAME = "cogniplane_refresh";
 export const REFRESH_COOKIE_MAX_AGE_S = 7 * 24 * 60 * 60;

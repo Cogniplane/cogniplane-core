@@ -40,7 +40,7 @@ import { type AfterSecurityChange, type SecurityChange, withSecurityChange } fro
 // origin, the configured RP id, the challenge of a single-use record
 // (passkey-challenge-store.ts), and user verification. A passkey with user
 // verification is itself two factors (the device and its PIN or biometric).
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/local-accounts.md.
 //
 // Changes that the tenant policy depends on (a new factor, a removed one)
 // take the tenant lock, then the identity, like every other factor change.

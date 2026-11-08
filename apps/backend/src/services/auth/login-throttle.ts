@@ -4,7 +4,7 @@ import type { Redis } from "ioredis";
 
 import { DERIVED_SECRET_LABELS, deriveSecret } from "../../lib/derived-secrets.js";
 
-// Per-identifier sign-in throttle (docs/ARCHITECTURE.md, "Authentication").
+// Per-identifier sign-in throttle (docs/architecture/local-accounts.md).
 //
 // - Throttle, never lock: after THRESHOLD failures, each further failure sets
 //   a deadline before the next try, 30 s doubling to 15 min. The record expires

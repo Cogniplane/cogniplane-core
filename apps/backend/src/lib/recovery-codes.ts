@@ -8,7 +8,7 @@ import { base32Encode } from "./totp.js";
 // HMAC-SHA256 under a key derived from DATA_ENCRYPTION_SECRET, so a copy of
 // the database alone does not allow offline guessing. When that secret
 // changes, old codes stop working and users make new ones.
-// See docs/ARCHITECTURE.md, "Authentication".
+// See docs/architecture/local-accounts.md.
 
 export const RECOVERY_CODE_COUNT = 10;
 export const RECOVERY_CODE_KEY_LABEL = DERIVED_SECRET_LABELS.recoveryCode;

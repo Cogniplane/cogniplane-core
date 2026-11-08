@@ -7,7 +7,7 @@ import type { StepUpAction } from "./step-up-store.js";
 // hash of a random id and is consumed once (GETDEL) when the browser answers.
 // A record made for one purpose never serves another, and a record bound to
 // a user, a sign-in flow, or a session serves only that one. See
-// docs/ARCHITECTURE.md, "Authentication".
+// docs/architecture/local-accounts.md.
 
 export const PASSKEY_CHALLENGE_TTL_SECONDS = 5 * 60;
 

@@ -11,7 +11,7 @@ import {
 } from "../services/auth/login-throttle.js";
 
 // The Lua scripts of the sign-in throttle against a real Redis
-// (docs/ARCHITECTURE.md, "Authentication"). The in-memory twin has
+// (docs/architecture/auth.md). The in-memory twin has
 // unit tests; this proves the scripts keep the same rules.
 
 if (process.env.INTEGRATION_REQUIRE_REDIS === "1" && !process.env.INTEGRATION_REDIS_URL) {

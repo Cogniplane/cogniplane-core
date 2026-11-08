@@ -48,7 +48,7 @@ const lastInput = () => vi.mocked(resolveRuntimeModel).mock.calls.at(-1)![0] as 
 
 describe("schedulerRuntimeResolver", () => {
   test("asks for the tenant's default model with that tenant's settings and catalog", async () => {
-    vi.mocked(resolveRuntimeModel).mockResolvedValue({ kind: "ok", runtimeAdapter, selectedModel: null, selectedEffort: undefined });
+    vi.mocked(resolveRuntimeModel).mockResolvedValue({ kind: "ok", runtimeAdapter, selectedModel: AVAILABLE_MODELS[0]!, selectedEffort: undefined });
     const { resolve, getOrCreateTenantSettings, list, hasKey } = resolver();
 
     await resolve("tenant-b");
@@ -73,12 +73,6 @@ describe("schedulerRuntimeResolver", () => {
     vi.mocked(resolveRuntimeModel).mockResolvedValue({ kind: "ok", runtimeAdapter, selectedModel: model, selectedEffort: "high" });
 
     expect(await resolver().resolve("tenant-a")).toEqual({ kind: "ok", adapter: runtimeAdapter, modelId: model.id, effort: "high" });
-  });
-
-  test("returns no model id when the resolver selected none", async () => {
-    vi.mocked(resolveRuntimeModel).mockResolvedValue({ kind: "ok", runtimeAdapter, selectedModel: null, selectedEffort: undefined });
-
-    expect(await resolver().resolve("tenant-a")).toMatchObject({ kind: "ok", modelId: null });
   });
 
   test.each([

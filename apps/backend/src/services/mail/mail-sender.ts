@@ -4,8 +4,7 @@ import { parseEmail } from "../../lib/email-address.js";
 import type { MailFrom, SmtpSettings } from "../../lib/smtp-settings.js";
 
 // Sends one message. Only the outbox worker calls it, after the change that
-// the message reports has committed. See docs/ARCHITECTURE.md,
-// "Authentication".
+// the message reports has committed. See docs/architecture/email.md.
 
 export type OutgoingMail = { to: string; subject: string; text: string; html: string };
 

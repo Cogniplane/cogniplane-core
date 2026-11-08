@@ -27,7 +27,7 @@ import { type AfterSecurityChange, type SecurityChange, withSecurityChange } fro
 export { managerMayAct };
 
 // Local accounts: sign-in, one-time links, password change, and the manager
-// actions. See docs/ARCHITECTURE.md, "Authentication".
+// actions. See docs/architecture/local-accounts.md.
 //
 // Pools. `lookupDb` is the maintenance pool and is used only for the two
 // reads that run before the tenant is known: account by email, link by token

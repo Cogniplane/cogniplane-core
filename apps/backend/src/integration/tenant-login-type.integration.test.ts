@@ -1,6 +1,6 @@
 // Migration 070 and the sign-in rules that depend on it, against a real
-// Postgres with the production roles. See docs/ARCHITECTURE.md,
-// "Authentication": tenants.login_type is fixed at creation, users.email_key
+// Postgres with the production roles. See docs/architecture/auth.md:
+// tenants.login_type is fixed at creation, users.email_key
 // makes emails that differ only in case one identity, and WorkOS provisioning
 // never adopts a row it does not already own.
 

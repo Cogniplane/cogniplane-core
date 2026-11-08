@@ -1,5 +1,9 @@
 import { buildApp } from "./app.js";
 
+// After this, a stop that has not finished exits with code 1. Container stop
+// timeouts must be longer (compose.yaml: stop_grace_period).
+const SHUTDOWN_DEADLINE_MS = 35_000;
+
 const app = await buildApp();
 
 // Crash on programmer errors instead of limping along in an undefined state.
@@ -22,9 +26,9 @@ async function shutdown(reason: string, exitCode: number, error?: unknown): Prom
   }
   shuttingDown = true;
   const deadline = setTimeout(() => {
-    app.log.error("Graceful shutdown exceeded 35 seconds");
+    app.log.error(`Graceful shutdown exceeded ${SHUTDOWN_DEADLINE_MS / 1000} seconds`);
     process.exit(1);
-  }, 35_000);
+  }, SHUTDOWN_DEADLINE_MS);
   deadline.unref();
   if (error) {
     app.log.error({ err: error }, `shutting down: ${reason}`);

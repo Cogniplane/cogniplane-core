@@ -9,7 +9,7 @@ import { LocalAccountError, managerMayAct, type RequestMeta } from "../services/
 import { type LocalAuth, requireStepUp } from "../services/auth/local-auth.js";
 import { MFA_POLICIES } from "../services/auth/local-mfa-service.js";
 
-// Manager actions on local accounts (docs/ARCHITECTURE.md, "Authentication").
+// Manager actions on local accounts (docs/architecture/local-accounts.md).
 // Same rights as the role routes in tenant.ts: owner and admin manage; nobody
 // acts on themselves; nobody acts on an owner; only an owner acts on an admin
 // or creates an admin. Nobody creates an owner here: a new account is not

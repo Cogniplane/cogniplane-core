@@ -5,8 +5,7 @@ import type { Pool } from "../../lib/db.js";
 import { classifySendError, type MailSender, type OutgoingMail, type SendFailure } from "./mail-sender.js";
 
 // Sends what email_outbox holds. Runs in every backend process, on the
-// maintenance pool (it serves every tenant). See docs/ARCHITECTURE.md,
-// "Authentication".
+// maintenance pool (it serves every tenant). See docs/architecture/email.md.
 //
 // - Claim: FOR UPDATE SKIP LOCKED, so two processes never take one row. A
 //   claim carries a random token; only the claimer can finish the row.

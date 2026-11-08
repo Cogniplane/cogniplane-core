@@ -3,7 +3,7 @@ import type { AdminUser, LinkEmailStatus, LocalAccountStatus } from "@cogniplane
 import type { Actor, MemberRole } from "./person-access.logic";
 
 /*
- * Local accounts (docs/ARCHITECTURE.md, "Authentication"). These
+ * Local accounts (docs/architecture/local-accounts.md). These
  * rules mirror apps/backend/src/routes/tenant-local-members.ts. The backend
  * stays the authority; the page uses them only to hide refused actions.
  */

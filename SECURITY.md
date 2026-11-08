@@ -1,40 +1,37 @@
-# Security Policy
+# Security policy
 
-Cogniplane Core handles authentication, multi-tenant data, and sandboxed code execution. We take security seriously and welcome reports from researchers and users.
+Scope: how to report a vulnerability. The security design is in
+[docs/security.md](docs/security.md).
 
-## Reporting a vulnerability
+## Report a vulnerability
 
-**Please do not open a public GitHub issue for security vulnerabilities.**
+Do not open a public GitHub issue. Email `security@cogniplane.ai` with:
 
-Email **`security@cogniplane.ai`** with:
-
-- A description of the vulnerability and the affected component (which file, route, or feature).
+- The affected component (file, route or feature) and a description.
 - Steps to reproduce.
-- Your assessment of impact (confidentiality, integrity, availability).
-- Optionally, a proposed fix.
+- The impact on confidentiality, integrity or availability.
+- Optional: a proposed fix.
 
-We will acknowledge receipt within **5 business days** and work with you on a coordinated disclosure timeline. For most issues, we aim to ship a fix within 30 days of the initial report.
+We acknowledge a report within 5 business days and agree a disclosure timeline
+with you. We aim to fix most issues within 30 days. If you get no
+acknowledgement in 5 business days, send the report again.
 
-If you do not receive an acknowledgement within 5 business days, please follow up — the original email may have been misclassified.
+For the hosted product, Cogniplane Cloud, use the same address and name the
+hosted product in the report.
 
 ## Scope
 
-In scope:
+In scope: the code in this repository (backend, frontend, shared contracts,
+sandbox template), and dependency vulnerabilities that this code exposes.
 
-- The Cogniplane Core codebase in this repository (backend, frontend, shared contracts, and code execution sandbox).
-- Vulnerabilities in dependencies that are exposed by how Cogniplane Core uses them.
+Not in scope:
 
-Out of scope (please do not report):
+- Dependency vulnerabilities on code paths that this code never calls.
+- Issues that need tenant administrator access first, unless they let an admin
+  reach another tenant or gain owner rights (those are in scope).
+- Volumetric denial of service.
 
-- Vulnerabilities in `Cogniplane Cloud` (the hosted SaaS) — report those to the same email but mention the hosted product explicitly.
-- Vulnerabilities in upstream dependencies that we don't expose (e.g., theoretical CVEs in libraries we never invoke from a network-reachable code path).
-- Issues that require an attacker to already have administrator access to a Cogniplane tenant.
-- Denial-of-service via volumetric attacks (this is a deployment-side concern, not a code defect).
+## Credit
 
-## Acknowledgements
-
-With your permission, we'll list reporters of confirmed vulnerabilities in release notes and on the project's security page. If you prefer to remain anonymous, we will respect that.
-
-## Bounty
-
-Cogniplane Core does not currently run a paid bug bounty. We may add one in the future as the project grows. In the meantime, we appreciate every report and will credit reporters in releases.
+With your permission, we credit reporters of confirmed issues in release notes.
+There is no paid bug bounty.

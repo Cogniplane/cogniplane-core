@@ -9,7 +9,7 @@ export type TenantMembershipRole = "owner" | "admin" | "member";
 /**
  * What sign-in needs to know about one membership. `getRole` answers "is this
  * user a member"; this answers "may this user's token act in this tenant".
- * See docs/ARCHITECTURE.md, "Authentication".
+ * See docs/architecture/auth.md.
  */
 export type LocalAccountStatus = "pending_setup" | "active" | "disabled" | "removed";
 
