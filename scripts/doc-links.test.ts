@@ -324,6 +324,23 @@ it("puts a blank line before each heading", () => {
   expect(missing).toEqual([]);
 });
 
+// The shutdown numbers in the docs and in compose.yaml follow the backend's
+// own deadline: the stated deadline matches it, and every stop timeout is
+// longer.
+it("keeps the shutdown numbers in step with SHUTDOWN_DEADLINE_MS", () => {
+  const read = (file: string) => readFileSync(path.join(root, file), "utf8");
+  const deadlineMs = Number(/SHUTDOWN_DEADLINE_MS = ([\d_]+)/.exec(read("apps/backend/src/server.ts"))?.[1]?.replace(/_/g, ""));
+  expect(deadlineMs).toBeGreaterThan(0);
+  const stated = Number(/`SHUTDOWN_DEADLINE_MS` \((\d+) seconds\)/.exec(read("docs/operations.md").replace(/\s+/g, " "))?.[1]);
+  expect(stated * 1000).toBe(deadlineMs);
+  const timeouts = [
+    Number(/stop_grace_period: (\d+)s/.exec(read("compose.yaml"))?.[1]),
+    Number(/--stop-timeout (\d+)/.exec(read("docs/self-hosting.md"))?.[1]),
+    Number(/termination grace of at least (\d+) seconds/.exec(read("docs/operations.md").replace(/\s+/g, " "))?.[1])
+  ];
+  expect(timeouts.every((seconds) => seconds * 1000 > deadlineMs)).toBe(true);
+});
+
 // Every NEXT_PUBLIC_* variable that the frontend reads is in its variable table.
 it("documents every public frontend variable", () => {
   const files = execFileSync("git", ["ls-files", "-co", "--exclude-standard", "apps/frontend"], { cwd: root, encoding: "utf8" })

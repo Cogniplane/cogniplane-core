@@ -99,8 +99,10 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 - Deleted sessions go to trash for `SESSION_TRASH_RETENTION_DAYS`
   (`SESSION_TRASH_RETENTION_ENABLED`). Purge removes messages, storage objects
   and the checkpoint thread.
-- `PROJECT_FILE_RETENTION_ENABLED` removes old project file versions
-  (scheduler).
+- `PROJECT_FILE_RETENTION_ENABLED` (scheduler,
+  `ProjectFileStore.cleanupExpired`) deletes promoted files and files in the
+  trash for more than 30 days, with their versions. It does not prune the
+  versions of a live file.
 - Skill revision cleanup runs only when an admin calls it
   ([skills](skills.md#import-and-lifecycle)).
 - Spending records stay when sessions or messages are deleted.

@@ -39,8 +39,10 @@ session, user, tool, server, tool context and argument hash, and single use.
 
 ### Sensitive changes
 
-Data routes, weaker controls and skill releases go through `requireStepUp` and
-queue an owner notice. [sensitive changes](architecture/sensitive-changes.md)
+Data routes, weaker controls and skill releases need step-up (`requireStepUp`,
+`DataRouteControl.writeWithStepUpIfWeaker`, or `requireStepUpForOverlay` in an
+overlay) and queue an owner notice. [sensitive
+changes](architecture/sensitive-changes.md)
 
 ### Revocation
 
@@ -88,8 +90,8 @@ redirect and hide. Every rule is enforced in the backend.
     rotation tool.
 - `PII_RETENTION_KEK`, not `DATA_ENCRYPTION_SECRET`, encrypts kept PII findings
   (reversible retention).
-- `JWT_SECRET` signs tokens; `JWT_VERIFICATION_KEYS` keeps older keys valid
-  during rotation.
+- `JWT_SECRET` signs tokens: [tokens](architecture/auth.md#tokens-and-cookies),
+  [rotation](operations.md#rotate-secrets).
 - Startup rules for secrets: [configuration](configuration.md#startup-rules).
 - `redactSecrets()` (`services/redact-secrets.ts`) removes bearer headers, known
   token formats (the patterns in that file, for example `sk-ant-` keys and JWTs)

@@ -96,7 +96,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `DATABASE_URL` | string, minimum 1 | `"postgres://app_user:app_user_password@localhost:5432/cogniplane"` | [database-roles](database-roles.md), [self-hosting](self-hosting.md) |
 | `MODEL_SPENDING_MONTHLY_LIMIT_USD` | number, minimum 0, maximum 1_000_000 | `unset` | [model-spending](architecture/model-spending.md), [self-hosting](self-hosting.md) |
 | `MODEL_SPENDING_TURN_RESERVATION_USD` | number, minimum 0.000001, maximum 1_000_000 | `1` | [model-spending](architecture/model-spending.md), [self-hosting](self-hosting.md) |
-| `LOCAL_DEV_USER_ID` | string, minimum 1 | `"local-dev-user"` | [startup rules](#startup-rules), [getting-started](getting-started.md) |
+| `LOCAL_DEV_USER_ID` | string, minimum 1 | `"local-dev-user"` | [startup rules](#startup-rules) |
 | `ADMIN_USER_IDS` | string | `unset` | [startup rules](#startup-rules), [getting-started](getting-started.md) |
 | `ANTHROPIC_API_KEY` | string, minimum 1 | `unset` | [models](architecture/models.md), [docker-deploy](docker-deploy.md) |
 | `OPENAI_API_KEY` | string, minimum 1 | `unset` | [models](architecture/models.md), [getting-started](getting-started.md) |

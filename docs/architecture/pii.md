@@ -70,12 +70,16 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
 - Stored policy repair (`pii-policy.ts`):
   - A malformed retention, action or detector field takes its default; the
     policy shows a warning.
-  - No usable provider in `detect` mode: rules only, with a warning.
+  - Invalid stored provider fields (`provider.type`, `provider.model`) in
+    `detect` mode: rules only, with a warning.
   - The policy is invalid when protection is on and `mode` cannot be read or is
     `off`; when `enabled` cannot be read (unless `mode` is `off`); or when
-    `block` or `transform` mode has no usable provider.
+    `block` or `transform` mode has invalid stored provider fields.
   - An invalid policy stops content in scope with `pii_policy_invalid` until an
     admin saves a valid policy. Protection never turns off silently.
+  - Separate case: a valid policy while the operator has not configured a
+    provider (`PII_PROVIDER_ENABLED`). The mode table above applies; fix the
+    operator configuration, not the tenant policy.
 - An admin save sends the settings revision it loaded; a stale save gets `409
   pii_settings_conflict`.
 - If an upload's scan job cannot be queued, the upload fails with

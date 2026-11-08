@@ -59,7 +59,7 @@ variables named here.
 ## Sessions and turns
 
 - Session routes (`routes/sessions.ts`): list, create, rename, `archive`,
-  `restore` (from trash), delete (to trash; purge follows
+  `restore` (from trash, else un-archive), delete (to trash; purge follows
   [retention](data.md#retention-and-deletion)), messages, connect, interrupt.
   Per-session capability selection: `routes/session-capabilities.ts`.
 - A turn holds a session execution lease (`session_executions`,

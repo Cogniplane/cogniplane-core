@@ -2,8 +2,8 @@
 
 Scope: why the system has its current shape. Each record states the decision,
 the reason, and the rules that follow. Superseded records keep one line so the
-history stays clear. Current behavior is in the
-[architecture](architecture/overview.md) documents.
+history stays clear. Numbers are stable ids; a missing number was removed.
+Current behavior is in the [architecture](architecture/overview.md) documents.
 
 ## Active
 
@@ -104,8 +104,6 @@ an admin reconciles it. Rules: [model spending](architecture/model-spending.md).
 When a tenant asks to block or transform personal data, a provider error must
 not let that data through, so the check fails in those modes. Behavior per mode:
 [PII](architecture/pii.md).
-
-Numbers are stable ids; a missing number was removed.
 
 ## Superseded
 

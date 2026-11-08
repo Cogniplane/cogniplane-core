@@ -51,8 +51,8 @@ starts the backend (`http://localhost:3001`) and the frontend
 
 1. Open `http://localhost:3000`. In `dev-headers` mode there is no sign-in: the
    frontend sends `X-User-Id: local-dev-user` and `X-Tenant-Id:
-   local-dev-tenant`. Users in `ADMIN_USER_IDS` (default: `LOCAL_DEV_USER_ID`)
-   are owners; others are members.
+   local-dev-tenant`. Users in `ADMIN_USER_IDS` (by default the dev user) are
+   owners; others are members.
 2. Select a model and send "What files are in this workspace?". A tool card
    appears and the answer streams.
 3. Open `http://localhost:3000/admin` for tenant settings, skills and MCP

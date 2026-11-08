@@ -91,9 +91,10 @@ JavaScript: ask each model you enable for a small widget before you offer it.
     connections.
   - A leading wildcard matches subdomains only. No wildcard on a public suffix,
     or on a name whose children are public suffixes (`tldts` list, private
-    section included; backend only, `isRegistrableWildcardParent`). The sandbox
-    page keeps a copy of the other rules (`lib/mcp-app-sandbox-html.ts`) and
-    gives a widget only sources that it declared and the backend approved.
+    section included; `isRegistrableWildcardParent` in shared-types
+    `public-suffix.ts`, called by the backend only). The sandbox page keeps a
+    copy of the other rules (`lib/mcp-app-sandbox-html.ts`) and gives a widget
+    only sources that it declared and the backend approved.
   - Refused: IP addresses, `localhost`, special-use names, user info, paths,
     queries, spaces, quotes, semicolons, commas.
   - The rules check text, not DNS results.

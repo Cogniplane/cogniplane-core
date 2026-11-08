@@ -18,8 +18,8 @@ approval proof is in [approvals](approvals.md#policy-center-approval-proof).
     never matches);
   - `turnContexts`: `interactive` or `scheduled`.
 
-  Conditions are AND; values in one condition are OR; an omitted condition
-  matches all.
+  Conditions are AND; values in one condition are OR; an omitted or empty
+  condition matches all.
 - A proxy tool is `read_only` only when its upstream declares `readOnlyHint:
   true` (`deriveActionSeverity`, `services/mcp/policy-gate.ts`), so a severity
   rule trusts the upstream. For a proxy you do not trust, match on `toolNames`

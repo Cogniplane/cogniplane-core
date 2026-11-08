@@ -171,7 +171,7 @@ id fails after the rows are gone, because the tenant no longer exists.
   metadata, uptime and runtime activity.
 - Logs are structured (pino, level `LOG_LEVEL`) and drop credential URL
   parameters (`lib/sanitize-url.ts`); there is no metrics endpoint. The backend
-  listens on `API_HOST`:`API_PORT` (default port 3001).
+  listens on `API_HOST`:`API_PORT`.
 
 Alert on:
 

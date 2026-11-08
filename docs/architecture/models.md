@@ -80,6 +80,6 @@ settings in the same transaction. Custom models need no code change.
    Anthropic. A tenant with a spending limit skips this step.
 3. With no key: no title.
 
-No switch turns off step 2: only a working utility model keeps first messages
-off Anthropic.
+No switch turns off step 2 for a tenant without a spending limit that has an
+Anthropic key.
 

@@ -13,11 +13,10 @@ Scope: operator setup of the bundled connectors (GitHub, Notion, Jira, Microsoft
 | Jira Cloud (Pipedream Connect, read-only) | `PIPEDREAM_CLIENT_ID`, `PIPEDREAM_CLIENT_SECRET`, `PIPEDREAM_PROJECT_ID`, `PIPEDREAM_PROJECT_ENVIRONMENT` | None (Pipedream hosts the OAuth flow) | Connect a Jira account through Pipedream and pick one site |
 
 Each group of client id, secret and redirect URI (or project id) is
-all-or-nothing ([startup rules](configuration.md#startup-rules)).
-`PIPEDREAM_PROJECT_ENVIRONMENT` defaults to `development`; set `production` for
-a production Pipedream project. Then an admin enables the connector for the
-tenant in Admin > Connections. Without the variables, the connector shows "not
-configured".
+all-or-nothing ([startup rules](configuration.md#startup-rules)). Set
+`PIPEDREAM_PROJECT_ENVIRONMENT=production` for a production Pipedream project.
+Then an admin enables the connector for the tenant in Admin > Connections.
+Without the variables, the connector shows "not configured".
 
 GitHub tools work only on repositories that the member allows on the page
 Settings > GitHub (API `PUT /me/github-connection/repositories`, at most
