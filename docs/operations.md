@@ -17,11 +17,12 @@ Shutdown (`server.ts`, `app-bootstrap.ts`): on `SIGTERM` the backend refuses new
 turns (503 `server_draining`), stops the scheduler and mail workers, lets
 running turns finish for a few seconds, then interrupts the rest (saved as
 `interrupted`). Scheduled jobs get the same wait, then their runtimes close and
-a second, longer wait lets them write their outcome. After 35 seconds the
-process exits. Give each backend a termination grace of at least 40 seconds;
-Docker's default is 10 seconds (Compose `stop_grace_period`). Check a rolling
-restart: start a long chat turn, restart its backend, and see the turn end as
-interrupted, not stuck.
+a second, longer wait lets them write their outcome. After
+`SHUTDOWN_DEADLINE_MS` (35 seconds) the process exits. Give each backend a
+termination grace of at least 40 seconds; Docker's default is 10 seconds, and
+the Compose stack sets `stop_grace_period: 40s`. Check a rolling restart: start
+a long chat turn, restart its backend, and see the turn end as interrupted, not
+stuck.
 
 Migrations are forward-only; there are no down migrations, and older backends
 are not tested against a newer schema. If the new backends fail `/ready`, fix

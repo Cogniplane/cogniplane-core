@@ -134,6 +134,9 @@ services:
       dockerfile: docker/backend.Dockerfile
     container_name: cogniplane-backend
     restart: unless-stopped
+    # Longer than the backend's own shutdown deadline (SHUTDOWN_DEADLINE_MS in
+    # apps/backend/src/server.ts), so Docker does not kill it while it drains.
+    stop_grace_period: 40s
     security_opt:
       - no-new-privileges:true
     cap_drop:

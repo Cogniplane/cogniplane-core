@@ -62,10 +62,8 @@ Stop with `docker compose down`; add `--volumes` to delete all data.
   user. Deploy with `AUTH_MODE=jwt`, TLS and the steps in
   [self-hosting](self-hosting.md).
 - Artifacts and skill bundles use local storage in `backend-data`.
-- `compose.yaml` sets no `stop_grace_period`, so Docker stops the backend after
-  10 seconds, before its shutdown drain ends
-  ([shutdown](operations.md#upgrade)). A turn that runs during `docker compose
-  down` can stay unfinished.
+- The backend has `stop_grace_period: 40s`, longer than its shutdown deadline
+  ([shutdown](operations.md#upgrade)).
 
 ## Troubleshooting
 

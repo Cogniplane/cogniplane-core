@@ -122,8 +122,9 @@ redirect and hide. Every rule is enforced in the backend.
     refuses a DNS answer with a private or reserved address and pins the
     connection.
   - `ssrfSafeAgent` is an `Agent` of the `undici` package. Node's global `fetch`
-    bundles another undici version and cannot use it. Call
-    `assertDispatcherAwareFetch` on an injected fetch, so the global one throws.
+    bundles another undici version and may reject the agent or not apply it.
+    Call `assertDispatcherAwareFetch` on an injected fetch, so the global one
+    throws.
 - Proxy MCP upstreams are the exception: `mcpUpstreamUrlSchema` allows local and
   private addresses, because admins connect servers on their own network.
 

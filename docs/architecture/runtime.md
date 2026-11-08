@@ -175,7 +175,7 @@ teardown.
 | Stale approvals | `services/runtime/stale-approval-sweeper.ts` | At start, then every `APPROVAL_REQUEST_TTL_MS` |
 | Stale assistant messages | `services/runtime/stale-message-sweeper.ts` | At start, then at its stale deadline |
 | Idle session runtimes | `services/runtime/idle-teardown.ts` | Per session, after `RUNTIME_IDLE_TIMEOUT_MS` |
-| Expired in-memory rate-limit entries | `app-bootstrap.ts` (`limits.sweepExpired`) | Every 60 seconds |
+| Expired in-memory rate-limit entries | `app-bootstrap.ts` (`limits.sweepExpired`) | Every `RATE_LIMIT_SWEEP_INTERVAL_MS` |
 
 Add a worker:
 
