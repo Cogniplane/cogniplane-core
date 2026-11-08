@@ -29,15 +29,17 @@ reconnect with another GitHub account clears the list
 
 The bundled Microsoft 365 overlay (`private/sharepoint-overlay-backend`,
 `-frontend`, `-contracts`) adds SharePoint and OneDrive read tools (list sites,
-browse, search, read) and lists write tools (upload, create folder, import into
-a session). `MICROSOFT_SCOPES` requests read permissions only (`Files.Read.All`,
-`Sites.Read.All`). Microsoft Graph needs write permissions for upload and folder
-creation, so treat these write tools as unsupported until the scopes change in
-code.
+browse, search, read, import into a session) and write tools (upload, create
+folder). A member's sign-in asks for `Files.Read.All` and `Sites.Read.All`, or
+`Files.ReadWrite.All` and `Sites.ReadWrite.All` when the tenant turned on writes
+for Microsoft 365. A member who connected before writes were turned on
+reconnects; until then the write tools refuse with a reconnect message
+(`hasMicrosoftWriteScope`).
 
 1. Register an app in Microsoft Entra ID. Add the redirect URI
    `https://<backend>/integrations/microsoft/callback`, and the delegated
-   permissions in `MICROSOFT_SCOPES`
+   permissions `User.Read`, `offline_access` and either the two read scopes or
+   (for writes) the two ReadWrite scopes
    (`private/sharepoint-overlay-backend/src/services/microsoft-connection-service.ts`).
 2. Set `MICROSOFT_OAUTH_REDIRECT_URI` to that URI on the backend. Without it,
    the integration reports "not configured".

@@ -7,6 +7,7 @@ import { InMemoryAuditEventStore } from "../../../../apps/backend/src/test-helpe
 import { IntegrationOAuthStateStore } from "../../../../apps/backend/src/services/integrations/integration-oauth-state-store.js";
 
 import {
+  hasMicrosoftWriteScope,
   MicrosoftConnectionService,
   MicrosoftConnectionNotConfiguredError,
   MicrosoftInvalidEntraTenantError,
@@ -271,6 +272,7 @@ test("getAuthorizationUrl returns valid Entra ID URL", async () => {
   expect(parsed.searchParams.get("response_type")).toBe("code");
   expect(parsed.searchParams.get("redirect_uri")).toBe(TEST_REDIRECT_URI);
   expect(parsed.searchParams.get("scope")).toContain("Files.Read.All");
+  expect(parsed.searchParams.get("scope")).not.toContain("ReadWrite");
   expect(decodeProtectedHeader(parsed.searchParams.get("state")!).kid).toBe(config.JWT_KEY_ID);
   expect(browserBinding.name).toBe("cogniplane_oauth_bind_microsoft");
   expect(browserBinding.options).toMatchObject({
@@ -284,6 +286,26 @@ test("getAuthorizationUrl returns valid Entra ID URL", async () => {
 
 // The Redis key must stay the same, so a state issued before a deploy is
 // still valid after it.
+test("getAuthorizationUrl asks for write scopes only when the tenant turned on writes", async () => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
+  const integrationStates = new InMemoryIntegrationStateStore();
+  integrationStates.seed(createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET));
+  await integrationStates.upsert("tenant-1", "microsoft", { writesEnabled: true });
+  const service = new MicrosoftConnectionService(
+    config, new InMemoryMicrosoftConnectionStore(), undefined, undefined, integrationStates, TEST_REDIRECT_URI
+  );
+  const { url } = await service.getAuthorizationUrl({ tenantId: "tenant-1", userId: "user-1", ownerSecurityVersion: null });
+  const scope = new URL(url).searchParams.get("scope") ?? "";
+  expect(scope).toContain("Files.ReadWrite.All");
+  expect(scope).toContain("Sites.ReadWrite.All");
+});
+
+test("hasMicrosoftWriteScope accepts plain and resource-prefixed write scopes only", () => {
+  expect(hasMicrosoftWriteScope(["Files.ReadWrite.All"])).toBe(true);
+  expect(hasMicrosoftWriteScope(["https://graph.microsoft.com/Sites.ReadWrite.All"])).toBe(true);
+  expect(hasMicrosoftWriteScope(["Files.Read.All", "Sites.Read.All"])).toBe(false);
+});
+
 test("getAuthorizationUrl stores the OAuth state under the persisted Microsoft Redis key", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const integrationStates = new InMemoryIntegrationStateStore();

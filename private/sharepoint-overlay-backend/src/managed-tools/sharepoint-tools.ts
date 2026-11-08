@@ -2,7 +2,10 @@ import path from "node:path";
 
 import { isArtifactPiiEligible, type ArtifactRecord } from "../../../../apps/backend/src/services/artifacts/artifact-store.js";
 import type { ArtifactStorage } from "../../../../apps/backend/src/services/artifacts/artifact-storage.js";
-import type { MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
+import { hasMicrosoftWriteScope, type MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
+
+const MICROSOFT_WRITE_SCOPE_MISSING =
+  "This Microsoft connection can only read. Ask an admin to turn on Microsoft 365 writes, then reconnect your account in Settings > Microsoft 365.";
 import type {
   MicrosoftFileEntry,
   MicrosoftFilesService,
@@ -453,6 +456,7 @@ export function createSharepointTools(deps: SharepointToolDeps): ManagedToolDefi
         const creds = await deps.microsoftConnections.getRuntimeCredentials(context.tenantId, context.userId,
           boundIntegrationAccount(context.metadata, "microsoft"));
         if (!creds) return { error: "No Microsoft connection found. Connect your Microsoft account in settings." };
+        if (!hasMicrosoftWriteScope(creds.scopes)) return { error: MICROSOFT_WRITE_SCOPE_MISSING };
 
         const driveId = String(args.driveId);
         const parentId = String(args.parentId);
@@ -494,6 +498,7 @@ export function createSharepointTools(deps: SharepointToolDeps): ManagedToolDefi
         const creds = await deps.microsoftConnections.getRuntimeCredentials(context.tenantId, context.userId,
           boundIntegrationAccount(context.metadata, "microsoft"));
         if (!creds) return { error: "No Microsoft connection found. Connect your Microsoft account in settings." };
+        if (!hasMicrosoftWriteScope(creds.scopes)) return { error: MICROSOFT_WRITE_SCOPE_MISSING };
 
         const driveId = String(args.driveId);
         const parentId = String(args.parentId);

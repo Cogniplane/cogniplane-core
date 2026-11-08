@@ -33,7 +33,16 @@ const MICROSOFT_STATE_ISSUER = "cogniplane";
 const MICROSOFT_STATE_TTL = "10m";
 const MICROSOFT_STATE_TTL_SECONDS = 10 * 60;
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
-const MICROSOFT_SCOPES = "User.Read Files.Read.All Sites.Read.All offline_access";
+// Read scopes always; write scopes only when the tenant turned on Microsoft 365
+// writes, so a read-only tenant never asks users for write consent. A user who
+// connected before writes were turned on reconnects to grant them.
+const MICROSOFT_READ_SCOPES = "User.Read Files.Read.All Sites.Read.All offline_access";
+const MICROSOFT_WRITE_SCOPES = "User.Read Files.ReadWrite.All Sites.ReadWrite.All offline_access";
+
+/** True when the granted scopes allow writing files (Graph may prefix them with its resource URL). */
+export function hasMicrosoftWriteScope(scopes: readonly string[]): boolean {
+  return scopes.some((scope) => /(^|\/)(Files|Sites)\.ReadWrite\.All$/.test(scope));
+}
 
 export type MicrosoftTenantConfig = {
   clientId: string;
@@ -130,6 +139,8 @@ export type MicrosoftRuntimeCredentials = {
   displayName: string | null;
   email: string | null;
   token: string;
+  /** The scopes Microsoft granted to this connection. */
+  scopes: string[];
 };
 
 export class MicrosoftConnectionNotConfiguredError extends Error {
@@ -342,7 +353,8 @@ export class MicrosoftConnectionService {
     url.searchParams.set("client_id", tenantConfig.clientId);
     url.searchParams.set("response_type", "code");
     url.searchParams.set("redirect_uri", this.getRedirectUri());
-    url.searchParams.set("scope", MICROSOFT_SCOPES);
+    const integrationState = await this.integrationStates.get(input.tenantId, "microsoft");
+    url.searchParams.set("scope", integrationState?.writesEnabled ? MICROSOFT_WRITE_SCOPES : MICROSOFT_READ_SCOPES);
     url.searchParams.set("state", state);
     url.searchParams.set("response_mode", "query");
     return { url: url.toString(), browserBinding: binding.cookie };
@@ -577,7 +589,8 @@ export class MicrosoftConnectionService {
       microsoftUserId: refreshed.microsoftUserId,
       displayName: refreshed.microsoftDisplayName,
       email: refreshed.microsoftEmail,
-      token: decrypt(refreshed.accessTokenEncrypted, this.config.DATA_ENCRYPTION_SECRET)
+      token: decrypt(refreshed.accessTokenEncrypted, this.config.DATA_ENCRYPTION_SECRET),
+      scopes: refreshed.grantedScopes
     };
   }
 
