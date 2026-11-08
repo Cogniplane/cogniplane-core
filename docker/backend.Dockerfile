@@ -1,11 +1,12 @@
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS builder
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072 AS builder
 
 WORKDIR /workspace
 
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
 
-RUN corepack enable
+# Node 25 and later do not include Corepack.
+RUN npm install -g corepack@0.36.0 && corepack enable
 
 COPY package.json pnpm-lock.yaml tsconfig.base.json eslint.config.mjs ./
 COPY docker/backend-pnpm-workspace.yaml pnpm-workspace.yaml
@@ -25,7 +26,7 @@ COPY apps/backend apps/backend
 RUN pnpm --filter @cogniplane/backend build:bundle \
   && pnpm --filter @cogniplane/backend deploy --prod --no-optional --legacy /opt/backend
 
-FROM node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS runtime
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072 AS runtime
 
 ARG BUILD_SHA=""
 ARG BUILD_DATE=""

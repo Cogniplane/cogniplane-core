@@ -6,9 +6,9 @@ stack, see [Docker deploy](docker-deploy.md). For production, see
 
 ## Prerequisites
 
-- Node.js 24 (`engines.node`); 24.7 or later for local accounts ([startup
-  rules](configuration.md#startup-rules)). pnpm through Corepack (`corepack
-  enable`; `package.json` pins the version).
+- Node.js 26 (`engines.node`). pnpm through Corepack: Node 25 and later do not
+  include Corepack, so run `npm install -g corepack`, then `corepack enable`.
+  `package.json` pins the pnpm version.
 - Docker with the Compose plugin. `make dev` runs PostgreSQL in a container.
 - `lsof` (the port check of `make dev` uses it) and Poppler's `pdftotext` (PDF
   text extraction; `PDFTOTEXT_BINARY_PATH`).
