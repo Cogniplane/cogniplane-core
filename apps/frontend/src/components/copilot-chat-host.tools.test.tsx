@@ -380,7 +380,10 @@ describe("pending approvals in the card of their call", () => {
     expect(server.decisions[0]!.body).toEqual({ decision: "approve", rememberForTurn: true });
     await waitFor(() => expect((within(card(/Write file/)).getByRole("button", { name: "Approve once" }) as HTMLButtonElement).disabled).toBe(false));
     expect(within(card(/Write file/)).getByText("needs approval")).toBeTruthy();
-    expect(list()).toBeNull();
+    // The list says why, and does not list the approval a second time.
+    expect(within(list()!).getByText("Decision not confirmed")).toBeTruthy();
+    expect(within(list()!).getByText("The server did not confirm your decision (HTTP 500). Try again.")).toBeTruthy();
+    expect(within(list()!).queryByRole("button", { name: "Approve once" })).toBeNull();
   });
 
   it("removes the controls when the approval expires and lists the expiry notice", async () => {
