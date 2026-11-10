@@ -89,6 +89,29 @@ audit event.
   skill as read-only `/skills/<slug>/SKILL.md` plus its bundle files, through a
   `CompositeBackend` route of the agent file tools. `execute` cannot read it; it
   is not copied into the sandbox.
+- While a bundle stays cached, its companion files are read once per backend
+  process and shared across sessions.
+  `SkillCompanionCache` (same file) keeps one copy of each bundle's companion
+  files, and all sessions use it. The key is the storage backend instance and
+  the full storage URI; both URI layouts hold the tenant id and the content
+  hash. Concurrent builds of one bundle share one read. A failed read is not
+  kept, so the next build reads again.
+- Cache limits (code constants `COMPANION_CACHE_MAX_BYTES` and
+  `COMPANION_CACHE_MAX_ENTRIES`): 64 MiB of file bytes and 256 bundles. The
+  cache removes the least recently used bundle first and does not keep a
+  bundle larger than 64 MiB. A removed bundle stays in memory while a session
+  that serves it is alive; the next build reads it again.
+- Each build still calls `materializeBundle`, so the storage checks the path
+  again. If storage reports the bundle unavailable, the build does not serve
+  its cached companions. Their bytes stay in memory
+  until eviction or a restart. Each build also generates `SKILL.md` from the
+  current revision. The `/skills/` backend returns copies of binary content,
+  so a caller cannot change the shared bytes.
+- Not verified: the byte limit counts file bytes, not process memory, and a
+  decoded text file can use up to two times its file size. No memory benchmark
+  under production load exists. The cache does not read a bundle again when its
+  bytes change under the same URI (see the content hash note in [bundle
+  storage](#bundle-storage)); the change shows after eviction or a restart.
 - The deepagents skills middleware puts only each skill's name, description and
   path in the system prompt; the instructions stay in the file, and the model
   reads `SKILL.md` when it needs it.
