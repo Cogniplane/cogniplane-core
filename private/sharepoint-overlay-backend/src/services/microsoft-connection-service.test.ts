@@ -1077,6 +1077,79 @@ test.each([
   else expect(store.record?.microsoftUserId).toBe("ms-other");
 });
 
+// A failed refresh falls back to the stored token only while the connection
+// that the refresh started from is still current and not suspended.
+test.each([
+  ["a disconnect", "disconnect", "a timeout"],
+  ["a disconnect", "disconnect", "a refused refresh"],
+  ["a suspension", "suspend", "a timeout"],
+  ["a suspension", "suspend", "a refused refresh"],
+  ["a reconnect to another account", "reconnect", "a timeout"],
+  ["a reconnect to another account", "reconnect", "a refused refresh"]
+])("a refresh that fails after %s returns no credentials (%s, %s)", async (_label, change, failure) => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
+  const store = new InMemoryMicrosoftConnectionStore();
+  const integrationStates = new InMemoryIntegrationStateStore();
+  integrationStates.seed(createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET));
+  const service = new MicrosoftConnectionService(config, store, undefined, undefined, integrationStates);
+  const connection = (microsoftUserId: string, access: string): MicrosoftConnectionRecord => ({
+    tenantId: "tenant-1", userId: "user-1", microsoftUserId, microsoftEmail: null, microsoftDisplayName: null,
+    tokenType: "bearer", grantedScopes: [], accessTokenEncrypted: encrypt(access, config.DATA_ENCRYPTION_SECRET),
+    // Inside the refresh window and still valid: getRuntimeCredentials refreshes first.
+    accessTokenExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    refreshTokenEncrypted: encrypt(`refresh-${microsoftUserId}`, config.DATA_ENCRYPTION_SECRET),
+    refreshTokenExpiresAt: null, tokenLastRefreshedAt: null, tokenLastUsedAt: null,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+  });
+  const key = JSON.stringify(["tenant-1", "user-1"]);
+  store.record = connection("ms-user-1", "old-token");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    // The connection changes while the token request runs.
+    if (change === "disconnect") store.record = null;
+    else if (change === "suspend") { store.currentVersions.set(key, 2); store.ownerVersions.set(key, 1); }
+    else store.record = connection("ms-other", "other-token");
+    if (failure === "a timeout") throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+    return Response.json({ error: "invalid_grant" }, { status: 400 });
+  };
+  try {
+    expect(await service.getRuntimeCredentials("tenant-1", "user-1")).toBeNull();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  expect(store.markUsedCount).toBe(0);
+});
+
+test("a refresh that fails after a reconnect to the same account returns the current token", async () => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
+  const store = new InMemoryMicrosoftConnectionStore();
+  const integrationStates = new InMemoryIntegrationStateStore();
+  integrationStates.seed(createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET));
+  const service = new MicrosoftConnectionService(config, store, undefined, undefined, integrationStates);
+  const connection = (access: string, expiresInMs: number): MicrosoftConnectionRecord => ({
+    tenantId: "tenant-1", userId: "user-1", microsoftUserId: "ms-user-1", microsoftEmail: null,
+    microsoftDisplayName: null, tokenType: "bearer", grantedScopes: [],
+    accessTokenEncrypted: encrypt(access, config.DATA_ENCRYPTION_SECRET),
+    accessTokenExpiresAt: new Date(Date.now() + expiresInMs).toISOString(),
+    refreshTokenEncrypted: encrypt(`refresh-${access}`, config.DATA_ENCRYPTION_SECRET),
+    refreshTokenExpiresAt: null, tokenLastRefreshedAt: null, tokenLastUsedAt: null,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+  });
+  store.record = connection("old-token", 60_000);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    store.record = connection("new-token", 3_600_000);
+    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  };
+  try {
+    expect((await service.getRuntimeCredentials("tenant-1", "user-1"))?.token).toBe("new-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 // A confirm needs an identity that the provider attests. Graph
 // returned no email, and a display name proves nothing: no confirm.
 test("a suspended connection without an email cannot be confirmed", async () => {

@@ -56,7 +56,9 @@ The member routes of the file picker (`GET /integrations/microsoft/sites`,
 the read tools do; otherwise they answer 403 `microsoft_integration_disabled`
 (`private/sharepoint-overlay-backend/src/routes/microsoft-files.ts`). Identity and Graph requests stop after 15
 seconds, and an import download after 120 seconds (`private/sharepoint-overlay-backend/src/services/graph-http.ts`).
-A refresh that fails or stops keeps the stored token while it is valid.
+A refresh that fails or stops keeps the stored token while it is valid, but only
+if the connection is still current: the backend reads it again, and a
+disconnect, a suspension or a reconnect to another account gives no token.
 
 ## Proxy MCP servers
 

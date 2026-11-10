@@ -662,10 +662,10 @@ export class MicrosoftConnectionService {
       );
       payload = (await response.json()) as MicrosoftTokenResponse;
     } catch {
-      return record;
+      return this.storedConnectionAfterFailedRefresh(record);
     }
     if (!response.ok || !payload.access_token) {
-      return record;
+      return this.storedConnectionAfterFailedRefresh(record);
     }
 
     // A refresh has no session. Bind it to the row it started from, so it
@@ -684,6 +684,16 @@ export class MicrosoftConnectionService {
         ? encrypt(payload.refresh_token, this.config.DATA_ENCRYPTION_SECRET)
         : record.refreshTokenEncrypted
     });
+  }
+
+  // The stored token after a failed refresh. Read the connection again: a
+  // disconnect, a suspension or a reconnect to another account can occur while
+  // the token request runs, and then the token loaded before it must not be used.
+  private async storedConnectionAfterFailedRefresh(
+    record: MicrosoftConnectionRecord
+  ): Promise<MicrosoftConnectionRecord | null> {
+    const current = await this.store.get(record.tenantId, record.userId);
+    return current?.microsoftUserId === record.microsoftUserId ? current : null;
   }
 
   private getRedirectUri(): string {
