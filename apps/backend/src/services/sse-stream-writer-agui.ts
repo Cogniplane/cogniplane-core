@@ -50,15 +50,12 @@ const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
 // round-trip on the token-delta path.
 const STREAMING_PERSIST_INTERVAL_MS = 3_000;
 
-// How long the turn will wait for an in-flight checkpoint before finishing
-// without it. The drain exists so a checkpoint cannot settle "streaming" after
-// the terminal status — but the checkpoint is a database write with no
-// cancellation, so an unbounded wait would trade one stuck row for a stuck
-// REQUEST: no terminal update, no writer.end(), and the route's turn slot held
-// until the pool gave up. Past this budget the turn finishes; the late
-// checkpoint may then land last, which is the failure the drain was avoiding —
-// but only when the database is already broken, and a stuck row is recoverable
-// by sweepStaleAssistantMessages while a wedged session is not.
+// How long the turn waits for an in-flight checkpoint before it writes the
+// final status without it. The checkpoint is a database write with no
+// cancellation. An unbounded wait would stop the request instead: no terminal
+// update, no writer.end(), and the route's turn slot held until the pool gave
+// up. A checkpoint that lands after the final write changes nothing, because
+// MessageStore.updateContent saves an active status only on an active row.
 const CHECKPOINT_DRAIN_DEADLINE_MS = 2_000;
 
 export type StreamAssistantReplyAGUIInput = {
@@ -202,10 +199,11 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
   let checkpointTimer: ReturnType<typeof setInterval> | null = null;
   let checkpointInFlight: Promise<void> | null = null;
   /**
-   * Stops checkpointing and waits for any write already awaiting the DB. Must
-   * run before every terminal `updateContent`: a checkpoint that settles after
-   * the final status would write `"streaming"` over it and pin the row mid-turn
-   * — the exact state this whole mechanism exists to prevent.
+   * Stops checkpointing and waits, up to CHECKPOINT_DRAIN_DEADLINE_MS, for a
+   * write already sent to the database. Run it before every terminal write so
+   * that the checkpoint usually settles first. A checkpoint that settles later
+   * cannot replace the final status, because the store refuses `streaming` on
+   * a finished row.
    */
   const settleCheckpoints = async (): Promise<void> => {
     if (checkpointTimer) clearInterval(checkpointTimer);
@@ -404,8 +402,9 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
     //
     // Best-effort by design: this is insurance against a process death, so a
     // transient DB failure must not end a turn the client is still reading. The
-    // write is unconditional (`updated_at` is the point even when the text has
-    // not moved) but rate-limited to one per interval.
+    // write runs once per interval, also when the text has not moved, because
+    // `updated_at` is the point. The store applies it only while the row is
+    // active.
     const rowId = assistantMessageId;
     const writeCheckpoint = async (): Promise<void> => {
       try {
