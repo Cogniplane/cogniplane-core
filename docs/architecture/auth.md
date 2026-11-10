@@ -65,6 +65,10 @@ Sign-in types:
 - `GET /downloads/:token` is public: the single-use token is the credential.
 - A valid JWT is not enough: the user must be a member of the tenant (403
   `not_a_member`).
+- A database or pool error in the membership lookup gets 503
+  `auth_unavailable` with `Retry-After`. It is not a 401, so the client keeps
+  the session. `/auth/refresh` answers 503 `refresh_unavailable` in the same
+  case.
 - CSRF: state-changing routes take JSON (artifact upload takes multipart); none
   accepts a form body from another site. Auth mutations (`/auth/callback`,
   `/auth/refresh`, `/auth/logout`, local sign-in, link, step-up and password
