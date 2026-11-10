@@ -8,9 +8,11 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  capCommandOutput,
   confinedDeleteCommand,
   E2bDeepAgentsSandbox,
   isSandboxGoneError,
+  SandboxFileTooLargeError,
   type E2bDeepAgentsSandboxOptions
 } from "./deep-agents-e2b-backend.js";
 import type { E2bNetworkConfig, E2bRequestLimits, loadE2bSandboxClass } from "../runtime/e2b-sandbox.js";
@@ -47,7 +49,28 @@ afterEach(() => {
   }
 });
 
-type RunCall = { command: string; options?: Record<string, unknown> };
+/** `command` is the command of the model; `sent` is what the backend sent, with the output cap. */
+type RunCall = { command: string; sent: string; options?: Record<string, unknown> };
+
+/** The command inside the output cap of capCommandOutput, or the command as sent when it has no cap. */
+function innerCommand(sent: string): string {
+  return /^\{ \{ ([\s\S]*)\n\} 2>&1 1>&3 3>&- \| /.exec(sent)?.[1] ?? sent;
+}
+
+/** A stream of the bytes, in chunks of `chunkBytes`, as the SDK returns a "stream" read. */
+function streamOf(bytes: Uint8Array, chunkBytes = 64 * 1024): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= bytes.byteLength) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(bytes.slice(offset, offset + chunkBytes));
+      offset += chunkBytes;
+    }
+  });
+}
 
 function makeFakeSandbox(overrides: {
   runResult?: (command: string) => unknown | Promise<unknown>;
@@ -77,10 +100,10 @@ function makeFakeSandbox(overrides: {
           );
         }
       },
-      read: async (path: string) => {
+      read: async (path: string, _opts?: { format: "stream" }) => {
         const stored = files.get(path);
         if (!stored) throw new Error(`file not found: ${path}`);
-        return stored;
+        return streamOf(stored);
       },
       getInfo: async (path: string) => {
         const stored = files.get(path);
@@ -89,8 +112,10 @@ function makeFakeSandbox(overrides: {
       }
     },
     commands: {
-      run: async (command: string, options?: Record<string, unknown>) => {
-        runCalls.push({ command, options });
+      run: async (sent: string, options?: Record<string, unknown>) => {
+        // The tests read the command of the model; the output cap around it has its own tests.
+        const command = innerCommand(sent);
+        runCalls.push({ command, sent, options });
         if (overrides.runResult) return overrides.runResult(command);
         return { stdout: `ran:${command}`, stderr: "", exitCode: 0 };
       },
@@ -405,11 +430,11 @@ describe("E2bDeepAgentsSandbox", () => {
         firstRead = false;
         throw gone;
       }
-      return new Uint8Array([1, 2, 3]);
+      return streamOf(new Uint8Array([1, 2, 3]));
     });
     const freshSandbox = makeFakeSandbox();
     freshSandbox.sandbox.sandboxId = "sbx-456";
-    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([1, 2, 3]));
+    freshSandbox.sandbox.files.read = vi.fn(async () => streamOf(new Uint8Array([1, 2, 3])));
     const create = vi
       .fn()
       .mockResolvedValueOnce(deadSandbox.sandbox)
@@ -498,11 +523,11 @@ describe("E2bDeepAgentsSandbox", () => {
         firstRead = false;
         throw wrappedGone;
       }
-      return new Uint8Array([9, 9, 9]);
+      return streamOf(new Uint8Array([9, 9, 9]));
     });
     const freshSandbox = makeFakeSandbox();
     freshSandbox.sandbox.sandboxId = "sbx-456";
-    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([9, 9, 9]));
+    freshSandbox.sandbox.files.read = vi.fn(async () => streamOf(new Uint8Array([9, 9, 9])));
     const create = vi
       .fn()
       .mockResolvedValueOnce(deadSandbox.sandbox)
@@ -825,11 +850,11 @@ describe("E2bDeepAgentsSandbox", () => {
         firstRead = false;
         throw gone;
       }
-      return new Uint8Array([1]);
+      return streamOf(new Uint8Array([1]));
     });
     const freshSandbox = makeFakeSandbox();
     freshSandbox.sandbox.sandboxId = "sbx-456";
-    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([1]));
+    freshSandbox.sandbox.files.read = vi.fn(async () => streamOf(new Uint8Array([1])));
     const create = vi
       .fn()
       .mockResolvedValueOnce(deadSandbox.sandbox)
@@ -883,11 +908,11 @@ describe("E2bDeepAgentsSandbox", () => {
         firstRead = false;
         throw gone;
       }
-      return new Uint8Array([7]);
+      return streamOf(new Uint8Array([7]));
     });
     const freshSandbox = makeFakeSandbox();
     freshSandbox.sandbox.sandboxId = "sbx-456";
-    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([7]));
+    freshSandbox.sandbox.files.read = vi.fn(async () => streamOf(new Uint8Array([7])));
     const create = vi
       .fn()
       .mockResolvedValueOnce(deadSandbox.sandbox)
@@ -923,7 +948,7 @@ describe("E2bDeepAgentsSandbox", () => {
     });
     const freshSandbox = makeFakeSandbox();
     freshSandbox.sandbox.sandboxId = "sbx-456";
-    freshSandbox.sandbox.files.read = vi.fn(async () => new Uint8Array([9]));
+    freshSandbox.sandbox.files.read = vi.fn(async () => streamOf(new Uint8Array([9])));
     const create = vi
       .fn()
       .mockResolvedValueOnce(deadSandbox.sandbox)
@@ -3180,5 +3205,106 @@ describe("E2bDeepAgentsSandbox delete in a real shell", () => {
 
     expect(await backend.delete(`/${name}`)).toEqual({ path: `/${name}`, filesUpdate: null });
     expect(await exists(path.join(workspace, name))).toBe(false);
+  });
+});
+
+// The backend holds what it reads from the sandbox in memory, and one backend serves
+// every tenant. These limits keep one session from filling that memory.
+
+describe("E2bDeepAgentsSandbox read limits", () => {
+  /** A stream of `total` bytes in chunks of 10, that counts the bytes that the reader pulled. */
+  function countingStream(total: number) {
+    const pulled = { bytes: 0 };
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled.bytes >= total) {
+          controller.close();
+          return;
+        }
+        const size = Math.min(10, total - pulled.bytes);
+        pulled.bytes += size;
+        controller.enqueue(new Uint8Array(size).fill(65));
+      }
+    });
+    return { stream, pulled };
+  }
+
+  function backendWithFile(total: number) {
+    const fake = makeFakeSandbox();
+    const counted = countingStream(total);
+    fake.sandbox.files.read = async () => counted.stream;
+    const { backend } = makeBackend({ fake, options: { maxFileReadBytes: 100 } });
+    return { backend, pulled: counted.pulled };
+  }
+
+  it("reads a file of exactly the limit", async () => {
+    const { backend } = backendWithFile(100);
+    expect((await backend.readFileBytes("big.bin")).byteLength).toBe(100);
+  });
+
+  it("refuses a larger file and stops the download at the limit", async () => {
+    const { backend, pulled } = backendWithFile(10_000);
+    await expect(backend.readFileBytes("big.bin")).rejects.toBeInstanceOf(SandboxFileTooLargeError);
+    expect(pulled.bytes).toBeLessThanOrEqual(130); // the limit and the read-ahead of the stream, not the whole file
+  });
+
+  it("fails a download of a larger file with the size error, not a file_not_found code", async () => {
+    // deepagents reports every error code as "not found"; the thrown error gives the model the cause.
+    const { backend, pulled } = backendWithFile(10_000);
+    await expect(backend.downloadFiles(["/big.bin"])).rejects.toThrow("larger than the 100 byte limit");
+    expect(pulled.bytes).toBeLessThanOrEqual(130); // the limit and the read-ahead of the stream, not the whole file
+  });
+
+  it("sends each command with the output cap around it", async () => {
+    const fake = makeFakeSandbox();
+    const { backend } = makeBackend({ fake });
+    await backend.execute("echo hi");
+    expect(fake.runCalls.at(-1)!.sent).toBe(capCommandOutput("echo hi", 256_000));
+  });
+});
+
+describe("capCommandOutput in a real shell", () => {
+  const execFileAsync = promisify(execFile);
+
+  /** Runs the capped command as the SDK does (bash -l -c) and returns its output and exit code. */
+  async function run(command: string, maxBytes = 10) {
+    try {
+      const { stdout, stderr } = await execFileAsync("/bin/bash", ["-c", capCommandOutput(command, maxBytes)]);
+      return { stdout, stderr, exitCode: 0 };
+    } catch (error) {
+      const failed = error as { stdout: string; stderr: string; code: number };
+      return { stdout: failed.stdout, stderr: failed.stderr, exitCode: failed.code };
+    }
+  }
+
+  it("keeps short output and the exit code", async () => {
+    expect(await run("echo out; echo err >&2; exit 7", 100)).toEqual({ stdout: "out\n", stderr: "err\n", exitCode: 7 });
+  });
+
+  it("caps stdout and stderr each at the limit", async () => {
+    const result = await run("seq 1 100000; seq 1 100000 >&2");
+    expect(result.stdout).toHaveLength(10);
+    expect(result.stderr).toHaveLength(10);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("lets the command run to its end after the cap", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "cogniplane-cap-"));
+    try {
+      const result = await run(`seq 1 100000; echo done > '${dir}/end'; exit 3`);
+      expect(result.exitCode).toBe(3);
+      expect(await readFile(path.join(dir, "end"), "utf8")).toBe("done\n");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the normal exit code of a pipeline in the command (no pipefail)", async () => {
+    expect((await run("false | true")).exitCode).toBe(0);
+  });
+
+  it("runs a here-document and a comment on the last line", async () => {
+    expect((await run("cat <<EOF\nhere\nEOF", 100)).stdout).toBe("here\n");
+    expect((await run("echo text # comment", 100)).stdout).toBe("text\n");
   });
 });

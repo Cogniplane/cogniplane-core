@@ -142,7 +142,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `ARTIFACT_BUCKET_ACCESS_KEY_ID` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
 | `ARTIFACT_BUCKET_SECRET_ACCESS_KEY` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
 | `ARTIFACT_BUCKET_SESSION_TOKEN` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
-| `ARTIFACT_MAX_UPLOAD_BYTES` | number, integer, > 0 | `26214400` | [projects-and-files](architecture/projects-and-files.md), [skills](architecture/skills.md) |
+| `ARTIFACT_MAX_UPLOAD_BYTES` | number, integer, > 0 | `26214400` | [projects-and-files](architecture/projects-and-files.md), [sandbox](architecture/sandbox.md) |
 | `MAX_REQUEST_BODY_BYTES` | number, integer, > 0 | `2097152` | [security](security.md) |
 | `LOG_LEVEL` | one of ["fatal", "error", "warn", "info", "debug", "trace", "silent"] | `"info"` | [operations](operations.md) |
 | `ARTIFACT_DOWNLOAD_TTL_MS` | number, integer, > 0 | `900000` | [projects-and-files](architecture/projects-and-files.md) |
