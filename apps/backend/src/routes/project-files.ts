@@ -26,7 +26,9 @@ import {
   ProjectFileStore,
 } from "../services/project-file-store.js";
 import { parseRequestInput } from "../lib/route-validation.js";
+import { consumeResourceRead } from "../lib/resource-read-limit.js";
 import { apiError } from "../lib/http-errors.js";
+import { RequestLimitsUnavailableError } from "../services/redis-request-limits.js";
 import { serialize } from "../lib/serialize-response.js";
 
 const projectParams = z.object({ projectId: z.string().uuid() });
@@ -50,6 +52,8 @@ export async function registerProjectFileRoutes(
         return reply
           .code(error.status)
           .send(apiError(error.code, error.message));
+      // The app error handler answers a limit store outage with 503 and Retry-After.
+      if (error instanceof RequestLimitsUnavailableError) throw error;
       request.log.error({ err: error }, "Project file request failed");
       return reply
         .code(500)
@@ -358,6 +362,8 @@ export async function registerProjectFileRoutes(
       async (request, reply) => {
         const params = parseRequestInput(reply, versionParams, request.params);
         if (!params.ok) return params.response;
+        const limited = await consumeResourceRead(stores.limits, request, reply);
+        if (limited) return limited;
         const content = await files.content(
           { ...request.auth, ...params.value },
           params.value.fileId,

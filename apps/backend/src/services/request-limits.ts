@@ -6,9 +6,11 @@ export type LimitResource =
   | "artifact_upload"
   | "project_file_write"
   | "scheduled_job_create"
+  | "settings_write"
   | "oauth_callback"
   | "admin_query"
-  | "auth_organizations";
+  | "auth_organizations"
+  | "resource_read";
 type LimitScope = "user" | "tenant";
 type LimitType = "rate_limit" | "usage_quota";
 
@@ -21,9 +23,11 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   artifact_upload: "artifact upload",
   project_file_write: "project file write",
   scheduled_job_create: "scheduled job creation",
+  settings_write: "settings write",
   oauth_callback: "OAuth callback",
   admin_query: "admin request",
-  auth_organizations: "organization list"
+  auth_organizations: "organization list",
+  resource_read: "resource read"
 };
 
 export function rateLimitMessage(resource: LimitResource, scope: LimitScope): string {
@@ -45,12 +49,16 @@ export type RequestLimitsConfigKeys = Pick<
   | "PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW"
+  | "SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW"
   | "ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW"
   | "ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW"
   | "AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW"
   | "AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW"
+  | "RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW"
+  | "RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW"
   | "TURN_QUOTA_PER_USER_PER_DAY"
   | "TURN_QUOTA_PER_TENANT_PER_DAY"
 >;
@@ -85,6 +93,10 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
           user: config.SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW
         },
+        settings_write: {
+          user: config.SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW
+        },
         oauth_callback: {
           user: config.OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW
@@ -96,6 +108,10 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
         auth_organizations: {
           user: config.AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        resource_read: {
+          user: config.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW
         }
       }
     },

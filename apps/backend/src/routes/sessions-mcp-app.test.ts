@@ -61,7 +61,9 @@ it("reads only a saved app call in a readable session and filters resource metad
     mcpServers: policy.enabledMcpServers.includes("quote-server") && (!selection || selection.connectorIds.includes("quote-server"))
       ? [{ id: "quote-server", mode: "proxy" }] : []
   }));
+  const consumeRateLimit = vi.fn(async () => null);
   const app = await sessionRoutesApp({
+    limits: { consumeRateLimit },
     sessions: { getReadable, getCapabilitySelection: async () => selection }, messages: { getMcpAppCall },
     dynamicConfig: {
       getMcpServerForUser: async (_tenantId: string, _serverId: string, userId: string) => {
@@ -79,7 +81,9 @@ it("reads only a saved app call in a readable session and filters resource metad
   app.decorate("config", { MCP_UPSTREAM_TIMEOUT_MS: 2000, MCP_UPSTREAM_MAX_RESPONSE_BYTES: 2 * 1024 * 1024,
     DATA_ENCRYPTION_SECRET: "test-data-encryption-secret-32-bytes-minimum" } as typeof app.config);
   expect((await app.inject(`/sessions/${DENIED}/mcp-apps/saved`)).statusCode).toBe(404);
+  expect(consumeRateLimit).toHaveBeenLastCalledWith({ resource: "resource_read", userId: "user", tenantId: "tenant" });
   expect((await app.inject(`/sessions/${ALLOWED}/mcp-apps/unknown`)).statusCode).toBe(404);
+  expect(consumeRateLimit).toHaveBeenCalledTimes(2);
   expect(reads).toHaveLength(0);
   policy.enabledMcpServers = [];
   expect((await app.inject(`/sessions/${ALLOWED}/mcp-apps/saved`)).statusCode).toBe(404);
@@ -152,4 +156,32 @@ it("reads only a saved app call in a readable session and filters resource metad
   const priorReads = reads.length;
   expect((await app.inject(`/sessions/${ALLOWED}/mcp-apps/saved`)).statusCode).toBe(404);
   expect(reads).toHaveLength(priorReads);
+});
+
+it("refuses over the shared resource read limit before any lookup, config compile, policy check or upstream read", async () => {
+  const limited = {
+    error: "limit_exceeded", limitType: "rate_limit", resource: "resource_read", scope: "user", limit: 20,
+    retryAfterMs: 4_200, resetAt: new Date(0).toISOString(), message: "User resource read rate limit exceeded."
+  };
+  const consumeRateLimit = vi.fn(async () => limited);
+  const work = {
+    getReadable: vi.fn(), getMcpAppCall: vi.fn(), isUserBetaTester: vi.fn(), compileRuntimeConfig: vi.fn(),
+    gateCompletedToolResource: vi.fn(), getMcpServerForUser: vi.fn()
+  };
+  const app = await sessionRoutesApp({
+    limits: { consumeRateLimit },
+    sessions: { getReadable: work.getReadable },
+    messages: { getMcpAppCall: work.getMcpAppCall },
+    dynamicConfig: { compileRuntimeConfig: work.compileRuntimeConfig, getMcpServerForUser: work.getMcpServerForUser },
+    tenantMembers: { isUserBetaTester: work.isUserBetaTester },
+    policyService: { gateCompletedToolResource: work.gateCompletedToolResource }
+  });
+
+  const response = await app.inject(`/sessions/${ALLOWED}/mcp-apps/saved`);
+
+  expect(response.statusCode).toBe(429);
+  expect(response.headers["retry-after"]).toBe("5");
+  expect(response.json()).toEqual(limited);
+  expect(consumeRateLimit).toHaveBeenCalledWith({ resource: "resource_read", userId: "user", tenantId: "tenant" });
+  for (const call of Object.values(work)) expect(call).not.toHaveBeenCalled();
 });

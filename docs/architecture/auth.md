@@ -65,6 +65,14 @@ Sign-in types:
 - `GET /downloads/:token` is public: the single-use token is the credential.
 - A valid JWT is not enough: the user must be a member of the tenant (403
   `not_a_member`).
+- Request admission and `/auth/refresh` use `PrivilegedAuthStateLookup`
+  (`services/tenant-member-store.ts`). Each membership read sends one SELECT
+  on the maintenance pool, with tenant and user predicates and no cache. The
+  normal app-pool store keeps its `withTenantScope` transaction and RLS scope.
+- A database or pool error in the membership lookup gets 503
+  `auth_unavailable` with `Retry-After`. It is not a 401, so the client keeps
+  the session. `/auth/refresh` answers 503 `refresh_unavailable` in the same
+  case.
 - CSRF: state-changing routes take JSON (artifact upload takes multipart); none
   accepts a form body from another site. Auth mutations (`/auth/callback`,
   `/auth/refresh`, `/auth/logout`, local sign-in, link, step-up and password
@@ -109,6 +117,19 @@ Sign-in types:
 `services/auth/workos-tenant-provisioning.ts`. Setup:
 [self-hosting](../self-hosting.md#authentication).
 
+- Input: `code` and `state` must be strings, and `code` can have at most
+  `OAUTH_CODE_MAX_LENGTH` characters. Other bodies return 400
+  `invalid_request`. A missing code returns 400 `missing_code`. A state that
+  does not match the state cookie returns 400 `invalid_state`. A missing PKCE
+  verifier cookie returns 400 `invalid_pkce_verifier`. The route sends the
+  code to WorkOS only after these checks.
+- The state and PKCE cookies are single use. Every answer after the rate limit
+  deletes them.
+- Refused code: if the WorkOS code exchange answers 400 with the OAuth error
+  `invalid_grant`, the route returns 401 `invalid_code`. The user must start
+  a new sign-in. The log line names no code, state, verifier or WorkOS answer.
+- Other WorkOS failures of the code exchange return 500: network errors,
+  WorkOS 5xx and 429 answers, and a refused client or API key.
 - Organization: a hint counts only when it matches a membership. One membership
   selects that organization. Several return 409
   `organization_selection_required`, and the user signs in again with one. None

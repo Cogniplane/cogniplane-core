@@ -19,6 +19,8 @@ import { GENERATIVE_UI_PANEL_TARGET, type Artifact, type McpAppCall } from "@cog
 type DraftSeam = import("./widget-draft").WidgetDraftSeam;
 const frames = vi.hoisted(() => ({
   rendered: [] as Array<{ toolCallId: string; busy: boolean; canEdit: boolean }>,
+  // Tool calls whose view throws while it renders.
+  failing: new Set<string>(),
   // The seam that the host gives a tool view.
   draft: null as DraftSeam | null
 }));
@@ -46,6 +48,7 @@ vi.mock(mcpSession.rendererPath, async (importOriginal) => {
 
 vi.mock("next/dynamic", () => ({
   default: () => (props: { toolCallId: string; busy: boolean; canEdit: boolean; draft: DraftSeam }) => {
+    if (frames.failing.has(props.toolCallId)) throw new Error("secret widget payload");
     frames.rendered.push({ toolCallId: props.toolCallId, busy: props.busy, canEdit: props.canEdit });
     frames.draft = props.draft;
     return <div data-testid="mcp-app-frame" data-call-id={props.toolCallId} data-busy={String(props.busy)} />;
@@ -97,6 +100,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   frames.rendered = [];
   frames.draft = null;
+  frames.failing.clear();
   selector.disabled = [];
 });
 
@@ -1164,6 +1168,31 @@ describe("CopilotChatHost message slots", () => {
     expect(assistant.compareDocumentPosition(screen.getAllByTestId("mcp-app-frame")[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // A frame cannot send while the turn runs.
     expect(screen.getAllByTestId("mcp-app-frame").every((frame) => frame.dataset.busy === "true")).toBe(true);
+  });
+
+  it("keeps the reply and the other tool views when one tool view fails to render", async () => {
+    frames.failing.add("tc-bad");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    server.connect("s-1", idleHistory([
+      { id: "u1", role: "user", content: "Show quotes" },
+      {
+        id: "a1", role: "assistant", content: "Here they are.", toolCalls: [
+          { id: "tc-bad", type: "function", function: { name: "show_quotes", arguments: "{}" } },
+          { id: "tc-good", type: "function", function: { name: "show_chart", arguments: "{}" } }
+        ]
+      },
+      { id: "tc-bad:result", role: "tool", toolCallId: "tc-bad", content: "Quotes" },
+      { id: "tc-good:result", role: "tool", toolCallId: "tc-good", content: "Chart" }
+    ]));
+    render(hostElement({ session: { initialMcpApps: { "tc-bad": app, "tc-good": app } } }));
+
+    await waitFor(() => expect(screen.getAllByTestId("mcp-app-frame").map((frame) => frame.dataset.callId)).toEqual(["tc-good"]));
+    expect(await screen.findByText("Here they are.")).toBeTruthy();
+    const failure = screen.getAllByRole("alert").find((alert) => alert.textContent?.includes("Tool view unavailable"));
+    expect(failure).toBeTruthy();
+    expect(document.body.textContent).not.toContain("secret widget payload");
+    // The composer stays: the failure is local to the tool view.
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeTruthy();
   });
 
   it("renders only trusted images and turns other images into links", async () => {

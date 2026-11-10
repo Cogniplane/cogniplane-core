@@ -1,8 +1,9 @@
 # Data and tenancy
 
-Scope: tenant isolation, database pools, tenant settings, retention and
-deletion, persistence, audit, usage, rate limits. Projects and artifacts are in
-[projects and files](projects-and-files.md). PII is in [PII protection](pii.md).
+Scope: tenant isolation, database pools, tenant settings, user settings,
+retention and deletion, persistence, audit, usage, rate limits. Projects and
+artifacts are in [projects and files](projects-and-files.md). PII is in [PII
+protection](pii.md).
 The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 
 ## Tenant isolation
@@ -89,6 +90,31 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   matches the approved hosts.
 - Provider keys and model enablement fields:
   [models](models.md#model-providers).
+
+## User settings
+
+- `user_settings_sections` keeps one JSON config per user and section key
+  (`scheduled_jobs`, `github`, `skills`, `mcp`, `model`). `PUT
+  /me/settings/:section` (`routes/settings.ts`) replaces a config, adds 1 to
+  its version and writes the audit event `user.settings.updated`.
+- Only the scheduled jobs page reads a config: `defaultTimeZone` and
+  `enableOnCreate` of `scheduled_jobs`, through `GET /me/settings`. The
+  backend only stores and returns the sections; it does not check what a
+  config contains. The GitHub page uses the GitHub connection routes, not the
+  `github` section.
+- Size limit: 65,536 bytes (`SETTINGS_SECTION_MAX_BYTES`). Fastify refuses a
+  larger request body before it parses it. The route then refuses a config
+  whose stored text, `JSON.stringify(config)` in UTF-8, is larger. Both
+  answer 413 `settings_section_too_large` with fixed text. Rows that an
+  earlier version saved can be larger; they stay as they are.
+- Each save uses the `settings_write` rate limit
+  (`SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW`,
+  `SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW`) before any database write.
+  Each request that gets to the route handler counts, also a request that
+  fails validation. A body over the size limit does not count: Fastify refuses
+  it first.
+- A scheduled job does not copy the sections:
+  [scheduler](runtime.md#scheduler).
 
 ## Retention and deletion
 
@@ -180,3 +206,16 @@ use Redis: they count in process and through the `session_executions` lease.
   rules](../configuration.md#startup-rules).
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
   `resetAt`.
+- `resource_read` is one budget for three member reads that do heavy work on
+  each call. The artifact and project file version PDF previews
+  (`GET .../preview-text`) run `pdftotext`. The MCP App resource route
+  (`GET /sessions/:sessionId/mcp-apps/:toolCallId`) compiles the runtime
+  config, checks policy and can send a signed `resources/read` upstream. The
+  three routes share one counter per user and one per tenant
+  (`RESOURCE_READ_LIMIT_PER_*_PER_WINDOW`), so a client gets no more calls by
+  alternating routes. The check (`lib/resource-read-limit.ts`) runs after
+  input validation and before any lookup, so a 404 or 422 also counts.
+- Each saved widget in a chat loads its resource when it renders. In a chat
+  with more widgets than the user limit, each widget after the limit shows an
+  error and a reload button; a reload works when the next window starts. For
+  chats like this, increase `RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW`.

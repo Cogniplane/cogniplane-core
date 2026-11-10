@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import cookie from "@fastify/cookie";
 import Fastify from "fastify";
+import type { Redis } from "ioredis";
 
+import { handleAppError } from "../app.js";
 import { registerSettingsRoutes, type SettingsRouteStores } from "./settings.js";
+import { RedisRequestLimits } from "../services/redis-request-limits.js";
+import { RequestLimits } from "../services/request-limits.js";
 import type { Pool } from "../lib/db.js";
 import { FakeDatabase } from "../test-helpers/fake-database.js";
 import { FakePool, type QueryResultRow } from "../test-helpers/fake-pool.js";
@@ -12,14 +16,15 @@ import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
-import type {
-  CreateScheduledJobResult,
-  ScheduledJobAdmission,
-  ScheduledJobRecord,
-  ScheduledJobRunRecord,
-  UpdateScheduledJobResult,
-  UserSettingsSectionKey,
-  UserSettingsSectionRecord
+import {
+  userSettingsSectionKeys,
+  type CreateScheduledJobResult,
+  type ScheduledJobAdmission,
+  type ScheduledJobRecord,
+  type ScheduledJobRunRecord,
+  type UpdateScheduledJobResult,
+  type UserSettingsSectionKey,
+  type UserSettingsSectionRecord
 } from "../services/user-settings-store.js";
 import type { NotionUserConnectionSummary } from "../services/integrations/notion/notion-connection-service.js";
 import {
@@ -372,8 +377,11 @@ async function createApp(overrides: {
   limits?: SettingsRouteStores["limits"];
   piiProtection?: SettingsRouteStores["piiProtection"];
   db?: Pool;
+  // The error handler of the real app (`app.ts`).
+  appErrorHandler?: boolean;
 } = {}) {
   const app = Fastify();
+  if (overrides.appErrorHandler) app.setErrorHandler(handleAppError);
   await app.register(cookie);
   const settings = new InMemoryUserSettingsStore();
   const auditEvents = new InMemoryAuditEventStore();
@@ -471,6 +479,298 @@ test("settings routes expose default sections and persist section config", async
   expect(updateResponse.json().section.config.defaultTimeZone).toBe("UTC");
   expect(auditEvents.events.length).toBe(1);
 
+  await app.close();
+});
+
+// The documented section size limit: 64 KiB of UTF-8.
+const SECTION_LIMIT_BYTES = 65_536;
+const SECTION_TOO_LARGE = {
+  error: "settings_section_too_large",
+  message: "The settings section is larger than the 64 KiB limit."
+};
+
+// A PUT body of exactly `bytes` UTF-8 bytes. "€" is 3 bytes but 1 UTF-16
+// unit, so the string has far fewer characters than bytes.
+function sectionBodyOfBytes(bytes: number): string {
+  const textBytes = bytes - Buffer.byteLength('{"config":{"note":""}}');
+  const text = "€".repeat(Math.floor(textBytes / 3)) + "a".repeat(textBytes % 3);
+  const body = `{"config":{"note":"${text}"}}`;
+  expect(Buffer.byteLength(body, "utf8")).toBe(bytes);
+  return body;
+}
+
+function putSection(app: Awaited<ReturnType<typeof createApp>>["app"], body: string, sectionKey = "model") {
+  return app.inject({
+    method: "PUT",
+    url: `/me/settings/${sectionKey}`,
+    headers: { "content-type": "application/json" },
+    payload: body
+  });
+}
+
+function recordingLimits(consumed: string[]): SettingsRouteStores["limits"] {
+  return {
+    async consumeRateLimit(input) {
+      consumed.push(input.resource);
+      return null;
+    },
+    async consumeTurnQuota() {
+      return null;
+    },
+    sweepExpired() {}
+  };
+}
+
+test("a section save accepts a body of exactly 64 KiB of multibyte text", async () => {
+  const { app, settings, auditEvents } = await createApp({ appErrorHandler: true });
+  const body = sectionBodyOfBytes(SECTION_LIMIT_BYTES);
+
+  const response = await putSection(app, body);
+
+  expect(response.statusCode).toBe(200);
+  const [section] = await settings.listSections("settings-tenant", "settings-user");
+  expect(section?.config).toEqual(JSON.parse(body).config);
+  expect(auditEvents.events.map((event) => event.type)).toEqual(["user.settings.updated"]);
+  await app.close();
+});
+
+test("a section save one byte over 64 KiB returns 413 with fixed text and writes nothing", async () => {
+  const consumed: string[] = [];
+  const { app, settings, auditEvents } = await createApp({
+    appErrorHandler: true,
+    limits: recordingLimits(consumed)
+  });
+  const body = sectionBodyOfBytes(SECTION_LIMIT_BYTES + 1);
+  // The limit counts bytes: this body has fewer characters than the limit.
+  expect(body.length).toBeLessThan(SECTION_LIMIT_BYTES / 2);
+
+  const response = await putSection(app, body);
+
+  expect(response.statusCode).toBe(413);
+  expect(response.json()).toEqual(SECTION_TOO_LARGE);
+  expect(await settings.listSections("settings-tenant", "settings-user")).toEqual([]);
+  expect(auditEvents.events).toEqual([]);
+  // Fastify refuses the body before the handler runs.
+  expect(consumed).toEqual([]);
+  await app.close();
+});
+
+test("a section save whose config grows past 64 KiB when parsed returns 413 and writes nothing", async () => {
+  const pool = new FakePool();
+  const { app, settings, auditEvents } = await createApp({ appErrorHandler: true, db: pool.asPool() });
+  // `1e20` is 4 bytes in the body; JSON.stringify writes it as 21 digits.
+  const body = `{"config":{"n":[${Array.from({ length: 3_500 }, () => "1e20").join(",")}]}}`;
+  expect(Buffer.byteLength(body, "utf8")).toBeLessThan(SECTION_LIMIT_BYTES);
+  expect(Buffer.byteLength(JSON.stringify(JSON.parse(body).config), "utf8")).toBeGreaterThan(SECTION_LIMIT_BYTES);
+
+  const response = await putSection(app, body);
+
+  expect(response.statusCode).toBe(413);
+  expect(response.json()).toEqual(SECTION_TOO_LARGE);
+  expect(await settings.listSections("settings-tenant", "settings-user")).toEqual([]);
+  expect(auditEvents.events).toEqual([]);
+  expect(pool.queries).toEqual([]);
+  await app.close();
+});
+
+
+test("a section save accepts exactly 64 KiB of stored config after numeric expansion", async () => {
+  const { app, settings } = await createApp({ appErrorHandler: true });
+  const compact = `{"config":{"n":[${Array.from({ length: 2_800 }, () => "1e20").join(",")}],"note":""}}`;
+  const padding = SECTION_LIMIT_BYTES - Buffer.byteLength(JSON.stringify(JSON.parse(compact).config), "utf8");
+  const body = compact.replace('"note":""', `"note":"${"a".repeat(padding)}"`);
+  expect(Buffer.byteLength(body, "utf8")).toBeLessThan(SECTION_LIMIT_BYTES);
+  expect(Buffer.byteLength(JSON.stringify(JSON.parse(body).config), "utf8")).toBe(SECTION_LIMIT_BYTES);
+
+  const response = await putSection(app, body);
+
+  expect(response.statusCode).toBe(200);
+  const [section] = await settings.listSections("settings-tenant", "settings-user");
+  expect(section?.config).toEqual(JSON.parse(body).config);
+  await app.close();
+});
+
+test("section saves keep the scheduled-job defaults and accept empty planned sections", async () => {
+  const consumed: string[] = [];
+  const { app, auditEvents } = await createApp({ appErrorHandler: true, limits: recordingLimits(consumed) });
+  const defaults = { defaultTimeZone: "America/Toronto", enableOnCreate: true };
+
+  expect((await putSection(app, JSON.stringify({ config: defaults }), "scheduled_jobs")).statusCode).toBe(200);
+  for (const sectionKey of ["github", "skills", "mcp", "model"]) {
+    expect((await putSection(app, JSON.stringify({ config: {} }), sectionKey)).statusCode).toBe(200);
+  }
+
+  const list = await app.inject({ method: "GET", url: "/me/settings" });
+  const sections = list.json().sections as Array<{ sectionKey: string; version: number; config: unknown }>;
+  expect(sections.map(({ sectionKey, version, config }) => ({ sectionKey, version, config }))).toEqual([
+    { sectionKey: "scheduled_jobs", version: 1, config: defaults },
+    { sectionKey: "github", version: 1, config: {} },
+    { sectionKey: "skills", version: 1, config: {} },
+    { sectionKey: "mcp", version: 1, config: {} },
+    { sectionKey: "model", version: 1, config: {} }
+  ]);
+  expect(auditEvents.events).toHaveLength(5);
+  expect(consumed).toEqual(Array.from({ length: 5 }, () => "settings_write"));
+  await app.close();
+});
+
+test("section saves use the settings_write limit per user and per tenant, before any write", async () => {
+  // The real in-memory limiter, built from app configuration.
+  const limits = RequestLimits.fromAppConfig(createTestConfig({
+    SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW: 2,
+    SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW: 3
+  }));
+  const { app, settings, auditEvents } = await createApp({ limits });
+  const save = (userId: string, tenantId = "settings-tenant") => app.inject({
+    method: "PUT",
+    url: "/me/settings/scheduled_jobs",
+    headers: { "x-user-id": userId, "x-tenant-id": tenantId },
+    payload: { config: { defaultTimeZone: "UTC", enableOnCreate: true } }
+  });
+
+  expect((await save("user-a")).statusCode).toBe(200);
+  expect((await save("user-a")).statusCode).toBe(200);
+  const userLimited = await save("user-a");
+  expect(userLimited.statusCode).toBe(429);
+  expect(Number(userLimited.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+  expect(userLimited.json()).toMatchObject({
+    error: "limit_exceeded",
+    resource: "settings_write",
+    scope: "user",
+    limit: 2,
+    message: "User settings write rate limit exceeded."
+  });
+
+  // Each user has a key: another member saves until the tenant key is full.
+  expect((await save("user-b")).statusCode).toBe(200);
+  const tenantLimited = await save("user-b");
+  expect(tenantLimited.statusCode).toBe(429);
+  expect(tenantLimited.json()).toMatchObject({ resource: "settings_write", scope: "tenant", limit: 3 });
+
+  // Another tenant has its own key.
+  expect((await save("user-c", "other-tenant")).statusCode).toBe(200);
+
+  // A refused save writes no section and no audit event.
+  expect((await settings.listSections("settings-tenant", "user-a"))[0]?.version).toBe(2);
+  expect((await settings.listSections("settings-tenant", "user-b"))[0]?.version).toBe(1);
+  expect(auditEvents.events.filter((event) => event.type === "user.settings.updated")).toHaveLength(4);
+
+  // The settings limit is not the scheduled-job creation limit.
+  const job = await app.inject({
+    method: "POST",
+    url: "/me/scheduled-jobs",
+    headers: { "x-user-id": "user-a" },
+    payload: {
+      jobName: "Digest", cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt",
+      input: { prompt: "Write the digest." }, enabled: false
+    }
+  });
+  expect(job.statusCode).toBe(201);
+  await app.close();
+});
+
+test("a settings_write limit of 0 turns that scope off", async () => {
+  const limits = RequestLimits.fromAppConfig(createTestConfig({
+    SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW: 0,
+    SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW: 0
+  }));
+  const { app } = await createApp({ limits });
+
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    expect((await putSection(app, JSON.stringify({ config: {} }))).statusCode).toBe(200);
+  }
+  await app.close();
+});
+
+test("a section save fails closed with a retryable 503 when the limit store is down", async () => {
+  // The real Redis limiter with a Redis that refuses every command.
+  const redis = {
+    async eval() {
+      throw new Error("connect ECONNREFUSED");
+    }
+  } as unknown as Redis;
+  const limits = RedisRequestLimits.fromAppConfig(redis, createTestConfig({}));
+  const { app, settings, auditEvents } = await createApp({ appErrorHandler: true, limits });
+
+  const response = await putSection(app, JSON.stringify({ config: {} }));
+
+  expect(response.statusCode).toBe(503);
+  expect(response.headers["retry-after"]).toBe("5");
+  expect(response.json()).toEqual({
+    error: "request_limits_unavailable",
+    message: "Request limits are temporarily unavailable."
+  });
+  expect(await settings.listSections("settings-tenant", "settings-user")).toEqual([]);
+  expect(auditEvents.events).toEqual([]);
+  await app.close();
+});
+
+const snapshotProbeJob = (jobName: string, enabled = false) => ({
+  jobName, cronExpression: "0 9 * * *", timeZone: "UTC", targetType: "prompt",
+  input: { prompt: "Write the digest." }, enabled
+});
+
+test("new and edited jobs do not copy settings sections, even oversized legacy ones", async () => {
+  const { app, settings } = await createApp();
+  // Rows saved before the size limit can be larger than any save allows now.
+  for (const sectionKey of userSettingsSectionKeys) {
+    await settings.upsertSection({
+      tenantId: "settings-tenant",
+      userId: "settings-user",
+      sectionKey,
+      config: { legacy: "x".repeat(1_000_000) }
+    });
+  }
+  const listSections = vi.spyOn(settings, "listSections");
+
+  const created = await app.inject({ method: "POST", url: "/me/scheduled-jobs", payload: snapshotProbeJob("Digest") });
+  expect(created.statusCode).toBe(201);
+  expect(created.json().scheduledJob.settingsSnapshot).toEqual({});
+  const jobId = created.json().scheduledJob.jobId as string;
+
+  const edited = await app.inject({ method: "PUT", url: `/me/scheduled-jobs/${jobId}`, payload: snapshotProbeJob("Digest 2") });
+  expect(edited.statusCode).toBe(200);
+  expect(edited.json().scheduledJob.settingsSnapshot).toEqual({});
+  expect((await settings.getScheduledJob("settings-tenant", jobId, "settings-user"))?.settingsSnapshot).toEqual({});
+  // A job save does not read the sections at all.
+  expect(listSections).not.toHaveBeenCalled();
+  await app.close();
+});
+
+test("a job saved with an old snapshot keeps it until its next edit", async () => {
+  const { app, settings } = await createApp();
+  const oldSnapshot = { model: { version: 3, config: { legacy: "x".repeat(100_000) } } };
+  const jobId = randomUUID();
+  await settings.createScheduledJob({
+    tenantId: "settings-tenant",
+    jobId,
+    userId: "settings-user",
+    jobName: "Legacy digest",
+    description: null,
+    cronExpression: "0 9 * * *",
+    timeZone: "UTC",
+    targetType: "prompt",
+    targetRef: null,
+    input: { prompt: "Write the digest." },
+    settingsSnapshot: oldSnapshot,
+    enabled: false,
+    nextRunAt: null,
+    ownerSecurityVersion: null
+  }, { maxActive: 0 });
+  await settings.upsertSection({
+    tenantId: "settings-tenant",
+    userId: "settings-user",
+    sectionKey: "model",
+    config: { legacy: "y".repeat(100_000) }
+  });
+
+  // The API still returns the stored snapshot of a job that nobody edited.
+  const listed = await app.inject({ method: "GET", url: "/me/scheduled-jobs" });
+  expect(listed.json().scheduledJobs[0].settingsSnapshot).toEqual(oldSnapshot);
+
+  const edited = await app.inject({ method: "PUT", url: `/me/scheduled-jobs/${jobId}`, payload: snapshotProbeJob("Legacy digest") });
+  expect(edited.statusCode).toBe(200);
+  expect(edited.json().scheduledJob.settingsSnapshot).toEqual({});
   await app.close();
 });
 

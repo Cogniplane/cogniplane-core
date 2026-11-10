@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Approval, McpAppCall } from "@cogniplane/shared-types";
 import type { AbstractAgent } from "@ag-ui/client";
 
+import { ApiError } from "../api-client";
 import * as sessionApi from "../session-api";
 import type { RuntimeNoticeRow } from "../../components/chat-cards/chat-cards.types";
 import { useAguiCustomEvents } from "./use-agui-custom-events";
@@ -577,6 +578,222 @@ describe("useAguiCustomEvents — approval reads during other approval changes",
     await answer(0, [pending("B")]);
 
     expect(result.current.approvals).toEqual([]);
+  });
+});
+
+// The decision request fails. The user must see why, and when the server
+// reports that the approval is not open, the cards follow its pending list.
+describe("useAguiCustomEvents — a failed approval decision", () => {
+  const pending = (approvalId: string) => ({
+    approvalId, sessionId: "s-1", itemId: `item-${approvalId}`, kind: "command_execution",
+    title: `Run ${approvalId}`, summary: "ls", status: "pending", createdAt: "2026-11-10T00:00:00.000Z"
+  }) as unknown as Approval;
+  const request = (approvalId: string) => ({
+    approvalId, itemId: `item-${approvalId}`, kind: "command_execution", title: `Run ${approvalId}`, summary: "ls"
+  });
+  // The error that api-client builds from the response body.
+  const refused = (status: number, body: { error?: string; message?: string }) => new ApiError({
+    status, code: body.error, method: "POST", path: "/approvals/A/decision",
+    message: body.message ?? body.error ?? `Request failed: ${status}`
+  });
+  const failureNotices = (notices: RuntimeNoticeRow[]) =>
+    notices.filter((notice) => notice.noticeId.startsWith("approval-decision-failed:"));
+  const rows = (approvals: ReturnType<typeof useAguiCustomEvents>["approvals"]) =>
+    approvals.map((row) => [row.approvalId, row.decisionState]);
+
+  /** Each read waits until the test answers it. */
+  function heldReads() {
+    const answers: Array<(approvals: Approval[]) => void> = [];
+    const list = vi.spyOn(sessionApi, "listApprovals").mockImplementation(
+      () => new Promise<Approval[]>((resolve) => { answers.push(resolve); })
+    );
+    const answer = (index: number, approvals: Approval[]) => act(async () => answers[index]!(approvals));
+    return { list, answer };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("shows an error notice and enables the buttons again when the request fails", async () => {
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(new TypeError("Failed to fetch"));
+    const list = vi.spyOn(sessionApi, "listApprovals");
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+
+    expect(rows(result.current.approvals)).toEqual([["A", "pending"]]);
+    expect(failureNotices(result.current.notices)).toEqual([expect.objectContaining({
+      noticeId: "approval-decision-failed:A",
+      level: "error",
+      title: "Decision not confirmed",
+      message: "The request to the server failed. Check your connection, then try again."
+    })]);
+    // The approval can still be open, so the row stays and no read replaces it.
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("shows the message of the server, and one notice for each approval", async () => {
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(
+      refused(503, { error: "internal_error", message: "An unexpected error occurred." })
+    );
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "reject" }));
+    await act(async () => result.current.onApprovalDecision("A", { decision: "reject" }));
+
+    expect(rows(result.current.approvals)).toEqual([["A", "pending"]]);
+    expect(failureNotices(result.current.notices).map((notice) => notice.message)).toEqual([
+      "An unexpected error occurred. Try again."
+    ]);
+  });
+
+  it("removes the notice when a later decision succeeds", async () => {
+    const decision = vi.spyOn(sessionApi, "resolveApproval").mockRejectedValueOnce(refused(503, { error: "unavailable" }));
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    expect(failureNotices(result.current.notices).map((notice) => notice.message)).toEqual([
+      "The server did not confirm your decision (HTTP 503). Try again."
+    ]);
+
+    decision.mockResolvedValue(undefined);
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    expect(result.current.approvals).toEqual([]);
+    expect(failureNotices(result.current.notices)).toEqual([]);
+  });
+
+  it.each([404, 409, 410])("follows the pending approvals of the server after a %i", async (status) => {
+    const { list, answer } = heldReads();
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(status, { error: "approval_not_found" }));
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() =>
+      useAguiCustomEvents(agent, { initialApprovals: [pending("A"), pending("B")] })
+    );
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    expect(list).toHaveBeenCalledWith("s-1", expect.any(AbortSignal));
+    expect(failureNotices(result.current.notices)).toEqual([expect.objectContaining({
+      noticeId: "approval-decision-failed:A",
+      level: "error",
+      title: "Approval no longer open"
+    })]);
+
+    // Another tab decided A. The notice says why its card goes.
+    await answer(0, [pending("B")]);
+    expect(rows(result.current.approvals)).toEqual([["B", "pending"]]);
+    expect(failureNotices(result.current.notices)).toHaveLength(1);
+  });
+
+  it("keeps the row when the server still lists it as pending", async () => {
+    const { answer } = heldReads();
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(404, { error: "approval_not_found" }));
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    await answer(0, [pending("A")]);
+
+    expect(rows(result.current.approvals)).toEqual([["A", "pending"]]);
+  });
+
+  it("keeps an approval that a live event adds while the read runs", async () => {
+    const { list, answer } = heldReads();
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
+    const { agent, run, emit } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    run.init();
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    // The backend saves C before it sends the event, so the first read can
+    // miss C and a read that starts after the event includes it.
+    emit("approval_required", request("C"));
+    expect(list).toHaveBeenCalledTimes(2);
+    await answer(0, []);
+    expect(rows(result.current.approvals)).toEqual([["A", "pending"], ["C", "pending"]]);
+
+    await answer(1, [pending("C")]);
+    expect(rows(result.current.approvals)).toEqual([["C", "pending"]]);
+  });
+
+  it("does not start a read for a live event when no read runs", () => {
+    const list = vi.spyOn(sessionApi, "listApprovals");
+    const { agent, run, emit } = makeFakeAgent();
+    renderHook(() => useAguiCustomEvents(agent));
+
+    run.init();
+    emit("approval_required", request("C"));
+
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a newer snapshot", (current: ReturnType<typeof useAguiCustomEvents>) =>
+      current.syncServerState({ messages: [], approvals: [pending("A"), pending("B")] })],
+    ["a clean end of the turn", (current: ReturnType<typeof useAguiCustomEvents>) => current.clearApprovals()]
+  ])("lets %s outrank the read", async (_, replace) => {
+    const { answer } = heldReads();
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
+    const { agent } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    act(() => replace(result.current));
+    const after = rows(result.current.approvals);
+    await answer(0, [pending("D")]);
+
+    expect(rows(result.current.approvals)).toEqual(after);
+  });
+
+  it("ignores a read that returns after a new run starts", async () => {
+    const { answer } = heldReads();
+    vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
+    const { agent, run } = makeFakeAgent();
+    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
+    run.init(true);
+    await answer(0, []);
+
+    expect(rows(result.current.approvals)).toEqual([["A", "pending"]]);
+  });
+
+  it("ignores a decision answer that returns after a session switch", async () => {
+    let fail!: (error: unknown) => void;
+    vi.spyOn(sessionApi, "resolveApproval").mockImplementation(
+      () => new Promise<void>((_, reject) => { fail = reject; })
+    );
+    const list = vi.spyOn(sessionApi, "listApprovals");
+    const first = makeFakeAgent();
+    const second = makeFakeAgent();
+    const { result, rerender } = renderHook(
+      ({ agent }) => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }),
+      { initialProps: { agent: first.agent } }
+    );
+
+    act(() => result.current.onApprovalDecision("A", { decision: "approve" }));
+    rerender({ agent: second.agent });
+    await act(async () => fail(refused(409, { error: "approval_not_found" })));
+
+    expect(failureNotices(result.current.notices)).toEqual([]);
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("starts no read after the host unmounts", async () => {
+    let fail!: (error: unknown) => void;
+    vi.spyOn(sessionApi, "resolveApproval").mockImplementation(
+      () => new Promise<void>((_, reject) => { fail = reject; })
+    );
+    const list = vi.spyOn(sessionApi, "listApprovals");
+    const { agent } = makeFakeAgent();
+    const { result, unmount } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+
+    act(() => result.current.onApprovalDecision("A", { decision: "approve" }));
+    unmount();
+    await act(async () => fail(refused(410, { error: "approval_not_found" })));
+
+    expect(list).not.toHaveBeenCalled();
   });
 });
 

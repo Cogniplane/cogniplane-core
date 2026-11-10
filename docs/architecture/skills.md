@@ -41,12 +41,29 @@ Import validation (`skill-import-service.ts`, `skill-bundle-validator.ts`,
 `skill-bundle-limits.ts`) applies to zip uploads and GitHub archives:
 
 - Compressed size at most `ARTIFACT_MAX_UPLOAD_BYTES`, checked before parsing.
+  A GitHub download stops at this size.
 - Per-file, total-uncompressed and file-count limits in
-  `skill-bundle-limits.ts`; each entry must declare its size, and the decoded
-  length must match.
-- Paths are POSIX-normalized; absolute paths and `..` are rejected; the result
-  must stay under the extraction root. A GitHub subdirectory must stay inside
-  the archive.
+  `skill-bundle-limits.ts`; each entry must declare its size, and inflation
+  has a hard output limit. The decoded length is not compared with the
+  declared size. For a zip upload, the limits apply to the whole archive.
+  For a GitHub archive, they apply to the selected skill folder only.
+- A GitHub archive holds the whole repository. The import selects the skill
+  folder from the entry names, and inflates and writes only that folder:
+  - The folder is `subdirectory` (or the path of a tree URL) below the archive
+    root, the one top-level folder of the archive. Paths match by whole
+    segments, so `skills/pdf` does not select `skills/pdf-tools`.
+  - Without a subdirectory, the folder is the one folder below the archive root
+    that has a `SKILL.md` file. Hidden folders and `__MACOSX` do not count. No
+    folder or more than one folder is an error.
+  - The import refuses an archive with more than `MAX_GITHUB_ARCHIVE_ENTRIES`
+    entries (files and folders) before it parses the archive. This conservative
+    guard counts central directory signatures, including matches in file
+    content, so it can also refuse archives below that entry count.
+- JSZip resolves `.` and `..` segments in entry names before selection.
+  Selection and extraction use the same resulting path. Each path is then
+  POSIX-normalized and must be relative and stay under the extraction root,
+  including paths of entries that are not extracted. A GitHub subdirectory
+  cannot be absolute or contain `..`.
 - Symlinks are errors; other non-regular files are skipped.
 - Bundle root allows only the files `SKILL.md`, `README.md`, `LICENSE` (exact
   names) and the directories `assets/`, `references/`, `scripts/`.
@@ -109,6 +126,29 @@ audit event.
   skill as read-only `/skills/<slug>/SKILL.md` plus its bundle files, through a
   `CompositeBackend` route of the agent file tools. `execute` cannot read it; it
   is not copied into the sandbox.
+- While a bundle stays cached, its companion files are read once per backend
+  process and shared across sessions.
+  `SkillCompanionCache` (same file) keeps one copy of each bundle's companion
+  files, and all sessions use it. The key is the storage backend instance and
+  the full storage URI; both URI layouts hold the tenant id and the content
+  hash. Concurrent builds of one bundle share one read. A failed read is not
+  kept, so the next build reads again.
+- Cache limits (code constants `COMPANION_CACHE_MAX_BYTES` and
+  `COMPANION_CACHE_MAX_ENTRIES`): 64 MiB of file bytes and 256 bundles. The
+  cache removes the least recently used bundle first and does not keep a
+  bundle larger than 64 MiB. A removed bundle stays in memory while a session
+  that serves it is alive; the next build reads it again.
+- Each build still calls `materializeBundle`, so the storage checks the path
+  again. If storage reports the bundle unavailable, the build does not serve
+  its cached companions. Their bytes stay in memory
+  until eviction or a restart. Each build also generates `SKILL.md` from the
+  current revision. The `/skills/` backend returns copies of binary content,
+  so a caller cannot change the shared bytes.
+- Not verified: the byte limit counts file bytes, not process memory, and a
+  decoded text file can use up to two times its file size. No memory benchmark
+  under production load exists. The cache does not read a bundle again when its
+  bytes change under the same URI (see the content hash note in [bundle
+  storage](#bundle-storage)); the change shows after eviction or a restart.
 - The deepagents skills middleware puts only each skill's name, description and
   path in the system prompt; the instructions stay in the file, and the model
   reads `SKILL.md` when it needs it.

@@ -2,8 +2,8 @@ import { Response, type fetch as undiciFetch, type RequestInit } from "undici";
 import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
-import { test, expect, onTestFinished } from "vitest";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { test, expect, onTestFinished, vi } from "vitest";
 
 import JSZip from "jszip";
 
@@ -16,6 +16,7 @@ import {
   MAX_GITHUB_REDIRECTS
 } from "./skill-import-service.js";
 import { AdminConfigError } from "../admin-config-error.js";
+import { MAX_GITHUB_ARCHIVE_ENTRIES, MAX_SKILL_BUNDLE_FILES } from "./skill-bundle-limits.js";
 import { LocalSkillBundleStorage } from "./skill-bundle-storage.js";
 import type { ImportedSkillBundleRecord } from "../admin-config-records.js";
 
@@ -826,4 +827,368 @@ test("importSkillBundleFromZip rejects archives exceeding the maximum file count
       actorUserId: "admin-user"
     })
   ).rejects.toThrow(/maximum file count/);
+});
+
+// GitHub zipballs hold a whole repository under one `owner-repo-sha/` folder.
+// The importer must choose the skill folder from the entry names, and apply the
+// bundle limits and the bounded inflate to that folder only.
+const ZIPBALL_ROOT = "owner-repo-abc123";
+
+function skillMarkdown(name: string): string {
+  return `---\nname: ${name}\ndescription: A test skill\n---\n# Instructions\nTest skill instructions.\n`;
+}
+
+function addUnrelatedFiles(archive: JSZip, folder: string, count: number): void {
+  for (let i = 0; i < count; i += 1) {
+    archive.file(`${ZIPBALL_ROOT}/${folder}/file-${i}.md`, `Unrelated repository file ${i}.\n`);
+  }
+}
+
+function zipballFetch(archiveBuffer: Buffer): typeof undiciFetch {
+  return (async (url: string | URL) => {
+    const value = url.toString();
+    if (value.includes("/zipball/")) {
+      return new Response(new Uint8Array(archiveBuffer), {
+        status: 200,
+        headers: { "Content-Type": "application/zip" }
+      });
+    }
+    if (value.endsWith("/repos/owner/repo")) {
+      return new Response(JSON.stringify({ default_branch: "main" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    throw new Error(`Unexpected fetch URL: ${value}`);
+  }) as typeof undiciFetch;
+}
+
+async function importZipball(
+  archiveBuffer: Buffer,
+  options: {
+    githubUrl?: string;
+    ref?: string;
+    subdirectory?: string;
+    config?: Parameters<typeof createTestConfig>[0];
+    recorder?: { calls: RecordedImportInput[]; storageUris: Array<string | null> };
+  } = {}
+) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-zipball-"));
+  onTestFinished(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  return importSkillBundleFromGithub({
+    tenantId: "test-tenant",
+    config: createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: path.join(root, "cache"), ...options.config }),
+    skillRevisions: buildFakeSkillRevisions(options.recorder),
+    skillBundleStorage: new LocalSkillBundleStorage(path.join(root, "cache")),
+    githubUrl: options.githubUrl ?? "https://github.com/owner/repo",
+    ref: options.ref,
+    subdirectory: options.subdirectory,
+    actorUserId: "admin-user",
+    fetchFn: zipballFetch(archiveBuffer)
+  });
+}
+
+type CentralRecord = { name: string; centralOffset: number; localOffset: number };
+
+// Reads the central directory of an archive this file generated (no comment,
+// no zip64), so a test can edit the fields of one named entry.
+function readCentralRecords(archiveBuffer: Buffer): CentralRecord[] {
+  const endOffset = archiveBuffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  const recordCount = archiveBuffer.readUInt16LE(endOffset + 10);
+  let offset = archiveBuffer.readUInt32LE(endOffset + 16);
+  const records: CentralRecord[] = [];
+  for (let i = 0; i < recordCount; i += 1) {
+    const nameLength = archiveBuffer.readUInt16LE(offset + 28);
+    const extraLength = archiveBuffer.readUInt16LE(offset + 30);
+    const commentLength = archiveBuffer.readUInt16LE(offset + 32);
+    records.push({
+      name: archiveBuffer.toString("utf8", offset + 46, offset + 46 + nameLength),
+      centralOffset: offset,
+      localOffset: archiveBuffer.readUInt32LE(offset + 42)
+    });
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return records;
+}
+
+function findCentralRecord(archiveBuffer: Buffer, name: string): CentralRecord {
+  const record = readCentralRecords(archiveBuffer).find((candidate) => candidate.name === name);
+  if (!record) {
+    throw new Error(`No zip entry named ${name}`);
+  }
+  return record;
+}
+
+/** Make an entry declare `size` uncompressed bytes in both of its headers. */
+function rewriteDeclaredSize(archiveBuffer: Buffer, name: string, size: number): void {
+  const record = findCentralRecord(archiveBuffer, name);
+  archiveBuffer.writeUInt32LE(size, record.centralOffset + 24);
+  archiveBuffer.writeUInt32LE(size, record.localOffset + 22);
+}
+
+/**
+ * Make the deflate stream of an entry start with a reserved block type, so any
+ * attempt to inflate it fails. An import that succeeds proves it never
+ * inflated the entry.
+ */
+function corruptDeflateData(archiveBuffer: Buffer, name: string): void {
+  const record = findCentralRecord(archiveBuffer, name);
+  const nameLength = archiveBuffer.readUInt16LE(record.localOffset + 26);
+  const extraLength = archiveBuffer.readUInt16LE(record.localOffset + 28);
+  archiveBuffer[record.localOffset + 30 + nameLength + extraLength] = 0xff;
+}
+
+function recordedFilePaths(recorder: { calls: RecordedImportInput[] }): string[] {
+  const files = recorder.calls[0]?.metadata.files as Array<{ path: string }> | undefined;
+  return (files ?? []).map((file) => file.path);
+}
+
+test("importSkillBundleFromGithub imports a small skill folder from a repository with more than 50 unrelated files", async () => {
+  const archive = new JSZip();
+  addUnrelatedFiles(archive, "docs", 80);
+  addUnrelatedFiles(archive, "src/lib", 80);
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/notes.md`, "Companion notes.\n");
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  const recorder = { calls: [] as RecordedImportInput[], storageUris: [] as Array<string | null> };
+  // The marketplace sends the repository URL, ref and subdirectory as separate
+  // fields, so this input has the marketplace shape.
+  const imported = await importZipball(archiveBuffer, {
+    ref: "main",
+    subdirectory: "skills/demo-skill",
+    recorder
+  });
+
+  expect(imported.skill.skillId).toBe("demo-skill");
+  expect(recorder.calls[0]?.sourceLabel).toBe("owner/repo@main");
+  expect(recordedFilePaths(recorder)).toEqual(["references/notes.md", "SKILL.md"]);
+  expect(recorder.storageUris[0]).toMatch(/^file:\/\//);
+});
+
+test("importSkillBundleFromGithub does not inflate oversized, lying or corrupt entries outside the selected folder", async () => {
+  const archive = new JSZip();
+  // Honest but larger than the per-file cap.
+  archive.file(`${ZIPBALL_ROOT}/vendor/huge.bin`, "A".repeat(11 * 1024 * 1024));
+  // Inflates past the per-file cap; its headers say 64 bytes (rewritten below).
+  archive.file(`${ZIPBALL_ROOT}/vendor/bomb.txt`, "B".repeat(12 * 1024 * 1024));
+  // Any inflate of this entry throws (corrupted below).
+  archive.file(`${ZIPBALL_ROOT}/vendor/corrupt.txt`, "This deflate stream gets corrupted.\n".repeat(20));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  rewriteDeclaredSize(archiveBuffer, `${ZIPBALL_ROOT}/vendor/bomb.txt`, 64);
+  corruptDeflateData(archiveBuffer, `${ZIPBALL_ROOT}/vendor/corrupt.txt`);
+
+  const imported = await importZipball(archiveBuffer, {
+    githubUrl: "https://github.com/owner/repo/tree/main/skills/demo-skill"
+  });
+
+  expect(imported.skill.skillId).toBe("demo-skill");
+}, 30_000);
+
+test("importSkillBundleFromGithub keeps the file-count limit on the selected folder", async () => {
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/big-skill/SKILL.md`, skillMarkdown("big-skill"));
+  // SKILL.md plus 50 companion files = 51 files, one over MAX_SKILL_BUNDLE_FILES.
+  for (let i = 0; i < 50; i += 1) {
+    archive.file(`${ZIPBALL_ROOT}/skills/big-skill/references/file-${i}.txt`, `content ${i}`);
+  }
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer" });
+
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/big-skill" }))
+    .rejects.toThrow(/maximum file count of 50/);
+});
+
+test("importSkillBundleFromGithub keeps the per-file limit on the selected folder", async () => {
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/big.txt`, "A".repeat(11 * 1024 * 1024));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill" }))
+    .rejects.toThrow(/references\/big\.txt exceeds the maximum file size of 10485760 bytes/);
+});
+
+test("importSkillBundleFromGithub keeps the total-size limit on the selected folder only", async () => {
+  const archive = new JSZip();
+  // Outside the selection and larger than the whole 5,000-byte budget. It must
+  // not count against the selected folder.
+  archive.file(`${ZIPBALL_ROOT}/docs/unrelated.txt`, "U".repeat(20_000));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/a.txt`, "a".repeat(3_000));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/b.txt`, "b".repeat(3_000));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  expect(archiveBuffer.byteLength).toBeLessThan(5_000);
+
+  const config = { ARTIFACT_MAX_UPLOAD_BYTES: 5_000 };
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill", config }))
+    .rejects.toThrow(/references\/b\.txt expands past the \d+-byte limit|exceeds the maximum uncompressed size/);
+
+  // The same budget accepts the selected folder when it fits.
+  const fitting = new JSZip();
+  fitting.file(`${ZIPBALL_ROOT}/docs/unrelated.txt`, "U".repeat(20_000));
+  fitting.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  fitting.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/a.txt`, "a".repeat(3_000));
+  const fittingBuffer = await fitting.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  await expect(importZipball(fittingBuffer, { subdirectory: "skills/demo-skill", config }))
+    .resolves.toBeDefined();
+});
+
+test("importSkillBundleFromGithub bounds the inflate of a selected entry that lies about its size", async () => {
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/references/bomb.txt`, "A".repeat(12 * 1024 * 1024));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  rewriteDeclaredSize(archiveBuffer, `${ZIPBALL_ROOT}/skills/demo-skill/references/bomb.txt`, 64);
+
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill" }))
+    .rejects.toThrow(/references\/bomb\.txt expands past the 10485760-byte limit/);
+}, 30_000);
+
+test("importSkillBundleFromGithub finds the only SKILL.md folder among unrelated files", async () => {
+  const archive = new JSZip();
+  addUnrelatedFiles(archive, "docs", 80);
+  // Hidden folders do not hold candidate skills, as before.
+  archive.file(`${ZIPBALL_ROOT}/.github/skill-template/SKILL.md`, skillMarkdown("skill-template"));
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+
+  const recorder = { calls: [] as RecordedImportInput[], storageUris: [] as Array<string | null> };
+  const imported = await importZipball(archiveBuffer, { recorder });
+
+  expect(imported.skill.skillId).toBe("demo-skill");
+  expect(recordedFilePaths(recorder)).toEqual(["SKILL.md"]);
+});
+
+test("importSkillBundleFromGithub reports a missing or ambiguous SKILL.md in a large repository", async () => {
+  const missing = new JSZip();
+  addUnrelatedFiles(missing, "docs", 80);
+  const missingBuffer = await missing.generateAsync({ type: "nodebuffer" });
+
+  await expect(importZipball(missingBuffer))
+    .rejects.toThrow(/exactly one skill bundle root with SKILL\.md/);
+
+  const ambiguous = new JSZip();
+  addUnrelatedFiles(ambiguous, "docs", 80);
+  ambiguous.file(`${ZIPBALL_ROOT}/skills/first-skill/SKILL.md`, skillMarkdown("first-skill"));
+  ambiguous.file(`${ZIPBALL_ROOT}/skills/second-skill/SKILL.md`, skillMarkdown("second-skill"));
+  const ambiguousBuffer = await ambiguous.generateAsync({ type: "nodebuffer" });
+
+  await expect(importZipball(ambiguousBuffer))
+    .rejects.toThrow(/exactly one skill bundle root with SKILL\.md/);
+});
+
+test("importSkillBundleFromGithub rejects malformed archive bytes as AdminConfigError", async () => {
+  const result = importZipball(Buffer.from("this is definitely not a zip archive"));
+  await expect(result).rejects.toThrow(AdminConfigError);
+  await expect(result).rejects.toThrow(/not a valid zip archive/);
+});
+
+test("importSkillBundleFromGithub rejects a repository archive above the entry limit before parsing it", async () => {
+  expect(MAX_GITHUB_ARCHIVE_ENTRIES).toBeGreaterThan(MAX_SKILL_BUNDLE_FILES);
+
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  for (let i = 0; i < MAX_GITHUB_ARCHIVE_ENTRIES; i += 1) {
+    archive.file(`${ZIPBALL_ROOT}/f${i}`, "", { createFolders: false });
+  }
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer" });
+
+  const loadAsync = vi.spyOn(JSZip, "loadAsync");
+  onTestFinished(() => loadAsync.mockRestore());
+
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill" }))
+    .rejects.toThrow(new RegExp(`more than ${MAX_GITHUB_ARCHIVE_ENTRIES} entries`));
+  expect(loadAsync).not.toHaveBeenCalled();
+}, 30_000);
+
+test("importSkillBundleFromGithub rejects an unsafe entry path outside the selected folder", async () => {
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  // JSZip strips a leading slash when a file is added, so rename the entry in
+  // its internal map (as the zip-slip test above does).
+  archive.file(`${ZIPBALL_ROOT}/placeholder.txt`, "pwned");
+  const malicious = archive.files[`${ZIPBALL_ROOT}/placeholder.txt`]!;
+  malicious.name = "/evil.txt";
+  archive.files["/evil.txt"] = malicious;
+  delete archive.files[`${ZIPBALL_ROOT}/placeholder.txt`];
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer" });
+
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill" }))
+    .rejects.toThrow(/Unsafe zip entry path: \/evil\.txt/);
+});
+
+test("importSkillBundleFromGithub matches the subdirectory by whole path segments", async () => {
+  const archive = new JSZip();
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("demo-skill"));
+  // A sibling whose name starts with the selected name. Its files must not be
+  // counted or inflated.
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill-extra/SKILL.md`, skillMarkdown("demo-skill-extra"));
+  for (let i = 0; i < 60; i += 1) {
+    archive.file(`${ZIPBALL_ROOT}/skills/demo-skill-extra/references/file-${i}.md`, `extra ${i}`);
+  }
+  archive.file(`${ZIPBALL_ROOT}/skills/demo-skill-extra/references/corrupt.md`, "corrupt me\n".repeat(20));
+  const archiveBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  corruptDeflateData(archiveBuffer, `${ZIPBALL_ROOT}/skills/demo-skill-extra/references/corrupt.md`);
+
+  const recorder = { calls: [] as RecordedImportInput[], storageUris: [] as Array<string | null> };
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo-skill", recorder }))
+    .resolves.toBeDefined();
+  expect(recordedFilePaths(recorder)).toEqual(["SKILL.md"]);
+
+  // A name prefix that is not a whole folder name does not select anything.
+  await expect(importZipball(archiveBuffer, { subdirectory: "skills/demo" }))
+    .rejects.toThrow(/GitHub subdirectory "skills\/demo" does not exist in the repository archive/);
+});
+
+test("importSkillBundleFromGithub removes its temporary folder when an import fails", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-cleanup-"));
+  const isolatedTmp = path.join(root, "tmp");
+  await mkdir(isolatedTmp);
+  const previousTmpdir = process.env.TMPDIR;
+  onTestFinished(async () => {
+    if (previousTmpdir === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = previousTmpdir;
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  // Fails while it extracts the selected folder (file-count limit).
+  const tooMany = new JSZip();
+  tooMany.file(`${ZIPBALL_ROOT}/skills/big-skill/SKILL.md`, skillMarkdown("big-skill"));
+  for (let i = 0; i < 50; i += 1) {
+    tooMany.file(`${ZIPBALL_ROOT}/skills/big-skill/references/file-${i}.txt`, `content ${i}`);
+  }
+  const tooManyBuffer = await tooMany.generateAsync({ type: "nodebuffer" });
+
+  // Fails after extraction, in bundle validation (name mismatch).
+  const invalid = new JSZip();
+  invalid.file(`${ZIPBALL_ROOT}/skills/demo-skill/SKILL.md`, skillMarkdown("other-name"));
+  const invalidBuffer = await invalid.generateAsync({ type: "nodebuffer" });
+
+  const storageRoot = path.join(root, "cache");
+  process.env.TMPDIR = isolatedTmp;
+  expect(os.tmpdir()).toBe(isolatedTmp);
+
+  for (const archiveBuffer of [tooManyBuffer, invalidBuffer]) {
+    await expect(importSkillBundleFromGithub({
+      tenantId: "test-tenant",
+      config: createTestConfig({ SKILL_BUNDLE_STORAGE_ROOT: storageRoot }),
+      skillRevisions: buildFakeSkillRevisions(),
+      skillBundleStorage: new LocalSkillBundleStorage(storageRoot),
+      githubUrl: "https://github.com/owner/repo",
+      ref: "main",
+      subdirectory: archiveBuffer === tooManyBuffer ? "skills/big-skill" : "skills/demo-skill",
+      actorUserId: "admin-user",
+      fetchFn: zipballFetch(archiveBuffer)
+    })).rejects.toThrow(AdminConfigError);
+  }
+
+  expect(await readdir(isolatedTmp)).toEqual([]);
 });

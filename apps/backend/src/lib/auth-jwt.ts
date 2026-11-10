@@ -1,13 +1,14 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 
 import { type AppConfig, arePasskeysEnabled, isLoginTypeEnabled, isPasswordRecoveryEnabled } from "../config.js";
-import { verifyAccessToken, isTokenExpiredError } from "./jwt.js";
+import { type AccessTokenPayload, verifyAccessToken, isTokenExpiredError } from "./jwt.js";
 import { tryAuthenticateRuntimeToken } from "./auth-runtime-token.js";
 import { checkAuthAdmission } from "./auth-admission.js";
 import { isPublicAuthPath, isPublicDownloadRequest } from "./auth-public-paths.js";
+import { apiError } from "./http-errors.js";
 import { listIntegrationOAuthCallbackPaths } from "../services/integrations/integration-registry.js";
 import { sanitizeUrl } from "./sanitize-url.js";
-import type { TenantMemberStore } from "../services/tenant-member-store.js";
+import type { PrivilegedAuthStateLookup, TenantAuthState } from "../services/tenant-member-store.js";
 
 // Session routes every login type uses. Refresh and logout read only the
 // refresh cookie, so they must be reachable without an access token. The
@@ -69,7 +70,7 @@ export function jwtPublicAuthPaths(
  */
 export function jwtAuth(
   config: AppConfig,
-  tenantMembers: Pick<TenantMemberStore, "getAuthState">,
+  authStates: Pick<PrivilegedAuthStateLookup, "getAuthState">,
   oauthCallbackPaths: readonly string[] = listIntegrationOAuthCallbackPaths()
 ) {
   const publicAuthPaths = jwtPublicAuthPaths(config, oauthCallbackPaths);
@@ -99,37 +100,9 @@ export function jwtAuth(
     }
 
     const token = authHeader.slice(7);
+    let payload: AccessTokenPayload;
     try {
-      const payload = await verifyAccessToken(config, token);
-
-      // Look up the user's role and login type in this tenant. The caller must
-      // build the store on `privilegedDb`, because no tenant context exists yet.
-      const admission = checkAuthAdmission(config, await tenantMembers.getAuthState(payload.tid, payload.sub), {
-        sv: payload.sv
-      });
-      if (!admission.ok) {
-        request.log.warn(
-          { url: sanitizeUrl(request.url), method: request.method, userId: payload.sub, tenantId: payload.tid, reason: admission.error },
-          "auth 403: membership does not admit this token"
-        );
-        reply.code(403).send({ error: admission.error });
-        return;
-      }
-
-      const { role, authSource, securityVersion } = admission.state;
-      request.auth = {
-        userId: payload.sub,
-        tenantId: payload.tid,
-        email: payload.email,
-        role,
-        isAdmin: role === "owner" || role === "admin",
-        session: {
-          familyId: payload.fid,
-          authSource,
-          ...(securityVersion === null ? {} : { securityVersion }),
-          ...(payload.amr ? { amr: payload.amr } : {})
-        }
-      };
+      payload = await verifyAccessToken(config, token);
     } catch (err) {
       if (isTokenExpiredError(err)) {
         request.log.warn({ url: sanitizeUrl(request.url), method: request.method }, "auth 401: JWT expired");
@@ -138,6 +111,51 @@ export function jwtAuth(
       }
       request.log.warn({ url: sanitizeUrl(request.url), method: request.method, err }, "auth 401: invalid JWT");
       reply.code(401).send({ error: "invalid_token" });
+      return;
     }
+
+    // Look up the user's role and login type in this tenant. The caller must
+    // build `PrivilegedAuthStateLookup` on `privilegedDb`, because no tenant
+    // context exists yet.
+    // The token is valid here, so a failed lookup is a server fault: answer a
+    // retryable 503, as /auth/refresh does. A 401 would make the client drop
+    // the session.
+    let authState: TenantAuthState | null;
+    try {
+      authState = await authStates.getAuthState(payload.tid, payload.sub);
+    } catch (err) {
+      request.log.error(
+        { url: sanitizeUrl(request.url), method: request.method, userId: payload.sub, tenantId: payload.tid, err },
+        "auth 503: membership lookup failed"
+      );
+      reply.header("Retry-After", "1");
+      reply.code(503).send(apiError("auth_unavailable", "The server cannot check your session now. Try again in a moment."));
+      return;
+    }
+
+    const admission = checkAuthAdmission(config, authState, { sv: payload.sv });
+    if (!admission.ok) {
+      request.log.warn(
+        { url: sanitizeUrl(request.url), method: request.method, userId: payload.sub, tenantId: payload.tid, reason: admission.error },
+        "auth 403: membership does not admit this token"
+      );
+      reply.code(403).send({ error: admission.error });
+      return;
+    }
+
+    const { role, authSource, securityVersion } = admission.state;
+    request.auth = {
+      userId: payload.sub,
+      tenantId: payload.tid,
+      email: payload.email,
+      role,
+      isAdmin: role === "owner" || role === "admin",
+      session: {
+        familyId: payload.fid,
+        authSource,
+        ...(securityVersion === null ? {} : { securityVersion }),
+        ...(payload.amr ? { amr: payload.amr } : {})
+      }
+    };
   };
 }

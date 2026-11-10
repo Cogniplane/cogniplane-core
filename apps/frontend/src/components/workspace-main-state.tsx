@@ -1,10 +1,13 @@
 "use client";
 // What the chat area shows when it has no chat to show: no session is
-// selected, the session or the chat code is loading, or the first load of the
-// session failed with nothing cached. The no-model notice comes before all of
-// these in the shell, and a cached chat comes before the load error.
+// selected, the session or the chat code is loading, the first load of the
+// session failed with nothing cached, or the chat threw an error. The no-model
+// notice comes before all of these in the shell, and a cached chat comes
+// before the load error.
 
 import { CircleAlertIcon, LoaderCircleIcon } from "lucide-react";
+import { catchError, type ErrorInfo } from "next/error";
+import { useEffect } from "react";
 
 import { Button } from "./ui/button";
 
@@ -78,3 +81,60 @@ export function WorkspaceNoSession({ hasSessions, isCreating, onNewSession, onSh
     </section>
   );
 }
+
+type ChatRenderErrorProps = {
+  isCreating: boolean;
+  /** Starts a new session, which leaves the one that failed. */
+  onNewSession: () => void;
+  /** Opens the session sidebar. Absent while it is already open. */
+  onShowSessions?: () => void;
+  /** Runs when the notice replaces the chat. */
+  onFailure?: () => void;
+};
+
+/**
+ * The chat of the selected session threw while it rendered or in an effect.
+ * Try again renders the same saved messages again, so it can fail again. New
+ * session and the session sidebar are the ways out. The notice never shows
+ * the error, which can hold message or tool text.
+ */
+export function WorkspaceRenderError({ isCreating, onRetry, onNewSession, onShowSessions, onFailure }: ChatRenderErrorProps & {
+  onRetry: () => void;
+}) {
+  useEffect(() => {
+    onFailure?.();
+  }, [onFailure]);
+  return (
+    <section className={NOTICE_FRAME}>
+      <div role="alert" className={NOTICE_CARD}>
+        <CircleAlertIcon aria-hidden="true" className="size-6 text-danger" />
+        <h2 className="text-base font-semibold text-on-surface">This session could not be shown</h2>
+        <p className="max-w-md text-sm text-on-surface-variant">
+          An error stopped this chat from displaying. Saved messages and files are not deleted. If the error
+          comes back, start a new session or open another one.
+        </p>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button type="button" variant="outline" onClick={onRetry}>Try again</Button>
+          <Button type="button" onClick={onNewSession} disabled={isCreating} aria-busy={isCreating || undefined}>
+            {isCreating ? "Creating…" : "New session"}
+          </Button>
+          {onShowSessions ? (
+            <Button type="button" variant="outline" onClick={onShowSessions}>
+              Open sessions
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ChatRenderFailure(props: ChatRenderErrorProps, { reset }: ErrorInfo) {
+  return <WorkspaceRenderError {...props} onRetry={reset} />;
+}
+
+/**
+ * Wraps the chat of one session. Key it by session id, so that a switch to
+ * another session starts with no error.
+ */
+export const ChatRenderBoundary = catchError(ChatRenderFailure);

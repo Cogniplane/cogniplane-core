@@ -45,10 +45,10 @@ const dashboard = vi.hoisted(() => ({ mounts: 0 }));
 vi.mock("../../../components/admin/pii/admin-pii-dashboard", async () => {
   const { useEffect, useState } = await import("react");
   return {
-    AdminPiiDashboard: function AdminPiiDashboard() {
+    AdminPiiDashboard: function AdminPiiDashboard({ active }: { active?: boolean }) {
       const [range, setRange] = useState("7d");
       useEffect(() => { dashboard.mounts += 1; }, []);
-      return <div><p>Activity range {range}</p><button type="button" onClick={() => setRange("30d")}>Show 30 days</button></div>;
+      return <div data-active={String(active)}><p>Activity range {range}</p><button type="button" onClick={() => setRange("30d")}>Show 30 days</button></div>;
     }
   };
 });
@@ -115,6 +115,19 @@ it("keeps the settings draft and the activity range when tabs switch by click, b
   expect(screen.getByText("Activity range 30d")).toBeTruthy();
   expect(dashboard.mounts).toBe(1);
   expect(getTenantDetails).toHaveBeenCalledOnce();
+});
+
+it("marks the kept Activity panel inactive while Settings shows", async () => {
+  vi.mocked(getTenantDetails).mockResolvedValue(tenant());
+  mount("/admin/privacy?tab=activity");
+  const activity = (await screen.findByText("Activity range 7d")).parentElement!;
+  expect(activity.dataset.active).toBe("true");
+
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Settings" }), { button: 0 });
+  expect(activity.dataset.active).toBe("false");
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Activity" }), { button: 0 });
+  expect(activity.dataset.active).toBe("true");
+  expect(dashboard.mounts).toBe(1);
 });
 
 it("opens the Activity tab from the URL and keeps other query values when switching", async () => {

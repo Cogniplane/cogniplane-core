@@ -12,6 +12,7 @@ import {
   type SessionList,
   renameSession as apiRenameSession
 } from "../lib/session-api";
+import { NEW_SESSION_PARAM } from "../lib/new-session-link";
 import { createProjectSession as apiCreateProjectSession } from "../lib/project-api";
 import { SESSION_TRASH_RETENTION_DAYS, type Session } from "@cogniplane/shared-types";
 import { useSessionPages, updateSessionCaches } from "./use-session-pages";
@@ -70,6 +71,16 @@ function syncSessionLink(sessionId: string | null, mode: "push" | "replace" = "r
   else window.history.replaceState(window.history.state, "", url);
 }
 
+/** Removes the New session link parameter from the workspace URL. Returns
+ *  whether the URL had it. */
+function takeNewSessionLink(): boolean {
+  const url = new URL(window.location.href);
+  if (url.pathname !== "/" || !url.searchParams.has(NEW_SESSION_PARAM)) return false;
+  url.searchParams.delete(NEW_SESSION_PARAM);
+  window.history.replaceState(window.history.state, "", url);
+  return true;
+}
+
 function readPinnedSessionIds(scope: string | null): Set<string> {
   if (!scope) return new Set();
   try {
@@ -113,6 +124,11 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
 
   const [restoreIds, setRestoreIds] = useState<string[]>([]);
   const [hydrated, setHydrated] = useState(false);
+  // True from a New session link (`lib/new-session-link.ts`) until the first
+  // restore. The error pages send that link to leave a session that fails to
+  // render, so that restore selects no session: not the linked one, not the
+  // saved one, not the first one.
+  const [newSessionRequested, setNewSessionRequested] = useState(false);
   const baseSessions = useMemo(() => sessionsQuery.data?.sessions ?? [], [sessionsQuery.data?.sessions]);
   const lookupIds = useMemo(() => {
     const loadedIds = new Set(baseSessions.map((session) => session.sessionId));
@@ -152,8 +168,10 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     removeUnscopedKeys(user?.userId);
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPinnedSessionIds(readPinnedSessionIds(scope));
+    const startNew = syncUrl && takeNewSessionLink();
+    if (startNew) setNewSessionRequested(true);
     const linked = syncUrl && window.location.pathname === "/" ? new URLSearchParams(window.location.search).get("session") : null;
-    setRestoreIds([linked, readPersistedSessionId(scope)].filter((id): id is string => Boolean(id)));
+    setRestoreIds(startNew ? [] : [linked, readPersistedSessionId(scope)].filter((id): id is string => Boolean(id)));
     setHydrated(true);
   }, [scope, syncUrl, user?.userId]);
 
@@ -173,8 +191,10 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     }
     if (hasRestored) return;
     if (sessionsQuery.status !== "success" || !hydrated) return;
-    if (lookupIds.length > 0 && !lookupQuery.isSuccess) return;
-    if (listedSessions.length === 0) {
+    // A New session link needs no lookup: it selects no session.
+    if (newSessionRequested) setNewSessionRequested(false);
+    else if (lookupIds.length > 0 && !lookupQuery.isSuccess) return;
+    if (newSessionRequested || listedSessions.length === 0) {
       setSelectedSessionId(null);
       persistSelectedSessionId(scope, null);
       if (syncUrl) syncSessionLink(null);
@@ -190,7 +210,7 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     persistSelectedSessionId(scope, restoredId);
     if (syncUrl) syncSessionLink(restoredId);
     setHasRestored(true);
-  }, [enabled, hasRestored, sessionsQuery.status, listedSessions, syncUrl, hydrated, lookupIds.length, lookupQuery.isSuccess, scope]);
+  }, [enabled, hasRestored, sessionsQuery.status, listedSessions, syncUrl, hydrated, lookupIds.length, lookupQuery.isSuccess, scope, newSessionRequested]);
 
   useEffect(() => {
     if (!enabled || !syncUrl) return;
@@ -403,6 +423,8 @@ export function useSessionList(input?: { enabled?: boolean; syncUrl?: boolean })
     trashRetentionDays: sessionsQuery.data?.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS,
     selectedSessionId,
     selectedSession,
+    /** The page opened from a New session link. True for the renders until the restore. */
+    newSessionRequested,
     isLoadingSessions: sessionsQuery.isPending && enabled,
     error,
     listError,

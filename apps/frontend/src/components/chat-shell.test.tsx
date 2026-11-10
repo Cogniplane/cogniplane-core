@@ -1031,6 +1031,22 @@ describe("ChatShell workspace frame", () => {
     expect(paneWidth()).toBe("620px");
   });
 
+  it("opens the panel at the default width and still resizes it when the browser blocks storage", () => {
+    const blocked = vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+      throw new DOMException("Access is denied for this document.", "SecurityError");
+    });
+    try {
+      measureFrame(1000);
+      render(<ChatShell />);
+      expect(paneWidth()).toBe("380px");
+      fireEvent.keyDown(screen.getByRole("separator", { name: "Resize artifacts panel" }), { key: "ArrowLeft" });
+      expect(paneWidth()).toBe("396px");
+    } finally {
+      // The shared afterEach clears storage before it restores the spies.
+      blocked.mockRestore();
+    }
+  });
+
   it("keeps one chat host while the panel moves between beside the chat and over it", async () => {
     measureFrame(1280);
     render(<ChatShell />);

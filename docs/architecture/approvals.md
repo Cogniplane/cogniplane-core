@@ -43,6 +43,10 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
   arguments or position.
 - Approval reads return public fields only, never proofs, payloads or runtime
   identity.
+- The decision route returns 404 `approval_not_found` when no open approval
+  matches the caller. In the browser (`use-agui-custom-events.ts`), a failed
+  decision shows an error notice and enables the controls again. After a 404,
+  409 or 410, the browser reads the pending approvals again and shows that list.
 - Tests: `deep-agents-graph.test.ts` pins the SDK behavior;
   `deep-agents-approval-cards.test.ts` runs the real graph.
 
