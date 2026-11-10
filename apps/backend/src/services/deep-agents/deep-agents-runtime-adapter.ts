@@ -702,75 +702,78 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     if (this.pendingSessionCreations.has(session.sessionId) || this.activeTurns.has(session.sessionId)) {
       throw new SessionBusyError(session.sessionId);
     }
-    this.activeTurns.add(session.sessionId);
-    state.lastActiveAt = new Date().toISOString();
-    this.clearIdleTimer(state);
-
-    // Install cancellation and the watchdog as soon as the slot is reserved.
-    // Sandbox renewal, approval reconfiguration, artifact sync, and the graph
-    // all consume the same bounded working-time budget.
     // The abort reason of the turn is a TurnStopReason when the backend
     // stopped it (a security change, ended tool access); the interrupted
     // RUN_FINISHED carries it to the user.
     const turnAbort = new AbortController();
     const onSessionAbort = () => turnAbort.abort(state.abortController.signal.reason);
     const onAdmissionAbort = () => turnAbort.abort();
-    if (state.abortController.signal.aborted) {
-      turnAbort.abort(state.abortController.signal.reason);
-    } else {
-      state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
-    }
-    if (input.cancelSignal?.aborted) turnAbort.abort();
-    else input.cancelSignal?.addEventListener("abort", onAdmissionAbort, { once: true });
-    state.activeTurnInterrupt.current = async (reason) => {
-      turnAbort.abort(reason);
-    };
     const { arm: armWatchdog, disarm: disarmWatchdog, timedOut } = this.createTurnWatchdog(
       turnAbort
     );
     const responseId = input.assistantMessageId ?? uuidv7();
     const modelId = input.model ?? defaultDeepAgentsModelId();
+    const vendorModel = resolveModelConstruction(modelId).vendorModel;
     let spending: ModelSpendingCallback | undefined;
     const finishSpending = async () => {
       try { await spending?.finish(); }
       catch (err) { this.log.error({ err, responseId }, "Failed to settle model spending; reservation retained"); }
     };
-    // The closed callback must not stay in the map after its turn.
-    const forgetSpending = () => {
-      if (spending && this.spending.get(state.runtimeId) === spending) this.spending.delete(state.runtimeId);
-    };
-    // Ends the turn in the sandbox. It is set when the turn begins there, and every exit below calls it.
+    // The finally block at the end closes these. Each one is set when the turn
+    // opens it, so after a setup failure the block closes only what the turn opened.
     let endSandboxTurn: () => void = () => {};
-    // Both turn exits call the two steps below: releaseTurnSlot after a setup
-    // failure, and the finally block of the stream. Each exit keeps its own order.
-    const removeAbortListeners = () => {
-      state.abortController.signal.removeEventListener("abort", onSessionAbort);
-      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
-    };
-    // Clears the response id that runtime notices use, and the notices held for it.
-    const clearTurnResponse = () => {
-      state.activeTurnResponseId.current = null;
-      state.pendingTurnEvents = [];
-    };
-    const releaseTurnSlot = async () => {
-      endSandboxTurn();
-      await finishSpending();
-      forgetSpending();
-      disarmWatchdog();
-      removeAbortListeners();
-      this.activeTurns.delete(session.sessionId);
-      state.activeTurnInterrupt.current = null;
-      clearTurnResponse();
-      await this.finishIntegrationInvalidation(state);
+    let approvalTurn: ApprovalTurn | undefined;
+    let subscription: { unsubscribe(): void } | undefined;
+    // Record per-turn usage and cost on the assistant row keyed by responseId. The raw
+    // streamEvents envelopes flow through the backend's streamTurn, so wrap it
+    // to accumulate usage in-band without the driver needing to know.
+    const usageTotals = createEmptyUsage();
+    // Priced per call: a long-context tier applies to one call's input, not to
+    // the sum of the turn. Null when any call has no price.
+    const usageCost: { usd: number | null } = { usd: 0 };
+    // Token usage + cost must land on the row BEFORE the terminal frame reaches
+    // the client: RUN_FINISHED / RUN_ERROR is what makes the frontend stop
+    // streaming and refetch the message, so a flush in the `finally` below —
+    // which only runs once the consumer has already written that frame to the
+    // socket — races the refetch and can serve null tokens and null cost.
+    // Memoized, so the `finally` stays a backstop for turns that ended without
+    // a terminal event (an abandoned generator) rather than writing twice.
+    let usageFlush: Promise<void> | null = null;
+    const flushUsage = (): Promise<void> => {
+      // Share the write and its deadline across terminal-event and final cleanup.
+      usageFlush ??= withUsageFlushDeadline(
+        Promise.all([finishSpending(), this.persistTurnUsage(state, responseId, usageTotals, vendorModel, usageCost.usd)]).then(() => undefined)
+      );
+      return usageFlush;
     };
     // Checked at each model start of the turn, on every path that calls the
     // model (ModelStartCheck). With a spending reservation the check runs in
     // the spending callback, before its ledger write.
     const checkModelStart = this.stores.toolContexts && input.toolContextId
       ? () => this.requireLiveToolContext(state.sessionId, state.runtimeId) : undefined;
-    armWatchdog();
+
+    // From here the turn holds the session slot. Every exit, also a setup
+    // failure, goes through the finally block at the end, and only that block
+    // releases the slot.
+    this.activeTurns.add(session.sessionId);
     try {
-      const vendorModel = resolveModelConstruction(modelId).vendorModel;
+      state.lastActiveAt = new Date().toISOString();
+      this.clearIdleTimer(state);
+
+      // Install cancellation and the watchdog as soon as the slot is reserved.
+      // Sandbox renewal, approval reconfiguration, artifact sync, and the graph
+      // all consume the same bounded working-time budget.
+      if (state.abortController.signal.aborted) {
+        turnAbort.abort(state.abortController.signal.reason);
+      } else {
+        state.abortController.signal.addEventListener("abort", onSessionAbort, { once: true });
+      }
+      if (input.cancelSignal?.aborted) turnAbort.abort();
+      else input.cancelSignal?.addEventListener("abort", onAdmissionAbort, { once: true });
+      state.activeTurnInterrupt.current = async (reason) => {
+        turnAbort.abort(reason);
+      };
+      armWatchdog();
       const reservation = await this.stores.modelSpending?.reserve({
         tenantId: state.tenantId, userId: state.userId, sessionId: state.sessionId,
         reservationId: responseId, turnContext: input.turnContext ?? "interactive", modelName: vendorModel
@@ -781,64 +784,53 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           vendorModel, turnAbort.signal, checkModelStart);
         this.spending.set(state.runtimeId, spending);
       }
-    } catch (error) {
-      await releaseTurnSlot();
-      throw error;
-    }
 
-    // A turn starts in the sandbox here, for an interactive turn and for a
-    // scheduled job alike. The admin may have changed the approved hosts since
-    // the last turn, and the network of a sandbox is fixed when it is created.
-    // What was confirmed in an earlier turn must not carry over, so the first
-    // operation of this turn reads the live network of the sandbox once and
-    // replaces it if it does not match the policy as it is now. It is
-    // synchronous and must not throw. If it does, the turn fails rather than run
-    // on a confirmation that may be stale. The sandbox ends the turn when the
-    // turn is cancelled, and every exit of this method ends it too, so that
-    // nothing the turn asked of the sandbox runs after it.
-    try {
+      // A turn starts in the sandbox here, for an interactive turn and for a
+      // scheduled job alike. The admin may have changed the approved hosts since
+      // the last turn, and the network of a sandbox is fixed when it is created.
+      // What was confirmed in an earlier turn must not carry over, so the first
+      // operation of this turn reads the live network of the sandbox once and
+      // replaces it if it does not match the policy as it is now. It is
+      // synchronous and must not throw. If it does, the turn fails rather than run
+      // on a confirmation that may be stale. The sandbox ends the turn when the
+      // turn is cancelled, and every exit of this method ends it too, so that
+      // nothing the turn asked of the sandbox runs after it.
       endSandboxTurn = state.runtime.beginSandboxTurn?.(turnAbort.signal) ?? endSandboxTurn;
-    } catch (error) {
-      await releaseTurnSlot();
-      throw error;
-    }
 
-    // Claim the response id before the sandbox renewal and artifact sync. Both
-    // can replace the sandbox, and the notice of a replacement needs the id
-    // before the push hook exists.
-    state.activeTurnResponseId.current = responseId;
-    state.pendingTurnEvents = [];
+      // Claim the response id before the sandbox renewal and artifact sync. Both
+      // can replace the sandbox, and the notice of a replacement needs the id
+      // before the push hook exists.
+      state.activeTurnResponseId.current = responseId;
+      state.pendingTurnEvents = [];
 
-    // Push the sandbox lifetime back out before anything touches it (artifact
-    // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
-    // FIRST tool use and is never renewed, so an active session eventually
-    // crosses it mid-turn and silently loses its whole workspace. Extending at
-    // each turn start makes the cap idle-based instead. No-op (and no sandbox
-    // creation) when the session has never used one. The E2B sandbox checks its
-    // network against the current policy first, and replaces nothing itself: a
-    // sandbox that does not match is killed instead of kept alive.
-    //
-    // Guarded rather than trusted: the slot is already reserved here, so an
-    // implementation that rejects would leak the session busy forever. The
-    // production sandbox swallows its own failures (an unextendable sandbox is
-    // recovered by withSandbox on the next op), but the interface does not
-    // promise that, and a failed extension must never cost a turn.
-    try {
-      await this.waitForTurnSetup(
-        Promise.resolve(state.runtime.extendSandboxTimeout?.()),
-        turnAbort.signal
-      );
-    } catch (err) {
-      this.log.warn(
-        { err, sessionId: session.sessionId },
-        "Failed to extend the sandbox lifetime at turn start; continuing"
-      );
-    }
+      // Push the sandbox lifetime back out before anything touches it (artifact
+      // sync in onBeforeTurn does). The E2B cap otherwise runs from the session's
+      // FIRST tool use and is never renewed, so an active session eventually
+      // crosses it mid-turn and silently loses its whole workspace. Extending at
+      // each turn start makes the cap idle-based instead. No-op (and no sandbox
+      // creation) when the session has never used one. The E2B sandbox checks its
+      // network against the current policy first, and replaces nothing itself: a
+      // sandbox that does not match is killed instead of kept alive.
+      //
+      // Guarded rather than trusted: the production sandbox swallows its own
+      // failures (an unextendable sandbox is recovered by withSandbox on the next
+      // op), but the interface does not promise that, and a failed extension must
+      // never cost a turn.
+      try {
+        await this.waitForTurnSetup(
+          Promise.resolve(state.runtime.extendSandboxTimeout?.()),
+          turnAbort.signal
+        );
+      } catch (err) {
+        this.log.warn(
+          { err, sessionId: session.sessionId },
+          "Failed to extend the sandbox lifetime at turn start; continuing"
+        );
+      }
 
-    // Project approval mode is read before dispatch and belongs to this turn,
-    // not to the warm session. Reconfigure the graph before artifact sync or
-    // model work so a later setting change cannot affect an active turn.
-    try {
+      // Project approval mode is read before dispatch and belongs to this turn,
+      // not to the warm session. Reconfigure the graph before artifact sync or
+      // model work so a later setting change cannot affect an active turn.
       await this.waitForTurnSetup(
         Promise.resolve(
           state.runtime.setApprovalSettings({
@@ -848,24 +840,14 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         ),
         turnAbort.signal
       );
-    } catch (error) {
-      await releaseTurnSlot();
-      throw error;
-    }
 
-    // Artifact workspace sync and turn-input building run after slot reservation.
-    if (input.onBeforeTurn) {
-      try {
+      // Artifact workspace sync and turn-input building run after slot reservation.
+      if (input.onBeforeTurn) {
         await this.waitForTurnSetup(input.onBeforeTurn(turnAbort.signal), turnAbort.signal);
-      } catch (error) {
-        await releaseTurnSlot();
-        throw error;
       }
-    }
 
-    let conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-    if (!turnAbort.signal.aborted && state.execution?.projectId && this.stores.conversationMessages) {
-      try {
+      let conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+      if (!turnAbort.signal.aborted && state.execution?.projectId && this.stores.conversationMessages) {
         // Project sessions do not use the LangGraph checkpointer for transcript
         // state. Read the complete durable transcript so a long-lived shared
         // conversation does not silently lose its oldest turns at the normal
@@ -886,334 +868,305 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           .map(({ role, content }) => ({ role, content }));
         if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
-      } catch (error) {
-        await releaseTurnSlot();
-        throw error;
       }
-    }
 
-    // Recent memories enter model input as a labelled data message. They are read
-    // for every turn, so an edit or a delete in settings applies at once.
-    let memoryContext: string | null = null;
-    await this.waitForTurnSetup(
-      this.loadMemoryContext(state, session.runtimePolicy).then((text) => { memoryContext = text; }),
-      turnAbort.signal
-    );
-
-    // An abort raised during onBeforeTurn (client disconnect, session teardown)
-    // is NOT short-circuited here: the run is still started so the stream leads
-    // with RUN_STARTED and then terminates through the subscription's abort
-    // branch with the interrupted RUN_FINISHED the writer needs to mark the row.
-    // `turnAbort.signal` is threaded into the backend, so the graph stream
-    // rejects immediately rather than doing any model work.
-
-    // Artifact-scoped turns arrive with `userInputs` REPLACING the raw prompt
-    // because the artifact-context block embeds the prompt at its end.
-    const textInputs = input.userInputs ?? [];
-    const promptText =
-      textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
-
-    const queue = new AsyncQueue<BaseEvent>();
-    // Events raised BEFORE the agent run starts cannot go onto the queue:
-    // @ag-ui/client's verifier rejects any stream whose first event is not
-    // RUN_STARTED ("First event must be 'RUN_STARTED'"), and the agent emits
-    // that only once subscribed, ~100 lines below. So everything raised until
-    // then is held here and flushed right after the run's first event.
-    //
-    // The gate is on the SINK, not on individual call sites. Today nothing can
-    // actually reach the push hook in this window — the path from here to the
-    // subscription below contains no await, so no other task interleaves — and
-    // gating each known call site would be equivalent. It is written this way
-    // because that property is an accident of the current control flow: adding
-    // one await above the subscription would silently reopen the ordering bug,
-    // and a sink-level switch cannot be defeated that way.
-    const preRunEvents: BaseEvent[] = [];
-    const pendingWorkspaceReset = this.pendingWorkspaceResetNotices.get(session.sessionId);
-    if (pendingWorkspaceReset) {
-      preRunEvents.push(
-        runtimeNoticeEvent({
-          noticeId: pendingWorkspaceReset.noticeId,
-          level: "warning",
-          title: "Workspace reset",
-          message: pendingWorkspaceReset.message,
-          createdAt: new Date().toISOString()
-        })
+      // Recent memories enter model input as a labelled data message. They are read
+      // for every turn, so an edit or a delete in settings applies at once.
+      let memoryContext: string | null = null;
+      await this.waitForTurnSetup(
+        this.loadMemoryContext(state, session.runtimePolicy).then((text) => { memoryContext = text; }),
+        turnAbort.signal
       );
-    }
-    let runStarted = false;
-    const emitAGUI = (ev: BaseEvent) => {
-      if (runStarted) queue.push(ev);
-      else preRunEvents.push(ev);
-    };
-    // Out-of-band runtime notices use the active turn's AG-UI sink.
-    state.activeTurnPush.current = emitAGUI;
-    // Notices raised during onBeforeTurn, before the hook above existed.
-    for (const buffered of state.pendingTurnEvents.splice(0)) emitAGUI(buffered);
 
-    state.toolContextRef.current = input.toolContextId ?? null;
-    state.policyContextRef.current = input.toolContextId
-      ? {
-          toolContextId: input.toolContextId,
-          turnContext: input.turnContext ?? "interactive",
-          enforcementMode: session.runtimePolicy.policyEnforcementMode
-        }
-      : null;
-    const approvalTurn = this.approvalCoordinator.openTurn({
-      identity: { tenantId: state.tenantId, userId: state.userId, sessionId: state.sessionId,
-        runtimeId: state.runtimeId, turnId: responseId },
-      projectId, durableNative: Boolean(state.execution), signal: turnAbort.signal,
-      hasLocalActor: (actor) => {
-        const current = this.sessions.get(state.sessionId);
-        return current?.tenantId === actor.tenantId && current.userId === actor.userId;
-      },
-      validateLocalDecision: async (actor) => {
-        const current = this.sessions.get(state.sessionId);
-        if (!current || current.tenantId !== actor.tenantId || current.userId !== actor.userId)
-          throw sessionOwnershipMismatch();
-        await this.requireCurrentExecution(current);
-      }
-    });
+      // An abort raised during onBeforeTurn (client disconnect, session teardown)
+      // is NOT short-circuited here: the run is still started so the stream leads
+      // with RUN_STARTED and then terminates through the subscription's abort
+      // branch with the interrupted RUN_FINISHED the writer needs to mark the row.
+      // `turnAbort.signal` is threaded into the backend, so the graph stream
+      // rejects immediately rather than doing any model work.
 
-    const effort = input.effort ?? defaultEffortForModel(modelId);
+      // Artifact-scoped turns arrive with `userInputs` REPLACING the raw prompt
+      // because the artifact-context block embeds the prompt at its end.
+      const textInputs = input.userInputs ?? [];
+      const promptText =
+        textInputs.length > 0 ? textInputs.map((entry) => entry.text).join("\n\n") : input.prompt;
 
-    // Record per-turn usage and cost on the assistant row keyed by responseId. The raw
-    // streamEvents envelopes flow through the backend's streamTurn, so wrap it
-    // to accumulate usage in-band without the driver needing to know.
-    const usageTotals = createEmptyUsage();
-    const usageModelName = resolveModelConstruction(modelId).vendorModel;
-    // Priced per call: a long-context tier applies to one call's input, not to
-    // the sum of the turn. Null when any call has no price.
-    const usageCost: { usd: number | null } = { usd: 0 };
-
-    const rawBackend = createSessionAGUITurnBackend({
-      callbacks: spending ? [spending] : checkModelStart ? [new ModelStartCheck(checkModelStart)] : undefined,
-      threadId: state.threadId,
-      runtime: state.runtime,
-      toolContextRef: state.toolContextRef,
-      modelId,
-      effort,
-      promptText,
-      conversationMessages,
-      projectInstructions: input.projectInstructions,
-      generativeUiContext: input.generativeUiContext,
-      generativeUiTransport: input.generativeUiTransport,
-      memoryContext,
-      signal: turnAbort.signal,
-      onGraphReady: async () => {
-        // Availability is recorded once per turn, after MCP loading succeeds.
-        // Empty-instruction skills are excluded by the library builder too.
-        const resources = [
-          ...state.configBundle.skills
-            .filter((skill) => skill.instructions.trim())
-            .map((skill) => ({
-              resourceType: "skill" as const,
-              resourceId: skill.id,
-              metadata: { associatedToolIds: skill.associatedToolIds ?? [] }
-            })),
-          ...[...new Set(state.runtime.getMcpToolServers().values())].map((serverId) => ({
-            resourceType: "mcp_server" as const,
-            resourceId: serverId
-          }))
-        ];
-        await this.stores.activationTracker?.recordMaterialization(
-          { tenantId: state.tenantId, sessionId: state.sessionId, messageId: responseId },
-          resources
+      const queue = new AsyncQueue<BaseEvent>();
+      // Events raised BEFORE the agent run starts cannot go onto the queue:
+      // @ag-ui/client's verifier rejects any stream whose first event is not
+      // RUN_STARTED ("First event must be 'RUN_STARTED'"), and the agent emits
+      // that only once subscribed, ~100 lines below. So everything raised until
+      // then is held here and flushed right after the run's first event.
+      //
+      // The gate is on the SINK, not on individual call sites. Today nothing can
+      // actually reach the push hook in this window — the path from here to the
+      // subscription below contains no await, so no other task interleaves — and
+      // gating each known call site would be equivalent. It is written this way
+      // because that property is an accident of the current control flow: adding
+      // one await above the subscription would silently reopen the ordering bug,
+      // and a sink-level switch cannot be defeated that way.
+      const preRunEvents: BaseEvent[] = [];
+      const pendingWorkspaceReset = this.pendingWorkspaceResetNotices.get(session.sessionId);
+      if (pendingWorkspaceReset) {
+        preRunEvents.push(
+          runtimeNoticeEvent({
+            noticeId: pendingWorkspaceReset.noticeId,
+            level: "warning",
+            title: "Workspace reset",
+            message: pendingWorkspaceReset.message,
+            createdAt: new Date().toISOString()
+          })
         );
-      },
-      awaitDecisions: async (actions, emit) => {
-        if (turnAbort.signal.aborted) {
-          return actions.map(() => ({ type: "reject" as const, message: "Turn aborted." }));
-        }
-        // A scheduled turn has nobody to answer a prompt. Reject at once, so
-        // the job does not hold its slot until the watchdog fails it.
-        if (input.turnContext === "scheduled") {
-          this.log.info(
-            { sessionId: state.sessionId, toolNames: actions.map((action) => action.name) },
-            "Rejected approval-gated tool calls in a scheduled turn"
-          );
-          return actions.map(() => ({
-            type: "reject" as const,
-            message: "This action needs approval. A scheduled job cannot ask for approval, so the action was not run."
-          }));
-        }
-        // Human approval latency is bounded by APPROVAL_REQUEST_TTL_MS, not the
-        // turn watchdog. Disarm while the prompt is pending, re-arm after.
-        disarmWatchdog();
-        try {
-          return await this.collectApprovalDecisions({
-            state,
-            approvalTurn,
-            actions,
-            emit
-          });
-        } finally {
-          if (!turnAbort.signal.aborted) armWatchdog();
-        }
       }
-    });
+      let runStarted = false;
+      const emitAGUI = (ev: BaseEvent) => {
+        if (runStarted) queue.push(ev);
+        else preRunEvents.push(ev);
+      };
+      // Out-of-band runtime notices use the active turn's AG-UI sink.
+      state.activeTurnPush.current = emitAGUI;
+      // Notices raised during onBeforeTurn, before the hook above existed.
+      for (const buffered of state.pendingTurnEvents.splice(0)) emitAGUI(buffered);
 
-    const backend: AGUITurnBackend = {
-      ...rawBackend,
-      async *streamTurn(streamInput) {
-        for await (const rawEvent of rawBackend.streamTurn(streamInput)) {
-          spending?.observeEvent(rawEvent);
-          const callUsage = usageFromStreamEvent(rawEvent);
-          if (callUsage) {
-            addUsage(usageTotals, callUsage);
-            const callCost = calculateCostUsd(usageModelName, callUsage);
-            usageCost.usd = usageCost.usd === null || callCost === null ? null : usageCost.usd + callCost;
+      state.toolContextRef.current = input.toolContextId ?? null;
+      state.policyContextRef.current = input.toolContextId
+        ? {
+            toolContextId: input.toolContextId,
+            turnContext: input.turnContext ?? "interactive",
+            enforcementMode: session.runtimePolicy.policyEnforcementMode
           }
-          yield rawEvent;
-        }
-      }
-    };
-
-    const agent = new DeepAgentsAGUIAgent({
-      backend,
-      assistantMessageId: responseId,
-      toolContextId: input.toolContextId ?? null,
-      approvalAbortSignal: turnAbort.signal,
-      // The keepalive runs after each approval decision. See `onApprovalRound`
-      // in deep-agents-agui-agent.ts. The callback logs failures and never throws
-      // them. A missed keepalive degrades the turn, but an exception here would
-      // kill it.
-      onApprovalRound: async (signal) => {
-        if (signal?.aborted) return;
-        this.stores.activeTurns?.keepAlive(state.sessionId);
-        if (!input.toolContextId || !this.stores.toolContexts) return;
-        if (signal?.aborted) return;
-        try {
-          const extended = await this.stores.toolContexts.extend(
-            state.tenantId,
-            input.toolContextId,
-            this.config.TOOL_CONTEXT_TTL_MS
-          );
-          if (!extended) {
-            // The context was not found, expired, or ended by a security
-            // change (tool-execution-context-store.ts). Every tool call of
-            // the turn would fail, so the turn stops at this step, on the
-            // replica that runs it. A turn with an execution whose access
-            // already ended (a project role change, a removal) fails at the
-            // resume with its own error: requireExecution runs before the
-            // next model call. Every other turn stops here, with the reason
-            // `security_change` when the owner's version changed.
-            this.log.warn(
-              { sessionId: state.sessionId, toolContextId: input.toolContextId },
-              "Tool context was not found, expired, or ended by a security change at the approval round; the turn stops"
-            );
-            const failsAtResume = Boolean(state.execution) &&
-              !(await this.requireCurrentExecution(state).then(() => true, () => false));
-            if (!failsAtResume) turnAbort.abort(await this.endedToolContextReason(state.tenantId, input.toolContextId));
-          }
-        } catch (err) {
-          this.log.error(
-            { err, sessionId: state.sessionId, toolContextId: input.toolContextId },
-            "Failed to extend the tool context across an approval round"
-          );
-        }
-      }
-    });
-
-    const subscription = agent
-      .run({ threadId: state.threadId, runId: responseId, state: {}, messages: [] } as never)
-      .subscribe({
-        next: (event) => {
-          queue.push(event);
-          // The run's first event has now led the stream (RUN_STARTED, or
-          // RUN_ERROR which the verifier also accepts), so held events are
-          // legal from here. Flip the sink BEFORE draining so anything pushed
-          // concurrently during the drain goes straight to the queue and cannot
-          // be appended to a buffer nobody will read again.
-          if (!runStarted) {
-            runStarted = true;
-            for (const pending of preRunEvents.splice(0)) queue.push(pending);
-            if (
-              pendingWorkspaceReset &&
-              this.pendingWorkspaceResetNotices.get(session.sessionId)?.noticeId ===
-                pendingWorkspaceReset.noticeId
-            ) {
-              this.clearPendingWorkspaceResetNotice(
-                session.sessionId,
-                pendingWorkspaceReset.noticeId
-              );
-            }
-          }
+        : null;
+      const openedApprovalTurn = this.approvalCoordinator.openTurn({
+        identity: { tenantId: state.tenantId, userId: state.userId, sessionId: state.sessionId,
+          runtimeId: state.runtimeId, turnId: responseId },
+        projectId, durableNative: Boolean(state.execution), signal: turnAbort.signal,
+        hasLocalActor: (actor) => {
+          const current = this.sessions.get(state.sessionId);
+          return current?.tenantId === actor.tenantId && current.userId === actor.userId;
         },
-        error: (err: unknown) => {
-          // Any error path means the run never emitted a first event, so the
-          // `next` handler never flushed pre-run notices. They cannot be
-          // emitted from here: a CUSTOM ahead of the terminal event would break
-          // the verifier's RUN_STARTED-first rule that this buffering exists to
-          // satisfy. Logged rather than dropped silently, and done BEFORE the
-          // branch returns below so a watchdog timeout or a Stop is covered too.
-          if (preRunEvents.length > 0) {
-            this.log.warn(
-              { sessionId: state.sessionId, dropped: preRunEvents.length },
-              "Deep Agents AG-UI turn ended before its run started; pre-run notices were not delivered"
-            );
-            preRunEvents.length = 0;
-          }
-          // Watchdog expiry is a terminal FAILURE, not a user interrupt: emit
-          // RUN_ERROR so the client surfaces it as an error/retry. Checked before the abort
-          // branch because the watchdog fires via turnAbort.abort().
-          if (timedOut()) {
-            this.log.error(
-              { err, sessionId: state.sessionId, timeoutMs: this.config.RUNTIME_TURN_TIMEOUT_MS },
-              "Deep Agents AG-UI turn exceeded RUNTIME_TURN_TIMEOUT_MS and was aborted"
-            );
-            queue.push({
-              type: EventType.RUN_ERROR,
-              message: "The turn exceeded the platform time limit and was stopped."
-            } as BaseEvent);
-            queue.end();
-            return;
-          }
-          // A turn-abort (Stop button / client disconnect / session teardown)
-          // surfaces here as the graph stream's AbortError. That is a graceful
-          // stop, not a failure. Emitting RUN_ERROR would make
-          // an intentional Stop render as an error/retry in AG-UI clients.
-          //
-          // This is a clean terminal RUN_FINISHED (a successful-but-early
-          // finish), carrying only the private `interrupted` status marker — NOT
-          // an `outcome:{type:"interrupt"}`, which AG-UI/CopilotKit would treat
-          // as a resumable pause. See AGUI_INTERRUPTED_RESULT for the full why.
+        validateLocalDecision: async (actor) => {
+          const current = this.sessions.get(state.sessionId);
+          if (!current || current.tenantId !== actor.tenantId || current.userId !== actor.userId)
+            throw sessionOwnershipMismatch();
+          await this.requireCurrentExecution(current);
+        }
+      });
+      approvalTurn = openedApprovalTurn;
+
+      const effort = input.effort ?? defaultEffortForModel(modelId);
+
+      const rawBackend = createSessionAGUITurnBackend({
+        callbacks: spending ? [spending] : checkModelStart ? [new ModelStartCheck(checkModelStart)] : undefined,
+        threadId: state.threadId,
+        runtime: state.runtime,
+        toolContextRef: state.toolContextRef,
+        modelId,
+        effort,
+        promptText,
+        conversationMessages,
+        projectInstructions: input.projectInstructions,
+        generativeUiContext: input.generativeUiContext,
+        generativeUiTransport: input.generativeUiTransport,
+        memoryContext,
+        signal: turnAbort.signal,
+        onGraphReady: async () => {
+          // Availability is recorded once per turn, after MCP loading succeeds.
+          // Empty-instruction skills are excluded by the library builder too.
+          const resources = [
+            ...state.configBundle.skills
+              .filter((skill) => skill.instructions.trim())
+              .map((skill) => ({
+                resourceType: "skill" as const,
+                resourceId: skill.id,
+                metadata: { associatedToolIds: skill.associatedToolIds ?? [] }
+              })),
+            ...[...new Set(state.runtime.getMcpToolServers().values())].map((serverId) => ({
+              resourceType: "mcp_server" as const,
+              resourceId: serverId
+            }))
+          ];
+          await this.stores.activationTracker?.recordMaterialization(
+            { tenantId: state.tenantId, sessionId: state.sessionId, messageId: responseId },
+            resources
+          );
+        },
+        awaitDecisions: async (actions, emit) => {
           if (turnAbort.signal.aborted) {
-            queue.push({
-              type: EventType.RUN_FINISHED,
-              threadId: state.threadId,
-              runId: responseId,
-              result: interruptedResult(turnStopReasonOf(turnAbort.signal.reason))
-            } as BaseEvent);
-            queue.end();
-            return;
+            return actions.map(() => ({ type: "reject" as const, message: "Turn aborted." }));
           }
-          this.log.error({ err, sessionId: state.sessionId }, "Deep Agents AG-UI turn failed");
-          queue.push({
-            type: EventType.RUN_ERROR,
-            message: clientSafeTurnFailureMessage(err)
-          } as BaseEvent);
-          queue.end();
-        },
-        complete: () => queue.end()
+          // A scheduled turn has nobody to answer a prompt. Reject at once, so
+          // the job does not hold its slot until the watchdog fails it.
+          if (input.turnContext === "scheduled") {
+            this.log.info(
+              { sessionId: state.sessionId, toolNames: actions.map((action) => action.name) },
+              "Rejected approval-gated tool calls in a scheduled turn"
+            );
+            return actions.map(() => ({
+              type: "reject" as const,
+              message: "This action needs approval. A scheduled job cannot ask for approval, so the action was not run."
+            }));
+          }
+          // Human approval latency is bounded by APPROVAL_REQUEST_TTL_MS, not the
+          // turn watchdog. Disarm while the prompt is pending, re-arm after.
+          disarmWatchdog();
+          try {
+            return await this.collectApprovalDecisions({
+              state,
+              approvalTurn: openedApprovalTurn,
+              actions,
+              emit
+            });
+          } finally {
+            if (!turnAbort.signal.aborted) armWatchdog();
+          }
+        }
       });
 
-    // Token usage + cost must land on the row BEFORE the terminal frame reaches
-    // the client: RUN_FINISHED / RUN_ERROR is what makes the frontend stop
-    // streaming and refetch the message, so a flush in the `finally` below —
-    // which only runs once the consumer has already written that frame to the
-    // socket — races the refetch and can serve null tokens and null cost.
-    // Memoized, so the `finally` stays a backstop for turns that ended without
-    // a terminal event (an abandoned generator) rather than writing twice.
-    let usageFlush: Promise<void> | null = null;
-    const flushUsage = (): Promise<void> => {
-      // Share the write and its deadline across terminal-event and final cleanup.
-      usageFlush ??= withUsageFlushDeadline(
-        Promise.all([finishSpending(), this.persistTurnUsage(state, responseId, usageTotals, usageModelName, usageCost.usd)]).then(() => undefined)
-      );
-      return usageFlush;
-    };
+      const backend: AGUITurnBackend = {
+        ...rawBackend,
+        async *streamTurn(streamInput) {
+          for await (const rawEvent of rawBackend.streamTurn(streamInput)) {
+            spending?.observeEvent(rawEvent);
+            const callUsage = usageFromStreamEvent(rawEvent);
+            if (callUsage) {
+              addUsage(usageTotals, callUsage);
+              const callCost = calculateCostUsd(vendorModel, callUsage);
+              usageCost.usd = usageCost.usd === null || callCost === null ? null : usageCost.usd + callCost;
+            }
+            yield rawEvent;
+          }
+        }
+      };
 
-    try {
+      const agent = new DeepAgentsAGUIAgent({
+        backend,
+        assistantMessageId: responseId,
+        toolContextId: input.toolContextId ?? null,
+        approvalAbortSignal: turnAbort.signal,
+        // The keepalive runs after each approval decision. See `onApprovalRound`
+        // in deep-agents-agui-agent.ts. The callback logs failures and never throws
+        // them. A missed keepalive degrades the turn, but an exception here would
+        // kill it.
+        onApprovalRound: async (signal) => {
+          if (signal?.aborted) return;
+          this.stores.activeTurns?.keepAlive(state.sessionId);
+          if (!input.toolContextId || !this.stores.toolContexts) return;
+          if (signal?.aborted) return;
+          try {
+            const extended = await this.stores.toolContexts.extend(
+              state.tenantId,
+              input.toolContextId,
+              this.config.TOOL_CONTEXT_TTL_MS
+            );
+            if (!extended) {
+              // The context was not found, expired, or ended by a security
+              // change (tool-execution-context-store.ts). Every tool call of
+              // the turn would fail, so the turn stops at this step, on the
+              // replica that runs it. A turn with an execution whose access
+              // already ended (a project role change, a removal) fails at the
+              // resume with its own error: requireExecution runs before the
+              // next model call. Every other turn stops here, with the reason
+              // `security_change` when the owner's version changed.
+              this.log.warn(
+                { sessionId: state.sessionId, toolContextId: input.toolContextId },
+                "Tool context was not found, expired, or ended by a security change at the approval round; the turn stops"
+              );
+              const failsAtResume = Boolean(state.execution) &&
+                !(await this.requireCurrentExecution(state).then(() => true, () => false));
+              if (!failsAtResume) turnAbort.abort(await this.endedToolContextReason(state.tenantId, input.toolContextId));
+            }
+          } catch (err) {
+            this.log.error(
+              { err, sessionId: state.sessionId, toolContextId: input.toolContextId },
+              "Failed to extend the tool context across an approval round"
+            );
+          }
+        }
+      });
+
+      subscription = agent
+        .run({ threadId: state.threadId, runId: responseId, state: {}, messages: [] } as never)
+        .subscribe({
+          next: (event) => {
+            queue.push(event);
+            // The run's first event has now led the stream (RUN_STARTED, or
+            // RUN_ERROR which the verifier also accepts), so held events are
+            // legal from here. Flip the sink BEFORE draining so anything pushed
+            // concurrently during the drain goes straight to the queue and cannot
+            // be appended to a buffer nobody will read again.
+            if (!runStarted) {
+              runStarted = true;
+              for (const pending of preRunEvents.splice(0)) queue.push(pending);
+              if (
+                pendingWorkspaceReset &&
+                this.pendingWorkspaceResetNotices.get(session.sessionId)?.noticeId ===
+                  pendingWorkspaceReset.noticeId
+              ) {
+                this.clearPendingWorkspaceResetNotice(
+                  session.sessionId,
+                  pendingWorkspaceReset.noticeId
+                );
+              }
+            }
+          },
+          error: (err: unknown) => {
+            // Any error path means the run never emitted a first event, so the
+            // `next` handler never flushed pre-run notices. They cannot be
+            // emitted from here: a CUSTOM ahead of the terminal event would break
+            // the verifier's RUN_STARTED-first rule that this buffering exists to
+            // satisfy. Logged rather than dropped silently, and done BEFORE the
+            // branch returns below so a watchdog timeout or a Stop is covered too.
+            if (preRunEvents.length > 0) {
+              this.log.warn(
+                { sessionId: state.sessionId, dropped: preRunEvents.length },
+                "Deep Agents AG-UI turn ended before its run started; pre-run notices were not delivered"
+              );
+              preRunEvents.length = 0;
+            }
+            // Watchdog expiry is a terminal FAILURE, not a user interrupt: emit
+            // RUN_ERROR so the client surfaces it as an error/retry. Checked before the abort
+            // branch because the watchdog fires via turnAbort.abort().
+            if (timedOut()) {
+              this.log.error(
+                { err, sessionId: state.sessionId, timeoutMs: this.config.RUNTIME_TURN_TIMEOUT_MS },
+                "Deep Agents AG-UI turn exceeded RUNTIME_TURN_TIMEOUT_MS and was aborted"
+              );
+              queue.push({
+                type: EventType.RUN_ERROR,
+                message: "The turn exceeded the platform time limit and was stopped."
+              } as BaseEvent);
+              queue.end();
+              return;
+            }
+            // A turn-abort (Stop button / client disconnect / session teardown)
+            // surfaces here as the graph stream's AbortError. That is a graceful
+            // stop, not a failure. Emitting RUN_ERROR would make
+            // an intentional Stop render as an error/retry in AG-UI clients.
+            //
+            // This is a clean terminal RUN_FINISHED (a successful-but-early
+            // finish), carrying only the private `interrupted` status marker — NOT
+            // an `outcome:{type:"interrupt"}`, which AG-UI/CopilotKit would treat
+            // as a resumable pause. See AGUI_INTERRUPTED_RESULT for the full why.
+            if (turnAbort.signal.aborted) {
+              queue.push({
+                type: EventType.RUN_FINISHED,
+                threadId: state.threadId,
+                runId: responseId,
+                result: interruptedResult(turnStopReasonOf(turnAbort.signal.reason))
+              } as BaseEvent);
+              queue.end();
+              return;
+            }
+            this.log.error({ err, sessionId: state.sessionId }, "Deep Agents AG-UI turn failed");
+            queue.push({
+              type: EventType.RUN_ERROR,
+              message: clientSafeTurnFailureMessage(err)
+            } as BaseEvent);
+            queue.end();
+          },
+          complete: () => queue.end()
+        });
+
       for await (const event of queue) {
         if (event.type === EventType.RUN_FINISHED || event.type === EventType.RUN_ERROR) {
           await flushUsage();
@@ -1223,20 +1176,24 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     } finally {
       endSandboxTurn();
       disarmWatchdog();
-      subscription.unsubscribe();
+      subscription?.unsubscribe();
       const wasAborted = turnAbort.signal.aborted;
       turnAbort.abort();
-      if (wasAborted) approvalTurn.cancelAndExpire("turn_interrupted");
-      else approvalTurn.cancelLocal();
-      removeAbortListeners();
+      if (wasAborted) approvalTurn?.cancelAndExpire("turn_interrupted");
+      else approvalTurn?.cancelLocal();
+      state.abortController.signal.removeEventListener("abort", onSessionAbort);
+      input.cancelSignal?.removeEventListener("abort", onAdmissionAbort);
       state.activeTurnInterrupt.current = null;
       state.activeTurnPush.current = null;
-      clearTurnResponse();
+      // Runtime notices use this response id, and hold their events for it.
+      state.activeTurnResponseId.current = null;
+      state.pendingTurnEvents = [];
       state.policyContextRef.current = null;
       // Record token usage + cumulative cost onto the assistant row (no-ops when
       // the turn consumed nothing or the writer created no backing row).
       await flushUsage();
-      forgetSpending();
+      // The closed callback must not stay in the map after its turn.
+      if (spending && this.spending.get(state.runtimeId) === spending) this.spending.delete(state.runtimeId);
       this.activeTurns.delete(session.sessionId);
       await this.finishIntegrationInvalidation(state);
     }
