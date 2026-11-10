@@ -269,7 +269,12 @@ export function ChatShell() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = readStoredArtifactPaneWidth(window.localStorage.getItem("artifact-pane-width"));
+    let stored: number | null = null;
+    try {
+      stored = readStoredArtifactPaneWidth(window.localStorage.getItem("artifact-pane-width"));
+    } catch {
+      // Blocked storage: keep the default width.
+    }
     // SSR-safe localStorage hydration: lazy init would cause hydration mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (stored != null) setArtifactPaneWidth(stored);
