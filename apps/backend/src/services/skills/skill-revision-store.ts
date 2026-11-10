@@ -18,6 +18,12 @@ import { lockOrganizationSkillNames } from "./organization-skill-name-lock.js";
 import { insertAuthorUpdate } from "./organization-skill-submission-store.js";
 import { assertSkillReleaseSnapshot, latestSkillRevisionId, skillReleaseSnapshot } from "./skill-release-impact-store.js";
 
+// The import transaction that publishes a stored bundle holds this lock until
+// it ends. See deleteUnpublishedBundle.
+function skillBundleLockKey(tenantId: string, storageUri: string): string {
+  return JSON.stringify(["skill-bundle", tenantId, storageUri]);
+}
+
 export class SkillRevisionStore {
   constructor(
     private readonly db: Pool,
@@ -158,15 +164,39 @@ export class SkillRevisionStore {
     validationMessages: Array<Record<string, unknown>>;
     metadata: Record<string, unknown>;
     createdBy: string;
-    // Called with the freshly-allocated revision number. The bundle is
-    // uploaded to storage here so the S3 key can embed the revision number.
-    // Inline (single-file SKILL.md) revisions return { storageUri: null } —
-    // no bundle is persisted and the SKILL.md body lives in metadata.instructions.
-    storeBundle: (input: { revisionNumber: number }) => Promise<{ storageUri: string | null }>;
+    // Runs before the import transaction, so a slow upload holds no
+    // transaction and no lock. It must write to a new location on each call,
+    // as SkillBundleStorage.storeBundle does. Inline (single-file SKILL.md) revisions
+    // return { storageUri: null }: no bundle is stored and the SKILL.md body
+    // lives in metadata.instructions.
+    storeBundle: () => Promise<{ storageUri: string | null }>;
+    // Deletes what storeBundle wrote when the import fails. Without it, a
+    // failed import leaves the stored bundle in place.
+    deleteBundle?: (storageUri: string) => Promise<void>;
   }): Promise<ImportedSkillBundleRecord> {
-    let allocatedRevisionNumber: number | null = null;
+    const { storageUri } = await input.storeBundle();
+    try {
+      return await this.insertImportedRevision(tenantId, input, storageUri);
+    } catch (error) {
+      if (storageUri && input.deleteBundle) {
+        await this.deleteUnpublishedBundle(tenantId, storageUri, input.deleteBundle);
+      }
+      throw error;
+    }
+  }
 
-    await withTenantScope(this.db, tenantId, async (client) => {
+  private async insertImportedRevision(
+    tenantId: string,
+    input: Omit<Parameters<SkillRevisionStore["importSkillBundle"]>[1], "storeBundle" | "deleteBundle">,
+    storageUri: string | null
+  ): Promise<ImportedSkillBundleRecord> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      // Before the name lock. The only other user of this lock,
+      // deleteUnpublishedBundle, never waits for it, so the order cannot deadlock.
+      if (storageUri) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+          [skillBundleLockKey(tenantId, storageUri)]);
+      }
       await lockOrganizationSkillNames(client, tenantId);
       // Scope the existence check to THIS tenant only. Including the 'system'
       // row here would make a tenant import whose skillId collides with a
@@ -235,7 +265,6 @@ export class SkillRevisionStore {
         [input.skillId, tenantId]
       );
       const revisionNumber = Number(revisionNumberResult.rows[0]?.next_revision_number ?? 1);
-      allocatedRevisionNumber = revisionNumber;
 
       const metadata = { ...input.metadata };
       delete metadata.organizationSubmissionId;
@@ -266,9 +295,7 @@ export class SkillRevisionStore {
         }
       }
 
-      const { storageUri } = await input.storeBundle({ revisionNumber });
-
-      await this.insertSkillRevision(client, tenantId, {
+      const revision = await this.insertSkillRevision(client, tenantId, {
         skillId: input.skillId,
         revisionNumber,
         sourceType: input.sourceType,
@@ -291,20 +318,50 @@ export class SkillRevisionStore {
         reviewedAt: null,
         activatedAt: null
       });
+
+      // Read in the transaction: an import that reports a failure leaves no
+      // revision, so its bundle can go.
+      const skill = await this.skillStore.getSkill(tenantId, input.skillId, client);
+      if (!skill) {
+        throw new Error(`Failed to load imported skill ${input.skillId}.`);
+      }
+      return { skill, revision };
     });
+  }
 
-    const skill = await this.skillStore.getSkill(tenantId, input.skillId);
-    if (!skill) {
-      throw new Error(`Failed to load imported skill ${input.skillId}.`);
+  /**
+   * After a failed import, deletes the bundle that it stored if no revision
+   * uses it. A COMMIT error does not tell whether the commit applied, so the
+   * reference check runs only after the import transaction has ended: while
+   * that transaction holds the bundle lock, the bundle stays. The import
+   * stored a new location, so no later transaction can start to use it.
+   * When the check or the delete fails, the bundle stays as an orphan: that
+   * costs storage, while deleting a bundle in use would break a revision.
+   */
+  private async deleteUnpublishedBundle(
+    tenantId: string,
+    storageUri: string,
+    deleteBundle: (storageUri: string) => Promise<void>
+  ): Promise<void> {
+    try {
+      const unpublished = await withTenantScope(this.db, tenantId, async (client) => {
+        const lock = await client.query<{ locked: boolean }>(
+          "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked",
+          [skillBundleLockKey(tenantId, storageUri)]
+        );
+        if (!lock.rows[0]?.locked) return false;
+        const references = await client.query(
+          `SELECT 1 FROM admin_skill_revisions
+           WHERE bundle_storage_uri = $1 AND tenant_id = $2
+           LIMIT 1`,
+          [storageUri, tenantId]
+        );
+        return references.rowCount === 0;
+      });
+      if (unpublished) await deleteBundle(storageUri);
+    } catch {
+      // The caller rethrows the import error; this failure must not replace it.
     }
-
-    const revisions = await this.listSkillRevisions(tenantId, input.skillId);
-    const revision = revisions[0];
-    if (!revision || revision.revisionNumber !== allocatedRevisionNumber) {
-      throw new Error(`Failed to load imported revision for skill ${input.skillId}.`);
-    }
-
-    return { skill, revision };
   }
 
   async activateSkillRevision(tenantId: string, input: {

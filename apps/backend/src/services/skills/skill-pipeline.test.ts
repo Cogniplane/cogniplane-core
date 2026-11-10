@@ -55,9 +55,9 @@ test("skill pipeline: imported instructions reach the in-memory library SKILL.md
       validationStatus: string;
       metadata: Record<string, unknown>;
       createdBy: string;
-      storeBundle: (input: { revisionNumber: number }) => Promise<{ storageUri: string | null }>;
+      storeBundle: () => Promise<{ storageUri: string | null }>;
     }): Promise<ImportedSkillBundleRecord> {
-      const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
+      const { storageUri } = await input.storeBundle();
       const skill: AdminSkillRecord = {
         skillId: input.skillId,
         skillName: input.skillName,

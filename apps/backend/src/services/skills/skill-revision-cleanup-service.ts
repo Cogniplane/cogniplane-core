@@ -90,6 +90,9 @@ export async function cleanupInactiveSkillRevisions(input: {
       }
 
       report.deletedRevisionIds.push(deletedRevision.skillRevisionId);
+      // No lock with imports is needed between this count and the delete: an
+      // import stores each bundle at a new location (storeBundle), so no
+      // revision starts to use a location after its last reference is gone.
       if (deletedRevision.bundleStorageUri) {
           const remainingReferences = await input.skillRevisions.countSkillRevisionsByBundleStorageUri(
             input.tenantId,

@@ -33,7 +33,7 @@ type RecordedImportInput = {
   validationMessages: Array<Record<string, unknown>>;
   metadata: Record<string, unknown>;
   createdBy: string;
-  storeBundle: (input: { revisionNumber: number }) => Promise<{ storageUri: string | null }>;
+  storeBundle: () => Promise<{ storageUri: string | null }>;
 };
 
 function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; storageUris: Array<string | null> }) {
@@ -43,7 +43,7 @@ function buildFakeSkillRevisions(recorder?: { calls: RecordedImportInput[]; stor
       input: RecordedImportInput
     ): Promise<ImportedSkillBundleRecord> {
       recorder?.calls.push(input);
-      const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
+      const { storageUri } = await input.storeBundle();
       recorder?.storageUris.push(storageUri);
       return {
         skill: {

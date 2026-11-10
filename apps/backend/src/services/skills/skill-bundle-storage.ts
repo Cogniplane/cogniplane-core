@@ -19,7 +19,6 @@ import type { AppConfig } from "../../config.js";
 export type StoreBundleInput = {
   tenantId: string;
   skillId: string;
-  revisionNumber: number;
   bundleName: string;
   contentHash: string;
   sourcePath: string;
@@ -31,8 +30,12 @@ export type StoreBundleResult = {
 
 export interface SkillBundleStorage {
   readonly backend: "local" | "bucket";
+  // Writes to a new location on each call, also for bytes that are already
+  // stored. No revision uses a location before the import that wrote it
+  // commits. So a failed import can delete what it wrote, and cleanup never
+  // deletes a location that an import is about to publish.
   storeBundle(input: StoreBundleInput): Promise<StoreBundleResult>;
-  // Bundles are read in place from the content-addressed cache
+  // Bundles are read in place from the storage URI cache
   // (materializeBundle). Do not add a method that installs a bundle to a
   // caller-supplied destination: it needs a containment check.
   materializeBundle(storageUri: string): Promise<{ localPath: string }>;
@@ -156,29 +159,23 @@ export class LocalSkillBundleStorage implements SkillBundleStorage {
 
   async storeBundle(input: StoreBundleInput): Promise<StoreBundleResult> {
     // Namespace by tenantId so two tenants importing the same bundleName +
-    // contentHash do not share an on-disk path. Cleanup reference-counts per
-    // tenant, so a shared path would let one tenant's cleanup rm a bundle
-    // another tenant still uses. Mirrors the bucket backend's
-    // `skills/<tenantId>/...` layout.
-    const bundlePath = containedPath(this.rootPath, path.join(input.tenantId, input.bundleName, input.contentHash));
+    // contentHash do not share an on-disk path. Mirrors the bucket backend's
+    // `skills/<tenantId>/...` layout. Revisions stored before upload ids were
+    // added share `<contentHash>/` directories; cleanup reference-counts them.
+    const hashPath = containedPath(this.rootPath, path.join(input.tenantId, input.bundleName, input.contentHash));
+    // Built from the checked path, never from the raw hash. A suffix on the
+    // last segment keeps the path in the same checked parent directory.
+    const bundlePath = `${hashPath}-${uuidv7()}`;
     await assertRealContainment(this.rootPath, bundlePath, true);
-    if (await pathExists(bundlePath)) {
-      return { storageUri: `file://${bundlePath}` };
-    }
-
-    const parentPath = path.dirname(bundlePath);
-    // Built from the checked path, never from the raw hash.
-    const tempPath = path.join(parentPath, `${path.basename(bundlePath)}.tmp-${uuidv7()}`);
-    await mkdir(parentPath, { recursive: true });
+    // A copy interrupted by a crash stays under a `.tmp` name, not a bundle name.
+    const tempPath = `${bundlePath}.tmp`;
+    await mkdir(path.dirname(bundlePath), { recursive: true });
 
     try {
       await cp(input.sourcePath, tempPath, { recursive: true });
       await rename(tempPath, bundlePath);
     } catch (error) {
       await rm(tempPath, { recursive: true, force: true });
-      if (await pathExists(bundlePath)) {
-        return { storageUri: `file://${bundlePath}` };
-      }
       throw error;
     }
 
@@ -245,19 +242,21 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
     this.uploader = deps.uploader ?? defaultBucketUploader(deps.client);
   }
 
-  private buildObjectKey(input: Pick<StoreBundleInput, "tenantId" | "skillId" | "revisionNumber" | "contentHash">): string {
+  // A new key on each call. Keys of older revisions are
+  // `<revisionNumber>-<contentHash>.tar.gz`; reads and deletes take any key.
+  private newObjectKey(input: Pick<StoreBundleInput, "tenantId" | "skillId" | "contentHash">): string {
     const prefix = (this.deps.keyPrefix ?? "").trim().replace(/^\/+|\/+$/g, "");
     const baseSegments = [
       "skills",
       encodeURIComponent(input.tenantId),
       encodeURIComponent(input.skillId),
-      `${input.revisionNumber}-${input.contentHash}.tar.gz`
+      `${input.contentHash}-${uuidv7()}.tar.gz`
     ];
     return prefix ? `${prefix}/${baseSegments.join("/")}` : baseSegments.join("/");
   }
 
   async storeBundle(input: StoreBundleInput): Promise<StoreBundleResult> {
-    const key = this.buildObjectKey(input);
+    const key = this.newObjectKey(input);
 
     const tarStream = tar.create(
       {
@@ -292,7 +291,7 @@ export class BucketSkillBundleStorage implements SkillBundleStorage {
       normalizedPrefix && key.startsWith(`${normalizedPrefix}/`)
         ? key.slice(normalizedPrefix.length + 1)
         : key;
-    // Strip the trailing `.tar.gz` so the cache dir name is just `<rev>-<hash>`.
+    // Strip the trailing `.tar.gz` from the object name for the cache directory.
     const withoutSuffix = withoutPrefix.replace(/\.tar\.gz$/, "");
     return containedPath(this.deps.cacheRoot, path.join(bucketName, withoutSuffix));
   }
