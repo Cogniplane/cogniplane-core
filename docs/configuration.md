@@ -170,6 +170,8 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `10` | [data](architecture/data.md), [runtime](architecture/runtime.md) |
 | `SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `50` | [data](architecture/data.md), [runtime](architecture/runtime.md) |
 | `SCHEDULED_JOB_MAX_ACTIVE_PER_USER` | number, integer, minimum 0 | `50` | [startup rules](#startup-rules), [runtime](architecture/runtime.md) |
+| `SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
+| `SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
 | `OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
 | `OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
 | `ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `300` | [data](architecture/data.md) |

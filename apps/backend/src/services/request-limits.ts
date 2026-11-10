@@ -6,6 +6,7 @@ export type LimitResource =
   | "artifact_upload"
   | "project_file_write"
   | "scheduled_job_create"
+  | "settings_write"
   | "oauth_callback"
   | "admin_query"
   | "auth_organizations";
@@ -21,6 +22,7 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   artifact_upload: "artifact upload",
   project_file_write: "project file write",
   scheduled_job_create: "scheduled job creation",
+  settings_write: "settings write",
   oauth_callback: "OAuth callback",
   admin_query: "admin request",
   auth_organizations: "organization list"
@@ -45,6 +47,8 @@ export type RequestLimitsConfigKeys = Pick<
   | "PROJECT_FILE_WRITE_LIMIT_PER_TENANT_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW"
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
+  | "SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW"
+  | "SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW"
   | "ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW"
@@ -84,6 +88,10 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
         scheduled_job_create: {
           user: config.SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        settings_write: {
+          user: config.SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW
         },
         oauth_callback: {
           user: config.OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW,

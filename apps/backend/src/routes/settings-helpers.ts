@@ -41,20 +41,6 @@ export function buildSectionSummaries(
   });
 }
 
-export function buildSettingsSnapshot(
-  sections: Awaited<ReturnType<UserSettingsStore["listSections"]>>
-): Record<string, unknown> {
-  return Object.fromEntries(
-    sections.map((section) => [
-      section.sectionKey,
-      {
-        version: section.version,
-        config: section.config
-      }
-    ])
-  );
-}
-
 export function buildScheduledJobAuditPayload(job: {
   jobId: string;
   jobName: string;
