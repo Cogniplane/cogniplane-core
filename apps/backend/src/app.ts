@@ -24,7 +24,7 @@ import { sanitizeUrl } from "./lib/sanitize-url.js";
 import { registerSecurityHeaders } from "./lib/security-headers.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerTenantRoutes } from "./routes/tenant.js";
-import { TenantMemberStore } from "./services/tenant-member-store.js";
+import { PrivilegedAuthStateLookup } from "./services/tenant-member-store.js";
 import { ApprovalStore } from "./services/auth/approval-store.js";
 import { MessageStore } from "./services/message-store.js";
 import { RequestLimitsUnavailableError } from "./services/redis-request-limits.js";
@@ -257,10 +257,12 @@ export async function buildApp() {
   // gating here rejects unauthenticated callers before body parsing/validation.
   switch (config.AUTH_MODE) {
     case "jwt": {
-      // Auth callback and membership lookups must bypass RLS because they run before
-      // the tenant context is established. Use a separate privileged connection pool.
-      const authTenantMembers = new TenantMemberStore(privilegedDb);
-      app.addHook("onRequest", jwtAuth(config, authTenantMembers, deps.integrationDescriptors.oauthCallbackPaths()));
+      // The membership lookup runs before the tenant context exists, so it
+      // reads through `privilegedDb` (BYPASSRLS, checked at startup above).
+      // Its SQL keeps the tenant and user predicates. One statement per
+      // request, outside a transaction: see PrivilegedAuthStateLookup.
+      const authStates = new PrivilegedAuthStateLookup(privilegedDb);
+      app.addHook("onRequest", jwtAuth(config, authStates, deps.integrationDescriptors.oauthCallbackPaths()));
       break;
     }
     case "dev-headers":

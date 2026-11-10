@@ -7,7 +7,7 @@ import { checkAuthAdmission } from "./auth-admission.js";
 import { isPublicAuthPath, isPublicDownloadRequest } from "./auth-public-paths.js";
 import { listIntegrationOAuthCallbackPaths } from "../services/integrations/integration-registry.js";
 import { sanitizeUrl } from "./sanitize-url.js";
-import type { TenantMemberStore } from "../services/tenant-member-store.js";
+import type { PrivilegedAuthStateLookup } from "../services/tenant-member-store.js";
 
 // Session routes every login type uses. Refresh and logout read only the
 // refresh cookie, so they must be reachable without an access token. The
@@ -69,7 +69,7 @@ export function jwtPublicAuthPaths(
  */
 export function jwtAuth(
   config: AppConfig,
-  tenantMembers: Pick<TenantMemberStore, "getAuthState">,
+  authStates: Pick<PrivilegedAuthStateLookup, "getAuthState">,
   oauthCallbackPaths: readonly string[] = listIntegrationOAuthCallbackPaths()
 ) {
   const publicAuthPaths = jwtPublicAuthPaths(config, oauthCallbackPaths);
@@ -102,9 +102,10 @@ export function jwtAuth(
     try {
       const payload = await verifyAccessToken(config, token);
 
-      // Look up the user's role and login type in this tenant. The caller must
-      // build the store on `privilegedDb`, because no tenant context exists yet.
-      const admission = checkAuthAdmission(config, await tenantMembers.getAuthState(payload.tid, payload.sub), {
+      // Look up the user's role and login type in this tenant, on every
+      // request. No tenant context exists yet, so the caller passes a
+      // `PrivilegedAuthStateLookup` on `privilegedDb`.
+      const admission = checkAuthAdmission(config, await authStates.getAuthState(payload.tid, payload.sub), {
         sv: payload.sv
       });
       if (!admission.ok) {

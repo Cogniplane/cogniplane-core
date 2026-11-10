@@ -65,6 +65,10 @@ Sign-in types:
 - `GET /downloads/:token` is public: the single-use token is the credential.
 - A valid JWT is not enough: the user must be a member of the tenant (403
   `not_a_member`).
+- Request admission and `/auth/refresh` use `PrivilegedAuthStateLookup`
+  (`services/tenant-member-store.ts`). Each membership read sends one SELECT
+  on the maintenance pool, with tenant and user predicates and no cache. The
+  normal app-pool store keeps its `withTenantScope` transaction and RLS scope.
 - CSRF: state-changing routes take JSON (artifact upload takes multipart); none
   accepts a form body from another site. Auth mutations (`/auth/callback`,
   `/auth/refresh`, `/auth/logout`, local sign-in, link, step-up and password

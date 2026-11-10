@@ -17,7 +17,7 @@ import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.
 
 const CONFIG = createTestConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["local"] });
 
-type Harness = { app: FastifyInstance; redis: FakeRefreshTokenRedis; account: { securityVersion: number } };
+type Harness = { app: FastifyInstance; pool: FakePool; redis: FakeRefreshTokenRedis; account: { securityVersion: number } };
 
 async function buildHarness(): Promise<Harness> {
   const pool = new FakePool();
@@ -37,7 +37,7 @@ async function buildHarness(): Promise<Harness> {
     auditEvents: new InMemoryAuditEventStore() as never,
     refreshTokens: new RefreshTokenRotationService(redis, 60)
   });
-  return { app, redis, account };
+  return { app, pool, redis, account };
 }
 
 /** A refresh cookie of a local session that started at `securityVersion`. */
@@ -74,6 +74,18 @@ describe("POST /auth/refresh, a local session of an older security version", () 
 
     expect(res.statusCode).toBe(200);
     expect(refreshSetCookie(res.headers["set-cookie"])).toMatch(/.+/);
+  });
+
+  // The membership read is one statement on the privileged pool, with no
+  // BEGIN, set_config or COMMIT. The email read follows it.
+  test("reads the membership with one statement, outside a transaction", async () => {
+    const res = await refresh(harness, await localSessionCookie(harness, "fid-statements", 1));
+
+    expect(res.statusCode).toBe(200);
+    expect(harness.pool.queries.map(({ text, values }) => [text.trim().split("\n")[0], values])).toEqual([
+      ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version", ["tenant-1", "user-1"]],
+      ["SELECT email FROM users WHERE user_id = $1 LIMIT 1", ["user-1"]]
+    ]);
   });
 
   // Another tab can have the newer cookie when this answer arrives: for
