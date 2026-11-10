@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { focusManager, useQuery } from "@tanstack/react-query";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 import { getPiiProviderStatus } from "../lib/admin-api";
+import { ApiError } from "../lib/api-client";
+import { shouldRetryQuery } from "../lib/query-provider";
+import { queryKeys } from "../lib/query-keys";
 import type { PiiProviderStatus } from "@cogniplane/shared-types";
+
+/** How often the pill reads the status while the document is visible. */
+const STATUS_POLL_MS = 10_000;
 
 type PillVariant = "ok" | "probing" | "outage" | "neutral";
 
@@ -46,41 +53,61 @@ function resolvePill(status: PiiProviderStatus | null, now: number): ResolvedPil
   };
 }
 
-export function PiiProviderStatusPill() {
-  const [status, setStatus] = useState<PiiProviderStatus | null | undefined>(undefined);
-  const [now, setNow] = useState<number>(() => Date.now());
+// The next read gets the same answer: the session ended (401) or the user is
+// no longer an admin (403).
+function isAccessError(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
 
+// Query's focus manager tells if the document is visible. The poll uses the same signal.
+function subscribeToVisibility(onChange: () => void): () => void {
+  return focusManager.subscribe(onChange);
+}
+
+function isDocumentVisible(): boolean {
+  return focusManager.isFocused();
+}
+
+/** A clock that ticks once a second until `until`. With `until` null it does not tick. */
+function useCountdownClock(until: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    let cancelled = false;
-    const fetchStatus = async () => {
-      try {
-        const result = await getPiiProviderStatus();
-        if (!cancelled) setStatus(result);
-      } catch {
-        // Errors here mean the breaker subsystem is gone or down. Treat as
-        // unknown rather than spamming red — the indicator is best-effort.
-        if (!cancelled) setStatus(null);
-      }
-    };
-    void fetchStatus();
-    // Cheap call, mostly cache hits in Redis.
-    const refresh = setInterval(fetchStatus, 10_000);
-    // Tick the clock once a second so the "retry in Xs" countdown updates.
-    const tick = setInterval(() => setNow(Date.now()), 1_000);
-    return () => {
-      cancelled = true;
-      clearInterval(refresh);
-      clearInterval(tick);
-    };
-  }, []);
+    if (until === null) return;
+    const timer = setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= until) clearInterval(timer);
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [until]);
+  return now;
+}
 
-  const pill = useMemo(() => {
-    if (status === undefined) return null;
-    return resolvePill(status, now);
-  }, [status, now]);
+/**
+ * Set `active` to false while the panel that holds the pill stays mounted but
+ * hidden. The pill then stops its reads and its countdown.
+ */
+export function PiiProviderStatusPill({ active = true }: { active?: boolean }) {
+  // Query does not run the interval read while the document is hidden
+  // (refetchIntervalInBackground is false).
+  const statusQuery = useQuery({
+    queryKey: queryKeys.admin.piiProviderStatus(),
+    queryFn: getPiiProviderStatus,
+    enabled: active,
+    refetchInterval: (query) => (isAccessError(query.state.error) ? false : STATUS_POLL_MS),
+    retry: (failureCount, error) => !isAccessError(error) && shouldRetryQuery(failureCount, error)
+  });
+  const visible = useSyncExternalStore(subscribeToVisibility, isDocumentVisible, () => true);
+  // A failed read shows "unknown". The indicator is best-effort, so it does not show an error.
+  const status = statusQuery.isError ? null : (statusQuery.data ?? null);
+  const retryAt = status?.state === "open" ? status.willRetryAt : null;
+  const clock = useCountdownClock(active && visible ? retryAt : null);
 
-  if (!pill) return null;
+  if (statusQuery.isPending || isAccessError(statusQuery.error)) return null;
 
+  // The clock does not tick while no countdown shows, so its value can be old.
+  // The time of the last read is a lower limit.
+  const pill = resolvePill(status, Math.max(clock, statusQuery.dataUpdatedAt));
   const variantClass = VARIANT_CLASSES[pill.variant];
 
   return (
