@@ -38,7 +38,7 @@ Other auth rules are in the subsystem documents.
 - POST `/admin/mcp-servers` (admin, step-up)
 - PUT `/admin/mcp-servers/:serverId` (admin, step-up)
 - POST `/admin/mcp-servers/:serverId/disable` (admin)
-- POST `/admin/mcp-servers/:serverId/publish` (admin)
+- POST `/admin/mcp-servers/:serverId/publish` (admin, step-up)
 - POST `/admin/mcp-servers/:serverId/unpublish` (admin)
 
 ## [routes/admin/admin-model-routes.ts](../apps/backend/src/routes/admin/admin-model-routes.ts)

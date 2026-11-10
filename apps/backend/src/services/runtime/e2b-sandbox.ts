@@ -64,7 +64,7 @@ export type E2bSandboxLike = {
   sandboxId: string;
   files: {
     write: (files: Array<{ path: string; data: string | ArrayBuffer }>) => Promise<void>;
-    read: (path: string, opts: { format: "bytes" }) => Promise<Uint8Array>;
+    read: (path: string, opts: { format: "stream" }) => Promise<ReadableStream<Uint8Array>>;
     getInfo: (path: string) => Promise<{ size: number }>;
   };
   commands: {

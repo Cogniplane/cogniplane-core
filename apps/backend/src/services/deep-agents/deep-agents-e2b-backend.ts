@@ -85,6 +85,17 @@ import { dispatchExecuteResult } from "./execute-result-event.js";
  *  stdout, and unbounded output would balloon the prompt. */
 const MAX_EXECUTE_OUTPUT_CHARS = 64_000;
 
+/**
+ * The bytes of stdout, and separately of stderr, that one command may send to the
+ * backend. The SDK keeps all output of a command in memory until the command ends,
+ * so the sandbox drops the rest (capCommandOutput). Four bytes for each character
+ * of MAX_EXECUTE_OUTPUT_CHARS: the cap never cuts output that the model would see.
+ */
+const MAX_EXECUTE_OUTPUT_BYTES = MAX_EXECUTE_OUTPUT_CHARS * 4;
+
+/** Default of E2bDeepAgentsSandboxOptions.maxFileReadBytes, the default of ARTIFACT_MAX_UPLOAD_BYTES. */
+const DEFAULT_MAX_FILE_READ_BYTES = 25 * 1024 * 1024;
+
 /** Model-facing error for paths that escape the session workspace. */
 const OUTSIDE_WORKSPACE_ERROR = "Path is outside the session workspace";
 
@@ -142,6 +153,12 @@ export type E2bDeepAgentsSandboxOptions = {
    * It never exceeds what is left of the deadline.
    */
   networkRequestTimeoutMs: number;
+  /**
+   * The largest file, in bytes, that the backend reads from the sandbox
+   * (ARTIFACT_MAX_UPLOAD_BYTES). A larger file fails the read with
+   * SandboxFileTooLargeError, and the backend stops the download at this size.
+   */
+  maxFileReadBytes?: number;
   /**
    * Checks in the database that this runtime still owns the session, which is
    * that its execution lease is current. It runs before every try to kill a
@@ -909,7 +926,7 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
       // still dropped there, so a subsequent execute() gets a fresh sandbox.
       return await this.withSandbox(turn, async (sandbox) => {
         try {
-          const result = await sandbox.commands.run(command, {
+          const result = await sandbox.commands.run(capCommandOutput(command, MAX_EXECUTE_OUTPUT_BYTES), {
             cwd: this.options.workspacePath,
             timeoutMs: this.options.executeTimeoutMs
           });
@@ -994,12 +1011,14 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
         live();
         try {
           const sandboxPath = this.toSandboxPath(filePath);
-          const content = await sandbox.files.read(sandboxPath, { format: "bytes" });
+          const content = await this.readCapped(sandbox, sandboxPath);
           responses.push({ path: filePath, content, error: null });
         } catch (err: unknown) {
           // Sandbox-gone escapes to withSandbox for recreation; a per-file
-          // not-found stays a structured error code.
-          if (isSandboxGoneError(err)) throw err;
+          // not-found stays a structured error code. A file that is too large also
+          // escapes: deepagents reports every error code as "not found", and the
+          // thrown message tells the model the real cause.
+          if (isSandboxGoneError(err) || err instanceof SandboxFileTooLargeError) throw err;
           responses.push({ path: filePath, content: null, error: toDownloadErrorCode(err) });
         }
       }
@@ -1134,8 +1153,41 @@ export class E2bDeepAgentsSandbox extends BaseSandbox {
   /** Read raw bytes at a workspace-relative path (adapter readRuntimeFile). */
   async readFileBytes(filePath: string): Promise<Uint8Array> {
     return this.withSandbox(this.currentTurn(), (sandbox) =>
-      sandbox.files.read(this.toSandboxPath(filePath), { format: "bytes" })
+      this.readCapped(sandbox, this.toSandboxPath(filePath))
     );
+  }
+
+  /**
+   * Reads a file as a stream and stops at maxFileReadBytes, so the backend never holds
+   * more than the limit and one chunk. A size check before the read is not enough: the
+   * file can grow after the check. The SDK's "bytes" read buffers the whole file.
+   */
+  private async readCapped(sandbox: E2bSandboxLike, sandboxPath: string): Promise<Uint8Array> {
+    const limit = this.options.maxFileReadBytes ?? DEFAULT_MAX_FILE_READ_BYTES;
+    const reader = (await sandbox.files.read(sandboxPath, { format: "stream" })).getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) {
+          await reader.cancel().catch(() => {});
+          throw new SandboxFileTooLargeError(limit);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const content = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      content.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return content;
   }
 
   /** Size of a workspace file without buffering it (adapter statRuntimeFile). */
@@ -1246,6 +1298,32 @@ class ProviderRequestTimeoutError extends Error {
     super(`the provider did not answer a request within ${timeoutMs} ms`);
     this.name = "ProviderRequestTimeoutError";
   }
+}
+
+/** A sandbox file that is larger than maxFileReadBytes. The message is safe to show to the model. */
+export class SandboxFileTooLargeError extends Error {
+  constructor(readonly limitBytes: number) {
+    super(`The file is larger than the ${limitBytes} byte limit for a read from the sandbox.`);
+    this.name = "SandboxFileTooLargeError";
+  }
+}
+
+/**
+ * The command, changed so that at most `maxBytes` of stdout and `maxBytes` of stderr
+ * leave the sandbox. Each stream goes through `head -c`, then `cat` reads and drops
+ * the rest: the command is not stopped by a closed pipe and runs to its end. The exit
+ * code of the command is kept (PIPESTATUS); pipefail is not set, so the pipelines of
+ * the command keep their normal exit codes. The command runs in a subshell, as a part
+ * of a pipeline: an `exit` in it ends only that subshell. The new line before `}` ends
+ * a here-document or a comment on the last line of the command.
+ * Commands run under bash (the SDK starts `/bin/bash -l -c`).
+ */
+export function capCommandOutput(command: string, maxBytes: number): string {
+  const drain = `{ head -c ${maxBytes}; cat >/dev/null; }`;
+  return (
+    `{ { ${command}\n} 2>&1 1>&3 3>&- | ${drain}; exit "\${PIPESTATUS[0]}"; } ` +
+    `3>&1 1>&2 | ${drain}; exit "\${PIPESTATUS[0]}"`
+  );
 }
 
 function toExecuteResponse(result: {

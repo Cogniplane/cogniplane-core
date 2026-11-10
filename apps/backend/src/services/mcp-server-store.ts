@@ -61,6 +61,20 @@ export function pendingLegacyQueryAuth(server: Pick<AdminMcpServerRecord,
   return extractLegacyQueryAuth(server.upstreamUrl);
 }
 
+/** The answer to an edit that changes where a saved secret goes without the secret. */
+export const MCP_SECRET_REENTRY_MESSAGE =
+  "Enter the secret again. The address or the authentication method changed, and the saved secret is not sent to a new destination.";
+
+/** The origin of an upstream URL; the text itself when it is not a URL (validation rejects it later). */
+function urlOrigin(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
 export class McpServerStore {
   constructor(
     private readonly db: Pool,
@@ -396,13 +410,21 @@ export class McpServerStore {
       if (credentialScope === "personal" && (input.mode !== "proxy" || upstreamAuthType === "none")) {
         throw new AdminConfigError("Personal credentials require an authenticated proxy.");
       }
+      // A saved secret was given for one origin and one way of sending it. An edit
+      // that changes either must supply the secret again: keeping it would send it
+      // to an address, or in a place, that the person who saved it never chose.
+      const existingSecret = existingScope === "organization" && existing.rows[0].upstream_auth_secret_encrypted
+        ? String(existing.rows[0].upstream_auth_secret_encrypted)
+        : null;
+      const secretTargetChanged =
+        urlOrigin(upstreamUrl) !== urlOrigin(existing.rows[0].upstream_url ? String(existing.rows[0].upstream_url) : null) ||
+        upstreamAuthType !== existingAuthType ||
+        upstreamAuthName !== (existing.rows[0].upstream_auth_name ? String(existing.rows[0].upstream_auth_name) : null);
       const encryptedSecret = upstreamAuthType === "none" || credentialScope === "personal"
         ? null
         : input.upstreamAuthSecret
           ? encrypt(input.upstreamAuthSecret, this.encryptionSecret)
-          : existingScope === "organization" && existing.rows[0].upstream_auth_secret_encrypted
-            ? String(existing.rows[0].upstream_auth_secret_encrypted)
-            : null;
+          : existingSecret;
       // A partial update is validated before this merge, with the omitted
       // fields unknown. Validate the merged state as well, so an update that
       // changes only the header name cannot store a reserved or invalid header.
@@ -417,6 +439,12 @@ export class McpServerStore {
       }, { requireUrlAndSecret: false });
       if (input.mode === "proxy" && !upstreamUrl) {
         throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
+      }
+      if (
+        existingSecret && !input.upstreamAuthSecret && secretTargetChanged &&
+        credentialScope === "organization" && upstreamAuthType !== "none"
+      ) {
+        throw new AdminConfigError(MCP_SECRET_REENTRY_MESSAGE);
       }
       if (credentialScope === "organization" && upstreamAuthType !== "none" && !encryptedSecret) {
         throw new AdminConfigError(

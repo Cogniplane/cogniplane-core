@@ -143,6 +143,7 @@ const CASES: Record<StepUpRoute, Case> = {
   "PUT /admin/mcp-servers/:serverId/inherited-availability": {
     url: `/admin/mcp-servers/${SHARED_SERVER_ID}/inherited-availability`, payload: { audience: "members" }
   },
+  "POST /admin/mcp-servers/:serverId/publish": { url: `/admin/mcp-servers/${MCP_SERVER_ID}/publish` },
   "POST /admin/mcp-servers/:serverId/widget-domains/approve": {
     url: `/admin/mcp-servers/${MCP_SERVER_ID}/widget-domains/approve`,
     payload: { directive: "connectDomains", source: "https://api.example.com" }
@@ -189,6 +190,7 @@ const DATA_ROUTES: Partial<Record<StepUpRoute, DataSettingChange>> = {
   "POST /admin/mcp-servers/setup": { setting: "mcp_server", serverId: MCP_SERVER_ID, created: true },
   "PUT /admin/mcp-servers/:serverId/setup": { setting: "mcp_server", serverId: MCP_SERVER_ID, created: false },
   "PUT /admin/mcp-servers/:serverId/inherited-availability": { setting: "mcp_server_audience", serverId: SHARED_SERVER_ID },
+  "POST /admin/mcp-servers/:serverId/publish": { setting: "mcp_server_audience", serverId: MCP_SERVER_ID },
   "POST /admin/mcp-servers/:serverId/widget-domains/approve": { setting: "mcp_widget_domain", serverId: MCP_SERVER_ID },
   "PUT /admin/integrations/:integrationId": { setting: "integration", integrationName: "Census app", fields: ["Read access turned on"] },
   "POST /admin/policy/rules": { setting: "policy_rules", change: "rule_added", ruleId: "pol_census_new", ruleName: "Allow all" },
@@ -422,6 +424,7 @@ function adminStores(calls: string[], writes: Array<{ method: string; args: unkn
       updateMcpServer: (...args) => commitChange(args, MCP_SERVER),
       saveMcpServerWithAudience: (...args) => commitChange(args, MCP_SERVER),
       setInheritedMcpAudience: (...args) => commitChange(args, SHARED_SERVER),
+      setMcpServerPublished: (...args) => commitChange(args, MCP_SERVER),
       // A release runs the owner notice in its transaction.
       activateSkillRevision: async (_tenantId, input) => {
         await (input as { alsoInTransaction?: (client: unknown) => Promise<void> }).alsoInTransaction?.(CHANGE_TRANSACTION);
@@ -700,14 +703,16 @@ describe("step-up routes", () => {
   test.each([
     ["PUT /admin/mcp-servers/:serverId", "/admin/mcp-servers/no-such-server", { ...MCP_BODY, serverId: "no-such-server" }],
     ["PUT /admin/mcp-servers/:serverId/setup", "/admin/mcp-servers/no-such-server/setup", { ...MCP_BODY, serverId: "no-such-server", audience: "members" }],
-    ["PUT /admin/mcp-servers/:serverId/inherited-availability", `/admin/mcp-servers/${MCP_SERVER_ID}/inherited-availability`, { audience: "members" }]
+    ["PUT /admin/mcp-servers/:serverId/inherited-availability", `/admin/mcp-servers/${MCP_SERVER_ID}/inherited-availability`, { audience: "members" }],
+    ["POST /admin/mcp-servers/:serverId/publish", "/admin/mcp-servers/no-such-server/publish", undefined]
   ] as const)("%s: a missing server answers 404 and does not spend the step-up token", async (route, url, payload) => {
     const { app, consume, stepUp, notices } = await buildApp();
     const { token } = await stepUp.create({
       userId: IDENTITY.userId, tenantId: IDENTITY.tenantId, familyId: "family-1",
       securityVersion: IDENTITY.securityVersion, action: STEP_UP_ROUTES[route]
     }, ["pwd", "otp"]);
-    const missing = await app.inject({ method: "PUT", url, payload, headers: { origin: ORIGIN, "x-step-up": token } });
+    const method = route.startsWith("POST ") ? "POST" : "PUT";
+    const missing = await app.inject({ method, url, payload, headers: { origin: ORIGIN, "x-step-up": token } });
     expect(missing.statusCode).toBe(404);
     expect(consume).not.toHaveBeenCalled();
     expect(notices).toEqual([]);

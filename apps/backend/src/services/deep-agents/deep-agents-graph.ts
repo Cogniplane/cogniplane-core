@@ -307,6 +307,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
     onSandboxRecreated: init.onSandboxRecreated, sandboxBinding: init.sandboxBinding,
     resolveNetworkPolicy: options.resolveNetworkPolicy,
     networkConfirmTimeoutMs: options.networkConfirmTimeoutMs, networkRequestTimeoutMs: options.networkRequestTimeoutMs,
+    maxFileReadBytes: options.maxFileReadBytes,
     // The session lease is checked in the database before a sandbox that does not match the policy is killed.
     requireOwnership: init.requireExecution,
     logger: init.logger

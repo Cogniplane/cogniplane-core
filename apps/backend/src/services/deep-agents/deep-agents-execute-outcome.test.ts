@@ -69,13 +69,18 @@ afterEach(async () => {
 
 type RunCommand = (command: string) => Promise<{ stdout: string; stderr: string; exitCode?: number }>;
 
+/** The command of the model inside the output cap that the backend adds. */
+function modelCommand(sent: string): string {
+  return /^\{ \{ ([\s\S]*)\n\} 2>&1 1>&3 3>&- \| /.exec(sent)?.[1] ?? sent;
+}
+
 /** `run` gets the commands of the model. The backend's own `mkdir -p` of the workspace, at creation, always succeeds. */
 function setup(run: RunCommand) {
   control.sandbox = {
     sandboxId: "sandbox",
-    files: { write: async () => {}, read: async () => new Uint8Array(), getInfo: async () => ({ size: 0 }) },
+    files: { write: async () => {}, read: async () => new Blob([]).stream(), getInfo: async () => ({ size: 0 }) },
     commands: { run: (async (command: string) => command.startsWith("mkdir -p ")
-      ? { stdout: "", stderr: "", exitCode: 0 } : run(command)) as E2bSandboxLike["commands"]["run"] },
+      ? { stdout: "", stderr: "", exitCode: 0 } : run(modelCommand(command))) as E2bSandboxLike["commands"]["run"] },
     setTimeout: async () => {}, kill: async () => {}
   };
   const runtime = createDeepAgentsSessionRuntime({
