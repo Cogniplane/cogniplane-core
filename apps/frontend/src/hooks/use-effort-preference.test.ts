@@ -1,15 +1,21 @@
 // @vitest-environment jsdom
 import { act, renderHook, cleanup } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // vitest runs with globals:false, so RTL cannot auto-register its cleanup.
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 import type { Model } from "@cogniplane/shared-types";
 
 import { useEffortPreference } from "./use-effort-preference";
 
 const STORAGE_KEY = "cogniplane:effort";
+
+const denied = (): never => { throw new DOMException("Access is denied for this document.", "SecurityError"); };
+const full = (): never => { throw new DOMException("The quota has been exceeded.", "QuotaExceededError"); };
 
 function makeModel(overrides: Partial<Model> = {}): Model {
   return {
@@ -92,5 +98,33 @@ describe("useEffortPreference", () => {
 
     expect(result.current.effort).toBe("low");
     expect(localStorage.getItem(STORAGE_KEY)).toBe("low");
+  });
+
+  // A blocked or full storage must not crash the chat shell or undo a choice.
+  it.each([
+    ["the browser blocks storage", () => { vi.spyOn(window, "localStorage", "get").mockImplementation(denied); }],
+    ["storage cannot read, save or remove", () => {
+      vi.spyOn(Storage.prototype, "getItem").mockImplementation(denied);
+      vi.spyOn(Storage.prototype, "setItem").mockImplementation(full);
+      vi.spyOn(Storage.prototype, "removeItem").mockImplementation(denied);
+    }]
+  ])("keeps the chosen effort for this page when %s", (_, failStorage) => {
+    failStorage();
+    const { result, rerender } = renderHook(
+      ({ model, enabled }: { model: Model; enabled: boolean }) => useEffortPreference(model, enabled, true),
+      { initialProps: { model: makeModel(), enabled: true } }
+    );
+    expect(result.current.effort).toBe("medium");
+
+    act(() => {
+      result.current.setEffort("low");
+    });
+    expect(result.current.effort).toBe("low");
+
+    rerender({ model: makeModel({ supportedEfforts: ["medium", "high"], defaultEffort: "high" }), enabled: true });
+    expect(result.current.effort).toBe("high");
+
+    rerender({ model: makeModel(), enabled: false });
+    expect(result.current.effort).toBeNull();
   });
 });

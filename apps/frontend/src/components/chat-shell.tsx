@@ -34,7 +34,7 @@ import { WorkspaceHeader } from "./workspace-header";
 import { useProjectFileSelection } from "../hooks/use-project-library";
 import { MAX_PROJECT_FILE_SELECTIONS, ProjectFileSelection } from "./project-file-selection";
 import { Button } from "./ui/button";
-import { WorkspaceLoadError, WorkspaceLoading, WorkspaceNoSession } from "./workspace-main-state";
+import { ChatRenderBoundary, WorkspaceLoadError, WorkspaceLoading, WorkspaceNoSession } from "./workspace-main-state";
 import { WORKSPACE_DRAWER_BACKDROP, WORKSPACE_DRAWER_SURFACE, WorkspaceDrawerHeader } from "./workspace-drawer";
 
 // CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
@@ -257,6 +257,13 @@ export function ChatShell() {
   const [createDialog, setCreateDialog] = useState({ open: false, key: 0 });
   const openCreateDialog = useCallback(() => setCreateDialog((current) => ({ open: true, key: current.key + 1 })), []);
   useShortcut(SHORTCUTS.newSession, openCreateDialog, true, SESSION_DRAWER);
+  // The error pages link here to leave a session that fails to render. The
+  // session list then restores no session, and New session opens once.
+  const [seenNewSessionRequest, setSeenNewSessionRequest] = useState(false);
+  if (sessionList.newSessionRequested !== seenNewSessionRequest) {
+    setSeenNewSessionRequest(sessionList.newSessionRequested);
+    if (sessionList.newSessionRequested) setCreateDialog((current) => ({ open: true, key: current.key + 1 }));
+  }
   useShortcut(SHORTCUTS.toggleArtifacts, () => setIsArtifactPaneOpen((open) => !open), Boolean(sessionList.selectedSession));
 
   const { model, setModel } = useModelPreference(allModels);
@@ -269,7 +276,12 @@ export function ChatShell() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = readStoredArtifactPaneWidth(window.localStorage.getItem("artifact-pane-width"));
+    let stored: number | null = null;
+    try {
+      stored = readStoredArtifactPaneWidth(window.localStorage.getItem("artifact-pane-width"));
+    } catch {
+      // Blocked storage: keep the default width.
+    }
     // SSR-safe localStorage hydration: lazy init would cause hydration mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (stored != null) setArtifactPaneWidth(stored);
@@ -310,6 +322,17 @@ export function ChatShell() {
   }
 
   const { messages } = chatWorkspace;
+
+  // The chat failed and unmounted, so its stream no longer updates the live
+  // turn state that it lifted here. Go back to the saved state. The session
+  // list still reports a turn that continues on the server.
+  const initialApprovalCount = chatWorkspace.initialApprovals.length;
+  const clearLiveTurn = useCallback(() => {
+    setTurnRunning(false);
+    setIsReloadingAfterTurn(false);
+    setTurnActivity(null);
+    setLiveApprovalCount(initialApprovalCount);
+  }, [initialApprovalCount]);
 
   const formatSessionForClipboardCallback = useCallback(
     (): string | undefined => formatSessionForClipboard(messages),
@@ -714,60 +737,74 @@ export function ChatShell() {
                 }}
               />
             ) : sessionList.selectedSessionId && chatWorkspace.isSessionDataReady ? (
-              <CopilotChatHost
-                // Key on session so switching sessions remounts the host. The
-                // new host connects and loads that session's history.
+              // Key on session so switching sessions remounts the host, and an
+              // error in the chat of one session does not stay for the next.
+              // The new host connects and loads that session's history. The
+              // sidebar and header are outside the boundary and keep working.
+              <ChatRenderBoundary
                 key={sessionList.selectedSessionId}
-                session={{
-                  id: sessionList.selectedSessionId,
-                  initialToolStatuses,
-                  initialMcpApps,
-                  initialApprovals: chatWorkspace.initialApprovals,
-                  initialNotices,
-                  isRunning: selectedIsServerRunning,
-                  canEdit: selectedDisplaySession?.canEdit !== false,
-                  initialPrompt: resolveDraftIntent?.sessionId === sessionId && projectId
-                    ? `Resolve the selected project draft conflict. The selected draft ID is ${resolveDraftIntent.draftId}. First call project_get_conflict_context with that draft ID and compare the base, latest published, and proposed text. If the intended merge is clear, call project_reconcile_conflict with the same draft ID and the merged text. If it is ambiguous, explain the alternatives and do not write a draft. Never promote, delete, or change folders.`
-                    : undefined
+                isCreating={sessionList.isCreatingSession}
+                onNewSession={() => {
+                  // Same project as the failed session, as the transcript notice does.
+                  void sessionList.createSession(selectedRawSession?.canEdit === false ? null : projectId).catch(() => {
+                    // The session list shows a failed create in the workspace banner.
+                  });
                 }}
-                modelSelection={{
-                  model,
-                  effort,
-                  models: allModels,
-                  showEffortSelector,
-                  onModelChange: setModel,
-                  onEffortChange: setEffort
-                }}
-                usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
-                artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
-                projectFileIds={confirmedProjectFileIds}
-                artifactInventory={artifactInventory}
-                draftScope={user ? { userId: user.userId, tenantId: user.tenantId } : undefined}
-                events={{
-                  onInitialPromptSent: () => setResolveDraftIntent(null),
-                  onArtifactsChanged: () => {
-                    if (!sessionId) return;
-                    void chatWorkspace.refreshSessionData(sessionId).catch(() => {
-                      // The session query shows the refresh error in the workspace banner.
-                    });
-                  },
-                  onTurnSettled: () => {
-                    setIsReloadingAfterTurn(true);
-                    void sessionList.reload().finally(() => setIsReloadingAfterTurn(false));
-                    if (projectId) void queryClient.invalidateQueries({ queryKey: queryKeys.projects.library(projectId) });
-                    // CopilotKit owns the live stream, so persisted state (token
-                    // usage, cost) only lands via a REST reload once a turn ends.
-                    if (sessionList.selectedSessionId) {
-                      void chatWorkspace.refreshSessionData(sessionList.selectedSessionId).catch(() => {
-                        // The session query exposes this failure in the workspace banner.
+                onShowSessions={isSidebarOpen ? undefined : () => setIsSidebarOpen(true)}
+                onFailure={clearLiveTurn}
+              >
+                <CopilotChatHost
+                  session={{
+                    id: sessionList.selectedSessionId,
+                    initialToolStatuses,
+                    initialMcpApps,
+                    initialApprovals: chatWorkspace.initialApprovals,
+                    initialNotices,
+                    isRunning: selectedIsServerRunning,
+                    canEdit: selectedDisplaySession?.canEdit !== false,
+                    initialPrompt: resolveDraftIntent?.sessionId === sessionId && projectId
+                      ? `Resolve the selected project draft conflict. The selected draft ID is ${resolveDraftIntent.draftId}. First call project_get_conflict_context with that draft ID and compare the base, latest published, and proposed text. If the intended merge is clear, call project_reconcile_conflict with the same draft ID and the merged text. If it is ambiguous, explain the alternatives and do not write a draft. Never promote, delete, or change folders.`
+                      : undefined
+                  }}
+                  modelSelection={{
+                    model,
+                    effort,
+                    models: allModels,
+                    showEffortSelector,
+                    onModelChange: setModel,
+                    onEffortChange: setEffort
+                  }}
+                  usage={{ contextTokens, contextWindow, sessionCostUsd: sessionCost }}
+                  artifactIds={chatWorkspace.artifactState.visibleSelectedArtifactIds}
+                  projectFileIds={confirmedProjectFileIds}
+                  artifactInventory={artifactInventory}
+                  draftScope={user ? { userId: user.userId, tenantId: user.tenantId } : undefined}
+                  events={{
+                    onInitialPromptSent: () => setResolveDraftIntent(null),
+                    onArtifactsChanged: () => {
+                      if (!sessionId) return;
+                      void chatWorkspace.refreshSessionData(sessionId).catch(() => {
+                        // The session query shows the refresh error in the workspace banner.
                       });
-                    }
-                  },
-                  onTurnActivityChange: setTurnActivity,
-                  onTurnRunningChange: setTurnRunning,
-                  onPendingApprovalsChange: setLiveApprovalCount
-                }}
-              />
+                    },
+                    onTurnSettled: () => {
+                      setIsReloadingAfterTurn(true);
+                      void sessionList.reload().finally(() => setIsReloadingAfterTurn(false));
+                      if (projectId) void queryClient.invalidateQueries({ queryKey: queryKeys.projects.library(projectId) });
+                      // CopilotKit owns the live stream, so persisted state (token
+                      // usage, cost) only lands via a REST reload once a turn ends.
+                      if (sessionList.selectedSessionId) {
+                        void chatWorkspace.refreshSessionData(sessionList.selectedSessionId).catch(() => {
+                          // The session query exposes this failure in the workspace banner.
+                        });
+                      }
+                    },
+                    onTurnActivityChange: setTurnActivity,
+                    onTurnRunningChange: setTurnRunning,
+                    onPendingApprovalsChange: setLiveApprovalCount
+                  }}
+                />
+              </ChatRenderBoundary>
             ) : sessionLoadFailed ? (
               <WorkspaceLoadError
                 message={sessionLoadMessage ?? ""}

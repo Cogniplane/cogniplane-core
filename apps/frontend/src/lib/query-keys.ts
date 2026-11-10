@@ -71,6 +71,7 @@ export const queryKeys = {
     }) => [...queryKeys.admin.all, "pii", "recent", params] as const,
     piiJobsStats: (params: { range: string; from?: string; to?: string }) =>
       [...queryKeys.admin.all, "pii", "jobs/stats", params] as const,
+    piiProviderStatus: () => [...queryKeys.admin.all, "pii", "provider-status"] as const,
     policyRules: () => [...queryKeys.admin.all, "policy", "rules"] as const,
     // Params are the serializable decisions filter+paging shape; passed verbatim
     // so two different filter sets get distinct cache entries.

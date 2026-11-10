@@ -177,6 +177,10 @@ Alert on:
 
 - Backend 5xx rate and startup failures.
 - Redis unavailable: with `jwt`, sign-in and token refresh fail.
+- Log lines `idle database connection failed`: PostgreSQL or the network
+  closed an idle connection of the pool in field `pool`. The pool opens a new
+  connection on the next query. Many lines in a short time mean a database
+  restart, a failover or a network fault.
 - `audit_events` auth failures (`event_type LIKE 'auth.%'`).
 - `approvals` still `pending` after their TTL.
 - `scheduled_job_runs` failures.

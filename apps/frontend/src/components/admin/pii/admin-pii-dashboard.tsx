@@ -53,7 +53,8 @@ function rangeQueryParams(range: RangeState): { range: PiiRangePreset; from?: st
     : { range: range.preset };
 }
 
-export function AdminPiiDashboard() {
+/** `active` is false while the page keeps this panel mounted but hidden. */
+export function AdminPiiDashboard({ active = true }: { active?: boolean }) {
   const queryClient = useQueryClient();
   const [range, setRange] = useState<RangeState>({ preset: "7d" });
 
@@ -87,7 +88,7 @@ export function AdminPiiDashboard() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm text-on-surface-variant">
           <p>{policyInvalid ? "Content in scope is stopped." : policy ? policySentence(policy) : isLoading ? "Loading activity..." : ""}</p>
-          <PiiProviderStatusPill />
+          <PiiProviderStatusPill active={active} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <RangeSelector range={range} onChange={setRange} />

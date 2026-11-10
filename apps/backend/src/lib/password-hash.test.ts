@@ -41,12 +41,15 @@ describe("PasswordHasher", () => {
     expect(await hasher.verify(stored, "anything at all here")).toEqual({ ok: false, needsRehash: false });
   });
 
-  test("refuses work past its concurrency instead of queueing", async () => {
-    const single = new PasswordHasher(1);
-    const results = await Promise.allSettled([single.hash("first password value"), single.hash("second password value")]);
-    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
-    const rejected = results.find((result) => result.status === "rejected") as PromiseRejectedResult;
-    expect(rejected.reason).toBeInstanceOf(PasswordHasherBusyError);
+  // 2 is the LOCAL_AUTH_HASH_CONCURRENCY default.
+  test.each([1, 2])("with a limit of %i, refuses work past it instead of queueing", async (limit) => {
+    const limited = new PasswordHasher(limit);
+    const calls = Array.from({ length: limit + 1 }, (_, index) => limited.hash(`password value number ${index}`));
+    const results = await Promise.allSettled(calls);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(limit);
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toBeInstanceOf(PasswordHasherBusyError);
   });
 
   test("verifyDummy does the work and never throws for a normal password", async () => {

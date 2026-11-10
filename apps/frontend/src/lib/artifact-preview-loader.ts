@@ -5,7 +5,13 @@ import {
   fetchArtifactContent,
   fetchArtifactPreviewText
 } from "./artifact-api";
-import { isImageArtifact, isPdfArtifact } from "./artifact-preview";
+import {
+  ArtifactPreviewTooLargeError,
+  exceedsTextPreviewLimit,
+  isImageArtifact,
+  isPdfArtifact,
+  TEXT_PREVIEW_MAX_BYTES
+} from "./artifact-preview";
 
 export function artifactApiBase(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
@@ -20,6 +26,8 @@ export function artifactApiBase(): string {
  * - image  → mint a signed download URL, render via <img>  → { kind: "image", imageUrl }
  * - pdf    → server-extracted text                          → { kind: "text", text }
  * - other  → mint a signed URL, fetch the raw text body     → { kind: "text", text }
+ *            Over TEXT_PREVIEW_MAX_BYTES it throws ArtifactPreviewTooLargeError
+ *            and does not show part of the file.
  *
  * Keeps the branch logic of the preview flow. The deps are injectable, so tests
  * do not hit the network.
@@ -43,7 +51,7 @@ const defaultDeps: ArtifactPreviewLoaderDeps = {
 };
 
 export async function loadArtifactPreview(
-  artifact: Pick<Artifact, "artifactId" | "mimeType">,
+  artifact: Pick<Artifact, "artifactId" | "mimeType" | "fileSizeBytes">,
   deps: ArtifactPreviewLoaderDeps = defaultDeps
 ): Promise<ArtifactPreviewResult> {
   const { artifactId, mimeType } = artifact;
@@ -58,7 +66,11 @@ export async function loadArtifactPreview(
     return { kind: "text", text };
   }
 
+  // A preview download spends a single-use token and writes an
+  // artifact_downloaded audit event, so check the recorded size first.
+  // fetchContent counts the bytes too, because the recorded size can be wrong.
+  if (exceedsTextPreviewLimit(artifact)) throw new ArtifactPreviewTooLargeError();
   const handle = await deps.createDownload(artifactId);
-  const text = await deps.fetchContent(`${deps.apiBase()}${handle.url}`);
+  const text = await deps.fetchContent(`${deps.apiBase()}${handle.url}`, TEXT_PREVIEW_MAX_BYTES);
   return { kind: "text", text };
 }

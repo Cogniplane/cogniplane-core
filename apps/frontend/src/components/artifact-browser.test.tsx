@@ -4,6 +4,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Artifact } from "@cogniplane/shared-types";
 import { ArtifactBrowser } from "./artifact-browser";
+import {
+  ArtifactPreviewTooLargeError, TEXT_PREVIEW_MAX_BYTES, TEXT_PREVIEW_TOO_LARGE_MESSAGE
+} from "../lib/artifact-preview";
 
 const api = vi.hoisted(() => ({
   browse: vi.fn(), preview: vi.fn(), download: vi.fn(), replace: vi.fn(), error: vi.fn(), search: ""
@@ -154,6 +157,23 @@ it("explains unsupported formats separately from processing and keeps full conte
   expect((within(row).getByRole("button", { name: `Preview ${fullName}` }) as HTMLButtonElement).disabled).toBe(true);
   expect((within(row).getByRole("button", { name: `Download ${fullName}` }) as HTMLButtonElement).disabled).toBe(false);
   expect(screen.getByText("Preview and download will be available when the file is ready.")).toBeTruthy();
+});
+
+it("refuses an oversized text preview with download guidance, no retry, and a working download", async () => {
+  const large = { ...artifact, fileSizeBytes: TEXT_PREVIEW_MAX_BYTES + 1 };
+  api.browse.mockResolvedValue({ items: [large], nextCursor: null });
+  api.preview.mockRejectedValue(new ArtifactPreviewTooLargeError());
+  api.download.mockRejectedValue(new Error("Download unavailable"));
+  mount();
+  await screen.findByText("notes.md");
+  fireEvent.click(screen.getByRole("button", { name: "Preview notes.md" }));
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toBe(TEXT_PREVIEW_TOO_LARGE_MESSAGE);
+  expect(screen.queryByRole("button", { name: "Retry preview" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  fireEvent.click(screen.getByRole("button", { name: "Download notes.md" }));
+  await waitFor(() => expect(api.download).toHaveBeenCalledWith("artifact-1"));
 });
 
 it("announces preview failure and retries the same artifact without changing eligibility", async () => {

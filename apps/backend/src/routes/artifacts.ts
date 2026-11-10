@@ -8,7 +8,7 @@ import { ProjectAccessError } from "../services/project-access.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
 import { UploadAdmission } from "../services/artifacts/upload-admission.js";
 
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 
 import type { AppDependencies } from "../app-dependencies.js";
 import type { SessionStore } from "../services/session-store.js";
@@ -19,7 +19,8 @@ import type { AuditEventStore } from "../services/audit-event-store.js";
 import type { PiiArtifactScanEnqueuer } from "../services/pii/pii-artifact-scan-enqueuer.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { ensureUser } from "../lib/db.js";
-import { apiError, getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
+import { apiError, notFoundError, requestError } from "../lib/http-errors.js";
+import { isFileTooLargeError } from "../lib/multipart-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { consumeResourceRead } from "../lib/resource-read-limit.js";
 import { artifactIdParams, sessionIdParams } from "../lib/route-schemas.js";
@@ -50,6 +51,23 @@ function getUploadFields(
   }
 
   return values;
+}
+
+function respondArtifactUploadError(reply: FastifyReply, error: unknown) {
+  if (isFileTooLargeError(error)) {
+    reply.code(413);
+    return apiError("artifact_too_large", "This file exceeds the upload size limit.");
+  }
+  // Busboy gives these malformed-body errors no status code. Classify only
+  // its fixed parser messages, so unexpected stream failures remain opaque.
+  if (error instanceof Error && (
+    error.message === "Unexpected end of multipart data" ||
+    error.message === "Multipart: Boundary not found"
+  )) {
+    reply.code(400);
+    return apiError("invalid_multipart", "The multipart upload is malformed.");
+  }
+  throw error;
 }
 
 export function buildArtifactRouteStores(deps: AppDependencies) {
@@ -188,8 +206,7 @@ export async function registerArtifactRoutes(
         }
       });
     } catch (error) {
-      reply.code(413);
-      return apiError("artifact_too_large", getErrorMessage(error, "Artifact upload rejected."));
+      return respondArtifactUploadError(reply, error);
     }
 
     if (!file) {
@@ -213,8 +230,7 @@ export async function registerArtifactRoutes(
     try {
       buffer = await file.toBuffer();
     } catch (error) {
-      reply.code(413);
-      return apiError("artifact_too_large", getErrorMessage(error, "Artifact upload rejected."));
+      return respondArtifactUploadError(reply, error);
     }
 
     const { fileTypeFromBuffer } = await import("file-type");

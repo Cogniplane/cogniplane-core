@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import type { AppDependencies } from "../app-dependencies.js";
-import { clientSafeToolErrorMessage, ToolCallError } from "../lib/tool-call-error.js";
+import { clientSafeToolErrorMessage, ToolCallError, toolErrorForLog } from "../lib/tool-call-error.js";
 import {
   forwardRpc,
   type ForwardRpcLimits,
@@ -832,9 +832,9 @@ async function handleManagedToolCall(
     if (error instanceof PolicyBlockedError) {
       return failure(rpc.id, -32004, error.explanation);
     }
-    // The raw error is logged here and only here: the RPC error the model reads
-    // is deliberately generic unless the throw was written for it.
-    logger.warn({ error, serverId, toolName }, "Managed tool call failed");
+    // The cause is logged here and only here: the RPC error the model reads is
+    // deliberately generic unless the throw was written for it.
+    logger.warn({ error: toolErrorForLog(error), serverId, toolName }, "Managed tool call failed");
     return failure(rpc.id, -32000, clientSafeToolErrorMessage(error, "Tool call failed."));
   }
 }
@@ -1017,7 +1017,7 @@ async function handleForwardedToolCall(
       return failure(rpc.id, -32004, error.explanation);
     }
     logger.warn(
-      { error, serverId: server.id, toolName: String(params.name ?? "") },
+      { error: toolErrorForLog(error), serverId: server.id, toolName: String(params.name ?? "") },
       "Forwarded tool call failed"
     );
     return failure(rpc.id, -32000, clientSafeToolErrorMessage(error, "Tool call failed."));

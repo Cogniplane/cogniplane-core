@@ -2,6 +2,7 @@ import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 import { describe, test, expect, vi } from "vitest";
 
+import { handleAppError } from "../app.js";
 import { registerArtifactRoutes } from "./artifacts.js";
 import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
 import { FakePool } from "../test-helpers/fake-pool.js";
@@ -652,14 +653,20 @@ describe("GET /artifacts/:artifactId/preview-text", () => {
   });
 });
 
-// ── POST /artifacts (file name validation) ───────────────────────────────────
+// ── POST /artifacts (upload validation) ──────────────────────────────────────
 
-describe("POST /artifacts file name validation", () => {
+describe("POST /artifacts upload validation", () => {
   const sessionId = "0196f7ca-8d4b-7a70-9f3f-222222222222";
   const boundary = "----cogniplane-upload-boundary";
 
   // Raw bytes, so a NUL really reaches the multipart parser.
-  function multipartBody(input: { fields?: Record<string, string>; filename: string; content?: string }) {
+  function multipartBody(input: {
+    fields?: Record<string, string>;
+    filename: string;
+    content?: string;
+    fileField?: string;
+    truncated?: boolean;
+  }) {
     const chunks: Buffer[] = [];
     for (const [name, value] of Object.entries({ sessionId, ...input.fields })) {
       chunks.push(
@@ -670,16 +677,19 @@ describe("POST /artifacts file name validation", () => {
     }
     chunks.push(
       Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${input.filename}"\r\n` +
-          "Content-Type: text/plain\r\n\r\n"
+        `--${boundary}\r\nContent-Disposition: form-data; name="${input.fileField ?? "file"}"; ` +
+          `filename="${input.filename}"\r\nContent-Type: text/plain\r\n\r\n`
       ),
-      Buffer.from(input.content ?? "artifact body"),
-      Buffer.from(`\r\n--${boundary}--\r\n`)
+      Buffer.from(input.content ?? "artifact body")
     );
+    if (!input.truncated) chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
     return Buffer.concat(chunks);
   }
 
-  async function buildUploadApp(maxUploadBytes?: number) {
+  // `fileError` makes request.file() reject with it. The real parser raises
+  // the size error from toBuffer(), so the size branch of request.file()
+  // needs this stub.
+  async function buildUploadApp(maxUploadBytes?: number, fileError?: Error) {
     const calls = {
       requireUploadAccess: 0,
       put: [] as string[],
@@ -734,19 +744,25 @@ describe("POST /artifacts file name validation", () => {
     };
     const config = createTestConfig(maxUploadBytes ? { ARTIFACT_MAX_UPLOAD_BYTES: maxUploadBytes } : {});
     const app = Fastify();
+    app.setErrorHandler(handleAppError);
     app.decorate("config", config);
     app.decorate("db", new FakePool().onQuery(/INSERT INTO users/, () => ({ rows: [], rowCount: 1 })).asPool());
     await app.register(multipart, { limits: { fileSize: config.ARTIFACT_MAX_UPLOAD_BYTES, files: 1 } });
     app.addHook("preHandler", async (request) => {
       request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+      if (fileError) {
+        request.file = async () => {
+          throw fileError;
+        };
+      }
     });
     await registerArtifactRoutes(app, stores as never);
     await app.ready();
-    const upload = (body: Buffer) =>
+    const upload = (body: Buffer, contentType = `multipart/form-data; boundary=${boundary}`) =>
       app.inject({
         method: "POST",
         url: "/artifacts",
-        headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+        headers: { "content-type": contentType },
         payload: body
       });
     return { app, calls, upload };
@@ -813,7 +829,70 @@ describe("POST /artifacts file name validation", () => {
     const response = await upload(multipartBody({ filename: "no\0tes.txt", content: "far more than eight bytes" }));
 
     expect(response.statusCode).toBe(413);
-    expect(response.json().error).toBe("artifact_too_large");
+    expect(response.json()).toEqual(tooLarge);
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
+
+  const tooLarge = { error: "artifact_too_large", message: "This file exceeds the upload size limit." };
+  const malformed = { error: "invalid_multipart", message: "The multipart upload is malformed." };
+
+  test("answers a size error from request.file() with the same fixed 413", async () => {
+    const error = Object.assign(new Error("request file too large"), {
+      code: "FST_REQ_FILE_TOO_LARGE",
+      statusCode: 413
+    });
+    const { app, calls, upload } = await buildUploadApp(undefined, error);
+
+    const response = await upload(multipartBody({ filename: "notes.txt" }));
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toEqual(tooLarge);
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
+
+  test("does not report a truncated body as too large", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "notes.txt", truncated: true }));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual(malformed);
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
+
+  test("does not report a body without a multipart boundary as too large", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "notes.txt" }), "multipart/form-data");
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual(malformed);
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
+
+  test("keeps unexpected upload failures opaque", async () => {
+    const { app, calls, upload } = await buildUploadApp(undefined, new Error("storage.internal connection failed"));
+    const response = await upload(multipartBody({ filename: "notes.txt" }));
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: "internal_error", message: "An unexpected error occurred." });
+    expect(calls.put).toEqual([]);
+    await app.close();
+  });
+
+  test("keeps the status and code of a 4xx parser error", async () => {
+    const { app, calls, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "notes.txt", fileField: "toString" }));
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: "FST_PROTO_VIOLATION",
+      message: "prototype property is not allowed as field name"
+    });
     expect(calls.put).toEqual([]);
     await app.close();
   });

@@ -86,8 +86,8 @@ export type PoolIdentity = {
 };
 
 /**
- * Pool options for a request, worker, or agent-turn pool. Use this for every
- * such pool, so that none gets pg's unbounded defaults.
+ * Pool options for a request, worker, or agent-turn pool. `createOperationalPool`
+ * applies them, so that no such pool gets pg's unbounded defaults.
  */
 export function operationalPoolOptions(identity: PoolIdentity): PoolConfig {
   return {
@@ -100,13 +100,61 @@ export function operationalPoolOptions(identity: PoolIdentity): PoolConfig {
   };
 }
 
+/** Receives the errors of idle pool connections. The Fastify logger fits. */
+export type PoolErrorLogger = {
+  error(meta: object, msg: string): void;
+};
+
+// For operator scripts, which have no Fastify logger. Same line format as
+// lib/redis.ts.
+const defaultPoolErrorLogger: PoolErrorLogger = {
+  error(meta, msg) {
+    console.error(JSON.stringify({ level: "error", msg, ...meta }));
+  }
+};
+
+/**
+ * Build a request, worker, or agent-turn pool: the operational limits and an
+ * `error` listener. Use this for every such pool.
+ *
+ * When an idle client loses its connection, pg-pool removes the client and
+ * emits `error` on the pool. A Postgres restart or failover, a dropped NAT
+ * entry or pg_terminate_backend causes this. With no listener, the event
+ * throws, and server.ts stops the process on the uncaught exception. Every
+ * in-flight turn on the replica then stops, although the pool opens a new
+ * connection on the next checkout.
+ *
+ * The log line holds the pool name, the error code and the message. It never
+ * holds the error object. pg-pool puts the client in `err.client`, and the
+ * client holds the connection parameters: user, host, password and TLS key
+ * material.
+ */
+export function createOperationalPool(
+  identity: PoolIdentity,
+  logger: PoolErrorLogger = defaultPoolErrorLogger
+): Pool {
+  const pool = new Pool(operationalPoolOptions(identity));
+  pool.on("error", (error) => {
+    const code = (error as { code?: unknown }).code;
+    logger.error(
+      {
+        pool: identity.applicationName,
+        ...(typeof code === "string" ? { code } : {}),
+        err: error.message
+      },
+      "idle database connection failed"
+    );
+  });
+  return pool;
+}
+
 /** The pool every route shares. */
-export function createDatabase(config: AppConfig): Pool {
-  return new Pool(operationalPoolOptions({
+export function createDatabase(config: AppConfig, logger?: PoolErrorLogger): Pool {
+  return createOperationalPool({
     connectionString: config.DATABASE_URL,
     applicationName: "cogniplane-backend",
     max: POOL_MAX
-  }));
+  }, logger);
 }
 
 /**
@@ -118,17 +166,16 @@ export function createDatabase(config: AppConfig): Pool {
  *
  * `application_name` differs, so `pg_stat_activity` shows the two pools apart.
  */
-export function createMaintenanceDatabase(connectionString: string): Pool {
-  return createOperationalDatabase(connectionString, "cogniplane-backend-maintenance");
+export function createMaintenanceDatabase(connectionString: string, logger?: PoolErrorLogger): Pool {
+  return createOperationalPool(
+    { connectionString, applicationName: "cogniplane-backend-maintenance", max: POOL_MAX },
+    logger
+  );
 }
 
 // Reserved for explicit operator commands such as tenant offboarding.
-export function createPrivilegedDatabase(connectionString: string): Pool {
-  return createOperationalDatabase(connectionString, "cogniplane-operator");
-}
-
-function createOperationalDatabase(connectionString: string, applicationName: string): Pool {
-  return new Pool(operationalPoolOptions({ connectionString, applicationName, max: POOL_MAX }));
+export function createPrivilegedDatabase(connectionString: string, logger?: PoolErrorLogger): Pool {
+  return createOperationalPool({ connectionString, applicationName: "cogniplane-operator", max: POOL_MAX }, logger);
 }
 
 export async function withTenantScope<T>(
