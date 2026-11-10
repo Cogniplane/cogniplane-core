@@ -15,6 +15,9 @@ principles are in `apps/frontend/PRODUCT.md`.
   (`services/agui-history.ts` on the backend). Tests:
   `copilot-chat-host*.test.tsx`, `services/agui-history.test.ts`.
 - The host mounts a new provider for each session, so no state crosses sessions.
+- An error boundary keyed by session wraps the host. Tool views and side panel
+  views have their own boundaries. See [render
+  errors](frontend.md#render-errors).
 - Generated UI events and renderer callbacks never start an agent turn. Only the
   user's Send starts a turn.
 

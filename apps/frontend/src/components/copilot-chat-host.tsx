@@ -124,6 +124,7 @@ import { ContextWindowMeter } from "./context-window-meter";
 import { ApprovalRowView } from "./chat-cards/approval-row";
 import { approvalsByCall, MountedToolCards, ToolApprovalContext, useListedApprovals, type ToolApprovals } from "./chat-cards/tool-approvals";
 import { MarkdownImage } from "./markdown-image";
+import { RenderBoundary } from "./render-boundary";
 import { SafeMarkdown } from "./safe-markdown";
 import { watchReadingOverflow } from "../lib/reading-overflow";
 import { WidgetDraftNotice, useWidgetDraft, type WidgetDraftComposer, type WidgetDraftSeam } from "./widget-draft";
@@ -232,9 +233,14 @@ function ChatAssistantMessage(props: CopilotChatAssistantMessageProps) {
         copyButton={ChatCopyButton} />
       {context ? calls.map((call) => {
         const app = context.apps[call.id];
+        // A tool view that fails while it loads or renders leaves the reply
+        // and the other views in place.
         return app ? (
-          <McpAppFrame key={call.id} sessionId={context.sessionId} toolCallId={call.id} toolName={call.function.name}
-            app={app} draft={context.draft} canEdit={context.canEdit} busy={context.busy} />
+          <RenderBoundary key={call.id} title="Tool view unavailable"
+            description="An error stopped this view from displaying. Trying again does not run the tool again or send a message.">
+            <McpAppFrame sessionId={context.sessionId} toolCallId={call.id} toolName={call.function.name}
+              app={app} draft={context.draft} canEdit={context.canEdit} busy={context.busy} />
+          </RenderBoundary>
         ) : null;
       }) : null}
     </>

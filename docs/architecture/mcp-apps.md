@@ -50,6 +50,9 @@ JavaScript: ask each model you enable for a small widget before you offer it.
   session read access, server selection, tool enablement, the declared URI and
   current Policy Center rules. A newly disabled tool or blocking rule also hides
   saved widgets.
+- A tool view that throws while it loads or renders shows a local notice; the
+  reply and the other views stay ([render
+  errors](frontend.md#render-errors)).
 - Generic inline `resource` blocks are not widgets. The backend neither emits
   nor saves them; the tool card names each by URI and MIME type only.
 - Old rows can hold `ToolResult.uiResources`. History returns the field; nothing

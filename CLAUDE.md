@@ -74,7 +74,7 @@ cited file.
 | PII detection, scan jobs, PII policy | [PII protection](docs/architecture/pii.md) |
 | Skills, skill bundles, capability resolution | [skills](docs/architecture/skills.md) |
 | Long-term memory, memory consent | [memory](docs/architecture/memory.md) |
-| Frontend routes, providers, API clients, builds, [add a page](docs/architecture/frontend.md#add-a-page) | [frontend](docs/architecture/frontend.md) |
+| Frontend routes, providers, API clients, builds, [render errors](docs/architecture/frontend.md#render-errors), [add a page](docs/architecture/frontend.md#add-a-page) | [frontend](docs/architecture/frontend.md) |
 | Chat host, `render_ui`, side panel, tool cards | [chat UI](docs/architecture/chat-ui.md) |
 | Widgets, `render_interactive_ui`, MCP App sandbox | [MCP Apps](docs/architecture/mcp-apps.md) |
 | Commands, tests, CI, [new HTTP route and shared contracts](docs/development.md#conventions), deferred SQL, releases | [development](docs/development.md) |
