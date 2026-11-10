@@ -280,8 +280,10 @@ export const envSchema = z.object({
   AUTH_LOGIN_TYPES: z.string().trim().optional(),
   // Password hashes that one backend process computes at the same time. Each
   // Argon2id hash holds 19 MiB for about 30 ms on a libuv thread; a request
-  // past the limit gets a retryable 503 instead of a queue that grows.
-  LOCAL_AUTH_HASH_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(4),
+  // past the limit gets a retryable 503 instead of a queue that grows. The
+  // default leaves 2 of the 4 default libuv threads for fs, dns.lookup and
+  // zlib. See docs/architecture/local-accounts.md to tune it.
+  LOCAL_AUTH_HASH_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(2),
   // Passkeys (WebAuthn) for local accounts are on only when this is set. The
   // relying-party id: the frontend's hostname (API_ORIGIN), or a parent
   // domain of it. Credentials are bound to it: changing it later makes every
