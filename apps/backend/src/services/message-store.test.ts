@@ -880,6 +880,28 @@ test("MessageStore.updateContent returns null when no row matched", async () => 
   expect(result).toBe(null);
 });
 
+// A late mid-turn checkpoint must not reopen a finished row. The database
+// behavior is in turn-checkpoint.integration.test.ts.
+test("MessageStore.updateContent saves an active status only on an active row", async () => {
+  const db = new ScriptedDatabase();
+  const guarded: Array<[string, boolean]> = [];
+  let sql = "";
+  db.scripts = [{
+    match: (t) => { sql = t; return t.includes("UPDATE messages") && t.includes("content_text = $5"); },
+    fn: (vals) => {
+      guarded.push([String(vals[3]), sql.includes("AND status IN ('pending', 'streaming')")]);
+      return { rows: [], rowCount: 0 };
+    }
+  }];
+  const store = new MessageStore(db as unknown as Pool);
+  for (const status of ["pending", "streaming", "completed", "error", "interrupted"] as const) {
+    await store.updateContent("t", "m-1", "u", status, "text");
+  }
+  expect(guarded).toEqual([
+    ["pending", true], ["streaming", true], ["completed", false], ["error", false], ["interrupted", false]
+  ]);
+});
+
 test("MessageStore.updateContent returns mapped record on success", async () => {
   const db = new ScriptedDatabase();
   const finishTools = vi.fn(() => ({ rows: [], rowCount: 1 }));

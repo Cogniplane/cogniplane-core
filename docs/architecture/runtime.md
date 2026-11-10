@@ -95,6 +95,11 @@ scheduled turns:
 - The SSE writer owns wire output, mid-turn checkpoints and MCP App events. It
   releases turn admission once, after finalization and before the terminal
   event.
+- A mid-turn checkpoint saves `streaming` and the text so far. Before the final
+  write, the writer waits for a checkpoint in flight for at most
+  `CHECKPOINT_DRAIN_DEADLINE_MS` (`sse-stream-writer-agui.ts`). The store saves
+  `pending` or `streaming` only on a row that has one of these statuses, so a
+  checkpoint that arrives after the final write changes nothing.
 - Finalization does not retry runtime or tool actions.
 
 ## Reconnect and stop
